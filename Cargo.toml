@@ -1,0 +1,11 @@
+[package]
+name = "dmuxai"
+version = "0.1.0"
+edition = "2024"
+description = "One terminal. Multiple AI coding agents."
+license = "MIT"
+
+[dependencies]
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+
