@@ -1,0 +1,40 @@
+name: Release Windows binary
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Package release archive and checksum
+        shell: pwsh
+        run: |
+          $archiveName = 'dmuxai-windows-x86_64.zip'
+          $distributionDirectory = Join-Path $env:RUNNER_TEMP 'dmuxai-release'
+          New-Item -ItemType Directory -Path $distributionDirectory | Out-Null
+          Copy-Item 'target\release\dmuxai.exe' (Join-Path $distributionDirectory 'dmuxai.exe')
+          Compress-Archive -Path (Join-Path $distributionDirectory 'dmuxai.exe') -DestinationPath $archiveName
+          $hash = (Get-FileHash -LiteralPath $archiveName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archiveName" | Set-Content -LiteralPath "$archiveName.sha256" -NoNewline -Encoding ascii
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dmuxai-windows-x86_64.zip
+            dmuxai-windows-x86_64.zip.sha256

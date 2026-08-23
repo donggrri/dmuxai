@@ -14,7 +14,10 @@ into shell commands.
 
 ## Requirements
 
-- Rust and Cargo
+The Windows release installer does not require Rust, Cargo, or Git. It installs
+the DmuxAI executable only; coding-agent CLIs remain independently installed and
+authenticated tools.
+
 - Codex CLI, authenticated with `codex login`
 - Cursor Agent CLI, authenticated with `cursor-agent login`
 - AGY CLI with a working account/configuration
@@ -28,22 +31,41 @@ cursor-agent --version
 cursor-agent status
 agy --version
 agy models
+opencode --version
+claude --version
+pi --version
 ```
 
 ## Install and run in any project
 
-On Windows, run the installer once from this repository. It installs the
-`dmuxai` executable into Cargo's user bin directory and adds that directory to
-your user `PATH` when needed.
+### Windows
+
+Install the latest published Windows release for the current user. No
+administrator permissions are required. The installer downloads the release,
+verifies its SHA-256 checksum, installs `dmuxai.exe` to
+`%LOCALAPPDATA%\DmuxAI\bin`, and adds that directory to the user `PATH`.
+
+PowerShell:
 
 ```powershell
-cd C:\path\to\DmuxAI
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\install.ps1
+irm https://raw.githubusercontent.com/donggrri/dmuxai/main/install.ps1 | iex
 ```
 
-After that, open a new PowerShell window, move to any project, and run
-`dmuxai` with no path argument:
+Or, after cloning the repository, run `install.cmd` from Command Prompt or
+`install.ps1` from PowerShell. These use the same published release; they do
+not build from source.
+
+```cmd
+cd C:\path\to\DmuxAI
+install.cmd
+```
+
+At the end of installation, DmuxAI reports whether Codex, Cursor Agent, AGY,
+OpenCode, Claude Code, and Pi are available on `PATH`. Missing tools do not
+prevent DmuxAI from installing. To omit that report, run
+`./install.ps1 -SkipProviderCheck`.
+
+Then move to any project and run `dmuxai` with no path argument:
 
 ```powershell
 cd C:\path\to\project
@@ -51,10 +73,12 @@ dmuxai
 ```
 
 DmuxAI uses the folder from which it was started as its workspace, so its agents
-operate on that project. To refresh the installed executable after changing
-DmuxAI, run `.\install.ps1` again from this repository.
+operate on that project. To update it, run the installer again; it replaces the
+current-user executable with the latest published release.
 
-Manual installation is also available when Cargo is already on `PATH`:
+### Build from source
+
+Rust and Cargo are required only when building from source:
 
 ```powershell
 cargo install --path . --locked --force
