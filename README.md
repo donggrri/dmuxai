@@ -48,14 +48,25 @@ cargo run
 
 Controls:
 
-- `Up` / `Down`: select an agent
 - Type or paste: edit the prompt
 - `Backspace`: delete the previous character
 - `Enter`: send to the selected agent
+- Type `/`: preview matching slash commands; use `Up` / `Down` and `Enter` or `Tab`
+- `/agent`: open the active-agent picker, then use `Up` / `Down` and `Enter`
+- `/mode`: choose `Ask`, `Plan`, or `Implement` for the active agent
 - `F2`: load and open that agent's model picker
 - Model picker `Up` / `Down`, `Enter`, `Esc`: move, select, or close
+- Mouse wheel: scroll the chat history without changing the active agent
+- Drag across Chat text: highlight and copy the selected text to the system clipboard
+- Drag the prompt pane's top border: resize the chat/prompt height ratio
 - `Ctrl+C`: cancel the selected agent's active turn
 - `Esc`: stop all owned child processes, restore the terminal, and exit
+
+`/agent` changes only which adapter receives the next prompt. Each provider's
+thread, session, or conversation remains alive while DmuxAI is running, so
+switching away and back continues that agent's existing conversation.
+The active agent is shown in the bottom status line; the agent list appears only
+inside the `/agent` picker instead of occupying a permanent sidebar.
 
 Model catalogs are loaded lazily only when `F2` is pressed. The chosen model is
 kept separately for each agent and passed to subsequent turns. A CLI can list a
@@ -67,19 +78,22 @@ resuming them after a DmuxAI restart remains future session-management work.
 
 ## Safety and platform behavior
 
-The current adapters intentionally use non-editing modes while the permission
-request UI is not implemented:
+Every agent starts in `Ask`. Modes are kept separately per agent and apply to
+subsequent turns:
 
-- Codex: `read-only`, approvals `never`
-- Cursor: `--mode ask`
-- AGY: `--mode plan --sandbox`
+| Mode | Codex | Cursor | AGY |
+| --- | --- | --- | --- |
+| `Ask` | read-only sandbox | `--mode ask` | plan+sandbox with a Q&A instruction |
+| `Plan` | read-only sandbox with a planning instruction | `--mode plan` | `--mode plan --sandbox` |
+| `Implement` | workspace-write sandbox, approvals `never` | `--force --sandbox enabled` | `--mode accept-edits --sandbox` |
 
-The selected agent's safety mode is shown in the bottom status bar. AGY's
-`plan+sandbox` mode can produce a `plan.md` artifact and ask for a plan review;
-that is an expected safe-plan response, not an indication that DmuxAI executed
-file changes. DmuxAI marks this response separately in the chat. If AGY is
-already continuing a plan-review conversation, its `conversation_id` is reused
-for subsequent turns until DmuxAI exits.
+`Implement` is the only mode intended to modify project files. It must be
+selected explicitly with `/mode`; commands remain constrained to the provider's
+workspace/sandbox configuration. DmuxAI never enables Codex danger-full-access,
+Cursor's unsandboxed mode, or AGY's `--dangerously-skip-permissions` flag.
+
+The active mode is shown in the bottom status bar and in the `/agent` picker.
+Mode changes are rejected by the UI while that agent has an active turn.
 
 Windows uses `codex.exe` and `agy.exe`. Cursor's Windows installer exposes shell
 wrappers, so DmuxAI resolves the latest installed Cursor version and launches

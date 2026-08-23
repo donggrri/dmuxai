@@ -1,0 +1,1410 @@
+//! Durable, provider-neutral conversations backed by SQLite.
+//!
+//! `ConversationEngine` is the module's interface. It owns identifiers,
+//! transactions, recovery, provider bindings, and context projection so callers
+//! do not need to coordinate those invariants themselves.
+
+use std::{
+    error::Error,
+    fmt, fs,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Type,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+const SCHEMA_VERSION: i64 = 1;
+const MAX_CONTEXT_CHARS: usize = 32_000;
+const RECENT_TAIL_CHARS: usize = 12_000;
+const SUMMARY_PROMPT_VERSION: &str = "conversation-summary-v1";
+
+const MIGRATION_1: &str = r#"
+CREATE TABLE IF NOT EXISTS conversations (
+    id              TEXT PRIMARY KEY,
+    workspace_root  TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    created_at_ms   INTEGER NOT NULL,
+    updated_at_ms   INTEGER NOT NULL,
+    archived_at_ms  INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS conversations_by_workspace_activity
+    ON conversations(workspace_root, archived_at_ms, updated_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS turns (
+    id                  TEXT PRIMARY KEY,
+    conversation_id     TEXT NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    seq                 INTEGER NOT NULL,
+    requested_agent     TEXT NOT NULL
+        CHECK (requested_agent IN ('codex', 'cursor', 'agy')),
+    model_id            TEXT,
+    status              TEXT NOT NULL
+        CHECK (status IN (
+            'queued', 'running', 'completed',
+            'cancelled', 'failed', 'interrupted'
+        )),
+    error_text          TEXT,
+    context_through_seq INTEGER NOT NULL DEFAULT 0,
+    created_at_ms       INTEGER NOT NULL,
+    started_at_ms       INTEGER,
+    completed_at_ms     INTEGER,
+    UNIQUE (conversation_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS turns_by_conversation_seq
+    ON turns(conversation_id, seq);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id              TEXT PRIMARY KEY,
+    turn_id         TEXT NOT NULL
+        REFERENCES turns(id) ON DELETE CASCADE,
+    ordinal         INTEGER NOT NULL CHECK (ordinal IN (0, 1)),
+    role            TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    text            TEXT NOT NULL DEFAULT '',
+    state           TEXT NOT NULL
+        CHECK (state IN ('complete', 'streaming', 'interrupted')),
+    created_at_ms   INTEGER NOT NULL,
+    updated_at_ms   INTEGER NOT NULL,
+    UNIQUE (turn_id, ordinal),
+    UNIQUE (turn_id, role)
+);
+
+CREATE TABLE IF NOT EXISTS provider_bindings (
+    conversation_id      TEXT NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    agent                TEXT NOT NULL
+        CHECK (agent IN ('codex', 'cursor', 'agy')),
+    provider_session_id  TEXT NOT NULL,
+    status               TEXT NOT NULL CHECK (status IN ('active', 'stale')),
+    known_through_seq    INTEGER NOT NULL DEFAULT 0,
+    bound_by_turn_id     TEXT REFERENCES turns(id),
+    created_at_ms        INTEGER NOT NULL,
+    updated_at_ms        INTEGER NOT NULL,
+    PRIMARY KEY (conversation_id, agent),
+    UNIQUE (agent, provider_session_id)
+);
+
+CREATE TABLE IF NOT EXISTS context_checkpoints (
+    conversation_id    TEXT NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    agent              TEXT NOT NULL
+        CHECK (agent IN ('codex', 'cursor', 'agy')),
+    covers_through_seq INTEGER NOT NULL,
+    source_hash        BLOB NOT NULL CHECK (length(source_hash) = 32),
+    prompt_version     TEXT NOT NULL,
+    summary_json       TEXT NOT NULL,
+    created_at_ms      INTEGER NOT NULL,
+    PRIMARY KEY (conversation_id, agent, covers_through_seq)
+);
+
+CREATE INDEX IF NOT EXISTS checkpoints_latest
+    ON context_checkpoints(
+        conversation_id,
+        agent,
+        covers_through_seq DESC
+    );
+
+PRAGMA user_version = 1;
+"#;
+
+#[derive(Debug)]
+pub enum ConversationError {
+    Sqlite(rusqlite::Error),
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    NoActiveConversation,
+    ConversationNotFound(ConversationId),
+    AgentBusy(AgentKey),
+    InvalidOutput(String),
+    StaleSummary,
+    UnsupportedSchema(i64),
+    ClockBeforeUnixEpoch,
+}
+
+impl fmt::Display for ConversationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sqlite(error) => write!(formatter, "conversation database error: {error}"),
+            Self::Io(error) => write!(formatter, "conversation I/O error: {error}"),
+            Self::Json(error) => write!(formatter, "invalid conversation JSON: {error}"),
+            Self::NoActiveConversation => formatter.write_str("no conversation is active"),
+            Self::ConversationNotFound(id) => write!(formatter, "conversation {id} was not found"),
+            Self::AgentBusy(agent) => write!(formatter, "{agent} already has an active turn"),
+            Self::InvalidOutput(message) => write!(formatter, "invalid agent output: {message}"),
+            Self::StaleSummary => formatter.write_str("summary source changed before commit"),
+            Self::UnsupportedSchema(version) => {
+                write!(
+                    formatter,
+                    "conversation database schema {version} is newer than supported"
+                )
+            }
+            Self::ClockBeforeUnixEpoch => {
+                formatter.write_str("system clock is before the Unix epoch")
+            }
+        }
+    }
+}
+
+impl Error for ConversationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Sqlite(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::Json(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for ConversationError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
+    }
+}
+
+impl From<std::io::Error> for ConversationError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for ConversationError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ConversationId(String);
+
+impl ConversationId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ConversationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TurnId(String);
+
+impl TurnId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TurnId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentKey {
+    Codex,
+    Cursor,
+    Agy,
+}
+
+impl AgentKey {
+    fn as_db(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Cursor => "cursor",
+            Self::Agy => "agy",
+        }
+    }
+
+    fn from_db(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "codex" => Ok(Self::Codex),
+            "cursor" => Ok(Self::Cursor),
+            "agy" => Ok(Self::Agy),
+            other => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                Type::Text,
+                format!("unknown agent {other}").into(),
+            )),
+        }
+    }
+}
+
+impl fmt::Display for AgentKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Codex => "Codex",
+            Self::Cursor => "Cursor",
+            Self::Agy => "AGY",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TurnStatus {
+    Queued,
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+    Interrupted,
+}
+
+impl TurnStatus {
+    fn from_db(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "cancelled" => Ok(Self::Cancelled),
+            "failed" => Ok(Self::Failed),
+            "interrupted" => Ok(Self::Interrupted),
+            other => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                Type::Text,
+                format!("unknown turn status {other}").into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageRole {
+    User,
+    Assistant,
+}
+
+impl MessageRole {
+    fn from_db(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "user" => Ok(Self::User),
+            "assistant" => Ok(Self::Assistant),
+            other => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                Type::Text,
+                format!("unknown message role {other}").into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageState {
+    Complete,
+    Streaming,
+    Interrupted,
+}
+
+impl MessageState {
+    fn from_db(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "complete" => Ok(Self::Complete),
+            "streaming" => Ok(Self::Streaming),
+            "interrupted" => Ok(Self::Interrupted),
+            other => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                Type::Text,
+                format!("unknown message state {other}").into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BindingStatus {
+    Active,
+    Stale,
+}
+
+impl BindingStatus {
+    fn from_db(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "active" => Ok(Self::Active),
+            "stale" => Ok(Self::Stale),
+            other => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                Type::Text,
+                format!("unknown binding status {other}").into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderBinding {
+    pub agent: AgentKey,
+    pub provider_session_id: String,
+    pub status: BindingStatus,
+    pub known_through_seq: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationCard {
+    pub id: ConversationId,
+    pub title: String,
+    pub updated_at_ms: i64,
+    pub turn_count: u64,
+    pub last_agent: Option<AgentKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptMessage {
+    pub id: String,
+    pub turn_id: TurnId,
+    pub turn_seq: i64,
+    pub agent: AgentKey,
+    pub role: MessageRole,
+    pub text: String,
+    pub state: MessageState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationSnapshot {
+    pub id: ConversationId,
+    pub title: String,
+    pub turns: Vec<TurnSnapshot>,
+    pub messages: Vec<TranscriptMessage>,
+    pub bindings: Vec<ProviderBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnSnapshot {
+    pub id: TurnId,
+    pub seq: i64,
+    pub agent: AgentKey,
+    pub model_id: Option<String>,
+    pub status: TurnStatus,
+    pub error_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationSelection {
+    New { title: Option<String> },
+    Existing(ConversationId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeginTurn {
+    pub agent: AgentKey,
+    pub model_id: Option<String>,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRequest {
+    pub conversation_id: ConversationId,
+    pub turn_id: TurnId,
+    pub agent: AgentKey,
+    pub model_id: Option<String>,
+    pub prompt: String,
+    pub resume_session: Option<String>,
+    pub context: ContextProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginTurnOutcome {
+    Ready(AgentRequest),
+    NeedsSummary(SummaryJob),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectedTurn {
+    pub seq: i64,
+    pub user: String,
+    pub assistant: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextProjection {
+    pub summary: Option<String>,
+    pub recent: Vec<ProjectedTurn>,
+    pub through_seq: i64,
+    pub source_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryJob {
+    conversation_id: ConversationId,
+    agent: AgentKey,
+    covers_through_seq: i64,
+    source_hash: [u8; 32],
+    previous_summary: Option<SummaryDocument>,
+    source_turns: Vec<ProjectedTurn>,
+}
+
+impl SummaryJob {
+    pub fn agent(&self) -> AgentKey {
+        self.agent
+    }
+
+    pub fn covers_through_seq(&self) -> i64 {
+        self.covers_through_seq
+    }
+
+    pub fn previous_summary(&self) -> Option<&SummaryDocument> {
+        self.previous_summary.as_ref()
+    }
+
+    pub fn source_turns(&self) -> &[ProjectedTurn] {
+        &self.source_turns
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryDocument {
+    pub goal: Option<String>,
+    pub constraints: Vec<String>,
+    pub decisions: Vec<String>,
+    pub facts: Vec<String>,
+    pub files: Vec<String>,
+    pub failed_attempts: Vec<String>,
+    pub open_questions: Vec<String>,
+}
+
+impl SummaryDocument {
+    fn render(&self) -> String {
+        let mut sections = Vec::new();
+        if let Some(goal) = &self.goal {
+            sections.push(format!("Goal:\n{goal}"));
+        }
+        push_summary_section(&mut sections, "Constraints", &self.constraints);
+        push_summary_section(&mut sections, "Decisions", &self.decisions);
+        push_summary_section(&mut sections, "Facts", &self.facts);
+        push_summary_section(&mut sections, "Files", &self.files);
+        push_summary_section(&mut sections, "Failed attempts", &self.failed_attempts);
+        push_summary_section(&mut sections, "Open questions", &self.open_questions);
+        sections.join("\n\n")
+    }
+}
+
+fn push_summary_section(sections: &mut Vec<String>, title: &str, values: &[String]) {
+    if !values.is_empty() {
+        let body = values
+            .iter()
+            .map(|value| format!("- {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("{title}:\n{body}"));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnOutput {
+    pub conversation_id: ConversationId,
+    pub turn_id: TurnId,
+    pub agent: AgentKey,
+    pub event: TurnEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEvent {
+    Started,
+    ProviderSessionBound(String),
+    TextDelta(String),
+    Notice(String),
+    Completed,
+    Cancelled,
+    Failed {
+        message: String,
+        invalidates_binding: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptPatch {
+    TurnStarted {
+        turn_id: TurnId,
+        agent: AgentKey,
+    },
+    ProviderBound {
+        agent: AgentKey,
+        provider_session_id: String,
+    },
+    AssistantDelta {
+        turn_id: TurnId,
+        agent: AgentKey,
+        delta: String,
+    },
+    Notice {
+        turn_id: TurnId,
+        agent: AgentKey,
+        text: String,
+    },
+    TurnFinished {
+        turn_id: TurnId,
+        agent: AgentKey,
+        status: TurnStatus,
+    },
+}
+
+pub struct ConversationEngine {
+    connection: Connection,
+    workspace_root: String,
+    active_conversation: Option<ConversationId>,
+}
+
+impl ConversationEngine {
+    pub fn open(db_path: &Path, workspace_root: &Path) -> Result<Self, ConversationError> {
+        if let Some(parent) = db_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+
+        let workspace_root = normalize_workspace(workspace_root)?;
+        let connection = Connection::open(db_path)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "NORMAL")?;
+
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(ConversationError::UnsupportedSchema(version));
+        }
+        if version < 1 {
+            connection.execute_batch(MIGRATION_1)?;
+        }
+
+        Ok(Self {
+            connection,
+            workspace_root,
+            active_conversation: None,
+        })
+    }
+
+    pub fn list(&self) -> Result<Vec<ConversationCard>, ConversationError> {
+        let mut statement = self.connection.prepare(
+            "SELECT c.id, c.title, c.updated_at_ms,
+                    COUNT(t.id),
+                    (SELECT requested_agent
+                       FROM turns latest
+                      WHERE latest.conversation_id = c.id
+                      ORDER BY latest.seq DESC
+                      LIMIT 1)
+               FROM conversations c
+               LEFT JOIN turns t ON t.conversation_id = c.id
+              WHERE c.workspace_root = ?1 AND c.archived_at_ms IS NULL
+              GROUP BY c.id
+              ORDER BY c.updated_at_ms DESC, c.id DESC",
+        )?;
+        let rows = statement.query_map([&self.workspace_root], |row| {
+            let last_agent: Option<String> = row.get(4)?;
+            Ok(ConversationCard {
+                id: ConversationId::new(row.get::<_, String>(0)?),
+                title: row.get(1)?,
+                updated_at_ms: row.get(2)?,
+                turn_count: row.get::<_, i64>(3)?.try_into().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(error))
+                })?,
+                last_agent: last_agent.as_deref().map(AgentKey::from_db).transpose()?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(ConversationError::from)
+    }
+
+    pub fn select(
+        &mut self,
+        selection: ConversationSelection,
+    ) -> Result<ConversationSnapshot, ConversationError> {
+        let conversation_id = match selection {
+            ConversationSelection::New { title } => {
+                let now = now_ms()?;
+                let id = ConversationId::new(Uuid::new_v4().to_string());
+                self.connection.execute(
+                    "INSERT INTO conversations
+                        (id, workspace_root, title, created_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?4)",
+                    params![
+                        id.as_str(),
+                        self.workspace_root,
+                        title
+                            .filter(|title| !title.trim().is_empty())
+                            .unwrap_or_else(|| "New conversation".to_owned()),
+                        now,
+                    ],
+                )?;
+                id
+            }
+            ConversationSelection::Existing(id) => {
+                if !self.conversation_exists(&id)? {
+                    return Err(ConversationError::ConversationNotFound(id));
+                }
+                self.recover_interrupted(&id)?;
+                id
+            }
+        };
+
+        self.active_conversation = Some(conversation_id.clone());
+        self.load_snapshot(&conversation_id)
+    }
+
+    pub fn begin_turn(&mut self, input: BeginTurn) -> Result<BeginTurnOutcome, ConversationError> {
+        let conversation_id = self
+            .active_conversation
+            .clone()
+            .ok_or(ConversationError::NoActiveConversation)?;
+
+        if self.agent_is_busy(&conversation_id, input.agent)? {
+            return Err(ConversationError::AgentBusy(input.agent));
+        }
+
+        let projection = match self.build_projection(&conversation_id, input.agent)? {
+            ProjectionBuild::Ready(projection) => projection,
+            ProjectionBuild::NeedsSummary(job) => return Ok(BeginTurnOutcome::NeedsSummary(job)),
+        };
+
+        let resume_session =
+            self.active_binding_for(&conversation_id, input.agent, projection.through_seq)?;
+        let now = now_ms()?;
+        let turn_id = TurnId::new(Uuid::new_v4().to_string());
+        let message_id = Uuid::new_v4().to_string();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let seq: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE conversation_id = ?1",
+            [conversation_id.as_str()],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO turns
+                (id, conversation_id, seq, requested_agent, model_id, status,
+                 context_through_seq, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)",
+            params![
+                turn_id.as_str(),
+                conversation_id.as_str(),
+                seq,
+                input.agent.as_db(),
+                input.model_id,
+                projection.through_seq,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO messages
+                (id, turn_id, ordinal, role, text, state, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, 0, 'user', ?3, 'complete', ?4, ?4)",
+            params![message_id, turn_id.as_str(), input.prompt, now],
+        )?;
+        transaction.execute(
+            "UPDATE conversations
+                SET title = CASE WHEN title = 'New conversation' THEN ?2 ELSE title END,
+                    updated_at_ms = ?3
+              WHERE id = ?1",
+            params![
+                conversation_id.as_str(),
+                title_from_prompt(&input.prompt),
+                now
+            ],
+        )?;
+        transaction.commit()?;
+
+        Ok(BeginTurnOutcome::Ready(AgentRequest {
+            conversation_id,
+            turn_id,
+            agent: input.agent,
+            model_id: input.model_id,
+            prompt: input.prompt,
+            resume_session,
+            context: projection,
+        }))
+    }
+
+    pub fn record_turn_outputs(
+        &mut self,
+        outputs: &[TurnOutput],
+    ) -> Result<Vec<TranscriptPatch>, ConversationError> {
+        if outputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let now = now_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut patches = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            let turn = load_turn_identity(&transaction, &output.turn_id)?;
+            if turn.conversation_id != output.conversation_id || turn.agent != output.agent {
+                return Err(ConversationError::InvalidOutput(format!(
+                    "turn {} belongs to conversation {} and {}, not conversation {} and {}",
+                    output.turn_id,
+                    turn.conversation_id,
+                    turn.agent,
+                    output.conversation_id,
+                    output.agent,
+                )));
+            }
+            apply_turn_event(&transaction, output, &turn, now, &mut patches)?;
+        }
+        transaction.commit()?;
+        Ok(patches)
+    }
+
+    pub fn commit_summary(
+        &mut self,
+        job: SummaryJob,
+        document: SummaryDocument,
+    ) -> Result<(), ConversationError> {
+        if !self.conversation_exists(&job.conversation_id)? {
+            return Err(ConversationError::ConversationNotFound(job.conversation_id));
+        }
+        let turns = load_projected_turns(&self.connection, &job.conversation_id, job.agent)?;
+        let current_hash = hash_turns(
+            turns
+                .iter()
+                .filter(|turn| turn.seq <= job.covers_through_seq),
+        );
+        if current_hash != job.source_hash {
+            return Err(ConversationError::StaleSummary);
+        }
+
+        let now = now_ms()?;
+        self.connection.execute(
+            "INSERT INTO context_checkpoints
+                (conversation_id, agent, covers_through_seq, source_hash,
+                 prompt_version, summary_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(conversation_id, agent, covers_through_seq) DO UPDATE SET
+                 source_hash = excluded.source_hash,
+                 prompt_version = excluded.prompt_version,
+                 summary_json = excluded.summary_json,
+                 created_at_ms = excluded.created_at_ms",
+            params![
+                job.conversation_id.as_str(),
+                job.agent.as_db(),
+                job.covers_through_seq,
+                &job.source_hash[..],
+                SUMMARY_PROMPT_VERSION,
+                serde_json::to_string(&document)?,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn conversation_exists(&self, id: &ConversationId) -> Result<bool, ConversationError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversations
+                     WHERE id = ?1 AND workspace_root = ?2 AND archived_at_ms IS NULL
+                 )",
+                params![id.as_str(), self.workspace_root],
+                |row| row.get(0),
+            )
+            .map_err(ConversationError::from)
+    }
+
+    fn recover_interrupted(&mut self, id: &ConversationId) -> Result<(), ConversationError> {
+        let now = now_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE provider_bindings
+                SET status = 'stale', updated_at_ms = ?2
+              WHERE conversation_id = ?1
+                AND agent IN (
+                    SELECT requested_agent FROM turns
+                     WHERE conversation_id = ?1 AND status IN ('queued', 'running')
+                )",
+            params![id.as_str(), now],
+        )?;
+        transaction.execute(
+            "UPDATE messages
+                SET state = 'interrupted', updated_at_ms = ?2
+              WHERE turn_id IN (
+                    SELECT id FROM turns
+                     WHERE conversation_id = ?1 AND status IN ('queued', 'running')
+                )
+                AND state = 'streaming'",
+            params![id.as_str(), now],
+        )?;
+        transaction.execute(
+            "UPDATE turns
+                SET status = 'interrupted', completed_at_ms = ?2,
+                    error_text = COALESCE(error_text, 'DmuxAI stopped before the turn completed')
+              WHERE conversation_id = ?1 AND status IN ('queued', 'running')",
+            params![id.as_str(), now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn agent_is_busy(
+        &self,
+        conversation_id: &ConversationId,
+        agent: AgentKey,
+    ) -> Result<bool, ConversationError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM turns
+                     WHERE conversation_id = ?1 AND requested_agent = ?2
+                       AND status IN ('queued', 'running')
+                 )",
+                params![conversation_id.as_str(), agent.as_db()],
+                |row| row.get(0),
+            )
+            .map_err(ConversationError::from)
+    }
+
+    fn active_binding_for(
+        &self,
+        conversation_id: &ConversationId,
+        agent: AgentKey,
+        through_seq: i64,
+    ) -> Result<Option<String>, ConversationError> {
+        self.connection
+            .query_row(
+                "SELECT provider_session_id
+                   FROM provider_bindings
+                  WHERE conversation_id = ?1 AND agent = ?2
+                    AND status = 'active' AND known_through_seq >= ?3",
+                params![conversation_id.as_str(), agent.as_db(), through_seq],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ConversationError::from)
+    }
+
+    fn build_projection(
+        &self,
+        conversation_id: &ConversationId,
+        agent: AgentKey,
+    ) -> Result<ProjectionBuild, ConversationError> {
+        let turns = load_projected_turns(&self.connection, conversation_id, agent)?;
+        let through_seq = turns.last().map_or(0, |turn| turn.seq);
+        let checkpoint = self.latest_valid_checkpoint(conversation_id, agent, &turns)?;
+        let covers_through_seq = checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.covers);
+        let recent = turns
+            .iter()
+            .filter(|turn| turn.seq > covers_through_seq)
+            .cloned()
+            .collect::<Vec<_>>();
+        let summary = checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.document.render());
+        let projected_chars = summary.as_ref().map_or(0, String::len)
+            + recent.iter().map(projected_turn_chars).sum::<usize>();
+        if projected_chars <= MAX_CONTEXT_CHARS {
+            return Ok(ProjectionBuild::Ready(ContextProjection {
+                summary,
+                recent,
+                through_seq,
+                source_hash: hash_turns(turns.iter()),
+            }));
+        }
+
+        let mut tail_chars = 0;
+        let mut tail_start = turns.len();
+        for (index, turn) in turns.iter().enumerate().rev() {
+            let chars = projected_turn_chars(turn);
+            if tail_chars + chars > RECENT_TAIL_CHARS {
+                break;
+            }
+            tail_chars += chars;
+            tail_start = index;
+        }
+        let covers_index = if tail_start == 0 {
+            turns.len()
+        } else {
+            tail_start
+        };
+        let source_turns = turns[..covers_index].to_vec();
+        let covers = source_turns.last().map_or(through_seq, |turn| turn.seq);
+        let previous_summary = checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.covers < covers)
+            .map(|checkpoint| checkpoint.document.clone());
+        let previous_covers = checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.covers);
+        let incremental_source = source_turns
+            .iter()
+            .filter(|turn| turn.seq > previous_covers)
+            .cloned()
+            .collect();
+        Ok(ProjectionBuild::NeedsSummary(SummaryJob {
+            conversation_id: conversation_id.clone(),
+            agent,
+            covers_through_seq: covers,
+            source_hash: hash_turns(source_turns.iter()),
+            previous_summary,
+            source_turns: incremental_source,
+        }))
+    }
+
+    fn latest_valid_checkpoint(
+        &self,
+        conversation_id: &ConversationId,
+        agent: AgentKey,
+        turns: &[ProjectedTurn],
+    ) -> Result<Option<Checkpoint>, ConversationError> {
+        let mut statement = self.connection.prepare(
+            "SELECT covers_through_seq, source_hash, summary_json
+               FROM context_checkpoints
+              WHERE conversation_id = ?1 AND agent = ?2 AND prompt_version = ?3
+              ORDER BY covers_through_seq DESC",
+        )?;
+        let mut rows = statement.query(params![
+            conversation_id.as_str(),
+            agent.as_db(),
+            SUMMARY_PROMPT_VERSION,
+        ])?;
+        while let Some(row) = rows.next()? {
+            let covers: i64 = row.get(0)?;
+            let stored_hash: Vec<u8> = row.get(1)?;
+            let expected_hash = hash_turns(turns.iter().filter(|turn| turn.seq <= covers));
+            if stored_hash.as_slice() != expected_hash {
+                continue;
+            }
+            let summary_json: String = row.get(2)?;
+            let document = serde_json::from_str(&summary_json)?;
+            return Ok(Some(Checkpoint { covers, document }));
+        }
+        Ok(None)
+    }
+
+    fn load_snapshot(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<ConversationSnapshot, ConversationError> {
+        let title = self.connection.query_row(
+            "SELECT title FROM conversations WHERE id = ?1 AND workspace_root = ?2",
+            params![conversation_id.as_str(), self.workspace_root],
+            |row| row.get(0),
+        )?;
+
+        let mut turn_statement = self.connection.prepare(
+            "SELECT id, seq, requested_agent, model_id, status, error_text
+               FROM turns WHERE conversation_id = ?1 ORDER BY seq",
+        )?;
+        let turns = turn_statement
+            .query_map([conversation_id.as_str()], |row| {
+                Ok(TurnSnapshot {
+                    id: TurnId::new(row.get::<_, String>(0)?),
+                    seq: row.get(1)?,
+                    agent: AgentKey::from_db(&row.get::<_, String>(2)?)?,
+                    model_id: row.get(3)?,
+                    status: TurnStatus::from_db(&row.get::<_, String>(4)?)?,
+                    error_text: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut message_statement = self.connection.prepare(
+            "SELECT m.id, m.turn_id, t.seq, t.requested_agent,
+                    m.role, m.text, m.state
+               FROM messages m
+               JOIN turns t ON t.id = m.turn_id
+              WHERE t.conversation_id = ?1
+              ORDER BY t.seq, m.ordinal",
+        )?;
+        let messages = message_statement
+            .query_map([conversation_id.as_str()], |row| {
+                Ok(TranscriptMessage {
+                    id: row.get(0)?,
+                    turn_id: TurnId::new(row.get::<_, String>(1)?),
+                    turn_seq: row.get(2)?,
+                    agent: AgentKey::from_db(&row.get::<_, String>(3)?)?,
+                    role: MessageRole::from_db(&row.get::<_, String>(4)?)?,
+                    text: row.get(5)?,
+                    state: MessageState::from_db(&row.get::<_, String>(6)?)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut binding_statement = self.connection.prepare(
+            "SELECT agent, provider_session_id, status, known_through_seq
+               FROM provider_bindings
+              WHERE conversation_id = ?1
+              ORDER BY agent",
+        )?;
+        let bindings = binding_statement
+            .query_map([conversation_id.as_str()], |row| {
+                Ok(ProviderBinding {
+                    agent: AgentKey::from_db(&row.get::<_, String>(0)?)?,
+                    provider_session_id: row.get(1)?,
+                    status: BindingStatus::from_db(&row.get::<_, String>(2)?)?,
+                    known_through_seq: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(ConversationSnapshot {
+            id: conversation_id.clone(),
+            title,
+            turns,
+            messages,
+            bindings,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum ProjectionBuild {
+    Ready(ContextProjection),
+    NeedsSummary(SummaryJob),
+}
+
+#[derive(Debug)]
+struct Checkpoint {
+    covers: i64,
+    document: SummaryDocument,
+}
+
+#[derive(Debug)]
+struct TurnIdentity {
+    conversation_id: ConversationId,
+    agent: AgentKey,
+    seq: i64,
+    status: TurnStatus,
+    context_through_seq: i64,
+}
+
+fn load_turn_identity(
+    transaction: &Transaction<'_>,
+    turn_id: &TurnId,
+) -> Result<TurnIdentity, ConversationError> {
+    transaction
+        .query_row(
+            "SELECT conversation_id, requested_agent, seq, status, context_through_seq
+               FROM turns WHERE id = ?1",
+            [turn_id.as_str()],
+            |row| {
+                Ok(TurnIdentity {
+                    conversation_id: ConversationId::new(row.get::<_, String>(0)?),
+                    agent: AgentKey::from_db(&row.get::<_, String>(1)?)?,
+                    seq: row.get(2)?,
+                    status: TurnStatus::from_db(&row.get::<_, String>(3)?)?,
+                    context_through_seq: row.get(4)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| ConversationError::InvalidOutput(format!("unknown turn {turn_id}")))
+}
+
+fn apply_turn_event(
+    transaction: &Transaction<'_>,
+    output: &TurnOutput,
+    turn: &TurnIdentity,
+    now: i64,
+    patches: &mut Vec<TranscriptPatch>,
+) -> Result<(), ConversationError> {
+    match &output.event {
+        TurnEvent::Started => {
+            ensure_turn_state(turn, &[TurnStatus::Queued], "start")?;
+            transaction.execute(
+                "UPDATE turns SET status = 'running', started_at_ms = ?2 WHERE id = ?1",
+                params![output.turn_id.as_str(), now],
+            )?;
+            patches.push(TranscriptPatch::TurnStarted {
+                turn_id: output.turn_id.clone(),
+                agent: output.agent,
+            });
+        }
+        TurnEvent::ProviderSessionBound(provider_session_id) => {
+            ensure_turn_state(turn, &[TurnStatus::Queued, TurnStatus::Running], "bind")?;
+            transaction.execute(
+                "INSERT INTO provider_bindings
+                    (conversation_id, agent, provider_session_id, status,
+                     known_through_seq, bound_by_turn_id, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?6)
+                 ON CONFLICT(conversation_id, agent) DO UPDATE SET
+                     provider_session_id = excluded.provider_session_id,
+                     status = 'active',
+                     known_through_seq = excluded.known_through_seq,
+                     bound_by_turn_id = excluded.bound_by_turn_id,
+                     updated_at_ms = excluded.updated_at_ms",
+                params![
+                    output.conversation_id.as_str(),
+                    output.agent.as_db(),
+                    provider_session_id,
+                    turn.context_through_seq,
+                    output.turn_id.as_str(),
+                    now,
+                ],
+            )?;
+            patches.push(TranscriptPatch::ProviderBound {
+                agent: output.agent,
+                provider_session_id: provider_session_id.clone(),
+            });
+        }
+        TurnEvent::TextDelta(delta) => {
+            ensure_turn_state(
+                turn,
+                &[TurnStatus::Queued, TurnStatus::Running],
+                "append text",
+            )?;
+            transaction.execute(
+                "UPDATE turns
+                    SET status = 'running', started_at_ms = COALESCE(started_at_ms, ?2)
+                  WHERE id = ?1",
+                params![output.turn_id.as_str(), now],
+            )?;
+            transaction.execute(
+                "INSERT INTO messages
+                    (id, turn_id, ordinal, role, text, state, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 1, 'assistant', ?3, 'streaming', ?4, ?4)
+                 ON CONFLICT(turn_id, role) DO UPDATE SET
+                     text = messages.text || excluded.text,
+                     updated_at_ms = excluded.updated_at_ms",
+                params![
+                    Uuid::new_v4().to_string(),
+                    output.turn_id.as_str(),
+                    delta,
+                    now,
+                ],
+            )?;
+            patches.push(TranscriptPatch::AssistantDelta {
+                turn_id: output.turn_id.clone(),
+                agent: output.agent,
+                delta: delta.clone(),
+            });
+        }
+        TurnEvent::Notice(text) => patches.push(TranscriptPatch::Notice {
+            turn_id: output.turn_id.clone(),
+            agent: output.agent,
+            text: text.clone(),
+        }),
+        TurnEvent::Completed => {
+            ensure_turn_state(turn, &[TurnStatus::Queued, TurnStatus::Running], "complete")?;
+            finish_turn(transaction, output, turn, now, TurnStatus::Completed, None)?;
+            transaction.execute(
+                "UPDATE provider_bindings
+                    SET known_through_seq = MAX(known_through_seq, ?3), updated_at_ms = ?4
+                  WHERE conversation_id = ?1 AND agent = ?2 AND status = 'active'",
+                params![
+                    output.conversation_id.as_str(),
+                    output.agent.as_db(),
+                    turn.seq,
+                    now,
+                ],
+            )?;
+            patches.push(TranscriptPatch::TurnFinished {
+                turn_id: output.turn_id.clone(),
+                agent: output.agent,
+                status: TurnStatus::Completed,
+            });
+        }
+        TurnEvent::Cancelled => {
+            ensure_turn_state(turn, &[TurnStatus::Queued, TurnStatus::Running], "cancel")?;
+            finish_turn(transaction, output, turn, now, TurnStatus::Cancelled, None)?;
+            mark_binding_stale(transaction, output, now)?;
+            patches.push(TranscriptPatch::TurnFinished {
+                turn_id: output.turn_id.clone(),
+                agent: output.agent,
+                status: TurnStatus::Cancelled,
+            });
+        }
+        TurnEvent::Failed {
+            message,
+            invalidates_binding,
+        } => {
+            ensure_turn_state(turn, &[TurnStatus::Queued, TurnStatus::Running], "fail")?;
+            finish_turn(
+                transaction,
+                output,
+                turn,
+                now,
+                TurnStatus::Failed,
+                Some(message),
+            )?;
+            if *invalidates_binding {
+                mark_binding_stale(transaction, output, now)?;
+            }
+            patches.push(TranscriptPatch::TurnFinished {
+                turn_id: output.turn_id.clone(),
+                agent: output.agent,
+                status: TurnStatus::Failed,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn ensure_turn_state(
+    turn: &TurnIdentity,
+    allowed: &[TurnStatus],
+    operation: &str,
+) -> Result<(), ConversationError> {
+    if allowed.contains(&turn.status) {
+        Ok(())
+    } else {
+        Err(ConversationError::InvalidOutput(format!(
+            "cannot {operation} a {:?} turn",
+            turn.status
+        )))
+    }
+}
+
+fn finish_turn(
+    transaction: &Transaction<'_>,
+    output: &TurnOutput,
+    _turn: &TurnIdentity,
+    now: i64,
+    status: TurnStatus,
+    error: Option<&String>,
+) -> Result<(), ConversationError> {
+    let status_text = match status {
+        TurnStatus::Completed => "completed",
+        TurnStatus::Cancelled => "cancelled",
+        TurnStatus::Failed => "failed",
+        _ => unreachable!("finish_turn only accepts terminal states"),
+    };
+    transaction.execute(
+        "UPDATE turns
+            SET status = ?2, error_text = ?3, completed_at_ms = ?4
+          WHERE id = ?1",
+        params![output.turn_id.as_str(), status_text, error, now],
+    )?;
+    if status == TurnStatus::Completed {
+        transaction.execute(
+            "INSERT INTO messages
+                (id, turn_id, ordinal, role, text, state, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, 1, 'assistant', '', 'complete', ?3, ?3)
+             ON CONFLICT(turn_id, role) DO UPDATE SET
+                 state = 'complete', updated_at_ms = excluded.updated_at_ms",
+            params![Uuid::new_v4().to_string(), output.turn_id.as_str(), now],
+        )?;
+    } else {
+        transaction.execute(
+            "UPDATE messages SET state = 'interrupted', updated_at_ms = ?2
+              WHERE turn_id = ?1 AND role = 'assistant'",
+            params![output.turn_id.as_str(), now],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE conversations SET updated_at_ms = ?2 WHERE id = ?1",
+        params![output.conversation_id.as_str(), now],
+    )?;
+    Ok(())
+}
+
+fn mark_binding_stale(
+    transaction: &Transaction<'_>,
+    output: &TurnOutput,
+    now: i64,
+) -> Result<(), ConversationError> {
+    transaction.execute(
+        "UPDATE provider_bindings SET status = 'stale', updated_at_ms = ?3
+          WHERE conversation_id = ?1 AND agent = ?2",
+        params![output.conversation_id.as_str(), output.agent.as_db(), now],
+    )?;
+    Ok(())
+}
+
+fn load_projected_turns(
+    connection: &Connection,
+    conversation_id: &ConversationId,
+    agent: AgentKey,
+) -> Result<Vec<ProjectedTurn>, ConversationError> {
+    let mut statement = connection.prepare(
+        "SELECT t.seq,
+                MAX(CASE WHEN m.role = 'user' THEN m.text END),
+                MAX(CASE WHEN m.role = 'assistant' THEN m.text END)
+           FROM turns t
+           JOIN messages m ON m.turn_id = t.id
+          WHERE t.conversation_id = ?1 AND t.requested_agent = ?2
+            AND t.status = 'completed'
+          GROUP BY t.id, t.seq
+         HAVING COUNT(CASE WHEN m.role = 'user' THEN 1 END) = 1
+            AND COUNT(CASE WHEN m.role = 'assistant' THEN 1 END) = 1
+          ORDER BY t.seq",
+    )?;
+    let turns = statement.query_map(params![conversation_id.as_str(), agent.as_db()], |row| {
+        Ok(ProjectedTurn {
+            seq: row.get(0)?,
+            user: row.get(1)?,
+            assistant: row.get(2)?,
+        })
+    })?;
+    turns
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(ConversationError::from)
+}
+
+fn hash_turns<'a>(turns: impl IntoIterator<Item = &'a ProjectedTurn>) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for turn in turns {
+        hasher.update(turn.seq.to_le_bytes());
+        hash_text(&mut hasher, &turn.user);
+        hash_text(&mut hasher, &turn.assistant);
+    }
+    hasher.finalize().into()
+}
+
+fn hash_text(hasher: &mut Sha256, text: &str) {
+    hasher.update((text.len() as u64).to_le_bytes());
+    hasher.update(text.as_bytes());
+}
+
+fn projected_turn_chars(turn: &ProjectedTurn) -> usize {
+    turn.user.len() + turn.assistant.len() + 32
+}
+
+fn normalize_workspace(path: &Path) -> Result<String, ConversationError> {
+    let canonical = fs::canonicalize(path).or_else(|_| {
+        if path.is_absolute() {
+            Ok::<PathBuf, std::io::Error>(path.to_path_buf())
+        } else {
+            Ok(std::env::current_dir()?.join(path))
+        }
+    })?;
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+fn title_from_prompt(prompt: &str) -> String {
+    let title = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = title.chars();
+    let prefix = chars.by_ref().take(80).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else if prefix.is_empty() {
+        "New conversation".to_owned()
+    } else {
+        prefix
+    }
+}
+
+fn now_ms() -> Result<i64, ConversationError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ConversationError::ClockBeforeUnixEpoch)?
+        .as_millis();
+    i64::try_from(millis).map_err(|_| ConversationError::ClockBeforeUnixEpoch)
+}

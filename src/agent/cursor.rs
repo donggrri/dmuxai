@@ -14,7 +14,8 @@ use tokio::{
 };
 
 use super::{
-    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, ModelInfo, SpawnedAdapter,
+    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ExecutionMode,
+    ModelInfo, OutputContext, SpawnedAdapter,
 };
 use crate::process::cursor_command;
 
@@ -22,10 +23,11 @@ const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const STDERR_HISTORY_CAPACITY: usize = 8;
 
 enum CursorCommand {
-    Send(String),
+    Send(AgentRequest),
     Cancel,
     ListModels,
     SelectModel(String),
+    SelectMode(ExecutionMode),
 }
 
 pub struct CursorAdapter {
@@ -37,9 +39,9 @@ impl AgentAdapter for CursorAdapter {
         Agent::Cursor
     }
 
-    fn send(&self, prompt: String) -> Result<(), AdapterError> {
+    fn send(&self, request: AgentRequest) -> Result<(), AdapterError> {
         self.command_tx
-            .try_send(CursorCommand::Send(prompt))
+            .try_send(CursorCommand::Send(request))
             .map_err(map_send_error)
     }
 
@@ -58,6 +60,12 @@ impl AgentAdapter for CursorAdapter {
     fn select_model(&self, model: String) -> Result<(), AdapterError> {
         self.command_tx
             .try_send(CursorCommand::SelectModel(model))
+            .map_err(map_send_error)
+    }
+
+    fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
+        self.command_tx
+            .try_send(CursorCommand::SelectMode(mode))
             .map_err(map_send_error)
     }
 }
@@ -80,9 +88,9 @@ async fn runtime_loop(
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
 ) {
-    let mut active: Option<JoinHandle<Option<String>>> = None;
-    let mut session_id: Option<String> = None;
+    let mut active: Option<ActiveTurn> = None;
     let mut selected_model: Option<String> = None;
+    let mut selected_mode = ExecutionMode::default();
 
     loop {
         if active.is_none() {
@@ -90,11 +98,11 @@ async fn runtime_loop(
                 break;
             };
             match command {
-                CursorCommand::Send(prompt) => {
+                CursorCommand::Send(request) => {
                     active = Some(spawn_turn(
-                        prompt,
-                        session_id.clone(),
+                        request,
                         selected_model.clone(),
+                        selected_mode,
                         cwd.clone(),
                         event_tx.clone(),
                     ));
@@ -104,6 +112,7 @@ async fn runtime_loop(
                     Ok((models, _advertised_default)) => {
                         send_event(
                             &event_tx,
+                            None,
                             AgentEvent::ModelsListed {
                                 models,
                                 selected: selected_model.clone(),
@@ -112,23 +121,24 @@ async fn runtime_loop(
                         .await;
                     }
                     Err(error) => {
-                        send_event(&event_tx, AgentEvent::Error(error.to_string())).await;
+                        send_event(&event_tx, None, AgentEvent::Error(error.to_string())).await;
                     }
                 },
                 CursorCommand::SelectModel(model) => {
                     selected_model = Some(model.clone());
-                    send_event(&event_tx, AgentEvent::ModelSelected(model)).await;
+                    send_event(&event_tx, None, AgentEvent::ModelSelected(model)).await;
+                }
+                CursorCommand::SelectMode(mode) => {
+                    selected_mode = mode;
+                    send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
                 }
             }
             continue;
         }
 
-        let turn = active.as_mut().expect("checked above");
+        let turn = &mut active.as_mut().expect("checked above").handle;
         tokio::select! {
-            outcome = turn => {
-                if let Ok(Some(updated_session)) = outcome {
-                    session_id = Some(updated_session);
-                }
+            _ = turn => {
                 active = None;
             }
             command = command_rx.recv() => {
@@ -136,9 +146,11 @@ async fn runtime_loop(
                     Some(CursorCommand::Cancel) => {
                         stop_turn(active.take(), &event_tx).await;
                     }
-                    Some(CursorCommand::Send(_)) => {
+                    Some(CursorCommand::Send(request)) => {
+                        let context = OutputContext::from(&request);
                         send_event(
                             &event_tx,
+                            Some(&context),
                             AgentEvent::Notice(
                                 "Cursor is already running a turn; cancel it before sending another prompt"
                                     .to_owned(),
@@ -148,6 +160,7 @@ async fn runtime_loop(
                     Some(CursorCommand::ListModels) => {
                         send_event(
                             &event_tx,
+                            None,
                             AgentEvent::Notice(
                                 "finish or cancel the Cursor turn before loading models".to_owned(),
                             ),
@@ -156,8 +169,20 @@ async fn runtime_loop(
                     Some(CursorCommand::SelectModel(_)) => {
                         send_event(
                             &event_tx,
+                            None,
                             AgentEvent::Notice(
                                 "finish or cancel the Cursor turn before changing models".to_owned(),
+                            ),
+                        ).await;
+                    }
+                    Some(CursorCommand::SelectMode(mode)) => {
+                        selected_mode = mode;
+                        send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
+                        send_event(
+                            &event_tx,
+                            None,
+                            AgentEvent::Notice(
+                                "Cursor mode changed; it will apply to the next turn".to_owned(),
                             ),
                         ).await;
                     }
@@ -172,57 +197,49 @@ async fn runtime_loop(
 }
 
 fn spawn_turn(
-    prompt: String,
-    session_id: Option<String>,
+    request: AgentRequest,
     selected_model: Option<String>,
+    mode: ExecutionMode,
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
-) -> JoinHandle<Option<String>> {
-    tokio::spawn(async move {
-        match run_turn(prompt, session_id, selected_model, &cwd, &event_tx).await {
-            Ok(session_id) => session_id,
-            Err(error) => {
-                send_event(&event_tx, AgentEvent::Error(error.to_string())).await;
-                None
-            }
+) -> ActiveTurn {
+    let context = OutputContext::from(&request);
+    let error_context = context.clone();
+    let handle = tokio::spawn(async move {
+        if let Err(error) = run_turn(&request, selected_model, mode, &cwd, &event_tx).await {
+            send_event(
+                &event_tx,
+                Some(&error_context),
+                AgentEvent::Error(error.to_string()),
+            )
+            .await;
         }
-    })
+    });
+    ActiveTurn { handle, context }
 }
 
-async fn stop_turn(turn: Option<JoinHandle<Option<String>>>, event_tx: &mpsc::Sender<AgentOutput>) {
+struct ActiveTurn {
+    handle: JoinHandle<()>,
+    context: OutputContext,
+}
+
+async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
     if let Some(turn) = turn {
-        turn.abort();
-        let _ = turn.await;
-        send_event(event_tx, AgentEvent::Cancelled).await;
+        turn.handle.abort();
+        let _ = turn.handle.await;
+        send_event(event_tx, Some(&turn.context), AgentEvent::Cancelled).await;
     }
 }
 
 async fn run_turn(
-    prompt: String,
-    session_id: Option<String>,
+    request: &AgentRequest,
     selected_model: Option<String>,
+    mode: ExecutionMode,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
 ) -> io::Result<Option<String>> {
     let mut command = cursor_command()?;
-    command
-        .args([
-            "--print",
-            "--mode",
-            "ask",
-            "--output-format",
-            "stream-json",
-            "--stream-partial-output",
-            "--trust",
-            "--workspace",
-        ])
-        .arg(cwd);
-    if let Some(model) = selected_model {
-        command.arg("--model").arg(model);
-    }
-    if let Some(session_id) = session_id {
-        command.arg("--resume").arg(session_id);
-    }
+    configure_command(&mut command, request, selected_model.as_deref(), mode, cwd);
     command
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -244,13 +261,50 @@ async fn run_turn(
         .take()
         .ok_or_else(|| io::Error::other("Cursor stderr was not piped"))?;
 
-    send_event(event_tx, AgentEvent::Started).await;
-    stdin.write_all(prompt.as_bytes()).await?;
+    let context = OutputContext::from(request);
+    send_event(event_tx, Some(&context), AgentEvent::Started).await;
+    stdin.write_all(request.prompt.as_bytes()).await?;
     stdin.write_all(b"\n").await?;
     stdin.shutdown().await?;
     drop(stdin);
 
-    stream_child(&mut child, stdout, stderr, event_tx).await
+    stream_child(&mut child, stdout, stderr, event_tx, &context).await
+}
+
+fn configure_command(
+    command: &mut tokio::process::Command,
+    request: &AgentRequest,
+    selected_model: Option<&str>,
+    mode: ExecutionMode,
+    cwd: &Path,
+) {
+    command.arg("--print");
+    match mode {
+        ExecutionMode::Ask => {
+            command.args(["--mode", "ask"]);
+        }
+        ExecutionMode::Plan => {
+            command.args(["--mode", "plan"]);
+        }
+        ExecutionMode::Implement => {
+            command.args(["--force", "--sandbox", "enabled"]);
+        }
+    }
+    command
+        .args([
+            "--output-format",
+            "stream-json",
+            "--stream-partial-output",
+            "--trust",
+            "--workspace",
+        ])
+        .arg(cwd);
+    if let Some(model) = selected_model {
+        command.arg("--model").arg(model);
+    }
+    if let Some(session_id) = request.resume_session.as_deref() {
+        command.arg("--resume").arg(session_id);
+    }
 }
 
 async fn stream_child(
@@ -258,6 +312,7 @@ async fn stream_child(
     stdout: ChildStdout,
     stderr: ChildStderr,
     event_tx: &mpsc::Sender<AgentOutput>,
+    context: &OutputContext,
 ) -> io::Result<Option<String>> {
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
@@ -276,7 +331,7 @@ async fn stream_child(
                             io::Error::other(format!("invalid Cursor NDJSON: {error}"))
                         })?;
                         for event in normalize_event(&message, &mut state) {
-                            send_event(event_tx, event).await;
+                            send_event(event_tx, Some(context), event).await;
                         }
                     }
                     None => stdout_open = false,
@@ -314,8 +369,12 @@ struct CursorStreamState {
 }
 
 fn normalize_event(message: &Value, state: &mut CursorStreamState) -> Vec<AgentEvent> {
-    if let Some(session_id) = message.get("session_id").and_then(Value::as_str) {
+    let mut events = Vec::new();
+    if let Some(session_id) = message.get("session_id").and_then(Value::as_str)
+        && state.session_id.as_deref() != Some(session_id)
+    {
         state.session_id = Some(session_id.to_owned());
+        events.push(AgentEvent::ProviderSessionBound(session_id.to_owned()));
     }
 
     match message.get("type").and_then(Value::as_str) {
@@ -331,9 +390,7 @@ fn normalize_event(message: &Value, state: &mut CursorStreamState) -> Vec<AgentE
             let is_partial = message.get("timestamp_ms").is_some();
             if !text.is_empty() && (is_partial || !state.emitted_text) {
                 state.emitted_text = true;
-                vec![AgentEvent::TextDelta(text)]
-            } else {
-                Vec::new()
+                events.push(AgentEvent::TextDelta(text));
             }
         }
         Some("result") => {
@@ -344,15 +401,14 @@ fn normalize_event(message: &Value, state: &mut CursorStreamState) -> Vec<AgentE
                 .unwrap_or(false)
                 || message.get("subtype").and_then(Value::as_str) != Some("success")
             {
-                vec![AgentEvent::Error(
+                events.push(AgentEvent::Error(
                     message
                         .get("result")
                         .and_then(Value::as_str)
                         .unwrap_or("Cursor turn failed")
                         .to_owned(),
-                )]
+                ));
             } else {
-                let mut events = Vec::new();
                 if !state.emitted_text
                     && let Some(result) = message.get("result").and_then(Value::as_str)
                     && !result.is_empty()
@@ -360,11 +416,11 @@ fn normalize_event(message: &Value, state: &mut CursorStreamState) -> Vec<AgentE
                     events.push(AgentEvent::TextDelta(result.to_owned()));
                 }
                 events.push(AgentEvent::Completed);
-                events
             }
         }
-        _ => Vec::new(),
+        _ => {}
     }
+    events
 }
 
 async fn list_models(cwd: &Path) -> io::Result<(Vec<ModelInfo>, Option<String>)> {
@@ -413,10 +469,16 @@ fn push_stderr(history: &mut VecDeque<String>, line: String) {
     history.push_back(line);
 }
 
-async fn send_event(event_tx: &mpsc::Sender<AgentOutput>, event: AgentEvent) {
+async fn send_event(
+    event_tx: &mpsc::Sender<AgentOutput>,
+    context: Option<&OutputContext>,
+    event: AgentEvent,
+) {
     let _ = event_tx
         .send(AgentOutput {
             agent: Agent::Cursor,
+            conversation_id: context.map(|context| context.conversation_id.clone()),
+            turn_id: context.map(|context| context.turn_id.clone()),
             event,
         })
         .await;
@@ -468,7 +530,10 @@ mod tests {
 
         assert_eq!(
             normalize_event(&partial, &mut state),
-            vec![AgentEvent::TextDelta("CURSOR_OK".to_owned())]
+            vec![
+                AgentEvent::ProviderSessionBound("session".to_owned()),
+                AgentEvent::TextDelta("CURSOR_OK".to_owned()),
+            ]
         );
         assert!(normalize_event(&aggregate, &mut state).is_empty());
         assert_eq!(
@@ -478,16 +543,109 @@ mod tests {
         assert_eq!(state.session_id.as_deref(), Some("session"));
     }
 
+    #[test]
+    fn cursor_resume_session_is_passed_to_the_command() {
+        let cwd = Path::new("workspace");
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conversation"),
+            turn_id: super::super::TurnId::new("turn"),
+            prompt: "hello".to_owned(),
+            resume_session: Some("cursor-session".to_owned()),
+        };
+        let mut command = tokio::process::Command::new("cursor-agent");
+
+        configure_command(
+            &mut command,
+            &request,
+            Some("cursor-model"),
+            ExecutionMode::Ask,
+            cwd,
+        );
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--resume", "cursor-session"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--model", "cursor-model"])
+        );
+    }
+
+    #[test]
+    fn cursor_execution_modes_use_native_cli_flags() {
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conversation"),
+            turn_id: super::super::TurnId::new("turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+        };
+        let cwd = Path::new("workspace");
+
+        let args_for = |mode| {
+            let mut command = tokio::process::Command::new("cursor-agent");
+            configure_command(&mut command, &request, None, mode, cwd);
+            command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let ask = args_for(ExecutionMode::Ask);
+        assert!(ask.windows(2).any(|args| args == ["--mode", "ask"]));
+        let plan = args_for(ExecutionMode::Plan);
+        assert!(plan.windows(2).any(|args| args == ["--mode", "plan"]));
+        let implement = args_for(ExecutionMode::Implement);
+        assert!(implement.iter().any(|arg| arg == "--force"));
+        assert!(
+            implement
+                .windows(2)
+                .any(|args| args == ["--sandbox", "enabled"])
+        );
+        assert!(!implement.iter().any(|arg| arg == "--mode"));
+    }
+
+    #[tokio::test]
+    async fn selecting_mode_is_acknowledged_without_starting_a_process() {
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let (adapter, worker) = spawn_cursor_adapter(event_tx, PathBuf::from("workspace"));
+
+        adapter.select_mode(ExecutionMode::Implement).unwrap();
+
+        let output = timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("mode selection should be acknowledged")
+            .expect("runtime should remain connected");
+        assert_eq!(
+            output.event,
+            AgentEvent::ModeSelected(ExecutionMode::Implement)
+        );
+        drop(adapter);
+        worker.await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires a locally installed and authenticated Cursor Agent CLI"]
     async fn real_cursor_turn_streams_to_completion() {
         let (event_tx, mut event_rx) = mpsc::channel(128);
         let cwd = std::env::current_dir().unwrap();
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("real-conversation"),
+            turn_id: super::super::TurnId::new("real-turn"),
+            prompt: "Reply with exactly CURSOR_OK. Do not use tools or modify files.".to_owned(),
+            resume_session: None,
+        };
         let turn = tokio::spawn(async move {
             run_turn(
-                "Reply with exactly CURSOR_OK. Do not use tools or modify files.".to_owned(),
-                None,
+                &request,
                 Some("cursor-grok-4.6-high".to_owned()),
+                ExecutionMode::Ask,
                 &cwd,
                 &event_tx,
             )
@@ -502,9 +660,11 @@ mod tests {
                     AgentEvent::Completed => return answer,
                     AgentEvent::Error(error) => panic!("Cursor turn failed: {error}"),
                     AgentEvent::Started
+                    | AgentEvent::ProviderSessionBound(_)
                     | AgentEvent::Notice(_)
                     | AgentEvent::ModelsListed { .. }
                     | AgentEvent::ModelSelected(_)
+                    | AgentEvent::ModeSelected(_)
                     | AgentEvent::Cancelled => {}
                 }
             }

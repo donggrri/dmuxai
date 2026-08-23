@@ -14,7 +14,8 @@ use tokio::{
 };
 
 use super::{
-    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, ModelInfo, SpawnedAdapter,
+    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ConversationId,
+    ExecutionMode, ModelInfo, OutputContext, SpawnedAdapter,
 };
 use crate::process::{headless_command, resolve_program};
 
@@ -24,10 +25,11 @@ const CODEX_BINARY_OVERRIDE: &str = "DMUXAI_CODEX_BIN";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 enum CodexCommand {
-    Send(String),
+    Send(AgentRequest),
     Cancel,
     ListModels,
     SelectModel(String),
+    SelectMode(ExecutionMode),
 }
 
 pub struct CodexAdapter {
@@ -39,9 +41,9 @@ impl AgentAdapter for CodexAdapter {
         Agent::Codex
     }
 
-    fn send(&self, prompt: String) -> Result<(), AdapterError> {
+    fn send(&self, request: AgentRequest) -> Result<(), AdapterError> {
         self.command_tx
-            .try_send(CodexCommand::Send(prompt))
+            .try_send(CodexCommand::Send(request))
             .map_err(map_send_error)
     }
 
@@ -60,6 +62,12 @@ impl AgentAdapter for CodexAdapter {
     fn select_model(&self, model: String) -> Result<(), AdapterError> {
         self.command_tx
             .try_send(CodexCommand::SelectModel(model))
+            .map_err(map_send_error)
+    }
+
+    fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
+        self.command_tx
+            .try_send(CodexCommand::SelectMode(mode))
             .map_err(map_send_error)
     }
 }
@@ -83,7 +91,9 @@ struct CodexClient {
     stdin: ChildStdin,
     raw_rx: mpsc::Receiver<RawMessage>,
     readers: Vec<JoinHandle<()>>,
-    thread_id: String,
+    thread_id: Option<String>,
+    conversation_id: Option<ConversationId>,
+    output_context: Option<OutputContext>,
     active_turn_id: Option<String>,
     pending_turn_request_id: Option<u64>,
     turn_ready_for_interrupt: bool,
@@ -99,7 +109,7 @@ enum RawMessage {
 }
 
 impl CodexClient {
-    async fn start(cwd: &Path, event_tx: &mpsc::Sender<AgentOutput>) -> io::Result<Self> {
+    async fn start(_cwd: &Path, event_tx: &mpsc::Sender<AgentOutput>) -> io::Result<Self> {
         let program = resolve_program(CODEX_BINARY_OVERRIDE, "codex.exe", "codex");
         let mut command = headless_command(program);
         command
@@ -133,7 +143,9 @@ impl CodexClient {
             stdin,
             raw_rx,
             readers,
-            thread_id: String::new(),
+            thread_id: None,
+            conversation_id: None,
+            output_context: None,
             active_turn_id: None,
             pending_turn_request_id: None,
             turn_ready_for_interrupt: false,
@@ -163,24 +175,33 @@ impl CodexClient {
             .write_message(json!({ "method": "initialized", "params": {} }))
             .await?;
 
-        let thread_id = client.next_id();
-        client
-            .write_message(json!({
-                "method": "thread/start",
-                "id": thread_id,
-                "params": {
-                    "cwd": cwd.to_string_lossy(),
-                    "approvalPolicy": "never",
-                    "sandbox": "read-only"
-                }
-            }))
-            .await?;
-        let response = client
-            .wait_for_success_response(thread_id, event_tx)
-            .await?;
-        client.thread_id = extract_thread_id(&response)?;
-
         Ok(client)
+    }
+
+    async fn open_thread(
+        &mut self,
+        cwd: &Path,
+        request: &AgentRequest,
+        event_tx: &mpsc::Sender<AgentOutput>,
+    ) -> io::Result<Option<String>> {
+        if self.conversation_id.as_ref() == Some(&request.conversation_id)
+            && self.thread_id.is_some()
+        {
+            return Ok(None);
+        }
+
+        let request_id = self.next_id();
+        self.write_message(thread_open_request(
+            request_id,
+            cwd,
+            request.resume_session.as_deref(),
+        ))
+        .await?;
+        let response = self.wait_for_success_response(request_id, event_tx).await?;
+        let thread_id = extract_thread_id(&response)?;
+        self.thread_id = Some(thread_id.clone());
+        self.conversation_id = Some(request.conversation_id.clone());
+        Ok(Some(thread_id))
     }
 
     fn next_id(&mut self) -> u64 {
@@ -189,24 +210,25 @@ impl CodexClient {
         id
     }
 
-    async fn start_turn(&mut self, prompt: String, model: Option<&str>) -> io::Result<()> {
+    async fn start_turn(
+        &mut self,
+        request: &AgentRequest,
+        model: Option<&str>,
+        mode: ExecutionMode,
+    ) -> io::Result<()> {
+        let thread_id = self
+            .thread_id
+            .clone()
+            .ok_or_else(|| io::Error::other("Codex thread was not opened"))?;
         let request_id = self.next_id();
         self.pending_turn_request_id = Some(request_id);
+        self.output_context = Some(OutputContext::from(request));
         self.turn_ready_for_interrupt = false;
         self.interrupt_sent = false;
         self.cancel_requested = false;
-        let mut params = json!({
-            "threadId": self.thread_id,
-            "input": [{ "type": "text", "text": prompt }]
-        });
-        if let Some(model) = model {
-            params["model"] = Value::String(model.to_owned());
-        }
-        self.write_message(json!({
-            "method": "turn/start",
-            "id": request_id,
-            "params": params
-        }))
+        self.write_message(turn_start_request(
+            request_id, &thread_id, request, model, mode,
+        ))
         .await
     }
 
@@ -237,13 +259,14 @@ impl CodexClient {
         if self.turn_ready_for_interrupt
             && !self.interrupt_sent
             && let Some(turn_id) = self.active_turn_id.clone()
+            && let Some(thread_id) = self.thread_id.clone()
         {
             let request_id = self.next_id();
             self.write_message(json!({
                 "method": "turn/interrupt",
                 "id": request_id,
                 "params": {
-                    "threadId": self.thread_id,
+                    "threadId": thread_id,
                     "turnId": turn_id
                 }
             }))
@@ -327,6 +350,133 @@ impl CodexClient {
     }
 }
 
+fn thread_open_request(request_id: u64, cwd: &Path, resume_session: Option<&str>) -> Value {
+    let mut params = json!({
+        "cwd": cwd.to_string_lossy(),
+        "approvalPolicy": "never",
+        "sandbox": "read-only"
+    });
+    let method = if let Some(thread_id) = resume_session {
+        params["threadId"] = Value::String(thread_id.to_owned());
+        "thread/resume"
+    } else {
+        "thread/start"
+    };
+    json!({
+        "method": method,
+        "id": request_id,
+        "params": params
+    })
+}
+
+fn turn_start_request(
+    request_id: u64,
+    thread_id: &str,
+    request: &AgentRequest,
+    model: Option<&str>,
+    mode: ExecutionMode,
+) -> Value {
+    let mut params = json!({
+        "threadId": thread_id,
+        "input": [{ "type": "text", "text": codex_prompt(mode, &request.prompt) }],
+        "approvalPolicy": "never",
+        "sandboxPolicy": match mode {
+            ExecutionMode::Ask | ExecutionMode::Plan => "readOnly",
+            ExecutionMode::Implement => "workspaceWrite",
+        }
+    });
+    if let Some(model) = model {
+        params["model"] = Value::String(model.to_owned());
+    }
+    json!({
+        "method": "turn/start",
+        "id": request_id,
+        "params": params
+    })
+}
+
+fn codex_prompt(mode: ExecutionMode, prompt: &str) -> String {
+    match mode {
+        ExecutionMode::Plan => {
+            format!("Plan only. Do not modify files or execute implementation steps.\n\n{prompt}")
+        }
+        ExecutionMode::Ask | ExecutionMode::Implement => prompt.to_owned(),
+    }
+}
+
+async fn begin_request(
+    client: &mut CodexClient,
+    request: &AgentRequest,
+    selected_model: Option<&str>,
+    mode: ExecutionMode,
+    cwd: &Path,
+    event_tx: &mpsc::Sender<AgentOutput>,
+) -> io::Result<()> {
+    let context = OutputContext::from(request);
+    if let Some(thread_id) = client.open_thread(cwd, request, event_tx).await? {
+        send_event(
+            event_tx,
+            Some(&context),
+            AgentEvent::ProviderSessionBound(thread_id),
+        )
+        .await;
+    }
+    client.start_turn(request, selected_model, mode).await?;
+    send_event(event_tx, Some(&context), AgentEvent::Started).await;
+    Ok(())
+}
+
+fn conversation_requires_reconnect(
+    current: Option<&ConversationId>,
+    requested: &ConversationId,
+) -> bool {
+    current.is_some_and(|current| current != requested)
+}
+
+async fn connect_for_request(
+    request: &AgentRequest,
+    selected_model: Option<&str>,
+    mode: ExecutionMode,
+    cwd: &Path,
+    event_tx: &mpsc::Sender<AgentOutput>,
+) -> Option<CodexClient> {
+    let context = OutputContext::from(request);
+    match CodexClient::start(cwd, event_tx).await {
+        Ok(mut started) => {
+            if let Err(error) = begin_request(
+                &mut started,
+                request,
+                selected_model,
+                mode,
+                cwd,
+                event_tx,
+            )
+            .await
+            {
+                send_event(
+                    event_tx,
+                    Some(&context),
+                    AgentEvent::Error(error.to_string()),
+                )
+                .await;
+                started.shutdown().await;
+                None
+            } else {
+                Some(started)
+            }
+        }
+        Err(error) => {
+            send_event(
+                event_tx,
+                Some(&context),
+                AgentEvent::Error(format!("could not start Codex: {error}")),
+            )
+            .await;
+            None
+        }
+    }
+}
+
 async fn runtime_loop(
     mut command_rx: mpsc::Receiver<CodexCommand>,
     event_tx: mpsc::Sender<AgentOutput>,
@@ -334,35 +484,29 @@ async fn runtime_loop(
 ) {
     let mut client: Option<CodexClient> = None;
     let mut selected_model: Option<String> = None;
+    let mut selected_mode = ExecutionMode::default();
 
     loop {
         if client.is_none() {
             match command_rx.recv().await {
-                Some(CodexCommand::Send(prompt)) => match CodexClient::start(&cwd, &event_tx).await
-                {
-                    Ok(mut started) => {
-                        if let Err(error) =
-                            started.start_turn(prompt, selected_model.as_deref()).await
-                        {
-                            send_event(&event_tx, AgentEvent::Error(error.to_string())).await;
-                            started.shutdown().await;
-                        } else {
-                            send_event(&event_tx, AgentEvent::Started).await;
-                            client = Some(started);
-                        }
-                    }
-                    Err(error) => {
-                        send_event(
-                            &event_tx,
-                            AgentEvent::Error(format!("could not start Codex: {error}")),
-                        )
-                        .await;
-                    }
-                },
+                Some(CodexCommand::Send(request)) => {
+                    client = connect_for_request(
+                        &request,
+                        selected_model.as_deref(),
+                        selected_mode,
+                        &cwd,
+                        &event_tx,
+                    )
+                    .await;
+                }
                 Some(CodexCommand::Cancel) => {}
                 Some(CodexCommand::SelectModel(model)) => {
                     selected_model = Some(model.clone());
-                    send_event(&event_tx, AgentEvent::ModelSelected(model)).await;
+                    send_event(&event_tx, None, AgentEvent::ModelSelected(model)).await;
+                }
+                Some(CodexCommand::SelectMode(mode)) => {
+                    selected_mode = mode;
+                    send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
                 }
                 Some(CodexCommand::ListModels) => match CodexClient::start(&cwd, &event_tx).await {
                     Ok(mut started) => match started.list_models(&event_tx).await {
@@ -372,6 +516,7 @@ async fn runtime_loop(
                             }
                             send_event(
                                 &event_tx,
+                                None,
                                 AgentEvent::ModelsListed {
                                     models,
                                     selected: selected_model.clone(),
@@ -381,13 +526,14 @@ async fn runtime_loop(
                             client = Some(started);
                         }
                         Err(error) => {
-                            send_event(&event_tx, AgentEvent::Error(error.to_string())).await;
+                            send_event(&event_tx, None, AgentEvent::Error(error.to_string())).await;
                             started.shutdown().await;
                         }
                     },
                     Err(error) => {
                         send_event(
                             &event_tx,
+                            None,
                             AgentEvent::Error(format!("could not start Codex: {error}")),
                         )
                         .await;
@@ -399,32 +545,51 @@ async fn runtime_loop(
         }
 
         let active_client = client.as_mut().expect("checked above");
+        let mut reconnect_request = None;
         tokio::select! {
             command = command_rx.recv() => {
                 match command {
-                    Some(CodexCommand::Send(prompt)) => {
+                    Some(CodexCommand::Send(request)) => {
+                        let context = OutputContext::from(&request);
                         if active_client.active_turn_id.is_some()
                             || active_client.pending_turn_request_id.is_some()
                         {
                             send_event(
                                 &event_tx,
+                                Some(&context),
                                 AgentEvent::Notice(
                                     "Codex is already running a turn; cancel it before sending another prompt"
                                         .to_owned(),
                                 ),
                             ).await;
-                        } else if let Err(error) = active_client
-                            .start_turn(prompt, selected_model.as_deref())
-                            .await
-                        {
-                            send_event(&event_tx, AgentEvent::Error(error.to_string())).await;
-                        } else {
-                            send_event(&event_tx, AgentEvent::Started).await;
+                        } else if conversation_requires_reconnect(
+                            active_client.conversation_id.as_ref(),
+                            &request.conversation_id,
+                        ) {
+                            reconnect_request = Some(request);
+                        } else if let Err(error) = begin_request(
+                            active_client,
+                            &request,
+                            selected_model.as_deref(),
+                            selected_mode,
+                            &cwd,
+                            &event_tx,
+                        ).await {
+                            send_event(
+                                &event_tx,
+                                Some(&context),
+                                AgentEvent::Error(error.to_string()),
+                            ).await;
                         }
                     }
                     Some(CodexCommand::Cancel) => {
                         if let Err(error) = active_client.request_cancel().await {
-                            send_event(&event_tx, AgentEvent::Error(error.to_string())).await;
+                            let context = active_client.output_context.clone();
+                            send_event(
+                                &event_tx,
+                                context.as_ref(),
+                                AgentEvent::Error(error.to_string()),
+                            ).await;
                         }
                     }
                     Some(CodexCommand::ListModels) => {
@@ -433,6 +598,7 @@ async fn runtime_loop(
                         {
                             send_event(
                                 &event_tx,
+                                None,
                                 AgentEvent::Notice(
                                     "finish or cancel the Codex turn before loading models".to_owned(),
                                 ),
@@ -445,6 +611,7 @@ async fn runtime_loop(
                                     }
                                     send_event(
                                         &event_tx,
+                                        None,
                                         AgentEvent::ModelsListed {
                                             models,
                                             selected: selected_model.clone(),
@@ -452,7 +619,7 @@ async fn runtime_loop(
                                     ).await;
                                 }
                                 Err(error) => {
-                                    send_event(&event_tx, AgentEvent::Error(error.to_string())).await;
+                                    send_event(&event_tx, None, AgentEvent::Error(error.to_string())).await;
                                 }
                             }
                         }
@@ -463,13 +630,29 @@ async fn runtime_loop(
                         {
                             send_event(
                                 &event_tx,
+                                None,
                                 AgentEvent::Notice(
                                     "finish or cancel the Codex turn before changing models".to_owned(),
                                 ),
                             ).await;
                         } else {
                             selected_model = Some(model.clone());
-                            send_event(&event_tx, AgentEvent::ModelSelected(model)).await;
+                            send_event(&event_tx, None, AgentEvent::ModelSelected(model)).await;
+                        }
+                    }
+                    Some(CodexCommand::SelectMode(mode)) => {
+                        let busy = active_client.active_turn_id.is_some()
+                            || active_client.pending_turn_request_id.is_some();
+                        selected_mode = mode;
+                        send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
+                        if busy {
+                            send_event(
+                                &event_tx,
+                                None,
+                                AgentEvent::Notice(
+                                    "Codex mode changed; it will apply to the next turn".to_owned(),
+                                ),
+                            ).await;
                         }
                     }
                     None => break,
@@ -484,12 +667,26 @@ async fn runtime_loop(
                     Some(RawMessage::StdoutClosed) | None => {
                         send_event(
                             &event_tx,
+                            active_client.output_context.as_ref(),
                             AgentEvent::Error("Codex app-server stopped unexpectedly".to_owned()),
                         ).await;
                         break;
                     }
                 }
             }
+        }
+
+        if let Some(request) = reconnect_request {
+            let previous = client.take().expect("a conversation client was active");
+            previous.shutdown().await;
+            client = connect_for_request(
+                &request,
+                selected_model.as_deref(),
+                selected_mode,
+                &cwd,
+                &event_tx,
+            )
+            .await;
         }
     }
 
@@ -506,7 +703,9 @@ async fn handle_message(
     if is_pending_turn_response(client.pending_turn_request_id, &message) {
         client.pending_turn_request_id = None;
         if let Some(error) = response_error(&message) {
-            send_event(event_tx, AgentEvent::Error(error)).await;
+            let context = client.output_context.take();
+            reset_turn(client);
+            send_event(event_tx, context.as_ref(), AgentEvent::Error(error)).await;
             return;
         }
         client.active_turn_id = extract_turn_id(&message);
@@ -514,6 +713,9 @@ async fn handle_message(
     }
 
     if message.get("method").and_then(Value::as_str) == Some("turn/started") {
+        if client.output_context.is_none() {
+            return;
+        }
         if let Some(turn_id) = message.pointer("/params/turn/id").and_then(Value::as_str) {
             client.active_turn_id = Some(turn_id.to_owned());
         }
@@ -521,23 +723,33 @@ async fn handle_message(
         if client.cancel_requested
             && let Err(error) = client.send_interrupt_if_ready().await
         {
-            send_event(event_tx, AgentEvent::Error(error.to_string())).await;
+            send_event(
+                event_tx,
+                client.output_context.as_ref(),
+                AgentEvent::Error(error.to_string()),
+            )
+            .await;
         }
         return;
     }
 
-    let event = normalized_event(&message);
-    match event {
-        Some(event @ (AgentEvent::Completed | AgentEvent::Cancelled)) => {
-            client.active_turn_id = None;
-            client.turn_ready_for_interrupt = false;
-            client.interrupt_sent = false;
-            client.cancel_requested = false;
-            send_event(event_tx, event).await;
-        }
-        Some(event) => send_event(event_tx, event).await,
-        None => {}
+    let terminal = message.get("method").and_then(Value::as_str) == Some("turn/completed");
+    if let Some(event) = normalized_event(&message) {
+        let context = client.output_context.clone();
+        send_event(event_tx, context.as_ref(), event).await;
     }
+    if terminal {
+        reset_turn(client);
+        client.output_context = None;
+    }
+}
+
+fn reset_turn(client: &mut CodexClient) {
+    client.active_turn_id = None;
+    client.pending_turn_request_id = None;
+    client.turn_ready_for_interrupt = false;
+    client.interrupt_sent = false;
+    client.cancel_requested = false;
 }
 
 fn is_pending_turn_response(pending_request_id: Option<u64>, message: &Value) -> bool {
@@ -546,7 +758,7 @@ fn is_pending_turn_response(pending_request_id: Option<u64>, message: &Value) ->
 
 async fn forward_notification(message: Value, event_tx: &mpsc::Sender<AgentOutput>) {
     if let Some(event) = normalized_event(&message) {
-        send_event(event_tx, event).await;
+        send_event(event_tx, None, event).await;
     }
 }
 
@@ -643,10 +855,16 @@ fn extract_turn_id(message: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-async fn send_event(event_tx: &mpsc::Sender<AgentOutput>, event: AgentEvent) {
+async fn send_event(
+    event_tx: &mpsc::Sender<AgentOutput>,
+    context: Option<&OutputContext>,
+    event: AgentEvent,
+) {
     let _ = event_tx
         .send(AgentOutput {
             agent: Agent::Codex,
+            conversation_id: context.map(|context| context.conversation_id.clone()),
+            turn_id: context.map(|context| context.turn_id.clone()),
             event,
         })
         .await;
@@ -691,6 +909,43 @@ async fn read_stderr(stderr: ChildStderr, raw_tx: mpsc::Sender<RawMessage>) {
 mod tests {
     use super::*;
 
+    fn request(prompt: &str) -> AgentRequest {
+        AgentRequest {
+            conversation_id: super::super::ConversationId::new("conversation"),
+            turn_id: super::super::TurnId::new("turn"),
+            prompt: prompt.to_owned(),
+            resume_session: None,
+        }
+    }
+
+    async fn idle_test_client() -> CodexClient {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--help")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let stdin = child.stdin.take().expect("test child stdin should be piped");
+        let (_raw_tx, raw_rx) = mpsc::channel(1);
+        CodexClient {
+            child,
+            stdin,
+            raw_rx,
+            readers: Vec::new(),
+            thread_id: Some("thread".to_owned()),
+            conversation_id: Some(super::super::ConversationId::new("conversation")),
+            output_context: None,
+            active_turn_id: None,
+            pending_turn_request_id: None,
+            turn_ready_for_interrupt: false,
+            interrupt_sent: false,
+            cancel_requested: false,
+            next_request_id: 1,
+        }
+    }
+
     #[test]
     fn extracts_thread_and_turn_ids_from_responses() {
         let thread = json!({ "id": 2, "result": { "thread": { "id": "thr_123" } } });
@@ -698,6 +953,68 @@ mod tests {
 
         assert_eq!(extract_thread_id(&thread).unwrap(), "thr_123");
         assert_eq!(extract_turn_id(&turn).as_deref(), Some("turn_456"));
+    }
+
+    #[test]
+    fn builds_fresh_and_resumed_thread_payloads() {
+        let cwd = Path::new("workspace");
+        let fresh = thread_open_request(10, cwd, None);
+        let resumed = thread_open_request(11, cwd, Some("thr_existing"));
+
+        assert_eq!(
+            fresh.get("method").and_then(Value::as_str),
+            Some("thread/start")
+        );
+        assert!(fresh.pointer("/params/threadId").is_none());
+        assert_eq!(
+            resumed.get("method").and_then(Value::as_str),
+            Some("thread/resume")
+        );
+        assert_eq!(
+            resumed.pointer("/params/threadId").and_then(Value::as_str),
+            Some("thr_existing")
+        );
+        assert_eq!(
+            resumed
+                .pointer("/params/approvalPolicy")
+                .and_then(Value::as_str),
+            Some("never")
+        );
+        assert_eq!(
+            resumed.pointer("/params/sandbox").and_then(Value::as_str),
+            Some("read-only")
+        );
+    }
+
+    #[test]
+    fn conversation_switch_requires_a_new_app_server_client() {
+        let first = super::super::ConversationId::new("first");
+        let second = super::super::ConversationId::new("second");
+
+        assert!(!conversation_requires_reconnect(None, &first));
+        assert!(!conversation_requires_reconnect(Some(&first), &first));
+        assert!(conversation_requires_reconnect(Some(&first), &second));
+    }
+
+    #[tokio::test]
+    async fn late_turn_started_does_not_reactivate_an_idle_client() {
+        let mut client = idle_test_client().await;
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+
+        handle_message(
+            &mut client,
+            json!({
+                "method": "turn/started",
+                "params": { "turn": { "id": "late-turn" } }
+            }),
+            &event_tx,
+        )
+        .await;
+
+        assert!(client.active_turn_id.is_none());
+        assert!(!client.turn_ready_for_interrupt);
+        assert!(event_rx.try_recv().is_err());
+        client.shutdown().await;
     }
 
     #[test]
@@ -793,6 +1110,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn codex_execution_modes_set_per_turn_sandbox_and_approval_policy() {
+        let request = request("implement this");
+
+        let ask = turn_start_request(1, "thread", &request, None, ExecutionMode::Ask);
+        assert_eq!(
+            ask.pointer("/params/sandboxPolicy"),
+            Some(&json!("readOnly"))
+        );
+        assert_eq!(ask.pointer("/params/approvalPolicy"), Some(&json!("never")));
+
+        let plan = turn_start_request(2, "thread", &request, None, ExecutionMode::Plan);
+        assert_eq!(
+            plan.pointer("/params/sandboxPolicy"),
+            Some(&json!("readOnly"))
+        );
+        assert!(
+            plan.pointer("/params/input/0/text")
+                .and_then(Value::as_str)
+                .unwrap()
+                .starts_with("Plan only")
+        );
+
+        let implement = turn_start_request(
+            3,
+            "thread",
+            &request,
+            Some("model"),
+            ExecutionMode::Implement,
+        );
+        assert_eq!(
+            implement.pointer("/params/sandboxPolicy"),
+            Some(&json!("workspaceWrite"))
+        );
+        assert_eq!(implement.pointer("/params/model"), Some(&json!("model")));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires a locally installed and authenticated Codex CLI"]
     async fn real_codex_app_server_handshake() {
@@ -802,7 +1156,10 @@ mod tests {
             .await
             .expect("the installed Codex app-server should complete its handshake");
 
-        assert!(!client.thread_id.is_empty());
+        assert!(
+            client.thread_id.is_none(),
+            "handshake/model discovery must not create a conversation binding"
+        );
         client.shutdown().await;
     }
 
@@ -814,11 +1171,10 @@ mod tests {
         let mut client = CodexClient::start(&cwd, &event_tx)
             .await
             .expect("the installed Codex app-server should complete its handshake");
+        let request = request("Reply with exactly CODEX_OK. Do not use tools or modify files.");
+        client.open_thread(&cwd, &request, &event_tx).await.unwrap();
         client
-            .start_turn(
-                "Reply with exactly CODEX_OK. Do not use tools or modify files.".to_owned(),
-                None,
-            )
+            .start_turn(&request, None, ExecutionMode::Ask)
             .await
             .unwrap();
 
@@ -844,9 +1200,11 @@ mod tests {
                         AgentEvent::Completed => return answer,
                         AgentEvent::Error(error) => panic!("Codex turn failed: {error}"),
                         AgentEvent::Started
+                        | AgentEvent::ProviderSessionBound(_)
                         | AgentEvent::Notice(_)
                         | AgentEvent::ModelsListed { .. }
                         | AgentEvent::ModelSelected(_)
+                        | AgentEvent::ModeSelected(_)
                         | AgentEvent::Cancelled => {}
                     }
                 }
@@ -867,12 +1225,12 @@ mod tests {
         let mut client = CodexClient::start(&cwd, &event_tx)
             .await
             .expect("the installed Codex app-server should complete its handshake");
+        let request = request(
+            "Write a very detailed 5,000-word explanation of Rust ownership. Do not use tools.",
+        );
+        client.open_thread(&cwd, &request, &event_tx).await.unwrap();
         client
-            .start_turn(
-                "Write a very detailed 5,000-word explanation of Rust ownership. Do not use tools."
-                    .to_owned(),
-                None,
-            )
+            .start_turn(&request, None, ExecutionMode::Ask)
             .await
             .unwrap();
         client.request_cancel().await.unwrap();
@@ -900,10 +1258,12 @@ mod tests {
                         }
                         AgentEvent::Error(error) => panic!("Codex turn failed: {error}"),
                         AgentEvent::Started
+                        | AgentEvent::ProviderSessionBound(_)
                         | AgentEvent::TextDelta(_)
                         | AgentEvent::Notice(_)
                         | AgentEvent::ModelsListed { .. }
-                        | AgentEvent::ModelSelected(_) => {}
+                        | AgentEvent::ModelSelected(_)
+                        | AgentEvent::ModeSelected(_) => {}
                     }
                 }
             }

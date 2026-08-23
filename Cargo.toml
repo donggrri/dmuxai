@@ -6,9 +6,17 @@ description = "One terminal. Multiple AI coding agents."
 license = "MIT"
 
 [dependencies]
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 unicode-width = "0.2.1"
+unicode-segmentation = "1.13.3"
+uuid = { version = "1.25.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

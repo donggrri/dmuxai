@@ -28,21 +28,36 @@ impl Agent {
             Self::Agy => "AGY",
         }
     }
+}
 
-    /// The provider-specific safety mode used by the current adapter.
-    ///
-    /// Keep this close to the agent identity so the TUI and documentation can
-    /// describe the actual launch policy without duplicating provider names.
-    pub const fn safety_mode(self) -> &'static str {
+impl fmt::Display for Agent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+/// A provider-independent description of what an agent may do during a turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ExecutionMode {
+    #[default]
+    Ask,
+    Plan,
+    Implement,
+}
+
+impl ExecutionMode {
+    pub const ALL: [Self; 3] = [Self::Ask, Self::Plan, Self::Implement];
+
+    pub const fn name(self) -> &'static str {
         match self {
-            Self::Codex => "read-only",
-            Self::Cursor => "ask",
-            Self::Agy => "plan+sandbox",
+            Self::Ask => "Ask",
+            Self::Plan => "Plan",
+            Self::Implement => "Implement",
         }
     }
 }
 
-impl fmt::Display for Agent {
+impl fmt::Display for ExecutionMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.name())
     }
@@ -52,6 +67,7 @@ impl fmt::Display for Agent {
 #[derive(Debug, PartialEq, Eq)]
 pub enum AgentEvent {
     Started,
+    ProviderSessionBound(String),
     TextDelta(String),
     Notice(String),
     ModelsListed {
@@ -59,9 +75,73 @@ pub enum AgentEvent {
         selected: Option<String>,
     },
     ModelSelected(String),
+    ModeSelected(ExecutionMode),
     Completed,
     Cancelled,
     Error(String),
+}
+
+/// A DmuxAI-owned identifier for a conversation spanning provider sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConversationId(String);
+
+impl ConversationId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ConversationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// A DmuxAI-owned identifier used to correlate one request and its outputs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TurnId(String);
+
+impl TurnId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TurnId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRequest {
+    pub conversation_id: ConversationId,
+    pub turn_id: TurnId,
+    pub prompt: String,
+    pub resume_session: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OutputContext {
+    conversation_id: ConversationId,
+    turn_id: TurnId,
+}
+
+impl From<&AgentRequest> for OutputContext {
+    fn from(request: &AgentRequest) -> Self {
+        Self {
+            conversation_id: request.conversation_id.clone(),
+            turn_id: request.turn_id.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +162,8 @@ impl ModelInfo {
 #[derive(Debug, PartialEq, Eq)]
 pub struct AgentOutput {
     pub agent: Agent,
+    pub conversation_id: Option<ConversationId>,
+    pub turn_id: Option<TurnId>,
     pub event: AgentEvent,
 }
 
@@ -109,10 +191,11 @@ impl Error for AdapterError {}
 /// through a separate bounded channel.
 pub trait AgentAdapter: Send {
     fn agent(&self) -> Agent;
-    fn send(&self, prompt: String) -> Result<(), AdapterError>;
+    fn send(&self, request: AgentRequest) -> Result<(), AdapterError>;
     fn cancel(&self) -> Result<(), AdapterError>;
     fn request_models(&self) -> Result<(), AdapterError>;
     fn select_model(&self, model: String) -> Result<(), AdapterError>;
+    fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError>;
 }
 
 pub type SpawnedAdapter = (Box<dyn AgentAdapter>, JoinHandle<()>);
