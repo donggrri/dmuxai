@@ -426,57 +426,6 @@ async fn begin_request(
     Ok(())
 }
 
-fn conversation_requires_reconnect(
-    current: Option<&ConversationId>,
-    requested: &ConversationId,
-) -> bool {
-    current.is_some_and(|current| current != requested)
-}
-
-async fn connect_for_request(
-    request: &AgentRequest,
-    selected_model: Option<&str>,
-    mode: ExecutionMode,
-    cwd: &Path,
-    event_tx: &mpsc::Sender<AgentOutput>,
-) -> Option<CodexClient> {
-    let context = OutputContext::from(request);
-    match CodexClient::start(cwd, event_tx).await {
-        Ok(mut started) => {
-            if let Err(error) = begin_request(
-                &mut started,
-                request,
-                selected_model,
-                mode,
-                cwd,
-                event_tx,
-            )
-            .await
-            {
-                send_event(
-                    event_tx,
-                    Some(&context),
-                    AgentEvent::Error(error.to_string()),
-                )
-                .await;
-                started.shutdown().await;
-                None
-            } else {
-                Some(started)
-            }
-        }
-        Err(error) => {
-            send_event(
-                event_tx,
-                Some(&context),
-                AgentEvent::Error(format!("could not start Codex: {error}")),
-            )
-            .await;
-            None
-        }
-    }
-}
-
 async fn runtime_loop(
     mut command_rx: mpsc::Receiver<CodexCommand>,
     event_tx: mpsc::Sender<AgentOutput>,
@@ -490,14 +439,39 @@ async fn runtime_loop(
         if client.is_none() {
             match command_rx.recv().await {
                 Some(CodexCommand::Send(request)) => {
-                    client = connect_for_request(
-                        &request,
-                        selected_model.as_deref(),
-                        selected_mode,
-                        &cwd,
-                        &event_tx,
-                    )
-                    .await;
+                    let context = OutputContext::from(&request);
+                    match CodexClient::start(&cwd, &event_tx).await {
+                        Ok(mut started) => {
+                            if let Err(error) = begin_request(
+                                &mut started,
+                                &request,
+                                selected_model.as_deref(),
+                                selected_mode,
+                                &cwd,
+                                &event_tx,
+                            )
+                            .await
+                            {
+                                send_event(
+                                    &event_tx,
+                                    Some(&context),
+                                    AgentEvent::Error(error.to_string()),
+                                )
+                                .await;
+                                started.shutdown().await;
+                            } else {
+                                client = Some(started);
+                            }
+                        }
+                        Err(error) => {
+                            send_event(
+                                &event_tx,
+                                Some(&context),
+                                AgentEvent::Error(format!("could not start Codex: {error}")),
+                            )
+                            .await;
+                        }
+                    }
                 }
                 Some(CodexCommand::Cancel) => {}
                 Some(CodexCommand::SelectModel(model)) => {
@@ -545,7 +519,6 @@ async fn runtime_loop(
         }
 
         let active_client = client.as_mut().expect("checked above");
-        let mut reconnect_request = None;
         tokio::select! {
             command = command_rx.recv() => {
                 match command {
@@ -562,11 +535,6 @@ async fn runtime_loop(
                                         .to_owned(),
                                 ),
                             ).await;
-                        } else if conversation_requires_reconnect(
-                            active_client.conversation_id.as_ref(),
-                            &request.conversation_id,
-                        ) {
-                            reconnect_request = Some(request);
                         } else if let Err(error) = begin_request(
                             active_client,
                             &request,
@@ -675,19 +643,6 @@ async fn runtime_loop(
                 }
             }
         }
-
-        if let Some(request) = reconnect_request {
-            let previous = client.take().expect("a conversation client was active");
-            previous.shutdown().await;
-            client = connect_for_request(
-                &request,
-                selected_model.as_deref(),
-                selected_mode,
-                &cwd,
-                &event_tx,
-            )
-            .await;
-        }
     }
 
     if let Some(client) = client {
@@ -713,9 +668,6 @@ async fn handle_message(
     }
 
     if message.get("method").and_then(Value::as_str) == Some("turn/started") {
-        if client.output_context.is_none() {
-            return;
-        }
         if let Some(turn_id) = message.pointer("/params/turn/id").and_then(Value::as_str) {
             client.active_turn_id = Some(turn_id.to_owned());
         }
@@ -918,34 +870,6 @@ mod tests {
         }
     }
 
-    async fn idle_test_client() -> CodexClient {
-        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
-        command
-            .arg("--help")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let mut child = command.spawn().unwrap();
-        let stdin = child.stdin.take().expect("test child stdin should be piped");
-        let (_raw_tx, raw_rx) = mpsc::channel(1);
-        CodexClient {
-            child,
-            stdin,
-            raw_rx,
-            readers: Vec::new(),
-            thread_id: Some("thread".to_owned()),
-            conversation_id: Some(super::super::ConversationId::new("conversation")),
-            output_context: None,
-            active_turn_id: None,
-            pending_turn_request_id: None,
-            turn_ready_for_interrupt: false,
-            interrupt_sent: false,
-            cancel_requested: false,
-            next_request_id: 1,
-        }
-    }
-
     #[test]
     fn extracts_thread_and_turn_ids_from_responses() {
         let thread = json!({ "id": 2, "result": { "thread": { "id": "thr_123" } } });
@@ -984,37 +908,6 @@ mod tests {
             resumed.pointer("/params/sandbox").and_then(Value::as_str),
             Some("read-only")
         );
-    }
-
-    #[test]
-    fn conversation_switch_requires_a_new_app_server_client() {
-        let first = super::super::ConversationId::new("first");
-        let second = super::super::ConversationId::new("second");
-
-        assert!(!conversation_requires_reconnect(None, &first));
-        assert!(!conversation_requires_reconnect(Some(&first), &first));
-        assert!(conversation_requires_reconnect(Some(&first), &second));
-    }
-
-    #[tokio::test]
-    async fn late_turn_started_does_not_reactivate_an_idle_client() {
-        let mut client = idle_test_client().await;
-        let (event_tx, mut event_rx) = mpsc::channel(1);
-
-        handle_message(
-            &mut client,
-            json!({
-                "method": "turn/started",
-                "params": { "turn": { "id": "late-turn" } }
-            }),
-            &event_tx,
-        )
-        .await;
-
-        assert!(client.active_turn_id.is_none());
-        assert!(!client.turn_ready_for_interrupt);
-        assert!(event_rx.try_recv().is_err());
-        client.shutdown().await;
     }
 
     #[test]
