@@ -32,31 +32,35 @@ agy models
 
 ## Install and run in any project
 
-Install DmuxAI once from this repository:
+On Windows, run the installer once from this repository. It installs the
+`dmuxai` executable into Cargo's user bin directory and adds that directory to
+your user `PATH` when needed.
 
 ```powershell
 cd C:\path\to\DmuxAI
-cargo install --path . --locked
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\install.ps1
 ```
 
-Then open any project by passing its directory:
-
-```powershell
-dmuxai C:\path\to\project
-# Equivalent:
-dmuxai --workspace C:\path\to\project
-```
-
-If no directory is passed, DmuxAI uses the current directory. This makes the
-following the shortest workflow when the terminal is already in the project:
+After that, open a new PowerShell window, move to any project, and run
+`dmuxai` with no path argument:
 
 ```powershell
 cd C:\path\to\project
 dmuxai
 ```
 
-Paths containing spaces work normally when quoted. `dmuxai --help` shows all
-startup options. Conversations remain scoped by the canonical project path.
+DmuxAI uses the folder from which it was started as its workspace, so its agents
+operate on that project. To refresh the installed executable after changing
+DmuxAI, run `.\install.ps1` again from this repository.
+
+Manual installation is also available when Cargo is already on `PATH`:
+
+```powershell
+cargo install --path . --locked --force
+```
+
+Conversations remain scoped by the canonical project path.
 
 ## Run from source
 
