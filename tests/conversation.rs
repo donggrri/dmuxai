@@ -1,11 +1,9 @@
-#[path = "../src/conversation.rs"]
-mod conversation;
-
-use conversation::{
-    AgentKey, BeginTurn, BeginTurnOutcome, BindingStatus, ConversationEngine,
+use dmuxai::conversation::{
+    AgentKey, BeginTurn, BeginTurnOutcome, BindingStatus, ConversationEngine, ConversationError,
     ConversationSelection, MessageRole, MessageState, SummaryDocument, TurnEvent, TurnOutput,
     TurnStatus,
 };
+use rusqlite::Connection;
 use tempfile::TempDir;
 
 struct Harness {
@@ -32,7 +30,7 @@ impl Harness {
     }
 }
 
-fn ready(outcome: BeginTurnOutcome) -> conversation::AgentRequest {
+fn ready(outcome: BeginTurnOutcome) -> dmuxai::conversation::AgentRequest {
     match outcome {
         BeginTurnOutcome::Ready(request) => request,
         BeginTurnOutcome::NeedsSummary(_) => panic!("test conversation unexpectedly needs summary"),
@@ -41,7 +39,7 @@ fn ready(outcome: BeginTurnOutcome) -> conversation::AgentRequest {
 
 fn complete_turn(
     engine: &mut ConversationEngine,
-    request: &conversation::AgentRequest,
+    request: &dmuxai::conversation::AgentRequest,
     provider_session_id: &str,
     answer: &str,
 ) {
@@ -165,6 +163,69 @@ fn projections_and_bindings_are_isolated_by_agent() {
 }
 
 #[test]
+fn selecting_away_from_a_live_turn_and_back_keeps_it_recordable() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+    let conversation_b = engine
+        .select(ConversationSelection::New {
+            title: Some("Conversation B".to_owned()),
+        })
+        .unwrap()
+        .id;
+    let conversation_a = engine
+        .select(ConversationSelection::New {
+            title: Some("Conversation A".to_owned()),
+        })
+        .unwrap()
+        .id;
+    let request = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Codex,
+                model_id: None,
+                prompt: "Keep working while I switch views".to_owned(),
+            })
+            .unwrap(),
+    );
+    let envelope = |event| TurnOutput {
+        conversation_id: request.conversation_id.clone(),
+        turn_id: request.turn_id.clone(),
+        agent: request.agent,
+        event,
+    };
+    engine
+        .record_turn_outputs(&[
+            envelope(TurnEvent::Started),
+            envelope(TurnEvent::ProviderSessionBound("thread-a".to_owned())),
+            envelope(TurnEvent::TextDelta("partial ".to_owned())),
+        ])
+        .unwrap();
+
+    engine
+        .select(ConversationSelection::Existing(conversation_b))
+        .unwrap();
+    let live = engine
+        .select(ConversationSelection::Existing(conversation_a.clone()))
+        .unwrap();
+    assert_eq!(live.turns[0].status, TurnStatus::Running);
+    assert_eq!(live.messages[1].state, MessageState::Streaming);
+    assert_eq!(live.bindings[0].status, BindingStatus::Active);
+
+    engine
+        .record_turn_outputs(&[
+            envelope(TurnEvent::TextDelta("answer".to_owned())),
+            envelope(TurnEvent::Completed),
+        ])
+        .unwrap();
+    let completed = engine
+        .select(ConversationSelection::Existing(conversation_a))
+        .unwrap();
+    assert_eq!(completed.turns[0].status, TurnStatus::Completed);
+    assert_eq!(completed.messages[1].state, MessageState::Complete);
+    assert_eq!(completed.messages[1].text, "partial answer");
+}
+
+#[test]
 fn unfinished_turn_is_interrupted_and_its_binding_is_not_resumed() {
     let harness = Harness::new();
     let conversation_id;
@@ -201,6 +262,7 @@ fn unfinished_turn_is_interrupted_and_its_binding_is_not_resumed() {
     }
 
     let mut reopened = harness.open();
+    assert_eq!(reopened.recover_workspace().unwrap(), 1);
     let snapshot = reopened
         .select(ConversationSelection::Existing(conversation_id))
         .unwrap();
@@ -220,6 +282,137 @@ fn unfinished_turn_is_interrupted_and_its_binding_is_not_resumed() {
     );
     assert!(next.resume_session.is_none());
     assert!(next.context.recent.is_empty());
+}
+
+#[test]
+fn workspace_recovery_handles_all_live_turns_without_touching_other_workspaces() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_a = temp.path().join("workspace-a");
+    let workspace_b = temp.path().join("workspace-b");
+    std::fs::create_dir(&workspace_a).unwrap();
+    std::fs::create_dir(&workspace_b).unwrap();
+    let database = temp.path().join("dmuxai.sqlite3");
+
+    let queued_conversation;
+    let running_conversation;
+    {
+        let mut engine = ConversationEngine::open(&database, &workspace_a).unwrap();
+        queued_conversation = engine
+            .select(ConversationSelection::New {
+                title: Some("Queued in A".to_owned()),
+            })
+            .unwrap()
+            .id;
+        let queued = ready(
+            engine
+                .begin_turn(BeginTurn {
+                    agent: AgentKey::Cursor,
+                    model_id: None,
+                    prompt: "queued".to_owned(),
+                })
+                .unwrap(),
+        );
+        engine
+            .record_turn_outputs(&[TurnOutput {
+                conversation_id: queued.conversation_id.clone(),
+                turn_id: queued.turn_id.clone(),
+                agent: queued.agent,
+                event: TurnEvent::ProviderSessionBound("cursor-queued-a".to_owned()),
+            }])
+            .unwrap();
+
+        running_conversation = engine
+            .select(ConversationSelection::New {
+                title: Some("Running in A".to_owned()),
+            })
+            .unwrap()
+            .id;
+        let running = ready(
+            engine
+                .begin_turn(BeginTurn {
+                    agent: AgentKey::Agy,
+                    model_id: None,
+                    prompt: "running".to_owned(),
+                })
+                .unwrap(),
+        );
+        let envelope = |event| TurnOutput {
+            conversation_id: running.conversation_id.clone(),
+            turn_id: running.turn_id.clone(),
+            agent: running.agent,
+            event,
+        };
+        engine
+            .record_turn_outputs(&[
+                envelope(TurnEvent::Started),
+                envelope(TurnEvent::ProviderSessionBound("agy-running-a".to_owned())),
+                envelope(TurnEvent::TextDelta("partial-a".to_owned())),
+            ])
+            .unwrap();
+    }
+
+    let other_conversation;
+    {
+        let mut engine = ConversationEngine::open(&database, &workspace_b).unwrap();
+        other_conversation = engine
+            .select(ConversationSelection::New {
+                title: Some("Running in B".to_owned()),
+            })
+            .unwrap()
+            .id;
+        let running = ready(
+            engine
+                .begin_turn(BeginTurn {
+                    agent: AgentKey::Codex,
+                    model_id: None,
+                    prompt: "other workspace".to_owned(),
+                })
+                .unwrap(),
+        );
+        let envelope = |event| TurnOutput {
+            conversation_id: running.conversation_id.clone(),
+            turn_id: running.turn_id.clone(),
+            agent: running.agent,
+            event,
+        };
+        engine
+            .record_turn_outputs(&[
+                envelope(TurnEvent::Started),
+                envelope(TurnEvent::ProviderSessionBound(
+                    "codex-running-b".to_owned(),
+                )),
+                envelope(TurnEvent::TextDelta("partial-b".to_owned())),
+            ])
+            .unwrap();
+    }
+
+    let mut recovered = ConversationEngine::open(&database, &workspace_a).unwrap();
+    assert_eq!(recovered.recover_workspace().unwrap(), 2);
+    assert_eq!(recovered.recover_workspace().unwrap(), 0);
+
+    let queued = recovered
+        .select(ConversationSelection::Existing(queued_conversation))
+        .unwrap();
+    assert_eq!(queued.turns[0].status, TurnStatus::Interrupted);
+    assert_eq!(queued.messages.len(), 1);
+    assert_eq!(queued.bindings[0].status, BindingStatus::Stale);
+
+    let running = recovered
+        .select(ConversationSelection::Existing(running_conversation))
+        .unwrap();
+    assert_eq!(running.turns[0].status, TurnStatus::Interrupted);
+    assert_eq!(running.messages[1].state, MessageState::Interrupted);
+    assert_eq!(running.messages[1].text, "partial-a");
+    assert_eq!(running.bindings[0].status, BindingStatus::Stale);
+
+    let mut untouched = ConversationEngine::open(&database, &workspace_b).unwrap();
+    let other = untouched
+        .select(ConversationSelection::Existing(other_conversation))
+        .unwrap();
+    assert_eq!(other.turns[0].status, TurnStatus::Running);
+    assert_eq!(other.messages[1].state, MessageState::Streaming);
+    assert_eq!(other.messages[1].text, "partial-b");
+    assert_eq!(other.bindings[0].status, BindingStatus::Active);
 }
 
 #[test]
@@ -331,6 +524,7 @@ fn a_mismatched_output_rolls_back_the_entire_batch() {
     }
 
     let mut reopened = harness.open();
+    assert_eq!(reopened.recover_workspace().unwrap(), 1);
     let snapshot = reopened
         .select(ConversationSelection::Existing(conversation_id))
         .unwrap();
@@ -375,4 +569,209 @@ fn cancellation_is_terminal_and_invalidates_the_binding() {
         .unwrap();
     assert_eq!(snapshot.turns[0].status, TurnStatus::Cancelled);
     assert_eq!(snapshot.bindings[0].status, BindingStatus::Stale);
+}
+
+#[test]
+fn explicit_summary_is_incremental_and_invalidates_native_resume() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+    let conversation_id = engine
+        .select(ConversationSelection::New { title: None })
+        .unwrap()
+        .id;
+    assert!(engine.prepare_summary(AgentKey::Codex).unwrap().is_none());
+
+    let first = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Codex,
+                model_id: None,
+                prompt: "first prompt".to_owned(),
+            })
+            .unwrap(),
+    );
+    complete_turn(&mut engine, &first, "thread-1", "first answer");
+
+    let first_job = engine.prepare_summary(AgentKey::Codex).unwrap().unwrap();
+    assert!(first_job.previous_summary().is_none());
+    assert_eq!(first_job.covers_through_seq(), 1);
+    assert_eq!(first_job.source_turns().len(), 1);
+    assert_eq!(first_job.source_turns()[0].seq, 1);
+    engine
+        .commit_summary(
+            first_job,
+            SummaryDocument {
+                goal: Some("first summary".to_owned()),
+                ..SummaryDocument::default()
+            },
+        )
+        .unwrap();
+
+    let after_first_summary = engine
+        .select(ConversationSelection::Existing(conversation_id))
+        .unwrap();
+    assert_eq!(after_first_summary.bindings[0].status, BindingStatus::Stale);
+    let second = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Codex,
+                model_id: None,
+                prompt: "second prompt".to_owned(),
+            })
+            .unwrap(),
+    );
+    assert!(second.resume_session.is_none());
+    assert!(
+        second
+            .context
+            .summary
+            .as_deref()
+            .unwrap()
+            .contains("first summary")
+    );
+    complete_turn(&mut engine, &second, "thread-2", "second answer");
+
+    let second_job = engine.prepare_summary(AgentKey::Codex).unwrap().unwrap();
+    assert_eq!(second_job.covers_through_seq(), 2);
+    assert_eq!(
+        second_job.previous_summary().unwrap().goal.as_deref(),
+        Some("first summary")
+    );
+    assert_eq!(second_job.source_turns().len(), 1);
+    assert_eq!(second_job.source_turns()[0].seq, 2);
+}
+
+#[test]
+fn explicit_summary_rejects_a_busy_agent() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+    engine
+        .select(ConversationSelection::New { title: None })
+        .unwrap();
+    ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Agy,
+                model_id: None,
+                prompt: "still queued".to_owned(),
+            })
+            .unwrap(),
+    );
+
+    assert!(matches!(
+        engine.prepare_summary(AgentKey::Agy),
+        Err(ConversationError::AgentBusy(AgentKey::Agy))
+    ));
+}
+
+#[test]
+fn oversized_summary_is_rejected_without_invalidating_the_binding() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+    engine
+        .select(ConversationSelection::New { title: None })
+        .unwrap();
+    let first = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Cursor,
+                model_id: None,
+                prompt: "small history".to_owned(),
+            })
+            .unwrap(),
+    );
+    complete_turn(&mut engine, &first, "cursor-session", "small answer");
+    let job = engine.prepare_summary(AgentKey::Cursor).unwrap().unwrap();
+
+    assert!(matches!(
+        engine.commit_summary(
+            job,
+            SummaryDocument {
+                goal: Some("x".repeat(40_000)),
+                ..SummaryDocument::default()
+            }
+        ),
+        Err(ConversationError::SummaryTooLarge {
+            actual_chars,
+            maximum_chars,
+        }) if actual_chars > maximum_chars
+    ));
+
+    let next = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Cursor,
+                model_id: None,
+                prompt: "binding remains usable".to_owned(),
+            })
+            .unwrap(),
+    );
+    assert_eq!(next.resume_session.as_deref(), Some("cursor-session"));
+}
+
+#[test]
+fn unicode_summary_uses_the_same_character_budget_as_projection() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+    engine
+        .select(ConversationSelection::New { title: None })
+        .unwrap();
+    let first = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Codex,
+                model_id: None,
+                prompt: "한국어 요약".to_owned(),
+            })
+            .unwrap(),
+    );
+    complete_turn(&mut engine, &first, "codex-thread", "짧은 답변");
+    let job = engine.prepare_summary(AgentKey::Codex).unwrap().unwrap();
+    engine
+        .commit_summary(
+            job,
+            SummaryDocument {
+                goal: Some("한".repeat(15_000)),
+                ..SummaryDocument::default()
+            },
+        )
+        .unwrap();
+
+    assert!(matches!(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Codex,
+                model_id: None,
+                prompt: "요약 뒤 계속".to_owned(),
+            })
+            .unwrap(),
+        BeginTurnOutcome::Ready(_)
+    ));
+}
+
+#[test]
+fn failed_initial_migration_rolls_back_every_schema_change() {
+    let harness = Harness::new();
+    let connection = Connection::open(&harness.database).unwrap();
+    connection
+        .execute_batch("CREATE VIEW turns AS SELECT 1 AS id;")
+        .unwrap();
+    drop(connection);
+
+    assert!(ConversationEngine::open(&harness.database, &harness.workspace).is_err());
+
+    let connection = Connection::open(&harness.database).unwrap();
+    let conversations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'table' AND name = 'conversations'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(conversations, 0);
+    assert_eq!(version, 0);
 }

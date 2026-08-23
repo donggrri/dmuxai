@@ -21,6 +21,7 @@ use uuid::Uuid;
 const SCHEMA_VERSION: i64 = 1;
 const MAX_CONTEXT_CHARS: usize = 32_000;
 const RECENT_TAIL_CHARS: usize = 12_000;
+const MAX_SUMMARY_CHARS: usize = MAX_CONTEXT_CHARS - RECENT_TAIL_CHARS;
 const SUMMARY_PROMPT_VERSION: &str = "conversation-summary-v1";
 
 const MIGRATION_1: &str = r#"
@@ -123,6 +124,10 @@ pub enum ConversationError {
     AgentBusy(AgentKey),
     InvalidOutput(String),
     StaleSummary,
+    SummaryTooLarge {
+        actual_chars: usize,
+        maximum_chars: usize,
+    },
     UnsupportedSchema(i64),
     ClockBeforeUnixEpoch,
 }
@@ -138,6 +143,13 @@ impl fmt::Display for ConversationError {
             Self::AgentBusy(agent) => write!(formatter, "{agent} already has an active turn"),
             Self::InvalidOutput(message) => write!(formatter, "invalid agent output: {message}"),
             Self::StaleSummary => formatter.write_str("summary source changed before commit"),
+            Self::SummaryTooLarge {
+                actual_chars,
+                maximum_chars,
+            } => write!(
+                formatter,
+                "summary is {actual_chars} characters; maximum is {maximum_chars}"
+            ),
             Self::UnsupportedSchema(version) => {
                 write!(
                     formatter,
@@ -578,7 +590,7 @@ impl ConversationEngine {
         }
 
         let workspace_root = normalize_workspace(workspace_root)?;
-        let connection = Connection::open(db_path)?;
+        let mut connection = Connection::open(db_path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -589,7 +601,10 @@ impl ConversationEngine {
             return Err(ConversationError::UnsupportedSchema(version));
         }
         if version < 1 {
-            connection.execute_batch(MIGRATION_1)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(MIGRATION_1)?;
+            transaction.commit()?;
         }
 
         Ok(Self {
@@ -657,7 +672,6 @@ impl ConversationEngine {
                 if !self.conversation_exists(&id)? {
                     return Err(ConversationError::ConversationNotFound(id));
                 }
-                self.recover_interrupted(&id)?;
                 id
             }
         };
@@ -739,6 +753,43 @@ impl ConversationEngine {
         }))
     }
 
+    /// Prepares a rolling summary for the active conversation and agent.
+    ///
+    /// The source contains only completed turns after the latest valid
+    /// checkpoint, while the source hash covers the complete canonical head.
+    pub fn prepare_summary(
+        &self,
+        agent: AgentKey,
+    ) -> Result<Option<SummaryJob>, ConversationError> {
+        let conversation_id = self
+            .active_conversation
+            .clone()
+            .ok_or(ConversationError::NoActiveConversation)?;
+        if self.agent_is_busy(&conversation_id, agent)? {
+            return Err(ConversationError::AgentBusy(agent));
+        }
+
+        let turns = load_projected_turns(&self.connection, &conversation_id, agent)?;
+        let Some(covers_through_seq) = turns.last().map(|turn| turn.seq) else {
+            return Ok(None);
+        };
+        let checkpoint = self.latest_valid_checkpoint(&conversation_id, agent, &turns)?;
+        if checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.covers >= covers_through_seq)
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(make_summary_job(
+            &conversation_id,
+            agent,
+            &turns,
+            checkpoint.as_ref(),
+            covers_through_seq,
+        )))
+    }
+
     pub fn record_turn_outputs(
         &mut self,
         outputs: &[TurnOutput],
@@ -775,10 +826,43 @@ impl ConversationEngine {
         job: SummaryJob,
         document: SummaryDocument,
     ) -> Result<(), ConversationError> {
-        if !self.conversation_exists(&job.conversation_id)? {
+        let rendered_chars = document.render().chars().count();
+        if rendered_chars > MAX_SUMMARY_CHARS {
+            return Err(ConversationError::SummaryTooLarge {
+                actual_chars: rendered_chars,
+                maximum_chars: MAX_SUMMARY_CHARS,
+            });
+        }
+        let summary_json = serde_json::to_string(&document)?;
+        let now = now_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM conversations
+                 WHERE id = ?1 AND workspace_root = ?2 AND archived_at_ms IS NULL
+             )",
+            params![job.conversation_id.as_str(), self.workspace_root],
+            |row| row.get(0),
+        )?;
+        if !exists {
             return Err(ConversationError::ConversationNotFound(job.conversation_id));
         }
-        let turns = load_projected_turns(&self.connection, &job.conversation_id, job.agent)?;
+        let busy: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM turns
+                 WHERE conversation_id = ?1 AND requested_agent = ?2
+                   AND status IN ('queued', 'running')
+             )",
+            params![job.conversation_id.as_str(), job.agent.as_db()],
+            |row| row.get(0),
+        )?;
+        if busy {
+            return Err(ConversationError::AgentBusy(job.agent));
+        }
+
+        let turns = load_projected_turns(&transaction, &job.conversation_id, job.agent)?;
         let current_hash = hash_turns(
             turns
                 .iter()
@@ -788,8 +872,7 @@ impl ConversationEngine {
             return Err(ConversationError::StaleSummary);
         }
 
-        let now = now_ms()?;
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO context_checkpoints
                 (conversation_id, agent, covers_through_seq, source_hash,
                  prompt_version, summary_json, created_at_ms)
@@ -805,10 +888,17 @@ impl ConversationEngine {
                 job.covers_through_seq,
                 &job.source_hash[..],
                 SUMMARY_PROMPT_VERSION,
-                serde_json::to_string(&document)?,
+                summary_json,
                 now,
             ],
         )?;
+        transaction.execute(
+            "UPDATE provider_bindings
+                SET status = 'stale', updated_at_ms = ?3
+              WHERE conversation_id = ?1 AND agent = ?2",
+            params![job.conversation_id.as_str(), job.agent.as_db(), now],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -825,7 +915,12 @@ impl ConversationEngine {
             .map_err(ConversationError::from)
     }
 
-    fn recover_interrupted(&mut self, id: &ConversationId) -> Result<(), ConversationError> {
+    /// Atomically interrupts unfinished turns left by an earlier app process.
+    ///
+    /// Recovery is scoped to this engine's workspace and returns the number of
+    /// queued or running turns it transitioned. Call this once during startup;
+    /// ordinary conversation selection must not affect live turns.
+    pub fn recover_workspace(&mut self) -> Result<usize, ConversationError> {
         let now = now_ms()?;
         let transaction = self
             .connection
@@ -833,32 +928,42 @@ impl ConversationEngine {
         transaction.execute(
             "UPDATE provider_bindings
                 SET status = 'stale', updated_at_ms = ?2
-              WHERE conversation_id = ?1
-                AND agent IN (
-                    SELECT requested_agent FROM turns
-                     WHERE conversation_id = ?1 AND status IN ('queued', 'running')
+              WHERE EXISTS (
+                    SELECT 1
+                      FROM turns t
+                      JOIN conversations c ON c.id = t.conversation_id
+                     WHERE c.workspace_root = ?1
+                       AND t.status IN ('queued', 'running')
+                       AND t.conversation_id = provider_bindings.conversation_id
+                       AND t.requested_agent = provider_bindings.agent
                 )",
-            params![id.as_str(), now],
+            params![self.workspace_root, now],
         )?;
         transaction.execute(
             "UPDATE messages
                 SET state = 'interrupted', updated_at_ms = ?2
-              WHERE turn_id IN (
-                    SELECT id FROM turns
-                     WHERE conversation_id = ?1 AND status IN ('queued', 'running')
-                )
-                AND state = 'streaming'",
-            params![id.as_str(), now],
+              WHERE state = 'streaming'
+                AND turn_id IN (
+                    SELECT t.id
+                      FROM turns t
+                      JOIN conversations c ON c.id = t.conversation_id
+                     WHERE c.workspace_root = ?1
+                       AND t.status IN ('queued', 'running')
+                )",
+            params![self.workspace_root, now],
         )?;
-        transaction.execute(
+        let recovered = transaction.execute(
             "UPDATE turns
                 SET status = 'interrupted', completed_at_ms = ?2,
                     error_text = COALESCE(error_text, 'DmuxAI stopped before the turn completed')
-              WHERE conversation_id = ?1 AND status IN ('queued', 'running')",
-            params![id.as_str(), now],
+              WHERE status IN ('queued', 'running')
+                AND conversation_id IN (
+                    SELECT id FROM conversations WHERE workspace_root = ?1
+                )",
+            params![self.workspace_root, now],
         )?;
         transaction.commit()?;
-        Ok(())
+        Ok(recovered)
     }
 
     fn agent_is_busy(
@@ -917,7 +1022,9 @@ impl ConversationEngine {
         let summary = checkpoint
             .as_ref()
             .map(|checkpoint| checkpoint.document.render());
-        let projected_chars = summary.as_ref().map_or(0, String::len)
+        let projected_chars = summary
+            .as_ref()
+            .map_or(0, |summary| summary.chars().count())
             + recent.iter().map(projected_turn_chars).sum::<usize>();
         if projected_chars <= MAX_CONTEXT_CHARS {
             return Ok(ProjectionBuild::Ready(ContextProjection {
@@ -945,26 +1052,21 @@ impl ConversationEngine {
         };
         let source_turns = turns[..covers_index].to_vec();
         let covers = source_turns.last().map_or(through_seq, |turn| turn.seq);
-        let previous_summary = checkpoint
+        let covers = if checkpoint
             .as_ref()
-            .filter(|checkpoint| checkpoint.covers < covers)
-            .map(|checkpoint| checkpoint.document.clone());
-        let previous_covers = checkpoint
-            .as_ref()
-            .map_or(0, |checkpoint| checkpoint.covers);
-        let incremental_source = source_turns
-            .iter()
-            .filter(|turn| turn.seq > previous_covers)
-            .cloned()
-            .collect();
-        Ok(ProjectionBuild::NeedsSummary(SummaryJob {
-            conversation_id: conversation_id.clone(),
+            .is_some_and(|checkpoint| checkpoint.covers >= covers)
+        {
+            through_seq
+        } else {
+            covers
+        };
+        Ok(ProjectionBuild::NeedsSummary(make_summary_job(
+            conversation_id,
             agent,
-            covers_through_seq: covers,
-            source_hash: hash_turns(source_turns.iter()),
-            previous_summary,
-            source_turns: incremental_source,
-        }))
+            &turns,
+            checkpoint.as_ref(),
+            covers,
+        )))
     }
 
     fn latest_valid_checkpoint(
@@ -1084,6 +1186,28 @@ enum ProjectionBuild {
 struct Checkpoint {
     covers: i64,
     document: SummaryDocument,
+}
+
+fn make_summary_job(
+    conversation_id: &ConversationId,
+    agent: AgentKey,
+    turns: &[ProjectedTurn],
+    checkpoint: Option<&Checkpoint>,
+    covers_through_seq: i64,
+) -> SummaryJob {
+    let previous_covers = checkpoint.map_or(0, |checkpoint| checkpoint.covers);
+    SummaryJob {
+        conversation_id: conversation_id.clone(),
+        agent,
+        covers_through_seq,
+        source_hash: hash_turns(turns.iter().filter(|turn| turn.seq <= covers_through_seq)),
+        previous_summary: checkpoint.map(|checkpoint| checkpoint.document.clone()),
+        source_turns: turns
+            .iter()
+            .filter(|turn| turn.seq > previous_covers && turn.seq <= covers_through_seq)
+            .cloned()
+            .collect(),
+    }
 }
 
 #[derive(Debug)]
@@ -1374,7 +1498,7 @@ fn hash_text(hasher: &mut Sha256, text: &str) {
 }
 
 fn projected_turn_chars(turn: &ProjectedTurn) -> usize {
-    turn.user.len() + turn.assistant.len() + 32
+    turn.user.chars().count() + turn.assistant.chars().count() + 32
 }
 
 fn normalize_workspace(path: &Path) -> Result<String, ConversationError> {

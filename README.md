@@ -8,9 +8,9 @@ into shell commands.
 
 | Agent | Transport | Conversation continuity |
 | --- | --- | --- |
-| Codex | `codex app-server --stdio` JSONL | One App Server thread per DmuxAI run |
-| Cursor | `--print --output-format stream-json` NDJSON | `session_id` + `--resume` |
-| AGY | stream-json input/output NDJSON | `conversation_id` + `--conversation` |
+| Codex | `codex app-server --stdio` JSONL | durable `thread_id` + `thread/resume` |
+| Cursor | `--print --output-format stream-json` NDJSON | durable `session_id` + `--resume` |
+| AGY | stream-json input/output NDJSON | durable `conversation_id` + `--conversation` |
 
 ## Requirements
 
@@ -30,13 +30,44 @@ agy --version
 agy models
 ```
 
-## Run
+## Install and run in any project
+
+Install DmuxAI once from this repository:
+
+```powershell
+cd C:\path\to\DmuxAI
+cargo install --path . --locked
+```
+
+Then open any project by passing its directory:
+
+```powershell
+dmuxai C:\path\to\project
+# Equivalent:
+dmuxai --workspace C:\path\to\project
+```
+
+If no directory is passed, DmuxAI uses the current directory. This makes the
+following the shortest workflow when the terminal is already in the project:
+
+```powershell
+cd C:\path\to\project
+dmuxai
+```
+
+Paths containing spaces work normally when quoted. `dmuxai --help` shows all
+startup options. Conversations remain scoped by the canonical project path.
+
+## Run from source
 
 Windows PowerShell:
 
 ```powershell
 cd C:\Users\tlsfmswls\Desktop\DmuxAI
 cargo run
+
+# Open another project without changing directories:
+cargo run -- C:\path\to\project
 ```
 
 Linux shell:
@@ -44,6 +75,8 @@ Linux shell:
 ```bash
 cd /path/to/DmuxAI
 cargo run
+
+# Or: cargo run -- /path/to/project
 ```
 
 Controls:
@@ -54,6 +87,11 @@ Controls:
 - Type `/`: preview matching slash commands; use `Up` / `Down` and `Enter` or `Tab`
 - `/agent`: open the active-agent picker, then use `Up` / `Down` and `Enter`
 - `/mode`: choose `Ask`, `Plan`, or `Implement` for the active agent
+- `/new [title]`: create and switch to a durable conversation
+- `/conversations` or `F3`: list and load conversations for the current workspace
+- `/resume <id-prefix>`: load one conversation by a unique ID prefix
+- `/summarize`: compress the selected agent's completed context
+- `/share <codex|cursor|agy>`: explicitly share the current transcript with one agent
 - `F2`: load and open that agent's model picker
 - Model picker `Up` / `Down`, `Enter`, `Esc`: move, select, or close
 - Mouse wheel: scroll the chat history without changing the active agent
@@ -62,9 +100,10 @@ Controls:
 - `Ctrl+C`: cancel the selected agent's active turn
 - `Esc`: stop all owned child processes, restore the terminal, and exit
 
-`/agent` changes only which adapter receives the next prompt. Each provider's
-thread, session, or conversation remains alive while DmuxAI is running, so
-switching away and back continues that agent's existing conversation.
+`/agent` changes only which adapter receives the next prompt. Within a DmuxAI
+conversation, each provider keeps its own native thread/session binding. Merely
+switching agents does not inject another agent's transcript; use `/share` when
+that transfer is intentional.
 The active agent is shown in the bottom status line; the agent list appears only
 inside the `/agent` picker instead of occupying a permanent sidebar.
 
@@ -73,8 +112,17 @@ kept separately for each agent and passed to subsequent turns. A CLI can list a
 model that the current account or team policy does not permit; that provider
 error is shown in chat so another model can be selected.
 
-Provider thread/session IDs are reused while DmuxAI remains open. Persisting and
-resuming them after a DmuxAI restart remains future session-management work.
+DmuxAI stores the canonical transcript, turns, provider bindings, and context
+checkpoints in SQLite. On restart it restores the latest conversation for the
+current workspace and resumes a valid provider-native session. If no valid
+native session is available, DmuxAI injects that agent's saved summary and
+recent completed turns into a fresh session. The full transcript is retained;
+summarization only changes the context projection sent to the provider.
+
+The database is stored at `%LOCALAPPDATA%\DmuxAI\conversations.sqlite3` on
+Windows, `$XDG_STATE_HOME/dmuxai/conversations.sqlite3` when `XDG_STATE_HOME` is
+set, or `~/.local/state/dmuxai/conversations.sqlite3` otherwise. Conversations
+are scoped by the canonical current workspace path.
 
 ## Safety and platform behavior
 
@@ -138,6 +186,10 @@ model without hard-coding it into production selection behavior.
 
 ```text
 TUI / keyboard
+    -> ConversationEngine
+        -> SQLite WAL: conversations / turns / messages
+        -> provider bindings by (conversation, agent)
+        -> agent-specific summary checkpoint + recent tail
     -> bounded command mpsc (8 per agent)
         -> Codex actor
             -> persistent App Server JSONL process
@@ -149,6 +201,7 @@ TUI / keyboard
             -> resume with provider conversation_id
     -> bounded AgentOutput mpsc (64 shared)
     -> provider-independent AgentEvent
+        -> correlated conversation/turn persistence
         -> text/model/completion/error state
         -> coalesced rendering (at most every 25 ms)
 ```
@@ -200,6 +253,7 @@ similar to move-capturing owning C++ values in a task lambda.
 
 - `src/main.rs`: Tokio entry point and terminal RAII guard
 - `src/app.rs`: event loop, chat rendering, routing, model picker, shutdown
+- `src/conversation.rs`: durable SQLite conversation engine and context projection
 - `src/agent/mod.rs`: provider-independent events, models, adapter interface
 - `src/agent/codex.rs`: Codex App Server client
 - `src/agent/cursor.rs`: Cursor NDJSON process and session adapter
@@ -213,5 +267,5 @@ Protocol references:
 - [Cursor stream-json output](https://docs.cursor.com/en/cli/reference/output-format)
 - [Google Antigravity headless mode](https://antigravity.google/docs/cli/headless/)
 
-The next major step is tool/permission event normalization followed by durable
-session persistence across DmuxAI restarts.
+The next major step is tool/permission event normalization and richer structured
+message parts beyond the current normalized text transcript.
