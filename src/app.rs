@@ -47,7 +47,21 @@ const DEFAULT_INPUT_HEIGHT: u16 = 3;
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MIN_MAIN_HEIGHT: u16 = 5;
 const STATUS_HEIGHT: u16 = 1;
+const SIDEBAR_WIDTH: u16 = 24;
+const COMPACT_SIDEBAR_WIDTH: u16 = 20;
+const CONTEXT_WIDTH: u16 = 30;
+const COMPACT_CONTEXT_WIDTH: u16 = 0;
+const ACTIVITY_HEIGHT: u16 = 5;
 const MAX_SUMMARY_BUFFER_CHARS: usize = 80_000;
+
+const SURFACE: Color = Color::Rgb(15, 17, 23);
+const PANEL_SURFACE: Color = Color::Rgb(22, 25, 33);
+const PANEL_BORDER: Color = Color::Rgb(55, 62, 76);
+const MUTED: Color = Color::Rgb(137, 146, 163);
+const TEXT: Color = Color::Rgb(224, 228, 236);
+const ACCENT: Color = Color::Rgb(111, 190, 255);
+const SUCCESS: Color = Color::Rgb(111, 215, 157);
+const WARNING: Color = Color::Rgb(245, 193, 92);
 
 #[derive(Clone, Copy)]
 enum SlashAction {
@@ -181,9 +195,17 @@ struct SlashPreview {
 
 #[derive(Clone, Copy)]
 struct UiAreas {
+    sidebar: Rect,
     chat: Rect,
+    context: Rect,
+    activity: Rect,
     input: Rect,
     status: Rect,
+}
+
+struct SidebarTaskHit {
+    area: Rect,
+    id: StoredConversationId,
 }
 
 pub struct App {
@@ -221,6 +243,8 @@ pub struct App {
     input_height: u16,
     resizing_input: bool,
     terminal_area: Rect,
+    sidebar_new_task_area: Rect,
+    sidebar_task_hits: Vec<SidebarTaskHit>,
 }
 
 impl App {
@@ -303,6 +327,8 @@ impl App {
             input_height: DEFAULT_INPUT_HEIGHT,
             resizing_input: false,
             terminal_area: Rect::default(),
+            sidebar_new_task_area: Rect::default(),
+            sidebar_task_hits: Vec::new(),
         };
         app.restore_snapshot(snapshot);
         Ok(app)
@@ -592,7 +618,11 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let areas = self.ui_areas(self.terminal_area);
-                if mouse.row == areas.input.y {
+                if self.sidebar_new_task_contains(mouse.column, mouse.row) {
+                    self.create_conversation(None);
+                } else if let Some(id) = self.sidebar_task_at(mouse.column, mouse.row) {
+                    self.select_conversation(id);
+                } else if mouse.row == areas.input.y {
                     self.resizing_input = true;
                     self.chat_selection = None;
                     self.selecting_chat = false;
@@ -625,6 +655,17 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn sidebar_new_task_contains(&self, column: u16, row: u16) -> bool {
+        rect_contains(self.sidebar_new_task_area, column, row)
+    }
+
+    fn sidebar_task_at(&self, column: u16, row: u16) -> Option<StoredConversationId> {
+        self.sidebar_task_hits
+            .iter()
+            .find(|hit| rect_contains(hit.area, column, row))
+            .map(|hit| hit.id.clone())
     }
 
     fn chat_cell_at(&self, column: u16, row: u16, clamp: bool) -> Option<CellPosition> {
@@ -1459,7 +1500,14 @@ impl App {
         self.terminal_area = frame.area();
         let areas = self.ui_areas(self.terminal_area);
 
+        frame.render_widget(
+            Block::default().style(Style::default().bg(SURFACE).fg(TEXT)),
+            frame.area(),
+        );
+        self.draw_sidebar(frame, areas.sidebar);
         self.draw_chat(frame, areas.chat);
+        self.draw_context(frame, areas.context);
+        self.draw_activity(frame, areas.activity);
         self.draw_input(frame, areas.input);
         self.draw_status(frame, areas.status);
         if let Some(picker) = &self.model_picker {
@@ -1477,32 +1525,166 @@ impl App {
 
     fn ui_areas(&self, area: Rect) -> UiAreas {
         let input_height = clamp_input_height(self.input_height, area.height);
-        let main_height = area
+        let workspace_height = area
             .height
             .saturating_sub(input_height.saturating_add(STATUS_HEIGHT));
         let vertical = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(main_height),
+                Constraint::Length(workspace_height),
                 Constraint::Length(input_height),
                 Constraint::Length(STATUS_HEIGHT),
             ])
             .split(area);
+
+        let (sidebar_width, context_width) = if area.width >= 110 {
+            (SIDEBAR_WIDTH, CONTEXT_WIDTH)
+        } else if area.width >= 76 {
+            (COMPACT_SIDEBAR_WIDTH, COMPACT_CONTEXT_WIDTH)
+        } else {
+            (0, 0)
+        };
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(sidebar_width),
+                Constraint::Min(0),
+                Constraint::Length(context_width),
+            ])
+            .split(vertical[0]);
+
+        let activity_height = if columns[1].height >= MIN_MAIN_HEIGHT + ACTIVITY_HEIGHT {
+            ACTIVITY_HEIGHT
+        } else {
+            0
+        };
+        let activity = Rect::new(
+            columns[1].x,
+            columns[1].bottom().saturating_sub(activity_height),
+            columns[1].width,
+            activity_height,
+        );
+
         UiAreas {
-            chat: vertical[0],
+            sidebar: columns[0],
+            // Keep the chat rect as the full center column so prompt resizing
+            // retains the same geometry contract as the original TUI. The
+            // activity drawer is painted over its lower edge in Phase 1.
+            chat: columns[1],
+            context: columns[2],
+            activity,
             input: vertical[1],
             status: vertical[2],
         }
     }
 
+    fn draw_sidebar(&mut self, frame: &mut Frame, area: Rect) {
+        self.sidebar_new_task_area = Rect::default();
+        self.sidebar_task_hits.clear();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let active_agent = self.adapters[self.selected].agent();
+        let state = if self.busy_agents.contains(&active_agent) {
+            "running"
+        } else {
+            "ready"
+        };
+        let conversations = self.engine.list().unwrap_or_default();
+        let content = Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        );
+        let workspace_rows = 3;
+        let first_task_row = content.y.saturating_add(2);
+        let max_task_rows = usize::from(content.height.saturating_sub(workspace_rows + 2));
+
+        let panel = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(PANEL_BORDER))
+            .style(Style::default().bg(PANEL_SURFACE).fg(TEXT))
+            .title(" WORKSPACE ");
+        frame.render_widget(panel, area);
+        if content.height == 0 {
+            return;
+        }
+
+        self.sidebar_new_task_area = Rect::new(content.x, content.y, content.width, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  + ", Style::default().fg(ACCENT)),
+                Span::styled("New task", Style::default().fg(TEXT)),
+            ])),
+            self.sidebar_new_task_area,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  RECENT",
+                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            ))),
+            Rect::new(content.x, content.y.saturating_add(1), content.width, 1),
+        );
+
+        for (index, conversation) in conversations.into_iter().take(max_task_rows).enumerate() {
+            let row = Rect::new(
+                content.x,
+                first_task_row.saturating_add(index as u16),
+                content.width,
+                1,
+            );
+            let selected = conversation.id == self.conversation_id;
+            let (marker, marker_color, title_style) = if selected {
+                (
+                    "  ● ",
+                    SUCCESS,
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("  ○ ", MUTED, Style::default().fg(MUTED))
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(marker, Style::default().fg(marker_color)),
+                    Span::styled(
+                        truncate_for_width(&conversation.title, content.width.saturating_sub(5)),
+                        title_style,
+                    ),
+                ])),
+                row,
+            );
+            self.sidebar_task_hits.push(SidebarTaskHit {
+                area: row,
+                id: conversation.id,
+            });
+        }
+
+        let workspace_top = content.bottom().saturating_sub(workspace_rows);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled("  WORKSPACE", Style::default().fg(MUTED))),
+                Line::from(Span::styled(
+                    format!("  {} · {}", workspace_label(), state),
+                    Style::default().fg(TEXT),
+                )),
+            ]),
+            Rect::new(content.x, workspace_top, content.width, workspace_rows),
+        );
+    }
+
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
         let mut lines = Vec::new();
 
         for message in &self.messages {
             let (label, color) = match message.role {
-                Role::User => ("You".to_owned(), Color::Cyan),
-                Role::Agent(agent) => (agent.to_string(), Color::Green),
-                Role::System => ("DmuxAI".to_owned(), Color::DarkGray),
+                Role::User => ("You".to_owned(), ACCENT),
+                Role::Agent(agent) => (agent.to_string(), SUCCESS),
+                Role::System => ("DmuxAI".to_owned(), MUTED),
             };
 
             lines.push(Line::from(Span::styled(
@@ -1523,12 +1705,18 @@ impl App {
             .saturating_sub(self.chat_scroll.min(max_scroll))
             .min(u16::MAX as usize) as u16;
         let chat_title = format!(
-            " {} [{}] ",
+            " CONVERSATION / {} [{}] ",
             self.conversation_title,
             short_id(self.conversation_id.as_str())
         );
         let chat = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(chat_title))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(PANEL_BORDER))
+                    .style(Style::default().bg(SURFACE).fg(TEXT))
+                    .title(chat_title),
+            )
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
         frame.render_widget(chat, area);
@@ -1545,14 +1733,119 @@ impl App {
         }
     }
 
+    fn draw_context(&self, frame: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let active_agent = self.adapters[self.selected].agent();
+        let mode = self.modes.get(&active_agent).copied().unwrap_or_default();
+        let mut lines = vec![
+            Line::from(Span::styled(
+                " CHANGES  ·  3 files",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "   M  src/app.rs",
+                Style::default().fg(WARNING),
+            )),
+            Line::from(Span::styled(
+                "   A  docs/ui-plan.md",
+                Style::default().fg(SUCCESS),
+            )),
+            Line::from(Span::styled(
+                "   M  README.md",
+                Style::default().fg(WARNING),
+            )),
+            Line::default(),
+            Line::from(Span::styled(
+                " PROJECT",
+                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled("   ▾ src", Style::default().fg(TEXT))),
+            Line::from(Span::styled("     app.rs", Style::default().fg(MUTED))),
+            Line::from(Span::styled("     agent/", Style::default().fg(MUTED))),
+            Line::from(Span::styled("   ▸ tests", Style::default().fg(MUTED))),
+            Line::default(),
+            Line::from(Span::styled(
+                " ACTIVE CONTEXT",
+                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("   {} · {}", active_agent, mode),
+                Style::default().fg(TEXT),
+            )),
+        ];
+        let visible_height = area.height.saturating_sub(2) as usize;
+        lines.truncate(visible_height);
+        let panel = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(PANEL_BORDER))
+                    .style(Style::default().bg(PANEL_SURFACE).fg(TEXT))
+                    .title(" CONTEXT "),
+            )
+            .wrap(Wrap { trim: true });
+        frame.render_widget(panel, area);
+    }
+
+    fn draw_activity(&self, frame: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let agent = self.adapters[self.selected].agent();
+        let (status, status_color, detail) = if self.busy_agents.contains(&agent) {
+            (
+                "RUNNING",
+                WARNING,
+                format!("{} is processing the current task", agent),
+            )
+        } else {
+            (
+                "READY",
+                SUCCESS,
+                "Waiting for the next instruction".to_owned(),
+            )
+        };
+        let activity = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(format!("  ● {status}  "), Style::default().fg(status_color)),
+                Span::styled(detail, Style::default().fg(TEXT)),
+            ]),
+            Line::from(Span::styled(
+                "  Last activity  ·  UI shell ready  ·  Logs are collapsed by default",
+                Style::default().fg(MUTED),
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(PANEL_BORDER))
+                .style(Style::default().bg(PANEL_SURFACE).fg(TEXT))
+                .title(" ACTIVITY "),
+        )
+        .wrap(Wrap { trim: true });
+        frame.render_widget(activity, area);
+    }
+
     fn draw_input(&self, frame: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
         let title = if self.resizing_input {
             " Prompt (resizing) "
         } else {
-            " Prompt (drag top border) "
+            " PROMPT  ·  Enter to send  ·  / for commands "
         };
-        let input = Paragraph::new(self.input.as_str())
-            .block(Block::default().borders(Borders::ALL).title(title));
+        let input = Paragraph::new(self.input.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .style(Style::default().bg(PANEL_SURFACE).fg(TEXT))
+                .title(title),
+        );
         frame.render_widget(input, area);
 
         let cursor_offset = input_cursor_offset(self.input.as_str());
@@ -1571,6 +1864,9 @@ impl App {
     }
 
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
         let selected = self.adapters[self.selected].agent();
         let state = if self.busy_agents.contains(&selected) {
             "BUSY"
@@ -1593,11 +1889,12 @@ impl App {
             .unwrap_or("provider default");
         let status = Line::from(vec![
             Span::styled(
-                format!(" {selected} {state} "),
-                Style::default().fg(Color::Black).bg(Color::Yellow),
+                format!(" {selected}  {state} "),
+                Style::default().fg(Color::Black).bg(SUCCESS),
             ),
             Span::raw(format!(
-                "  Model: {model}  Mode: {}  /mode  /agent  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc quit{}",
+                "  {}  ·  Model: {model}  ·  Mode: {}  ·  F3 tasks  F2 model  Ctrl+C cancel  Esc quit{}",
+                workspace_label(),
                 self.modes.get(&selected).copied().unwrap_or_default(),
                 self.copy_notice
                     .as_ref()
@@ -1924,6 +2221,10 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
 fn updated_description(updated_at_ms: i64) -> String {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1977,6 +2278,28 @@ fn parse_summary_document(text: &str) -> Result<SummaryDocument, serde_json::Err
 
 fn input_cursor_offset(input: &str) -> u16 {
     UnicodeWidthStr::width(input).min(u16::MAX as usize) as u16
+}
+
+fn truncate_for_width(value: &str, max_width: u16) -> String {
+    let max_width = usize::from(max_width);
+    if value.chars().count() <= max_width {
+        return value.to_owned();
+    }
+    if max_width <= 1 {
+        return "…".to_owned();
+    }
+    value.chars().take(max_width - 1).collect::<String>() + "…"
+}
+
+fn workspace_label() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "workspace".to_owned())
 }
 
 fn matching_slash_commands(input: &str) -> Vec<&'static SlashCommand> {
@@ -3106,6 +3429,74 @@ mod tests {
         let small = render_text_at(&mut app, 40, 10);
         assert!(small.contains("Commands"));
         assert!(small.contains("/agent"));
+    }
+
+    #[test]
+    fn phase1_renders_the_workspace_shell_panels() {
+        let (mut app, _) = test_app();
+
+        let rendered = render_text_at(&mut app, 120, 30);
+
+        assert!(rendered.contains("WORKSPACE"));
+        assert!(rendered.contains("CONVERSATION"));
+        assert!(rendered.contains("CONTEXT"));
+        assert!(rendered.contains("ACTIVITY"));
+        assert!(rendered.contains("PROMPT"));
+        assert!(rendered.contains("CHANGES"));
+    }
+
+    #[test]
+    fn phase1_collapses_context_panels_for_compact_terminals() {
+        let (mut app, _) = test_app();
+
+        let rendered = render_text_at(&mut app, 72, 24);
+
+        assert!(rendered.contains("CONVERSATION"));
+        assert!(!rendered.contains("CONTEXT"));
+        assert!(!rendered.contains("WORKSPACE"));
+    }
+
+    #[test]
+    fn sidebar_new_task_creates_and_selects_a_conversation() {
+        let (mut app, _) = test_app();
+        let before = app.engine.list().unwrap().len();
+        let previous_id = app.conversation_id.clone();
+
+        let _ = render_text_at(&mut app, 120, 30);
+        let area = app.sidebar_new_task_area;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.engine.list().unwrap().len(), before + 1);
+        assert_ne!(app.conversation_id, previous_id);
+    }
+
+    #[test]
+    fn sidebar_task_click_loads_the_selected_conversation() {
+        let (mut app, _) = test_app();
+        let first_id = app.conversation_id.clone();
+        app.create_conversation(Some("Second task".to_owned()));
+
+        let _ = render_text_at(&mut app, 120, 30);
+        let hit = app
+            .sidebar_task_hits
+            .iter()
+            .find(|hit| hit.id == first_id)
+            .expect("the first conversation should be visible in the sidebar");
+        let (column, row) = (hit.area.x, hit.area.y);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.conversation_id, first_id);
+        assert_eq!(app.conversation_title, "New conversation");
     }
 
     #[test]
