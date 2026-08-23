@@ -1,7 +1,17 @@
-use std::fmt;
+mod agy;
+mod codex;
+mod cursor;
+
+use std::{error::Error, fmt};
+
+use tokio::{sync::mpsc, task::JoinHandle};
+
+pub use agy::spawn_agy_adapter;
+pub use codex::spawn_codex_adapter;
+pub use cursor::spawn_cursor_adapter;
 
 /// An AI provider that can own conversations and produce messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Agent {
     Codex,
     Cursor,
@@ -26,54 +36,77 @@ impl fmt::Display for Agent {
     }
 }
 
-/// Events emitted by an adapter and consumed by the application.
-///
-/// Real providers will eventually send these through a bounded async channel.
+/// Provider-independent events emitted by a runtime and consumed by the UI.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AgentEvent {
+    Started,
     TextDelta(String),
+    Notice(String),
+    ModelsListed {
+        models: Vec<ModelInfo>,
+        selected: Option<String>,
+    },
+    ModelSelected(String),
     Completed,
+    Cancelled,
     Error(String),
 }
 
-/// The small provider boundary needed by the local prototype.
-///
-/// `send` is deliberately synchronous for now. Phase 3 can replace the return
-/// value with a bounded Tokio channel without coupling the UI to a provider.
-pub trait AgentAdapter {
-    fn agent(&self) -> Agent;
-    fn send(&mut self, prompt: &str) -> Vec<AgentEvent>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub label: String,
 }
 
-/// A deterministic local adapter used until a real structured protocol is added.
-pub struct FakeAgent {
-    agent: Agent,
-}
-
-impl FakeAgent {
-    pub const fn new(agent: Agent) -> Self {
-        Self { agent }
-    }
-}
-
-impl AgentAdapter for FakeAgent {
-    fn agent(&self) -> Agent {
-        self.agent
-    }
-
-    fn send(&mut self, prompt: &str) -> Vec<AgentEvent> {
-        if prompt.trim() == "/error" {
-            return vec![AgentEvent::Error(
-                "simulated local adapter failure".to_owned(),
-            )];
+impl ModelInfo {
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
         }
-
-        vec![
-            AgentEvent::TextDelta(format!(
-                "Local prototype reply from {}: I received \"{prompt}\".",
-                self.agent
-            )),
-            AgentEvent::Completed,
-        ]
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AgentOutput {
+    pub agent: Agent,
+    pub event: AgentEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterError {
+    CommandQueueFull,
+    RuntimeStopped,
+}
+
+impl fmt::Display for AdapterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CommandQueueFull => formatter.write_str("agent command queue is full"),
+            Self::RuntimeStopped => formatter.write_str("agent runtime has stopped"),
+        }
+    }
+}
+
+impl Error for AdapterError {}
+
+/// The synchronous UI-facing handle for an asynchronous agent runtime.
+///
+/// Commands are deliberately non-blocking: the UI either enqueues one or gets
+/// a visible backpressure error. The runtime owns the process and emits events
+/// through a separate bounded channel.
+pub trait AgentAdapter: Send {
+    fn agent(&self) -> Agent;
+    fn send(&self, prompt: String) -> Result<(), AdapterError>;
+    fn cancel(&self) -> Result<(), AdapterError>;
+    fn request_models(&self) -> Result<(), AdapterError>;
+    fn select_model(&self, model: String) -> Result<(), AdapterError>;
+}
+
+pub type SpawnedAdapter = (Box<dyn AgentAdapter>, JoinHandle<()>);
+
+pub const EVENT_CHANNEL_CAPACITY: usize = 64;
+
+pub fn event_channel() -> (mpsc::Sender<AgentOutput>, mpsc::Receiver<AgentOutput>) {
+    mpsc::channel(EVENT_CHANNEL_CAPACITY)
 }

@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod process;
 
 use std::io::{self, Stdout};
 
@@ -12,9 +13,13 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 type DmuxTerminal = Terminal<CrosstermBackend<Stdout>>;
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
     let mut session = TerminalSession::start()?;
-    App::new().run(session.terminal_mut())
+    let mut app = App::new();
+    let result = app.run(session.terminal_mut()).await;
+    app.shutdown().await;
+    result
 }
 
 /// Owns terminal raw/alternate-screen state and restores it on every return path.
