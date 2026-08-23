@@ -315,6 +315,7 @@ struct AgyStreamState {
     conversation_id: Option<String>,
     emitted_text: bool,
     terminal: bool,
+    response_text: String,
 }
 
 fn normalize_event(message: &Value, state: &mut AgyStreamState) -> Vec<AgentEvent> {
@@ -342,6 +343,7 @@ fn normalize_event(message: &Value, state: &mut AgyStreamState) -> Vec<AgentEven
                 Vec::new()
             } else {
                 state.emitted_text = true;
+                state.response_text.push_str(text);
                 vec![AgentEvent::TextDelta(text.to_owned())]
             }
         }
@@ -359,7 +361,14 @@ fn normalize_event(message: &Value, state: &mut AgyStreamState) -> Vec<AgentEven
                             message.pointer("/result/response").and_then(Value::as_str)
                         && !response.is_empty()
                     {
+                        state.response_text.push_str(response);
                         events.push(AgentEvent::TextDelta(response.to_owned()));
+                    }
+                    if is_plan_review_response(&state.response_text) {
+                        events.push(AgentEvent::Notice(
+                            "AGY returned a plan for review; no file changes were executed (plan+sandbox mode)."
+                                .to_owned(),
+                        ));
                     }
                     events.push(AgentEvent::Completed);
                     events
@@ -376,6 +385,16 @@ fn normalize_event(message: &Value, state: &mut AgyStreamState) -> Vec<AgentEven
         }
         _ => Vec::new(),
     }
+}
+
+fn is_plan_review_response(response: &str) -> bool {
+    let response = response.to_ascii_lowercase();
+    let mentions_plan = response.contains("plan.md")
+        || response.contains("implementation plan")
+        || response.contains("plan artifact");
+    let requests_review =
+        response.contains("approve") || response.contains("review") || response.contains("proceed");
+    mentions_plan && requests_review
 }
 
 async fn list_models(cwd: &Path) -> io::Result<Vec<ModelInfo>> {
@@ -474,6 +493,32 @@ mod tests {
             vec![AgentEvent::Completed]
         );
         assert_eq!(state.conversation_id.as_deref(), Some("conversation"));
+    }
+
+    #[test]
+    fn marks_plan_review_responses_as_a_notice() {
+        let mut state = AgyStreamState::default();
+        let result = json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "I created the implementation plan artifact at plan.md. Please review and approve the plan to proceed."
+            }
+        });
+
+        assert_eq!(
+            normalize_event(&result, &mut state),
+            vec![
+                AgentEvent::TextDelta(
+                    "I created the implementation plan artifact at plan.md. Please review and approve the plan to proceed.".to_owned()
+                ),
+                AgentEvent::Notice(
+                    "AGY returned a plan for review; no file changes were executed (plan+sandbox mode)."
+                        .to_owned()
+                ),
+                AgentEvent::Completed,
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

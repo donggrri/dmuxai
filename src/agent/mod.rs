@@ -28,6 +28,18 @@ impl Agent {
             Self::Agy => "AGY",
         }
     }
+
+    /// The provider-specific safety mode used by the current adapter.
+    ///
+    /// Keep this close to the agent identity so the TUI and documentation can
+    /// describe the actual launch policy without duplicating provider names.
+    pub const fn safety_mode(self) -> &'static str {
+        match self {
+            Self::Codex => "read-only",
+            Self::Cursor => "ask",
+            Self::Agy => "plan+sandbox",
+        }
+    }
 }
 
 impl fmt::Display for Agent {

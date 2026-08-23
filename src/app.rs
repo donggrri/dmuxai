@@ -18,6 +18,7 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, timeout},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{
     Agent, AgentAdapter, AgentEvent, AgentOutput, ModelInfo, event_channel, spawn_agy_adapter,
@@ -107,7 +108,7 @@ impl App {
             input: String::new(),
             messages: vec![Message::new(
                 Role::System,
-                "Codex, Cursor, and AGY use real structured headless protocols. Press F2 to choose a model or Ctrl+C to cancel the selected agent.",
+                "Codex, Cursor, and AGY use real structured headless protocols. Safety modes: Codex read-only, Cursor ask, AGY plan+sandbox. AGY may return a plan for review; it does not execute file changes. Press F2 to choose a model or Ctrl+C to cancel the selected agent.",
             )],
             adapters,
             event_rx,
@@ -519,7 +520,7 @@ impl App {
             .block(Block::default().borders(Borders::ALL).title(" Prompt "));
         frame.render_widget(input, area);
 
-        let cursor_offset = self.input.chars().count() as u16;
+        let cursor_offset = input_cursor_offset(self.input.as_str());
         let cursor_x = area
             .x
             .saturating_add(1)
@@ -557,7 +558,8 @@ impl App {
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             ),
             Span::raw(format!(
-                "  Model: {model}  F2 model  Enter send  Ctrl+C cancel  Esc quit"
+                "  Model: {model}  Mode: {}  F2 model  Enter send  Ctrl+C cancel  Esc quit",
+                selected.safety_mode(),
             )),
         ]);
         frame.render_widget(Paragraph::new(status), area);
@@ -611,6 +613,10 @@ impl App {
         );
         frame.render_stateful_widget(list, area, &mut state);
     }
+}
+
+fn input_cursor_offset(input: &str) -> u16 {
+    UnicodeWidthStr::width(input).min(u16::MAX as usize) as u16
 }
 
 fn centered_rect(horizontal_percent: u16, vertical_percent: u16, area: Rect) -> Rect {
@@ -793,5 +799,24 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
         assert!(app.model_picker.is_some());
         assert!(app.model_catalogs[&Agent::Codex].loading);
+    }
+
+    #[test]
+    fn startup_message_explains_provider_safety_modes() {
+        let (app, _) = test_app();
+
+        assert!(app.messages[0].content.contains("AGY plan+sandbox"));
+        assert!(
+            app.messages[0]
+                .content
+                .contains("does not execute file changes")
+        );
+    }
+
+    #[test]
+    fn input_cursor_offset_uses_terminal_width_for_korean() {
+        assert_eq!(input_cursor_offset("abc"), 3);
+        assert_eq!(input_cursor_offset("한글"), 4);
+        assert_eq!(input_cursor_offset("a한글"), 5);
     }
 }

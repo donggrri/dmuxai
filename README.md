@@ -74,6 +74,13 @@ request UI is not implemented:
 - Cursor: `--mode ask`
 - AGY: `--mode plan --sandbox`
 
+The selected agent's safety mode is shown in the bottom status bar. AGY's
+`plan+sandbox` mode can produce a `plan.md` artifact and ask for a plan review;
+that is an expected safe-plan response, not an indication that DmuxAI executed
+file changes. DmuxAI marks this response separately in the chat. If AGY is
+already continuing a plan-review conversation, its `conversation_id` is reused
+for subsequent turns until DmuxAI exits.
+
 Windows uses `codex.exe` and `agy.exe`. Cursor's Windows installer exposes shell
 wrappers, so DmuxAI resolves the latest installed Cursor version and launches
 its bundled `node.exe index.js` directly. Linux uses `codex`, `cursor-agent`,
