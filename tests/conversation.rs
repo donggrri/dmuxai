@@ -118,7 +118,7 @@ fn completed_conversation_and_binding_survive_restart() {
 }
 
 #[test]
-fn projections_and_bindings_are_isolated_by_agent() {
+fn projections_are_shared_across_agents_and_bindings_remain_provider_scoped() {
     let harness = Harness::new();
     let mut engine = harness.open();
     engine
@@ -145,7 +145,9 @@ fn projections_and_bindings_are_isolated_by_agent() {
             .unwrap(),
     );
     assert!(cursor.resume_session.is_none());
-    assert!(cursor.context.recent.is_empty());
+    assert_eq!(cursor.context.recent.len(), 1);
+    assert_eq!(cursor.context.recent[0].agent, AgentKey::Codex);
+    assert_eq!(cursor.context.recent[0].user, "Codex-only secret");
     complete_turn(&mut engine, &cursor, "cursor-session", "Cursor answer");
 
     let codex_again = ready(
@@ -157,9 +159,123 @@ fn projections_and_bindings_are_isolated_by_agent() {
             })
             .unwrap(),
     );
-    assert_eq!(codex_again.resume_session.as_deref(), Some("codex-thread"));
-    assert_eq!(codex_again.context.recent.len(), 1);
+    assert!(codex_again.resume_session.is_none());
+    assert_eq!(codex_again.context.recent.len(), 2);
     assert_eq!(codex_again.context.recent[0].user, "Codex-only secret");
+    assert_eq!(codex_again.context.recent[0].agent, AgentKey::Codex);
+    assert_eq!(codex_again.context.recent[1].user, "What do you know?");
+    assert_eq!(codex_again.context.recent[1].agent, AgentKey::Cursor);
+}
+
+#[test]
+fn shared_projection_is_scoped_to_the_active_conversation() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+    let conversation_a = engine
+        .select(ConversationSelection::New {
+            title: Some("A".to_owned()),
+        })
+        .unwrap()
+        .id;
+    let first = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Codex,
+                model_id: None,
+                prompt: "private A".to_owned(),
+            })
+            .unwrap(),
+    );
+    complete_turn(&mut engine, &first, "a-thread", "answer A");
+
+    let conversation_b = engine
+        .select(ConversationSelection::New {
+            title: Some("B".to_owned()),
+        })
+        .unwrap()
+        .id;
+    let in_b = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Cursor,
+                model_id: None,
+                prompt: "question B".to_owned(),
+            })
+            .unwrap(),
+    );
+    assert!(in_b.context.recent.is_empty());
+    complete_turn(&mut engine, &in_b, "b-session", "answer B");
+
+    engine
+        .select(ConversationSelection::Existing(conversation_a))
+        .unwrap();
+    let in_a = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Cursor,
+                model_id: None,
+                prompt: "follow A".to_owned(),
+            })
+            .unwrap(),
+    );
+    assert_eq!(in_a.context.recent.len(), 1);
+    assert_eq!(in_a.context.recent[0].user, "private A");
+    assert!(
+        !in_a
+            .context
+            .recent
+            .iter()
+            .any(|turn| turn.user == "question B")
+    );
+
+    engine
+        .select(ConversationSelection::Existing(conversation_b))
+        .unwrap();
+    let back_to_b = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Agy,
+                model_id: None,
+                prompt: "follow B".to_owned(),
+            })
+            .unwrap(),
+    );
+    assert_eq!(back_to_b.context.recent.len(), 1);
+    assert_eq!(back_to_b.context.recent[0].user, "question B");
+}
+
+#[test]
+fn summary_source_includes_completed_turns_from_all_agents() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+    engine
+        .select(ConversationSelection::New { title: None })
+        .unwrap();
+    let codex = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Codex,
+                model_id: None,
+                prompt: "codex goal".to_owned(),
+            })
+            .unwrap(),
+    );
+    complete_turn(&mut engine, &codex, "codex-thread", &"c".repeat(2_000));
+    let cursor = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Cursor,
+                model_id: None,
+                prompt: "cursor constraint".to_owned(),
+            })
+            .unwrap(),
+    );
+    complete_turn(&mut engine, &cursor, "cursor-session", &"u".repeat(2_000));
+
+    let job = engine.prepare_summary(AgentKey::Agy).unwrap().unwrap();
+    assert_eq!(job.source_turns().len(), 2);
+    assert_eq!(job.source_turns()[0].agent, AgentKey::Codex);
+    assert_eq!(job.source_turns()[1].agent, AgentKey::Cursor);
 }
 
 #[test]

@@ -118,8 +118,8 @@ Controls:
 - `/new [title]`: create and switch to a durable conversation
 - `/conversations` or `F3`: list and load conversations for the current workspace
 - `/resume <id-prefix>`: load one conversation by a unique ID prefix
-- `/summarize`: compress the selected agent's completed context
-- `/share <codex|cursor|agy>`: explicitly share the current transcript with one agent
+- `/summarize`: compress the completed shared context for the selected agent
+- `/share <codex|cursor|agy>`: optionally replay a context import to one agent; ordinary turns are shared automatically
 - `F2`: load and open that agent's model picker
 - Model picker `Up` / `Down`, `Enter`, `Esc`: move, select, or close
 - Mouse wheel: scroll the chat history without changing the active agent
@@ -128,10 +128,11 @@ Controls:
 - `Ctrl+C`: cancel the selected agent's active turn
 - `Esc`: stop all owned child processes, restore the terminal, and exit
 
-`/agent` changes only which adapter receives the next prompt. Within a DmuxAI
-conversation, each provider keeps its own native thread/session binding. Merely
-switching agents does not inject another agent's transcript; use `/share` when
-that transfer is intentional.
+`/agent` changes which adapter receives the next prompt. Within a DmuxAI
+conversation, each provider keeps its own native thread/session binding, while
+completed turns are automatically projected into the next request for every
+agent. Merely switching agents no longer requires `/share`; the command remains
+available only for an explicit replay when desired.
 The active agent is shown in the bottom status line; the agent list appears only
 inside the `/agent` picker instead of occupying a permanent sidebar.
 
@@ -143,9 +144,10 @@ error is shown in chat so another model can be selected.
 DmuxAI stores the canonical transcript, turns, provider bindings, and context
 checkpoints in SQLite. On restart it restores the latest conversation for the
 current workspace and resumes a valid provider-native session. If no valid
-native session is available, DmuxAI injects that agent's saved summary and
-recent completed turns into a fresh session. The full transcript is retained;
-summarization only changes the context projection sent to the provider.
+native session covers the common conversation head, DmuxAI injects the shared
+rolling summary and recent completed turns from all agents into a fresh
+session. The full transcript is retained; summarization only changes the
+bounded context projection sent to the provider.
 
 The database is stored at `%LOCALAPPDATA%\DmuxAI\conversations.sqlite3` on
 Windows, `$XDG_STATE_HOME/dmuxai/conversations.sqlite3` when `XDG_STATE_HOME` is

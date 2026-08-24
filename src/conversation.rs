@@ -447,6 +447,7 @@ pub enum BeginTurnOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectedTurn {
     pub seq: i64,
+    pub agent: AgentKey,
     pub user: String,
     pub assistant: String,
 }
@@ -769,7 +770,7 @@ impl ConversationEngine {
             return Err(ConversationError::AgentBusy(agent));
         }
 
-        let turns = load_projected_turns(&self.connection, &conversation_id, agent)?;
+        let turns = load_projected_turns(&self.connection, &conversation_id)?;
         let Some(covers_through_seq) = turns.last().map(|turn| turn.seq) else {
             return Ok(None);
         };
@@ -862,7 +863,7 @@ impl ConversationEngine {
             return Err(ConversationError::AgentBusy(job.agent));
         }
 
-        let turns = load_projected_turns(&transaction, &job.conversation_id, job.agent)?;
+        let turns = load_projected_turns(&transaction, &job.conversation_id)?;
         let current_hash = hash_turns(
             turns
                 .iter()
@@ -1008,7 +1009,7 @@ impl ConversationEngine {
         conversation_id: &ConversationId,
         agent: AgentKey,
     ) -> Result<ProjectionBuild, ConversationError> {
-        let turns = load_projected_turns(&self.connection, conversation_id, agent)?;
+        let turns = load_projected_turns(&self.connection, conversation_id)?;
         let through_seq = turns.last().map_or(0, |turn| turn.seq);
         let checkpoint = self.latest_valid_checkpoint(conversation_id, agent, &turns)?;
         let covers_through_seq = checkpoint
@@ -1455,26 +1456,29 @@ fn mark_binding_stale(
 fn load_projected_turns(
     connection: &Connection,
     conversation_id: &ConversationId,
-    agent: AgentKey,
 ) -> Result<Vec<ProjectedTurn>, ConversationError> {
     let mut statement = connection.prepare(
         "SELECT t.seq,
+                t.requested_agent,
                 MAX(CASE WHEN m.role = 'user' THEN m.text END),
                 MAX(CASE WHEN m.role = 'assistant' THEN m.text END)
            FROM turns t
            JOIN messages m ON m.turn_id = t.id
-          WHERE t.conversation_id = ?1 AND t.requested_agent = ?2
+          WHERE t.conversation_id = ?1
             AND t.status = 'completed'
-          GROUP BY t.id, t.seq
+         GROUP BY t.id, t.seq
          HAVING COUNT(CASE WHEN m.role = 'user' THEN 1 END) = 1
             AND COUNT(CASE WHEN m.role = 'assistant' THEN 1 END) = 1
+            AND MAX(CASE WHEN m.role = 'user' THEN m.text END)
+                NOT LIKE '[DmuxAI explicit context import]%'
           ORDER BY t.seq",
     )?;
-    let turns = statement.query_map(params![conversation_id.as_str(), agent.as_db()], |row| {
+    let turns = statement.query_map(params![conversation_id.as_str()], |row| {
         Ok(ProjectedTurn {
             seq: row.get(0)?,
-            user: row.get(1)?,
-            assistant: row.get(2)?,
+            agent: AgentKey::from_db(&row.get::<_, String>(1)?)?,
+            user: row.get(2)?,
+            assistant: row.get(3)?,
         })
     })?;
     turns
@@ -1486,6 +1490,7 @@ fn hash_turns<'a>(turns: impl IntoIterator<Item = &'a ProjectedTurn>) -> [u8; 32
     let mut hasher = Sha256::new();
     for turn in turns {
         hasher.update(turn.seq.to_le_bytes());
+        hash_text(&mut hasher, turn.agent.as_db());
         hash_text(&mut hasher, &turn.user);
         hash_text(&mut hasher, &turn.assistant);
     }
