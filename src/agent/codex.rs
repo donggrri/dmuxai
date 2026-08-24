@@ -425,9 +425,11 @@ fn turn_start_request(
         "threadId": thread_id,
         "input": [{ "type": "text", "text": codex_prompt(mode, &request.prompt) }],
         "approvalPolicy": "never",
-        "sandboxPolicy": match mode {
-            ExecutionMode::Ask | ExecutionMode::Plan => "readOnly",
-            ExecutionMode::Implement => "workspaceWrite",
+        "sandboxPolicy": {
+            "type": match mode {
+                ExecutionMode::Ask | ExecutionMode::Plan => "readOnly",
+                ExecutionMode::Implement => "workspaceWrite",
+            }
         }
     });
     if let Some(model) = model {
@@ -1477,7 +1479,7 @@ mod tests {
             Some(&json!("never"))
         );
         assert_eq!(
-            payload.pointer("/params/sandboxPolicy"),
+            payload.pointer("/params/sandboxPolicy/type"),
             Some(&json!("readOnly"))
         );
     }
@@ -1595,21 +1597,24 @@ mod tests {
     }
 
     #[test]
+    // TC-046 / INT-040: App Server requires a tagged sandbox-policy object.
     fn codex_execution_modes_set_per_turn_sandbox_and_approval_policy() {
         let request = request("implement this");
 
         let ask = turn_start_request(1, "thread", &request, None, None, ExecutionMode::Ask);
         assert_eq!(
-            ask.pointer("/params/sandboxPolicy"),
+            ask.pointer("/params/sandboxPolicy/type"),
             Some(&json!("readOnly"))
         );
+        assert!(ask.pointer("/params/sandboxPolicy").unwrap().is_object());
         assert_eq!(ask.pointer("/params/approvalPolicy"), Some(&json!("never")));
 
         let plan = turn_start_request(2, "thread", &request, None, None, ExecutionMode::Plan);
         assert_eq!(
-            plan.pointer("/params/sandboxPolicy"),
+            plan.pointer("/params/sandboxPolicy/type"),
             Some(&json!("readOnly"))
         );
+        assert!(plan.pointer("/params/sandboxPolicy").unwrap().is_object());
         assert!(
             plan.pointer("/params/input/0/text")
                 .and_then(Value::as_str)
@@ -1626,8 +1631,14 @@ mod tests {
             ExecutionMode::Implement,
         );
         assert_eq!(
-            implement.pointer("/params/sandboxPolicy"),
+            implement.pointer("/params/sandboxPolicy/type"),
             Some(&json!("workspaceWrite"))
+        );
+        assert!(
+            implement
+                .pointer("/params/sandboxPolicy")
+                .unwrap()
+                .is_object()
         );
         assert_eq!(implement.pointer("/params/model"), Some(&json!("model")));
     }
