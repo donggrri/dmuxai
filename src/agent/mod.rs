@@ -73,9 +73,17 @@ pub enum AgentEvent {
     ModelsListed {
         models: Vec<ModelInfo>,
         selected: Option<String>,
+        selected_effort: Option<String>,
     },
     ModelSelected(String),
+    EffortSelected(String),
     ModeSelected(ExecutionMode),
+    ToolProgress {
+        item_id: String,
+        summary: String,
+        state: String,
+    },
+    Status(String),
     Completed,
     Cancelled,
     Error(String),
@@ -148,6 +156,8 @@ impl From<&AgentRequest> for OutputContext {
 pub struct ModelInfo {
     pub id: String,
     pub label: String,
+    pub efforts: Vec<String>,
+    pub default_effort: Option<String>,
 }
 
 impl ModelInfo {
@@ -155,6 +165,22 @@ impl ModelInfo {
         Self {
             id: id.into(),
             label: label.into(),
+            efforts: Vec::new(),
+            default_effort: None,
+        }
+    }
+
+    pub fn with_efforts(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        efforts: Vec<String>,
+        default_effort: Option<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            efforts,
+            default_effort,
         }
     }
 }
@@ -171,6 +197,7 @@ pub struct AgentOutput {
 pub enum AdapterError {
     CommandQueueFull,
     RuntimeStopped,
+    Unsupported,
 }
 
 impl fmt::Display for AdapterError {
@@ -178,6 +205,7 @@ impl fmt::Display for AdapterError {
         match self {
             Self::CommandQueueFull => formatter.write_str("agent command queue is full"),
             Self::RuntimeStopped => formatter.write_str("agent runtime has stopped"),
+            Self::Unsupported => formatter.write_str("agent does not support this command"),
         }
     }
 }
@@ -195,7 +223,13 @@ pub trait AgentAdapter: Send {
     fn cancel(&self) -> Result<(), AdapterError>;
     fn request_models(&self) -> Result<(), AdapterError>;
     fn select_model(&self, model: String) -> Result<(), AdapterError>;
+    fn select_effort(&self, _effort: String) -> Result<(), AdapterError> {
+        Err(AdapterError::Unsupported)
+    }
     fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError>;
+    fn request_status(&self) -> Result<(), AdapterError> {
+        Err(AdapterError::Unsupported)
+    }
 }
 
 pub type SpawnedAdapter = (Box<dyn AgentAdapter>, JoinHandle<()>);

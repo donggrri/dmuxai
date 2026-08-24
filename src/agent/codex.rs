@@ -23,13 +23,16 @@ const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const RAW_MESSAGE_CHANNEL_CAPACITY: usize = 64;
 const CODEX_BINARY_OVERRIDE: &str = "DMUXAI_CODEX_BIN";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const TOOL_SUMMARY_LIMIT: usize = 240;
 
 enum CodexCommand {
     Send(AgentRequest),
     Cancel,
     ListModels,
     SelectModel(String),
+    SelectEffort(String),
     SelectMode(ExecutionMode),
+    RequestStatus,
 }
 
 pub struct CodexAdapter {
@@ -65,9 +68,21 @@ impl AgentAdapter for CodexAdapter {
             .map_err(map_send_error)
     }
 
+    fn select_effort(&self, effort: String) -> Result<(), AdapterError> {
+        self.command_tx
+            .try_send(CodexCommand::SelectEffort(effort))
+            .map_err(map_send_error)
+    }
+
     fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
         self.command_tx
             .try_send(CodexCommand::SelectMode(mode))
+            .map_err(map_send_error)
+    }
+
+    fn request_status(&self) -> Result<(), AdapterError> {
+        self.command_tx
+            .try_send(CodexCommand::RequestStatus)
             .map_err(map_send_error)
     }
 }
@@ -217,6 +232,7 @@ impl CodexClient {
         &mut self,
         request: &AgentRequest,
         model: Option<&str>,
+        effort: Option<&str>,
         mode: ExecutionMode,
     ) -> io::Result<()> {
         let thread_id = self
@@ -230,7 +246,7 @@ impl CodexClient {
         self.interrupt_sent = false;
         self.cancel_requested = false;
         self.write_message(turn_start_request(
-            request_id, &thread_id, request, model, mode,
+            request_id, &thread_id, request, model, effort, mode,
         ))
         .await
     }
@@ -248,6 +264,31 @@ impl CodexClient {
         .await?;
         let response = self.wait_for_success_response(request_id, event_tx).await?;
         parse_model_list(&response)
+    }
+
+    async fn status(&mut self, event_tx: &mpsc::Sender<AgentOutput>) -> String {
+        let rate_limits = self
+            .status_response("account/rateLimits/read", event_tx)
+            .await
+            .map(|response| format_rate_limits(&response))
+            .unwrap_or_else(|error| format!("Rate limits: unavailable ({error})"));
+        let usage = self
+            .status_response("account/usage/read", event_tx)
+            .await
+            .map(|response| format_usage(&response))
+            .unwrap_or_else(|error| format!("Token activity: unavailable ({error})"));
+        format!("Codex status\n{usage}\n{rate_limits}")
+    }
+
+    async fn status_response(
+        &mut self,
+        method: &str,
+        event_tx: &mpsc::Sender<AgentOutput>,
+    ) -> io::Result<Value> {
+        let request_id = self.next_id();
+        self.write_message(json!({ "method": method, "id": request_id, "params": {} }))
+            .await?;
+        self.wait_for_success_response(request_id, event_tx).await
     }
 
     async fn request_cancel(&mut self) -> io::Result<()> {
@@ -377,6 +418,7 @@ fn turn_start_request(
     thread_id: &str,
     request: &AgentRequest,
     model: Option<&str>,
+    effort: Option<&str>,
     mode: ExecutionMode,
 ) -> Value {
     let mut params = json!({
@@ -390,6 +432,9 @@ fn turn_start_request(
     });
     if let Some(model) = model {
         params["model"] = Value::String(model.to_owned());
+    }
+    if let Some(effort) = effort {
+        params["effort"] = Value::String(effort.to_owned());
     }
     json!({
         "method": "turn/start",
@@ -411,6 +456,7 @@ async fn begin_request(
     client: &mut CodexClient,
     request: &AgentRequest,
     selected_model: Option<&str>,
+    selected_effort: Option<&str>,
     mode: ExecutionMode,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
@@ -424,7 +470,9 @@ async fn begin_request(
         )
         .await;
     }
-    client.start_turn(request, selected_model, mode).await?;
+    client
+        .start_turn(request, selected_model, selected_effort, mode)
+        .await?;
     send_event(event_tx, Some(&context), AgentEvent::Started).await;
     Ok(())
 }
@@ -458,6 +506,7 @@ fn conversation_requires_reconnect(
 async fn connect_for_request(
     request: &AgentRequest,
     selected_model: Option<&str>,
+    selected_effort: Option<&str>,
     mode: ExecutionMode,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
@@ -465,8 +514,16 @@ async fn connect_for_request(
     let context = OutputContext::from(request);
     match CodexClient::start(cwd, event_tx).await {
         Ok(mut started) => {
-            if let Err(error) =
-                begin_request(&mut started, request, selected_model, mode, cwd, event_tx).await
+            if let Err(error) = begin_request(
+                &mut started,
+                request,
+                selected_model,
+                selected_effort,
+                mode,
+                cwd,
+                event_tx,
+            )
+            .await
             {
                 send_event(
                     event_tx,
@@ -499,6 +556,8 @@ async fn runtime_loop(
 ) {
     let mut client: Option<CodexClient> = None;
     let mut selected_model: Option<String> = None;
+    let mut selected_effort: Option<String> = None;
+    let mut model_catalog = Vec::new();
     let mut selected_mode = ExecutionMode::default();
 
     loop {
@@ -508,6 +567,7 @@ async fn runtime_loop(
                     client = connect_for_request(
                         &request,
                         selected_model.as_deref(),
+                        selected_effort.as_deref(),
                         selected_mode,
                         &cwd,
                         &event_tx,
@@ -519,6 +579,10 @@ async fn runtime_loop(
                     selected_model = Some(model.clone());
                     send_event(&event_tx, None, AgentEvent::ModelSelected(model)).await;
                 }
+                Some(CodexCommand::SelectEffort(effort)) => {
+                    selected_effort = Some(effort.clone());
+                    send_event(&event_tx, None, AgentEvent::EffortSelected(effort)).await;
+                }
                 Some(CodexCommand::SelectMode(mode)) => {
                     selected_mode = mode;
                     send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
@@ -526,8 +590,17 @@ async fn runtime_loop(
                 Some(CodexCommand::ListModels) => match CodexClient::start(&cwd, &event_tx).await {
                     Ok(mut started) => match started.list_models(&event_tx).await {
                         Ok((models, default_model)) => {
+                            model_catalog = models.clone();
                             if selected_model.is_none() {
                                 selected_model = default_model;
+                            }
+                            if selected_effort.is_none() {
+                                selected_effort = selected_model.as_ref().and_then(|selected| {
+                                    model_catalog
+                                        .iter()
+                                        .find(|model| &model.id == selected)
+                                        .and_then(|model| model.default_effort.clone())
+                                });
                             }
                             send_event(
                                 &event_tx,
@@ -535,6 +608,7 @@ async fn runtime_loop(
                                 AgentEvent::ModelsListed {
                                     models,
                                     selected: selected_model.clone(),
+                                    selected_effort: selected_effort.clone(),
                                 },
                             )
                             .await;
@@ -554,6 +628,25 @@ async fn runtime_loop(
                         .await;
                     }
                 },
+                Some(CodexCommand::RequestStatus) => {
+                    match CodexClient::start(&cwd, &event_tx).await {
+                        Ok(mut started) => {
+                            let status = started.status(&event_tx).await;
+                            send_event(&event_tx, None, AgentEvent::Status(status)).await;
+                            client = Some(started);
+                        }
+                        Err(error) => {
+                            send_event(
+                            &event_tx,
+                            None,
+                            AgentEvent::Status(format!(
+                                "Codex status\nToken activity: unavailable ({error})\nRate limits: unavailable ({error})"
+                            )),
+                        )
+                        .await;
+                        }
+                    }
+                }
                 None => break,
             }
             continue;
@@ -588,6 +681,7 @@ async fn runtime_loop(
                             active_client,
                             &request,
                             selected_model.as_deref(),
+                            selected_effort.as_deref(),
                             selected_mode,
                             &cwd,
                             &event_tx,
@@ -623,8 +717,17 @@ async fn runtime_loop(
                         } else {
                             match active_client.list_models(&event_tx).await {
                                 Ok((models, default_model)) => {
+                                    model_catalog = models.clone();
                                     if selected_model.is_none() {
                                         selected_model = default_model;
+                                    }
+                                    if selected_effort.is_none() {
+                                        selected_effort = selected_model.as_ref().and_then(|selected| {
+                                            model_catalog
+                                                .iter()
+                                                .find(|model| &model.id == selected)
+                                                .and_then(|model| model.default_effort.clone())
+                                        });
                                     }
                                     send_event(
                                         &event_tx,
@@ -632,6 +735,7 @@ async fn runtime_loop(
                                         AgentEvent::ModelsListed {
                                             models,
                                             selected: selected_model.clone(),
+                                            selected_effort: selected_effort.clone(),
                                         },
                                     ).await;
                                 }
@@ -654,7 +758,28 @@ async fn runtime_loop(
                             ).await;
                         } else {
                             selected_model = Some(model.clone());
+                            selected_effort = model_catalog
+                                .iter()
+                                .find(|candidate| candidate.id == model)
+                                .and_then(|candidate| candidate.default_effort.clone());
                             send_event(&event_tx, None, AgentEvent::ModelSelected(model)).await;
+                        }
+                    }
+                    Some(CodexCommand::SelectEffort(effort)) => {
+                        if active_client.active_turn_id.is_some()
+                            || active_client.pending_turn_request_id.is_some()
+                        {
+                            send_event(
+                                &event_tx,
+                                None,
+                                AgentEvent::Notice(
+                                    "finish or cancel the Codex turn before changing effort".to_owned(),
+                                ),
+                            )
+                            .await;
+                        } else {
+                            selected_effort = Some(effort.clone());
+                            send_event(&event_tx, None, AgentEvent::EffortSelected(effort)).await;
                         }
                     }
                     Some(CodexCommand::SelectMode(mode)) => {
@@ -670,6 +795,23 @@ async fn runtime_loop(
                                     "Codex mode changed; it will apply to the next turn".to_owned(),
                                 ),
                             ).await;
+                        }
+                    }
+                    Some(CodexCommand::RequestStatus) => {
+                        if active_client.active_turn_id.is_some()
+                            || active_client.pending_turn_request_id.is_some()
+                        {
+                            send_event(
+                                &event_tx,
+                                None,
+                                AgentEvent::Status(
+                                    "Codex status\nToken activity: unavailable while a turn is active\nRate limits: unavailable while a turn is active".to_owned(),
+                                ),
+                            )
+                            .await;
+                        } else {
+                            let status = active_client.status(&event_tx).await;
+                            send_event(&event_tx, None, AgentEvent::Status(status)).await;
                         }
                     }
                     None => break,
@@ -699,6 +841,7 @@ async fn runtime_loop(
             client = connect_for_request(
                 &request,
                 selected_model.as_deref(),
+                selected_effort.as_deref(),
                 selected_mode,
                 &cwd,
                 &event_tx,
@@ -785,6 +928,7 @@ fn normalized_event(message: &Value) -> Option<AgentEvent> {
             .pointer("/params/delta")
             .and_then(Value::as_str)
             .map(|delta| AgentEvent::TextDelta(delta.to_owned())),
+        "item/started" | "item/completed" => normalize_tool_progress(message),
         "turn/completed" => match message
             .pointer("/params/turn/status")
             .and_then(Value::as_str)
@@ -815,6 +959,92 @@ fn normalized_event(message: &Value) -> Option<AgentEvent> {
             ))
         }
         _ => None,
+    }
+}
+
+fn normalize_tool_progress(message: &Value) -> Option<AgentEvent> {
+    let item = message.pointer("/params/item")?;
+    let item_id = item.get("id")?.as_str()?.to_owned();
+    let state = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            if message.get("method").and_then(Value::as_str) == Some("item/started") {
+                "in progress"
+            } else {
+                "completed"
+            }
+        })
+        .to_owned();
+    let summary = match item.get("type")?.as_str()? {
+        "commandExecution" => format!(
+            "Command: {}",
+            bounded_summary(
+                item.get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("command")
+            )
+        ),
+        "mcpToolCall" => format!(
+            "MCP: {}/{}",
+            item.get("server")
+                .and_then(Value::as_str)
+                .unwrap_or("server"),
+            item.get("tool").and_then(Value::as_str).unwrap_or("tool")
+        ),
+        "dynamicToolCall" => format!(
+            "Tool: {}",
+            item.get("tool").and_then(Value::as_str).unwrap_or("tool")
+        ),
+        "collabToolCall" => format!(
+            "Collaboration: {}",
+            item.get("tool").and_then(Value::as_str).unwrap_or("tool")
+        ),
+        "webSearch" => format!(
+            "Web search: {}",
+            bounded_summary(
+                item.get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or("search")
+            )
+        ),
+        "imageView" => format!(
+            "View image: {}",
+            bounded_summary(item.get("path").and_then(Value::as_str).unwrap_or("image"))
+        ),
+        "fileChange" => {
+            let paths = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .map(|changes| {
+                    changes
+                        .iter()
+                        .filter_map(|change| change.get("path").and_then(Value::as_str))
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|paths| !paths.is_empty())
+                .unwrap_or_else(|| "files".to_owned());
+            format!("File changes: {}", bounded_summary(&paths))
+        }
+        _ => return None,
+    };
+    Some(AgentEvent::ToolProgress {
+        item_id,
+        summary,
+        state,
+    })
+}
+
+fn bounded_summary(value: &str) -> String {
+    let single_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = single_line.chars();
+    let prefix = chars.by_ref().take(TOOL_SUMMARY_LIMIT).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
     }
 }
 
@@ -851,10 +1081,111 @@ fn parse_model_list(message: &Value) -> io::Result<(Vec<ModelInfo>, Option<Strin
             {
                 selected = Some(id.clone());
             }
-            Some(ModelInfo::new(id, label))
+            let efforts: Vec<String> = model
+                .get("supportedReasoningEfforts")
+                .and_then(Value::as_array)
+                .map(|efforts| {
+                    efforts
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let default_effort = model
+                .get("defaultReasoningEffort")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|effort| efforts.iter().any(|supported| supported == effort));
+            Some(ModelInfo::with_efforts(id, label, efforts, default_effort))
         })
         .collect::<Vec<_>>();
     Ok((models, selected))
+}
+
+fn format_usage(response: &Value) -> String {
+    let summary = response.pointer("/result/summary");
+    let lifetime = summary
+        .and_then(|summary| summary.get("lifetimeTokens"))
+        .and_then(Value::as_u64)
+        .map(format_tokens)
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let latest_daily = response
+        .pointer("/result/dailyUsageBuckets")
+        .and_then(Value::as_array)
+        .and_then(|buckets| buckets.last())
+        .and_then(|bucket| {
+            Some((
+                bucket.get("startDate")?.as_str()?,
+                bucket.get("tokens")?.as_u64()?,
+            ))
+        })
+        .map(|(date, tokens)| format!("{date}: {}", format_tokens(tokens)))
+        .unwrap_or_else(|| "unavailable".to_owned());
+    format!("Token activity: lifetime {lifetime}; latest day {latest_daily}")
+}
+
+fn format_rate_limits(response: &Value) -> String {
+    let limits = response
+        .pointer("/result/rateLimitsByLimitId")
+        .and_then(Value::as_object);
+    let entries = if let Some(limits) = limits {
+        limits
+            .iter()
+            .map(|(id, limit)| (id.clone(), limit))
+            .collect::<Vec<_>>()
+    } else if let Some(limit) = response.pointer("/result/rateLimits") {
+        vec![("codex".to_owned(), limit)]
+    } else {
+        return "Rate limits: unavailable".to_owned();
+    };
+    let rendered = entries
+        .into_iter()
+        .filter_map(|(id, limit)| {
+            let used = limit.pointer("/primary/usedPercent")?.as_f64()?;
+            let remaining = (100.0 - used).clamp(0.0, 100.0);
+            let minutes = limit
+                .pointer("/primary/windowDurationMins")
+                .and_then(Value::as_u64)
+                .map(|minutes| format!(" / {minutes}m"))
+                .unwrap_or_default();
+            let reset = limit
+                .pointer("/primary/resetsAt")
+                .and_then(Value::as_i64)
+                .map(reset_description)
+                .unwrap_or_else(|| "reset unavailable".to_owned());
+            Some(format!("{id}: {remaining:.0}% remaining{minutes}; {reset}"))
+        })
+        .collect::<Vec<_>>();
+    if rendered.is_empty() {
+        "Rate limits: unavailable".to_owned()
+    } else {
+        format!("Rate limits: {}", rendered.join("; "))
+    }
+}
+
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn reset_description(resets_at: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(resets_at);
+    let minutes = (resets_at.saturating_sub(now) + 59) / 60;
+    if minutes <= 0 {
+        "reset due".to_owned()
+    } else {
+        format!("resets in {minutes}m")
+    }
 }
 
 fn extract_thread_id(message: &Value) -> io::Result<String> {
@@ -1128,6 +1459,99 @@ mod tests {
     }
 
     #[test]
+    // TC-040: selected effort is a per-turn override and preserves safety fields.
+    fn codex_turn_request_includes_selected_effort() {
+        let request = request("inspect this");
+        let payload = turn_start_request(
+            1,
+            "thread",
+            &request,
+            Some("gpt-test"),
+            Some("high"),
+            ExecutionMode::Ask,
+        );
+
+        assert_eq!(payload.pointer("/params/effort"), Some(&json!("high")));
+        assert_eq!(
+            payload.pointer("/params/approvalPolicy"),
+            Some(&json!("never"))
+        );
+        assert_eq!(
+            payload.pointer("/params/sandboxPolicy"),
+            Some(&json!("readOnly"))
+        );
+    }
+
+    #[test]
+    // TC-042 and TC-043: only recognized tool items become concise lifecycle events.
+    fn normalizes_codex_tool_item_lifecycle() {
+        let started = json!({
+            "method": "item/started",
+            "params": { "item": {
+                "id": "tool-1", "type": "commandExecution",
+                "command": "rg --files", "status": "inProgress"
+            }}
+        });
+        let completed = json!({
+            "method": "item/completed",
+            "params": { "item": {
+                "id": "tool-1", "type": "commandExecution",
+                "command": "rg --files", "status": "completed",
+                "aggregatedOutput": "not rendered"
+            }}
+        });
+        let malformed = json!({ "method": "item/started", "params": { "item": { "id": "x" } } });
+
+        assert_eq!(
+            normalized_event(&started),
+            Some(AgentEvent::ToolProgress {
+                item_id: "tool-1".to_owned(),
+                summary: "Command: rg --files".to_owned(),
+                state: "inProgress".to_owned(),
+            })
+        );
+        assert_eq!(
+            normalized_event(&completed),
+            Some(AgentEvent::ToolProgress {
+                item_id: "tool-1".to_owned(),
+                summary: "Command: rg --files".to_owned(),
+                state: "completed".to_owned(),
+            })
+        );
+        assert_eq!(normalized_event(&malformed), None);
+    }
+
+    #[test]
+    // TC-044 and TC-045: provider status can be complete or explicitly unavailable.
+    fn codex_status_formats_usage_and_rate_limit_fixtures() {
+        let usage = json!({
+            "result": {
+                "summary": { "lifetimeTokens": 12345 },
+                "dailyUsageBuckets": [{ "startDate": "2026-08-24", "tokens": 321 }]
+            }
+        });
+        let rates = json!({
+            "result": { "rateLimits": {
+                "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 0 }
+            }}
+        });
+
+        assert_eq!(
+            format_usage(&usage),
+            "Token activity: lifetime 12.3K; latest day 2026-08-24: 321"
+        );
+        assert!(format_rate_limits(&rates).contains("75% remaining / 15m; reset due"));
+        assert_eq!(
+            format_usage(&json!({ "result": {} })),
+            "Token activity: lifetime unavailable; latest day unavailable"
+        );
+        assert_eq!(
+            format_rate_limits(&json!({ "result": {} })),
+            "Rate limits: unavailable"
+        );
+    }
+
+    #[test]
     fn normalizes_all_terminal_turn_statuses() {
         let completed = json!({
             "method": "turn/completed",
@@ -1174,14 +1598,14 @@ mod tests {
     fn codex_execution_modes_set_per_turn_sandbox_and_approval_policy() {
         let request = request("implement this");
 
-        let ask = turn_start_request(1, "thread", &request, None, ExecutionMode::Ask);
+        let ask = turn_start_request(1, "thread", &request, None, None, ExecutionMode::Ask);
         assert_eq!(
             ask.pointer("/params/sandboxPolicy"),
             Some(&json!("readOnly"))
         );
         assert_eq!(ask.pointer("/params/approvalPolicy"), Some(&json!("never")));
 
-        let plan = turn_start_request(2, "thread", &request, None, ExecutionMode::Plan);
+        let plan = turn_start_request(2, "thread", &request, None, None, ExecutionMode::Plan);
         assert_eq!(
             plan.pointer("/params/sandboxPolicy"),
             Some(&json!("readOnly"))
@@ -1198,6 +1622,7 @@ mod tests {
             "thread",
             &request,
             Some("model"),
+            None,
             ExecutionMode::Implement,
         );
         assert_eq!(
@@ -1234,7 +1659,7 @@ mod tests {
         let request = request("Reply with exactly CODEX_OK. Do not use tools or modify files.");
         client.open_thread(&cwd, &request, &event_tx).await.unwrap();
         client
-            .start_turn(&request, None, ExecutionMode::Ask)
+            .start_turn(&request, None, None, ExecutionMode::Ask)
             .await
             .unwrap();
 
@@ -1264,7 +1689,10 @@ mod tests {
                         | AgentEvent::Notice(_)
                         | AgentEvent::ModelsListed { .. }
                         | AgentEvent::ModelSelected(_)
+                        | AgentEvent::EffortSelected(_)
                         | AgentEvent::ModeSelected(_)
+                        | AgentEvent::ToolProgress { .. }
+                        | AgentEvent::Status(_)
                         | AgentEvent::Cancelled => {}
                     }
                 }
@@ -1290,7 +1718,7 @@ mod tests {
         );
         client.open_thread(&cwd, &request, &event_tx).await.unwrap();
         client
-            .start_turn(&request, None, ExecutionMode::Ask)
+            .start_turn(&request, None, None, ExecutionMode::Ask)
             .await
             .unwrap();
         client.request_cancel().await.unwrap();
@@ -1323,7 +1751,9 @@ mod tests {
                         | AgentEvent::Notice(_)
                         | AgentEvent::ModelsListed { .. }
                         | AgentEvent::ModelSelected(_)
+                        | AgentEvent::EffortSelected(_)
                         | AgentEvent::ModeSelected(_) => {}
+                        AgentEvent::ToolProgress { .. } | AgentEvent::Status(_) => {}
                     }
                 }
             }

@@ -53,6 +53,8 @@ const MAX_SUMMARY_BUFFER_CHARS: usize = 80_000;
 enum SlashAction {
     Agent,
     Mode,
+    Effort,
+    Status,
     New,
     Conversations,
     Resume,
@@ -67,7 +69,7 @@ struct SlashCommand {
     action: SlashAction,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 7] = [
+const SLASH_COMMANDS: [SlashCommand; 9] = [
     SlashCommand {
         name: "/agent",
         description: "Switch the active agent",
@@ -77,6 +79,16 @@ const SLASH_COMMANDS: [SlashCommand; 7] = [
         name: "/mode",
         description: "Choose Ask, Plan, or Implement",
         action: SlashAction::Mode,
+    },
+    SlashCommand {
+        name: "/effort",
+        description: "Choose Codex reasoning effort",
+        action: SlashAction::Effort,
+    },
+    SlashCommand {
+        name: "/status",
+        description: "Show Codex token and rate-limit status",
+        action: SlashAction::Status,
     },
     SlashCommand {
         name: "/new",
@@ -131,10 +143,16 @@ impl Message {
 struct ModelCatalog {
     models: Vec<ModelInfo>,
     selected: Option<String>,
+    selected_effort: Option<String>,
     loading: bool,
 }
 
 struct ModelPicker {
+    agent: Agent,
+    cursor: usize,
+}
+
+struct EffortPicker {
     agent: Agent,
     cursor: usize,
 }
@@ -206,11 +224,13 @@ pub struct App {
     streaming_messages: HashMap<Agent, usize>,
     model_catalogs: HashMap<Agent, ModelCatalog>,
     model_picker: Option<ModelPicker>,
+    effort_picker: Option<EffortPicker>,
     agent_picker: Option<AgentPicker>,
     mode_picker: Option<ModePicker>,
     conversation_picker: Option<ConversationPicker>,
     slash_preview: Option<SlashPreview>,
     modes: HashMap<Agent, ExecutionMode>,
+    tool_messages: HashMap<Agent, HashMap<String, usize>>,
     chat_scroll: usize,
     chat_selection: Option<ChatSelection>,
     selecting_chat: bool,
@@ -265,7 +285,7 @@ impl App {
             input: String::new(),
             messages: vec![Message::new(
                 Role::System,
-                "Codex, Cursor, and AGY use real structured headless protocols. Completed turns are shared automatically with every agent; /share is optional. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, F2 to choose a model, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
+                "Codex, Cursor, and AGY use real structured headless protocols. Completed turns are shared automatically with every agent; /share is optional. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /effort to choose Codex reasoning effort, /status to view Codex usage, F2 to choose a model, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
             )],
             adapters,
             event_rx,
@@ -285,6 +305,7 @@ impl App {
                 .map(|agent| (agent, ModelCatalog::default()))
                 .collect(),
             model_picker: None,
+            effort_picker: None,
             agent_picker: None,
             mode_picker: None,
             conversation_picker: None,
@@ -293,6 +314,7 @@ impl App {
                 .into_iter()
                 .map(|agent| (agent, ExecutionMode::default()))
                 .collect(),
+            tool_messages: HashMap::new(),
             chat_scroll: 0,
             chat_selection: None,
             selecting_chat: false,
@@ -326,6 +348,7 @@ impl App {
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
                     Event::Paste(text)
                         if self.model_picker.is_none()
+                            && self.effort_picker.is_none()
                             && self.agent_picker.is_none()
                             && self.mode_picker.is_none()
                             && self.conversation_picker.is_none() =>
@@ -468,6 +491,10 @@ impl App {
             self.handle_mode_picker_key(key);
             return;
         }
+        if self.effort_picker.is_some() {
+            self.handle_effort_picker_key(key);
+            return;
+        }
         if self.model_picker.is_some() {
             self.handle_model_picker_key(key);
             return;
@@ -563,6 +590,8 @@ impl App {
         match action {
             SlashAction::Agent => self.open_agent_picker(),
             SlashAction::Mode => self.open_mode_picker(),
+            SlashAction::Effort => self.open_effort_picker(),
+            SlashAction::Status => self.request_status(),
             SlashAction::New => self.create_conversation(None),
             SlashAction::Conversations => self.open_conversation_picker(),
             SlashAction::Resume => self.push_system("Usage: /resume <conversation-id>"),
@@ -584,6 +613,7 @@ impl App {
         if self.agent_picker.is_some()
             || self.mode_picker.is_some()
             || self.model_picker.is_some()
+            || self.effort_picker.is_some()
             || self.conversation_picker.is_some()
         {
             return;
@@ -887,6 +917,75 @@ impl App {
         }
     }
 
+    fn open_effort_picker(&mut self) {
+        let agent = self.adapters[self.selected].agent();
+        if agent != Agent::Codex {
+            self.push_system("Reasoning effort is available for Codex only.");
+            return;
+        }
+        if self.busy_agents.contains(&agent) {
+            self.push_system("Finish or cancel the Codex turn before changing effort.");
+            return;
+        }
+        let catalog = self
+            .model_catalogs
+            .get_mut(&agent)
+            .expect("every agent has a model catalog");
+        let should_load = catalog.models.is_empty() && !catalog.loading;
+        if should_load {
+            catalog.loading = true;
+        }
+        let cursor = selected_effort_options(catalog)
+            .iter()
+            .position(|effort| catalog.selected_effort.as_deref() == Some(effort.as_str()))
+            .unwrap_or(0);
+        self.effort_picker = Some(EffortPicker { agent, cursor });
+        if should_load && let Err(error) = self.adapters[self.selected].request_models() {
+            catalog.loading = false;
+            self.effort_picker = None;
+            self.push_system(format!("Could not load Codex effort options: {error}"));
+        }
+    }
+
+    fn handle_effort_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.effort_picker.as_mut() else {
+            return;
+        };
+        let catalog = self
+            .model_catalogs
+            .get(&picker.agent)
+            .expect("every agent has a model catalog");
+        let options = selected_effort_options(catalog);
+        match key.code {
+            KeyCode::Esc => self.effort_picker = None,
+            KeyCode::Up => picker.cursor = picker.cursor.saturating_sub(1),
+            KeyCode::Down if !options.is_empty() => {
+                picker.cursor = (picker.cursor + 1).min(options.len() - 1);
+            }
+            KeyCode::Enter if !options.is_empty() => {
+                let effort = options[picker.cursor].clone();
+                match self.adapters[adapter_index(picker.agent)].select_effort(effort.clone()) {
+                    Ok(()) => self.effort_picker = None,
+                    Err(error) => {
+                        self.push_system(format!("Could not select Codex effort {effort}: {error}"))
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn request_status(&mut self) {
+        let agent = self.adapters[self.selected].agent();
+        if agent != Agent::Codex {
+            self.push_system("Usage status is available for Codex only.");
+            return;
+        }
+        if let Err(error) = self.adapters[self.selected].request_status() {
+            self.push_system(format!("Could not request Codex status: {error}"));
+        }
+    }
+
     fn submit_prompt(&mut self) {
         if self.input.trim().is_empty() {
             return;
@@ -901,6 +1000,14 @@ impl App {
             }
             "/mode" => {
                 self.execute_slash_action(SlashAction::Mode);
+                return;
+            }
+            "/effort" => {
+                self.execute_slash_action(SlashAction::Effort);
+                return;
+            }
+            "/status" => {
+                self.execute_slash_action(SlashAction::Status);
                 return;
             }
             "/conversations" => {
@@ -1102,7 +1209,7 @@ impl App {
         if self.messages.is_empty() {
             self.messages.push(Message::new(
                 Role::System,
-                "Codex, Cursor, and AGY use real structured headless protocols. Completed turns are shared automatically with every agent; /share is optional. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, F2 to choose a model, F3 to load a conversation, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
+                "Codex, Cursor, and AGY use real structured headless protocols. Completed turns are shared automatically with every agent; /share is optional. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /effort to choose Codex reasoning effort, /status to view Codex usage, F2 to choose a model, F3 to load a conversation, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
             ));
         }
         self.chat_scroll = 0;
@@ -1329,7 +1436,10 @@ impl App {
             }
             AgentEvent::ModelsListed { .. }
             | AgentEvent::ModelSelected(_)
-            | AgentEvent::ModeSelected(_) => false,
+            | AgentEvent::EffortSelected(_)
+            | AgentEvent::ModeSelected(_)
+            | AgentEvent::ToolProgress { .. }
+            | AgentEvent::Status(_) => false,
         }
     }
 
@@ -1347,13 +1457,18 @@ impl App {
                 self.messages
                     .push(Message::new(Role::System, format!("{agent}: {notice}")));
             }
-            AgentEvent::ModelsListed { models, selected } => {
+            AgentEvent::ModelsListed {
+                models,
+                selected,
+                selected_effort,
+            } => {
                 let catalog = self
                     .model_catalogs
                     .get_mut(&agent)
                     .expect("every agent has a model catalog");
                 catalog.models = models;
                 catalog.selected = selected;
+                catalog.selected_effort = selected_effort;
                 catalog.loading = false;
                 if let Some(picker) = self.model_picker.as_mut()
                     && picker.agent == agent
@@ -1376,6 +1491,11 @@ impl App {
                     .get_mut(&agent)
                     .expect("every agent has a model catalog");
                 catalog.selected = Some(model.clone());
+                catalog.selected_effort = catalog
+                    .models
+                    .iter()
+                    .find(|candidate| candidate.id == model)
+                    .and_then(|candidate| candidate.default_effort.clone());
                 let label = catalog
                     .models
                     .iter()
@@ -1387,9 +1507,23 @@ impl App {
                     format!("{agent} model selected: {label}"),
                 ));
             }
+            AgentEvent::EffortSelected(effort) => {
+                let catalog = self
+                    .model_catalogs
+                    .get_mut(&agent)
+                    .expect("every agent has a model catalog");
+                catalog.selected_effort = Some(effort.clone());
+                self.push_system(format!("{agent} reasoning effort selected: {effort}."));
+            }
             AgentEvent::ModeSelected(mode) => {
                 self.modes.insert(agent, mode);
             }
+            AgentEvent::ToolProgress {
+                item_id,
+                summary,
+                state,
+            } => self.apply_tool_progress(agent, item_id, summary, state),
+            AgentEvent::Status(status) => self.apply_status(agent, status),
             AgentEvent::Completed => self.finish_turn(agent),
             AgentEvent::Cancelled => {
                 self.finish_turn(agent);
@@ -1432,6 +1566,63 @@ impl App {
         self.busy_agents.remove(&agent);
         self.active_turns.remove(&agent);
         self.streaming_messages.remove(&agent);
+        self.tool_messages.remove(&agent);
+    }
+
+    fn apply_tool_progress(
+        &mut self,
+        agent: Agent,
+        item_id: String,
+        summary: String,
+        state: String,
+    ) {
+        let message = format!("{agent} tool [{state}]: {summary}");
+        if let Some(index) = self
+            .tool_messages
+            .get(&agent)
+            .and_then(|messages| messages.get(&item_id))
+            .copied()
+            && let Some(existing) = self.messages.get_mut(index)
+        {
+            existing.content = message;
+            return;
+        }
+        let index = self.messages.len();
+        self.messages.push(Message::new(Role::System, message));
+        self.tool_messages
+            .entry(agent)
+            .or_default()
+            .insert(item_id, index);
+    }
+
+    fn apply_status(&mut self, agent: Agent, status: String) {
+        let (model, effort) = self
+            .model_catalogs
+            .get(&agent)
+            .map(|catalog| {
+                let model = catalog
+                    .selected
+                    .as_deref()
+                    .and_then(|selected| {
+                        catalog
+                            .models
+                            .iter()
+                            .find(|model| model.id == selected)
+                            .map(|model| model.label.as_str())
+                    })
+                    .or(catalog.selected.as_deref())
+                    .unwrap_or("provider default");
+                let effort = catalog
+                    .selected_effort
+                    .as_deref()
+                    .unwrap_or("provider default");
+                (model.to_owned(), effort.to_owned())
+            })
+            .unwrap_or_else(|| ("provider default".to_owned(), "provider default".to_owned()));
+        self.push_system(format!(
+            "Codex status\nModel: {model}\nEffort: {effort}\n{}",
+            status.strip_prefix("Codex status\n").unwrap_or(&status)
+        ));
     }
 
     fn push_system(&mut self, content: impl Into<String>) {
@@ -1464,6 +1655,8 @@ impl App {
         self.draw_status(frame, areas.status);
         if let Some(picker) = &self.model_picker {
             self.draw_model_picker(frame, picker);
+        } else if let Some(picker) = &self.effort_picker {
+            self.draw_effort_picker(frame, picker);
         } else if let Some(picker) = &self.conversation_picker {
             self.draw_conversation_picker(frame, picker);
         } else if let Some(picker) = &self.agent_picker {
@@ -1564,6 +1757,7 @@ impl App {
         if self.model_picker.is_none()
             && self.agent_picker.is_none()
             && self.mode_picker.is_none()
+            && self.effort_picker.is_none()
             && self.conversation_picker.is_none()
         {
             frame.set_cursor_position((cursor_x, area.y.saturating_add(1)));
@@ -1597,7 +1791,11 @@ impl App {
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             ),
             Span::raw(format!(
-                "  Model: {model}  Mode: {}  /mode  /agent  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc quit{}",
+                "  Model: {model}  Effort: {}  Mode: {}  /effort  /status  /mode  /agent  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc quit{}",
+                self.model_catalogs
+                    .get(&selected)
+                    .and_then(|catalog| catalog.selected_effort.as_deref())
+                    .unwrap_or("provider default"),
                 self.modes.get(&selected).copied().unwrap_or_default(),
                 self.copy_notice
                     .as_ref()
@@ -1654,6 +1852,68 @@ impl App {
         let mut state = ListState::default().with_selected(
             (!catalog.models.is_empty()).then_some(picker.cursor.min(catalog.models.len() - 1)),
         );
+        frame.render_stateful_widget(list, area, &mut state);
+    }
+
+    fn draw_effort_picker(&self, frame: &mut Frame, picker: &EffortPicker) {
+        let area = centered_fixed_rect(52, 7, frame.area());
+        frame.render_widget(Clear, area);
+        let catalog = self
+            .model_catalogs
+            .get(&picker.agent)
+            .expect("every agent has a model catalog");
+        if catalog.loading {
+            frame.render_widget(
+                Paragraph::new("Loading Codex model effort options...").block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Codex effort "),
+                ),
+                area,
+            );
+            return;
+        }
+        let options = selected_effort_options(catalog);
+        if options.is_empty() {
+            frame.render_widget(
+                Paragraph::new("The selected model does not advertise reasoning effort options.")
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Codex effort ")
+                            .title_bottom(" Esc close "),
+                    ),
+                area,
+            );
+            return;
+        }
+        let items = options
+            .iter()
+            .map(|effort| {
+                let marker = if catalog.selected_effort.as_deref() == Some(effort.as_str()) {
+                    "*"
+                } else {
+                    " "
+                };
+                ListItem::new(format!("{marker} {effort}"))
+            })
+            .collect::<Vec<_>>();
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Codex effort ")
+                    .title_bottom(" Up/Down move  Enter select  Esc close "),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ");
+        let mut state =
+            ListState::default().with_selected(Some(picker.cursor.min(options.len() - 1)));
         frame.render_stateful_widget(list, area, &mut state);
     }
 
@@ -1876,6 +2136,9 @@ fn stored_event(event: &AgentEvent) -> Option<TurnEvent> {
         AgentEvent::ProviderSessionBound(id) => Some(TurnEvent::ProviderSessionBound(id.clone())),
         AgentEvent::TextDelta(delta) => Some(TurnEvent::TextDelta(delta.clone())),
         AgentEvent::Notice(notice) => Some(TurnEvent::Notice(notice.clone())),
+        AgentEvent::ToolProgress { summary, state, .. } => {
+            Some(TurnEvent::Notice(format!("Tool [{state}]: {summary}")))
+        }
         AgentEvent::Completed => Some(TurnEvent::Completed),
         AgentEvent::Cancelled => Some(TurnEvent::Cancelled),
         AgentEvent::Error(message) => Some(TurnEvent::Failed {
@@ -1884,7 +2147,9 @@ fn stored_event(event: &AgentEvent) -> Option<TurnEvent> {
         }),
         AgentEvent::ModelsListed { .. }
         | AgentEvent::ModelSelected(_)
+        | AgentEvent::EffortSelected(_)
         | AgentEvent::ModeSelected(_) => None,
+        AgentEvent::Status(_) => None,
     }
 }
 
@@ -2045,9 +2310,19 @@ fn event_requires_turn_context(event: &AgentEvent) -> bool {
         AgentEvent::Started
             | AgentEvent::ProviderSessionBound(_)
             | AgentEvent::TextDelta(_)
+            | AgentEvent::ToolProgress { .. }
             | AgentEvent::Completed
             | AgentEvent::Cancelled
     )
+}
+
+fn selected_effort_options(catalog: &ModelCatalog) -> Vec<String> {
+    catalog
+        .selected
+        .as_ref()
+        .and_then(|selected| catalog.models.iter().find(|model| &model.id == selected))
+        .map(|model| model.efforts.clone())
+        .unwrap_or_default()
 }
 
 fn clamp_input_height(requested_height: u16, terminal_height: u16) -> u16 {
@@ -3046,6 +3321,7 @@ mod tests {
                     ModelInfo::new("cursor-b", "Cursor B"),
                 ],
                 selected: Some("cursor-a".to_owned()),
+                selected_effort: None,
             },
         );
         app.apply_agent_event(
@@ -3056,6 +3332,117 @@ mod tests {
         let cursor = app.model_catalogs.get(&Agent::Cursor).unwrap();
         assert_eq!(cursor.selected.as_deref(), Some("cursor-b"));
         assert!(app.model_catalogs[&Agent::Codex].selected.is_none());
+    }
+
+    #[test]
+    // TC-041: Codex effort options are model-scoped and unavailable to other agents.
+    fn effort_picker_is_codex_only_and_uses_selected_model_options() {
+        let (mut app, _) = test_app();
+        app.apply_agent_event(
+            Agent::Codex,
+            AgentEvent::ModelsListed {
+                models: vec![ModelInfo::with_efforts(
+                    "gpt-codex",
+                    "Codex Test",
+                    vec!["low".to_owned(), "high".to_owned()],
+                    Some("low".to_owned()),
+                )],
+                selected: Some("gpt-codex".to_owned()),
+                selected_effort: Some("low".to_owned()),
+            },
+        );
+
+        app.open_effort_picker();
+        assert_eq!(app.effort_picker.as_ref().unwrap().cursor, 0);
+        let rendered = render_text_at(&mut app, 80, 24);
+        assert!(rendered.contains("Codex effort"));
+        assert!(rendered.contains("high"));
+
+        app.effort_picker = None;
+        app.selected = adapter_index(Agent::Cursor);
+        app.open_effort_picker();
+        assert!(app.effort_picker.is_none());
+        assert!(app.messages.last().unwrap().content.contains("Codex only"));
+    }
+
+    #[test]
+    // TC-043: only the active turn can render and update its transient tool progress.
+    fn codex_tool_progress_is_scoped_and_bounded_to_its_active_turn() {
+        let (mut app, sent) = test_app();
+        app.input = "inspect".to_owned();
+        app.submit_prompt();
+        let request = sent.lock().unwrap()[0].1.clone();
+
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(request.conversation_id.clone()),
+            turn_id: Some(request.turn_id.clone()),
+            event: AgentEvent::ToolProgress {
+                item_id: "tool-1".to_owned(),
+                summary: "Command: rg --files".to_owned(),
+                state: "inProgress".to_owned(),
+            },
+        }));
+        assert!(app.messages.last().unwrap().content.contains("inProgress"));
+
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(request.conversation_id.clone()),
+            turn_id: Some(request.turn_id.clone()),
+            event: AgentEvent::ToolProgress {
+                item_id: "tool-1".to_owned(),
+                summary: "Command: rg --files".to_owned(),
+                state: "completed".to_owned(),
+            },
+        }));
+        assert!(app.messages.last().unwrap().content.contains("completed"));
+
+        assert!(!app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(request.conversation_id),
+            turn_id: Some(TurnId::new("wrong-turn")),
+            event: AgentEvent::ToolProgress {
+                item_id: "tool-2".to_owned(),
+                summary: "Command: leaked".to_owned(),
+                state: "inProgress".to_owned(),
+            },
+        }));
+        assert!(
+            !app.messages
+                .iter()
+                .any(|message| message.content.contains("leaked"))
+        );
+    }
+
+    #[test]
+    // TC-044: status includes current UI configuration and provider-returned usage text.
+    fn codex_status_includes_model_effort_and_provider_usage() {
+        let (mut app, _) = test_app();
+        app.apply_agent_event(
+            Agent::Codex,
+            AgentEvent::ModelsListed {
+                models: vec![ModelInfo::with_efforts(
+                    "gpt-codex",
+                    "Codex Test",
+                    vec!["medium".to_owned()],
+                    Some("medium".to_owned()),
+                )],
+                selected: Some("gpt-codex".to_owned()),
+                selected_effort: Some("medium".to_owned()),
+            },
+        );
+        app.apply_agent_event(
+            Agent::Codex,
+            AgentEvent::Status(
+                "Codex status\nToken activity: lifetime 12.3K\nRate limits: codex: 75% remaining"
+                    .to_owned(),
+            ),
+        );
+
+        let status = &app.messages.last().unwrap().content;
+        assert!(status.contains("Model: Codex Test"));
+        assert!(status.contains("Effort: medium"));
+        assert!(status.contains("75% remaining"));
     }
 
     #[test]

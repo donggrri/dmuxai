@@ -116,6 +116,7 @@ async fn runtime_loop(
                             AgentEvent::ModelsListed {
                                 models,
                                 selected: selected_model.clone(),
+                                selected_effort: None,
                             },
                         )
                         .await;
@@ -664,7 +665,10 @@ mod tests {
                     | AgentEvent::Notice(_)
                     | AgentEvent::ModelsListed { .. }
                     | AgentEvent::ModelSelected(_)
+                    | AgentEvent::EffortSelected(_)
                     | AgentEvent::ModeSelected(_)
+                    | AgentEvent::ToolProgress { .. }
+                    | AgentEvent::Status(_)
                     | AgentEvent::Cancelled => {}
                 }
             }

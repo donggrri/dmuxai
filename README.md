@@ -115,6 +115,8 @@ Controls:
 - Type `/`: preview matching slash commands; use `Up` / `Down` and `Enter` or `Tab`
 - `/agent`: open the active-agent picker, then use `Up` / `Down` and `Enter`
 - `/mode`: choose `Ask`, `Plan`, or `Implement` for the active agent
+- `/effort`: choose a supported Codex reasoning effort for later turns
+- `/status`: show Codex model/effort plus available token activity and rate limits
 - `/new [title]`: create and switch to a durable conversation
 - `/conversations` or `F3`: list and load conversations for the current workspace
 - `/resume <id-prefix>`: load one conversation by a unique ID prefix
@@ -140,6 +142,14 @@ Model catalogs are loaded lazily only when `F2` is pressed. The chosen model is
 kept separately for each agent and passed to subsequent turns. A CLI can list a
 model that the current account or team policy does not permit; that provider
 error is shown in chat so another model can be selected.
+
+For Codex, `/effort` loads the selected model's advertised reasoning-effort
+options and applies the selected value to subsequent turns. During a Codex
+turn, DmuxAI shows concise transient progress for commands, MCP calls, file
+changes, searches, and other supported tool items. `/status` displays
+provider-reported token activity and quota windows when the current Codex
+authentication supports those fields; unavailable fields are labeled rather
+than estimated.
 
 DmuxAI stores the canonical transcript, turns, provider bindings, and context
 checkpoints in SQLite. On restart it restores the latest conversation for the
