@@ -198,6 +198,7 @@ pub enum AdapterError {
     CommandQueueFull,
     RuntimeStopped,
     Unsupported,
+    UnsupportedMode { agent: Agent, mode: ExecutionMode },
 }
 
 impl fmt::Display for AdapterError {
@@ -206,6 +207,18 @@ impl fmt::Display for AdapterError {
             Self::CommandQueueFull => formatter.write_str("agent command queue is full"),
             Self::RuntimeStopped => formatter.write_str("agent runtime has stopped"),
             Self::Unsupported => formatter.write_str("agent does not support this command"),
+            Self::UnsupportedMode { agent, mode }
+                if *agent == Agent::Cursor
+                    && *mode == ExecutionMode::Implement
+                    && cfg!(windows) =>
+            {
+                formatter.write_str(
+                    "Cursor Implement mode is unavailable on Windows because Cursor sandbox mode requires macOS or Linux",
+                )
+            }
+            Self::UnsupportedMode { agent, mode } => formatter.write_str(
+                &format!("{agent} {mode} mode is unavailable on this platform"),
+            ),
         }
     }
 }
@@ -225,6 +238,9 @@ pub trait AgentAdapter: Send {
     fn select_model(&self, model: String) -> Result<(), AdapterError>;
     fn select_effort(&self, _effort: String) -> Result<(), AdapterError> {
         Err(AdapterError::Unsupported)
+    }
+    fn validate_mode(&self, _mode: ExecutionMode) -> Result<(), AdapterError> {
+        Ok(())
     }
     fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError>;
     fn request_status(&self) -> Result<(), AdapterError> {

@@ -114,7 +114,7 @@ Controls:
 - `Enter`: send to the selected agent
 - Type `/`: preview matching slash commands; use `Up` / `Down` and `Enter` or `Tab`
 - `/agent`: open the active-agent picker, then use `Up` / `Down` and `Enter`
-- `/mode`: choose `Ask`, `Plan`, or `Implement` for the active agent
+- `/mode`: choose `Ask`, `Plan`, or `Implement` for the active agent; Cursor Implement is unavailable on Windows
 - `/effort`: choose a supported Codex reasoning effort for later turns
 - `/status`: show Codex model/effort plus available token activity and rate limits
 - `/new [title]`: create and switch to a durable conversation
@@ -177,12 +177,16 @@ subsequent turns:
 | --- | --- | --- | --- |
 | `Ask` | read-only sandbox | `--mode ask` | plan+sandbox with a Q&A instruction |
 | `Plan` | read-only sandbox with a planning instruction | `--mode plan` | `--mode plan --sandbox` |
-| `Implement` | workspace-write sandbox, approvals `never` | `--force --sandbox enabled` | `--mode accept-edits --sandbox` |
+| `Implement` | workspace-write sandbox, approvals `never` | `--force --sandbox enabled` (macOS/Linux only; unavailable on Windows) | `--mode accept-edits --sandbox` |
 
 `Implement` is the only mode intended to modify project files. It must be
 selected explicitly with `/mode`; commands remain constrained to the provider's
 workspace/sandbox configuration. DmuxAI never enables Codex danger-full-access,
 Cursor's unsandboxed mode, or AGY's `--dangerously-skip-permissions` flag.
+
+Cursor Implement is unavailable on Windows because Cursor sandbox mode requires
+macOS or Linux. DmuxAI rejects that mode before changing the selected mode or
+starting a provider process; use Cursor Ask or Plan on Windows.
 
 The active mode is shown in the bottom status bar and in the `/agent` picker.
 Mode changes are rejected by the UI while that agent has an active turn.
@@ -190,7 +194,8 @@ Mode changes are rejected by the UI while that agent has an active turn.
 Windows uses `codex.exe` and `agy.exe`. Cursor's Windows installer exposes shell
 wrappers, so DmuxAI resolves the latest installed Cursor version and launches
 its bundled `node.exe index.js` directly. Linux uses `codex`, `cursor-agent`,
-and `agy`. Windows children receive `CREATE_NO_WINDOW`.
+and `agy`. Windows children receive `CREATE_NO_WINDOW`; Cursor Implement remains
+disabled on Windows because its sandbox is unavailable there.
 
 Executable overrides:
 

@@ -63,7 +63,12 @@ impl AgentAdapter for CursorAdapter {
             .map_err(map_send_error)
     }
 
+    fn validate_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
+        validate_cursor_mode(mode)
+    }
+
     fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
+        validate_cursor_mode(mode)?;
         self.command_tx
             .try_send(CursorCommand::SelectMode(mode))
             .map_err(map_send_error)
@@ -99,13 +104,23 @@ async fn runtime_loop(
             };
             match command {
                 CursorCommand::Send(request) => {
-                    active = Some(spawn_turn(
-                        request,
-                        selected_model.clone(),
-                        selected_mode,
-                        cwd.clone(),
-                        event_tx.clone(),
-                    ));
+                    if let Err(error) = validate_cursor_mode(selected_mode) {
+                        let context = OutputContext::from(&request);
+                        send_event(
+                            &event_tx,
+                            Some(&context),
+                            AgentEvent::Error(error.to_string()),
+                        )
+                        .await;
+                    } else {
+                        active = Some(spawn_turn(
+                            request,
+                            selected_model.clone(),
+                            selected_mode,
+                            cwd.clone(),
+                            event_tx.clone(),
+                        ));
+                    }
                 }
                 CursorCommand::Cancel => {}
                 CursorCommand::ListModels => match list_models(&cwd).await {
@@ -239,6 +254,7 @@ async fn run_turn(
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
 ) -> io::Result<Option<String>> {
+    validate_cursor_mode(mode).map_err(|error| io::Error::other(error.to_string()))?;
     let mut command = cursor_command()?;
     configure_command(&mut command, request, selected_model.as_deref(), mode, cwd);
     command
@@ -360,6 +376,16 @@ async fn stream_child(
         }));
     }
     Ok(state.session_id)
+}
+
+fn validate_cursor_mode(mode: ExecutionMode) -> Result<(), AdapterError> {
+    if mode == ExecutionMode::Implement && cfg!(windows) {
+        return Err(AdapterError::UnsupportedMode {
+            agent: Agent::Cursor,
+            mode,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -493,6 +519,17 @@ mod tests {
     use super::*;
 
     #[test]
+    // TC-060, TC-063 / INT-060, INT-061: only Windows Cursor Implement is blocked.
+    fn cursor_mode_validation_matches_platform() {
+        assert_eq!(validate_cursor_mode(ExecutionMode::Ask), Ok(()));
+        assert_eq!(validate_cursor_mode(ExecutionMode::Plan), Ok(()));
+        assert_eq!(
+            validate_cursor_mode(ExecutionMode::Implement).is_ok(),
+            !cfg!(windows)
+        );
+    }
+
+    #[test]
     fn parses_cursor_models_and_default() {
         let (models, selected) = parse_model_list(
             "Available models\nauto - Auto (default)\ngpt-5 - GPT-5\n\nTip: ignored",
@@ -617,18 +654,74 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let (adapter, worker) = spawn_cursor_adapter(event_tx, PathBuf::from("workspace"));
 
-        adapter.select_mode(ExecutionMode::Implement).unwrap();
+        adapter.select_mode(ExecutionMode::Plan).unwrap();
 
         let output = timeout(Duration::from_secs(1), event_rx.recv())
             .await
             .expect("mode selection should be acknowledged")
             .expect("runtime should remain connected");
-        assert_eq!(
-            output.event,
-            AgentEvent::ModeSelected(ExecutionMode::Implement)
-        );
+        assert_eq!(output.event, AgentEvent::ModeSelected(ExecutionMode::Plan));
         drop(adapter);
         worker.await.unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    // TC-060 / INT-060: Windows rejects Cursor Implement before queueing a mode change.
+    async fn windows_cursor_implement_mode_is_rejected_before_queueing() {
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let (adapter, worker) = spawn_cursor_adapter(event_tx, PathBuf::from("workspace"));
+        let expected = AdapterError::UnsupportedMode {
+            agent: Agent::Cursor,
+            mode: ExecutionMode::Implement,
+        };
+
+        assert_eq!(
+            adapter.validate_mode(ExecutionMode::Implement),
+            Err(expected)
+        );
+        assert_eq!(adapter.select_mode(ExecutionMode::Implement), Err(expected));
+        assert!(
+            timeout(Duration::from_millis(100), event_rx.recv())
+                .await
+                .is_err()
+        );
+
+        drop(adapter);
+        worker.await.unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    // TC-061 / NFR-060: the runtime guard runs before Cursor command lookup or spawning.
+    async fn windows_cursor_implement_turn_is_rejected_before_process_spawn() {
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conversation"),
+            turn_id: super::super::TurnId::new("turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+        };
+
+        let error = run_turn(
+            &request,
+            None,
+            ExecutionMode::Implement,
+            Path::new("missing-workspace"),
+            &event_tx,
+        )
+        .await
+        .expect_err("Windows Cursor Implement must be blocked");
+
+        assert_eq!(
+            error.to_string(),
+            AdapterError::UnsupportedMode {
+                agent: Agent::Cursor,
+                mode: ExecutionMode::Implement,
+            }
+            .to_string()
+        );
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
