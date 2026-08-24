@@ -22,6 +22,7 @@ installed and authenticated independently.
 | Term | Definition |
 | --- | --- |
 | Workspace | The canonical directory from which DmuxAI starts; all durable conversations are scoped to it. |
+| Runtime session | One live DmuxAI process lifetime, identified independently from its conversations and provider sessions. |
 | Conversation | A DmuxAI-owned transcript with a stable UUID, title, ordered turns, and per-agent provider bindings. |
 | Turn | One user prompt sent to one selected agent, with queued/running/completed/cancelled/failed/interrupted state. |
 | Agent | One of Codex, Cursor, or AGY. Agent session continuity and selected model are independent. |
@@ -45,11 +46,14 @@ installed and authenticated independently.
 
 | ID | Priority | Requirement |
 | --- | --- | --- |
-| FR-001 | Must | On start, DmuxAI uses the current directory as the workspace and restores the most recently updated unarchived conversation for that canonical workspace; if none exists, it creates one. |
+| FR-001 | Must | On start, DmuxAI uses the current directory as the workspace and, when no live peer session exists, restores the most recently updated unarchived conversation for that canonical workspace; if none exists, it creates one. A live peer gets a fresh conversation as specified by FR-050. |
 | FR-002 | Must | DmuxAI provides exactly the Codex, Cursor, and AGY adapters, routes the next ordinary prompt to the selected adapter, and presents provider output as normalized UI events. |
 | FR-003 | Must | Each provider is launched through structured stdin/stdout protocols, never by interpolating user prompt text into a shell command. |
 | FR-004 | Must | On Windows, provider child processes are launched without flashing an additional console window. |
 | FR-005 | Should | Provider executable paths may be overridden by `DMUXAI_CODEX_BIN`, `DMUXAI_CURSOR_BIN`, and `DMUXAI_AGY_BIN`; otherwise platform defaults are used. |
+| FR-050 | Must | Given one DmuxAI process is live in a canonical workspace, when another process starts from that workspace, the new process starts in a different fresh conversation while the first process remains usable. Existing workspace conversations remain available through the conversation picker. |
+| FR-051 | Must | A live peer's queued or running turns and provider bindings are not interrupted by another process's startup recovery; turns owned by a closed, expired, or legacy-unowned session recover as interrupted using the existing behavior. |
+| FR-052 | Must | Runtime session ownership and liveness are persisted per process, normal shutdown closes the session, and the active UI refreshes its lease while running. |
 
 ### 2.2 Agent selection, modes, and models
 
@@ -113,8 +117,11 @@ installed and authenticated independently.
 | ID | Priority | Requirement |
 | --- | --- | --- |
 | BR-010 | Must | The SQLite database uses foreign keys, WAL mode, and transactional schema migration. A failed initial migration leaves no partially applied schema and an unknown newer schema version is rejected. |
-| BR-011 | Must | Persistent conversation data includes conversations, turns, messages, provider bindings, and context checkpoints. All are isolated by canonical workspace and appropriate conversation/agent keys. |
+| BR-011 | Must | Persistent conversation data includes conversations, turns, messages, provider bindings, context checkpoints, runtime sessions, and turn ownership. All are isolated by canonical workspace and appropriate conversation/agent/session keys. |
+| BR-050 | Must | Each queued or running turn records the runtime session that created it; startup recovery only interrupts turns whose owner is missing, closed, or lease-expired. |
+| BR-051 | Must | The at-most-one queued or running turn rule for one `(conversation, agent)` is enforced atomically across separate SQLite connections; separate instance conversations may run the same agent concurrently. |
 | NFR-003 | Must | The application restores raw terminal mode, alternate screen, mouse capture, and cursor visibility on normal and error return paths. |
+| NFR-050 | Must | Runtime-session storage is an additive transactional extension; provider request/event protocols and existing conversation data remain compatible. |
 | FR-030 | Should | Windows installation downloads a published release asset, verifies its SHA-256 checksum, installs `dmuxai.exe` under the current user's local application data, and adds that directory to the user PATH without requiring administrator privileges. |
 | NFR-004 | Should | Linux defaults to `codex`, `cursor-agent`, and `agy`; Windows defaults to `.exe` shims and resolves Cursor's bundled Node entrypoint when no override is supplied. |
 
@@ -158,6 +165,13 @@ or replace this evidence deliberately.
 | TC-018 | UX-002, UX-003, FR-043 | Idle agent binding and Codex model catalog | Press Tab on a highlighted Codex model or change mode before a follow-up | Tab opens model-scoped effort choices; mode change starts a fresh context-projected provider session | `src/app.rs`: `model_picker_tab_selects_codex_model_and_opens_its_effort_picker`; `mode_change_reopens_the_agent_with_shared_context` |
 | TC-019 | UX-011 | TUI test app with an idle prompt | Submit exactly `/quit` or select it from `/q` preview | Input is cleared, no provider turn starts, and the application enters its existing exit state | `src/app.rs`: `exact_quit_command_exits_without_starting_a_turn`; `slash_preview_can_execute_quit_with_enter`; `slash_preview_can_execute_quit_with_tab` |
 | TC-020 | UX-012 | TUI test app with no, preview, and picker overlays | Press `Esc` in each state | The relevant overlay closes and the application remains running | `src/app.rs`: `escape_never_exits_the_application` |
+| TC-050 | FR-050, FR-052 | One live app runtime and a temporary database | Start a second runtime from the same workspace | The second runtime selects a fresh conversation; the first conversation remains in the shared list | `src/app.rs`: `multiple_live_instances_start_in_separate_conversations` |
+| TC-051 | FR-050, FR-051, BR-050 | First runtime has a queued turn and a fresh heartbeat | Start a second runtime, then deliver output through the first | The first turn remains queued/running and can complete without peer recovery | `src/app.rs`: `multiple_live_instances_start_in_separate_conversations` |
+| TC-052 | FR-051, BR-050 | Closed and lease-expired session owners with partial output | Open a later engine and recover the workspace | Only orphaned turns become interrupted; partial text remains and bindings become stale | `tests/conversation.rs`: `closed_or_expired_session_turns_are_recovered` |
+| TC-053 | FR-001, FR-052 | Completed conversation and cleanly closed prior runtime | Start a new runtime with no live peer | Latest conversation and transcript are restored | `src/app.rs`: `a_new_app_instance_loads_the_latest_conversation` |
+| TC-054 | BR-051 | Separate engines select the same conversation and agent | Start a turn in engine A, then request one in engine B | Engine B receives `AgentBusy` and no duplicate turn is inserted | `tests/conversation.rs`: `busy_agent_is_rejected_across_runtime_sessions` |
+| TC-055 | BR-051 | Two instance conversations in one workspace | Start the same agent in both | Both requests are accepted because busy state is conversation-scoped | `tests/conversation.rs`: `same_agent_can_run_in_separate_instance_conversations` |
+| TC-056 | BR-010, BR-011, NFR-050 | Existing v1-shaped database with canonical data | Install the additive runtime-session schema and reopen | Schema/data remain readable and the user-version contract is preserved | `tests/conversation.rs`: `runtime_session_schema_extension_preserves_existing_data` |
 
 ## 5. Test execution contract
 

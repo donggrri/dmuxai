@@ -23,8 +23,21 @@ const MAX_CONTEXT_CHARS: usize = 32_000;
 const RECENT_TAIL_CHARS: usize = 12_000;
 const MAX_SUMMARY_CHARS: usize = MAX_CONTEXT_CHARS - RECENT_TAIL_CHARS;
 const SUMMARY_PROMPT_VERSION: &str = "conversation-summary-v1";
+const SESSION_LEASE_MS: i64 = 30_000;
 
 const MIGRATION_1: &str = r#"
+CREATE TABLE IF NOT EXISTS runtime_sessions (
+    id              TEXT PRIMARY KEY,
+    workspace_root  TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('active', 'closed')),
+    created_at_ms   INTEGER NOT NULL,
+    last_seen_at_ms INTEGER NOT NULL,
+    closed_at_ms    INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS runtime_sessions_by_workspace_status
+    ON runtime_sessions(workspace_root, status, last_seen_at_ms);
+
 CREATE TABLE IF NOT EXISTS conversations (
     id              TEXT PRIMARY KEY,
     workspace_root  TEXT NOT NULL,
@@ -55,11 +68,15 @@ CREATE TABLE IF NOT EXISTS turns (
     created_at_ms       INTEGER NOT NULL,
     started_at_ms       INTEGER,
     completed_at_ms     INTEGER,
+    owner_session_id    TEXT REFERENCES runtime_sessions(id),
     UNIQUE (conversation_id, seq)
 );
 
 CREATE INDEX IF NOT EXISTS turns_by_conversation_seq
     ON turns(conversation_id, seq);
+
+CREATE INDEX IF NOT EXISTS turns_by_owner_status
+    ON turns(owner_session_id, status);
 
 CREATE TABLE IF NOT EXISTS messages (
     id              TEXT PRIMARY KEY,
@@ -113,6 +130,59 @@ CREATE INDEX IF NOT EXISTS checkpoints_latest
 
 PRAGMA user_version = 1;
 "#;
+
+/// Installs the runtime-session objects for databases created by the original
+/// v1 migration. The extension intentionally does not bump `user_version`:
+/// older binaries can ignore the additive table and nullable column during a
+/// rollback. Every change is committed together or not at all.
+fn ensure_runtime_session_schema(connection: &mut Connection) -> Result<(), ConversationError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS runtime_sessions (
+            id              TEXT PRIMARY KEY,
+            workspace_root  TEXT NOT NULL,
+            status          TEXT NOT NULL CHECK (status IN ('active', 'closed')),
+            created_at_ms   INTEGER NOT NULL,
+            last_seen_at_ms INTEGER NOT NULL,
+            closed_at_ms    INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS runtime_sessions_by_workspace_status
+            ON runtime_sessions(workspace_root, status, last_seen_at_ms);
+        "#,
+    )?;
+
+    let turns_kind: Option<String> = transaction
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name = 'turns'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if turns_kind.as_deref() == Some("table") {
+        let has_owner_column = {
+            let mut statement = transaction.prepare("PRAGMA table_info(turns)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .any(|name| name == "owner_session_id")
+        };
+        if !has_owner_column {
+            transaction.execute_batch(
+                "ALTER TABLE turns ADD COLUMN owner_session_id TEXT REFERENCES runtime_sessions(id);",
+            )?;
+        }
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS turns_by_owner_status
+                ON turns(owner_session_id, status);",
+        )?;
+    }
+
+    transaction.commit()?;
+    Ok(())
+}
 
 #[derive(Debug)]
 pub enum ConversationError {
@@ -577,6 +647,8 @@ pub enum TranscriptPatch {
 
 pub struct ConversationEngine {
     connection: Connection,
+    session_id: String,
+    session_closed: bool,
     workspace_root: String,
     active_conversation: Option<ConversationId>,
 }
@@ -608,11 +680,80 @@ impl ConversationEngine {
             transaction.commit()?;
         }
 
+        ensure_runtime_session_schema(&mut connection)?;
+        let session_id = Uuid::new_v4().to_string();
+        let now = now_ms()?;
+        connection.execute(
+            "INSERT INTO runtime_sessions
+                (id, workspace_root, status, created_at_ms, last_seen_at_ms)
+             VALUES (?1, ?2, 'active', ?3, ?3)",
+            params![session_id, workspace_root, now],
+        )?;
+
         Ok(Self {
             connection,
+            session_id,
+            session_closed: false,
             workspace_root,
             active_conversation: None,
         })
+    }
+
+    /// Returns whether another non-expired DmuxAI process is using this
+    /// workspace. The caller uses this only for startup conversation choice;
+    /// it is not a process-wide singleton lock.
+    pub fn has_live_peer(&self) -> Result<bool, ConversationError> {
+        let now = now_ms()?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM runtime_sessions
+                     WHERE workspace_root = ?1
+                       AND id <> ?2
+                       AND status = 'active'
+                       AND last_seen_at_ms >= ?3
+                 )",
+                params![
+                    self.workspace_root,
+                    self.session_id,
+                    now.saturating_sub(SESSION_LEASE_MS)
+                ],
+                |row| row.get(0),
+            )
+            .map_err(ConversationError::from)
+    }
+
+    /// Refreshes this process's lease. The TUI calls this periodically while
+    /// its event loop is alive so a later process can distinguish a live peer
+    /// from a crashed one.
+    pub fn touch_session(&mut self) -> Result<(), ConversationError> {
+        if self.session_closed {
+            return Ok(());
+        }
+        self.connection.execute(
+            "UPDATE runtime_sessions
+                SET last_seen_at_ms = ?2
+              WHERE id = ?1 AND status = 'active'",
+            params![self.session_id, now_ms()?],
+        )?;
+        Ok(())
+    }
+
+    /// Marks this process closed so a later startup may recover any turn it
+    /// left unfinished. Drop calls this best-effort as a final fallback.
+    pub fn close_session(&mut self) -> Result<(), ConversationError> {
+        if self.session_closed {
+            return Ok(());
+        }
+        let now = now_ms()?;
+        self.connection.execute(
+            "UPDATE runtime_sessions
+                SET status = 'closed', closed_at_ms = ?2, last_seen_at_ms = ?2
+              WHERE id = ?1 AND status = 'active'",
+            params![self.session_id, now],
+        )?;
+        self.session_closed = true;
+        Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<ConversationCard>, ConversationError> {
@@ -687,10 +828,6 @@ impl ConversationEngine {
             .clone()
             .ok_or(ConversationError::NoActiveConversation)?;
 
-        if self.agent_is_busy(&conversation_id, input.agent)? {
-            return Err(ConversationError::AgentBusy(input.agent));
-        }
-
         let projection = match self.build_projection(&conversation_id, input.agent)? {
             ProjectionBuild::Ready(projection) => projection,
             ProjectionBuild::NeedsSummary(job) => return Ok(BeginTurnOutcome::NeedsSummary(job)),
@@ -704,6 +841,9 @@ impl ConversationEngine {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Self::agent_is_busy_in(&transaction, &conversation_id, input.agent)? {
+            return Err(ConversationError::AgentBusy(input.agent));
+        }
         let seq: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE conversation_id = ?1",
             [conversation_id.as_str()],
@@ -712,8 +852,8 @@ impl ConversationEngine {
         transaction.execute(
             "INSERT INTO turns
                 (id, conversation_id, seq, requested_agent, model_id, status,
-                 context_through_seq, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)",
+                 context_through_seq, created_at_ms, owner_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8)",
             params![
                 turn_id.as_str(),
                 conversation_id.as_str(),
@@ -722,6 +862,7 @@ impl ConversationEngine {
                 input.model_id,
                 projection.through_seq,
                 now,
+                self.session_id,
             ],
         )?;
         transaction.execute(
@@ -936,33 +1077,50 @@ impl ConversationEngine {
             .map_err(ConversationError::from)
     }
 
-    /// Atomically interrupts unfinished turns left by an earlier app process.
-    ///
-    /// Recovery is scoped to this engine's workspace and returns the number of
-    /// queued or running turns it transitioned. Call this once during startup;
-    /// ordinary conversation selection must not affect live turns.
+    /// Atomically interrupts unfinished turns owned by a closed, expired, or
+    /// legacy-unowned session. Recovery is scoped to this engine's workspace;
+    /// a live peer's queued/running turns remain untouched.
     pub fn recover_workspace(&mut self) -> Result<usize, ConversationError> {
         let now = now_ms()?;
+        let cutoff = now.saturating_sub(SESSION_LEASE_MS);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
+            "UPDATE runtime_sessions
+                SET status = 'closed', closed_at_ms = ?3
+              WHERE workspace_root = ?1
+                AND id <> ?2
+                AND status = 'active'
+                AND last_seen_at_ms < ?4",
+            params![self.workspace_root, self.session_id, now, cutoff],
+        )?;
+        transaction.execute(
             "UPDATE provider_bindings
-                SET status = 'stale', updated_at_ms = ?2
+                SET status = 'stale', updated_at_ms = ?3
               WHERE EXISTS (
                     SELECT 1
                       FROM turns t
                       JOIN conversations c ON c.id = t.conversation_id
                      WHERE c.workspace_root = ?1
                        AND t.status IN ('queued', 'running')
+                       AND (
+                            t.owner_session_id IS NULL
+                            OR NOT EXISTS (
+                                SELECT 1 FROM runtime_sessions s
+                                 WHERE s.id = t.owner_session_id
+                                   AND s.status = 'active'
+                                   AND s.last_seen_at_ms >= ?2
+                            )
+                       )
                        AND t.conversation_id = provider_bindings.conversation_id
                        AND t.requested_agent = provider_bindings.agent
                 )",
-            params![self.workspace_root, now],
+            params![self.workspace_root, cutoff, now],
         )?;
         transaction.execute(
             "UPDATE messages
-                SET state = 'interrupted', updated_at_ms = ?2
+                SET state = 'interrupted', updated_at_ms = ?3
               WHERE state = 'streaming'
                 AND turn_id IN (
                     SELECT t.id
@@ -970,18 +1128,36 @@ impl ConversationEngine {
                       JOIN conversations c ON c.id = t.conversation_id
                      WHERE c.workspace_root = ?1
                        AND t.status IN ('queued', 'running')
+                       AND (
+                            t.owner_session_id IS NULL
+                            OR NOT EXISTS (
+                                SELECT 1 FROM runtime_sessions s
+                                 WHERE s.id = t.owner_session_id
+                                   AND s.status = 'active'
+                                   AND s.last_seen_at_ms >= ?2
+                            )
+                       )
                 )",
-            params![self.workspace_root, now],
+            params![self.workspace_root, cutoff, now],
         )?;
         let recovered = transaction.execute(
             "UPDATE turns
-                SET status = 'interrupted', completed_at_ms = ?2,
+                SET status = 'interrupted', completed_at_ms = ?3,
                     error_text = COALESCE(error_text, 'DmuxAI stopped before the turn completed')
               WHERE status IN ('queued', 'running')
                 AND conversation_id IN (
                     SELECT id FROM conversations WHERE workspace_root = ?1
+                )
+                AND (
+                    owner_session_id IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1 FROM runtime_sessions s
+                         WHERE s.id = turns.owner_session_id
+                           AND s.status = 'active'
+                           AND s.last_seen_at_ms >= ?2
+                    )
                 )",
-            params![self.workspace_root, now],
+            params![self.workspace_root, cutoff, now],
         )?;
         transaction.commit()?;
         Ok(recovered)
@@ -993,6 +1169,24 @@ impl ConversationEngine {
         agent: AgentKey,
     ) -> Result<bool, ConversationError> {
         self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM turns
+                     WHERE conversation_id = ?1 AND requested_agent = ?2
+                       AND status IN ('queued', 'running')
+                 )",
+                params![conversation_id.as_str(), agent.as_db()],
+                |row| row.get(0),
+            )
+            .map_err(ConversationError::from)
+    }
+
+    fn agent_is_busy_in(
+        transaction: &Transaction<'_>,
+        conversation_id: &ConversationId,
+        agent: AgentKey,
+    ) -> Result<bool, ConversationError> {
+        transaction
             .query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM turns
@@ -1194,6 +1388,12 @@ impl ConversationEngine {
             messages,
             bindings,
         })
+    }
+}
+
+impl Drop for ConversationEngine {
+    fn drop(&mut self) {
+        let _ = self.close_session();
     }
 }
 

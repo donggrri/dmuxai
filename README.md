@@ -76,6 +76,11 @@ DmuxAI uses the folder from which it was started as its workspace, so its agents
 operate on that project. To update it, run the installer again; it replaces the
 current-user executable with the latest published release.
 
+You can start multiple DmuxAI windows from the same project at the same time.
+When another live DmuxAI window already owns that workspace, a new window
+starts in its own conversation and provider processes; the existing workspace
+conversation list remains available from `/conversations` or `F3`.
+
 ### Build from source
 
 Rust and Cargo are required only when building from source:
@@ -155,13 +160,15 @@ searches, and other supported tool items. `/status` displays provider-reported
 token activity and quota windows when the current Codex authentication supports
 those fields; unavailable fields are labeled rather than estimated.
 
-DmuxAI stores the canonical transcript, turns, provider bindings, and context
-checkpoints in SQLite. On restart it restores the latest conversation for the
-current workspace and resumes a valid provider-native session. If no valid
-native session covers the common conversation head, DmuxAI injects the shared
-rolling summary and recent completed turns from all agents into a fresh
-session. The full transcript is retained; summarization only changes the
-bounded context projection sent to the provider.
+DmuxAI stores the canonical transcript, turns, provider bindings, context
+checkpoints, and runtime-session ownership in SQLite. When no other live window
+is using the current workspace, restart restores the latest conversation and
+resumes a valid provider-native session. A new window started beside a live
+peer receives a fresh conversation, while all completed workspace conversations
+remain selectable. If no valid native session covers the common conversation
+head, DmuxAI injects the shared rolling summary and recent completed turns from
+all agents into a fresh session. The full transcript is retained; summarization
+only changes the bounded context projection sent to the provider.
 
 The database is stored at `%LOCALAPPDATA%\DmuxAI\conversations.sqlite3` on
 Windows, `$XDG_STATE_HOME/dmuxai/conversations.sqlite3` when `XDG_STATE_HOME` is
@@ -244,7 +251,8 @@ model without hard-coding it into production selection behavior.
 ```text
 TUI / keyboard
     -> ConversationEngine
-        -> SQLite WAL: conversations / turns / messages
+    -> SQLite WAL: runtime_sessions / conversations / turns / messages
+        -> per-process session heartbeat and turn ownership
         -> provider bindings by (conversation, agent)
         -> agent-specific summary checkpoint + recent tail
     -> bounded command mpsc (8 per agent)
@@ -310,7 +318,7 @@ similar to move-capturing owning C++ values in a task lambda.
 
 - `src/main.rs`: Tokio entry point and terminal RAII guard
 - `src/app.rs`: event loop, chat rendering, routing, model picker, shutdown
-- `src/conversation.rs`: durable SQLite conversation engine and context projection
+- `src/conversation.rs`: durable SQLite conversations, runtime sessions, and context projection
 - `src/agent/mod.rs`: provider-independent events, models, adapter interface
 - `src/agent/codex.rs`: Codex App Server client
 - `src/agent/cursor.rs`: Cursor NDJSON process and session adapter

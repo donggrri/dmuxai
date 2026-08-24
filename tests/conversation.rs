@@ -1,7 +1,7 @@
 use dmuxai::conversation::{
     AgentKey, BeginTurn, BeginTurnOutcome, BindingStatus, ConversationEngine, ConversationError,
-    ConversationSelection, MessageRole, MessageState, SummaryDocument, TurnEvent, TurnOutput,
-    TurnStatus,
+    ConversationId, ConversationSelection, MessageRole, MessageState, SummaryDocument, TurnEvent,
+    TurnId, TurnOutput, TurnStatus,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -890,4 +890,242 @@ fn failed_initial_migration_rolls_back_every_schema_change() {
         .unwrap();
     assert_eq!(conversations, 0);
     assert_eq!(version, 0);
+}
+
+// TC-052 / FR-051, BR-050: closed and expired owners are recovered, including
+// their partial assistant text and provider binding.
+#[test]
+fn closed_or_expired_session_turns_are_recovered() {
+    let harness = Harness::new();
+    let mut closed = harness.open();
+    let closed_conversation = closed
+        .select(ConversationSelection::New { title: None })
+        .unwrap()
+        .id;
+    let closed_request = ready(
+        closed
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Codex,
+                model_id: None,
+                prompt: "closed owner".to_owned(),
+            })
+            .unwrap(),
+    );
+    closed
+        .record_turn_outputs(&[
+            TurnOutput {
+                conversation_id: closed_request.conversation_id.clone(),
+                turn_id: closed_request.turn_id.clone(),
+                agent: closed_request.agent,
+                event: TurnEvent::Started,
+            },
+            TurnOutput {
+                conversation_id: closed_request.conversation_id.clone(),
+                turn_id: closed_request.turn_id.clone(),
+                agent: closed_request.agent,
+                event: TurnEvent::ProviderSessionBound("closed-session".to_owned()),
+            },
+            TurnOutput {
+                conversation_id: closed_request.conversation_id.clone(),
+                turn_id: closed_request.turn_id.clone(),
+                agent: closed_request.agent,
+                event: TurnEvent::TextDelta("partial closed".to_owned()),
+            },
+        ])
+        .unwrap();
+    closed.close_session().unwrap();
+
+    let mut live = harness.open();
+    let expired_conversation = live
+        .select(ConversationSelection::New { title: None })
+        .unwrap()
+        .id;
+    let expired_request = ready(
+        live.begin_turn(BeginTurn {
+            agent: AgentKey::Cursor,
+            model_id: None,
+            prompt: "expired owner".to_owned(),
+        })
+        .unwrap(),
+    );
+    live.record_turn_outputs(&[
+        TurnOutput {
+            conversation_id: expired_request.conversation_id.clone(),
+            turn_id: expired_request.turn_id.clone(),
+            agent: expired_request.agent,
+            event: TurnEvent::Started,
+        },
+        TurnOutput {
+            conversation_id: expired_request.conversation_id.clone(),
+            turn_id: expired_request.turn_id.clone(),
+            agent: expired_request.agent,
+            event: TurnEvent::ProviderSessionBound("expired-session".to_owned()),
+        },
+        TurnOutput {
+            conversation_id: expired_request.conversation_id.clone(),
+            turn_id: expired_request.turn_id.clone(),
+            agent: expired_request.agent,
+            event: TurnEvent::TextDelta("partial expired".to_owned()),
+        },
+    ])
+    .unwrap();
+
+    let connection = Connection::open(&harness.database).unwrap();
+    connection
+        .execute(
+            "UPDATE runtime_sessions SET last_seen_at_ms = 0 WHERE status = 'active'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut recovered = harness.open();
+    assert_eq!(recovered.recover_workspace().unwrap(), 2);
+
+    for conversation_id in [closed_conversation, expired_conversation] {
+        let snapshot = recovered
+            .select(ConversationSelection::Existing(conversation_id))
+            .unwrap();
+        assert_eq!(snapshot.turns[0].status, TurnStatus::Interrupted);
+        assert_eq!(snapshot.messages[1].state, MessageState::Interrupted);
+        assert!(snapshot.messages[1].text.starts_with("partial "));
+        assert_eq!(snapshot.bindings[0].status, BindingStatus::Stale);
+    }
+}
+
+// TC-054 / BR-051: the busy invariant is checked inside the write transaction
+// and applies across separate runtime-session database connections.
+#[test]
+fn busy_agent_is_rejected_across_runtime_sessions() {
+    let harness = Harness::new();
+    let mut first = harness.open();
+    let conversation_id = first
+        .select(ConversationSelection::New { title: None })
+        .unwrap()
+        .id;
+    ready(
+        first
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Codex,
+                model_id: None,
+                prompt: "first live turn".to_owned(),
+            })
+            .unwrap(),
+    );
+
+    let mut second = harness.open();
+    second
+        .select(ConversationSelection::Existing(conversation_id.clone()))
+        .unwrap();
+    assert!(matches!(
+        second.begin_turn(BeginTurn {
+            agent: AgentKey::Codex,
+            model_id: None,
+            prompt: "must wait".to_owned(),
+        }),
+        Err(ConversationError::AgentBusy(AgentKey::Codex))
+    ));
+
+    let snapshot = second
+        .select(ConversationSelection::Existing(conversation_id))
+        .unwrap();
+    assert_eq!(snapshot.turns.len(), 1);
+}
+
+// TC-055 / BR-051: separate instance conversations can run the same provider
+// concurrently without sharing the per-conversation busy state.
+#[test]
+fn same_agent_can_run_in_separate_instance_conversations() {
+    let harness = Harness::new();
+    let mut first = harness.open();
+    first
+        .select(ConversationSelection::New { title: None })
+        .unwrap();
+    ready(
+        first
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Codex,
+                model_id: None,
+                prompt: "first window".to_owned(),
+            })
+            .unwrap(),
+    );
+
+    let mut second = harness.open();
+    second
+        .select(ConversationSelection::New { title: None })
+        .unwrap();
+    assert!(matches!(
+        second.begin_turn(BeginTurn {
+            agent: AgentKey::Codex,
+            model_id: None,
+            prompt: "second window".to_owned(),
+        }),
+        Ok(BeginTurnOutcome::Ready(_))
+    ));
+}
+
+// TC-056 / NFR-050: an old v1-shaped database receives the additive session
+// objects transactionally without losing its canonical transcript.
+#[test]
+fn runtime_session_schema_extension_preserves_existing_data() {
+    let harness = Harness::new();
+    let conversation_id;
+    {
+        let mut engine = harness.open();
+        conversation_id = engine
+            .select(ConversationSelection::New { title: None })
+            .unwrap()
+            .id;
+        let request = ready(
+            engine
+                .begin_turn(BeginTurn {
+                    agent: AgentKey::Agy,
+                    model_id: None,
+                    prompt: "preserve this".to_owned(),
+                })
+                .unwrap(),
+        );
+        complete_turn(&mut engine, &request, "agy-preserved", "still here");
+    }
+
+    let connection = Connection::open(&harness.database).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP INDEX turns_by_owner_status;
+             ALTER TABLE turns DROP COLUMN owner_session_id;
+             DROP TABLE runtime_sessions;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut reopened = harness.open();
+    let snapshot = reopened
+        .select(ConversationSelection::Existing(conversation_id))
+        .unwrap();
+    assert_eq!(snapshot.messages[1].text, "still here");
+    assert_eq!(snapshot.turns[0].status, TurnStatus::Completed);
+
+    let connection = Connection::open(&harness.database).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let session_table: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'runtime_sessions'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let owner_column: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('turns') WHERE name = 'owner_session_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 1);
+    assert_eq!(session_table, 1);
+    assert_eq!(owner_column, 1);
 }

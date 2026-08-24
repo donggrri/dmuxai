@@ -419,11 +419,15 @@ impl App {
         mut engine: ConversationEngine,
     ) -> Result<Self, ConversationError> {
         engine.recover_workspace()?;
-        let snapshot = match engine.list()?.into_iter().next() {
-            Some(conversation) => {
-                engine.select(ConversationSelection::Existing(conversation.id))?
+        let snapshot = if engine.has_live_peer()? {
+            engine.select(ConversationSelection::New { title: None })?
+        } else {
+            match engine.list()?.into_iter().next() {
+                Some(conversation) => {
+                    engine.select(ConversationSelection::Existing(conversation.id))?
+                }
+                None => engine.select(ConversationSelection::New { title: None })?,
             }
-            None => engine.select(ConversationSelection::New { title: None })?,
         };
         let mut app = Self {
             exit: false,
@@ -431,7 +435,7 @@ impl App {
             input: String::new(),
             messages: vec![Message::new(
                 Role::System,
-                "Codex, Cursor, and AGY use real structured headless protocols. Completed turns are shared automatically with every agent; /share is optional. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /effort to choose Codex reasoning effort, /status to view Codex usage, /quit to exit, F2 to choose a model, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
+                "Codex, Cursor, and AGY use real structured headless protocols. Completed turns are shared automatically with every agent; /share is optional. If another DmuxAI window is already running in this workspace, this window starts a separate conversation. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /effort to choose Codex reasoning effort, /status to view Codex usage, /quit to exit, F2 to choose a model, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
             )],
             adapters,
             event_rx,
@@ -485,8 +489,18 @@ impl App {
         terminal.draw(|frame| self.draw(frame))?;
         let mut dirty = false;
         let mut last_render = Instant::now();
+        let mut last_session_heartbeat = Instant::now();
 
         while !self.exit {
+            if last_session_heartbeat.elapsed() >= Duration::from_secs(5) {
+                if let Err(error) = self.engine.touch_session() {
+                    self.push_system(format!(
+                        "Could not refresh the DmuxAI runtime session: {error}"
+                    ));
+                }
+                last_session_heartbeat = Instant::now();
+                dirty = true;
+            }
             dirty |= self.drain_agent_events();
 
             while event::poll(Duration::ZERO)? {
@@ -541,6 +555,7 @@ impl App {
         self.busy_agents.clear();
         self.active_turns.clear();
         self.streaming_messages.clear();
+        let _ = self.engine.close_session();
     }
 
     fn drain_agent_events(&mut self) -> bool {
@@ -4418,6 +4433,57 @@ mod tests {
             clamp_input_height(u16::MAX, 30),
             30 - MIN_MAIN_HEIGHT - STATUS_HEIGHT
         );
+    }
+
+    #[test]
+    // TC-050 / FR-050, FR-052: a live peer receives a separate startup conversation.
+    fn multiple_live_instances_start_in_separate_conversations() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("state.sqlite3");
+        let workspace = std::env::current_dir().unwrap();
+        let engine = ConversationEngine::open(&db_path, &workspace).unwrap();
+        let (mut first_app, sent) = test_app_with_engine(engine);
+        let first_conversation = first_app.conversation_id.clone();
+        first_app.input = "first window keeps working".to_owned();
+        first_app.submit_prompt();
+        let request = sent.lock().unwrap()[0].1.clone();
+
+        let engine = ConversationEngine::open(&db_path, &workspace).unwrap();
+        let (second_app, _) = test_app_with_engine(engine);
+
+        assert_ne!(second_app.conversation_id, first_conversation);
+        assert!(
+            second_app
+                .engine
+                .list()
+                .unwrap()
+                .iter()
+                .any(|conversation| conversation.id == first_conversation)
+        );
+        let live_snapshot = first_app
+            .engine
+            .select(ConversationSelection::Existing(first_conversation.clone()))
+            .unwrap();
+        assert_eq!(live_snapshot.turns[0].status, TurnStatus::Queued);
+
+        assert!(first_app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(request.conversation_id.clone()),
+            turn_id: Some(request.turn_id.clone()),
+            event: AgentEvent::TextDelta("first answer".to_owned()),
+        }));
+        assert!(first_app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(request.conversation_id),
+            turn_id: Some(request.turn_id),
+            event: AgentEvent::Completed,
+        }));
+
+        let completed = first_app
+            .engine
+            .select(ConversationSelection::Existing(first_conversation))
+            .unwrap();
+        assert_eq!(completed.turns[0].status, TurnStatus::Completed);
     }
 
 }
