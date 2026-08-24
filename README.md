@@ -123,7 +123,8 @@ Controls:
 - `/summarize`: compress the completed shared context for the selected agent
 - `/share <codex|cursor|agy>`: optionally replay a context import to one agent; ordinary turns are shared automatically
 - `F2`: load and open that agent's model picker
-- Model picker `Up` / `Down`, `Enter`, `Esc`: move, select, or close
+- Model picker `Up` / `Down`, `Enter`, `Esc`: move, select, or close; on Codex,
+  `Tab` selects the highlighted model and opens its effort picker
 - Mouse wheel: scroll the chat history without changing the active agent
 - Drag across Chat text: highlight and copy the selected text to the system clipboard
 - Drag the prompt pane's top border: resize the chat/prompt height ratio
@@ -144,12 +145,14 @@ model that the current account or team policy does not permit; that provider
 error is shown in chat so another model can be selected.
 
 For Codex, `/effort` loads the selected model's advertised reasoning-effort
-options and applies the selected value to subsequent turns. During a Codex
-turn, DmuxAI shows concise transient progress for commands, MCP calls, file
-changes, searches, and other supported tool items. `/status` displays
-provider-reported token activity and quota windows when the current Codex
-authentication supports those fields; unavailable fields are labeled rather
-than estimated.
+options and applies the selected value to subsequent turns. In the model picker,
+press `Tab` to choose effort for the highlighted model. Changing an idle agent's
+mode retires only that agent's native session; the next prompt opens a new
+mode-scoped session with DmuxAI's completed shared context. During a Codex turn,
+DmuxAI shows concise transient progress for commands, MCP calls, file changes,
+searches, and other supported tool items. `/status` displays provider-reported
+token activity and quota windows when the current Codex authentication supports
+those fields; unavailable fields are labeled rather than estimated.
 
 DmuxAI stores the canonical transcript, turns, provider bindings, and context
 checkpoints in SQLite. On restart it restores the latest conversation for the

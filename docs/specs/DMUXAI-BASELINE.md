@@ -56,12 +56,13 @@ installed and authenticated independently.
 | ID | Priority | Requirement |
 | --- | --- | --- |
 | UX-001 | Must | `/agent` opens an agent picker. Changing the selected agent affects only later submissions; completed turns from the active conversation are automatically projected into the next request. |
-| UX-002 | Must | `/mode` opens a mode picker for the selected agent and is rejected while that agent has an active turn. Modes remain independent per agent. |
+| UX-002 | Must | `/mode` opens a mode picker for the selected agent and is rejected while that agent has an active turn. Changing an idle agent's mode retires only that agent's native binding, so the next prompt starts a fresh mode-scoped session with the completed shared context. Modes remain independent per agent. |
 | INT-001 | Must | Codex Ask and Plan send `sandboxPolicy.type: "readOnly"`; Implement sends `sandboxPolicy.type: "workspaceWrite"`. Codex always uses an approval policy of `never`, and Plan prepends an instruction not to implement. |
 | INT-002 | Must | Cursor maps Ask to `--mode ask`, Plan to `--mode plan`, and Implement to `--force --sandbox enabled`; it uses `--print --output-format stream-json --stream-partial-output --trust --workspace`. |
 | INT-003 | Must | AGY maps Ask/Plan to `--mode plan --sandbox` and Implement to `--mode accept-edits --sandbox`; Ask and Plan prompts explicitly prohibit implementation. |
-| UX-003 | Must | `F2` loads the selected agent's model catalog lazily. Model selection is per agent and a provider error is displayed rather than silently changing the model. |
+| UX-003 | Must | `F2` loads the selected agent's model catalog lazily. Model selection is per agent and a provider error is displayed rather than silently changing the model. In the Codex model picker, `Tab` selects the highlighted model and opens that model's effort picker. |
 | FR-040 | Must | For idle Codex, `/effort` shows the selected model's advertised reasoning-effort values and applies the selection to subsequent Codex turns; other agents and active Codex turns are rejected without changing a setting. |
+| FR-043 | Must | Changing an idle agent's mode retires only its active provider binding. The next prompt preserves completed DmuxAI context but does not resume the retired native session. |
 
 ### 2.3 Conversation and turn lifecycle
 
@@ -151,6 +152,7 @@ or replace this evidence deliberately.
 | TC-015 | NFR-003, FR-030 | Windows release or local terminal smoke environment | Start/exit or run installer | Terminal is restored; installer checksum and installation flow succeed | Manual command documented in release review |
 | TC-016 | NFR-001 | An adapter command channel at capacity and the shared event-channel constructor | Attempt another UI command and inspect channel capacity | The UI receives a queue-full error without blocking; the event channel remains bounded at 64 | Coverage gap: add deterministic adapter/channel capacity tests before changing queue behavior |
 | TC-017 | FR-040, FR-041, FR-042 | Codex App Server fixtures and active-turn UI state | Select effort, forward tool lifecycle items, and request status | Effort is sent only on later Codex turns; owned tool progress is bounded; usage/rate-limit data or explicit unavailable text renders | `src/agent/codex.rs`: effort/tool/status tests; `src/app.rs`: effort/tool/status tests |
+| TC-018 | UX-002, UX-003, FR-043 | Idle agent binding and Codex model catalog | Press Tab on a highlighted Codex model or change mode before a follow-up | Tab opens model-scoped effort choices; mode change starts a fresh context-projected provider session | `src/app.rs`: `model_picker_tab_selects_codex_model_and_opens_its_effort_picker`; `mode_change_reopens_the_agent_with_shared_context` |
 
 ## 5. Test execution contract
 

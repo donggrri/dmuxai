@@ -754,6 +754,26 @@ impl ConversationEngine {
         }))
     }
 
+    /// Retires one idle agent's native provider session without altering the
+    /// durable conversation. The next turn receives the normal shared-context
+    /// projection instead of resuming the retired provider session.
+    pub fn retire_active_binding(&mut self, agent: AgentKey) -> Result<bool, ConversationError> {
+        let conversation_id = self
+            .active_conversation
+            .clone()
+            .ok_or(ConversationError::NoActiveConversation)?;
+        if self.agent_is_busy(&conversation_id, agent)? {
+            return Err(ConversationError::AgentBusy(agent));
+        }
+
+        let changed = self.connection.execute(
+            "UPDATE provider_bindings SET status = 'stale', updated_at_ms = ?3
+              WHERE conversation_id = ?1 AND agent = ?2 AND status = 'active'",
+            params![conversation_id.as_str(), agent.as_db(), now_ms()?],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Prepares a rolling summary for the active conversation and agent.
     ///
     /// The source contains only completed turns after the latest valid

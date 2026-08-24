@@ -823,13 +823,29 @@ impl App {
                     .iter()
                     .position(|agent| *agent == picker.agent)
                     .expect("picker agent belongs to Agent::ALL");
+                let mode_changed = self.modes.get(&picker.agent).copied() != Some(mode);
+                if mode_changed
+                    && let Err(error) = self.engine.retire_active_binding(agent_key(picker.agent))
+                {
+                    self.messages.push(Message::new(
+                        Role::System,
+                        format!("Could not change {mode} mode for {}: {error}", picker.agent),
+                    ));
+                    self.mode_picker = Some(picker);
+                    return;
+                }
                 match self.adapters[adapter_index].select_mode(mode) {
                     Ok(()) => {
                         self.modes.insert(picker.agent, mode);
-                        self.messages.push(Message::new(
-                            Role::System,
-                            format!("{} mode selected: {mode}.", picker.agent),
-                        ));
+                        let message = if mode_changed {
+                            format!(
+                                "{} mode selected: {mode}. The next prompt opens a new session with shared context.",
+                                picker.agent
+                            )
+                        } else {
+                            format!("{} mode is already selected: {mode}.", picker.agent)
+                        };
+                        self.messages.push(Message::new(Role::System, message));
                     }
                     Err(error) => {
                         self.messages.push(Message::new(
@@ -884,36 +900,73 @@ impl App {
     }
 
     fn handle_model_picker_key(&mut self, key: KeyEvent) {
-        let Some(picker) = self.model_picker.as_mut() else {
+        let Some(mut picker) = self.model_picker.take() else {
             return;
         };
-        let catalog = self
-            .model_catalogs
-            .get(&picker.agent)
-            .expect("every agent has a model catalog");
 
         match key.code {
-            KeyCode::Esc => self.model_picker = None,
-            KeyCode::Up => picker.cursor = picker.cursor.saturating_sub(1),
-            KeyCode::Down if !catalog.models.is_empty() => {
-                picker.cursor = (picker.cursor + 1).min(catalog.models.len() - 1);
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                picker.cursor = picker.cursor.saturating_sub(1);
+                self.model_picker = Some(picker);
             }
-            KeyCode::Enter if !catalog.models.is_empty() => {
+            KeyCode::Down => {
+                let model_count = self
+                    .model_catalogs
+                    .get(&picker.agent)
+                    .expect("every agent has a model catalog")
+                    .models
+                    .len();
+                if model_count > 0 {
+                    picker.cursor = (picker.cursor + 1).min(model_count - 1);
+                }
+                self.model_picker = Some(picker);
+            }
+            KeyCode::Tab if picker.agent != Agent::Codex => self.model_picker = Some(picker),
+            KeyCode::Enter | KeyCode::Tab => {
+                let Some(model) = self
+                    .model_catalogs
+                    .get(&picker.agent)
+                    .and_then(|catalog| catalog.models.get(picker.cursor))
+                    .cloned()
+                else {
+                    self.model_picker = Some(picker);
+                    return;
+                };
                 let agent = picker.agent;
-                let model = catalog.models[picker.cursor].clone();
                 let adapter_index = Agent::ALL
                     .iter()
                     .position(|candidate| *candidate == agent)
                     .expect("picker agent belongs to Agent::ALL");
                 match self.adapters[adapter_index].select_model(model.id.clone()) {
-                    Ok(()) => self.model_picker = None,
-                    Err(error) => self.messages.push(Message::new(
-                        Role::System,
-                        format!("Could not select {} for {agent}: {error}", model.label),
-                    )),
+                    Ok(()) => {
+                        let catalog = self
+                            .model_catalogs
+                            .get_mut(&agent)
+                            .expect("every agent has a model catalog");
+                        catalog.selected = Some(model.id.clone());
+                        catalog.selected_effort = model.default_effort.clone();
+                        if key.code == KeyCode::Tab {
+                            let cursor = model
+                                .efforts
+                                .iter()
+                                .position(|effort| {
+                                    model.default_effort.as_deref() == Some(effort.as_str())
+                                })
+                                .unwrap_or(0);
+                            self.effort_picker = Some(EffortPicker { agent, cursor });
+                        }
+                    }
+                    Err(error) => {
+                        self.messages.push(Message::new(
+                            Role::System,
+                            format!("Could not select {} for {agent}: {error}", model.label),
+                        ));
+                        self.model_picker = Some(picker);
+                    }
                 }
             }
-            _ => {}
+            _ => self.model_picker = Some(picker),
         }
     }
 
@@ -1840,7 +1893,7 @@ impl App {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(title)
-                    .title_bottom(" Up/Down move  Enter select  Esc close "),
+                    .title_bottom(" Up/Down move  Enter select  Tab model + effort  Esc close "),
             )
             .highlight_style(
                 Style::default()
@@ -2550,6 +2603,47 @@ mod tests {
         let sent = sent.lock().unwrap();
         assert_eq!(sent[1].1.resume_session.as_deref(), Some("codex-thread"));
         assert_eq!(sent[1].1.prompt, "second");
+    }
+
+    #[test]
+    // TC-048 / FR-043: a mode change retires native resume but keeps shared context.
+    fn mode_change_reopens_the_agent_with_shared_context() {
+        let (mut app, sent) = test_app();
+        app.input = "first question".to_owned();
+        app.submit_prompt();
+        let first = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(first.conversation_id.clone()),
+            turn_id: Some(first.turn_id.clone()),
+            event: AgentEvent::ProviderSessionBound("codex-thread".to_owned()),
+        }));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(first.conversation_id.clone()),
+            turn_id: Some(first.turn_id.clone()),
+            event: AgentEvent::TextDelta("first answer".to_owned()),
+        }));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(first.conversation_id),
+            turn_id: Some(first.turn_id),
+            event: AgentEvent::Completed,
+        }));
+
+        app.open_mode_picker();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        app.input = "implement it".to_owned();
+        app.submit_prompt();
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(app.modes[&Agent::Codex], ExecutionMode::Implement);
+        assert!(sent[1].1.resume_session.is_none());
+        assert!(sent[1].1.prompt.contains("[DmuxAI shared context]"));
+        assert!(sent[1].1.prompt.contains("first answer"));
     }
 
     #[test]
@@ -3363,6 +3457,44 @@ mod tests {
         app.open_effort_picker();
         assert!(app.effort_picker.is_none());
         assert!(app.messages.last().unwrap().content.contains("Codex only"));
+    }
+
+    #[test]
+    // TC-047 / UX-040: Tab selects the highlighted Codex model and opens its effort choices.
+    fn model_picker_tab_selects_codex_model_and_opens_its_effort_picker() {
+        let (mut app, _) = test_app();
+        app.apply_agent_event(
+            Agent::Codex,
+            AgentEvent::ModelsListed {
+                models: vec![
+                    ModelInfo::with_efforts(
+                        "codex-a",
+                        "Codex A",
+                        vec!["low".to_owned()],
+                        Some("low".to_owned()),
+                    ),
+                    ModelInfo::with_efforts(
+                        "codex-b",
+                        "Codex B",
+                        vec!["medium".to_owned(), "high".to_owned()],
+                        Some("high".to_owned()),
+                    ),
+                ],
+                selected: Some("codex-a".to_owned()),
+                selected_effort: Some("low".to_owned()),
+            },
+        );
+
+        app.open_model_picker();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        let catalog = &app.model_catalogs[&Agent::Codex];
+        assert!(app.model_picker.is_none());
+        assert_eq!(catalog.selected.as_deref(), Some("codex-b"));
+        assert_eq!(catalog.selected_effort.as_deref(), Some("high"));
+        assert_eq!(app.effort_picker.as_ref().unwrap().agent, Agent::Codex);
+        assert_eq!(app.effort_picker.as_ref().unwrap().cursor, 1);
     }
 
     #[test]
