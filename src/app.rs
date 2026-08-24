@@ -830,6 +830,14 @@ impl App {
                     .iter()
                     .position(|agent| *agent == picker.agent)
                     .expect("picker agent belongs to Agent::ALL");
+                if let Err(error) = self.adapters[adapter_index].validate_mode(mode) {
+                    self.messages.push(Message::new(
+                        Role::System,
+                        format!("Could not select {mode} for {}: {error}", picker.agent),
+                    ));
+                    self.mode_picker = Some(picker);
+                    return;
+                }
                 let mode_changed = self.modes.get(&picker.agent).copied() != Some(mode);
                 if mode_changed
                     && let Err(error) = self.engine.retire_active_binding(agent_key(picker.agent))
@@ -1126,6 +1134,16 @@ impl App {
             return;
         }
 
+        let adapter_index = adapter_index(agent);
+        let mode = self.modes.get(&agent).copied().unwrap_or_default();
+        if let Err(error) = self.adapters[adapter_index].validate_mode(mode) {
+            if restore_input_on_failure {
+                self.input = prompt;
+            }
+            self.push_system(format!("Could not start {agent} in {mode} mode: {error}"));
+            return;
+        }
+
         self.chat_scroll = 0;
         let model_id = self
             .model_catalogs
@@ -1161,7 +1179,6 @@ impl App {
         let stored_conversation_id = request.conversation_id.clone();
         let stored_turn_id = request.turn_id.clone();
         let adapter_request = adapter_request(request);
-        let adapter_index = adapter_index(agent);
         self.messages.push(Message::new(Role::User, prompt.clone()));
         match self.adapters[adapter_index].send(adapter_request) {
             Ok(()) => {
@@ -2439,6 +2456,7 @@ mod tests {
         sent: SentRequests,
         cancelled: CancelRequests,
         fail_send: bool,
+        unsupported_mode: Option<ExecutionMode>,
     }
 
     impl AgentAdapter for RecordingAdapter {
@@ -2464,6 +2482,16 @@ mod tests {
         }
 
         fn select_model(&self, _model: String) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
+        fn validate_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
+            if self.unsupported_mode == Some(mode) {
+                return Err(AdapterError::UnsupportedMode {
+                    agent: self.agent,
+                    mode,
+                });
+            }
             Ok(())
         }
 
@@ -2505,6 +2533,7 @@ mod tests {
                     sent: Arc::clone(&sent),
                     cancelled: Arc::clone(&cancelled),
                     fail_send: failing_agent == Some(agent),
+                    unsupported_mode: None,
                 }) as Box<dyn AgentAdapter>
             })
             .collect();
@@ -2515,6 +2544,34 @@ mod tests {
             App::with_runtime(adapters, event_rx, Vec::new(), engine).unwrap(),
             sent,
             cancelled,
+        )
+    }
+
+    fn test_app_with_unsupported_mode(
+        engine: ConversationEngine,
+        agent: Agent,
+        mode: ExecutionMode,
+    ) -> (App, SentRequests) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let adapters = Agent::ALL
+            .into_iter()
+            .map(|candidate| {
+                Box::new(RecordingAdapter {
+                    agent: candidate,
+                    sent: Arc::clone(&sent),
+                    cancelled: Arc::clone(&cancelled),
+                    fail_send: false,
+                    unsupported_mode: (candidate == agent).then_some(mode),
+                }) as Box<dyn AgentAdapter>
+            })
+            .collect();
+        let (event_tx, event_rx) = event_channel();
+        drop(event_tx);
+
+        (
+            App::with_runtime(adapters, event_rx, Vec::new(), engine).unwrap(),
+            sent,
         )
     }
 
@@ -2655,6 +2712,49 @@ mod tests {
         assert!(sent[1].1.resume_session.is_none());
         assert!(sent[1].1.prompt.contains("[DmuxAI shared context]"));
         assert!(sent[1].1.prompt.contains("first answer"));
+    }
+
+    #[test]
+    // TC-060 / INT-060: unsupported modes do not retire a binding or change UI state.
+    fn unsupported_mode_is_rejected_before_binding_retirement() {
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (mut app, sent) =
+            test_app_with_unsupported_mode(engine, Agent::Cursor, ExecutionMode::Implement);
+        app.selected = adapter_index(Agent::Cursor);
+        app.input = "first".to_owned();
+        app.submit_prompt();
+        let first = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Cursor,
+            conversation_id: Some(first.conversation_id.clone()),
+            turn_id: Some(first.turn_id.clone()),
+            event: AgentEvent::ProviderSessionBound("cursor-session".to_owned()),
+        }));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Cursor,
+            conversation_id: Some(first.conversation_id),
+            turn_id: Some(first.turn_id),
+            event: AgentEvent::Completed,
+        }));
+
+        app.open_mode_picker();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.modes[&Agent::Cursor], ExecutionMode::Ask);
+        assert!(app.mode_picker.is_some());
+        assert!(app.messages.last().unwrap().content.contains("unavailable"));
+        let snapshot = app
+            .engine
+            .select(ConversationSelection::Existing(app.conversation_id.clone()))
+            .unwrap();
+        assert_eq!(
+            snapshot.bindings[0].status,
+            dmuxai::conversation::BindingStatus::Active
+        );
     }
 
     #[test]
