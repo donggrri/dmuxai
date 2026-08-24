@@ -122,6 +122,7 @@ Controls:
 - `/resume <id-prefix>`: load one conversation by a unique ID prefix
 - `/summarize`: compress the completed shared context for the selected agent
 - `/share <codex|cursor|agy>`: optionally replay a context import to one agent; ordinary turns are shared automatically
+- `/quit`: stop owned child processes, restore the terminal, and exit
 - `F2`: load and open that agent's model picker
 - Model picker `Up` / `Down`, `Enter`, `Esc`: move, select, or close; on Codex,
   `Tab` selects the highlighted model and opens its effort picker
@@ -129,7 +130,7 @@ Controls:
 - Drag across Chat text: highlight and copy the selected text to the system clipboard
 - Drag the prompt pane's top border: resize the chat/prompt height ratio
 - `Ctrl+C`: cancel the selected agent's active turn
-- `Esc`: stop all owned child processes, restore the terminal, and exit
+- `Esc`: close an open picker or slash preview; otherwise keep the application running
 
 `/agent` changes which adapter receives the next prompt. Within a DmuxAI
 conversation, each provider keeps its own native thread/session binding, while
@@ -209,6 +210,14 @@ cargo clippy --all-targets --all-features -- -D warnings
 rustup target add x86_64-unknown-linux-gnu
 cargo clippy --target x86_64-unknown-linux-gnu --all-targets --all-features -- -D warnings
 ```
+
+## Delivery workflow
+
+All behavior changes follow `Spec -> Plan -> Execute -> Review -> Test`.
+The current product contract and test traceability matrix are in
+[docs/specs/DMUXAI-BASELINE.md](docs/specs/DMUXAI-BASELINE.md); start a new
+feature from [docs/templates/FEATURE-SPEC.md](docs/templates/FEATURE-SPEC.md)
+and follow [docs/WORKFLOW.md](docs/WORKFLOW.md).
 
 Real-provider smoke tests are ignored in the ordinary suite because they need
 installed, authenticated CLIs and make real model requests:

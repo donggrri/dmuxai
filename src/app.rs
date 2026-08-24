@@ -55,6 +55,7 @@ enum SlashAction {
     Mode,
     Effort,
     Status,
+    Quit,
     New,
     Conversations,
     Resume,
@@ -69,7 +70,7 @@ struct SlashCommand {
     action: SlashAction,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 9] = [
+const SLASH_COMMANDS: [SlashCommand; 10] = [
     SlashCommand {
         name: "/agent",
         description: "Switch the active agent",
@@ -89,6 +90,11 @@ const SLASH_COMMANDS: [SlashCommand; 9] = [
         name: "/status",
         description: "Show Codex token and rate-limit status",
         action: SlashAction::Status,
+    },
+    SlashCommand {
+        name: "/quit",
+        description: "Exit DmuxAI",
+        action: SlashAction::Quit,
     },
     SlashCommand {
         name: "/new",
@@ -285,7 +291,7 @@ impl App {
             input: String::new(),
             messages: vec![Message::new(
                 Role::System,
-                "Codex, Cursor, and AGY use real structured headless protocols. Completed turns are shared automatically with every agent; /share is optional. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /effort to choose Codex reasoning effort, /status to view Codex usage, F2 to choose a model, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
+                "Codex, Cursor, and AGY use real structured headless protocols. Completed turns are shared automatically with every agent; /share is optional. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /effort to choose Codex reasoning effort, /status to view Codex usage, /quit to exit, F2 to choose a model, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
             )],
             adapters,
             event_rx,
@@ -505,7 +511,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Esc => self.exit = true,
+            KeyCode::Esc => {}
             KeyCode::F(2) => self.open_model_picker(),
             KeyCode::F(3) => self.open_conversation_picker(),
             KeyCode::Enter => self.submit_prompt(),
@@ -592,6 +598,7 @@ impl App {
             SlashAction::Mode => self.open_mode_picker(),
             SlashAction::Effort => self.open_effort_picker(),
             SlashAction::Status => self.request_status(),
+            SlashAction::Quit => self.exit = true,
             SlashAction::New => self.create_conversation(None),
             SlashAction::Conversations => self.open_conversation_picker(),
             SlashAction::Resume => self.push_system("Usage: /resume <conversation-id>"),
@@ -1061,6 +1068,10 @@ impl App {
             }
             "/status" => {
                 self.execute_slash_action(SlashAction::Status);
+                return;
+            }
+            "/quit" => {
+                self.execute_slash_action(SlashAction::Quit);
                 return;
             }
             "/conversations" => {
@@ -1844,7 +1855,7 @@ impl App {
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             ),
             Span::raw(format!(
-                "  Model: {model}  Effort: {}  Mode: {}  /effort  /status  /mode  /agent  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc quit{}",
+                "  Model: {model}  Effort: {}  Mode: {}  /effort  /status  /mode  /agent  /quit exit  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close{}",
                 self.model_catalogs
                     .get(&selected)
                     .and_then(|catalog| catalog.selected_effort.as_deref())
@@ -3618,6 +3629,51 @@ mod tests {
     }
 
     #[test]
+    // TC-019 / UX-011: exact /quit exits without starting a provider turn.
+    fn exact_quit_command_exits_without_starting_a_turn() {
+        let (mut app, sent) = test_app();
+        app.input = "/quit".to_owned();
+
+        app.submit_prompt();
+
+        assert!(app.exit);
+        assert!(app.input.is_empty());
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    // TC-020 / UX-011: slash preview selection can execute /quit.
+    fn slash_preview_can_execute_quit_with_tab() {
+        let (mut app, sent) = test_app();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(matching_slash_commands(&app.input)[0].name, "/quit");
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert!(app.exit);
+        assert!(app.slash_preview.is_none());
+        assert!(app.input.is_empty());
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    // TC-020 / UX-011: Enter executes the highlighted /quit command too.
+    fn slash_preview_can_execute_quit_with_enter() {
+        let (mut app, sent) = test_app();
+
+        app.input = "/quit".to_owned();
+        app.refresh_slash_preview();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.exit);
+        assert!(app.slash_preview.is_none());
+        assert!(app.input.is_empty());
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn slash_preview_filters_and_executes_mode_with_tab() {
         let (mut app, _) = test_app();
 
@@ -3638,8 +3694,16 @@ mod tests {
     }
 
     #[test]
-    fn slash_preview_escape_closes_preview_before_exiting() {
+    // TC-021 / UX-012: Esc dismisses UI but never exits the application.
+    fn escape_never_exits_the_application() {
         let (mut app, _) = test_app();
+
+        app.input = "draft".to_owned();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.exit);
+        assert_eq!(app.input, "draft");
+
+        app.input.clear();
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -3648,7 +3712,25 @@ mod tests {
         assert_eq!(app.input, "/");
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.exit);
+        assert!(!app.exit);
+
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        assert!(app.conversation_picker.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.conversation_picker.is_none());
+        assert!(!app.exit);
+    }
+
+    #[test]
+    // TC-022 / UX-011: whitespace keeps /quit on the ordinary prompt path.
+    fn quit_with_whitespace_is_regular_prompt_text() {
+        let (mut app, sent) = test_app();
+        app.input = "/quit ".to_owned();
+
+        app.submit_prompt();
+
+        assert!(!app.exit);
+        assert_eq!(sent.lock().unwrap()[0].1.prompt, "/quit ");
     }
 
     #[test]
@@ -3842,4 +3924,5 @@ mod tests {
             30 - MIN_MAIN_HEIGHT - STATUS_HEIGHT
         );
     }
+
 }
