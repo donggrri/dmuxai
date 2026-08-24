@@ -182,6 +182,145 @@ struct ActiveTurn {
     turn_id: StoredTurnId,
 }
 
+const MAX_ACTIVITY_DETAIL_CHARS: usize = 72;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityKind {
+    Turn,
+    Summary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityState {
+    Queued,
+    Running,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityPhase {
+    Starting,
+    Working,
+    Responding,
+    Tool,
+    Summarizing,
+}
+
+impl ActivityPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Working => "working",
+            Self::Responding => "responding",
+            Self::Tool => "tool",
+            Self::Summarizing => "summarizing",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AgentActivity {
+    kind: ActivityKind,
+    state: ActivityState,
+    phase: ActivityPhase,
+    started_at: Instant,
+    last_event_at: Option<Instant>,
+    detail: Option<String>,
+}
+
+impl AgentActivity {
+    fn queued(kind: ActivityKind, now: Instant) -> Self {
+        Self {
+            kind,
+            state: ActivityState::Queued,
+            phase: if kind == ActivityKind::Summary {
+                ActivityPhase::Summarizing
+            } else {
+                ActivityPhase::Starting
+            },
+            started_at: now,
+            last_event_at: None,
+            detail: None,
+        }
+    }
+
+    fn observe(&mut self, event: &AgentEvent, now: Instant) {
+        let phase = match event {
+            AgentEvent::Started => {
+                self.state = ActivityState::Running;
+                Some(if self.kind == ActivityKind::Summary {
+                    ActivityPhase::Summarizing
+                } else {
+                    ActivityPhase::Starting
+                })
+            }
+            AgentEvent::ProviderSessionBound(_) | AgentEvent::Notice(_) => {
+                self.state = ActivityState::Running;
+                Some(if self.kind == ActivityKind::Summary {
+                    ActivityPhase::Summarizing
+                } else {
+                    ActivityPhase::Working
+                })
+            }
+            AgentEvent::TextDelta(_) => {
+                self.state = ActivityState::Running;
+                Some(if self.kind == ActivityKind::Summary {
+                    ActivityPhase::Summarizing
+                } else {
+                    ActivityPhase::Responding
+                })
+            }
+            AgentEvent::ToolProgress { .. } => {
+                self.state = ActivityState::Running;
+                Some(if self.kind == ActivityKind::Summary {
+                    ActivityPhase::Summarizing
+                } else {
+                    ActivityPhase::Tool
+                })
+            }
+            AgentEvent::Completed
+            | AgentEvent::Cancelled
+            | AgentEvent::Error(_)
+            | AgentEvent::ModelsListed { .. }
+            | AgentEvent::ModelSelected(_)
+            | AgentEvent::EffortSelected(_)
+            | AgentEvent::ModeSelected(_)
+            | AgentEvent::Status(_) => None,
+        };
+        if let Some(phase) = phase {
+            self.phase = phase;
+            self.last_event_at = Some(now);
+            self.detail = match event {
+                AgentEvent::ToolProgress { summary, state, .. }
+                    if self.kind == ActivityKind::Turn =>
+                {
+                    Some(bounded_activity_detail(&format!("[{state}] {summary}")))
+                }
+                _ => None,
+            };
+        }
+    }
+
+    fn state_label(&self) -> &'static str {
+        match self.state {
+            ActivityState::Queued => "QUEUED",
+            ActivityState::Running => "RUNNING",
+        }
+    }
+
+    fn compact_label(&self) -> &'static str {
+        self.state_label()
+    }
+
+    fn elapsed(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.started_at)
+    }
+
+    fn last_event_age(&self, now: Instant) -> Option<Duration> {
+        self.last_event_at
+            .map(|last_event| now.saturating_duration_since(last_event))
+    }
+}
+
 struct DeferredTurn {
     conversation_id: StoredConversationId,
     agent: Agent,
@@ -227,6 +366,7 @@ pub struct App {
     deferred_turns: Vec<DeferredTurn>,
     restored_inputs: HashMap<StoredConversationId, String>,
     busy_agents: HashSet<Agent>,
+    activities: HashMap<Agent, AgentActivity>,
     streaming_messages: HashMap<Agent, usize>,
     model_catalogs: HashMap<Agent, ModelCatalog>,
     model_picker: Option<ModelPicker>,
@@ -305,6 +445,7 @@ impl App {
             deferred_turns: Vec::new(),
             restored_inputs: HashMap::new(),
             busy_agents: HashSet::new(),
+            activities: HashMap::new(),
             streaming_messages: HashMap::new(),
             model_catalogs: Agent::ALL
                 .into_iter()
@@ -451,6 +592,7 @@ impl App {
                     return true;
                 }
 
+                self.observe_activity(output.agent, &output.event, Instant::now());
                 let visible = conversation_id.as_str() == self.conversation_id.as_str();
                 let terminal = matches!(
                     output.event,
@@ -1190,6 +1332,10 @@ impl App {
                     },
                 );
                 self.busy_agents.insert(agent);
+                self.activities.insert(
+                    agent,
+                    AgentActivity::queued(ActivityKind::Turn, Instant::now()),
+                );
             }
             Err(error) => {
                 let failed = TurnOutput {
@@ -1386,6 +1532,10 @@ impl App {
         match self.adapters[adapter_index(agent)].send(request) {
             Ok(()) => {
                 self.busy_agents.insert(agent);
+                self.activities.insert(
+                    agent,
+                    AgentActivity::queued(ActivityKind::Summary, Instant::now()),
+                );
                 self.pending_summary = Some(PendingSummary {
                     job,
                     conversation_id: self.conversation_id.clone(),
@@ -1423,6 +1573,7 @@ impl App {
     }
 
     fn apply_summary_output(&mut self, output: AgentOutput) -> bool {
+        self.observe_activity(output.agent, &output.event, Instant::now());
         match output.event {
             AgentEvent::Started | AgentEvent::ProviderSessionBound(_) | AgentEvent::Notice(_) => {
                 true
@@ -1438,6 +1589,7 @@ impl App {
                     };
                     let _ = self.adapters[adapter_index(pending.agent)].cancel();
                     self.busy_agents.remove(&pending.agent);
+                    self.activities.remove(&pending.agent);
                     if let Some(deferred) = pending.deferred {
                         self.restore_deferred_input(deferred);
                     }
@@ -1458,6 +1610,7 @@ impl App {
                     return false;
                 };
                 self.busy_agents.remove(&pending.agent);
+                self.activities.remove(&pending.agent);
                 let visible = pending.conversation_id == self.conversation_id;
                 match parse_summary_document(&pending.buffer)
                     .map_err(|error| error.to_string())
@@ -1500,6 +1653,7 @@ impl App {
                     return false;
                 };
                 self.busy_agents.remove(&pending.agent);
+                self.activities.remove(&pending.agent);
                 if let Some(deferred) = pending.deferred {
                     self.restore_deferred_input(deferred);
                 }
@@ -1645,9 +1799,52 @@ impl App {
 
     fn finish_turn(&mut self, agent: Agent) {
         self.busy_agents.remove(&agent);
+        self.activities.remove(&agent);
         self.active_turns.remove(&agent);
         self.streaming_messages.remove(&agent);
         self.tool_messages.remove(&agent);
+    }
+
+    fn observe_activity(&mut self, agent: Agent, event: &AgentEvent, now: Instant) {
+        if let Some(activity) = self.activities.get_mut(&agent) {
+            activity.observe(event, now);
+        }
+    }
+
+    fn activity_summary(&self, agent: Agent, now: Instant) -> String {
+        let Some(activity) = self.activities.get(&agent) else {
+            return "IDLE".to_owned();
+        };
+        let last_event = activity
+            .last_event_age(now)
+            .map(|age| format!("last event {} ago", format_elapsed(age)))
+            .unwrap_or_else(|| "waiting for provider start".to_owned());
+        let detail = activity
+            .detail
+            .as_deref()
+            .map(|detail| format!(" · {detail}"))
+            .unwrap_or_default();
+        format!(
+            "{} · {} · {} · {}{}",
+            activity.state_label(),
+            activity.phase.label(),
+            format_elapsed(activity.elapsed(now)),
+            last_event,
+            detail,
+        )
+    }
+
+    fn other_activity_summary(&self, selected: Agent) -> String {
+        Agent::ALL
+            .into_iter()
+            .filter(|agent| *agent != selected)
+            .filter_map(|agent| {
+                self.activities
+                    .get(&agent)
+                    .map(|activity| format!("{agent} {}", activity.compact_label()))
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 
     fn apply_tool_progress(
@@ -1847,11 +2044,28 @@ impl App {
 
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
         let selected = self.adapters[self.selected].agent();
-        let state = if self.busy_agents.contains(&selected) {
-            "BUSY"
+        let now = Instant::now();
+        let state = self
+            .activities
+            .get(&selected)
+            .map(AgentActivity::state_label)
+            .unwrap_or_else(|| {
+                if self.busy_agents.contains(&selected) {
+                    "BUSY"
+                } else {
+                    "IDLE"
+                }
+            });
+        let activity = if self.activities.contains_key(&selected) {
+            let summary = self.activity_summary(selected, now);
+            summary
+                .split_once(" · ")
+                .map(|(_, detail)| detail.to_owned())
+                .unwrap_or(summary)
         } else {
-            "IDLE"
+            state.to_owned()
         };
+        let other_activity = self.other_activity_summary(selected);
         let model = self
             .model_catalogs
             .get(&selected)
@@ -1872,7 +2086,12 @@ impl App {
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             ),
             Span::raw(format!(
-                "  Model: {model}  Effort: {}  Mode: {}  /effort  /status  /mode  /agent  /quit exit  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close{}",
+                "  {activity}{}  Model: {model}  Effort: {}  Mode: {}  /effort  /status  /mode  /agent  /quit exit  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close{}",
+                if other_activity.is_empty() {
+                    String::new()
+                } else {
+                    format!("  | {other_activity}")
+                },
                 self.model_catalogs
                     .get(&selected)
                     .and_then(|catalog| catalog.selected_effort.as_deref())
@@ -2397,6 +2616,29 @@ fn event_requires_turn_context(event: &AgentEvent) -> bool {
     )
 }
 
+fn format_elapsed(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
+}
+
+fn bounded_activity_detail(value: &str) -> String {
+    let single_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = single_line.chars();
+    let prefix = chars
+        .by_ref()
+        .take(MAX_ACTIVITY_DETAIL_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
 fn selected_effort_options(catalog: &ModelCatalog) -> Vec<String> {
     catalog
         .selected
@@ -2611,6 +2853,150 @@ mod tests {
             app.conversation_id.as_str()
         );
         assert_eq!(sent[0].1.resume_session, None);
+    }
+
+    #[test]
+    // TC-060 / FR-060: accepted requests are visible before provider start.
+    fn queued_activity_is_visible_after_request_acceptance() {
+        let (mut app, _) = test_app();
+        app.input = "keep working".to_owned();
+
+        app.submit_prompt();
+
+        let status = app.activity_summary(Agent::Codex, Instant::now());
+        assert!(status.starts_with("QUEUED"));
+        assert!(status.contains("waiting for provider start"));
+        assert!(render_text_at(&mut app, 180, 24).contains("Codex QUEUED"));
+
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (mut failing_app, _) = test_app_with_engine_and_failure(engine, Some(Agent::Codex));
+        failing_app.input = "retry me".to_owned();
+        failing_app.submit_prompt();
+        assert!(!failing_app.activities.contains_key(&Agent::Codex));
+        assert_eq!(failing_app.input, "retry me");
+    }
+
+    #[test]
+    // TC-061 / FR-061, UX-030: observable events update the displayed phase.
+    fn running_activity_reflects_observable_phase() {
+        let (mut app, sent) = test_app();
+        app.input = "inspect the workspace".to_owned();
+        app.submit_prompt();
+        let request = sent.lock().unwrap()[0].1.clone();
+
+        let output = |event| AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(request.conversation_id.clone()),
+            turn_id: Some(request.turn_id.clone()),
+            event,
+        };
+        assert!(app.apply_agent_output(output(AgentEvent::Started)));
+        assert_eq!(
+            app.activities.get(&Agent::Codex).unwrap().phase,
+            ActivityPhase::Starting
+        );
+
+        assert!(app.apply_agent_output(output(AgentEvent::TextDelta(
+            "I am checking the files.".to_owned(),
+        ))));
+        assert_eq!(
+            app.activities.get(&Agent::Codex).unwrap().phase,
+            ActivityPhase::Responding
+        );
+
+        assert!(
+            app.apply_agent_output(output(AgentEvent::ToolProgress {
+                item_id: "tool-1".to_owned(),
+                summary: "a very long command summary that should remain bounded in the status bar"
+                    .to_owned(),
+                state: "in progress".to_owned(),
+            }))
+        );
+        let activity = app.activities.get(&Agent::Codex).unwrap();
+        assert_eq!(activity.phase, ActivityPhase::Tool);
+        assert!(
+            activity.detail.as_deref().unwrap().chars().count() <= MAX_ACTIVITY_DETAIL_CHARS + 1
+        );
+        assert!(
+            app.activity_summary(Agent::Codex, Instant::now())
+                .contains("tool")
+        );
+    }
+
+    #[test]
+    // TC-062 / FR-061, UX-030: elapsed and last-event age remain observations.
+    fn activity_status_reports_observed_event_age() {
+        let (mut app, _) = test_app();
+        let now = Instant::now();
+        app.activities.insert(
+            Agent::Codex,
+            AgentActivity {
+                kind: ActivityKind::Turn,
+                state: ActivityState::Running,
+                phase: ActivityPhase::Working,
+                started_at: now - Duration::from_secs(125),
+                last_event_at: Some(now - Duration::from_secs(65)),
+                detail: None,
+            },
+        );
+
+        let status = app.activity_summary(Agent::Codex, now);
+        assert_eq!(status, "RUNNING · working · 2m 05s · last event 1m 05s ago");
+        assert!(!status.contains("stalled"));
+        assert!(!status.contains("waiting"));
+    }
+
+    #[test]
+    // TC-063 / UX-031, FR-062: active agents are discoverable and terminal cleanup is isolated.
+    fn active_agents_are_visible_and_terminal_activity_is_cleared() {
+        let (mut app, sent) = test_app();
+        app.input = "codex work".to_owned();
+        app.submit_prompt();
+        app.selected = 1;
+        app.input = "cursor work".to_owned();
+        app.submit_prompt();
+        let requests = sent.lock().unwrap().clone();
+        let codex_request = requests
+            .iter()
+            .find(|(agent, _)| *agent == Agent::Codex)
+            .unwrap()
+            .1
+            .clone();
+        let cursor_request = requests
+            .iter()
+            .find(|(agent, _)| *agent == Agent::Cursor)
+            .unwrap()
+            .1
+            .clone();
+
+        for (agent, request) in [
+            (Agent::Codex, codex_request.clone()),
+            (Agent::Cursor, cursor_request.clone()),
+        ] {
+            assert!(app.apply_agent_output(AgentOutput {
+                agent,
+                conversation_id: Some(request.conversation_id),
+                turn_id: Some(request.turn_id),
+                event: AgentEvent::Started,
+            }));
+        }
+        let before = render_text_at(&mut app, 180, 24);
+        assert!(before.contains("Cursor RUNNING"));
+        assert!(before.contains("Codex RUNNING"));
+
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(codex_request.conversation_id),
+            turn_id: Some(codex_request.turn_id),
+            event: AgentEvent::Completed,
+        }));
+        let after = render_text_at(&mut app, 180, 24);
+        assert!(after.contains("Cursor RUNNING"));
+        assert!(!after.contains("Codex RUNNING"));
+        assert!(!app.activities.contains_key(&Agent::Codex));
+        assert!(app.activities.contains_key(&Agent::Cursor));
     }
 
     #[test]
@@ -3090,6 +3476,10 @@ mod tests {
         app.input = "/summarize".to_owned();
         app.submit_prompt();
         let summary = sent.lock().unwrap()[1].1.clone();
+        assert_eq!(
+            app.activities.get(&Agent::Codex).unwrap().kind,
+            ActivityKind::Summary
+        );
         assert!(summary.resume_session.is_none());
         assert!(summary.prompt.contains("failed_attempts"));
         assert!(summary.prompt.contains("untrusted data"));
@@ -3099,6 +3489,10 @@ mod tests {
             turn_id: Some(summary.turn_id.clone()),
             event: AgentEvent::ProviderSessionBound("ignored-summary-session".to_owned()),
         }));
+        assert!(
+            app.activity_summary(Agent::Codex, Instant::now())
+                .contains("summarizing")
+        );
         assert!(app.apply_agent_output(AgentOutput {
             agent: Agent::Codex,
             conversation_id: Some(summary.conversation_id.clone()),
@@ -3114,6 +3508,7 @@ mod tests {
             turn_id: Some(summary.turn_id),
             event: AgentEvent::Completed,
         }));
+        assert!(!app.activities.contains_key(&Agent::Codex));
 
         app.input = "continue".to_owned();
         app.submit_prompt();
