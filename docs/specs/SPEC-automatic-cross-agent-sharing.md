@@ -104,8 +104,8 @@ summary/failure limits (TC-005).
 
 ## 7. Implementation plan
 
-See [PLAN-automatic-cross-agent-sharing.md](PLAN-automatic-cross-agent-sharing.md)
-and [TASKS-automatic-cross-agent-sharing.md](TASKS-automatic-cross-agent-sharing.md).
+See [PLAN-automatic-cross-agent-sharing.md](../plans/PLAN-automatic-cross-agent-sharing.md)
+and [TASKS-automatic-cross-agent-sharing.md](../tasks/TASKS-automatic-cross-agent-sharing.md).
 
 | Order | Change | Files / modules | Requirement IDs | Verification |
 | --- | --- | --- | --- | --- |
@@ -119,5 +119,5 @@ and [TASKS-automatic-cross-agent-sharing.md](TASKS-automatic-cross-agent-sharing
 - [ ] The diff has been reviewed against scope and non-goals.
 - [ ] Required Rust checks pass: format, all targets test, and clippy.
 - [ ] The specification traceability gate passes.
-- [ ] `REVIEW-automatic-cross-agent-sharing.md` records commands, results,
+- [ ] `../reviews/REVIEW-automatic-cross-agent-sharing.md` records commands, results,
   residual risk, and rollback notes.

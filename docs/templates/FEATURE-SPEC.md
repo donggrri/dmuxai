@@ -95,7 +95,7 @@ accidental scope expansion.
 
 ## 7. Implementation plan
 
-Link or add the detailed `PLAN-<slug>.md` and `TASKS-<slug>.md`. The plan must
+Link or add the detailed `../plans/PLAN-<slug>.md` and `../tasks/TASKS-<slug>.md`. The plan must
 reference requirement and test IDs; it must not introduce new behavior.
 
 | Order | Change | Files / modules | Requirement IDs | Verification |
@@ -109,5 +109,5 @@ reference requirement and test IDs; it must not introduce new behavior.
 - [ ] Required Rust checks pass: format, all targets test, and clippy.
 - [ ] External-provider smoke tests are marked run, skipped, or blocked with a
   reason; skipped is never reported as passing.
-- [ ] `REVIEW-<slug>.md` records commands, result, residual risk, and rollback
+- [ ] `../reviews/REVIEW-<slug>.md` records commands, result, residual risk, and rollback
   notes.

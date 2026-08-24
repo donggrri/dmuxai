@@ -1,7 +1,7 @@
 # REVIEW: Slash-command quit
 
 Status: complete  
-Spec: [SPEC-quit-slash-command.md](SPEC-quit-slash-command.md)  
+Spec: [SPEC-quit-slash-command.md](../specs/SPEC-quit-slash-command.md)
 Reviewed: 2026-08-24
 
 ## Result
@@ -35,7 +35,7 @@ PowerShell `PATH`.
 - `cargo test --all-targets`: 102 passed, 6 ignored, 0 failed. The ignored
   tests require authenticated provider CLIs and were not counted as passes.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
-- `scripts/check-spec.ps1` for `SPEC-quit-slash-command.md`: passed.
+- `scripts/check-spec.ps1` for `docs/specs/SPEC-quit-slash-command.md`: passed.
 - `scripts/check-spec.ps1` for `docs/specs/DMUXAI-BASELINE.md`: passed.
 - `git diff --check`: passed; Git reported only existing line-ending notices.
 

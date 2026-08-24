@@ -1,7 +1,7 @@
 # TASKS: Codex model effort and mode-context transition
 
 Status: complete
-Spec: [SPEC-codex-model-effort-mode-context.md](SPEC-codex-model-effort-mode-context.md)
+Spec: [SPEC-codex-model-effort-mode-context.md](../specs/SPEC-codex-model-effort-mode-context.md)
 
 - [x] T1 — Add and run red TC-047/TC-048 regression tests. Requirements:
   UX-040, FR-043. Verify: the two named `cargo test` commands fail before the fix.

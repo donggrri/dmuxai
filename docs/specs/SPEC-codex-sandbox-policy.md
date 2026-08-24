@@ -61,11 +61,11 @@ and workspace-write Implement permissions.
 
 ## 7. Implementation plan
 
-See [PLAN-codex-sandbox-policy.md](PLAN-codex-sandbox-policy.md) and
-[TASKS-codex-sandbox-policy.md](TASKS-codex-sandbox-policy.md).
+See [PLAN-codex-sandbox-policy.md](../plans/PLAN-codex-sandbox-policy.md) and
+[TASKS-codex-sandbox-policy.md](../tasks/TASKS-codex-sandbox-policy.md).
 
 ## 8. Review and test exit criteria
 
 - [ ] TC-046 passes after failing against the legacy string shape.
 - [ ] Rust format, all-target tests, and clippy pass.
-- [ ] `REVIEW-codex-sandbox-policy.md` records evidence and no live-provider test is claimed.
+- [ ] `../reviews/REVIEW-codex-sandbox-policy.md` records evidence and no live-provider test is claimed.

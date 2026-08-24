@@ -82,8 +82,8 @@ change the application exit state.
 
 ## 7. Implementation plan
 
-See [PLAN-quit-slash-command.md](PLAN-quit-slash-command.md) and
-[TASKS-quit-slash-command.md](TASKS-quit-slash-command.md).
+See [PLAN-quit-slash-command.md](../plans/PLAN-quit-slash-command.md) and
+[TASKS-quit-slash-command.md](../tasks/TASKS-quit-slash-command.md).
 
 ## 8. Review and test exit criteria
 
@@ -93,5 +93,5 @@ See [PLAN-quit-slash-command.md](PLAN-quit-slash-command.md) and
   gates pass.
 - [x] External-provider smoke tests are marked skipped with a reason unless
   explicitly run with authenticated CLIs.
-- [x] `REVIEW-quit-slash-command.md` records commands, results, residual risk,
+- [x] `../reviews/REVIEW-quit-slash-command.md` records commands, results, residual risk,
   and rollback notes.

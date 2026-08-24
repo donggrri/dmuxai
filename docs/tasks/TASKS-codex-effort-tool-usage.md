@@ -1,7 +1,7 @@
 # TASKS: Codex effort, tool progress, and usage status
 
 Status: complete
-Spec: [SPEC-codex-effort-tool-usage.md](SPEC-codex-effort-tool-usage.md)
+Spec: [SPEC-codex-effort-tool-usage.md](../specs/SPEC-codex-effort-tool-usage.md)
 
 - [x] T1 — Extend agent contracts and Codex adapter request/event parsing for
   effort, tool lifecycle, and status. Requirements: FR-040, FR-041, FR-042,
@@ -14,4 +14,4 @@ Spec: [SPEC-codex-effort-tool-usage.md](SPEC-codex-effort-tool-usage.md)
   tests. Requirements: TC-040, TC-041, TC-042, TC-043, TC-044, TC-045.
   Verify: `cargo test --all-targets`.
 - [x] T4 — Validate docs and run repository gates. Requirements: all.
-  Verify: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath SPEC-codex-effort-tool-usage.md`, `cargo fmt --check`, `cargo test --all-targets`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+  Verify: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/SPEC-codex-effort-tool-usage.md`, `cargo fmt --check`, `cargo test --all-targets`, and `cargo clippy --all-targets --all-features -- -D warnings`.

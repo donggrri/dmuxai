@@ -1,7 +1,7 @@
 # TASKS: Slash-command quit
 
 Status: complete  
-Spec: [SPEC-quit-slash-command.md](SPEC-quit-slash-command.md)
+Spec: [SPEC-quit-slash-command.md](../specs/SPEC-quit-slash-command.md)
 
 - [x] T1 - Add `/quit` to slash preview and exact submission routing.
   Requirements: UX-011. Verify: `cargo test exact_quit_command_exits_without_starting_a_turn`,

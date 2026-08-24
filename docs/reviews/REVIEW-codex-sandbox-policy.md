@@ -1,7 +1,7 @@
 # REVIEW: Codex sandbox-policy object compatibility
 
 Status: complete
-Spec: [SPEC-codex-sandbox-policy.md](SPEC-codex-sandbox-policy.md)
+Spec: [SPEC-codex-sandbox-policy.md](../specs/SPEC-codex-sandbox-policy.md)
 
 ## Spec compliance
 
@@ -24,7 +24,7 @@ Spec: [SPEC-codex-sandbox-policy.md](SPEC-codex-sandbox-policy.md)
 ## Test evidence
 
 - Red reproduction: `C:\Users\tlsfmswls\.cargo\bin\cargo.exe test codex_execution_modes_set_per_turn_sandbox_and_approval_policy` failed before the fix with `left: None`, `right: Some(String("readOnly"))` for `/params/sandboxPolicy/type`.
-- `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath SPEC-codex-sandbox-policy.md`: passed.
+- `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/SPEC-codex-sandbox-policy.md`: passed.
 - `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/DMUXAI-BASELINE.md`: passed.
 - `C:\Users\tlsfmswls\.cargo\bin\cargo.exe fmt --check`: passed.
 - `C:\Users\tlsfmswls\.cargo\bin\cargo.exe test --all-targets`: passed; 96 tests passed and 5 authenticated provider smoke tests were ignored as intended.

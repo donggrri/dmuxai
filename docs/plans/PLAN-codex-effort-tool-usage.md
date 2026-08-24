@@ -1,7 +1,7 @@
 # PLAN: Codex effort, tool progress, and usage status
 
 Status: complete
-Spec: [SPEC-codex-effort-tool-usage.md](SPEC-codex-effort-tool-usage.md)
+Spec: [SPEC-codex-effort-tool-usage.md](../specs/SPEC-codex-effort-tool-usage.md)
 
 1. Extend provider-neutral event and adapter interfaces with Codex effort,
    bounded tool-progress, and status-report contracts. Preserve the existing

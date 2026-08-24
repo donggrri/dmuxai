@@ -1,7 +1,7 @@
 # TASKS: Codex sandbox-policy object compatibility
 
 Status: complete
-Spec: [SPEC-codex-sandbox-policy.md](SPEC-codex-sandbox-policy.md)
+Spec: [SPEC-codex-sandbox-policy.md](../specs/SPEC-codex-sandbox-policy.md)
 
 - [x] T1 — Make TC-046 fail against the legacy string request shape. Requirements:
   INT-040. Verify: `cargo test codex_execution_modes_set_per_turn_sandbox_and_approval_policy`.

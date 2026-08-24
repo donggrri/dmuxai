@@ -13,15 +13,15 @@ to redesign it.
 
 ## Required artifacts and gates
 
-For a feature or behavior change, create these files at the repository root
-using an ASCII kebab-case `<slug>`:
+For a feature or behavior change, create these files under `docs/` using an
+ASCII kebab-case `<slug>`:
 
-1. `SPEC-<slug>.md` — requirements, boundaries, acceptance scenarios, and test
+1. `docs/specs/SPEC-<slug>.md` — requirements, boundaries, acceptance scenarios, and test
    mapping. Start from `docs/templates/FEATURE-SPEC.md`.
-2. `PLAN-<slug>.md` — ordered implementation plan, risks, and rollback notes.
-3. `TASKS-<slug>.md` — independently verifiable tasks. Every code task must
+2. `docs/plans/PLAN-<slug>.md` — ordered implementation plan, risks, and rollback notes.
+3. `docs/tasks/TASKS-<slug>.md` — independently verifiable tasks. Every code task must
    name the requirement IDs and the test command it will satisfy.
-4. `REVIEW-<slug>.md` — spec compliance, regression risk, and test evidence.
+4. `docs/reviews/REVIEW-<slug>.md` — spec compliance, regression risk, and test evidence.
 
 Documentation-only edits may use a short plan and review in the pull request or
 task description, but must still preserve links and render correctly.
@@ -64,13 +64,13 @@ observable behavior. Do not commit unless the user explicitly requests it.
 - Check persistence migrations, cancellation/error paths, per-agent isolation,
   and platform-dependent process behavior whenever they are in scope.
 - Record unmet requirements, residual risks, and intentionally untested paths
-  in `REVIEW-<slug>.md`.
+  in `docs/reviews/REVIEW-<slug>.md`.
 
 ### 5. Test
 
 - Run the narrow tests from the spec first, then repository gates appropriate to
   the changed area.
-- For every changed `SPEC-*.md` or baseline spec, run
+- For every changed `docs/specs/SPEC-*.md` or baseline spec, run
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath <path>`
   before review.
 - Default Rust gates:

@@ -94,8 +94,8 @@ misowned events are ignored using the existing active-turn ownership gate.
 
 ## 7. Implementation plan
 
-See [PLAN-codex-effort-tool-usage.md](PLAN-codex-effort-tool-usage.md) and
-[TASKS-codex-effort-tool-usage.md](TASKS-codex-effort-tool-usage.md).
+See [PLAN-codex-effort-tool-usage.md](../plans/PLAN-codex-effort-tool-usage.md) and
+[TASKS-codex-effort-tool-usage.md](../tasks/TASKS-codex-effort-tool-usage.md).
 
 ## 8. Review and test exit criteria
 
@@ -103,4 +103,4 @@ See [PLAN-codex-effort-tool-usage.md](PLAN-codex-effort-tool-usage.md) and
 - [ ] The diff has been reviewed against scope and non-goals.
 - [ ] Required Rust checks pass: format, all targets test, and clippy.
 - [ ] External-provider smoke tests are marked run, skipped, or blocked with a reason.
-- [ ] `REVIEW-codex-effort-tool-usage.md` records commands, result, residual risk, and rollback notes.
+- [ ] `../reviews/REVIEW-codex-effort-tool-usage.md` records commands, result, residual risk, and rollback notes.

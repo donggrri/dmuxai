@@ -8,7 +8,7 @@ but it does not allow implementation to become the only specification.
 
 The authoritative sources are, in order:
 
-1. An approved `SPEC-<slug>.md` for a new or changed feature.
+1. An approved `docs/specs/SPEC-<slug>.md` for a new or changed feature.
 2. `docs/specs/DMUXAI-BASELINE.md` for already shipped behavior not changed by
    that feature.
 3. Existing tests only as evidence of implementation, never as permission to
@@ -18,13 +18,13 @@ The authoritative sources are, in order:
 
 | Phase | Required output | Exit gate |
 | --- | --- | --- |
-| Spec | `SPEC-<slug>.md` | Scope, non-goals, measurable requirements, and test scenarios are complete. |
-| Plan | `PLAN-<slug>.md` and `TASKS-<slug>.md` | File-level plan and task-level verification are known. |
+| Spec | `docs/specs/SPEC-<slug>.md` | Scope, non-goals, measurable requirements, and test scenarios are complete. |
+| Plan | `docs/plans/PLAN-<slug>.md` and `docs/tasks/TASKS-<slug>.md` | File-level plan and task-level verification are known. |
 | Execute | Code and tests | Every task is implemented without expanding scope. |
-| Review | `REVIEW-<slug>.md` | Diff conforms to each requirement and records residual risks. |
+| Review | `docs/reviews/REVIEW-<slug>.md` | Diff conforms to each requirement and records residual risks. |
 | Test | Command output in review | Narrow tests and applicable repository gates pass. |
 
-`TASKS-<slug>.md` is deliberately separate from a plan: it is the execution
+`docs/tasks/TASKS-<slug>.md` is deliberately separate from a plan: it is the execution
 checklist, and every item must be independently verifiable.
 
 ## Writing a testable spec

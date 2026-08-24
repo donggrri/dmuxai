@@ -1,8 +1,8 @@
 # REVIEW: Automatic cross-agent conversation sharing
 
 Status: complete  
-Spec: `SPEC-automatic-cross-agent-sharing.md`  
-Plan: `PLAN-automatic-cross-agent-sharing.md`  
+Spec: `../specs/SPEC-automatic-cross-agent-sharing.md`
+Plan: `../plans/PLAN-automatic-cross-agent-sharing.md`
 Review date: 2026-08-24
 
 ## Spec compliance
@@ -33,7 +33,7 @@ Commands run from `C:\Users\tlsfmswls\Desktop\DmuxAI`:
   5 provider-authentication tests ignored; 15 conversation integration tests
   passed.
 - `cargo clippy --all-targets --all-features -- -D warnings` — passed.
-- `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath SPEC-automatic-cross-agent-sharing.md` — passed.
+- `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/SPEC-automatic-cross-agent-sharing.md` — passed.
 - `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/DMUXAI-BASELINE.md` — passed.
 - `git diff --check` — passed (only existing Windows line-ending warnings).
 

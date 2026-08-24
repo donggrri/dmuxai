@@ -1,6 +1,6 @@
 # TASKS: Agent modes and chat copy
 
-PLAN: `PLAN-agent-modes-copy.md`
+PLAN: `../plans/PLAN-agent-modes-copy.md`
 Status: complete
 
 - [x] Tmode — Add Ask/Plan/Implement mappings for Codex, Cursor, and AGY.

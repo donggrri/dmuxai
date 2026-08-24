@@ -1,7 +1,7 @@
 # PLAN: Codex model effort and mode-context transition
 
 Status: complete
-Spec: [SPEC-codex-model-effort-mode-context.md](SPEC-codex-model-effort-mode-context.md)
+Spec: [SPEC-codex-model-effort-mode-context.md](../specs/SPEC-codex-model-effort-mode-context.md)
 
 1. Add red UI tests for Tab model-to-effort transition and fresh shared-context
    request after mode change. (UX-040, FR-043, TC-047, TC-048)

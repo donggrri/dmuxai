@@ -76,11 +76,11 @@ The durable conversation and completed context remain unchanged.
 
 ## 7. Implementation plan
 
-See [PLAN-codex-model-effort-mode-context.md](PLAN-codex-model-effort-mode-context.md)
-and [TASKS-codex-model-effort-mode-context.md](TASKS-codex-model-effort-mode-context.md).
+See [PLAN-codex-model-effort-mode-context.md](../plans/PLAN-codex-model-effort-mode-context.md)
+and [TASKS-codex-model-effort-mode-context.md](../tasks/TASKS-codex-model-effort-mode-context.md).
 
 ## 8. Review and test exit criteria
 
 - [ ] TC-047 and TC-048 fail against the current behavior, then pass after the fix.
 - [ ] Spec validation and all Rust format, test, and clippy gates pass.
-- [ ] `REVIEW-codex-model-effort-mode-context.md` records evidence and any unrun live-provider smoke test.
+- [ ] `../reviews/REVIEW-codex-model-effort-mode-context.md` records evidence and any unrun live-provider smoke test.

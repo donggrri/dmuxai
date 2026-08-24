@@ -182,7 +182,7 @@ Record a live test as `passed`, `failed`, `skipped` (with reason), or `blocked`
 
 ## 6. Change protocol
 
-Any change to this baseline must create a `SPEC-<slug>.md` from
+Any change to this baseline must create a `docs/specs/SPEC-<slug>.md` from
 `docs/templates/FEATURE-SPEC.md`, identify which IDs are modified, and state
 whether the new behavior is backward-compatible. Changes to INV, BR, INT, or
 NFR requirements require a test that demonstrates both the new result and the

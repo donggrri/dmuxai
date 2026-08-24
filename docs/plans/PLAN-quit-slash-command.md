@@ -1,7 +1,7 @@
 # PLAN: Slash-command quit
 
 Status: complete  
-Spec: [SPEC-quit-slash-command.md](SPEC-quit-slash-command.md)
+Spec: [SPEC-quit-slash-command.md](../specs/SPEC-quit-slash-command.md)
 
 1. Add `/quit` to the slash-command catalog and route exact command execution
    to the existing application exit state. (UX-011, TC-019, TC-020)

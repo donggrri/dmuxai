@@ -1,8 +1,8 @@
 # TASKS: Automatic cross-agent conversation sharing
 
 Status: complete  
-Spec: `SPEC-automatic-cross-agent-sharing.md`  
-Plan: `PLAN-automatic-cross-agent-sharing.md`
+Spec: `../specs/SPEC-automatic-cross-agent-sharing.md`
+Plan: `../plans/PLAN-automatic-cross-agent-sharing.md`
 
 - [x] T-projection — Add source-agent labels and all-completed-turn projection;
   protects FR-025, FR-026, FR-028, NFR-005; verify with `cargo test --test conversation`.

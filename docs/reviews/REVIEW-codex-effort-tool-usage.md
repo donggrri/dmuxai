@@ -1,7 +1,7 @@
 # REVIEW: Codex effort, tool progress, and usage status
 
 Status: complete
-Spec: [SPEC-codex-effort-tool-usage.md](SPEC-codex-effort-tool-usage.md)
+Spec: [SPEC-codex-effort-tool-usage.md](../specs/SPEC-codex-effort-tool-usage.md)
 
 ## Spec compliance
 
@@ -28,7 +28,7 @@ Spec: [SPEC-codex-effort-tool-usage.md](SPEC-codex-effort-tool-usage.md)
 
 ## Test evidence
 
-- `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath SPEC-codex-effort-tool-usage.md`: passed.
+- `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/SPEC-codex-effort-tool-usage.md`: passed.
 - `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/DMUXAI-BASELINE.md`: passed.
 - `C:\Users\tlsfmswls\.cargo\bin\cargo.exe fmt --check`: passed.
 - `C:\Users\tlsfmswls\.cargo\bin\cargo.exe test --all-targets`: passed: 96 tests; 5 authenticated-provider smoke tests ignored as intended.

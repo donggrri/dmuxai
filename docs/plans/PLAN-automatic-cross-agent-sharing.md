@@ -1,7 +1,7 @@
 # PLAN: Automatic cross-agent conversation sharing
 
 Status: complete  
-Spec: `SPEC-automatic-cross-agent-sharing.md`  
+Spec: `../specs/SPEC-automatic-cross-agent-sharing.md`
 Baseline: `v0.1.0` / `ca66284`
 
 ## Goal
@@ -52,5 +52,5 @@ available to the previous projection implementation.
 2. `cargo fmt --check`.
 3. `cargo test --all-targets`.
 4. `cargo clippy --all-targets --all-features -- -D warnings`.
-5. `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath SPEC-automatic-cross-agent-sharing.md`.
+5. `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/SPEC-automatic-cross-agent-sharing.md`.
 6. `git diff --check`.
