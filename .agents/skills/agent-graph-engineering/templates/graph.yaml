@@ -1,0 +1,95 @@
+# Agent Graph Definition Template
+# Copy this file to your workspace and fill in nodes/edges for your task.
+# The graph topology IS the orchestration logic.
+
+graph:
+  name: "my-workflow"
+  description: "One-line description of what this graph accomplishes"
+
+# ─── Nodes ───────────────────────────────────────────────────
+# Each node = one agent with one job. Describe the job in one sentence.
+# execution: task_subagent | task_builtin | task_background | task_cloud | self
+# subagent: optional name matching .cursor/agents/<name>.md (without .md)
+
+nodes:
+  - id: A
+    name: "Researcher"
+    job: "Gather information about X and return a structured summary"
+    execution: task_subagent
+    subagent: graph-researcher
+    input_schema:
+      topic: string
+    output_schema:
+      summary: string
+      sources: list[string]
+
+  - id: B
+    name: "Drafter"
+    job: "Write a first draft based on research summary"
+    execution: task_subagent
+    subagent: graph-drafter
+    input_schema:
+      summary: string
+    output_schema:
+      draft: string
+
+  - id: C
+    name: "Reviewer"
+    job: "Review draft for accuracy and clarity, return revision notes"
+    execution: task_subagent
+    subagent: graph-reviewer
+    input_schema:
+      draft: string
+      summary: string
+    output_schema:
+      notes: string
+      approved: boolean
+
+# ─── Edges ───────────────────────────────────────────────────
+# Each edge = explicit context flow. Define what payload travels,
+# how to trim it, and what happens on failure.
+
+edges:
+  - from: A
+    to: B
+    payload:
+      type: structured        # structured | freeform
+      content: "A.output.summary"
+      trim_rule: keep_only     # keep_only | pass_through | summarize
+    on_failure:
+      retry: 1
+      fallback: human_escalate # skip | default_value | human_escalate
+
+  - from: B
+    to: C
+    payload:
+      type: structured
+      content: "B.output.draft, A.output.summary"
+      trim_rule: pass_through
+    on_failure:
+      retry: 1
+      fallback: default_value
+
+# ─── Conditional Routing (optional) ──────────────────────────
+# Use when the next node depends on a decision from the current node.
+
+routing:
+  - source: C
+    condition: "C.output.approved == true"
+    target: D                # next node if condition holds
+
+  - source: C
+    condition: "C.output.approved == false"
+    target: B                # loop back for revision
+    max_iterations: 2        # prevent infinite cycles
+
+# ─── Graph State (optional) ─────────────────────────────────
+# Global state object. Nodes read/write explicitly. Keep minimal.
+
+state:
+  iteration_count: 0
+  max_iterations: 3
+  artifacts:
+    - path: "./output.md"
+      writer: D
+      verified: false

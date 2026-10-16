@@ -1,0 +1,17 @@
+---
+description: >-
+  Multi-agent DAG workflows: nodes, edges, Task fan-out/fan-in, and graph.yaml.
+  Apply when designing or running 3+ agent roles, pipelines, or parallel graphs.
+alwaysApply: false
+---
+
+When orchestrating multiple agents as a graph, read and follow the project skill:
+
+`.agents/skills/agent-graph-engineering/SKILL.md`
+
+Also use:
+
+- `.agents/skills/agent-graph-engineering/templates/graph.yaml` and `templates/edge-contract.md`
+- Example subagents in `.cursor/agents/graph-*.md`
+
+Keep edge payloads explicit, trim context between nodes, and verify side effects before declaring success.
