@@ -10,12 +10,12 @@
 | --- | --- |
 | `git clone https://github.com/donggrri/cursor-agent-graph-engineering` | **실패** — `Repository not found` (비공개 저장소, 현 환경 토큰으로 접근 불가) |
 | `gh api repos/donggrri/cursor-agent-graph-engineering` | **404** |
-| 대체 조치 | 사용자가 기대하는 경로에 **수동 배치** (내용은 public graph-engineering 패턴 + 본 분석 요구사항에 맞춤). 상세: [`.agents/skills/agent-graph-engineering/INSTALL.md`](../.agents/skills/agent-graph-engineering/INSTALL.md) |
+| 대체 조치 | 분석 후 공식 `scripts/install.sh`로 교체 설치 완료 (donggrri/cursor-agent-graph-engineering main). |
 
-수동 추가 파일:
+설치된 파일:
 
-- `.agents/skills/agent-graph-engineering/SKILL.md`, `templates/graph.yaml`
-- `.cursor/agents/graph-orchestrator.md`, `graph-implementer.md`, `graph-researcher.md`, `graph-reviewer.md`
+- `.agents/skills/agent-graph-engineering/SKILL.md`, `templates/graph.yaml`, `templates/edge-contract.md`
+- `.cursor/agents/graph-{planner,router,reviewer}.md` (grok-4.7-medium), `graph-{drafter,worker}.md` (composer-2.5), `graph-researcher.md` (haiku)
 - `.cursor/rules/agent-graph-engineering.mdc`
 
 공식 `install.sh` 실행 후 위 파일을 upstream과 diff하여 정합성을 맞출 것을 권장합니다.
@@ -206,7 +206,7 @@ workspace_root/
 
 ### 4.4 agent-graph-engineering 스킬
 
-이 PR에 수동 설치한 스킬은 분석·그래프 작성용. 제품 스킬 루트는 **`.agents/skills/`** 로 통일 (`.cursor/skills`와 중복 시 `.agents` 우선 정책 문서화).
+이 PR에 설치한 스킬은 분석·그래프 작성용. 제품 스킬 루트는 **`.agents/skills/`** 로 통일 (`.cursor/skills`와 중복 시 `.agents` 우선 정책 문서화).
 
 ---
 
@@ -260,4 +260,4 @@ Spec job은 해당 run에서 Rust 실패 전 단계; 최근 연속 push에서 Ve
 - **편집이 “막힌” 가장 흔한 원인(Windows):** Cursor **Implement 자체가 플랫폼 가드로 차단**되며, DmuxAI는 의도적으로 비샌드박스 Cursor를 쓰지 않습니다.  
 - **그 외:** Ask/Plan 모드, AGY plan+sandbox, Codex readOnly, WSL/Windows workspace 경로 불일치·`/mnt/c` 권한.  
 - **앱 방향:** Win 셸 + **WSL 내부 dmuxai** + Linux workspace + (후속) tmux/skills.  
-- **agent-graph-engineering:** upstream clone 불가 → 수동 설치; 공식 `install.sh`로 교체 권장.
+- **agent-graph-engineering:** 공식 `install.sh`로 설치됨 (클라우드 VM에서는 clone 권한이 없어 처음엔 수동 배치했음).

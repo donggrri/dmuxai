@@ -33,17 +33,17 @@ nodes:
     inputs: [src/main.rs, src/app.rs, conversation.rs, CI workflows]
     outputs: [architecture_map, ci_observations]
   - id: plan-wsl-app
-    role: graph-orchestrator
+    role: graph-planner
     model: grok-4.7-medium
     inputs: [permission_flag_matrix, owner_goal_context]
     outputs: [wsl_hosting_options, recommendation]
   - id: plan-skills
-    role: graph-orchestrator
+    role: graph-planner
     model: grok-4.7-medium
     inputs: [cursor_skill_conventions, .agents/skills layout]
     outputs: [skills_discovery_design, ui_launch_contract]
   - id: synthesize-report
-    role: graph-implementer
+    role: graph-worker
     model: composer-2.5
     inputs: [architecture_map, permission_flag_matrix, wsl_hosting_options, skills_discovery_design]
     outputs: [docs/ANALYSIS.md, docs/dmuxai-graph.yaml]
