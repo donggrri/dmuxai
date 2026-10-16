@@ -42,6 +42,8 @@ pub struct ThemeToml {
     pub agy: Option<String>,
     pub other: Option<String>,
     pub system: Option<String>,
+    /// Force colored output even when `NO_COLOR` is set.
+    pub force_color: Option<bool>,
 }
 
 impl Theme {
@@ -215,5 +217,43 @@ mod tests {
         assert_eq!(custom.color_for(Speaker::Agy), Color::Blue);
         assert_eq!(custom.color_for(Speaker::Other), Color::Black);
         assert_eq!(custom.color_for(Speaker::System), Color::Magenta);
+    }
+}
+
+/// Decide whether chat colors should be emitted.
+///
+/// Crossterm drops every color when `NO_COLOR` is set (non-empty), which made
+/// the speaker theme invisible. `DMUXAI_FORCE_COLOR=1` or `[theme]
+/// force_color = true` re-enables colors; `DMUXAI_FORCE_COLOR=0` disables them.
+pub fn resolve_color_output(
+    no_color: Option<&str>,
+    force_env: Option<&str>,
+    force_config: Option<bool>,
+) -> bool {
+    if let Some(v) = force_env {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    if force_config == Some(true) {
+        return true;
+    }
+    !no_color.is_some_and(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod color_output_tests {
+    use super::resolve_color_output;
+
+    #[test]
+    fn no_color_disables_unless_forced() {
+        assert!(resolve_color_output(None, None, None));
+        assert!(!resolve_color_output(Some("1"), None, None));
+        assert!(resolve_color_output(Some(""), None, None));
+        assert!(resolve_color_output(Some("1"), Some("1"), None));
+        assert!(resolve_color_output(Some("1"), None, Some(true)));
+        assert!(!resolve_color_output(None, Some("0"), Some(true)));
     }
 }
