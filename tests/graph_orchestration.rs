@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default)]
 use dmuxai::graph::{
     ExecutionPlan, GraphRun, GraphRunPhase, GraphRunSession, NodeRole, ORCHESTRATOR_MODEL,
     plan_request, save_run, validate_model_id,
