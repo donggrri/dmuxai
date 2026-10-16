@@ -2,6 +2,12 @@
 
 pub const ALLOWED_MODEL: &str = "composer-2.5";
 
+/// Role bucket aliases (all resolve to the only permitted model).
+pub const ORCHESTRATOR_MODEL: &str = ALLOWED_MODEL;
+pub const RESEARCH_MODEL: &str = ALLOWED_MODEL;
+pub const IMPLEMENT_MODEL: &str = ALLOWED_MODEL;
+pub const PLAN_REVIEW_MODEL: &str = ALLOWED_MODEL;
+
 /// Returns true when `model_id` is exactly the allowed model (case-insensitive, trimmed).
 pub fn is_allowed_model(model_id: &str) -> bool {
     model_id.trim().eq_ignore_ascii_case(ALLOWED_MODEL)
@@ -45,6 +51,10 @@ mod tests {
     fn validate_rejects_fast_and_foreign_models() {
         assert!(validate_model_id("composer-2.5").is_ok());
         assert!(validate_model_id("composer-2.5-fast").is_err());
+        assert!(validate_model_id("grok-4.7-medium").is_err());
+        assert!(validate_model_id("claude-haiku-5-5-high").is_err());
+        assert!(validate_model_id("claude-sonnet-5-5").is_err());
         assert!(validate_model_id("gpt-5").is_err());
+        assert!(validate_model_id("gemini-4").is_err());
     }
 }

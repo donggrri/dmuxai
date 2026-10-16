@@ -39,7 +39,12 @@ use dmuxai::{
         SummaryJob, TranscriptMessage, TurnEvent, TurnId as StoredTurnId, TurnOutput, TurnSnapshot,
         TurnStatus,
     },
+    graph::{
+        ExecutionPlan, GraphAction, GraphRun, GraphRunPhase, GraphRunSession, NodeAssignment,
+        plan_request, save_run,
+    },
     settings::DmuxSettings,
+    skills::{discover_skills, skill_prompt_prefix},
 };
 
 use crate::agent::{
@@ -403,6 +408,9 @@ pub struct App {
     input_height: u16,
     resizing_input: bool,
     terminal_area: Rect,
+    graph_session: Option<GraphRunSession>,
+    graph_assignment_line: String,
+    graph_active_turn_node: Option<String>,
 }
 
 impl App {
@@ -507,6 +515,9 @@ impl App {
             input_height: DEFAULT_INPUT_HEIGHT,
             resizing_input: false,
             terminal_area: Rect::default(),
+            graph_session: None,
+            graph_assignment_line: String::new(),
+            graph_active_turn_node: None,
         };
         app.restore_snapshot(snapshot);
         Ok(app)
@@ -1414,6 +1425,42 @@ impl App {
             self.attach_image_path(&prompt);
             return;
         }
+        if prompt == "/graph" {
+            self.show_graph_status();
+            return;
+        }
+        if prompt == "/graph continue" {
+            self.continue_graph_gate();
+            return;
+        }
+        if let Some(args) = prompt.strip_prefix("/graph override ") {
+            self.override_graph_node(args);
+            return;
+        }
+
+        if self.settings.graph_enabled && !prompt.trim_start().starts_with('/') {
+            match plan_request(&prompt, &self.workspace_root, &self.settings) {
+                ExecutionPlan::Single(plan) => {
+                    let agent = self.adapters[self.selected].agent();
+                    let runner = runner_name(agent);
+                    if self
+                        .apply_runner_and_model(runner, &plan.model_id)
+                        .is_some()
+                    {
+                        self.graph_assignment_line =
+                            format!("single {} → {}", plan.role, plan.model_id);
+                        self.submit_to_agent(agent, plan.job, true);
+                    }
+                    return;
+                }
+                ExecutionPlan::Graph(mut plan) => {
+                    plan.limits.max_parallel = self.settings.graph_max_parallel;
+                    plan.limits.max_retries = self.settings.graph_max_retries;
+                    self.start_graph_run(plan);
+                    return;
+                }
+            }
+        }
 
         let agent = self.adapters[self.selected].agent();
         self.submit_to_agent(agent, prompt, true);
@@ -1925,9 +1972,9 @@ impl App {
                 state,
             } => self.apply_tool_progress(agent, item_id, summary, state),
             AgentEvent::Status(status) => self.apply_status(agent, status),
-            AgentEvent::Completed => self.finish_turn(agent),
+            AgentEvent::Completed => self.finish_turn_outcome(agent, true),
             AgentEvent::Cancelled => {
-                self.finish_turn(agent);
+                self.finish_turn_outcome(agent, false);
                 self.messages.push(Message::new(
                     Role::System,
                     format!("{agent} turn cancelled."),
@@ -1937,7 +1984,7 @@ impl App {
                 if let Some(catalog) = self.model_catalogs.get_mut(&agent) {
                     catalog.loading = false;
                 }
-                self.finish_turn(agent);
+                self.finish_turn_outcome(agent, false);
                 self.messages.push(Message::new(
                     Role::System,
                     format!("{agent} error: {error}"),
@@ -1964,11 +2011,174 @@ impl App {
     }
 
     fn finish_turn(&mut self, agent: Agent) {
+        self.finish_turn_outcome(agent, true);
+    }
+
+    fn finish_turn_outcome(&mut self, agent: Agent, success: bool) {
         self.busy_agents.remove(&agent);
         self.activities.remove(&agent);
         self.active_turns.remove(&agent);
         self.streaming_messages.remove(&agent);
         self.tool_messages.remove(&agent);
+        if let Some(node_id) = self.graph_active_turn_node.take()
+            && let Some(session) = self.graph_session.as_mut()
+        {
+            let actions = session.on_node_finished(&node_id, success);
+            self.graph_assignment_line = session.assignment_line();
+            let _ = save_run(&self.workspace_root, session.run());
+            self.dispatch_graph_actions(actions);
+        }
+    }
+
+    fn apply_runner_and_model(&mut self, runner: &str, model_id: &str) -> Option<Agent> {
+        let agent = runner_from_str(runner)?;
+        self.selected = adapter_index(agent);
+        let index = adapter_index(agent);
+        if let Err(error) = self.adapters[index].select_model(model_id.to_owned()) {
+            self.push_system(format!("Could not select model {model_id}: {error}"));
+        } else if let Some(catalog) = self.model_catalogs.get_mut(&agent) {
+            catalog.selected = Some(model_id.to_owned());
+        }
+        Some(agent)
+    }
+
+    fn start_graph_run(&mut self, plan: dmuxai::graph::GraphPlan) {
+        let run = GraphRun {
+            plan,
+            conversation_id: self.conversation_id.as_str().to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+        };
+        let mut session = GraphRunSession::new(run);
+        self.graph_assignment_line = session.assignment_line();
+        self.push_system(format!(
+            "Graph {} (orchestrator {}): {}",
+            session.run().plan.id,
+            session.run().plan.orchestrator_model,
+            self.graph_assignment_line
+        ));
+        let actions = session.schedule();
+        let _ = save_run(&self.workspace_root, session.run());
+        self.graph_session = Some(session);
+        self.dispatch_graph_actions(actions);
+    }
+
+    fn dispatch_graph_actions(&mut self, actions: Vec<GraphAction>) {
+        for action in actions {
+            match action {
+                GraphAction::StartNode(assignment) => self.start_graph_node(assignment),
+                GraphAction::PauseForGate(assignment) => {
+                    self.push_system(format!(
+                        "Gate: confirm sensitive step {} ({}) with /graph continue",
+                        assignment.node_id, assignment.role
+                    ));
+                    self.graph_active_turn_node = None;
+                }
+                GraphAction::Completed => {
+                    self.push_system("Graph run completed.");
+                    self.graph_session = None;
+                    self.graph_assignment_line.clear();
+                }
+                GraphAction::Failed(message) => {
+                    self.push_system(format!("Graph failed: {message}"));
+                }
+            }
+        }
+        if let Some(session) = self.graph_session.as_ref() {
+            let _ = save_run(&self.workspace_root, session.run());
+        }
+    }
+
+    fn start_graph_node(&mut self, assignment: NodeAssignment) {
+        let Some(agent) = self.apply_runner_and_model(&assignment.runner, &assignment.model_id)
+        else {
+            self.push_system(format!("Unknown graph runner: {}", assignment.runner));
+            return;
+        };
+        self.graph_active_turn_node = Some(assignment.node_id.clone());
+        let mut prompt = assignment.prompt;
+        if let Some(session) = &self.graph_session {
+            let skill_id = session
+                .run()
+                .plan
+                .nodes
+                .iter()
+                .find(|node| node.id == assignment.node_id)
+                .and_then(|node| node.skill.clone());
+            if let Some(skill_id) = skill_id {
+                let skills = discover_skills(&self.workspace_root);
+                if let Some(skill) = skills.iter().find(|skill| skill.id == skill_id) {
+                    prompt = format!("{}{}", skill_prompt_prefix(skill), prompt);
+                }
+            }
+        }
+        self.push_system(format!(
+            "Graph node {} via {} model {}",
+            assignment.node_id, agent, assignment.model_id
+        ));
+        self.submit_to_agent(agent, prompt, false);
+    }
+
+    fn show_graph_status(&mut self) {
+        if self.graph_assignment_line.is_empty() {
+            self.push_system("No active graph assignment. Send a multi-step prompt to plan one.");
+            return;
+        }
+        self.push_system(format!("Graph assignment: {}", self.graph_assignment_line));
+        if self
+            .graph_session
+            .as_ref()
+            .is_some_and(|session| session.run().phase == GraphRunPhase::WaitingGate)
+        {
+            self.push_system("Waiting for gate confirmation. Use /graph continue.");
+        }
+    }
+
+    fn continue_graph_gate(&mut self) {
+        let Some(session) = self.graph_session.as_mut() else {
+            self.push_system("No graph run is waiting for confirmation.");
+            return;
+        };
+        let actions = session.acknowledge_gate();
+        self.graph_assignment_line = session.assignment_line();
+        self.dispatch_graph_actions(actions);
+    }
+
+    fn override_graph_node(&mut self, args: &str) {
+        let parts = args.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 3 {
+            self.push_system("Usage: /graph override <node-id> <cursor|agy|codex> <model-id>");
+            return;
+        }
+        let node_id = parts[0];
+        let runner = parts[1];
+        let model_id = parts[2];
+        if let Err(error) = dmuxai::graph::validate_model_id(model_id) {
+            self.push_system(format!("Model rejected: {error}"));
+            return;
+        }
+        let Some(session) = self.graph_session.as_mut() else {
+            self.push_system("No active graph to override.");
+            return;
+        };
+        let updated = session
+            .run_mut()
+            .plan
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+            .map(|node| {
+                node.runner = runner.to_owned();
+                node.model_id = model_id.to_owned();
+            });
+        if updated.is_some() {
+            self.graph_assignment_line = session.assignment_line();
+            let snapshot = session.run().clone();
+            self.push_system(format!("Overrode {} → {} {}", node_id, runner, model_id));
+            let _ = save_run(&self.workspace_root, &snapshot);
+        } else {
+            self.push_system(format!("No graph node named {node_id}"));
+        }
     }
 
     fn observe_activity(&mut self, agent: Agent, event: &AgentEvent, now: Instant) {
@@ -2265,7 +2475,7 @@ impl App {
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             ),
             Span::raw(format!(
-                "  {activity}{}  Model: {model}  Effort: {}  Mode: {}  /effort  /status  /mode  /agent  /quit exit  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close{}",
+                "  {activity}{}  Model: {model}  Effort: {}  Mode: {}  /effort  /status  /mode  /agent  /graph  /quit exit  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close{}{}",
                 if other_activity.is_empty() {
                     String::new()
                 } else {
@@ -2276,6 +2486,11 @@ impl App {
                     .and_then(|catalog| catalog.selected_effort.as_deref())
                     .unwrap_or("provider default"),
                 self.modes.get(&selected).copied().unwrap_or_default(),
+                if self.graph_assignment_line.is_empty() {
+                    String::new()
+                } else {
+                    format!("  Graph: {}", self.graph_assignment_line)
+                },
                 self.copy_notice
                     .as_ref()
                     .map(|notice| format!("  {notice}"))
@@ -2581,6 +2796,23 @@ fn adapter_request(
         prompt,
         resume_session: request.resume_session,
         image_paths,
+    }
+}
+
+fn runner_name(agent: Agent) -> &'static str {
+    match agent {
+        Agent::Cursor => "cursor",
+        Agent::Agy => "agy",
+        Agent::Codex => "codex",
+    }
+}
+
+fn runner_from_str(runner: &str) -> Option<Agent> {
+    match runner.trim().to_ascii_lowercase().as_str() {
+        "cursor" => Some(Agent::Cursor),
+        "agy" => Some(Agent::Agy),
+        "codex" => Some(Agent::Codex),
+        _ => None,
     }
 }
 

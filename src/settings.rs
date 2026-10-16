@@ -3,17 +3,28 @@ use std::path::Path;
 use serde::Deserialize;
 
 /// Workspace-local and environment overrides for DmuxAI behavior.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DmuxSettings {
     pub cursor_windows_unsandboxed: bool,
     pub routing_default_agent: Option<String>,
     pub routing_cursor_models: Vec<String>,
+    pub graph_enabled: bool,
+    pub graph_max_parallel: usize,
+    pub graph_max_retries: u32,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct DmuxToml {
     cursor: Option<CursorToml>,
     routing: Option<RoutingToml>,
+    graph: Option<GraphToml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GraphToml {
+    enabled: Option<bool>,
+    max_parallel: Option<usize>,
+    max_retries: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -48,8 +59,32 @@ impl DmuxSettings {
                 settings.routing_default_agent = routing.default_agent;
                 settings.routing_cursor_models = routing.cursor_models.unwrap_or_default();
             }
+            if let Some(graph) = parsed.graph {
+                if let Some(enabled) = graph.enabled {
+                    settings.graph_enabled = enabled;
+                }
+                if let Some(max_parallel) = graph.max_parallel {
+                    settings.graph_max_parallel = max_parallel;
+                }
+                if let Some(max_retries) = graph.max_retries {
+                    settings.graph_max_retries = max_retries;
+                }
+            }
         }
         settings
+    }
+}
+
+impl Default for DmuxSettings {
+    fn default() -> Self {
+        Self {
+            cursor_windows_unsandboxed: false,
+            routing_default_agent: None,
+            routing_cursor_models: Vec::new(),
+            graph_enabled: true,
+            graph_max_parallel: 2,
+            graph_max_retries: 2,
+        }
     }
 }
 
