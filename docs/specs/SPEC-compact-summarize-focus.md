@@ -1,6 +1,6 @@
 # SPEC: `/compact` and `/summarize <focus>`
 
-Status: Draft (planned; `/summarize` exists)  
+Status: Implemented  
 Owner: DmuxAI  
 Created: 2026-10-17  
 Baseline: `73e3f4d`  
@@ -44,8 +44,8 @@ Related: dogfood plan, conversation-continuity-research
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
 | TC-340 | FR-342 | unit | conversation with turns | `/summarize`, then submit | summary internal; next turn uses it; invalid summary rejected | `cargo test explicit_summary_is_internal_and_the_next_turn_uses_it_fresh`; `invalid_summary_does_not_replace_the_canonical_transcript` |
-| TC-341 | FR-340 | unit | idle app | `/compact` | same request as `/summarize` | *proposed*: `compact_is_alias_for_summarize` |
-| TC-342 | FR-341 | unit | idle app | `/compact decisions only` | summary prompt contains focus | *proposed*: `summarize_focus_is_included_in_prompt` |
+| TC-341 | FR-340 | unit | idle app | `/compact` | same request as `/summarize` | `compact_is_alias_for_summarize` |
+| TC-342 | FR-341 | unit | idle app | `/compact decisions only` | summary prompt contains focus | `summarize_focus_is_included_in_prompt` |
 
 ## 6. Data, integration, and safety contracts
 
