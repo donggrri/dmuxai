@@ -1,0 +1,17 @@
+---
+description: Agent graph engineering contracts for multi-agent DmuxAI delivery
+globs:
+  - docs/**/*-graph.yaml
+  - docs/ANALYSIS.md
+  - .agents/skills/**/*
+alwaysApply: false
+---
+
+# Agent graph engineering
+
+When changing multi-agent workflows or Windows+WSL hosting:
+
+1. Treat `docs/*-graph.yaml` as the authoritative node/edge contract.
+2. Assign models per skill policy: `grok-4.7-medium` (orchestrate/review), `composer-2.5` (implement), `claude-haiku-5-5-high` (research/test). Never use `*-fast` models.
+3. Preserve DmuxAI adapter sandbox boundaries documented in `docs/specs/DMUXAI-BASELINE.md`.
+4. Edge context must be explicit and bounded; do not assume cross-pane shared state until a transport exists.

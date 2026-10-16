@@ -1,0 +1,97 @@
+# DmuxAI Windows+WSL App & skills — analysis delivery graph
+schema: cursor-agent-graph/v1
+profile: workflow-lite/v1
+id: dmuxai-windows-wsl-analysis
+family: dmuxai-platform
+status: active
+
+intent: |
+  Produce docs/ANALYSIS.md and agent-graph install artifacts without product code changes.
+  Success: root-cause map for edit/permission failures, Windows+WSL option recommendation,
+  .agents/skills design, and PR-sized phased plan with node/model assignments.
+
+scope:
+  repository: donggrri/dmuxai
+  authority: documentation-only
+  external_side_effects: none
+
+model_policy:
+  orchestrate: grok-4.7-medium
+  implement: composer-2.5
+  research_test: claude-haiku-5-5-high
+  disallow_patterns: ["*-fast"]
+
+nodes:
+  - id: research-permissions
+    role: graph-researcher
+    model: claude-haiku-5-5-high
+    inputs: [DMUXAI-BASELINE, src/agent/*, README safety table]
+    outputs: [permission_flag_matrix, file_line_refs]
+  - id: research-architecture
+    role: graph-researcher
+    model: claude-haiku-5-5-high
+    inputs: [src/main.rs, src/app.rs, conversation.rs, CI workflows]
+    outputs: [architecture_map, ci_observations]
+  - id: plan-wsl-app
+    role: graph-orchestrator
+    model: grok-4.7-medium
+    inputs: [permission_flag_matrix, owner_goal_context]
+    outputs: [wsl_hosting_options, recommendation]
+  - id: plan-skills
+    role: graph-orchestrator
+    model: grok-4.7-medium
+    inputs: [cursor_skill_conventions, .agents/skills layout]
+    outputs: [skills_discovery_design, ui_launch_contract]
+  - id: synthesize-report
+    role: graph-implementer
+    model: composer-2.5
+    inputs: [architecture_map, permission_flag_matrix, wsl_hosting_options, skills_discovery_design]
+    outputs: [docs/ANALYSIS.md, docs/dmuxai-graph.yaml]
+  - id: review-report
+    role: graph-reviewer
+    model: grok-4.7-medium
+    inputs: [docs/ANALYSIS.md, DMUXAI-BASELINE non-goals]
+    outputs: [review_verdict, residual_risks]
+
+edges:
+  - from: START
+    to: research-permissions
+    guard: analysis_only_no_code_diff
+    context: { mode: read-only, paths: ["src/agent", "src/process", "docs/specs"] }
+  - from: START
+    to: research-architecture
+    guard: parallel_ok
+    context: { mode: read-only, paths: ["src", ".github", "README.md"] }
+  - from: research-permissions
+    to: plan-wsl-app
+    guard: matrix_complete
+    context: { permission_root_causes: full, windows_cursor_guard: included }
+  - from: research-architecture
+    to: plan-wsl-app
+    guard: arch_map_complete
+    context: { note: "current main is Ratatui TUI, not tmux multiplexer yet" }
+  - from: research-architecture
+    to: plan-skills
+    guard: arch_map_complete
+    context: { ui_entry: app.rs, no_skills_module_today: true }
+  - from: plan-wsl-app
+    to: synthesize-report
+    guard: recommendation_chosen
+    context: { preferred: wsl_launcher_with_linux_dmuxai }
+  - from: plan-skills
+    to: synthesize-report
+    guard: design_complete
+    context: { skill_root: ".agents/skills", skill_file: "SKILL.md" }
+  - from: synthesize-report
+    to: review-report
+    guard: docs_written
+    context: { files: ["docs/ANALYSIS.md", "docs/dmuxai-graph.yaml"] }
+  - from: review-report
+    to: END
+    guard: verdict_pass_or_documented_risks
+    context: { pr: draft, branch: cursor/windows-wsl-analysis-d337 }
+
+execution_policy:
+  max_parallel_nodes: 2
+  max_delegation_depth: 1
+  merge_policy: synthesize-report owns canonical ANALYSIS.md

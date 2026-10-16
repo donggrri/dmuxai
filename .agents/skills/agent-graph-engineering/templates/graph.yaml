@@ -1,0 +1,69 @@
+# Template: Cursor agent graph (agent-graph-engineering)
+schema: cursor-agent-graph/v1
+profile: workflow-lite/v1
+id: example-graph
+status: draft
+
+intent: |
+  Replace with measurable outcome, trigger, success criteria, and non-goals.
+
+scope:
+  repository: .
+  authority: scoped-write-in-implement-only
+  external_side_effects: internal-reversible
+
+model_policy:
+  orchestrate: grok-4.7-medium
+  implement: composer-2.5
+  research_test: claude-haiku-5-5-high
+  disallow_patterns: ["*-fast"]
+
+nodes:
+  - id: orchestrate
+    agent: graph-orchestrator
+    model: grok-4.7-medium
+    inputs: [approved_intent, repo_context]
+    outputs: [task_graph, acceptance_criteria]
+  - id: research
+    agent: graph-researcher
+    model: claude-haiku-5-5-high
+    inputs: [task_graph, code_paths]
+    outputs: [findings, test_matrix]
+  - id: implement
+    agent: graph-implementer
+    model: composer-2.5
+    inputs: [task_graph, findings]
+    outputs: [patch, test_evidence]
+  - id: review
+    agent: graph-reviewer
+    model: grok-4.7-medium
+    inputs: [patch, acceptance_criteria, test_evidence]
+    outputs: [review_verdict, blockers]
+
+edges:
+  - from: START
+    to: orchestrate
+    guard: intent_approved
+    context: { intent_brief: bounded }
+    stop: fail_closed_on_scope_gap
+  - from: orchestrate
+    to: research
+    guard: needs_discovery
+    context: { task_graph: full, paths: allowlist }
+  - from: research
+    to: implement
+    guard: findings_complete
+    context: { findings: full, constraints: sandbox_flags }
+  - from: implement
+    to: review
+    guard: patch_ready
+    context: { diff_summary: bounded, tests: command_list }
+  - from: review
+    to: END
+    guard: verdict_recorded
+    context: { verdict: pass|fail|blocked }
+
+execution_policy:
+  max_parallel_nodes: 1
+  max_delegation_depth: 2
+  merge_policy: orchestrator_retains_canonical_status
