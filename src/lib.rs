@@ -7,5 +7,6 @@ pub mod graph;
 pub mod model_policy;
 pub mod settings;
 pub mod skills;
+pub mod theme;
 pub mod ui_png;
 pub mod workspace;
