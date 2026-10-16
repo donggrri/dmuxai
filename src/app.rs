@@ -516,7 +516,13 @@ impl App {
             streaming_messages: HashMap::new(),
             model_catalogs: Agent::all()
                 .into_iter()
-                .map(|agent| (agent, ModelCatalog::default()))
+                .map(|agent| {
+                    let mut catalog = ModelCatalog::default();
+                    if agent == Agent::Cursor {
+                        catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                    }
+                    (agent, catalog)
+                })
                 .collect(),
             model_picker: None,
             effort_picker: None,
@@ -1214,6 +1220,24 @@ impl App {
                     .iter()
                     .position(|candidate| *candidate == agent)
                     .expect("picker agent belongs to Agent::all()");
+                if agent == Agent::Cursor
+                    && let Err(error) =
+                        dmuxai::model_policy::validate_model_for_runner("cursor", &model.id)
+                {
+                    self.push_system(format!(
+                        "Model {} rejected for Cursor ({error}); replaced with {}",
+                        model.label,
+                        dmuxai::model_policy::ALLOWED_MODEL
+                    ));
+                    let _ = self.adapters[adapter_index]
+                        .select_model(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                    let catalog = self
+                        .model_catalogs
+                        .get_mut(&agent)
+                        .expect("every agent has a model catalog");
+                    catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                    return;
+                }
                 match self.adapters[adapter_index].select_model(model.id.clone()) {
                     Ok(()) => {
                         let catalog = self
@@ -1551,6 +1575,37 @@ impl App {
             }
             self.push_system(format!("Could not start {agent} in {mode} mode: {error}"));
             return;
+        }
+
+        if agent == Agent::Cursor {
+            let current = self
+                .model_catalogs
+                .get(&agent)
+                .and_then(|catalog| catalog.selected.clone());
+            match current {
+                Some(selected) => {
+                    if let Err(err) =
+                        dmuxai::model_policy::validate_model_for_runner("cursor", &selected)
+                    {
+                        self.push_system(format!(
+                            "Disallowed model '{selected}' for Cursor replaced with {}: {err}",
+                            dmuxai::model_policy::ALLOWED_MODEL
+                        ));
+                        if let Some(catalog) = self.model_catalogs.get_mut(&agent) {
+                            catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                        }
+                        let _ = self.adapters[adapter_index]
+                            .select_model(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                    }
+                }
+                None => {
+                    if let Some(catalog) = self.model_catalogs.get_mut(&agent) {
+                        catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                    }
+                    let _ = self.adapters[adapter_index]
+                        .select_model(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                }
+            }
         }
 
         self.chat_scroll = 0;
@@ -1991,7 +2046,19 @@ impl App {
                     .get_mut(&agent)
                     .expect("every agent has a model catalog");
                 catalog.models = models;
-                catalog.selected = selected;
+                catalog.selected = if agent == Agent::Cursor {
+                    match selected {
+                        Some(ref m)
+                            if dmuxai::model_policy::validate_model_for_runner("cursor", m)
+                                .is_ok() =>
+                        {
+                            selected
+                        }
+                        _ => Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned()),
+                    }
+                } else {
+                    selected
+                };
                 catalog.selected_effort = selected_effort;
                 catalog.loading = false;
                 if let Some(picker) = self.model_picker.as_mut()
@@ -2010,6 +2077,17 @@ impl App {
                 }
             }
             AgentEvent::ModelSelected(model) => {
+                let model = if agent == Agent::Cursor
+                    && dmuxai::model_policy::validate_model_for_runner("cursor", &model).is_err()
+                {
+                    self.push_system(format!(
+                        "Disallowed model '{model}' for Cursor replaced with {}",
+                        dmuxai::model_policy::ALLOWED_MODEL
+                    ));
+                    dmuxai::model_policy::ALLOWED_MODEL.to_owned()
+                } else {
+                    model
+                };
                 let catalog = self
                     .model_catalogs
                     .get_mut(&agent)
@@ -2201,9 +2279,21 @@ impl App {
             .get(&agent)
             .and_then(|catalog| catalog.selected.clone())
         {
+            if agent == Agent::Cursor {
+                if dmuxai::model_policy::validate_model_for_runner("cursor", &selected).is_ok() {
+                    return Some(selected);
+                }
+                return Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+            }
             return Some(selected);
         }
-        (agent == Agent::Cursor).then(|| planned.to_owned())
+        if agent == Agent::Cursor {
+            if dmuxai::model_policy::validate_model_for_runner("cursor", planned).is_ok() {
+                return Some(planned.to_owned());
+            }
+            return Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+        }
+        None
     }
 
     fn apply_runner_and_model(&mut self, runner: &str, model_id: &str) -> Option<Agent> {
@@ -2214,6 +2304,19 @@ impl App {
             return Some(agent);
         };
         let model_id = model_id.as_str();
+        if agent == Agent::Cursor
+            && let Some(prev) = self
+                .model_catalogs
+                .get(&agent)
+                .and_then(|c| c.selected.as_deref())
+            && prev != model_id
+            && dmuxai::model_policy::validate_model_for_runner("cursor", prev).is_err()
+        {
+            self.push_system(format!(
+                "Disallowed model '{prev}' for Cursor replaced with {}: disallowed by policy",
+                dmuxai::model_policy::ALLOWED_MODEL
+            ));
+        }
         if self
             .model_catalogs
             .get(&agent)
@@ -2851,20 +2954,39 @@ impl App {
             state.to_owned()
         };
         let other_activity = self.other_activity_summary(selected);
-        let model = self
-            .model_catalogs
-            .get(&selected)
-            .and_then(|catalog| {
-                catalog.selected.as_ref().map(|selected| {
-                    catalog
-                        .models
-                        .iter()
-                        .find(|model| &model.id == selected)
-                        .map(|model| model.label.as_str())
-                        .unwrap_or(selected)
+        let model = if selected == Agent::Cursor {
+            self.model_catalogs
+                .get(&selected)
+                .and_then(|catalog| {
+                    catalog.selected.as_ref().and_then(|sel| {
+                        if dmuxai::model_policy::validate_model_for_runner("cursor", sel).is_ok() {
+                            catalog
+                                .models
+                                .iter()
+                                .find(|m| &m.id == sel)
+                                .map(|m| m.label.as_str())
+                                .or(Some(sel.as_str()))
+                        } else {
+                            None
+                        }
+                    })
                 })
-            })
-            .unwrap_or("provider default");
+                .unwrap_or(dmuxai::model_policy::ALLOWED_MODEL)
+        } else {
+            self.model_catalogs
+                .get(&selected)
+                .and_then(|catalog| {
+                    catalog.selected.as_ref().map(|selected| {
+                        catalog
+                            .models
+                            .iter()
+                            .find(|model| &model.id == selected)
+                            .map(|model| model.label.as_str())
+                            .unwrap_or(selected)
+                    })
+                })
+                .unwrap_or("provider default")
+        };
         let mode_name = format!("{}", self.modes.get(&selected).copied().unwrap_or_default());
         let effort_name = self
             .model_catalogs
@@ -4008,6 +4130,97 @@ mod tests {
     }
 
     #[test]
+    // TC-412 / FR-411: If a disallowed model is somehow set for Cursor, it is replaced with composer-2.5 and a system notice is pushed.
+    fn disallowed_model_in_app_is_replaced_with_composer_2_5_and_notified() {
+        let (mut app, sent) = test_app();
+        app.selected = adapter_index(Agent::Cursor);
+        app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected =
+            Some("composer-2.5-fast".to_owned());
+
+        app.submit_to_agent(Agent::Cursor, "hello".to_owned(), false);
+
+        assert_eq!(
+            app.model_catalogs[&Agent::Cursor].selected.as_deref(),
+            Some("composer-2.5")
+        );
+        let notice = app.messages.iter().find(|m| {
+            m.content.contains(
+                "Disallowed model 'composer-2.5-fast' for Cursor replaced with composer-2.5",
+            )
+        });
+        assert!(
+            notice.is_some(),
+            "system notice should be emitted when disallowed model is replaced: {:?}",
+            app.messages
+        );
+        let sent_requests = sent.lock().unwrap();
+        assert_eq!(sent_requests.len(), 1);
+        assert_eq!(sent_requests[0].0, Agent::Cursor);
+    }
+
+    #[test]
+    // TC-413 / FR-410, FR-412: Slash-prefixed prompt to Cursor still pins composer-2.5.
+    fn slash_prefixed_prompt_to_cursor_still_pins_composer_2_5() {
+        let (mut app, sent) = test_app();
+        app.selected = adapter_index(Agent::Cursor);
+        app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
+
+        app.input = "/custom-command test".to_owned();
+        app.submit_prompt();
+
+        assert_eq!(
+            app.model_catalogs[&Agent::Cursor].selected.as_deref(),
+            Some("composer-2.5")
+        );
+        let sent_requests = sent.lock().unwrap();
+        assert_eq!(sent_requests.len(), 1);
+        assert_eq!(sent_requests[0].0, Agent::Cursor);
+        assert_eq!(sent_requests[0].1.prompt, "/custom-command test");
+    }
+
+    #[test]
+    // TC-414 / UX-410: Cursor status bar shows composer-2.5 instead of provider default.
+    fn cursor_status_shows_composer_2_5_instead_of_provider_default() {
+        let (mut app, _sent) = test_app();
+        app.terminal_area = Rect::new(0, 0, 100, 30);
+        app.selected = adapter_index(Agent::Cursor);
+
+        // 1. When catalog.selected is None (or cleared), Cursor status shows composer-2.5
+        app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
+        let rendered = render_text_at(&mut app, 100, 30);
+        assert!(
+            rendered.contains("composer-2.5"),
+            "Cursor status should show composer-2.5 when model selection is None: {rendered}"
+        );
+        assert!(
+            !rendered.contains("provider default"),
+            "Cursor status should never show provider default: {rendered}"
+        );
+
+        // 2. When catalog.selected is set to a disallowed fast model, Cursor status shows composer-2.5
+        app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected =
+            Some("composer-2.5-fast".to_owned());
+        let rendered_disallowed = render_text_at(&mut app, 100, 30);
+        assert!(
+            rendered_disallowed.contains("composer-2.5"),
+            "Cursor status should show composer-2.5 when fast model is set: {rendered_disallowed}"
+        );
+        assert!(
+            !rendered_disallowed.contains("composer-2.5-fast"),
+            "Cursor status should not show disallowed model: {rendered_disallowed}"
+        );
+
+        // 3. For another runner (e.g. Codex) with no selection, provider default is shown
+        app.selected = adapter_index(Agent::Codex);
+        app.model_catalogs.get_mut(&Agent::Codex).unwrap().selected = None;
+        let rendered_codex = render_text_at(&mut app, 100, 30);
+        assert!(
+            rendered_codex.contains("provider default"),
+            "Codex status without selection should show provider default: {rendered_codex}"
+        );
+    }
+
+    #[test]
     fn submitting_routes_to_the_selected_agent() {
         let (mut app, sent) = test_app();
         app.selected = adapter_index(Agent::Cursor);
@@ -5147,23 +5360,20 @@ mod tests {
     fn model_catalog_and_selection_are_kept_per_agent() {
         let (mut app, _) = test_app();
         app.apply_agent_event(
-            Agent::Cursor,
+            Agent::Agy,
             AgentEvent::ModelsListed {
                 models: vec![
-                    ModelInfo::new("cursor-a", "Cursor A"),
-                    ModelInfo::new("cursor-b", "Cursor B"),
+                    ModelInfo::new("agy-a", "AGY A"),
+                    ModelInfo::new("agy-b", "AGY B"),
                 ],
-                selected: Some("cursor-a".to_owned()),
+                selected: Some("agy-a".to_owned()),
                 selected_effort: None,
             },
         );
-        app.apply_agent_event(
-            Agent::Cursor,
-            AgentEvent::ModelSelected("cursor-b".to_owned()),
-        );
+        app.apply_agent_event(Agent::Agy, AgentEvent::ModelSelected("agy-b".to_owned()));
 
-        let cursor = app.model_catalogs.get(&Agent::Cursor).unwrap();
-        assert_eq!(cursor.selected.as_deref(), Some("cursor-b"));
+        let agy = app.model_catalogs.get(&Agent::Agy).unwrap();
+        assert_eq!(agy.selected.as_deref(), Some("agy-b"));
         assert!(app.model_catalogs[&Agent::Codex].selected.is_none());
     }
 

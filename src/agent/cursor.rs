@@ -109,7 +109,7 @@ async fn runtime_loop(
     windows_unsandboxed: bool,
 ) {
     let mut active: Option<ActiveTurn> = None;
-    let mut selected_model: Option<String> = None;
+    let mut selected_model: Option<String> = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
     let mut selected_mode = ExecutionMode::default();
 
     loop {
@@ -141,12 +141,23 @@ async fn runtime_loop(
                 CursorCommand::Cancel => {}
                 CursorCommand::ListModels => match list_models(&cwd).await {
                     Ok((models, _advertised_default)) => {
+                        let selected = match &selected_model {
+                            Some(model)
+                                if dmuxai::model_policy::validate_model_for_runner(
+                                    "cursor", model,
+                                )
+                                .is_ok() =>
+                            {
+                                selected_model.clone()
+                            }
+                            _ => Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned()),
+                        };
                         send_event(
                             &event_tx,
                             None,
                             AgentEvent::ModelsListed {
                                 models,
-                                selected: selected_model.clone(),
+                                selected,
                                 selected_effort: None,
                             },
                         )
@@ -157,8 +168,13 @@ async fn runtime_loop(
                     }
                 },
                 CursorCommand::SelectModel(model) => {
-                    selected_model = Some(model.clone());
-                    send_event(&event_tx, None, AgentEvent::ModelSelected(model)).await;
+                    let effective =
+                        match dmuxai::model_policy::validate_model_for_runner("cursor", &model) {
+                            Ok(()) => model,
+                            Err(_) => dmuxai::model_policy::ALLOWED_MODEL.to_owned(),
+                        };
+                    selected_model = Some(effective.clone());
+                    send_event(&event_tx, None, AgentEvent::ModelSelected(effective)).await;
                 }
                 CursorCommand::SelectMode(mode) => {
                     selected_mode = mode;
@@ -366,9 +382,13 @@ fn configure_command(
             "--workspace",
         ])
         .arg(cwd);
-    if let Some(model) = selected_model {
-        command.arg("--model").arg(model);
-    }
+    let model = match selected_model {
+        Some(model) if dmuxai::model_policy::validate_model_for_runner("cursor", model).is_ok() => {
+            model
+        }
+        _ => dmuxai::model_policy::ALLOWED_MODEL,
+    };
+    command.arg("--model").arg(model);
     if let Some(session_id) = request.resume_session.as_deref() {
         command.arg("--resume").arg(session_id);
     }
@@ -656,7 +676,7 @@ mod tests {
         configure_command(
             &mut command,
             &request,
-            Some("cursor-model"),
+            Some("composer-2.5"),
             ExecutionMode::Ask,
             cwd,
             false,
@@ -673,8 +693,76 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|args| args == ["--model", "cursor-model"])
+                .any(|args| args == ["--model", "composer-2.5"])
         );
+    }
+
+    #[test]
+    // TC-410 / INT-410: cursor argv always contains --model composer-2.5 by default.
+    fn cursor_argv_always_contains_composer_2_5_by_default() {
+        let cwd = Path::new("workspace");
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conversation"),
+            turn_id: super::super::TurnId::new("turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        let mut command = tokio::process::Command::new("cursor-agent");
+        configure_command(&mut command, &request, None, ExecutionMode::Ask, cwd, false);
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--model", "composer-2.5"]),
+            "cursor argv should include --model composer-2.5 by default: {args:?}"
+        );
+    }
+
+    #[test]
+    // TC-411 / FR-411, INT-410: a fast model is rejected and replaced with composer-2.5 in argv.
+    fn cursor_argv_rejects_and_replaces_fast_model() {
+        let cwd = Path::new("workspace");
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conversation"),
+            turn_id: super::super::TurnId::new("turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+
+        for disallowed in ["composer-2.5-fast", "claude-3-5-sonnet-fast", "gpt-5", ""] {
+            let mut command = tokio::process::Command::new("cursor-agent");
+            configure_command(
+                &mut command,
+                &request,
+                Some(disallowed),
+                ExecutionMode::Ask,
+                cwd,
+                false,
+            );
+
+            let args = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(
+                args.windows(2)
+                    .any(|args| args == ["--model", "composer-2.5"]),
+                "disallowed model {disallowed:?} should be replaced by composer-2.5 in argv: {args:?}"
+            );
+            if !disallowed.is_empty() {
+                assert!(
+                    !args.iter().any(|arg| arg == disallowed),
+                    "disallowed model {disallowed:?} should not appear in argv: {args:?}"
+                );
+            }
+        }
     }
 
     #[test]
