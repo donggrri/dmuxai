@@ -1448,8 +1448,11 @@ impl App {
                         .apply_runner_and_model(runner, &plan.model_id)
                         .is_some()
                     {
+                        let shown_model = self
+                            .effective_model_for(agent, &plan.model_id)
+                            .unwrap_or_else(|| "provider default".to_owned());
                         self.graph_assignment_line =
-                            format!("single {} → {}", plan.role, plan.model_id);
+                            format!("single {} → {}", plan.role, shown_model);
                         self.submit_to_agent(agent, plan.job, true);
                     }
                     return;
@@ -2031,10 +2034,38 @@ impl App {
         }
     }
 
+    /// The model a planned step should actually use on `agent`.
+    ///
+    /// A model the user picked with F2 for that agent always wins. The graph's
+    /// composer-2.5 default only applies to the Cursor runner; other runners
+    /// fall back to their provider default (`None`).
+    fn effective_model_for(&self, agent: Agent, planned: &str) -> Option<String> {
+        if let Some(selected) = self
+            .model_catalogs
+            .get(&agent)
+            .and_then(|catalog| catalog.selected.clone())
+        {
+            return Some(selected);
+        }
+        (agent == Agent::Cursor).then(|| planned.to_owned())
+    }
+
     fn apply_runner_and_model(&mut self, runner: &str, model_id: &str) -> Option<Agent> {
         let agent = runner_from_str(runner)?;
         self.selected = adapter_index(agent);
         let index = adapter_index(agent);
+        let Some(model_id) = self.effective_model_for(agent, model_id) else {
+            return Some(agent);
+        };
+        let model_id = model_id.as_str();
+        if self
+            .model_catalogs
+            .get(&agent)
+            .and_then(|catalog| catalog.selected.as_deref())
+            == Some(model_id)
+        {
+            return Some(agent);
+        }
         if let Err(error) = self.adapters[index].select_model(model_id.to_owned()) {
             self.push_system(format!("Could not select model {model_id}: {error}"));
         } else if let Some(catalog) = self.model_catalogs.get_mut(&agent) {
@@ -2113,9 +2144,12 @@ impl App {
                 }
             }
         }
+        let shown_model = self
+            .effective_model_for(agent, &assignment.model_id)
+            .unwrap_or_else(|| "provider default".to_owned());
         self.push_system(format!(
             "Graph node {} via {} model {}",
-            assignment.node_id, agent, assignment.model_id
+            assignment.node_id, agent, shown_model
         ));
         self.submit_to_agent(agent, prompt, false);
     }
@@ -2154,7 +2188,7 @@ impl App {
         let node_id = parts[0];
         let runner = parts[1];
         let model_id = parts[2];
-        if let Err(error) = dmuxai::graph::validate_model_id(model_id) {
+        if let Err(error) = dmuxai::model_policy::validate_model_for_runner(runner, model_id) {
             self.push_system(format!("Model rejected: {error}"));
             return;
         }
@@ -3260,6 +3294,81 @@ mod tests {
         .unwrap();
         app.selected = adapter_index(Agent::Codex);
         (app, sent)
+    }
+
+    fn find_cell_fg(app: &mut App, needle: &str) -> Option<Color> {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if let Some(byte_idx) = row.find(needle) {
+                let col = row[..byte_idx].chars().count() as u16;
+                return Some(buffer[(col, y)].fg);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn user_selected_agy_model_wins_over_graph_default() {
+        let (mut app, _sent) = test_app();
+        app.model_catalogs.get_mut(&Agent::Agy).unwrap().selected =
+            Some("gemini-3.8-flash-low".to_owned());
+        assert_eq!(
+            app.apply_runner_and_model("agy", "composer-2.5"),
+            Some(Agent::Agy)
+        );
+        assert_eq!(
+            app.model_catalogs[&Agent::Agy].selected.as_deref(),
+            Some("gemini-3.8-flash-low")
+        );
+        assert_eq!(
+            app.effective_model_for(Agent::Agy, "composer-2.5")
+                .as_deref(),
+            Some("gemini-3.8-flash-low")
+        );
+    }
+
+    #[test]
+    fn graph_default_model_only_applies_to_cursor() {
+        let (mut app, _sent) = test_app();
+        app.model_catalogs.get_mut(&Agent::Agy).unwrap().selected = None;
+        app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
+        assert_eq!(app.effective_model_for(Agent::Agy, "composer-2.5"), None);
+        app.apply_runner_and_model("agy", "composer-2.5");
+        assert_eq!(app.model_catalogs[&Agent::Agy].selected, None);
+        assert_eq!(
+            app.effective_model_for(Agent::Cursor, "composer-2.5")
+                .as_deref(),
+            Some("composer-2.5")
+        );
+    }
+
+    #[test]
+    fn chat_lines_render_with_speaker_theme_colors() {
+        let (mut app, _sent) = test_app();
+        app.messages.clear();
+        app.messages
+            .push(Message::new(Role::User, "zzuserline".to_owned()));
+        app.messages.push(Message::new(
+            Role::Agent(Agent::Cursor),
+            "zzcursorline".to_owned(),
+        ));
+        app.messages.push(Message::new(
+            Role::Agent(Agent::Agy),
+            "zzagyline".to_owned(),
+        ));
+        app.messages
+            .push(Message::new(Role::System, "zzsystemline".to_owned()));
+        let theme = app.settings.theme;
+        assert_eq!(find_cell_fg(&mut app, "zzuserline"), Some(theme.user));
+        assert_eq!(find_cell_fg(&mut app, "zzcursorline"), Some(theme.cursor));
+        assert_eq!(find_cell_fg(&mut app, "zzagyline"), Some(theme.agy));
+        assert_eq!(find_cell_fg(&mut app, "zzsystemline"), Some(theme.system));
     }
 
     fn render_text_at(app: &mut App, width: u16, height: u16) -> String {

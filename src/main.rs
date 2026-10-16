@@ -29,7 +29,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok()
         .and_then(|normalized| dmuxai::workspace::wsl_mnt_warning(&normalized));
     let engine = ConversationEngine::open(&conversation_db_path()?, &workspace_root)?;
+    let no_color = std::env::var("NO_COLOR").ok();
+    let force_env = std::env::var("DMUXAI_FORCE_COLOR").ok();
+    let color_enabled = dmuxai::theme::resolve_color_output(
+        no_color.as_deref(),
+        force_env.as_deref(),
+        settings.theme_force_color,
+    );
+    crossterm::style::force_color_output(color_enabled);
     let mut app = App::new(engine, workspace_root, settings)?;
+    if !color_enabled {
+        app.push_startup_notice(
+            "Chat colors are off because NO_COLOR is set. Run with DMUXAI_FORCE_COLOR=1 or set [theme] force_color = true in dmuxai.toml to enable them.".to_owned(),
+        );
+    }
     if let Some(warning) = startup_warning {
         app.push_startup_notice(warning);
     }

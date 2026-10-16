@@ -30,6 +30,17 @@ pub fn validate_model_id(model_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Runner-aware validation: Cursor stays composer-2.5 only; AGY may use
+/// `gemini-*-flash-*` models (the dogfooding runner); opencode may use `*-free`.
+pub fn validate_model_for_runner(runner: &str, model_id: &str) -> Result<(), String> {
+    let lower = model_id.trim().to_ascii_lowercase();
+    match runner.trim().to_ascii_lowercase().as_str() {
+        "agy" if lower.starts_with("gemini-") && lower.contains("-flash") => Ok(()),
+        "opencode" if lower.starts_with("opencode/") && lower.ends_with("-free") => Ok(()),
+        _ => validate_model_id(model_id),
+    }
+}
+
 /// Default model for graph nodes, subagents, and auto-routing.
 pub fn default_model() -> &'static str {
     ALLOWED_MODEL
@@ -56,5 +67,15 @@ mod tests {
         assert!(validate_model_id("claude-sonnet-5-5").is_err());
         assert!(validate_model_id("gpt-5").is_err());
         assert!(validate_model_id("gemini-4").is_err());
+    }
+
+    #[test]
+    fn runner_aware_policy_allows_agy_flash_only_on_agy() {
+        assert!(validate_model_for_runner("agy", "gemini-3.8-flash-medium").is_ok());
+        assert!(validate_model_for_runner("agy", "composer-2.5").is_ok());
+        assert!(validate_model_for_runner("agy", "gemini-4-pro").is_err());
+        assert!(validate_model_for_runner("cursor", "gemini-3.8-flash-medium").is_err());
+        assert!(validate_model_for_runner("opencode", "opencode/glm-5.3-flash-free").is_ok());
+        assert!(validate_model_for_runner("cursor", "opencode/glm-5.3-flash-free").is_err());
     }
 }

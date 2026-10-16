@@ -14,6 +14,7 @@ pub struct DmuxSettings {
     pub graph_max_parallel: usize,
     pub graph_max_retries: u32,
     pub theme: Theme,
+    pub theme_force_color: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -65,6 +66,7 @@ impl DmuxSettings {
             }
             if let Some(theme) = &parsed.theme {
                 settings.theme = Theme::from_toml(theme);
+                settings.theme_force_color = theme.force_color;
             }
             if let Some(graph) = parsed.graph {
                 if let Some(enabled) = graph.enabled {
@@ -92,6 +94,7 @@ impl Default for DmuxSettings {
             graph_max_parallel: 2,
             graph_max_retries: 2,
             theme: Theme::default(),
+            theme_force_color: None,
         }
     }
 }
