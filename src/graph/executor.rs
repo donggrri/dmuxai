@@ -169,6 +169,85 @@ impl GraphRunSession {
             .collect::<Vec<_>>()
             .join(" | ")
     }
+
+    pub fn status_line(&self) -> Option<String> {
+        self.status_line_with(|_runner, model| model.to_owned())
+    }
+
+    pub fn status_line_with<F>(&self, mut resolve_model: F) -> Option<String>
+    where
+        F: FnMut(&str, &str) -> String,
+    {
+        let non_orch: Vec<&GraphNode> = self
+            .run
+            .plan
+            .nodes
+            .iter()
+            .filter(|node| node.role != NodeRole::Orchestrate)
+            .collect();
+        if non_orch.is_empty() {
+            return None;
+        }
+        let m = non_orch.len();
+
+        if let Some(pos) = non_orch
+            .iter()
+            .position(|n| self.active.contains(&n.id) || n.status == GraphNodeStatus::Running)
+        {
+            let current_node = non_orch[pos];
+            let n = pos + 1;
+            let model = resolve_model(&current_node.runner, &current_node.model_id);
+            return Some(format!(
+                "Graph {n}/{m} · {} {} · {} {model} · running",
+                current_node.id, current_node.role, current_node.runner
+            ));
+        }
+
+        if let Some(pos) = non_orch
+            .iter()
+            .position(|n| n.status == GraphNodeStatus::Failed)
+        {
+            let current_node = non_orch[pos];
+            let n = pos + 1;
+            let model = resolve_model(&current_node.runner, &current_node.model_id);
+            return Some(format!(
+                "Graph {n}/{m} · {} {} · {} {model} · failed",
+                current_node.id, current_node.role, current_node.runner
+            ));
+        }
+
+        if non_orch.iter().all(|n| {
+            matches!(
+                n.status,
+                GraphNodeStatus::Completed | GraphNodeStatus::Skipped
+            )
+        }) {
+            let current_node = non_orch.last().unwrap();
+            let n = m;
+            let model = resolve_model(&current_node.runner, &current_node.model_id);
+            return Some(format!(
+                "Graph {n}/{m} · {} {} · {} {model} · done",
+                current_node.id, current_node.role, current_node.runner
+            ));
+        }
+
+        let pos = non_orch
+            .iter()
+            .position(|n| {
+                !matches!(
+                    n.status,
+                    GraphNodeStatus::Completed | GraphNodeStatus::Skipped
+                )
+            })
+            .unwrap_or(0);
+        let current_node = non_orch[pos];
+        let n = pos + 1;
+        let model = resolve_model(&current_node.runner, &current_node.model_id);
+        Some(format!(
+            "Graph {n}/{m} · {} {} · {} {model} · pending",
+            current_node.id, current_node.role, current_node.runner
+        ))
+    }
 }
 
 fn dependencies_met(plan: &GraphPlan, node_id: &str, completed: &HashSet<String>) -> bool {
@@ -213,5 +292,133 @@ impl RoleShort for GraphNode {
             NodeRole::Route => "route",
             NodeRole::Review => "review",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::types::{GraphEdge, GraphLimits};
+
+    #[test]
+    fn graph_status_line_updates_across_node_lifecycle_states() {
+        let plan = GraphPlan {
+            schema: "cursor-agent-graph/v1".to_owned(),
+            id: "test-run".to_owned(),
+            orchestrator_model: "composer-2.5".to_owned(),
+            user_prompt: "multi step prompt".to_owned(),
+            nodes: vec![
+                GraphNode {
+                    id: "orchestrate".to_owned(),
+                    role: NodeRole::Orchestrate,
+                    job: "Build execution graph".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: GraphNodeStatus::Completed,
+                    attempt: 0,
+                },
+                GraphNode {
+                    id: "step-1".to_owned(),
+                    role: NodeRole::Research,
+                    job: "Research task".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: GraphNodeStatus::Pending,
+                    attempt: 0,
+                },
+                GraphNode {
+                    id: "step-2".to_owned(),
+                    role: NodeRole::Implement,
+                    job: "Implement task".to_owned(),
+                    runner: "agy".to_owned(),
+                    model_id: "gemini-3.8-flash-medium".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: GraphNodeStatus::Pending,
+                    attempt: 0,
+                },
+                GraphNode {
+                    id: "step-3".to_owned(),
+                    role: NodeRole::Test,
+                    job: "Test task".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: GraphNodeStatus::Pending,
+                    attempt: 0,
+                },
+                GraphNode {
+                    id: "step-4".to_owned(),
+                    role: NodeRole::Review,
+                    job: "Review task".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: GraphNodeStatus::Pending,
+                    attempt: 0,
+                },
+            ],
+            edges: vec![
+                GraphEdge {
+                    from: "step-1".to_owned(),
+                    to: "step-2".to_owned(),
+                },
+                GraphEdge {
+                    from: "step-2".to_owned(),
+                    to: "step-3".to_owned(),
+                },
+                GraphEdge {
+                    from: "step-3".to_owned(),
+                    to: "step-4".to_owned(),
+                },
+            ],
+            limits: GraphLimits {
+                max_parallel: 1,
+                max_retries: 1,
+            },
+        };
+
+        let run = GraphRun {
+            plan,
+            conversation_id: "conv-1".to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+        };
+        let mut session = GraphRunSession::new(run);
+
+        // 1. Pending step-1
+        assert_eq!(
+            session.status_line().as_deref(),
+            Some("Graph 1/4 · step-1 research · cursor composer-2.5 · pending")
+        );
+
+        // 2. Schedule step-1 -> Running
+        let actions = session.schedule();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            session.status_line().as_deref(),
+            Some("Graph 1/4 · step-1 research · cursor composer-2.5 · running")
+        );
+
+        // 3. Complete step-1 -> step-2 is scheduled and Running
+        let actions = session.on_node_finished("step-1", true);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            session.status_line().as_deref(),
+            Some("Graph 2/4 · step-2 implement · agy gemini-3.8-flash-medium · running")
+        );
+
+        // 4. Fail step-2 with max_retries = 1 -> Failed
+        let _ = session.on_node_finished("step-2", false);
+        assert_eq!(
+            session.status_line().as_deref(),
+            Some("Graph 2/4 · step-2 implement · agy gemini-3.8-flash-medium · failed")
+        );
     }
 }

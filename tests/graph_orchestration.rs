@@ -35,6 +35,26 @@ fn simple_prompt_uses_single_agent() {
 }
 
 #[test]
+fn planner_creates_single_node_or_multi_node_graph_by_complexity() {
+    let dir = tempdir().unwrap();
+    let simple = plan_request("what is 2+2", dir.path(), &DmuxSettings::default());
+    assert!(matches!(simple, ExecutionPlan::Single(_)));
+
+    let complex = plan_request(
+        "research the auth module, plan migration, implement fix, and test",
+        dir.path(),
+        &DmuxSettings::default(),
+    );
+    match complex {
+        ExecutionPlan::Graph(graph) => {
+            assert!(graph.nodes.len() > 1);
+            assert_eq!(graph.orchestrator_model, ORCHESTRATOR_MODEL);
+        }
+        ExecutionPlan::Single(_) => panic!("expected multi-node graph"),
+    }
+}
+
+#[test]
 fn validate_rejects_fast_and_non_composer_models() {
     assert!(validate_model_id("grok-4.7-medium-fast").is_err());
     assert!(validate_model_id("grok-4.7-medium").is_err());

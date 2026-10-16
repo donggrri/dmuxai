@@ -41,7 +41,7 @@ use dmuxai::{
     },
     graph::{
         ExecutionPlan, GraphAction, GraphRun, GraphRunPhase, GraphRunSession, NodeAssignment,
-        plan_request, save_run,
+        NodeRole, plan_request, save_run,
     },
     settings::DmuxSettings,
     skills::{discover_skills, skill_prompt_prefix},
@@ -369,6 +369,7 @@ struct SlashPreview {
 #[derive(Clone, Copy)]
 struct UiAreas {
     chat: Rect,
+    graph_status: Option<Rect>,
     input: Rect,
     status: Rect,
 }
@@ -418,6 +419,7 @@ pub struct App {
     graph_session: Option<GraphRunSession>,
     graph_assignment_line: String,
     graph_active_turn_node: Option<String>,
+    single_graph_plan: Option<(NodeRole, Agent, String)>,
 }
 
 impl App {
@@ -528,6 +530,7 @@ impl App {
             graph_session: None,
             graph_assignment_line: String::new(),
             graph_active_turn_node: None,
+            single_graph_plan: None,
         };
         app.restore_snapshot(snapshot);
         Ok(app)
@@ -1470,6 +1473,10 @@ impl App {
                             .unwrap_or_else(|| "provider default".to_owned());
                         self.graph_assignment_line =
                             format!("single {} → {}", plan.role, shown_model);
+                        if !self.busy_agents.contains(&agent) {
+                            self.single_graph_plan =
+                                Some((plan.role, agent, plan.model_id.clone()));
+                        }
                         self.submit_to_agent(agent, plan.job, true);
                     }
                     return;
@@ -2047,6 +2054,11 @@ impl App {
         self.active_turns.remove(&agent);
         self.streaming_messages.remove(&agent);
         self.tool_messages.remove(&agent);
+        if let Some((_, single_agent, _)) = self.single_graph_plan
+            && single_agent == agent
+        {
+            self.single_graph_plan = None;
+        }
         if let Some(node_id) = self.graph_active_turn_node.take()
             && let Some(session) = self.graph_session.as_mut()
         {
@@ -2098,6 +2110,7 @@ impl App {
     }
 
     fn start_graph_run(&mut self, plan: dmuxai::graph::GraphPlan) {
+        self.single_graph_plan = None;
         let run = GraphRun {
             plan,
             conversation_id: self.conversation_id.as_str().to_owned(),
@@ -2133,6 +2146,7 @@ impl App {
                     self.push_system("Graph run completed.");
                     self.graph_session = None;
                     self.graph_assignment_line.clear();
+                    self.single_graph_plan = None;
                 }
                 GraphAction::Failed(message) => {
                     self.push_system(format!("Graph failed: {message}"));
@@ -2373,6 +2387,9 @@ impl App {
         let areas = self.ui_areas(self.terminal_area);
 
         self.draw_chat(frame, areas.chat);
+        if let Some(graph_status_area) = areas.graph_status {
+            self.draw_graph_status(frame, graph_status_area);
+        }
         self.draw_input(frame, areas.input);
         self.draw_status(frame, areas.status);
         if let Some(picker) = &self.model_picker {
@@ -2390,23 +2407,76 @@ impl App {
         }
     }
 
+    fn current_graph_status_line(&self) -> Option<String> {
+        if let Some(session) = &self.graph_session
+            && session.run().phase != GraphRunPhase::Completed
+        {
+            return session.status_line_with(|runner, planned| {
+                if let Some(agent) = runner_from_str(runner) {
+                    self.effective_model_for(agent, planned)
+                        .unwrap_or_else(|| "provider default".to_owned())
+                } else {
+                    planned.to_owned()
+                }
+            });
+        }
+        if let Some((role, agent, planned_model)) = &self.single_graph_plan {
+            let runner = runner_name(*agent);
+            let model = self
+                .effective_model_for(*agent, planned_model)
+                .unwrap_or_else(|| "provider default".to_owned());
+            return Some(format!(
+                "Graph 1/1 · single {role} · {runner} {model} · running"
+            ));
+        }
+        None
+    }
+
     fn ui_areas(&self, area: Rect) -> UiAreas {
         let input_height = clamp_input_height(self.input_height, area.height);
-        let main_height = area
-            .height
-            .saturating_sub(input_height.saturating_add(STATUS_HEIGHT));
-        let vertical = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(main_height),
-                Constraint::Length(input_height),
-                Constraint::Length(STATUS_HEIGHT),
-            ])
-            .split(area);
-        UiAreas {
-            chat: vertical[0],
-            input: vertical[1],
-            status: vertical[2],
+        let show_graph_status = self.current_graph_status_line().is_some()
+            && area.height >= MIN_MAIN_HEIGHT + 1 + input_height + STATUS_HEIGHT;
+
+        if show_graph_status {
+            let graph_status_height = 1u16;
+            let main_height = area.height.saturating_sub(
+                input_height
+                    .saturating_add(STATUS_HEIGHT)
+                    .saturating_add(graph_status_height),
+            );
+            let vertical = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(main_height),
+                    Constraint::Length(graph_status_height),
+                    Constraint::Length(input_height),
+                    Constraint::Length(STATUS_HEIGHT),
+                ])
+                .split(area);
+            UiAreas {
+                chat: vertical[0],
+                graph_status: Some(vertical[1]),
+                input: vertical[2],
+                status: vertical[3],
+            }
+        } else {
+            let main_height = area
+                .height
+                .saturating_sub(input_height.saturating_add(STATUS_HEIGHT));
+            let vertical = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(main_height),
+                    Constraint::Length(input_height),
+                    Constraint::Length(STATUS_HEIGHT),
+                ])
+                .split(area);
+            UiAreas {
+                chat: vertical[0],
+                graph_status: None,
+                input: vertical[1],
+                status: vertical[2],
+            }
         }
     }
 
@@ -2464,6 +2534,14 @@ impl App {
         self.visible_chat_lines = visible_buffer_lines(frame, self.chat_content_area);
         if let Some(selection) = self.chat_selection {
             highlight_chat_selection(frame, self.chat_content_area, selection);
+        }
+    }
+
+    fn draw_graph_status(&self, frame: &mut Frame, area: Rect) {
+        if let Some(status) = self.current_graph_status_line() {
+            let paragraph = Paragraph::new(status)
+                .style(Style::default().fg(self.settings.theme.color_for(Speaker::System)));
+            frame.render_widget(paragraph, area);
         }
     }
 
@@ -3386,6 +3464,150 @@ mod tests {
                 .as_deref(),
             Some("composer-2.5")
         );
+    }
+
+    #[test]
+    fn graph_status_line_renders_above_prompt_and_hides_when_idle() {
+        let (mut app, _sent) = test_app();
+        app.terminal_area = Rect::new(0, 0, 100, 30);
+
+        // 1. Idle: no graph status line, layout unchanged
+        let areas = app.ui_areas(app.terminal_area);
+        assert!(areas.graph_status.is_none());
+        let idle_rendered = render_text_at(&mut app, 100, 30);
+        assert!(!idle_rendered.contains("Graph "));
+
+        // 2. Active multi-node graph run: status line rendered with system color
+        let plan = dmuxai::graph::GraphPlan {
+            schema: "cursor-agent-graph/v1".to_owned(),
+            id: "run-test".to_owned(),
+            orchestrator_model: "composer-2.5".to_owned(),
+            user_prompt: "multi-step task".to_owned(),
+            nodes: vec![
+                dmuxai::graph::GraphNode {
+                    id: "orchestrate".to_owned(),
+                    role: NodeRole::Orchestrate,
+                    job: "Build graph".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Completed,
+                    attempt: 0,
+                },
+                dmuxai::graph::GraphNode {
+                    id: "step-1".to_owned(),
+                    role: NodeRole::Research,
+                    job: "Research task".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Completed,
+                    attempt: 0,
+                },
+                dmuxai::graph::GraphNode {
+                    id: "step-2".to_owned(),
+                    role: NodeRole::Implement,
+                    job: "Implement task".to_owned(),
+                    runner: "agy".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Running,
+                    attempt: 0,
+                },
+                dmuxai::graph::GraphNode {
+                    id: "step-3".to_owned(),
+                    role: NodeRole::Test,
+                    job: "Test task".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Pending,
+                    attempt: 0,
+                },
+                dmuxai::graph::GraphNode {
+                    id: "step-4".to_owned(),
+                    role: NodeRole::Review,
+                    job: "Review task".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Pending,
+                    attempt: 0,
+                },
+            ],
+            edges: vec![],
+            limits: dmuxai::graph::GraphLimits::default(),
+        };
+        let run = GraphRun {
+            plan,
+            conversation_id: "c1".to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+        };
+        let session = GraphRunSession::new(run);
+        app.graph_session = Some(session);
+
+        // F2 model for AGY
+        app.model_catalogs.get_mut(&Agent::Agy).unwrap().selected =
+            Some("gemini-3.8-flash-medium".to_owned());
+
+        let areas = app.ui_areas(app.terminal_area);
+        assert!(areas.graph_status.is_some());
+        assert_eq!(areas.graph_status.unwrap().height, 1);
+        assert_eq!(areas.graph_status.unwrap().y, areas.chat.bottom());
+        assert_eq!(areas.input.y, areas.graph_status.unwrap().bottom());
+
+        let rendered = render_text_at(&mut app, 100, 30);
+        assert!(
+            rendered
+                .contains("Graph 2/4 · step-2 implement · agy gemini-3.8-flash-medium · running")
+        );
+        assert_eq!(
+            find_cell_fg(&mut app, "Graph 2/4"),
+            Some(app.settings.theme.color_for(Speaker::System))
+        );
+
+        // 3. Single-plan prompt turn
+        app.graph_session = None;
+        app.single_graph_plan = Some((
+            NodeRole::Implement,
+            Agent::Cursor,
+            "composer-2.5".to_owned(),
+        ));
+        let areas = app.ui_areas(app.terminal_area);
+        assert!(areas.graph_status.is_some());
+        let rendered = render_text_at(&mut app, 100, 30);
+        assert!(rendered.contains("Graph 1/1 · single implement · cursor composer-2.5 · running"));
+
+        // When turn finishes, single plan cleared
+        app.finish_turn(Agent::Cursor);
+        let areas = app.ui_areas(app.terminal_area);
+        assert!(areas.graph_status.is_none());
+    }
+
+    #[test]
+    fn disabled_graph_bypasses_planner_and_renders_no_status_line() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_enabled = false;
+        app.selected = adapter_index(Agent::Cursor);
+        app.input = "research auth and implement fix".to_owned();
+
+        app.submit_prompt();
+
+        assert!(app.graph_session.is_none());
+        assert!(app.single_graph_plan.is_none());
+        let areas = app.ui_areas(Rect::new(0, 0, 100, 30));
+        assert!(areas.graph_status.is_none());
+        let rendered = render_text_at(&mut app, 100, 30);
+        assert!(!rendered.contains("Graph "));
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, Agent::Cursor);
     }
 
     #[test]
