@@ -30,7 +30,7 @@ Status: draft · 기준 커밋: `73e3f4d` (main, PR #6 이후) · 작성일: 202
 | [SPEC-speaker-colors](specs/SPEC-speaker-colors.md) | Implemented | FR-320~322, UX-320, TC-320~324 | FR-THEME-*, TC-THEME-* |
 | [SPEC-custom-agent-provider](specs/SPEC-custom-agent-provider.md) | Implemented | FR-330~335, UX-330, TC-330~337 | FR-CUSTOM-*, TC-CUSTOM-* |
 | [SPEC-compact-summarize-focus](specs/SPEC-compact-summarize-focus.md) | Implemented | FR-340~342, TC-340~342 | FR-COMPACT-*, TC-COMPACT-* |
-| [SPEC-windows-desktop](specs/SPEC-windows-desktop.md) | Draft (tui-stabilize 병합 후 구현) | FR-390~398, NFR-390, UX-390, TC-390~404 | FR-WIN-*, TC-WIN-* |
+| [SPEC-windows-desktop](specs/SPEC-windows-desktop.md) | In progress (launcher core 구현, 패키징 대기) | FR-390~398, NFR-390, UX-390, TC-390~404 | FR-WIN-*, TC-WIN-* |
 | [SPEC-graph-default-status](specs/SPEC-graph-default-status.md) | Implemented | FR-370~373, UX-370~371, TC-370~375 | FR-GRAPH-*, TC-GRAPH-* |
 | [SPEC-tui-stabilize](specs/SPEC-tui-stabilize.md) | Implemented | FR-380~, TC-380~ | dogfood #1, #4, #5, #6 |
 | [SPEC-activity-rendering](specs/SPEC-activity-rendering.md) | Implemented | FR-360~365, UX-360~362, TC-360~367 | FR-ACTIVITY-*, TC-ACTIVITY-* |

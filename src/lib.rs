@@ -6,6 +6,7 @@ pub mod clipboard_image;
 pub mod conversation;
 pub mod custom_agent;
 pub mod graph;
+pub mod launcher;
 pub mod model_policy;
 pub mod settings;
 pub mod skills;

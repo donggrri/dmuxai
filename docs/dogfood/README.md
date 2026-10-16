@@ -67,5 +67,17 @@ Format: id, status, repro, cause, fix.
 ## #16 Interrupted worker left activity WIP uncommitted; rebase onto #8–#11 conflicted — fixed during resume
 - Stash/rebase hit keep-both conflicts in app.rs/settings.rs/TEST-PLAN; the expand test also outgrew the 40-row test viewport after the graph status line landed (raised to 60). Lesson: commit WIP per node so a resume can rebase cleanly.
 
+## #17 Fast-typed `/agent agy` + Enter is sent to the selected agent as a prompt — open
+- Repro (tmux send-keys, no delay): the slash popup had not opened yet, so Enter submitted `/agent agy` to Cursor as a normal turn (cancelled at once). Unknown `/…` text should never be forwarded to a provider; `/agent <name>` with an argument should switch directly.
+
+## #18 Cursor turn shows "Model: provider default" — open (policy risk)
+- A Cursor turn started outside the graph path (prompt began with `/`) used the provider default model instead of composer-2.5. Cursor should always pin composer-2.5 when no F2 model is chosen.
+
+## #19 Screen not repainted after a turn completes — open
+- Under tmux the status bar kept showing `AGY RUNNING · 4m 09s` long after AGY exited; the next key press repainted it as IDLE with the full answer. Related to #15. Likely the draw loop only redraws on input/agent events and misses the final one.
+
+## #20 Graph-by-default can route repo work to the box cursor-agent — friction
+- Because the box cursor-agent is a company account, the dogfood worktree disables the graph locally (`dmuxai.toml` `[graph] enabled=false`, git-excluded) and drives AGY directly. A per-runner allow-list (`[graph] runners = ["agy","opencode"]`) would let the graph stay on.
+
 ## Process note
 #2, #3 (PR #6) and #7 (PR #8) were fixed directly (not through DmuxAI), because #3 blocked the AGY flash runner that dogfooding needs.

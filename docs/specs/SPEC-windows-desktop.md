@@ -1,6 +1,6 @@
 # SPEC: Windows desktop launcher (DmuxAI inside WSL)
 
-Status: Draft — to be implemented after the tui-stabilize work merges
+Status: In progress — steps 1–2 implemented (launcher core, config, `dmuxai-launcher` bin); step 3 packaging (zip/MSI, Start-menu shortcut) and live W-rows pending
 Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `bcdb0eb`
@@ -25,7 +25,7 @@ the native Windows build cannot lift (ANALYSIS §2.1, §3).
 ### In scope
 
 - Start-menu shortcut / `dmuxai.exe` launcher on Windows that starts Windows
-  Terminal with `wsl.exe -d <distro> --cd <linux path> dmuxai`
+  Terminal with `wsl.exe -d <distro> --cd <linux path> --exec sh -lc "exec dmuxai"` (login shell so ~/.cargo/bin is on PATH; fixed string, no user text)
 - Distro and workspace selection, remembered between runs
 - First-run checks: WSL installed, distro present, `dmuxai` present inside the
   distro, and agy/cursor-agent/opencode presence — each with a clear fix-it message
@@ -75,7 +75,7 @@ question.
 
 | ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| FR-390 | Must | User starts DmuxAI from the Start-menu shortcut or by running `dmuxai.exe` on Windows. | Windows Terminal opens running `wsl.exe -d <distro> --cd <linux path> dmuxai`; the TUI appears with the converted workspace. | If Windows Terminal is not installed, the launcher starts `wsl.exe` directly in the default console and shows a notice naming the `wt.exe` install command, without blocking. | TC-390, TC-391 |
+| FR-390 | Must | User starts DmuxAI from the Start-menu shortcut or by running `dmuxai.exe` on Windows. | Windows Terminal opens running `wsl.exe -d <distro> --cd <linux path> --exec sh -lc "exec dmuxai"` (login shell so ~/.cargo/bin is on PATH; fixed string, no user text); the TUI appears with the converted workspace. | If Windows Terminal is not installed, the launcher starts `wsl.exe` directly in the default console and shows a notice naming the `wt.exe` install command, without blocking. | TC-390, TC-391 |
 | FR-391 | Must | The distro is chosen on first run (or via re-selection). | With one WSL distro it is used without prompting; with several, an explicit picker lists `wsl --list` names; the choice is remembered and reused silently on later launches. | An empty distro list behaves like the missing-distro check (FR-393) instead of launching. | TC-392, TC-393 |
 | FR-392 | Must | A Windows workspace path is given (launcher argument, last-used, or picked folder). | The launcher converts it to a Linux path inside the target distro (`wslpath -u`) before launch and starts `dmuxai` with that path as its working directory; the Linux path is the persisted workspace key. | If the path does not exist inside the distro (drive not mounted, folder deleted), the launcher shows a fix-it message and does not start the TUI; `\\wsl$`/`\\wsl.localhost` forms are never emitted back to the user. | TC-394 |
 | FR-393 | Must | First run, or a previous launch was blocked. | Checks run in order — WSL installed, distro present, `dmuxai` present inside the distro — and each failure stops launch with a fix-it message naming the exact remediation command. Missing agent CLIs (agy, cursor-agent, opencode) are reported as one non-blocking list with per-CLI fix-it commands; launch continues. | The blocked list is comprehensive for one pass: after fixing one item, the next missing item is reported on the next attempt, never all-at-once-then-success ambiguity. | TC-395, TC-396, TC-397 |
@@ -94,20 +94,20 @@ is needed in CI. Live/WSL checks are manual and recorded in TEST-PLAN §3 (W-row
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-390 | FR-390 | unit | stubbed environment with `wt.exe` present; distro `Ubuntu`; workspace `C:\src\p` → `/home/u/p` | build the launch command | argv is exactly `wt.exe new-tab wsl.exe -d Ubuntu --cd /home/u/p dmuxai` (no shell string) | *proposed*: `launcher_builds_windows_terminal_command` |
-| TC-391 | FR-390 | unit | `wt.exe` absent | build the launch command | argv is `wsl.exe -d ... --cd ... dmuxai` and a notice naming the Windows Terminal install source is recorded | *proposed*: `launcher_falls_back_without_windows_terminal` |
-| TC-392 | FR-391, FR-392 | unit | launcher config with remembered distro and last workspace | launch | remembered values are used without prompting; corrupt/unreadable config behaves as "not remembered" | *proposed*: `launcher_remembers_distro_and_workspace` |
-| TC-393 | FR-391 | unit | two distros listed, none remembered | first launch | picker lists both distros; the selected one is persisted and reported | *proposed*: `launcher_prompts_when_distro_ambiguous` |
-| TC-394 | FR-392 | unit | input `C:\src\my project` and a fake `wslpath` | convert | result is `/mnt/c/src/my project` round-tripped through the fake (spaces preserved); a `\\wsl$` input raises the never-reemit error path | *proposed*: `windows_path_maps_to_wsl_path` |
-| TC-395 | FR-393 | unit | `wsl.exe --status` reports not installed | first-run checks | blocked with fix-it naming `wsl --install`, exit code non-zero, TUI not started | *proposed*: `launcher_reports_missing_wsl` |
-| TC-396 | FR-393 | unit | distro present, `dmuxai` probe returns not-found | first-run checks | blocked with fix-it naming the in-distro install command | *proposed*: `launcher_reports_missing_dmuxai_in_distro` |
-| TC-397 | FR-393 | unit | `agy` and `cursor-agent` present, `opencode` missing | first-run checks | one non-blocking notice listing `opencode` with its fix-it command; launch proceeds | *proposed*: `launcher_reports_missing_agent_clis_non_blocking` |
-| TC-398 | FR-394 | unit | converted path `/mnt/c/src/p` | pre-launch gate | performance warning shown; launch denied without confirm; `--allow-mnt` remembered confirm suppresses repeats | *proposed*: `mnt_path_shows_performance_warning` |
+| TC-390 | FR-390 | unit | stubbed environment with `wt.exe` present; distro `Ubuntu`; workspace `C:\src\p` → `/home/u/p` | build the launch command | argv is exactly `wt.exe new-tab wsl.exe -d Ubuntu --cd /home/u/p --exec sh -lc "exec dmuxai"` (login shell so ~/.cargo/bin is on PATH; fixed string, no user text) (no shell string) | `launcher_builds_windows_terminal_command` (src/launcher/mod.rs) |
+| TC-391 | FR-390 | unit | `wt.exe` absent | build the launch command | argv is `wsl.exe -d ... --cd ... --exec sh -lc "exec dmuxai"` (login shell so ~/.cargo/bin is on PATH; fixed string, no user text) and a notice naming the Windows Terminal install source is recorded | `launcher_falls_back_without_windows_terminal` (src/launcher/mod.rs) |
+| TC-392 | FR-391, FR-392 | unit | launcher config with remembered distro and last workspace | launch | remembered values are used without prompting; corrupt/unreadable config behaves as "not remembered" | `launcher_remembers_distro_and_workspace` (src/launcher/mod.rs) |
+| TC-393 | FR-391 | unit | two distros listed, none remembered | first launch | picker lists both distros; the selected one is persisted and reported | `launcher_prompts_when_distro_ambiguous` (src/launcher/mod.rs) |
+| TC-394 | FR-392 | unit | input `C:\src\my project` and a fake `wslpath` | convert | result is `/mnt/c/src/my project` round-tripped through the fake (spaces preserved); a `\\wsl$` input raises the never-reemit error path | `windows_path_maps_to_wsl_path` (src/launcher/mod.rs) |
+| TC-395 | FR-393 | unit | `wsl.exe --status` reports not installed | first-run checks | blocked with fix-it naming `wsl --install`, exit code non-zero, TUI not started | `launcher_reports_missing_wsl` (src/launcher/mod.rs) |
+| TC-396 | FR-393 | unit | distro present, `dmuxai` probe returns not-found | first-run checks | blocked with fix-it naming the in-distro install command | `launcher_reports_missing_dmuxai_in_distro` (src/launcher/mod.rs) |
+| TC-397 | FR-393 | unit | `agy` and `cursor-agent` present, `opencode` missing | first-run checks | one non-blocking notice listing `opencode` with its fix-it command; launch proceeds | `launcher_reports_missing_agent_clis_non_blocking` (src/launcher/mod.rs) |
+| TC-398 | FR-394 | unit | converted path `/mnt/c/src/p` | pre-launch gate | performance warning shown; launch denied without confirm; `--allow-mnt` remembered confirm suppresses repeats | `mnt_path_shows_performance_warning` (src/launcher/mod.rs) |
 | TC-399 | FR-395 | unit + manual | Windows clipboard contains PNG; session inside WSL | Ctrl+V paste | decode→attach→save chain: reuse existing tests `base64_powershell_output_decodes_to_png`, `clipboard_paste_registers_pending_image_chip`, `clipboard_paste_without_png_is_a_noop`; WSL end-to-end recorded as TEST-PLAN §3 W-row (live-TUI) | `cargo test base64_powershell_output_decodes_to_png`; live checklist W-03 |
 | TC-400 | FR-396 | integration (manual on windows-latest) | published zip on a clean Windows user profile | install, then uninstall | shortcut exists and points at the installed launcher; uninstall removes shortcut and files; no build tools required | manual: TEST-PLAN §3 W-row (installation) |
 | TC-401 | FR-397 | manual | MSI on a clean profile, then again over an existing install | install, upgrade | per-user shortcut present; upgrade replaces the launcher in place with a single entry | manual: TEST-PLAN §3 W-row (only after OQ-003 resolves) |
-| TC-402 | FR-398 | unit | distro `dmuxai --version` output older than the launcher floor | launch | update fix-it message with the exact command; if the version probe fails, the "cannot verify version" notice path is used and launch continues | *proposed*: `launcher_detects_stale_wsl_dmuxai_version` |
-| TC-403 | NFR-390 | unit | workspace text containing `"& ( )` and spaces | build every launcher command | each command is one argv list; the hostile text stays inside a single argument and never reaches `cmd.exe`/PowerShell | *proposed*: `launcher_never_assembles_shell_command_string` |
+| TC-402 | FR-398 | unit | distro `dmuxai --version` output older than the launcher floor | launch | update fix-it message with the exact command; if the version probe fails, the "cannot verify version" notice path is used and launch continues | `launcher_detects_stale_wsl_dmuxai_version` (src/launcher/mod.rs) |
+| TC-403 | NFR-390 | unit | workspace text containing `"& ( )` and spaces | build every launcher command | each command is one argv list; the hostile text stays inside a single argument and never reaches `cmd.exe`/PowerShell | `launcher_never_assembles_shell_command_string` (src/launcher/mod.rs) |
 | TC-404 | UX-390, FR-393 | manual live | real WSL machine, at least one missing item | first-run checks | every shown message fits one screen with a copyable fix-it command; fixes resolve in one retry per FR-393 | live checklist W-0x rows in TEST-PLAN §3 |
 
 Required coverage prompts: happy path (TC-390, TC-392, TC-394, TC-400),
