@@ -9,6 +9,8 @@ pub enum Speaker {
     Agy,
     Other,
     System,
+    /// A `[[agents.custom]]` agent; colored by its `color` setting.
+    Custom(u8),
 }
 
 /// Runtime theme colors for each speaker role.
@@ -87,6 +89,10 @@ impl Theme {
             Speaker::Agy => self.agy,
             Speaker::Other => self.other,
             Speaker::System => self.system,
+            Speaker::Custom(index) => crate::custom_agent::spec_at(index)
+                .and_then(|spec| spec.color.as_deref())
+                .and_then(parse_color)
+                .unwrap_or(self.other),
         }
     }
 }

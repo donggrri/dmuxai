@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MAX_CONTEXT_CHARS: usize = 32_000;
 const RECENT_TAIL_CHARS: usize = 12_000;
 const MAX_SUMMARY_CHARS: usize = MAX_CONTEXT_CHARS - RECENT_TAIL_CHARS;
@@ -130,6 +130,72 @@ CREATE INDEX IF NOT EXISTS checkpoints_latest
 
 PRAGMA user_version = 1;
 "#;
+
+/// v2: drop the built-in-only agent CHECK constraints so `[[agents.custom]]`
+/// agents can own turns, bindings and checkpoints. SQLite cannot alter a
+/// CHECK, so each affected table is rebuilt from its own stored definition.
+fn migrate_to_v2(connection: &mut Connection) -> Result<(), ConversationError> {
+    connection.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = (|| -> Result<(), ConversationError> {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (table, column) in [
+            ("turns", "requested_agent"),
+            ("provider_bindings", "agent"),
+            ("context_checkpoints", "agent"),
+        ] {
+            let sql: Option<String> = transaction
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(sql) = sql else { continue };
+            let old_check = format!("CHECK ({column} IN ('codex', 'cursor', 'agy'))");
+            if !sql.contains(&old_check) {
+                continue;
+            }
+            let indexes = {
+                let mut statement = transaction.prepare(
+                    "SELECT sql FROM sqlite_master
+                      WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL",
+                )?;
+                statement
+                    .query_map([table], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let new_table = format!("{table}_v2");
+            let create = sql
+                .replacen(&old_check, &format!("CHECK (length({column}) > 0)"), 1)
+                .replacen(
+                    &format!("CREATE TABLE {table}"),
+                    &format!("CREATE TABLE {new_table}"),
+                    1,
+                );
+            transaction.execute_batch(&create)?;
+            transaction.execute_batch(&format!(
+                "INSERT INTO {new_table} SELECT * FROM {table};
+                 DROP TABLE {table};
+                 ALTER TABLE {new_table} RENAME TO {table};"
+            ))?;
+            for index in indexes {
+                transaction.execute_batch(&index)?;
+            }
+        }
+        transaction.execute_batch("PRAGMA user_version = 2;")?;
+        let violations: i64 =
+            transaction.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        if violations != 0 {
+            return Err(ConversationError::UnsupportedSchema(-1));
+        }
+        transaction.commit()?;
+        Ok(())
+    })();
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    result
+}
 
 /// Installs the runtime-session objects for databases created by the original
 /// v1 migration. The extension intentionally does not bump `user_version`:
@@ -302,13 +368,17 @@ impl fmt::Display for TurnId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentKey {
     Codex,
     Cursor,
     Agy,
+    /// A `[[agents.custom]]` agent by registry index; `u8::MAX` = no longer configured.
+    Custom(u8),
 }
+
+/// Registry index used for stored turns of a custom agent that is no longer configured.
+pub const UNKNOWN_CUSTOM_AGENT: u8 = u8::MAX;
 
 impl AgentKey {
     fn as_db(self) -> &'static str {
@@ -316,6 +386,9 @@ impl AgentKey {
             Self::Codex => "codex",
             Self::Cursor => "cursor",
             Self::Agy => "agy",
+            Self::Custom(index) => crate::custom_agent::spec_at(index)
+                .map(|spec| spec.name.as_str())
+                .unwrap_or("custom-unknown"),
         }
     }
 
@@ -324,12 +397,28 @@ impl AgentKey {
             "codex" => Ok(Self::Codex),
             "cursor" => Ok(Self::Cursor),
             "agy" => Ok(Self::Agy),
-            other => Err(rusqlite::Error::FromSqlConversionFailure(
+            "" => Err(rusqlite::Error::FromSqlConversionFailure(
                 0,
                 Type::Text,
-                format!("unknown agent {other}").into(),
+                "empty agent name".into(),
+            )),
+            other => Ok(Self::Custom(
+                crate::custom_agent::index_of(other).unwrap_or(UNKNOWN_CUSTOM_AGENT),
             )),
         }
+    }
+}
+
+impl Serialize for AgentKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_db())
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::from_db(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -339,6 +428,9 @@ impl fmt::Display for AgentKey {
             Self::Codex => "Codex",
             Self::Cursor => "Cursor",
             Self::Agy => "AGY",
+            Self::Custom(index) => crate::custom_agent::spec_at(*index)
+                .map(|spec| spec.label())
+                .unwrap_or("custom"),
         })
     }
 }
@@ -681,6 +773,9 @@ impl ConversationEngine {
         }
 
         ensure_runtime_session_schema(&mut connection)?;
+        if version < 2 {
+            migrate_to_v2(&mut connection)?;
+        }
         let session_id = Uuid::new_v4().to_string();
         let now = now_ms()?;
         connection.execute(
@@ -1749,4 +1844,67 @@ fn now_ms() -> Result<i64, ConversationError> {
         .map_err(|_| ConversationError::ClockBeforeUnixEpoch)?
         .as_millis();
     i64::try_from(millis).map_err(|_| ConversationError::ClockBeforeUnixEpoch)
+}
+
+#[cfg(test)]
+mod schema_v2_tests {
+    use super::*;
+
+    #[test]
+    fn v1_database_is_migrated_and_accepts_custom_agents() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        let db = temp.path().join("db.sqlite3");
+        {
+            let connection = Connection::open(&db).unwrap();
+            connection.execute_batch(MIGRATION_1).unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO conversations VALUES ('c1', '/x', 't', 1, 1, NULL);
+                     INSERT INTO turns (id, conversation_id, seq, requested_agent, status, created_at_ms)
+                       VALUES ('t1', 'c1', 1, 'agy', 'completed', 1);
+                     INSERT INTO messages VALUES ('m1', 't1', 0, 'user', 'hi', 'complete', 1, 1);",
+                )
+                .unwrap();
+            assert!(
+                connection
+                    .execute(
+                        "INSERT INTO turns (id, conversation_id, seq, requested_agent, status, created_at_ms)
+                           VALUES ('t2', 'c1', 2, 'opencode', 'completed', 1)",
+                        [],
+                    )
+                    .is_err()
+            );
+        }
+        drop(ConversationEngine::open(&db, &workspace).unwrap());
+        let connection = Connection::open(&db).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        connection
+            .execute(
+                "INSERT INTO turns (id, conversation_id, seq, requested_agent, status, created_at_ms)
+                   VALUES ('t2', 'c1', 2, 'opencode', 'completed', 1)",
+                [],
+            )
+            .unwrap();
+        let kept: String = connection
+            .query_row("SELECT text FROM messages WHERE id = 'm1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, "hi");
+        let index_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'turns_by_conversation_seq'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
+        // Re-opening a v2 database is a no-op.
+        drop(ConversationEngine::open(&db, &workspace).unwrap());
+    }
 }

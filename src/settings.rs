@@ -15,6 +15,10 @@ pub struct DmuxSettings {
     pub graph_max_retries: u32,
     pub theme: Theme,
     pub theme_force_color: Option<bool>,
+    /// `[[agents.custom]]` headless agents (installed into the registry at startup).
+    pub custom_agents: Vec<crate::custom_agent::CustomAgentSpec>,
+    /// Problems found while reading dmuxai.toml, shown at startup.
+    pub config_warnings: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -23,6 +27,13 @@ struct DmuxToml {
     routing: Option<RoutingToml>,
     graph: Option<GraphToml>,
     theme: Option<ThemeToml>,
+    agents: Option<AgentsToml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AgentsToml {
+    #[serde(default)]
+    custom: Vec<crate::custom_agent::CustomAgentSpec>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -50,9 +61,21 @@ impl DmuxSettings {
             settings.cursor_windows_unsandboxed = true;
         }
         let config_path = workspace.join("dmuxai.toml");
-        if let Ok(contents) = std::fs::read_to_string(&config_path)
-            && let Ok(parsed) = toml::from_str::<DmuxToml>(&contents)
-        {
+        let parsed = std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|contents| match toml::from_str::<DmuxToml>(&contents) {
+                Ok(parsed) => Some(parsed),
+                Err(error) => {
+                    settings
+                        .config_warnings
+                        .push(format!("dmuxai.toml ignored: {error}"));
+                    None
+                }
+            });
+        if let Some(parsed) = parsed {
+            if let Some(agents) = parsed.agents {
+                settings.custom_agents = agents.custom;
+            }
             if parsed
                 .cursor
                 .and_then(|cursor| cursor.windows_unsandboxed)
@@ -95,6 +118,8 @@ impl Default for DmuxSettings {
             graph_max_retries: 2,
             theme: Theme::default(),
             theme_force_color: None,
+            custom_agents: Vec::new(),
+            config_warnings: Vec::new(),
         }
     }
 }

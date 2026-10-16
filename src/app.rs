@@ -51,6 +51,7 @@ use dmuxai::{
 use crate::agent::{
     Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ConversationId, ExecutionMode,
     ModelInfo, TurnId, event_channel, spawn_agy_adapter, spawn_codex_adapter, spawn_cursor_adapter,
+    spawn_custom_adapter,
 };
 
 const RENDER_INTERVAL: Duration = Duration::from_millis(25);
@@ -421,16 +422,19 @@ impl App {
         settings: DmuxSettings,
     ) -> Result<Self, ConversationError> {
         let (event_tx, event_rx) = event_channel();
-        let mut adapters = Vec::with_capacity(Agent::ALL.len());
-        let mut workers = Vec::with_capacity(Agent::ALL.len());
+        let mut adapters = Vec::with_capacity(Agent::all().len());
+        let mut workers = Vec::with_capacity(Agent::all().len());
 
-        for agent in Agent::ALL {
+        for agent in Agent::all() {
             let (adapter, worker) = match agent {
                 Agent::Codex => spawn_codex_adapter(event_tx.clone(), workspace_root.clone()),
                 Agent::Cursor => {
                     spawn_cursor_adapter(event_tx.clone(), workspace_root.clone(), settings.clone())
                 }
                 Agent::Agy => spawn_agy_adapter(event_tx.clone(), workspace_root.clone()),
+                Agent::Custom(index) => {
+                    spawn_custom_adapter(index, event_tx.clone(), workspace_root.clone())
+                }
             };
             adapters.push(adapter);
             workers.push(worker);
@@ -491,7 +495,7 @@ impl App {
             busy_agents: HashSet::new(),
             activities: HashMap::new(),
             streaming_messages: HashMap::new(),
-            model_catalogs: Agent::ALL
+            model_catalogs: Agent::all()
                 .into_iter()
                 .map(|agent| (agent, ModelCatalog::default()))
                 .collect(),
@@ -501,7 +505,7 @@ impl App {
             mode_picker: None,
             conversation_picker: None,
             slash_preview: None,
-            modes: Agent::ALL
+            modes: Agent::all()
                 .into_iter()
                 .map(|agent| (agent, ExecutionMode::default()))
                 .collect(),
@@ -994,12 +998,12 @@ impl App {
                 self.agent_picker = Some(picker);
             }
             KeyCode::Down => {
-                picker.cursor = (picker.cursor + 1).min(Agent::ALL.len() - 1);
+                picker.cursor = (picker.cursor + 1).min(Agent::all().len() - 1);
                 self.agent_picker = Some(picker);
             }
             KeyCode::Enter => {
                 self.selected = picker.cursor;
-                let agent = Agent::ALL[self.selected];
+                let agent = Agent::all()[self.selected];
                 self.messages.push(Message::new(
                     Role::System,
                     format!("Active agent: {agent}."),
@@ -1044,10 +1048,10 @@ impl App {
             }
             KeyCode::Enter => {
                 let mode = ExecutionMode::ALL[picker.cursor];
-                let adapter_index = Agent::ALL
+                let adapter_index = Agent::all()
                     .iter()
                     .position(|agent| *agent == picker.agent)
-                    .expect("picker agent belongs to Agent::ALL");
+                    .expect("picker agent belongs to Agent::all()");
                 if let Err(error) = self.adapters[adapter_index].validate_mode(mode) {
                     self.messages.push(Message::new(
                         Role::System,
@@ -1167,10 +1171,10 @@ impl App {
                     return;
                 };
                 let agent = picker.agent;
-                let adapter_index = Agent::ALL
+                let adapter_index = Agent::all()
                     .iter()
                     .position(|candidate| *candidate == agent)
-                    .expect("picker agent belongs to Agent::ALL");
+                    .expect("picker agent belongs to Agent::all()");
                 match self.adapters[adapter_index].select_model(model.id.clone()) {
                     Ok(()) => {
                         let catalog = self
@@ -1277,6 +1281,7 @@ impl App {
             Agent::Cursor => AttachmentRunnerKind::Cursor,
             Agent::Agy => AttachmentRunnerKind::Agy,
             Agent::Codex => AttachmentRunnerKind::Codex,
+            Agent::Custom(_) => AttachmentRunnerKind::Custom,
         }
     }
 
@@ -2182,12 +2187,18 @@ impl App {
     fn override_graph_node(&mut self, args: &str) {
         let parts = args.split_whitespace().collect::<Vec<_>>();
         if parts.len() != 3 {
-            self.push_system("Usage: /graph override <node-id> <cursor|agy|codex> <model-id>");
+            self.push_system(
+                "Usage: /graph override <node-id> <cursor|agy|codex|custom-agent-name> <model-id>",
+            );
             return;
         }
         let node_id = parts[0];
         let runner = parts[1];
         let model_id = parts[2];
+        if runner_from_str(runner).is_none() {
+            self.push_system(format!("Unknown runner: {runner}"));
+            return;
+        }
         if let Err(error) = dmuxai::model_policy::validate_model_for_runner(runner, model_id) {
             self.push_system(format!("Model rejected: {error}"));
             return;
@@ -2246,7 +2257,7 @@ impl App {
     }
 
     fn other_activity_summary(&self, selected: Agent) -> String {
-        Agent::ALL
+        Agent::all()
             .into_iter()
             .filter(|agent| *agent != selected)
             .filter_map(|agent| {
@@ -2656,7 +2667,7 @@ impl App {
     fn draw_agent_picker(&self, frame: &mut Frame, picker: &AgentPicker) {
         let area = centered_fixed_rect(48, 7, frame.area());
         frame.render_widget(Clear, area);
-        let items = Agent::ALL
+        let items = Agent::all()
             .into_iter()
             .enumerate()
             .map(|(index, agent)| {
@@ -2805,6 +2816,7 @@ fn agent_key(agent: Agent) -> AgentKey {
         Agent::Codex => AgentKey::Codex,
         Agent::Cursor => AgentKey::Cursor,
         Agent::Agy => AgentKey::Agy,
+        Agent::Custom(index) => AgentKey::Custom(index),
     }
 }
 
@@ -2813,14 +2825,15 @@ fn agent_from_key(agent: AgentKey) -> Agent {
         AgentKey::Codex => Agent::Codex,
         AgentKey::Cursor => Agent::Cursor,
         AgentKey::Agy => Agent::Agy,
+        AgentKey::Custom(index) => Agent::Custom(index),
     }
 }
 
 fn adapter_index(agent: Agent) -> usize {
-    Agent::ALL
+    Agent::all()
         .iter()
         .position(|candidate| *candidate == agent)
-        .expect("agent belongs to Agent::ALL")
+        .expect("agent belongs to Agent::all()")
 }
 
 fn adapter_request(
@@ -2846,6 +2859,9 @@ fn runner_name(agent: Agent) -> &'static str {
         Agent::Cursor => "cursor",
         Agent::Agy => "agy",
         Agent::Codex => "codex",
+        Agent::Custom(index) => dmuxai::custom_agent::spec_at(index)
+            .map(|spec| spec.name.as_str())
+            .unwrap_or("custom"),
     }
 }
 
@@ -2854,7 +2870,7 @@ fn runner_from_str(runner: &str) -> Option<Agent> {
         "cursor" => Some(Agent::Cursor),
         "agy" => Some(Agent::Agy),
         "codex" => Some(Agent::Codex),
-        _ => None,
+        other => dmuxai::custom_agent::index_of(other).map(Agent::Custom),
     }
 }
 
@@ -3232,7 +3248,7 @@ mod tests {
     ) -> (App, SentRequests, CancelRequests) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let adapters = Agent::ALL
+        let adapters = Agent::all()
             .into_iter()
             .map(|agent| {
                 Box::new(RecordingAdapter {
@@ -3268,7 +3284,7 @@ mod tests {
     ) -> (App, SentRequests) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let adapters = Agent::ALL
+        let adapters = Agent::all()
             .into_iter()
             .map(|candidate| {
                 Box::new(RecordingAdapter {
@@ -5110,6 +5126,7 @@ fn speaker_for(agent: Agent) -> Speaker {
         Agent::Cursor => Speaker::Cursor,
         Agent::Agy => Speaker::Agy,
         Agent::Codex => Speaker::Other,
+        Agent::Custom(index) => Speaker::Custom(index),
     }
 }
 

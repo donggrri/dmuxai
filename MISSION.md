@@ -18,9 +18,11 @@ DmuxAI is a **Rust + Ratatui** terminal orchestrator. It does not scrape ANSI te
 
 6. **Platforms** — **Linux TUI first** (primary dev and CI target). **Windows** ships as a launcher that runs DmuxAI **inside WSL** with a Linux workspace canonical path.
 
-7. **Model policy** — **Only `composer-2.5`** may be used or defaulted for any graph node, subagent, or DmuxAI routing default. No haiku, grok, sonnet, gpt, gemini, or `*-fast` models. Guards/tests enforce this in-repo.
+7. **Model policy** — **Only `composer-2.5`** may be used or defaulted for any graph node, subagent, or DmuxAI routing default. No haiku, grok, sonnet, gpt, gemini, or `*-fast` models. Guards/tests enforce this in-repo. Exception (2026-10-17, dogfooding): a model the user picks with F2 for a non-Cursor runner is honored under that runner's policy (AGY `gemini-*-flash-*`; custom agents' `allowed_models`); graph defaults stay `composer-2.5`.
 
-8. **Graph execution reports** — Every product PR includes an honest Korean **Graph execution report** in `docs/graph-runs/<topic>.md` and a matching section in the PR body (graph used, roles, models, edge payloads, retries, timings; no false claims of delegation).
+8. **Custom headless runners** — DmuxAI must be able to run **any headless agent CLI declared in config** (`[[agents.custom]]` in `dmuxai.toml`), not only the built-in primaries (see [docs/agents/custom-agents.md](docs/agents/custom-agents.md)).
+
+9. **Graph execution reports** — Every product PR includes an honest Korean **Graph execution report** in `docs/graph-runs/<topic>.md` and a matching section in the PR body (graph used, roles, models, edge payloads, retries, timings; no false claims of delegation).
 
 ## Non-goals (for now)
 

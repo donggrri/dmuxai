@@ -37,7 +37,13 @@ pub fn validate_model_for_runner(runner: &str, model_id: &str) -> Result<(), Str
     match runner.trim().to_ascii_lowercase().as_str() {
         "agy" if lower.starts_with("gemini-") && lower.contains("-flash") => Ok(()),
         "opencode" if lower.starts_with("opencode/") && lower.ends_with("-free") => Ok(()),
-        _ => validate_model_id(model_id),
+        "cursor" | "agy" | "codex" => validate_model_id(model_id),
+        other => {
+            match crate::custom_agent::index_of(other).and_then(crate::custom_agent::spec_at) {
+                Some(spec) => crate::custom_agent::validate_custom_model(spec, model_id),
+                None => validate_model_id(model_id),
+            }
+        }
     }
 }
 

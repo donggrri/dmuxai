@@ -235,6 +235,8 @@ pub enum RunnerKind {
     Cursor,
     Agy,
     Codex,
+    /// `[[agents.custom]]`: `image_arg` flag or `@path` prompt tokens.
+    Custom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,7 +252,7 @@ pub enum RunnerImageSupport {
 
 pub fn runner_image_support(agent: RunnerKind) -> RunnerImageSupport {
     match agent {
-        RunnerKind::Cursor | RunnerKind::Agy | RunnerKind::Codex => {
+        RunnerKind::Cursor | RunnerKind::Agy | RunnerKind::Codex | RunnerKind::Custom => {
             RunnerImageSupport::PromptReferences
         }
     }
