@@ -18,11 +18,78 @@ use super::{
     ModelInfo, OutputContext, SpawnedAdapter, implement_outcome::ImplementTurnTracker,
     prompt_with_image_tokens,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crate::process::{headless_command, resolve_program};
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const STDERR_HISTORY_CAPACITY: usize = 8;
 const AGY_BINARY_OVERRIDE: &str = "DMUXAI_AGY_BIN";
+const AGY_MODEL_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CachedAgyModels {
+    pub timestamp_secs: u64,
+    pub models: Vec<ModelInfo>,
+}
+
+pub(crate) fn agy_models_cache_path() -> io::Result<PathBuf> {
+    if let Some(base) = std::env::var_os("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(base).join("dmuxai").join("agy-models.json"));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+            return Ok(PathBuf::from(base).join("DmuxAI").join("agy-models.json"));
+        }
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "neither XDG_STATE_HOME nor HOME is configured",
+        )
+    })?;
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("state")
+        .join("dmuxai")
+        .join("agy-models.json"))
+}
+
+pub(crate) fn read_disk_cache(
+    path: &Path,
+    now_secs: u64,
+    ttl_secs: u64,
+) -> Option<(Vec<ModelInfo>, bool)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let cached: CachedAgyModels = serde_json::from_str(&content).ok()?;
+    let is_fresh = now_secs.saturating_sub(cached.timestamp_secs) < ttl_secs;
+    Some((cached.models, is_fresh))
+}
+
+pub(crate) fn write_disk_cache(
+    path: &Path,
+    models: &[ModelInfo],
+    timestamp_secs: u64,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let cached = CachedAgyModels {
+        timestamp_secs,
+        models: models.to_vec(),
+    };
+    let json = serde_json::to_string_pretty(&cached)?;
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
+fn current_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 enum AgyCommand {
     Send(AgentRequest),
@@ -93,6 +160,7 @@ async fn runtime_loop(
     let mut active: Option<ActiveTurn> = None;
     let mut selected_model: Option<String> = None;
     let mut selected_mode = ExecutionMode::default();
+    let memory_models_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
 
     loop {
         if active.is_none() {
@@ -110,8 +178,29 @@ async fn runtime_loop(
                     ));
                 }
                 AgyCommand::Cancel => {}
-                AgyCommand::ListModels => match list_models(&cwd).await {
-                    Ok(models) => {
+                AgyCommand::ListModels => {
+                    let now = current_timestamp_secs();
+                    let cache_path = agy_models_cache_path().ok();
+
+                    let (cached_models, is_fresh) = {
+                        let mem = memory_models_cache.lock().unwrap().clone();
+                        if let Some(models) = mem {
+                            (Some(models), true)
+                        } else if let Some(ref path) = cache_path {
+                            if let Some((disk_models, fresh)) =
+                                read_disk_cache(path, now, AGY_MODEL_CACHE_TTL_SECS)
+                            {
+                                *memory_models_cache.lock().unwrap() = Some(disk_models.clone());
+                                (Some(disk_models), fresh)
+                            } else {
+                                (None, false)
+                            }
+                        } else {
+                            (None, false)
+                        }
+                    };
+
+                    if let Some(models) = cached_models {
                         send_event(
                             &event_tx,
                             None,
@@ -122,11 +211,78 @@ async fn runtime_loop(
                             },
                         )
                         .await;
+
+                        if !is_fresh {
+                            let event_tx_clone = event_tx.clone();
+                            let cwd_clone = cwd.clone();
+                            let selected_model_clone = selected_model.clone();
+                            let cache_path_clone = cache_path.clone();
+                            let memory_cache_clone = memory_models_cache.clone();
+                            tokio::spawn(async move {
+                                if let Ok(fresh_models) = list_models(&cwd_clone).await {
+                                    *memory_cache_clone.lock().unwrap() =
+                                        Some(fresh_models.clone());
+                                    if let Some(ref path) = cache_path_clone {
+                                        let _ = write_disk_cache(
+                                            path,
+                                            &fresh_models,
+                                            current_timestamp_secs(),
+                                        );
+                                    }
+                                    send_event(
+                                        &event_tx_clone,
+                                        None,
+                                        AgentEvent::ModelsListed {
+                                            models: fresh_models,
+                                            selected: selected_model_clone,
+                                            selected_effort: None,
+                                        },
+                                    )
+                                    .await;
+                                }
+                            });
+                        }
+                    } else {
+                        let event_tx_clone = event_tx.clone();
+                        let cwd_clone = cwd.clone();
+                        let selected_model_clone = selected_model.clone();
+                        let cache_path_clone = cache_path.clone();
+                        let memory_cache_clone = memory_models_cache.clone();
+                        tokio::spawn(async move {
+                            match list_models(&cwd_clone).await {
+                                Ok(fresh_models) => {
+                                    *memory_cache_clone.lock().unwrap() =
+                                        Some(fresh_models.clone());
+                                    if let Some(ref path) = cache_path_clone {
+                                        let _ = write_disk_cache(
+                                            path,
+                                            &fresh_models,
+                                            current_timestamp_secs(),
+                                        );
+                                    }
+                                    send_event(
+                                        &event_tx_clone,
+                                        None,
+                                        AgentEvent::ModelsListed {
+                                            models: fresh_models,
+                                            selected: selected_model_clone,
+                                            selected_effort: None,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                Err(error) => {
+                                    send_event(
+                                        &event_tx_clone,
+                                        None,
+                                        AgentEvent::Error(error.to_string()),
+                                    )
+                                    .await;
+                                }
+                            }
+                        });
                     }
-                    Err(error) => {
-                        send_event(&event_tx, None, AgentEvent::Error(error.to_string())).await;
-                    }
-                },
+                }
                 AgyCommand::SelectModel(model) => {
                     selected_model = Some(model.clone());
                     send_event(&event_tx, None, AgentEvent::ModelSelected(model)).await;
@@ -802,5 +958,46 @@ mod tests {
         assert!(
             matches!(events.last(), Some(AgentEvent::Error(e)) if e.contains("without producing"))
         );
+    }
+
+    #[test]
+    fn test_disk_cache_roundtrip_and_freshness() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_file = dir.path().join("agy-models.json");
+
+        let sample_models = vec![
+            ModelInfo::new("gemini-3.8-flash", "Gemini 3.8 Flash"),
+            ModelInfo::new("gemini-pro", "Gemini Pro"),
+        ];
+
+        let base_time = 1_000_000;
+        write_disk_cache(&cache_file, &sample_models, base_time).unwrap();
+
+        // Fresh check: 10 hours later (< 24h)
+        let now_fresh = base_time + 10 * 3600;
+        let result = read_disk_cache(&cache_file, now_fresh, AGY_MODEL_CACHE_TTL_SECS);
+        assert!(result.is_some());
+        let (models, is_fresh) = result.unwrap();
+        assert!(is_fresh);
+        assert_eq!(models, sample_models);
+
+        // Expired check: 25 hours later (> 24h)
+        let now_expired = base_time + 25 * 3600;
+        let result_expired = read_disk_cache(&cache_file, now_expired, AGY_MODEL_CACHE_TTL_SECS);
+        assert!(result_expired.is_some());
+        let (models_exp, is_fresh_exp) = result_expired.unwrap();
+        assert!(!is_fresh_exp);
+        assert_eq!(models_exp, sample_models);
+    }
+
+    #[test]
+    fn test_disk_cache_missing_or_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_file = dir.path().join("missing.json");
+        assert!(read_disk_cache(&cache_file, 1000, 3600).is_none());
+
+        let corrupt_file = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt_file, "not valid json").unwrap();
+        assert!(read_disk_cache(&corrupt_file, 1000, 3600).is_none());
     }
 }

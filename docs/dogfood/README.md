@@ -3,7 +3,7 @@
 Bugs and friction found while using DmuxAI to develop DmuxAI.
 Format: id, status, repro, cause, fix.
 
-## #1 No headless mode; `dmuxai --help` without a TTY fails — open
+## #1 No headless mode; `dmuxai --help` without a TTY fails — fixed (PR tui-stabilize)
 - Repro: `dmuxai --help` (or any run with stdout not a terminal) → `Error: Os { code: 6, kind: Uncategorized, message: "No such device or address" }`.
 - Cause: `main` always enters raw mode / alternate screen; no argument parsing, no `--help`, no headless prompt mode.
 - Impact: DmuxAI can only be driven via a real terminal (tmux `send-keys`/`capture-pane` works).
@@ -19,13 +19,13 @@ Format: id, status, repro, cause, fix.
 - Fix: a model picked with F2 for that agent always wins; the composer-2.5 graph default only applies to the Cursor runner; other runners use their provider default. `/graph override` uses the runner-aware policy (AGY: `gemini-*-flash-*`; opencode: `opencode/*-free`; Cursor: composer-2.5 only).
 - Verified live in tmux: AGY + Gemini 3.8 Flash (Medium) answered `PONG`.
 
-## #4 F2 model list for AGY is slow — open (friction)
+## #4 F2 model list for AGY is slow — fixed (PR tui-stabilize: model cache)
 - Repro: F2 on AGY shows "Loading models from the provider CLI..." for ~20 s.
 
-## #5 Status bar truncated on narrow terminals — open (friction)
+## #5 Status bar truncated on narrow terminals — fixed (PR tui-stabilize)
 - Repro: 200-column terminal; status line's right side (`Esc close`) is cut.
 
-## #6 Enter right after a long pasted/typed burst is swallowed — open
+## #6 Enter right after a long pasted/typed burst is swallowed — fixed (PR tui-stabilize)
 - Repro (tmux): `send-keys -l "<~600 chars>"` immediately followed by `send-keys Enter` → text stays in the prompt, nothing is sent; a second Enter sends it. With a 1 s pause before Enter it works.
 - Likely cause: paste-burst detection treats an Enter inside the burst window as a literal newline.
 
