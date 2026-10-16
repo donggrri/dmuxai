@@ -70,8 +70,10 @@ Format: id, status, repro, cause, fix.
 ## #17 Fast-typed `/agent agy` + Enter is sent to the selected agent as a prompt — open
 - Repro (tmux send-keys, no delay): the slash popup had not opened yet, so Enter submitted `/agent agy` to Cursor as a normal turn (cancelled at once). Unknown `/…` text should never be forwarded to a provider; `/agent <name>` with an argument should switch directly.
 
-## #18 Cursor turn shows "Model: provider default" — open (policy risk)
-- A Cursor turn started outside the graph path (prompt began with `/`) used the provider default model instead of composer-2.5. Cursor should always pin composer-2.5 when no F2 model is chosen.
+## #18 Cursor turn shows "Model: provider default" — fixed (PR cursor-model-pin)
+- Repro: A Cursor turn started outside the graph path (prompt began with `/`) used the provider default model instead of composer-2.5.
+- Cause: `submit_to_agent` submitted with whatever model was in `catalog.selected` (None outside graph), and `cursor.rs` omitted `--model` when unset.
+- Fix: Cursor adapter argv now always pins `--model composer-2.5` by default; any disallowed or fast model is replaced with `composer-2.5`; `submit_to_agent`, `effective_model_for`, `apply_runner_and_model`, and F2 selection enforce `composer-2.5` and emit a system notice on replacement; the status bar shows `composer-2.5` instead of "provider default".
 
 ## #19 Screen not repainted after a turn completes — open
 - Under tmux the status bar kept showing `AGY RUNNING · 4m 09s` long after AGY exited; the next key press repainted it as IDLE with the full answer. Related to #15. Likely the draw loop only redraws on input/agent events and misses the final one.
