@@ -71,18 +71,15 @@ impl DmuxSettings {
             settings.cursor_windows_unsandboxed = true;
         }
 
-        if let Some(user_path) = user_config_path {
-            if let Ok(contents) = std::fs::read_to_string(user_path) {
-                match toml::from_str::<DmuxToml>(&contents) {
-                    Ok(parsed) => {
-                        settings.apply_toml(parsed);
-                    }
-                    Err(error) => {
-                        settings
-                            .config_warnings
-                            .push(format!("dmuxai.toml ignored: {error}"));
-                    }
-                }
+        if let Some(user_path) = user_config_path
+            && let Ok(contents) = std::fs::read_to_string(user_path)
+        {
+            match toml::from_str::<DmuxToml>(&contents) {
+                Ok(parsed) => settings.apply_toml(parsed),
+                Err(error) => settings.config_warnings.push(format!(
+                    "user config {} ignored: {error}",
+                    user_path.display()
+                )),
             }
         }
 
