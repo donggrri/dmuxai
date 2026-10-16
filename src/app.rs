@@ -4266,7 +4266,7 @@ mod tests {
         app.selected = adapter_index(Agent::Cursor);
         app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
 
-        app.input = "/custom-command test".to_owned();
+        app.input = "//custom-command test".to_owned(); // escaped literal slash (FR-420)
         app.submit_prompt();
 
         assert_eq!(
