@@ -16,6 +16,7 @@ use tokio::{
 use super::{
     AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ExecutionMode,
     ModelInfo, OutputContext, SpawnedAdapter, implement_outcome::ImplementTurnTracker,
+    prompt_with_image_tokens,
 };
 use crate::process::cursor_command;
 use dmuxai::settings::DmuxSettings;
@@ -324,7 +325,8 @@ async fn run_turn(
         .await;
     }
     send_event(event_tx, Some(&context), AgentEvent::Started).await;
-    stdin.write_all(request.prompt.as_bytes()).await?;
+    let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
+    stdin.write_all(prompt.as_bytes()).await?;
     stdin.write_all(b"\n").await?;
     stdin.shutdown().await?;
     drop(stdin);
@@ -647,6 +649,7 @@ mod tests {
             turn_id: super::super::TurnId::new("turn"),
             prompt: "hello".to_owned(),
             resume_session: Some("cursor-session".to_owned()),
+            image_paths: vec![],
         };
         let mut command = tokio::process::Command::new("cursor-agent");
 
@@ -675,12 +678,42 @@ mod tests {
     }
 
     #[test]
+    // FR-IMG-5: Cursor has no `--image` flag; image paths become `@path` tokens
+    // appended to the prompt written to stdin.
+    fn cursor_passes_image_paths_to_cli() {
+        let cwd = Path::new("workspace");
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conversation"),
+            turn_id: super::super::TurnId::new("turn"),
+            prompt: "describe".to_owned(),
+            resume_session: None,
+            image_paths: vec![
+                PathBuf::from("/tmp/shot.png"),
+                PathBuf::from("/tmp/other.png"),
+            ],
+        };
+        let mut command = tokio::process::Command::new("cursor-agent");
+        configure_command(&mut command, &request, None, ExecutionMode::Ask, cwd, false);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg == "--image"));
+        assert_eq!(
+            prompt_with_image_tokens(&request.prompt, &request.image_paths),
+            "describe @/tmp/shot.png @/tmp/other.png"
+        );
+    }
+
+    #[test]
     fn cursor_execution_modes_use_native_cli_flags() {
         let request = AgentRequest {
             conversation_id: super::super::ConversationId::new("conversation"),
             turn_id: super::super::TurnId::new("turn"),
             prompt: "hello".to_owned(),
             resume_session: None,
+            image_paths: vec![],
         };
         let cwd = Path::new("workspace");
 
@@ -768,6 +801,7 @@ mod tests {
             turn_id: super::super::TurnId::new("turn"),
             prompt: "hello".to_owned(),
             resume_session: None,
+            image_paths: vec![],
         };
 
         let error = run_turn(
@@ -802,6 +836,7 @@ mod tests {
             turn_id: super::super::TurnId::new("real-turn"),
             prompt: "Reply with exactly CURSOR_OK. Do not use tools or modify files.".to_owned(),
             resume_session: None,
+            image_paths: vec![],
         };
         let turn = tokio::spawn(async move {
             run_turn(

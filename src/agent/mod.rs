@@ -3,7 +3,7 @@ mod codex;
 mod cursor;
 mod implement_outcome;
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, path::PathBuf};
 
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -144,6 +144,7 @@ pub struct AgentRequest {
     pub turn_id: TurnId,
     pub prompt: String,
     pub resume_session: Option<String>,
+    pub image_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +253,24 @@ pub trait AgentAdapter: Send {
     fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError>;
     fn request_status(&self) -> Result<(), AdapterError> {
         Err(AdapterError::Unsupported)
+    }
+}
+
+/// Cursor Agent and AGY have no `--image` CLI flag; image attachments are
+/// passed as `@<absolute path>` tokens appended to the prompt text.
+pub(crate) fn prompt_with_image_tokens(prompt: &str, image_paths: &[PathBuf]) -> String {
+    if image_paths.is_empty() {
+        return prompt.to_owned();
+    }
+    let refs = image_paths
+        .iter()
+        .map(|path| format!("@{}", path.display()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if prompt.trim().is_empty() {
+        refs
+    } else {
+        format!("{prompt} {refs}")
     }
 }
 

@@ -13,6 +13,8 @@ use tokio::{
     time::{Duration, Instant, timeout_at},
 };
 
+use dmuxai::attachments::prompt_with_image_references;
+
 use super::{
     AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ConversationId,
     ExecutionMode, ModelInfo, OutputContext, SpawnedAdapter,
@@ -429,7 +431,10 @@ fn turn_start_request(
 ) -> Value {
     let mut params = json!({
         "threadId": thread_id,
-        "input": [{ "type": "text", "text": codex_prompt(mode, &request.prompt) }],
+        "input": [{ "type": "text", "text": prompt_with_image_references(
+            &codex_prompt(mode, &request.prompt),
+            &request.image_paths,
+        ) }],
         "approvalPolicy": "never",
         "sandboxPolicy": {
             "type": match mode {
@@ -1293,6 +1298,7 @@ mod tests {
             turn_id: super::super::TurnId::new("turn"),
             prompt: prompt.to_owned(),
             resume_session: None,
+            image_paths: vec![],
         }
     }
 

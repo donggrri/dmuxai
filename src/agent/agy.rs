@@ -16,6 +16,7 @@ use tokio::{
 use super::{
     AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ExecutionMode,
     ModelInfo, OutputContext, SpawnedAdapter, implement_outcome::ImplementTurnTracker,
+    prompt_with_image_tokens,
 };
 use crate::process::{headless_command, resolve_program};
 
@@ -266,9 +267,10 @@ async fn run_turn(
 
     let context = OutputContext::from(request);
     send_event(event_tx, Some(&context), AgentEvent::Started).await;
+    let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
     let mut input = serde_json::to_vec(&json!({
         "event": "user",
-        "message": { "content": agy_prompt(mode, &request.prompt) }
+        "message": { "content": agy_prompt(mode, &prompt) }
     }))
     .map_err(io::Error::other)?;
     input.push(b'\n');
@@ -591,6 +593,7 @@ mod tests {
             turn_id: super::super::TurnId::new("turn"),
             prompt: "hello".to_owned(),
             resume_session: Some("agy-conversation".to_owned()),
+            image_paths: vec![],
         };
         let mut command = tokio::process::Command::new("agy");
 
@@ -614,12 +617,40 @@ mod tests {
     }
 
     #[test]
+    // FR-IMG-5 / INT-IMG-2: AGY has no `--image` flag; image paths become
+    // `@path` tokens appended to the text prompt.
+    fn agy_passes_image_paths_to_cli() {
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conversation"),
+            turn_id: super::super::TurnId::new("turn"),
+            prompt: "describe".to_owned(),
+            resume_session: None,
+            image_paths: vec![
+                PathBuf::from("/tmp/shot.png"),
+                PathBuf::from("/tmp/other.png"),
+            ],
+        };
+        let mut command = tokio::process::Command::new("agy");
+        configure_command(&mut command, &request, None, ExecutionMode::Ask);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg == "--image"));
+        let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
+        assert_eq!(prompt, "describe @/tmp/shot.png @/tmp/other.png");
+        assert!(agy_prompt(ExecutionMode::Ask, &prompt).ends_with(&prompt));
+    }
+
+    #[test]
     fn agy_execution_modes_use_native_cli_flags_and_safe_prompts() {
         let request = AgentRequest {
             conversation_id: super::super::ConversationId::new("conversation"),
             turn_id: super::super::TurnId::new("turn"),
             prompt: "hello".to_owned(),
             resume_session: None,
+            image_paths: vec![],
         };
 
         let args_for = |mode| {
@@ -684,6 +715,7 @@ mod tests {
             turn_id: super::super::TurnId::new("real-turn"),
             prompt: "Reply with exactly AGY_OK. Do not use tools or modify files.".to_owned(),
             resume_session: None,
+            image_paths: vec![],
         };
         let turn = tokio::spawn(async move {
             run_turn(&request, None, ExecutionMode::Ask, &cwd, &event_tx).await
