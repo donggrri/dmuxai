@@ -9,7 +9,7 @@
 
 ## Residual risks
 
-- Planner is heuristic in Rust; live `grok-4.7-medium` orchestrator CLI turn not wired yet.
+- Planner is heuristic in Rust; live orchestrator CLI turn not wired yet. All models remain `composer-2.5` per policy.
 - Graph resume on app restart not auto-loaded (JSON persisted; manual reload follow-up).
 
 ## Tests

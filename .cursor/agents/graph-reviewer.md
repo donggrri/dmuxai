@@ -3,7 +3,7 @@ name: graph-reviewer
 description: >-
   Reviews drafts for correctness, safety, and clarity. Use after drafting or
   before merge. Returns structured approval and revision notes.
-model: grok-4.7-medium
+model: composer-2.5
 readonly: true
 ---
 

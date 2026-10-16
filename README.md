@@ -219,17 +219,10 @@ through `cmd.exe`, PowerShell command strings, or `/bin/sh`.
 ## Agent graph orchestration (default)
 
 Multi-step prompts are planned as an agent-graph-engineering DAG before any CLI
-turn runs. The orchestrator model is `grok-4.7-medium`. Node models are chosen by
-role:
-
-| Role bucket | Model |
-| --- | --- |
-| research / explore / test | `claude-haiku-5-5-high` |
-| implement / draft | `composer-2.5` |
-| plan / route / review | `grok-4.7-medium` |
-
-Model ids containing `fast` are rejected. Short 1–2 step prompts skip the graph
-and run on the **currently selected** agent with the bucket model applied.
+turn runs. **Every graph node uses `composer-2.5` only** (repository model policy).
+Model ids containing `fast`, or any non–composer-2.5 id, are rejected. Short 1–2
+step prompts skip the graph and run on the **currently selected** agent with
+`composer-2.5` applied.
 
 - Status bar shows the active graph assignment.
 - `/graph` — show the current plan

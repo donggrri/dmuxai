@@ -35,8 +35,14 @@ fn simple_prompt_uses_single_agent() {
 }
 
 #[test]
-fn validate_rejects_fast_models() {
+fn validate_rejects_fast_and_non_composer_models() {
     assert!(validate_model_id("grok-4.7-medium-fast").is_err());
+    assert!(validate_model_id("grok-4.7-medium").is_err());
+    assert!(validate_model_id("claude-haiku-5-5-high").is_err());
+    assert!(validate_model_id("claude-sonnet-5-5").is_err());
+    assert!(validate_model_id("gpt-5").is_err());
+    assert!(validate_model_id("gemini-4").is_err());
+    assert!(validate_model_id("composer-2.5").is_ok());
 }
 
 #[test]

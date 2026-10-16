@@ -3,7 +3,7 @@ name: graph-router
 description: >-
   Classifies input and emits a routing label for conditional graph branches.
   Use when the next node depends on a discrete decision.
-model: grok-4.7-medium
+model: composer-2.5
 readonly: true
 ---
 
