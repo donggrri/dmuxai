@@ -918,4 +918,18 @@ image_arg = []
             vec!["x", "-m", "m1", "use {model} and {workspace} {unknown}"]
         );
     }
+
+    #[test]
+    fn models_are_filtered_and_policy_enforced() {
+        let spec: CustomAgentSpec = toml::from_str(
+            "name = \"oc\"\ncommand = [\"oc\"]\nmodels_filter = \"-free$\"\nallowed_models = \"^opencode/.*-free$\"",
+        )
+        .unwrap();
+        assert_eq!(
+            filter_models(&spec, "opencode/a-free\nopencode/b\n\nopencode/c-free\n"),
+            vec!["opencode/a-free", "opencode/c-free"]
+        );
+        assert!(validate_custom_model(&spec, "opencode/a-free").is_ok());
+        assert!(validate_custom_model(&spec, "opencode/b").is_err());
+    }
 }
