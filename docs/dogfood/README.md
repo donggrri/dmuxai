@@ -81,5 +81,8 @@ Format: id, status, repro, cause, fix.
 ## #20 Graph-by-default can route repo work to the box cursor-agent — friction
 - Because the box cursor-agent is a company account, the dogfood worktree disables the graph locally (`dmuxai.toml` `[graph] enabled=false`, git-excluded) and drives AGY directly. A per-runner allow-list (`[graph] runners = ["agy","opencode"]`) would let the graph stay on.
 
+## #21 AGY wrote PowerShell with parameters that do not exist — fixed in review
+- `Join-Path -LiteralPath` / `New-Item -LiteralPath` parse fine but fail at run time. Lesson: run scripts under pwsh on the box (parse + dry run) before merging; added to the windows-pkg graph run.
+
 ## Process note
 #2, #3 (PR #6) and #7 (PR #8) were fixed directly (not through DmuxAI), because #3 blocked the AGY flash runner that dogfooding needs.

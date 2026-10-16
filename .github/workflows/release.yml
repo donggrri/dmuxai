@@ -18,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release executable
-        run: cargo build --release --locked
+        run: cargo build --release --locked --bin dmuxai --bin dmuxai-launcher
 
       - name: Package release archive and checksum
         shell: pwsh
@@ -27,7 +27,11 @@ jobs:
           $distributionDirectory = Join-Path $env:RUNNER_TEMP 'dmuxai-release'
           New-Item -ItemType Directory -Path $distributionDirectory | Out-Null
           Copy-Item 'target\release\dmuxai.exe' (Join-Path $distributionDirectory 'dmuxai.exe')
-          Compress-Archive -Path (Join-Path $distributionDirectory 'dmuxai.exe') -DestinationPath $archiveName
+          Copy-Item 'target\release\dmuxai-launcher.exe' (Join-Path $distributionDirectory 'dmuxai-launcher.exe')
+          Copy-Item 'packaging\windows\install.ps1' (Join-Path $distributionDirectory 'install.ps1')
+          Copy-Item 'packaging\windows\uninstall.ps1' (Join-Path $distributionDirectory 'uninstall.ps1')
+          Copy-Item 'packaging\windows\README-windows.txt' (Join-Path $distributionDirectory 'README-windows.txt')
+          Compress-Archive -Path "$distributionDirectory\*" -DestinationPath $archiveName
           $hash = (Get-FileHash -LiteralPath $archiveName -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $archiveName" | Set-Content -LiteralPath "$archiveName.sha256" -NoNewline -Encoding ascii
 
