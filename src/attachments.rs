@@ -113,6 +113,23 @@ impl ImageAttachmentStore {
         Ok(self.push_record(dest, byte_size))
     }
 
+    /// Registers an already-saved file (for example a clipboard PNG written
+    /// next to the other attachments) as a pending image.
+    pub fn ingest_saved_file(
+        &mut self,
+        saved: PathBuf,
+    ) -> Result<ImageAttachment, AttachmentError> {
+        let byte_size = fs::metadata(&saved)?.len();
+        if byte_size > self.max_bytes {
+            return Err(AttachmentError::TooLarge {
+                path: saved.clone(),
+                size: byte_size,
+                limit: self.max_bytes,
+            });
+        }
+        Ok(self.push_record(saved, byte_size))
+    }
+
     fn push_record(&mut self, path: PathBuf, byte_size: u64) -> ImageAttachment {
         let label = format!("Image #{}", self.next_index);
         self.next_index += 1;
@@ -222,9 +239,10 @@ pub enum RunnerKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerImageSupport {
-    /// Provider CLI accepts repeated `--image <path>` (or `-i`).
+    /// Reserved for provider CLIs that accept a separate image flag such as
+    /// `--image <path>` (or `-i`); no DmuxAI runner uses one today.
     CliImageFlag,
-    /// Headless protocol: embed `@path` references in the text prompt only.
+    /// `@path` references appended to the text prompt (Cursor, AGY, Codex).
     PromptReferences,
     /// DmuxAI does not attach binaries; user sees a notice.
     Unsupported,
@@ -232,8 +250,9 @@ pub enum RunnerImageSupport {
 
 pub fn runner_image_support(agent: RunnerKind) -> RunnerImageSupport {
     match agent {
-        RunnerKind::Cursor | RunnerKind::Agy => RunnerImageSupport::CliImageFlag,
-        RunnerKind::Codex => RunnerImageSupport::PromptReferences,
+        RunnerKind::Cursor | RunnerKind::Agy | RunnerKind::Codex => {
+            RunnerImageSupport::PromptReferences
+        }
     }
 }
 

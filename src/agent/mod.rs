@@ -256,6 +256,24 @@ pub trait AgentAdapter: Send {
     }
 }
 
+/// Cursor Agent and AGY have no `--image` CLI flag; image attachments are
+/// passed as `@<absolute path>` tokens appended to the prompt text.
+pub(crate) fn prompt_with_image_tokens(prompt: &str, image_paths: &[PathBuf]) -> String {
+    if image_paths.is_empty() {
+        return prompt.to_owned();
+    }
+    let refs = image_paths
+        .iter()
+        .map(|path| format!("@{}", path.display()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if prompt.trim().is_empty() {
+        refs
+    } else {
+        format!("{prompt} {refs}")
+    }
+}
+
 pub type SpawnedAdapter = (Box<dyn AgentAdapter>, JoinHandle<()>);
 
 pub const EVENT_CHANNEL_CAPACITY: usize = 64;

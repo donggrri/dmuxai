@@ -16,6 +16,7 @@ use tokio::{
 use super::{
     AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ExecutionMode,
     ModelInfo, OutputContext, SpawnedAdapter, implement_outcome::ImplementTurnTracker,
+    prompt_with_image_tokens,
 };
 use crate::process::cursor_command;
 use dmuxai::settings::DmuxSettings;
@@ -324,7 +325,8 @@ async fn run_turn(
         .await;
     }
     send_event(event_tx, Some(&context), AgentEvent::Started).await;
-    stdin.write_all(request.prompt.as_bytes()).await?;
+    let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
+    stdin.write_all(prompt.as_bytes()).await?;
     stdin.write_all(b"\n").await?;
     stdin.shutdown().await?;
     drop(stdin);
@@ -369,9 +371,6 @@ fn configure_command(
     }
     if let Some(session_id) = request.resume_session.as_deref() {
         command.arg("--resume").arg(session_id);
-    }
-    for path in &request.image_paths {
-        command.arg("--image").arg(path);
     }
 }
 
@@ -679,6 +678,8 @@ mod tests {
     }
 
     #[test]
+    // FR-IMG-5: Cursor has no `--image` flag; image paths become `@path` tokens
+    // appended to the prompt written to stdin.
     fn cursor_passes_image_paths_to_cli() {
         let cwd = Path::new("workspace");
         let request = AgentRequest {
@@ -686,7 +687,10 @@ mod tests {
             turn_id: super::super::TurnId::new("turn"),
             prompt: "describe".to_owned(),
             resume_session: None,
-            image_paths: vec![PathBuf::from("/tmp/shot.png")],
+            image_paths: vec![
+                PathBuf::from("/tmp/shot.png"),
+                PathBuf::from("/tmp/other.png"),
+            ],
         };
         let mut command = tokio::process::Command::new("cursor-agent");
         configure_command(&mut command, &request, None, ExecutionMode::Ask, cwd, false);
@@ -695,9 +699,10 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--image", "/tmp/shot.png"])
+        assert!(!args.iter().any(|arg| arg == "--image"));
+        assert_eq!(
+            prompt_with_image_tokens(&request.prompt, &request.image_paths),
+            "describe @/tmp/shot.png @/tmp/other.png"
         );
     }
 

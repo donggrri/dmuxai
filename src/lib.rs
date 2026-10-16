@@ -1,6 +1,7 @@
 pub mod attachments;
 pub mod chat_selection;
 pub mod clipboard;
+pub mod clipboard_image;
 pub mod conversation;
 pub mod graph;
 pub mod model_policy;
