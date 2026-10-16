@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io, mem,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -25,6 +25,10 @@ use tokio::{
 use unicode_width::UnicodeWidthStr;
 
 use dmuxai::{
+    attachments::{
+        ImageAttachmentStore, RunnerKind as AttachmentRunnerKind, image_paths_in_text,
+        is_supported_image_path, runner_image_support_message,
+    },
     chat_selection::{CellPosition, ChatSelection},
     clipboard::copy_text,
     conversation::{
@@ -62,6 +66,7 @@ enum SlashAction {
     Resume,
     Summarize,
     Share,
+    Image,
 }
 
 #[derive(Clone, Copy)]
@@ -71,7 +76,7 @@ struct SlashCommand {
     action: SlashAction,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 10] = [
+const SLASH_COMMANDS: [SlashCommand; 11] = [
     SlashCommand {
         name: "/agent",
         description: "Switch the active agent",
@@ -121,6 +126,11 @@ const SLASH_COMMANDS: [SlashCommand; 10] = [
         name: "/share",
         description: "Manually replay context (automatic sharing is on)",
         action: SlashAction::Share,
+    },
+    SlashCommand {
+        name: "/image",
+        description: "Attach a png/jpg/webp image for the next prompt",
+        action: SlashAction::Image,
     },
 ];
 
@@ -353,8 +363,8 @@ struct UiAreas {
 pub struct App {
     exit: bool,
     selected: usize,
-    #[allow(dead_code)]
     workspace_root: PathBuf,
+    pending_images: ImageAttachmentStore,
     #[allow(dead_code)]
     settings: DmuxSettings,
     input: String,
@@ -451,10 +461,11 @@ impl App {
             selected: adapter_index(Agent::default()),
             workspace_root,
             settings,
+            pending_images: ImageAttachmentStore::new(),
             input: String::new(),
             messages: vec![Message::new(
                 Role::System,
-                "Codex, Cursor, and AGY use real structured headless protocols. Completed turns are shared automatically with every agent; /share is optional. If another DmuxAI window is already running in this workspace, this window starts a separate conversation. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /effort to choose Codex reasoning effort, /status to view Codex usage, /quit to exit, F2 to choose a model, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
+                "Codex, Cursor, and AGY use real structured headless protocols. Completed turns are shared automatically with every agent; /share is optional. If another DmuxAI window is already running in this workspace, this window starts a separate conversation. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /image to attach screenshots, /effort to choose Codex reasoning effort, /status to view Codex usage, /quit to exit, F2 to choose a model, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
             )],
             adapters,
             event_rx,
@@ -533,8 +544,16 @@ impl App {
                             && self.mode_picker.is_none()
                             && self.conversation_picker.is_none() =>
                     {
-                        self.input.push_str(&text);
-                        self.refresh_slash_preview();
+                        let trimmed = text.trim();
+                        if !trimmed.contains('\n')
+                            && is_supported_image_path(Path::new(trimmed))
+                            && trimmed.split_whitespace().count() == 1
+                        {
+                            self.attach_image_path(trimmed);
+                        } else {
+                            self.input.push_str(&text);
+                            self.refresh_slash_preview();
+                        }
                     }
                     _ => {}
                 }
@@ -780,6 +799,7 @@ impl App {
             SlashAction::Resume => self.push_system("Usage: /resume <conversation-id>"),
             SlashAction::Summarize => self.start_explicit_summary(),
             SlashAction::Share => self.push_system("Usage: /share <codex|cursor|agy>"),
+            SlashAction::Image => self.push_system("Usage: /image <path>"),
         }
     }
 
@@ -1230,6 +1250,59 @@ impl App {
         }
     }
 
+    fn attachment_runner_kind(agent: Agent) -> AttachmentRunnerKind {
+        match agent {
+            Agent::Cursor => AttachmentRunnerKind::Cursor,
+            Agent::Agy => AttachmentRunnerKind::Agy,
+            Agent::Codex => AttachmentRunnerKind::Codex,
+        }
+    }
+
+    fn attach_image_path(&mut self, raw: &str) -> bool {
+        let path = raw.trim();
+        if path.is_empty() {
+            self.push_system("Usage: /image <path> (png, jpg, or webp; max 10 MiB per file)");
+            return false;
+        }
+        match self
+            .pending_images
+            .ingest_path(&self.workspace_root, Path::new(path))
+        {
+            Ok(attachment) => {
+                self.push_system(format!(
+                    "Attached {} ({} bytes). Images are sent with the next prompt.",
+                    attachment.label, attachment.byte_size
+                ));
+                true
+            }
+            Err(error) => {
+                self.push_system(format!("Could not attach image: {error}"));
+                false
+            }
+        }
+    }
+
+    fn ingest_images_referenced_in_prompt(&mut self, prompt: &str) {
+        for path in image_paths_in_text(prompt) {
+            if self
+                .pending_images
+                .items()
+                .iter()
+                .any(|item| item.path == path)
+            {
+                continue;
+            }
+            if let Err(error) = self.pending_images.ingest_path(&self.workspace_root, &path) {
+                self.push_system(format!("Could not attach {}: {error}", path.display()));
+            }
+        }
+    }
+
+    fn collect_turn_image_paths(&mut self, prompt: &str) -> Vec<PathBuf> {
+        self.ingest_images_referenced_in_prompt(prompt);
+        self.pending_images.paths()
+    }
+
     fn submit_prompt(&mut self) {
         if self.input.trim().is_empty() {
             return;
@@ -1294,6 +1367,19 @@ impl App {
             self.share_conversation(target.trim());
             return;
         }
+        if prompt == "/image" {
+            self.push_system("Usage: /image <path>");
+            return;
+        }
+        if let Some(path) = prompt.strip_prefix("/image ") {
+            self.attach_image_path(path);
+            return;
+        }
+
+        if prompt_should_attach_only(&prompt) {
+            self.attach_image_path(&prompt);
+            return;
+        }
 
         let agent = self.adapters[self.selected].agent();
         self.submit_to_agent(agent, prompt, true);
@@ -1354,10 +1440,21 @@ impl App {
 
         let stored_conversation_id = request.conversation_id.clone();
         let stored_turn_id = request.turn_id.clone();
-        let adapter_request = adapter_request(request);
+        let image_paths = self.collect_turn_image_paths(&prompt);
+        if !image_paths.is_empty()
+            && let Some(message) = runner_image_support_message(Self::attachment_runner_kind(agent))
+        {
+            self.push_system(message);
+            if restore_input_on_failure {
+                self.input = prompt;
+            }
+            return;
+        }
+        let adapter_request = adapter_request(request, image_paths);
         self.messages.push(Message::new(Role::User, prompt.clone()));
         match self.adapters[adapter_index].send(adapter_request) {
             Ok(()) => {
+                self.pending_images.clear();
                 self.active_turns.insert(
                     agent,
                     ActiveTurn {
@@ -1562,6 +1659,7 @@ impl App {
             turn_id: turn_id.clone(),
             prompt,
             resume_session: None,
+            image_paths: vec![],
         };
         match self.adapters[adapter_index(agent)].send(request) {
             Ok(()) => {
@@ -2055,10 +2153,19 @@ impl App {
     }
 
     fn draw_input(&self, frame: &mut Frame, area: Rect) {
-        let title = if self.resizing_input {
+        let base_title = if self.resizing_input {
             " Prompt (resizing) "
         } else {
             " Prompt (drag top border) "
+        };
+        let title = if self.pending_images.is_empty() {
+            base_title.to_owned()
+        } else {
+            format!(
+                "{} | Attachments: {} ",
+                base_title.trim(),
+                self.pending_images.chip_line()
+            )
         };
         let input = Paragraph::new(self.input.as_str())
             .block(Block::default().borders(Borders::ALL).title(title));
@@ -2425,7 +2532,10 @@ fn adapter_index(agent: Agent) -> usize {
         .expect("agent belongs to Agent::ALL")
 }
 
-fn adapter_request(request: dmuxai::conversation::AgentRequest) -> AgentRequest {
+fn adapter_request(
+    request: dmuxai::conversation::AgentRequest,
+    image_paths: Vec<PathBuf>,
+) -> AgentRequest {
     let prompt = if request.resume_session.is_some() {
         request.prompt
     } else {
@@ -2436,7 +2546,16 @@ fn adapter_request(request: dmuxai::conversation::AgentRequest) -> AgentRequest 
         turn_id: TurnId::new(request.turn_id.as_str()),
         prompt,
         resume_session: request.resume_session,
+        image_paths,
     }
+}
+
+fn prompt_should_attach_only(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with('/')
+        && trimmed.split_whitespace().count() == 1
+        && is_supported_image_path(Path::new(trimmed))
 }
 
 fn render_restored_prompt(context: &ContextProjection, prompt: &str) -> String {
@@ -2723,6 +2842,7 @@ fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use dmuxai::ui_png::buffer_to_rgb_image;
     use ratatui::backend::TestBackend;
 
     use super::*;
@@ -4520,5 +4640,71 @@ mod tests {
             .select(ConversationSelection::Existing(first_conversation))
             .unwrap();
         assert_eq!(completed.turns[0].status, TurnStatus::Completed);
+    }
+
+    fn save_png(app: &mut App, path: &std::path::Path, width: u16, height: u16) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let image = buffer_to_rgb_image(terminal.backend().buffer());
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        image.save(path).unwrap();
+    }
+
+    #[test]
+    fn image_slash_command_attaches_supported_file() {
+        let (mut app, _) = test_app();
+        let file = std::env::current_dir()
+            .unwrap()
+            .join("dmuxai-test-attach.png");
+        std::fs::write(&file, b"\x89PNG").unwrap();
+        app.input = format!("/image {}", file.display());
+        app.submit_prompt();
+        assert_eq!(app.pending_images.len(), 1);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn submit_prompt_forwards_image_paths_to_adapter() {
+        let (mut app, sent) = test_app();
+        let file = std::env::current_dir()
+            .unwrap()
+            .join("dmuxai-test-send.png");
+        std::fs::write(&file, b"\x89PNG").unwrap();
+        app.input = format!("/image {}", file.display());
+        app.submit_prompt();
+        app.input = "Describe the screenshot".to_owned();
+        app.submit_prompt();
+        let request = sent.lock().unwrap()[0].1.clone();
+        assert_eq!(request.image_paths.len(), 1);
+        assert!(request.image_paths[0].exists());
+        assert!(app.pending_images.is_empty());
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn export_documentation_screenshots() {
+        if std::env::var("DMUXAI_EXPORT_SCREENSHOTS").is_err() {
+            return;
+        }
+        let out = std::path::Path::new("docs/screenshots");
+        let (mut app, _) = test_app();
+        save_png(&mut app, &out.join("main-tui.png"), 120, 36);
+
+        app.input = "Summarize the repository layout".to_owned();
+        app.submit_prompt();
+        app.messages.push(Message::new(
+            Role::Agent(Agent::Codex),
+            "Scanning sources and summarizing modules...",
+        ));
+        save_png(&mut app, &out.join("agent-turn.png"), 120, 36);
+
+        app.open_model_picker();
+        save_png(&mut app, &out.join("model-picker.png"), 120, 36);
+        app.model_picker = None;
+        app.open_mode_picker();
+        save_png(&mut app, &out.join("mode-picker.png"), 120, 36);
     }
 }

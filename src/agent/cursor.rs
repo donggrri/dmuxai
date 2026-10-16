@@ -370,6 +370,9 @@ fn configure_command(
     if let Some(session_id) = request.resume_session.as_deref() {
         command.arg("--resume").arg(session_id);
     }
+    for path in &request.image_paths {
+        command.arg("--image").arg(path);
+    }
 }
 
 async fn stream_child(
@@ -647,6 +650,7 @@ mod tests {
             turn_id: super::super::TurnId::new("turn"),
             prompt: "hello".to_owned(),
             resume_session: Some("cursor-session".to_owned()),
+            image_paths: vec![],
         };
         let mut command = tokio::process::Command::new("cursor-agent");
 
@@ -675,12 +679,36 @@ mod tests {
     }
 
     #[test]
+    fn cursor_passes_image_paths_to_cli() {
+        let cwd = Path::new("workspace");
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conversation"),
+            turn_id: super::super::TurnId::new("turn"),
+            prompt: "describe".to_owned(),
+            resume_session: None,
+            image_paths: vec![PathBuf::from("/tmp/shot.png")],
+        };
+        let mut command = tokio::process::Command::new("cursor-agent");
+        configure_command(&mut command, &request, None, ExecutionMode::Ask, cwd, false);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--image", "/tmp/shot.png"])
+        );
+    }
+
+    #[test]
     fn cursor_execution_modes_use_native_cli_flags() {
         let request = AgentRequest {
             conversation_id: super::super::ConversationId::new("conversation"),
             turn_id: super::super::TurnId::new("turn"),
             prompt: "hello".to_owned(),
             resume_session: None,
+            image_paths: vec![],
         };
         let cwd = Path::new("workspace");
 
@@ -768,6 +796,7 @@ mod tests {
             turn_id: super::super::TurnId::new("turn"),
             prompt: "hello".to_owned(),
             resume_session: None,
+            image_paths: vec![],
         };
 
         let error = run_turn(
@@ -802,6 +831,7 @@ mod tests {
             turn_id: super::super::TurnId::new("real-turn"),
             prompt: "Reply with exactly CURSOR_OK. Do not use tools or modify files.".to_owned(),
             resume_session: None,
+            image_paths: vec![],
         };
         let turn = tokio::spawn(async move {
             run_turn(

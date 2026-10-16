@@ -317,6 +317,9 @@ fn configure_command(
     if let Some(conversation_id) = request.resume_session.as_deref() {
         command.arg("--conversation").arg(conversation_id);
     }
+    for path in &request.image_paths {
+        command.arg("--image").arg(path);
+    }
 }
 
 async fn stream_child(
@@ -591,6 +594,7 @@ mod tests {
             turn_id: super::super::TurnId::new("turn"),
             prompt: "hello".to_owned(),
             resume_session: Some("agy-conversation".to_owned()),
+            image_paths: vec![],
         };
         let mut command = tokio::process::Command::new("agy");
 
@@ -620,6 +624,7 @@ mod tests {
             turn_id: super::super::TurnId::new("turn"),
             prompt: "hello".to_owned(),
             resume_session: None,
+            image_paths: vec![],
         };
 
         let args_for = |mode| {
@@ -684,6 +689,7 @@ mod tests {
             turn_id: super::super::TurnId::new("real-turn"),
             prompt: "Reply with exactly AGY_OK. Do not use tools or modify files.".to_owned(),
             resume_session: None,
+            image_paths: vec![],
         };
         let turn = tokio::spawn(async move {
             run_turn(&request, None, ExecutionMode::Ask, &cwd, &event_tx).await

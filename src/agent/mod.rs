@@ -3,7 +3,7 @@ mod codex;
 mod cursor;
 mod implement_outcome;
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, path::PathBuf};
 
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -144,6 +144,7 @@ pub struct AgentRequest {
     pub turn_id: TurnId,
     pub prompt: String,
     pub resume_session: Option<String>,
+    pub image_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]

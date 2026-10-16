@@ -117,6 +117,7 @@ cargo run
 Controls:
 
 - Type or paste: edit the prompt
+- `/image <path>` or paste a single image path (`png`, `jpg`, `webp`, max 10 MiB each): attach files for the next prompt; attachments appear in the prompt title bar
 - `Backspace`: delete the previous character
 - `Enter`: send to the selected agent
 - Type `/`: preview matching slash commands; use `Up` / `Down` and `Enter` or `Tab`
@@ -214,6 +215,31 @@ Executable overrides:
 
 Prompts are written to child stdin. Neither Windows nor Linux routes prompt text
 through `cmd.exe`, PowerShell command strings, or `/bin/sh`.
+
+## Image attachments
+
+Attach `png`, `jpg`, or `webp` files (10 MiB per file) before sending a prompt:
+
+- `/image path/to/screenshot.png`
+- Paste a single filesystem path into the prompt area
+- Mention supported paths in the prompt text (for example `see ./ui.png`)
+
+Attached files are copied under `.dmuxai/attachments/` in the workspace. The
+prompt title shows `[Image #1]` chips until the turn is sent successfully.
+
+| Agent | How images are passed |
+| --- | --- |
+| Cursor | `cursor-agent --image <path>` (repeated per file) |
+| AGY | `agy --image <path>` (repeated per file) |
+| Codex | `@path` references appended to the turn text (app-server JSON has no separate image field in DmuxAI today) |
+
+Regenerate UI reference screenshots from the Ratatui test backend:
+
+```bash
+DMUXAI_EXPORT_SCREENSHOTS=1 cargo test export_documentation_screenshots -- --nocapture
+```
+
+Outputs land in `docs/screenshots/`.
 
 ## Verify
 
