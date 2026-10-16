@@ -154,4 +154,18 @@ mod theme_config_tests {
         assert_eq!(settings.theme.agy, Theme::default().agy);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn graph_enabled_by_default_and_can_be_disabled() {
+        let dir =
+            std::env::temp_dir().join(format!("dmuxai-graph-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let default_settings = DmuxSettings::load(&dir);
+        assert!(default_settings.graph_enabled);
+
+        std::fs::write(dir.join("dmuxai.toml"), "[graph]\nenabled = false\n").unwrap();
+        let disabled_settings = DmuxSettings::load(&dir);
+        assert!(!disabled_settings.graph_enabled);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
