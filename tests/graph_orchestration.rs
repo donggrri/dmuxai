@@ -1,0 +1,112 @@
+use dmuxai::graph::{
+    ExecutionPlan, GraphRun, GraphRunPhase, GraphRunSession, NodeRole, ORCHESTRATOR_MODEL,
+    plan_request, save_run, validate_model_id,
+};
+use dmuxai::settings::DmuxSettings;
+use dmuxai::skills::discover_skills;
+use tempfile::tempdir;
+
+#[test]
+fn planner_sets_orchestrator_model() {
+    let dir = tempdir().unwrap();
+    let plan = plan_request(
+        "research the auth module, plan migration, implement fix, and review",
+        dir.path(),
+        &DmuxSettings::default(),
+    );
+    let graph = match plan {
+        ExecutionPlan::Graph(graph) => graph,
+        ExecutionPlan::Single(_) => panic!("expected multi-node graph"),
+    };
+    assert_eq!(graph.orchestrator_model, ORCHESTRATOR_MODEL);
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|node| node.role == NodeRole::Orchestrate)
+    );
+}
+
+#[test]
+fn simple_prompt_uses_single_agent() {
+    let dir = tempdir().unwrap();
+    let plan = plan_request("fix typo in README", dir.path(), &DmuxSettings::default());
+    assert!(matches!(plan, ExecutionPlan::Single(_)));
+}
+
+#[test]
+fn validate_rejects_fast_models() {
+    assert!(validate_model_id("grok-4.7-medium-fast").is_err());
+}
+
+#[test]
+fn store_round_trip() {
+    let dir = tempdir().unwrap();
+    let plan = plan_request(
+        "explore codebase and implement feature with tests and review",
+        dir.path(),
+        &DmuxSettings::default(),
+    );
+    let graph = match plan {
+        ExecutionPlan::Graph(graph) => graph,
+        ExecutionPlan::Single(_) => panic!("expected graph"),
+    };
+    let run = GraphRun {
+        plan: graph,
+        conversation_id: "conv-1".to_owned(),
+        phase: GraphRunPhase::Active,
+        waiting_gate_node: None,
+    };
+    let path = save_run(dir.path(), &run).unwrap();
+    assert!(path.exists());
+    let loaded = dmuxai::graph::load_run(dir.path(), &run.plan.id).unwrap();
+    assert_eq!(loaded.plan.id, run.plan.id);
+}
+
+#[test]
+fn gate_pauses_until_continue() {
+    let dir = tempdir().unwrap();
+    let plan = plan_request(
+        "research auth, plan database migration, implement merge to main",
+        dir.path(),
+        &DmuxSettings::default(),
+    );
+    let graph = match plan {
+        ExecutionPlan::Graph(graph) => graph,
+        ExecutionPlan::Single(_) => panic!("expected graph"),
+    };
+    let run = GraphRun {
+        plan: graph,
+        conversation_id: "conv".to_owned(),
+        phase: GraphRunPhase::Active,
+        waiting_gate_node: None,
+    };
+    let mut session = GraphRunSession::new(run);
+    let first = session.schedule();
+    assert!(
+        first
+            .iter()
+            .any(|action| matches!(action, dmuxai::graph::GraphAction::PauseForGate(_)))
+            || first
+                .iter()
+                .any(|action| matches!(action, dmuxai::graph::GraphAction::StartNode(_)))
+    );
+    if first
+        .iter()
+        .any(|a| matches!(a, dmuxai::graph::GraphAction::PauseForGate(_)))
+    {
+        let after = session.acknowledge_gate();
+        assert!(!after.is_empty() || session.run().phase == GraphRunPhase::WaitingGate);
+    }
+}
+
+#[test]
+fn discover_skills_finds_agent_graph_engineering() {
+    let skills = discover_skills(std::path::Path::new("."));
+    assert!(
+        skills
+            .iter()
+            .any(|skill| skill.id == "agent-graph-engineering"),
+        "expected agent-graph-engineering skill in repo"
+    );
+}

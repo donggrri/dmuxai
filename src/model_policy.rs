@@ -1,10 +1,26 @@
-//! Enforces the repository-wide composer-2.5-only model policy.
+//! Graph-era model policy: role buckets + fast-model rejection.
 
-pub const ALLOWED_MODEL: &str = "composer-2.5";
+pub const ORCHESTRATOR_MODEL: &str = "grok-4.7-medium";
+pub const RESEARCH_MODEL: &str = "claude-haiku-5-5-high";
+pub const IMPLEMENT_MODEL: &str = "composer-2.5";
+pub const PLAN_REVIEW_MODEL: &str = "grok-4.7-medium";
 
-/// Returns true when `model_id` is exactly the allowed model (case-insensitive, trimmed).
+/// Legacy alias used in docs/tests that still mention a single default implement model.
+pub const ALLOWED_MODEL: &str = IMPLEMENT_MODEL;
+
+const ALLOWED: &[&str] = &[
+    ORCHESTRATOR_MODEL,
+    RESEARCH_MODEL,
+    IMPLEMENT_MODEL,
+    PLAN_REVIEW_MODEL,
+];
+
+/// Returns true when `model_id` is on the graph allow-list (case-insensitive).
 pub fn is_allowed_model(model_id: &str) -> bool {
-    model_id.trim().eq_ignore_ascii_case(ALLOWED_MODEL)
+    let trimmed = model_id.trim();
+    ALLOWED
+        .iter()
+        .any(|candidate| trimmed.eq_ignore_ascii_case(candidate))
 }
 
 /// Rejects disallowed model ids used in routing, graphs, or agent defaults.
@@ -18,15 +34,16 @@ pub fn validate_model_id(model_id: &str) -> Result<(), String> {
     }
     if !is_allowed_model(trimmed) {
         return Err(format!(
-            "model {trimmed} is not allowed; only {ALLOWED_MODEL} is permitted"
+            "model {trimmed} is not allowed; permitted: {}",
+            ALLOWED.join(", ")
         ));
     }
     Ok(())
 }
 
-/// Default model for graph nodes, subagents, and auto-routing.
+/// Default model for implement/draft graph nodes.
 pub fn default_model() -> &'static str {
-    ALLOWED_MODEL
+    IMPLEMENT_MODEL
 }
 
 #[cfg(test)]
@@ -34,11 +51,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_composer_2_5_is_allowed() {
+    fn graph_models_are_allowed() {
         assert!(is_allowed_model("composer-2.5"));
-        assert!(is_allowed_model(" Composer-2.5 "));
-        assert!(!is_allowed_model("claude-haiku-5-5-high"));
-        assert!(!is_allowed_model("grok-4.7-medium-fast"));
+        assert!(is_allowed_model("grok-4.7-medium"));
+        assert!(is_allowed_model("claude-haiku-5-5-high"));
     }
 
     #[test]

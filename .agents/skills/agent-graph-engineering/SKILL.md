@@ -102,11 +102,13 @@ Design multi-agent workflows as **directed graphs**: agents are nodes, context a
 
 ## Model assignment (example subagents)
 
-Use **only `composer-2.5`** for every graph node and subagent in this repository (see `MISSION.md`). Do not default to or invoke haiku, grok, sonnet, gpt, gemini, or any `*-fast` model.
+Follow `MISSION.md` model buckets (never `*-fast`):
 
 | Role bucket | Model | Example agents |
 | --- | --- | --- |
-| All roles (research, implement, orchestrate, review, route, draft) | `composer-2.5` | `graph-*` under `.cursor/agents/` |
+| orchestrate / plan / route / review | `grok-4.7-medium` | `graph-planner`, `graph-router`, `graph-reviewer` |
+| research / explore / test | `claude-haiku-5-5-high` | `graph-researcher`, `explore` |
+| implement / draft | `composer-2.5` | `graph-drafter`, `graph-worker` |
 
 Omit `model` on custom agents to inherit the parent model when appropriate.
 

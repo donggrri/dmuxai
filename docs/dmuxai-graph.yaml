@@ -16,11 +16,11 @@ scope:
   external_side_effects: none
 
 model_policy:
-  allowed_only: composer-2.5
-  orchestrate: composer-2.5
-  implement: composer-2.5
-  research_test: composer-2.5
-  disallow_patterns: ["*-fast", "*haiku*", "*grok*", "*sonnet*", "*gpt*", "*gemini*"]
+  orchestrate: grok-4.7-medium
+  plan_route_review: grok-4.7-medium
+  research_explore_test: claude-haiku-5-5-high
+  implement_draft: composer-2.5
+  disallow_patterns: ["*fast*"]
 
 nodes:
   - id: research-permissions

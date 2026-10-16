@@ -216,6 +216,38 @@ Executable overrides:
 Prompts are written to child stdin. Neither Windows nor Linux routes prompt text
 through `cmd.exe`, PowerShell command strings, or `/bin/sh`.
 
+## Agent graph orchestration (default)
+
+Multi-step prompts are planned as an agent-graph-engineering DAG before any CLI
+turn runs. The orchestrator model is `grok-4.7-medium`. Node models are chosen by
+role:
+
+| Role bucket | Model |
+| --- | --- |
+| research / explore / test | `claude-haiku-5-5-high` |
+| implement / draft | `composer-2.5` |
+| plan / route / review | `grok-4.7-medium` |
+
+Model ids containing `fast` are rejected. Short 1–2 step prompts skip the graph
+and run on the **currently selected** agent with the bucket model applied.
+
+- Status bar shows the active graph assignment.
+- `/graph` — show the current plan
+- `/graph continue` — approve a merge/DB/auth gate
+- `/graph override <node> <cursor\|agy\|codex> <model-id>` — override runner/model
+
+Graph state is stored under `.dmuxai/graphs/` for resume. Skills are loaded from
+`.agents/skills/*/SKILL.md` and prefixed to node prompts when bound.
+
+Disable auto-planning in `dmuxai.toml`:
+
+```toml
+[graph]
+enabled = false
+max_parallel = 2
+max_retries = 2
+```
+
 ## Image attachments
 
 Attach `png`, `jpg`, or `webp` files (10 MiB per file) before sending a prompt:

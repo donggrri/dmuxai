@@ -18,7 +18,7 @@ DmuxAI is a **Rust + Ratatui** terminal orchestrator. It does not scrape ANSI te
 
 6. **Platforms** — **Linux TUI first** (primary dev and CI target). **Windows** ships as a launcher that runs DmuxAI **inside WSL** with a Linux workspace canonical path.
 
-7. **Model policy** — **Only `composer-2.5`** may be used or defaulted for any graph node, subagent, or DmuxAI routing default. No haiku, grok, sonnet, gpt, gemini, or `*-fast` models. Guards/tests enforce this in-repo.
+7. **Model policy** — Graph orchestration uses **`grok-4.7-medium`** for orchestrate/plan/route/review, **`claude-haiku-5-5-high`** for research/explore/test, and **`composer-2.5`** for implement/draft. Any model id containing **`fast`** is rejected. Guards/tests enforce the allow-list in-repo.
 
 8. **Graph execution reports** — Every product PR includes an honest Korean **Graph execution report** in `docs/graph-runs/<topic>.md` and a matching section in the PR body (graph used, roles, models, edge payloads, retries, timings; no false claims of delegation).
 
