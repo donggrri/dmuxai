@@ -45,6 +45,7 @@ use dmuxai::{
     },
     settings::DmuxSettings,
     skills::{discover_skills, skill_prompt_prefix},
+    theme::Speaker,
 };
 
 use crate::agent::{
@@ -2350,17 +2351,24 @@ impl App {
         let mut lines = Vec::new();
 
         for message in &self.messages {
+            let theme = &self.settings.theme;
             let (label, color) = match message.role {
-                Role::User => ("You".to_owned(), Color::Cyan),
-                Role::Agent(agent) => (agent.to_string(), Color::Green),
-                Role::System => ("DmuxAI".to_owned(), Color::DarkGray),
+                Role::User => ("You".to_owned(), theme.color_for(Speaker::User)),
+                Role::Agent(agent) => (agent.to_string(), theme.color_for(speaker_for(agent))),
+                Role::System => ("DmuxAI".to_owned(), theme.color_for(Speaker::System)),
             };
+            let body_style = Style::default().fg(color);
 
             lines.push(Line::from(Span::styled(
                 label,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                body_style.add_modifier(Modifier::BOLD),
             )));
-            lines.extend(message.content.lines().map(Line::from));
+            lines.extend(
+                message
+                    .content
+                    .lines()
+                    .map(|line| Line::from(Span::styled(line.to_owned(), body_style))),
+            );
             lines.push(Line::default());
         }
 
@@ -4985,5 +4993,35 @@ mod tests {
 
         assert!(app.pending_images.is_empty());
         assert_eq!(app.input, "keep me");
+    }
+}
+
+fn speaker_for(agent: Agent) -> Speaker {
+    match agent {
+        Agent::Cursor => Speaker::Cursor,
+        Agent::Agy => Speaker::Agy,
+        Agent::Codex => Speaker::Other,
+    }
+}
+
+#[cfg(test)]
+mod speaker_style_tests {
+    use super::*;
+    use dmuxai::theme::Theme;
+
+    #[test]
+    fn agents_map_to_distinct_speakers() {
+        assert_eq!(speaker_for(Agent::Cursor), Speaker::Cursor);
+        assert_eq!(speaker_for(Agent::Agy), Speaker::Agy);
+        assert_eq!(speaker_for(Agent::Codex), Speaker::Other);
+        let t = Theme::default();
+        assert_ne!(
+            t.color_for(Speaker::User),
+            t.color_for(speaker_for(Agent::Cursor))
+        );
+        assert_ne!(
+            t.color_for(speaker_for(Agent::Cursor)),
+            t.color_for(speaker_for(Agent::Agy))
+        );
     }
 }
