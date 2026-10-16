@@ -569,16 +569,7 @@ impl App {
                             && self.mode_picker.is_none()
                             && self.conversation_picker.is_none() =>
                     {
-                        let trimmed = text.trim();
-                        if !trimmed.contains('\n')
-                            && is_supported_image_path(Path::new(trimmed))
-                            && trimmed.split_whitespace().count() == 1
-                        {
-                            self.attach_image_path(trimmed);
-                        } else {
-                            self.input.push_str(&text);
-                            self.refresh_slash_preview();
-                        }
+                        self.handle_paste(text);
                     }
                     _ => {}
                 }
@@ -700,6 +691,25 @@ impl App {
         }
     }
 
+    fn handle_paste(&mut self, text: String) {
+        let trimmed = text.trim();
+        if !trimmed.contains('\n')
+            && is_supported_image_path(Path::new(trimmed))
+            && trimmed.split_whitespace().count() == 1
+        {
+            self.attach_image_path(trimmed);
+            return;
+        }
+
+        let has_trailing_newline = text.ends_with('\n') || text.ends_with('\r');
+        let clean = text.trim_end_matches(['\r', '\n']);
+        self.input.push_str(clean);
+        self.refresh_slash_preview();
+        if has_trailing_newline {
+            self.submit_prompt();
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.cancel_selected();
@@ -743,7 +753,7 @@ impl App {
             KeyCode::Esc => {}
             KeyCode::F(2) => self.open_model_picker(),
             KeyCode::F(3) => self.open_conversation_picker(),
-            KeyCode::Enter => self.submit_prompt(),
+            KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => self.submit_prompt(),
             KeyCode::Backspace => {
                 self.input.pop();
                 self.refresh_slash_preview();
@@ -774,7 +784,9 @@ impl App {
                     preview.cursor = (preview.cursor + 1).min(match_count.saturating_sub(1));
                 }
             }
-            KeyCode::Enter | KeyCode::Tab => self.execute_selected_slash_command(),
+            KeyCode::Enter | KeyCode::Tab | KeyCode::Char('\n') | KeyCode::Char('\r') => {
+                self.execute_selected_slash_command()
+            }
             KeyCode::Backspace => {
                 self.input.pop();
                 self.refresh_slash_preview();
@@ -1367,7 +1379,10 @@ impl App {
             return;
         }
 
-        let prompt = mem::take(&mut self.input);
+        let mut prompt = mem::take(&mut self.input);
+        if prompt.ends_with('\n') || prompt.ends_with('\r') {
+            prompt.truncate(prompt.trim_end_matches(['\r', '\n']).len());
+        }
         self.slash_preview = None;
         for command in ["/summarize", "/compact"] {
             if let Some(rest) = prompt
@@ -2618,34 +2633,37 @@ impl App {
                 })
             })
             .unwrap_or("provider default");
-        let status = Line::from(vec![
-            Span::styled(
-                format!(" {selected} {state} "),
-                Style::default().fg(Color::Black).bg(Color::Yellow),
-            ),
-            Span::raw(format!(
-                "  {activity}{}  Model: {model}  Effort: {}  Mode: {}  /effort  /status  /mode  /agent  /graph  /quit exit  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close{}{}",
-                if other_activity.is_empty() {
-                    String::new()
-                } else {
-                    format!("  | {other_activity}")
-                },
-                self.model_catalogs
-                    .get(&selected)
-                    .and_then(|catalog| catalog.selected_effort.as_deref())
-                    .unwrap_or("provider default"),
-                self.modes.get(&selected).copied().unwrap_or_default(),
-                if self.graph_assignment_line.is_empty() {
-                    String::new()
-                } else {
-                    format!("  Graph: {}", self.graph_assignment_line)
-                },
-                self.copy_notice
-                    .as_ref()
-                    .map(|notice| format!("  {notice}"))
-                    .unwrap_or_default(),
-            )),
-        ]);
+        let mode_name = format!("{}", self.modes.get(&selected).copied().unwrap_or_default());
+        let effort_name = self
+            .model_catalogs
+            .get(&selected)
+            .and_then(|catalog| catalog.selected_effort.as_deref())
+            .unwrap_or("provider default");
+        let notice_name = self.copy_notice.as_deref().unwrap_or("");
+
+        let segments = StatusSegments {
+            agent: selected.name(),
+            state,
+            model,
+            mode: &mode_name,
+            effort: effort_name,
+            activity: &activity,
+            other_activity: &other_activity,
+            graph: &self.graph_assignment_line,
+            copy_notice: notice_name,
+        };
+
+        let status_line = fit_status_segments(&segments, area.width as usize);
+        let badge = format!(" {selected} {state} ");
+        let status = if status_line.starts_with(&badge) {
+            let rest = &status_line[badge.len()..];
+            Line::from(vec![
+                Span::styled(badge, Style::default().fg(Color::Black).bg(Color::Yellow)),
+                Span::raw(rest.to_owned()),
+            ])
+        } else {
+            Line::from(vec![Span::raw(status_line)])
+        };
         frame.render_widget(Paragraph::new(status), area);
     }
 
@@ -2976,6 +2994,112 @@ fn prompt_should_attach_only(prompt: &str) -> bool {
         && !trimmed.starts_with('/')
         && trimmed.split_whitespace().count() == 1
         && is_supported_image_path(Path::new(trimmed))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StatusSegments<'a> {
+    pub agent: &'a str,
+    pub state: &'a str,
+    pub model: &'a str,
+    pub mode: &'a str,
+    pub effort: &'a str,
+    pub activity: &'a str,
+    pub other_activity: &'a str,
+    pub graph: &'a str,
+    pub copy_notice: &'a str,
+}
+
+pub(crate) fn fit_status_segments(segments: &StatusSegments<'_>, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let agent_state = format!(" {} {} ", segments.agent, segments.state);
+    let other = if segments.other_activity.is_empty() {
+        String::new()
+    } else {
+        format!("  | {}", segments.other_activity)
+    };
+    let graph = if segments.graph.is_empty() {
+        String::new()
+    } else {
+        format!("  Graph: {}", segments.graph)
+    };
+    let notice = if segments.copy_notice.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", segments.copy_notice)
+    };
+
+    // Candidate 1: Full status with all slash commands and all key hints
+    let full = format!(
+        "{agent_state}  {}{other}  Model: {}  Effort: {}  Mode: {}{graph}{notice}  /effort  /status  /mode  /agent  /graph  /quit exit  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close",
+        segments.activity, segments.model, segments.effort, segments.mode
+    );
+    if full.chars().count() <= width {
+        return full;
+    }
+
+    // Candidate 2: Drop low-priority slash commands
+    let no_slash = format!(
+        "{agent_state}  {}{other}  Model: {}  Effort: {}  Mode: {}{graph}{notice}  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close",
+        segments.activity, segments.model, segments.effort, segments.mode
+    );
+    if no_slash.chars().count() <= width {
+        return no_slash;
+    }
+
+    // Candidate 3: Drop secondary navigation keys (F2, F3)
+    let core_hints = format!(
+        "{agent_state}  {}{other}  Model: {}  Effort: {}  Mode: {}{graph}{notice}  Enter send  Ctrl+C cancel  Esc close",
+        segments.activity, segments.model, segments.effort, segments.mode
+    );
+    if core_hints.chars().count() <= width {
+        return core_hints;
+    }
+
+    // Candidate 4: Abbreviate key hints ("Enter  Ctrl+C  Esc") and simplify default effort
+    let effort_display = if segments.effort == "provider default" {
+        "default"
+    } else {
+        segments.effort
+    };
+    let abbr_hints = format!(
+        "{agent_state}{other}  Model: {}  Effort: {effort_display}  Mode: {}  Enter  Ctrl+C  Esc",
+        segments.model, segments.mode
+    );
+    if abbr_hints.chars().count() <= width {
+        return abbr_hints;
+    }
+
+    // Candidate 5: Abbreviated keys without effort
+    let no_effort_hints = format!(
+        "{agent_state}{other}  Model: {}  Mode: {}  Enter  Ctrl+C  Esc",
+        segments.model, segments.mode
+    );
+    if no_effort_hints.chars().count() <= width {
+        return no_effort_hints;
+    }
+
+    // Candidate 6: Drop all hints, keep essential (agent+state, model, mode)
+    let essential = format!(
+        "{agent_state}  Model: {}  Mode: {}",
+        segments.model, segments.mode
+    );
+    if essential.chars().count() <= width {
+        return essential;
+    }
+
+    // Candidate 7: Tight format for narrow width (<= 40)
+    let tight = format!("{agent_state}  {}  {}", segments.model, segments.mode);
+    if tight.chars().count() <= width {
+        return tight;
+    }
+
+    // Candidate 8: Truncate to width with ellipsis
+    let mut truncated: String = tight.chars().take(width.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
 }
 
 fn render_restored_prompt(context: &ContextProjection, prompt: &str) -> String {
@@ -5422,6 +5546,91 @@ mod tests {
 
         assert!(app.pending_images.is_empty());
         assert_eq!(app.input, "keep me");
+    }
+
+    #[test]
+    fn fit_status_segments_at_widths_40_80_200() {
+        let segments = StatusSegments {
+            agent: "Cursor",
+            state: "IDLE",
+            model: "composer-2.5",
+            mode: "ask",
+            effort: "provider default",
+            activity: "IDLE",
+            other_activity: "",
+            graph: "",
+            copy_notice: "",
+        };
+
+        // Width 200: includes all slash hints and key hints
+        let at_200 = fit_status_segments(&segments, 200);
+        assert!(at_200.chars().count() <= 200);
+        assert!(at_200.contains("Model: composer-2.5"));
+        assert!(at_200.contains("Mode: ask"));
+        assert!(at_200.contains("/effort"));
+        assert!(at_200.contains("/status"));
+        assert!(at_200.contains("F2 model"));
+        assert!(at_200.contains("Enter send"));
+
+        // Width 80: drops slash hints, preserves key hints/status, fits in 80
+        let at_80 = fit_status_segments(&segments, 80);
+        assert!(at_80.chars().count() <= 80);
+        assert!(!at_80.contains("/effort"));
+        assert!(at_80.contains("Model: composer-2.5"));
+        assert!(at_80.contains("Mode: ask"));
+        assert!(at_80.contains("Esc"));
+
+        // Width 40: essential info fits within 40
+        let at_40 = fit_status_segments(&segments, 40);
+        assert!(at_40.chars().count() <= 40);
+        assert!(at_40.contains("Cursor"));
+        assert!(at_40.contains("IDLE"));
+        assert!(at_40.contains("ask"));
+    }
+
+    #[test]
+    fn enter_immediately_after_paste_burst_submits_prompt() {
+        let (mut app, sent) = test_app();
+        let burst = "a".repeat(600);
+        app.handle_paste(burst.clone());
+        assert_eq!(app.input, burst);
+
+        // Enter right after the burst
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.input.is_empty(),
+            "prompt buffer must be cleared on submit"
+        );
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1.prompt, burst);
+    }
+
+    #[test]
+    fn paste_with_trailing_newline_submits_immediately() {
+        let (mut app, sent) = test_app();
+        app.handle_paste("hello world\n".to_string());
+        assert!(
+            app.input.is_empty(),
+            "prompt buffer must be submitted immediately"
+        );
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1.prompt, "hello world");
+    }
+
+    #[test]
+    fn char_newline_key_submits_prompt() {
+        let (mut app, sent) = test_app();
+        app.input.push_str("some input");
+        app.handle_key(KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE));
+        assert!(
+            app.input.is_empty(),
+            "prompt buffer must be submitted on char newline"
+        );
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1.prompt, "some input");
     }
 }
 

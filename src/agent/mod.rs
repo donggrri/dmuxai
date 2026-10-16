@@ -180,7 +180,7 @@ impl From<&AgentRequest> for OutputContext {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     pub label: String,

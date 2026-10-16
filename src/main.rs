@@ -4,7 +4,7 @@ mod process;
 
 use std::{
     error::Error,
-    io::{self, Stdout},
+    io::{self, IsTerminal, Stdout},
     path::PathBuf,
 };
 
@@ -20,8 +20,78 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 type DmuxTerminal = Terminal<CrosstermBackend<Stdout>>;
 
+#[derive(Debug, PartialEq, Eq)]
+enum CliAction {
+    Help,
+    Version,
+    Run,
+    Unknown(String),
+}
+
+const USAGE: &str = "\
+DmuxAI - One terminal. Multiple AI coding agents.
+
+Usage:
+  dmuxai [--help|--version]
+
+Options:
+  -h, --help       Print this help message and exit
+  -V, --version    Print version information and exit
+
+Configuration:
+  dmuxai.toml      Optional configuration file in the workspace root or parent directories
+
+Environment variables:
+  DMUXAI_FORCE_COLOR  Force color output on (1) or off (0)
+  NO_COLOR            Disable color output unless forced
+  XDG_STATE_HOME      Directory for application state and conversation history
+";
+
+fn parse_cli<I, S>(args: I) -> CliAction
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut action = CliAction::Run;
+    for arg in args {
+        match arg.as_ref() {
+            "-h" | "--help" => return CliAction::Help,
+            "-V" | "--version" => {
+                if action == CliAction::Run {
+                    action = CliAction::Version;
+                }
+            }
+            other => return CliAction::Unknown(other.to_owned()),
+        }
+    }
+    action
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let action = parse_cli(std::env::args().skip(1));
+    match action {
+        CliAction::Help => {
+            print!("{USAGE}");
+            return Ok(());
+        }
+        CliAction::Version => {
+            println!("dmuxai {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        CliAction::Unknown(flag) => {
+            eprintln!("error: unexpected argument '{flag}'\n\n{USAGE}");
+            std::process::exit(2);
+        }
+        CliAction::Run => {}
+    }
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        eprintln!(
+            "dmuxai needs an interactive terminal (TTY); run it in a terminal, or see dmuxai --help"
+        );
+        std::process::exit(1);
+    }
     let workspace_root = dmuxai::workspace::resolve_workspace_root()?;
     dmuxai::workspace::ensure_directory_writable(&workspace_root)?;
     let settings = DmuxSettings::load(&workspace_root);
@@ -139,5 +209,45 @@ impl Drop for TerminalSession {
             LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cli_empty_args_defaults_to_run() {
+        assert_eq!(parse_cli(std::iter::empty::<&str>()), CliAction::Run);
+    }
+
+    #[test]
+    fn parse_cli_help_flags() {
+        assert_eq!(parse_cli(["--help"]), CliAction::Help);
+        assert_eq!(parse_cli(["-h"]), CliAction::Help);
+    }
+
+    #[test]
+    fn parse_cli_version_flags() {
+        assert_eq!(parse_cli(["--version"]), CliAction::Version);
+        assert_eq!(parse_cli(["-V"]), CliAction::Version);
+    }
+
+    #[test]
+    fn parse_cli_unknown_flags() {
+        assert_eq!(
+            parse_cli(["--unknown"]),
+            CliAction::Unknown("--unknown".to_owned())
+        );
+        assert_eq!(parse_cli(["-x"]), CliAction::Unknown("-x".to_owned()));
+        assert_eq!(
+            parse_cli(["positional"]),
+            CliAction::Unknown("positional".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_cli_help_takes_precedence_over_version() {
+        assert_eq!(parse_cli(["--version", "--help"]), CliAction::Help);
     }
 }
