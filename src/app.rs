@@ -1616,6 +1616,19 @@ impl App {
         }
 
         if self.settings.graph_enabled && !prompt.trim_start().starts_with('/') {
+            if self
+                .settings
+                .graph_allowed_runners
+                .as_ref()
+                .is_some_and(|runners| runners.is_empty())
+            {
+                self.push_system(
+                    "Graph disabled: allowed_runners list is empty. Falling back to single-agent mode.",
+                );
+                let agent = self.adapters[self.selected].agent();
+                self.submit_to_agent(agent, prompt, true);
+                return;
+            }
             match plan_request(&prompt, &self.workspace_root, &self.settings) {
                 ExecutionPlan::Single(plan) => {
                     let agent = self.adapters[self.selected].agent();
@@ -2510,11 +2523,18 @@ impl App {
     }
 
     fn show_graph_status(&mut self) {
+        let allowed_str = match &self.settings.graph_allowed_runners {
+            Some(runners) if runners.is_empty() => "none (graph disabled)".to_owned(),
+            Some(runners) => runners.join(", "),
+            None => "all".to_owned(),
+        };
         if self.graph_assignment_line.is_empty() {
             self.push_system("No active graph assignment. Send a multi-step prompt to plan one.");
+            self.push_system(format!("Allowed runners: {allowed_str}"));
             return;
         }
         self.push_system(format!("Graph assignment: {}", self.graph_assignment_line));
+        self.push_system(format!("Allowed runners: {allowed_str}"));
         if self
             .graph_session
             .as_ref()
@@ -2547,6 +2567,12 @@ impl App {
         let model_id = parts[2];
         if runner_from_str(runner).is_none() {
             self.push_system(format!("Unknown runner: {runner}"));
+            return;
+        }
+        if !dmuxai::graph::is_runner_allowed(runner, &self.settings) {
+            self.push_system(format!(
+                "Runner '{runner}' is not allowed by graph.allowed_runners"
+            ));
             return;
         }
         if let Err(error) = dmuxai::model_policy::validate_model_for_runner(runner, model_id) {
@@ -6544,6 +6570,110 @@ mod tests {
         let thinking_summary = app.activity_summary(Agent::Agy, now);
         assert!(thinking_summary.contains("last event 0s ago"));
         assert!(thinking_summary.contains("working"));
+    }
+
+    #[test]
+    fn graph_status_shows_allowed_runners() {
+        // TC-435, UX-430
+        let (mut app, _) = test_app();
+        app.settings.graph_allowed_runners = Some(vec!["agy".to_owned(), "opencode".to_owned()]);
+        app.input = "/graph status".to_owned();
+        app.submit_prompt();
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Allowed runners: agy, opencode"))
+        );
+
+        // Also test /graph alias
+        app.input = "/graph".to_owned();
+        app.submit_prompt();
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Allowed runners: agy, opencode"))
+        );
+
+        // Test with None (all)
+        app.settings.graph_allowed_runners = None;
+        app.input = "/graph".to_owned();
+        app.submit_prompt();
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Allowed runners: all"))
+        );
+    }
+
+    #[test]
+    fn graph_override_rejects_disallowed_runner() {
+        // TC-432, FR-432
+        let (mut app, _) = test_app();
+        app.settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
+
+        // Start a mock graph run
+        let plan = dmuxai::graph::GraphPlan {
+            schema: "cursor-agent-graph/v1".to_owned(),
+            id: "test-run".to_owned(),
+            orchestrator_model: "gemini-3.8-flash-low".to_owned(),
+            user_prompt: "test prompt".to_owned(),
+            nodes: vec![dmuxai::graph::GraphNode {
+                id: "step-1".to_owned(),
+                role: dmuxai::graph::NodeRole::Implement,
+                job: "job 1".to_owned(),
+                runner: "agy".to_owned(),
+                model_id: "gemini-3.8-flash-low".to_owned(),
+                skill: None,
+                requires_gate: false,
+                status: dmuxai::graph::GraphNodeStatus::Pending,
+                attempt: 0,
+            }],
+            edges: Vec::new(),
+            limits: dmuxai::graph::default_limits(),
+        };
+        app.start_graph_run(plan);
+
+        // Try to override to cursor (which is disallowed)
+        app.input = "/graph override step-1 cursor composer-2.5".to_owned();
+        app.submit_prompt();
+
+        // Node runner should remain agy
+        let node_runner = app
+            .graph_session
+            .as_ref()
+            .unwrap()
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.id == "step-1")
+            .unwrap()
+            .runner
+            .clone();
+        assert_eq!(node_runner, "agy");
+        assert!(app.messages.iter().any(|m| {
+            m.content
+                .contains("Runner 'cursor' is not allowed by graph.allowed_runners")
+        }));
+    }
+
+    #[test]
+    fn empty_allowed_runners_falls_back_to_single_agent_with_notice() {
+        // TC-433, INT-430
+        let (mut app, sent) = test_app();
+        app.settings.graph_allowed_runners = Some(Vec::new());
+
+        // Complex multi-step prompt that would normally trigger a graph plan
+        app.input = "research the auth module, plan migration, implement fix, and test".to_owned();
+        app.submit_prompt();
+
+        // No graph session should be started
+        assert!(app.graph_session.is_none());
+        assert!(app.messages.iter().any(|m| m.content.contains(
+            "Graph disabled: allowed_runners list is empty. Falling back to single-agent mode."
+        )));
+        // Prompt submitted directly to selected agent
+        assert_eq!(sent.lock().unwrap().len(), 1);
     }
 }
 

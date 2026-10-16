@@ -84,8 +84,16 @@ Format: id, status, repro, cause, fix.
 - Cause: event draining completion was throttled by `RENDER_INTERVAL` without an immediate draw trigger, and the event loop lacked a timer tick while agents were busy without keyboard events.
 - Fix: `drain_agent_events` returns completion to force an immediate terminal redraw; `dirty` persists across throttled iterations; 1s busy tick (`app.tick()`) marks dirty while any agent is busy so `working · Ns · last event Ns ago` advances.
 
-## #20 Graph-by-default can route repo work to the box cursor-agent — friction
-- Because the box cursor-agent is a company account, the dogfood worktree disables the graph locally (`dmuxai.toml` `[graph] enabled=false`, git-excluded) and drives AGY directly. A per-runner allow-list (`[graph] runners = ["agy","opencode"]`) would let the graph stay on.
+## #20 Graph-by-default can route repo work to the box cursor-agent — fixed (this PR)
+- Repro: Because the box cursor-agent is a company account, graph-by-default routed work to `cursor-agent`.
+- Cause: Multi-step prompt planning unconditionally assigned nodes to `cursor` (or `routing_default_agent`) without a mechanism to restrict graph execution to specific runners, and configuration was only workspace-local.
+- Fix: Added `[graph] allowed_runners = ["agy", "opencode", ...]` in `src/settings.rs` supporting built-ins (`agy`, `codex`, `cursor`) and custom agent names. Unknown runners emit a config warning and are ignored. `assign_runner` selects `routing.default_agent` if allowed, otherwise `cursor` if allowed, otherwise the first allowed runner; if empty, it falls back to single-agent mode with the selected agent and a system notice. Graph nodes (including orchestrate) and `/graph override` strictly enforce the allowed list. Supported machine-global user configuration loading from `$XDG_CONFIG_HOME/dmuxai/dmuxai.toml` (fallback `~/.config/dmuxai/dmuxai.toml`) with per-key workspace overrides. Displayed allowed runners in `/graph` and `/graph status`.
+
+## #22 Graph plan header shows composer-2.5 for nodes routed to AGY — open (cosmetic)
+- With `allowed_runners = ["agy"]` the nodes correctly run on AGY, but the plan line still prints `step-1:plan→composer-2.5`. It should print the effective per-runner model.
+
+## #23 AGY repeatedly invents `App::handle_enter` in tests — friction
+- Two separate AGY sessions wrote tests calling a nonexistent `handle_enter`; the real entry point is `submit_prompt`. A test-helper note in AGENTS/README would avoid the loop.
 
 ## #21 AGY wrote PowerShell with parameters that do not exist — fixed in review
 - `Join-Path -LiteralPath` / `New-Item -LiteralPath` parse fine but fail at run time. Lesson: run scripts under pwsh on the box (parse + dry run) before merging; added to the windows-pkg graph run.
