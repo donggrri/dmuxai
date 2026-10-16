@@ -110,6 +110,7 @@ pub enum AgentEvent {
         summary: String,
         state: String,
     },
+    Activity(dmuxai::activity::ActivityItem),
     Status(String),
     Completed,
     Cancelled,

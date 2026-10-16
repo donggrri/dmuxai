@@ -865,6 +865,7 @@ mod tests {
                     | AgentEvent::EffortSelected(_)
                     | AgentEvent::ModeSelected(_)
                     | AgentEvent::ToolProgress { .. }
+                    | AgentEvent::Activity(_)
                     | AgentEvent::Status(_)
                     | AgentEvent::Cancelled => {}
                 }

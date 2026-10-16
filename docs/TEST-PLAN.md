@@ -33,6 +33,7 @@ Status: draft · 기준 커밋: `73e3f4d` (main, PR #6 이후) · 작성일: 202
 | [SPEC-windows-desktop](specs/SPEC-windows-desktop.md) | Draft (tui-stabilize 병합 후 구현) | FR-390~398, NFR-390, UX-390, TC-390~404 | FR-WIN-*, TC-WIN-* |
 | [SPEC-graph-default-status](specs/SPEC-graph-default-status.md) | Implemented | FR-370~373, UX-370~371, TC-370~375 | FR-GRAPH-*, TC-GRAPH-* |
 | [SPEC-tui-stabilize](specs/SPEC-tui-stabilize.md) | Implemented | FR-380~, TC-380~ | dogfood #1, #4, #5, #6 |
+| [SPEC-activity-rendering](specs/SPEC-activity-rendering.md) | Implemented | FR-360~365, UX-360~362, TC-360~367 | FR-ACTIVITY-*, TC-ACTIVITY-* |
 
 SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없는 것은 `*proposed*`로 표시했다. 확인된 실제 테스트: `user_selected_agy_model_wins_over_graph_default`, `graph_default_model_only_applies_to_cursor`, `chat_lines_render_with_speaker_theme_colors`, `explicit_summary_is_internal_and_the_next_turn_uses_it_fresh` 등 (§2 표의 일부 제안 이름은 이 실제 이름으로 대체된다).
 

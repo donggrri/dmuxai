@@ -602,6 +602,11 @@ fn normalize_event(
                 events.push(AgentEvent::TextDelta(text.to_owned()));
             }
         }
+        Some("step_update") => {
+            if let Some(activity) = dmuxai::activity::from_agy_step(message) {
+                events.push(AgentEvent::Activity(activity));
+            }
+        }
         Some("result") => {
             state.terminal = true;
             let status = message
@@ -927,6 +932,7 @@ mod tests {
                     | AgentEvent::EffortSelected(_)
                     | AgentEvent::ModeSelected(_)
                     | AgentEvent::ToolProgress { .. }
+                    | AgentEvent::Activity(_)
                     | AgentEvent::Status(_)
                     | AgentEvent::Cancelled => {}
                 }
@@ -999,5 +1005,56 @@ mod tests {
         let corrupt_file = dir.path().join("corrupt.json");
         std::fs::write(&corrupt_file, "not valid json").unwrap();
         assert!(read_disk_cache(&corrupt_file, 1000, 3600).is_none());
+    }
+
+    #[test]
+    fn normalizes_agy_activity_step_updates() {
+        let mut state = AgyStreamState::default();
+        let tool_update = json!({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_name": "run",
+                "tool_info": {
+                    "parameters": {
+                        "command": "cargo test"
+                    }
+                },
+                "state": "ACTIVE"
+            }
+        });
+        let events = normalize_event(&tool_update, ExecutionMode::Implement, &mut state);
+        assert_eq!(
+            events,
+            vec![AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "run".to_owned(),
+                target: "cargo test".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: serde_json::to_string_pretty(
+                    &tool_update["step_update"]["tool_info"]["parameters"]
+                )
+                .unwrap(),
+            })]
+        );
+
+        let thinking_update = json!({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "thinking",
+                "thinking_delta": "thinking about code"
+            }
+        });
+        let events = normalize_event(&thinking_update, ExecutionMode::Implement, &mut state);
+        assert_eq!(
+            events,
+            vec![AgentEvent::Activity(
+                dmuxai::activity::ActivityItem::Thinking {
+                    text: "thinking about code".to_owned(),
+                    started_ms: 0,
+                    finished_ms: None,
+                }
+            )]
+        );
     }
 }

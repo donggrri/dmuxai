@@ -75,6 +75,7 @@ enum SlashAction {
     Summarize,
     Share,
     Image,
+    Details,
 }
 
 #[derive(Clone, Copy)]
@@ -84,7 +85,7 @@ struct SlashCommand {
     action: SlashAction,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 12] = [
+const SLASH_COMMANDS: [SlashCommand; 13] = [
     SlashCommand {
         name: "/agent",
         description: "Switch the active agent",
@@ -145,6 +146,11 @@ const SLASH_COMMANDS: [SlashCommand; 12] = [
         description: "Attach a png/jpg/webp image for the next prompt",
         action: SlashAction::Image,
     },
+    SlashCommand {
+        name: "/details",
+        description: "Toggle expanded tool and activity details",
+        action: SlashAction::Details,
+    },
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -152,6 +158,7 @@ enum Role {
     User,
     Agent(Agent),
     System,
+    Activity(dmuxai::activity::ActivityItem),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -293,7 +300,7 @@ impl AgentActivity {
                     ActivityPhase::Responding
                 })
             }
-            AgentEvent::ToolProgress { .. } => {
+            AgentEvent::ToolProgress { .. } | AgentEvent::Activity(_) => {
                 self.state = ActivityState::Running;
                 Some(if self.kind == ActivityKind::Summary {
                     ActivityPhase::Summarizing
@@ -319,6 +326,9 @@ impl AgentActivity {
                 {
                     Some(bounded_activity_detail(&format!("[{state}] {summary}")))
                 }
+                AgentEvent::Activity(item) if self.kind == ActivityKind::Turn => Some(
+                    bounded_activity_detail(&dmuxai::activity::collapsed_line(item)),
+                ),
                 _ => None,
             };
         }
@@ -420,6 +430,8 @@ pub struct App {
     graph_assignment_line: String,
     graph_active_turn_node: Option<String>,
     single_graph_plan: Option<(NodeRole, Agent, String)>,
+    last_group_expanded: bool,
+    all_details_expanded: bool,
 }
 
 impl App {
@@ -531,6 +543,8 @@ impl App {
             graph_assignment_line: String::new(),
             graph_active_turn_node: None,
             single_graph_plan: None,
+            last_group_expanded: false,
+            all_details_expanded: false,
         };
         app.restore_snapshot(snapshot);
         Ok(app)
@@ -715,6 +729,10 @@ impl App {
             self.cancel_selected();
             return;
         }
+        if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.toggle_last_activity_details();
+            return;
+        }
         if self.conversation_picker.is_some() {
             self.handle_conversation_picker_key(key);
             return;
@@ -846,6 +864,7 @@ impl App {
             SlashAction::Summarize => self.start_explicit_summary(None),
             SlashAction::Share => self.push_system("Usage: /share <codex|cursor|agy>"),
             SlashAction::Image => self.push_system("Usage: /image <path>"),
+            SlashAction::Details => self.toggle_all_activity_details(),
         }
     }
 
@@ -1428,6 +1447,10 @@ impl App {
                 self.push_system("Usage: /share <codex|cursor|agy>");
                 return;
             }
+            "/details" => {
+                self.execute_slash_action(SlashAction::Details);
+                return;
+            }
             _ => {}
         }
 
@@ -1670,6 +1693,8 @@ impl App {
         self.conversation_title = snapshot.title;
         self.messages.clear();
         self.streaming_messages.clear();
+        self.last_group_expanded = false;
+        self.all_details_expanded = false;
         for turn in &snapshot.turns {
             for message in snapshot
                 .messages
@@ -1723,6 +1748,7 @@ impl App {
             .iter()
             .filter(|message| {
                 message.role != Role::System
+                    && !matches!(message.role, Role::Activity(_))
                     && !message
                         .content
                         .starts_with("[DmuxAI explicit context import]")
@@ -1731,7 +1757,7 @@ impl App {
                 let role = match message.role {
                     Role::User => "User".to_owned(),
                     Role::Agent(source) => source.to_string(),
-                    Role::System => unreachable!(),
+                    Role::System | Role::Activity(_) => unreachable!(),
                 };
                 format!("{role}:\n{}", message.content)
             })
@@ -1936,6 +1962,7 @@ impl App {
             | AgentEvent::EffortSelected(_)
             | AgentEvent::ModeSelected(_)
             | AgentEvent::ToolProgress { .. }
+            | AgentEvent::Activity(_)
             | AgentEvent::Status(_) => false,
         }
     }
@@ -2020,6 +2047,7 @@ impl App {
                 summary,
                 state,
             } => self.apply_tool_progress(agent, item_id, summary, state),
+            AgentEvent::Activity(item) => self.apply_activity(agent, item),
             AgentEvent::Status(status) => self.apply_status(agent, status),
             AgentEvent::Completed => self.finish_turn_outcome(agent, true),
             AgentEvent::Cancelled => {
@@ -2040,6 +2068,84 @@ impl App {
                 ));
             }
         }
+    }
+
+    fn apply_activity(&mut self, _agent: Agent, item: dmuxai::activity::ActivityItem) {
+        match item {
+            dmuxai::activity::ActivityItem::Tool { ref name, .. } => {
+                let found = self.messages.iter_mut().rev().find_map(|msg| {
+                    if let Role::Activity(dmuxai::activity::ActivityItem::Tool {
+                        name: existing_name,
+                        status: dmuxai::activity::ToolStatus::Running,
+                        ..
+                    }) = &mut msg.role
+                        && existing_name == name
+                    {
+                        return Some(msg);
+                    }
+                    None
+                });
+
+                if let Some(msg) = found {
+                    msg.role = Role::Activity(item);
+                } else {
+                    self.messages.push(Message::new(Role::Activity(item), ""));
+                }
+            }
+            dmuxai::activity::ActivityItem::Thinking {
+                text: incoming_text,
+                started_ms: incoming_started,
+                finished_ms: incoming_finished,
+            } => {
+                let found = self.messages.iter_mut().rev().find_map(|msg| {
+                    if let Role::Activity(dmuxai::activity::ActivityItem::Thinking {
+                        text: existing_text,
+                        started_ms: existing_started,
+                        finished_ms: existing_finished,
+                    }) = &mut msg.role
+                        && existing_finished.is_none()
+                    {
+                        if incoming_finished.is_some() {
+                            *existing_finished = incoming_finished;
+                        }
+                        if *existing_started == 0 && incoming_started != 0 {
+                            *existing_started = incoming_started;
+                        }
+                        if !incoming_text.is_empty() {
+                            existing_text.push_str(&incoming_text);
+                        }
+                        return Some(());
+                    }
+                    None
+                });
+
+                if found.is_none() {
+                    self.messages.push(Message::new(
+                        Role::Activity(dmuxai::activity::ActivityItem::Thinking {
+                            text: incoming_text,
+                            started_ms: incoming_started,
+                            finished_ms: incoming_finished,
+                        }),
+                        "",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn toggle_last_activity_details(&mut self) {
+        let has_activity = self
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, Role::Activity(_)));
+        if !has_activity {
+            return;
+        }
+        self.last_group_expanded = !self.last_group_expanded;
+    }
+
+    fn toggle_all_activity_details(&mut self) {
+        self.all_details_expanded = !self.all_details_expanded;
     }
 
     fn append_delta(&mut self, agent: Agent, delta: String) {
@@ -2498,26 +2604,73 @@ impl App {
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
         let mut lines = Vec::new();
 
-        for message in &self.messages {
+        let mut i = 0;
+        while i < self.messages.len() {
+            let message = &self.messages[i];
             let theme = &self.settings.theme;
-            let (label, color) = match message.role {
-                Role::User => ("You".to_owned(), theme.color_for(Speaker::User)),
-                Role::Agent(agent) => (agent.to_string(), theme.color_for(speaker_for(agent))),
-                Role::System => ("DmuxAI".to_owned(), theme.color_for(Speaker::System)),
-            };
-            let body_style = Style::default().fg(color);
-
-            lines.push(Line::from(Span::styled(
-                label,
-                body_style.add_modifier(Modifier::BOLD),
-            )));
-            lines.extend(
-                message
-                    .content
-                    .lines()
-                    .map(|line| Line::from(Span::styled(line.to_owned(), body_style))),
-            );
-            lines.push(Line::default());
+            match &message.role {
+                Role::User => {
+                    let (label, color) = ("You".to_owned(), theme.color_for(Speaker::User));
+                    let body_style = Style::default().fg(color);
+                    lines.push(Line::from(Span::styled(
+                        label,
+                        body_style.add_modifier(Modifier::BOLD),
+                    )));
+                    lines.extend(
+                        message
+                            .content
+                            .lines()
+                            .map(|line| Line::from(Span::styled(line.to_owned(), body_style))),
+                    );
+                    lines.push(Line::default());
+                    i += 1;
+                }
+                Role::Agent(agent) => {
+                    let (label, color) = (agent.to_string(), theme.color_for(speaker_for(*agent)));
+                    let body_style = Style::default().fg(color);
+                    lines.push(Line::from(Span::styled(
+                        label,
+                        body_style.add_modifier(Modifier::BOLD),
+                    )));
+                    lines.extend(
+                        message
+                            .content
+                            .lines()
+                            .map(|line| Line::from(Span::styled(line.to_owned(), body_style))),
+                    );
+                    lines.push(Line::default());
+                    i += 1;
+                }
+                Role::System => {
+                    let (label, color) = ("DmuxAI".to_owned(), theme.color_for(Speaker::System));
+                    let body_style = Style::default().fg(color);
+                    lines.push(Line::from(Span::styled(
+                        label,
+                        body_style.add_modifier(Modifier::BOLD),
+                    )));
+                    lines.extend(
+                        message
+                            .content
+                            .lines()
+                            .map(|line| Line::from(Span::styled(line.to_owned(), body_style))),
+                    );
+                    lines.push(Line::default());
+                    i += 1;
+                }
+                Role::Activity(_) => {
+                    let start = i;
+                    while i < self.messages.len()
+                        && matches!(self.messages[i].role, Role::Activity(_))
+                    {
+                        i += 1;
+                    }
+                    let chunk = &self.messages[start..i];
+                    let is_last_group = !self.messages[i..]
+                        .iter()
+                        .any(|m| matches!(m.role, Role::Activity(_)));
+                    self.render_activity_group(chunk, is_last_group, &mut lines);
+                }
+            }
         }
 
         let visible_height = area.height.saturating_sub(2) as usize;
@@ -2558,6 +2711,85 @@ impl App {
                 .style(Style::default().fg(self.settings.theme.color_for(Speaker::System)));
             frame.render_widget(paragraph, area);
         }
+    }
+
+    fn render_activity_group(
+        &self,
+        chunk: &[Message],
+        is_last_group: bool,
+        lines: &mut Vec<Line<'static>>,
+    ) {
+        let theme = &self.settings.theme;
+        let is_expanded = self.all_details_expanded || (is_last_group && self.last_group_expanded);
+
+        let mut visible: Vec<&dmuxai::activity::ActivityItem> = Vec::new();
+        for msg in chunk {
+            if let Role::Activity(ref item) = msg.role {
+                match item {
+                    dmuxai::activity::ActivityItem::Tool { .. } => {
+                        if self.settings.ui.show_tools != dmuxai::activity::ShowTools::Hidden {
+                            visible.push(item);
+                        }
+                    }
+                    dmuxai::activity::ActivityItem::Thinking { finished_ms, .. } => {
+                        match self.settings.ui.show_thinking {
+                            dmuxai::activity::ShowThinking::Hidden => {}
+                            dmuxai::activity::ShowThinking::Collapsed => {
+                                if finished_ms.is_some() {
+                                    visible.push(item);
+                                }
+                            }
+                            dmuxai::activity::ShowThinking::Live => {
+                                visible.push(item);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if visible.is_empty() {
+            return;
+        }
+
+        let system_color = theme.system;
+
+        if is_expanded || self.settings.ui.show_tools == dmuxai::activity::ShowTools::Expanded {
+            for item in visible {
+                let col = dmuxai::activity::collapsed_line(item);
+                if !col.is_empty() {
+                    let mut style = Style::default().fg(system_color);
+                    if let dmuxai::activity::ActivityItem::Thinking {
+                        finished_ms: None, ..
+                    } = item
+                    {
+                        style = style.add_modifier(Modifier::DIM | Modifier::ITALIC);
+                    }
+                    lines.push(Line::from(Span::styled(col, style)));
+                }
+                for exp in dmuxai::activity::expanded_lines(
+                    item,
+                    dmuxai::activity::DEFAULT_MAX_EXPANDED_LINES,
+                ) {
+                    lines.push(Line::from(Span::styled(
+                        exp,
+                        Style::default().fg(system_color),
+                    )));
+                }
+            }
+        } else {
+            let cloned_items: Vec<dmuxai::activity::ActivityItem> =
+                visible.into_iter().cloned().collect();
+            let grouped = dmuxai::activity::group_tools(&cloned_items);
+            for g in grouped {
+                let mut style = Style::default().fg(system_color);
+                if g.starts_with("thinking… ") {
+                    style = style.add_modifier(Modifier::DIM | Modifier::ITALIC);
+                }
+                lines.push(Line::from(Span::styled(g, style)));
+            }
+        }
+        lines.push(Line::default());
     }
 
     fn draw_input(&self, frame: &mut Frame, area: Rect) {
@@ -3140,6 +3372,7 @@ fn stored_event(event: &AgentEvent) -> Option<TurnEvent> {
         AgentEvent::ToolProgress { summary, state, .. } => {
             Some(TurnEvent::Notice(format!("Tool [{state}]: {summary}")))
         }
+        AgentEvent::Activity(_) => None,
         AgentEvent::Completed => Some(TurnEvent::Completed),
         AgentEvent::Cancelled => Some(TurnEvent::Cancelled),
         AgentEvent::Error(message) => Some(TurnEvent::Failed {
@@ -3318,6 +3551,7 @@ fn event_requires_turn_context(event: &AgentEvent) -> bool {
             | AgentEvent::ProviderSessionBound(_)
             | AgentEvent::TextDelta(_)
             | AgentEvent::ToolProgress { .. }
+            | AgentEvent::Activity(_)
             | AgentEvent::Completed
             | AgentEvent::Cancelled
     )
@@ -5631,6 +5865,184 @@ mod tests {
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].1.prompt, "some input");
+    }
+
+    fn render_test_buffer(app: &mut App) -> String {
+        let backend = TestBackend::new(120, 60);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            text.push_str(&row);
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    // TC-360 / FR-360: Tool calls render as single collapsed lines with status symbols.
+    fn tool_call_collapsed_rendering() {
+        let (mut app, _) = test_app();
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "edit".to_owned(),
+                target: "src/app.rs (+12 -3)".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        );
+        let text = render_test_buffer(&mut app);
+        assert!(text.contains("▸ edit src/app.rs (+12 -3)"));
+
+        // Running tool updates in place to Ok
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "edit".to_owned(),
+                target: "src/app.rs (+12 -3)".to_owned(),
+                status: dmuxai::activity::ToolStatus::Ok,
+                duration_ms: Some(4200),
+                detail: String::new(),
+            }),
+        );
+        let text = render_test_buffer(&mut app);
+        assert!(text.contains("▸ edit src/app.rs (+12 -3) ✓ 4.2s"));
+
+        // Failed tool call
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "run".to_owned(),
+                target: "cargo test".to_owned(),
+                status: dmuxai::activity::ToolStatus::Failed,
+                duration_ms: Some(1500),
+                detail: String::new(),
+            }),
+        );
+        let text = render_test_buffer(&mut app);
+        assert!(text.contains("▸ run cargo test ✗ 1.5s"));
+    }
+
+    #[test]
+    // TC-361 / FR-360 / UX-360 / UX-361: Interactive expand/collapse via Ctrl+O and /details.
+    fn tool_call_expand_collapse_and_truncation() {
+        let (mut app, _) = test_app();
+        let content_60 = (1..=60)
+            .map(|i| format!("line_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "run".to_owned(),
+                target: "cargo test".to_owned(),
+                status: dmuxai::activity::ToolStatus::Ok,
+                duration_ms: Some(4200),
+                detail: content_60,
+            }),
+        );
+
+        // Initially collapsed: tool summary visible, output lines hidden
+        let text_collapsed = render_test_buffer(&mut app);
+        assert!(text_collapsed.contains("▸ run cargo test ✓ 4.2s"));
+        assert!(!text_collapsed.contains("line_1"));
+
+        // Ctrl+O toggles last activity group expansion
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        let text_expanded = render_test_buffer(&mut app);
+        assert!(text_expanded.contains("▸ run cargo test ✓ 4.2s"));
+        assert!(text_expanded.contains("line_1"));
+        assert!(text_expanded.contains("line_39"));
+        assert!(text_expanded.contains("… [21 lines truncated]"));
+
+        // Ctrl+O again collapses
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        let text_collapsed_again = render_test_buffer(&mut app);
+        assert!(!text_collapsed_again.contains("line_1"));
+
+        // /details slash action toggles all groups expanded
+        app.execute_slash_action(SlashAction::Details);
+        let text_details = render_test_buffer(&mut app);
+        assert!(text_details.contains("line_1"));
+        assert!(text_details.contains("… [21 lines truncated]"));
+
+        // /details again restores collapsed state
+        app.execute_slash_action(SlashAction::Details);
+        let text_details_off = render_test_buffer(&mut app);
+        assert!(!text_details_off.contains("line_1"));
+    }
+
+    #[test]
+    // TC-365 / FR-364: show_tools = "hidden" and show_thinking = "hidden" suppress rendering.
+    fn activity_rendering_hidden_config() {
+        let (mut app, _) = test_app();
+        app.settings.ui.show_tools = dmuxai::activity::ShowTools::Hidden;
+        app.settings.ui.show_thinking = dmuxai::activity::ShowThinking::Hidden;
+
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "edit".to_owned(),
+                target: "src/hidden.rs".to_owned(),
+                status: dmuxai::activity::ToolStatus::Ok,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        );
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Thinking {
+                text: "hidden thinking stream".to_owned(),
+                started_ms: 0,
+                finished_ms: None,
+            }),
+        );
+
+        let text = render_test_buffer(&mut app);
+        assert!(!text.contains("src/hidden.rs"));
+        assert!(!text.contains("hidden thinking stream"));
+    }
+
+    #[test]
+    // TC-364 / FR-362 / FR-363: Activity events never produce TurnEvents or enter shared transcript.
+    fn thinking_never_persisted_to_db_or_shared_context() {
+        let tool_event = AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+            name: "edit".to_owned(),
+            target: "src/app.rs".to_owned(),
+            status: dmuxai::activity::ToolStatus::Ok,
+            duration_ms: None,
+            detail: "edits".to_owned(),
+        });
+        assert_eq!(stored_event(&tool_event), None);
+
+        let thinking_event = AgentEvent::Activity(dmuxai::activity::ActivityItem::Thinking {
+            text: "ephemeral internal thought".to_owned(),
+            started_ms: 0,
+            finished_ms: Some(12000),
+        });
+        assert_eq!(stored_event(&thinking_event), None);
+
+        let (mut app, _) = test_app();
+        app.apply_agent_event(Agent::Agy, thinking_event);
+        app.messages
+            .push(Message::new(Role::User, "user instruction".to_owned()));
+
+        // Verify transcript sharing excludes Activity items
+        let transcript = app
+            .messages
+            .iter()
+            .filter(|m| m.role != Role::System && !matches!(m.role, Role::Activity(_)))
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!transcript.contains("ephemeral internal thought"));
+        assert!(transcript.contains("user instruction"));
     }
 }
 
