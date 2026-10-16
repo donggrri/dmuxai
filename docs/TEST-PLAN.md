@@ -30,6 +30,7 @@ Status: draft · 기준 커밋: `73e3f4d` (main, PR #6 이후) · 작성일: 202
 | [SPEC-speaker-colors](specs/SPEC-speaker-colors.md) | Implemented | FR-320~322, UX-320, TC-320~324 | FR-THEME-*, TC-THEME-* |
 | [SPEC-custom-agent-provider](specs/SPEC-custom-agent-provider.md) | Implemented | FR-330~335, UX-330, TC-330~337 | FR-CUSTOM-*, TC-CUSTOM-* |
 | [SPEC-compact-summarize-focus](specs/SPEC-compact-summarize-focus.md) | Draft | FR-340~342, TC-340~342 | FR-COMPACT-*, TC-COMPACT-* |
+| [SPEC-windows-desktop](specs/SPEC-windows-desktop.md) | Draft (tui-stabilize 병합 후 구현) | FR-390~398, NFR-390, UX-390, TC-390~404 | FR-WIN-*, TC-WIN-* |
 
 SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없는 것은 `*proposed*`로 표시했다. 확인된 실제 테스트: `user_selected_agy_model_wins_over_graph_default`, `graph_default_model_only_applies_to_cursor`, `chat_lines_render_with_speaker_theme_colors`, `explicit_summary_is_internal_and_the_next_turn_uses_it_fresh` 등 (§2 표의 일부 제안 이름은 이 실제 이름으로 대체된다).
 
