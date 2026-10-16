@@ -2,6 +2,16 @@
 
 **범위:** `main` 워크트리 코드 읽기 전용 분석 (본 문서·그래프·agent-graph-engineering 설치 파일만 변경).  
 **작성:** Cloud Agent 분석 턴 (2026-10-16).  
+
+### Phase 1 (permissions + mission) 상태 — 2026-10-16
+
+| 항목 | 상태 |
+| --- | --- |
+| `MISSION.md` + composer-2.5-only 정책 | **완료** (PR) |
+| Cursor Windows Implement opt-in (`dmuxai.toml` / env) | **완료** (PR) |
+| Implement 턴 실패 기록 (권한/무변경) | **부분 완료** (adapter 스트림 검증) |
+| 이미지 직접 첨부 / auto-routing / WSL 런처 | **보류** (외부 그래프 오케스트레이터 디스패치 대기) |
+
 **관련 그래프:** [`docs/dmuxai-graph.yaml`](dmuxai-graph.yaml)
 
 ## agent-graph-engineering 설치 상태
@@ -15,7 +25,7 @@
 설치된 파일:
 
 - `.agents/skills/agent-graph-engineering/SKILL.md`, `templates/graph.yaml`, `templates/edge-contract.md`
-- `.cursor/agents/graph-{planner,router,reviewer}.md` (grok-4.7-medium), `graph-{drafter,worker}.md` (composer-2.5), `graph-researcher.md` (haiku)
+- `.cursor/agents/graph-*.md` (composer-2.5 only per repository model policy)
 - `.cursor/rules/agent-graph-engineering.mdc`
 
 공식 `install.sh` 실행 후 위 파일을 upstream과 diff하여 정합성을 맞출 것을 권장합니다.
@@ -228,15 +238,15 @@ workspace_root/
 
 | PR | 내용 | Graph node | 역할 | 모델 |
 | --- | --- | --- | --- | --- |
-| PR-1 | `docs/spec` + WSL 런처 스파이크 (Tauri `wsl.exe` 호출, 경로 변환) | `plan-wsl-app` | orchestrate | grok-4.7-medium |
-| PR-2 | `DMUXAI_WORKSPACE`, `normalize_workspace` WSL 테스트 | `research-permissions` | research | claude-haiku-5-5-high |
-| PR-3 | Win UI: Cursor Implement 가드 메시지·대체 에이전트 CTA | `review-report` | review | grok-4.7-medium |
-| PR-4 | `.agents/skills` 디스커버리 라이브러리 + 단위 테스트 | `plan-skills` | research | claude-haiku-5-5-high |
+| PR-1 | `docs/spec` + WSL 런처 스파이크 (Tauri `wsl.exe` 호출, 경로 변환) | `plan-wsl-app` | orchestrate | composer-2.5 |
+| PR-2 | `DMUXAI_WORKSPACE`, `normalize_workspace` WSL 테스트 | `research-permissions` | research | composer-2.5 |
+| PR-3 | Win UI: Cursor Implement 가드 메시지·대체 에이전트 CTA | `review-report` | review | composer-2.5 |
+| PR-4 | `.agents/skills` 디스커버리 라이브러리 + 단위 테스트 | `plan-skills` | research | composer-2.5 |
 | PR-5 | `/skills` TUI + skill preamble 주입 | `synthesize-report` | implement | composer-2.5 |
 | PR-6 | 스킬 메타 SQLite + conversation 연결 | `implement` | implement | composer-2.5 |
-| PR-7 | tmux 세션 매니저 (WSL only) POC | `plan-wsl-app` | orchestrate | grok-4.7-medium |
-| PR-8 | worktree-per-skill pane + graph.yaml run ledger | `orchestrate` | orchestrate | grok-4.7-medium |
-| PR-9 | CI fmt/clippy/test 정리 | `research-architecture` | test | claude-haiku-5-5-high |
+| PR-7 | tmux 세션 매니저 (WSL only) POC | `plan-wsl-app` | orchestrate | composer-2.5 |
+| PR-8 | worktree-per-skill pane + graph.yaml run ledger | `orchestrate` | orchestrate | composer-2.5 |
+| PR-9 | CI fmt/clippy/test 정리 | `research-architecture` | test | composer-2.5 |
 
 의존 순서: PR-1/2 → PR-3; PR-4 → PR-5 → PR-6; PR-7/8는 PR-1 이후; PR-9는 병행 가능.
 

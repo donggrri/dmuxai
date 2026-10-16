@@ -2,6 +2,8 @@
 
 One terminal. Multiple AI coding agents.
 
+Product direction and model policy: see [MISSION.md](MISSION.md) (primary CLIs: **cursor-agent** then **agy**; graph workflows use **composer-2.5** only).
+
 DmuxAI is a Ratatui client for three real, structured, headless coding-agent
 CLIs. It does not scrape ANSI terminal screens and does not assemble prompts
 into shell commands.

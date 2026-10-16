@@ -15,9 +15,10 @@ use tokio::{
 
 use super::{
     AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ExecutionMode,
-    ModelInfo, OutputContext, SpawnedAdapter,
+    ModelInfo, OutputContext, SpawnedAdapter, implement_outcome::ImplementTurnTracker,
 };
 use crate::process::cursor_command;
+use dmuxai::settings::DmuxSettings;
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const STDERR_HISTORY_CAPACITY: usize = 8;
@@ -32,6 +33,7 @@ enum CursorCommand {
 
 pub struct CursorAdapter {
     command_tx: mpsc::Sender<CursorCommand>,
+    windows_unsandboxed: bool,
 }
 
 impl AgentAdapter for CursorAdapter {
@@ -64,11 +66,11 @@ impl AgentAdapter for CursorAdapter {
     }
 
     fn validate_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
-        validate_cursor_mode(mode)
+        validate_cursor_mode(mode, self.windows_unsandboxed)
     }
 
     fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
-        validate_cursor_mode(mode)?;
+        validate_cursor_mode(mode, self.windows_unsandboxed)?;
         self.command_tx
             .try_send(CursorCommand::SelectMode(mode))
             .map_err(map_send_error)
@@ -82,16 +84,28 @@ fn map_send_error(error: mpsc::error::TrySendError<CursorCommand>) -> AdapterErr
     }
 }
 
-pub fn spawn_cursor_adapter(event_tx: mpsc::Sender<AgentOutput>, cwd: PathBuf) -> SpawnedAdapter {
+pub fn spawn_cursor_adapter(
+    event_tx: mpsc::Sender<AgentOutput>,
+    cwd: PathBuf,
+    settings: DmuxSettings,
+) -> SpawnedAdapter {
+    let windows_unsandboxed = settings.cursor_windows_unsandboxed;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-    let worker = tokio::spawn(runtime_loop(command_rx, event_tx, cwd));
-    (Box::new(CursorAdapter { command_tx }), worker)
+    let worker = tokio::spawn(runtime_loop(command_rx, event_tx, cwd, windows_unsandboxed));
+    (
+        Box::new(CursorAdapter {
+            command_tx,
+            windows_unsandboxed,
+        }),
+        worker,
+    )
 }
 
 async fn runtime_loop(
     mut command_rx: mpsc::Receiver<CursorCommand>,
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
+    windows_unsandboxed: bool,
 ) {
     let mut active: Option<ActiveTurn> = None;
     let mut selected_model: Option<String> = None;
@@ -104,7 +118,7 @@ async fn runtime_loop(
             };
             match command {
                 CursorCommand::Send(request) => {
-                    if let Err(error) = validate_cursor_mode(selected_mode) {
+                    if let Err(error) = validate_cursor_mode(selected_mode, windows_unsandboxed) {
                         let context = OutputContext::from(&request);
                         send_event(
                             &event_tx,
@@ -119,6 +133,7 @@ async fn runtime_loop(
                             selected_mode,
                             cwd.clone(),
                             event_tx.clone(),
+                            windows_unsandboxed,
                         ));
                     }
                 }
@@ -218,11 +233,21 @@ fn spawn_turn(
     mode: ExecutionMode,
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
+    windows_unsandboxed: bool,
 ) -> ActiveTurn {
     let context = OutputContext::from(&request);
     let error_context = context.clone();
     let handle = tokio::spawn(async move {
-        if let Err(error) = run_turn(&request, selected_model, mode, &cwd, &event_tx).await {
+        if let Err(error) = run_turn(
+            &request,
+            selected_model,
+            mode,
+            &cwd,
+            &event_tx,
+            windows_unsandboxed,
+        )
+        .await
+        {
             send_event(
                 &event_tx,
                 Some(&error_context),
@@ -253,10 +278,19 @@ async fn run_turn(
     mode: ExecutionMode,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
+    windows_unsandboxed: bool,
 ) -> io::Result<Option<String>> {
-    validate_cursor_mode(mode).map_err(|error| io::Error::other(error.to_string()))?;
+    validate_cursor_mode(mode, windows_unsandboxed)
+        .map_err(|error| io::Error::other(error.to_string()))?;
     let mut command = cursor_command()?;
-    configure_command(&mut command, request, selected_model.as_deref(), mode, cwd);
+    configure_command(
+        &mut command,
+        request,
+        selected_model.as_deref(),
+        mode,
+        cwd,
+        windows_unsandboxed,
+    );
     command
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -279,13 +313,23 @@ async fn run_turn(
         .ok_or_else(|| io::Error::other("Cursor stderr was not piped"))?;
 
     let context = OutputContext::from(request);
+    if mode == ExecutionMode::Implement && cfg!(windows) && windows_unsandboxed {
+        send_event(
+            event_tx,
+            Some(&context),
+            AgentEvent::Notice(
+                "Warning: Cursor Implement is running without sandbox on Windows (opt-in). The agent can modify files outside the workspace sandbox.".to_owned(),
+            ),
+        )
+        .await;
+    }
     send_event(event_tx, Some(&context), AgentEvent::Started).await;
     stdin.write_all(request.prompt.as_bytes()).await?;
     stdin.write_all(b"\n").await?;
     stdin.shutdown().await?;
     drop(stdin);
 
-    stream_child(&mut child, stdout, stderr, event_tx, &context).await
+    stream_child(&mut child, stdout, stderr, event_tx, &context, mode).await
 }
 
 fn configure_command(
@@ -294,6 +338,7 @@ fn configure_command(
     selected_model: Option<&str>,
     mode: ExecutionMode,
     cwd: &Path,
+    windows_unsandboxed: bool,
 ) {
     command.arg("--print");
     match mode {
@@ -302,6 +347,9 @@ fn configure_command(
         }
         ExecutionMode::Plan => {
             command.args(["--mode", "plan"]);
+        }
+        ExecutionMode::Implement if cfg!(windows) && windows_unsandboxed => {
+            command.arg("--force");
         }
         ExecutionMode::Implement => {
             command.args(["--force", "--sandbox", "enabled"]);
@@ -330,6 +378,7 @@ async fn stream_child(
     stderr: ChildStderr,
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
+    mode: ExecutionMode,
 ) -> io::Result<Option<String>> {
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
@@ -338,12 +387,14 @@ async fn stream_child(
     let mut stderr_open = true;
     let mut exit_status = None;
     let mut state = CursorStreamState::default();
+    let mut implement_tracker = ImplementTurnTracker::new(mode);
 
     while stdout_open || stderr_open || exit_status.is_none() {
         tokio::select! {
             line = stdout_lines.next_line(), if stdout_open => {
                 match line? {
                     Some(line) => {
+                        implement_tracker.observe_provider_line(&line);
                         let message: Value = serde_json::from_str(&line).map_err(|error| {
                             io::Error::other(format!("invalid Cursor NDJSON: {error}"))
                         })?;
@@ -367,8 +418,11 @@ async fn stream_child(
     }
 
     let status = exit_status.expect("child.wait runs before the loop can finish");
+    let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
+    if let Err(reason) = implement_tracker.finish(&status, &diagnostic, state.terminal) {
+        return Err(io::Error::other(reason));
+    }
     if !state.terminal {
-        let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
         return Err(io::Error::other(if diagnostic.is_empty() {
             format!("Cursor exited with {status} without a terminal result")
         } else {
@@ -378,8 +432,11 @@ async fn stream_child(
     Ok(state.session_id)
 }
 
-fn validate_cursor_mode(mode: ExecutionMode) -> Result<(), AdapterError> {
-    if mode == ExecutionMode::Implement && cfg!(windows) {
+fn validate_cursor_mode(
+    mode: ExecutionMode,
+    windows_unsandboxed: bool,
+) -> Result<(), AdapterError> {
+    if mode == ExecutionMode::Implement && cfg!(windows) && !windows_unsandboxed {
         return Err(AdapterError::UnsupportedMode {
             agent: Agent::Cursor,
             mode,
@@ -521,12 +578,13 @@ mod tests {
     #[test]
     // TC-060, TC-063 / INT-060, INT-061: only Windows Cursor Implement is blocked.
     fn cursor_mode_validation_matches_platform() {
-        assert_eq!(validate_cursor_mode(ExecutionMode::Ask), Ok(()));
-        assert_eq!(validate_cursor_mode(ExecutionMode::Plan), Ok(()));
+        assert_eq!(validate_cursor_mode(ExecutionMode::Ask, false), Ok(()));
+        assert_eq!(validate_cursor_mode(ExecutionMode::Plan, false), Ok(()));
         assert_eq!(
-            validate_cursor_mode(ExecutionMode::Implement).is_ok(),
+            validate_cursor_mode(ExecutionMode::Implement, false).is_ok(),
             !cfg!(windows)
         );
+        assert_eq!(validate_cursor_mode(ExecutionMode::Implement, true), Ok(()));
     }
 
     #[test]
@@ -598,6 +656,7 @@ mod tests {
             Some("cursor-model"),
             ExecutionMode::Ask,
             cwd,
+            false,
         );
 
         let args = command
@@ -627,7 +686,7 @@ mod tests {
 
         let args_for = |mode| {
             let mut command = tokio::process::Command::new("cursor-agent");
-            configure_command(&mut command, &request, None, mode, cwd);
+            configure_command(&mut command, &request, None, mode, cwd, false);
             command
                 .as_std()
                 .get_args()
@@ -652,7 +711,11 @@ mod tests {
     #[tokio::test]
     async fn selecting_mode_is_acknowledged_without_starting_a_process() {
         let (event_tx, mut event_rx) = mpsc::channel(8);
-        let (adapter, worker) = spawn_cursor_adapter(event_tx, PathBuf::from("workspace"));
+        let (adapter, worker) = spawn_cursor_adapter(
+            event_tx,
+            PathBuf::from("workspace"),
+            dmuxai::settings::DmuxSettings::default(),
+        );
 
         adapter.select_mode(ExecutionMode::Plan).unwrap();
 
@@ -670,7 +733,11 @@ mod tests {
     // TC-060 / INT-060: Windows rejects Cursor Implement before queueing a mode change.
     async fn windows_cursor_implement_mode_is_rejected_before_queueing() {
         let (event_tx, mut event_rx) = mpsc::channel(8);
-        let (adapter, worker) = spawn_cursor_adapter(event_tx, PathBuf::from("workspace"));
+        let (adapter, worker) = spawn_cursor_adapter(
+            event_tx,
+            PathBuf::from("workspace"),
+            dmuxai::settings::DmuxSettings::default(),
+        );
         let expected = AdapterError::UnsupportedMode {
             agent: Agent::Cursor,
             mode: ExecutionMode::Implement,
@@ -709,6 +776,7 @@ mod tests {
             ExecutionMode::Implement,
             Path::new("missing-workspace"),
             &event_tx,
+            false,
         )
         .await
         .expect_err("Windows Cursor Implement must be blocked");
@@ -738,10 +806,11 @@ mod tests {
         let turn = tokio::spawn(async move {
             run_turn(
                 &request,
-                Some("cursor-grok-4.6-high".to_owned()),
+                Some("composer-2.5".to_owned()),
                 ExecutionMode::Ask,
                 &cwd,
                 &event_tx,
+                false,
             )
             .await
         });

@@ -7,7 +7,7 @@
 use std::{
     error::Error,
     fmt, fs,
-    path::{Path, PathBuf},
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -1727,14 +1727,7 @@ fn projected_turn_chars(turn: &ProjectedTurn) -> usize {
 }
 
 fn normalize_workspace(path: &Path) -> Result<String, ConversationError> {
-    let canonical = fs::canonicalize(path).or_else(|_| {
-        if path.is_absolute() {
-            Ok::<PathBuf, std::io::Error>(path.to_path_buf())
-        } else {
-            Ok(std::env::current_dir()?.join(path))
-        }
-    })?;
-    Ok(canonical.to_string_lossy().into_owned())
+    crate::workspace::normalize_workspace_path(path).map_err(ConversationError::from)
 }
 
 fn title_from_prompt(prompt: &str) -> String {

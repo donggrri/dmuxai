@@ -115,6 +115,8 @@ struct CodexClient {
     interrupt_sent: bool,
     cancel_requested: bool,
     next_request_id: u64,
+    active_mode: ExecutionMode,
+    implement_write_observed: bool,
 }
 
 enum RawMessage {
@@ -167,6 +169,8 @@ impl CodexClient {
             interrupt_sent: false,
             cancel_requested: false,
             next_request_id: 1,
+            active_mode: ExecutionMode::default(),
+            implement_write_observed: false,
         };
 
         let initialize_id = client.next_id();
@@ -245,6 +249,8 @@ impl CodexClient {
         self.turn_ready_for_interrupt = false;
         self.interrupt_sent = false;
         self.cancel_requested = false;
+        self.active_mode = mode;
+        self.implement_write_observed = false;
         self.write_message(turn_start_request(
             request_id, &thread_id, request, model, effort, mode,
         ))
@@ -897,8 +903,30 @@ async fn handle_message(
 
     let terminal = message.get("method").and_then(Value::as_str) == Some("turn/completed");
     if let Some(event) = normalized_event(&message) {
+        if matches!(
+            &event,
+            AgentEvent::ToolProgress { summary, .. }
+                if summary.starts_with("File changes")
+        ) {
+            client.implement_write_observed = true;
+        }
         let context = client.output_context.clone();
-        send_event(event_tx, context.as_ref(), event).await;
+        if terminal
+            && client.active_mode == ExecutionMode::Implement
+            && matches!(&event, AgentEvent::Completed)
+            && !client.implement_write_observed
+        {
+            send_event(
+                event_tx,
+                context.as_ref(),
+                AgentEvent::Error(
+                    "implement mode completed without any observed file changes".to_owned(),
+                ),
+            )
+            .await;
+        } else {
+            send_event(event_tx, context.as_ref(), event).await;
+        }
     }
     if terminal {
         reset_turn(client);
@@ -1296,6 +1324,8 @@ mod tests {
             interrupt_sent: false,
             cancel_requested: false,
             next_request_id: 1,
+            active_mode: ExecutionMode::default(),
+            implement_write_observed: false,
         }
     }
 

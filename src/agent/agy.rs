@@ -15,7 +15,7 @@ use tokio::{
 
 use super::{
     AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ExecutionMode,
-    ModelInfo, OutputContext, SpawnedAdapter,
+    ModelInfo, OutputContext, SpawnedAdapter, implement_outcome::ImplementTurnTracker,
 };
 use crate::process::{headless_command, resolve_program};
 
@@ -276,7 +276,7 @@ async fn run_turn(
     stdin.shutdown().await?;
     drop(stdin);
 
-    stream_child(&mut child, stdout, stderr, event_tx, &context).await
+    stream_child(&mut child, stdout, stderr, event_tx, &context, mode).await
 }
 
 fn agy_prompt(mode: ExecutionMode, prompt: &str) -> String {
@@ -325,6 +325,7 @@ async fn stream_child(
     stderr: ChildStderr,
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
+    mode: ExecutionMode,
 ) -> io::Result<Option<String>> {
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
@@ -333,16 +334,18 @@ async fn stream_child(
     let mut stderr_open = true;
     let mut exit_status = None;
     let mut state = AgyStreamState::default();
+    let mut implement_tracker = ImplementTurnTracker::new(mode);
 
     while stdout_open || stderr_open || exit_status.is_none() {
         tokio::select! {
             line = stdout_lines.next_line(), if stdout_open => {
                 match line? {
                     Some(line) => {
+                        implement_tracker.observe_provider_line(&line);
                         let message: Value = serde_json::from_str(&line).map_err(|error| {
                             io::Error::other(format!("invalid AGY NDJSON: {error}"))
                         })?;
-                        for event in normalize_event(&message, &mut state) {
+                        for event in normalize_event(&message, mode, &mut state) {
                             send_event(event_tx, Some(context), event).await;
                         }
                     }
@@ -362,8 +365,11 @@ async fn stream_child(
     }
 
     let status = exit_status.expect("child.wait runs before the loop can finish");
+    let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
+    if let Err(reason) = implement_tracker.finish(&status, &diagnostic, state.terminal) {
+        return Err(io::Error::other(reason));
+    }
     if !state.terminal {
-        let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
         return Err(io::Error::other(if diagnostic.is_empty() {
             format!("AGY exited with {status} without a terminal result")
         } else {
@@ -381,7 +387,11 @@ struct AgyStreamState {
     response_text: String,
 }
 
-fn normalize_event(message: &Value, state: &mut AgyStreamState) -> Vec<AgentEvent> {
+fn normalize_event(
+    message: &Value,
+    mode: ExecutionMode,
+    state: &mut AgyStreamState,
+) -> Vec<AgentEvent> {
     let mut events = Vec::new();
     if let Some(conversation_id) = message
         .get("conversation_id")
@@ -428,6 +438,13 @@ fn normalize_event(message: &Value, state: &mut AgyStreamState) -> Vec<AgentEven
                         events.push(AgentEvent::TextDelta(response.to_owned()));
                     }
                     if is_plan_review_response(&state.response_text) {
+                        if mode == ExecutionMode::Implement {
+                            events.push(AgentEvent::Error(
+                                "AGY returned a plan for review instead of applying edits in Implement mode."
+                                    .to_owned(),
+                            ));
+                            return events;
+                        }
                         events.push(AgentEvent::Notice(
                             "AGY returned a plan for review; no file changes were executed (plan+sandbox mode)."
                                 .to_owned(),
@@ -554,14 +571,14 @@ mod tests {
         });
 
         assert_eq!(
-            normalize_event(&delta, &mut state),
+            normalize_event(&delta, ExecutionMode::Ask, &mut state),
             vec![
                 AgentEvent::ProviderSessionBound("conversation".to_owned()),
                 AgentEvent::TextDelta("AGY_OK".to_owned()),
             ]
         );
         assert_eq!(
-            normalize_event(&result, &mut state),
+            normalize_event(&result, ExecutionMode::Ask, &mut state),
             vec![AgentEvent::Completed]
         );
         assert_eq!(state.conversation_id.as_deref(), Some("conversation"));
@@ -643,7 +660,7 @@ mod tests {
         });
 
         assert_eq!(
-            normalize_event(&result, &mut state),
+            normalize_event(&result, ExecutionMode::Plan, &mut state),
             vec![
                 AgentEvent::TextDelta(
                     "I created the implementation plan artifact at plan.md. Please review and approve the plan to proceed.".to_owned()
