@@ -1125,7 +1125,7 @@ fn runtime_session_schema_extension_preserves_existing_data() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2, "v2 drops the built-in-only agent CHECKs");
     assert_eq!(session_table, 1);
     assert_eq!(owner_column, 1);
 }

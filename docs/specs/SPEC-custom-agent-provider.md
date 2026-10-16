@@ -1,6 +1,6 @@
 # SPEC: Generic headless custom agent provider (`[[agents.custom]]`)
 
-Status: Draft (in progress)  
+Status: Implemented (PR #8)  
 Owner: DmuxAI  
 Created: 2026-10-17  
 Baseline: `73e3f4d`  
@@ -49,13 +49,13 @@ Any agent CLI with a headless command (opencode, Hermes, pi, ...) can be connect
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-330 | FR-330 | unit | valid / invalid toml | load | registered / field error | *proposed*: `custom_agent_config_parses_and_validates` |
-| TC-331 | FR-331 | unit | prompt with spaces/quotes, 2 images | build argv | exact argv, no shell | *proposed*: `custom_agent_placeholders_expand_without_shell` |
-| TC-332 | FR-332 | integration | fake script emitting jsonl | run turn | text + session captured | *proposed*: `custom_agent_jsonl_stream_and_failure` |
-| TC-333 | FR-333 | integration | fake script exit 1 / stderr match | run turn | Failed with reason | *proposed*: `custom_agent_failure_rules_fail_turn` |
-| TC-334 | FR-333 | integration | script spawning child, sleeps | timeout | group killed, no orphans | *proposed*: `custom_agent_timeout_kills_process_group` |
-| TC-335 | FR-334 | unit | one custom agent, models_command fake | open picker | filtered list; disallowed model rejected | *proposed*: `custom_agent_listed_in_agent_picker` |
-| TC-336 | FR-335 | unit | stored session id | build second turn | resume arg + env + temp config | *proposed*: `custom_agent_resume_and_temp_config` |
+| TC-330 | FR-330 | unit | valid / invalid toml | load | registered / field error | `test_deserialize_full_spec`, `test_validate_constraints` (src/custom_agent.rs); invalid toml → startup notice |
+| TC-331 | FR-331 | unit | prompt with spaces/quotes, 2 images | build argv | exact argv, no shell | `test_build_argv_prompt_injection_prevented`, `substituted_values_are_not_rescanned`, `test_build_argv_images_and_resume` |
+| TC-332 | FR-332 | integration | fake script emitting jsonl | run turn | text + session captured | `jsonl_agent_streams_text_and_keeps_prompt_as_one_arg`, `test_parse_jsonl_opencode_sample` (unix; fake agent `tests/fixtures/fake-agent.sh`) |
+| TC-333 | FR-333 | integration | fake script exit 1 / stderr match | run turn | Failed with reason | `failures_are_detected`, `test_failure_reason` |
+| TC-334 | FR-333 | integration | script spawning child, sleeps | timeout | group killed, no orphans | `timeout_kills_the_process_group` (unix) |
+| TC-335 | FR-334 | unit | one custom agent, models_command fake | open picker | filtered list; disallowed model rejected | `models_are_filtered_and_policy_enforced`; picker listing verified live (TEST-PLAN L-12) |
+| TC-336 | FR-335 | unit | stored session id | build second turn | resume arg + env + temp config | `test_build_argv_images_and_resume`, `temp_config_is_written_passed_and_removed` (unix) |
 | TC-337 | UX-330 | manual | opencode example config, `opencode/glm-5.3-flash-free` | send prompt in TUI | reply in configured color | TEST-PLAN L-12 |
 
 ## 6. Data, integration, and safety contracts

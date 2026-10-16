@@ -28,7 +28,7 @@ Status: draft · 기준 커밋: `73e3f4d` (main, PR #6 이후) · 작성일: 202
 | [SPEC-permission-hardening](specs/SPEC-permission-hardening.md) | Implemented | FR-300~303, TC-300~305 | FR-PERM-*, TC-PERM-* |
 | [SPEC-model-policy](specs/SPEC-model-policy.md) | Implemented | FR-310~314, TC-310~315 | FR-MODEL-*, TC-MODEL-* |
 | [SPEC-speaker-colors](specs/SPEC-speaker-colors.md) | Implemented | FR-320~322, UX-320, TC-320~324 | FR-THEME-*, TC-THEME-* |
-| [SPEC-custom-agent-provider](specs/SPEC-custom-agent-provider.md) | Draft | FR-330~335, UX-330, TC-330~337 | FR-CUSTOM-*, TC-CUSTOM-* |
+| [SPEC-custom-agent-provider](specs/SPEC-custom-agent-provider.md) | Implemented | FR-330~335, UX-330, TC-330~337 | FR-CUSTOM-*, TC-CUSTOM-* |
 | [SPEC-compact-summarize-focus](specs/SPEC-compact-summarize-focus.md) | Draft | FR-340~342, TC-340~342 | FR-COMPACT-*, TC-COMPACT-* |
 
 SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없는 것은 `*proposed*`로 표시했다. 확인된 실제 테스트: `user_selected_agy_model_wins_over_graph_default`, `graph_default_model_only_applies_to_cursor`, `chat_lines_render_with_speaker_theme_colors`, `explicit_summary_is_internal_and_the_next_turn_uses_it_fresh` 등 (§2 표의 일부 제안 이름은 이 실제 이름으로 대체된다).
@@ -337,7 +337,7 @@ Permissions SPEC 부재 · 색상/NO_COLOR SPEC 부재 · 러너별 모델 선�
 | L-09 | `/quit` | `/quit` 또는 `/q` 미리보기에서 Enter | 즉시 종료, 터미널 복구(raw mode 해제) | ☐ | ☐ |
 | L-10 | Esc / Ctrl+C | 유휴/실행 중 각각 Esc, Ctrl+C | Esc는 종료하지 않고 오버레이만 닫음. Ctrl+C 동작 기록(정책 UX-QUIT-2 확정 전) | ☐ | ☐ |
 | L-11 | 다중 인스턴스 | 같은 workspace에서 창 2개 실행 | 서로 다른 대화, 공유 목록에 둘 다 보임, DB 잠금 오류 없음 | ☐ | ☐ |
-| L-12 | custom agent (구현 후) | opencode 예시 설정, `opencode/glm-5.3-flash-free`로 "PONG만 답해" | 응답 수신, opencode 전용 색 | ☐ | ☐ |
+| L-12 | custom agent (구현 후) | opencode 예시 설정, `opencode/glm-5.3-flash-free`로 "PONG만 답해" | 응답 수신, opencode 전용 색 | ☑ (2026-10-17 tmux, PONG 주황색) | ☐ |
 | L-13 | 좁은 폭 | 폭 80으로 줄임 | 상태줄 잘림 기록(#5) | ☐ | ☐ |
 
 판정: 모든 행 Pass(또는 "기록" 항목은 값 기록) → 체크리스트 통과. 실패 시 `docs/dogfood/README.md`에 번호를 붙여 기록.

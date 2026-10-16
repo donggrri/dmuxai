@@ -29,7 +29,9 @@ pub fn default_limits() -> super::types::GraphLimits {
 pub fn assign_runner(_role: NodeRole, settings: &DmuxSettings) -> String {
     if let Some(default) = settings.routing_default_agent.as_deref() {
         let lower = default.trim().to_ascii_lowercase();
-        if matches!(lower.as_str(), "agy" | "codex" | "cursor") {
+        if matches!(lower.as_str(), "agy" | "codex" | "cursor")
+            || crate::custom_agent::index_of(&lower).is_some()
+        {
             return lower;
         }
     }

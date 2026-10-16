@@ -241,6 +241,16 @@ max_parallel = 2
 max_retries = 2
 ```
 
+## Custom headless agents
+
+Any headless agent CLI (opencode, hermes, pi, ...) can be added via `[[agents.custom]]`
+in `dmuxai.toml` — no Rust code. Custom runners appear in `/agent` and F2, keep their own
+chat color, and can act as graph runners. See
+[docs/agents/custom-agents.md](docs/agents/custom-agents.md) for the fields and
+[docs/agents/presets.toml](docs/agents/presets.toml) for ready-made presets.
+
+`NO_COLOR` disables chat colors unless `DMUXAI_FORCE_COLOR=1` is set.
+
 ## Image attachments
 
 Attach `png`, `jpg`, or `webp` files (10 MiB per file) before sending a prompt:

@@ -310,7 +310,14 @@ fn configure_command(
             command.args(["--mode", "plan", "--sandbox"]);
         }
         ExecutionMode::Implement => {
-            command.args(["--mode", "accept-edits", "--sandbox"]);
+            // Headless AGY auto-denies tools it cannot prompt for (e.g. run_command),
+            // which silently produced empty Implement turns. The sandbox still applies.
+            command.args([
+                "--mode",
+                "accept-edits",
+                "--sandbox",
+                "--dangerously-skip-permissions",
+            ]);
         }
     }
     if let Some(model) = selected_model {
@@ -389,6 +396,22 @@ struct AgyStreamState {
     response_text: String,
 }
 
+fn denied_actions_summary(message: &Value) -> Option<String> {
+    let denied = message.pointer("/result/denied_actions")?.as_array()?;
+    let names = denied
+        .iter()
+        .map(|action| {
+            action
+                .get("display_name")
+                .or_else(|| action.get("action"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    (!names.is_empty()).then(|| names.join(", "))
+}
+
 fn normalize_event(
     message: &Value,
     mode: ExecutionMode,
@@ -431,6 +454,12 @@ fn normalize_event(
                 .unwrap_or("ERROR");
             match status {
                 "SUCCESS" => {
+                    if let Some(denied) = denied_actions_summary(message) {
+                        events.push(AgentEvent::Error(format!(
+                            "AGY denied permission for: {denied}. Headless AGY cannot prompt; allow it in AGY settings or use Implement mode."
+                        )));
+                        return events;
+                    }
                     if !state.emitted_text
                         && let Some(response) =
                             message.pointer("/result/response").and_then(Value::as_str)
@@ -438,6 +467,12 @@ fn normalize_event(
                     {
                         state.response_text.push_str(response);
                         events.push(AgentEvent::TextDelta(response.to_owned()));
+                    }
+                    if state.response_text.trim().is_empty() {
+                        events.push(AgentEvent::Error(
+                            "AGY finished without producing any output.".to_owned(),
+                        ));
+                        return events;
                     }
                     if is_plan_review_response(&state.response_text) {
                         if mode == ExecutionMode::Implement {
@@ -752,5 +787,20 @@ mod tests {
             .expect("real AGY turn should return a conversation ID");
         assert!(!conversation.is_empty());
         assert!(answer.contains("AGY_OK"), "unexpected answer: {answer}");
+    }
+
+    #[test]
+    fn denied_actions_and_empty_output_are_errors() {
+        let mut state = AgyStreamState::default();
+        let denied = json!({"event":"result","result":{"status":"SUCCESS","response":"","denied_actions":[{"action":"command","display_name":"RunCommand"}]}});
+        let events = normalize_event(&denied, ExecutionMode::Implement, &mut state);
+        assert!(matches!(events.last(), Some(AgentEvent::Error(e)) if e.contains("RunCommand")));
+
+        let mut state = AgyStreamState::default();
+        let empty = json!({"event":"result","result":{"status":"SUCCESS","response":""}});
+        let events = normalize_event(&empty, ExecutionMode::Ask, &mut state);
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Error(e)) if e.contains("without producing"))
+        );
     }
 }

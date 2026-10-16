@@ -417,6 +417,7 @@ dependencies = [
  "crossterm",
  "image",
  "ratatui",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

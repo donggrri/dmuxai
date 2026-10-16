@@ -37,7 +37,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         settings.theme_force_color,
     );
     crossterm::style::force_color_output(color_enabled);
+    let custom_warnings = dmuxai::custom_agent::install_registry(settings.custom_agents.clone());
+    let config_warnings = settings.config_warnings.clone();
     let mut app = App::new(engine, workspace_root, settings)?;
+    for warning in config_warnings.into_iter().chain(custom_warnings) {
+        app.push_startup_notice(warning);
+    }
     if !color_enabled {
         app.push_startup_notice(
             "Chat colors are off because NO_COLOR is set. Run with DMUXAI_FORCE_COLOR=1 or set [theme] force_color = true in dmuxai.toml to enable them.".to_owned(),

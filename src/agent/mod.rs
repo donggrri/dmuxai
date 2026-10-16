@@ -1,6 +1,7 @@
 mod agy;
 mod codex;
 mod cursor;
+mod custom;
 mod implement_outcome;
 
 use std::{error::Error, fmt, path::PathBuf};
@@ -10,6 +11,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 pub use agy::spawn_agy_adapter;
 pub use codex::spawn_codex_adapter;
 pub use cursor::spawn_cursor_adapter;
+pub use custom::spawn_custom_adapter;
 
 /// An AI provider that can own conversations and produce messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -17,11 +19,24 @@ pub enum Agent {
     Codex,
     Cursor,
     Agy,
+    /// A `[[agents.custom]]` headless agent, by registry index.
+    Custom(u8),
 }
 
 impl Agent {
-    /// UI and spawn order: primary runners first, optional Codex last.
-    pub const ALL: [Self; 3] = [Self::Cursor, Self::Agy, Self::Codex];
+    /// Built-in runners in UI and spawn order: primary runners first, optional Codex last.
+    pub const BUILTIN: [Self; 3] = [Self::Cursor, Self::Agy, Self::Codex];
+
+    /// Built-in runners followed by every configured custom agent.
+    pub fn all() -> Vec<Self> {
+        let mut agents = Self::BUILTIN.to_vec();
+        agents.extend(
+            (0..dmuxai::custom_agent::registry().len())
+                .filter_map(|index| u8::try_from(index).ok())
+                .map(Self::Custom),
+        );
+        agents
+    }
 
     #[allow(dead_code)]
     pub const PRIMARY: [Self; 2] = [Self::Cursor, Self::Agy];
@@ -30,11 +45,14 @@ impl Agent {
         Self::Cursor
     }
 
-    pub const fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
             Self::Cursor => "Cursor",
             Self::Agy => "AGY",
+            Self::Custom(index) => dmuxai::custom_agent::spec_at(index)
+                .map(|spec| spec.label())
+                .unwrap_or("custom"),
         }
     }
 }

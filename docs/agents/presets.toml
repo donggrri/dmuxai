@@ -1,0 +1,45 @@
+# Example [[agents.custom]] presets. Copy the ones you want into dmuxai.toml.
+# Status: opencode = tested (2026-10-17, opencode/glm-5.3-flash-free);
+#         hermes   = flags checked against `hermes --help`, not run from DmuxAI;
+#         pi       = UNTESTED (CLI not installed; flags are a guess, verify with `pi --help`).
+
+[[agents.custom]]
+name = "opencode"
+label = "opencode"
+color = "#ffa500"
+command = ["opencode", "run", "--format", "json", "-m", "{model}", "--dir", "{workspace}", "{prompt}"]
+prompt_via = "arg"
+image_arg = ["-f", "{image}"]
+default_model = "opencode/glm-5.3-flash-free"
+models_command = ["opencode", "models"]
+models_filter = "-free$"
+allowed_models = "^opencode/.*-free$"
+output = "jsonl"
+text_path = "/part/text"
+text_when = { path = "/type", equals = "text" }
+error_path = "/error/message"
+session_id_path = "/sessionID"
+resume_arg = ["--session", "{session_id}"]
+timeout_secs = 1800
+failure_stderr = "(?i)permission denied|rejected permission"
+temp_config_template = '{"$schema":"https://opencode.ai/config.json","permission":{"edit":"{edit}","bash":"{edit}","webfetch":"allow"}}'
+env = { OPENCODE_CONFIG = "{temp_config}" }
+
+[[agents.custom]]
+name = "hermes"
+label = "Hermes"
+color = "#d4af37"
+command = ["hermes", "--in", "{workspace}", "-m", "{model}", "-z", "{prompt}"]
+output = "text"
+timeout_secs = 1800
+failure_stderr = "(?i)permission denied"
+[agents.custom.modes]
+implement = ["--yolo"]
+
+[[agents.custom]]
+name = "pi"
+label = "pi"
+color = "#40e0d0"
+command = ["pi", "-p", "{prompt}", "--model", "{model}"]
+output = "text"
+timeout_secs = 1800
