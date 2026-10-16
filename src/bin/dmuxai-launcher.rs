@@ -1,7 +1,7 @@
 #[cfg(not(windows))]
 fn main() {
     eprintln!("dmuxai-launcher is only supported on Windows.");
-    exit_after_pause(1);
+    std::process::exit(1);
 }
 
 /// Started from the Start-menu shortcut the console closes on exit, so keep
