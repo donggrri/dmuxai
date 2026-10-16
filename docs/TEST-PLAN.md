@@ -35,6 +35,7 @@ Status: draft · 기준 커밋: `73e3f4d` (main, PR #6 이후) · 작성일: 202
 | [SPEC-tui-stabilize](specs/SPEC-tui-stabilize.md) | Implemented | FR-380~, TC-380~ | dogfood #1, #4, #5, #6 |
 | [SPEC-activity-rendering](specs/SPEC-activity-rendering.md) | Implemented | FR-360~365, UX-360~362, TC-360~367 | FR-ACTIVITY-*, TC-ACTIVITY-* |
 | [SPEC-cursor-model-pin](specs/SPEC-cursor-model-pin.md) | Implemented | FR-410~412, UX-410, INT-410, TC-410~414 | dogfood #18 |
+| [SPEC-input-redraw](specs/SPEC-input-redraw.md) | Implemented | FR-420~415, TC-420~416 | dogfood #15, #17, #19 |
 
 SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없는 것은 `*proposed*`로 표시했다. 확인된 실제 테스트: `user_selected_agy_model_wins_over_graph_default`, `graph_default_model_only_applies_to_cursor`, `chat_lines_render_with_speaker_theme_colors`, `explicit_summary_is_internal_and_the_next_turn_uses_it_fresh` 등 (§2 표의 일부 제안 이름은 이 실제 이름으로 대체된다).
 
@@ -148,6 +149,12 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M2,M7 | SPEC-cursor-model-pin | FR-411 | TC-412 | `disallowed_model_in_app_is_replaced_with_composer_2_5_and_notified` | unit | ✅ | dogfood #18 |
 | M2,M7 | SPEC-cursor-model-pin | FR-410, FR-412 | TC-413 | `slash_prefixed_prompt_to_cursor_still_pins_composer_2_5` | unit | ✅ | dogfood #18 |
 | M2,M7 | SPEC-cursor-model-pin | UX-410 | TC-414 | `cursor_status_shows_composer_2_5_instead_of_provider_default` | unit | ✅ | dogfood #18 |
+| M6 (TUI) | SPEC-input-redraw | FR-420 | TC-420 | `escaped_slash_prompt_is_sent_as_regular_prompt` | unit | ✅ |  |
+| M6 (TUI) | SPEC-input-redraw | FR-421 | TC-421 | `unknown_slash_command_is_not_sent_and_keeps_input` | unit | ✅ |  |
+| M6 (TUI) | SPEC-input-redraw | FR-422 | TC-422, TC-423 | `fast_typed_agent_command_switches_agent_without_sending`, `fast_typed_mode_command_sets_mode_without_sending` | unit | ✅ |  |
+| M6 (TUI) | SPEC-input-redraw | FR-423 | TC-424 | `drain_agent_events_completion_triggers_immediate_draw` | unit | ✅ |  |
+| M6 (TUI) | SPEC-input-redraw | FR-424 | TC-425 | `tick_marks_dirty_while_busy` | unit | ✅ |  |
+| M2,M6 | SPEC-input-redraw | FR-425 | TC-426 | `activity_event_resets_last_event_age` | unit | ✅ |  |
 
 
 ### 1.1 주의할 ⚠️ 항목

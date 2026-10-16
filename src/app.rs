@@ -275,6 +275,7 @@ impl AgentActivity {
     }
 
     fn observe(&mut self, event: &AgentEvent, now: Instant) {
+        self.last_event_at = Some(now);
         let phase = match event {
             AgentEvent::Started => {
                 self.state = ActivityState::Running;
@@ -300,10 +301,20 @@ impl AgentActivity {
                     ActivityPhase::Responding
                 })
             }
-            AgentEvent::ToolProgress { .. } | AgentEvent::Activity(_) => {
+            AgentEvent::ToolProgress { .. } => {
                 self.state = ActivityState::Running;
                 Some(if self.kind == ActivityKind::Summary {
                     ActivityPhase::Summarizing
+                } else {
+                    ActivityPhase::Tool
+                })
+            }
+            AgentEvent::Activity(item) => {
+                self.state = ActivityState::Running;
+                Some(if self.kind == ActivityKind::Summary {
+                    ActivityPhase::Summarizing
+                } else if item.is_thinking() {
+                    ActivityPhase::Working
                 } else {
                     ActivityPhase::Tool
                 })
@@ -319,7 +330,6 @@ impl AgentActivity {
         };
         if let Some(phase) = phase {
             self.phase = phase;
-            self.last_event_at = Some(now);
             self.detail = match event {
                 AgentEvent::ToolProgress { summary, state, .. }
                     if self.kind == ActivityKind::Turn =>
@@ -384,6 +394,12 @@ struct UiAreas {
     status: Rect,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DrainEventsOutcome {
+    pub changed: bool,
+    pub completed: bool,
+}
+
 pub struct App {
     exit: bool,
     selected: usize,
@@ -432,6 +448,7 @@ pub struct App {
     single_graph_plan: Option<(NodeRole, Agent, String)>,
     last_group_expanded: bool,
     all_details_expanded: bool,
+    pub(crate) dirty: bool,
 }
 
 impl App {
@@ -551,9 +568,18 @@ impl App {
             single_graph_plan: None,
             last_group_expanded: false,
             all_details_expanded: false,
+            dirty: false,
         };
         app.restore_snapshot(snapshot);
         Ok(app)
+    }
+
+    pub fn tick(&mut self) -> bool {
+        let busy = !self.busy_agents.is_empty();
+        if busy {
+            self.dirty = true;
+        }
+        busy
     }
 
     pub async fn run<B>(&mut self, terminal: &mut Terminal<B>) -> Result<(), B::Error>
@@ -565,6 +591,7 @@ impl App {
         let mut dirty = false;
         let mut last_render = Instant::now();
         let mut last_session_heartbeat = Instant::now();
+        let mut last_busy_tick = Instant::now();
 
         while !self.exit {
             if last_session_heartbeat.elapsed() >= Duration::from_secs(5) {
@@ -576,7 +603,17 @@ impl App {
                 last_session_heartbeat = Instant::now();
                 dirty = true;
             }
-            dirty |= self.drain_agent_events();
+
+            if last_busy_tick.elapsed() >= Duration::from_secs(1) {
+                if self.tick() {
+                    dirty = true;
+                }
+                last_busy_tick = Instant::now();
+            }
+
+            let drain = self.drain_agent_events();
+            dirty |= drain.changed || self.dirty;
+            self.dirty = false;
 
             while event::poll(Duration::ZERO)? {
                 match event::read()? {
@@ -600,7 +637,7 @@ impl App {
                 break;
             }
 
-            if dirty && last_render.elapsed() >= RENDER_INTERVAL {
+            if drain.completed || (dirty && last_render.elapsed() >= RENDER_INTERVAL) {
                 terminal.draw(|frame| self.draw(frame))?;
                 dirty = false;
                 last_render = Instant::now();
@@ -632,12 +669,20 @@ impl App {
         let _ = self.engine.close_session();
     }
 
-    fn drain_agent_events(&mut self) -> bool {
-        let mut changed = false;
+    fn drain_agent_events(&mut self) -> DrainEventsOutcome {
+        let mut outcome = DrainEventsOutcome::default();
         while let Ok(output) = self.event_rx.try_recv() {
-            changed |= self.apply_agent_output(output);
+            let terminal = matches!(
+                output.event,
+                AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_)
+            );
+            let changed = self.apply_agent_output(output);
+            outcome.changed |= changed;
+            if terminal && changed {
+                outcome.completed = true;
+            }
         }
-        changed
+        outcome
     }
 
     fn apply_agent_output(&mut self, output: AgentOutput) -> bool {
@@ -655,6 +700,8 @@ impl App {
                 {
                     return false;
                 }
+
+                self.observe_activity(output.agent, &output.event, Instant::now());
 
                 let Some(event) = stored_event(&output.event) else {
                     self.apply_agent_event(output.agent, output.event);
@@ -681,7 +728,6 @@ impl App {
                     return true;
                 }
 
-                self.observe_activity(output.agent, &output.event, Instant::now());
                 let visible = conversation_id.as_str() == self.conversation_id.as_str();
                 let terminal = matches!(
                     output.event,
@@ -1076,6 +1122,49 @@ impl App {
         self.mode_picker = Some(ModePicker { agent, cursor });
     }
 
+    fn set_agent_mode(&mut self, agent: Agent, mode: ExecutionMode) -> Result<bool, String> {
+        if self.busy_agents.contains(&agent) {
+            return Err(format!(
+                "Finish or cancel the {agent} turn before changing modes."
+            ));
+        }
+        let adapter_index = Agent::all()
+            .iter()
+            .position(|candidate| *candidate == agent)
+            .expect("agent belongs to Agent::all()");
+        if let Err(error) = self.adapters[adapter_index].validate_mode(mode) {
+            return Err(format!("Could not select {mode} for {agent}: {error}"));
+        }
+        let mode_changed = self.modes.get(&agent).copied() != Some(mode);
+        if mode_changed && let Err(error) = self.engine.retire_active_binding(agent_key(agent)) {
+            return Err(format!("Could not change {mode} mode for {agent}: {error}"));
+        }
+        if let Err(error) = self.adapters[adapter_index].select_mode(mode) {
+            return Err(format!("Could not select {mode} for {agent}: {error}"));
+        }
+        self.modes.insert(agent, mode);
+        Ok(mode_changed)
+    }
+
+    fn select_active_agent_mode(&mut self, mode: ExecutionMode) {
+        let agent = self.adapters[self.selected].agent();
+        match self.set_agent_mode(agent, mode) {
+            Ok(mode_changed) => {
+                let message = if mode_changed {
+                    format!(
+                        "{agent} mode selected: {mode}. The next prompt opens a new session with shared context."
+                    )
+                } else {
+                    format!("{agent} mode is already selected: {mode}.")
+                };
+                self.messages.push(Message::new(Role::System, message));
+            }
+            Err(error) => {
+                self.messages.push(Message::new(Role::System, error));
+            }
+        }
+    }
+
     fn handle_mode_picker_key(&mut self, key: KeyEvent) {
         let Some(mut picker) = self.mode_picker.take() else {
             return;
@@ -1093,32 +1182,8 @@ impl App {
             }
             KeyCode::Enter => {
                 let mode = ExecutionMode::ALL[picker.cursor];
-                let adapter_index = Agent::all()
-                    .iter()
-                    .position(|agent| *agent == picker.agent)
-                    .expect("picker agent belongs to Agent::all()");
-                if let Err(error) = self.adapters[adapter_index].validate_mode(mode) {
-                    self.messages.push(Message::new(
-                        Role::System,
-                        format!("Could not select {mode} for {}: {error}", picker.agent),
-                    ));
-                    self.mode_picker = Some(picker);
-                    return;
-                }
-                let mode_changed = self.modes.get(&picker.agent).copied() != Some(mode);
-                if mode_changed
-                    && let Err(error) = self.engine.retire_active_binding(agent_key(picker.agent))
-                {
-                    self.messages.push(Message::new(
-                        Role::System,
-                        format!("Could not change {mode} mode for {}: {error}", picker.agent),
-                    ));
-                    self.mode_picker = Some(picker);
-                    return;
-                }
-                match self.adapters[adapter_index].select_mode(mode) {
-                    Ok(()) => {
-                        self.modes.insert(picker.agent, mode);
+                match self.set_agent_mode(picker.agent, mode) {
+                    Ok(mode_changed) => {
                         let message = if mode_changed {
                             format!(
                                 "{} mode selected: {mode}. The next prompt opens a new session with shared context.",
@@ -1130,10 +1195,7 @@ impl App {
                         self.messages.push(Message::new(Role::System, message));
                     }
                     Err(error) => {
-                        self.messages.push(Message::new(
-                            Role::System,
-                            format!("Could not select {mode} for {}: {error}", picker.agent),
-                        ));
+                        self.messages.push(Message::new(Role::System, error));
                         self.mode_picker = Some(picker);
                     }
                 }
@@ -1427,98 +1489,130 @@ impl App {
             prompt.truncate(prompt.trim_end_matches(['\r', '\n']).len());
         }
         self.slash_preview = None;
-        for command in ["/summarize", "/compact"] {
-            if let Some(rest) = prompt
-                .strip_prefix(command)
-                .filter(|rest| rest.is_empty() || rest.starts_with(' '))
-                .map(str::trim)
-            {
-                let focus = (!rest.is_empty()).then(|| rest.to_owned());
-                self.start_explicit_summary(focus);
-                return;
-            }
-        }
-        match prompt.as_str() {
-            "/agent" => {
-                self.execute_slash_action(SlashAction::Agent);
-                return;
-            }
-            "/mode" => {
-                self.execute_slash_action(SlashAction::Mode);
-                return;
-            }
-            "/effort" => {
-                self.execute_slash_action(SlashAction::Effort);
-                return;
-            }
-            "/status" => {
-                self.execute_slash_action(SlashAction::Status);
-                return;
-            }
-            "/quit" => {
-                self.execute_slash_action(SlashAction::Quit);
-                return;
-            }
-            "/conversations" => {
-                self.open_conversation_picker();
-                return;
-            }
-            "/resume" => {
-                self.push_system("Usage: /resume <conversation-id>");
-                return;
-            }
-            "/share" => {
-                self.push_system("Usage: /share <codex|cursor|agy>");
-                return;
-            }
-            "/details" => {
-                self.execute_slash_action(SlashAction::Details);
-                return;
-            }
-            _ => {}
-        }
-
-        if prompt == "/new" || prompt.starts_with("/new ") {
-            let title = prompt
-                .strip_prefix("/new")
-                .map(str::trim)
-                .filter(|title| !title.is_empty())
-                .map(str::to_owned);
-            self.create_conversation(title);
-            return;
-        }
-        if let Some(prefix) = prompt.strip_prefix("/resume ") {
-            self.resume_conversation(prefix.trim());
-            return;
-        }
-        if let Some(target) = prompt.strip_prefix("/share ") {
-            self.share_conversation(target.trim());
-            return;
-        }
-        if prompt == "/image" {
-            self.push_system("Usage: /image <path>");
-            return;
-        }
-        if let Some(path) = prompt.strip_prefix("/image ") {
-            self.attach_image_path(path);
-            return;
-        }
 
         if prompt_should_attach_only(&prompt) {
             self.attach_image_path(&prompt);
             return;
         }
-        if prompt == "/graph" {
-            self.show_graph_status();
-            return;
-        }
-        if prompt == "/graph continue" {
-            self.continue_graph_gate();
-            return;
-        }
-        if let Some(args) = prompt.strip_prefix("/graph override ") {
-            self.override_graph_node(args);
-            return;
+
+        let is_escaped = prompt.starts_with("//");
+        if is_escaped {
+            prompt = prompt[1..].to_owned();
+        } else if prompt.starts_with('/') && !first_token_is_path(&prompt) {
+            let cmd = prompt.split_whitespace().next().unwrap_or(&prompt);
+            match cmd {
+                "/agent" => {
+                    let arg = prompt.strip_prefix("/agent").unwrap().trim();
+                    if arg.is_empty() {
+                        self.execute_slash_action(SlashAction::Agent);
+                    } else if let Some(agent) = runner_from_str(arg) {
+                        self.selected = adapter_index(agent);
+                        self.messages.push(Message::new(
+                            Role::System,
+                            format!("Active agent: {agent}."),
+                        ));
+                    } else {
+                        self.push_system(format!(
+                            "Unknown agent: {arg}. Use /agent to pick from available agents."
+                        ));
+                    }
+                    return;
+                }
+                "/mode" => {
+                    let arg = prompt.strip_prefix("/mode").unwrap().trim();
+                    if arg.is_empty() {
+                        self.execute_slash_action(SlashAction::Mode);
+                    } else {
+                        match arg.to_ascii_lowercase().as_str() {
+                            "ask" => self.select_active_agent_mode(ExecutionMode::Ask),
+                            "plan" => self.select_active_agent_mode(ExecutionMode::Plan),
+                            "implement" => self.select_active_agent_mode(ExecutionMode::Implement),
+                            _ => self.push_system("Usage: /mode <ask|plan|implement>"),
+                        }
+                    }
+                    return;
+                }
+                "/summarize" | "/compact" => {
+                    let rest = prompt.strip_prefix(cmd).unwrap_or("").trim();
+                    let focus = (!rest.is_empty()).then(|| rest.to_owned());
+                    self.start_explicit_summary(focus);
+                    return;
+                }
+                "/effort" => {
+                    self.execute_slash_action(SlashAction::Effort);
+                    return;
+                }
+                "/status" => {
+                    self.execute_slash_action(SlashAction::Status);
+                    return;
+                }
+                "/quit" => {
+                    self.execute_slash_action(SlashAction::Quit);
+                    return;
+                }
+                "/new" => {
+                    let title = prompt
+                        .strip_prefix("/new")
+                        .map(str::trim)
+                        .filter(|title| !title.is_empty())
+                        .map(str::to_owned);
+                    self.create_conversation(title);
+                    return;
+                }
+                "/conversations" => {
+                    self.open_conversation_picker();
+                    return;
+                }
+                "/resume" => {
+                    let rest = prompt.strip_prefix("/resume").unwrap().trim();
+                    if rest.is_empty() {
+                        self.push_system("Usage: /resume <conversation-id>");
+                    } else {
+                        self.resume_conversation(rest);
+                    }
+                    return;
+                }
+                "/share" => {
+                    let rest = prompt.strip_prefix("/share").unwrap().trim();
+                    if rest.is_empty() {
+                        self.push_system("Usage: /share <codex|cursor|agy>");
+                    } else {
+                        self.share_conversation(rest);
+                    }
+                    return;
+                }
+                "/image" => {
+                    let rest = prompt.strip_prefix("/image").unwrap().trim();
+                    if rest.is_empty() {
+                        self.push_system("Usage: /image <path>");
+                    } else {
+                        self.attach_image_path(rest);
+                    }
+                    return;
+                }
+                "/details" => {
+                    self.execute_slash_action(SlashAction::Details);
+                    return;
+                }
+                "/graph" => {
+                    let rest = prompt.strip_prefix("/graph").unwrap().trim();
+                    if rest.is_empty() {
+                        self.show_graph_status();
+                    } else if rest == "continue" {
+                        self.continue_graph_gate();
+                    } else if let Some(args) = rest.strip_prefix("override ") {
+                        self.override_graph_node(args.trim());
+                    } else {
+                        self.show_graph_status();
+                    }
+                    return;
+                }
+                _ => {
+                    self.push_system(format!("Unknown command: {cmd} (type / for the list)"));
+                    self.input = prompt;
+                    return;
+                }
+            }
         }
 
         if self.settings.graph_enabled && !prompt.trim_start().starts_with('/') {
@@ -3340,6 +3434,13 @@ fn runner_from_str(runner: &str) -> Option<Agent> {
         "codex" => Some(Agent::Codex),
         other => dmuxai::custom_agent::index_of(other).map(Agent::Custom),
     }
+}
+
+/// `/home/u/shot.png describe this` is a path, not a slash command: the
+/// first token has a second `/` or names an existing file.
+fn first_token_is_path(prompt: &str) -> bool {
+    let token = prompt.split_whitespace().next().unwrap_or("");
+    token[1..].contains('/') || Path::new(token).exists()
 }
 
 fn prompt_should_attach_only(prompt: &str) -> bool {
@@ -5660,10 +5761,10 @@ mod tests {
     }
 
     #[test]
-    // TC-022 / UX-011: whitespace keeps /quit on the ordinary prompt path.
+    // TC-022 / UX-011: // escape keeps /quit on the ordinary prompt path.
     fn quit_with_whitespace_is_regular_prompt_text() {
         let (mut app, sent) = test_app();
-        app.input = "/quit ".to_owned();
+        app.input = "//quit ".to_owned();
 
         app.submit_prompt();
 
@@ -5674,7 +5775,7 @@ mod tests {
     #[test]
     fn whitespace_after_command_sends_it_as_regular_prompt() {
         let (mut app, sent) = test_app();
-        app.input = "/agent ".to_owned();
+        app.input = "//agent ".to_owned();
 
         app.submit_prompt();
 
@@ -6253,6 +6354,196 @@ mod tests {
             .join("\n");
         assert!(!transcript.contains("ephemeral internal thought"));
         assert!(transcript.contains("user instruction"));
+    }
+
+    #[test]
+    // TC-420 / FR-420: messages starting with // send a literal / prompt (escape).
+    fn escaped_slash_prompt_is_sent_as_regular_prompt() {
+        let (mut app, sent) = test_app();
+        app.input = "//agent agy".to_owned();
+
+        app.submit_prompt();
+
+        assert_eq!(sent.lock().unwrap()[0].1.prompt, "/agent agy");
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    // FR-421 boundary: an absolute path is a prompt, not an unknown command.
+    fn absolute_path_prompt_is_not_treated_as_slash_command() {
+        let (mut app, sent) = test_app();
+        app.input = "/tmp/screenshot.png what is wrong here".to_owned();
+        app.submit_prompt();
+        assert!(
+            app.messages
+                .iter()
+                .all(|m| !m.content.starts_with("Unknown command"))
+        );
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(first_token_is_path("/home/u/x.png"));
+        assert!(!first_token_is_path("/x arg"));
+    }
+
+    #[test]
+    // TC-421 / FR-421: unknown slash not sent (sent list empty).
+    fn unknown_slash_command_is_not_sent_and_keeps_input() {
+        let (mut app, sent) = test_app();
+        app.input = "/x arg".to_owned();
+
+        app.submit_prompt();
+
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(app.input, "/x arg");
+        let last_message = app.messages.last().expect("notice pushed");
+        assert_eq!(last_message.role, Role::System);
+        assert_eq!(
+            last_message.content,
+            "Unknown command: /x (type / for the list)"
+        );
+    }
+
+    #[test]
+    // TC-422 / FR-422: "/agent agy" typed char by char then Enter switches agent without sending.
+    fn fast_typed_agent_command_switches_agent_without_sending() {
+        let (mut app, sent) = test_app();
+        app.selected = adapter_index(Agent::Cursor);
+
+        for ch in "/agent agy".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(app.adapters[app.selected].agent(), Agent::Agy);
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    // TC-423 / FR-422: "/mode implement" sets mode.
+    fn fast_typed_mode_command_sets_mode_without_sending() {
+        let (mut app, sent) = test_app();
+        let selected_agent = app.adapters[app.selected].agent();
+        assert_eq!(
+            app.modes.get(&selected_agent).copied(),
+            Some(ExecutionMode::Ask)
+        );
+
+        app.input = "/mode implement".to_owned();
+        app.submit_prompt();
+
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(
+            app.modes.get(&selected_agent).copied(),
+            Some(ExecutionMode::Implement)
+        );
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    // TC-424 / FR-423: drain_agent_events returning completion always triggers immediate draw.
+    fn drain_agent_events_completion_triggers_immediate_draw() {
+        let (mut app, _) = test_app();
+        app.active_turns.insert(
+            Agent::Cursor,
+            ActiveTurn {
+                conversation_id: StoredConversationId::new(app.conversation_id.as_str()),
+                turn_id: StoredTurnId::new("turn-1"),
+            },
+        );
+        app.busy_agents.insert(Agent::Cursor);
+
+        let (tx, rx) = event_channel();
+        app.event_rx = rx;
+        tx.try_send(AgentOutput {
+            agent: Agent::Cursor,
+            conversation_id: Some(ConversationId::new(app.conversation_id.as_str())),
+            turn_id: Some(TurnId::new("turn-1")),
+            event: AgentEvent::Completed,
+        })
+        .unwrap();
+
+        let outcome = app.drain_agent_events();
+        assert!(outcome.changed);
+        assert!(outcome.completed);
+    }
+
+    #[test]
+    // TC-425 / FR-424: tick marks dirty while busy.
+    fn tick_marks_dirty_while_busy() {
+        let (mut app, _) = test_app();
+        assert!(!app.dirty);
+        assert!(!app.tick());
+        assert!(!app.dirty);
+
+        app.busy_agents.insert(Agent::Agy);
+        assert!(app.tick());
+        assert!(app.dirty);
+    }
+
+    #[test]
+    // TC-426 / FR-425: activity event resets last-event age.
+    fn activity_event_resets_last_event_age() {
+        let (mut app, _) = test_app();
+        let now = Instant::now();
+        let old_time = now - Duration::from_secs(65);
+        app.active_turns.insert(
+            Agent::Agy,
+            ActiveTurn {
+                conversation_id: StoredConversationId::new(app.conversation_id.as_str()),
+                turn_id: StoredTurnId::new("turn-1"),
+            },
+        );
+        app.activities.insert(
+            Agent::Agy,
+            AgentActivity {
+                kind: ActivityKind::Turn,
+                state: ActivityState::Running,
+                phase: ActivityPhase::Working,
+                started_at: now - Duration::from_secs(120),
+                last_event_at: Some(old_time),
+                detail: None,
+            },
+        );
+
+        let initial_summary = app.activity_summary(Agent::Agy, now);
+        assert!(initial_summary.contains("last event 1m 05s ago"));
+
+        let activity_item = dmuxai::activity::ActivityItem::Tool {
+            name: "edit".to_owned(),
+            target: "src/app.rs".to_owned(),
+            status: dmuxai::activity::ToolStatus::Running,
+            duration_ms: None,
+            detail: String::new(),
+        };
+
+        let output = AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(app.conversation_id.as_str())),
+            turn_id: Some(TurnId::new("turn-1")),
+            event: AgentEvent::Activity(activity_item),
+        };
+
+        assert!(app.apply_agent_output(output));
+
+        let updated_summary = app.activity_summary(Agent::Agy, now);
+        assert!(updated_summary.contains("last event 0s ago"));
+        assert!(updated_summary.contains("tool"));
+
+        let thinking_item = dmuxai::activity::ActivityItem::Thinking {
+            text: "planning next step".to_owned(),
+            started_ms: 1000,
+            finished_ms: None,
+        };
+        let output2 = AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(app.conversation_id.as_str())),
+            turn_id: Some(TurnId::new("turn-1")),
+            event: AgentEvent::Activity(thinking_item),
+        };
+        assert!(app.apply_agent_output(output2));
+        let thinking_summary = app.activity_summary(Agent::Agy, now);
+        assert!(thinking_summary.contains("last event 0s ago"));
+        assert!(thinking_summary.contains("working"));
     }
 }
 
