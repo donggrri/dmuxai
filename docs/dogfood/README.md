@@ -64,5 +64,8 @@ Format: id, status, repro, cause, fix.
 ## #15 "last event Ns ago" keeps growing while AGY runs tools — open
 - Repro: AGY Implement turn that reads/edits files: status shows `working · 9m · last event 9m ago` although AGY is active (tool steps are not counted as events). Looks hung; it is not. The activity-rendering work maps tool steps to events.
 
+## #16 Interrupted worker left activity WIP uncommitted; rebase onto #8–#11 conflicted — fixed during resume
+- Stash/rebase hit keep-both conflicts in app.rs/settings.rs/TEST-PLAN; the expand test also outgrew the 40-row test viewport after the graph status line landed (raised to 60). Lesson: commit WIP per node so a resume can rebase cleanly.
+
 ## Process note
 #2, #3 (PR #6) and #7 (PR #8) were fixed directly (not through DmuxAI), because #3 blocked the AGY flash runner that dogfooding needs.

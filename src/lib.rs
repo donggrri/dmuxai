@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod attachments;
 pub mod chat_selection;
 pub mod clipboard;

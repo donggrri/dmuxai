@@ -2,6 +2,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::activity::UiSettings;
 use crate::theme::{Theme, ThemeToml};
 
 /// Workspace-local and environment overrides for DmuxAI behavior.
@@ -17,6 +18,8 @@ pub struct DmuxSettings {
     pub theme_force_color: Option<bool>,
     /// `[[agents.custom]]` headless agents (installed into the registry at startup).
     pub custom_agents: Vec<crate::custom_agent::CustomAgentSpec>,
+    /// Activity rendering settings (tool calls and model thinking).
+    pub ui: UiSettings,
     /// Problems found while reading dmuxai.toml, shown at startup.
     pub config_warnings: Vec<String>,
 }
@@ -28,6 +31,7 @@ struct DmuxToml {
     graph: Option<GraphToml>,
     theme: Option<ThemeToml>,
     agents: Option<AgentsToml>,
+    ui: Option<UiSettings>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -102,6 +106,9 @@ impl DmuxSettings {
                     settings.graph_max_retries = max_retries;
                 }
             }
+            if let Some(ui) = parsed.ui {
+                settings.ui = ui;
+            }
         }
         settings
     }
@@ -119,6 +126,7 @@ impl Default for DmuxSettings {
             theme: Theme::default(),
             theme_force_color: None,
             custom_agents: Vec::new(),
+            ui: UiSettings::default(),
             config_warnings: Vec::new(),
         }
     }
@@ -137,6 +145,7 @@ fn env_flag(name: &str) -> bool {
 #[cfg(test)]
 mod theme_config_tests {
     use super::*;
+    use crate::activity::{ShowThinking, ShowTools};
     use ratatui::style::Color;
 
     #[test]
@@ -167,5 +176,49 @@ mod theme_config_tests {
         let disabled_settings = DmuxSettings::load(&dir);
         assert!(!disabled_settings.graph_enabled);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Run only via `ui_config_activity_rendering_parsing` (shared temp dirs).
+    fn parses_ui_section() {
+        let dir = std::env::temp_dir().join(format!("dmuxai-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("dmuxai.toml"),
+            "[ui]\nshow_tools = \"expanded\"\nshow_thinking = \"hidden\"\n",
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(&dir);
+        assert_eq!(settings.ui.show_tools, ShowTools::Expanded);
+        assert_eq!(settings.ui.show_thinking, ShowThinking::Hidden);
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Default when missing [ui]
+        let dir_missing =
+            std::env::temp_dir().join(format!("dmuxai-ui-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir_missing).unwrap();
+        std::fs::write(dir_missing.join("dmuxai.toml"), "# no ui section\n").unwrap();
+        let settings_missing = DmuxSettings::load(&dir_missing);
+        assert_eq!(settings_missing.ui.show_tools, ShowTools::Collapsed);
+        assert_eq!(settings_missing.ui.show_thinking, ShowThinking::Live);
+        std::fs::remove_dir_all(&dir_missing).ok();
+
+        // Fallback when invalid values
+        let dir_invalid =
+            std::env::temp_dir().join(format!("dmuxai-ui-invalid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir_invalid).unwrap();
+        std::fs::write(
+            dir_invalid.join("dmuxai.toml"),
+            "[ui]\nshow_tools = \"unknown\"\nshow_thinking = \"invalid\"\n",
+        )
+        .unwrap();
+        let settings_invalid = DmuxSettings::load(&dir_invalid);
+        assert_eq!(settings_invalid.ui.show_tools, ShowTools::Collapsed);
+        assert_eq!(settings_invalid.ui.show_thinking, ShowThinking::Live);
+        std::fs::remove_dir_all(&dir_invalid).ok();
+    }
+
+    #[test]
+    fn ui_config_activity_rendering_parsing() {
+        parses_ui_section();
     }
 }

@@ -1739,6 +1739,7 @@ mod tests {
                         | AgentEvent::EffortSelected(_)
                         | AgentEvent::ModeSelected(_)
                         | AgentEvent::ToolProgress { .. }
+                        | AgentEvent::Activity(_)
                         | AgentEvent::Status(_)
                         | AgentEvent::Cancelled => {}
                     }
@@ -1800,7 +1801,9 @@ mod tests {
                         | AgentEvent::ModelSelected(_)
                         | AgentEvent::EffortSelected(_)
                         | AgentEvent::ModeSelected(_) => {}
-                        AgentEvent::ToolProgress { .. } | AgentEvent::Status(_) => {}
+                        AgentEvent::ToolProgress { .. }
+                        | AgentEvent::Activity(_)
+                        | AgentEvent::Status(_) => {}
                     }
                 }
             }
