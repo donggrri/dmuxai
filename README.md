@@ -223,23 +223,15 @@ Attach `png`, `jpg`, or `webp` files (10 MiB per file) before sending a prompt:
 - `/image path/to/screenshot.png`
 - Paste a single filesystem path into the prompt area
 - Mention supported paths in the prompt text (for example `see ./ui.png`)
+- Press Ctrl+V or Alt+V with a PNG image in the clipboard
 
-Attached files are copied under `.dmuxai/attachments/` in the workspace. The
-prompt title shows `[Image #1]` chips until the turn is sent successfully.
+Attached files are copied under `.dmuxai/attachments/` in the workspace. Clipboard
+images are saved there as `clip-<uuid>.png`. The prompt title shows `[Image #1]`
+chips until the turn is sent successfully.
 
-| Agent | How images are passed |
-| --- | --- |
-| Cursor | `cursor-agent --image <path>` (repeated per file) |
-| AGY | `agy --image <path>` (repeated per file) |
-| Codex | `@path` references appended to the turn text (app-server JSON has no separate image field in DmuxAI today) |
-
-Regenerate UI reference screenshots from the Ratatui test backend:
-
-```bash
-DMUXAI_EXPORT_SCREENSHOTS=1 cargo test export_documentation_screenshots -- --nocapture
-```
-
-Outputs land in `docs/screenshots/`.
+Cursor and AGY have no `--image` CLI flag, so their prompts carry `@<path>`
+tokens appended to the prompt text; Codex keeps `@path` references in the turn
+text (the app-server JSON has no separate image field in DmuxAI today).
 
 ## Verify
 

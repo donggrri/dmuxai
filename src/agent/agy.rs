@@ -16,6 +16,7 @@ use tokio::{
 use super::{
     AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ExecutionMode,
     ModelInfo, OutputContext, SpawnedAdapter, implement_outcome::ImplementTurnTracker,
+    prompt_with_image_tokens,
 };
 use crate::process::{headless_command, resolve_program};
 
@@ -266,9 +267,10 @@ async fn run_turn(
 
     let context = OutputContext::from(request);
     send_event(event_tx, Some(&context), AgentEvent::Started).await;
+    let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
     let mut input = serde_json::to_vec(&json!({
         "event": "user",
-        "message": { "content": agy_prompt(mode, &request.prompt) }
+        "message": { "content": agy_prompt(mode, &prompt) }
     }))
     .map_err(io::Error::other)?;
     input.push(b'\n');
@@ -316,9 +318,6 @@ fn configure_command(
     }
     if let Some(conversation_id) = request.resume_session.as_deref() {
         command.arg("--conversation").arg(conversation_id);
-    }
-    for path in &request.image_paths {
-        command.arg("--image").arg(path);
     }
 }
 
@@ -615,6 +614,33 @@ mod tests {
                 .any(|args| args == ["--conversation", "agy-conversation"])
         );
         assert!(args.windows(2).any(|args| args == ["--model", "agy-model"]));
+    }
+
+    #[test]
+    // FR-IMG-5 / INT-IMG-2: AGY has no `--image` flag; image paths become
+    // `@path` tokens appended to the text prompt.
+    fn agy_passes_image_paths_to_cli() {
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conversation"),
+            turn_id: super::super::TurnId::new("turn"),
+            prompt: "describe".to_owned(),
+            resume_session: None,
+            image_paths: vec![
+                PathBuf::from("/tmp/shot.png"),
+                PathBuf::from("/tmp/other.png"),
+            ],
+        };
+        let mut command = tokio::process::Command::new("agy");
+        configure_command(&mut command, &request, None, ExecutionMode::Ask);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg == "--image"));
+        let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
+        assert_eq!(prompt, "describe @/tmp/shot.png @/tmp/other.png");
+        assert!(agy_prompt(ExecutionMode::Ask, &prompt).ends_with(&prompt));
     }
 
     #[test]

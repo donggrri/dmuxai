@@ -31,6 +31,7 @@ use dmuxai::{
     },
     chat_selection::{CellPosition, ChatSelection},
     clipboard::copy_text,
+    clipboard_image::{ClipboardCmd, read_clipboard_png_with, save_attachment},
     conversation::{
         AgentKey, BeginTurn, BeginTurnOutcome, ContextProjection, ConversationCard,
         ConversationEngine, ConversationError, ConversationId as StoredConversationId,
@@ -705,6 +706,15 @@ impl App {
             return;
         }
 
+        if key.code == KeyCode::Char('v')
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.attach_clipboard_image();
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {}
             KeyCode::F(2) => self.open_model_picker(),
@@ -1280,6 +1290,30 @@ impl App {
                 false
             }
         }
+    }
+
+    /// FR-CLIP-2 / UX-CLIP-1: pasting a clipboard image (Ctrl+V or Alt+V)
+    /// saves the PNG in the workspace and shows its chip in the prompt line.
+    fn attach_clipboard_image_with(&mut self, cmds: &[ClipboardCmd]) {
+        let Some(bytes) = read_clipboard_png_with(cmds) else {
+            return;
+        };
+        match save_attachment(&self.workspace_root, &bytes) {
+            Ok(path) => match self.pending_images.ingest_saved_file(path) {
+                Ok(attachment) => self.push_system(format!(
+                    "Attached {} ({} bytes) from the clipboard. Images are sent with the next prompt.",
+                    attachment.label, attachment.byte_size
+                )),
+                Err(error) => self
+                    .push_system(format!("Could not attach clipboard image: {error}")),
+            },
+            Err(error) => self.push_system(format!("Could not save clipboard image: {error}")),
+        }
+    }
+
+    fn attach_clipboard_image(&mut self) {
+        let cmds = dmuxai::clipboard_image::default_clipboard_commands();
+        self.attach_clipboard_image_with(&cmds);
     }
 
     fn ingest_images_referenced_in_prompt(&mut self, prompt: &str) {
@@ -2842,7 +2876,6 @@ fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use dmuxai::ui_png::buffer_to_rgb_image;
     use ratatui::backend::TestBackend;
 
     use super::*;
@@ -4642,17 +4675,6 @@ mod tests {
         assert_eq!(completed.turns[0].status, TurnStatus::Completed);
     }
 
-    fn save_png(app: &mut App, path: &std::path::Path, width: u16, height: u16) {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| app.draw(frame)).unwrap();
-        let image = buffer_to_rgb_image(terminal.backend().buffer());
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        image.save(path).unwrap();
-    }
-
     #[test]
     fn image_slash_command_attaches_supported_file() {
         let (mut app, _) = test_app();
@@ -4685,26 +4707,51 @@ mod tests {
     }
 
     #[test]
-    fn export_documentation_screenshots() {
-        if std::env::var("DMUXAI_EXPORT_SCREENSHOTS").is_err() {
-            return;
-        }
-        let out = std::path::Path::new("docs/screenshots");
+    // FR-CLIP-2 / UX-IMG-1: a clipboard PNG is saved under
+    // `.dmuxai/attachments/` and both the chip line and the store register it.
+    fn clipboard_paste_registers_pending_image_chip() {
         let (mut app, _) = test_app();
-        save_png(&mut app, &out.join("main-tui.png"), 120, 36);
+        let cmds = [ClipboardCmd::new(
+            "sh",
+            ["-c", "printf '\\211PNG\\015\\012\\032\\012data'"],
+        )];
 
-        app.input = "Summarize the repository layout".to_owned();
-        app.submit_prompt();
-        app.messages.push(Message::new(
-            Role::Agent(Agent::Codex),
-            "Scanning sources and summarizing modules...",
-        ));
-        save_png(&mut app, &out.join("agent-turn.png"), 120, 36);
+        app.attach_clipboard_image_with(&cmds);
 
-        app.open_model_picker();
-        save_png(&mut app, &out.join("model-picker.png"), 120, 36);
-        app.model_picker = None;
-        app.open_mode_picker();
-        save_png(&mut app, &out.join("mode-picker.png"), 120, 36);
+        assert_eq!(app.pending_images.len(), 1);
+        assert_eq!(app.pending_images.chip_line(), "[Image #1]");
+        let saved = app.pending_images.items()[0].path.clone();
+        assert!(saved.starts_with(dmuxai::attachments::attachments_dir(&app.workspace_root)));
+        assert_eq!(
+            std::fs::read(&saved).unwrap(),
+            [
+                0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, b'd', b'a', b't', b'a'
+            ]
+            .to_vec()
+        );
+        let _ = std::fs::remove_file(saved);
+
+        app.attach_clipboard_image_with(&cmds);
+        assert_eq!(app.pending_images.chip_line(), "[Image #1] [Image #2]");
+        for path in app.pending_images.paths() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    // FR-CLIP-3: when the clipboard holds no PNG, nothing changes: no
+    // attachment is registered and the text input is untouched.
+    fn clipboard_paste_without_png_is_a_noop() {
+        let (mut app, _) = test_app();
+        app.input = "keep me".to_owned();
+        let cmds = [
+            ClipboardCmd::new("sh", ["-c", "exit 1"]),
+            ClipboardCmd::new("sh", ["-c", "printf 'plain text'"]),
+        ];
+
+        app.attach_clipboard_image_with(&cmds);
+
+        assert!(app.pending_images.is_empty());
+        assert_eq!(app.input, "keep me");
     }
 }
