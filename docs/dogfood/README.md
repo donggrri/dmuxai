@@ -29,7 +29,7 @@ Format: id, status, repro, cause, fix.
 - Repro (tmux): `send-keys -l "<~600 chars>"` immediately followed by `send-keys Enter` → text stays in the prompt, nothing is sent; a second Enter sends it. With a 1 s pause before Enter it works.
 - Likely cause: paste-burst detection treats an Enter inside the burst window as a literal newline.
 
-## #7 AGY Implement turns silently empty — fixed (PR #7)
+## #7 AGY Implement turns silently empty — fixed (PR #8)
 - Repro: AGY + Implement, ask it to create a file → turn ends after ~20 s with no text, no file, no error.
 - Cause: headless AGY auto-denies `run_command` (`result.denied_actions`, `response: ""`; stderr says "no output produced ... auto-denied"). DmuxAI treated it as success.
 - Fix: Implement mode passes `--dangerously-skip-permissions` (still `--sandbox`); `denied_actions` or an empty response is now an error turn.
@@ -38,11 +38,11 @@ Format: id, status, repro, cause, fix.
 - Repro: AGY flash, Implement, "create src/agent/opencode.rs ... run cargo build" → "waiting for the background compilation" for 5+ min with no events; cancelled with Ctrl+C. No file was written.
 - Workaround used: smaller prompts that say "do not run cargo"; the orchestrator compiles.
 
-## #9 Built-in-only agent CHECK constraints in the conversation DB — fixed (PR #7)
+## #9 Built-in-only agent CHECK constraints in the conversation DB — fixed (PR #8)
 - Repro: first opencode prompt → `CHECK constraint failed: requested_agent IN ('codex', 'cursor', 'agy')`.
 - Fix: schema v2 rebuilds `turns`, `provider_bindings`, `context_checkpoints` without the built-in-only CHECK. Older binaries refuse a v2 DB (`UnsupportedSchema`).
 
-## #10 Invalid dmuxai.toml was silently ignored — fixed (PR #7)
+## #10 Invalid dmuxai.toml was silently ignored — fixed (PR #8)
 - Repro: any TOML syntax error → all settings silently dropped.
 - Fix: startup notice `dmuxai.toml ignored: <parse error>`.
 
@@ -51,4 +51,4 @@ Format: id, status, repro, cause, fix.
 - AGY's first `substitute` re-scanned substituted values (a prompt containing `{model}` would be rewritten). Replaced by a single-pass substitution with a test.
 
 ## Process note
-#2, #3 (PR #6) and #7 were fixed directly (not through DmuxAI), because #3 blocked the AGY flash runner that dogfooding needs.
+#2, #3 (PR #6) and #7 (PR #8) were fixed directly (not through DmuxAI), because #3 blocked the AGY flash runner that dogfooding needs.
