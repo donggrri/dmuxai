@@ -439,7 +439,9 @@ async fn send(
         .await;
 }
 
-#[cfg(test)]
+// The fake agent is a POSIX shell script; Windows CI covers the pure parts in
+// `dmuxai::custom_agent` tests.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::agent::{ConversationId, TurnId};
