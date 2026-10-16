@@ -19,6 +19,20 @@ Status: draft · 기준 커밋: `73e3f4d` (main, PR #6 이후) · 작성일: 202
 | M7 | Model policy: composer-2.5 only (그래프/서브에이전트/기본값) |
 | M8 | Graph execution report (`docs/graph-runs/`) |
 
+## 0.1 새 SPEC 문서 (2026-10-17 추가)
+
+§2의 제안 중 오늘 구현/설계된 기능은 아래 SPEC으로 정식화했다. SPEC에서는 CI 형식(`FR-\d+`, `TC-\d+`)에 맞춰 숫자 ID를 쓰고, 이 문서의 접두어 ID는 그 대응표다.
+
+| SPEC | Status | 숫자 ID | 이 문서 제안 ID |
+|---|---|---|---|
+| [SPEC-permission-hardening](specs/SPEC-permission-hardening.md) | Implemented | FR-300~303, TC-300~305 | FR-PERM-*, TC-PERM-* |
+| [SPEC-model-policy](specs/SPEC-model-policy.md) | Implemented | FR-310~314, TC-310~315 | FR-MODEL-*, TC-MODEL-* |
+| [SPEC-speaker-colors](specs/SPEC-speaker-colors.md) | Implemented | FR-320~322, UX-320, TC-320~324 | FR-THEME-*, TC-THEME-* |
+| [SPEC-custom-agent-provider](specs/SPEC-custom-agent-provider.md) | Draft | FR-330~335, UX-330, TC-330~337 | FR-CUSTOM-*, TC-CUSTOM-* |
+| [SPEC-compact-summarize-focus](specs/SPEC-compact-summarize-focus.md) | Draft | FR-340~342, TC-340~342 | FR-COMPACT-*, TC-COMPACT-* |
+
+SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없는 것은 `*proposed*`로 표시했다. 확인된 실제 테스트: `user_selected_agy_model_wins_over_graph_default`, `graph_default_model_only_applies_to_cursor`, `chat_lines_render_with_speaker_theme_colors`, `explicit_summary_is_internal_and_the_next_turn_uses_it_fresh` 등 (§2 표의 일부 제안 이름은 이 실제 이름으로 대체된다).
+
 ## 1. 추적성 매트릭스
 
 상태 기준:
