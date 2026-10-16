@@ -1,7 +1,21 @@
 #[cfg(not(windows))]
 fn main() {
     eprintln!("dmuxai-launcher is only supported on Windows.");
-    std::process::exit(1);
+    exit_after_pause(1);
+}
+
+/// Started from the Start-menu shortcut the console closes on exit, so keep
+/// fix-it messages visible until the user presses Enter.
+#[cfg(windows)]
+fn exit_after_pause(code: i32) -> ! {
+    use std::io::{BufRead, IsTerminal, Write};
+    if std::io::stdin().is_terminal() {
+        eprint!("Press Enter to close...");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+    }
+    std::process::exit(code);
 }
 
 #[cfg(windows)]
@@ -47,14 +61,14 @@ fn main() {
     if !probe.wsl_installed() {
         eprintln!("Blocked: WSL is not installed or not running");
         eprintln!("Fix-it: wsl --install");
-        std::process::exit(1);
+        exit_after_pause(1);
     }
 
     let distros = match probe.list_distros() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Error listing WSL distros: {e}");
-            std::process::exit(1);
+            exit_after_pause(1);
         }
     };
 
@@ -78,21 +92,21 @@ fn main() {
                             available[choice - 1].clone()
                         } else {
                             eprintln!("Invalid choice");
-                            std::process::exit(1);
+                            exit_after_pause(1);
                         }
                     } else {
                         eprintln!("Invalid input");
-                        std::process::exit(1);
+                        exit_after_pause(1);
                     }
                 } else {
                     eprintln!("Failed to read input");
-                    std::process::exit(1);
+                    exit_after_pause(1);
                 }
             }
             DistroChoice::Blocked { reason, fixit } => {
                 eprintln!("Blocked: {reason}");
                 eprintln!("Fix-it: {fixit}");
-                std::process::exit(1);
+                exit_after_pause(1);
             }
         }
     };
@@ -101,7 +115,7 @@ fn main() {
         CheckResult::Blocked { reason, fixit } => {
             eprintln!("Blocked: {reason}");
             eprintln!("Fix-it: {fixit}");
-            std::process::exit(1);
+            exit_after_pause(1);
         }
         CheckResult::Ok { warnings } => {
             for warn in warnings {
@@ -124,7 +138,7 @@ fn main() {
                 "Error: Installed dmuxai version inside distro '{selected_distro}' ({current}) is older than required minimum ({required})."
             );
             eprintln!("Fix-it: {fixit}");
-            std::process::exit(1);
+            exit_after_pause(1);
         }
         VersionGateResult::Unverified { warning } => {
             println!("Notice: {warning}");
@@ -143,7 +157,7 @@ fn main() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error converting workspace path: {e}");
-            std::process::exit(1);
+            exit_after_pause(1);
         }
     };
 
@@ -159,7 +173,7 @@ fn main() {
                 || !answer.trim().eq_ignore_ascii_case("y")
             {
                 eprintln!("Launch cancelled.");
-                std::process::exit(1);
+                exit_after_pause(1);
             }
             allow_mnt = true;
         }
@@ -176,7 +190,7 @@ fn main() {
         Ok(cmd) => cmd,
         Err(e) => {
             eprintln!("Error: {e}");
-            std::process::exit(1);
+            exit_after_pause(1);
         }
     };
     if let Some(notice) = launch_cmd.notice {
@@ -194,7 +208,7 @@ fn main() {
         }
         Err(e) => {
             eprintln!("Failed to launch terminal: {e}");
-            std::process::exit(1);
+            exit_after_pause(1);
         }
     }
 }

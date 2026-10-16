@@ -30,7 +30,7 @@ Status: draft · 기준 커밋: `73e3f4d` (main, PR #6 이후) · 작성일: 202
 | [SPEC-speaker-colors](specs/SPEC-speaker-colors.md) | Implemented | FR-320~322, UX-320, TC-320~324 | FR-THEME-*, TC-THEME-* |
 | [SPEC-custom-agent-provider](specs/SPEC-custom-agent-provider.md) | Implemented | FR-330~335, UX-330, TC-330~337 | FR-CUSTOM-*, TC-CUSTOM-* |
 | [SPEC-compact-summarize-focus](specs/SPEC-compact-summarize-focus.md) | Implemented | FR-340~342, TC-340~342 | FR-COMPACT-*, TC-COMPACT-* |
-| [SPEC-windows-desktop](specs/SPEC-windows-desktop.md) | In progress (launcher core 구현, 패키징 대기) | FR-390~398, NFR-390, UX-390, TC-390~404 | FR-WIN-*, TC-WIN-* |
+| [SPEC-windows-desktop](specs/SPEC-windows-desktop.md) | In progress (launcher core 및 패키징 구현 완료, live W-rows 검증 대기) | FR-390~398, NFR-390, UX-390, TC-390~405 | FR-WIN-*, TC-WIN-* |
 | [SPEC-graph-default-status](specs/SPEC-graph-default-status.md) | Implemented | FR-370~373, UX-370~371, TC-370~375 | FR-GRAPH-*, TC-GRAPH-* |
 | [SPEC-tui-stabilize](specs/SPEC-tui-stabilize.md) | Implemented | FR-380~, TC-380~ | dogfood #1, #4, #5, #6 |
 | [SPEC-activity-rendering](specs/SPEC-activity-rendering.md) | Implemented | FR-360~365, UX-360~362, TC-360~367 | FR-ACTIVITY-*, TC-ACTIVITY-* |
@@ -351,6 +351,19 @@ Permissions SPEC 부재 · 색상/NO_COLOR SPEC 부재 · 러너별 모델 선�
 | L-13 | 좁은 폭 | 폭 80으로 줄임 | 상태줄 잘림 기록(#5) | ☐ | ☐ |
 
 판정: 모든 행 Pass(또는 "기록" 항목은 값 기록) → 체크리스트 통과. 실패 시 `docs/dogfood/README.md`에 번호를 붙여 기록.
+
+### 3.1 Windows / WSL 데스크톱 수동 체크리스트 (W-rows)
+
+SPEC: [SPEC-windows-desktop.md](specs/SPEC-windows-desktop.md) (FR-390~FR-396, UX-390)
+
+| # | TC ID | 항목 | 절차 | 기대 결과 | Status |
+|---|---|---|---|---|---|
+| W-01 | TC-390, TC-400 | install from zip on clean profile, shortcut opens Windows Terminal in WSL | 클린 Windows 사용자 프로필에서 `dmuxai-windows-x86_64.zip` 압축 해제 후 `install.ps1` 실행, 생성된 시작 메뉴 바로가기("DmuxAI.lnk") 클릭 | `%LOCALAPPDATA%\Programs\DmuxAI`에 `dmuxai-launcher.exe`와 `dmuxai.exe` 복사, 시작 메뉴에 바로가기 생성, 실행 시 Windows Terminal(wt.exe)이 열리고 WSL 내 dmuxai 세션 정상 시작 | Status: not run |
+| W-02 | TC-400 | reinstall no duplicate | 이미 설치된 상태에서 `install.ps1`을 다시 실행 | 파일 덮어쓰기 완료, 시작 메뉴 바로가기 중복 생성 없이 단일 항목 유지 | Status: not run |
+| W-03 | TC-399 | Ctrl+V image paste in WSL session | Windows 클립보드에 PNG 복사 후 WSL TUI 세션에서 Ctrl+V 입력 | Windows 클립보드 브리지(powershell Get-Clipboard) 경유하여 이미지 첨부([Image #1]), `.dmuxai/attachments/`에 PNG 저장 | Status: not run |
+| W-04 | TC-400 | uninstall | `uninstall.ps1` 실행 | 시작 메뉴 바로가기("DmuxAI.lnk") 삭제 및 `%LOCALAPPDATA%\Programs\DmuxAI` 폴더 완전 제거 | Status: not run |
+| W-05 | TC-395, TC-396, TC-404 | missing WSL/distro/dmuxai fix-it messages | WSL 미설치, 배포판 없음, 또는 배포판 내 dmuxai 미설치 상태에서 런처 실행 | 각 단계별로 정확한 조치 명령어(fix-it command)가 한 화면에 표시되고 안전하게 블록됨 | Status: not run |
+| W-06 | TC-398, TC-404 | /mnt warning | `/mnt/c/...` 경로를 작업 디렉터리로 전달하여 런처 실행 | 성능 경고 표시 및 계속 진행 여부 명시적 확인(확인 없이 실행 차단, 확인 저장 시 다음부터 생략) | Status: not run |
 
 ## 4. Release gate — Windows 앱 착수 조건
 

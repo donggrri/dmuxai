@@ -12,3 +12,7 @@ Spec: [SPEC-windows-desktop.md](../specs/SPEC-windows-desktop.md)
 - [x] T7 - Implement distro version verification (`version_gate`). Requirements: FR-398. Verify: `cargo test launcher_detects_stale_wsl_dmuxai_version`.
 - [x] T8 - Implement launch argv builder (`build_launch_command`). Requirements: FR-390, NFR-390. Verify: `cargo test launcher_builds_windows_terminal_command`, `cargo test launcher_falls_back_without_windows_terminal`, and `cargo test launcher_never_assembles_shell_command_string`.
 - [x] T9 - Create `src/bin/dmuxai-launcher.rs` with `RealProbe` on Windows and unsupported stub elsewhere. Requirements: FR-390. Verify: compilation of `dmuxai-launcher`.
+- [x] T10 - Implement `packaging/windows/install.ps1`, `packaging/windows/uninstall.ps1`, and `packaging/windows/README-windows.txt`. Requirements: FR-396. Verify: `cargo test --test windows_packaging`.
+- [x] T11 - Implement `scripts/package-windows.sh` and update `.github/workflows/release.yml`. Requirements: FR-396, FR-397. Verify: `cargo test --test windows_packaging`.
+- [x] T12 - Add static assertion test suite in `tests/windows_packaging.rs`. Requirements: FR-396. Verify: `cargo test --test windows_packaging`.
+- [x] T13 - Add manual W-01..W-06 checklist rows to `docs/TEST-PLAN.md` §3. Requirements: FR-395, FR-396, UX-390. Verify: manual inspection in `docs/TEST-PLAN.md`.

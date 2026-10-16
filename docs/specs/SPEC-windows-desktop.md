@@ -1,6 +1,6 @@
 # SPEC: Windows desktop launcher (DmuxAI inside WSL)
 
-Status: In progress — steps 1–2 implemented (launcher core, config, `dmuxai-launcher` bin); step 3 packaging (zip/MSI, Start-menu shortcut) and live W-rows pending
+Status: In progress — steps 1–3 implemented (launcher core, config, `dmuxai-launcher` bin, zip packaging + installer scripts); step 4 live W-rows pending (W-01..W-06 defined in TEST-PLAN §3, not run)
 Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `bcdb0eb`
@@ -50,7 +50,7 @@ the native Windows build cannot lift (ANALYSIS §2.1, §3).
 | --- | --- | --- | --- |
 | OQ-001 | Proposed TC-* tests marked *proposed* have no code yet; they must exist before this spec becomes Implemented. | DmuxAI | Spec approval |
 | OQ-002 | Where the WSL-side package/auth state (e.g. `cursor-agent login`) is checked: presence only in the launcher, login state is left to the CLIs' own errors. Confirm before Must tests are written. | DmuxAI | Spec approval |
-| OQ-003 | MSI vs zip for the first release: zip is the Must, MSI is a Should; confirm MSI tooling (e.g. WiX) availability in CI before FR-397 evidence. | DmuxAI | Before FR-397 test execution |
+| OQ-003 | Resolved: zip packaging with install.ps1/uninstall.ps1 is the shipping format for M6; MSI remains documented as not yet available until WiX pipeline is established. | DmuxAI | Resolved |
 
 No implementation starts while a Must requirement depends on an unanswered
 question.
@@ -81,7 +81,7 @@ question.
 | FR-393 | Must | First run, or a previous launch was blocked. | Checks run in order — WSL installed, distro present, `dmuxai` present inside the distro — and each failure stops launch with a fix-it message naming the exact remediation command. Missing agent CLIs (agy, cursor-agent, opencode) are reported as one non-blocking list with per-CLI fix-it commands; launch continues. | The blocked list is comprehensive for one pass: after fixing one item, the next missing item is reported on the next attempt, never all-at-once-then-success ambiguity. | TC-395, TC-396, TC-397 |
 | FR-394 | Must | The converted workspace path starts with `/mnt/`. | The launcher shows a performance/ownership warning that names the slow path and suggests an ext4 clone (for example `git clone` under `~/projects/`), and requires an explicit continue decision. | Without confirmation the launcher stops before `wt.exe` is started; an explicit remembered "proceed on `/mnt/`" choice suppresses repeats. | TC-398 |
 | FR-395 | Must | The user presses Ctrl+V (or Alt+V where the terminal uses it) with a PNG image in the Windows clipboard during a WSL TUI session. | The image is attached (`[Image #N]` chips), saved under `.dmuxai/attachments/`, and paths are forwarded to the provider exactly as on Linux (existing clipboard fallback chain including the Windows `powershell.exe` bridge). | If no image decodes, the paste is a no-op notice; drag/drop or file paths keep working; interactive pass-through behavior stays governed by the image spec (M5). | TC-399 |
-| FR-396 | Must | The user installs from the published release zip. | Per-user install places the launcher + uninstaller, creates a Start-menu shortcut for the current user, and requires no Rust, Cargo, or Git on the Windows machine. | Uninstall removes the shortcut and installed files; a second install overwrites cleanly instead of duplicating entries. | TC-400 |
+| FR-396 | Must | The user installs from the published release zip. | Per-user install places the launcher + uninstaller, creates a Start-menu shortcut for the current user, and requires no Rust, Cargo, or Git on the Windows machine. | Uninstall removes the shortcut and installed files; a second install overwrites cleanly instead of duplicating entries. | TC-400, TC-405 |
 | FR-397 | Should | The user installs from the MSI. | Same per-user scope and shortcut result as FR-396; upgrading over an existing install replaces the launcher in place. | If MSI packaging is not wired in CI, the release ships zip only and the MSI is documented as not yet available. | TC-401 |
 | FR-398 | Must | The user runs the installer/launcher again after a release. | The previous launcher version is replaced; if the distro-side `dmuxai` version is older than the launcher's minimum floor, a fix-it message names the exact update command instead of starting a known-incompatible session. | Version detection failure (no `--version` support yet on older builds) falls back to a "cannot verify version" notice and still launches, rather than guessing compatibility. | TC-402 |
 | NFR-390 | Must | Any launcher execution of Windows-side commands. | All child processes are launched as fixed argv arrays (`wsl.exe`, `wslpath`, `wt.exe` with separate arguments); workspace text or distro names are never embedded into `cmd.exe`/PowerShell command strings. | Paths with spaces, quotes, `&`, or parentheses are passed through byte-for-byte as one argument each. | TC-403 |
@@ -104,13 +104,14 @@ is needed in CI. Live/WSL checks are manual and recorded in TEST-PLAN §3 (W-row
 | TC-397 | FR-393 | unit | `agy` and `cursor-agent` present, `opencode` missing | first-run checks | one non-blocking notice listing `opencode` with its fix-it command; launch proceeds | `launcher_reports_missing_agent_clis_non_blocking` (src/launcher/mod.rs) |
 | TC-398 | FR-394 | unit | converted path `/mnt/c/src/p` | pre-launch gate | performance warning shown; launch denied without confirm; `--allow-mnt` remembered confirm suppresses repeats | `mnt_path_shows_performance_warning` (src/launcher/mod.rs) |
 | TC-399 | FR-395 | unit + manual | Windows clipboard contains PNG; session inside WSL | Ctrl+V paste | decode→attach→save chain: reuse existing tests `base64_powershell_output_decodes_to_png`, `clipboard_paste_registers_pending_image_chip`, `clipboard_paste_without_png_is_a_noop`; WSL end-to-end recorded as TEST-PLAN §3 W-row (live-TUI) | `cargo test base64_powershell_output_decodes_to_png`; live checklist W-03 |
-| TC-400 | FR-396 | integration (manual on windows-latest) | published zip on a clean Windows user profile | install, then uninstall | shortcut exists and points at the installed launcher; uninstall removes shortcut and files; no build tools required | manual: TEST-PLAN §3 W-row (installation) |
-| TC-401 | FR-397 | manual | MSI on a clean profile, then again over an existing install | install, upgrade | per-user shortcut present; upgrade replaces the launcher in place with a single entry | manual: TEST-PLAN §3 W-row (only after OQ-003 resolves) |
+| TC-400 | FR-396 | integration (manual on windows-latest) | published zip on a clean Windows user profile | install, then uninstall | shortcut exists and points at the installed launcher; uninstall removes shortcut and files; no build tools required | manual: TEST-PLAN §3 W-row (installation W-01, W-02, W-04) |
+| TC-401 | FR-397 | manual | MSI on a clean profile, then again over an existing install | install, upgrade | per-user shortcut present; upgrade replaces the launcher in place with a single entry | manual: TEST-PLAN §3 W-row (MSI documented as not yet available; ships zip only) |
 | TC-402 | FR-398 | unit | distro `dmuxai --version` output older than the launcher floor | launch | update fix-it message with the exact command; if the version probe fails, the "cannot verify version" notice path is used and launch continues | `launcher_detects_stale_wsl_dmuxai_version` (src/launcher/mod.rs) |
 | TC-403 | NFR-390 | unit | workspace text containing `"& ( )` and spaces | build every launcher command | each command is one argv list; the hostile text stays inside a single argument and never reaches `cmd.exe`/PowerShell | `launcher_never_assembles_shell_command_string` (src/launcher/mod.rs) |
-| TC-404 | UX-390, FR-393 | manual live | real WSL machine, at least one missing item | first-run checks | every shown message fits one screen with a copyable fix-it command; fixes resolve in one retry per FR-393 | live checklist W-0x rows in TEST-PLAN §3 |
+| TC-404 | UX-390, FR-393 | manual live | real WSL machine, at least one missing item | first-run checks | every shown message fits one screen with a copyable fix-it command; fixes resolve in one retry per FR-393 | live checklist W-0x rows in TEST-PLAN §3 (W-05, W-06) |
+| TC-405 | FR-396 | integration (automated) | release workflow, cross-package script, install/uninstall ps1 scripts | run windows packaging test suite | install.ps1 contains shortcut name, LOCALAPPDATA install path, no Invoke-Expression; release.yml and package-windows.sh list dmuxai-launcher.exe and both ps1 files | `cargo test --test windows_packaging` (tests/windows_packaging.rs) |
 
-Required coverage prompts: happy path (TC-390, TC-392, TC-394, TC-400),
+Required coverage prompts: happy path (TC-390, TC-392, TC-394, TC-400, TC-405),
 boundary (TC-391 fallback, TC-393 empty/ambiguous distro list, TC-398 confirm
 gate, TC-403 primitive characters), failure (TC-395, TC-396, TC-397, TC-402),
 state transition (blocked → fixed → launched across repeated first-run passes,
@@ -138,7 +139,7 @@ IDs only, no new behavior):
 | --- | --- | --- | --- | --- |
 | 1 | Launcher core library + fake-probe unit tests (state model, argv builder, checks) | new `launcher/` crate (or `src/bin/dmuxai-launcher.rs`) | FR-390..394, FR-398, NFR-390 | TC-390..398, TC-402, TC-403 |
 | 2 | Launcher config persistence | launcher config module | FR-391, FR-392, FR-394 | TC-392, TC-393, TC-398 |
-| 3 | Release packaging (zip, MSI behind OQ-003) | CI release workflow additions | FR-396, FR-397 | TC-400, TC-401 |
+| 3 | Release packaging (zip, MSI stays documented as not yet available) | `packaging/windows/*`, `scripts/package-windows.sh`, `.github/workflows/release.yml` | FR-396, FR-397 | TC-400, TC-401, TC-405 |
 | 4 | W-rows in TEST-PLAN §3 checklist and first live run | `docs/TEST-PLAN.md` | FR-395, UX-390 | TC-399, TC-404 |
 
 ## 8. Review and test exit criteria
