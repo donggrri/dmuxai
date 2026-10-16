@@ -1,6 +1,7 @@
 mod agy;
 mod codex;
 mod cursor;
+mod implement_outcome;
 
 use std::{error::Error, fmt};
 
@@ -19,7 +20,15 @@ pub enum Agent {
 }
 
 impl Agent {
-    pub const ALL: [Self; 3] = [Self::Codex, Self::Cursor, Self::Agy];
+    /// UI and spawn order: primary runners first, optional Codex last.
+    pub const ALL: [Self; 3] = [Self::Cursor, Self::Agy, Self::Codex];
+
+    #[allow(dead_code)]
+    pub const PRIMARY: [Self; 2] = [Self::Cursor, Self::Agy];
+
+    pub const fn default() -> Self {
+        Self::Cursor
+    }
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -208,12 +217,10 @@ impl fmt::Display for AdapterError {
             Self::RuntimeStopped => formatter.write_str("agent runtime has stopped"),
             Self::Unsupported => formatter.write_str("agent does not support this command"),
             Self::UnsupportedMode { agent, mode }
-                if *agent == Agent::Cursor
-                    && *mode == ExecutionMode::Implement
-                    && cfg!(windows) =>
+                if *agent == Agent::Cursor && *mode == ExecutionMode::Implement && cfg!(windows) =>
             {
                 formatter.write_str(
-                    "Cursor Implement mode is unavailable on Windows because Cursor sandbox mode requires macOS or Linux",
+                    "Cursor Implement mode is unavailable on Windows unless cursor.windows_unsandboxed = true in dmuxai.toml or DMUXAI_CURSOR_WINDOWS_UNSANDBOXED is set (unsandboxed; not recommended)",
                 )
             }
             Self::UnsupportedMode { agent, mode } => formatter.write_str(

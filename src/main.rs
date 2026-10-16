@@ -15,15 +15,24 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use dmuxai::conversation::ConversationEngine;
+use dmuxai::settings::DmuxSettings;
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 type DmuxTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let workspace_root = std::env::current_dir()?;
+    let workspace_root = dmuxai::workspace::resolve_workspace_root()?;
+    dmuxai::workspace::ensure_directory_writable(&workspace_root)?;
+    let settings = DmuxSettings::load(&workspace_root);
+    let startup_warning = dmuxai::workspace::normalize_workspace_path(&workspace_root)
+        .ok()
+        .and_then(|normalized| dmuxai::workspace::wsl_mnt_warning(&normalized));
     let engine = ConversationEngine::open(&conversation_db_path()?, &workspace_root)?;
-    let mut app = App::new(engine, workspace_root)?;
+    let mut app = App::new(engine, workspace_root, settings)?;
+    if let Some(warning) = startup_warning {
+        app.push_startup_notice(warning);
+    }
     let mut session = TerminalSession::start()?;
     let result = app.run(session.terminal_mut()).await;
     app.shutdown().await;

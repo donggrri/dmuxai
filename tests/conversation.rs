@@ -1,7 +1,7 @@
 use dmuxai::conversation::{
     AgentKey, BeginTurn, BeginTurnOutcome, BindingStatus, ConversationEngine, ConversationError,
-    ConversationId, ConversationSelection, MessageRole, MessageState, SummaryDocument, TurnEvent,
-    TurnId, TurnOutput, TurnStatus,
+    ConversationSelection, MessageRole, MessageState, SummaryDocument, TurnEvent, TurnOutput,
+    TurnStatus,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;

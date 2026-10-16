@@ -2,6 +2,16 @@
 
 **범위:** `main` 워크트리 코드 읽기 전용 분석 (본 문서·그래프·agent-graph-engineering 설치 파일만 변경).  
 **작성:** Cloud Agent 분석 턴 (2026-10-16).  
+
+### Phase 1 (permissions + mission) 상태 — 2026-10-16
+
+| 항목 | 상태 |
+| --- | --- |
+| `MISSION.md` + composer-2.5-only 정책 | **완료** (PR) |
+| Cursor Windows Implement opt-in (`dmuxai.toml` / env) | **완료** (PR) |
+| Implement 턴 실패 기록 (권한/무변경) | **부분 완료** (adapter 스트림 검증) |
+| 이미지 직접 첨부 / auto-routing / WSL 런처 | **보류** (외부 그래프 오케스트레이터 디스패치 대기) |
+
 **관련 그래프:** [`docs/dmuxai-graph.yaml`](dmuxai-graph.yaml)
 
 ## agent-graph-engineering 설치 상태

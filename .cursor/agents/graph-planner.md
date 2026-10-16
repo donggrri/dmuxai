@@ -3,7 +3,7 @@ name: graph-planner
 description: >-
   Decomposes a goal into graph nodes and edges for a manager-worker pattern.
   Use before fan-out or hierarchical delegation.
-model: grok-4.7-medium
+model: composer-2.5
 readonly: true
 ---
 

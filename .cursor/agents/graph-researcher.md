@@ -4,7 +4,7 @@ description: >-
   Gathers facts and codebase context for a graph node. Use for research,
   exploration, and validation-style information gathering. Returns structured
   summaries, not prose essays.
-model: claude-haiku-5-5-high
+model: composer-2.5
 readonly: true
 ---
 

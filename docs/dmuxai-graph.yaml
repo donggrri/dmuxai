@@ -16,30 +16,31 @@ scope:
   external_side_effects: none
 
 model_policy:
-  orchestrate: grok-4.7-medium
+  allowed_only: composer-2.5
+  orchestrate: composer-2.5
   implement: composer-2.5
-  research_test: claude-haiku-5-5-high
-  disallow_patterns: ["*-fast"]
+  research_test: composer-2.5
+  disallow_patterns: ["*-fast", "*haiku*", "*grok*", "*sonnet*", "*gpt*", "*gemini*"]
 
 nodes:
   - id: research-permissions
     role: graph-researcher
-    model: claude-haiku-5-5-high
+    model: composer-2.5
     inputs: [DMUXAI-BASELINE, src/agent/*, README safety table]
     outputs: [permission_flag_matrix, file_line_refs]
   - id: research-architecture
     role: graph-researcher
-    model: claude-haiku-5-5-high
+    model: composer-2.5
     inputs: [src/main.rs, src/app.rs, conversation.rs, CI workflows]
     outputs: [architecture_map, ci_observations]
   - id: plan-wsl-app
     role: graph-planner
-    model: grok-4.7-medium
+    model: composer-2.5
     inputs: [permission_flag_matrix, owner_goal_context]
     outputs: [wsl_hosting_options, recommendation]
   - id: plan-skills
     role: graph-planner
-    model: grok-4.7-medium
+    model: composer-2.5
     inputs: [cursor_skill_conventions, .agents/skills layout]
     outputs: [skills_discovery_design, ui_launch_contract]
   - id: synthesize-report
@@ -49,7 +50,7 @@ nodes:
     outputs: [docs/ANALYSIS.md, docs/dmuxai-graph.yaml]
   - id: review-report
     role: graph-reviewer
-    model: grok-4.7-medium
+    model: composer-2.5
     inputs: [docs/ANALYSIS.md, DMUXAI-BASELINE non-goals]
     outputs: [review_verdict, residual_risks]
 

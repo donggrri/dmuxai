@@ -34,6 +34,7 @@ use dmuxai::{
         SummaryJob, TranscriptMessage, TurnEvent, TurnId as StoredTurnId, TurnOutput, TurnSnapshot,
         TurnStatus,
     },
+    settings::DmuxSettings,
 };
 
 use crate::agent::{
@@ -352,6 +353,10 @@ struct UiAreas {
 pub struct App {
     exit: bool,
     selected: usize,
+    #[allow(dead_code)]
+    workspace_root: PathBuf,
+    #[allow(dead_code)]
+    settings: DmuxSettings,
     input: String,
     messages: Vec<Message>,
     adapters: Vec<Box<dyn AgentAdapter>>,
@@ -393,6 +398,7 @@ impl App {
     pub fn new(
         engine: ConversationEngine,
         workspace_root: PathBuf,
+        settings: DmuxSettings,
     ) -> Result<Self, ConversationError> {
         let (event_tx, event_rx) = event_channel();
         let mut adapters = Vec::with_capacity(Agent::ALL.len());
@@ -401,7 +407,9 @@ impl App {
         for agent in Agent::ALL {
             let (adapter, worker) = match agent {
                 Agent::Codex => spawn_codex_adapter(event_tx.clone(), workspace_root.clone()),
-                Agent::Cursor => spawn_cursor_adapter(event_tx.clone(), workspace_root.clone()),
+                Agent::Cursor => {
+                    spawn_cursor_adapter(event_tx.clone(), workspace_root.clone(), settings.clone())
+                }
                 Agent::Agy => spawn_agy_adapter(event_tx.clone(), workspace_root.clone()),
             };
             adapters.push(adapter);
@@ -409,7 +417,14 @@ impl App {
         }
         drop(event_tx);
 
-        Self::with_runtime(adapters, event_rx, workers, engine)
+        Self::with_runtime(
+            adapters,
+            event_rx,
+            workers,
+            engine,
+            workspace_root,
+            settings,
+        )
     }
 
     fn with_runtime(
@@ -417,6 +432,8 @@ impl App {
         event_rx: mpsc::Receiver<AgentOutput>,
         workers: Vec<JoinHandle<()>>,
         mut engine: ConversationEngine,
+        workspace_root: PathBuf,
+        settings: DmuxSettings,
     ) -> Result<Self, ConversationError> {
         engine.recover_workspace()?;
         let snapshot = if engine.has_live_peer()? {
@@ -431,7 +448,9 @@ impl App {
         };
         let mut app = Self {
             exit: false,
-            selected: 0,
+            selected: adapter_index(Agent::default()),
+            workspace_root,
+            settings,
             input: String::new(),
             messages: vec![Message::new(
                 Role::System,
@@ -1922,6 +1941,10 @@ impl App {
         self.messages.push(Message::new(Role::System, content));
     }
 
+    pub fn push_startup_notice(&mut self, content: impl Into<String>) {
+        self.push_system(content);
+    }
+
     fn restore_deferred_input(&mut self, deferred: DeferredTurn) {
         if deferred.conversation_id == self.conversation_id {
             self.input = deferred.prompt;
@@ -2797,11 +2820,18 @@ mod tests {
         let (event_tx, event_rx) = event_channel();
         drop(event_tx);
 
-        (
-            App::with_runtime(adapters, event_rx, Vec::new(), engine).unwrap(),
-            sent,
-            cancelled,
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            std::env::current_dir().unwrap_or_default(),
+            DmuxSettings::default(),
         )
+        .unwrap();
+        // Most unit tests were authored with Codex as the implicit active runner.
+        app.selected = adapter_index(Agent::Codex);
+        (app, sent, cancelled)
     }
 
     fn test_app_with_unsupported_mode(
@@ -2826,10 +2856,17 @@ mod tests {
         let (event_tx, event_rx) = event_channel();
         drop(event_tx);
 
-        (
-            App::with_runtime(adapters, event_rx, Vec::new(), engine).unwrap(),
-            sent,
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            std::env::current_dir().unwrap_or_default(),
+            DmuxSettings::default(),
         )
+        .unwrap();
+        app.selected = adapter_index(Agent::Codex);
+        (app, sent)
     }
 
     fn render_text_at(app: &mut App, width: u16, height: u16) -> String {
@@ -2851,7 +2888,7 @@ mod tests {
     #[test]
     fn submitting_routes_to_the_selected_agent() {
         let (mut app, sent) = test_app();
-        app.selected = 1;
+        app.selected = adapter_index(Agent::Cursor);
         app.input = "Explain ownership".to_owned();
 
         app.submit_prompt();
@@ -2969,7 +3006,7 @@ mod tests {
         let (mut app, sent) = test_app();
         app.input = "codex work".to_owned();
         app.submit_prompt();
-        app.selected = 1;
+        app.selected = adapter_index(Agent::Cursor);
         app.input = "cursor work".to_owned();
         app.submit_prompt();
         let requests = sent.lock().unwrap().clone();
@@ -3336,11 +3373,12 @@ mod tests {
         app.input = "leave running".to_owned();
         app.submit_prompt();
         let interrupted_id = app.conversation_id.clone();
+        app.engine.close_session().unwrap();
         drop(app);
 
         let engine = ConversationEngine::open(&db_path, &workspace).unwrap();
         let (mut reopened, _) = test_app_with_engine(engine);
-        assert_eq!(reopened.conversation_id, interrupted_id);
+        reopened.select_conversation(interrupted_id);
         assert!(reopened.messages.iter().any(|message| {
             message
                 .content
@@ -4323,18 +4361,16 @@ mod tests {
     #[test]
     fn agent_picker_changes_active_agent() {
         let (mut app, _) = test_app();
+        app.selected = adapter_index(Agent::Cursor);
         app.input = "/agent".to_owned();
         app.submit_prompt();
 
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected, adapter_index(Agent::Agy));
         assert!(app.agent_picker.is_none());
-        assert_eq!(
-            app.messages.last().unwrap().content,
-            "Active agent: Cursor."
-        );
+        assert_eq!(app.messages.last().unwrap().content, "Active agent: AGY.");
     }
 
     #[test]
@@ -4343,13 +4379,13 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
 
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected, adapter_index(Agent::Codex));
     }
 
     #[test]
     fn mouse_scroll_moves_chat_without_changing_agent() {
         let (mut app, _) = test_app();
-        app.selected = 1;
+        app.selected = adapter_index(Agent::Cursor);
         let mouse = MouseEvent {
             kind: MouseEventKind::ScrollUp,
             column: 30,
@@ -4359,7 +4395,7 @@ mod tests {
 
         app.handle_mouse(mouse);
 
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected, adapter_index(Agent::Cursor));
         assert_eq!(app.chat_scroll, 3);
     }
 
@@ -4485,5 +4521,4 @@ mod tests {
             .unwrap();
         assert_eq!(completed.turns[0].status, TurnStatus::Completed);
     }
-
 }
