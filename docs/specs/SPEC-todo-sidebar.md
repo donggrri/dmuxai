@@ -16,7 +16,7 @@ Decision: move the to-do UI into a toggleable sidebar panel, opened from a heade
 | --- | --- | --- | --- |
 | FR-840 | Must | The header has a `To-dos` button with a count badge of open to-dos. It toggles a sidebar panel that holds the whole to-do UI (list, add form, Jira field, MCP import). The panel is closed by default, and its open state persists in `localStorage` | TC-840, TC-841 |
 | FR-841 | Must | The to-do list in the panel can be filtered by state (`open` / `done` / `all`) and by a text search. Each item keeps its run/done/delete actions and view-only mode exactly as before | TC-840, TC-841 |
-| FR-842 | Must | The Files and To-dos sidebars share one right-hand sidebar region with tabs: opening one switches to its tab, and the toggle buttons show which is active. `Esc` closes the sidebar | TC-840, TC-842 |
+| FR-842 | Must | The Files and To-dos sidebars share one right-hand sidebar region with tabs: opening one switches to its tab, and the toggle buttons show which is active. `Esc` closes the sidebar when focus is not in a text field or the docs editor, so the existing preview/editor Esc handling wins (SPEC-docs-tree FR-833 owns the shell) | TC-840, TC-842 |
 | UX-840 | Must | The badge and buttons have accessible names (`aria-controls`, `aria-expanded`). Below 900px the sidebar is an overlay drawer, consistent with UX-830 | TC-840 |
 
 ## 3. Tests
@@ -25,4 +25,4 @@ Decision: move the to-do UI into a toggleable sidebar panel, opened from a heade
 | --- | --- | --- | --- | --- | --- |
 | TC-840 | FR-840..FR-842, UX-840 | unit (asset) | index.html, JS and CSS assets | Header `To-dos` button with badge and `aria-controls`; the to-do form/list live inside the sidebar tab panel; state filter and search; Esc handler | `src/web/assets.rs` `todo_sidebar_assets` |
 | TC-841 | FR-840, FR-841 | unit | `web::parity` matrix | To-do actions keep their parity rows (create/run/done/delete/import) after the move | `src/web/parity.rs` `todo_actions_still_covered` |
-| TC-842 | FR-840..FR-842 | e2e (ignored, headless Chrome) | demo snapshot with to-dos | Clicking `To-dos` opens the panel with items; switching to Files changes the tab; screenshot captured | `src/web/server.rs` `todo_sidebar_renders_in_headless_chrome` |
+| TC-842 | FR-840..FR-842 | e2e (ignored, headless Chrome) | demo snapshot with to-dos | Clicking `To-dos` opens the panel with items; the `done` filter and a search term reduce the visible items to the expected ones (FR-841 behaviour); switching to Files changes the tab; screenshot captured | `src/web/server.rs` `todo_sidebar_renders_in_headless_chrome` |

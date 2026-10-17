@@ -35,5 +35,5 @@ Specs: SPEC-cursor-stream-dedupe, SPEC-first-run, SPEC-running-indicators, SPEC-
    - a sidebar shell (`#sidebar` with tabs) in index.html;
    - a tree component in docs.js with lazy fetch and `localStorage`.
 5. **To-do sidebar (#44)**: move `#todos` into the sidebar tab, add the header button and badge, state filter and search, and Esc to close.
-6. **Cursor pre-warm (#41)**: a `WarmProcess {argv, child, spawned_at}` slot in the cursor adapter. Reuse on an exact argv match; kill and reap on mismatch, idle timeout, `/new` or quit. Disabled for `run` and graph nodes.
+6. **Cursor pre-warm (#41)**: a `WarmProcess {argv, child, spawned_at}` slot in the cursor adapter. Reuse on an exact argv match; kill and reap on mismatch, idle timeout (App 1 s tick), agent removal, `/new` or quit. Own process group / job object. Disabled for `run` and graph nodes.
 7. **Release v0.2.1**: CHANGELOG, version bump to 0.2.1, release PR, tag, then verify the musl tarball (`--version`) and the Windows zip.

@@ -17,7 +17,7 @@ Source: Dongjin's dogfooding of the v0.2.0 release binary on Linux (`dmuxai --we
 | 7 | Cursor latency: measured; pre-warm the next cursor-agent | perf | [SPEC-cursor-latency](specs/SPEC-cursor-latency.md) (FR-805..807) | [#41](https://github.com/donggrri/dmuxai/issues/41) | planned |
 | 8 | Release v0.2.1: CHANGELOG, version bump, tag, verify the Linux and Windows assets | release | — | — | after 1–7 |
 
-Order: 1 → 2+3 → 4 → 5 → 6 (4–6 share the web assets, so they go in sequence) and, in parallel, 7 → release.
+Order: 1 → 2+3 → 4 → 5 → 6 (4–6 share the web assets, so they go in sequence). 7 runs in parallel with 4–6. The release waits for all of 1–7.
 
 ## Later (not scheduled)
 
