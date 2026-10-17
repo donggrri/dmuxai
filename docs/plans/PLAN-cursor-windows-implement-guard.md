@@ -4,13 +4,13 @@ Status: complete
 Spec: [SPEC-cursor-windows-implement-guard.md](../specs/SPEC-cursor-windows-implement-guard.md)
 
 1. Extend the provider adapter contract with a side-effect-free mode
-   validation hook and an explicit unsupported-mode error. (INT-060, TC-060)
+   validation hook and an explicit unsupported-mode error. (INT-480, TC-480)
 2. Reject Cursor Implement on Windows during capability validation and again at
    the runtime boundary before command construction/spawning; keep Ask, Plan,
-   and supported-platform command flags unchanged. (NFR-060, INT-061, TC-061..TC-063)
+   and supported-platform command flags unchanged. (NFR-480, INT-481, TC-481..TC-483)
 3. Make the mode picker call validation before retiring a provider binding or
    accepting the new mode, so an unavailable Windows mode cannot alter durable
-   state. (INT-060, TC-060)
+   state. (INT-480, TC-480)
 4. Update README and baseline traceability, run the spec check and Rust gates,
    and record review evidence. (all requirements)
 

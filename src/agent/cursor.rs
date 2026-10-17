@@ -598,7 +598,7 @@ mod tests {
     use super::*;
 
     #[test]
-    // TC-060, TC-063 / INT-060, INT-061: only Windows Cursor Implement is blocked.
+    // TC-480, TC-483 / INT-480, INT-481: only Windows Cursor Implement is blocked.
     fn cursor_mode_validation_matches_platform() {
         assert_eq!(validate_cursor_mode(ExecutionMode::Ask, false), Ok(()));
         assert_eq!(validate_cursor_mode(ExecutionMode::Plan, false), Ok(()));
@@ -851,7 +851,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    // TC-060 / INT-060: Windows rejects Cursor Implement before queueing a mode change.
+    // TC-480 / INT-480: Windows rejects Cursor Implement before queueing a mode change.
     async fn windows_cursor_implement_mode_is_rejected_before_queueing() {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let (adapter, worker) = spawn_cursor_adapter(
@@ -881,7 +881,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    // TC-061 / NFR-060: the runtime guard runs before Cursor command lookup or spawning.
+    // TC-481 / NFR-480: the runtime guard runs before Cursor command lookup or spawning.
     async fn windows_cursor_implement_turn_is_rejected_before_process_spawn() {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let request = AgentRequest {

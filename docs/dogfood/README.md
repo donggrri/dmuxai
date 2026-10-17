@@ -58,8 +58,9 @@ Format: id, status, repro, cause, fix.
 ## #13 opencode (glm-5.3-flash-free) forgets fixed-size array length — fixed in review loop
 - Adding `/compact` to `const SLASH_COMMANDS: [SlashCommand; 11]` without bumping the length; one follow-up prompt with the compiler error fixed it.
 
-## #14 Parallel worktrees all append to the same TEST-PLAN index rows — friction
+## #14 Parallel worktrees all append to the same TEST-PLAN index rows — resolved (SPEC-spec-index)
 - Every spec PR adds a row at the end of the spec index table in `docs/TEST-PLAN.md`, so the second PR to merge always conflicts on rebase. Resolution is trivial (keep both rows). Suggested fix: one index file per spec or a generated index.
+- Downgraded friction → resolved: the §0.1 table is gone; each SPEC carries its own `Status:` metadata plus ID ranges, `scripts/spec-index.sh` prints the index on demand, and `tests/spec_index.rs` enforces the rule, so a new SPEC touches only its own file.
 
 ## #15 "last event Ns ago" keeps growing while AGY runs tools — fixed (PR #18)
 - Repro: AGY Implement turn that reads/edits files: status shows `working · 9m · last event 9m ago` although AGY is active (tool steps are not counted as events). Looks hung; it is not.
