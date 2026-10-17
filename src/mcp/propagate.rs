@@ -627,3 +627,58 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod builtin_memory_tests {
+    use super::*;
+    use crate::mcp::resolve_servers;
+    use crate::settings::{BUILTIN_MEMORY_SERVER_NAME, DmuxSettings};
+
+    // TC-734 (FR-733, INT-561): with memory on, the built-in entry becomes an
+    // opencode `local` entry and a custom `mcpServers` entry, with no env, headers
+    // or vault path.
+    #[test]
+    fn builtin_memory_server_reaches_opencode_and_custom_json() {
+        let ws = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        let v = vault.path().display().to_string().replace('\\', "/");
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            format!("[memory]\nvault = \"{v}\"\n"),
+        )
+        .unwrap();
+        let exe = std::env::temp_dir().join("dmuxai-bin").join("dmuxai");
+        let exe_str = exe.to_string_lossy().into_owned();
+        let ws_str = ws.path().to_string_lossy().into_owned();
+        let s = DmuxSettings::load_with_exe(ws.path(), None, Some(&exe));
+        let (resolved, warnings) = resolve_servers(&s.mcp_servers, |_| None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let (json, applied) = merge_opencode_mcp("{}", &resolved);
+        assert!(applied);
+        let value: Value = serde_json::from_str(&json).unwrap();
+        let entry = &value["mcp"][BUILTIN_MEMORY_SERVER_NAME];
+        assert_eq!(entry["type"], "local");
+        assert_eq!(entry["command"][0].as_str(), Some(exe_str.as_str()));
+        assert_eq!(entry["command"][1], "mcp-memory");
+        assert_eq!(entry["command"][2], "--workspace");
+        assert_eq!(entry["command"][3].as_str(), Some(ws_str.as_str()));
+        assert!(entry.get("environment").is_none());
+
+        let custom_text = custom_mcp_json(&resolved);
+        let custom: Value = serde_json::from_str(&custom_text).unwrap();
+        let entry = &custom["mcpServers"][BUILTIN_MEMORY_SERVER_NAME];
+        assert_eq!(entry["command"].as_str(), Some(exe_str.as_str()));
+        assert_eq!(entry["args"][0], "mcp-memory");
+        assert!(entry.get("env").is_none() && entry.get("headers").is_none());
+
+        // The vault path (JSON-escaped) appears in neither generated document.
+        let vault_json = Value::String(vault.path().display().to_string()).to_string();
+        let needle = &vault_json[1..vault_json.len() - 1];
+        assert!(!json.contains(needle), "opencode config leaks vault path");
+        assert!(
+            !custom_text.contains(needle),
+            "custom json leaks vault path"
+        );
+    }
+}

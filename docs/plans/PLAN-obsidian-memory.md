@@ -23,6 +23,18 @@ Status: implemented, in review
   JSON-RPC stdio MCP server (INT-729). Registration is a documented
   `[[mcp.servers]]` entry until slice C lands (OQ-721).
 
+## Follow-up: built-in shared memory MCP entry (FR-733)
+
+Slice C is merged, so OQ-721 is resolved: `DmuxSettings::load` appends a
+built-in `dmuxai-memory` stdio entry (`<current exe> mcp-memory --workspace
+<root>`) to the merged `[[mcp.servers]]` list whenever `[memory]` resolves,
+unless a configured entry (enabled, disabled or invalid) uses that name. It
+then reaches every runner, the dashboard registry and `/api/mcp/servers`
+through the existing slice C paths. The vault path stays out of argv; the
+child reads `[memory]` from the workspace. Tests inject the executable
+(`load_with_exe`) so they never depend on the test binary path or the real
+HOME config.
+
 ## Risks and rollback
 
 - No SQLite or adapter protocol change. Removing `[memory]` turns every

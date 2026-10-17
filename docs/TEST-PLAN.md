@@ -240,6 +240,9 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-dashboard-parity | FR-783 | TC-785 | `dashboard_slash_commands_via_prompt` | unit | ✅ | dashboard parity (G2) |
 | M8,M2 | SPEC-dashboard-parity | FR-782,FR-783,UX-780 | TC-786 | `session_module_has_parity_controls`, `session_assets_are_served_hardened` | unit (asset) | ✅ | dashboard parity (G2) |
 | M8,M2 | SPEC-dashboard-parity | FR-784 | TC-787 | `tui_commands_have_dashboard_controls`, `parity_matrix_controls_exist_in_session_js` | unit | ✅ | dashboard parity (G2) |
+| M8,M2 | SPEC-obsidian-memory | FR-733 | TC-733 | `builtin_memory_mcp_server_*` | unit | ✅ | shared memory MCP entry |
+| M8,M2 | SPEC-obsidian-memory | FR-733 | TC-734 | `builtin_memory_server_*` (propagate, registry) | unit | ✅ | shared memory MCP entry |
+| M8,M2 | SPEC-obsidian-memory | FR-733 | TC-735 | `builtin_memory_server_connects_via_shared_list` | integration | ✅ | shared memory MCP entry |
 
 
 ### 1.1 주의할 ⚠️ 항목
