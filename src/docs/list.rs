@@ -100,7 +100,7 @@ fn dir_has_children(ws: &Workspace, dir_path: &Path) -> bool {
             let Ok(target) = std::fs::canonicalize(entry.path()) else {
                 continue;
             };
-            if !target.starts_with(ws.root()) {
+            if !ws.is_visible_target(&target) {
                 continue;
             }
             if let Ok(meta) = std::fs::metadata(entry.path())
@@ -145,8 +145,17 @@ pub fn list_children(ws: &Workspace, dir: &str, limit: usize) -> Result<TreeList
     let reader = std::fs::read_dir(&target_dir)?;
     let mut dir_entries = Vec::new();
     let mut file_entries = Vec::new();
+    // NFR-752: bound the work for huge directories, like list_documents.
+    let scan_cap = limit.saturating_mul(WALK_CAP_MULTIPLIER);
+    let mut scanned = 0usize;
+    let mut scan_truncated = false;
 
     for entry in reader.flatten() {
+        scanned += 1;
+        if scanned > scan_cap {
+            scan_truncated = true;
+            break;
+        }
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
@@ -181,7 +190,7 @@ pub fn list_children(ws: &Workspace, dir: &str, limit: usize) -> Result<TreeList
             let Ok(target) = std::fs::canonicalize(entry.path()) else {
                 continue;
             };
-            if !target.starts_with(ws.root()) {
+            if !ws.is_visible_target(&target) {
                 continue;
             }
             let Ok(meta) = std::fs::metadata(entry.path()) else {
@@ -228,7 +237,7 @@ pub fn list_children(ws: &Workspace, dir: &str, limit: usize) -> Result<TreeList
     file_entries.sort_by(|a, b| a.name.cmp(&b.name));
 
     let total = dir_entries.len() + file_entries.len();
-    let truncated = total > limit;
+    let truncated = scan_truncated || total > limit;
 
     let mut entries = dir_entries;
     entries.extend(file_entries);
@@ -290,7 +299,7 @@ pub fn list_documents(ws: &Workspace, limit: usize) -> DocList {
                 let Ok(target) = std::fs::canonicalize(entry.path()) else {
                     continue;
                 };
-                if !target.starts_with(root) {
+                if !ws.is_visible_target(&target) {
                     continue;
                 }
                 match std::fs::metadata(entry.path()) {
@@ -417,6 +426,12 @@ mod tests {
             .unwrap();
             std::os::unix::fs::symlink(dir.path().join("docs/a.md"), dir.path().join("link_in.md"))
                 .unwrap();
+            // A link into an ignored dir must stay hidden (e.g. .dmuxai/web.json).
+            std::os::unix::fs::symlink(
+                dir.path().join(".dmuxai/nested/x.md"),
+                dir.path().join("link_ignored.md"),
+            )
+            .unwrap();
         }
 
         let ws = Workspace::new(dir.path()).unwrap();
@@ -467,6 +482,7 @@ mod tests {
         {
             assert!(file_names.contains(&"link_in.md"));
             assert!(!file_names.contains(&"link_out.md"));
+            assert!(!file_names.contains(&"link_ignored.md"));
             assert!(!dir_names.contains(&"linkdir"));
         }
         for ignored in IGNORED_DIRS {

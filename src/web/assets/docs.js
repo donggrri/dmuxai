@@ -42,6 +42,7 @@
   var readOnly = false;
   var readOnlyKnown = false;
   var entries = [];
+  var entriesLoaded = false;
   var listTruncated = false;
   var filterText = '';
   var changesTimer = null;
@@ -433,7 +434,9 @@
       }
       if (group) {
         group.removeAttribute('hidden');
-        if (!group.hasChildNodes()) {
+        if (!group.hasChildNodes() || group._failed) {
+          group._failed = false;
+          group.replaceChildren();
           group.appendChild(el('div', 'tree-hint', 'loading\u2026'));
           fetchDir(path).then(function (children) {
             var groupSig = entriesSignature(children);
@@ -441,7 +444,13 @@
               return;
             }
             group._lastSig = groupSig;
-            var focusedPath = getFocusedTreePath() || pendingFocusPath;
+            // Only restore a pending focus while focus is still on the page
+            // body or in the tree, never stealing it from the filter or preview.
+            var active = document.activeElement;
+            var treeEl = $('docs-tree');
+            var mayRestore = !active || active === document.body ||
+              (treeEl && treeEl.contains(active));
+            var focusedPath = getFocusedTreePath() || (mayRestore ? pendingFocusPath : null);
             group.replaceChildren();
             renderChildrenInto(group, children, parseInt(item.getAttribute('aria-level') || '1', 10) + 1);
             updateRovingTabindex();
@@ -450,6 +459,7 @@
             }
           }).catch(function () {
             group.replaceChildren();
+            group._failed = true; // the next expand retries the fetch
             group.appendChild(el('div', 'tree-hint', 'error loading'));
           });
         }
@@ -529,6 +539,15 @@
     if (!tree) { return; }
     var focusedPath = getFocusedTreePath();
     tree.replaceChildren();
+    if (!entriesLoaded) {
+      tree.appendChild(el('div', 'tree-hint', 'loading\u2026'));
+      return;
+    }
+    if (listTruncated) {
+      // The filter searches the capped /api/docs list; say so instead of
+      // silently missing files past the cap.
+      tree.appendChild(el('p', 'tree-hint', 'file list truncated; some files may not match'));
+    }
 
     var matches = [];
     for (var i = 0; i < entries.length; i++) {
@@ -790,6 +809,7 @@
     api('GET', '/api/docs')
       .then(function (payload) {
         entries = payload && Array.isArray(payload.entries) ? payload.entries : [];
+        entriesLoaded = true;
         listTruncated = Boolean(payload && payload.truncated);
         renderTree();
       })
@@ -863,6 +883,7 @@
           } else {
             api('GET', '/api/docs').then(function (payload) {
               entries = payload && Array.isArray(payload.entries) ? payload.entries : [];
+              entriesLoaded = true;
               listTruncated = Boolean(payload && payload.truncated);
               renderFilteredTree(filterText.toLowerCase().trim());
             }).catch(function () {});

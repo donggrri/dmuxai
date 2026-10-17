@@ -388,6 +388,12 @@ mod tests {
         assert!(DOCS_JS.contains("key === 'ArrowRight'"));
         assert!(DOCS_JS.contains("key === 'Enter'"));
         assert!(DOCS_JS.contains("function ticketUrl("));
+        // Review fixes: changes panel always refreshes, nested focus restore
+        // never steals focus, filter reports truncation, failed loads retry.
+        assert!(DOCS_JS.contains("pendingFocusPath"));
+        assert!(DOCS_JS.contains("mayRestore"));
+        assert!(DOCS_JS.contains("file list truncated"));
+        assert!(DOCS_JS.contains("group._failed"));
 
         // 3. docs.css contains sidebar container and narrow-width drawer media query
         assert!(DOCS_CSS.contains(".sidebar"));

@@ -24,21 +24,22 @@ Plan: [PLAN-docs-tree](../plans/PLAN-docs-tree.md)
 
 ## Test evidence
 
-Environment: Linux.
+Environment: Linux x86_64, `CARGO_TARGET_DIR=/workspace/dmux-wt/docs-preview/target` (this worktree's isolated target dir). Fresh results after round 4, rebased on main `f6165fe`:
 
 - `node --check src/web/assets/*.js`: clean.
 - `cargo fmt --check`: clean.
 - `cargo clippy --locked --all-targets -- -D warnings`: clean.
-- `cargo test --locked --all-targets`: 540 passed, 0 failed, 10 ignored.
+- `cargo test --locked --all-targets`: 552 passed, 0 failed, 11 ignored.
 - `cargo test --locked --test web_docs_preview -- --ignored`: 2 passed (`docs_preview_renders_in_headless_chrome`, `docs_tree_renders_in_headless_chrome`).
+- `scripts/spec-index.sh`: index unchanged.
 
 ## Residual risks
 
 - Headless Chrome tests require Playwright and Chromium installed on the host. In deterministic CI environments without Chromium, the test remains `#[ignore]` and unit/asset tests provide deterministic regression protection.
 
-## Cross-review: AGY (gemini-3.8-flash-high): APPROVE
+## Cross-review
 
-No blockers; FR-830..FR-833, UX-830, and TC-830..TC-834 are satisfied.
+AGY (gemini-3.8-flash-high) implemented and reviewed rounds 1-2. AGY hit its quota during round 3, so the maintainer hand-coded rounds 3-4. opencode-haiku reviewed round 4.
 
 ### Round 1 Review Findings
 
@@ -65,3 +66,23 @@ No blockers; FR-830..FR-833, UX-830, and TC-830..TC-834 are satisfied.
 | 5 | Nit | Unused `fmtSize` remaining in `docs.js` | Deleted `fmtSize` |
 | 6 | Nit | Path sanitization for `aria-owns` group IDs risked collisions | Switched to sequential counter IDs (`tree-group-${++treeIdSeq}`) |
 | 7 | Nit | Sidebar toggles persisted before first snapshot under `'default'` key | Deferred saving until active workspace is known (`pendingOpen`/`pendingExpanded`) |
+
+### Round 3 Review Findings (hand-coded)
+
+| Item | Finding | Resolution |
+| --- | --- | --- |
+| 1 | `changesSignature` gated `renderChanges`, so a running turn's output tail stopped refreshing | The changes panel re-renders on every poll/snapshot; the signature (changed file paths only) only decides tree invalidation |
+| 2 | Focus lost for items inside expanded folders when the tree rebuilt | `restoreFocusToPath` records a pending path when the item is not rendered yet; the folder fetch restores it after its children render |
+| 3 | `safeId` naming, duplicate signature check in `renderChanges` | Renamed to `groupId`; removed the duplicate check |
+
+### Round 4 Review Findings (opencode-haiku: REQUEST_CHANGES, fixed)
+
+| Item | Finding | Resolution |
+| --- | --- | --- |
+| 1 | Security: a symlink into an ignored dir (e.g. `notes.md -> .dmuxai/web.json`) resolved, was listed and was savable | `Workspace::is_visible_target` rejects canonical targets inside `IGNORED_DIRS`; used by `resolve`, `list_children`, `dir_has_children` and `list_documents`. Tests: `rejects_symlink_into_ignored_dir`, `tree_children_lists_one_level` (`link_ignored.md`) |
+| 2 | Pending focus restore could steal focus from the filter or preview | Restored only while focus is on the body or inside the tree |
+| 3 | Filter silently missed files past the `/api/docs` cap, and showed "no match" before the first fetch | Shows `loading…` until the list arrives and a truncation hint when `truncated` |
+| 4 | `list_children` work was unbounded for huge directories | Scan capped at `limit × 20` entries; sets `truncated` |
+| 5 | A failed folder load never retried | The next expand refetches |
+
+Not changed: preview dialog focus trap/return (pre-existing behaviour from SPEC-docs-preview, out of scope here); stale-response sequencing between overlapping tree fetches (low impact, the next poll corrects it); `:` rejection in paths (FR-740 confinement rule).
