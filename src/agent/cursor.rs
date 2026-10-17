@@ -533,6 +533,8 @@ struct CursorStreamState {
     session_id: Option<String>,
     emitted_text: bool,
     terminal: bool,
+    /// Text streamed as partials since the last segment aggregate (FR-800).
+    segment_text: String,
 }
 
 fn normalize_event(message: &Value, state: &mut CursorStreamState) -> Vec<AgentEvent> {
@@ -554,8 +556,32 @@ fn normalize_event(message: &Value, state: &mut CursorStreamState) -> Vec<AgentE
                 .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
                 .filter_map(|block| block.get("text").and_then(Value::as_str))
                 .collect::<String>();
-            let is_partial = message.get("timestamp_ms").is_some();
-            if !text.is_empty() && (is_partial || !state.emitted_text) {
+            // With `--stream-partial-output`, cursor-agent sends three kinds of
+            // `assistant` events (SPEC-cursor-stream-dedupe FR-800):
+            // - partial deltas (`timestamp_ms`, no `model_call_id`);
+            // - a segment aggregate before each tool call (`model_call_id`,
+            //   usually also `timestamp_ms`) repeating the segment's text;
+            // - a final aggregate of the whole turn (neither key).
+            // Only the deltas are shown; an aggregate contributes only text
+            // that was not streamed.
+            if message.get("model_call_id").is_some() {
+                let segment = std::mem::take(&mut state.segment_text);
+                let missing = if segment.is_empty() {
+                    text.as_str()
+                } else {
+                    text.strip_prefix(segment.as_str()).unwrap_or("")
+                };
+                if !missing.is_empty() {
+                    state.emitted_text = true;
+                    events.push(AgentEvent::TextDelta(missing.to_owned()));
+                }
+            } else if message.get("timestamp_ms").is_some() {
+                if !text.is_empty() {
+                    state.emitted_text = true;
+                    state.segment_text.push_str(&text);
+                    events.push(AgentEvent::TextDelta(text));
+                }
+            } else if !text.is_empty() && !state.emitted_text {
                 state.emitted_text = true;
                 events.push(AgentEvent::TextDelta(text));
             }
@@ -720,6 +746,85 @@ mod tests {
             vec![AgentEvent::Completed]
         );
         assert_eq!(state.session_id.as_deref(), Some("session"));
+    }
+
+    // TC-800 / FR-800: a recorded cursor-agent 2026.10.16 stream (plan mode,
+    // tool calls between text segments) yields each text exactly once.
+    #[test]
+    fn recorded_cursor_stream_text_appears_once() {
+        let fixture =
+            include_str!("../../tests/fixtures/cursor/stream-partial-tool-segments.jsonl");
+        let mut state = CursorStreamState::default();
+        let mut text = String::new();
+        let mut completed = 0;
+        let mut result_text = None;
+        for line in fixture.lines().filter(|line| !line.trim().is_empty()) {
+            let message: Value = serde_json::from_str(line).unwrap();
+            if message.get("type").and_then(Value::as_str) == Some("result") {
+                result_text = message
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            for event in normalize_event(&message, &mut state) {
+                match event {
+                    AgentEvent::TextDelta(delta) => text.push_str(&delta),
+                    AgentEvent::Completed => completed += 1,
+                    _ => {}
+                }
+            }
+        }
+        let first = "README와 Cargo.toml만 읽어 프로젝트를 세 문장으로 요약합니다.";
+        assert_eq!(text.matches(first).count(), 1, "segment duplicated: {text}");
+        assert_eq!(Some(text.clone()), result_text);
+        assert_eq!(completed, 1);
+    }
+
+    // TC-801 / FR-800, FR-801: segment aggregates add only unstreamed text;
+    // without partials they carry the whole segment; the final aggregate is
+    // used only when nothing was streamed.
+    #[test]
+    fn cursor_segment_aggregates_add_only_missing_text() {
+        let partial = |text: &str| json!({"type": "assistant", "timestamp_ms": 1, "message": {"content": [{"type": "text", "text": text}]}});
+        let segment = |text: &str| json!({"type": "assistant", "timestamp_ms": 2, "model_call_id": "m", "message": {"content": [{"type": "text", "text": text}]}});
+        let deltas = |events: Vec<AgentEvent>| {
+            events
+                .into_iter()
+                .filter_map(|event| match event {
+                    AgentEvent::TextDelta(text) => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut state = CursorStreamState::default();
+        assert_eq!(
+            deltas(normalize_event(&partial("Look"), &mut state)),
+            ["Look"]
+        );
+        assert_eq!(
+            deltas(normalize_event(&partial("ing."), &mut state)),
+            ["ing."]
+        );
+        assert!(deltas(normalize_event(&segment("Looking."), &mut state)).is_empty());
+        // A segment aggregate longer than the streamed text adds the tail only.
+        assert_eq!(
+            deltas(normalize_event(&partial("Done"), &mut state)),
+            ["Done"]
+        );
+        assert_eq!(
+            deltas(normalize_event(&segment("Done!"), &mut state)),
+            ["!"]
+        );
+
+        // No partials (older cursor-agent or no --stream-partial-output).
+        let mut state = CursorStreamState::default();
+        assert_eq!(
+            deltas(normalize_event(&segment("Only segment."), &mut state)),
+            ["Only segment."]
+        );
+        let final_aggregate = json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "Only segment."}]}});
+        assert!(deltas(normalize_event(&final_aggregate, &mut state)).is_empty());
     }
 
     #[test]

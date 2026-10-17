@@ -240,6 +240,8 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-dashboard-parity | FR-783 | TC-785 | `dashboard_slash_commands_via_prompt` | unit | ✅ | dashboard parity (G2) |
 | M8,M2 | SPEC-dashboard-parity | FR-782,FR-783,UX-780 | TC-786 | `session_module_has_parity_controls`, `session_assets_are_served_hardened` | unit (asset) | ✅ | dashboard parity (G2) |
 | M8,M2 | SPEC-dashboard-parity | FR-784 | TC-787 | `tui_commands_have_dashboard_controls`, `parity_matrix_controls_exist_in_session_js` | unit | ✅ | dashboard parity (G2) |
+| M7 | SPEC-cursor-stream-dedupe | FR-800 | TC-800 | `recorded_cursor_stream_text_appears_once` | unit (recorded fixture) | ✅ | v0.2.1 Cursor duplicate fix |
+| M7 | SPEC-cursor-stream-dedupe | FR-800, FR-801 | TC-801 | `cursor_segment_aggregates_add_only_missing_text` | unit | ✅ | v0.2.1 Cursor duplicate fix |
 | M8,M2 | SPEC-obsidian-memory | FR-720 | TC-720 | `memory_settings_*` | unit | ✅ | Obsidian memory (slice E) |
 | M8,M2 | SPEC-obsidian-memory | FR-721 | TC-721 | `context_*` | unit | ✅ | Obsidian memory (slice E) |
 | M8,M2 | SPEC-obsidian-memory | FR-721 | TC-722 | `context_budget_*` | unit | ✅ | Obsidian memory (slice E) |
