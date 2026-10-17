@@ -16,7 +16,10 @@ use tokio::{
 
 use super::{
     AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ExecutionMode,
-    ModelInfo, OutputContext, SpawnedAdapter, implement_outcome::ImplementTurnTracker,
+    ModelInfo, OutputContext, SpawnedAdapter,
+    implement_outcome::{
+        ImplementTurnTracker, is_plan_only_implement_outcome, is_plan_review_response,
+    },
     prompt_with_image_tokens,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,6 +32,8 @@ const AGY_BINARY_OVERRIDE: &str = "DMUXAI_AGY_BIN";
 const AGY_MODEL_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 const AGY_IDLE_TIMEOUT_ENV: &str = "DMUXAI_AGY_IDLE_TIMEOUT_SECS";
 const AGY_IDLE_TIMEOUT_DEFAULT_SECS: u64 = 300;
+const AGY_RESULT_GRACE_SECS: u64 = 3;
+const AGY_PLAN_ONLY_MAX_ATTEMPTS: usize = 2;
 
 /// Resolves the idle timeout from `DMUXAI_AGY_IDLE_TIMEOUT_SECS`.
 ///
@@ -337,7 +342,7 @@ async fn runtime_loop(
                         send_event(
                             &event_tx,
                             Some(&context),
-                            AgentEvent::Notice(
+                            AgentEvent::Error(
                                 "AGY is already running a turn; cancel it before sending another prompt"
                                     .to_owned(),
                             ),
@@ -424,9 +429,93 @@ async fn run_turn(
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
 ) -> io::Result<Option<String>> {
+    let context = OutputContext::from(request);
+    send_event(event_tx, Some(&context), AgentEvent::Started).await;
+
+    let base_prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
+    let mut resume_session = request.resume_session.clone();
+    let mut attempt = 0usize;
+
+    while attempt < AGY_PLAN_ONLY_MAX_ATTEMPTS {
+        let strict = attempt > 0;
+        let user_prompt = if strict {
+            agy_implement_retry_prompt(&base_prompt)
+        } else {
+            agy_prompt(mode, &base_prompt)
+        };
+
+        let outcome = run_single_agy_process(
+            request,
+            selected_model.as_deref(),
+            mode,
+            cwd,
+            event_tx,
+            &context,
+            resume_session.as_deref(),
+            &user_prompt,
+        )
+        .await?;
+
+        resume_session = outcome.conversation_id.clone();
+
+        if mode != ExecutionMode::Implement
+            || !is_plan_only_implement_outcome(
+                outcome.writes_observed,
+                &outcome.response_text,
+            )
+        {
+            emit_terminal_event(event_tx, &context, outcome.terminal).await;
+            return Ok(outcome.conversation_id);
+        }
+
+        attempt += 1;
+        if attempt >= AGY_PLAN_ONLY_MAX_ATTEMPTS {
+            return Err(io::Error::other(
+                "AGY returned plan-only responses twice without applying edits in Implement mode.",
+            ));
+        }
+
+        send_event(
+            event_tx,
+            Some(&context),
+            AgentEvent::Notice(
+                "AGY returned a plan without file edits; retrying once with a stricter Implement instruction."
+                    .to_owned(),
+            ),
+        )
+        .await;
+    }
+
+    Ok(resume_session)
+}
+
+struct SingleAgyOutcome {
+    conversation_id: Option<String>,
+    response_text: String,
+    writes_observed: bool,
+    terminal: AgentEvent,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_single_agy_process(
+    request: &AgentRequest,
+    selected_model: Option<&str>,
+    mode: ExecutionMode,
+    cwd: &Path,
+    event_tx: &mpsc::Sender<AgentOutput>,
+    context: &OutputContext,
+    resume_session: Option<&str>,
+    user_prompt: &str,
+) -> io::Result<SingleAgyOutcome> {
     let program = resolve_program(AGY_BINARY_OVERRIDE, "agy.exe", "agy");
     let mut command = headless_command(program);
-    configure_command(&mut command, request, selected_model.as_deref(), mode);
+    configure_command_for_resume(
+        &mut command,
+        request,
+        selected_model,
+        mode,
+        resume_session,
+    );
     command
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -448,12 +537,9 @@ async fn run_turn(
         .take()
         .ok_or_else(|| io::Error::other("AGY stderr was not piped"))?;
 
-    let context = OutputContext::from(request);
-    send_event(event_tx, Some(&context), AgentEvent::Started).await;
-    let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
     let mut input = serde_json::to_vec(&json!({
         "event": "user",
-        "message": { "content": agy_prompt(mode, &prompt) }
+        "message": { "content": user_prompt }
     }))
     .map_err(io::Error::other)?;
     input.push(b'\n');
@@ -461,7 +547,29 @@ async fn run_turn(
     stdin.shutdown().await?;
     drop(stdin);
 
-    stream_child(&mut child, stdout, stderr, event_tx, &context, mode).await
+    stream_child(&mut child, stdout, stderr, event_tx, context, mode).await
+}
+
+fn configure_command_for_resume(
+    command: &mut tokio::process::Command,
+    request: &AgentRequest,
+    selected_model: Option<&str>,
+    mode: ExecutionMode,
+    resume_session: Option<&str>,
+) {
+    configure_command(command, selected_model, mode);
+    let conversation_id = resume_session.or(request.resume_session.as_deref());
+    if let Some(conversation_id) = conversation_id {
+        command.arg("--conversation").arg(conversation_id);
+    }
+}
+
+async fn emit_terminal_event(
+    event_tx: &mpsc::Sender<AgentOutput>,
+    context: &OutputContext,
+    event: AgentEvent,
+) {
+    send_event(event_tx, Some(context), event).await;
 }
 
 fn agy_prompt(mode: ExecutionMode, prompt: &str) -> String {
@@ -473,14 +581,19 @@ fn agy_prompt(mode: ExecutionMode, prompt: &str) -> String {
             "Create a plan only. Do not modify files or execute implementation steps.\n\n{prompt}"
         ),
         ExecutionMode::Implement => format!(
-            "Run every command in the foreground with a bounded timeout. Do not start background or detached processes.\n\n{prompt}"
+            "Apply edits directly to files in the workspace. Do not produce plans, plan artifacts, or ask for review before editing. Run every command in the foreground with a bounded timeout. Do not start background or detached processes.\n\n{prompt}"
         ),
     }
 }
 
+fn agy_implement_retry_prompt(prompt: &str) -> String {
+    format!(
+        "CRITICAL: Implement mode requires immediate file edits. Do not write plans, do not create plan.md, and do not ask for approval. Apply every change now.\n\n{prompt}"
+    )
+}
+
 fn configure_command(
     command: &mut tokio::process::Command,
-    request: &AgentRequest,
     selected_model: Option<&str>,
     mode: ExecutionMode,
 ) {
@@ -508,9 +621,6 @@ fn configure_command(
     if let Some(model) = selected_model {
         command.arg("--model").arg(model);
     }
-    if let Some(conversation_id) = request.resume_session.as_deref() {
-        command.arg("--conversation").arg(conversation_id);
-    }
 }
 
 async fn stream_child(
@@ -520,7 +630,7 @@ async fn stream_child(
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
     mode: ExecutionMode,
-) -> io::Result<Option<String>> {
+) -> io::Result<SingleAgyOutcome> {
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
     let mut stderr_history = VecDeque::with_capacity(STDERR_HISTORY_CAPACITY);
@@ -532,9 +642,11 @@ async fn stream_child(
 
     let idle_secs = agy_idle_timeout_secs();
     let mut idle_deadline = idle_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
+    let mut result_grace_deadline: Option<Instant> = None;
 
     while stdout_open || stderr_open || exit_status.is_none() {
-        let deadline = idle_deadline.unwrap_or_else(Instant::now);
+        let idle_deadline_at = idle_deadline.unwrap_or_else(Instant::now);
+        let grace_deadline_at = result_grace_deadline.unwrap_or_else(Instant::now);
         tokio::select! {
             line = stdout_lines.next_line(), if stdout_open => {
                 match line? {
@@ -542,12 +654,21 @@ async fn stream_child(
                         if let Some(secs) = idle_secs {
                             idle_deadline = Some(Instant::now() + Duration::from_secs(secs));
                         }
-                        implement_tracker.observe_provider_line(&line);
                         let message: Value = serde_json::from_str(&line).map_err(|error| {
                             io::Error::other(format!("invalid AGY NDJSON: {error}"))
                         })?;
+                        implement_tracker.observe_agy_message(&message);
                         for event in normalize_event(&message, mode, &mut state) {
                             send_event(event_tx, Some(context), event).await;
+                        }
+                        if state.result_received {
+                            stdout_open = false;
+                            stderr_open = false;
+                            if result_grace_deadline.is_none() {
+                                result_grace_deadline = Some(
+                                    Instant::now() + Duration::from_secs(AGY_RESULT_GRACE_SECS),
+                                );
+                            }
                         }
                     }
                     None => stdout_open = false,
@@ -562,36 +683,75 @@ async fn stream_child(
             status = child.wait(), if exit_status.is_none() => {
                 exit_status = Some(status?);
             }
-            _ = tokio::time::sleep_until(deadline), if idle_deadline.is_some() => {
+            _ = tokio::time::sleep_until(idle_deadline_at), if idle_deadline.is_some() => {
                 child.kill().await.ok();
                 return Err(io::Error::other(format!(
                     "AGY produced no events for {}s; it may be waiting on a background command. Run commands in the foreground with a bounded timeout.",
                     idle_secs.unwrap_or(AGY_IDLE_TIMEOUT_DEFAULT_SECS)
                 )));
             }
+            _ = tokio::time::sleep_until(grace_deadline_at), if result_grace_deadline.is_some() && exit_status.is_none() => {
+                child.kill().await.ok();
+                if let Ok(Some(status)) = child.try_wait() {
+                    exit_status = Some(status);
+                }
+            }
         }
     }
 
     let status = exit_status.expect("child.wait runs before the loop can finish");
     let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
-    if let Err(reason) = implement_tracker.finish(&status, &diagnostic, state.terminal) {
-        return Err(io::Error::other(reason));
+    let protocol_completed = state.pending_terminal.is_some();
+    let plan_only = mode == ExecutionMode::Implement
+        && is_plan_only_implement_outcome(
+            implement_tracker.writes_observed(),
+            &state.response_text,
+        );
+    let require_writes = mode == ExecutionMode::Implement && !plan_only;
+    let writes_observed = implement_tracker.writes_observed();
+    if let Err(reason) = implement_tracker.finish(
+        &status,
+        &diagnostic,
+        protocol_completed,
+        require_writes,
+    ) {
+        return Ok(SingleAgyOutcome {
+            conversation_id: state.conversation_id,
+            response_text: state.response_text,
+            writes_observed,
+            terminal: AgentEvent::Error(reason),
+        });
     }
-    if !state.terminal {
-        return Err(io::Error::other(if diagnostic.is_empty() {
+    if !protocol_completed {
+        let message = if diagnostic.is_empty() {
             format!("AGY exited with {status} without a terminal result")
         } else {
             format!("AGY exited with {status}: {diagnostic}")
-        }));
+        };
+        return Ok(SingleAgyOutcome {
+            conversation_id: state.conversation_id,
+            response_text: state.response_text,
+            writes_observed,
+            terminal: AgentEvent::Error(message),
+        });
     }
-    Ok(state.conversation_id)
+
+    Ok(SingleAgyOutcome {
+        conversation_id: state.conversation_id,
+        response_text: state.response_text,
+        writes_observed,
+        terminal: state
+            .pending_terminal
+            .expect("protocol_completed implies a pending terminal event"),
+    })
 }
 
 #[derive(Default)]
 struct AgyStreamState {
     conversation_id: Option<String>,
     emitted_text: bool,
-    terminal: bool,
+    result_received: bool,
+    pending_terminal: Option<AgentEvent>,
     response_text: String,
 }
 
@@ -651,7 +811,7 @@ fn normalize_event(
             }
         }
         Some("result") => {
-            state.terminal = true;
+            state.result_received = true;
             let status = message
                 .pointer("/result/status")
                 .and_then(Value::as_str)
@@ -659,7 +819,7 @@ fn normalize_event(
             match status {
                 "SUCCESS" => {
                     if let Some(denied) = denied_actions_summary(message) {
-                        events.push(AgentEvent::Error(format!(
+                        state.pending_terminal = Some(AgentEvent::Error(format!(
                             "AGY denied permission for: {denied}. Headless AGY cannot prompt; allow it in AGY settings or use Implement mode."
                         )));
                         return events;
@@ -673,49 +833,38 @@ fn normalize_event(
                         events.push(AgentEvent::TextDelta(response.to_owned()));
                     }
                     if state.response_text.trim().is_empty() {
-                        events.push(AgentEvent::Error(
+                        state.pending_terminal = Some(AgentEvent::Error(
                             "AGY finished without producing any output.".to_owned(),
                         ));
                         return events;
                     }
-                    if is_plan_review_response(&state.response_text) {
-                        if mode == ExecutionMode::Implement {
-                            events.push(AgentEvent::Error(
-                                "AGY returned a plan for review instead of applying edits in Implement mode."
-                                    .to_owned(),
-                            ));
-                            return events;
-                        }
+                    if is_plan_review_response(&state.response_text)
+                        && mode != ExecutionMode::Implement
+                    {
                         events.push(AgentEvent::Notice(
                             "AGY returned a plan for review; no file changes were executed (plan+sandbox mode)."
                                 .to_owned(),
                         ));
                     }
-                    events.push(AgentEvent::Completed);
+                    state.pending_terminal = Some(AgentEvent::Completed);
                 }
-                "CANCELED" | "INTERRUPTED" => events.push(AgentEvent::Cancelled),
-                _ => events.push(AgentEvent::Error(
-                    message
-                        .pointer("/result/error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("AGY turn failed")
-                        .to_owned(),
-                )),
+                "CANCELED" | "INTERRUPTED" => {
+                    state.pending_terminal = Some(AgentEvent::Cancelled);
+                }
+                _ => {
+                    state.pending_terminal = Some(AgentEvent::Error(
+                        message
+                            .pointer("/result/error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("AGY turn failed")
+                            .to_owned(),
+                    ));
+                }
             }
         }
         _ => {}
     }
     events
-}
-
-fn is_plan_review_response(response: &str) -> bool {
-    let response = response.to_ascii_lowercase();
-    let mentions_plan = response.contains("plan.md")
-        || response.contains("implementation plan")
-        || response.contains("plan artifact");
-    let requests_review =
-        response.contains("approve") || response.contains("review") || response.contains("proceed");
-    mentions_plan && requests_review
 }
 
 async fn list_models(cwd: &Path) -> io::Result<Vec<ModelInfo>> {
@@ -818,10 +967,11 @@ mod tests {
                 AgentEvent::TextDelta("AGY_OK".to_owned()),
             ]
         );
-        assert_eq!(
-            normalize_event(&result, ExecutionMode::Ask, &mut state),
-            vec![AgentEvent::Completed]
-        );
+        assert_eq!(normalize_event(&result, ExecutionMode::Ask, &mut state), vec![]);
+        assert!(matches!(
+            state.pending_terminal,
+            Some(AgentEvent::Completed)
+        ));
         assert_eq!(state.conversation_id.as_deref(), Some("conversation"));
     }
 
@@ -836,11 +986,12 @@ mod tests {
         };
         let mut command = tokio::process::Command::new("agy");
 
-        configure_command(
+        configure_command_for_resume(
             &mut command,
             &request,
             Some("agy-model"),
             ExecutionMode::Ask,
+            Some("agy-conversation"),
         );
 
         let args = command
@@ -870,7 +1021,7 @@ mod tests {
             ],
         };
         let mut command = tokio::process::Command::new("agy");
-        configure_command(&mut command, &request, None, ExecutionMode::Ask);
+        configure_command(&mut command, None, ExecutionMode::Ask);
         let args = command
             .as_std()
             .get_args()
@@ -884,17 +1035,9 @@ mod tests {
 
     #[test]
     fn agy_execution_modes_use_native_cli_flags_and_safe_prompts() {
-        let request = AgentRequest {
-            conversation_id: super::super::ConversationId::new("conversation"),
-            turn_id: super::super::TurnId::new("turn"),
-            prompt: "hello".to_owned(),
-            resume_session: None,
-            image_paths: vec![],
-        };
-
         let args_for = |mode| {
             let mut command = tokio::process::Command::new("agy");
-            configure_command(&mut command, &request, None, mode);
+            configure_command(&mut command, None, mode);
             command
                 .as_std()
                 .get_args()
@@ -939,9 +1082,12 @@ mod tests {
                     "AGY returned a plan for review; no file changes were executed (plan+sandbox mode)."
                         .to_owned()
                 ),
-                AgentEvent::Completed,
             ]
         );
+        assert!(matches!(
+            state.pending_terminal,
+            Some(AgentEvent::Completed)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -999,14 +1145,19 @@ mod tests {
         let mut state = AgyStreamState::default();
         let denied = json!({"event":"result","result":{"status":"SUCCESS","response":"","denied_actions":[{"action":"command","display_name":"RunCommand"}]}});
         let events = normalize_event(&denied, ExecutionMode::Implement, &mut state);
-        assert!(matches!(events.last(), Some(AgentEvent::Error(e)) if e.contains("RunCommand")));
+        assert!(events.is_empty());
+        assert!(matches!(
+            state.pending_terminal,
+            Some(AgentEvent::Error(e)) if e.contains("RunCommand")
+        ));
 
         let mut state = AgyStreamState::default();
         let empty = json!({"event":"result","result":{"status":"SUCCESS","response":""}});
-        let events = normalize_event(&empty, ExecutionMode::Ask, &mut state);
-        assert!(
-            matches!(events.last(), Some(AgentEvent::Error(e)) if e.contains("without producing"))
-        );
+        let _events = normalize_event(&empty, ExecutionMode::Ask, &mut state);
+        assert!(matches!(
+            state.pending_terminal,
+            Some(AgentEvent::Error(e)) if e.contains("without producing")
+        ));
     }
 
     #[test]
@@ -1118,12 +1269,16 @@ mod tests {
 
     #[test]
     fn implement_prompt_forbids_background_commands() {
-        // FR-443 / TC-443: Implement mode must instruct AGY to keep commands in
-        // the foreground with a bounded timeout and to avoid background or
-        // detached processes; Ask/Plan stay untouched.
+        // FR-443 / TC-443, FR-502 / TC-502: Implement mode must apply edits,
+        // keep commands in the foreground with a bounded timeout, and avoid
+        // background or detached processes; Ask/Plan stay untouched.
         let wrapped = agy_prompt(ExecutionMode::Implement, "build the thing");
         assert!(
-            wrapped.starts_with("Run every command in the foreground"),
+            wrapped.starts_with("Apply edits directly"),
+            "unexpected Implement prompt: {wrapped}"
+        );
+        assert!(
+            wrapped.contains("Do not produce plans"),
             "unexpected Implement prompt: {wrapped}"
         );
         assert!(
@@ -1133,6 +1288,46 @@ mod tests {
         assert!(wrapped.ends_with("\n\nbuild the thing"));
         assert!(!agy_prompt(ExecutionMode::Ask, "hi").contains("background"));
         assert!(!agy_prompt(ExecutionMode::Plan, "hi").contains("background"));
+    }
+
+    #[test]
+    fn result_event_defers_terminal_until_process_exit() {
+        let mut state = AgyStreamState::default();
+        let result = json!({
+            "event": "result",
+            "result": { "status": "SUCCESS", "response": "AGY_OK" }
+        });
+        let events = normalize_event(&result, ExecutionMode::Implement, &mut state);
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_)
+            )
+        }));
+        assert!(state.result_received);
+        assert!(matches!(
+            state.pending_terminal,
+            Some(AgentEvent::Completed)
+        ));
+    }
+
+    #[test]
+    fn implement_plan_only_does_not_error_on_first_result_line() {
+        let mut state = AgyStreamState::default();
+        let result = json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "I wrote the plan to plan.md. Please review and approve before I edit files."
+            }
+        });
+        let events = normalize_event(&result, ExecutionMode::Implement, &mut state);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], AgentEvent::TextDelta(_)));
+        assert!(matches!(
+            state.pending_terminal,
+            Some(AgentEvent::Completed)
+        ));
     }
 
     #[cfg(unix)]
@@ -1306,5 +1501,74 @@ mod tests {
         .await;
 
         outcome.expect("stdout events within the timeout should keep the turn alive");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn agy_result_grace_kills_lingering_child_after_result() {
+        // FR-505 / TC-505: after the result line the adapter waits briefly for
+        // process exit, then kills the child and emits a single terminal event.
+        let result_event = json!({
+            "event": "result",
+            "result": { "status": "SUCCESS", "response": "AGY_OK" }
+        });
+        let line = result_event.to_string();
+        let (_dir, fake) = write_fake_agy(|_| {
+            format!(
+                "#!/bin/sh\nread -r _dmuxai_user\nprintf '%s\\n' '{line}'\nsleep 60\n"
+            )
+        });
+
+        let started = Instant::now();
+        let outcome = with_agy_spawn_env(&fake, "0", async {
+            timeout(
+                Duration::from_secs(15),
+                run_fake_agy_turn(ExecutionMode::Ask),
+            )
+            .await
+            .expect("grace kill should finish quickly")
+        })
+        .await;
+
+        outcome.expect("result should succeed after grace kill");
+        assert!(
+            started.elapsed() < Duration::from_secs(12),
+            "turn took too long: {}",
+            started.elapsed().as_secs()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn implement_plan_only_retries_once_then_fails() {
+        // FR-504 / TC-504: plan-only Implement outcomes retry once, then fail.
+        let plan_response = json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "conversation_id": "plan-only",
+                "response": "I saved the implementation plan to plan.md. Please review and approve before editing."
+            }
+        });
+        let plan_line = plan_response.to_string();
+        let (_dir, fake) = write_fake_agy(|_| {
+            format!("#!/bin/sh\nread -r _dmuxai_user\nprintf '%s\\n' '{plan_line}'\n")
+        });
+
+        let outcome = with_agy_spawn_env(&fake, "0", async {
+            timeout(
+                Duration::from_secs(20),
+                run_fake_agy_turn(ExecutionMode::Implement),
+            )
+            .await
+            .expect("plan-only retry should finish promptly")
+        })
+        .await;
+
+        let error = outcome.expect_err("second plan-only attempt should fail the turn");
+        assert!(
+            error.to_string().contains("plan-only"),
+            "unexpected error: {error}"
+        );
     }
 }

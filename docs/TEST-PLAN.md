@@ -161,6 +161,7 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M2 | SPEC-agent-test-helpers | FR-512 | TC-516 | `submitting_routes_to_the_selected_agent` | unit | ✅ | dogfood #23 |
 | M2 | SPEC-agent-test-helpers | FR-519 | TC-513, TC-514, TC-515 | `every_spec_has_status_line`, `spec_ids_are_unique_across_specs`, `spec_index_script_lists_every_spec` | unit | ✅ | SPEC-spec-index |
 | M2 | SPEC-agent-test-helpers | FR-517, FR-518 | TC-517, TC-518 | manual PR review | manual | ✅ | dogfood #23 |
+| M4 | SPEC-implement-plan-only | FR-500..508 | TC-500..509 | `implement_prompt_forbids_background_commands`, `agy_write_tools_are_detected_from_step_updates`, `agy_plan_only_retries_once_then_fails`, `agy_result_grace_kills_lingering_child_after_result`, `cancel_clears_active_turn_even_when_busy_flag_was_cleared` | unit+integration | ✅ | dogfood #24 |
 
 
 ### 1.1 주의할 ⚠️ 항목

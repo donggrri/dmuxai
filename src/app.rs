@@ -1808,15 +1808,20 @@ impl App {
 
     fn cancel_selected(&mut self) {
         let agent = self.adapters[self.selected].agent();
-        if !self.busy_agents.contains(&agent) {
-            return;
-        }
+        let was_tracking = self.busy_agents.contains(&agent)
+            || self.active_turns.contains_key(&agent);
 
-        if let Err(error) = self.adapters[self.selected].cancel() {
+        if let Err(error) = self.adapters[self.selected].cancel()
+            && was_tracking
+        {
             self.messages.push(Message::new(
                 Role::System,
                 format!("Could not cancel {agent}: {error}"),
             ));
+        }
+
+        if was_tracking {
+            self.finish_turn_outcome(agent, false);
         }
     }
 
@@ -5628,6 +5633,54 @@ mod tests {
         assert!(!app.busy_agents.contains(&Agent::Agy));
         assert_eq!(app.messages.last().unwrap().role, Role::System);
         assert_eq!(app.messages.last().unwrap().content, "AGY turn cancelled.");
+    }
+
+    #[test]
+    fn already_running_adapter_error_clears_busy_state() {
+        let (mut app, sent) = test_app();
+        app.input = "first".to_owned();
+        app.submit_prompt();
+        let first = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(first.conversation_id.clone()),
+            turn_id: Some(first.turn_id.clone()),
+            event: AgentEvent::Started,
+        }));
+        assert!(app.busy_agents.contains(&Agent::Codex));
+
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(first.conversation_id),
+            turn_id: Some(first.turn_id),
+            event: AgentEvent::Error(
+                "Codex is already running a turn; cancel it before sending another prompt"
+                    .to_owned(),
+            ),
+        }));
+        assert!(!app.busy_agents.contains(&Agent::Codex));
+        assert!(!app.active_turns.contains_key(&Agent::Codex));
+    }
+
+    #[test]
+    fn cancel_clears_active_turn_even_when_busy_flag_was_cleared() {
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (mut app, _, cancelled) = test_app_runtime(engine, None);
+        app.active_turns.insert(
+            Agent::Codex,
+            ActiveTurn {
+                conversation_id: app.conversation_id.clone(),
+                turn_id: StoredTurnId::new("stale-turn"),
+            },
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(&*cancelled.lock().unwrap(), &[Agent::Codex]);
+        assert!(!app.active_turns.contains_key(&Agent::Codex));
+        assert!(!app.busy_agents.contains(&Agent::Codex));
     }
 
     #[test]

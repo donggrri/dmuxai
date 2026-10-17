@@ -95,6 +95,11 @@ Format: id, status, repro, cause, fix.
 - Cause: `assignment_line()` printed raw `node.model_id` without runner resolution.
 - Fix: Added `GraphSession::assignment_line_with(resolve)` rendering `<id>:<role>→<runner>:<model>`, and updated `App` to resolve effective models per runner (`resolved_assignment_line`), showing `provider default` for non-Cursor runners with no F2 pick while Cursor stays pinned to `composer-2.5`.
 
+## #24 Implement mode accepted plan-only AGY replies and left the adapter busy — fixed (SPEC-implement-plan-only)
+- Repro: AGY + Implement; AGY answers with a plan for review (no `write_to_file`). Turn ended early while the AGY child still ran; the next prompt showed “already running” as a Notice, cancel did nothing when the UI was idle, and write detection false-positived on the init tool list.
+- Cause: Terminal events fired on the `result` NDJSON line before process exit; concurrent sends used `Notice`; cancel required `busy_agents`; Implement prompt did not require edits; write detection scanned raw lines for `write_file`/`edit_file`.
+- Fix: Defer terminal events until child exit (grace kill after `result`); track writes from AGY tool `step_update` events; stricter Implement prompt with one plan-only retry then fail; concurrent sends emit `Error`; cancel clears `active_turns` and busy state.
+
 ## #23 AGY repeatedly invents `App::handle_enter` in tests — fixed
 - Two separate AGY sessions wrote tests calling a nonexistent `handle_enter`; the real entry point is `submit_prompt`.
 - Fix: `AGENTS.md` § Agent test helpers documents `submit_prompt`, `test_app()`, and related helpers; the `app` test module has a module doc listing them; `#[cfg(test)] App::handle_enter` forwards to `submit_prompt` so invented calls still compile.

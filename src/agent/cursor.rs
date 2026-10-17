@@ -199,7 +199,7 @@ async fn runtime_loop(
                         send_event(
                             &event_tx,
                             Some(&context),
-                            AgentEvent::Notice(
+                            AgentEvent::Error(
                                 "Cursor is already running a turn; cancel it before sending another prompt"
                                     .to_owned(),
                             ),
@@ -441,7 +441,9 @@ async fn stream_child(
 
     let status = exit_status.expect("child.wait runs before the loop can finish");
     let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
-    if let Err(reason) = implement_tracker.finish(&status, &diagnostic, state.terminal) {
+    if let Err(reason) =
+        implement_tracker.finish(&status, &diagnostic, state.terminal, mode == ExecutionMode::Implement)
+    {
         return Err(io::Error::other(reason));
     }
     if !state.terminal {

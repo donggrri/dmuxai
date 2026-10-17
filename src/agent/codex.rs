@@ -678,7 +678,7 @@ async fn runtime_loop(
                             send_event(
                                 &event_tx,
                                 Some(&context),
-                                AgentEvent::Notice(
+                                AgentEvent::Error(
                                     "Codex is already running a turn; cancel it before sending another prompt"
                                         .to_owned(),
                                 ),
