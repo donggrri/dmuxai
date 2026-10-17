@@ -186,9 +186,11 @@ mod tests {
         assert!(js.contains("window.sessionStorage.getItem(key)"));
         assert!(js.contains("window.sessionStorage.setItem(key, value)"));
         assert!(js.contains("storageGet(TOKEN_KEY)"));
-        // localStorage holds only the two theme keys; every set/remove targets them.
+        // localStorage holds only the theme/accent keys and the graph view mode;
+        // every set/remove targets one of them.
         assert!(js.contains("'dmuxai.theme'"));
         assert!(js.contains("'dmuxai.accent'"));
+        assert!(js.contains("'dmuxai.graphView'"));
         let mut local_storage_writes = 0;
         for line in js.lines() {
             let line = line.trim();
@@ -197,7 +199,9 @@ mod tests {
             {
                 local_storage_writes += 1;
                 assert!(
-                    line.contains("THEME_KEY") || line.contains("ACCENT_KEY"),
+                    line.contains("THEME_KEY")
+                        || line.contains("ACCENT_KEY")
+                        || line.contains("GRAPH_VIEW_KEY"),
                     "unexpected localStorage key in app.js: {line}"
                 );
             }
@@ -475,5 +479,134 @@ mod tests {
         assert!(INDEX_HTML.contains("id=\"import-form\""));
         assert!(APP_JS.contains("/api/import"));
         assert!(APP_JS.contains("/api/mcp/servers"));
+    }
+
+    // TC-704 / UX-700..UX-703, NFR-700: the embedded page builds the inline SVG
+    // subway map (g.node[data-id] stations, path.edge lines, state- classes), a
+    // percentage progress bar with a timing-guarded ETA, a persisted List/Graph
+    // toggle, a running pulse with a reduced-motion override, and no external
+    // resources.
+    #[test]
+    fn graph_view_svg_structure() {
+        // The renderer creates SVG nodes in the SVG namespace.
+        assert!(APP_JS.contains("document.createElementNS(SVG_NS"));
+        assert!(APP_JS.contains("var SVG_NS = 'http://www.w3.org/2000/svg';"));
+        // Stations: g.node[data-id] with circle stations and state- classes,
+        // focusable and labelled.
+        assert!(APP_JS.contains("svgEl('g')"));
+        assert!(APP_JS.contains("'node state-'"));
+        assert!(APP_JS.contains("svgEl('circle')"));
+        assert!(APP_JS.contains("setAttribute('data-id'"));
+        assert!(APP_JS.contains("setAttribute('role', 'button')"));
+        assert!(APP_JS.contains("setAttribute('aria-label'"));
+        assert!(APP_JS.contains("svgEl('title')"));
+        assert!(APP_JS.contains("function nodeTitleText"));
+        assert!(APP_JS.contains("svgEl('path')"));
+        // Edges: path.edge lines colored by the source state.
+        assert!(APP_JS.contains("'edge edge-'"));
+        // Toggle default and persistence.
+        assert!(APP_JS.contains("var GRAPH_VIEW_KEY = 'dmuxai.graphView';"));
+        assert!(APP_JS.contains("window.localStorage.setItem(GRAPH_VIEW_KEY"));
+        assert!(APP_JS.contains("layers > 1 ? 'graph' : 'list'"));
+        // Progress bar percentage plus a timing-guarded ETA.
+        assert!(APP_JS.contains("$('graph-percent')"));
+        assert!(APP_JS.contains("Math.round((completed / total) * 100) + '%'"));
+        assert!(APP_JS.contains("estimateEtaMs"));
+        assert!(APP_JS.contains("finished_at_ms"));
+        assert!(APP_JS.contains("$('graph-eta')"));
+        // Pan/zoom and the details panel.
+        assert!(APP_JS.contains("GRAPH_MIN_SCALE"));
+        assert!(APP_JS.contains("GRAPH_MAX_SCALE"));
+        assert!(APP_JS.contains("onGraphWheel"));
+        assert!(APP_JS.contains("selectGraphNode"));
+        assert!(APP_JS.contains("closeGraphDetail"));
+        assert!(APP_JS.contains("'Escape'"));
+
+        // The HTML carries the containers the renderer fills.
+        assert!(INDEX_HTML.contains("id=\"graph-canvas\""));
+        assert!(INDEX_HTML.contains("id=\"graph-view-toggle\""));
+        assert!(INDEX_HTML.contains("id=\"view-list\""));
+        assert!(INDEX_HTML.contains("id=\"view-graph\""));
+        assert!(INDEX_HTML.contains("id=\"graph-detail\""));
+        assert!(INDEX_HTML.contains("id=\"graph-fit\""));
+        assert!(INDEX_HTML.contains("class=\"graph-legend\""));
+
+        // CSS: state classes, edge colors, pulse keyframes, reduced-motion.
+        assert!(APP_CSS.contains(".graph-svg .node.state-completed .station"));
+        assert!(APP_CSS.contains(".graph-svg .node.state-running .ring"));
+        assert!(APP_CSS.contains("@keyframes dmuxai-node-pulse"));
+        assert!(APP_CSS.contains("@media (prefers-reduced-motion: reduce)"));
+        assert!(APP_CSS.contains(".graph-svg .edge-completed"));
+        assert!(APP_CSS.contains(".graph-svg .edge-failed"));
+        assert!(APP_CSS.contains("var(--ok)"));
+        assert!(APP_CSS.contains("var(--accent)"));
+        assert!(APP_CSS.contains("var(--err)"));
+
+        // CSP-safe: no inline handlers and no <style> blocks in the page.
+        assert!(!INDEX_HTML.contains("onclick="));
+        assert!(!INDEX_HTML.contains("<style"));
+
+        // No external resource URLs (CDN scripts/styles/fonts/images).
+        for asset in [INDEX_HTML, APP_JS, APP_CSS] {
+            for needle in [
+                "src=\"http",
+                "src='http",
+                "href=\"http",
+                "href='http",
+                "@import",
+                "url(http",
+            ] {
+                assert!(
+                    !asset.contains(needle),
+                    "unexpected external resource reference {needle:?}"
+                );
+            }
+        }
+        // app.js only mentions http twice: the inert SVG namespace and the
+        // localhost example in the missing-token message.
+        assert_eq!(
+            APP_JS.matches("http://").count(),
+            2,
+            "unexpected http:// URLs in app.js"
+        );
+    }
+
+    // UX-700/UX-703: bar segment order, station sublabels, auto-fit and lane
+    // routing match mockup #5.
+    #[test]
+    fn graph_view_progress_labels_fit_and_routing() {
+        // Progress bar order: completed, running, failed, then pending last.
+        assert!(APP_JS.contains(
+            "'completed', 'running', 'failed', 'pending', 'ready', 'waiting_gate', 'skipped'"
+        ));
+
+        // Station sublabels: short runner names and a state word when elapsed is
+        // unknown, plus the failed-attempt suffix.
+        assert!(APP_JS.contains("function runnerShortName"));
+        assert!(APP_JS.contains("replace(/^opencode-/i, '')"));
+        assert!(APP_JS.contains("=== 'agy'") || APP_JS.contains("=== \"agy\""));
+        assert!(APP_JS.contains("STATION_STATE_WORDS"));
+        assert!(APP_JS.contains("completed: 'done'"));
+        assert!(APP_JS.contains("waiting_gate: 'waiting'"));
+        assert!(APP_JS.contains("stationStateWord"));
+        assert!(APP_JS.contains(r"'\u00d7' + node.attempt"));
+
+        // Auto-fit on first render / node-set change; user pan/zoom preserved.
+        assert!(APP_JS.contains("function autoFitGraph"));
+        assert!(APP_JS.contains("function graphGeometryKey"));
+        assert!(APP_JS.contains("function syncGraphCanvas"));
+        assert!(APP_JS.contains("function updateRunningGraphStationMeta"));
+        assert!(APP_JS.contains("function tickDashboard"));
+        assert!(APP_JS.contains("function graphCanvasHeight"));
+        assert!(APP_JS.contains("graphUserInteracted"));
+
+        // Long edges detour onto a half-row lane; short edges stay straight.
+        assert!(APP_JS.contains("function longEdgePath"));
+        assert!(APP_JS.contains("GRAPH_ROW_H / 2"));
+        assert!(APP_JS.contains("span > 1"));
+
+        // Canvas bounds.
+        assert!(APP_CSS.contains("min-height: 320px;"));
+        assert!(APP_CSS.contains("max-height: 70vh;"));
     }
 }

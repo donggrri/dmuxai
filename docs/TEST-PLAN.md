@@ -210,6 +210,12 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-web-dashboard | NFR-561 | TC-577 | `codex_mcp_secrets_not_in_argv` | unit | ✅ | web dashboard slice C (MCP) |
 | M8,M2 | SPEC-web-dashboard | INT-561 | TC-578 | `cursor_mcp_notice_once_per_session` | unit | ✅ | web dashboard slice C (MCP) |
 | M8,M2 | SPEC-web-dashboard | FR-564 | TC-579 | `serve_snapshot_has_jira_base_url_at_startup` | integration | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-graph-view | FR-700 | TC-700 | `layout_assigns_layers_and_stable_order` | unit | ✅ | graph view slice H |
+| M8,M2 | SPEC-graph-view | FR-700 | TC-701 | `layout_is_cycle_safe_and_handles_empty` | unit | ✅ | graph view slice H |
+| M8,M2 | SPEC-graph-view | FR-701 | TC-702 | `snapshot_exposes_deps_and_layout`; `tests/web_serve.rs` | unit + integration | ✅ | graph view slice H |
+| M8,M2 | SPEC-graph-view | FR-702 | TC-703 | `dashboard_nodes_carry_log_tail_and_changed_files` | unit | ✅ | graph view slice H |
+| M8,M2 | SPEC-graph-view | UX-700 | TC-704 | `graph_view_svg_structure` | unit | ✅ | graph view slice H |
+| M8,M2 | SPEC-graph-view | UX-700 | TC-705 | `graph_view_renders_in_headless_chrome` (`--ignored`) | e2e | ✅ | graph view slice H, opt-in |
 
 
 ### 1.1 주의할 ⚠️ 항목

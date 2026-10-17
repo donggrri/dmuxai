@@ -897,7 +897,7 @@ mod tests {
     use crate::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
     use crate::todo::{Todo, TodoStore};
     use crate::web::auth::generate_token;
-    use crate::web::snapshot::{GraphCounts, GraphView, NodeView, SnapshotSource};
+    use crate::web::snapshot::{GraphCounts, GraphView, NodeDetail, NodeView, SnapshotSource};
 
     fn parse_sse_revisions(buf_str: &str) -> Vec<u64> {
         let mut revs = Vec::new();
@@ -1153,6 +1153,7 @@ mod tests {
                 failed: 0,
                 skipped: 0,
             },
+            layers: 1,
             nodes: vec![NodeView {
                 id: "n1".to_string(),
                 role: NodeRole::Implement,
@@ -1164,6 +1165,9 @@ mod tests {
                 started_at_ms: None,
                 finished_at_ms: None,
                 elapsed_ms: None,
+                deps: Vec::new(),
+                layout: None,
+                detail: NodeDetail::default(),
             }],
             edges: vec![GraphEdge {
                 from: "a".to_string(),

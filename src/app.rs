@@ -420,6 +420,183 @@ pub(crate) struct DrainEventsOutcome {
     pub completed: bool,
 }
 
+const NODE_DETAIL_MAX_BUFFER_LINES: usize = 100;
+const NODE_DETAIL_MAX_CURRENT_LINE_CHARS: usize = 4096;
+
+fn take_char_prefix(s: &str, max_chars: usize) -> (String, String) {
+    if s.chars().count() <= max_chars {
+        return (s.to_owned(), String::new());
+    }
+    let head: String = s.chars().take(max_chars).collect();
+    let head_bytes = head.len();
+    (head, s[head_bytes..].to_owned())
+}
+
+/// Redact dashboard URL tokens before persisting node log lines (FR-702).
+fn redact_log_text(input: &str) -> String {
+    let mut out = input.to_owned();
+    for marker in ["?token=", "token="] {
+        let mut search_from = 0usize;
+        while let Some(rel) = out[search_from..].find(marker) {
+            let start = search_from + rel + marker.len();
+            let rest = &out[start..];
+            let value_len = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_hexdigit())
+                .map(|ch| ch.len_utf8())
+                .sum::<usize>();
+            if value_len == 0 {
+                search_from = start;
+                continue;
+            }
+            out.replace_range(start..start + value_len, "[redacted]");
+            search_from = start + "[redacted]".len();
+        }
+    }
+    out
+}
+
+#[derive(Debug, Default, Clone)]
+struct NodeDetailTracker {
+    lines: Vec<String>,
+    current_line: String,
+    changed_files: Vec<String>,
+}
+
+impl NodeDetailTracker {
+    fn push_completed_line(&mut self, line: String) {
+        self.lines.push(line);
+        if self.lines.len() > NODE_DETAIL_MAX_BUFFER_LINES {
+            self.lines.remove(0);
+        }
+    }
+
+    fn enforce_current_line_cap(&mut self) {
+        while self.current_line.chars().count() > NODE_DETAIL_MAX_CURRENT_LINE_CHARS {
+            let (head, tail) =
+                take_char_prefix(&self.current_line, NODE_DETAIL_MAX_CURRENT_LINE_CHARS);
+            self.push_completed_line(head.trim_end_matches('\r').to_owned());
+            self.current_line = tail;
+        }
+    }
+
+    fn record_text(&mut self, text: &str) {
+        let text = redact_log_text(text);
+        for ch in text.chars() {
+            if ch == '\n' {
+                let line = std::mem::take(&mut self.current_line);
+                let line = line.trim_end_matches('\r').to_owned();
+                self.push_completed_line(line);
+            } else {
+                self.current_line.push(ch);
+                self.enforce_current_line_cap();
+            }
+        }
+    }
+
+    fn record_file_change(&mut self, target: &str, workspace_root: &Path) {
+        let trimmed = target.trim();
+        let payload = if let Some(stripped) = trimmed.strip_prefix("File changes:") {
+            stripped.trim()
+        } else {
+            trimmed
+        };
+        for item in payload.split(',') {
+            let item = item.trim();
+            if let Some(rel) = normalize_workspace_path(item, workspace_root)
+                && !self.changed_files.contains(&rel)
+                && self.changed_files.len() < 50
+            {
+                self.changed_files.push(rel);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> dmuxai::web::NodeDetail {
+        let mut all_lines = self.lines.clone();
+        if !self.current_line.is_empty() {
+            all_lines.push(self.current_line.trim_end_matches('\r').to_owned());
+        }
+        let start = all_lines.len().saturating_sub(20);
+        let log_tail = all_lines[start..]
+            .iter()
+            .map(|l| dmuxai::web::truncate_with_ellipsis(l, 300))
+            .collect();
+        dmuxai::web::NodeDetail {
+            log_tail,
+            changed_files: self.changed_files.clone(),
+        }
+    }
+}
+
+fn is_write_tool(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    const EXACT: &[&str] = &[
+        "edit",
+        "write",
+        "write_to_file",
+        "create_file",
+        "replace_file_content",
+        "edit_file",
+        "write_file",
+        "notebook_edit",
+        "sed_file",
+        "multi_replace_file_content",
+        "apply_patch",
+        "str_replace",
+        "search_replace",
+    ];
+    if EXACT.contains(&lower.as_str()) {
+        return true;
+    }
+    lower.starts_with("write_")
+        || lower.starts_with("edit_")
+        || lower.ends_with("_write")
+        || lower.ends_with("_edit")
+}
+
+fn normalize_workspace_path(target: &str, workspace_root: &Path) -> Option<String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let target = if let Some(idx) = target.rfind(" (") {
+        &target[..idx]
+    } else {
+        target
+    };
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+
+    let p = Path::new(target);
+    if p.is_absolute() {
+        if let Ok(rel) = p.strip_prefix(workspace_root) {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if !rel_str.is_empty() && !rel_str.starts_with("../") {
+                return Some(rel_str);
+            }
+        }
+        if let (Ok(canon_p), Ok(canon_root)) = (p.canonicalize(), workspace_root.canonicalize())
+            && let Ok(rel) = canon_p.strip_prefix(&canon_root)
+        {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if !rel_str.is_empty() && !rel_str.starts_with("../") {
+                return Some(rel_str);
+            }
+        }
+        None
+    } else {
+        let clean = target.trim_start_matches("./").replace('\\', "/");
+        if clean.starts_with("../") || clean.contains("/../") {
+            None
+        } else {
+            Some(clean)
+        }
+    }
+}
+
 pub struct App {
     exit: bool,
     selected: usize,
@@ -464,7 +641,9 @@ pub struct App {
     terminal_area: Rect,
     graph_session: Option<GraphRunSession>,
     graph_assignment_line: String,
-    graph_active_turn_node: Option<String>,
+    /// Graph node id currently driven by each agent turn (parallel-safe, FR-702).
+    graph_agent_nodes: HashMap<Agent, String>,
+    graph_node_details: HashMap<String, NodeDetailTracker>,
     single_graph_plan: Option<(NodeRole, Agent, String)>,
     last_group_expanded: bool,
     all_details_expanded: bool,
@@ -633,7 +812,8 @@ impl App {
             terminal_area: Rect::default(),
             graph_session: None,
             graph_assignment_line: String::new(),
-            graph_active_turn_node: None,
+            graph_agent_nodes: HashMap::new(),
+            graph_node_details: HashMap::new(),
             single_graph_plan: None,
             last_group_expanded: false,
             all_details_expanded: false,
@@ -2098,6 +2278,8 @@ impl App {
         // Switching conversations clears the dashboard's retained graph so the
         // previous conversation's finished run is not shown (FR-525/FR-530).
         self.last_graph_run = None;
+        self.graph_node_details.clear();
+        self.graph_agent_nodes.clear();
         self.messages.clear();
         self.streaming_messages.clear();
         self.last_group_expanded = false;
@@ -2376,6 +2558,26 @@ impl App {
     }
 
     fn apply_agent_event(&mut self, agent: Agent, event: AgentEvent) {
+        if let Some(node_id) = self.active_graph_node_for_agent(agent) {
+            let tracker = self.graph_node_details.entry(node_id).or_default();
+            match &event {
+                AgentEvent::TextDelta(delta) => {
+                    tracker.record_text(delta);
+                }
+                AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                    name, target, ..
+                }) => {
+                    if is_write_tool(name) {
+                        tracker.record_file_change(target, &self.workspace_root);
+                    }
+                }
+                AgentEvent::ToolProgress { summary, .. } if summary.starts_with("File changes") => {
+                    tracker.record_file_change(summary, &self.workspace_root);
+                }
+                _ => {}
+            }
+        }
+
         match event {
             AgentEvent::Started => {
                 self.busy_agents.insert(agent);
@@ -2636,7 +2838,7 @@ impl App {
             }
             self.publish_todos();
         }
-        if let Some(node_id) = self.graph_active_turn_node.take()
+        if let Some(node_id) = self.graph_agent_nodes.remove(&agent)
             && let Some(session) = self.graph_session.as_mut()
         {
             let actions = session.on_node_finished(&node_id, success);
@@ -2723,6 +2925,8 @@ impl App {
 
     fn start_graph_run(&mut self, plan: dmuxai::graph::GraphPlan) {
         self.single_graph_plan = None;
+        self.graph_node_details.clear();
+        self.graph_agent_nodes.clear();
         let run = GraphRun {
             plan,
             conversation_id: self.conversation_id.as_str().to_owned(),
@@ -2757,7 +2961,6 @@ impl App {
                         "Gate: confirm sensitive step {} ({}) with /graph continue",
                         assignment.node_id, assignment.role
                     ));
-                    self.graph_active_turn_node = None;
                 }
                 GraphAction::Completed => {
                     self.push_system("Graph run completed.");
@@ -2776,30 +2979,21 @@ impl App {
                 }
                 GraphAction::Failed(message) => {
                     self.push_system(format!("Graph failed: {message}"));
-                    if let Some(node_id) = self.graph_active_turn_node.take() {
-                        let runner = self
-                            .graph_session
-                            .as_ref()
-                            .and_then(|s| s.run().plan.nodes.iter().find(|n| n.id == node_id))
-                            .map(|n| n.runner.clone());
-                        if let Some(runner) = runner
-                            && let Some(agent) = runner_from_str(&runner)
-                        {
-                            let _ = self.adapters[adapter_index(agent)].cancel();
-                            if let Some(active) = self.active_turns.remove(&agent) {
-                                let stored_output = TurnOutput {
-                                    conversation_id: active.conversation_id,
-                                    turn_id: active.turn_id,
-                                    agent: agent_key(agent),
-                                    event: TurnEvent::Cancelled,
-                                };
-                                let _ = self.engine.record_turn_outputs(&[stored_output]);
-                            }
-                            self.busy_agents.remove(&agent);
-                            self.streaming_messages.remove(&agent);
-                            self.activities.remove(&agent);
-                            self.tool_messages.remove(&agent);
+                    for (agent, _node_id) in self.graph_agent_nodes.drain() {
+                        let _ = self.adapters[adapter_index(agent)].cancel();
+                        if let Some(active) = self.active_turns.remove(&agent) {
+                            let stored_output = TurnOutput {
+                                conversation_id: active.conversation_id,
+                                turn_id: active.turn_id,
+                                agent: agent_key(agent),
+                                event: TurnEvent::Cancelled,
+                            };
+                            let _ = self.engine.record_turn_outputs(&[stored_output]);
                         }
+                        self.busy_agents.remove(&agent);
+                        self.streaming_messages.remove(&agent);
+                        self.activities.remove(&agent);
+                        self.tool_messages.remove(&agent);
                     }
                     self.graph_session = None;
                     self.graph_assignment_line.clear();
@@ -2824,6 +3018,10 @@ impl App {
         }
     }
 
+    fn active_graph_node_for_agent(&self, agent: Agent) -> Option<String> {
+        self.graph_agent_nodes.get(&agent).cloned()
+    }
+
     fn start_graph_node(&mut self, assignment: NodeAssignment) -> Result<(), String> {
         if self.graph_session.is_none() {
             return Err("no active graph session".to_owned());
@@ -2837,7 +3035,9 @@ impl App {
             ))]);
             return Err(format!("unknown graph runner: {}", assignment.runner));
         };
-        self.graph_active_turn_node = Some(assignment.node_id.clone());
+        self.graph_node_details.remove(&assignment.node_id);
+        self.graph_agent_nodes
+            .insert(agent, assignment.node_id.clone());
         let mut prompt = assignment.prompt;
         if let Some(session) = &self.graph_session {
             let skill_id = session
@@ -3282,10 +3482,18 @@ impl App {
             self.last_graph_run = Some(run);
         }
 
-        let graph = self
+        let mut graph = self
             .last_graph_run
             .as_ref()
             .map(dmuxai::web::snapshot_from_run);
+
+        if let Some(graph) = graph.as_mut() {
+            for node in &mut graph.nodes {
+                if let Some(tracker) = self.graph_node_details.get(&node.id) {
+                    node.detail = tracker.snapshot();
+                }
+            }
+        }
 
         hub.publish(agents, graph);
     }
@@ -5545,6 +5753,347 @@ mod tests {
             hub.snapshot().graph.is_none(),
             "the previous conversation's graph must not leak into a new one"
         );
+    }
+
+    // TC-703 / FR-702: running graph nodes carry log_tail (last 20 lines, truncated to 300 chars)
+    // and changed_files (workspace-relative, max 50, no paths outside workspace).
+    #[test]
+    fn dashboard_nodes_carry_log_tail_and_changed_files() {
+        let (mut app, _sent) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            app.workspace_root.to_string_lossy().into_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+
+        app.graph_session = Some(GraphRunSession::new(GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: "run-detail-test".to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: "track details".to_owned(),
+                limits: dmuxai::graph::GraphLimits::default(),
+                nodes: vec![dmuxai::graph::GraphNode {
+                    id: "step-1".to_owned(),
+                    role: NodeRole::Implement,
+                    job: "perform work".to_owned(),
+                    runner: "agy".to_owned(),
+                    model_id: "opencode-default".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Running,
+                    attempt: 1,
+                }],
+                edges: vec![],
+            },
+            conversation_id: app.conversation_id.as_str().to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+        }));
+        app.busy_agents.insert(Agent::Agy);
+        app.graph_agent_nodes
+            .insert(Agent::Agy, "step-1".to_owned());
+
+        // 1. Emit 25 lines of output, where line 15 is 350 chars long
+        let mut output_text = String::new();
+        for i in 1..=25 {
+            if i == 15 {
+                output_text.push_str(&"x".repeat(350));
+            } else if i == 25 {
+                output_text.push_str(&format!("{}extra", "x".repeat(299)));
+                output_text.push('😀');
+            } else if i == 20 {
+                output_text.push_str("open http://127.0.0.1/?token=deadbeefcafe00");
+            } else {
+                output_text.push_str(&format!("log line {i}"));
+            }
+            output_text.push('\n');
+        }
+        app.apply_agent_event(Agent::Agy, AgentEvent::TextDelta(output_text));
+
+        // 2. Emit write events:
+        // - A tool event with workspace-relative path and diff stats
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "edit".to_owned(),
+                target: "src/app.rs (+12 -3)".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        );
+        // - A tool event with absolute path inside workspace
+        let abs_path = app
+            .workspace_root
+            .join("src/main.rs")
+            .to_string_lossy()
+            .into_owned();
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "write_to_file".to_owned(),
+                target: abs_path,
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        );
+        // - A tool event with path OUTSIDE workspace (must be ignored)
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "edit".to_owned(),
+                target: "/etc/outside.txt".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        );
+        // - More than 50 files to verify the 50 cap
+        for i in 0..60 {
+            app.apply_agent_event(
+                Agent::Agy,
+                AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                    name: "edit".to_owned(),
+                    target: format!("src/file_{i}.rs"),
+                    status: dmuxai::activity::ToolStatus::Running,
+                    duration_ms: None,
+                    detail: String::new(),
+                }),
+            );
+        }
+
+        app.publish_dashboard();
+
+        let snapshot = hub.snapshot();
+        let graph = snapshot.graph.expect("expected graph");
+        let node = &graph.nodes[0];
+
+        // Verify log_tail: last 20 lines (lines 6..=25)
+        assert_eq!(node.detail.log_tail.len(), 20);
+        assert_eq!(node.detail.log_tail[0], "log line 6");
+        assert!(node.detail.log_tail[19].starts_with("xxx"));
+        // Line 15 was 350 chars; in the 20-line window (index 15 - 6 = 9), it should be truncated to 300 chars + ellipsis
+        assert_eq!(node.detail.log_tail[9].chars().count(), 301);
+        assert!(node.detail.log_tail[9].ends_with('…'));
+        assert_eq!(node.detail.log_tail[19].chars().count(), 301);
+        assert!(node.detail.log_tail[19].ends_with('…'));
+        assert!(
+            !node
+                .detail
+                .log_tail
+                .iter()
+                .any(|line| line.contains("deadbeefcafe00")),
+            "token query values must be redacted from log_tail"
+        );
+
+        // Verify changed_files:
+        assert!(node.detail.changed_files.contains(&"src/app.rs".to_owned()));
+        assert!(
+            node.detail
+                .changed_files
+                .contains(&"src/main.rs".to_owned())
+        );
+        assert!(
+            !node
+                .detail
+                .changed_files
+                .iter()
+                .any(|f| f.contains("outside"))
+        );
+        assert_eq!(node.detail.changed_files.len(), 50);
+    }
+
+    // FR-702: parallel runners attribute output to the correct node; retries reset detail.
+    #[test]
+    fn dashboard_node_detail_parallel_and_retry() {
+        use dmuxai::graph::NodeAssignment;
+
+        let (mut app, _sent) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            app.workspace_root.to_string_lossy().into_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+
+        app.graph_session = Some(GraphRunSession::new(GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: "parallel-detail".to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: "parallel".to_owned(),
+                limits: dmuxai::graph::GraphLimits {
+                    max_parallel: 2,
+                    max_retries: 2,
+                },
+                nodes: vec![
+                    dmuxai::graph::GraphNode {
+                        id: "node-a".to_owned(),
+                        role: NodeRole::Implement,
+                        job: "work a".to_owned(),
+                        runner: "codex".to_owned(),
+                        model_id: "m".to_owned(),
+                        skill: None,
+                        requires_gate: false,
+                        status: dmuxai::graph::GraphNodeStatus::Running,
+                        attempt: 1,
+                    },
+                    dmuxai::graph::GraphNode {
+                        id: "node-b".to_owned(),
+                        role: NodeRole::Review,
+                        job: "work b".to_owned(),
+                        runner: "cursor".to_owned(),
+                        model_id: "m".to_owned(),
+                        skill: None,
+                        requires_gate: false,
+                        status: dmuxai::graph::GraphNodeStatus::Running,
+                        attempt: 1,
+                    },
+                ],
+                edges: vec![],
+            },
+            conversation_id: app.conversation_id.as_str().to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+        }));
+        app.graph_agent_nodes
+            .insert(Agent::Codex, "node-a".to_owned());
+        app.graph_agent_nodes
+            .insert(Agent::Cursor, "node-b".to_owned());
+        app.busy_agents.insert(Agent::Codex);
+        app.busy_agents.insert(Agent::Cursor);
+
+        app.apply_agent_event(
+            Agent::Codex,
+            AgentEvent::TextDelta("codex-only\n".to_owned()),
+        );
+        app.apply_agent_event(
+            Agent::Cursor,
+            AgentEvent::TextDelta("cursor-only\n".to_owned()),
+        );
+        app.publish_dashboard();
+
+        let graph = hub.snapshot().graph.expect("graph");
+        let node_a = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "node-a")
+            .expect("node-a");
+        let node_b = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "node-b")
+            .expect("node-b");
+        assert!(
+            node_a
+                .detail
+                .log_tail
+                .iter()
+                .any(|line| line.contains("codex-only"))
+        );
+        assert!(
+            !node_a
+                .detail
+                .log_tail
+                .iter()
+                .any(|line| line.contains("cursor-only"))
+        );
+        assert!(
+            node_b
+                .detail
+                .log_tail
+                .iter()
+                .any(|line| line.contains("cursor-only"))
+        );
+        assert!(
+            !node_b
+                .detail
+                .log_tail
+                .iter()
+                .any(|line| line.contains("codex-only"))
+        );
+
+        app.graph_session = Some(GraphRunSession::new(GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: "retry-detail".to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: "retry".to_owned(),
+                limits: dmuxai::graph::GraphLimits::default(),
+                nodes: vec![dmuxai::graph::GraphNode {
+                    id: "step-1".to_owned(),
+                    role: NodeRole::Implement,
+                    job: "retry work".to_owned(),
+                    runner: "agy".to_owned(),
+                    model_id: "m".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Running,
+                    attempt: 2,
+                }],
+                edges: vec![],
+            },
+            conversation_id: app.conversation_id.as_str().to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+        }));
+        app.graph_agent_nodes
+            .insert(Agent::Agy, "step-1".to_owned());
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::TextDelta("before-retry\n".to_owned()),
+        );
+        app.busy_agents.remove(&Agent::Agy);
+        let assignment = NodeAssignment {
+            node_id: "step-1".to_owned(),
+            runner: "agy".to_owned(),
+            model_id: "m".to_owned(),
+            prompt: "retry work".to_owned(),
+            role: NodeRole::Implement,
+        };
+        app.start_graph_node(assignment)
+            .expect("start retry attempt");
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::TextDelta("after-retry\n".to_owned()),
+        );
+        app.publish_dashboard();
+
+        let retry_graph = hub.snapshot().graph.expect("graph after retry");
+        let retry_node = &retry_graph.nodes[0];
+        assert!(
+            retry_node
+                .detail
+                .log_tail
+                .iter()
+                .any(|line| line.contains("after-retry"))
+        );
+        assert!(
+            !retry_node
+                .detail
+                .log_tail
+                .iter()
+                .any(|line| line.contains("before-retry"))
+        );
+    }
+
+    #[test]
+    fn is_write_tool_matches_known_names_not_substrings() {
+        assert!(is_write_tool("edit"));
+        assert!(is_write_tool("apply_patch"));
+        assert!(is_write_tool("str_replace"));
+        assert!(!is_write_tool("credit"));
+        assert!(!is_write_tool("readonly"));
+    }
+
+    #[test]
+    fn redact_log_text_scrubs_token_query_values() {
+        let redacted = redact_log_text("see ?token=abc123dead and token=00ff11aa");
+        assert!(!redacted.contains("abc123dead"));
+        assert!(!redacted.contains("00ff11aa"));
+        assert!(redacted.contains("?token=[redacted]"));
+        assert!(redacted.contains("token=[redacted]"));
     }
 
     // TC-542 / FR-542: run to-do as agent or through graph planner;

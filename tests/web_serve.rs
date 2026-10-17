@@ -48,9 +48,54 @@ fn http_get(authority: &str, path: &str, token: Option<&str>) -> (u16, String) {
     (status, response)
 }
 
+/// A graph fixture whose plan carries edges, for TC-702 / FR-701 / NFR-700.
+fn write_graph_fixture(workspace: &std::path::Path) {
+    let graphs = workspace.join(".dmuxai").join("graphs");
+    std::fs::create_dir_all(&graphs).expect("create graphs dir");
+    let run = serde_json::json!({
+        "plan": {
+            "schema": "dmuxai.graph/v1",
+            "id": "serve-run",
+            "orchestrator_model": "gpt-4o",
+            "user_prompt": "serve graph",
+            "limits": { "max_parallel": 2, "max_retries": 2 },
+            "nodes": [
+                {
+                    "id": "a", "role": "plan", "job": "root",
+                    "runner": "codex", "model_id": "m", "skill": null,
+                    "requires_gate": false, "status": "completed", "attempt": 1
+                },
+                {
+                    "id": "b", "role": "implement", "job": "left",
+                    "runner": "codex", "model_id": "m", "skill": null,
+                    "requires_gate": false, "status": "running", "attempt": 1
+                },
+                {
+                    "id": "c", "role": "review", "job": "right",
+                    "runner": "codex", "model_id": "m", "skill": null,
+                    "requires_gate": false, "status": "pending", "attempt": 0
+                }
+            ],
+            "edges": [
+                { "from": "a", "to": "b" },
+                { "from": "a", "to": "c" }
+            ]
+        },
+        "conversation_id": "conv-1",
+        "phase": "active",
+        "waiting_gate_node": null
+    });
+    std::fs::write(
+        graphs.join("serve.json"),
+        serde_json::to_vec_pretty(&run).expect("serialize graph fixture"),
+    )
+    .expect("write graph fixture");
+}
+
 #[test]
 fn serve_prints_token_url_and_serves_state() {
     let workspace = tempfile::tempdir().expect("temp workspace");
+    write_graph_fixture(workspace.path());
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
         .args(["serve", "--port", "0"])
@@ -111,6 +156,32 @@ fn serve_prints_token_url_and_serves_state() {
     assert!(
         with_token_body.contains("dmuxai.dashboard/v1"),
         "body missing snapshot schema: {with_token_body}"
+    );
+
+    // TC-702 / FR-701 / NFR-700: the file-sourced graph exposes deps, layout
+    // and layers. The serve loop polls on an interval, so retry briefly.
+    let mut graph_body = with_token_body.clone();
+    for _ in 0..40 {
+        if graph_body.contains("\"deps\":[\"a\"]")
+            && graph_body.contains("\"layout\":{\"layer\":1,\"order\":0}")
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        let (_, body) = http_get(authority, "/api/state", Some(token));
+        graph_body = body;
+    }
+    assert!(
+        graph_body.contains("\"deps\":[\"a\"]"),
+        "served graph node missing deps: {graph_body}"
+    );
+    assert!(
+        graph_body.contains("\"layout\":{\"layer\":1,\"order\":0}"),
+        "served graph node missing layout: {graph_body}"
+    );
+    assert!(
+        graph_body.contains("\"layers\":2"),
+        "served graph missing layers count: {graph_body}"
     );
 
     let (without_token_status, _) = http_get(authority, "/api/state", None);

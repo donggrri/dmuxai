@@ -194,7 +194,7 @@ impl DashboardHub {
 mod tests {
     use super::*;
     use crate::graph::{GraphEdge, GraphNodeStatus, GraphRunPhase, NodeRole};
-    use crate::web::snapshot::{GraphCounts, NodeView};
+    use crate::web::snapshot::{GraphCounts, NodeDetail, NodeView};
 
     fn make_test_graph(id: &str, status: GraphNodeStatus) -> GraphView {
         make_test_graph_with_attempt(id, status, 0)
@@ -233,6 +233,7 @@ mod tests {
                 failed: 0,
                 skipped: 0,
             },
+            layers: 1,
             nodes: vec![NodeView {
                 id: "node-1".to_string(),
                 role: NodeRole::Implement,
@@ -244,6 +245,9 @@ mod tests {
                 started_at_ms: None,
                 finished_at_ms: None,
                 elapsed_ms: None,
+                deps: Vec::new(),
+                layout: None,
+                detail: NodeDetail::default(),
             }],
             edges: vec![GraphEdge {
                 from: "a".to_string(),

@@ -6,8 +6,11 @@ var POLL_MAX_MS = 30000;
 var MAX_SSE_FAILURES = 3;
 var JOB_PREVIEW_LEN = 120;
 var TOKEN_KEY = 'dmuxai.token';
+// UX-700: progress-bar segment order is completed (green), running (striped
+// blue), failed (red), then the remaining states with pending last, matching
+// mockup #5.
 var STATUS_ORDER = [
-  'pending', 'ready', 'running', 'waiting_gate', 'completed', 'failed', 'skipped'
+  'completed', 'running', 'failed', 'pending', 'ready', 'waiting_gate', 'skipped'
 ];
 
 function storageGet(key) {
@@ -417,7 +420,7 @@ function renderNodes(graph, nowMs) {
     var meta = el('div', 'node-meta');
     meta.appendChild(el('span', 'node-role', String(node.role || '')));
     meta.appendChild(el('span', 'dot', '\u00b7'));
-    meta.appendChild(el('span', 'node-runner', String(node.runner || '')));
+    meta.appendChild(el('span', 'node-runner', runnerShortName(node.runner)));
     if (node.model_id) {
       meta.appendChild(el('span', 'dot', '\u00b7'));
       meta.appendChild(el('span', 'node-model', String(node.model_id || '')));
@@ -430,6 +433,731 @@ function renderNodes(graph, nowMs) {
 
     list.appendChild(item);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Graph view (SPEC-graph-view UX-700..UX-703, NFR-700, TC-704).
+// Inline SVG "subway map": x = layout layer column, y = order row. Stations are
+// circles colored by state via theme CSS variables; edges are thick rounded
+// paths from dependency to dependent, colored by the source node's state.
+// No external resources, no inline style attributes (SVG attributes only).
+// ---------------------------------------------------------------------------
+
+var GRAPH_VIEW_KEY = 'dmuxai.graphView';
+// Standard SVG namespace; not a fetched resource.
+var SVG_NS = 'http://www.w3.org/2000/svg';
+var GRAPH_PAD = 70;
+var GRAPH_COL_W = 190;
+var GRAPH_ROW_H = 130;
+var GRAPH_R = 13;
+var GRAPH_MIN_SCALE = 0.25;
+var GRAPH_MAX_SCALE = 3;
+// UX-700/UX-703: long edges detour onto a lane offset half a row from the
+// source, and the canvas auto-fits the map within these height bounds.
+var GRAPH_LANE_K = 40;
+var GRAPH_FIT_PAD = 6;
+var GRAPH_MIN_H = 320;
+var GRAPH_MAX_H_RATIO = 0.7;
+
+// graphViewPref is the stored user choice (or null before one exists, in which
+// case the default follows the layer count: Graph when layers > 1).
+var graphViewPref = null;
+var graphViewMode = 'graph';
+var graphTransform = { scale: 1, x: 0, y: 0 };
+var graphSelectedId = null;
+var graphPan = null;
+var graphZoomGroup = null;
+// Set once the user pans/zooms; auto-fit still re-runs when the node set
+// changes so a growing graph is always fully visible (UX-703).
+var graphUserInteracted = false;
+var lastGraphGeometryKey = null;
+var lastGraphCanvasRevision = null;
+var lastGraphCanvasGeometryKey = null;
+var graphGeometry = null;
+
+function svgEl(tag) { return document.createElementNS(SVG_NS, tag); }
+
+function svgText(x, y, text, className) {
+  var node = svgEl('text');
+  node.setAttribute('x', x);
+  node.setAttribute('y', y);
+  node.setAttribute('text-anchor', 'middle');
+  node.setAttribute('class', className);
+  node.textContent = text;
+  return node;
+}
+
+function graphCircle(className, cx, cy, r) {
+  var circle = svgEl('circle');
+  circle.setAttribute('class', className);
+  circle.setAttribute('cx', cx);
+  circle.setAttribute('cy', cy);
+  circle.setAttribute('r', r);
+  return circle;
+}
+
+function graphNodeStatus(node) {
+  return node && typeof node.status === 'string' ? node.status : 'pending';
+}
+
+// Deterministic fallback layering from deps, used only if a snapshot has no
+// server-side layout (FR-700 already computes it server-side).
+function computeDepsLayers(nodes) {
+  var layer = {};
+  var i;
+  for (i = 0; i < nodes.length; i++) { layer[String(nodes[i].id)] = 0; }
+  for (var pass = 0; pass < nodes.length; pass++) {
+    var changed = false;
+    for (i = 0; i < nodes.length; i++) {
+      var deps = Array.isArray(nodes[i].deps) ? nodes[i].deps : [];
+      var best = 0;
+      for (var d = 0; d < deps.length; d++) {
+        var dep = layer[String(deps[d])];
+        if (typeof dep === 'number' && dep + 1 > best) { best = dep + 1; }
+      }
+      var key = String(nodes[i].id);
+      if (best > layer[key]) { layer[key] = best; changed = true; }
+    }
+    if (!changed) { break; }
+  }
+  return layer;
+}
+
+function buildGraphGeometry(graph) {
+  var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+  var entries = [];
+  var missingLayout = false;
+  var i;
+  for (i = 0; i < nodes.length; i++) {
+    var node = nodes[i];
+    var hasLayout = node && node.layout &&
+      typeof node.layout.layer === 'number' && typeof node.layout.order === 'number';
+    if (!hasLayout) { missingLayout = true; }
+    entries.push({
+      node: node,
+      id: String(node.id),
+      layer: hasLayout ? node.layout.layer : 0,
+      order: hasLayout ? node.layout.order : 0,
+      index: i
+    });
+  }
+  if (missingLayout) {
+    var fallback = computeDepsLayers(nodes);
+    for (i = 0; i < entries.length; i++) {
+      var depth = fallback[entries[i].id];
+      entries[i].layer = typeof depth === 'number' ? depth : 0;
+    }
+    var orderInLayer = {};
+    var byPlan = entries.slice().sort(function (a, b) { return a.index - b.index; });
+    for (i = 0; i < byPlan.length; i++) {
+      var planned = byPlan[i];
+      var ord = orderInLayer[planned.layer] || 0;
+      orderInLayer[planned.layer] = ord + 1;
+      planned.order = ord;
+    }
+  }
+  entries.sort(function (a, b) {
+    if (a.layer !== b.layer) { return a.layer - b.layer; }
+    if (a.order !== b.order) { return a.order - b.order; }
+    return a.index - b.index;
+  });
+
+  var rowInLayer = {};
+  var maxLayer = 0;
+  var maxRow = 0;
+  var positions = {};
+  for (i = 0; i < entries.length; i++) {
+    var entry = entries[i];
+    var row = rowInLayer[entry.layer] || 0;
+    rowInLayer[entry.layer] = row + 1;
+    entry.x = GRAPH_PAD + entry.layer * GRAPH_COL_W;
+    entry.y = GRAPH_PAD + row * GRAPH_ROW_H;
+    positions[entry.id] = entry;
+    if (entry.layer > maxLayer) { maxLayer = entry.layer; }
+    if (row > maxRow) { maxRow = row; }
+  }
+  return {
+    entries: entries,
+    positions: positions,
+    width: GRAPH_PAD * 2 + maxLayer * GRAPH_COL_W,
+    height: GRAPH_PAD * 2 + maxRow * GRAPH_ROW_H
+  };
+}
+
+// Subway-style rounded elbow: leave the source horizontally, cross at the
+// midpoint, and enter the target horizontally.
+function edgePath(from, to) {
+  var sx = from.x + GRAPH_R;
+  var sy = from.y;
+  var tx = to.x - GRAPH_R;
+  var ty = to.y;
+  if (tx <= sx + 4) {
+    var mid = (sx + tx) / 2;
+    return 'M' + sx + ',' + sy + ' L' + mid + ',' + sy +
+      ' L' + mid + ',' + ty + ' L' + tx + ',' + ty;
+  }
+  var span = (typeof to.layer === 'number' && typeof from.layer === 'number')
+    ? to.layer - from.layer
+    : 1;
+  if (span > 1) {
+    return longEdgePath(sx, sy, tx, ty);
+  }
+  var mx1 = sx + (tx - sx) * 0.4;
+  var mx2 = sx + (tx - sx) * 0.6;
+  return 'M' + sx + ',' + sy +
+    ' L' + mx1 + ',' + sy +
+    ' L' + mx2 + ',' + ty +
+    ' L' + tx + ',' + ty;
+}
+
+// UX-700: an edge that spans more than one layer detours onto a horizontal
+// lane halfway between the source row and its neighbour, so it never runs
+// through the stations of an intermediate layer. The corner joins are rounded
+// by the .edge stroke-linejoin rule.
+function longEdgePath(sx, sy, tx, ty) {
+  var k = Math.min(GRAPH_LANE_K, (tx - sx) / 3);
+  var laneY = ty >= sy ? sy + GRAPH_ROW_H / 2 : sy - GRAPH_ROW_H / 2;
+  var a = sx + k;
+  var b = tx - k;
+  return 'M' + sx + ',' + sy +
+    ' L' + a + ',' + sy +
+    ' L' + a + ',' + laneY +
+    ' L' + b + ',' + laneY +
+    ' L' + b + ',' + ty +
+    ' L' + tx + ',' + ty;
+}
+
+// UX-700: collapse long runner ids to the short label used by mockup #5
+// (`opencode-glm` -> `glm`, `agy` -> `AGY`).
+function runnerShortName(name) {
+  var short = String(name || '').replace(/^opencode-/i, '');
+  if (short.toLowerCase() === 'agy') { return 'AGY'; }
+  return short;
+}
+
+// UX-700: without a measured elapsed time the station sublabel shows the state
+// word instead (mockup #5: done / failed / running / pending / waiting / skipped).
+var STATION_STATE_WORDS = {
+  completed: 'done',
+  failed: 'failed',
+  running: 'running',
+  pending: 'pending',
+  ready: 'pending',
+  waiting_gate: 'waiting',
+  skipped: 'skipped'
+};
+
+function stationStateWord(status) {
+  return STATION_STATE_WORDS[status] || 'pending';
+}
+
+function nodeAriaLabel(node) {
+  return String(node.id) + ': ' + String(node.role || '') + ', ' +
+    runnerShortName(node.runner) + ', ' + graphNodeStatus(node);
+}
+
+function nodeTitleText(node) {
+  return String(node.id) + ' \u2014 ' + String(node.role || '') + ' (' +
+    runnerShortName(node.runner) + ')';
+}
+
+function graphNodeElementById(id) {
+  var groups = document.querySelectorAll('.graph-svg g.node[data-id]');
+  for (var i = 0; i < groups.length; i++) {
+    if (groups[i].getAttribute('data-id') === id) { return groups[i]; }
+  }
+  return null;
+}
+
+function nodeMetaLabel(node, nowMs) {
+  var parts = [];
+  if (node.runner) { parts.push(runnerShortName(node.runner)); }
+  var status = graphNodeStatus(node);
+  var ms = nodeElapsed(node, snapshot, nowMs);
+  parts.push(ms === null ? stationStateWord(status) : fmtElapsed(ms));
+  if (status === 'failed' && typeof node.attempt === 'number' && node.attempt > 1) {
+    parts.push('\u00d7' + node.attempt);
+  }
+  return parts.join(' \u00b7 ');
+}
+
+function graphStation(entry, nowMs) {
+  var node = entry.node;
+  var status = graphNodeStatus(node);
+  var group = svgEl('g');
+  var classes = 'node state-' + status;
+  if (graphSelectedId === entry.id) { classes += ' node-selected'; }
+  group.setAttribute('class', classes);
+  group.setAttribute('data-id', entry.id);
+  group.setAttribute('transform', 'translate(' + entry.x + ',' + entry.y + ')');
+  group.setAttribute('tabindex', '0');
+  group.setAttribute('role', 'button');
+  group.setAttribute('aria-label', nodeAriaLabel(node));
+
+  var title = svgEl('title');
+  title.textContent = nodeTitleText(node);
+  group.appendChild(title);
+
+  if (status === 'running') {
+    group.appendChild(graphCircle('ring ring-outer', 0, 0, GRAPH_R + 9));
+    group.appendChild(graphCircle('ring ring-inner', 0, 0, GRAPH_R + 4));
+    group.appendChild(graphCircle('core', 0, 0, GRAPH_R));
+    group.appendChild(graphCircle('dot', 0, 0, 5));
+  } else {
+    group.appendChild(graphCircle('station', 0, 0, GRAPH_R));
+    if (status === 'completed') {
+      var check = svgEl('path');
+      check.setAttribute('class', 'check');
+      check.setAttribute('d', 'M-6,0 L-2,4 L6,-5');
+      group.appendChild(check);
+    } else if (status === 'failed') {
+      var cross = svgEl('path');
+      cross.setAttribute('class', 'cross');
+      cross.setAttribute('d', 'M-5,-5 L5,5 M5,-5 L-5,5');
+      group.appendChild(cross);
+    }
+  }
+
+  group.appendChild(svgText(0, -(GRAPH_R + 12), entry.id, 'node-label'));
+  group.appendChild(svgText(0, GRAPH_R + 20, nodeMetaLabel(node, nowMs), 'node-meta'));
+
+  group.addEventListener('click', function () { selectGraphNode(entry.id); });
+  group.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+      e.preventDefault();
+      selectGraphNode(entry.id);
+    }
+  });
+  return group;
+}
+
+function applyGraphTransform() {
+  if (!graphZoomGroup) { return; }
+  graphZoomGroup.setAttribute(
+    'transform',
+    'translate(' + graphTransform.x + ',' + graphTransform.y + ') scale(' + graphTransform.scale + ')'
+  );
+}
+
+// UX-703: key the node set by ids and layout so a pan/zoom is only dropped
+// when the map itself changes, not on every status tick or detail re-render.
+function graphGeometryKey(geometry) {
+  var parts = [];
+  for (var i = 0; i < geometry.entries.length; i++) {
+    var entry = geometry.entries[i];
+    parts.push(entry.id + '@' + entry.layer + ',' + entry.order);
+  }
+  return parts.join('|');
+}
+
+// UX-700: the canvas grows with the map but stays within [320px, 70vh].
+function graphCanvasHeight(geometry) {
+  var viewportMax = Math.round(window.innerHeight * GRAPH_MAX_H_RATIO);
+  var maxH = Math.max(GRAPH_MIN_H, viewportMax);
+  return Math.max(GRAPH_MIN_H, Math.min(geometry.height, maxH));
+}
+
+// UX-703: scale and center the whole map inside the canvas. Returns false when
+// the canvas has no measured size (e.g. while the List view hides it).
+function autoFitGraph(geometry) {
+  var canvas = $('graph-canvas');
+  if (!canvas) { return false; }
+  var cw = canvas.clientWidth;
+  var ch = canvas.clientHeight;
+  if (!cw || !ch) { return false; }
+  var availW = Math.max(1, cw - GRAPH_FIT_PAD * 2);
+  var availH = Math.max(1, ch - GRAPH_FIT_PAD * 2);
+  var scale = Math.min(availW / geometry.width, availH / geometry.height, 1);
+  scale = Math.max(GRAPH_MIN_SCALE, Math.min(GRAPH_MAX_SCALE, scale));
+  graphTransform.scale = scale;
+  graphTransform.x = (cw - geometry.width * scale) / 2;
+  graphTransform.y = (ch - geometry.height * scale) / 2;
+  return true;
+}
+
+function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
+  var canvas = $('graph-canvas');
+  if (!canvas) { return; }
+  graphZoomGroup = null;
+  canvas.replaceChildren();
+  var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+  if (nodes.length === 0) {
+    canvas.appendChild(el('p', 'empty', 'no nodes in this run'));
+    return;
+  }
+
+  var geometry = geometryOpt || buildGraphGeometry(graph);
+  graphGeometry = geometry;
+  var width = geometry.width;
+  var height = geometry.height;
+  canvas.style.height = graphCanvasHeight(geometry) + 'px';
+  var svg = svgEl('svg');
+  svg.setAttribute('class', 'graph-svg');
+  svg.setAttribute('width', width);
+  svg.setAttribute('height', height);
+  svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', 'Dependency graph, ' + nodes.length + ' nodes');
+
+  var zoom = svgEl('g');
+  zoom.setAttribute('class', 'graph-zoom');
+  graphZoomGroup = zoom;
+
+  var edges = graph && Array.isArray(graph.edges) ? graph.edges : [];
+  var i;
+  for (i = 0; i < edges.length; i++) {
+    var edge = edges[i] || {};
+    var from = geometry.positions[String(edge.from)];
+    var to = geometry.positions[String(edge.to)];
+    if (!from || !to || from.id === to.id) { continue; }
+    var path = svgEl('path');
+    path.setAttribute('class', 'edge edge-' + graphNodeStatus(from.node));
+    path.setAttribute('d', edgePath(from, to));
+    zoom.appendChild(path);
+  }
+
+  for (i = 0; i < geometry.entries.length; i++) {
+    zoom.appendChild(graphStation(geometry.entries[i], nowMs));
+  }
+
+  // Auto-fit only until the user pans/zooms; geometry changes do not refit (UX-703).
+  var key = geometryKeyOpt || graphGeometryKey(geometry);
+  if (!graphUserInteracted) {
+    autoFitGraph(geometry);
+  }
+  lastGraphGeometryKey = key;
+
+  svg.appendChild(zoom);
+  canvas.appendChild(svg);
+  applyGraphTransform();
+}
+
+function updateGraphNodeSelection() {
+  var groups = document.querySelectorAll('.graph-svg g.node[data-id]');
+  for (var i = 0; i < groups.length; i++) {
+    var id = groups[i].getAttribute('data-id');
+    groups[i].classList.toggle('node-selected', id === graphSelectedId);
+  }
+}
+
+function updateRunningGraphStationMeta(graph, nowMs) {
+  var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+  for (var i = 0; i < nodes.length; i++) {
+    var node = nodes[i];
+    if (graphNodeStatus(node) !== 'running') { continue; }
+    var group = graphNodeElementById(String(node.id));
+    if (!group) { continue; }
+    var meta = group.querySelector('.node-meta');
+    if (meta) { meta.textContent = nodeMetaLabel(node, nowMs); }
+  }
+}
+
+function syncGraphCanvas(graph, nowMs, revision) {
+  if (!graph) { return; }
+  var geometry = buildGraphGeometry(graph);
+  var key = graphGeometryKey(geometry);
+  var needsBuild = lastGraphCanvasRevision !== revision ||
+    lastGraphCanvasGeometryKey !== key ||
+    !document.querySelector('.graph-svg');
+  if (needsBuild) {
+    renderGraphCanvas(graph, nowMs, geometry, key);
+    lastGraphCanvasRevision = revision;
+    lastGraphCanvasGeometryKey = key;
+    updateGraphNodeSelection();
+    return;
+  }
+  graphGeometry = geometry;
+  updateRunningGraphStationMeta(graph, nowMs);
+  updateGraphNodeSelection();
+}
+
+function selectGraphNode(id) {
+  graphSelectedId = id;
+  var graph = snapshot && snapshot.graph ? snapshot.graph : null;
+  var now = lastRendered || Date.now();
+  updateGraphNodeSelection();
+  renderGraphDetail(graph, now);
+}
+
+function closeGraphDetail() {
+  var focusId = graphSelectedId;
+  graphSelectedId = null;
+  var panel = $('graph-detail');
+  if (panel) {
+    panel.hidden = true;
+    panel.replaceChildren();
+  }
+  updateGraphNodeSelection();
+  if (focusId) {
+    var node = graphNodeElementById(focusId);
+    if (node) { node.focus(); }
+  }
+}
+
+function detailRow(list, label, value) {
+  list.appendChild(el('dt', null, label));
+  list.appendChild(el('dd', null, value));
+}
+
+function detailSection(title, items, className) {
+  var section = el('div', 'detail-section');
+  section.appendChild(el('h4', 'detail-section-title', title));
+  if (!items || items.length === 0) {
+    section.appendChild(el('p', 'detail-empty', 'none'));
+    return section;
+  }
+  if (className === 'detail-log') {
+    var pre = el('pre', className);
+    var lines = [];
+    for (var i = 0; i < items.length; i++) { lines.push(String(items[i])); }
+    pre.textContent = lines.join('\n');
+    section.appendChild(pre);
+  } else {
+    var ul = el('ul', className);
+    for (var j = 0; j < items.length; j++) {
+      ul.appendChild(el('li', null, String(items[j])));
+    }
+    section.appendChild(ul);
+  }
+  return section;
+}
+
+function renderGraphDetail(graph, nowMs) {
+  var panel = $('graph-detail');
+  if (!panel) { return; }
+  var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+  var node = null;
+  for (var i = 0; i < nodes.length; i++) {
+    if (String(nodes[i].id) === graphSelectedId) { node = nodes[i]; break; }
+  }
+  if (!node || graphViewMode !== 'graph') {
+    if (!node) { graphSelectedId = null; }
+    panel.hidden = true;
+    panel.replaceChildren();
+    return;
+  }
+
+  panel.hidden = false;
+  panel.replaceChildren();
+
+  var head = el('div', 'detail-head');
+  head.appendChild(el('h3', 'detail-title', String(node.id)));
+  var close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'btn detail-close';
+  close.textContent = 'Close';
+  close.setAttribute('aria-label', 'Close node details');
+  close.addEventListener('click', closeGraphDetail);
+  head.appendChild(close);
+  panel.appendChild(head);
+
+  var status = graphNodeStatus(node);
+  panel.appendChild(el('span', 'badge badge-' + status, status));
+
+  var list = el('dl', 'detail-grid');
+  detailRow(list, 'Runner', runnerShortName(node.runner) || '\u2013');
+  detailRow(list, 'Model', String(node.model_id || '\u2013'));
+  detailRow(list, 'Role', String(node.role || '\u2013'));
+  detailRow(list, 'Attempt', String(typeof node.attempt === 'number' ? node.attempt : 0));
+  var ms = nodeElapsed(node, snapshot, nowMs);
+  detailRow(list, 'Elapsed', ms === null ? '\u2013' : fmtElapsed(ms));
+  detailRow(list, 'Job', String(node.job || '\u2013'));
+  panel.appendChild(list);
+
+  var detail = node.detail && typeof node.detail === 'object' ? node.detail : {};
+  panel.appendChild(detailSection(
+    'Log tail', Array.isArray(detail.log_tail) ? detail.log_tail : [], 'detail-log'
+  ));
+  panel.appendChild(detailSection(
+    'Changed files', Array.isArray(detail.changed_files) ? detail.changed_files : [], 'detail-files'
+  ));
+}
+
+// ETA is only derivable from real timings: at least one finished node with a
+// measured duration, and work still remaining. Otherwise it is omitted.
+function estimateEtaMs(graph) {
+  var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+  var total = 0;
+  var done = 0;
+  var active = 0;
+  var sum = 0;
+  var finished = 0;
+  for (var i = 0; i < nodes.length; i++) {
+    var node = nodes[i];
+    total += 1;
+    var status = graphNodeStatus(node);
+    if (status === 'completed' || status === 'failed' || status === 'skipped') {
+      done += 1;
+      var ms = null;
+      if (typeof node.elapsed_ms === 'number') {
+        ms = node.elapsed_ms;
+      } else if (
+        typeof node.started_at_ms === 'number' && typeof node.finished_at_ms === 'number'
+      ) {
+        ms = node.finished_at_ms - node.started_at_ms;
+      }
+      if (ms !== null && ms > 0) { sum += ms; finished += 1; }
+    } else if (status === 'running') {
+      active += 1;
+    }
+  }
+  var remaining = total - done;
+  if (remaining <= 0 || finished === 0) { return null; }
+  var concurrency = active > 0 ? active : 1;
+  return Math.round((sum / finished) * remaining / concurrency);
+}
+
+function renderGraphSummary(graph) {
+  renderBar(graph);
+  renderCounts(graph);
+
+  var counts = graphCounts(graph);
+  var total = 0;
+  var completed = 0;
+  var i;
+  for (i = 0; i < counts.length; i++) {
+    total += counts[i].n;
+    if (counts[i].key === 'completed') { completed = counts[i].n; }
+  }
+
+  var percentEl = $('graph-percent');
+  if (percentEl) {
+    percentEl.textContent = total > 0 ? Math.round((completed / total) * 100) + '%' : '0%';
+  }
+
+  var etaEl = $('graph-eta');
+  if (etaEl) {
+    var etaMs = estimateEtaMs(graph);
+    if (etaMs === null) {
+      etaEl.hidden = true;
+      etaEl.textContent = '';
+    } else {
+      etaEl.hidden = false;
+      etaEl.textContent = 'ETA ~' + fmtElapsed(etaMs);
+    }
+  }
+}
+
+function resolveGraphViewMode(graph) {
+  if (graphViewPref === 'graph' || graphViewPref === 'list') { return graphViewPref; }
+  var layers = graph && typeof graph.layers === 'number' ? graph.layers : 0;
+  return layers > 1 ? 'graph' : 'list';
+}
+
+function applyGraphViewMode() {
+  var graph = snapshot && snapshot.graph ? snapshot.graph : null;
+  graphViewMode = resolveGraphViewMode(graph);
+
+  var list = $('nodes');
+  var stage = $('graph-stage');
+  var detail = $('graph-detail');
+  var listBtn = $('view-list');
+  var graphBtn = $('view-graph');
+
+  if (list) { list.hidden = graphViewMode !== 'list'; }
+  if (stage) { stage.hidden = graphViewMode !== 'graph'; }
+  if (detail && (graphViewMode !== 'graph' || !graphSelectedId)) { detail.hidden = true; }
+
+  if (listBtn) {
+    listBtn.classList.toggle('on', graphViewMode === 'list');
+    listBtn.setAttribute('aria-pressed', graphViewMode === 'list' ? 'true' : 'false');
+  }
+  if (graphBtn) {
+    graphBtn.classList.toggle('on', graphViewMode === 'graph');
+    graphBtn.setAttribute('aria-pressed', graphViewMode === 'graph' ? 'true' : 'false');
+  }
+}
+
+function setGraphViewChoice(mode) {
+  graphViewPref = mode === 'list' ? 'list' : 'graph';
+  try { window.localStorage.setItem(GRAPH_VIEW_KEY, graphViewPref); } catch (err) { /* ignore */ }
+  if (graphViewPref === 'list') {
+    closeGraphDetail();
+  }
+  applyGraphViewMode();
+  if (graphViewPref === 'graph') {
+    var graph = snapshot && snapshot.graph ? snapshot.graph : null;
+    var now = lastRendered || Date.now();
+    var rev = snapshot && typeof snapshot.revision === 'number' ? snapshot.revision : null;
+    if (graph && rev !== null) {
+      syncGraphCanvas(graph, now, rev);
+    }
+    renderGraphDetail(graph, now);
+  }
+}
+
+function onGraphWheel(e) {
+  if (!graphZoomGroup) { return; }
+  e.preventDefault();
+  var canvas = $('graph-canvas');
+  if (!canvas) { return; }
+  graphUserInteracted = true;
+  var rect = canvas.getBoundingClientRect();
+  var px = e.clientX - rect.left;
+  var py = e.clientY - rect.top;
+  var factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+  var scale = graphTransform.scale * factor;
+  scale = Math.max(GRAPH_MIN_SCALE, Math.min(GRAPH_MAX_SCALE, scale));
+  var ratio = scale / graphTransform.scale;
+  graphTransform.x = px - (px - graphTransform.x) * ratio;
+  graphTransform.y = py - (py - graphTransform.y) * ratio;
+  graphTransform.scale = scale;
+  applyGraphTransform();
+}
+
+function onGraphDragStart(e) {
+  if (!graphZoomGroup) { return; }
+  if (e.target && e.target.closest && e.target.closest('.node')) { return; }
+  graphUserInteracted = true;
+  graphPan = { x: e.clientX, y: e.clientY, ox: graphTransform.x, oy: graphTransform.y };
+}
+
+function onGraphDragMove(e) {
+  if (!graphPan) { return; }
+  graphTransform.x = graphPan.ox + (e.clientX - graphPan.x);
+  graphTransform.y = graphPan.oy + (e.clientY - graphPan.y);
+  applyGraphTransform();
+}
+
+function onGraphDragEnd() {
+  graphPan = null;
+}
+
+function onGraphKeydown(e) {
+  if (e.key === 'Escape' && graphSelectedId) { closeGraphDetail(); }
+}
+
+function bindGraphControls() {
+  var listBtn = $('view-list');
+  var graphBtn = $('view-graph');
+  var fit = $('graph-fit');
+  if (listBtn) { listBtn.addEventListener('click', function () { setGraphViewChoice('list'); }); }
+  if (graphBtn) { graphBtn.addEventListener('click', function () { setGraphViewChoice('graph'); }); }
+  if (fit) {
+    fit.addEventListener('click', function () {
+      // Re-enable auto-fit and frame the whole map again.
+      graphUserInteracted = false;
+      if (graphGeometry && autoFitGraph(graphGeometry)) {
+        applyGraphTransform();
+        return;
+      }
+      var graph = snapshot && snapshot.graph ? snapshot.graph : null;
+      if (graph) { renderGraphCanvas(graph, lastRendered || Date.now()); }
+    });
+  }
+  var canvas = $('graph-canvas');
+  if (canvas) {
+    canvas.addEventListener('wheel', onGraphWheel, { passive: false });
+    canvas.addEventListener('mousedown', onGraphDragStart);
+    canvas.addEventListener('mousemove', onGraphDragMove);
+    canvas.addEventListener('mouseup', onGraphDragEnd);
+    canvas.addEventListener('mouseleave', onGraphDragEnd);
+  }
+  document.addEventListener('keydown', onGraphKeydown);
+
+  var stored = null;
+  try { stored = window.localStorage.getItem(GRAPH_VIEW_KEY); } catch (err) { stored = null; }
+  graphViewPref = (stored === 'graph' || stored === 'list') ? stored : null;
 }
 
 function renderGateHint(graph) {
@@ -1300,9 +2028,14 @@ function render(nowMs) {
   if (!graph) {
     $('graph-empty').hidden = false;
     $('graph-body').hidden = true;
+    graphZoomGroup = null;
+    lastGraphCanvasRevision = null;
+    lastGraphCanvasGeometryKey = null;
     renderGateHint(null);
     renderCounts(null);
     renderBar(null);
+    if ($('graph-percent')) { $('graph-percent').textContent = '0%'; }
+    if ($('graph-eta')) { $('graph-eta').hidden = true; $('graph-eta').textContent = ''; }
   } else {
     $('graph-empty').hidden = true;
     $('graph-body').hidden = false;
@@ -1313,20 +2046,38 @@ function render(nowMs) {
     );
     $('graph-prompt').textContent = String(graph.user_prompt || '');
     $('graph-prompt').title = String(graph.user_prompt || '');
-    renderCounts(graph);
-    renderBar(graph);
+    renderGraphSummary(graph);
     renderNodes(graph, nowMs);
+    applyGraphViewMode();
+    if (graphViewMode === 'graph') {
+      syncGraphCanvas(graph, nowMs, snap.revision);
+      renderGraphDetail(graph, nowMs);
+    } else {
+      renderGraphDetail(graph, nowMs);
+    }
     renderGateHint(graph);
+  }
+}
+
+function tickDashboard() {
+  var snap = snapshot;
+  if (!snap || typeof snap.receivedAt !== 'number') { return; }
+  var now = Date.now();
+  var graph = snap.graph;
+  if (!graph) { return; }
+  renderGraphSummary(graph);
+  renderNodes(graph, now);
+  if (graphViewMode === 'graph') {
+    updateRunningGraphStationMeta(graph, now);
+    if (graphSelectedId) {
+      renderGraphDetail(graph, now);
+    }
   }
 }
 
 function scheduleTick() {
   if (tickTimer !== null) { return; }
-  tickTimer = setInterval(function() {
-    var snap = snapshot;
-    if (!snap || typeof lastRendered !== 'number') { return; }
-    render(lastRendered);
-  }, TICK_MS);
+  tickTimer = setInterval(tickDashboard, TICK_MS);
 }
 
 function onSnapshotEvent(e) {
@@ -1501,6 +2252,9 @@ function init() {
   if (colorSchemeMedia && typeof colorSchemeMedia.addEventListener === 'function') {
     colorSchemeMedia.addEventListener('change', colorSchemeListener);
   }
+
+  // Graph controls (toggle, pan/zoom, details) work without a token too.
+  bindGraphControls();
 
   if (!token) {
     showMsg(

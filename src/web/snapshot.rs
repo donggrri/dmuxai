@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph::{GraphEdge, GraphNodeStatus, GraphRun, GraphRunPhase, NodeRole};
 use crate::todo::Todo;
+use crate::web::layout::{NodeLayout, layout_graph};
 
 pub const SNAPSHOT_SCHEMA: &str = "dmuxai.dashboard/v1";
 
@@ -66,6 +67,9 @@ pub struct GraphView {
     pub current_nodes: Vec<String>,
     pub waiting_gate_node: Option<String>,
     pub counts: GraphCounts,
+    /// Number of layers in the layout (0 when the graph has no nodes).
+    #[serde(default)]
+    pub layers: u32,
     pub nodes: Vec<NodeView>,
     pub edges: Vec<GraphEdge>,
 }
@@ -95,9 +99,27 @@ pub struct NodeView {
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
     pub elapsed_ms: Option<u64>,
+    /// Incoming node ids, in plan order.
+    #[serde(default)]
+    pub deps: Vec<String>,
+    /// Layered position for the Graph view, when available.
+    #[serde(default)]
+    pub layout: Option<NodeLayout>,
+    /// Per-node details; empty until a publisher fills them (FR-702).
+    #[serde(default)]
+    pub detail: NodeDetail,
 }
 
-fn truncate_with_ellipsis(s: &str, limit: usize) -> String {
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NodeDetail {
+    #[serde(default)]
+    pub log_tail: Vec<String>,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+}
+
+pub fn truncate_with_ellipsis(s: &str, limit: usize) -> String {
     let mut chars = s.chars();
     let prefix: String = chars.by_ref().take(limit).collect();
     if chars.next().is_some() {
@@ -128,6 +150,47 @@ pub fn snapshot_from_run(run: &GraphRun) -> GraphView {
     let mut current_nodes = Vec::new();
     let mut nodes = Vec::with_capacity(run.plan.nodes.len());
 
+    let node_ids: Vec<&str> = run.plan.nodes.iter().map(|node| node.id.as_str()).collect();
+    let edge_pairs: Vec<(&str, &str)> = run
+        .plan
+        .edges
+        .iter()
+        .map(|edge| (edge.from.as_str(), edge.to.as_str()))
+        .collect();
+    let layout = layout_graph(&node_ids, &edge_pairs);
+    let layers = layout
+        .values()
+        .map(|placed| placed.layer)
+        .max()
+        .map_or(0, |deepest| deepest + 1);
+
+    let mut plan_position: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for (position, node) in run.plan.nodes.iter().enumerate() {
+        plan_position.entry(node.id.as_str()).or_insert(position);
+    }
+    let mut incoming: std::collections::BTreeMap<&str, Vec<(&str, usize)>> =
+        std::collections::BTreeMap::new();
+    for edge in &run.plan.edges {
+        if edge.from == edge.to {
+            continue;
+        }
+        let (Some(&source), Some(_)) = (
+            plan_position.get(edge.from.as_str()),
+            plan_position.get(edge.to.as_str()),
+        ) else {
+            continue;
+        };
+        incoming
+            .entry(edge.to.as_str())
+            .or_default()
+            .push((edge.from.as_str(), source));
+    }
+    for sources in incoming.values_mut() {
+        sources.sort_by_key(|(_, position)| *position);
+        sources.dedup_by(|a, b| a.0 == b.0);
+    }
+
     for node in &run.plan.nodes {
         match node.status {
             GraphNodeStatus::Pending => counts.pending += 1,
@@ -142,6 +205,11 @@ pub fn snapshot_from_run(run: &GraphRun) -> GraphView {
             GraphNodeStatus::Skipped => counts.skipped += 1,
         }
 
+        let deps = incoming
+            .get(node.id.as_str())
+            .map(|sources| sources.iter().map(|(id, _)| (*id).to_string()).collect())
+            .unwrap_or_default();
+
         nodes.push(NodeView {
             id: node.id.clone(),
             role: node.role,
@@ -153,6 +221,9 @@ pub fn snapshot_from_run(run: &GraphRun) -> GraphView {
             started_at_ms: None,
             finished_at_ms: None,
             elapsed_ms: None,
+            deps,
+            layout: layout.get(node.id.as_str()).copied(),
+            detail: NodeDetail::default(),
         });
     }
 
@@ -164,6 +235,7 @@ pub fn snapshot_from_run(run: &GraphRun) -> GraphView {
         current_nodes,
         waiting_gate_node: run.waiting_gate_node.clone(),
         counts,
+        layers,
         nodes,
         edges: run.plan.edges.clone(),
     }
@@ -280,6 +352,72 @@ mod tests {
         assert!(json.contains("\"started_at_ms\":null"));
         assert!(json.contains("\"finished_at_ms\":null"));
         assert!(json.contains("\"elapsed_ms\":null"));
+    }
+
+    // TC-702 / FR-701: nodes expose deps and layout, graph exposes layers.
+    #[test]
+    fn snapshot_exposes_deps_and_layout() {
+        let make_node = |id: &str, job: &str| GraphNode {
+            id: id.to_string(),
+            role: NodeRole::Implement,
+            job: job.to_string(),
+            runner: "codex".to_string(),
+            model_id: "m".to_string(),
+            skill: None,
+            requires_gate: false,
+            status: GraphNodeStatus::Pending,
+            attempt: 0,
+        };
+        let run = GraphRun {
+            plan: GraphPlan {
+                schema: "dmuxai.graph/v1".to_string(),
+                id: "run-layout".to_string(),
+                orchestrator_model: "gpt-4o".to_string(),
+                user_prompt: "prompt".to_string(),
+                limits: GraphLimits::default(),
+                nodes: vec![
+                    make_node("a", "root"),
+                    make_node("b", "left"),
+                    make_node("c", "right"),
+                ],
+                // Deliberately out of plan order and with a duplicate.
+                edges: vec![
+                    GraphEdge {
+                        from: "a".to_string(),
+                        to: "c".to_string(),
+                    },
+                    GraphEdge {
+                        from: "a".to_string(),
+                        to: "b".to_string(),
+                    },
+                    GraphEdge {
+                        from: "a".to_string(),
+                        to: "b".to_string(),
+                    },
+                ],
+            },
+            conversation_id: "conv-1".to_string(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+        };
+
+        let view = snapshot_from_run(&run);
+
+        assert_eq!(view.layers, 2);
+        let find = |id: &str| view.nodes.iter().find(|node| node.id == id).unwrap();
+        assert_eq!(find("a").deps, Vec::<String>::new());
+        assert_eq!(find("b").deps, vec!["a".to_string()]);
+        assert_eq!(find("c").deps, vec!["a".to_string()]);
+        assert_eq!(find("a").layout, Some(NodeLayout { layer: 0, order: 0 }));
+        assert_eq!(find("b").layout, Some(NodeLayout { layer: 1, order: 0 }));
+        assert_eq!(find("c").layout, Some(NodeLayout { layer: 1, order: 1 }));
+        assert_eq!(find("a").detail, NodeDetail::default());
+
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(json.contains("\"deps\":[\"a\"]"));
+        assert!(json.contains("\"layers\":2"));
+        assert!(json.contains("\"layout\":{\"layer\":0,\"order\":0}"));
+        assert!(json.contains("\"detail\":{\"log_tail\":[],\"changed_files\":[]}"));
     }
 
     #[test]

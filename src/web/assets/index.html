@@ -90,10 +90,32 @@
         <span id="graph-id" class="graph-id"></span>
         <span id="graph-phase" class="graph-phase"></span>
         <span id="graph-model" class="graph-model"></span>
+        <div id="graph-view-toggle" class="toggle" role="group" aria-label="Graph view mode">
+          <button id="view-list" type="button" class="toggle-btn" aria-pressed="false">List</button>
+          <button id="view-graph" type="button" class="toggle-btn on" aria-pressed="true">Graph</button>
+        </div>
       </div>
       <p id="graph-prompt" class="graph-prompt"></p>
-      <div id="graph-bar" class="bar" title="graph progress by node status"></div>
-      <p id="graph-counts" class="counts"></p>
+      <div class="graph-summary">
+        <div id="graph-bar" class="bar" title="graph progress by node status"></div>
+        <span id="graph-percent" class="graph-percent">0%</span>
+        <span id="graph-eta" class="graph-eta" hidden></span>
+        <span id="graph-counts" class="counts"></span>
+      </div>
+      <div class="graph-toolbar">
+        <button id="graph-fit" type="button" class="btn">Fit</button>
+        <span class="graph-hint">wheel to zoom &middot; drag to pan &middot; click a node for details</span>
+      </div>
+      <div id="graph-stage" class="graph-stage">
+        <div id="graph-canvas" class="graph-canvas"></div>
+        <aside id="graph-detail" class="graph-detail" hidden aria-label="Node details"></aside>
+      </div>
+      <div class="graph-legend">
+        <span class="legend-item"><i class="legend-swatch legend-pending"></i>pending</span>
+        <span class="legend-item"><i class="legend-swatch legend-running"></i>running</span>
+        <span class="legend-item"><i class="legend-swatch legend-completed"></i>completed</span>
+        <span class="legend-item"><i class="legend-swatch legend-failed"></i>failed</span>
+      </div>
       <ol id="nodes" class="nodes"></ol>
     </div>
     <p id="gate-hint" class="gate" hidden></p>
