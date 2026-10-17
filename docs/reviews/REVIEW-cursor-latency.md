@@ -37,9 +37,29 @@ Tasks: [TASKS-cursor-latency](../tasks/TASKS-cursor-latency.md)
 | Blocking `std::process::Command` in async reap | Replaced with `tokio::process::Command` |
 | Starter config missing Cursor options | Added `# prewarm = true` and `# prewarm_idle_secs = 300` to `src/init.rs` template |
 
+### Round 2 (hand-coded; AGY quota exhausted)
+
+- `reset()` (startup, `/new`, `/resume`) only discards the warm process and bumps the epoch; it never spawns. The App no longer pre-starts from `apply_runner_and_model` (graph routing). Tests: `app_does_not_prestart_cursor_on_startup_or_new`, `app_new_conversation_discards_warm_cursor_process`, `prewarm_discarded_on_arg_change` step 4.
+- `selecting_mode_is_acknowledged_without_starting_a_process` takes `TEST_CURSOR_MUTEX` and disables pre-start explicitly.
+- SPEC "Implementation decisions" records triggers, reset epoch, process groups, the MCP skip and the Windows deferral. ROADMAP "Later" has the Windows item.
+
+### Round 3 (opencode-haiku: REQUEST_CHANGES, fixed)
+
+1. Cancelling a graph-node turn spawned a warm process. The Cancel arm now skips it for graph turns.
+2. `reap_warm_process` only sent group `SIGKILL` on timeout, so TERM-ignoring descendants leaked. It now always kills the group after the TERM grace period. Test: `reaping_warm_process_kills_term_ignoring_grandchild`.
+3. `reset()` used `try_send` and could drop the reset on a full queue. A full queue now falls back to an async send.
+4. `stop_turn` sent `SIGKILL` right after `SIGTERM`. It now uses `terminate_group` (TERM, poll up to 500 ms, then KILL).
+
+Not changed: warm stdout/stderr are not drained while idle (cursor-agent prints nothing before it reads the prompt). After a restart, a selection pre-start has no `--resume`, so the first resumed turn discards it; this is wasteful but correct. Cold turns still stop via task abort, as before.
+
 ## Test evidence
 
-Environment: Linux x86_64, `CARGO_TARGET_DIR=/workspace/dmux-wt/dashboard-parity/target-me`.
+Environment: Linux x86_64. `CARGO_TARGET_DIR=/workspace/dmux-wt/dashboard-parity/target-me` is this worktree's isolated target dir (not a repo setting). Fresh results after round 3 are below; the earlier per-test list follows.
+
+- `cargo fmt --check` and `cargo clippy --locked --all-targets -- -D warnings`: clean.
+- `cargo test --locked --all-targets`: 562 passed, 0 failed, 11 ignored. The pre-start tests were re-run 3× with no flakes.
+- `scripts/spec-index.sh`: index unchanged.
+- Live check (2026-10-18, composer-2.5, prompt "Reply with one word: ok.", 5 runs each): time to first text was 3.2–6.3 s cold (median 4.5 s) and 2.5–4.1 s when pre-started 8 s earlier (median 3.3 s), about 1.2 s (26%) faster.
 
 - Unit tests:
   - `agent::cursor::tests::prewarm_reused_when_args_match` (TC-805): PASSED

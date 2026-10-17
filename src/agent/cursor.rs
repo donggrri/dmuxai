@@ -151,9 +151,21 @@ impl AgentAdapter for CursorAdapter {
     }
 
     fn reset(&self) -> Result<(), AdapterError> {
-        self.command_tx
-            .try_send(CursorCommand::Reset)
-            .map_err(map_send_error)
+        match self.command_tx.try_send(CursorCommand::Reset) {
+            // A full queue must not drop the reset (FR-807: /new kills the warm
+            // process and invalidates --resume), so deliver it asynchronously.
+            Err(mpsc::error::TrySendError::Full(command)) => {
+                let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                    return Err(map_send_error(mpsc::error::TrySendError::Full(command)));
+                };
+                let tx = self.command_tx.clone();
+                handle.spawn(async move {
+                    let _ = tx.send(command).await;
+                });
+                Ok(())
+            }
+            other => other.map_err(map_send_error),
+        }
     }
 
     fn tick(&self) -> Result<(), AdapterError> {
@@ -215,34 +227,48 @@ impl Drop for WarmProcess {
     }
 }
 
+/// Sends `signal` (e.g. `-TERM`) to the whole process group `pgid` (Unix).
+#[cfg(unix)]
+async fn signal_group(pgid: u32, signal: &str) -> bool {
+    tokio::process::Command::new("kill")
+        .args([signal, "--", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|status| status.success())
+}
+
+/// SIGTERM the group, wait up to 500 ms for it to go away, then SIGKILL
+/// whatever is left (descendants that ignore SIGTERM included).
+#[cfg(unix)]
+async fn terminate_group(pgid: u32) {
+    if !signal_group(pgid, "-TERM").await {
+        return; // group already gone
+    }
+    let deadline = Instant::now() + std::time::Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if !signal_group(pgid, "-0").await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let _ = signal_group(pgid, "-KILL").await;
+}
+
 async fn reap_warm_process(mut warm: WarmProcess) {
     if let Some(mut child) = warm.child.take() {
         #[cfg(unix)]
         if let Some(id) = child.id() {
-            let _ = tokio::process::Command::new("kill")
-                .args(["-TERM", &format!("-{id}")])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
+            let _ = signal_group(id, "-TERM").await;
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await;
+            // Always clean up the rest of the group, even if the leader exited
+            // in time: children may ignore SIGTERM.
+            let _ = signal_group(id, "-KILL").await;
         }
-        let exit_status =
-            tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await;
-        if exit_status.is_err() {
-            #[cfg(unix)]
-            if let Some(id) = child.id() {
-                let _ = tokio::process::Command::new("kill")
-                    .args(["-KILL", &format!("-{id}")])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .await;
-            }
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
+        let _ = child.start_kill();
+        let _ = child.wait().await;
     }
 }
 
@@ -554,8 +580,9 @@ async fn runtime_loop(
                 match command {
                     Some(CursorCommand::Cancel) => {
                         let cancelled_turn = active.take();
+                        let was_graph = cancelled_turn.as_ref().is_some_and(|t| t.is_graph);
                         stop_turn(cancelled_turn, &event_tx).await;
-                        if can_prewarm {
+                        if can_prewarm && !was_graph {
                             warm_process = spawn_warm_process(
                                 latest_session_id.as_deref(),
                                 selected_model.as_deref(),
@@ -688,20 +715,7 @@ async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput
     if let Some(turn) = turn {
         #[cfg(unix)]
         if let Some(pgid) = turn.warm_pgid {
-            let _ = tokio::process::Command::new("kill")
-                .args(["-TERM", &format!("-{pgid}")])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
-            let _ = tokio::process::Command::new("kill")
-                .args(["-KILL", &format!("-{pgid}")])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
+            terminate_group(pgid).await;
         }
         turn.handle.abort();
         let _ = turn.handle.await;
@@ -2281,6 +2295,49 @@ pub(crate) mod tests {
 
         drop(adapter);
         let _ = worker.await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    // TC-807 / FR-807: reaping a warm process kills its whole process group,
+    // including a grandchild that ignores SIGTERM.
+    async fn reaping_warm_process_kills_term_ignoring_grandchild() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = FakeCursorFixture::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let script = dir.path().join("cursor-agent");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntrap '' TERM\n(trap '' TERM; exec sleep 300) &\necho $! > \"{}\"\nread -r line\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: the fixture holds TEST_CURSOR_MUTEX for the whole test.
+        unsafe { std::env::set_var("DMUXAI_CURSOR_BIN", &script) };
+
+        let warm = spawn_warm_process(None, None, ExecutionMode::Ask, dir.path(), false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let grandchild = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "grandchild never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(fixture.is_pid_alive(grandchild));
+        reap_warm_process(warm).await;
+        assert!(
+            fixture
+                .wait_for_pid_gone(grandchild, Duration::from_secs(3))
+                .await,
+            "grandchild must die with the warm process group"
+        );
     }
 
     #[tokio::test]
