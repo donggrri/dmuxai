@@ -407,6 +407,20 @@ cargo install --path . --locked --force
 
 Conversations remain scoped by the canonical project path.
 
+## Linux / WSL release binary
+
+Each tagged release also has a prebuilt `dmuxai-linux-x86_64.tar.gz`, built
+on `ubuntu-latest` and needing a matching or newer glibc. Inside WSL (or on
+Linux), run:
+
+```bash
+curl -LO https://github.com/donggrri/dmuxai/releases/latest/download/dmuxai-linux-x86_64.tar.gz
+curl -LO https://github.com/donggrri/dmuxai/releases/latest/download/dmuxai-linux-x86_64.tar.gz.sha256
+sha256sum -c dmuxai-linux-x86_64.tar.gz.sha256
+tar xzf dmuxai-linux-x86_64.tar.gz
+install -m 0755 dmuxai-linux-x86_64/dmuxai ~/.local/bin/dmuxai
+```
+
 ## Run from source
 
 Windows PowerShell:

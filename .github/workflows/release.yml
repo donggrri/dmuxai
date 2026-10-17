@@ -1,4 +1,4 @@
-name: Release Windows binary
+name: Release binaries
 
 on:
   push:
@@ -35,10 +35,69 @@ jobs:
           $hash = (Get-FileHash -LiteralPath $archiveName -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $archiveName" | Set-Content -LiteralPath "$archiveName.sha256" -NoNewline -Encoding ascii
 
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmuxai-windows-x86_64
+          path: |
+            dmuxai-windows-x86_64.zip
+            dmuxai-windows-x86_64.zip.sha256
+          if-no-files-found: error
+
+  linux:
+    # Linux x86_64 binary for WSL and native Linux users. Attached to the same
+    # release as the Windows zip by the publish job below.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release executable
+        run: cargo build --release --locked --bin dmuxai
+
+      - name: Package release archive and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_name='dmuxai-linux-x86_64.tar.gz'
+          staging_directory="$RUNNER_TEMP/dmuxai-linux-x86_64"
+          mkdir -p "$staging_directory"
+          cp target/release/dmuxai "$staging_directory/dmuxai"
+          cp README.md "$staging_directory/README.md"
+          if [ -f CHANGELOG.md ]; then cp CHANGELOG.md "$staging_directory/CHANGELOG.md"; fi
+          tar -C "$RUNNER_TEMP" -czf "$archive_name" dmuxai-linux-x86_64
+          sha256sum "$archive_name" > "$archive_name.sha256"
+
+      - name: Upload Linux release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmuxai-linux-x86_64
+          path: |
+            dmuxai-linux-x86_64.tar.gz
+            dmuxai-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    # One publisher so the Windows and Linux assets land on the same release
+    # without two jobs racing to create it.
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            dmuxai-windows-x86_64.zip
-            dmuxai-windows-x86_64.zip.sha256
+            dist/dmuxai-windows-x86_64.zip
+            dist/dmuxai-windows-x86_64.zip.sha256
+            dist/dmuxai-linux-x86_64.tar.gz
+            dist/dmuxai-linux-x86_64.tar.gz.sha256
