@@ -95,8 +95,9 @@ Format: id, status, repro, cause, fix.
 - Cause: `assignment_line()` printed raw `node.model_id` without runner resolution.
 - Fix: Added `GraphSession::assignment_line_with(resolve)` rendering `<id>:<role>→<runner>:<model>`, and updated `App` to resolve effective models per runner (`resolved_assignment_line`), showing `provider default` for non-Cursor runners with no F2 pick while Cursor stays pinned to `composer-2.5`.
 
-## #23 AGY repeatedly invents `App::handle_enter` in tests — friction
-- Two separate AGY sessions wrote tests calling a nonexistent `handle_enter`; the real entry point is `submit_prompt`. A test-helper note in AGENTS/README would avoid the loop.
+## #23 AGY repeatedly invents `App::handle_enter` in tests — fixed
+- Two separate AGY sessions wrote tests calling a nonexistent `handle_enter`; the real entry point is `submit_prompt`.
+- Fix: `AGENTS.md` § Agent test helpers documents `submit_prompt`, `test_app()`, and related helpers; the `app` test module has a module doc listing them; `#[cfg(test)] App::handle_enter` forwards to `submit_prompt` so invented calls still compile.
 
 ## #21 AGY wrote PowerShell with parameters that do not exist — fixed in review
 - `Join-Path -LiteralPath` / `New-Item -LiteralPath` parse fine but fail at run time. Lesson: run scripts under pwsh on the box (parse + dry run) before merging; added to the windows-pkg graph run.

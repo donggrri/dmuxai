@@ -155,6 +155,12 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M1,M2 | SPEC-graph-plan-header | FR-460 | TC-460 | `assignment_line_uses_resolver_per_runner` | unit | ✅ | dogfood #22 |
 | M1,M2 | SPEC-graph-plan-header | FR-461 | TC-461 | `graph_assignment_shows_agy_model_not_composer` | unit | ✅ | dogfood #22 |
 | M1,M2 | SPEC-graph-plan-header | FR-462 | TC-462 | `graph_assignment_cursor_stays_composer` | unit | ✅ | dogfood #22 |
+| M2 | SPEC-agent-test-helpers | FR-510–FR-514 | TC-510 | `agents_md_documents_agent_test_helpers` | unit | ✅ | dogfood #23 |
+| M2 | SPEC-agent-test-helpers | FR-515 | TC-512 | `app_tests_module_doc_lists_helpers` | unit | ✅ | dogfood #23 |
+| M2 | SPEC-agent-test-helpers | FR-516 | TC-511 | `handle_enter_alias_submits_prompt` | unit | ✅ | dogfood #23 |
+| M2 | SPEC-agent-test-helpers | FR-512 | TC-516 | `submitting_routes_to_the_selected_agent` | unit | ✅ | dogfood #23 |
+| M2 | SPEC-agent-test-helpers | FR-519 | TC-513, TC-514, TC-515 | `every_spec_has_status_line`, `spec_ids_are_unique_across_specs`, `spec_index_script_lists_every_spec` | unit | ✅ | SPEC-spec-index |
+| M2 | SPEC-agent-test-helpers | FR-517, FR-518 | TC-517, TC-518 | manual PR review | manual | ✅ | dogfood #23 |
 
 
 ### 1.1 주의할 ⚠️ 항목
