@@ -5,6 +5,14 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+## [0.2.1] - 2026-10-18
+
+Dogfood fixes from the 2026-10-17 Linux trial of v0.2.0, PRs #39 and #47-#52
+(milestone [v0.2.1](https://github.com/donggrri/dmuxai/milestone/1), issues
+#40-#46). Linux is the supported platform for this release. Windows builds
+still compile, but the new features are not re-checked on Windows, and the
+Cursor pre-start has no Windows job object yet (see ROADMAP "Later").
+
 ### Added
 
 - **Built-in opencode runner (SPEC-first-run FR-810..FR-812).** When `opencode`
@@ -63,6 +71,14 @@ All notable changes to dmuxai are listed here. Versions follow
   runner in chat.
 - `[agents]` without `[[agents.custom]]` (for example, only
   `builtin_opencode`) no longer clears the custom agents from the other config.
+
+### Fixed
+
+- **Cursor text shown twice (SPEC-cursor-stream-dedupe FR-800, FR-801, #40).**
+  With `--stream-partial-output`, cursor-agent repeats each text segment as an
+  aggregate event before a tool call. DmuxAI showed that segment a second time
+  in the TUI and the dashboard. Aggregates now add only text that was not
+  already streamed; streams without partial deltas show each segment once.
 
 ### Docs
 
@@ -195,4 +211,5 @@ Changes since v0.1.1 (2026-08-24), PRs #1-#38.
   - the non-Windows `dmuxai-launcher` stub (#17)
   - bash-only spec-index tests are gated on Windows (#24)
 
+[0.2.1]: https://github.com/donggrri/dmuxai/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/donggrri/dmuxai/compare/v0.1.1...v0.2.0
