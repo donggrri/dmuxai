@@ -125,6 +125,8 @@ fn spec_ids_are_unique_across_specs() {
     );
 }
 
+// bash on Windows runners resolves to WSL/absent; the script is a Linux/macOS dev tool.
+#[cfg(not(windows))]
 #[test]
 fn spec_index_script_lists_every_spec() {
     let output = Command::new("bash")
