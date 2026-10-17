@@ -13,4 +13,5 @@ pub mod skills;
 pub mod state_path;
 pub mod theme;
 pub mod ui_png;
+pub mod web;
 pub mod workspace;

@@ -107,5 +107,32 @@ Format: id, status, repro, cause, fix.
 ## #21 AGY wrote PowerShell with parameters that do not exist — fixed in review
 - `Join-Path -LiteralPath` / `New-Item -LiteralPath` parse fine but fail at run time. Lesson: run scripts under pwsh on the box (parse + dry run) before merging; added to the windows-pkg graph run.
 
+## #25 tmux paste needs extra Enter presses — open
+- Repro (web-dashboard run, 2026-10-17): `tmux paste-buffer -p` of a long prompt, then Enter: nothing is sent; it took two to three more Enter presses before the turn started (also no redraw after Enter during graph planning).
+
+## #26 Ctrl+C cancels the step but the graph continues — open
+- Cancelling the running node's turn leaves the graph run advancing to the next node and the status line stuck on `running`.
+
+## #27 Killing the tmux session orphans `opencode run` children — open
+- `tmux kill-session` ends dmuxai without reaping the custom-agent child; the orphan keeps editing files. Workaround: kill leftover `opencode run` processes by hand.
+
+## #28 `routing.default_agent` ignored at startup — open
+- With `default_agent = "opencode-deepseek"` the TUI still starts on Cursor (reproduced again in the web-dashboard run); `/agent` is needed every time.
+
+## #29 Graph header shows orchestrator composer-2.5 when every node runs opencode — open
+- The plan header's orchestrator label is not resolved per runner (the node labels were fixed in #22).
+
+## #30 Pane PATH misses `~/.local/bin` / `~/.opencode/bin` — open
+- dmuxai launched from a non-login shell cannot find `agy` / `opencode`; workaround: start it with `env PATH=$HOME/.local/bin:$HOME/.opencode/bin:$PATH`.
+
+## #31 Custom agents show `Model: provider default` while running their `default_model` — open
+- `opencode-glm` ran `-m opencode/glm-5.3-flash-free`, but the status bar said `Model: provider default`.
+
+## #32 Graph routing sends every node to `routing.default_agent` — open
+- `assign_runner` ignores the node role, so a per-role split (AGY for the hardest node, opencode deepseek/glm for the rest) cannot be expressed through the graph. The web-dashboard run used one dmuxai instance per runner with `[graph] enabled = false` in an untracked worktree `dmuxai.toml` instead.
+
+## #33 opencode turns show no progress for minutes — open
+- opencode `--format json` turns showed `responding · last event 4m ago` with no tool activity until the final text, so a long glm run looks hung.
+
 ## Process note
 #2, #3 (PR #6) and #7 (PR #8) were fixed directly (not through DmuxAI), because #3 blocked the AGY flash runner that dogfooding needs.

@@ -4,7 +4,10 @@ mod process;
 
 use std::{
     error::Error,
-    io::{self, IsTerminal, Stdout},
+    io::{self, IsTerminal, Stdout, Write},
+    net::{IpAddr, Ipv4Addr},
+    path::Path,
+    time::Duration,
 };
 
 use app::App;
@@ -15,15 +18,39 @@ use crossterm::{
 };
 use dmuxai::conversation::ConversationEngine;
 use dmuxai::settings::DmuxSettings;
+use dmuxai::web::{
+    DEFAULT_PORT, DashboardHub, DashboardServer, FileGraphSource, ServerConfig, SnapshotSource,
+    check_bind, generate_token, start_server,
+};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 type DmuxTerminal = Terminal<CrosstermBackend<Stdout>>;
+
+/// CLI options for the dashboard server (FR-520, FR-521, FR-524).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebOptions {
+    port: u16,
+    bind: IpAddr,
+    allow_remote: bool,
+}
+
+impl Default for WebOptions {
+    fn default() -> Self {
+        Self {
+            port: DEFAULT_PORT,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            allow_remote: false,
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum CliAction {
     Help,
     Version,
     Run,
+    Serve(WebOptions),
+    RunWeb(WebOptions),
     Unknown(String),
 }
 
@@ -32,10 +59,17 @@ DmuxAI - One terminal. Multiple AI coding agents.
 
 Usage:
   dmuxai [--help|--version]
+  dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
+  dmuxai --web [--port N] [--bind ADDR] [--allow-remote]
 
 Options:
   -h, --help       Print this help message and exit
   -V, --version    Print version information and exit
+  serve            Run the local dashboard server without the TUI
+  --web            Run the TUI and the local dashboard server
+  --port N         Dashboard port (default 7420)
+  --bind ADDR      Dashboard bind address (default 127.0.0.1)
+  --allow-remote   Allow binding to a non-loopback address
 
 Configuration:
   dmuxai.toml      Optional configuration file in the workspace root or parent directories
@@ -51,19 +85,93 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut action = CliAction::Run;
-    for arg in args {
-        match arg.as_ref() {
-            "-h" | "--help" => return CliAction::Help,
-            "-V" | "--version" => {
-                if action == CliAction::Run {
-                    action = CliAction::Version;
+    let args: Vec<String> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_owned())
+        .collect();
+
+    let serve = args.first().map(String::as_str) == Some("serve");
+    let web = args.iter().any(|arg| arg == "--web");
+
+    if !serve && !web {
+        // Preserve the original single-action semantics exactly: `--help`
+        // returns immediately, `--version` is honored only while the action is
+        // still `Run`, and any other argument returns `Unknown` at that point.
+        let mut action = CliAction::Run;
+        for arg in &args {
+            match arg.as_str() {
+                "-h" | "--help" => return CliAction::Help,
+                "-V" | "--version" => {
+                    if action == CliAction::Run {
+                        action = CliAction::Version;
+                    }
+                }
+                other => return CliAction::Unknown(other.to_owned()),
+            }
+        }
+        return action;
+    }
+
+    // With `serve`/`--web` present, `--help` and `--version` win from any
+    // position (FR-520).
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        return CliAction::Help;
+    }
+    if args.iter().any(|arg| arg == "-V" || arg == "--version") {
+        return CliAction::Version;
+    }
+
+    // `serve` and `--web` are mutually exclusive, and `serve` is only valid as
+    // the first argument; anything else is an unknown argument.
+    if serve && web {
+        return CliAction::Unknown("--web".to_owned());
+    }
+
+    let mut options = WebOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "serve" => {
+                if index != 0 {
+                    return CliAction::Unknown("serve".to_owned());
                 }
             }
+            "--web" => {}
+            "--port" => {
+                index += 1;
+                match args.get(index).and_then(|value| value.parse::<u16>().ok()) {
+                    Some(port) => options.port = port,
+                    None => return CliAction::Unknown("--port".to_owned()),
+                }
+            }
+            "--bind" => {
+                index += 1;
+                let bind = args
+                    .get(index)
+                    .map(|value| {
+                        let inner = value
+                            .strip_prefix('[')
+                            .and_then(|rest| rest.strip_suffix(']'))
+                            .unwrap_or(value.as_str());
+                        inner.parse::<IpAddr>()
+                    })
+                    .and_then(Result::ok);
+                match bind {
+                    Some(bind) => options.bind = bind,
+                    None => return CliAction::Unknown("--bind".to_owned()),
+                }
+            }
+            "--allow-remote" => options.allow_remote = true,
             other => return CliAction::Unknown(other.to_owned()),
         }
+        index += 1;
     }
-    action
+
+    if serve {
+        CliAction::Serve(options)
+    } else {
+        CliAction::RunWeb(options)
+    }
 }
 
 #[tokio::main]
@@ -82,9 +190,61 @@ async fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("error: unexpected argument '{flag}'\n\n{USAGE}");
             std::process::exit(2);
         }
-        CliAction::Run => {}
+        CliAction::Serve(options) => return run_serve(options).await,
+        CliAction::RunWeb(options) => return run_tui(Some(options)).await,
+        CliAction::Run => return run_tui(None).await,
+    }
+}
+
+/// `dmuxai serve`: read-only dashboard over persisted graph runs (FR-520, FR-524).
+async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
+    let workspace_root = dmuxai::workspace::resolve_workspace_root()?;
+    let workspace = dmuxai::workspace::normalize_workspace_path(&workspace_root)
+        .unwrap_or_else(|_| workspace_root.display().to_string());
+
+    if let Err(error) = check_bind(options.bind, options.allow_remote) {
+        eprintln!("error: {error}\n\n{USAGE}");
+        std::process::exit(2);
     }
 
+    let hub = DashboardHub::new(SnapshotSource::Files, workspace);
+    let config = ServerConfig {
+        bind: options.bind,
+        port: options.port,
+        allow_remote: options.allow_remote,
+        token: generate_token(),
+    };
+    let server = match start_server(config, hub.clone()).await {
+        Ok(server) => server,
+        Err(error) => {
+            eprintln!("error: could not start the dashboard server: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    println!("dmuxai dashboard: {}", server.url);
+    io::stdout().flush()?;
+    if let Some(warning) = &server.warning {
+        eprintln!("{warning}");
+    }
+
+    let mut source = FileGraphSource::new(&workspace_root);
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let graph = source.poll();
+                hub.publish(Vec::new(), graph);
+            }
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
+
+    Ok(())
+}
+
+/// Run the TUI, optionally alongside the in-process dashboard (FR-520, FR-530).
+async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         eprintln!(
             "dmuxai needs an interactive terminal (TTY); run it in a terminal, or see dmuxai --help"
@@ -109,7 +269,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     crossterm::style::force_color_output(color_enabled);
     let custom_warnings = dmuxai::custom_agent::install_registry(settings.custom_agents.clone());
     let config_warnings = settings.config_warnings.clone();
-    let mut app = App::new(engine, workspace_root, settings)?;
+    let mut app = App::new(engine, workspace_root.clone(), settings)?;
     for warning in config_warnings.into_iter().chain(custom_warnings) {
         app.push_startup_notice(warning);
     }
@@ -124,10 +284,57 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Some(warning) = startup_warning {
         app.push_startup_notice(warning);
     }
+    let dashboard = if let Some(options) = web {
+        attach_web_dashboard(&mut app, &workspace_root, options).await
+    } else {
+        None
+    };
     let mut session = TerminalSession::start()?;
     let result = app.run(session.terminal_mut()).await;
     app.shutdown().await;
+    if let Some(server) = dashboard {
+        server.abort();
+    }
     result.map_err(Into::into)
+}
+
+/// Start the TUI-source dashboard and attach it to `app` (FR-521, FR-524, FR-530).
+///
+/// Returns the running server so the caller can keep it alive for the whole
+/// TUI run and abort it afterwards.
+async fn attach_web_dashboard(
+    app: &mut App,
+    workspace_root: &Path,
+    options: WebOptions,
+) -> Option<DashboardServer> {
+    let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
+        .unwrap_or_else(|_| workspace_root.display().to_string());
+    let hub = DashboardHub::new(SnapshotSource::Tui, workspace);
+    let config = ServerConfig {
+        bind: options.bind,
+        port: options.port,
+        allow_remote: options.allow_remote,
+        token: generate_token(),
+    };
+
+    match start_server(config, hub.clone()).await {
+        Ok(server) => {
+            app.attach_dashboard(hub);
+            app.push_startup_notice(format!("dmuxai dashboard: {}", server.url));
+            if let Some(warning) = server.warning.clone() {
+                app.push_startup_notice(warning);
+            }
+            Some(server)
+        }
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+        Err(error) => {
+            app.push_startup_notice(format!("dmuxai dashboard failed to start: {error}"));
+            None
+        }
+    }
 }
 
 /// Owns terminal raw/alternate-screen state and restores it on every return path.
@@ -220,5 +427,95 @@ mod tests {
     #[test]
     fn parse_cli_help_takes_precedence_over_version() {
         assert_eq!(parse_cli(["--version", "--help"]), CliAction::Help);
+    }
+
+    fn web_default() -> WebOptions {
+        WebOptions::default()
+    }
+
+    // TC-520 / FR-520: serve and --web flag parsing.
+    #[test]
+    fn parse_cli_serve_and_web_flags() {
+        assert_eq!(parse_cli(["serve"]), CliAction::Serve(web_default()));
+        assert_eq!(
+            parse_cli(["serve", "--port", "9000"]),
+            CliAction::Serve(WebOptions {
+                port: 9000,
+                ..web_default()
+            })
+        );
+        assert_eq!(
+            parse_cli(["serve", "--bind", "127.0.0.1"]),
+            CliAction::Serve(WebOptions {
+                bind: "127.0.0.1".parse().unwrap(),
+                ..web_default()
+            })
+        );
+        assert_eq!(
+            parse_cli(["serve", "--bind", "[::1]"]),
+            CliAction::Serve(WebOptions {
+                bind: "::1".parse().unwrap(),
+                ..web_default()
+            })
+        );
+        assert_eq!(
+            parse_cli(["serve", "--bind", "::1"]),
+            CliAction::Serve(WebOptions {
+                bind: "::1".parse().unwrap(),
+                ..web_default()
+            })
+        );
+        assert_eq!(
+            parse_cli(["serve", "--bind", "0.0.0.0", "--allow-remote"]),
+            CliAction::Serve(WebOptions {
+                bind: "0.0.0.0".parse().unwrap(),
+                allow_remote: true,
+                ..web_default()
+            })
+        );
+        assert_eq!(parse_cli(["--web"]), CliAction::RunWeb(web_default()));
+        assert_eq!(
+            parse_cli(["--web", "--port", "0"]),
+            CliAction::RunWeb(WebOptions {
+                port: 0,
+                ..web_default()
+            })
+        );
+        assert!(matches!(
+            parse_cli(["serve", "--port"]),
+            CliAction::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_cli(["serve", "--port", "x"]),
+            CliAction::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_cli(["serve", "--nope"]),
+            CliAction::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_cli(["--port", "9000"]),
+            CliAction::Unknown(_)
+        ));
+        // `serve` is only valid as the first argument; `--web` excludes `serve`.
+        assert!(matches!(
+            parse_cli(["--web", "serve"]),
+            CliAction::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_cli(["serve", "serve"]),
+            CliAction::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_cli(["serve", "--web"]),
+            CliAction::Unknown(_)
+        ));
+        // Original single-action semantics are preserved without serve/--web.
+        assert_eq!(
+            parse_cli(["foo", "--version"]),
+            CliAction::Unknown("foo".to_owned())
+        );
+        // With --web present, --version wins.
+        assert_eq!(parse_cli(["--version", "--web"]), CliAction::Version);
     }
 }

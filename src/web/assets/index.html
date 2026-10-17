@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<title>DmuxAI dashboard</title>
+<link rel="stylesheet" href="/assets/app.css">
+<script src="/assets/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <h1 class="brand">DmuxAI<span class="brand-sub">dashboard</span></h1>
+  <nav id="status" class="status" aria-label="dashboard status">
+    <span class="stat"><span class="stat-k">workspace</span><span id="workspace" class="stat-v">&ndash;</span></span>
+    <span class="stat"><span class="stat-k">source</span><span id="source" class="stat-v">&ndash;</span></span>
+    <span class="stat"><span class="stat-k">rev</span><span id="revision" class="stat-v">&ndash;</span></span>
+    <span id="conn" class="conn conn-connecting" aria-live="polite">connecting</span>
+  </nav>
+</header>
+
+<main>
+  <p id="msg" class="notice" role="status" aria-live="polite" hidden></p>
+
+  <section class="panel">
+    <h2 class="panel-title">Agents</h2>
+    <div id="agents" class="agents"></div>
+  </section>
+
+  <section id="graph" class="panel">
+    <h2 class="panel-title">Graph</h2>
+    <p id="graph-empty" class="empty">No graph run yet</p>
+    <div id="graph-body" hidden>
+      <div class="graph-meta">
+        <span id="graph-id" class="graph-id"></span>
+        <span id="graph-phase" class="graph-phase"></span>
+        <span id="graph-model" class="graph-model"></span>
+      </div>
+      <p id="graph-prompt" class="graph-prompt"></p>
+      <div id="graph-bar" class="bar" title="graph progress by node status"></div>
+      <p id="graph-counts" class="counts"></p>
+      <ol id="nodes" class="nodes"></ol>
+    </div>
+    <p id="gate-hint" class="gate" hidden></p>
+  </section>
+</main>
+</body>
+</html>
