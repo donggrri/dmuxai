@@ -409,9 +409,9 @@ Conversations remain scoped by the canonical project path.
 
 ## Linux / WSL release binary
 
-Each tagged release also has a prebuilt `dmuxai-linux-x86_64.tar.gz`, built
-on `ubuntu-latest` and needing a matching or newer glibc. Inside WSL (or on
-Linux), run:
+Each tagged release also has a prebuilt, statically linked (musl)
+`dmuxai-linux-x86_64.tar.gz` that runs on any x86_64 Linux distro, including
+WSL. Inside WSL (or on Linux), run:
 
 ```bash
 curl -LO https://github.com/donggrri/dmuxai/releases/latest/download/dmuxai-linux-x86_64.tar.gz
@@ -426,11 +426,12 @@ install -m 0755 dmuxai-linux-x86_64/dmuxai ~/.local/bin/dmuxai
 Windows PowerShell:
 
 ```powershell
-cd C:\Users\tlsfmswls\Desktop\DmuxAI
+cd C:\path\to\DmuxAI
 cargo run
 
-# Open another project without changing directories:
-cargo run -- C:\path\to\project
+# Open another project without changing directories (the workspace is
+# DMUXAI_WORKSPACE, or the current directory when it is unset):
+$env:DMUXAI_WORKSPACE = 'C:\path\to\project'; cargo run
 ```
 
 Linux shell:
@@ -439,7 +440,8 @@ Linux shell:
 cd /path/to/DmuxAI
 cargo run
 
-# Or: cargo run -- /path/to/project
+# Open another project without changing directories:
+DMUXAI_WORKSPACE=/path/to/project cargo run
 ```
 
 Controls:

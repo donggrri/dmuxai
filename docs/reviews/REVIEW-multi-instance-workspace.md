@@ -36,16 +36,16 @@ filesystem, or provider-session sharing behavior.
 
 ## 3. Test evidence
 
-Commands were run from `C:\Users\tlsfmswls\Desktop\DmuxAI` with the bundled
+Commands were run from `C:\path\to\DmuxAI` with the bundled
 Rust toolchain path because Cargo is not on the PowerShell `PATH`.
 
 | Command | Result |
 | --- | --- |
 | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/SPEC-multi-instance-workspace.md` | Pass |
 | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/DMUXAI-BASELINE.md` | Pass |
-| `C:\Users\tlsfmswls\.cargo\bin\cargo.exe fmt --check` | Pass |
-| `C:\Users\tlsfmswls\.cargo\bin\cargo.exe test --all-targets --target-dir target\\release-verify` | Pass: 8 library, 93 binary, and 31 integration tests; 5 live-provider tests ignored |
-| `C:\Users\tlsfmswls\.cargo\bin\cargo.exe clippy --all-targets --all-features --target-dir target\\release-verify -- -D warnings` | Pass |
+| `%USERPROFILE%\.cargo\bin\cargo.exe fmt --check` | Pass |
+| `%USERPROFILE%\.cargo\bin\cargo.exe test --all-targets --target-dir target\\release-verify` | Pass: 8 library, 93 binary, and 31 integration tests; 5 live-provider tests ignored |
+| `%USERPROFILE%\.cargo\bin\cargo.exe clippy --all-targets --all-features --target-dir target\\release-verify -- -D warnings` | Pass |
 
 The full all-target run includes the acceptance tests for live peer startup,
 latest-conversation restore, closed/expired recovery, cross-session busy

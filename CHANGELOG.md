@@ -50,8 +50,8 @@ Changes since v0.1.1 (2026-08-24), PRs #1-#27.
   - idle timeout
   - a foreground-only Implement prompt (#21)
   - a terminal lifecycle fix (#26)
-- **Release workflow:** now also builds `dmuxai-linux-x86_64.tar.gz` with a
-  SHA-256 checksum for WSL and Linux users. It is published to the same
+- **Release workflow:** now also builds a static (musl)
+  `dmuxai-linux-x86_64.tar.gz` with a SHA-256 checksum for WSL and Linux users. It is published to the same
   GitHub release as the Windows zip.
 
 ### Fixed

@@ -24,7 +24,7 @@ Review date: 2026-08-24
 
 ## Automated evidence
 
-Commands run from `C:\Users\tlsfmswls\Desktop\DmuxAI`:
+Commands run from `C:\path\to\DmuxAI`:
 
 - `cargo fmt --check` — passed.
 - `cargo test --test conversation` — 15 passed, 0 failed.
