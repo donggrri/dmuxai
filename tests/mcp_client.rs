@@ -381,8 +381,10 @@ done
         name: "group-stdio-a".to_owned(),
         kind: ServerKind::Generic,
         transport: Transport::Stdio {
-            command: launcher_a.to_str().unwrap().to_owned(),
-            args: vec![],
+            // Run through `sh` instead of exec'ing the freshly written script:
+            // exec can fail with ETXTBSY while parallel tests fork.
+            command: "/bin/sh".to_owned(),
+            args: vec![launcher_a.to_str().unwrap().to_owned()],
             env: BTreeMap::new(),
         },
         runners: None,
@@ -462,8 +464,10 @@ done
         name: "group-stdio-b".to_owned(),
         kind: ServerKind::Generic,
         transport: Transport::Stdio {
-            command: launcher_b.to_str().unwrap().to_owned(),
-            args: vec![],
+            // Run through `sh` instead of exec'ing the freshly written script:
+            // exec can fail with ETXTBSY while parallel tests fork.
+            command: "/bin/sh".to_owned(),
+            args: vec![launcher_b.to_str().unwrap().to_owned()],
             env: BTreeMap::new(),
         },
         runners: None,
