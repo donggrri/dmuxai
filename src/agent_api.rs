@@ -117,14 +117,9 @@ pub fn runner_ids(settings: &DmuxSettings) -> Vec<(String, String)> {
     ids
 }
 
-/// Whether `runner` may run under `[graph] allowed_runners` (NFR-762).
+/// Whether `runner` may run under `[graph] allowed_runners` (NFR-762, FR-813).
 pub fn runner_allowed(settings: &DmuxSettings, runner: &str) -> bool {
-    match &settings.graph_allowed_runners {
-        None => true,
-        Some(allowed) => allowed
-            .iter()
-            .any(|r| r.trim().eq_ignore_ascii_case(runner.trim())),
-    }
+    settings.graph_runner_allowed(runner)
 }
 
 /// `dmuxai status --json` (FR-763).

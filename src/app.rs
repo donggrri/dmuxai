@@ -3713,6 +3713,9 @@ impl App {
         let allowed_str = match &self.settings.graph_allowed_runners {
             Some(runners) if runners.is_empty() => "none (graph disabled)".to_owned(),
             Some(runners) => runners.join(", "),
+            None if self.settings.custom_agents.iter().any(|spec| spec.builtin) => {
+                "all except the built-in opencode".to_owned()
+            }
             None => "all".to_owned(),
         };
         if self.graph_assignment_line.is_empty() {

@@ -4,9 +4,9 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | [x] | 0 | SPECs, PLAN, TASKS, ROADMAP, issues #40–#46, milestone v0.2.1 | all | maintainer | — | `cargo test --test spec_index` |
 | [x] | 1 | Cursor segment dedupe + recorded fixture | FR-800, FR-801 | maintainer | opencode-haiku | TC-800, TC-801 |
-| [ ] | 2 | Built-in opencode preset, empty-model message | FR-810..FR-813 | opencode-haiku | AGY | TC-810..TC-812 |
-| [ ] | 3 | `dmuxai init` starter config | FR-814 | opencode-haiku | AGY | TC-813, TC-814 |
-| [ ] | 4 | README first run + tarball layout, doc test | FR-815, FR-816 | maintainer | opencode-haiku | TC-815 |
+| [x] | 2 | Built-in opencode preset, empty-model message | FR-810..FR-813 | opencode-haiku | AGY | TC-810..TC-812 |
+| [x] | 3 | `dmuxai init` starter config | FR-814 | opencode-haiku | AGY | TC-813, TC-814 |
+| [x] | 4 | README first run + tarball layout, doc test | FR-815, FR-816 | maintainer | opencode-haiku | TC-815 |
 | [ ] | 5 | RunState model, snapshot/status fields, TUI spinner and end marks | FR-820..FR-822, UX-820, UX-821 | AGY | opencode-haiku | TC-820..TC-822 |
 | [ ] | 6 | Web status pill, chip/graph-node spinners, title/favicon | FR-823, FR-824, UX-821 (web), NFR-820 | opencode-haiku | AGY | TC-823, TC-824 |
 | [ ] | 7 | `/api/docs/tree` (confined, bounded) | FR-830, FR-831 | opencode-haiku | AGY | TC-830..TC-832 |

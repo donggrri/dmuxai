@@ -3,6 +3,44 @@
 All notable changes to dmuxai are listed here. Versions follow
 [Semantic Versioning](https://semver.org/); dates are Asia/Seoul.
 
+## Unreleased
+
+### Added
+
+- **Built-in opencode runner (SPEC-first-run FR-810..FR-812).** When `opencode`
+  is on `PATH` (or `DMUXAI_OPENCODE_BIN` names it) and no `[[agents.custom]]`
+  entry is named `opencode`, DmuxAI registers an `opencode` runner. It uses the
+  documented opencode command and the free-model policy
+  (`allowed_models = "^opencode/.*-free$"`); the first allowed listed model is
+  the default. Model listing times out after 10 seconds. A failed or empty
+  listing still shows the runner, and selecting it or sending a prompt names
+  the policy and how to override it. A user `[[agents.custom]]` named
+  `opencode` replaces the preset; `[agents] builtin_opencode = false` hides it.
+- **`dmuxai init [--workspace] [--force]` (FR-814).** Writes a commented starter
+  `dmuxai.toml` to the user config, or to the workspace with `--workspace`. It
+  lists the runners found on `PATH` and refuses to overwrite without `--force`.
+
+### Changed
+
+- **Graph routing exception for the built-in opencode runner (FR-813).** With
+  `[graph] allowed_runners` unset, every runner may take graph nodes except the
+  built-in opencode preset. List `opencode` in `allowed_runners` to allow it.
+  Your own `[[agents.custom]]` agents keep the previous rule. Single-agent runs
+  and TUI or dashboard selection are unchanged. Existing v0.2.0 users who have
+  `opencode` on `PATH` and no `opencode` custom agent will see a new `opencode`
+  runner in chat.
+- `[agents]` without `[[agents.custom]]` (for example, only
+  `builtin_opencode`) no longer clears the custom agents from the other config.
+
+### Docs
+
+- README: new "First run" section covering the built-in runners, opencode
+  detection and its free-model policy, and `dmuxai init`.
+- README: the Linux/WSL install steps match the release archive
+  (`dmuxai-linux-x86_64/{dmuxai,README.md,CHANGELOG.md}`), with
+  `mkdir -p ~/.local/bin`, the `install` command, a `tar --strip-components=1`
+  one-liner, and a PATH note.
+
 ## [0.2.0] - 2026-10-17
 
 Changes since v0.1.1 (2026-08-24), PRs #1-#38.

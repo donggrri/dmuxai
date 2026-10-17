@@ -41,6 +41,9 @@ pub struct DmuxSettings {
     pub theme_force_color: Option<bool>,
     /// `[[agents.custom]]` headless agents (installed into the registry at startup).
     pub custom_agents: Vec<crate::custom_agent::CustomAgentSpec>,
+    /// `[agents] builtin_opencode` (default true). `false` hides the built-in
+    /// opencode preset (SPEC-first-run FR-811).
+    pub builtin_opencode: bool,
     /// `[[mcp.servers]]` merged from user and repo configs by name (repo wins).
     pub mcp_servers: Vec<crate::mcp::McpServerSpec>,
     /// `[todo] jira_base_url` (user or repo, repo wins) used to derive links
@@ -137,8 +140,10 @@ struct WebToml {
 
 #[derive(Debug, Default, Deserialize)]
 struct AgentsToml {
-    #[serde(default)]
-    custom: Vec<crate::custom_agent::CustomAgentSpec>,
+    /// `None` when the table has no `[[agents.custom]]`, so a `[agents]` table
+    /// that only sets `builtin_opencode` keeps the other config's agents.
+    custom: Option<Vec<crate::custom_agent::CustomAgentSpec>>,
+    builtin_opencode: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -178,25 +183,34 @@ impl DmuxSettings {
 
     /// Like [`Self::load_with_user_config`] with the DmuxAI executable injected
     /// for the built-in `dmuxai-memory` entry (FR-733), so tests are deterministic.
+    /// The opencode executable is looked up in the environment (FR-810).
     pub(crate) fn load_with_exe(
         workspace: &Path,
         user_config_path: Option<&Path>,
         exe: Option<&Path>,
     ) -> Self {
+        Self::load_with_opencode(workspace, user_config_path, exe, find_opencode_bin())
+    }
+
+    /// Loads settings with the opencode executable injected (`None` = not
+    /// installed), so the preset decision is deterministic in tests (FR-810).
+    pub(crate) fn load_with_opencode(
+        workspace: &Path,
+        user_config_path: Option<&Path>,
+        exe: Option<&Path>,
+        opencode_bin: Option<PathBuf>,
+    ) -> Self {
         let mut settings = Self::default();
-        // Custom agent names seen in *either* config, so an id defined only in
-        // the user config is not reported as unknown after the workspace config
-        // replaces `[[agents.custom]]`.
-        let mut known_custom: Vec<String> = Vec::new();
         if env_flag("DMUXAI_CURSOR_WINDOWS_UNSANDBOXED") {
             settings.cursor_windows_unsandboxed = true;
         }
 
+        let mut configs: Vec<DmuxToml> = Vec::new();
         if let Some(user_path) = user_config_path
             && let Ok(contents) = std::fs::read_to_string(user_path)
         {
             match toml::from_str::<DmuxToml>(&contents) {
-                Ok(parsed) => settings.apply_toml(parsed, &mut known_custom),
+                Ok(parsed) => configs.push(parsed),
                 Err(error) => settings.config_warnings.push(format!(
                     "user config {} ignored: {error}",
                     user_path.display()
@@ -207,15 +221,51 @@ impl DmuxSettings {
         let config_path = workspace.join("dmuxai.toml");
         if let Ok(contents) = std::fs::read_to_string(&config_path) {
             match toml::from_str::<DmuxToml>(&contents) {
-                Ok(parsed) => {
-                    settings.apply_toml(parsed, &mut known_custom);
-                }
+                Ok(parsed) => configs.push(parsed),
                 Err(error) => {
                     settings
                         .config_warnings
                         .push(format!("dmuxai.toml ignored: {error}"));
                 }
             }
+        }
+
+        // FR-810/FR-811: the preset is registered only when `builtin_opencode` is
+        // not false in either config, no config names its own `opencode` agent,
+        // and the executable exists. This is decided before `allowed_runners` is
+        // validated, so `allowed_runners = ["opencode"]` is accepted.
+        let agents = || configs.iter().filter_map(|parsed| parsed.agents.as_ref());
+        settings.builtin_opencode = agents()
+            .filter_map(|agents| agents.builtin_opencode)
+            .next_back()
+            .unwrap_or(true);
+        let names_opencode = agents()
+            .flat_map(|agents| agents.custom.iter().flatten())
+            .any(|spec| spec.name.eq_ignore_ascii_case("opencode"));
+        let preset_bin = opencode_bin.filter(|_| settings.builtin_opencode && !names_opencode);
+
+        // Custom agent names seen in *either* config, so an id defined only in
+        // the user config is not reported as unknown after the workspace config
+        // replaces `[[agents.custom]]`.
+        let mut known_custom: Vec<String> = Vec::new();
+        if preset_bin.is_some() {
+            known_custom.push("opencode".to_owned());
+        }
+        for parsed in configs {
+            settings.apply_toml(parsed, &mut known_custom, preset_bin.is_some());
+        }
+        if let Some(program) = preset_bin
+            && !settings
+                .custom_agents
+                .iter()
+                .any(|spec| spec.name.eq_ignore_ascii_case("opencode"))
+        {
+            // Appended last so existing custom agent indices do not move.
+            settings
+                .custom_agents
+                .push(crate::custom_agent::opencode_preset(
+                    &program.to_string_lossy(),
+                ));
         }
 
         let mut known: Vec<&str> = vec!["cursor", "agy", "codex"];
@@ -309,7 +359,12 @@ impl DmuxSettings {
         self.config_warnings.retain(|w| seen.insert(w.clone()));
     }
 
-    fn apply_toml(&mut self, parsed: DmuxToml, known_custom: &mut Vec<String>) {
+    fn apply_toml(
+        &mut self,
+        parsed: DmuxToml,
+        known_custom: &mut Vec<String>,
+        preset_pending: bool,
+    ) {
         if let Some(memory) = parsed.memory {
             if memory.vault.is_some() {
                 self.memory_raw.vault = memory.vault;
@@ -324,11 +379,13 @@ impl DmuxSettings {
                 self.memory_raw.inject = memory.inject;
             }
         }
-        if let Some(agents) = parsed.agents {
-            for spec in &agents.custom {
+        if let Some(agents) = parsed.agents
+            && let Some(custom) = agents.custom
+        {
+            for spec in &custom {
                 known_custom.push(spec.name.clone());
             }
-            self.custom_agents = agents.custom;
+            self.custom_agents = custom;
         }
         if let Some(mcp) = parsed.mcp {
             self.merge_mcp_servers(mcp.servers);
@@ -383,6 +440,7 @@ impl DmuxSettings {
                         continue;
                     }
                     if matches!(lower.as_str(), "agy" | "codex" | "cursor")
+                        || (preset_pending && lower == "opencode")
                         || self
                             .custom_agents
                             .iter()
@@ -464,6 +522,24 @@ impl DmuxSettings {
     }
 }
 
+impl DmuxSettings {
+    /// Whether `runner` may take graph nodes (SPEC-first-run FR-813). An unset
+    /// `allowed_runners` admits every runner except the built-in opencode
+    /// preset; a listed runner, including the preset, is admitted.
+    pub fn graph_runner_allowed(&self, runner: &str) -> bool {
+        let runner = runner.trim();
+        match &self.graph_allowed_runners {
+            Some(allowed) => allowed
+                .iter()
+                .any(|r| r.trim().eq_ignore_ascii_case(runner)),
+            None => !self
+                .custom_agents
+                .iter()
+                .any(|spec| spec.builtin && spec.name.eq_ignore_ascii_case(runner)),
+        }
+    }
+}
+
 impl Default for DmuxSettings {
     fn default() -> Self {
         Self {
@@ -477,6 +553,7 @@ impl Default for DmuxSettings {
             theme: Theme::default(),
             theme_force_color: None,
             custom_agents: Vec::new(),
+            builtin_opencode: true,
             mcp_servers: Vec::new(),
             todo_jira_base_url: None,
             ui: UiSettings::default(),
@@ -556,6 +633,59 @@ fn normalize_jira_base_url(value: &str) -> Result<String, String> {
     Ok(trimmed.trim_end_matches('/').to_owned())
 }
 
+/// Finds the opencode executable (SPEC-first-run FR-810). `DMUXAI_OPENCODE_BIN`
+/// is authoritative when set: it must name an existing file. Otherwise the first
+/// `opencode` file on `PATH` is used.
+pub fn find_opencode_bin() -> Option<PathBuf> {
+    match std::env::var_os("DMUXAI_OPENCODE_BIN").filter(|value| !value.is_empty()) {
+        Some(raw) => {
+            let path = PathBuf::from(raw);
+            path.is_file().then_some(path)
+        }
+        None => find_on_path("opencode"),
+    }
+}
+
+/// Searches `PATH` for the first file called `name` (`name.exe` or `name.cmd`
+/// on Windows). No shell is involved.
+pub fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let file_names: Vec<String> = if cfg!(windows) {
+        vec![
+            format!("{name}.exe"),
+            format!("{name}.cmd"),
+            format!("{name}.bat"),
+            name.to_owned(),
+        ]
+    } else {
+        vec![name.to_owned()]
+    };
+    std::env::split_paths(&path_var)
+        .flat_map(|dir| {
+            file_names
+                .iter()
+                .map(move |file| dir.join(file))
+                .collect::<Vec<_>>()
+        })
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// A regular file the current user may execute (on Unix, any execute bit).
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
 fn env_flag(name: &str) -> bool {
     match std::env::var(name) {
         Ok(value) => matches!(
@@ -566,7 +696,7 @@ fn env_flag(name: &str) -> bool {
     }
 }
 
-fn default_user_config_path() -> Option<PathBuf> {
+pub fn default_user_config_path() -> Option<PathBuf> {
     if let Some(base) = std::env::var_os("XDG_CONFIG_HOME") {
         let base_path = PathBuf::from(base);
         if !base_path.as_os_str().is_empty() {
@@ -1476,6 +1606,179 @@ mod builtin_memory_mcp_tests {
                 "{:?}",
                 s.config_warnings
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod builtin_opencode_tests {
+    use super::*;
+    use crate::custom_agent::opencode_preset;
+
+    /// Fake opencode executable: a plain file is enough for the PATH check.
+    fn fake_opencode(dir: &Path) -> PathBuf {
+        let path = dir.join("opencode");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        path
+    }
+
+    // TC-810 / FR-810, FR-811: the preset is registered only when opencode is
+    // installed, no config names its own `opencode`, and `builtin_opencode` is
+    // not false. `allowed_runners = ["opencode"]` validates with the preset.
+    #[test]
+    fn builtin_opencode_preset_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_opencode(dir.path());
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let user = dir.path().join("user.toml");
+
+        // Installed, no config: the preset is registered from the template.
+        let settings = DmuxSettings::load_with_opencode(&ws, Some(&user), None, Some(bin.clone()));
+        assert_eq!(
+            settings.custom_agents.len(),
+            1,
+            "{:?}",
+            settings.custom_agents
+        );
+        let preset = &settings.custom_agents[0];
+        assert!(preset.builtin);
+        assert_eq!(preset.name, "opencode");
+        assert_eq!(preset.command[0], bin.to_string_lossy());
+        assert_eq!(preset.default_model, None);
+        assert_eq!(preset.allowed_models.as_deref(), Some("^opencode/.*-free$"));
+        assert_eq!(preset.models_filter.as_deref(), Some("-free$"));
+        assert_eq!(
+            preset.models_command,
+            vec![bin.to_string_lossy().into_owned(), "models".to_owned()]
+        );
+        assert_eq!(
+            preset.command,
+            opencode_preset(&bin.to_string_lossy()).command
+        );
+        assert!(
+            settings.config_warnings.is_empty(),
+            "{:?}",
+            settings.config_warnings
+        );
+
+        // Not installed: no preset and no error.
+        let missing = DmuxSettings::load_with_opencode(&ws, Some(&user), None, None);
+        assert!(missing.custom_agents.is_empty());
+        assert!(missing.config_warnings.is_empty());
+
+        // A user entry named opencode wins; the preset is absent.
+        std::fs::write(
+            &user,
+            "[[agents.custom]]\nname = \"opencode\"\ncommand = [\"my-opencode\"]\n",
+        )
+        .unwrap();
+        let user_wins = DmuxSettings::load_with_opencode(&ws, Some(&user), None, Some(bin.clone()));
+        assert_eq!(user_wins.custom_agents.len(), 1);
+        assert!(!user_wins.custom_agents[0].builtin);
+        assert_eq!(user_wins.custom_agents[0].command, vec!["my-opencode"]);
+
+        // `builtin_opencode = false` in the workspace hides the preset.
+        std::fs::write(&user, "").unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            "[agents]\nbuiltin_opencode = false\n",
+        )
+        .unwrap();
+        let disabled = DmuxSettings::load_with_opencode(&ws, Some(&user), None, Some(bin.clone()));
+        assert!(!disabled.builtin_opencode);
+        assert!(disabled.custom_agents.is_empty());
+
+        // `[agents]` without custom agents keeps the user's custom agents.
+        std::fs::write(
+            &user,
+            "[[agents.custom]]\nname = \"pi\"\ncommand = [\"pi\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            "[agents]\nbuiltin_opencode = true\n",
+        )
+        .unwrap();
+        let kept = DmuxSettings::load_with_opencode(&ws, Some(&user), None, Some(bin.clone()));
+        let names: Vec<&str> = kept.custom_agents.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["pi", "opencode"]);
+
+        // The preset can be named in allowed_runners without a warning.
+        std::fs::write(&user, "").unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            "[graph]\nallowed_runners = [\"opencode\", \"cursor\"]\n",
+        )
+        .unwrap();
+        let listed = DmuxSettings::load_with_opencode(&ws, Some(&user), None, Some(bin.clone()));
+        assert_eq!(
+            listed.graph_allowed_runners,
+            Some(vec!["opencode".to_owned(), "cursor".to_owned()])
+        );
+        assert!(
+            listed.config_warnings.is_empty(),
+            "{:?}",
+            listed.config_warnings
+        );
+
+        // Without the preset, the same list is reported as unknown.
+        let unknown = DmuxSettings::load_with_opencode(&ws, Some(&user), None, None);
+        assert!(
+            unknown
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("unknown runner 'opencode'")),
+            "{:?}",
+            unknown.config_warnings
+        );
+    }
+
+    // FR-813: with allowed_runners unset the preset takes no graph nodes; a
+    // listed preset and user-configured custom agents keep the old rule.
+    #[test]
+    fn builtin_preset_is_not_graph_routed_unless_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_opencode(dir.path());
+        let user = dir.path().join("user.toml");
+        std::fs::write(
+            &user,
+            "[[agents.custom]]\nname = \"pi\"\ncommand = [\"pi\"]\n",
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_opencode(dir.path(), Some(&user), None, Some(bin));
+        assert!(!settings.graph_runner_allowed("opencode"));
+        assert!(settings.graph_runner_allowed("pi"));
+        assert!(settings.graph_runner_allowed("cursor"));
+
+        let mut listed = settings.clone();
+        listed.graph_allowed_runners = Some(vec!["opencode".to_owned()]);
+        assert!(listed.graph_runner_allowed("opencode"));
+        assert!(!listed.graph_runner_allowed("cursor"));
+    }
+
+    // TC-814 / FR-814: the starter config is all comments, so it parses to the
+    // defaults, with or without the opencode example, and names every section.
+    #[test]
+    fn starter_config_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dmuxai.toml");
+        for detected in [false, true] {
+            let text = crate::init::starter_config(detected);
+            for key in [
+                "[theme]",
+                "[routing]",
+                "[graph]",
+                "[cursor]",
+                "[agents]",
+                "builtin_opencode",
+            ] {
+                assert!(text.contains(key), "missing {key}");
+            }
+            std::fs::write(&path, &text).unwrap();
+            // No opencode executable here: the example stays a comment.
+            let settings = DmuxSettings::load_with_opencode(dir.path(), Some(&path), None, None);
+            assert_eq!(settings, DmuxSettings::default(), "detected={detected}");
         }
     }
 }
