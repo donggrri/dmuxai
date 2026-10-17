@@ -372,6 +372,9 @@ mod tests {
         // Header button with badge, wired to the shared sidebar.
         assert!(INDEX_HTML.contains(r#"id="todos-toggle""#));
         assert!(INDEX_HTML.contains(r#"id="todos-count""#));
+        // UX-840: the count is part of the button's accessible name.
+        assert!(INDEX_HTML.contains(r#"aria-label="To-dos, 0 open""#));
+        assert!(APP_JS.contains("'To-dos, ' + open + ' open'"));
         let toggle_start = INDEX_HTML.find(r#"id="todos-toggle""#).unwrap();
         let toggle_tag = &INDEX_HTML[INDEX_HTML[..toggle_start].rfind('<').unwrap()..];
         let toggle_tag = &toggle_tag[..toggle_tag.find('>').unwrap()];

@@ -125,6 +125,7 @@ with sync_playwright() as p:
     pg.click("#todos-toggle")
     pg.wait_for_selector("#sidebar.open #tab-panel-todos:not([hidden])", timeout=15000)
     out["todos_expanded"] = pg.get_attribute("#todos-toggle", "aria-expanded")
+    out["toggle_label"] = pg.get_attribute("#todos-toggle", "aria-label")
     out["tab_todos_selected"] = pg.get_attribute("#tab-todos", "aria-selected")
     pg.wait_for_function("document.querySelectorAll('#todo-list .todo').length === 3", timeout=15000)
     out["open_count"] = len(visible_titles(pg))
@@ -191,6 +192,7 @@ with sync_playwright() as p:
 
     assert_eq!(v["sidebar_open_before"], false, "{v}");
     assert_eq!(v["todos_expanded"], "true", "{v}");
+    assert_eq!(v["toggle_label"], "To-dos, 3 open", "{v}");
     assert_eq!(v["tab_todos_selected"], "true", "{v}");
     assert_eq!(v["open_count"], 3, "{v}");
     let open_after: Vec<String> = serde_json::from_value(v["open_after_done"].clone()).unwrap();

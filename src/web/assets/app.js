@@ -1985,7 +1985,9 @@ function updateTodoCount(allTodos) {
     if (allTodos[i] && String(allTodos[i].status || 'open') !== 'done') { open++; }
   }
   badge.textContent = String(open);
-  badge.setAttribute('aria-label', open + ' open to-do' + (open === 1 ? '' : 's'));
+  // A span's aria-label is ignored, so the count is announced via the button name.
+  var toggle = $('todos-toggle');
+  if (toggle) { toggle.setAttribute('aria-label', 'To-dos, ' + open + ' open'); }
 }
 
 function bindTodoFilter() {
