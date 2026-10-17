@@ -22,3 +22,9 @@ Nits 7 (rustfmt) and 8 (redundant assert): `cargo fmt --check` is clean, and the
 | --- | --- | --- |
 | 1 | The turn-suffix check also applied to segment aggregates, so identical consecutive segments without partials collapsed (a regression) | Fixed: segment aggregates without partials are always shown in full. Only the final aggregate is compared with the turn. Tested |
 | 2 | A whole-turn final aggregate after a streamed last segment dropped its tail | Fixed: the final aggregate first tries the whole-turn prefix. Tested |
+
+## Round 3: APPROVE
+
+Both round-2 blockers were confirmed resolved, with no regression found. A residual, non-blocking note: a final aggregate that carried `timestamp_ms` would be read as a partial. cursor-agent does not emit one (the recorded fixture's final aggregate has neither key), which matches the FR-800 definition.
+
+Evidence (maintainer, `ddf3bde`): `cargo fmt --check` and `cargo clippy --locked --all-targets -- -D warnings` are clean; `cargo test --locked --all-targets` gives 529 passed, 0 failed, 9 ignored; `agent::cursor` has 13 passed.
