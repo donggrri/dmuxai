@@ -24,7 +24,7 @@ use crate::memory::{MemoryError, MemoryHandle, Proposal, SaveOutcome};
 use crate::todo::{NewTodo, TodoError, TodoPatch, TodoSource, TodoStatus};
 use crate::web::DEFAULT_PORT;
 use crate::web::auth::{BindCheck, check_bind, dashboard_url, token_matches};
-use crate::web::commands::{DashboardCommand, RunMode, RunTodoError};
+use crate::web::commands::{DashboardCommand, RunMode, RunTodoError, SessionCommand};
 use crate::web::hub::DashboardHub;
 
 /// Slice B dependencies injected into the router (FR-541, FR-542).
@@ -361,6 +361,22 @@ async fn get_app_css() -> impl IntoResponse {
     )
 }
 
+async fn get_session_css() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::SESSION_CSS,
+    )
+}
+
 async fn get_memory_js() -> impl IntoResponse {
     (
         [
@@ -374,6 +390,22 @@ async fn get_memory_js() -> impl IntoResponse {
             (HeaderName::from_static("x-content-type-options"), "nosniff"),
         ],
         crate::web::assets::MEMORY_JS,
+    )
+}
+
+async fn get_session_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::SESSION_JS,
     )
 }
 
@@ -807,6 +839,34 @@ async fn post_prompt(
     )
 }
 
+/// `POST /api/command`: picker and lifecycle actions (SPEC-dashboard-parity
+/// FR-781). Answers with the updated session.
+async fn post_command(
+    State(state): State<AppState>,
+    ApiJson(command): ApiJson<SessionCommand>,
+) -> Response {
+    let Some(sender) = state.services.commands.clone() else {
+        return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
+    };
+    let (reply, rx) = oneshot::channel();
+    if sender
+        .send(DashboardCommand::Session { command, reply })
+        .await
+        .is_err()
+    {
+        return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
+    }
+    match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Err(_) => error_json(StatusCode::GATEWAY_TIMEOUT, "command timed out"),
+        Ok(Err(_)) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        Ok(Ok(Err(error))) => run_error_response(error),
+        Ok(Ok(Ok(session))) => json_ok(
+            StatusCode::OK,
+            &serde_json::json!({ "ok": true, "session": session }),
+        ),
+    }
+}
+
 fn run_error_response(error: RunTodoError) -> Response {
     match error {
         RunTodoError::Busy(message) => error_json(StatusCode::CONFLICT, &message),
@@ -816,6 +876,8 @@ fn run_error_response(error: RunTodoError) -> Response {
         RunTodoError::Forbidden(message) => error_json(StatusCode::FORBIDDEN, &message),
         RunTodoError::UnknownAgent(message) => error_json(StatusCode::NOT_FOUND, &message),
         RunTodoError::NotFound => error_json(StatusCode::NOT_FOUND, "to-do not found"),
+        RunTodoError::Missing(message) => error_json(StatusCode::NOT_FOUND, &message),
+        RunTodoError::Invalid(message) => error_json(StatusCode::BAD_REQUEST, &message),
         RunTodoError::Internal(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
 }
@@ -989,6 +1051,8 @@ pub fn build_router_with(
         .route("/", get(get_index))
         .route("/assets/app.js", get(get_app_js))
         .route("/assets/memory.js", get(get_memory_js))
+        .route("/assets/session.js", get(get_session_js))
+        .route("/assets/session.css", get(get_session_css))
         .route("/assets/app.css", get(get_app_css))
         .route("/api/state", get(get_state))
         .route("/api/memory", get(get_memory))
@@ -1009,6 +1073,7 @@ pub fn build_router_with(
         .route("/api/mcp/servers", get(list_mcp_servers))
         .route("/api/import", post(import_todos))
         .route("/api/prompt", post(post_prompt))
+        .route("/api/command", post(post_command))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_and_auth_middleware,
@@ -1484,6 +1549,157 @@ mod tests {
             }
         });
         tx
+    }
+
+    fn spawn_session_reply(
+        outcome: Result<crate::web::SessionView, RunTodoError>,
+    ) -> (
+        mpsc::Sender<DashboardCommand>,
+        Arc<std::sync::Mutex<Vec<SessionCommand>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_task = Arc::clone(&seen);
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                if let DashboardCommand::Session { command, reply } = command {
+                    seen_task.lock().unwrap().push(command);
+                    let _ = reply.send(outcome.clone());
+                }
+            }
+        });
+        (tx, seen)
+    }
+
+    // TC-783 (FR-781): `POST /api/command` parses every action, maps App
+    // refusals to HTTP statuses, needs the token and answers 409 in `serve`.
+    #[tokio::test]
+    async fn command_route_contract() {
+        let token = "command-token-123".to_string();
+        let session = crate::web::SessionView {
+            conversation_id: "conv-1".to_owned(),
+            selected_agent: "codex".to_owned(),
+            ..crate::web::SessionView::default()
+        };
+        let router_with = |commands: mpsc::Sender<DashboardCommand>| {
+            build_router_with(
+                test_hub(),
+                token.clone(),
+                allowed_localhost(),
+                DashboardServices {
+                    commands: Some(commands),
+                    web_attached: true,
+                    ..DashboardServices::default()
+                },
+            )
+        };
+
+        let (tx, seen) = spawn_session_reply(Ok(session));
+        let router = router_with(tx);
+        let bodies = [
+            r#"{"command":"select_agent","agent":"agy"}"#,
+            r#"{"command":"set_mode","mode":"plan"}"#,
+            r#"{"command":"load_models","agent":"codex"}"#,
+            r#"{"command":"select_model","agent":"codex","model":"m1"}"#,
+            r#"{"command":"set_effort","effort":"high"}"#,
+            r#"{"command":"cancel","agent":"codex"}"#,
+            r#"{"command":"new_conversation","title":"T"}"#,
+            r#"{"command":"load_conversation","id":"conv-1"}"#,
+            r#"{"command":"share","target":"cursor"}"#,
+            r#"{"command":"status"}"#,
+            r#"{"command":"toggle_details"}"#,
+            r#"{"command":"quit"}"#,
+        ];
+        for body in bodies {
+            let resp = router
+                .clone()
+                .oneshot(json_request("POST", "/api/command", &token, body))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+            assert_eq!(json["ok"], true);
+            assert_eq!(json["session"]["conversation_id"], "conv-1");
+        }
+        assert_eq!(seen.lock().unwrap().len(), bodies.len());
+        assert_eq!(
+            seen.lock().unwrap()[1],
+            SessionCommand::SetMode {
+                agent: None,
+                mode: "plan".to_owned()
+            }
+        );
+
+        for body in [
+            r#"{"command":"warp"}"#,
+            r#"{"command":"select_agent"}"#,
+            r#"not json"#,
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(json_request("POST", "/api/command", &token, body))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        for (error, status) in [
+            (
+                RunTodoError::Forbidden("no".to_owned()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                RunTodoError::UnknownAgent("x".to_owned()),
+                StatusCode::NOT_FOUND,
+            ),
+            (RunTodoError::Missing("x".to_owned()), StatusCode::NOT_FOUND),
+            (RunTodoError::Busy("busy".to_owned()), StatusCode::CONFLICT),
+            (
+                RunTodoError::Invalid("bad".to_owned()),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let (tx, _seen) = spawn_session_reply(Err(error));
+            let resp = router_with(tx)
+                .oneshot(json_request(
+                    "POST",
+                    "/api/command",
+                    &token,
+                    r#"{"command":"status"}"#,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status);
+        }
+
+        let (tx, _seen) = spawn_session_reply(Err(RunTodoError::NotFound));
+        let resp = router_with(tx)
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                "wrong-token",
+                r#"{"command":"status"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let serve_router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices::default(),
+        );
+        let resp = serve_router
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                r#"{"command":"status"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
     // TC-541 / FR-541: CRUD routes and the snapshot reflect every mutation.

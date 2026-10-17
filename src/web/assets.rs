@@ -1,6 +1,8 @@
 pub const INDEX_HTML: &str = include_str!("assets/index.html");
 pub const APP_JS: &str = include_str!("assets/app.js");
 pub const MEMORY_JS: &str = include_str!("assets/memory.js");
+pub const SESSION_JS: &str = include_str!("assets/session.js");
+pub const SESSION_CSS: &str = include_str!("assets/session.css");
 pub const APP_CSS: &str = include_str!("assets/app.css");
 
 #[cfg(test)]
@@ -131,6 +133,72 @@ mod tests {
         assert!(MEMORY_JS.contains("/api/memory/save"));
         assert!(MEMORY_JS.contains("/approve"));
         assert!(MEMORY_JS.contains("/reject"));
+    }
+
+    // TC-786 (FR-782, FR-783, UX-780, NFR-780): the session module is wired
+    // into the page and carries the prompt, palette and busy-state behavior.
+    #[test]
+    fn session_module_has_parity_controls() {
+        assert!(INDEX_HTML.contains("id=\"session\""));
+        assert!(INDEX_HTML.contains("/assets/session.js"));
+        assert!(INDEX_HTML.contains("/assets/session.css"));
+        // Enter sends, Shift+Enter is a newline, IME composition never sends.
+        assert!(SESSION_JS.contains("e.key === 'Enter' && !e.shiftKey"));
+        assert!(SESSION_JS.contains("e.isComposing"));
+        // Ctrl+K and "/" in an empty prompt open the palette; Esc closes it.
+        assert!(SESSION_JS.contains("e.key === 'k'"));
+        assert!(SESSION_JS.contains("ui.input.value === '/'"));
+        assert!(SESSION_JS.contains("e.key === 'Escape'"));
+        // UX-780: pickers are disabled and Cancel is shown while busy.
+        assert!(SESSION_JS.contains("ui.mode.disabled = viewOnly || busy"));
+        assert!(SESSION_JS.contains("ui.model.disabled = viewOnly || busy"));
+        assert!(SESSION_JS.contains("ui.cancel.hidden = !busy"));
+        assert!(SESSION_JS.contains("/api/command"));
+        assert!(SESSION_JS.contains("/api/prompt"));
+        // CSP: no inline handlers or HTML injection.
+        assert!(!SESSION_JS.contains("innerHTML"));
+        assert!(!SESSION_JS.contains("onclick"));
+        assert!(SESSION_CSS.starts_with("/* session"));
+        // NFR-780: app.js only re-dispatches snapshots; session.js reuses them
+        // instead of opening a second SSE stream.
+        assert!(!APP_JS.contains("/assets/session.js"));
+        assert!(APP_JS.contains("new CustomEvent('dmuxai:snapshot'"));
+        assert!(SESSION_JS.contains("addEventListener('dmuxai:snapshot'"));
+        assert!(!SESSION_JS.contains("EventSource"));
+    }
+
+    // TC-786 (NFR-780): the module and its stylesheet are served with the
+    // same hardened headers as the other assets, without a token.
+    #[tokio::test]
+    async fn session_assets_are_served_hardened() {
+        let hub = crate::web::DashboardHub::new(
+            crate::web::SnapshotSource::Tui,
+            "/workspace".to_string(),
+        );
+        let router = build_router(hub, "testtoken123".to_string(), None);
+        for (uri, content_type, body) in [
+            ("/assets/session.js", "text/javascript", SESSION_JS),
+            ("/assets/session.css", "text/css", SESSION_CSS),
+        ] {
+            let req = axum::http::Request::builder()
+                .uri(uri)
+                .header("Host", "localhost:7420")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{uri}");
+            let headers = resp.headers().clone();
+            assert!(
+                headers["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with(content_type)
+            );
+            assert_eq!(headers["content-security-policy"], "default-src 'self'");
+            assert_eq!(headers["x-content-type-options"], "nosniff");
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(bytes.as_ref(), body.as_bytes());
+        }
     }
 
     // TC-543: static_page_has_todo_panel (SPEC-web-dashboard UX-540)

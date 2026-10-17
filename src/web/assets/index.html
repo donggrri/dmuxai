@@ -7,6 +7,7 @@
 <meta name="referrer" content="no-referrer">
 <title>DmuxAI dashboard</title>
 <link rel="stylesheet" href="/assets/app.css">
+<link rel="stylesheet" href="/assets/session.css">
 <script src="/assets/app.js" defer></script>
 </head>
 <body>
@@ -33,6 +34,8 @@
 
 <main>
   <p id="msg" class="notice" role="status" aria-live="polite" hidden></p>
+
+  <section id="session" class="panel" aria-label="Chat" hidden></section>
 
   <section class="panel">
     <h2 class="panel-title">Agents</h2>
@@ -124,5 +127,6 @@
   <section id="memory-panel" class="panel" aria-label="Memory"></section>
 </main>
 <script src="/assets/memory.js" defer></script>
+<script src="/assets/session.js" defer></script>
 </body>
 </html>

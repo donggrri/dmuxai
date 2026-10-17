@@ -232,6 +232,14 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M6,M8 | SPEC-agent-api | FR-771 | TC-773 | `command_hook_receives_event_on_stdin` | integration | ✅ | agent API (G1) |
 | M6,M8 | SPEC-agent-api | FR-773 | TC-774 | `discovery_file_and_token_env` | unit | ✅ | agent API (G1) |
 | M6,M8 | SPEC-agent-api | FR-768 | TC-775 | `app_emits_agent_lifecycle_events` | unit | ✅ | agent API (G1) |
+| M8,M2 | SPEC-dashboard-parity | FR-780 | TC-780 | `dashboard_session_snapshot_has_contract_keys` | unit | ✅ | dashboard parity (G2) |
+| M8,M2 | SPEC-dashboard-parity | FR-780 | TC-781 | `dashboard_session_transcript_is_capped` | unit | ✅ | dashboard parity (G2) |
+| M8,M2 | SPEC-dashboard-parity | FR-782 | TC-782 | `dashboard_prompt_streams_into_transcript` | unit | ✅ | dashboard parity (G2) |
+| M8,M2 | SPEC-dashboard-parity | FR-781 | TC-783 | `command_route_contract`, `dashboard_commands_match_tui_actions`, `dashboard_cancel_targets_the_named_agent` | integration | ✅ | dashboard parity (G2) |
+| M8,M2 | SPEC-dashboard-parity | FR-781 | TC-784 | `dashboard_new_and_load_conversation` | unit | ✅ | dashboard parity (G2) |
+| M8,M2 | SPEC-dashboard-parity | FR-783 | TC-785 | `dashboard_slash_commands_via_prompt` | unit | ✅ | dashboard parity (G2) |
+| M8,M2 | SPEC-dashboard-parity | FR-782,FR-783,UX-780 | TC-786 | `session_module_has_parity_controls`, `session_assets_are_served_hardened` | unit (asset) | ✅ | dashboard parity (G2) |
+| M8,M2 | SPEC-dashboard-parity | FR-784 | TC-787 | `tui_commands_have_dashboard_controls`, `parity_matrix_controls_exist_in_session_js` | unit | ✅ | dashboard parity (G2) |
 
 
 ### 1.1 주의할 ⚠️ 항목

@@ -153,6 +153,7 @@ clean exit. Read it instead of parsing logs.
 | GET | `/api/events` | `?since=N` | `200` SSE | 401, 403 |
 | GET | `/api/events/log` | `?since=N&limit=M` | `200` `{events, last_seq}` | 400, 401, 403 |
 | POST | `/api/prompt` | `{text, agent?, mode?}` | `202` `{accepted, conversation_id, agent}` | 400, 401, 403, 404, 409, 415, 504 (prompt not accepted within 10 s) |
+| POST | `/api/command` | `{command, ...}` (see below) | `200` `{ok, session}` | 400, 401, 403, 404, 409, 415, 504 |
 | GET | `/api/todos` | — | `200` `[Todo]` | 401, 403, 503 |
 | POST | `/api/todos` | `{title, body?}` | `201` `Todo` | 400, 401, 403, 413, 415, 503 |
 | PATCH | `/api/todos/{id}` | `{title?, body?, status?}` | `200` `Todo` | 400, 401, 403, 404, 415, 503 |
@@ -166,6 +167,28 @@ Status meanings:
 - `404` unknown to-do or unknown agent, `409` busy agent / already running / a
   `serve` dashboard asked to prompt or run, `503` to-do board unavailable,
   `504` run request timed out (to-do run) or prompt accept timed out (`POST /api/prompt`).
+
+`POST /api/command` runs a picker or lifecycle action the way the matching TUI
+command does (`dmuxai --web` only; SPEC-dashboard-parity FR-781). `agent`
+defaults to the selected agent:
+
+| `command` | Fields | TUI equivalent |
+| --- | --- | --- |
+| `select_agent` | `agent` | `/agent` |
+| `set_mode` | `agent?`, `mode` (`ask`/`plan`/`implement`) | `/mode` |
+| `load_models` | `agent?` | opening F2 |
+| `select_model` | `agent?`, `model` | F2 |
+| `set_effort` | `agent?`, `effort` (Codex) | `/effort` |
+| `cancel` | `agent?` | Ctrl+C |
+| `new_conversation` | `title?` | `/new` |
+| `load_conversation` | `id` | `/resume`, F3 |
+| `share` | `target` (`codex`/`cursor`/`agy`) | `/share` |
+| `status`, `toggle_details`, `quit` | — | `/status`, `/details`, `/quit` |
+
+Busy agents refuse mode/model/effort changes (409); runners outside
+`allowed_runners` are refused (403). With `dmuxai --web`, `/api/state` and SSE
+snapshots also carry `session` (conversation, per-agent pickers, transcript
+tail, recent conversations, slash commands).
 
 `POST /api/prompt` submits the text exactly like pressing Enter in the TUI
 (slash commands included). `GET /api/events/log` returns events with

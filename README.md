@@ -183,6 +183,12 @@ TOKEN="<token from .dmuxai/web.json>"
 curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:7420/api/state"
 ```
 
+With `dmuxai --web` the dashboard's Chat panel does everything the TUI does:
+prompt box (Enter sends, Shift+Enter adds a line), streaming transcript,
+agent/mode/model/effort pickers, every slash command (buttons or Ctrl+K), cancel,
+new/load conversation and share. Agents can drive the same actions through
+`POST /api/command`.
+
 Full reference: [docs/API.md](docs/API.md) — CLI, HTTP, MCP, events and `[notify]`.
 
 ## Attach any agent CLI

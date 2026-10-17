@@ -6,7 +6,7 @@ use crate::events::{EventDraft, EventSink};
 use crate::graph::GraphNodeStatus;
 use crate::todo::Todo;
 use crate::web::snapshot::{
-    AgentView, DashboardSnapshot, GraphView, SNAPSHOT_SCHEMA, SnapshotSource, UiTheme,
+    AgentView, DashboardSnapshot, GraphView, SNAPSHOT_SCHEMA, SessionView, SnapshotSource, UiTheme,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -48,6 +48,7 @@ impl DashboardHub {
             graph: None,
             todos: Vec::new(),
             jira_base_url: None,
+            session: None,
         };
 
         let (tx, _) = watch::channel(initial_snapshot.clone());
@@ -165,6 +166,23 @@ impl DashboardHub {
         if let Some(sink) = &self.events {
             sink.observe_snapshot(&changed_snapshot);
         }
+    }
+
+    /// Replaces the live chat session (SPEC-dashboard-parity FR-780), bumping
+    /// the revision only when it changes. Session changes are not
+    /// state-change events, so the event sink is not consulted.
+    pub fn set_session(&self, session: Option<SessionView>) {
+        let mut state = self.state.lock().unwrap();
+        if state.snapshot.session == session {
+            return;
+        }
+        state.snapshot.session = session;
+        state.snapshot.revision += 1;
+        state.snapshot.generated_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let _ = self.watch_tx.send_replace(state.snapshot.clone());
     }
 
     /// Attaches an event sink so snapshot changes are appended to the log.
