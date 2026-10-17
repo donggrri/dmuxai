@@ -40,6 +40,22 @@ startup; other origins/hosts are rejected. Binding elsewhere requires
 WSL and open the printed URL in the Windows browser (`localhost` is forwarded).
 Details: [SPEC-web-dashboard](docs/specs/SPEC-web-dashboard.md).
 
+### Graph view
+
+![Graph run as a subway map (demo data)](docs/images/web-graph-view.png)
+
+A graph run can be shown as a subway map instead of the step list (the
+**List / Graph** toggle is remembered per browser). Stations are laid out left
+to right by dependency depth, parallel nodes are stacked in the same column,
+and lines run from each dependency to its dependent. Completed stations show a
+check, failed ones a cross, the running station pulses (no animation with
+reduced motion), and pending ones are hollow. The bar on top shows overall
+progress; an ETA appears only when it can be computed from real node timings.
+Click a station (or focus it and press Enter) for its runner, model, status,
+attempt, elapsed time, job, last output lines, and changed files. Use the
+mouse wheel to zoom, drag to pan, and **Fit** to reset. It updates live and
+also works in `dmuxai serve`.
+
 ### To-do board
 
 ![DmuxAI to-do board (serve mode, view-only)](docs/images/web-todo.png)
