@@ -88,12 +88,14 @@ async fn mcp_client_stdio_and_http_against_mock() {
         transport: Transport::Stdio {
             command: env!("CARGO_BIN_EXE_dmuxai").to_owned(),
             args: vec!["__mock-mcp".to_owned()],
-            env: BTreeMap::new(),
+            // The mock never answers, so the timeout fires on every platform
+            // (a 1ns timeout raced the fast mock on Windows CI).
+            env: BTreeMap::from([("DMUXAI_MOCK_MCP_SILENT".to_owned(), "1".to_owned())]),
         },
         runners: None,
         tools: ToolNames::default(),
     };
-    let timeout_err = McpClient::connect(&timeout_server, Duration::from_nanos(1))
+    let timeout_err = McpClient::connect(&timeout_server, Duration::from_millis(300))
         .await
         .expect_err("connect with 1ns timeout should fail");
     let timeout_str = timeout_err.to_string();

@@ -48,11 +48,19 @@ pub async fn serve_stdio() {
     let _ = tokio::task::spawn_blocking(stdio_loop).await;
 }
 
+/// Env var that makes the stdio mock read requests but never answer, so
+/// timeout handling can be tested deterministically on every platform.
+pub const MOCK_SILENT_ENV: &str = "DMUXAI_MOCK_MCP_SILENT";
+
 fn stdio_loop() {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
+    let silent = std::env::var_os(MOCK_SILENT_ENV).is_some();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
+        if silent {
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
