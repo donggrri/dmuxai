@@ -34,7 +34,7 @@ Format: id, status, repro, cause, fix.
 - Cause: headless AGY auto-denies `run_command` (`result.denied_actions`, `response: ""`; stderr says "no output produced ... auto-denied"). DmuxAI treated it as success.
 - Fix: Implement mode passes `--dangerously-skip-permissions` (still `--sandbox`); `denied_actions` or an empty response is now an error turn.
 
-## #8 AGY long Implement turn hangs on a background command — open
+## #8 AGY long Implement turn hangs on a background command — fixed (PR #21, SPEC-agy-idle-timeout)
 - Repro: AGY flash, Implement, "create src/agent/opencode.rs ... run cargo build" → "waiting for the background compilation" for 5+ min with no events; cancelled with Ctrl+C. No file was written.
 - Workaround used: smaller prompts that say "do not run cargo"; the orchestrator compiles.
 
@@ -50,7 +50,7 @@ Format: id, status, repro, cause, fix.
 - AGY flash wrote `r#"... color = "#ffa500" ..."#` in tests; `"#` ends the raw string. Changed to `r##"..."##`.
 - AGY's first `substitute` re-scanned substituted values (a prompt containing `{model}` would be rewritten). Replaced by a single-pass substitution with a test.
 
-## #12 Conversation DB is global, not per worktree — open
+## #12 Conversation DB is global, not per worktree — fixed (PR #20, SPEC-state-per-repo)
 - Repro: run a v2-schema build (PR #8) once, then a build from an older `main` in another worktree → `Error: UnsupportedSchema(2)` and exit 1.
 - Cause: the DB lives at `$XDG_STATE_HOME/dmuxai/conversations.sqlite3` (default `~/.local/state`), shared by every worktree and binary version; there is no per-workspace override.
 - Workaround (parallel worktrees): `XDG_STATE_HOME=<worktree>/.dmuxai-state dmuxai`. Suggested fix: `DMUXAI_STATE_DIR` / `[state] dir`, and a clearer error naming the newer schema.
