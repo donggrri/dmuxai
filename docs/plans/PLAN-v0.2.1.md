@@ -1,6 +1,6 @@
 # PLAN: v0.2.1
 
-Status: Draft (v0.2.1)
+Status: implemented in v0.2.1 (released 2026-10-18)
 Specs: SPEC-cursor-stream-dedupe, SPEC-first-run, SPEC-running-indicators, SPEC-docs-tree, SPEC-todo-sidebar, SPEC-cursor-latency. Roadmap: [docs/ROADMAP.md](../ROADMAP.md)
 
 ## Process
