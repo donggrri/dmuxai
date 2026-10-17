@@ -290,9 +290,21 @@
       : session.conversation_id.slice(0, 8);
 
     setOptions(ui.agent, session.agents.map(function (a) {
+      var stateSuffix = '';
+      if (a.run && a.run.state === 'running') {
+        stateSuffix = ' · ⏳ running';
+      } else if (a.run && a.run.state === 'done') {
+        stateSuffix = ' · ✓ done';
+      } else if (a.run && a.run.state === 'failed') {
+        stateSuffix = ' · ✗ failed';
+      } else if (a.run && a.run.state === 'cancelled') {
+        stateSuffix = ' · ■ cancelled';
+      } else if (a.busy) {
+        stateSuffix = ' · busy';
+      }
       return {
         value: a.id,
-        label: a.label + (a.allowed ? '' : ' (not allowed)') + (a.busy ? ' · busy' : ''),
+        label: a.label + (a.allowed ? '' : ' (not allowed)') + stateSuffix,
         disabled: !a.allowed
       };
     }), session.selected_agent);
@@ -385,6 +397,23 @@
     } else {
       var empty = ui.transcript.querySelector('.session-empty');
       if (empty) { empty.parentNode.removeChild(empty); }
+    }
+    var currentAgent = selectedAgent();
+    var activeRun = currentAgent && currentAgent.run && currentAgent.run.state === 'running';
+    var hasStreaming = session.transcript.some(function (m) { return !!m.streaming; });
+    var workingNode = ui.transcript.querySelector('.msg-working');
+    if (activeRun && !hasStreaming) {
+      if (!workingNode) {
+        workingNode = el('li', 'msg msg-agent msg-working');
+        workingNode.appendChild(el('span', 'msg-who', currentAgent.label || currentAgent.id));
+        var textNode = el('div', 'msg-text');
+        textNode.appendChild(el('span', 'spinner'));
+        textNode.appendChild(document.createTextNode(' working\u2026'));
+        workingNode.appendChild(textNode);
+        ui.transcript.appendChild(workingNode);
+      }
+    } else if (workingNode) {
+      workingNode.parentNode.removeChild(workingNode);
     }
     if (stickToBottom) { ui.transcript.scrollTop = ui.transcript.scrollHeight; }
   }

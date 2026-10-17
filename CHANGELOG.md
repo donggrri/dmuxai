@@ -19,6 +19,13 @@ All notable changes to dmuxai are listed here. Versions follow
 - **`dmuxai init [--workspace] [--force]` (FR-814).** Writes a commented starter
   `dmuxai.toml` to the user config, or to the workspace with `--workspace`. It
   lists the runners found on `PATH` and refuses to overwrite without `--force`.
+- **Running indicators (SPEC-running-indicators FR-820..FR-824).** Each agent
+  has a run state (`idle`, `running`, `done`, `failed`, `cancelled`) with start
+  and end times, exposed in the dashboard snapshot and `/api/status`. The TUI
+  status bar shows a spinner and live elapsed seconds while a turn runs, then
+  `✓`, `✗` or `■`; `reduced_motion` shows a static mark. The web dashboard adds
+  a header status pill, spinners on agent chips and running graph nodes, and a
+  tab-title prefix.
 
 ### Changed
 

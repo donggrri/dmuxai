@@ -32,6 +32,35 @@ function storageRemove(key) {
 // which the CSP allows.
 // ---------------------------------------------------------------------------
 
+var baseDocumentTitle = document.title || 'DmuxAI dashboard';
+var lastObservedRunState = 'idle';
+
+function updateFavicon(state) {
+  var link = document.getElementById('favicon') || document.querySelector('link[rel~="icon"]');
+  if (!link) { return; }
+  var href = '/assets/favicon-idle.svg';
+  if (state === 'running') {
+    href = '/assets/favicon-running.svg';
+  } else if (state === 'done') {
+    href = '/assets/favicon-done.svg';
+  } else if (state === 'failed') {
+    href = '/assets/favicon-failed.svg';
+  }
+  if (link.getAttribute('href') !== href) {
+    link.setAttribute('href', href);
+  }
+}
+
+if (typeof window.addEventListener === 'function') {
+  window.addEventListener('focus', function () {
+    if (document.title.indexOf('✓ ') === 0 || document.title.indexOf('✗ ') === 0) {
+      document.title = baseDocumentTitle;
+      lastObservedRunState = 'idle';
+      updateFavicon('idle');
+    }
+  });
+}
+
 var THEME_KEY = 'dmuxai.theme';
 var ACCENT_KEY = 'dmuxai.accent';
 var THEME_VALUES = ['light', 'dark', 'system'];
@@ -188,6 +217,8 @@ function bindThemeControls() {
 // above stop further snapshot applications.
 function applySnapshotUi(snap) {
   var ui = snap && snap.ui ? snap.ui : null;
+  // [theme] reduced_motion / DMUXAI_REDUCED_MOTION (UX-821) also stills the web spinners.
+  document.documentElement.classList.toggle('reduced-motion', !!(ui && ui.reduced_motion));
   if (ui && validTheme(String(ui.theme || ''))) {
     snapshotUiTheme = String(ui.theme);
   }
@@ -277,7 +308,14 @@ function el(tag, className, text) {
 
 function badge(status) {
   var label = String(status || 'pending');
-  return el('span', 'badge badge-' + label, label);
+  var b = el('span', 'badge badge-' + label);
+  if (label === 'running') {
+    b.appendChild(el('span', 'spinner'));
+    b.appendChild(document.createTextNode(' ' + label));
+  } else {
+    b.textContent = label;
+  }
+  return b;
 }
 
 function graphCounts(graph) {
@@ -340,6 +378,18 @@ function renderCounts(graph) {
   }
   target.replaceChildren();
   target.appendChild(document.createTextNode(parts.length > 0 ? parts.join(' \u00b7 ') : 'no nodes yet'));
+}
+
+// Elapsed ms of a running agent run, corrected for server/browser clock skew
+// the same way as nodeElapsed (FR-823).
+function runElapsedMs(run, nowMs) {
+  if (!run || typeof run.started_at_ms !== 'number') { return 0; }
+  var snap = snapshot;
+  if (snap && typeof snap.generated_at_ms === 'number' && typeof snap.receivedAt === 'number') {
+    var serverNow = snap.sent_at_ms > 0 ? snap.sent_at_ms : snap.generated_at_ms;
+    return Math.max(0, (serverNow - run.started_at_ms) + (nowMs - snap.receivedAt));
+  }
+  return Math.max(0, nowMs - run.started_at_ms);
 }
 
 function nodeElapsed(node, snap, nowMs) {
@@ -699,7 +749,11 @@ function graphStation(entry, nowMs) {
   group.appendChild(title);
 
   if (status === 'running') {
-    group.appendChild(graphCircle('ring ring-outer', 0, 0, GRAPH_R + 9));
+    group.setAttribute('class', classes);
+    var spinnerG = svgEl('g');
+    spinnerG.setAttribute('class', 'station-spinner');
+    spinnerG.appendChild(graphCircle('ring ring-outer', 0, 0, GRAPH_R + 9));
+    group.appendChild(spinnerG);
     group.appendChild(graphCircle('ring ring-inner', 0, 0, GRAPH_R + 4));
     group.appendChild(graphCircle('core', 0, 0, GRAPH_R));
     group.appendChild(graphCircle('dot', 0, 0, 5));
@@ -1173,10 +1227,55 @@ function renderGateHint(graph) {
     '". Type /graph continue in the TUI to proceed.';
 }
 
-function renderAgents(agents) {
+var lastRenderedAgentsKey = null;
+
+function computeAgentsKey(list) {
+  var parts = [];
+  for (var i = 0; i < list.length; i++) {
+    var a = list[i] || {};
+    var r = a.run || {};
+    parts.push([
+      a.id,
+      a.label,
+      a.color,
+      a.busy ? 1 : 0,
+      a.phase,
+      a.model,
+      r.state,
+      r.started_at_ms,
+      r.ended_at_ms,
+      r.duration_ms
+    ].join('|'));
+  }
+  return parts.join(';;');
+}
+
+function renderAgents(agents, nowMs) {
   var wrap = $('agents');
-  wrap.replaceChildren();
+  if (!wrap) { return; }
   var list = Array.isArray(agents) ? agents : [];
+  var now = typeof nowMs === 'number' ? nowMs : Date.now();
+  var key = computeAgentsKey(list);
+
+  if (lastRenderedAgentsKey === key && wrap.children.length === list.length) {
+    for (var j = 0; j < list.length; j++) {
+      var a = list[j];
+      if (a && a.run && a.run.state === 'running' && typeof a.run.started_at_ms === 'number') {
+        var chipEl = wrap.children[j];
+        if (chipEl) {
+          var elapsedEl = chipEl.querySelector('.chip-run-elapsed');
+          if (elapsedEl) {
+            var ms = runElapsedMs(a.run, now);
+            elapsedEl.textContent = ' ' + (fmtElapsed(ms) || '0s');
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  lastRenderedAgentsKey = key;
+  wrap.replaceChildren();
   if (list.length === 0) {
     wrap.appendChild(el('p', 'empty', 'no agents'));
     return;
@@ -1205,6 +1304,30 @@ function renderAgents(agents) {
       var detail = bits.join(' \u00b7 ');
       chip.appendChild(el('span', 'chip-meta', detail));
     }
+
+    if (agent.run) {
+      var runState = agent.run.state;
+      if (runState === 'running') {
+        chip.classList.add('chip-running');
+        var runEl = el('span', 'chip-run chip-run-running');
+        runEl.appendChild(el('span', 'spinner'));
+        var ms = runElapsedMs(agent.run, now);
+        runEl.appendChild(el('span', 'chip-run-elapsed', ' ' + (fmtElapsed(ms) || '0s')));
+        chip.appendChild(runEl);
+      } else if (runState === 'done') {
+        chip.classList.add('chip-done');
+        var dur = typeof agent.run.duration_ms === 'number' ? fmtElapsed(agent.run.duration_ms) : '';
+        chip.appendChild(el('span', 'chip-run chip-run-done', '✓' + (dur ? ' ' + dur : '')));
+      } else if (runState === 'failed') {
+        chip.classList.add('chip-failed');
+        var dur = typeof agent.run.duration_ms === 'number' ? fmtElapsed(agent.run.duration_ms) : '';
+        chip.appendChild(el('span', 'chip-run chip-run-failed', '✗' + (dur ? ' ' + dur : '')));
+      } else if (runState === 'cancelled') {
+        chip.classList.add('chip-cancelled');
+        chip.appendChild(el('span', 'chip-run chip-run-cancelled', '■ cancelled'));
+      }
+    }
+
     wrap.appendChild(chip);
   }
 }
@@ -2014,6 +2137,175 @@ function bindImportForm() {
   });
 }
 
+function isRunStateTerminal(state) {
+  return state === 'done' || state === 'failed' || state === 'cancelled' || state === 'idle';
+}
+
+function getRunningAgents(snapshot) {
+  var agents = snapshot && Array.isArray(snapshot.agents) ? snapshot.agents : [];
+  return agents.filter(function (a) {
+    if (!a) { return false; }
+    if (a.run && a.run.state === 'running') { return true; }
+    if (a.run && isRunStateTerminal(a.run.state)) { return false; }
+    return Boolean(a.busy);
+  });
+}
+
+function getMostRecentEndedRun(snapshot) {
+  var agents = snapshot && Array.isArray(snapshot.agents) ? snapshot.agents : [];
+  var ended = [];
+  for (var i = 0; i < agents.length; i++) {
+    var a = agents[i];
+    if (a && a.run && (a.run.state === 'done' || a.run.state === 'failed' || a.run.state === 'cancelled')) {
+      ended.push(a.run);
+    }
+  }
+  if (ended.length === 0) { return null; }
+  ended.sort(function (x, y) {
+    var tx = typeof x.ended_at_ms === 'number' ? x.ended_at_ms : (x.started_at_ms || 0);
+    var ty = typeof y.ended_at_ms === 'number' ? y.ended_at_ms : (y.started_at_ms || 0);
+    return ty - tx;
+  });
+  return ended[0];
+}
+
+var lastRunStatusKey = null;
+
+function updateRunStatus(snap, nowMs) {
+  var pill = $('run-status');
+  if (!pill) { return; }
+  var runningAgents = getRunningAgents(snap);
+
+  if (runningAgents.length > 0) {
+    var first = runningAgents[0];
+    var firstLabel = first.label || first.id || 'agent';
+    var agentText = runningAgents.length > 1
+      ? firstLabel + ' +' + (runningAgents.length - 1)
+      : firstLabel;
+
+    var elapsedStr = '0s';
+    if (first.run && typeof first.run.started_at_ms === 'number') {
+      var ms = runElapsedMs(first.run, nowMs);
+      elapsedStr = fmtElapsed(ms) || '0s';
+    }
+
+    var statusKey = 'running:' + agentText;
+    if (lastRunStatusKey === statusKey && pill.classList.contains('run-status-running')) {
+      var textEl = pill.querySelector('.run-status-text');
+      if (textEl) {
+        textEl.textContent = 'Running \u00b7 ' + agentText + ' \u00b7 ' + elapsedStr;
+        return;
+      }
+    }
+
+    lastRunStatusKey = statusKey;
+    pill.className = 'run-status run-status-running';
+    pill.replaceChildren();
+    pill.appendChild(el('span', 'spinner'));
+    pill.appendChild(el('span', 'run-status-text', 'Running \u00b7 ' + agentText + ' \u00b7 ' + elapsedStr));
+  } else {
+    var lastEnded = getMostRecentEndedRun(snap);
+    var statusKey = 'idle';
+    if (lastEnded && lastEnded.state === 'done') {
+      var dur = typeof lastEnded.duration_ms === 'number'
+        ? fmtElapsed(lastEnded.duration_ms)
+        : (typeof lastEnded.ended_at_ms === 'number' && typeof lastEnded.started_at_ms === 'number'
+          ? fmtElapsed(lastEnded.ended_at_ms - lastEnded.started_at_ms)
+          : null);
+      var text = dur ? '✓ Done \u00b7 ' + dur : '✓ Done';
+      statusKey = 'done:' + text;
+      if (lastRunStatusKey !== statusKey) {
+        lastRunStatusKey = statusKey;
+        pill.className = 'run-status run-status-done';
+        pill.textContent = text;
+      }
+    } else if (lastEnded && lastEnded.state === 'failed') {
+      var dur = typeof lastEnded.duration_ms === 'number'
+        ? fmtElapsed(lastEnded.duration_ms)
+        : (typeof lastEnded.ended_at_ms === 'number' && typeof lastEnded.started_at_ms === 'number'
+          ? fmtElapsed(lastEnded.ended_at_ms - lastEnded.started_at_ms)
+          : null);
+      var text = dur ? '✗ Failed \u00b7 ' + dur : '✗ Failed';
+      statusKey = 'failed:' + text;
+      if (lastRunStatusKey !== statusKey) {
+        lastRunStatusKey = statusKey;
+        pill.className = 'run-status run-status-failed';
+        pill.textContent = text;
+      }
+    } else if (lastEnded && lastEnded.state === 'cancelled') {
+      statusKey = 'cancelled';
+      if (lastRunStatusKey !== statusKey) {
+        lastRunStatusKey = statusKey;
+        pill.className = 'run-status run-status-cancelled';
+        pill.textContent = '■ Cancelled';
+      }
+    } else {
+      statusKey = 'idle';
+      if (lastRunStatusKey !== statusKey) {
+        lastRunStatusKey = statusKey;
+        pill.className = 'run-status run-status-idle';
+        pill.textContent = 'Idle';
+      }
+    }
+  }
+}
+
+function updateTabTitle(snap) {
+  var runningAgents = getRunningAgents(snap);
+  if (runningAgents.length > 0) {
+    document.title = '⏳ ' + baseDocumentTitle;
+    lastObservedRunState = 'running';
+    updateFavicon('running');
+  } else {
+    var lastEnded = getMostRecentEndedRun(snap);
+    if (lastObservedRunState === 'running') {
+      if (lastEnded && lastEnded.state === 'done') {
+        document.title = '✓ ' + baseDocumentTitle;
+        lastObservedRunState = 'done';
+        updateFavicon('done');
+      } else if (lastEnded && lastEnded.state === 'failed') {
+        document.title = '✗ ' + baseDocumentTitle;
+        lastObservedRunState = 'failed';
+        updateFavicon('failed');
+      } else {
+        document.title = baseDocumentTitle;
+        lastObservedRunState = 'idle';
+        updateFavicon('idle');
+      }
+    } else if (lastObservedRunState !== 'done' && lastObservedRunState !== 'failed') {
+      document.title = baseDocumentTitle;
+      updateFavicon('idle');
+    }
+  }
+}
+
+function isSomethingRunning(snap) {
+  if (!snap) { return false; }
+  var agents = Array.isArray(snap.agents) ? snap.agents : [];
+  for (var i = 0; i < agents.length; i++) {
+    if (agents[i] && agents[i].run && agents[i].run.state === 'running') {
+      return true;
+    }
+    if (agents[i] && agents[i].busy && (!agents[i].run || !isRunStateTerminal(agents[i].run.state))) {
+      return true;
+    }
+  }
+  var graph = snap.graph;
+  if (graph) {
+    if (Array.isArray(graph.current_nodes) && graph.current_nodes.length > 0) {
+      return true;
+    }
+    if (Array.isArray(graph.nodes)) {
+      for (var j = 0; j < graph.nodes.length; j++) {
+        if (graphNodeStatus(graph.nodes[j]) === 'running') {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 function render(nowMs) {
   var snap = snapshot;
   if (!snap || typeof snap.revision !== 'number') { return; }
@@ -2022,7 +2314,9 @@ function render(nowMs) {
   $('source').textContent = String(snap.source || '-');
   $('revision').textContent = String(snap.revision);
 
-  renderAgents(snap.agents);
+  renderAgents(snap.agents, nowMs);
+  updateRunStatus(snap, nowMs);
+  updateTabTitle(snap);
 
   var graph = snap.graph;
   if (!graph) {
@@ -2063,6 +2357,16 @@ function tickDashboard() {
   var snap = snapshot;
   if (!snap || typeof snap.receivedAt !== 'number') { return; }
   var now = Date.now();
+  if (!isSomethingRunning(snap)) {
+    stopTickTimer();
+    updateRunStatus(snap, now);
+    updateTabTitle(snap);
+    renderAgents(snap.agents, now);
+    return;
+  }
+  updateRunStatus(snap, now);
+  updateTabTitle(snap);
+  renderAgents(snap.agents, now);
   var graph = snap.graph;
   if (!graph) { return; }
   renderGraphSummary(graph);
@@ -2077,7 +2381,9 @@ function tickDashboard() {
 
 function scheduleTick() {
   if (tickTimer !== null) { return; }
-  tickTimer = setInterval(tickDashboard, TICK_MS);
+  if (isSomethingRunning(snapshot)) {
+    tickTimer = setInterval(tickDashboard, TICK_MS);
+  }
 }
 
 function onSnapshotEvent(e) {
@@ -2105,7 +2411,11 @@ function applySnapshot(snap) {
   applySnapshotUi(snap);
   render(lastRendered);
   renderTodos(snap);
-  scheduleTick();
+  if (isSomethingRunning(snap)) {
+    scheduleTick();
+  } else {
+    stopTickTimer();
+  }
   // Optional modules (session.js) reuse this connection instead of opening
   // their own SSE stream (SPEC-dashboard-parity NFR-780).
   document.dispatchEvent(new CustomEvent('dmuxai:snapshot', { detail: snap }));

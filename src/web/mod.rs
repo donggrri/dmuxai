@@ -24,7 +24,7 @@ pub use server::{
     DashboardServer, DashboardServices, ServerConfig, build_router, build_router_with, start_server,
 };
 pub use snapshot::{
-    AgentView, DashboardSnapshot, GraphCounts, GraphView, NodeDetail, NodeView,
+    AgentView, DashboardSnapshot, GraphCounts, GraphView, NodeDetail, NodeView, RunStateView,
     SESSION_MESSAGE_MAX_BYTES, SESSION_TRANSCRIPT_MAX_BYTES, SESSION_TRANSCRIPT_MAX_MESSAGES,
     SESSION_TRUNCATED_MARKER, SNAPSHOT_SCHEMA, SessionAgent, SessionCommandInfo,
     SessionConversation, SessionMessage, SessionModel, SessionView, SnapshotSource, UiTheme,

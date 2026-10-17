@@ -410,6 +410,70 @@ async fn get_session_js() -> impl IntoResponse {
     )
 }
 
+async fn get_favicon_idle() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::FAVICON_IDLE_SVG,
+    )
+}
+
+async fn get_favicon_running() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::FAVICON_RUNNING_SVG,
+    )
+}
+
+async fn get_favicon_done() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::FAVICON_DONE_SVG,
+    )
+}
+
+async fn get_favicon_failed() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::FAVICON_FAILED_SVG,
+    )
+}
+
 async fn get_state(State(state): State<AppState>) -> Response {
     let mut snapshot = state.hub.snapshot();
     snapshot.sent_at_ms = crate::web::snapshot::now_ms();
@@ -1055,6 +1119,10 @@ pub fn build_router_with(
         .route("/assets/session.js", get(get_session_js))
         .route("/assets/session.css", get(get_session_css))
         .route("/assets/app.css", get(get_app_css))
+        .route("/assets/favicon-idle.svg", get(get_favicon_idle))
+        .route("/assets/favicon-running.svg", get(get_favicon_running))
+        .route("/assets/favicon-done.svg", get(get_favicon_done))
+        .route("/assets/favicon-failed.svg", get(get_favicon_failed))
         .route("/api/state", get(get_state))
         .route("/api/memory", get(get_memory))
         .route("/api/memory/save", post(post_memory_save))

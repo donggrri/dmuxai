@@ -6,6 +6,10 @@ pub const SESSION_CSS: &str = include_str!("assets/session.css");
 pub const APP_CSS: &str = include_str!("assets/app.css");
 pub const DOCS_JS: &str = include_str!("assets/docs.js");
 pub const DOCS_CSS: &str = include_str!("assets/docs.css");
+pub const FAVICON_IDLE_SVG: &str = include_str!("assets/favicon-idle.svg");
+pub const FAVICON_RUNNING_SVG: &str = include_str!("assets/favicon-running.svg");
+pub const FAVICON_DONE_SVG: &str = include_str!("assets/favicon-done.svg");
+pub const FAVICON_FAILED_SVG: &str = include_str!("assets/favicon-failed.svg");
 
 #[cfg(test)]
 mod tests {
@@ -743,5 +747,57 @@ mod tests {
         // Canvas bounds.
         assert!(APP_CSS.contains("min-height: 320px;"));
         assert!(APP_CSS.contains("max-height: 70vh;"));
+    }
+
+    #[test]
+    // TC-823 / FR-823, UX-821, NFR-820: dashboard_has_run_status_indicators
+    fn dashboard_has_run_status_indicators() {
+        assert!(INDEX_HTML.contains("id=\"run-status\""));
+        assert!(INDEX_HTML.contains("role=\"status\""));
+        assert!(INDEX_HTML.contains("id=\"favicon\""));
+        assert!(APP_CSS.contains(".run-status"));
+        assert!(APP_CSS.contains(".spinner"));
+        assert!(APP_CSS.contains("@media (prefers-reduced-motion: reduce)"));
+        assert!(APP_CSS.contains(".station-spinner"));
+        assert!(APP_CSS.contains(".chip-failed"));
+        assert!(APP_CSS.contains(".chip-cancelled"));
+        // The reduced-motion block must come after the base spinner rules so
+        // it wins the cascade, and it must stop the graph spinner.
+        let base_spinner = APP_CSS
+            .find(".graph-svg .station-spinner {")
+            .expect("base station-spinner rule");
+        let rm_block = APP_CSS
+            .rfind("@media (prefers-reduced-motion: reduce) {")
+            .expect("reduced-motion block");
+        assert!(
+            rm_block > base_spinner,
+            "reduced-motion block must follow spinner rules"
+        );
+        let rm_tail = &APP_CSS[rm_block..];
+        let rm_spinner = rm_tail
+            .find(".graph-svg .station-spinner {")
+            .expect("reduced-motion overrides station-spinner");
+        assert!(
+            rm_tail[rm_spinner..]
+                .trim_start_matches(".graph-svg .station-spinner {")
+                .trim_start()
+                .starts_with("animation: none")
+        );
+        assert!(APP_CSS.contains(".reduced-motion .graph-svg .station-spinner"));
+        assert!(APP_JS.contains("classList.toggle('reduced-motion'"));
+        // Pill and chip elapsed use the same clock-skew correction as nodes.
+        assert!(APP_JS.contains("function runElapsedMs"));
+        assert!(!APP_JS.contains("now - a.run.started_at_ms"));
+        assert!(APP_JS.contains("function tickDashboard"));
+        assert!(APP_JS.contains("station-spinner"));
+        assert!(APP_JS.contains("updateFavicon"));
+        assert!(APP_JS.contains("baseDocumentTitle"));
+        assert!(APP_JS.contains("window.addEventListener('focus'"));
+        assert!(APP_JS.contains("started_at_ms"));
+        assert!(APP_JS.contains("document.title"));
+        assert!(APP_JS.contains("running"));
+        assert!(APP_JS.contains("done"));
+        assert!(APP_JS.contains("failed"));
+        assert!(APP_JS.contains("cancelled"));
     }
 }

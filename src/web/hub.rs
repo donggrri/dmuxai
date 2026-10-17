@@ -408,6 +408,7 @@ mod tests {
         hub.set_ui(UiTheme {
             theme: "dark".to_string(),
             accent: Some("#3366ff".to_string()),
+            reduced_motion: None,
         });
         hub.publish(
             vec![
@@ -418,6 +419,7 @@ mod tests {
                     phase: None,
                     model: None,
                     color: Some("#123456".to_string()),
+                    run: None,
                 },
                 AgentView {
                     id: "cursor".to_string(),
@@ -426,6 +428,7 @@ mod tests {
                     phase: None,
                     model: None,
                     color: Some("#000080".to_string()),
+                    run: None,
                 },
             ],
             None,

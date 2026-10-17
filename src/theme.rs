@@ -33,6 +33,8 @@ pub struct Theme {
     pub accent: Option<Color>,
     /// Per-agent text colors from `[theme.agents]`; keys are lowercase and trimmed.
     pub agents: BTreeMap<String, Color>,
+    /// Reduce motion: static spinner indicator.
+    pub reduced_motion: bool,
 }
 
 impl Default for Theme {
@@ -49,6 +51,7 @@ impl Default for Theme {
             border: None,
             accent: None,
             agents: BTreeMap::new(),
+            reduced_motion: false,
         }
     }
 }
@@ -69,6 +72,8 @@ pub struct ThemeToml {
     pub agents: Option<BTreeMap<String, String>>,
     /// Force colored output even when `NO_COLOR` is set.
     pub force_color: Option<bool>,
+    /// Reduce motion: static spinner indicator.
+    pub reduced_motion: Option<bool>,
 }
 
 impl Theme {
@@ -82,6 +87,9 @@ impl Theme {
     /// Like [`Theme::apply_toml`], but records a warning for every invalid color
     /// instead of silently keeping the default.
     pub fn apply_toml_with_warnings(&mut self, t: &ThemeToml, warnings: &mut Vec<String>) {
+        if let Some(rm) = t.reduced_motion {
+            self.reduced_motion = rm;
+        }
         apply_color(&mut self.user, "[theme] user", &t.user, warnings);
         apply_color(&mut self.cursor, "[theme] cursor", &t.cursor, warnings);
         apply_color(&mut self.agy, "[theme] agy", &t.agy, warnings);

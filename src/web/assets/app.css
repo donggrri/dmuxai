@@ -353,6 +353,45 @@ h1.brand {
 .conn-error { border-color: var(--err); color: var(--err); }
 .conn-connecting { color: var(--muted); }
 
+.run-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 0.8em;
+  background: var(--bg-chip);
+  color: var(--muted);
+}
+
+.run-status-idle { color: var(--muted); border-color: var(--line); }
+.run-status-running {
+  color: var(--badge-running-text);
+  border-color: var(--badge-running-line);
+  background: var(--badge-running-bg);
+}
+.run-status-done { color: var(--ok); border-color: var(--ok); }
+.run-status-failed { color: var(--err); border-color: var(--err); }
+.run-status-cancelled { color: var(--muted); border-color: var(--line); }
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  display: inline-block;
+  width: 0.75em;
+  height: 0.75em;
+  vertical-align: -0.1em;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  box-sizing: border-box;
+}
+
 main {
   padding: 0 14px 40px;
   max-width: 880px;
@@ -435,6 +474,24 @@ main {
 }
 
 .chip-busy .chip-name { font-weight: 600; }
+
+.chip-run {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.85em;
+  color: var(--muted);
+}
+.chip-running {
+  border-color: var(--accent);
+}
+.chip-done { border-color: var(--ok); }
+.chip-failed { border-color: var(--err); }
+.chip-cancelled { border-color: var(--line); }
+.chip-run-running { color: var(--accent); }
+.chip-run-done { color: var(--ok); }
+.chip-run-failed { color: var(--err); }
+.chip-run-cancelled { color: var(--muted); }
 
 .graph-meta {
   display: flex;
@@ -1413,9 +1470,14 @@ main {
   stroke: var(--accent);
   stroke-width: 4;
 }
+.graph-svg .station-spinner {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: spin 0.8s linear infinite;
+}
 .graph-svg .node.state-running .dot { fill: var(--accent); }
 .graph-svg .node.state-running .ring { fill: none; stroke: var(--accent); }
-.graph-svg .node.state-running .ring-outer { stroke-width: 2; opacity: 0.35; }
+.graph-svg .node.state-running .ring-outer { stroke-width: 2; opacity: 0.8; stroke-dasharray: 24 50; }
 .graph-svg .node.state-running .ring-inner { stroke-width: 2; opacity: 0.6; }
 
 .graph-svg .check {
@@ -1481,10 +1543,6 @@ main {
 }
 
 .graph-svg .node.state-running .ring-inner { animation-delay: 0.4s; }
-
-@media (prefers-reduced-motion: reduce) {
-  .graph-svg .node.state-running .ring { animation: none; }
-}
 
 .graph-detail {
   flex: 0 0 260px;
@@ -1596,3 +1654,49 @@ main {
 .legend-failed { background: var(--err); }
 
 .nodes[hidden] { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+    border: none;
+    width: auto;
+    height: auto;
+    line-height: 1;
+  }
+  .spinner::before {
+    content: "●";
+    color: var(--accent);
+  }
+  .graph-svg .station-spinner {
+    animation: none;
+  }
+  .graph-svg .node.state-running .ring {
+    animation: none;
+  }
+  .graph-svg .node.state-running .ring-outer {
+    stroke-dasharray: none;
+    opacity: 0.35;
+  }
+}
+
+.reduced-motion .spinner {
+  animation: none;
+  border: none;
+  width: auto;
+  height: auto;
+  line-height: 1;
+}
+.reduced-motion .spinner::before {
+  content: "●";
+  color: var(--accent);
+}
+.reduced-motion .graph-svg .station-spinner {
+  animation: none;
+}
+.reduced-motion .graph-svg .node.state-running .ring {
+  animation: none;
+}
+.reduced-motion .graph-svg .node.state-running .ring-outer {
+  stroke-dasharray: none;
+  opacity: 0.35;
+}

@@ -39,6 +39,7 @@ pub struct DmuxSettings {
     pub graph_allowed_runners: Option<Vec<String>>,
     pub theme: Theme,
     pub theme_force_color: Option<bool>,
+    pub reduced_motion: bool,
     /// `[[agents.custom]]` headless agents (installed into the registry at startup).
     pub custom_agents: Vec<crate::custom_agent::CustomAgentSpec>,
     /// `[agents] builtin_opencode` (default true). `false` hides the built-in
@@ -285,6 +286,10 @@ impl DmuxSettings {
 
         settings.resolve_memory(workspace);
         settings.add_builtin_memory_server(workspace, exe);
+        if env_flag("DMUXAI_REDUCED_MOTION") {
+            settings.reduced_motion = true;
+            settings.theme.reduced_motion = true;
+        }
         settings.dedupe_warnings();
         settings
     }
@@ -421,6 +426,9 @@ impl DmuxSettings {
             if let Some(force_color) = theme.force_color {
                 self.theme_force_color = Some(force_color);
             }
+            if let Some(rm) = theme.reduced_motion {
+                self.reduced_motion = rm;
+            }
         }
         if let Some(graph) = parsed.graph {
             if let Some(enabled) = graph.enabled {
@@ -552,6 +560,7 @@ impl Default for DmuxSettings {
             graph_allowed_runners: None,
             theme: Theme::default(),
             theme_force_color: None,
+            reduced_motion: false,
             custom_agents: Vec::new(),
             builtin_opencode: true,
             mcp_servers: Vec::new(),
@@ -1615,6 +1624,9 @@ mod builtin_opencode_tests {
     use super::*;
     use crate::custom_agent::opencode_preset;
 
+    // Serializes tests that set DMUXAI_REDUCED_MOTION.
+    static REDUCED_MOTION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Fake opencode executable: a plain file is enough for the PATH check.
     fn fake_opencode(dir: &Path) -> PathBuf {
         let path = dir.join("opencode");
@@ -1780,5 +1792,45 @@ mod builtin_opencode_tests {
             let settings = DmuxSettings::load_with_opencode(dir.path(), Some(&path), None, None);
             assert_eq!(settings, DmuxSettings::default(), "detected={detected}");
         }
+    }
+
+    #[test]
+    fn theme_reduced_motion_config_and_env_var_are_honored() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("dmuxai.toml");
+
+        // 1. dmuxai.toml with [theme] reduced_motion = true
+        std::fs::write(&config_path, "[theme]\nreduced_motion = true\n").unwrap();
+        let settings = DmuxSettings::load_with_opencode(dir.path(), None, None, None);
+        assert!(settings.reduced_motion);
+        assert!(settings.theme.reduced_motion);
+
+        // 2. dmuxai.toml with [theme] reduced_motion = false
+        std::fs::write(&config_path, "[theme]\nreduced_motion = false\n").unwrap();
+        let settings = {
+            let _guard = REDUCED_MOTION_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            DmuxSettings::load_with_opencode(dir.path(), None, None, None)
+        };
+        assert!(!settings.reduced_motion);
+        assert!(!settings.theme.reduced_motion);
+
+        // 3. Environment variable DMUXAI_REDUCED_MOTION=1 overrides config.
+        // Hold the env lock so no other test sees the variable in flux.
+        let settings_env = {
+            let _guard = REDUCED_MOTION_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // SAFETY: REDUCED_MOTION_ENV_LOCK serializes every test that
+            // touches DMUXAI_REDUCED_MOTION.
+            unsafe { std::env::set_var("DMUXAI_REDUCED_MOTION", "1") };
+            let loaded = DmuxSettings::load_with_opencode(dir.path(), None, None, None);
+            // SAFETY: same exclusion as above.
+            unsafe { std::env::remove_var("DMUXAI_REDUCED_MOTION") };
+            loaded
+        };
+        assert!(settings_env.reduced_motion);
+        assert!(settings_env.theme.reduced_motion);
     }
 }

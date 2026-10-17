@@ -477,6 +477,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
     hub.set_ui(dmuxai::web::UiTheme {
         theme: settings.web_theme.theme,
         accent: settings.web_theme.accent,
+        reduced_motion: Some(settings.reduced_motion || settings.theme.reduced_motion),
     });
     hub.set_jira_base_url(settings.todo_jira_base_url.clone());
     // Seed once so `GET /api/state` / SSE show persisted to-dos before the
