@@ -8,8 +8,9 @@ use std::{
 };
 
 use dmuxai::custom_agent::{
-    CustomAgentOutput, CustomAgentSpec, PromptVia, SubstitutionContext, build_argv, failure_reason,
-    filter_models, parse_jsonl_line, spec_at, substitute,
+    BUILTIN_MODELS_TIMEOUT, CustomAgentOutput, CustomAgentSpec, PromptVia, SubstitutionContext,
+    build_argv, failure_reason, list_model_ids, parse_jsonl_line, policy_message, spec_at,
+    substitute,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -135,6 +136,11 @@ async fn runtime_loop(
                 .await;
             }
             CustomCommand::Send(request) => {
+                if let Err(error) = ensure_builtin_model(spec, &cwd, &mut selected_model).await {
+                    let context = OutputContext::from(&request);
+                    send(&event_tx, agent, Some(&context), AgentEvent::Error(error)).await;
+                    continue;
+                }
                 active = Some(spawn_turn(
                     agent,
                     spec,
@@ -150,11 +156,16 @@ async fn runtime_loop(
             CustomCommand::Cancel => stop_turn(agent, active.take(), &event_tx).await,
             CustomCommand::ListModels => {
                 let event = match list_models(spec, &cwd).await {
-                    Ok(models) => AgentEvent::ModelsListed {
-                        models,
-                        selected: selected_model.clone(),
-                        selected_effort: None,
-                    },
+                    Ok(models) => {
+                        if spec.builtin && selected_model.is_none() {
+                            selected_model = models.first().map(|model| model.id.clone());
+                        }
+                        AgentEvent::ModelsListed {
+                            models,
+                            selected: selected_model.clone(),
+                            selected_effort: None,
+                        }
+                    }
                     Err(error) => AgentEvent::Error(error),
                 };
                 send(&event_tx, agent, None, event).await;
@@ -175,25 +186,11 @@ async fn runtime_loop(
     }
 }
 
-async fn list_models(spec: &CustomAgentSpec, cwd: &PathBuf) -> Result<Vec<ModelInfo>, String> {
-    let mut ids = Vec::new();
-    if let Some((program, args)) = spec.models_command.split_first() {
-        let output = tokio::process::Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .map_err(|error| format!("{} models: {error}", spec.label()))?;
-        if !output.status.success() {
-            return Err(format!(
-                "{} models failed: {}",
-                spec.label(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        ids = filter_models(spec, &String::from_utf8_lossy(&output.stdout));
-    }
+/// Lists the models for the catalog. The built-in preset is bounded by a
+/// timeout and its policy errors name the way out (FR-812).
+async fn list_models(spec: &CustomAgentSpec, cwd: &Path) -> Result<Vec<ModelInfo>, String> {
+    let timeout = spec.builtin.then_some(BUILTIN_MODELS_TIMEOUT);
+    let mut ids = list_model_ids(spec, cwd, timeout).await?;
     if let Some(default) = &spec.default_model
         && !ids.contains(default)
     {
@@ -203,6 +200,25 @@ async fn list_models(spec: &CustomAgentSpec, cwd: &PathBuf) -> Result<Vec<ModelI
         .into_iter()
         .map(|id| ModelInfo::new(id.clone(), id))
         .collect())
+}
+
+/// The built-in preset without a picked model uses the first allowed listed
+/// model, so a turn never falls back to opencode's own default model (FR-812).
+async fn ensure_builtin_model(
+    spec: &CustomAgentSpec,
+    cwd: &Path,
+    selected: &mut Option<String>,
+) -> Result<(), String> {
+    if !spec.builtin || selected.is_some() {
+        return Ok(());
+    }
+    let models = list_models(spec, cwd).await?;
+    let first = models
+        .first()
+        .map(|model| model.id.clone())
+        .ok_or_else(|| policy_message(spec, None))?;
+    *selected = Some(first);
+    Ok(())
 }
 
 fn mode_names(mode: ExecutionMode) -> (&'static str, &'static str) {

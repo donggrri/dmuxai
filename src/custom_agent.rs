@@ -2,9 +2,15 @@
 //! See docs/agents/custom-agents.md.
 
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+/// Upper bound for the built-in preset's `models_command` (SPEC-first-run FR-813).
+pub const BUILTIN_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How the prompt is delivered to the runner process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -86,6 +92,58 @@ pub struct CustomAgentSpec {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub modes: CustomAgentModes,
+    /// True only for the built-in opencode preset (FR-810). Not configurable.
+    #[serde(skip)]
+    pub builtin: bool,
+}
+
+/// The built-in `opencode` runner (SPEC-first-run FR-810..FR-812): the documented
+/// opencode custom agent with the free-model policy. `program` is the executable
+/// that was found. `default_model` stays unset, so the first allowed listed model
+/// is used.
+pub fn opencode_preset(program: &str) -> CustomAgentSpec {
+    let words = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    CustomAgentSpec {
+        name: "opencode".to_owned(),
+        label: Some("opencode".to_owned()),
+        color: Some("#ffa500".to_owned()),
+        command: [
+            program,
+            "run",
+            "--format",
+            "json",
+            "-m",
+            "{model}",
+            "--dir",
+            "{workspace}",
+            "{prompt}",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+        prompt_via: PromptVia::Arg,
+        image_arg: words(&["-f", "{image}"]),
+        default_model: None,
+        models_command: words(&[program, "models"]),
+        models_filter: Some("-free$".to_owned()),
+        allowed_models: Some("^opencode/.*-free$".to_owned()),
+        output: CustomAgentOutput::Jsonl,
+        text_path: Some("/part/text".to_owned()),
+        text_when: Some(TextWhen {
+            path: "/type".to_owned(),
+            equals: "text".to_owned(),
+        }),
+        error_path: Some("/error/message".to_owned()),
+        session_id_path: Some("/sessionID".to_owned()),
+        resume_arg: words(&["--session", "{session_id}"]),
+        timeout_secs: Some(900),
+        failure_stderr: Some("(?i)permission denied|rejected permission".to_owned()),
+        temp_config_template: Some(
+            r#"{"permission":{"edit":"{edit}","bash":"{edit}","webfetch":"allow"}}"#.to_owned(),
+        ),
+        env: BTreeMap::from([("OPENCODE_CONFIG".to_owned(), "{temp_config}".to_owned())]),
+        builtin: true,
+        ..Default::default()
+    }
 }
 
 impl CustomAgentSpec {
@@ -418,7 +476,18 @@ pub fn failure_reason(
     if !exit_ok {
         let trimmed = stderr.trim();
         return Some(if trimmed.is_empty() {
-            "process exited with non-zero status".to_string()
+            let program = spec
+                .command
+                .first()
+                .map(|program| {
+                    Path::new(program)
+                        .file_name()
+                        .map_or(program.clone(), |name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_default();
+            format!(
+                "process exited with non-zero status and printed nothing on stderr; run `{program}` directly (same model and prompt) to see why"
+            )
         } else {
             trimmed.to_string()
         });
@@ -504,6 +573,95 @@ pub fn filter_models(spec: &CustomAgentSpec, stdout: &str) -> Vec<String> {
         .filter(|line| filter.as_ref().is_none_or(|re| re.is_match(line)))
         .map(str::to_owned)
         .collect()
+}
+
+/// The message shown when the built-in preset has no usable model (FR-812).
+pub fn policy_message(spec: &CustomAgentSpec, reason: Option<&str>) -> String {
+    let pattern = spec.allowed_models.as_deref().unwrap_or_default();
+    let detail = reason.map(|r| format!("; {r}")).unwrap_or_default();
+    format!(
+        "{label}: no allowed models (policy allowed_models = {pattern}{detail}). Run `{check}` to check, or override with an [[agents.custom]] named {name} (see `dmuxai init`).",
+        label = spec.label(),
+        check = spec.models_command.join(" "),
+        name = spec.name,
+    )
+}
+
+/// Runs `models_command` and returns the filtered model ids (no policy applied).
+async fn run_models_command(
+    spec: &CustomAgentSpec,
+    cwd: &Path,
+    timeout: Option<Duration>,
+) -> Result<Vec<String>, String> {
+    let Some((program, args)) = spec.models_command.split_first() else {
+        return Ok(Vec::new());
+    };
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let run = command.output();
+    let output = match timeout {
+        Some(limit) => match tokio::time::timeout(limit, run).await {
+            Ok(output) => output,
+            Err(_) => {
+                return Err(format!(
+                    "{} models timed out after {}s",
+                    spec.label(),
+                    limit.as_secs()
+                ));
+            }
+        },
+        None => run.await,
+    }
+    .map_err(|error| format!("{} models: {error}", spec.label()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = match stderr.trim() {
+            "" => format!(
+                "exited with {} and printed nothing on stderr",
+                output.status
+            ),
+            text => text.to_owned(),
+        };
+        return Err(format!("{} models failed: {detail}", spec.label()));
+    }
+    Ok(filter_models(
+        spec,
+        &String::from_utf8_lossy(&output.stdout),
+    ))
+}
+
+/// Lists the model ids for `spec`, honouring the model policy (FR-812).
+///
+/// For the built-in preset (`spec.builtin`) a failure, a timeout, or a listing
+/// with no `allowed_models` match is an error that names the policy and how to
+/// override it. Other agents keep the plain listing.
+pub async fn list_model_ids(
+    spec: &CustomAgentSpec,
+    cwd: &Path,
+    timeout: Option<Duration>,
+) -> Result<Vec<String>, String> {
+    let listed = run_models_command(spec, cwd, timeout).await;
+    if !spec.builtin {
+        return listed;
+    }
+    match listed {
+        Err(reason) => Err(policy_message(spec, Some(&reason))),
+        Ok(ids) => {
+            let allowed: Vec<String> = ids
+                .into_iter()
+                .filter(|id| validate_custom_model(spec, id).is_ok())
+                .collect();
+            if allowed.is_empty() {
+                Err(policy_message(spec, None))
+            } else {
+                Ok(allowed)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -905,7 +1063,12 @@ image_arg = []
 
         // 4. Non-zero exit without stderr
         let r4 = failure_reason(&spec, false, "", "", None);
-        assert_eq!(r4.as_deref(), Some("process exited with non-zero status"));
+        assert!(
+            r4.as_deref().is_some_and(|reason| reason
+                .starts_with("process exited with non-zero status")
+                && reason.contains("directly")),
+            "{r4:?}"
+        );
 
         // 5. Zero exit with empty reply text
         let r5 = failure_reason(&spec, true, "   \n  ", "", None);
@@ -946,5 +1109,53 @@ image_arg = []
         );
         assert!(validate_custom_model(&spec, "opencode/a-free").is_ok());
         assert!(validate_custom_model(&spec, "opencode/b").is_err());
+    }
+
+    // TC-812 / FR-812: when the built-in preset cannot list an allowed model
+    // (no match, non-zero exit, or timeout) the error names the policy and the
+    // way out; a valid listing keeps only the allowed ids.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preset_without_allowed_models_explains_policy() {
+        let cwd = std::env::temp_dir();
+        let timeout = Some(Duration::from_millis(300));
+        let with_script = |script: &str| {
+            let mut spec = opencode_preset("opencode");
+            spec.models_command = vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()];
+            spec
+        };
+        let assert_policy = |error: &str| {
+            assert!(error.starts_with("opencode: no allowed models"), "{error}");
+            assert!(
+                error.contains("allowed_models = ^opencode/.*-free$"),
+                "{error}"
+            );
+            assert!(error.contains("dmuxai init"), "{error}");
+        };
+
+        let err = list_model_ids(&with_script("printf 'opencode/paid\\n'"), &cwd, timeout)
+            .await
+            .unwrap_err();
+        assert_policy(&err);
+
+        let err = list_model_ids(&with_script("echo boom >&2; exit 1"), &cwd, timeout)
+            .await
+            .unwrap_err();
+        assert_policy(&err);
+        assert!(err.contains("boom"), "{err}");
+
+        let err = list_model_ids(&with_script("sleep 5"), &cwd, timeout)
+            .await
+            .unwrap_err();
+        assert_policy(&err);
+        assert!(err.contains("timed out"), "{err}");
+
+        let ids = list_model_ids(
+            &with_script("printf 'opencode/a-free\\nopencode/b\\nother/c-free\\n'"),
+            &cwd,
+            timeout,
+        )
+        .await;
+        assert_eq!(ids, Ok(vec!["opencode/a-free".to_owned()]));
     }
 }

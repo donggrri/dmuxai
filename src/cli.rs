@@ -1,5 +1,5 @@
 //! Agent-facing CLI subcommands (SPEC-agent-api FR-760..FR-767):
-//! `run`, `todo add|list|run`, `status`, `events`, `mcp`.
+//! `run`, `todo add|list|run`, `status`, `events`, `mcp`, `init`.
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -44,6 +44,11 @@ pub enum AgentCommand {
         json: bool,
     },
     Mcp,
+    /// `init [--workspace] [--force]` (SPEC-first-run FR-814).
+    Init {
+        workspace: bool,
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -56,7 +61,7 @@ pub struct RunOptions {
 }
 
 /// First arguments that select an agent-facing subcommand.
-pub const SUBCOMMANDS: [&str; 5] = ["run", "todo", "status", "events", "mcp"];
+pub const SUBCOMMANDS: [&str; 6] = ["run", "todo", "status", "events", "mcp", "init"];
 
 fn value<'a>(args: &'a [String], index: &mut usize, flag: &str) -> Result<&'a str, String> {
     *index += 1;
@@ -227,6 +232,18 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
             [] => Ok(AgentCommand::Mcp),
             [other, ..] => Err(format!("unexpected argument '{other}'")),
         },
+        "init" => {
+            let mut workspace = false;
+            let mut force = false;
+            for arg in rest {
+                match arg.as_str() {
+                    "--workspace" => workspace = true,
+                    "--force" => force = true,
+                    other => return Err(format!("unexpected argument '{other}'")),
+                }
+            }
+            Ok(AgentCommand::Init { workspace, force })
+        }
         other => Err(format!("unknown subcommand '{other}'")),
     }
 }
@@ -343,6 +360,7 @@ pub async fn execute(command: AgentCommand) -> i32 {
             print_events(&workspace_root, since, limit, follow, json).await;
             exit::OK
         }
+        AgentCommand::Init { workspace, force } => init_config(&workspace_root, workspace, force),
         AgentCommand::Mcp => {
             let backend = CliMcpBackend {
                 workspace_root: workspace_root.clone(),
@@ -366,6 +384,31 @@ pub async fn execute(command: AgentCommand) -> i32 {
             }
         }
     }
+}
+
+/// `dmuxai init` (FR-814): writes the starter config and reports the runners
+/// found on `PATH`. An existing file is kept unless `--force` is given.
+fn init_config(workspace_root: &Path, workspace: bool, force: bool) -> i32 {
+    let path = match dmuxai::init::target_path(workspace, workspace_root) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::FAILED;
+        }
+    };
+    let detected = dmuxai::init::detected_runners();
+    let opencode = detected.contains(&"opencode");
+    if let Err(error) = dmuxai::init::write_starter_config(&path, opencode, force) {
+        eprintln!("error: {error}");
+        return exit::FAILED;
+    }
+    println!("Wrote {}", path.display());
+    if detected.is_empty() {
+        println!("Detected runners on PATH: none");
+    } else {
+        println!("Detected runners on PATH: {}", detected.join(", "));
+    }
+    exit::OK
 }
 
 fn read_prompt(raw: &str) -> Result<String, ApiError> {
@@ -792,5 +835,26 @@ mod tests {
         assert!(parse(&args(&["events", "--limit", "0"])).is_err());
         assert_eq!(parse(&args(&["mcp"])), Ok(AgentCommand::Mcp));
         assert!(parse(&args(&["mcp", "--stdio"])).is_err());
+    }
+
+    // FR-814: `init` takes only --workspace and --force.
+    #[test]
+    fn parse_init_subcommand() {
+        assert_eq!(
+            parse(&args(&["init"])),
+            Ok(AgentCommand::Init {
+                workspace: false,
+                force: false
+            })
+        );
+        assert_eq!(
+            parse(&args(&["init", "--workspace", "--force"])),
+            Ok(AgentCommand::Init {
+                workspace: true,
+                force: true
+            })
+        );
+        assert!(parse(&args(&["init", "--global"])).is_err());
+        assert!(parse(&args(&["init", "extra"])).is_err());
     }
 }

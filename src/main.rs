@@ -88,6 +88,7 @@ Usage:
   dmuxai status [--json]
   dmuxai events [--since N] [--limit N] [--follow] [--json]
   dmuxai mcp
+  dmuxai init [--workspace] [--force]
 
 Options:
   -h, --help       Print this help message and exit
@@ -109,6 +110,8 @@ Options:
   status           Print workspace status (agents, to-dos, last graph, events)
   events           Print state-change events from .dmuxai/events.jsonl
   mcp              Serve DmuxAI as an MCP server over stdio
+  init             Write a commented starter dmuxai.toml to the user config
+                   (or the workspace with --workspace); --force overwrites
   --json           Print machine-readable JSON on stdout
 
 Configuration:

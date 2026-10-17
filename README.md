@@ -448,18 +448,73 @@ cargo install --path . --locked --force
 
 Conversations remain scoped by the canonical project path.
 
+## First run
+
+DmuxAI needs no configuration to start. Run `dmuxai` in a project folder:
+
+- **Built-in runners:** Cursor (`cursor-agent`), AGY (`agy`) and Codex (`codex`)
+  are always offered. Each needs its own CLI installed and signed in.
+- **opencode:** when the `opencode` executable is on `PATH` (or
+  `DMUXAI_OPENCODE_BIN` names one), DmuxAI adds an `opencode` runner. It follows
+  the free-model policy: only models matching `^opencode/.*-free$` are offered,
+  and the first one listed by `opencode models` is used by default. If the
+  listing fails, times out after 10 seconds, or has no free model, the runner
+  still appears, and choosing it or sending a prompt shows the policy message.
+  The built-in opencode runner takes no graph nodes unless you list `opencode`
+  in `[graph] allowed_runners`.
+- **Override:** an `[[agents.custom]]` entry named `opencode` in `dmuxai.toml`
+  replaces the built-in runner with your own command and model policy.
+  `[agents] builtin_opencode = false` hides it.
+
+To start from a commented config that lists the runners it detected:
+
+```bash
+dmuxai init                # user config: ~/.config/dmuxai/dmuxai.toml
+dmuxai init --workspace    # ./dmuxai.toml, for this project only
+```
+
+`dmuxai init` refuses to overwrite an existing file unless you add `--force`.
+It prints the path it wrote and the runners it found on `PATH`.
+
 ## Linux / WSL release binary
 
 Each tagged release also has a prebuilt, statically linked (musl)
 `dmuxai-linux-x86_64.tar.gz` that runs on any x86_64 Linux distro, including
-WSL. Inside WSL (or on Linux), run:
+WSL. Download it and check the checksum:
 
 ```bash
 curl -LO https://github.com/donggrri/dmuxai/releases/latest/download/dmuxai-linux-x86_64.tar.gz
 curl -LO https://github.com/donggrri/dmuxai/releases/latest/download/dmuxai-linux-x86_64.tar.gz.sha256
 sha256sum -c dmuxai-linux-x86_64.tar.gz.sha256
+```
+
+The archive keeps one top directory, so it does not scatter files into the
+current folder. It extracts to `dmuxai-linux-x86_64/{dmuxai,README.md,CHANGELOG.md}`.
+Extract it, then install the binary into `~/.local/bin`:
+
+```bash
+mkdir -p ~/.local/bin
 tar xzf dmuxai-linux-x86_64.tar.gz
 install -m 0755 dmuxai-linux-x86_64/dmuxai ~/.local/bin/dmuxai
+```
+
+Or do both in one step, without leaving the extracted directory behind:
+
+```bash
+mkdir -p ~/.local/bin
+tar -xzf dmuxai-linux-x86_64.tar.gz -C ~/.local/bin --strip-components=1 dmuxai-linux-x86_64/dmuxai
+```
+
+If `~/.local/bin` is not on your `PATH`, add it, for example in `~/.bashrc`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Then check the install:
+
+```bash
+dmuxai --version
 ```
 
 ## Run from source
@@ -623,6 +678,10 @@ allowed_runners = ["agy", "opencode"]
 
 A machine can exclude `cursor` from the graph globally across all workspaces by setting `[graph] allowed_runners = ["agy", "opencode"]` in the user-level configuration:
 - `$XDG_CONFIG_HOME/dmuxai/dmuxai.toml` (fallback `~/.config/dmuxai/dmuxai.toml`)
+
+Exception: when `allowed_runners` is unset, every runner may take graph nodes
+except the built-in opencode runner (see [First run](#first-run)). List
+`opencode` explicitly to allow it.
 
 User-level configuration is read first, and any keys in the workspace `dmuxai.toml` override user configuration per key.
 

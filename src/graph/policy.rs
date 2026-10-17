@@ -26,13 +26,10 @@ pub fn default_limits() -> super::types::GraphLimits {
     super::types::GraphLimits::default()
 }
 
+/// Whether a runner may take graph nodes (FR-813: the built-in opencode preset
+/// is excluded while `allowed_runners` is unset).
 pub fn is_runner_allowed(runner: &str, settings: &DmuxSettings) -> bool {
-    match &settings.graph_allowed_runners {
-        Some(allowed) => allowed
-            .iter()
-            .any(|r| r.eq_ignore_ascii_case(runner.trim())),
-        None => true,
-    }
+    settings.graph_runner_allowed(runner)
 }
 
 pub fn assign_runner(_role: NodeRole, settings: &DmuxSettings) -> String {
@@ -54,9 +51,13 @@ pub fn assign_runner(_role: NodeRole, settings: &DmuxSettings) -> String {
 
     if let Some(default) = settings.routing_default_agent.as_deref() {
         let lower = default.trim().to_ascii_lowercase();
-        if matches!(lower.as_str(), "agy" | "codex" | "cursor")
+        let known = matches!(lower.as_str(), "agy" | "codex" | "cursor")
             || crate::custom_agent::index_of(&lower).is_some()
-        {
+            || settings
+                .custom_agents
+                .iter()
+                .any(|spec| spec.name.eq_ignore_ascii_case(&lower));
+        if known && settings.graph_runner_allowed(&lower) {
             return lower;
         }
     }
@@ -104,5 +105,22 @@ mod tests {
         settings.graph_allowed_runners = None;
         assert!(is_runner_allowed("cursor", &settings));
         assert!(is_runner_allowed("agy", &settings));
+    }
+
+    #[test]
+    fn builtin_opencode_is_not_graph_routed_unless_listed() {
+        // FR-813 (SPEC-first-run): the built-in preset takes no graph nodes while
+        // allowed_runners is unset, even as the routing default.
+        let mut settings = DmuxSettings::default();
+        settings
+            .custom_agents
+            .push(crate::custom_agent::opencode_preset("opencode"));
+        settings.routing_default_agent = Some("opencode".to_owned());
+        assert!(!is_runner_allowed("opencode", &settings));
+        assert_eq!(assign_runner(NodeRole::Implement, &settings), "cursor");
+
+        settings.graph_allowed_runners = Some(vec!["opencode".to_owned()]);
+        assert!(is_runner_allowed("opencode", &settings));
+        assert_eq!(assign_runner(NodeRole::Implement, &settings), "opencode");
     }
 }

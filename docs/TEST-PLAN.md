@@ -278,12 +278,12 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-docs-preview | UX-753,INT-754 | TC-757 | `static_page_has_docs_panel` | unit | ✅ | docs preview (PR F) |
 | M8,M2 | SPEC-docs-preview | UX-753 | TC-758 | `docs_preview_renders_in_headless_chrome` (ignored) | e2e | ✅ | docs preview (PR F) |
 | M8,M2 | SPEC-docs-preview | INT-754 | TC-759 | `docs_module_exposes_api` | unit | ✅ | docs preview (PR F) |
-| M8,M2 | SPEC-first-run | FR-810,FR-811 | TC-810 | `builtin_opencode_preset_registration` | unit | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-first-run | FR-810,FR-813 | TC-811 | `fresh_install_lists_opencode` | integration | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-first-run | FR-812,FR-813 | TC-812 | `preset_without_allowed_models_explains_policy` | unit | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-first-run | FR-814 | TC-813 | `init_writes_starter_config` | integration | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-first-run | FR-814 | TC-814 | `starter_config_parses` | unit | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-first-run | FR-815,FR-816 | TC-815 | `readme_matches_release_layout` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-first-run | FR-810,FR-811 | TC-810 | `builtin_opencode_preset_registration` | unit | ✅ | v0.2.1 |
+| M8,M2 | SPEC-first-run | FR-810,FR-813 | TC-811 | `fresh_install_lists_opencode` | integration | ✅ | v0.2.1 |
+| M8,M2 | SPEC-first-run | FR-812,FR-813 | TC-812 | `preset_without_allowed_models_explains_policy` | unit | ✅ | v0.2.1 |
+| M8,M2 | SPEC-first-run | FR-814 | TC-813 | `init_writes_starter_config` | integration | ✅ | v0.2.1 |
+| M8,M2 | SPEC-first-run | FR-814 | TC-814 | `starter_config_parses` | unit | ✅ | v0.2.1 |
+| M8,M2 | SPEC-first-run | FR-815,FR-816 | TC-815 | `readme_matches_release_layout` | unit | ✅ | v0.2.1 |
 | M8,M2 | SPEC-running-indicators | FR-820,NFR-820 | TC-820 | `run_state_transitions_follow_turn_events` | unit | ⏳ | v0.2.1 |
 | M8,M2 | SPEC-running-indicators | FR-821,FR-822,UX-820 | TC-821 | `status_bar_spinner_and_end_marks` | unit | ⏳ | v0.2.1 |
 | M8,M2 | SPEC-running-indicators | FR-821,UX-821 | TC-822 | `spinner_frames_and_reduced_motion` | unit | ⏳ | v0.2.1 |

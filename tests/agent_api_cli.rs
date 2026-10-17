@@ -3,6 +3,7 @@
 //! Every test runs the real binary against a temporary workspace, state dir
 //! and config dir, so the user's own dmuxai config is never read.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -16,13 +17,19 @@ struct Sandbox {
 
 impl Sandbox {
     fn new(config: &str) -> Self {
+        let sandbox = Self::bare();
+        std::fs::write(sandbox.workspace.join("dmuxai.toml"), config).unwrap();
+        sandbox
+    }
+
+    /// A fresh install: empty HOME and config dir, no `dmuxai.toml` anywhere.
+    fn bare() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
         let workspace = root.join("ws");
         for sub in ["ws", "state", "cfg", "home"] {
             std::fs::create_dir_all(root.join(sub)).unwrap();
         }
-        std::fs::write(workspace.join("dmuxai.toml"), config).unwrap();
         Self {
             _dir: dir,
             root,
@@ -35,6 +42,11 @@ impl Sandbox {
     }
 
     fn run_with_stdin(&self, args: &[&str], stdin: Option<&str>) -> Output {
+        self.run_in_env(args, stdin, &[])
+    }
+
+    /// Runs the binary with `env` overrides (for example a custom `PATH`).
+    fn run_in_env(&self, args: &[&str], stdin: Option<&str>, env: &[(&str, OsString)]) -> Output {
         use std::io::Write;
         let mut child = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
             .args(args)
@@ -45,6 +57,8 @@ impl Sandbox {
             .env("APPDATA", self.root.join("cfg"))
             .env("HOME", self.root.join("home"))
             .env_remove("DMUXAI_WEB_TOKEN")
+            .env_remove("DMUXAI_OPENCODE_BIN")
+            .envs(env.iter().map(|(key, value)| (*key, value.clone())))
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -70,6 +84,33 @@ fn stdout_json(output: &Output) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+/// Writes a fake `opencode` script into `<root>/bin` and returns that directory.
+/// `opencode models` lists one free and one paid model.
+#[cfg(unix)]
+fn fake_opencode(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("opencode");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nif [ \"$1\" = models ]; then echo opencode/glm-5-free; echo opencode/paid; fi\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// `PATH` with `dir` first, so the fake opencode wins the lookup.
+#[cfg(unix)]
+fn path_with(dir: &Path) -> OsString {
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths).unwrap()
 }
 
 fn fake_agent_config(behavior: &str, allowed: Option<&str>) -> String {
@@ -289,4 +330,91 @@ fn events_cli_since_json() {
 
     let status = stdout_json(&sandbox.run(&["status", "--json"]));
     assert_eq!(status["events"]["last_seq"], 3);
+}
+
+// TC-811 / FR-810, FR-813: a fresh install (no dmuxai.toml) with opencode on
+// PATH lists the built-in opencode runner, and it is not in the graph runner
+// set while allowed_runners is unset. Without opencode it is not listed.
+#[cfg(unix)]
+#[test]
+fn fresh_install_lists_opencode() {
+    let sandbox = Sandbox::bare();
+    let bin = fake_opencode(&sandbox.root);
+    let with_opencode = [("PATH", path_with(&bin))];
+    let output = sandbox.run_in_env(&["status", "--json"], None, &with_opencode);
+    assert_eq!(output.status.code(), Some(0));
+    let json = stdout_json(&output);
+    assert_eq!(json["allowed_runners"], Value::Null, "{json}");
+    let agents = json["agents"].as_array().unwrap();
+    let opencode = agents
+        .iter()
+        .find(|agent| agent["id"] == "opencode")
+        .unwrap_or_else(|| panic!("opencode missing: {json}"));
+    assert_eq!(opencode["allowed"], false, "{json}");
+    let cursor = agents.iter().find(|agent| agent["id"] == "cursor").unwrap();
+    assert_eq!(cursor["allowed"], true);
+
+    let empty_path = [("PATH", OsString::new())];
+    let json = stdout_json(&sandbox.run_in_env(&["status", "--json"], None, &empty_path));
+    let agents = json["agents"].as_array().unwrap();
+    assert!(
+        agents.iter().all(|agent| agent["id"] != "opencode"),
+        "{json}"
+    );
+}
+
+// TC-813 / FR-814: `init` writes the starter file, the file parses cleanly, a
+// second run is refused without --force, and --workspace writes the workspace.
+#[cfg(unix)]
+#[test]
+fn init_writes_starter_config() {
+    let sandbox = Sandbox::bare();
+    let bin = fake_opencode(&sandbox.root);
+    let env = [("PATH", path_with(&bin))];
+    let user_config = sandbox.root.join("cfg").join("dmuxai").join("dmuxai.toml");
+
+    let first = sandbox.run_in_env(&["init"], None, &env);
+    let stderr = String::from_utf8_lossy(&first.stderr).into_owned();
+    assert_eq!(first.status.code(), Some(0), "{stderr}");
+    let stdout = String::from_utf8_lossy(&first.stdout).into_owned();
+    assert!(
+        stdout.contains(&user_config.display().to_string()),
+        "{stdout}"
+    );
+    assert!(stdout.contains("opencode"), "detected runners: {stdout}");
+
+    let text = std::fs::read_to_string(&user_config).unwrap();
+    for key in [
+        "[theme]",
+        "[routing]",
+        "[graph]",
+        "[cursor]",
+        "[agents]",
+        "builtin_opencode",
+        "# [[agents.custom]]",
+    ] {
+        assert!(text.contains(key), "missing {key}");
+    }
+    // The starter parses cleanly: no config warnings, and the built-in runner
+    // is still registered from PATH.
+    let status = stdout_json(&sandbox.run_in_env(&["status", "--json"], None, &env));
+    assert_eq!(status["warnings"], serde_json::json!([]), "{status}");
+    let listed = status["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|agent| agent["id"] == "opencode");
+    assert!(listed, "{status}");
+
+    let again = sandbox.run_in_env(&["init"], None, &env);
+    assert_ne!(again.status.code(), Some(0));
+    let refusal = String::from_utf8_lossy(&again.stderr);
+    assert!(refusal.contains("--force"), "{refusal}");
+
+    let forced = sandbox.run_in_env(&["init", "--force"], None, &env);
+    assert_eq!(forced.status.code(), Some(0));
+
+    let workspace = sandbox.run_in_env(&["init", "--workspace"], None, &env);
+    assert_eq!(workspace.status.code(), Some(0));
+    assert!(sandbox.workspace.join("dmuxai.toml").is_file());
 }
