@@ -1956,16 +1956,65 @@ function updateTodoViewOnlyHint(snap) {
   hint.hidden = !viewOnly;
 }
 
+// To-do sidebar filter (SPEC-todo-sidebar FR-841): state open/done/all plus
+// a text search over title, body and the Jira key.
+function todoFilterState() {
+  var sel = $('todo-filter-state');
+  var v = sel ? String(sel.value || 'open') : 'open';
+  return v === 'done' || v === 'all' ? v : 'open';
+}
+
+function todoMatchesFilter(todo, state, needle) {
+  if (!todo) { return false; }
+  var done = String(todo.status || 'open') === 'done';
+  if (state === 'open' && done) { return false; }
+  if (state === 'done' && !done) { return false; }
+  if (!needle) { return true; }
+  var hay = [todo.title, todo.body, todo.external_key].map(function (v) {
+    return String(v || '').toLowerCase();
+  }).join('\n');
+  return hay.indexOf(needle) !== -1;
+}
+
+// Header badge: open (not done) to-dos (FR-840).
+function updateTodoCount(allTodos) {
+  var badge = $('todos-count');
+  if (!badge) { return; }
+  var open = 0;
+  for (var i = 0; i < allTodos.length; i++) {
+    if (allTodos[i] && String(allTodos[i].status || 'open') !== 'done') { open++; }
+  }
+  badge.textContent = String(open);
+  badge.setAttribute('aria-label', open + ' open to-do' + (open === 1 ? '' : 's'));
+}
+
+function bindTodoFilter() {
+  var rerender = function () { if (snapshot) { renderTodos(snapshot); } };
+  var sel = $('todo-filter-state');
+  if (sel) { sel.addEventListener('change', rerender); }
+  var search = $('todo-search');
+  if (search) { search.addEventListener('input', rerender); }
+}
+
 function renderTodos(snap) {
   var list = $('todo-list');
   if (!list) { return; }
   updateTodoViewOnlyHint(snap);
-  var todos = snap && Array.isArray(snap.todos) ? snap.todos : [];
+  var allTodos = snap && Array.isArray(snap.todos) ? snap.todos : [];
+  updateTodoCount(allTodos);
+  var filterState = todoFilterState();
+  var searchEl = $('todo-search');
+  var needle = searchEl ? String(searchEl.value || '').trim().toLowerCase() : '';
+  var todos = allTodos.filter(function (t) {
+    // Keep the item being edited visible so unsaved input is never lost.
+    return (todoEditId && t && String(t.id) === todoEditId) ||
+      todoMatchesFilter(t, filterState, needle);
+  });
 
   var i;
   var alive = {};
-  for (i = 0; i < todos.length; i++) {
-    var todo = todos[i];
+  for (i = 0; i < allTodos.length; i++) {
+    var todo = allTodos[i];
     if (todo && todo.id) { alive[String(todo.id)] = true; }
   }
   if (todoEditId && !alive[todoEditId]) { todoEditId = null; }
@@ -2006,7 +2055,7 @@ function renderTodos(snap) {
 
   list.replaceChildren();
   if (todos.length === 0) {
-    list.appendChild(el('p', 'empty', 'no to-dos yet'));
+    list.appendChild(el('p', 'empty', allTodos.length === 0 ? 'no to-dos yet' : 'no to-dos match the filter'));
     return;
   }
   list.appendChild(frag);
@@ -2583,6 +2632,7 @@ function init() {
   render(Date.now());
   bindTodoForm();
   bindImportForm();
+  bindTodoFilter();
   loadImportServers();
   startSse();
 }

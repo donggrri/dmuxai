@@ -366,6 +366,62 @@ mod tests {
         );
     }
 
+    // TC-840: todo_sidebar_assets (SPEC-todo-sidebar FR-840..FR-842, UX-840)
+    #[test]
+    fn todo_sidebar_assets() {
+        // Header button with badge, wired to the shared sidebar.
+        assert!(INDEX_HTML.contains(r#"id="todos-toggle""#));
+        assert!(INDEX_HTML.contains(r#"id="todos-count""#));
+        let toggle_start = INDEX_HTML.find(r#"id="todos-toggle""#).unwrap();
+        let toggle_tag = &INDEX_HTML[INDEX_HTML[..toggle_start].rfind('<').unwrap()..];
+        let toggle_tag = &toggle_tag[..toggle_tag.find('>').unwrap()];
+        assert!(toggle_tag.contains(r#"aria-controls="sidebar""#));
+        assert!(toggle_tag.contains(r#"aria-expanded="false""#));
+        // The whole to-do UI lives inside the To-dos tab panel of the sidebar.
+        assert!(INDEX_HTML.contains(r#"id="tab-todos""#));
+        let panel = INDEX_HTML
+            .find(r#"id="tab-panel-todos""#)
+            .expect("to-dos tab panel");
+        let sidebar = INDEX_HTML.find(r#"<aside id="sidebar""#).unwrap();
+        let sidebar_end = INDEX_HTML[sidebar..].find("</aside>").unwrap() + sidebar;
+        assert!(panel > sidebar && panel < sidebar_end);
+        for id in [
+            "todo-form",
+            "todo-title",
+            "todo-jira",
+            "import-panel",
+            "todo-list",
+            "todo-filter-state",
+            "todo-search",
+            "todo-view-only",
+        ] {
+            let at = INDEX_HTML
+                .find(&format!(r#"id="{id}""#))
+                .unwrap_or_else(|| panic!("missing #{id}"));
+            assert!(
+                at > panel && at < sidebar_end,
+                "#{id} must be in the to-dos panel"
+            );
+        }
+        assert!(!INDEX_HTML.contains(r#"<section id="todos""#));
+        // State filter and search.
+        assert!(INDEX_HTML.contains(r#"<option value="done">"#));
+        assert!(INDEX_HTML.contains(r#"<option value="all">"#));
+        assert!(APP_JS.contains("function todoMatchesFilter("));
+        assert!(APP_JS.contains("function updateTodoCount("));
+        assert!(APP_JS.contains("bindTodoFilter();"));
+        // Tabs and Esc handling in the shared sidebar shell.
+        assert!(DOCS_JS.contains("function setActiveTab("));
+        assert!(DOCS_JS.contains("function toggleSidebarTab("));
+        assert!(DOCS_JS.contains("dmuxai.sidebar.tab."));
+        assert!(DOCS_JS.contains("function escapeClosesSidebar("));
+        assert!(DOCS_JS.contains("tag === 'TEXTAREA'"));
+        assert!(DOCS_JS.contains(r#"[aria-modal="true"]"#));
+        // Hidden tab panels really hide (the panel class sets display: flex).
+        assert!(DOCS_CSS.contains(".sidebar-tab-panel[hidden]"));
+        assert!(DOCS_CSS.contains(".todos-count"));
+    }
+
     // TC-833: docs_tree_sidebar_assets (SPEC-docs-tree FR-832, FR-833, UX-830)
     #[test]
     fn docs_tree_sidebar_assets() {

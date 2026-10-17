@@ -28,6 +28,7 @@
     <button id="accent-reset" type="button" class="btn accent-reset">Reset</button>
   </div>
   <button id="sidebar-toggle-files" type="button" class="btn sidebar-toggle" aria-controls="sidebar" aria-expanded="false" title="Toggle files sidebar">Files</button>
+  <button id="todos-toggle" type="button" class="btn sidebar-toggle" aria-controls="sidebar" aria-expanded="false" title="Toggle to-dos sidebar">To-dos <span id="todos-count" class="todos-count" aria-label="open to-dos">0</span></button>
   <nav id="status" class="status" aria-label="dashboard status">
     <span id="run-status" class="run-status run-status-idle" role="status" aria-live="polite">Idle</span>
     <span class="stat"><span class="stat-k">workspace</span><span id="workspace" class="stat-v">&ndash;</span></span>
@@ -47,48 +48,6 @@
     <div id="agents" class="agents"></div>
   </section>
 
-  <section id="todos" class="panel">
-    <h2 class="panel-title">To-dos</h2>
-    <p id="todo-view-only" class="hint" hidden>
-      View-only: start <code>dmuxai --web</code> to run to-dos from the browser.
-    </p>
-    <form id="todo-form" class="todo-form">
-      <div class="todo-form-row">
-        <label class="todo-field todo-field-title">
-          <span class="field-label">Title</span>
-          <input id="todo-title" name="title" type="text" maxlength="200" required autocomplete="off">
-        </label>
-        <button id="todo-add" type="submit" class="btn btn-primary">Add</button>
-      </div>
-      <label class="todo-field">
-        <span class="field-label">Body (optional)</span>
-        <textarea id="todo-body" name="body" rows="2"></textarea>
-      </label>
-      <label class="todo-field todo-field-jira">
-        <span class="field-label">Jira ticket (optional) &mdash; key or URL</span>
-        <span class="jira-in">
-          <input id="todo-jira" name="jira" type="text" maxlength="2048" autocomplete="off">
-          <span id="todo-jira-preview" class="todo-jira-preview" role="status" aria-live="polite" hidden></span>
-        </span>
-      </label>
-    </form>
-    <div id="import-panel" class="import-panel" hidden>
-      <h3 class="import-title">Import from Jira / Confluence</h3>
-      <form id="import-form" class="import-form">
-        <label class="todo-field import-field-server">
-          <span class="field-label">Server</span>
-          <select id="import-server" aria-label="MCP server to import from"></select>
-        </label>
-        <label class="todo-field import-field-query">
-          <span class="field-label">Query (issue key, JQL, page id or CQL)</span>
-          <input id="import-query" name="query" type="text" maxlength="500" autocomplete="off">
-        </label>
-        <button id="import-submit" type="submit" class="btn btn-primary">Import</button>
-      </form>
-      <p id="import-status" class="import-status" role="status" aria-live="polite" hidden></p>
-    </div>
-    <div id="todo-list" class="todo-list"></div>
-  </section>
 
   <section id="docs" class="panel">
     <h2 class="panel-title">Documents</h2>
@@ -141,7 +100,7 @@
   <div class="sidebar-header">
     <nav class="sidebar-tabs" role="tablist" aria-label="Sidebar tabs">
       <button id="tab-files" class="sidebar-tab active" role="tab" aria-selected="true" aria-controls="tab-panel-files" type="button">Files</button>
-      <!-- Extension point: SPEC-todo-sidebar adds To-dos tab here -->
+      <button id="tab-todos" class="sidebar-tab" role="tab" aria-selected="false" aria-controls="tab-panel-todos" type="button">To-dos</button>
     </nav>
     <button id="sidebar-close" type="button" class="btn sidebar-close" aria-label="Close sidebar">&times;</button>
   </div>
@@ -151,6 +110,58 @@
       <input id="docs-filter" class="docs-filter" type="search" autocomplete="off" placeholder="Filter files by path" aria-label="Filter files by path">
     </div>
     <div id="docs-tree" class="docs-tree" role="tree" aria-label="Files"></div>
+  </div>
+  <div id="tab-panel-todos" class="sidebar-tab-panel" role="tabpanel" aria-labelledby="tab-todos" hidden>
+    <div id="todos" class="todos-panel">
+      <p id="todo-view-only" class="hint" hidden>
+        View-only: start <code>dmuxai --web</code> to run to-dos from the browser.
+      </p>
+      <form id="todo-form" class="todo-form">
+        <div class="todo-form-row">
+          <label class="todo-field todo-field-title">
+            <span class="field-label">Title</span>
+            <input id="todo-title" name="title" type="text" maxlength="200" required autocomplete="off">
+          </label>
+          <button id="todo-add" type="submit" class="btn btn-primary">Add</button>
+        </div>
+        <label class="todo-field">
+          <span class="field-label">Body (optional)</span>
+          <textarea id="todo-body" name="body" rows="2"></textarea>
+        </label>
+        <label class="todo-field todo-field-jira">
+          <span class="field-label">Jira ticket (optional) &mdash; key or URL</span>
+          <span class="jira-in">
+            <input id="todo-jira" name="jira" type="text" maxlength="2048" autocomplete="off">
+            <span id="todo-jira-preview" class="todo-jira-preview" role="status" aria-live="polite" hidden></span>
+          </span>
+        </label>
+      </form>
+      <div id="import-panel" class="import-panel" hidden>
+        <h3 class="import-title">Import from Jira / Confluence</h3>
+        <form id="import-form" class="import-form">
+          <label class="todo-field import-field-server">
+            <span class="field-label">Server</span>
+            <select id="import-server" aria-label="MCP server to import from"></select>
+          </label>
+          <label class="todo-field import-field-query">
+            <span class="field-label">Query (issue key, JQL, page id or CQL)</span>
+            <input id="import-query" name="query" type="text" maxlength="500" autocomplete="off">
+          </label>
+          <button id="import-submit" type="submit" class="btn btn-primary">Import</button>
+        </form>
+        <p id="import-status" class="import-status" role="status" aria-live="polite" hidden></p>
+      </div>
+      <div class="todo-filter" role="search" aria-label="Filter to-dos">
+        <label class="field-label" for="todo-filter-state">Show</label>
+        <select id="todo-filter-state" class="todo-filter-state" aria-label="Filter to-dos by state">
+          <option value="open">Open</option>
+          <option value="done">Done</option>
+          <option value="all">All</option>
+        </select>
+        <input id="todo-search" class="todo-search" type="search" autocomplete="off" placeholder="Search to-dos" aria-label="Search to-dos">
+      </div>
+      <div id="todo-list" class="todo-list"></div>
+    </div>
   </div>
 </aside>
 <div id="sidebar-backdrop" class="sidebar-backdrop"></div>

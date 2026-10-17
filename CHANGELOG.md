@@ -35,6 +35,14 @@ All notable changes to dmuxai are listed here. Versions follow
   before. Expanded folders persist per workspace; it is keyboard accessible and
   becomes an overlay drawer below 900px (FR-832, FR-833, UX-830).
 
+- **To-dos in the sidebar (SPEC-todo-sidebar, #44).** The to-do UI (list,
+  add form, Jira field, MCP import) moved from the main column into a `To-dos`
+  tab of the right sidebar, opened from a header `To-dos (n)` button whose badge
+  counts open to-dos. The list can be filtered by state (open, done, all) and
+  searched. Files and To-dos share the sidebar as tabs; the active tab persists
+  per workspace, and Esc closes the sidebar unless you are typing or the
+  preview is open (FR-840..FR-842, UX-840).
+
 - **Cursor pre-start (SPEC-cursor-latency FR-805..FR-807).** In the TUI and
   dashboard, DmuxAI starts the next `cursor-agent` process while you type and
   hands it the prompt on send, saving an indicative ~1.4–2.1 s of measured

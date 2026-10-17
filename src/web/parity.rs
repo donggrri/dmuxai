@@ -186,4 +186,34 @@ mod tests {
         // A bare string that is not a declaration does not count.
         assert!(!page_has_control("var x = 'agent';", "agent"));
     }
+
+    // TC-841 (SPEC-todo-sidebar FR-840, FR-841): moving the to-do UI into the
+    // sidebar keeps every to-do action reachable: create, run, done, delete
+    // and MCP import, each with its control in the To-dos panel and its
+    // handler in app.js.
+    #[test]
+    fn todo_actions_still_covered() {
+        let html = crate::web::assets::INDEX_HTML;
+        let js = crate::web::assets::APP_JS;
+        let panel = html
+            .find(r#"id="tab-panel-todos""#)
+            .expect("to-dos tab panel");
+        let end = html[panel..].find("</aside>").expect("sidebar end") + panel;
+        let in_panel = |id: &str| {
+            html.find(&format!(r#"id="{id}""#))
+                .is_some_and(|at| at > panel && at < end)
+        };
+        // create
+        assert!(in_panel("todo-form") && in_panel("todo-add"));
+        assert!(js.contains("todoApi('POST', '/api/todos', body)"));
+        // import
+        assert!(in_panel("import-form") && js.contains("function submitImport()"));
+        // run / done / delete render into #todo-list inside the panel
+        assert!(in_panel("todo-list"));
+        assert!(js.contains("function runTodo(id, body)"));
+        assert!(js.contains("function todoRunControls(id, status)"));
+        assert!(js.contains("patchTodo(id, { status: box.checked ? 'done' : 'open' }, false)"));
+        assert!(js.contains("function deleteTodo(id)"));
+        assert!(js.contains("function updateTodoViewOnlyHint(snap)"));
+    }
 }

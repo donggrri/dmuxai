@@ -772,3 +772,50 @@
   font-size: 0.85em;
   font-style: italic;
 }
+
+/*
+ * To-dos sidebar tab (SPEC-todo-sidebar FR-840..FR-842, UX-840).
+ */
+
+.sidebar-tab-panel[hidden] {
+  display: none;
+}
+
+#tab-panel-todos {
+  overflow: auto;
+}
+
+.todos-panel .todo-form-row {
+  flex-wrap: wrap;
+}
+
+.todo-filter {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin: 10px 0 8px;
+}
+
+.todo-filter .todo-search {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.sidebar-toggle.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.todos-count {
+  display: inline-block;
+  min-width: 1.4em;
+  margin-left: 4px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--bg-panel);
+  font-size: 0.8em;
+  font-weight: 700;
+  line-height: 1.5;
+  text-align: center;
+}
