@@ -28,6 +28,27 @@
     <div id="agents" class="agents"></div>
   </section>
 
+  <section id="todos" class="panel">
+    <h2 class="panel-title">To-dos</h2>
+    <p id="todo-view-only" class="hint" hidden>
+      View-only: start <code>dmuxai --web</code> to run to-dos from the browser.
+    </p>
+    <form id="todo-form" class="todo-form">
+      <div class="todo-form-row">
+        <label class="todo-field todo-field-title">
+          <span class="field-label">Title</span>
+          <input id="todo-title" name="title" type="text" maxlength="200" required autocomplete="off">
+        </label>
+        <button id="todo-add" type="submit" class="btn btn-primary">Add</button>
+      </div>
+      <label class="todo-field">
+        <span class="field-label">Body (optional)</span>
+        <textarea id="todo-body" name="body" rows="2"></textarea>
+      </label>
+    </form>
+    <div id="todo-list" class="todo-list"></div>
+  </section>
+
   <section id="graph" class="panel">
     <h2 class="panel-title">Graph</h2>
     <p id="graph-empty" class="empty">No graph run yet</p>

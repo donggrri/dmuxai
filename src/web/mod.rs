@@ -5,6 +5,7 @@
 
 mod assets;
 mod auth;
+pub mod commands;
 mod file_source;
 mod hub;
 mod server;
@@ -13,7 +14,9 @@ mod snapshot;
 pub use auth::{BindCheck, check_bind, dashboard_url, generate_token};
 pub use file_source::FileGraphSource;
 pub use hub::DashboardHub;
-pub use server::{DashboardServer, ServerConfig, build_router, start_server};
+pub use server::{
+    DashboardServer, DashboardServices, ServerConfig, build_router, build_router_with, start_server,
+};
 pub use snapshot::{
     AgentView, DashboardSnapshot, GraphCounts, GraphView, NodeView, SNAPSHOT_SCHEMA,
     SnapshotSource, snapshot_from_run,

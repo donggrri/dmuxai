@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 use crate::graph::GraphNodeStatus;
+use crate::todo::Todo;
 use crate::web::snapshot::{
     AgentView, DashboardSnapshot, GraphView, SNAPSHOT_SCHEMA, SnapshotSource,
 };
@@ -42,6 +43,7 @@ impl DashboardHub {
             workspace,
             agents: Vec::new(),
             graph: None,
+            todos: Vec::new(),
         };
 
         let (tx, _) = watch::channel(initial_snapshot.clone());
@@ -118,6 +120,23 @@ impl DashboardHub {
             state.snapshot.graph = graph;
             let _ = self.watch_tx.send_replace(state.snapshot.clone());
         }
+    }
+
+    /// Replaces the to-do list, bumping the revision only when it changes
+    /// (FR-541). Agent/graph content is preserved.
+    pub fn set_todos(&self, todos: Vec<Todo>) {
+        let mut state = self.state.lock().unwrap();
+        if state.snapshot.todos == todos {
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        state.snapshot.todos = todos;
+        state.snapshot.revision += 1;
+        state.snapshot.generated_at_ms = now_ms;
+        let _ = self.watch_tx.send_replace(state.snapshot.clone());
     }
 
     pub fn snapshot(&self) -> DashboardSnapshot {

@@ -369,6 +369,227 @@ main {
   margin: 6px 0 0;
 }
 
+/* To-do board (SPEC-web-dashboard FR-541, FR-542, UX-540). */
+
+.hint {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  font-size: 0.85em;
+}
+
+.hint[hidden] {
+  display: none;
+}
+
+.todo-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.todo-form-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.todo-field-title {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.field-label {
+  display: block;
+  color: var(--text-dim);
+  font-size: 0.72em;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 3px;
+}
+
+.todo-form input[type="text"],
+.todo-form textarea,
+.todo-edit-title,
+.todo-edit-body {
+  width: 100%;
+  background: var(--bg-chip);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.95em;
+  padding: 6px 8px;
+}
+
+.todo-form textarea,
+.todo-edit-body {
+  resize: vertical;
+}
+
+.todo-form input[type="text"]:focus,
+.todo-form textarea:focus,
+.todo-edit-title:focus,
+.todo-edit-body:focus,
+.todo-agent-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.btn {
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-badge);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.85em;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  border-color: #274b73;
+  color: var(--accent);
+}
+
+.btn-danger {
+  color: #ffc4bd;
+}
+
+.btn-danger:hover:not(:disabled) {
+  border-color: var(--err);
+}
+
+.todo-list {
+  margin-top: 10px;
+}
+
+.todo {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-chip);
+  margin-bottom: 8px;
+}
+
+.todo-status-running {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
+.todo-editing {
+  border-color: var(--accent);
+  background: #16283c;
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
+.todo-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.todo-done {
+  margin: 0;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--ok);
+  cursor: pointer;
+  flex: none;
+}
+
+.todo-title {
+  margin: 0;
+  font-size: 1em;
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.todo-status-done .todo-title {
+  color: var(--text-faint);
+  text-decoration: line-through;
+}
+
+.todo-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: baseline;
+  margin-left: auto;
+}
+
+.todo-source-wrap {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.todo-source-ref {
+  color: var(--text-dim);
+  font-size: 0.8em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 18em;
+}
+
+.todo-runinfo {
+  margin: 6px 0 0;
+  color: var(--accent);
+  font-size: 0.85em;
+  overflow-wrap: anywhere;
+}
+
+.todo-error,
+.todo-last-error {
+  margin: 6px 0 0;
+  color: var(--err);
+  font-size: 0.85em;
+  overflow-wrap: anywhere;
+}
+
+.todo-controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.todo-agent-select {
+  background: var(--bg-chip);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.9em;
+  padding: 4px 6px;
+  max-width: 14em;
+}
+
 @media (max-width: 560px) {
   body { font-size: 14px; }
   .top { position: static; }
@@ -378,4 +599,8 @@ main {
   .stat-v { max-width: 9em; }
   .node { padding: 8px 10px; }
   .node-time { margin-left: auto; }
+  .todo-form-row { flex-direction: column; }
+  .todo-form-row .btn-primary { align-self: flex-start; }
+  .todo { padding: 8px 10px; }
+  .todo-actions { margin-left: 0; width: 100%; }
 }

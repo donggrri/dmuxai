@@ -40,6 +40,22 @@ startup; other origins/hosts are rejected. Binding elsewhere requires
 WSL and open the printed URL in the Windows browser (`localhost` is forwarded).
 Details: [SPEC-web-dashboard](docs/specs/SPEC-web-dashboard.md).
 
+### To-do board
+
+![DmuxAI to-do board (serve mode, view-only)](docs/images/web-todo.png)
+
+The dashboard also keeps a per-project to-do list (stored in the project's
+DmuxAI database, so it survives restarts). Add, edit, check off or delete
+to-dos in the browser, then send one to an agent (`Run` with an agent picked)
+or through the graph planner (`Run as graph`). The to-do shows `running` while
+the turn or graph runs, becomes `done` when it completes, and returns to
+`open` with the error if it fails or is cancelled. Runs are refused while the
+agent is busy or another graph is active, and they respect
+`[graph] allowed_runners` and the agent's current mode.
+
+`dmuxai serve` is view-only: you can manage to-dos but the run buttons are
+disabled with a hint. Start `dmuxai --web` to run to-dos from the browser.
+
 ## Attach any agent CLI
 
 Built-in runners are Cursor (`cursor-agent`), AGY and Codex. **Any other headless
