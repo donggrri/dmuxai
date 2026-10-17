@@ -408,6 +408,7 @@ mod tests {
         hub.set_ui(UiTheme {
             theme: "dark".to_string(),
             accent: Some("#3366ff".to_string()),
+            reduced_motion: None,
         });
         hub.publish(
             vec![

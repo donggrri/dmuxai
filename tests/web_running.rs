@@ -283,13 +283,10 @@ impl CdpClient {
 #[tokio::test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
 async fn running_indicator_renders_in_headless_chrome() {
-    let chrome_bin = match find_chrome_binary() {
-        Some(bin) => bin,
-        None => {
-            println!("skipping running_indicator_renders_in_headless_chrome: chrome not found");
-            return;
-        }
-    };
+    let chrome_bin = find_chrome_binary().expect(
+        "Chrome or Chromium binary was not found on PATH or via CHROME_BIN; \
+         install Google Chrome or Chromium to run this ignored e2e test",
+    );
 
     let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
     let now_ms = std::time::SystemTime::now()
@@ -392,10 +389,16 @@ async fn running_indicator_renders_in_headless_chrome() {
     }
 
     let page_ws_url = page_ws_url.expect("failed to obtain Chrome WebSocket debugger URL");
-    let ws_path = page_ws_url
-        .split(&format!("{cdp_port}"))
-        .nth(1)
-        .expect("valid ws path");
+    let ws_path = {
+        let without_scheme = page_ws_url
+            .strip_prefix("ws://")
+            .or_else(|| page_ws_url.strip_prefix("wss://"))
+            .unwrap_or(&page_ws_url);
+        let path_start = without_scheme
+            .find('/')
+            .expect("ws URL must contain a path component");
+        &without_scheme[path_start..]
+    };
 
     let mut cdp = CdpClient::connect(&format!("127.0.0.1:{cdp_port}"), ws_path)
         .expect("connect CDP websocket");
@@ -446,9 +449,31 @@ async fn running_indicator_renders_in_headless_chrome() {
         "expected document.title to start with '⏳', got: '{title_val}'"
     );
 
-    // 4. Save a screenshot to target dir
+    // 4. Assert favicon href is set to running icon
+    let favicon_href = cdp
+        .eval("document.querySelector('#favicon') ? document.querySelector('#favicon').getAttribute('href') : ''")
+        .expect("eval favicon href")
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    assert!(
+        favicon_href.contains("favicon-running.svg"),
+        "expected favicon href to contain favicon-running.svg, got: '{favicon_href}'"
+    );
+
+    // 5. Save a screenshot to target dir and assert it is created and non-empty
     let target_dir =
         PathBuf::from(std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_owned()));
     let screenshot_path = target_dir.join("running_indicator.png");
     cdp.capture_screenshot(&screenshot_path);
+    assert!(
+        screenshot_path.exists(),
+        "expected screenshot to exist at {}",
+        screenshot_path.display()
+    );
+    let meta = std::fs::metadata(&screenshot_path).expect("read screenshot metadata");
+    assert!(
+        meta.len() > 0,
+        "expected screenshot file to be non-empty, got 0 bytes"
+    );
 }

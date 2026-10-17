@@ -346,19 +346,19 @@ pub enum RunState {
         node: Option<String>,
     },
     Done {
-        duration: Duration,
+        duration: Option<Duration>,
         started_at_ms: Option<u64>,
         ended_at_ms: u64,
         node: Option<String>,
     },
     Failed {
-        duration: Duration,
+        duration: Option<Duration>,
         started_at_ms: Option<u64>,
         ended_at_ms: u64,
         node: Option<String>,
     },
     Cancelled {
-        duration: Duration,
+        duration: Option<Duration>,
         started_at_ms: Option<u64>,
         ended_at_ms: u64,
         node: Option<String>,
@@ -399,7 +399,7 @@ impl RunState {
                 state: "done".to_owned(),
                 started_at_ms: *started_at_ms,
                 ended_at_ms: Some(*ended_at_ms),
-                duration_ms: Some(duration.as_millis() as u64),
+                duration_ms: duration.map(|d| d.as_millis() as u64),
                 node: node.clone(),
             },
             RunState::Failed {
@@ -411,7 +411,7 @@ impl RunState {
                 state: "failed".to_owned(),
                 started_at_ms: *started_at_ms,
                 ended_at_ms: Some(*ended_at_ms),
-                duration_ms: Some(duration.as_millis() as u64),
+                duration_ms: duration.map(|d| d.as_millis() as u64),
                 node: node.clone(),
             },
             RunState::Cancelled {
@@ -423,7 +423,7 @@ impl RunState {
                 state: "cancelled".to_owned(),
                 started_at_ms: *started_at_ms,
                 ended_at_ms: Some(*ended_at_ms),
-                duration_ms: Some(duration.as_millis() as u64),
+                duration_ms: duration.map(|d| d.as_millis() as u64),
                 node: node.clone(),
             },
         }
@@ -876,6 +876,7 @@ pub struct App {
     message_link_cache: MessageLinkCache,
     visible_chat_link_rows: Vec<Vec<ChatFileLink>>,
     pub(crate) run_states: HashMap<Agent, RunState>,
+    busy_fallback_starts: Mutex<HashMap<Agent, (Instant, u64)>>,
     pub(crate) injected_now: Option<Instant>,
 }
 
@@ -1051,6 +1052,7 @@ impl App {
             message_link_cache: HashMap::new(),
             visible_chat_link_rows: Vec::new(),
             run_states: HashMap::new(),
+            busy_fallback_starts: Mutex::new(HashMap::new()),
             injected_now: None,
         };
         app.restore_snapshot(snapshot);
@@ -1061,12 +1063,22 @@ impl App {
         if let Some(state) = self.run_states.get(&agent) {
             state.clone()
         } else if self.busy_agents.contains(&agent) {
+            let mut starts = self.busy_fallback_starts.lock().unwrap();
+            let (started_at, started_at_ms) = *starts.entry(agent).or_insert_with(|| {
+                (
+                    self.injected_now.unwrap_or_else(Instant::now),
+                    unix_ms_now(),
+                )
+            });
             RunState::Running {
-                started_at: Instant::now(),
-                started_at_ms: unix_ms_now(),
+                started_at,
+                started_at_ms,
                 node: self.active_graph_node_for_agent(agent),
             }
         } else {
+            if let Ok(mut starts) = self.busy_fallback_starts.lock() {
+                starts.remove(&agent);
+            }
             RunState::Idle
         }
     }
@@ -3606,14 +3618,21 @@ impl App {
         }
         self.agent_lifecycle.remove(&agent);
         self.busy_agents.remove(&agent);
+        if let Ok(mut starts) = self.busy_fallback_starts.lock() {
+            starts.remove(&agent);
+        }
         self.activities.remove(&agent);
         let (started_at_ms, duration, node) = match self.run_states.get(&agent) {
             Some(RunState::Running {
                 started_at,
                 started_at_ms,
                 node,
-            }) => (Some(*started_at_ms), started_at.elapsed(), node.clone()),
-            _ => (None, Duration::ZERO, None),
+            }) => (
+                Some(*started_at_ms),
+                Some(started_at.elapsed()),
+                node.clone(),
+            ),
+            _ => (None, None, None),
         };
         let ended_at_ms = unix_ms_now();
         let end_state = if success {
@@ -4264,6 +4283,7 @@ impl App {
         hub.set_ui(dmuxai::web::UiTheme {
             theme: self.settings.web_theme.theme.clone(),
             accent: self.settings.web_theme.accent.clone(),
+            reduced_motion: Some(self.reduced_motion()),
         });
         self.dashboard = Some(hub);
         self.publish_dashboard();
@@ -5719,10 +5739,18 @@ impl App {
                 format!("{frame} {selected} {state} {}", format_elapsed(elapsed))
             }
             RunState::Done { duration, .. } => {
-                format!("✓ done {}", format_elapsed(duration))
+                if let Some(duration) = duration {
+                    format!("✓ done {}", format_elapsed(duration))
+                } else {
+                    "✓ done".to_owned()
+                }
             }
             RunState::Failed { duration, .. } => {
-                format!("✗ failed {}", format_elapsed(duration))
+                if let Some(duration) = duration {
+                    format!("✗ failed {}", format_elapsed(duration))
+                } else {
+                    "✗ failed".to_owned()
+                }
             }
             RunState::Cancelled { .. } => "■ cancelled".to_owned(),
             RunState::Idle => {
@@ -13068,7 +13096,7 @@ mod tests {
         app.run_states.insert(
             Agent::Codex,
             RunState::Failed {
-                duration: Duration::from_secs(3),
+                duration: Some(Duration::from_secs(3)),
                 started_at_ms: Some(1000),
                 ended_at_ms: 4000,
                 node: None,
@@ -13080,6 +13108,38 @@ mod tests {
             "expected '✗ failed' in: {text_failed}"
         );
         assert!(text_failed.contains("3s"), "expected 3s in: {text_failed}");
+
+        // Finish without a Running entry omits elapsed time (does not show 0s)
+        app.run_states.remove(&Agent::Codex);
+        app.finish_turn_outcome_with_error(Agent::Codex, true, None);
+        let text_no_elapsed = render_test_buffer(&mut app);
+        assert!(text_no_elapsed.contains("✓ done"));
+        assert!(!text_no_elapsed.contains("✓ done 0s"));
+
+        // Fallback run_state records start once when busy without a run entry
+        app.run_states.remove(&Agent::Codex);
+        app.busy_agents.insert(Agent::Codex);
+        let first_run = app.run_state(Agent::Codex);
+        let (first_inst, first_ms) = match first_run {
+            RunState::Running {
+                started_at,
+                started_at_ms,
+                ..
+            } => (started_at, started_at_ms),
+            _ => panic!("expected Running fallback"),
+        };
+        std::thread::sleep(Duration::from_millis(5));
+        let second_run = app.run_state(Agent::Codex);
+        let (second_inst, second_ms) = match second_run {
+            RunState::Running {
+                started_at,
+                started_at_ms,
+                ..
+            } => (started_at, started_at_ms),
+            _ => panic!("expected Running fallback"),
+        };
+        assert_eq!(first_inst, second_inst);
+        assert_eq!(first_ms, second_ms);
     }
 
     #[test]

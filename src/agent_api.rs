@@ -139,7 +139,7 @@ pub fn status_json(workspace_root: &Path) -> Value {
                 && let Some(runner) = rec.runner
             {
                 let state = match rec.to_state.as_str() {
-                    "started" | "running" => "running",
+                    "started" | "running" | "pending" | "stalled" => "running",
                     "completed" => "done",
                     "error" => "failed",
                     "cancelled" => "cancelled",
@@ -147,10 +147,24 @@ pub fn status_json(workspace_root: &Path) -> Value {
                 };
                 let mut run_val = json!({ "state": state });
                 if state == "running" {
-                    run_val["started_at_ms"] = json!(rec.ts_ms);
+                    let prev_start = last_agent_run
+                        .get(&runner)
+                        .filter(|prev| {
+                            prev.get("state").and_then(|s| s.as_str()) == Some("running")
+                        })
+                        .and_then(|prev| prev.get("started_at_ms").cloned());
+                    run_val["started_at_ms"] = prev_start.unwrap_or_else(|| json!(rec.ts_ms));
                 }
                 if let Some(node) = rec.node {
                     run_val["node"] = json!(node);
+                } else if let Some(prev_node) = last_agent_run
+                    .get(&runner)
+                    // Only the same (still running) run keeps its node; a new
+                    // run without a node must not inherit the previous one.
+                    .filter(|prev| prev.get("state").and_then(|s| s.as_str()) == Some("running"))
+                    .and_then(|prev| prev.get("node").cloned())
+                {
+                    run_val["node"] = prev_node;
                 }
                 last_agent_run.insert(runner, run_val);
             }
@@ -250,5 +264,114 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(todo.title, "write docs");
+    }
+
+    #[test]
+    fn status_json_maps_pending_and_stalled_to_running_preserving_start_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let dmux_dir = dir.path().join(".dmuxai");
+        std::fs::create_dir_all(&dmux_dir).unwrap();
+        let events_file = dmux_dir.join("events.jsonl");
+
+        let rec1 = crate::events::EventRecord {
+            v: 1,
+            seq: 1,
+            ts: "2026-04-18T00:00:00Z".to_string(),
+            ts_ms: 1000,
+            workspace: dir.path().display().to_string(),
+            kind: "agent".to_string(),
+            task: None,
+            todo: None,
+            node: Some("A".to_string()),
+            runner: Some("cursor".to_string()),
+            model: None,
+            from_state: Some("idle".to_string()),
+            to_state: "started".to_string(),
+            message: None,
+        };
+        let rec2 = crate::events::EventRecord {
+            v: 1,
+            seq: 2,
+            ts: "2026-04-18T00:00:05Z".to_string(),
+            ts_ms: 6000,
+            workspace: dir.path().display().to_string(),
+            kind: "agent".to_string(),
+            task: None,
+            todo: None,
+            node: None,
+            runner: Some("cursor".to_string()),
+            model: None,
+            from_state: Some("running".to_string()),
+            to_state: "pending".to_string(),
+            message: None,
+        };
+        let rec3 = crate::events::EventRecord {
+            v: 1,
+            seq: 3,
+            ts: "2026-04-18T00:00:10Z".to_string(),
+            ts_ms: 11000,
+            workspace: dir.path().display().to_string(),
+            kind: "agent".to_string(),
+            task: None,
+            todo: None,
+            node: None,
+            runner: Some("cursor".to_string()),
+            model: None,
+            from_state: Some("running".to_string()),
+            to_state: "stalled".to_string(),
+            message: None,
+        };
+
+        let content = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&rec1).unwrap(),
+            serde_json::to_string(&rec2).unwrap(),
+            serde_json::to_string(&rec3).unwrap(),
+        );
+        std::fs::write(&events_file, content).unwrap();
+
+        let val = status_json(dir.path());
+        let agents = val.get("agents").and_then(|a| a.as_array()).unwrap();
+        let cursor = agents
+            .iter()
+            .find(|a| a.get("id").and_then(|id| id.as_str()) == Some("cursor"))
+            .expect("cursor agent found");
+        let run = cursor.get("run").expect("run object found");
+        assert_eq!(run.get("state").and_then(|s| s.as_str()), Some("running"));
+        assert_eq!(
+            run.get("started_at_ms").and_then(|t| t.as_u64()),
+            Some(1000)
+        );
+        assert_eq!(run.get("node").and_then(|n| n.as_str()), Some("A"));
+
+        // The run completes, then a new run starts without a node: it must
+        // not inherit node "A" from the previous run.
+        let mut rec4 = rec3.clone();
+        rec4.seq = 4;
+        rec4.ts_ms = 12000;
+        rec4.to_state = "completed".to_string();
+        let mut rec5 = rec3.clone();
+        rec5.seq = 5;
+        rec5.ts_ms = 20000;
+        rec5.from_state = Some("idle".to_string());
+        rec5.to_state = "started".to_string();
+        let mut content = std::fs::read_to_string(&events_file).unwrap();
+        content.push_str(&format!(
+            "{}\n{}\n",
+            serde_json::to_string(&rec4).unwrap(),
+            serde_json::to_string(&rec5).unwrap(),
+        ));
+        std::fs::write(&events_file, content).unwrap();
+        let val = status_json(dir.path());
+        let run = val["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "cursor")
+            .map(|a| a["run"].clone())
+            .unwrap();
+        assert_eq!(run["state"], "running");
+        assert_eq!(run["started_at_ms"].as_u64(), Some(20000));
+        assert!(run.get("node").is_none(), "new run inherited node: {run}");
     }
 }

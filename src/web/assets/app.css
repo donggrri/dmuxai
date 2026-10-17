@@ -392,20 +392,6 @@ h1.brand {
   box-sizing: border-box;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .spinner {
-    animation: none;
-    border: none;
-    width: auto;
-    height: auto;
-    line-height: 1;
-  }
-  .spinner::before {
-    content: "●";
-    color: var(--accent);
-  }
-}
-
 main {
   padding: 0 14px 40px;
   max-width: 880px;
@@ -499,6 +485,9 @@ main {
 .chip-running {
   border-color: var(--accent);
 }
+.chip-done { border-color: var(--ok); }
+.chip-failed { border-color: var(--err); }
+.chip-cancelled { border-color: var(--line); }
 .chip-run-running { color: var(--accent); }
 .chip-run-done { color: var(--ok); }
 .chip-run-failed { color: var(--err); }
@@ -1481,9 +1470,14 @@ main {
   stroke: var(--accent);
   stroke-width: 4;
 }
+.graph-svg .station-spinner {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: spin 0.8s linear infinite;
+}
 .graph-svg .node.state-running .dot { fill: var(--accent); }
 .graph-svg .node.state-running .ring { fill: none; stroke: var(--accent); }
-.graph-svg .node.state-running .ring-outer { stroke-width: 2; opacity: 0.35; }
+.graph-svg .node.state-running .ring-outer { stroke-width: 2; opacity: 0.8; stroke-dasharray: 24 50; }
 .graph-svg .node.state-running .ring-inner { stroke-width: 2; opacity: 0.6; }
 
 .graph-svg .check {
@@ -1549,10 +1543,6 @@ main {
 }
 
 .graph-svg .node.state-running .ring-inner { animation-delay: 0.4s; }
-
-@media (prefers-reduced-motion: reduce) {
-  .graph-svg .node.state-running .ring { animation: none; }
-}
 
 .graph-detail {
   flex: 0 0 260px;
@@ -1664,3 +1654,49 @@ main {
 .legend-failed { background: var(--err); }
 
 .nodes[hidden] { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+    border: none;
+    width: auto;
+    height: auto;
+    line-height: 1;
+  }
+  .spinner::before {
+    content: "●";
+    color: var(--accent);
+  }
+  .graph-svg .station-spinner {
+    animation: none;
+  }
+  .graph-svg .node.state-running .ring {
+    animation: none;
+  }
+  .graph-svg .node.state-running .ring-outer {
+    stroke-dasharray: none;
+    opacity: 0.35;
+  }
+}
+
+.reduced-motion .spinner {
+  animation: none;
+  border: none;
+  width: auto;
+  height: auto;
+  line-height: 1;
+}
+.reduced-motion .spinner::before {
+  content: "●";
+  color: var(--accent);
+}
+.reduced-motion .graph-svg .station-spinner {
+  animation: none;
+}
+.reduced-motion .graph-svg .node.state-running .ring {
+  animation: none;
+}
+.reduced-motion .graph-svg .node.state-running .ring-outer {
+  stroke-dasharray: none;
+  opacity: 0.35;
+}

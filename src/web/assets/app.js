@@ -35,11 +35,28 @@ function storageRemove(key) {
 var baseDocumentTitle = document.title || 'DmuxAI dashboard';
 var lastObservedRunState = 'idle';
 
+function updateFavicon(state) {
+  var link = document.getElementById('favicon') || document.querySelector('link[rel~="icon"]');
+  if (!link) { return; }
+  var href = '/assets/favicon-idle.svg';
+  if (state === 'running') {
+    href = '/assets/favicon-running.svg';
+  } else if (state === 'done') {
+    href = '/assets/favicon-done.svg';
+  } else if (state === 'failed') {
+    href = '/assets/favicon-failed.svg';
+  }
+  if (link.getAttribute('href') !== href) {
+    link.setAttribute('href', href);
+  }
+}
+
 if (typeof window.addEventListener === 'function') {
   window.addEventListener('focus', function () {
     if (document.title.indexOf('✓ ') === 0 || document.title.indexOf('✗ ') === 0) {
       document.title = baseDocumentTitle;
       lastObservedRunState = 'idle';
+      updateFavicon('idle');
     }
   });
 }
@@ -200,6 +217,8 @@ function bindThemeControls() {
 // above stop further snapshot applications.
 function applySnapshotUi(snap) {
   var ui = snap && snap.ui ? snap.ui : null;
+  // [theme] reduced_motion / DMUXAI_REDUCED_MOTION (UX-821) also stills the web spinners.
+  document.documentElement.classList.toggle('reduced-motion', !!(ui && ui.reduced_motion));
   if (ui && validTheme(String(ui.theme || ''))) {
     snapshotUiTheme = String(ui.theme);
   }
@@ -718,9 +737,11 @@ function graphStation(entry, nowMs) {
   group.appendChild(title);
 
   if (status === 'running') {
-    classes += ' spinner';
     group.setAttribute('class', classes);
-    group.appendChild(graphCircle('ring ring-outer spinner', 0, 0, GRAPH_R + 9));
+    var spinnerG = svgEl('g');
+    spinnerG.setAttribute('class', 'station-spinner');
+    spinnerG.appendChild(graphCircle('ring ring-outer', 0, 0, GRAPH_R + 9));
+    group.appendChild(spinnerG);
     group.appendChild(graphCircle('ring ring-inner', 0, 0, GRAPH_R + 4));
     group.appendChild(graphCircle('core', 0, 0, GRAPH_R));
     group.appendChild(graphCircle('dot', 0, 0, 5));
@@ -1194,15 +1215,59 @@ function renderGateHint(graph) {
     '". Type /graph continue in the TUI to proceed.';
 }
 
+var lastRenderedAgentsKey = null;
+
+function computeAgentsKey(list) {
+  var parts = [];
+  for (var i = 0; i < list.length; i++) {
+    var a = list[i] || {};
+    var r = a.run || {};
+    parts.push([
+      a.id,
+      a.label,
+      a.color,
+      a.busy ? 1 : 0,
+      a.phase,
+      a.model,
+      r.state,
+      r.started_at_ms,
+      r.ended_at_ms,
+      r.duration_ms
+    ].join('|'));
+  }
+  return parts.join(';;');
+}
+
 function renderAgents(agents, nowMs) {
   var wrap = $('agents');
-  wrap.replaceChildren();
+  if (!wrap) { return; }
   var list = Array.isArray(agents) ? agents : [];
+  var now = typeof nowMs === 'number' ? nowMs : Date.now();
+  var key = computeAgentsKey(list);
+
+  if (lastRenderedAgentsKey === key && wrap.children.length === list.length) {
+    for (var j = 0; j < list.length; j++) {
+      var a = list[j];
+      if (a && a.run && a.run.state === 'running' && typeof a.run.started_at_ms === 'number') {
+        var chipEl = wrap.children[j];
+        if (chipEl) {
+          var elapsedEl = chipEl.querySelector('.chip-run-elapsed');
+          if (elapsedEl) {
+            var ms = Math.max(0, now - a.run.started_at_ms);
+            elapsedEl.textContent = ' ' + (fmtElapsed(ms) || '0s');
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  lastRenderedAgentsKey = key;
+  wrap.replaceChildren();
   if (list.length === 0) {
     wrap.appendChild(el('p', 'empty', 'no agents'));
     return;
   }
-  var now = typeof nowMs === 'number' ? nowMs : Date.now();
   for (var i = 0; i < list.length; i++) {
     var agent = list[i] || {};
     var chip = el('span', 'chip');
@@ -1237,7 +1302,7 @@ function renderAgents(agents, nowMs) {
         var ms = typeof agent.run.started_at_ms === 'number'
           ? Math.max(0, now - agent.run.started_at_ms)
           : 0;
-        runEl.appendChild(document.createTextNode(' ' + (fmtElapsed(ms) || '0s')));
+        runEl.appendChild(el('span', 'chip-run-elapsed', ' ' + (fmtElapsed(ms) || '0s')));
         chip.appendChild(runEl);
       } else if (runState === 'done') {
         chip.classList.add('chip-done');
@@ -2062,10 +2127,17 @@ function bindImportForm() {
   });
 }
 
+function isRunStateTerminal(state) {
+  return state === 'done' || state === 'failed' || state === 'cancelled' || state === 'idle';
+}
+
 function getRunningAgents(snapshot) {
   var agents = snapshot && Array.isArray(snapshot.agents) ? snapshot.agents : [];
   return agents.filter(function (a) {
-    return (a && a.run && a.run.state === 'running') || (a && a.busy);
+    if (!a) { return false; }
+    if (a.run && a.run.state === 'running') { return true; }
+    if (a.run && isRunStateTerminal(a.run.state)) { return false; }
+    return Boolean(a.busy);
   });
 }
 
@@ -2087,17 +2159,14 @@ function getMostRecentEndedRun(snapshot) {
   return ended[0];
 }
 
+var lastRunStatusKey = null;
+
 function updateRunStatus(snap, nowMs) {
   var pill = $('run-status');
   if (!pill) { return; }
   var runningAgents = getRunningAgents(snap);
-  pill.className = 'run-status';
 
   if (runningAgents.length > 0) {
-    pill.classList.add('run-status-running');
-    pill.replaceChildren();
-    pill.appendChild(el('span', 'spinner'));
-
     var first = runningAgents[0];
     var firstLabel = first.label || first.id || 'agent';
     var agentText = runningAgents.length > 1
@@ -2110,37 +2179,63 @@ function updateRunStatus(snap, nowMs) {
       elapsedStr = fmtElapsed(ms) || '0s';
     }
 
-    pill.appendChild(document.createTextNode('Running \u00b7 ' + agentText + ' \u00b7 ' + elapsedStr));
+    var statusKey = 'running:' + agentText;
+    if (lastRunStatusKey === statusKey && pill.classList.contains('run-status-running')) {
+      var textEl = pill.querySelector('.run-status-text');
+      if (textEl) {
+        textEl.textContent = 'Running \u00b7 ' + agentText + ' \u00b7 ' + elapsedStr;
+        return;
+      }
+    }
+
+    lastRunStatusKey = statusKey;
+    pill.className = 'run-status run-status-running';
+    pill.replaceChildren();
+    pill.appendChild(el('span', 'spinner'));
+    pill.appendChild(el('span', 'run-status-text', 'Running \u00b7 ' + agentText + ' \u00b7 ' + elapsedStr));
   } else {
     var lastEnded = getMostRecentEndedRun(snap);
+    var statusKey = 'idle';
     if (lastEnded && lastEnded.state === 'done') {
-      pill.classList.add('run-status-done');
-      pill.replaceChildren();
       var dur = typeof lastEnded.duration_ms === 'number'
         ? fmtElapsed(lastEnded.duration_ms)
         : (typeof lastEnded.ended_at_ms === 'number' && typeof lastEnded.started_at_ms === 'number'
           ? fmtElapsed(lastEnded.ended_at_ms - lastEnded.started_at_ms)
           : null);
       var text = dur ? '✓ Done \u00b7 ' + dur : '✓ Done';
-      pill.textContent = text;
+      statusKey = 'done:' + text;
+      if (lastRunStatusKey !== statusKey) {
+        lastRunStatusKey = statusKey;
+        pill.className = 'run-status run-status-done';
+        pill.textContent = text;
+      }
     } else if (lastEnded && lastEnded.state === 'failed') {
-      pill.classList.add('run-status-failed');
-      pill.replaceChildren();
       var dur = typeof lastEnded.duration_ms === 'number'
         ? fmtElapsed(lastEnded.duration_ms)
         : (typeof lastEnded.ended_at_ms === 'number' && typeof lastEnded.started_at_ms === 'number'
           ? fmtElapsed(lastEnded.ended_at_ms - lastEnded.started_at_ms)
           : null);
       var text = dur ? '✗ Failed \u00b7 ' + dur : '✗ Failed';
-      pill.textContent = text;
+      statusKey = 'failed:' + text;
+      if (lastRunStatusKey !== statusKey) {
+        lastRunStatusKey = statusKey;
+        pill.className = 'run-status run-status-failed';
+        pill.textContent = text;
+      }
     } else if (lastEnded && lastEnded.state === 'cancelled') {
-      pill.classList.add('run-status-cancelled');
-      pill.replaceChildren();
-      pill.textContent = '■ Cancelled';
+      statusKey = 'cancelled';
+      if (lastRunStatusKey !== statusKey) {
+        lastRunStatusKey = statusKey;
+        pill.className = 'run-status run-status-cancelled';
+        pill.textContent = '■ Cancelled';
+      }
     } else {
-      pill.classList.add('run-status-idle');
-      pill.replaceChildren();
-      pill.textContent = 'Idle';
+      statusKey = 'idle';
+      if (lastRunStatusKey !== statusKey) {
+        lastRunStatusKey = statusKey;
+        pill.className = 'run-status run-status-idle';
+        pill.textContent = 'Idle';
+      }
     }
   }
 }
@@ -2150,21 +2245,26 @@ function updateTabTitle(snap) {
   if (runningAgents.length > 0) {
     document.title = '⏳ ' + baseDocumentTitle;
     lastObservedRunState = 'running';
+    updateFavicon('running');
   } else {
     var lastEnded = getMostRecentEndedRun(snap);
     if (lastObservedRunState === 'running') {
       if (lastEnded && lastEnded.state === 'done') {
         document.title = '✓ ' + baseDocumentTitle;
         lastObservedRunState = 'done';
+        updateFavicon('done');
       } else if (lastEnded && lastEnded.state === 'failed') {
         document.title = '✗ ' + baseDocumentTitle;
         lastObservedRunState = 'failed';
+        updateFavicon('failed');
       } else {
         document.title = baseDocumentTitle;
         lastObservedRunState = 'idle';
+        updateFavicon('idle');
       }
     } else if (lastObservedRunState !== 'done' && lastObservedRunState !== 'failed') {
       document.title = baseDocumentTitle;
+      updateFavicon('idle');
     }
   }
 }
@@ -2176,7 +2276,7 @@ function isSomethingRunning(snap) {
     if (agents[i] && agents[i].run && agents[i].run.state === 'running') {
       return true;
     }
-    if (agents[i] && agents[i].busy) {
+    if (agents[i] && agents[i].busy && (!agents[i].run || !isRunStateTerminal(agents[i].run.state))) {
       return true;
     }
   }

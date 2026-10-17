@@ -171,6 +171,8 @@ pub struct UiTheme {
     pub theme: String,
     #[serde(default)]
     pub accent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduced_motion: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
