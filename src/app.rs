@@ -589,7 +589,17 @@ fn normalize_workspace_path(target: &str, workspace_root: &Path) -> Option<Strin
         None
     } else {
         let clean = target.trim_start_matches("./").replace('\\', "/");
-        if clean.starts_with("../") || clean.contains("/../") {
+        // Root-relative (`/etc/x`, `\\x`) or drive-prefixed (`C:x`) paths are
+        // not relative to the workspace on any platform (Windows treats
+        // `/etc/x` as non-absolute), so drop them like other outside paths.
+        let drive_prefixed = clean.as_bytes().get(1) == Some(&b':');
+        if clean.starts_with('/')
+            || drive_prefixed
+            || clean == ".."
+            || clean.starts_with("../")
+            || clean.contains("/../")
+            || clean.ends_with("/..")
+        {
             None
         } else {
             Some(clean)
