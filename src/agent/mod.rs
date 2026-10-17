@@ -10,7 +10,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 
 pub use agy::spawn_agy_adapter;
 pub use codex::spawn_codex_adapter;
-pub use cursor::spawn_cursor_adapter;
+pub use cursor::{CursorAdapterConfig, spawn_cursor_adapter};
 pub use custom::spawn_custom_adapter;
 
 /// An AI provider that can own conversations and produce messages.
@@ -270,6 +270,18 @@ pub trait AgentAdapter: Send {
         Ok(())
     }
     fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError>;
+    fn send_graph_node(&self, request: AgentRequest) -> Result<(), AdapterError> {
+        self.send(request)
+    }
+    fn prewarm(&self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    fn reset(&self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    fn tick(&self) -> Result<(), AdapterError> {
+        Ok(())
+    }
     fn request_status(&self) -> Result<(), AdapterError> {
         Err(AdapterError::Unsupported)
     }

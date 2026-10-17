@@ -31,6 +31,8 @@ impl Default for WebThemeSettings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DmuxSettings {
     pub cursor_windows_unsandboxed: bool,
+    pub cursor_prewarm: bool,
+    pub cursor_prewarm_idle_secs: u64,
     pub routing_default_agent: Option<String>,
     pub routing_cursor_models: Vec<String>,
     pub graph_enabled: bool,
@@ -164,6 +166,8 @@ struct GraphToml {
 #[derive(Debug, Default, Deserialize)]
 struct CursorToml {
     windows_unsandboxed: Option<bool>,
+    prewarm: Option<bool>,
+    prewarm_idle_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -405,12 +409,16 @@ impl DmuxSettings {
                     .push(format!("[todo] jira_base_url ignored: {message}")),
             }
         }
-        if parsed
-            .cursor
-            .and_then(|cursor| cursor.windows_unsandboxed)
-            .unwrap_or(false)
-        {
-            self.cursor_windows_unsandboxed = true;
+        if let Some(cursor) = parsed.cursor {
+            if let Some(windows_unsandboxed) = cursor.windows_unsandboxed {
+                self.cursor_windows_unsandboxed = windows_unsandboxed;
+            }
+            if let Some(prewarm) = cursor.prewarm {
+                self.cursor_prewarm = prewarm;
+            }
+            if let Some(idle) = cursor.prewarm_idle_secs {
+                self.cursor_prewarm_idle_secs = idle;
+            }
         }
         if let Some(routing) = parsed.routing {
             if let Some(default_agent) = routing.default_agent {
@@ -552,6 +560,8 @@ impl Default for DmuxSettings {
     fn default() -> Self {
         Self {
             cursor_windows_unsandboxed: false,
+            cursor_prewarm: true,
+            cursor_prewarm_idle_secs: 300,
             routing_default_agent: None,
             routing_cursor_models: Vec::new(),
             graph_enabled: true,
@@ -1616,6 +1626,23 @@ mod builtin_memory_mcp_tests {
                 s.config_warnings
             );
         }
+    }
+
+    #[test]
+    fn cursor_prewarm_settings_parse_and_override() {
+        let default_settings = DmuxSettings::default();
+        assert!(default_settings.cursor_prewarm);
+        assert_eq!(default_settings.cursor_prewarm_idle_secs, 300);
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            "[cursor]\nprewarm = false\nprewarm_idle_secs = 120\n",
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(ws.path());
+        assert!(!settings.cursor_prewarm);
+        assert_eq!(settings.cursor_prewarm_idle_secs, 120);
     }
 }
 

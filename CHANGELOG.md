@@ -35,6 +35,14 @@ All notable changes to dmuxai are listed here. Versions follow
   before. Expanded folders persist per workspace; it is keyboard accessible and
   becomes an overlay drawer below 900px (FR-832, FR-833, UX-830).
 
+- **Cursor pre-start (SPEC-cursor-latency FR-805..FR-807).** In the TUI and
+  dashboard, DmuxAI starts the next `cursor-agent` process while you type and
+  hands it the prompt on send, saving about 1.4–2.1 s per turn. The process is
+  reused only when its arguments match, and is stopped on a mode or model
+  change, `/new`, idle expiry (`[cursor] prewarm_idle_secs`, default 300) or
+  quit. Headless `dmuxai run` and graph nodes never pre-start;
+  `[cursor] prewarm = false` turns it off.
+
 ### Changed
 
 - **Graph routing exception for the built-in opencode runner (FR-813).** With

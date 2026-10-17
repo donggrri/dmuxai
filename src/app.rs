@@ -70,9 +70,9 @@ use dmuxai::{
 };
 
 use crate::agent::{
-    Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ConversationId, ExecutionMode,
-    ModelInfo, TurnId, event_channel, spawn_agy_adapter, spawn_codex_adapter, spawn_cursor_adapter,
-    spawn_custom_adapter,
+    Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ConversationId,
+    CursorAdapterConfig, ExecutionMode, ModelInfo, TurnId, event_channel, spawn_agy_adapter,
+    spawn_codex_adapter, spawn_cursor_adapter, spawn_custom_adapter,
 };
 
 const RENDER_INTERVAL: Duration = Duration::from_millis(25);
@@ -886,11 +886,31 @@ impl App {
         workspace_root: PathBuf,
         settings: DmuxSettings,
     ) -> Result<Self, ConversationError> {
+        Self::new_with_prewarm(engine, workspace_root, settings, false)
+    }
+
+    pub fn new_interactive(
+        engine: ConversationEngine,
+        workspace_root: PathBuf,
+        settings: DmuxSettings,
+    ) -> Result<Self, ConversationError> {
+        let prewarm = settings.cursor_prewarm;
+        Self::new_with_prewarm(engine, workspace_root, settings, prewarm)
+    }
+
+    fn new_with_prewarm(
+        engine: ConversationEngine,
+        workspace_root: PathBuf,
+        settings: DmuxSettings,
+        prewarm: bool,
+    ) -> Result<Self, ConversationError> {
         let (mcp_servers, mcp_warnings) =
             dmuxai::mcp::config::resolve_servers(&settings.mcp_servers, |k| std::env::var(k).ok());
         let (event_tx, event_rx) = event_channel();
         let mut adapters = Vec::with_capacity(Agent::all().len());
         let mut workers = Vec::with_capacity(Agent::all().len());
+
+        let cursor_config = CursorAdapterConfig::from_settings(&settings, prewarm);
 
         for agent in Agent::all() {
             let (adapter, worker) = match agent {
@@ -902,7 +922,7 @@ impl App {
                 Agent::Cursor => spawn_cursor_adapter(
                     event_tx.clone(),
                     workspace_root.clone(),
-                    settings.clone(),
+                    cursor_config.clone(),
                     mcp_servers.clone(),
                 ),
                 Agent::Agy => spawn_agy_adapter(event_tx.clone(), workspace_root.clone()),
@@ -1150,6 +1170,9 @@ impl App {
     }
 
     pub fn tick(&mut self) -> bool {
+        for adapter in &self.adapters {
+            let _ = adapter.tick();
+        }
         let busy = !self.busy_agents.is_empty();
         if busy {
             self.dirty = true;
@@ -1575,6 +1598,7 @@ impl App {
                     return Err(self.runner_forbidden(&id));
                 }
                 self.selected = adapter_index(target);
+                let _ = self.adapters[self.selected].prewarm();
                 self.push_system(format!("Active agent: {target}."));
             }
             SessionCommand::SetMode { agent, mode } => {
@@ -2211,6 +2235,7 @@ impl App {
             }
             KeyCode::Enter => {
                 self.selected = picker.cursor;
+                let _ = self.adapters[self.selected].prewarm();
                 let agent = Agent::all()[self.selected];
                 self.messages.push(Message::new(
                     Role::System,
@@ -2624,6 +2649,7 @@ impl App {
                         self.execute_slash_action(SlashAction::Agent);
                     } else if let Some(agent) = runner_from_str(arg) {
                         self.selected = adapter_index(agent);
+                        let _ = self.adapters[self.selected].prewarm();
                         self.messages.push(Message::new(
                             Role::System,
                             format!("Active agent: {agent}."),
@@ -2950,8 +2976,14 @@ impl App {
         }
         let mut adapter_request = adapter_request(request, image_paths);
         let injected_memory = self.inject_memory(agent, &mut adapter_request);
+        let is_graph = self.active_graph_node_for_agent(agent).is_some();
+        let send_result = if is_graph {
+            self.adapters[adapter_index].send_graph_node(adapter_request)
+        } else {
+            self.adapters[adapter_index].send(adapter_request)
+        };
         self.messages.push(Message::new(Role::User, prompt.clone()));
-        match self.adapters[adapter_index].send(adapter_request) {
+        match send_result {
             Ok(()) => {
                 if let Some(hash) = injected_memory {
                     self.memory_injected
@@ -3080,6 +3112,9 @@ impl App {
     fn restore_snapshot(&mut self, snapshot: ConversationSnapshot) {
         self.conversation_id = snapshot.id;
         self.conversation_title = snapshot.title;
+        for adapter in &self.adapters {
+            let _ = adapter.reset();
+        }
         // Switching conversations clears the dashboard's retained graph so the
         // previous conversation's finished run is not shown (FR-525/FR-530).
         self.last_graph_run = None;

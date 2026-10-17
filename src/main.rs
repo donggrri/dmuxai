@@ -589,7 +589,7 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     crossterm::style::force_color_output(color_enabled);
     let custom_warnings = dmuxai::custom_agent::install_registry(settings.custom_agents.clone());
     let config_warnings = settings.config_warnings.clone();
-    let mut app = App::new(engine, workspace_root.clone(), settings.clone())?;
+    let mut app = App::new_interactive(engine, workspace_root.clone(), settings.clone())?;
     for warning in config_warnings.into_iter().chain(custom_warnings) {
         app.push_startup_notice(warning);
     }

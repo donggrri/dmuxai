@@ -1,6 +1,6 @@
 # SPEC: cursor-latency
 
-Status: Draft (v0.2.1)
+Status: Implemented (v0.2.1)
 Created: 2026-10-17
 Related: Dongjin dogfood 2026-10-17 ("Cursor is really slow in dmuxai"); SPEC-cursor-stream-dedupe
 
