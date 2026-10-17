@@ -43,6 +43,7 @@
   var readOnlyKnown = false;
   var entries = [];
   var entriesLoaded = false;
+  var entriesError = '';
   var listTruncated = false;
   var filterText = '';
   var changesTimer = null;
@@ -540,7 +541,9 @@
     var focusedPath = getFocusedTreePath();
     tree.replaceChildren();
     if (!entriesLoaded) {
-      tree.appendChild(el('div', 'tree-hint', 'loading\u2026'));
+      tree.appendChild(entriesError
+        ? el('p', 'empty', 'documents unavailable: ' + entriesError)
+        : el('div', 'tree-hint', 'loading\u2026'));
       return;
     }
     if (listTruncated) {
@@ -810,10 +813,12 @@
       .then(function (payload) {
         entries = payload && Array.isArray(payload.entries) ? payload.entries : [];
         entriesLoaded = true;
+        entriesError = '';
         listTruncated = Boolean(payload && payload.truncated);
         renderTree();
       })
-      .catch(function () {
+      .catch(function (err) {
+        entriesError = (err && err.message) || 'request failed';
         renderTree();
       });
   }

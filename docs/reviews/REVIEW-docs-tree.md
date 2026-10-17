@@ -81,8 +81,10 @@ AGY (gemini-3.8-flash-high) implemented and reviewed rounds 1-2. AGY hit its quo
 | --- | --- | --- |
 | 1 | Security: a symlink into an ignored dir (e.g. `notes.md -> .dmuxai/web.json`) resolved, was listed and was savable | `Workspace::is_visible_target` rejects canonical targets inside `IGNORED_DIRS`; used by `resolve`, `list_children`, `dir_has_children` and `list_documents`. Tests: `rejects_symlink_into_ignored_dir`, `tree_children_lists_one_level` (`link_ignored.md`) |
 | 2 | Pending focus restore could steal focus from the filter or preview | Restored only while focus is on the body or inside the tree |
-| 3 | Filter silently missed files past the `/api/docs` cap, and showed "no match" before the first fetch | Shows `loading…` until the list arrives and a truncation hint when `truncated` |
+| 3 | Filter silently missed files past the `/api/docs` cap, and showed "no match" before the first fetch | Shows `loading…` until the list arrives (or `documents unavailable: …` if it fails, from the re-review) and a truncation hint when `truncated` |
 | 4 | `list_children` work was unbounded for huge directories | Scan capped at `limit × 20` entries; sets `truncated` |
 | 5 | A failed folder load never retried | The next expand refetches |
 
 Not changed: preview dialog focus trap/return (pre-existing behaviour from SPEC-docs-preview, out of scope here); stale-response sequencing between overlapping tree fetches (low impact, the next poll corrects it); `:` rejection in paths (FR-740 confinement rule).
+
+Re-review (opencode-haiku): one blocker (filter stuck on `loading…` when `/api/docs` fails), fixed; gates re-run with the same results.

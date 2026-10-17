@@ -393,6 +393,7 @@ mod tests {
         assert!(DOCS_JS.contains("pendingFocusPath"));
         assert!(DOCS_JS.contains("mayRestore"));
         assert!(DOCS_JS.contains("file list truncated"));
+        assert!(DOCS_JS.contains("documents unavailable: "));
         assert!(DOCS_JS.contains("group._failed"));
 
         // 3. docs.css contains sidebar container and narrow-width drawer media query
