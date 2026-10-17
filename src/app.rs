@@ -4615,7 +4615,7 @@ mod tests {
     }
 
     #[test]
-    // TC-060 / INT-060: unsupported modes do not retire a binding or change UI state.
+    // TC-480 / INT-480: unsupported modes do not retire a binding or change UI state.
     fn unsupported_mode_is_rejected_before_binding_retirement() {
         let workspace = std::env::current_dir().unwrap();
         let engine =

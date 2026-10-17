@@ -50,27 +50,27 @@ non-Cursor agent modes retain their existing behavior.
 
 | ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| INT-060 | Must | Given Windows and Cursor is idle, when the user attempts to select Implement. | DmuxAI rejects the mode before changing Cursor's selected mode or retiring its provider binding, and displays that Cursor Implement requires macOS or Linux sandbox support. | The mode picker remains available so the user can choose Ask or Plan; no provider process starts. | TC-060 |
-| NFR-060 | Must | Given any Cursor Implement request reaches the adapter runtime. | The request is rejected before `cursor_command`, command construction, or child-process spawning; Windows never invokes Cursor with `--sandbox enabled`. | The correlated request receives a terminal error and the runtime remains usable for later Ask/Plan requests. | TC-061 |
-| INT-061 | Must | Given a supported non-Windows platform and Cursor is selected. | Cursor Implement continues to use `--force --sandbox enabled`; Ask continues to use `--mode ask` and Plan uses `--mode plan`. | No mode gains broader permissions or changes provider protocol shape. | TC-062, TC-063 |
+| INT-480 | Must | Given Windows and Cursor is idle, when the user attempts to select Implement. | DmuxAI rejects the mode before changing Cursor's selected mode or retiring its provider binding, and displays that Cursor Implement requires macOS or Linux sandbox support. | The mode picker remains available so the user can choose Ask or Plan; no provider process starts. | TC-480 |
+| NFR-480 | Must | Given any Cursor Implement request reaches the adapter runtime. | The request is rejected before `cursor_command`, command construction, or child-process spawning; Windows never invokes Cursor with `--sandbox enabled`. | The correlated request receives a terminal error and the runtime remains usable for later Ask/Plan requests. | TC-481 |
+| INT-481 | Must | Given a supported non-Windows platform and Cursor is selected. | Cursor Implement continues to use `--force --sandbox enabled`; Ask continues to use `--mode ask` and Plan uses `--mode plan`. | No mode gains broader permissions or changes provider protocol shape. | TC-482, TC-483 |
 
 ## 5. Acceptance scenarios and test design
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-060 | INT-060 | unit | Construct a Cursor adapter mode request on the current target platform. | Validate and attempt Cursor Implement selection. | Windows returns the platform-specific `UnsupportedMode` error and does not queue a mode-change event; supported platforms accept it. The UI does not retire the binding or change mode state. | `src/agent/cursor.rs`: `cursor_mode_validation_matches_platform`; Windows `windows_cursor_implement_mode_is_rejected_before_queueing`; `src/app.rs`: `unsupported_mode_is_rejected_before_binding_retirement` |
-| TC-061 | NFR-060 | unit | Construct a Cursor Implement turn request on Windows with an unusable working directory. | Call the adapter's turn runner directly. | It returns the platform error before any provider event or process-spawn error can occur. | `src/agent/cursor.rs`: `windows_cursor_implement_turn_is_rejected_before_process_spawn` |
-| TC-062 | INT-061 | unit | Build Cursor command arguments for Ask, Plan, and Implement. | Inspect the constructed arguments on a supported target. | Existing flags remain exact, including Implement's `--force --sandbox enabled`. | `cargo test cursor_execution_modes_use_native_cli_flags` |
-| TC-063 | INT-061 | boundary | Validate Cursor Ask and Plan on every target. | Select each mode through the adapter capability check. | Both modes remain accepted on Windows and non-Windows targets. | `src/agent/cursor.rs`: `cursor_mode_validation_matches_platform` |
+| TC-480 | INT-480 | unit | Construct a Cursor adapter mode request on the current target platform. | Validate and attempt Cursor Implement selection. | Windows returns the platform-specific `UnsupportedMode` error and does not queue a mode-change event; supported platforms accept it. The UI does not retire the binding or change mode state. | `src/agent/cursor.rs`: `cursor_mode_validation_matches_platform`; Windows `windows_cursor_implement_mode_is_rejected_before_queueing`; `src/app.rs`: `unsupported_mode_is_rejected_before_binding_retirement` |
+| TC-481 | NFR-480 | unit | Construct a Cursor Implement turn request on Windows with an unusable working directory. | Call the adapter's turn runner directly. | It returns the platform error before any provider event or process-spawn error can occur. | `src/agent/cursor.rs`: `windows_cursor_implement_turn_is_rejected_before_process_spawn` |
+| TC-482 | INT-481 | unit | Build Cursor command arguments for Ask, Plan, and Implement. | Inspect the constructed arguments on a supported target. | Existing flags remain exact, including Implement's `--force --sandbox enabled`. | `cargo test cursor_execution_modes_use_native_cli_flags` |
+| TC-483 | INT-481 | boundary | Validate Cursor Ask and Plan on every target. | Select each mode through the adapter capability check. | Both modes remain accepted on Windows and non-Windows targets. | `src/agent/cursor.rs`: `cursor_mode_validation_matches_platform` |
 
 ## 6. Data, integration, and safety contracts
 
 | Area | Contract / change | Compatibility and rollback | Evidence |
 | --- | --- | --- | --- |
-| Persistence | No schema change; a rejected mode does not retire a provider binding. | Code/docs-only revert; existing conversations and bindings remain readable. | TC-060 |
-| Provider protocol | Windows must not launch the Cursor Implement command; supported platforms keep the existing command flags and NDJSON protocol. | No provider protocol migration. | TC-061, TC-062 |
-| Security / permissions | Do not fall back to unsandboxed Cursor execution or broaden permissions. | The safe fallback is user-visible rejection; Ask/Plan remain available. | TC-060, TC-061 |
-| Platform | Cursor Implement is unavailable on Windows because Cursor sandbox mode requires macOS or Linux. | A future Cursor Windows sandbox capability can remove the guard in a separately specified change. | TC-060, TC-061 |
+| Persistence | No schema change; a rejected mode does not retire a provider binding. | Code/docs-only revert; existing conversations and bindings remain readable. | TC-480 |
+| Provider protocol | Windows must not launch the Cursor Implement command; supported platforms keep the existing command flags and NDJSON protocol. | No provider protocol migration. | TC-481, TC-482 |
+| Security / permissions | Do not fall back to unsandboxed Cursor execution or broaden permissions. | The safe fallback is user-visible rejection; Ask/Plan remain available. | TC-480, TC-481 |
+| Platform | Cursor Implement is unavailable on Windows because Cursor sandbox mode requires macOS or Linux. | A future Cursor Windows sandbox capability can remove the guard in a separately specified change. | TC-480, TC-481 |
 
 ## 7. Implementation plan
 
@@ -79,9 +79,9 @@ See [PLAN-cursor-windows-implement-guard.md](../plans/PLAN-cursor-windows-implem
 
 | Order | Change | Files / modules | Requirement IDs | Verification |
 | --- | --- | --- | --- | --- |
-| 1 | Add provider mode validation and an actionable unsupported-mode error. | `src/agent/mod.rs`, `src/agent/cursor.rs` | INT-060, INT-061 | TC-060, TC-063 |
-| 2 | Add the runtime pre-spawn guard and preserve supported command construction. | `src/agent/cursor.rs` | NFR-060, INT-061 | TC-061, TC-062 |
-| 3 | Make the UI validate before retiring bindings or committing a mode change. | `src/app.rs` | INT-060 | TC-060 |
+| 1 | Add provider mode validation and an actionable unsupported-mode error. | `src/agent/mod.rs`, `src/agent/cursor.rs` | INT-480, INT-481 | TC-480, TC-483 |
+| 2 | Add the runtime pre-spawn guard and preserve supported command construction. | `src/agent/cursor.rs` | NFR-480, INT-481 | TC-481, TC-482 |
+| 3 | Make the UI validate before retiring bindings or committing a mode change. | `src/app.rs` | INT-480 | TC-480 |
 | 4 | Update product documentation and baseline traceability. | `README.md`, `docs/specs/DMUXAI-BASELINE.md` | all | spec check |
 
 ## 8. Review and test exit criteria

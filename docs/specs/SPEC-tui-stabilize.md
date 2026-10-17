@@ -100,7 +100,7 @@ F2 Pressed (AGY)
 | FR-387 | Must | Given a fresh process launch with an existing valid on-disk model cache file whose age is within the TTL (24 hours), when the user presses F2 on AGY for the first time. | The models must be loaded from disk and displayed in the picker immediately (<200 ms) without waiting for `agy models` CLI execution. | If the disk cache file is corrupt, unreadable, or missing, fall back to background discovery and display the loading indicator. | TC-386 |
 | FR-388 | Must | Given the on-disk cache for AGY is expired (>24 hours) or missing, when F2 is pressed or an asynchronous model refresh is initiated. | The model discovery subprocess must execute asynchronously in the background without freezing the UI thread or keyboard input handling; once finished, memory and disk caches must update atomically. If existing cached models exist, they remain browsable during background refresh. | If the subprocess fails or returns non-zero, existing cached models must not be cleared and a non-fatal warning notice must be shown. | TC-387, TC-388 |
 | FR-389 | Must | Given a rapid burst of characters in the prompt input (such as piped PTY text or fast paste) followed immediately by an `Enter` key event, when events are processed by the application loop. | The application must immediately trigger prompt submission (`submit_prompt`), dispatching the accumulated prompt text to the active agent without swallowing the `Enter` key or requiring a second keypress. | If the prompt input is empty or pure whitespace, submission is a no-op as normal. | TC-389 |
-| FR-390 | Must | Given the TUI terminal session initializes, when configuring terminal device features. | The session must enable bracketed paste mode (`EnableBracketedPaste`) and disable it (`DisableBracketedPaste`) on shutdown/drop. Pasty bursts and newline characters within single-line prompts must be normalized such that an Enter key event triggers submission rather than appending unhandled control characters. | When raw `\n` or `\r` arrives as part of a single-line prompt submission, it must trigger submission rather than corrupting the input buffer. | TC-390, TC-391 |
+| FR-490 | Must | Given the TUI terminal session initializes, when configuring terminal device features. | The session must enable bracketed paste mode (`EnableBracketedPaste`) and disable it (`DisableBracketedPaste`) on shutdown/drop. Pasty bursts and newline characters within single-line prompts must be normalized such that an Enter key event triggers submission rather than appending unhandled control characters. | When raw `\n` or `\r` arrives as part of a single-line prompt submission, it must trigger submission rather than corrupting the input buffer. | TC-490, TC-491 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -115,9 +115,9 @@ F2 Pressed (AGY)
 | TC-386 | FR-387 | unit | Disk cache file containing valid JSON model list and recent timestamp (<24h). | Read disk cache with `read_disk_cache`. | Models loaded directly from disk cache and marked fresh; no subprocess blocking needed. | `src/agent/agy.rs` (`test_disk_cache_roundtrip_and_freshness`) |
 | TC-387 | FR-388 | unit | Disk cache file older than 24h (expired TTL). | Read disk cache with `read_disk_cache`. | Models returned with `is_fresh = false` triggering asynchronous background refresh; fresh models written to disk. | `src/agent/agy.rs` (`test_disk_cache_roundtrip_and_freshness`) |
 | TC-388 | FR-388 | unit | Disk cache file is missing or corrupt. | Call `read_disk_cache`. | Corrupt or non-existent file returns `None` safely without panic. | `src/agent/agy.rs` (`test_disk_cache_missing_or_corrupt`) |
-| TC-389 | FR-389, FR-390 | unit | Prompt input populated by rapid sequence of key events (600 characters) without delay. | Dispatch `KeyCode::Enter` or `KeyCode::Char('\n')` immediately after burst. | `submit_prompt()` executes; input buffer is cleared; prompt is submitted to the active agent; prompt text does not remain in the input bar. | `src/app.rs` (`enter_immediately_after_paste_burst_submits_prompt`, `char_newline_key_submits_prompt`) |
-| TC-390 | FR-390 | unit | Terminal session initialization. | Execute `TerminalSession::start()` and drop session guard. | Terminal commands emitted include `EnableBracketedPaste`; drop commands include `DisableBracketedPaste`. | `src/main.rs` (`TerminalSession`) |
-| TC-391 | FR-390 | unit | Event loop receiving `Event::Paste(text)` ending in newline or followed by Enter. | Process paste event via `handle_paste`. | Text is accepted and submitted cleanly on Enter or trailing newline without leaving newline characters in input. | `src/app.rs` (`paste_with_trailing_newline_submits_immediately`, `enter_immediately_after_paste_burst_submits_prompt`) |
+| TC-389 | FR-389, FR-490 | unit | Prompt input populated by rapid sequence of key events (600 characters) without delay. | Dispatch `KeyCode::Enter` or `KeyCode::Char('\n')` immediately after burst. | `submit_prompt()` executes; input buffer is cleared; prompt is submitted to the active agent; prompt text does not remain in the input bar. | `src/app.rs` (`enter_immediately_after_paste_burst_submits_prompt`, `char_newline_key_submits_prompt`) |
+| TC-490 | FR-490 | unit | Terminal session initialization. | Execute `TerminalSession::start()` and drop session guard. | Terminal commands emitted include `EnableBracketedPaste`; drop commands include `DisableBracketedPaste`. | `src/main.rs` (`TerminalSession`) |
+| TC-491 | FR-490 | unit | Event loop receiving `Event::Paste(text)` ending in newline or followed by Enter. | Process paste event via `handle_paste`. | Text is accepted and submitted cleanly on Enter or trailing newline without leaving newline characters in input. | `src/app.rs` (`paste_with_trailing_newline_submits_immediately`, `enter_immediately_after_paste_burst_submits_prompt`) |
 
 ## 6. Data, integration, and safety contracts
 
@@ -126,21 +126,21 @@ F2 Pressed (AGY)
 | Persistence | On-disk model cache stored as JSON: `{"timestamp": <epoch_secs>, "models": [{"id": "...", "label": "..."}]}` under state directory. | If the cache file cannot be parsed or schema changes, it is cleanly discarded and regenerated from the provider CLI. | TC-386, TC-387 |
 | CLI / Protocol | Non-TTY CLI invocation prints plain text usage or version to `stdout` and exits 0. Non-TTY startup prints plain text to `stderr` and exits 1. | Fully backward compatible; does not alter existing interactive terminal experience. | TC-380, TC-381, TC-382 |
 | Security / permissions | Non-TTY startup rejection prevents headless background processes from inadvertently acquiring terminal control or hanging. | Prevents silent zombie processes in automated scripts. | TC-382 |
-| Platform | Standard `std::io::IsTerminal` checks for stdin/stdout across Linux and Windows. Bracketed paste sequences supported across ANSI/VT100 terminals. | Falls back gracefully if terminal does not support bracketed paste. | TC-382, TC-390 |
+| Platform | Standard `std::io::IsTerminal` checks for stdin/stdout across Linux and Windows. Bracketed paste sequences supported across ANSI/VT100 terminals. | Falls back gracefully if terminal does not support bracketed paste. | TC-382, TC-490 |
 
 ## 7. Implementation plan
 
 | Order | Change | Files / modules | Requirement IDs | Verification |
 | --- | --- | --- | --- | --- |
 | 1 | Add CLI flag argument parser (`--help`, `-h`, `--version`, `-V`) and TTY guard before terminal initialization. | `src/main.rs`, `src/lib.rs` | FR-380, FR-381, FR-382 | TC-380, TC-381, TC-382 |
-| 2 | Enable and disable bracketed paste mode in terminal session RAII guard. | `src/main.rs` | FR-390 | TC-390 |
+| 2 | Enable and disable bracketed paste mode in terminal session RAII guard. | `src/main.rs` | FR-490 | TC-490 |
 | 3 | Implement responsive status line layout dropping low-priority slash command hints and abbreviating key hints. | `src/app.rs` | FR-383, FR-384, FR-385 | TC-383, TC-384 |
 | 4 | Add persistent disk caching and in-process caching for AGY model discovery with 24-hour TTL and non-blocking background refresh. | `src/agent/agy.rs`, `src/app.rs`, `src/settings.rs` | FR-386, FR-387, FR-388 | TC-385, TC-386, TC-387, TC-388 |
-| 5 | Fix paste burst handling and Enter swallowing in event loop, ensuring immediate submission. | `src/app.rs` | FR-389, FR-390 | TC-389, TC-391 |
+| 5 | Fix paste burst handling and Enter swallowing in event loop, ensuring immediate submission. | `src/app.rs` | FR-389, FR-490 | TC-389, TC-491 |
 
 ## 8. Review and test exit criteria
 
-- [ ] All Must requirements (FR-380 through FR-390) map to passing test scenarios (TC-380 through TC-391).
+- [ ] All Must requirements (FR-380 through FR-389, FR-490) map to passing test scenarios (TC-380 through TC-389, TC-490 through TC-491).
 - [ ] The diff has been reviewed against scope and non-goals.
 - [ ] Required Rust checks pass: format, all targets test, and clippy.
 - [ ] Dogfood bugs #1, #4, #5, and #6 are verified fixed and closed in `docs/dogfood/README.md`.

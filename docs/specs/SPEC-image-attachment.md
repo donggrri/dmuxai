@@ -1,5 +1,8 @@
 # SPEC: Image attachments
 
+Status: Implemented
+Related: `docs/TEST-PLAN.md` §1 (M5, FR-IMG-1..5 traceability); [SPEC-clipboard-image-paste.md](SPEC-clipboard-image-paste.md)
+
 ## Requirements
 
 | ID | Requirement | Tests |

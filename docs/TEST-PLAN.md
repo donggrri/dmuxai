@@ -19,24 +19,14 @@ Status: draft · 기준 커밋: `73e3f4d` (main, PR #6 이후) · 작성일: 202
 | M7 | Model policy: composer-2.5 only (그래프/서브에이전트/기본값) |
 | M8 | Graph execution report (`docs/graph-runs/`) |
 
-## 0.1 새 SPEC 문서 (2026-10-17 추가)
+## 0.1 SPEC 색인 (2026-10-17)
 
-§2의 제안 중 오늘 구현/설계된 기능은 아래 SPEC으로 정식화했다. SPEC에서는 CI 형식(`FR-\d+`, `TC-\d+`)에 맞춰 숫자 ID를 쓰고, 이 문서의 접두어 ID는 그 대응표다.
+SPEC별 색인 행 테이블은 병렬 워크트리 병합 때마다 같은 자리에서 충돌하는 원인이었다(dogfood #14). 테이블은 제거했고, [SPEC-spec-index](specs/SPEC-spec-index.md) 규칙으로 대체했다.
 
-| SPEC | Status | 숫자 ID | 이 문서 제안 ID |
-|---|---|---|---|
-| [SPEC-permission-hardening](specs/SPEC-permission-hardening.md) | Implemented | FR-300~303, TC-300~305 | FR-PERM-*, TC-PERM-* |
-| [SPEC-model-policy](specs/SPEC-model-policy.md) | Implemented | FR-310~314, TC-310~315 | FR-MODEL-*, TC-MODEL-* |
-| [SPEC-speaker-colors](specs/SPEC-speaker-colors.md) | Implemented | FR-320~322, UX-320, TC-320~324 | FR-THEME-*, TC-THEME-* |
-| [SPEC-custom-agent-provider](specs/SPEC-custom-agent-provider.md) | Implemented | FR-330~335, UX-330, TC-330~337 | FR-CUSTOM-*, TC-CUSTOM-* |
-| [SPEC-compact-summarize-focus](specs/SPEC-compact-summarize-focus.md) | Implemented | FR-340~342, TC-340~342 | FR-COMPACT-*, TC-COMPACT-* |
-| [SPEC-windows-desktop](specs/SPEC-windows-desktop.md) | In progress (launcher core 및 패키징 구현 완료, live W-rows 검증 대기) | FR-390~398, NFR-390, UX-390, TC-390~405 | FR-WIN-*, TC-WIN-* |
-| [SPEC-graph-default-status](specs/SPEC-graph-default-status.md) | Implemented | FR-370~373, UX-370~371, TC-370~375 | FR-GRAPH-*, TC-GRAPH-* |
-| [SPEC-tui-stabilize](specs/SPEC-tui-stabilize.md) | Implemented | FR-380~, TC-380~ | dogfood #1, #4, #5, #6 |
-| [SPEC-activity-rendering](specs/SPEC-activity-rendering.md) | Implemented | FR-360~365, UX-360~362, TC-360~367 | FR-ACTIVITY-*, TC-ACTIVITY-* |
-| [SPEC-cursor-model-pin](specs/SPEC-cursor-model-pin.md) | Implemented | FR-410~412, UX-410, INT-410, TC-410~414 | dogfood #18 |
-| [SPEC-input-redraw](specs/SPEC-input-redraw.md) | Implemented | FR-420~425, TC-420~426 | dogfood #15, #17, #19 |
-| [SPEC-graph-allowed-runners](specs/SPEC-graph-allowed-runners.md) | Implemented | FR-430~433, UX-430, INT-430, TC-430~435 | dogfood #20 |
+- 각 `docs/specs/SPEC-*.md`는 파일 위쪽 10줄 안에 자체 `Status:` 메타데이터를 가진다.
+- 색인 표는 저장소에 상시 두지 않고, 필요할 때 생성기 `scripts/spec-index.sh`가 출력한다(SPEC 링크 · Status · ID 범위).
+- FR/NFR/UX/INT/TC 숫자 ID는 SPEC 파일 사이에서 한 번만 정의되며 `tests/spec_index.rs`(`every_spec_has_status_line`, `spec_ids_are_unique_across_specs`, `spec_index_script_lists_every_spec`)가 강제한다. 새 SPEC은 자기 파일만 만지면 된다.
+- 이 문서의 접두어 ID(`FR-PERM-*`, `TC-PERM-*` 등)는 숫자 ID 도입 전 제안 단계의 역사적 표기이며, 현재 대응 관계는 각 SPEC 파일 자체가 기록한다.
 
 SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없는 것은 `*proposed*`로 표시했다. 확인된 실제 테스트: `user_selected_agy_model_wins_over_graph_default`, `graph_default_model_only_applies_to_cursor`, `chat_lines_render_with_speaker_theme_colors`, `explicit_summary_is_internal_and_the_next_turn_uses_it_fresh` 등 (§2 표의 일부 제안 이름은 이 실제 이름으로 대체된다).
 
@@ -119,10 +109,10 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M2 (optional Codex) | SPEC-codex-model-effort-mode-context | FR-043, NFR-042 | TC-048 | `mode_change_reopens_the_agent_with_shared_context` | integration | ✅ |  |
 | M2 (optional Codex) | SPEC-codex-model-effort-mode-context | BR-042, NFR-042 | TC-049 | `busy_agent_cannot_open_mode_picker` | unit | ✅ |  |
 | M4 | SPEC-codex-sandbox-policy | INT-040, NFR-041 | TC-046 | `codex_execution_modes_set_per_turn_sandbox_and_approval_policy` | unit | ✅ |  |
-| M4,M6 | SPEC-cursor-windows-implement-guard | INT-060 | TC-060 | `cursor_mode_validation_matches_platform`, `windows_cursor_implement_mode_is_rejected_before_queueing`, `unsupported_mode_is_rejected_before_binding_retirement` | unit | ✅ |  |
-| M4,M6 | SPEC-cursor-windows-implement-guard | NFR-060 | TC-061 | `windows_cursor_implement_turn_is_rejected_before_process_spawn` | unit | ✅ |  |
-| M4,M6 | SPEC-cursor-windows-implement-guard | INT-061 | TC-062 | `cursor_execution_modes_use_native_cli_flags` | unit | ✅ |  |
-| M4,M6 | SPEC-cursor-windows-implement-guard | INT-061 | TC-063 | `cursor_mode_validation_matches_platform` | unit | ✅ |  |
+| M4,M6 | SPEC-cursor-windows-implement-guard | INT-480 | TC-480 | `cursor_mode_validation_matches_platform`, `windows_cursor_implement_mode_is_rejected_before_queueing`, `unsupported_mode_is_rejected_before_binding_retirement` | unit | ✅ |  |
+| M4,M6 | SPEC-cursor-windows-implement-guard | NFR-480 | TC-481 | `windows_cursor_implement_turn_is_rejected_before_process_spawn` | unit | ✅ |  |
+| M4,M6 | SPEC-cursor-windows-implement-guard | INT-481 | TC-482 | `cursor_execution_modes_use_native_cli_flags` | unit | ✅ |  |
+| M4,M6 | SPEC-cursor-windows-implement-guard | INT-481 | TC-483 | `cursor_mode_validation_matches_platform` | unit | ✅ |  |
 | M5 | SPEC-image-attachment | FR-IMG-1 | (req row) | `image_slash_command_attaches_supported_file` | unit | ✅ |  |
 | M5 | SPEC-image-attachment | FR-IMG-2 | (req row) | `rejects_oversized_images`, `copies_supported_image_into_workspace_store` | unit | ✅ |  |
 | M5 | SPEC-image-attachment | FR-IMG-3 | (req row) | `submit_prompt_forwards_image_paths_to_adapter` | unit | ✅ |  |
@@ -171,7 +161,7 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 - `SPEC-agent-graph-orchestration` UX-GRAPH-1, NFR-GRAPH-1: "manual / executor defaults"뿐 → TC-GRAPH-08/09 제안(§2.10).
 - `SPEC-agent-graph-orchestration`은 TC 표 없이 요구사항 행에 테스트 이름만 있음. `FR-GRAPH-7`의 `discover_skills`는 실제 이름 `discover_skills_finds_agent_graph_engineering`(필터 매칭).
 - `SPEC-image-attachment`도 TC 표가 없음. 두 SPEC 모두 템플릿 형식(§4 Requirements / §5 Acceptance scenarios)으로 옮기는 것을 권장.
-- TC ID가 SPEC 사이에서 겹침(예: TC-019, TC-050, TC-060이 BASELINE과 개별 SPEC에 모두 있음). CI는 BASELINE 안에서만 중복을 검사하므로, 새 ID는 기능 접두어(`TC-PERM-1` 등)를 쓴다.
+- TC ID가 SPEC 사이에서 겹치던 문제(TC-060..063, FR-390, TC-390..391 등)는 SPEC-spec-index 규칙으로 해소했다. 각 SPEC이 고유 범위를 쓰고 `tests/spec_index.rs`가 `SPEC-*` 파일 간 ID 유일성을 강제한다. BASELINE(`DMUXAI-BASELINE.md`)은 `SPEC-*` 이름 규칙 밖으로 나가서 SPEC 간 유일성 검사 대상이 아니다(예: TC-019, TC-050은 BASELINE과 개별 SPEC에 공존할 수 있다).
 
 ## 2. 갭과 제안 (❌)
 

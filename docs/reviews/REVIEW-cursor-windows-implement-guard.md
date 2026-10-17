@@ -7,15 +7,15 @@ Target: Windows (`x86_64-pc-windows-msvc`)
 
 ## Spec compliance
 
-- INT-060: `AgentAdapter::validate_mode` is called by the UI before mode
+- INT-480: `AgentAdapter::validate_mode` is called by the UI before mode
   binding retirement. Cursor returns an actionable `UnsupportedMode` error for
   Windows Implement, leaving the picker, selected mode, and active binding
   unchanged.
-- NFR-060: Cursor validates again in the runtime loop and at the beginning of
+- NFR-480: Cursor validates again in the runtime loop and at the beginning of
   `run_turn`, before `cursor_command()`, argument construction, or child
   spawning. No Windows Cursor Implement process can be started through these
   paths.
-- INT-061: Ask and Plan remain available on every target. The existing
+- INT-481: Ask and Plan remain available on every target. The existing
   supported-platform command mapping, including Implement's
   `--force --sandbox enabled`, remains unchanged.
 
