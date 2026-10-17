@@ -166,31 +166,529 @@
   }
 
   // -----------------------------------------------------------------------
+  // Sidebar shell and collapsible files tree (SPEC-docs-tree FR-832, FR-833, UX-830).
+  // -----------------------------------------------------------------------
+
+  var treeDirCache = {};
+  var expandedFolders = [];
+
+  function getWorkspaceKey() {
+    var wsEl = $('workspace');
+    var ws = (wsEl && wsEl.textContent && wsEl.textContent !== '\u2013' && wsEl.textContent !== '-')
+      ? wsEl.textContent.trim()
+      : 'default';
+    return ws;
+  }
+
+  function loadSidebarState() {
+    try {
+      var ws = getWorkspaceKey();
+      var openVal = window.localStorage.getItem('dmuxai.sidebar.open.' + ws);
+      var expVal = window.localStorage.getItem('dmuxai.sidebar.expanded.' + ws);
+      var open = openVal === 'true';
+      var exp = expVal ? JSON.parse(expVal) : [];
+      return { open: open, expanded: Array.isArray(exp) ? exp : [] };
+    } catch (e) {
+      return { open: false, expanded: [] };
+    }
+  }
+
+  function saveSidebarOpen(open) {
+    try {
+      var ws = getWorkspaceKey();
+      window.localStorage.setItem('dmuxai.sidebar.open.' + ws, open ? 'true' : 'false');
+    } catch (e) {}
+  }
+
+  function saveExpandedFolders(list) {
+    try {
+      var ws = getWorkspaceKey();
+      window.localStorage.setItem('dmuxai.sidebar.expanded.' + ws, JSON.stringify(list));
+    } catch (e) {}
+  }
+
+  function updateSidebarUI(open) {
+    var aside = $('sidebar');
+    var btn = $('sidebar-toggle-files');
+    var backdrop = $('sidebar-backdrop');
+    if (aside) {
+      if (open) {
+        aside.classList.add('open');
+        document.body.classList.add('sidebar-open');
+      } else {
+        aside.classList.remove('open');
+        document.body.classList.remove('sidebar-open');
+      }
+    }
+    if (btn) {
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+    if (backdrop) {
+      if (open) {
+        backdrop.classList.add('active');
+      } else {
+        backdrop.classList.remove('active');
+      }
+    }
+  }
+
+  function toggleSidebar() {
+    var aside = $('sidebar');
+    var isOpen = aside ? aside.classList.contains('open') : false;
+    var next = !isOpen;
+    saveSidebarOpen(next);
+    updateSidebarUI(next);
+  }
+
+  function closeSidebar() {
+    saveSidebarOpen(false);
+    updateSidebarUI(false);
+  }
+
+  function fetchDir(dir) {
+    if (treeDirCache[dir]) {
+      return Promise.resolve(treeDirCache[dir]);
+    }
+    var url = '/api/docs/tree?dir=' + encodeURIComponent(dir);
+    return api('GET', url).then(function (payload) {
+      var dirEntries = payload && Array.isArray(payload.entries) ? payload.entries : [];
+      treeDirCache[dir] = dirEntries;
+      return dirEntries;
+    });
+  }
+
+  function createDirItem(entry, level) {
+    var node = el('div', 'tree-node');
+    node.setAttribute('role', 'none');
+
+    var item = el('div', 'tree-item');
+    item.setAttribute('role', 'treeitem');
+    item.setAttribute('aria-expanded', 'false');
+    item.setAttribute('tabindex', '-1');
+    item.setAttribute('aria-level', String(level));
+    item.dataset.path = entry.path;
+    item.dataset.type = 'dir';
+
+    var toggle = el('span', 'tree-toggle', '\u25b6');
+    var icon = el('span', 'tree-icon', '\ud83d\udcc1');
+    var name = el('span', 'tree-name', entry.name || entry.path);
+
+    item.appendChild(toggle);
+    item.appendChild(icon);
+    item.appendChild(name);
+    node.appendChild(item);
+
+    var group = el('div', 'tree-group');
+    group.setAttribute('role', 'group');
+    group.setAttribute('hidden', '');
+    node.appendChild(group);
+
+    item.addEventListener('click', function (e) {
+      e.stopPropagation();
+      setFocusTreeItem(item);
+      toggleFolder(item);
+    });
+
+    if (expandedFolders.indexOf(entry.path) !== -1) {
+      toggleFolder(item, true);
+    }
+
+    return node;
+  }
+
+  function createFileItem(entry, level) {
+    var node = el('div', 'tree-node');
+    node.setAttribute('role', 'none');
+
+    var item = el('div', 'tree-item');
+    item.setAttribute('role', 'treeitem');
+    item.setAttribute('tabindex', '-1');
+    item.setAttribute('aria-level', String(level));
+    item.dataset.path = entry.path;
+    item.dataset.type = 'file';
+
+    var placeholder = el('span', 'tree-toggle');
+    var badge = kindBadge(entry.kind);
+    var name = el('span', 'tree-name', entry.name || entry.path);
+
+    item.appendChild(placeholder);
+    item.appendChild(badge);
+    item.appendChild(name);
+    node.appendChild(item);
+
+    item.addEventListener('click', function (e) {
+      e.stopPropagation();
+      setFocusTreeItem(item);
+      open(entry.path);
+    });
+
+    return node;
+  }
+
+  function toggleFolder(item, forceExpand) {
+    var path = item.dataset.path;
+    var isExpanded = item.getAttribute('aria-expanded') === 'true';
+    var shouldExpand = typeof forceExpand === 'boolean' ? forceExpand : !isExpanded;
+    var node = item.closest('.tree-node');
+    var group = node ? node.querySelector(':scope > .tree-group') : null;
+    var toggle = item.querySelector('.tree-toggle');
+
+    if (shouldExpand) {
+      item.setAttribute('aria-expanded', 'true');
+      if (toggle) {
+        toggle.classList.add('expanded');
+        toggle.textContent = '\u25bc';
+      }
+      if (expandedFolders.indexOf(path) === -1) {
+        expandedFolders.push(path);
+        saveExpandedFolders(expandedFolders);
+      }
+      if (group) {
+        group.removeAttribute('hidden');
+        if (!group.hasChildNodes()) {
+          group.appendChild(el('div', 'tree-item hint', 'loading\u2026'));
+          fetchDir(path).then(function (children) {
+            group.replaceChildren();
+            renderChildrenInto(group, children, parseInt(item.getAttribute('aria-level') || '1', 10) + 1);
+            updateRovingTabindex();
+          }).catch(function (err) {
+            group.replaceChildren();
+            group.appendChild(el('div', 'tree-item hint', 'error loading'));
+          });
+        }
+      }
+    } else {
+      item.setAttribute('aria-expanded', 'false');
+      if (toggle) {
+        toggle.classList.remove('expanded');
+        toggle.textContent = '\u25b6';
+      }
+      var idx = expandedFolders.indexOf(path);
+      if (idx !== -1) {
+        expandedFolders.splice(idx, 1);
+        saveExpandedFolders(expandedFolders);
+      }
+      if (group) {
+        group.setAttribute('hidden', '');
+      }
+    }
+    updateRovingTabindex();
+  }
+
+  function renderChildrenInto(container, childEntries, level) {
+    for (var i = 0; i < childEntries.length; i++) {
+      var entry = childEntries[i];
+      if (entry.entry_type === 'dir' || entry.type === 'dir') {
+        container.appendChild(createDirItem(entry, level));
+      } else {
+        container.appendChild(createFileItem(entry, level));
+      }
+    }
+  }
+
+  function renderLazyTree() {
+    var tree = $('docs-tree');
+    if (!tree) { return; }
+    if (!currentToken()) {
+      tree.replaceChildren();
+      tree.appendChild(el('p', 'empty', 'documents need token'));
+      return;
+    }
+    tree.replaceChildren();
+    tree.appendChild(el('div', 'tree-item hint', 'loading\u2026'));
+
+    fetchDir('').then(function (children) {
+      tree.replaceChildren();
+      if (children.length === 0) {
+        tree.appendChild(el('p', 'empty', 'no documents'));
+        return;
+      }
+      renderChildrenInto(tree, children, 1);
+      updateRovingTabindex();
+    }).catch(function (err) {
+      tree.replaceChildren();
+      tree.appendChild(el('p', 'empty', 'tree unavailable: ' + err.message));
+    });
+  }
+
+  function renderFilteredTree(needle) {
+    var tree = $('docs-tree');
+    if (!tree) { return; }
+    tree.replaceChildren();
+
+    var matches = [];
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i] || {};
+      var p = String(entry.path || '');
+      if (p.toLowerCase().indexOf(needle) !== -1) {
+        matches.push(entry);
+      }
+    }
+
+    if (matches.length === 0) {
+      tree.appendChild(el('p', 'empty', 'no documents match the filter'));
+      return;
+    }
+
+    // Build hierarchical tree structure from matching paths
+    var rootObj = { dirs: {}, files: [] };
+    for (var j = 0; j < matches.length; j++) {
+      var match = matches[j];
+      var parts = match.path.split('/');
+      var curr = rootObj;
+      var curPath = '';
+      for (var k = 0; k < parts.length - 1; k++) {
+        var dirName = parts[k];
+        curPath = curPath ? curPath + '/' + dirName : dirName;
+        if (!curr.dirs[dirName]) {
+          curr.dirs[dirName] = { name: dirName, path: curPath, dirs: {}, files: [] };
+        }
+        curr = curr.dirs[dirName];
+      }
+      curr.files.push(match);
+    }
+
+    function renderFilterNode(container, obj, level) {
+      var dirKeys = Object.keys(obj.dirs);
+      dirKeys.sort();
+      for (var d = 0; d < dirKeys.length; d++) {
+        var dirData = obj.dirs[dirKeys[d]];
+        var node = el('div', 'tree-node');
+        node.setAttribute('role', 'none');
+
+        var item = el('div', 'tree-item');
+        item.setAttribute('role', 'treeitem');
+        item.setAttribute('aria-expanded', 'true');
+        item.setAttribute('tabindex', '-1');
+        item.setAttribute('aria-level', String(level));
+        item.dataset.path = dirData.path;
+        item.dataset.type = 'dir';
+
+        var toggle = el('span', 'tree-toggle expanded', '\u25bc');
+        var icon = el('span', 'tree-icon', '\ud83d\udcc1');
+        var name = el('span', 'tree-name', dirData.name);
+
+        item.appendChild(toggle);
+        item.appendChild(icon);
+        item.appendChild(name);
+        node.appendChild(item);
+
+        var group = el('div', 'tree-group');
+        group.setAttribute('role', 'group');
+        node.appendChild(group);
+
+        item.addEventListener('click', function (e) {
+          e.stopPropagation();
+          setFocusTreeItem(item);
+          toggleFolder(item);
+        });
+
+        renderFilterNode(group, dirData, level + 1);
+        container.appendChild(node);
+      }
+
+      obj.files.sort(function (a, b) {
+        var na = a.path.split('/').pop();
+        var nb = b.path.split('/').pop();
+        return na.localeCompare(nb);
+      });
+      for (var f = 0; f < obj.files.length; f++) {
+        var fileEntry = obj.files[f];
+        var fileNode = createFileItem({
+          name: fileEntry.path.split('/').pop(),
+          path: fileEntry.path,
+          kind: fileEntry.kind
+        }, level);
+        container.appendChild(fileNode);
+      }
+    }
+
+    renderFilterNode(tree, rootObj, 1);
+    updateRovingTabindex();
+  }
+
+  function renderTree() {
+    var needle = filterText.toLowerCase().trim();
+    if (needle) {
+      renderFilteredTree(needle);
+    } else {
+      renderLazyTree();
+    }
+  }
+
+  function getVisibleTreeItems() {
+    var tree = $('docs-tree');
+    if (!tree) { return []; }
+    var allItems = tree.querySelectorAll('.tree-item');
+    var visible = [];
+    for (var i = 0; i < allItems.length; i++) {
+      var item = allItems[i];
+      var group = item.closest('.tree-group[hidden]');
+      if (!group) {
+        visible.push(item);
+      }
+    }
+    return visible;
+  }
+
+  function updateRovingTabindex() {
+    var visibleItems = getVisibleTreeItems();
+    var hasFocusable = false;
+    for (var i = 0; i < visibleItems.length; i++) {
+      if (visibleItems[i].getAttribute('tabindex') === '0') {
+        hasFocusable = true;
+        break;
+      }
+    }
+    if (!hasFocusable && visibleItems.length > 0) {
+      visibleItems[0].setAttribute('tabindex', '0');
+    }
+  }
+
+  function setFocusTreeItem(target) {
+    var items = getVisibleTreeItems();
+    for (var i = 0; i < items.length; i++) {
+      items[i].setAttribute('tabindex', '-1');
+    }
+    target.setAttribute('tabindex', '0');
+    target.focus();
+  }
+
+  function focusNextTreeItem(current) {
+    var items = getVisibleTreeItems();
+    var idx = items.indexOf(current);
+    if (idx !== -1 && idx + 1 < items.length) {
+      setFocusTreeItem(items[idx + 1]);
+    }
+  }
+
+  function focusPrevTreeItem(current) {
+    var items = getVisibleTreeItems();
+    var idx = items.indexOf(current);
+    if (idx > 0) {
+      setFocusTreeItem(items[idx - 1]);
+    }
+  }
+
+  function bindTreeKeyboard() {
+    var tree = $('docs-tree');
+    if (!tree) { return; }
+
+    tree.addEventListener('keydown', function (e) {
+      var active = document.activeElement;
+      if (!active || !active.classList.contains('tree-item')) {
+        return;
+      }
+      var key = e.key;
+      if (key === 'ArrowDown' || key === 'Down') {
+        e.preventDefault();
+        focusNextTreeItem(active);
+      } else if (key === 'ArrowUp' || key === 'Up') {
+        e.preventDefault();
+        focusPrevTreeItem(active);
+      } else if (key === 'ArrowRight' || key === 'Right') {
+        e.preventDefault();
+        if (active.dataset.type === 'dir') {
+          var isExp = active.getAttribute('aria-expanded') === 'true';
+          if (!isExp) {
+            toggleFolder(active, true);
+          } else {
+            focusNextTreeItem(active);
+          }
+        }
+      } else if (key === 'ArrowLeft' || key === 'Left') {
+        e.preventDefault();
+        if (active.dataset.type === 'dir' && active.getAttribute('aria-expanded') === 'true') {
+          toggleFolder(active, false);
+        } else {
+          var parentGroup = active.closest('.tree-group');
+          if (parentGroup) {
+            var parentNode = parentGroup.closest('.tree-node');
+            if (parentNode) {
+              var parentItem = parentNode.querySelector(':scope > .tree-item');
+              if (parentItem) {
+                setFocusTreeItem(parentItem);
+              }
+            }
+          }
+        }
+      } else if (key === 'Enter') {
+        e.preventDefault();
+        if (active.dataset.type === 'dir') {
+          toggleFolder(active);
+        } else if (active.dataset.path) {
+          open(active.dataset.path);
+        }
+      }
+    });
+  }
+
+  function initSidebar() {
+    var state = loadSidebarState();
+    expandedFolders = state.expanded;
+    updateSidebarUI(state.open);
+
+    var toggleBtn = $('sidebar-toggle-files');
+    if (toggleBtn) {
+      toggleBtn.addEventListener('click', toggleSidebar);
+    }
+
+    var closeBtn = $('sidebar-close');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', closeSidebar);
+    }
+
+    var backdrop = $('sidebar-backdrop');
+    if (backdrop) {
+      backdrop.addEventListener('click', closeSidebar);
+    }
+
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') {
+        var aside = $('sidebar');
+        if (aside && aside.classList.contains('open')) {
+          closeSidebar();
+          if (toggleBtn) { toggleBtn.focus(); }
+        }
+      }
+    });
+
+    bindTreeKeyboard();
+  }
+
+  // -----------------------------------------------------------------------
   // Document list (FR-741 over GET /api/docs).
   // -----------------------------------------------------------------------
 
   function refreshList() {
     var list = $('docs-list');
-    if (!list) { return; }
     if (!currentToken()) {
-      list.replaceChildren();
-      list.appendChild(
-        el('p', 'empty', 'documents need the dashboard token (?token= URL)')
-      );
+      if (list) {
+        list.replaceChildren();
+        list.appendChild(
+          el('p', 'empty', 'documents need the dashboard token (?token= URL)')
+        );
+      }
+      renderTree();
       return;
     }
+    treeDirCache = {};
     api('GET', '/api/docs')
       .then(function (payload) {
         entries = payload && Array.isArray(payload.entries) ? payload.entries : [];
         listTruncated = Boolean(payload && payload.truncated);
         renderList();
+        renderTree();
       })
       .catch(function (err) {
         renderList();
-        list.replaceChildren();
-        list.appendChild(
-          el('p', 'empty', 'documents unavailable: ' + err.message)
-        );
+        renderTree();
+        if (list) {
+          list.replaceChildren();
+          list.appendChild(
+            el('p', 'empty', 'documents unavailable: ' + err.message)
+          );
+        }
       });
   }
 
@@ -252,6 +750,7 @@
     input.addEventListener('input', function () {
       filterText = input.value;
       renderList();
+      renderTree();
     });
   }
 
@@ -1205,6 +1704,7 @@
   }
 
   function init() {
+    initSidebar();
     bindFilter();
     if (!currentToken()) {
       refreshList();

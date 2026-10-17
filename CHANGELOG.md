@@ -27,6 +27,14 @@ All notable changes to dmuxai are listed here. Versions follow
   a header status pill, spinners on agent chips and running graph nodes, and a
   tab-title prefix.
 
+- **Documents folder tree in a right sidebar (SPEC-docs-tree, #43).**
+  `GET /api/docs/tree?dir=` lists one directory at a time, with the same
+  confinement, ignore and symlink rules as the flat list (FR-830, FR-831). The
+  dashboard has a toggleable right sidebar (header `Files` button) with a
+  collapsible, lazily loaded tree; the path filter, preview and edit work as
+  before. Expanded folders persist per workspace; it is keyboard accessible and
+  becomes an overlay drawer below 900px (FR-832, FR-833, UX-830).
+
 ### Changed
 
 - **Graph routing exception for the built-in opencode runner (FR-813).** With

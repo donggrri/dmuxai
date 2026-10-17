@@ -289,11 +289,11 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-running-indicators | FR-821,UX-821 | TC-822 | `spinner_frames_and_reduced_motion` | unit | ✅ | v0.2.1 |
 | M8,M2 | SPEC-running-indicators | FR-823,UX-821,NFR-820 | TC-823 | `dashboard_has_run_status_indicators` | unit | ✅ | v0.2.1 |
 | M8,M2 | SPEC-running-indicators | FR-823,FR-824 | TC-824 | `running_indicator_renders_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.1 |
-| M8,M2 | SPEC-docs-tree | FR-830 | TC-830 | `tree_children_lists_one_level` | unit | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-docs-tree | FR-830,FR-831 | TC-831 | `tree_api_confined_and_bounded` | integration | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-docs-tree | FR-831 | TC-832 | `docs_routes_require_auth` (extended) | integration | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-docs-tree | FR-832,FR-833,UX-830 | TC-833 | `docs_tree_sidebar_assets` | unit | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-docs-tree | FR-832,UX-830 | TC-834 | `docs_tree_renders_in_headless_chrome` (ignored) | e2e | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-docs-tree | FR-830 | TC-830 | `tree_children_lists_one_level` | unit | ✅ | v0.2.1 |
+| M8,M2 | SPEC-docs-tree | FR-830,FR-831 | TC-831 | `tree_api_confined_and_bounded` | integration | ✅ | v0.2.1 |
+| M8,M2 | SPEC-docs-tree | FR-831 | TC-832 | `docs_routes_require_auth` (extended) | integration | ✅ | v0.2.1 |
+| M8,M2 | SPEC-docs-tree | FR-832,FR-833,UX-830 | TC-833 | `docs_tree_sidebar_assets` | unit | ✅ | v0.2.1 |
+| M8,M2 | SPEC-docs-tree | FR-832,UX-830 | TC-834 | `docs_tree_renders_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.1 |
 | M8,M2 | SPEC-todo-sidebar | FR-840..842,UX-840 | TC-840 | `todo_sidebar_assets` | unit | ⏳ | v0.2.1 |
 | M8,M2 | SPEC-todo-sidebar | FR-840,FR-841 | TC-841 | `todo_actions_still_covered` | unit | ⏳ | v0.2.1 |
 | M8,M2 | SPEC-todo-sidebar | FR-840..842 | TC-842 | `todo_sidebar_renders_in_headless_chrome` (ignored) | e2e | ⏳ | v0.2.1 |

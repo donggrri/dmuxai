@@ -366,6 +366,34 @@ mod tests {
         );
     }
 
+    // TC-833: docs_tree_sidebar_assets (SPEC-docs-tree FR-832, FR-833, UX-830)
+    #[test]
+    fn docs_tree_sidebar_assets() {
+        // 1. index.html contains sidebar container, toggle button, role="tree", tabs
+        assert!(INDEX_HTML.contains(r#"<aside id="sidebar" class="sidebar""#));
+        assert!(INDEX_HTML.contains(r#"aria-controls="sidebar""#));
+        assert!(INDEX_HTML.contains("Files"));
+        assert!(INDEX_HTML.contains(r#"role="tree""#));
+        assert!(INDEX_HTML.contains("tab-files"));
+
+        // 2. docs.js contains lazy-expand fetch of /api/docs/tree, role="treeitem",
+        // aria-expanded, localStorage persistence, keyboard handlers
+        assert!(DOCS_JS.contains("/api/docs/tree"));
+        assert!(DOCS_JS.contains("role"));
+        assert!(DOCS_JS.contains("treeitem"));
+        assert!(DOCS_JS.contains("aria-expanded"));
+        assert!(DOCS_JS.contains("localStorage"));
+        assert!(DOCS_JS.contains("ArrowDown") || DOCS_JS.contains("Down"));
+        assert!(DOCS_JS.contains("ArrowUp") || DOCS_JS.contains("Up"));
+        assert!(DOCS_JS.contains("ArrowLeft") || DOCS_JS.contains("Left"));
+        assert!(DOCS_JS.contains("ArrowRight") || DOCS_JS.contains("Right"));
+        assert!(DOCS_JS.contains("Enter"));
+
+        // 3. docs.css contains sidebar container and narrow-width drawer media query
+        assert!(DOCS_CSS.contains(".sidebar"));
+        assert!(DOCS_CSS.contains("900px"));
+    }
+
     // TC-608: theme_palettes_meet_wcag_contrast (SPEC-theme-colors NFR-600)
     #[test]
     fn theme_palettes_meet_wcag_contrast() {

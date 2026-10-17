@@ -341,6 +341,26 @@ async fn get_docs(State(state): State<DocsApiState>) -> Response {
     json_ok(StatusCode::OK, &list)
 }
 
+#[derive(Debug, Deserialize)]
+struct TreeQuery {
+    #[serde(default)]
+    dir: String,
+}
+
+async fn get_tree(State(state): State<DocsApiState>, Query(query): Query<TreeQuery>) -> Response {
+    let Some(service) = &state.docs else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
+    };
+    match crate::docs::list::list_children(
+        &service.workspace,
+        &query.dir,
+        crate::docs::MAX_LIST_ENTRIES,
+    ) {
+        Ok(tree) => json_ok(StatusCode::OK, &tree),
+        Err(e) => docs_error_response(e),
+    }
+}
+
 async fn get_file(
     State(state): State<DocsApiState>,
     Query(query): Query<FilePathQuery>,
@@ -860,6 +880,7 @@ where
         .route("/assets/docs.js", get(get_docs_js))
         .route("/assets/docs.css", get(get_docs_css))
         .route("/api/docs", get(get_docs))
+        .route("/api/docs/tree", get(get_tree))
         .route("/api/docs/file", get(get_file).put(put_file))
         .route("/api/docs/render", get(get_render).post(post_render))
         .route("/api/docs/view", post(post_view))
@@ -1608,7 +1629,16 @@ mod tests {
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // 4. Asset routes require no token -> 200
+        // 4. Missing token for /api/docs/tree -> 401 (TC-832)
+        let req_tree = axum::http::Request::builder()
+            .uri("/api/docs/tree")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_tree = router.clone().oneshot(req_tree).await.unwrap();
+        assert_eq!(resp_tree.status(), StatusCode::UNAUTHORIZED);
+
+        // 5. Asset routes require no token -> 200
         let req_js = axum::http::Request::builder()
             .uri("/assets/docs.js")
             .header("Host", "localhost:7420")
@@ -1668,5 +1698,167 @@ mod tests {
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // TC-831: tree_api_confined_and_bounded (SPEC-docs-tree FR-830, FR-831)
+    #[tokio::test]
+    async fn tree_api_confined_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        for ignored in crate::docs::IGNORED_DIRS {
+            std::fs::create_dir_all(dir.path().join(ignored).join("nested")).unwrap();
+            std::fs::write(dir.path().join(ignored).join("nested/x.md"), "# x").unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("docs/sub")).unwrap();
+        std::fs::write(dir.path().join("docs/a.md"), "# a").unwrap();
+        std::fs::write(dir.path().join("docs/sub/b.rs"), "fn b() {}").unwrap();
+        std::fs::write(dir.path().join("top.txt"), "top").unwrap();
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("secret.md"), "secret").unwrap();
+            std::fs::write(outside.path().join("outside.md"), "outside").unwrap();
+            std::os::unix::fs::symlink(outside.path(), dir.path().join("linkdir")).unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("outside.md"),
+                dir.path().join("link_out.md"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(dir.path().join("docs/a.md"), dir.path().join("link_in.md"))
+                .unwrap();
+        }
+
+        let ws = Workspace::new(dir.path()).unwrap();
+        let token = "testtoken";
+        let service = test_docs_service(
+            ws.clone(),
+            false,
+            crate::docs::changes::ChangeLog::default(),
+            None,
+        );
+        let router = test_router(Some(service), token);
+
+        let make_req = |uri: &str| {
+            axum::http::Request::builder()
+                .uri(uri)
+                .header("Host", "localhost:7420")
+                .header("Origin", "http://localhost:7420")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        // 1. 200 for root
+        let resp = router
+            .clone()
+            .oneshot(make_req("/api/docs/tree"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            resp.into_body().collect(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .to_bytes();
+        let tree: crate::docs::list::TreeList = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tree.dir, "");
+        assert!(!tree.truncated);
+        let names: Vec<&str> = tree.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"docs"));
+        assert!(names.contains(&"top.txt"));
+
+        // 200 for root with ?dir=
+        let resp = router
+            .clone()
+            .oneshot(make_req("/api/docs/tree?dir="))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 2. 200 for subdir
+        let resp = router
+            .clone()
+            .oneshot(make_req("/api/docs/tree?dir=docs"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            resp.into_body().collect(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .to_bytes();
+        let tree: crate::docs::list::TreeList = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tree.dir, "docs");
+        assert_eq!(tree.entries.len(), 2);
+        assert_eq!(tree.entries[0].name, "sub");
+        assert_eq!(tree.entries[1].name, "a.md");
+
+        // 3. 403 for ../, absolute and escaping symlink
+        let resp = router
+            .clone()
+            .oneshot(make_req("/api/docs/tree?dir=../outside"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = router
+            .clone()
+            .oneshot(make_req("/api/docs/tree?dir=/etc"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        #[cfg(unix)]
+        {
+            let resp = router
+                .clone()
+                .oneshot(make_req("/api/docs/tree?dir=link_out.md"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        // 4. 404 for missing and ignored
+        let resp = router
+            .clone()
+            .oneshot(make_req("/api/docs/tree?dir=missing"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = router
+            .clone()
+            .oneshot(make_req("/api/docs/tree?dir=target"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // 5. 400 for a file
+        let resp = router
+            .clone()
+            .oneshot(make_req("/api/docs/tree?dir=top.txt"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = router
+            .clone()
+            .oneshot(make_req("/api/docs/tree?dir=docs/a.md"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // 6. list_children with a cap of 3 sets truncated
+        std::fs::write(dir.path().join("c.txt"), "c").unwrap();
+        std::fs::write(dir.path().join("d.txt"), "d").unwrap();
+        let bounded = crate::docs::list::list_children(&ws, "", 3).unwrap();
+        assert!(bounded.truncated);
+        assert_eq!(bounded.entries.len(), 3);
     }
 }
