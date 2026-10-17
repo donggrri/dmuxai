@@ -56,6 +56,8 @@ use crate::agent::{
 
 const RENDER_INTERVAL: Duration = Duration::from_millis(25);
 const EVENT_LOOP_PAUSE: Duration = Duration::from_millis(5);
+const DASHBOARD_PUBLISH_MIN_INTERVAL: Duration = Duration::from_millis(200);
+const DASHBOARD_BUSY_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_INPUT_HEIGHT: u16 = 3;
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MIN_MAIN_HEIGHT: u16 = 5;
@@ -448,6 +450,8 @@ pub struct App {
     single_graph_plan: Option<(NodeRole, Agent, String)>,
     last_group_expanded: bool,
     all_details_expanded: bool,
+    dashboard: Option<dmuxai::web::DashboardHub>,
+    last_graph_run: Option<dmuxai::graph::GraphRun>,
     pub(crate) dirty: bool,
 }
 
@@ -568,6 +572,8 @@ impl App {
             single_graph_plan: None,
             last_group_expanded: false,
             all_details_expanded: false,
+            dashboard: None,
+            last_graph_run: None,
             dirty: false,
         };
         app.restore_snapshot(snapshot);
@@ -592,6 +598,8 @@ impl App {
         let mut last_render = Instant::now();
         let mut last_session_heartbeat = Instant::now();
         let mut last_busy_tick = Instant::now();
+        let mut last_publish = Instant::now();
+        let mut dashboard_dirty = false;
 
         while !self.exit {
             if last_session_heartbeat.elapsed() >= Duration::from_secs(5) {
@@ -615,6 +623,21 @@ impl App {
             dirty |= drain.changed || self.dirty;
             self.dirty = false;
 
+            // FR-530: publish on completed turns immediately, coalesce other
+            // changes to at most once per 200 ms, and refresh at least once a
+            // second while any agent is busy. The hub dedups by content, so
+            // extra publishes are cheap and never block the loop.
+            dashboard_dirty |= drain.changed || dirty;
+            let busy = !self.busy_agents.is_empty();
+            if drain.completed
+                || (dashboard_dirty && last_publish.elapsed() >= DASHBOARD_PUBLISH_MIN_INTERVAL)
+                || (busy && last_publish.elapsed() >= DASHBOARD_BUSY_INTERVAL)
+            {
+                self.publish_dashboard();
+                last_publish = Instant::now();
+                dashboard_dirty = false;
+            }
+
             while event::poll(Duration::ZERO)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key),
@@ -631,6 +654,7 @@ impl App {
                     _ => {}
                 }
                 dirty = true;
+                dashboard_dirty = true;
             }
 
             if self.exit {
@@ -1865,6 +1889,9 @@ impl App {
     fn restore_snapshot(&mut self, snapshot: ConversationSnapshot) {
         self.conversation_id = snapshot.id;
         self.conversation_title = snapshot.title;
+        // Switching conversations clears the dashboard's retained graph so the
+        // previous conversation's finished run is not shown (FR-525/FR-530).
+        self.last_graph_run = None;
         self.messages.clear();
         self.streaming_messages.clear();
         self.last_group_expanded = false;
@@ -1906,6 +1933,7 @@ impl App {
             let deferred = self.deferred_turns.remove(index);
             self.submit_to_agent(deferred.agent, deferred.prompt, true);
         }
+        self.publish_dashboard();
     }
 
     fn share_conversation(&mut self, target: &str) {
@@ -2729,6 +2757,59 @@ impl App {
 
     pub fn push_startup_notice(&mut self, content: impl Into<String>) {
         self.push_system(content);
+    }
+
+    /// Attaches the dashboard hub and publishes the current state (FR-530).
+    pub fn attach_dashboard(&mut self, hub: dmuxai::web::DashboardHub) {
+        self.dashboard = Some(hub);
+        self.publish_dashboard();
+    }
+
+    /// Publishes agent and graph state to the attached dashboard, if any (FR-530).
+    ///
+    /// The latest graph run is remembered so the dashboard keeps showing the
+    /// finished graph after `graph_session` is cleared (FR-525).
+    fn publish_dashboard(&mut self) {
+        let Some(hub) = self.dashboard.clone() else {
+            return;
+        };
+
+        let agents = self
+            .adapters
+            .iter()
+            .map(|adapter| {
+                let agent = adapter.agent();
+                dmuxai::web::AgentView {
+                    id: runner_name(agent).to_owned(),
+                    label: agent.name().to_owned(),
+                    busy: self.busy_agents.contains(&agent),
+                    phase: self
+                        .activities
+                        .get(&agent)
+                        .map(|activity| activity.phase.label().to_owned()),
+                    model: self
+                        .model_catalogs
+                        .get(&agent)
+                        .and_then(|catalog| catalog.selected.clone()),
+                }
+            })
+            .collect();
+
+        if let Some(run) = self
+            .graph_session
+            .as_ref()
+            .filter(|session| session.run().conversation_id == self.conversation_id.as_str())
+            .map(|session| session.run().clone())
+        {
+            self.last_graph_run = Some(run);
+        }
+
+        let graph = self
+            .last_graph_run
+            .as_ref()
+            .map(dmuxai::web::snapshot_from_run);
+
+        hub.publish(agents, graph);
     }
 
     fn restore_deferred_input(&mut self, deferred: DeferredTurn) {
@@ -4222,6 +4303,112 @@ mod tests {
         let resolved = resolved_assignment_line(&app.model_catalogs, session);
         assert!(resolved.contains("step-2:impl→cursor:composer-2.5"));
         assert!(!resolved.contains("grok-4.7-medium-fast"));
+    }
+
+    // TC-530 / FR-530: the App publishes its graph session and busy agents to
+    // the attached dashboard hub with the `tui` source.
+    #[test]
+    fn app_publishes_graph_state_to_dashboard() {
+        let (mut app, _sent) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/test-workspace".to_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+
+        app.graph_session = Some(GraphRunSession::new(GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: "run-web-test".to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: "build the dashboard".to_owned(),
+                limits: dmuxai::graph::GraphLimits::default(),
+                nodes: vec![dmuxai::graph::GraphNode {
+                    id: "step-1".to_owned(),
+                    role: NodeRole::Implement,
+                    job: "do the work".to_owned(),
+                    runner: "agy".to_owned(),
+                    model_id: "opencode-default".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Running,
+                    attempt: 1,
+                }],
+                edges: vec![],
+            },
+            conversation_id: app.conversation_id.as_str().to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+        }));
+        app.busy_agents.insert(Agent::Agy);
+        app.publish_dashboard();
+
+        let snapshot = hub.snapshot();
+        assert_eq!(snapshot.source, dmuxai::web::SnapshotSource::Tui);
+        let graph = snapshot.graph.expect("expected a graph view");
+        assert_eq!(graph.current_nodes, vec!["step-1".to_owned()]);
+        let agent = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.id == "agy")
+            .expect("expected the agy agent view");
+        assert!(agent.busy);
+
+        // FR-525: once the run finishes, the session is cleared but the
+        // dashboard keeps showing the last graph.
+        app.graph_session = None;
+        app.publish_dashboard();
+
+        let snapshot = hub.snapshot();
+        let graph = snapshot
+            .graph
+            .expect("expected the last graph to be retained");
+        assert_eq!(graph.id, "run-web-test");
+        assert_eq!(graph.phase, GraphRunPhase::Active);
+        assert_eq!(graph.current_nodes, vec!["step-1".to_owned()]);
+        assert_eq!(
+            graph.nodes[0].status,
+            dmuxai::graph::GraphNodeStatus::Running
+        );
+    }
+
+    // FR-525/FR-530: switching to a new conversation clears the retained graph
+    // (including a still-present stale session from the previous conversation).
+    #[test]
+    fn app_dashboard_clears_last_graph_on_new_conversation() {
+        let (mut app, _sent) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/test-workspace".to_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+
+        let stale_run = GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: "run-old".to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: "old conversation".to_owned(),
+                limits: dmuxai::graph::GraphLimits::default(),
+                nodes: vec![],
+                edges: vec![],
+            },
+            conversation_id: app.conversation_id.as_str().to_owned(),
+            phase: GraphRunPhase::Completed,
+            waiting_gate_node: None,
+        };
+        app.graph_session = Some(GraphRunSession::new(stale_run.clone()));
+        app.last_graph_run = Some(stale_run);
+        app.publish_dashboard();
+        assert!(hub.snapshot().graph.is_some());
+
+        app.create_conversation(None);
+
+        assert!(app.last_graph_run.is_none());
+        assert!(
+            hub.snapshot().graph.is_none(),
+            "the previous conversation's graph must not leak into a new one"
+        );
     }
 
     #[test]

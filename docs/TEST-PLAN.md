@@ -162,6 +162,18 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M2 | SPEC-agent-test-helpers | FR-519 | TC-513, TC-514, TC-515 | `every_spec_has_status_line`, `spec_ids_are_unique_across_specs`, `spec_index_script_lists_every_spec` | unit | ✅ | SPEC-spec-index |
 | M2 | SPEC-agent-test-helpers | FR-517, FR-518 | TC-517, TC-518 | manual PR review | manual | ✅ | dogfood #23 |
 | M4 | SPEC-implement-plan-only | FR-500..508 | TC-500..509 | `implement_prompt_forbids_background_commands`, `agy_write_tools_are_detected_from_step_updates`, `implement_plan_only_retries_once_then_fails`, `agy_result_grace_kills_lingering_child_after_result`, `cancel_clears_active_turn_even_when_busy_flag_was_cleared`, `agy_implement_grace_kill_after_success_result_completes`, `finish_accepts_forced_kill_after_result_in_implement_mode`, `provider_line_write_needles_cover_cursor_and_custom`, `agy_grace_closes_when_grandchild_holds_stderr_after_exit`, `implement_permission_denial_with_plan_like_response_is_not_a_plan_only_retry` | unit+integration | ✅ | dogfood #24 |
+| M6 | SPEC-web-dashboard | FR-520 | TC-520 | `parse_cli_serve_and_web_flags` | unit | ✅ | web dashboard slice A |
+| M6 | SPEC-web-dashboard | FR-520,FR-521 | TC-531 | `serve_prints_token_url_and_serves_state` | integration | ✅ | web dashboard slice A |
+| M6 | SPEC-web-dashboard | FR-521 | TC-521 | `token_is_random_hex_and_url_has_token` | unit | ✅ | web dashboard slice A |
+| M6 | SPEC-web-dashboard | FR-522 | TC-522 | `api_requires_token` | integration | ✅ | web dashboard slice A |
+| M6 | SPEC-web-dashboard | FR-523 | TC-523 | `foreign_origin_and_host_are_rejected` | integration | ✅ | web dashboard slice A |
+| M6 | SPEC-web-dashboard | FR-524 | TC-524 | `bind_policy_requires_opt_in_for_non_loopback` | unit | ✅ | web dashboard slice A |
+| M8 | SPEC-web-dashboard | FR-525,NFR-521 | TC-525 | `snapshot_reports_current_node_runner_and_counts` | unit | ✅ | web dashboard slice A |
+| M8 | SPEC-web-dashboard | FR-526 | TC-526 | `hub_tracks_node_timings_and_revisions` | unit | ✅ | web dashboard slice A |
+| M8 | SPEC-web-dashboard | FR-527 | TC-527 | `sse_streams_initial_and_updated_snapshots` | integration | ✅ | web dashboard slice A |
+| M8 | SPEC-web-dashboard | FR-528 | TC-528 | `file_source_picks_latest_valid_run` | unit | ✅ | web dashboard slice A |
+| M8 | SPEC-web-dashboard | FR-529,NFR-520 | TC-529 | `static_page_is_embedded_and_hardened` | integration | ✅ | web dashboard slice A |
+| M8,M2 | SPEC-web-dashboard | FR-530 | TC-530 | `app_publishes_graph_state_to_dashboard`, `app_dashboard_clears_last_graph_on_new_conversation` | unit | ✅ | web dashboard slice A |
 
 
 ### 1.1 주의할 ⚠️ 항목

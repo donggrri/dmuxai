@@ -14,6 +14,66 @@ into shell commands.
 | Cursor | `--print --output-format stream-json` NDJSON | durable `session_id` + `--resume` |
 | AGY | stream-json input/output NDJSON | durable `conversation_id` + `--conversation` |
 
+## What it looks like
+
+TUI (`dmuxai` in a project directory; here AGY answering in Ask mode):
+
+![DmuxAI TUI](docs/images/tui.png)
+
+Web dashboard (`dmuxai serve`, or `dmuxai --web` for TUI + dashboard), showing a
+graph run live: completed nodes with their runtime, the running node highlighted,
+and the runner/model for every node:
+
+![DmuxAI web dashboard](docs/images/web-dashboard.png)
+
+```bash
+cd /path/to/project
+dmuxai                 # TUI
+dmuxai --web           # TUI + local dashboard; the URL with its access token is shown as a notice
+dmuxai serve           # dashboard only (no TTY needed); prints: dmuxai dashboard: http://127.0.0.1:7420/?token=...
+dmuxai serve --port 0  # pick a free port
+```
+
+The dashboard binds `127.0.0.1` only and needs the per-start token printed at
+startup; other origins/hosts are rejected. Binding elsewhere requires
+`--bind ADDR --allow-remote` and prints a warning. On Windows, run DmuxAI inside
+WSL and open the printed URL in the Windows browser (`localhost` is forwarded).
+Details: [SPEC-web-dashboard](docs/specs/SPEC-web-dashboard.md).
+
+## Attach any agent CLI
+
+Built-in runners are Cursor (`cursor-agent`), AGY and Codex. **Any other headless
+agent CLI** (opencode, hermes, pi, Claude Code, ...) is attached with an
+`[[agents.custom]]` block in `dmuxai.toml` (repo) or `~/.config/dmuxai/dmuxai.toml`
+(user) — no Rust code. Custom agents show up in `/agent` and F2, keep conversation
+continuity via their session id, and can run graph nodes:
+
+```toml
+[[agents.custom]]
+name = "opencode-glm"
+command = ["opencode", "run", "--format", "json", "-m", "{model}", "--dir", "{workspace}", "{prompt}"]
+default_model = "opencode/glm-5.3-flash-free"
+output = "jsonl"
+text_path = "/part/text"
+text_when = { path = "/type", equals = "text" }
+session_id_path = "/sessionID"
+resume_arg = ["--session", "{session_id}"]
+
+[graph]
+allowed_runners = ["agy", "opencode-glm"]   # restrict which runners graph nodes may use
+```
+
+More fields and ready-made presets: [docs/agents/custom-agents.md](docs/agents/custom-agents.md),
+[docs/agents/presets.toml](docs/agents/presets.toml).
+
+**Shared MCP servers (planned, slice C of SPEC-web-dashboard):** MCP servers are
+defined once under `[[mcp.servers]]` (user config, optionally overridden per repo)
+and apply to every agent: DmuxAI hands them to each CLI in its native per-run form
+(opencode config, Codex `-c mcp_servers.*`, a generated `mcpServers` JSON for custom
+agents; Cursor/AGY per the runner matrix in the spec), and the dashboard's own MCP
+client uses the same list (e.g. Jira/Confluence import into to-dos). Secrets are
+referenced by env var name, never stored.
+
 ## Requirements
 
 The Windows release installer does not require Rust, Cargo, or Git. It installs
