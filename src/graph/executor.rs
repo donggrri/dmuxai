@@ -25,6 +25,8 @@ pub struct GraphRunSession {
     node_turns: HashMap<String, String>,
 }
 
+pub type GraphSession = GraphRunSession;
+
 impl GraphRunSession {
     pub fn new(run: GraphRun) -> Self {
         Self {
@@ -160,12 +162,30 @@ impl GraphRunSession {
     }
 
     pub fn assignment_line(&self) -> String {
+        self.assignment_line_with(|_runner, model| model.to_owned())
+    }
+
+    /// Rendered assignment line with each node's effective model resolved per
+    /// runner. `resolve` receives `(runner, planned_model)` and must return the
+    /// effective model the node will run on.
+    pub fn assignment_line_with<F>(&self, mut resolve: F) -> String
+    where
+        F: FnMut(&str, &str) -> String,
+    {
         self.run
             .plan
             .nodes
             .iter()
             .filter(|node| node.role != NodeRole::Orchestrate)
-            .map(|node| format!("{}:{}→{}", node.id, node.role_short(), node.model_id))
+            .map(|node| {
+                format!(
+                    "{}:{}→{}:{}",
+                    node.id,
+                    node.role_short(),
+                    node.runner,
+                    resolve(&node.runner, &node.model_id)
+                )
+            })
             .collect::<Vec<_>>()
             .join(" | ")
     }
@@ -419,6 +439,89 @@ mod tests {
         assert_eq!(
             session.status_line().as_deref(),
             Some("Graph 2/4 · step-2 implement · agy gemini-3.8-flash-medium · failed")
+        );
+    }
+
+    #[test]
+    // TC-460 / FR-460 / FR-462: `assignment_line_with` renders
+    // `<id>:<role>→<runner>:<model>`, calls `resolve(runner, planned)` per node,
+    // and keeps orchestrate nodes out of the line.
+    fn assignment_line_uses_resolver_per_runner() {
+        let plan = GraphPlan {
+            schema: "cursor-agent-graph/v1".to_owned(),
+            id: "test-assignment".to_owned(),
+            orchestrator_model: "composer-2.5".to_owned(),
+            user_prompt: "multi step prompt".to_owned(),
+            nodes: vec![
+                GraphNode {
+                    id: "orchestrate".to_owned(),
+                    role: NodeRole::Orchestrate,
+                    job: "Build execution graph".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: GraphNodeStatus::Completed,
+                    attempt: 0,
+                },
+                GraphNode {
+                    id: "impl-1".to_owned(),
+                    role: NodeRole::Implement,
+                    job: "Implement task".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: GraphNodeStatus::Pending,
+                    attempt: 0,
+                },
+                GraphNode {
+                    id: "research-1".to_owned(),
+                    role: NodeRole::Research,
+                    job: "Research task".to_owned(),
+                    runner: "agy".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: GraphNodeStatus::Pending,
+                    attempt: 0,
+                },
+            ],
+            edges: vec![],
+            limits: GraphLimits {
+                max_parallel: 1,
+                max_retries: 1,
+            },
+        };
+
+        let run = GraphRun {
+            plan,
+            conversation_id: "conv-1".to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+        };
+        let session = GraphRunSession::new(run);
+
+        // FR-460: the resolver receives (runner, planned) per node and the
+        // rendered segment is `<id>:<role>→<runner>:<model>`.
+        let resolved = session.assignment_line_with(|runner, planned| {
+            if runner == "agy" {
+                "gemini-3.8-flash-medium".to_owned()
+            } else if runner == "codex" {
+                "default".to_owned()
+            } else {
+                planned.to_owned()
+            }
+        });
+        assert_eq!(
+            resolved,
+            "impl-1:impl→cursor:composer-2.5 | research-1:research→agy:gemini-3.8-flash-medium"
+        );
+
+        // Without a resolver the planned model is shown as before.
+        assert_eq!(
+            session.assignment_line(),
+            "impl-1:impl→cursor:composer-2.5 | research-1:research→agy:composer-2.5"
         );
     }
 }

@@ -152,6 +152,9 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M1,M2 | SPEC-graph-allowed-runners | FR-430, INT-430 | TC-433 | `allowed_runners_parsing_and_unknown_runner_warning`, `empty_allowed_runners_planner_falls_back_to_single`, `empty_allowed_runners_falls_back_to_single_agent_with_notice` | unit | ✅ | dogfood #20 |
 | M1,M2 | SPEC-graph-allowed-runners | FR-433 | TC-434 | `user_config_merged_and_overridden_by_workspace` | unit | ✅ | dogfood #20 |
 | M1,M2 | SPEC-graph-allowed-runners | UX-430 | TC-435 | `graph_status_shows_allowed_runners` | unit | ✅ | dogfood #20 |
+| M1,M2 | SPEC-graph-plan-header | FR-460 | TC-460 | `assignment_line_uses_resolver_per_runner` | unit | ✅ | dogfood #22 |
+| M1,M2 | SPEC-graph-plan-header | FR-461 | TC-461 | `graph_assignment_shows_agy_model_not_composer` | unit | ✅ | dogfood #22 |
+| M1,M2 | SPEC-graph-plan-header | FR-462 | TC-462 | `graph_assignment_cursor_stays_composer` | unit | ✅ | dogfood #22 |
 
 
 ### 1.1 주의할 ⚠️ 항목

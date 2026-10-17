@@ -4,7 +4,7 @@ mod policy;
 mod store;
 mod types;
 
-pub use executor::{GraphAction, GraphRunSession, NodeAssignment};
+pub use executor::{GraphAction, GraphRunSession, GraphSession, NodeAssignment};
 pub use planner::plan_request;
 pub use policy::{
     ORCHESTRATOR_MODEL, assign_runner, default_limits, is_runner_allowed, model_for_role,

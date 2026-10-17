@@ -90,8 +90,10 @@ Format: id, status, repro, cause, fix.
 - Cause: Multi-step prompt planning unconditionally assigned nodes to `cursor` (or `routing_default_agent`) without a mechanism to restrict graph execution to specific runners, and configuration was only workspace-local.
 - Fix: Added `[graph] allowed_runners = ["agy", "opencode", ...]` in `src/settings.rs` supporting built-ins (`agy`, `codex`, `cursor`) and custom agent names. Unknown runners emit a config warning and are ignored. `assign_runner` selects `routing.default_agent` if allowed, otherwise `cursor` if allowed, otherwise the first allowed runner; if empty, it falls back to single-agent mode with the selected agent and a system notice. Graph nodes (including orchestrate) and `/graph override` strictly enforce the allowed list. Supported machine-global user configuration loading from `$XDG_CONFIG_HOME/dmuxai/dmuxai.toml` (fallback `~/.config/dmuxai/dmuxai.toml`) with per-key workspace overrides. Displayed allowed runners in `/graph` and `/graph status`.
 
-## #22 Graph plan header shows composer-2.5 for nodes routed to AGY — open (cosmetic)
-- With `allowed_runners = ["agy"]` the nodes correctly run on AGY, but the plan line still prints `step-1:plan→composer-2.5`. It should print the effective per-runner model.
+## #22 Graph plan header shows composer-2.5 for nodes routed to AGY — fixed
+- Repro: With `allowed_runners = ["agy"]` the nodes correctly run on AGY, but the plan line still printed `step-1:plan→composer-2.5`.
+- Cause: `assignment_line()` printed raw `node.model_id` without runner resolution.
+- Fix: Added `GraphSession::assignment_line_with(resolve)` rendering `<id>:<role>→<runner>:<model>`, and updated `App` to resolve effective models per runner (`resolved_assignment_line`), showing `provider default` for non-Cursor runners with no F2 pick while Cursor stays pinned to `composer-2.5`.
 
 ## #23 AGY repeatedly invents `App::handle_enter` in tests — friction
 - Two separate AGY sessions wrote tests calling a nonexistent `handle_enter`; the real entry point is `submit_prompt`. A test-helper note in AGENTS/README would avoid the loop.
