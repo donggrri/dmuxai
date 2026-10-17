@@ -56,6 +56,36 @@ agent is busy or another graph is active, and they respect
 `dmuxai serve` is view-only: you can manage to-dos but the run buttons are
 disabled with a hint. Start `dmuxai --web` to run to-dos from the browser.
 
+### Themes and colors
+
+![Dashboard in the light theme with a custom accent](docs/images/web-dashboard-light.png)
+
+The dashboard header has a Light/Dark/System theme switcher and an accent
+color picker (with a reset); both are stored in the page's `localStorage`,
+`System` follows the OS preference live, and they default from the config:
+
+```toml
+[web]
+theme = "dark"        # "light" | "dark" | "system" (default: system)
+accent = "#3b82f6"    # #rrggbb
+
+[theme]               # TUI surface colors
+background = "#0e1116"
+foreground = "#dbe4ee"
+border = "#232d3c"
+accent = "#4aa8ff"
+
+[theme.agents]        # text color per agent, custom agents included
+opencode-glm = "#ff8800"
+codex = "magenta"
+```
+
+Colors accept `#rrggbb` or the named terminal colors; invalid values become
+config warnings and the built-in default is used. `NO_COLOR` (without
+`force_color = true` or `DMUXAI_FORCE_COLOR=1`) keeps colors off. The
+dashboard reuses the `[theme.agents]` agent colors for its agent chips.
+Details: [SPEC-theme-colors](docs/specs/SPEC-theme-colors.md).
+
 ## Attach any agent CLI
 
 Built-in runners are Cursor (`cursor-agent`), AGY and Codex. **Any other headless

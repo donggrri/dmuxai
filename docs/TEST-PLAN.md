@@ -180,6 +180,16 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-web-dashboard | UX-540 | TC-543 | `static_page_has_todo_panel` | unit | ✅ | web dashboard slice B |
 | M8,M2 | SPEC-web-dashboard | FR-541 | TC-544 | `todo_routes_reject_invalid_requests` | integration | ✅ | web dashboard slice B |
 | M8,M6 | SPEC-web-dashboard | FR-542 | TC-545 | `todo_run_requires_web_mode` | integration | ✅ | web dashboard slice B |
+| M8,M2 | SPEC-theme-colors | FR-600 | TC-600 | `theme_parses_surface_colors_with_warnings` | unit | ✅ | theme settings (PR D) |
+| M8,M2 | SPEC-theme-colors | FR-600 | TC-601 | `tui_renders_theme_background_and_border` | unit | ✅ | theme settings (PR D) |
+| M8,M2 | SPEC-theme-colors | FR-601 | TC-602 | `theme_agent_colors_resolve_with_fallbacks` | unit | ✅ | theme settings (PR D) |
+| M8,M2 | SPEC-theme-colors | FR-601 | TC-603 | `tui_uses_per_agent_text_colors` | unit | ✅ | theme settings (PR D) |
+| M8,M2 | SPEC-theme-colors | FR-602 | TC-604 | `no_color_disables_new_theme_keys` | unit | ✅ | theme settings (PR D) |
+| M8,M2 | SPEC-theme-colors | FR-603 | TC-605 | `web_theme_settings_parse_with_fallbacks` | unit | ✅ | theme settings (PR D) |
+| M8,M2 | SPEC-theme-colors | FR-603 | TC-606 | `snapshot_exposes_ui_theme` | integration | ✅ | theme settings (PR D) |
+| M8,M2 | SPEC-theme-colors | UX-600 | TC-607 | `static_page_has_theme_controls` | integration | ✅ | theme settings (PR D) |
+| M8,M2 | SPEC-theme-colors | NFR-600 | TC-608 | `theme_palettes_meet_wcag_contrast` | unit | ✅ | theme settings (PR D) |
+| M8,M2 | SPEC-theme-colors | FR-604 | TC-609 | `dashboard_agents_carry_tui_colors` | unit | ✅ | theme settings (PR D) |
 
 
 ### 1.1 주의할 ⚠️ 항목

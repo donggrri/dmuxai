@@ -19,7 +19,7 @@ pub use server::{
 };
 pub use snapshot::{
     AgentView, DashboardSnapshot, GraphCounts, GraphView, NodeView, SNAPSHOT_SCHEMA,
-    SnapshotSource, snapshot_from_run,
+    SnapshotSource, UiTheme, snapshot_from_run,
 };
 
 /// Default dashboard port (OQ-520). If it is taken, an ephemeral port is used.
