@@ -96,7 +96,8 @@ async fn get_app_css() -> impl IntoResponse {
 }
 
 async fn get_state(State(state): State<AppState>) -> Response {
-    let snapshot = state.hub.snapshot();
+    let mut snapshot = state.hub.snapshot();
+    snapshot.sent_at_ms = crate::web::snapshot::now_ms();
     match serde_json::to_string(&snapshot) {
         Ok(json) => (
             StatusCode::OK,
@@ -124,7 +125,8 @@ async fn get_state(State(state): State<AppState>) -> Response {
 async fn get_events(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = WatchStream::new(state.hub.subscribe()).filter_map(|snapshot| {
+    let stream = WatchStream::new(state.hub.subscribe()).filter_map(|mut snapshot| {
+        snapshot.sent_at_ms = crate::web::snapshot::now_ms();
         serde_json::to_string(&snapshot)
             .ok()
             .map(|json| Ok(Event::default().event("snapshot").data(json)))

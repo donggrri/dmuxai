@@ -169,10 +169,11 @@ function nodeElapsed(node, snap, nowMs) {
       typeof snap.receivedAt === 'number'
     ) {
       // Server and browser clocks may disagree; interpolate from the
-      // generated-at timestamp plus the time our page held the snapshot.
+      // server send time (sent_at_ms) plus the time our page held the snapshot.
+      var serverNow = snap.sent_at_ms > 0 ? snap.sent_at_ms : snap.generated_at_ms;
       return Math.max(
         0,
-        (snap.generated_at_ms - node.started_at_ms) + (nowMs - snap.receivedAt)
+        (serverNow - node.started_at_ms) + (nowMs - snap.receivedAt)
       );
     }
     return null;

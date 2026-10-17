@@ -37,6 +37,7 @@ impl DashboardHub {
             schema: SNAPSHOT_SCHEMA.to_string(),
             revision: 0,
             generated_at_ms: now_ms,
+            sent_at_ms: 0,
             source,
             workspace,
             agents: Vec::new(),

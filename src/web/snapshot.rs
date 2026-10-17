@@ -17,6 +17,10 @@ pub struct DashboardSnapshot {
     pub schema: String,
     pub revision: u64,
     pub generated_at_ms: u64,
+    /// Server clock when this payload was sent (set per response, not part of
+    /// the revision); the page computes live elapsed time from it.
+    #[serde(default)]
+    pub sent_at_ms: u64,
     pub source: SnapshotSource,
     pub workspace: String,
     pub agents: Vec<AgentView>,
@@ -82,6 +86,14 @@ fn truncate_with_ellipsis(s: &str, limit: usize) -> String {
     } else {
         prefix
     }
+}
+
+/// Milliseconds since the Unix epoch on the server clock.
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 pub fn snapshot_from_run(run: &GraphRun) -> GraphView {
@@ -217,6 +229,7 @@ mod tests {
             schema: SNAPSHOT_SCHEMA.to_string(),
             revision: 1,
             generated_at_ms: 1000,
+            sent_at_ms: 0,
             source: SnapshotSource::Files,
             workspace: "/tmp/test".to_string(),
             agents: vec![AgentView {
