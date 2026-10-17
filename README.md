@@ -642,6 +642,18 @@ Executable overrides:
 Prompts are written to child stdin. Neither Windows nor Linux routes prompt text
 through `cmd.exe`, PowerShell command strings, or `/bin/sh`.
 
+### Cursor latency
+
+DmuxAI adds no measurable overhead to Cursor turns; the cold start latency is `cursor-agent`'s own process startup before it reads stdin. In interactive mode (TUI and web dashboard), DmuxAI pre-starts the next `cursor-agent` process in its own process group with piped stdin while you type or review the prior response, hiding an indicative ~1.4–2.1 s of measured cold start latency (the effective reduction depends on typing and idle time between turns).
+
+Pre-warming is enabled by default in interactive sessions and can be configured under `[cursor]`:
+
+```toml
+[cursor]
+prewarm = true              # set to false to disable pre-start
+prewarm_idle_secs = 300     # idle timeout in seconds before unprompted warm processes are reaped
+```
+
 ## Agent graph orchestration (default)
 
 Multi-step prompts are planned as an agent-graph-engineering DAG before any CLI

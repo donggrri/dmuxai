@@ -34,6 +34,10 @@ const STARTER_CONFIG: &str = r##"# DmuxAI configuration (dmuxai.toml). Everythin
 
 # [cursor]
 # windows_unsandboxed = false
+# Pre-warm the next cursor-agent process in the background (TUI / web only).
+# prewarm = true
+# Idle expiry for the pre-warmed process in seconds.
+# prewarm_idle_secs = 300
 
 # [agents]
 # The built-in opencode runner is registered automatically when `opencode` is on

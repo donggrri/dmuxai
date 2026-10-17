@@ -23,3 +23,4 @@ Order: 1 → 2+3 → 4 → 5 → 6 (4–6 share the web assets, so they go in se
 
 - Persistent cursor-agent session server, if cursor-agent ever ships one (would remove the cold start that pre-warm only hides).
 - Tree view in the TUI file picker (the dashboard tree comes first).
+- Windows compatibility (postponed in v0.2.1): job objects for Cursor warm processes (SPEC-cursor-latency FR-807), and re-check v0.2.1 features on Windows.

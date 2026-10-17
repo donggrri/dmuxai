@@ -297,10 +297,10 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-todo-sidebar | FR-840..842,UX-840 | TC-840 | `todo_sidebar_assets` | unit | ⏳ | v0.2.1 |
 | M8,M2 | SPEC-todo-sidebar | FR-840,FR-841 | TC-841 | `todo_actions_still_covered` | unit | ⏳ | v0.2.1 |
 | M8,M2 | SPEC-todo-sidebar | FR-840..842 | TC-842 | `todo_sidebar_renders_in_headless_chrome` (ignored) | e2e | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-cursor-latency | FR-805,FR-806 | TC-805 | `prewarm_reused_when_args_match` | unit | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-cursor-latency | FR-806,FR-807 | TC-806 | `prewarm_discarded_on_arg_change` | unit | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-cursor-latency | FR-807,NFR-805 | TC-807 | `prewarm_disabled_and_expiry` | unit | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-cursor-latency | FR-806 | TC-808 | `prewarm_exited_process_is_replaced` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-cursor-latency | FR-805,FR-806 | TC-805 | `prewarm_reused_when_args_match` | unit | ✅ | v0.2.1 |
+| M8,M2 | SPEC-cursor-latency | FR-806,FR-807 | TC-806 | `prewarm_discarded_on_arg_change` | unit | ✅ | v0.2.1 |
+| M8,M2 | SPEC-cursor-latency | FR-807,NFR-805 | TC-807 | `prewarm_disabled_and_expiry` | unit | ✅ | v0.2.1 |
+| M8,M2 | SPEC-cursor-latency | FR-806 | TC-808 | `prewarm_exited_process_is_replaced` | unit | ✅ | v0.2.1 |
 
 ### 1.1 주의할 ⚠️ 항목
 

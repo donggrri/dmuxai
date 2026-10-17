@@ -1,8 +1,10 @@
 use std::{
     collections::VecDeque,
+    ffi::OsString,
     io,
     path::{Path, PathBuf},
     process::Stdio,
+    time::Instant,
 };
 
 use serde_json::Value;
@@ -25,16 +27,73 @@ const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const STDERR_HISTORY_CAPACITY: usize = 8;
 
 enum CursorCommand {
-    Send(AgentRequest),
+    Send {
+        request: AgentRequest,
+        is_graph: bool,
+    },
     Cancel,
     ListModels,
     SelectModel(String),
     SelectMode(ExecutionMode),
+    Prewarm,
+    Reset,
+    Tick,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorAdapterConfig {
+    pub windows_unsandboxed: bool,
+    pub prewarm: bool,
+    pub prewarm_idle_secs: u64,
+}
+
+impl Default for CursorAdapterConfig {
+    fn default() -> Self {
+        Self {
+            windows_unsandboxed: false,
+            prewarm: false,
+            prewarm_idle_secs: 300,
+        }
+    }
+}
+
+impl From<DmuxSettings> for CursorAdapterConfig {
+    fn from(settings: DmuxSettings) -> Self {
+        Self {
+            windows_unsandboxed: settings.cursor_windows_unsandboxed,
+            prewarm: settings.cursor_prewarm,
+            prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
+        }
+    }
+}
+
+impl From<&DmuxSettings> for CursorAdapterConfig {
+    fn from(settings: &DmuxSettings) -> Self {
+        Self {
+            windows_unsandboxed: settings.cursor_windows_unsandboxed,
+            prewarm: settings.cursor_prewarm,
+            prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
+        }
+    }
+}
+
+impl CursorAdapterConfig {
+    pub fn from_settings(settings: &DmuxSettings, prewarm: bool) -> Self {
+        Self {
+            windows_unsandboxed: settings.cursor_windows_unsandboxed,
+            prewarm: prewarm && settings.cursor_prewarm,
+            prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
+        }
+    }
 }
 
 pub struct CursorAdapter {
     command_tx: mpsc::Sender<CursorCommand>,
     windows_unsandboxed: bool,
+    /// Bumped synchronously by `reset()`. The runtime applies a pending reset
+    /// before handling any later command, so a reset is never lost or
+    /// reordered behind a prompt sent after `/new` (FR-807).
+    reset_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AgentAdapter for CursorAdapter {
@@ -44,7 +103,19 @@ impl AgentAdapter for CursorAdapter {
 
     fn send(&self, request: AgentRequest) -> Result<(), AdapterError> {
         self.command_tx
-            .try_send(CursorCommand::Send(request))
+            .try_send(CursorCommand::Send {
+                request,
+                is_graph: false,
+            })
+            .map_err(map_send_error)
+    }
+
+    fn send_graph_node(&self, request: AgentRequest) -> Result<(), AdapterError> {
+        self.command_tx
+            .try_send(CursorCommand::Send {
+                request,
+                is_graph: true,
+            })
             .map_err(map_send_error)
     }
 
@@ -76,6 +147,29 @@ impl AgentAdapter for CursorAdapter {
             .try_send(CursorCommand::SelectMode(mode))
             .map_err(map_send_error)
     }
+
+    fn prewarm(&self) -> Result<(), AdapterError> {
+        self.command_tx
+            .try_send(CursorCommand::Prewarm)
+            .map_err(map_send_error)
+    }
+
+    fn reset(&self) -> Result<(), AdapterError> {
+        self.reset_requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Only a wake-up: a full queue is fine because the runtime checks
+        // `reset_requests` before every command it handles.
+        match self.command_tx.try_send(CursorCommand::Reset) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(error) => Err(map_send_error(error)),
+        }
+    }
+
+    fn tick(&self) -> Result<(), AdapterError> {
+        self.command_tx
+            .try_send(CursorCommand::Tick)
+            .map_err(map_send_error)
+    }
 }
 
 fn map_send_error(error: mpsc::error::TrySendError<CursorCommand>) -> AdapterError {
@@ -88,50 +182,220 @@ fn map_send_error(error: mpsc::error::TrySendError<CursorCommand>) -> AdapterErr
 pub fn spawn_cursor_adapter(
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
-    settings: DmuxSettings,
+    config: impl Into<CursorAdapterConfig>,
     mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
 ) -> SpawnedAdapter {
-    let windows_unsandboxed = settings.cursor_windows_unsandboxed;
+    let config = config.into();
+    let windows_unsandboxed = config.windows_unsandboxed;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+    let reset_requests = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let worker = tokio::spawn(runtime_loop(
         command_rx,
         event_tx,
         cwd,
-        windows_unsandboxed,
+        config,
         mcp_servers,
+        reset_requests.clone(),
     ));
     (
         Box::new(CursorAdapter {
             command_tx,
             windows_unsandboxed,
+            reset_requests,
         }),
         worker,
     )
+}
+
+struct WarmProcess {
+    program: OsString,
+    argv: Vec<OsString>,
+    cwd: PathBuf,
+    env_bin: Option<OsString>,
+    child: Option<tokio::process::Child>,
+    spawned_at: Instant,
+}
+
+impl Drop for WarmProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            #[cfg(unix)]
+            if let Some(id) = child.id() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &format!("-{id}")])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = child.start_kill();
+        }
+    }
+}
+
+/// Sends `signal` (e.g. `-TERM`) to the whole process group `pgid` (Unix).
+#[cfg(unix)]
+async fn signal_group(pgid: u32, signal: &str) -> bool {
+    tokio::process::Command::new("kill")
+        .args([signal, "--", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|status| status.success())
+}
+
+/// SIGTERM the group, wait up to 500 ms for it to go away, then SIGKILL
+/// whatever is left (descendants that ignore SIGTERM included).
+#[cfg(unix)]
+async fn terminate_group(pgid: u32) {
+    if !signal_group(pgid, "-TERM").await {
+        return; // group already gone
+    }
+    let deadline = Instant::now() + std::time::Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if !signal_group(pgid, "-0").await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let _ = signal_group(pgid, "-KILL").await;
+}
+
+async fn reap_warm_process(mut warm: WarmProcess) {
+    if let Some(mut child) = warm.child.take() {
+        #[cfg(unix)]
+        if let Some(id) = child.id() {
+            let _ = signal_group(id, "-TERM").await;
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await;
+            // Always clean up the rest of the group, even if the leader exited
+            // in time: children may ignore SIGTERM.
+            let _ = signal_group(id, "-KILL").await;
+        }
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+}
+
+fn spawn_warm_process(
+    resume_session: Option<&str>,
+    selected_model: Option<&str>,
+    mode: ExecutionMode,
+    cwd: &Path,
+    windows_unsandboxed: bool,
+) -> io::Result<WarmProcess> {
+    let mut command = cursor_command()?;
+    configure_command(
+        &mut command,
+        resume_session,
+        selected_model,
+        mode,
+        cwd,
+        windows_unsandboxed,
+    );
+    let program = command.as_std().get_program().to_os_string();
+    let argv = command
+        .as_std()
+        .get_args()
+        .map(|s| s.to_os_string())
+        .collect::<Vec<_>>();
+    let env_bin = std::env::var_os("DMUXAI_CURSOR_BIN");
+    #[cfg(unix)]
+    command.process_group(0);
+    command
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = command.spawn()?;
+    Ok(WarmProcess {
+        program,
+        argv,
+        cwd: cwd.to_path_buf(),
+        env_bin,
+        child: Some(child),
+        spawned_at: Instant::now(),
+    })
 }
 
 async fn runtime_loop(
     mut command_rx: mpsc::Receiver<CursorCommand>,
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
-    windows_unsandboxed: bool,
+    config: CursorAdapterConfig,
     mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
+    reset_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
+    let windows_unsandboxed = config.windows_unsandboxed;
+    let idle_limit = std::time::Duration::from_secs(config.prewarm_idle_secs);
     let applicable: Vec<dmuxai::mcp::ResolvedMcpServer> = mcp_servers
         .into_iter()
         .filter(|s| s.applies_to("cursor"))
         .collect();
+    let can_prewarm = config.prewarm && applicable.is_empty();
     let cursor_notice_emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut active: Option<ActiveTurn> = None;
     let mut selected_model: Option<String> = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
     let mut selected_mode = ExecutionMode::default();
+    let mut latest_session_id: Option<String> = None;
+    let mut reset_epoch: u64 = 0;
+    let mut warm_process: Option<WarmProcess> = None;
+    let mut resets_seen: u64 = 0;
+
+    // Applies resets requested via `CursorAdapter::reset` since the last check:
+    // forget the --resume session, bump the epoch, and discard the warm process.
+    macro_rules! apply_pending_reset {
+        () => {
+            let requested = reset_requests.load(std::sync::atomic::Ordering::SeqCst);
+            if requested != resets_seen {
+                resets_seen = requested;
+                latest_session_id = None;
+                reset_epoch = reset_epoch.wrapping_add(1);
+                if let Some(warm) = warm_process.take() {
+                    reap_warm_process(warm).await;
+                }
+            }
+        };
+    }
 
     loop {
+        apply_pending_reset!();
+        if let Some(warm) = &warm_process
+            && warm.spawned_at.elapsed() >= idle_limit
+        {
+            let warm = warm_process.take().unwrap();
+            reap_warm_process(warm).await;
+        }
+
         if active.is_none() {
-            let Some(command) = command_rx.recv().await else {
-                break;
+            let sleep_duration = match &warm_process {
+                Some(warm) => idle_limit.saturating_sub(warm.spawned_at.elapsed()),
+                None => std::time::Duration::from_secs(3600),
             };
+
+            let command = tokio::select! {
+                _ = tokio::time::sleep(sleep_duration), if warm_process.is_some() => {
+                    if let Some(warm) = warm_process.take() {
+                        reap_warm_process(warm).await;
+                    }
+                    continue;
+                }
+                cmd = command_rx.recv() => match cmd {
+                    Some(c) => c,
+                    None => {
+                        if let Some(warm) = warm_process.take() {
+                            reap_warm_process(warm).await;
+                        }
+                        break;
+                    }
+                }
+            };
+            apply_pending_reset!();
+
             match command {
-                CursorCommand::Send(request) => {
+                CursorCommand::Send { request, is_graph } => {
                     if let Err(error) = validate_cursor_mode(selected_mode, windows_unsandboxed) {
                         let context = OutputContext::from(&request);
                         send_event(
@@ -140,9 +404,13 @@ async fn runtime_loop(
                             AgentEvent::Error(error.to_string()),
                         )
                         .await;
-                    } else {
+                    } else if is_graph {
+                        if let Some(warm) = warm_process.take() {
+                            reap_warm_process(warm).await;
+                        }
                         active = Some(spawn_turn(
                             request,
+                            None,
                             selected_model.clone(),
                             selected_mode,
                             cwd.clone(),
@@ -150,6 +418,78 @@ async fn runtime_loop(
                             windows_unsandboxed,
                             applicable.clone(),
                             cursor_notice_emitted.clone(),
+                            true,
+                            reset_epoch,
+                        ));
+                    } else {
+                        let mut check_cmd = cursor_command().ok();
+                        if let Some(cmd) = &mut check_cmd {
+                            configure_command(
+                                cmd,
+                                request.resume_session.as_deref(),
+                                selected_model.as_deref(),
+                                selected_mode,
+                                &cwd,
+                                windows_unsandboxed,
+                            );
+                        }
+                        let turn_program = check_cmd
+                            .as_ref()
+                            .map(|cmd| cmd.as_std().get_program().to_os_string());
+                        let turn_argv = check_cmd
+                            .as_ref()
+                            .map(|cmd| {
+                                cmd.as_std()
+                                    .get_args()
+                                    .map(|s| s.to_os_string())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let turn_env_bin = std::env::var_os("DMUXAI_CURSOR_BIN");
+
+                        let warm_child = match warm_process.take() {
+                            Some(mut warm) => {
+                                let mut child = warm.child.take().unwrap();
+                                match child.try_wait() {
+                                    Ok(Some(_)) => {
+                                        let _ = child.wait().await;
+                                        None
+                                    }
+                                    Ok(None) => {
+                                        let matches = Some(&warm.program) == turn_program.as_ref()
+                                            && warm.argv == turn_argv
+                                            && warm.cwd == cwd
+                                            && warm.env_bin == turn_env_bin;
+                                        if matches {
+                                            Some(child)
+                                        } else {
+                                            warm.child = Some(child);
+                                            reap_warm_process(warm).await;
+                                            None
+                                        }
+                                    }
+                                    Err(_) => {
+                                        warm.child = Some(child);
+                                        reap_warm_process(warm).await;
+                                        None
+                                    }
+                                }
+                            }
+                            None => None,
+                        };
+
+                        active = Some(spawn_turn(
+                            request,
+                            warm_child,
+                            selected_model.clone(),
+                            selected_mode,
+                            cwd.clone(),
+                            event_tx.clone(),
+                            windows_unsandboxed,
+                            applicable.clone(),
+                            cursor_notice_emitted.clone(),
+                            false,
+                            reset_epoch,
                         ));
                     }
                 }
@@ -183,33 +523,100 @@ async fn runtime_loop(
                     }
                 },
                 CursorCommand::SelectModel(model) => {
-                    let effective =
-                        match dmuxai::model_policy::validate_model_for_runner("cursor", &model) {
-                            Ok(()) => model,
-                            Err(_) => dmuxai::model_policy::ALLOWED_MODEL.to_owned(),
-                        };
-                    selected_model = Some(effective.clone());
-                    send_event(&event_tx, None, AgentEvent::ModelSelected(effective)).await;
+                    let changed = selected_model.as_ref() != Some(&model);
+                    selected_model = Some(model.clone());
+                    if changed && let Some(warm) = warm_process.take() {
+                        reap_warm_process(warm).await;
+                        if can_prewarm {
+                            warm_process = spawn_warm_process(
+                                latest_session_id.as_deref(),
+                                selected_model.as_deref(),
+                                selected_mode,
+                                &cwd,
+                                windows_unsandboxed,
+                            )
+                            .ok();
+                        }
+                    }
+                    send_event(&event_tx, None, AgentEvent::ModelSelected(model)).await;
                 }
                 CursorCommand::SelectMode(mode) => {
+                    let changed = selected_mode != mode;
                     selected_mode = mode;
+                    if changed && let Some(warm) = warm_process.take() {
+                        reap_warm_process(warm).await;
+                        if can_prewarm {
+                            warm_process = spawn_warm_process(
+                                latest_session_id.as_deref(),
+                                selected_model.as_deref(),
+                                selected_mode,
+                                &cwd,
+                                windows_unsandboxed,
+                            )
+                            .ok();
+                        }
+                    }
                     send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
                 }
+                CursorCommand::Prewarm => {
+                    if warm_process.is_none() && can_prewarm {
+                        warm_process = spawn_warm_process(
+                            latest_session_id.as_deref(),
+                            selected_model.as_deref(),
+                            selected_mode,
+                            &cwd,
+                            windows_unsandboxed,
+                        )
+                        .ok();
+                    }
+                }
+                // Wake-up only; handled by apply_pending_reset! above.
+                CursorCommand::Reset => {}
+                CursorCommand::Tick => {}
             }
             continue;
         }
 
         let turn = &mut active.as_mut().expect("checked above").handle;
         tokio::select! {
-            _ = turn => {
-                active = None;
+            res = turn => {
+                apply_pending_reset!();
+                let completed_turn = active.take().expect("turn was active");
+                if completed_turn.reset_epoch == reset_epoch
+                    && let Ok(Ok(Some(session_id))) = &res
+                {
+                    latest_session_id = Some(session_id.clone());
+                }
+                if can_prewarm && !completed_turn.is_graph {
+                    warm_process = spawn_warm_process(
+                        latest_session_id.as_deref(),
+                        selected_model.as_deref(),
+                        selected_mode,
+                        &cwd,
+                        windows_unsandboxed,
+                    )
+                    .ok();
+                }
             }
             command = command_rx.recv() => {
+                apply_pending_reset!();
                 match command {
                     Some(CursorCommand::Cancel) => {
-                        stop_turn(active.take(), &event_tx).await;
+                        let cancelled_turn = active.take();
+                        let was_graph = cancelled_turn.as_ref().is_some_and(|t| t.is_graph);
+                        stop_turn(cancelled_turn, &event_tx).await;
+                        if can_prewarm && !was_graph {
+                            warm_process = spawn_warm_process(
+                                latest_session_id.as_deref(),
+                                selected_model.as_deref(),
+                                selected_mode,
+                                &cwd,
+                                windows_unsandboxed,
+                            )
+                            .ok();
+                        }
                     }
-                    Some(CursorCommand::Send(request)) => {
+                    Some(CursorCommand::Send { request, .. }) => {
                         let context = OutputContext::from(&request);
                         send_event(
                             &event_tx,
@@ -249,8 +656,14 @@ async fn runtime_loop(
                             ),
                         ).await;
                     }
+                    Some(CursorCommand::Prewarm | CursorCommand::Tick) => {}
+                    // Wake-up only; handled by apply_pending_reset! above.
+                    Some(CursorCommand::Reset) => {}
                     None => {
                         stop_turn(active.take(), &event_tx).await;
+                        if let Some(warm) = warm_process.take() {
+                            reap_warm_process(warm).await;
+                        }
                         break;
                     }
                 }
@@ -262,6 +675,7 @@ async fn runtime_loop(
 #[allow(clippy::too_many_arguments)]
 fn spawn_turn(
     request: AgentRequest,
+    warm_child: Option<tokio::process::Child>,
     selected_model: Option<String>,
     mode: ExecutionMode,
     cwd: PathBuf,
@@ -269,12 +683,16 @@ fn spawn_turn(
     windows_unsandboxed: bool,
     mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
     cursor_notice_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    is_graph: bool,
+    reset_epoch: u64,
 ) -> ActiveTurn {
+    let warm_pgid = warm_child.as_ref().and_then(|c| c.id());
     let context = OutputContext::from(&request);
     let error_context = context.clone();
     let handle = tokio::spawn(async move {
-        if let Err(error) = run_turn(
+        match run_turn_with_child(
             &request,
+            warm_child,
             selected_model,
             mode,
             &cwd,
@@ -285,33 +703,79 @@ fn spawn_turn(
         )
         .await
         {
-            send_event(
-                &event_tx,
-                Some(&error_context),
-                AgentEvent::Error(error.to_string()),
-            )
-            .await;
+            Ok(session_id) => Ok(session_id),
+            Err(error) => {
+                send_event(
+                    &event_tx,
+                    Some(&error_context),
+                    AgentEvent::Error(error.to_string()),
+                )
+                .await;
+                Err(error)
+            }
         }
     });
-    ActiveTurn { handle, context }
+    ActiveTurn {
+        handle,
+        context,
+        is_graph,
+        reset_epoch,
+        warm_pgid,
+    }
 }
 
 struct ActiveTurn {
-    handle: JoinHandle<()>,
+    handle: JoinHandle<io::Result<Option<String>>>,
     context: OutputContext,
+    is_graph: bool,
+    reset_epoch: u64,
+    // Only used for group kills on Unix (Windows support is postponed).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    warm_pgid: Option<u32>,
 }
 
 async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
     if let Some(turn) = turn {
+        #[cfg(unix)]
+        if let Some(pgid) = turn.warm_pgid {
+            terminate_group(pgid).await;
+        }
         turn.handle.abort();
         let _ = turn.handle.await;
         send_event(event_tx, Some(&turn.context), AgentEvent::Cancelled).await;
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-async fn run_turn(
+pub(crate) async fn run_turn(
     request: &AgentRequest,
+    selected_model: Option<String>,
+    mode: ExecutionMode,
+    cwd: &Path,
+    event_tx: &mpsc::Sender<AgentOutput>,
+    windows_unsandboxed: bool,
+    mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
+    cursor_notice_emitted: &std::sync::atomic::AtomicBool,
+) -> io::Result<Option<String>> {
+    run_turn_with_child(
+        request,
+        None,
+        selected_model,
+        mode,
+        cwd,
+        event_tx,
+        windows_unsandboxed,
+        mcp_servers,
+        cursor_notice_emitted,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_with_child(
+    request: &AgentRequest,
+    warm_child: Option<tokio::process::Child>,
     selected_model: Option<String>,
     mode: ExecutionMode,
     cwd: &Path,
@@ -354,23 +818,28 @@ async fn run_turn(
         None
     };
 
-    let mut command = cursor_command()?;
-    configure_command(
-        &mut command,
-        request,
-        selected_model.as_deref(),
-        mode,
-        cwd,
-        windows_unsandboxed,
-    );
-    command
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let mut child = match warm_child {
+        Some(child) => child,
+        None => {
+            let mut command = cursor_command()?;
+            configure_command(
+                &mut command,
+                request.resume_session.as_deref(),
+                selected_model.as_deref(),
+                mode,
+                cwd,
+                windows_unsandboxed,
+            );
+            command
+                .current_dir(cwd)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            command.spawn()?
+        }
+    };
 
-    let mut child = command.spawn()?;
     let mut stdin = child
         .stdin
         .take()
@@ -407,7 +876,7 @@ async fn run_turn(
 
 fn configure_command(
     command: &mut tokio::process::Command,
-    request: &AgentRequest,
+    resume_session: Option<&str>,
     selected_model: Option<&str>,
     mode: ExecutionMode,
     cwd: &Path,
@@ -444,7 +913,7 @@ fn configure_command(
         _ => dmuxai::model_policy::ALLOWED_MODEL,
     };
     command.arg("--model").arg(model);
-    if let Some(session_id) = request.resume_session.as_deref() {
+    if let Some(session_id) = resume_session {
         command.arg("--resume").arg(session_id);
     }
 }
@@ -713,7 +1182,7 @@ async fn send_event(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::json;
     use tokio::time::{Duration, timeout};
 
@@ -980,7 +1449,7 @@ mod tests {
 
         configure_command(
             &mut command,
-            &request,
+            request.resume_session.as_deref(),
             Some("composer-2.5"),
             ExecutionMode::Ask,
             cwd,
@@ -1014,7 +1483,14 @@ mod tests {
             image_paths: vec![],
         };
         let mut command = tokio::process::Command::new("cursor-agent");
-        configure_command(&mut command, &request, None, ExecutionMode::Ask, cwd, false);
+        configure_command(
+            &mut command,
+            request.resume_session.as_deref(),
+            None,
+            ExecutionMode::Ask,
+            cwd,
+            false,
+        );
 
         let args = command
             .as_std()
@@ -1044,7 +1520,7 @@ mod tests {
             let mut command = tokio::process::Command::new("cursor-agent");
             configure_command(
                 &mut command,
-                &request,
+                request.resume_session.as_deref(),
                 Some(disallowed),
                 ExecutionMode::Ask,
                 cwd,
@@ -1086,7 +1562,14 @@ mod tests {
             ],
         };
         let mut command = tokio::process::Command::new("cursor-agent");
-        configure_command(&mut command, &request, None, ExecutionMode::Ask, cwd, false);
+        configure_command(
+            &mut command,
+            request.resume_session.as_deref(),
+            None,
+            ExecutionMode::Ask,
+            cwd,
+            false,
+        );
         let args = command
             .as_std()
             .get_args()
@@ -1112,7 +1595,14 @@ mod tests {
 
         let args_for = |mode| {
             let mut command = tokio::process::Command::new("cursor-agent");
-            configure_command(&mut command, &request, None, mode, cwd, false);
+            configure_command(
+                &mut command,
+                request.resume_session.as_deref(),
+                None,
+                mode,
+                cwd,
+                false,
+            );
             command
                 .as_std()
                 .get_args()
@@ -1136,11 +1626,15 @@ mod tests {
 
     #[tokio::test]
     async fn selecting_mode_is_acknowledged_without_starting_a_process() {
+        // Serialize with the pre-start tests (they set DMUXAI_CURSOR_BIN) and
+        // disable pre-start explicitly: the default config now enables it.
+        #[cfg(unix)]
+        let _guard = TEST_CURSOR_MUTEX.lock().await;
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let (adapter, worker) = spawn_cursor_adapter(
             event_tx,
             PathBuf::from("workspace"),
-            dmuxai::settings::DmuxSettings::default(),
+            CursorAdapterConfig::from_settings(&dmuxai::settings::DmuxSettings::default(), false),
             Vec::new(),
         );
 
@@ -1283,6 +1777,9 @@ mod tests {
         assert!(answer.contains("CURSOR_OK"), "unexpected answer: {answer}");
     }
 
+    #[cfg(unix)]
+    pub(crate) static TEST_CURSOR_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn cursor_mcp_notice_once_per_session() {
         // TC-578, INT-561: Cursor runner with an existing user .cursor/mcp.json; two turns.
@@ -1290,6 +1787,9 @@ mod tests {
         use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
         use std::collections::BTreeMap;
         use std::sync::atomic::AtomicBool;
+
+        #[cfg(unix)]
+        let _guard = TEST_CURSOR_MUTEX.lock().await;
 
         let temp = tempfile::tempdir().unwrap();
         let cursor_dir = temp.path().join(".cursor");
@@ -1394,5 +1894,660 @@ mod tests {
         // User file remains untouched
         let content = std::fs::read_to_string(&user_file).unwrap();
         assert_eq!(content, r#"{"user": "pre-existing"}"#);
+    }
+
+    #[cfg(unix)]
+    pub(crate) struct FakeCursorFixture {
+        pub(crate) _guard: tokio::sync::MutexGuard<'static, ()>,
+        pub(crate) _dir: tempfile::TempDir,
+        pub(crate) log_path: PathBuf,
+        pub(crate) exit_once_marker: PathBuf,
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug, Clone)]
+    pub(crate) struct SpawnEntry {
+        pub(crate) pid: u32,
+        pub(crate) argv: Vec<String>,
+    }
+
+    #[cfg(unix)]
+    impl FakeCursorFixture {
+        pub(crate) async fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let guard = TEST_CURSOR_MUTEX.lock().await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let log_path = dir.path().join("fake_cursor.log");
+            let exit_once_marker = dir.path().join("exit_once.marker");
+            let script_path = dir.path().join("cursor-agent");
+            let script = format!(
+                "#!/bin/sh\n\
+                 PID=$$\n\
+                 LOG_FILE=\"{}\"\n\
+                 EXIT_MARKER=\"{}\"\n\
+                 echo \"SPAWN $PID $@\" >> \"$LOG_FILE\"\n\
+                 if [ -f \"$EXIT_MARKER\" ]; then\n\
+                     rm -f \"$EXIT_MARKER\"\n\
+                     echo \"EXIT_EARLY $PID\" >> \"$LOG_FILE\"\n\
+                     exit 1\n\
+                 fi\n\
+                 if read -r line; then\n\
+                     echo \"PROMPT $PID $line\" >> \"$LOG_FILE\"\n\
+                     echo '{{\"type\":\"assistant\",\"session_id\":\"sess-1\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"OK\"}}]}}}}'\n\
+                     echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"OK\",\"session_id\":\"sess-1\"}}'\n\
+                     exit 0\n\
+                 else\n\
+                     echo \"EOF $PID\" >> \"$LOG_FILE\"\n\
+                     echo \"Error: No prompt provided for print mode\" >&2\n\
+                     exit 1\n\
+                 fi\n",
+                log_path.display(),
+                exit_once_marker.display()
+            );
+            std::fs::write(&script_path, script).expect("write fake cursor");
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            unsafe {
+                std::env::set_var("DMUXAI_CURSOR_BIN", &script_path);
+            }
+            Self {
+                _guard: guard,
+                _dir: dir,
+                log_path,
+                exit_once_marker,
+            }
+        }
+
+        pub(crate) fn read_log_lines(&self) -> Vec<String> {
+            if let Ok(content) = std::fs::read_to_string(&self.log_path) {
+                content
+                    .lines()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
+
+        pub(crate) fn read_spawns(&self) -> Vec<SpawnEntry> {
+            self.read_log_lines()
+                .into_iter()
+                .filter_map(|line| {
+                    if let Some(rest) = line.strip_prefix("SPAWN ") {
+                        let mut parts = rest.split_whitespace();
+                        let pid = parts.next()?.parse::<u32>().ok()?;
+                        let argv = parts.map(str::to_owned).collect();
+                        Some(SpawnEntry { pid, argv })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+
+        pub(crate) async fn wait_for_spawns(
+            &self,
+            count: usize,
+            timeout_dur: Duration,
+        ) -> Vec<SpawnEntry> {
+            let start = Instant::now();
+            while start.elapsed() < timeout_dur {
+                let spawns = self.read_spawns();
+                if spawns.len() >= count {
+                    return spawns;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            self.read_spawns()
+        }
+
+        pub(crate) fn prompts_received(&self) -> Vec<(u32, String)> {
+            self.read_log_lines()
+                .into_iter()
+                .filter_map(|line| {
+                    if let Some(rest) = line.strip_prefix("PROMPT ") {
+                        let mut parts = rest.splitn(2, ' ');
+                        let pid = parts.next()?.parse::<u32>().ok()?;
+                        let prompt = parts.next()?.to_owned();
+                        Some((pid, prompt))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+
+        pub(crate) fn is_pid_alive(&self, pid: u32) -> bool {
+            let proc_stat = format!("/proc/{pid}/stat");
+            if let Ok(content) = std::fs::read_to_string(&proc_stat) {
+                if let Some(idx) = content.rfind(')') {
+                    let state = content[idx + 1..].trim().chars().next();
+                    if let Some(s) = state {
+                        return s != 'Z';
+                    }
+                }
+                true
+            } else {
+                std::process::Command::new("kill")
+                    .arg("-0")
+                    .arg(pid.to_string())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            }
+        }
+
+        pub(crate) async fn wait_for_pid_gone(&self, pid: u32, timeout_dur: Duration) -> bool {
+            let start = Instant::now();
+            while start.elapsed() < timeout_dur {
+                if !self.is_pid_alive(pid) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            !self.is_pid_alive(pid)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeCursorFixture {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("DMUXAI_CURSOR_BIN");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn wait_for_turn_completion(event_rx: &mut mpsc::Receiver<AgentOutput>) {
+        let timeout_dur = Duration::from_secs(5);
+        let start = Instant::now();
+        while start.elapsed() < timeout_dur {
+            match timeout(Duration::from_millis(500), event_rx.recv()).await {
+                Ok(Some(output)) => {
+                    if matches!(output.event, AgentEvent::Completed) {
+                        return;
+                    }
+                }
+                Ok(None) => panic!("event_rx closed unexpectedly"),
+                Err(_) => {}
+            }
+        }
+        panic!("turn did not complete within timeout");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    // TC-805 / FR-805, FR-806: After a turn completes, a warm process exists with the next-turn argv;
+    // the next prompt reuses it (one spawn total for turn 2); nothing is written to its stdin before the prompt.
+    async fn prewarm_reused_when_args_match() {
+        let fixture = FakeCursorFixture::new().await;
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let config = CursorAdapterConfig {
+            windows_unsandboxed: false,
+            prewarm: true,
+            prewarm_idle_secs: 300,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config, Vec::new());
+
+        // Turn 1
+        let req1 = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conv-1"),
+            turn_id: super::super::TurnId::new("turn-1"),
+            prompt: "prompt 1".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        adapter.send(req1).unwrap();
+        wait_for_turn_completion(&mut event_rx).await;
+
+        // After turn 1 completes, a warm process is spawned for turn 2 with --resume sess-1
+        let spawns = fixture.wait_for_spawns(2, Duration::from_secs(3)).await;
+        assert_eq!(spawns.len(), 2, "turn 1 spawn + warm process spawn");
+        let warm_pid = spawns[1].pid;
+        assert!(
+            fixture.is_pid_alive(warm_pid),
+            "warm process should be alive"
+        );
+        assert!(
+            spawns[1]
+                .argv
+                .windows(2)
+                .any(|w| w == ["--resume", "sess-1"]),
+            "warm process should be configured to resume turn 1's session: {:?}",
+            spawns[1].argv
+        );
+
+        // Verify nothing is written to warm process's stdin yet
+        let prompts_before = fixture.prompts_received();
+        assert_eq!(
+            prompts_before.len(),
+            1,
+            "only turn 1 prompt was received so far"
+        );
+        assert_eq!(prompts_before[0].0, spawns[0].pid);
+        let warm_logs_before = fixture
+            .read_log_lines()
+            .into_iter()
+            .filter(|l| l.contains(&warm_pid.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            warm_logs_before,
+            vec![format!("SPAWN {} {}", warm_pid, spawns[1].argv.join(" "))],
+            "no stdin bytes before prompt sent to warm process"
+        );
+
+        // Turn 2: matching arguments (--resume sess-1)
+        let req2 = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conv-1"),
+            turn_id: super::super::TurnId::new("turn-2"),
+            prompt: "prompt 2".to_owned(),
+            resume_session: Some("sess-1".to_owned()),
+            image_paths: vec![],
+        };
+        adapter.send(req2).unwrap();
+        wait_for_turn_completion(&mut event_rx).await;
+
+        // Turn 2 reused the warm process: exactly one spawn handled turn 2 (the warm process itself)
+        let prompts_after = fixture.prompts_received();
+        assert_eq!(prompts_after.len(), 2);
+        assert_eq!(
+            prompts_after[1].0, warm_pid,
+            "turn 2 prompt should be handled by warm process"
+        );
+        assert_eq!(prompts_after[1].1, "prompt 2");
+
+        // Exactly 3 spawns total: turn 1, warm process for turn 2 (reused), and warm process for turn 3
+        let spawns_after = fixture.wait_for_spawns(3, Duration::from_secs(3)).await;
+        assert_eq!(
+            spawns_after.len(),
+            3,
+            "one spawn total for turn 2 (reused warm process), plus next pre-start"
+        );
+
+        drop(adapter);
+        let _ = worker.await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    // Review fix: When MCP servers apply to Cursor, prewarm is skipped to avoid writing guard prematurely.
+    async fn prewarm_skipped_when_mcp_servers_apply() {
+        use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
+        use std::collections::BTreeMap;
+
+        let fixture = FakeCursorFixture::new().await;
+        let (event_tx, _) = mpsc::channel(64);
+        let config = CursorAdapterConfig {
+            windows_unsandboxed: false,
+            prewarm: true,
+            prewarm_idle_secs: 300,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+
+        let server = ResolvedMcpServer {
+            name: "test-server".to_owned(),
+            kind: ServerKind::Generic,
+            transport: Transport::Stdio {
+                command: "echo".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+            },
+            runners: Some(vec!["cursor".to_owned()]),
+            tools: ToolNames::default(),
+        };
+
+        let (adapter, worker) = spawn_cursor_adapter(
+            event_tx,
+            workspace.path().to_path_buf(),
+            config,
+            vec![server],
+        );
+
+        // Prewarm call should be a no-op because applicable MCP servers exist
+        adapter.prewarm().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            fixture.read_spawns().len(),
+            0,
+            "prewarm must be skipped when MCP servers apply to Cursor"
+        );
+
+        drop(adapter);
+        let _ = worker.await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    // TC-806 / FR-806, FR-807: Changing the mode or model before the prompt discards the warm process,
+    // and its pid no longer exists afterwards; a fresh one is spawned; /new discards it the same way.
+    async fn prewarm_discarded_on_arg_change() {
+        let fixture = FakeCursorFixture::new().await;
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let config = CursorAdapterConfig {
+            windows_unsandboxed: false,
+            prewarm: true,
+            prewarm_idle_secs: 300,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config, Vec::new());
+
+        // 1. Initial prewarm
+        adapter.prewarm().unwrap();
+        let spawns = fixture.wait_for_spawns(1, Duration::from_secs(3)).await;
+        assert_eq!(spawns.len(), 1);
+        let pid1 = spawns[0].pid;
+        assert!(fixture.is_pid_alive(pid1));
+
+        // 2. Change mode: Plan
+        adapter.select_mode(ExecutionMode::Plan).unwrap();
+        let event = event_rx.recv().await.unwrap();
+        assert_eq!(event.event, AgentEvent::ModeSelected(ExecutionMode::Plan));
+
+        assert!(
+            fixture
+                .wait_for_pid_gone(pid1, Duration::from_secs(3))
+                .await,
+            "pid1 should be dead after mode change"
+        );
+        let spawns = fixture.wait_for_spawns(2, Duration::from_secs(3)).await;
+        assert_eq!(spawns.len(), 2);
+        let pid2 = spawns[1].pid;
+        assert!(fixture.is_pid_alive(pid2));
+        assert!(spawns[1].argv.windows(2).any(|w| w == ["--mode", "plan"]));
+
+        // 3. Change model
+        adapter.select_model("custom-model".to_owned()).unwrap();
+        let event = event_rx.recv().await.unwrap();
+        assert_eq!(
+            event.event,
+            AgentEvent::ModelSelected("custom-model".to_owned())
+        );
+
+        assert!(
+            fixture
+                .wait_for_pid_gone(pid2, Duration::from_secs(3))
+                .await,
+            "pid2 should be dead after model change"
+        );
+        let spawns = fixture.wait_for_spawns(3, Duration::from_secs(3)).await;
+        assert_eq!(spawns.len(), 3);
+        let pid3 = spawns[2].pid;
+        assert!(fixture.is_pid_alive(pid3));
+
+        // 4. /new (reset)
+        adapter.reset().unwrap();
+        assert!(
+            fixture
+                .wait_for_pid_gone(pid3, Duration::from_secs(3))
+                .await,
+            "pid3 should be dead after /new reset"
+        );
+        // Reset never spawns; the next selection trigger does.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fixture.read_spawns().len(), 3, "reset must not spawn");
+        adapter.prewarm().unwrap();
+        let spawns = fixture.wait_for_spawns(4, Duration::from_secs(3)).await;
+        assert_eq!(spawns.len(), 4);
+        let pid4 = spawns[3].pid;
+        assert!(fixture.is_pid_alive(pid4));
+
+        // 5. Next prompt runs using the warm process
+        let req = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conv-1"),
+            turn_id: super::super::TurnId::new("turn-1"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        adapter.send(req).unwrap();
+        wait_for_turn_completion(&mut event_rx).await;
+
+        let prompts = fixture.prompts_received();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(
+            prompts[0].0, pid4,
+            "prompt should run in the warm process spawned after reset"
+        );
+
+        drop(adapter);
+        let _ = worker.await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    // TC-807 / FR-807: reaping a warm process kills its whole process group,
+    // including a grandchild that ignores SIGTERM.
+    async fn reaping_warm_process_kills_term_ignoring_grandchild() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = FakeCursorFixture::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let script = dir.path().join("cursor-agent");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntrap '' TERM\n(trap '' TERM; exec sleep 300) &\necho $! > \"{}\"\nread -r line\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: the fixture holds TEST_CURSOR_MUTEX for the whole test.
+        unsafe { std::env::set_var("DMUXAI_CURSOR_BIN", &script) };
+
+        let warm = spawn_warm_process(None, None, ExecutionMode::Ask, dir.path(), false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let grandchild = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "grandchild never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(fixture.is_pid_alive(grandchild));
+        reap_warm_process(warm).await;
+        assert!(
+            fixture
+                .wait_for_pid_gone(grandchild, Duration::from_secs(3))
+                .await,
+            "grandchild must die with the warm process group"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    // TC-807 / FR-807, NFR-805: No warm spawn when disabled, in headless run, or for graph nodes;
+    // idle expiry and quit kill it (pid gone).
+    async fn prewarm_disabled_and_expiry() {
+        let fixture = FakeCursorFixture::new().await;
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let workspace = tempfile::tempdir().unwrap();
+
+        // 1. Headless run config check: default config has prewarm = false
+        assert!(
+            !CursorAdapterConfig::default().prewarm,
+            "prewarm should default to false for headless/isolated use"
+        );
+
+        // 2. Disabled config: no warm spawn
+        let disabled_config = CursorAdapterConfig {
+            windows_unsandboxed: false,
+            prewarm: false,
+            prewarm_idle_secs: 300,
+        };
+        let (disabled_adapter, disabled_worker) = spawn_cursor_adapter(
+            event_tx.clone(),
+            workspace.path().to_path_buf(),
+            disabled_config,
+            Vec::new(),
+        );
+        disabled_adapter.prewarm().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            fixture.read_spawns().len(),
+            0,
+            "disabled adapter must not prewarm"
+        );
+
+        let req = AgentRequest {
+            conversation_id: super::super::ConversationId::new("c-dis"),
+            turn_id: super::super::TurnId::new("t-dis"),
+            prompt: "run disabled".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        disabled_adapter.send(req).unwrap();
+        wait_for_turn_completion(&mut event_rx).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            fixture.read_spawns().len(),
+            1,
+            "turn executed once, no warm process afterwards"
+        );
+        drop(disabled_adapter);
+        let _ = disabled_worker.await;
+
+        // 3. Graph nodes never prewarm
+        let enabled_config = CursorAdapterConfig {
+            windows_unsandboxed: false,
+            prewarm: true,
+            prewarm_idle_secs: 1, // short idle expiry for step 4
+        };
+        let (enabled_adapter, enabled_worker) = spawn_cursor_adapter(
+            event_tx.clone(),
+            workspace.path().to_path_buf(),
+            enabled_config,
+            Vec::new(),
+        );
+        enabled_adapter.prewarm().unwrap();
+        let spawns = fixture.wait_for_spawns(2, Duration::from_secs(3)).await;
+        let warm_pid = spawns[1].pid;
+        assert!(fixture.is_pid_alive(warm_pid));
+
+        let graph_req = AgentRequest {
+            conversation_id: super::super::ConversationId::new("c-graph"),
+            turn_id: super::super::TurnId::new("t-graph"),
+            prompt: "graph node prompt".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        enabled_adapter.send_graph_node(graph_req).unwrap();
+        assert!(
+            fixture
+                .wait_for_pid_gone(warm_pid, Duration::from_secs(3))
+                .await,
+            "warm process must be reaped on graph node"
+        );
+        wait_for_turn_completion(&mut event_rx).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            fixture.read_spawns().len(),
+            3,
+            "graph turn completed without spawning a warm process"
+        );
+
+        // 4. Idle expiry: prewarm a process and verify it expires
+        enabled_adapter.prewarm().unwrap();
+        let spawns = fixture.wait_for_spawns(4, Duration::from_secs(3)).await;
+        assert_eq!(spawns.len(), 4);
+        let idle_pid = spawns[3].pid;
+        assert!(fixture.is_pid_alive(idle_pid));
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        enabled_adapter.tick().unwrap();
+        assert!(
+            fixture
+                .wait_for_pid_gone(idle_pid, Duration::from_secs(3))
+                .await,
+            "idle warm process should be reaped after expiry"
+        );
+
+        // 5. Quit / shutdown kills any warm process
+        enabled_adapter.prewarm().unwrap();
+        let spawns = fixture.wait_for_spawns(5, Duration::from_secs(3)).await;
+        assert_eq!(spawns.len(), 5);
+        let quit_pid = spawns[4].pid;
+        assert!(fixture.is_pid_alive(quit_pid));
+
+        drop(enabled_adapter);
+        let _ = enabled_worker.await;
+        assert!(
+            fixture
+                .wait_for_pid_gone(quit_pid, Duration::from_secs(3))
+                .await,
+            "quit/drop must reap warm process"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    // TC-808 / FR-806: A warm process that has exited is reaped and the prompt runs in a fresh process.
+    async fn prewarm_exited_process_is_replaced() {
+        let fixture = FakeCursorFixture::new().await;
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let config = CursorAdapterConfig {
+            windows_unsandboxed: false,
+            prewarm: true,
+            prewarm_idle_secs: 300,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+
+        // Create the exit-once marker file so the warm process exits immediately on spawn
+        std::fs::write(&fixture.exit_once_marker, b"exit").unwrap();
+
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config, Vec::new());
+        adapter.prewarm().unwrap();
+
+        let spawns = fixture.wait_for_spawns(1, Duration::from_secs(3)).await;
+        assert_eq!(spawns.len(), 1);
+        let exited_pid = spawns[0].pid;
+
+        assert!(
+            fixture
+                .wait_for_pid_gone(exited_pid, Duration::from_secs(3))
+                .await,
+            "warm process should have exited immediately"
+        );
+
+        // Now send prompt. Since the warm process already exited, it is reaped and a fresh process is spawned.
+        let req = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conv-1"),
+            turn_id: super::super::TurnId::new("turn-1"),
+            prompt: "fresh prompt".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        adapter.send(req).unwrap();
+        wait_for_turn_completion(&mut event_rx).await;
+
+        let spawns = fixture.read_spawns();
+        assert_eq!(
+            spawns.len(),
+            2,
+            "exited warm process + fresh replacement process"
+        );
+        assert_ne!(spawns[1].pid, exited_pid);
+
+        let prompts = fixture.prompts_received();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(
+            prompts[0].0, spawns[1].pid,
+            "fresh process handled the prompt"
+        );
+        assert_eq!(prompts[0].1, "fresh prompt");
+
+        drop(adapter);
+        let _ = worker.await;
     }
 }
