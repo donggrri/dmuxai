@@ -670,6 +670,8 @@ The current product contract and test traceability matrix are in
 [docs/specs/DMUXAI-BASELINE.md](docs/specs/DMUXAI-BASELINE.md); start a new
 feature from [docs/templates/FEATURE-SPEC.md](docs/templates/FEATURE-SPEC.md)
 and follow [docs/WORKFLOW.md](docs/WORKFLOW.md).
+Planned work and its status are on the [roadmap](docs/ROADMAP.md) (with a
+GitHub milestone per release).
 
 Real-provider smoke tests are ignored in the ordinary suite because they need
 installed, authenticated CLIs and make real model requests:

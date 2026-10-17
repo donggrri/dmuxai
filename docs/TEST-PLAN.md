@@ -36,6 +36,7 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 - ✅ SPEC에 적힌 테스트 이름이 `src/`·`tests/`에 `fn <name>`으로 실제 존재 (또는 `cargo test` 필터 문자열로 매칭됨)
 - ⚠️ SPEC에는 있으나 이름 붙은 자동 테스트가 없음(수동/이름 없는 증거) 또는 코드에서 찾지 못함
 - ❌ SPEC도 테스트도 없음 → §2 갭으로 다룸
+- ⏳ v0.2.1 계획(SPEC 확정, 구현 PR에서 ✅로 전환) — [ROADMAP](ROADMAP.md)
 
 검증 방법: 각 SPEC의 `| TC-… |` 행(그래프/이미지 SPEC은 `| FR-… |` 요구사항 행의 Tests 열)에서 백틱 안 식별자를 뽑아 `rg 'fn <name>' src tests`로 확인했다.
 
@@ -277,7 +278,29 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-docs-preview | UX-753,INT-754 | TC-757 | `static_page_has_docs_panel` | unit | ✅ | docs preview (PR F) |
 | M8,M2 | SPEC-docs-preview | UX-753 | TC-758 | `docs_preview_renders_in_headless_chrome` (ignored) | e2e | ✅ | docs preview (PR F) |
 | M8,M2 | SPEC-docs-preview | INT-754 | TC-759 | `docs_module_exposes_api` | unit | ✅ | docs preview (PR F) |
-
+| M8,M2 | SPEC-first-run | FR-810,FR-811 | TC-810 | `builtin_opencode_preset_registration` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-first-run | FR-810,FR-813 | TC-811 | `fresh_install_lists_opencode` | integration | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-first-run | FR-812,FR-813 | TC-812 | `preset_without_allowed_models_explains_policy` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-first-run | FR-814 | TC-813 | `init_writes_starter_config` | integration | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-first-run | FR-814 | TC-814 | `starter_config_parses` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-first-run | FR-815,FR-816 | TC-815 | `readme_matches_release_layout` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-running-indicators | FR-820,NFR-820 | TC-820 | `run_state_transitions_follow_turn_events` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-running-indicators | FR-821,FR-822,UX-820 | TC-821 | `status_bar_spinner_and_end_marks` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-running-indicators | FR-821,UX-821 | TC-822 | `spinner_frames_and_reduced_motion` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-running-indicators | FR-823,UX-821,NFR-820 | TC-823 | `dashboard_has_run_status_indicators` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-running-indicators | FR-823,FR-824 | TC-824 | `running_indicator_renders_in_headless_chrome` (ignored) | e2e | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-docs-tree | FR-830 | TC-830 | `tree_children_lists_one_level` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-docs-tree | FR-830,FR-831 | TC-831 | `tree_api_confined_and_bounded` | integration | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-docs-tree | FR-831 | TC-832 | `docs_routes_require_auth` (extended) | integration | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-docs-tree | FR-832,FR-833,UX-830 | TC-833 | `docs_tree_sidebar_assets` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-docs-tree | FR-832,UX-830 | TC-834 | `docs_tree_renders_in_headless_chrome` (ignored) | e2e | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-todo-sidebar | FR-840..842,UX-840 | TC-840 | `todo_sidebar_assets` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-todo-sidebar | FR-840,FR-841 | TC-841 | `todo_actions_still_covered` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-todo-sidebar | FR-840..842 | TC-842 | `todo_sidebar_renders_in_headless_chrome` (ignored) | e2e | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-cursor-latency | FR-805,FR-806 | TC-805 | `prewarm_reused_when_args_match` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-cursor-latency | FR-806,FR-807 | TC-806 | `prewarm_discarded_on_arg_change` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-cursor-latency | FR-807,NFR-805 | TC-807 | `prewarm_disabled_and_expiry` | unit | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-cursor-latency | FR-806 | TC-808 | `prewarm_exited_process_is_replaced` | unit | ⏳ | v0.2.1 |
 
 ### 1.1 주의할 ⚠️ 항목
 
