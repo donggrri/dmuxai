@@ -2369,7 +2369,7 @@ impl App {
             && let Some(session) = self.graph_session.as_mut()
         {
             let actions = session.on_node_finished(&node_id, success);
-            self.graph_assignment_line = session.assignment_line();
+            self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
             let _ = save_run(&self.workspace_root, session.run());
             self.dispatch_graph_actions(actions);
         }
@@ -2381,8 +2381,18 @@ impl App {
     /// composer-2.5 default only applies to the Cursor runner; other runners
     /// fall back to their provider default (`None`).
     fn effective_model_for(&self, agent: Agent, planned: &str) -> Option<String> {
-        if let Some(selected) = self
-            .model_catalogs
+        Self::effective_model_for_catalogs(&self.model_catalogs, agent, planned)
+    }
+
+    /// Catalog-only variant of [`App::effective_model_for`] so model
+    /// resolution can run while a graph session holds a mutable borrow of the
+    /// run (e.g. when rendering the `Graph assignment:` line).
+    fn effective_model_for_catalogs(
+        catalogs: &HashMap<Agent, ModelCatalog>,
+        agent: Agent,
+        planned: &str,
+    ) -> Option<String> {
+        if let Some(selected) = catalogs
             .get(&agent)
             .and_then(|catalog| catalog.selected.clone())
         {
@@ -2449,7 +2459,7 @@ impl App {
             waiting_gate_node: None,
         };
         let mut session = GraphRunSession::new(run);
-        self.graph_assignment_line = session.assignment_line();
+        self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, &session);
         self.push_system(format!(
             "Graph {} (orchestrator {}): {}",
             session.run().plan.id,
@@ -2550,7 +2560,7 @@ impl App {
             return;
         };
         let actions = session.acknowledge_gate();
-        self.graph_assignment_line = session.assignment_line();
+        self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
         self.dispatch_graph_actions(actions);
     }
 
@@ -2594,7 +2604,7 @@ impl App {
                 node.model_id = model_id.to_owned();
             });
         if updated.is_some() {
-            self.graph_assignment_line = session.assignment_line();
+            self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
             let snapshot = session.run().clone();
             self.push_system(format!("Overrode {} → {} {}", node_id, runner, model_id));
             let _ = save_run(&self.workspace_root, &snapshot);
@@ -3442,6 +3452,24 @@ fn adapter_request(
     }
 }
 
+/// `Graph assignment:` line with each node's effective model resolved per
+/// runner (FR-460/FR-461). Non-Cursor runners without an F2 pick resolve to
+/// `provider default`, never composer-2.5; Cursor stays pinned to
+/// composer-2.5.
+fn resolved_assignment_line(
+    catalogs: &HashMap<Agent, ModelCatalog>,
+    session: &GraphRunSession,
+) -> String {
+    session.assignment_line_with(|runner, planned| {
+        if let Some(agent) = runner_from_str(runner) {
+            App::effective_model_for_catalogs(catalogs, agent, planned)
+                .unwrap_or_else(|| "provider default".to_owned())
+        } else {
+            planned.to_owned()
+        }
+    })
+}
+
 fn runner_name(agent: Agent) -> &'static str {
     match agent {
         Agent::Cursor => "cursor",
@@ -4071,6 +4099,107 @@ mod tests {
                 .as_deref(),
             Some("composer-2.5")
         );
+    }
+
+    fn start_multi_node_graph(app: &mut App, extra_nodes: Vec<dmuxai::graph::GraphNode>) {
+        let mut nodes = vec![dmuxai::graph::GraphNode {
+            id: "orchestrate".to_owned(),
+            role: NodeRole::Orchestrate,
+            job: "Build graph".to_owned(),
+            runner: "cursor".to_owned(),
+            model_id: "composer-2.5".to_owned(),
+            skill: None,
+            requires_gate: false,
+            status: dmuxai::graph::GraphNodeStatus::Completed,
+            attempt: 0,
+        }];
+        nodes.extend(extra_nodes);
+        app.settings.graph_enabled = true;
+        app.start_graph_run(dmuxai::graph::GraphPlan {
+            schema: "cursor-agent-graph/v1".to_owned(),
+            id: "test-run".to_owned(),
+            orchestrator_model: "composer-2.5".to_owned(),
+            user_prompt: "multi-step task".to_owned(),
+            nodes,
+            edges: vec![],
+            limits: dmuxai::graph::GraphLimits {
+                max_parallel: 1,
+                max_retries: 2,
+            },
+        });
+    }
+
+    #[test]
+    // TC-461 / FR-461: graph_assignment_line resolves per runner, so an AGY
+    // node with no F2 pick shows "provider default", never composer-2.5, both
+    // in the stored line and in the system message printed at run start.
+    fn graph_assignment_shows_agy_model_not_composer() {
+        let (mut app, _) = test_app();
+        app.model_catalogs.get_mut(&Agent::Agy).unwrap().selected = None;
+        start_multi_node_graph(
+            &mut app,
+            vec![dmuxai::graph::GraphNode {
+                id: "step-1".to_owned(),
+                role: NodeRole::Research,
+                job: "Research task".to_owned(),
+                runner: "agy".to_owned(),
+                model_id: "composer-2.5".to_owned(),
+                skill: None,
+                requires_gate: false,
+                status: dmuxai::graph::GraphNodeStatus::Pending,
+                attempt: 0,
+            }],
+        );
+
+        let line = &app.graph_assignment_line;
+        assert!(line.contains("step-1:research→agy:provider default"));
+        assert!(!line.contains("step-1:research→agy:composer-2.5"));
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("step-1:research→agy:provider default"))
+        );
+
+        // F2 pick wins for AGY once the user selects a model.
+        app.model_catalogs.get_mut(&Agent::Agy).unwrap().selected =
+            Some("gemini-3.8-flash-low".to_owned());
+        let session = app.graph_session.as_ref().unwrap();
+        let resolved = resolved_assignment_line(&app.model_catalogs, session);
+        assert!(resolved.contains("step-1:research→agy:gemini-3.8-flash-low"));
+    }
+
+    #[test]
+    // TC-462 / FR-462: Cursor nodes stay pinned to composer-2.5 in the
+    // assignment line, even with a disallowed F2 pick.
+    fn graph_assignment_cursor_stays_composer() {
+        let (mut app, _) = test_app();
+        app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
+        start_multi_node_graph(
+            &mut app,
+            vec![dmuxai::graph::GraphNode {
+                id: "step-2".to_owned(),
+                role: NodeRole::Implement,
+                job: "Implement task".to_owned(),
+                runner: "cursor".to_owned(),
+                model_id: "composer-2.5".to_owned(),
+                skill: None,
+                requires_gate: false,
+                status: dmuxai::graph::GraphNodeStatus::Pending,
+                attempt: 0,
+            }],
+        );
+        assert!(
+            app.graph_assignment_line
+                .contains("step-2:impl→cursor:composer-2.5")
+        );
+
+        // Disallowed F2 pick is replaced by the policy pin.
+        app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected =
+            Some("grok-4.7-medium-fast".to_owned());
+        let session = app.graph_session.as_ref().unwrap();
+        let resolved = resolved_assignment_line(&app.model_catalogs, session);
+        assert!(resolved.contains("step-2:impl→cursor:composer-2.5"));
+        assert!(!resolved.contains("grok-4.7-medium-fast"));
     }
 
     #[test]

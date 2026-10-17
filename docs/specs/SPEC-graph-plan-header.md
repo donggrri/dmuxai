@@ -9,7 +9,7 @@ The `Graph assignment:` line printed `node.model_id`, which the planner always s
 | ID | Pri | Requirement |
 |---|---|---|
 | FR-460 | Must | `GraphSession::assignment_line_with(resolve)` renders `<id>:<role>→<runner>:<model>`. `resolve(runner, planned)` returns the effective model. |
-| FR-461 | Must | The app uses the resolved line everywhere `graph_assignment_line` is set. For non-Cursor runners with no F2 pick it shows `default`, never composer-2.5. |
+| FR-461 | Must | The app uses the resolved line everywhere `graph_assignment_line` is set. For non-Cursor runners with no F2 pick it shows `provider default`, never composer-2.5. |
 | FR-462 | Must | Cursor nodes still show composer-2.5 (policy pin). |
 
 ## Acceptance
