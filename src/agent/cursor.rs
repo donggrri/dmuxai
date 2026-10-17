@@ -729,6 +729,8 @@ struct ActiveTurn {
     context: OutputContext,
     is_graph: bool,
     reset_epoch: u64,
+    // Only used for group kills on Unix (Windows support is postponed).
+    #[cfg_attr(not(unix), allow(dead_code))]
     warm_pgid: Option<u32>,
 }
 
@@ -1626,6 +1628,7 @@ pub(crate) mod tests {
     async fn selecting_mode_is_acknowledged_without_starting_a_process() {
         // Serialize with the pre-start tests (they set DMUXAI_CURSOR_BIN) and
         // disable pre-start explicitly: the default config now enables it.
+        #[cfg(unix)]
         let _guard = TEST_CURSOR_MUTEX.lock().await;
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let (adapter, worker) = spawn_cursor_adapter(
