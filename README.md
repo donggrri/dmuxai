@@ -139,19 +139,32 @@ and it is only re-sent on a resumed session when it changed.
   then `/memory approve <id>` or `/memory reject <id>`, or use the
   Approve/Reject buttons in the dashboard.
 - **MCP:** `dmuxai mcp-memory` is a stdio MCP server with `memory_search`,
-  `memory_get_context` and `memory_propose`. Register it once in the shared
-  MCP list so every runner can use it:
+  `memory_get_context` and `memory_propose`. When `[memory]` is set, DmuxAI adds
+  it to the shared MCP list automatically as `dmuxai-memory` (command = the
+  running DmuxAI executable, args `mcp-memory --workspace <repo>`), so every
+  runner, the dashboard and `/api/mcp/servers` see it. The entry holds no vault
+  path or secrets; the subcommand reads `[memory]` from the workspace.
+
+  To override it, add an entry with the same name. To disable it, add
+  `enabled = false` under that name (it is not re-added). A configured entry
+  with that name suppresses the automatic one even if it is invalid; the
+  config warning explains why.
 
   ```toml
+  # Replace the automatic entry with your own command
   [[mcp.servers]]
   name = "dmuxai-memory"
-  transport = "stdio"
-  command = "dmuxai"
-  args = ["mcp-memory"]
+  command = "/opt/dmuxai/bin/dmuxai"
+  args = ["mcp-memory", "--workspace", "/path/to/repo"]
+
+  # Or turn it off
+  [[mcp.servers]]
+  name = "dmuxai-memory"
+  enabled = false
   ```
 
-  It reads `[memory]` from the config (`--workspace DIR`, or override with
-  `--vault PATH --dir DIR --project NAME`).
+  Standalone use: `dmuxai mcp-memory --workspace DIR`, or override with
+  `--vault PATH --dir DIR --project NAME`.
 
 Details: [SPEC-obsidian-memory](docs/specs/SPEC-obsidian-memory.md).
 

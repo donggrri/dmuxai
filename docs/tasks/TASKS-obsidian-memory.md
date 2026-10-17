@@ -10,3 +10,4 @@
 | [x] | AGY, cursor composer-2.5 | Cross-reviews and fix rounds | all | `cargo test --all-targets` |
 
 | [x] | Grok Bot | Review record | all | see `docs/reviews/REVIEW-obsidian-memory.md` |
+| [x] | opencode-haiku (implementation and fix round), cursor composer-2.5 (review) | Built-in shared `dmuxai-memory` MCP entry when `[memory]` is set | FR-733, INT-732 | `cargo test --lib builtin_memory`; `cargo test --test memory_mcp builtin_memory_server_connects_via_shared_list` |

@@ -47,6 +47,20 @@ Target: Linux / Cross-platform (Windows CI)
   - The graph fallback planner hard-codes `model_id: composer-2.5` for every node, whatever the runner.
   - The opencode-muse runner hangs with no output when OpenRouter rejects the request (404 "Paid model training violation"), instead of reporting the error.
 
+## Follow-up review: shared memory MCP entry (FR-733)
+
+- Implementation: opencode-haiku. Review: cursor composer-2.5 (no blockers).
+- Fixed after review: TC-735 now isolates `HOME`, `XDG_CONFIG_HOME` and
+  `USERPROFILE` for the spawned `mcp-memory` child; TC-733 covers user
+  `enabled = false` + repo re-enable, user custom entry + repo
+  `enabled = false`, and an invalid configured `dmuxai-memory` entry (warning,
+  built-in suppressed).
+- Accepted minors: the exe path is not checked for existence (it is the
+  running binary); `mcp-memory` does a full settings load; Windows backslash
+  paths are covered only by CI; TC-734 asserts the opencode/registry paths,
+  and the Codex/Cursor paths reuse the same merged list.
+- `cargo test --all-targets --locked` (Linux): 450 passed, 0 failed, 7 ignored.
+
 ## Rollback
 
 There is no migration. Memory stays off unless `[memory] vault` is set. To roll back, revert the PR.

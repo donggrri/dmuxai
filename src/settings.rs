@@ -1,8 +1,11 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::activity::UiSettings;
+use crate::mcp::config::ToolNames;
+use crate::mcp::{McpServerSpec, ServerKind};
 use crate::notify::NotifySettings;
 use crate::theme::{Theme, ThemeToml};
 
@@ -55,6 +58,46 @@ pub struct DmuxSettings {
     pub memory: Option<crate::memory::MemoryConfig>,
     /// Raw `[memory]` keys merged per key (workspace wins), resolved in `load`.
     memory_raw: MemoryToml,
+    /// True when any configured `[[mcp.servers]]` entry (enabled or disabled)
+    /// is named `dmuxai-memory`; suppresses the built-in entry (FR-733).
+    memory_server_configured: bool,
+}
+
+/// Name of the built-in shared MCP entry added when `[memory]` is set (FR-733).
+pub const BUILTIN_MEMORY_SERVER_NAME: &str = "dmuxai-memory";
+
+/// Builds the built-in `dmuxai-memory` stdio entry (FR-733): the DmuxAI
+/// executable (absolute path) running `mcp-memory --workspace <root>`. The vault
+/// path and any secrets are never placed in the entry; the subcommand reads
+/// `[memory]` from the workspace. Errors carry the config warning text.
+pub fn builtin_memory_mcp_server(
+    exe: Option<&Path>,
+    workspace_root: &Path,
+) -> Result<McpServerSpec, String> {
+    let exe = match exe {
+        Some(path) if path.is_absolute() => path,
+        _ => {
+            return Err(format!(
+                "mcp server {BUILTIN_MEMORY_SERVER_NAME} not added: the DmuxAI executable path could not be resolved"
+            ));
+        }
+    };
+    Ok(McpServerSpec {
+        name: BUILTIN_MEMORY_SERVER_NAME.to_owned(),
+        command: Some(exe.to_string_lossy().into_owned()),
+        args: vec![
+            "mcp-memory".to_owned(),
+            "--workspace".to_owned(),
+            workspace_root.to_string_lossy().into_owned(),
+        ],
+        env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
+        kind: ServerKind::Generic,
+        runners: None,
+        enabled: true,
+        tools: ToolNames::default(),
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -129,6 +172,17 @@ impl DmuxSettings {
     }
 
     pub fn load_with_user_config(workspace: &Path, user_config_path: Option<&Path>) -> Self {
+        let exe = std::env::current_exe().ok();
+        Self::load_with_exe(workspace, user_config_path, exe.as_deref())
+    }
+
+    /// Like [`Self::load_with_user_config`] with the DmuxAI executable injected
+    /// for the built-in `dmuxai-memory` entry (FR-733), so tests are deterministic.
+    pub(crate) fn load_with_exe(
+        workspace: &Path,
+        user_config_path: Option<&Path>,
+        exe: Option<&Path>,
+    ) -> Self {
         let mut settings = Self::default();
         // Custom agent names seen in *either* config, so an id defined only in
         // the user config is not reported as unknown after the workspace config
@@ -180,8 +234,21 @@ impl DmuxSettings {
         }
 
         settings.resolve_memory(workspace);
+        settings.add_builtin_memory_server(workspace, exe);
         settings.dedupe_warnings();
         settings
+    }
+
+    /// FR-733: append the built-in `dmuxai-memory` shared entry when memory is
+    /// enabled and no configured entry (enabled or disabled) claims the name.
+    fn add_builtin_memory_server(&mut self, workspace: &Path, exe: Option<&Path>) {
+        if self.memory.is_none() || self.memory_server_configured {
+            return;
+        }
+        match builtin_memory_mcp_server(exe, workspace) {
+            Ok(spec) => self.mcp_servers.push(spec),
+            Err(warning) => self.config_warnings.push(warning),
+        }
     }
 
     /// FR-720: turn the merged `[memory]` keys into a [`MemoryConfig`].
@@ -374,6 +441,9 @@ impl DmuxSettings {
     /// become config warnings without reaching the resolved list.
     fn merge_mcp_servers(&mut self, incoming: Vec<crate::mcp::McpServerSpec>) {
         for spec in incoming {
+            if spec.name == BUILTIN_MEMORY_SERVER_NAME {
+                self.memory_server_configured = true;
+            }
             if let Err(error) = spec.validate() {
                 self.config_warnings.push(error);
                 continue;
@@ -415,6 +485,7 @@ impl Default for DmuxSettings {
             config_warnings: Vec::new(),
             memory: None,
             memory_raw: MemoryToml::default(),
+            memory_server_configured: false,
         }
     }
 }
@@ -1155,5 +1226,256 @@ timeout_secs = 0
                 .iter()
                 .any(|w| w.starts_with("notify: "))
         );
+    }
+}
+
+#[cfg(test)]
+mod builtin_memory_mcp_tests {
+    use super::*;
+
+    /// Absolute on every platform, so the built-in entry is always resolvable.
+    fn exe() -> PathBuf {
+        std::env::temp_dir().join("dmuxai-bin").join("dmuxai")
+    }
+
+    fn write_memory_ws(ws: &Path, vault: &Path, extra: &str) {
+        let v = vault.display().to_string().replace('\\', "/");
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            format!("[memory]\nvault = \"{v}\"\n{extra}"),
+        )
+        .unwrap();
+    }
+
+    // TC-733 (FR-733): memory on -> exactly one built-in entry, last, with the
+    // exe + `mcp-memory --workspace <root>` argv and no vault path or secrets.
+    #[test]
+    fn builtin_memory_mcp_server_appends_last_entry_when_memory_on() {
+        let ws = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        let user = ws.path().join("user.toml");
+        std::fs::write(
+            &user,
+            "[[mcp.servers]]\nname = \"other\"\ncommand = \"other-cmd\"\n",
+        )
+        .unwrap();
+        write_memory_ws(ws.path(), vault.path(), "");
+
+        let exe = exe();
+        let s = DmuxSettings::load_with_exe(ws.path(), Some(&user), Some(&exe));
+        assert!(s.memory.is_some());
+        let builtins: Vec<&McpServerSpec> = s
+            .mcp_servers
+            .iter()
+            .filter(|spec| spec.name == BUILTIN_MEMORY_SERVER_NAME)
+            .collect();
+        assert_eq!(builtins.len(), 1, "{:?}", s.mcp_servers);
+        let spec = builtins[0];
+        assert_eq!(
+            s.mcp_servers.last().map(|x| x.name.as_str()),
+            Some("dmuxai-memory")
+        );
+        assert_eq!(
+            spec.command.as_deref(),
+            Some(exe.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            spec.args,
+            vec![
+                "mcp-memory".to_owned(),
+                "--workspace".to_owned(),
+                ws.path().to_string_lossy().into_owned(),
+            ]
+        );
+        assert!(spec.env.is_empty() && spec.headers.is_empty() && spec.url.is_none());
+        assert_eq!(spec.kind, ServerKind::Generic);
+        assert!(spec.runners.is_none() && spec.enabled);
+        let vault_str = vault.path().to_string_lossy().into_owned();
+        assert!(spec.args.iter().all(|arg| !arg.contains(&vault_str)));
+        assert!(s.config_warnings.is_empty(), "{:?}", s.config_warnings);
+    }
+
+    // TC-733 (FR-733): memory off -> no built-in entry, no warning.
+    #[test]
+    fn builtin_memory_mcp_server_absent_when_memory_off() {
+        let ws = tempfile::tempdir().unwrap();
+        let exe = exe();
+        let s = DmuxSettings::load_with_exe(ws.path(), None, Some(&exe));
+        assert!(s.memory.is_none());
+        assert!(
+            s.mcp_servers
+                .iter()
+                .all(|x| x.name != BUILTIN_MEMORY_SERVER_NAME)
+        );
+        assert!(s.config_warnings.is_empty(), "{:?}", s.config_warnings);
+    }
+
+    // TC-733 (FR-733): a repo entry with the same name replaces the built-in one.
+    #[test]
+    fn builtin_memory_mcp_server_repo_entry_replaces_builtin() {
+        let ws = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        write_memory_ws(
+            ws.path(),
+            vault.path(),
+            "\n[[mcp.servers]]\nname = \"dmuxai-memory\"\ncommand = \"custom-memory\"\n",
+        );
+        let exe = exe();
+        let s = DmuxSettings::load_with_exe(ws.path(), None, Some(&exe));
+        let builtins: Vec<&McpServerSpec> = s
+            .mcp_servers
+            .iter()
+            .filter(|spec| spec.name == BUILTIN_MEMORY_SERVER_NAME)
+            .collect();
+        assert_eq!(builtins.len(), 1, "{:?}", s.mcp_servers);
+        assert_eq!(builtins[0].command.as_deref(), Some("custom-memory"));
+        assert!(builtins[0].args.is_empty());
+    }
+
+    // TC-733 (FR-733): `enabled = false` on the name removes it and it is not
+    // re-added, even though memory is on.
+    #[test]
+    fn builtin_memory_mcp_server_disabled_name_is_not_readded() {
+        let ws = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        write_memory_ws(
+            ws.path(),
+            vault.path(),
+            "\n[[mcp.servers]]\nname = \"dmuxai-memory\"\nenabled = false\n",
+        );
+        let exe = exe();
+        let s = DmuxSettings::load_with_exe(ws.path(), None, Some(&exe));
+        assert!(s.memory.is_some());
+        assert!(
+            s.mcp_servers
+                .iter()
+                .all(|x| x.name != BUILTIN_MEMORY_SERVER_NAME)
+        );
+        assert!(s.config_warnings.is_empty(), "{:?}", s.config_warnings);
+    }
+
+    // TC-733 (FR-733): an unresolvable (absent or relative) exe -> one warning,
+    // no entry.
+    #[test]
+    fn builtin_memory_mcp_server_unresolvable_exe_warns() {
+        let ws = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        write_memory_ws(ws.path(), vault.path(), "");
+
+        let s = DmuxSettings::load_with_exe(ws.path(), None, None);
+        assert!(
+            s.mcp_servers
+                .iter()
+                .all(|x| x.name != BUILTIN_MEMORY_SERVER_NAME)
+        );
+        let warnings: Vec<&String> = s
+            .config_warnings
+            .iter()
+            .filter(|w| w.contains(BUILTIN_MEMORY_SERVER_NAME))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{:?}", s.config_warnings);
+
+        let relative = Path::new("dmuxai");
+        assert!(builtin_memory_mcp_server(Some(relative), ws.path()).is_err());
+        assert!(builtin_memory_mcp_server(None, ws.path()).is_err());
+    }
+
+    // TC-733 (FR-733): user disables the name, repo re-enables it with its own
+    // entry -> the repo entry is the only one and no built-in duplicate is added.
+    #[test]
+    fn builtin_memory_mcp_server_user_disabled_repo_reenables_with_own_entry() {
+        let ws = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        let user = ws.path().join("user.toml");
+        std::fs::write(
+            &user,
+            "[[mcp.servers]]\nname = \"dmuxai-memory\"\nenabled = false\n",
+        )
+        .unwrap();
+        write_memory_ws(
+            ws.path(),
+            vault.path(),
+            "\n[[mcp.servers]]\nname = \"dmuxai-memory\"\ncommand = \"repo-memory\"\n",
+        );
+        let exe = exe();
+        let s = DmuxSettings::load_with_exe(ws.path(), Some(&user), Some(&exe));
+        let builtins: Vec<&McpServerSpec> = s
+            .mcp_servers
+            .iter()
+            .filter(|spec| spec.name == BUILTIN_MEMORY_SERVER_NAME)
+            .collect();
+        assert_eq!(builtins.len(), 1, "{:?}", s.mcp_servers);
+        assert_eq!(builtins[0].command.as_deref(), Some("repo-memory"));
+        assert!(builtins[0].args.is_empty(), "repo entry, not built-in");
+        assert!(s.config_warnings.is_empty(), "{:?}", s.config_warnings);
+    }
+
+    // TC-733 (FR-733): user custom entry, repo `enabled = false` on the name ->
+    // absent, and the built-in entry is not re-added.
+    #[test]
+    fn builtin_memory_mcp_server_user_custom_repo_disabled_stays_absent() {
+        let ws = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        let user = ws.path().join("user.toml");
+        std::fs::write(
+            &user,
+            "[[mcp.servers]]\nname = \"dmuxai-memory\"\ncommand = \"user-memory\"\n",
+        )
+        .unwrap();
+        write_memory_ws(
+            ws.path(),
+            vault.path(),
+            "\n[[mcp.servers]]\nname = \"dmuxai-memory\"\nenabled = false\n",
+        );
+        let exe = exe();
+        let s = DmuxSettings::load_with_exe(ws.path(), Some(&user), Some(&exe));
+        assert!(s.memory.is_some());
+        assert!(
+            s.mcp_servers
+                .iter()
+                .all(|spec| spec.name != BUILTIN_MEMORY_SERVER_NAME),
+            "{:?}",
+            s.mcp_servers
+        );
+        assert!(s.config_warnings.is_empty(), "{:?}", s.config_warnings);
+    }
+
+    // TC-733 (FR-733): a configured `dmuxai-memory` entry that fails validation
+    // warns and suppresses the built-in entry (README: a configured entry with
+    // that name wins even when invalid).
+    #[test]
+    fn builtin_memory_mcp_server_invalid_configured_entry_warns_and_suppresses() {
+        let ws = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        let exe = exe();
+        let cases = [
+            (
+                "\n[[mcp.servers]]\nname = \"dmuxai-memory\"\ncommand = \"a\"\nurl = \"https://mcp.example.invalid/mcp\"\n",
+                "sets both command and url",
+            ),
+            (
+                "\n[[mcp.servers]]\nname = \"dmuxai-memory\"\n",
+                "needs either command or url",
+            ),
+        ];
+        for (extra, expected) in cases {
+            write_memory_ws(ws.path(), vault.path(), extra);
+            let s = DmuxSettings::load_with_exe(ws.path(), None, Some(&exe));
+            assert!(s.memory.is_some());
+            assert!(
+                s.mcp_servers
+                    .iter()
+                    .all(|spec| spec.name != BUILTIN_MEMORY_SERVER_NAME),
+                "built-in must not be added: {:?}",
+                s.mcp_servers
+            );
+            assert!(
+                s.config_warnings
+                    .iter()
+                    .any(|w| w.contains("dmuxai-memory") && w.contains(expected)),
+                "{:?}",
+                s.config_warnings
+            );
+        }
     }
 }
