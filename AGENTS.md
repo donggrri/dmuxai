@@ -98,3 +98,33 @@ requirement.
 For a regression fix, first add a test that fails for the reported behavior,
 then implement the fix. For a new provider protocol, use saved JSON/NDJSON
 fixtures for normal, partial, malformed, and terminal events.
+
+## Agent test helpers
+
+When writing or extending `src/app.rs` integration tests, use the helpers in the
+`#[cfg(test)] mod tests` block. **There is no `App::handle_enter` in production**
+— submitting a prompt is [`submit_prompt`](src/app.rs) (bound to Enter in the
+TUI). A `#[cfg(test)]` `handle_enter` alias exists only so mistaken generated
+calls still compile.
+
+| Helper | Returns | Use when |
+| --- | --- | --- |
+| `test_app()` | `(App, SentRequests)` | Default: `:memory:` DB, recording adapters, Codex selected. |
+| `test_app_with_engine(engine)` | `(App, SentRequests)` | You need a specific [`ConversationEngine`](src/conversation.rs) (e.g. on-disk temp DB). |
+| `test_app_with_engine_and_failure(engine, agent)` | `(App, SentRequests)` | Simulate `AdapterError::CommandQueueFull` on send for one agent. |
+| `test_app_runtime(engine, failing_agent)` | `(App, SentRequests, CancelRequests)` | Assert cancel paths as well as sent requests. |
+| `test_app_with_unsupported_mode(engine, agent, mode)` | `(App, SentRequests)` | One agent returns `AdapterError::UnsupportedMode` for a mode. |
+
+Typical flow:
+
+```rust
+let (mut app, sent) = test_app();
+app.input = "hello".to_owned();
+app.submit_prompt(); // not handle_enter (test alias only)
+let requests = sent.lock().unwrap();
+assert_eq!(requests.len(), 1);
+```
+
+Set `app.selected = adapter_index(Agent::Cursor)` (or another runner) before
+submitting when the test depends on the active agent. Inspect captured traffic
+via `sent.lock().unwrap()`; each entry is `(Agent, AgentRequest)`.

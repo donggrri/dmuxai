@@ -1663,6 +1663,13 @@ impl App {
         self.submit_to_agent(agent, prompt, true);
     }
 
+    /// Test-only alias for generated tests that call `handle_enter`; production
+    /// code submits via [`submit_prompt`] (Enter key) instead.
+    #[cfg(test)]
+    fn handle_enter(&mut self) {
+        self.submit_prompt();
+    }
+
     fn submit_to_agent(&mut self, agent: Agent, prompt: String, restore_input_on_failure: bool) {
         if self.busy_agents.contains(&agent) {
             if restore_input_on_failure {
@@ -3901,6 +3908,16 @@ fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    //! Integration helpers for `App` unit tests (see `AGENTS.md` § Agent test helpers).
+    //!
+    //! - [`test_app`] — in-memory conversation DB, recording adapters, Codex selected.
+    //! - [`test_app_with_engine`] / [`test_app_with_engine_and_failure`] — reuse a
+    //!   [`ConversationEngine`] (persistence or schema scenarios).
+    //! - [`test_app_runtime`] — also returns cancel-request recording (`CancelRequests`).
+    //! - [`test_app_with_unsupported_mode`] — one agent rejects a mode via [`AdapterError`].
+    //! - [`submit_prompt`] — send the prompt buffer to the selected agent (set `app.input`
+    //!   first). There is no `handle_enter` in production; [`App::handle_enter`] is a
+    //!   `#[cfg(test)]` alias that forwards here.
     use std::sync::{Arc, Mutex};
 
     use ratatui::backend::TestBackend;
@@ -4474,6 +4491,17 @@ mod tests {
             rendered_codex.contains("provider default"),
             "Codex status without selection should show provider default: {rendered_codex}"
         );
+    }
+
+    #[test]
+    fn handle_enter_alias_submits_prompt() {
+        let (mut app, sent) = test_app();
+        app.input = "via alias".to_owned();
+        app.handle_enter();
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, Agent::Codex);
+        assert_eq!(requests[0].1.prompt, "via alias");
     }
 
     #[test]
