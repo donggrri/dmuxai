@@ -5,7 +5,6 @@ mod process;
 use std::{
     error::Error,
     io::{self, IsTerminal, Stdout},
-    path::PathBuf,
 };
 
 use app::App;
@@ -98,7 +97,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let startup_warning = dmuxai::workspace::normalize_workspace_path(&workspace_root)
         .ok()
         .and_then(|normalized| dmuxai::workspace::wsl_mnt_warning(&normalized));
-    let engine = ConversationEngine::open(&conversation_db_path()?, &workspace_root)?;
+    let (db_path, migration_notice) = dmuxai::state_path::prepare_repo_db(&workspace_root)?;
+    let engine = ConversationEngine::open(&db_path, &workspace_root)?;
     let no_color = std::env::var("NO_COLOR").ok();
     let force_env = std::env::var("DMUXAI_FORCE_COLOR").ok();
     let color_enabled = dmuxai::theme::resolve_color_output(
@@ -113,6 +113,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for warning in config_warnings.into_iter().chain(custom_warnings) {
         app.push_startup_notice(warning);
     }
+    if let Some(notice) = migration_notice {
+        app.push_startup_notice(notice);
+    }
     if !color_enabled {
         app.push_startup_notice(
             "Chat colors are off because NO_COLOR is set. Run with DMUXAI_FORCE_COLOR=1 or set [theme] force_color = true in dmuxai.toml to enable them.".to_owned(),
@@ -125,38 +128,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let result = app.run(session.terminal_mut()).await;
     app.shutdown().await;
     result.map_err(Into::into)
-}
-
-fn conversation_db_path() -> io::Result<PathBuf> {
-    #[cfg(windows)]
-    {
-        let base = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is not configured")
-        })?;
-        Ok(PathBuf::from(base)
-            .join("DmuxAI")
-            .join("conversations.sqlite3"))
-    }
-
-    #[cfg(not(windows))]
-    {
-        if let Some(base) = std::env::var_os("XDG_STATE_HOME") {
-            return Ok(PathBuf::from(base)
-                .join("dmuxai")
-                .join("conversations.sqlite3"));
-        }
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "neither XDG_STATE_HOME nor HOME is configured",
-            )
-        })?;
-        Ok(PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("dmuxai")
-            .join("conversations.sqlite3"))
-    }
 }
 
 /// Owns terminal raw/alternate-screen state and restores it on every return path.
