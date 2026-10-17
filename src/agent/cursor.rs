@@ -227,7 +227,8 @@ async fn reap_warm_process(mut warm: WarmProcess) {
                 .status()
                 .await;
         }
-        let exit_status = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+        let exit_status =
+            tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await;
         if exit_status.is_err() {
             #[cfg(unix)]
             if let Some(id) = child.id() {
@@ -1588,11 +1589,14 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn selecting_mode_is_acknowledged_without_starting_a_process() {
+        // Serialize with the pre-start tests (they set DMUXAI_CURSOR_BIN) and
+        // disable pre-start explicitly: the default config now enables it.
+        let _guard = TEST_CURSOR_MUTEX.lock().await;
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let (adapter, worker) = spawn_cursor_adapter(
             event_tx,
             PathBuf::from("workspace"),
-            dmuxai::settings::DmuxSettings::default(),
+            CursorAdapterConfig::from_settings(&dmuxai::settings::DmuxSettings::default(), false),
             Vec::new(),
         );
 
@@ -2248,6 +2252,10 @@ pub(crate) mod tests {
                 .await,
             "pid3 should be dead after /new reset"
         );
+        // Reset never spawns; the next selection trigger does.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fixture.read_spawns().len(), 3, "reset must not spawn");
+        adapter.prewarm().unwrap();
         let spawns = fixture.wait_for_spawns(4, Duration::from_secs(3)).await;
         assert_eq!(spawns.len(), 4);
         let pid4 = spawns[3].pid;

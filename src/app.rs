@@ -3804,7 +3804,6 @@ impl App {
         let agent = runner_from_str(runner)?;
         self.selected = adapter_index(agent);
         let index = adapter_index(agent);
-        let _ = self.adapters[index].prewarm();
         let Some(model_id) = self.effective_model_for(agent, model_id) else {
             return Some(agent);
         };
@@ -13299,18 +13298,38 @@ mod tests {
         // 2. /new (create_conversation path)
         app.create_conversation(Some("brand new chat".to_owned()));
 
-        // Old warm process is reaped; fresh warm process is spawned for the new conversation
+        // Old warm process is reaped; Reset never spawns a replacement (the
+        // next selection or finished turn does).
         assert!(
             fixture
                 .wait_for_pid_gone(warm_pid, Duration::from_secs(3))
                 .await,
             "old warm process must be reaped on /new"
         );
-        let spawns = fixture.wait_for_spawns(2, Duration::from_secs(3)).await;
-        assert_eq!(spawns.len(), 2);
-        let new_warm_pid = spawns[1].pid;
-        assert!(fixture.is_pid_alive(new_warm_pid));
-        assert_ne!(new_warm_pid, warm_pid);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fixture.read_spawns().len(), 1, "/new must not spawn");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    // SPEC-cursor-latency: no pre-start at TUI startup or on /new, and none
+    // when another agent is selected.
+    async fn app_does_not_prestart_cursor_on_startup_or_new() {
+        let fixture = crate::agent::FakeCursorFixture::new().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), temp_dir.path()).unwrap();
+        let mut settings = DmuxSettings::default();
+        settings.cursor_prewarm = true;
+        let mut app =
+            App::new_interactive(engine, temp_dir.path().to_path_buf(), settings).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fixture.read_spawns().len(), 0, "startup must not spawn");
+
+        app.selected = adapter_index(Agent::Codex);
+        app.create_conversation(Some("another chat".to_owned()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fixture.read_spawns().len(), 0, "/new must not spawn");
     }
 
     #[tokio::test]
