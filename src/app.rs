@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     io, mem,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -46,6 +47,8 @@ use dmuxai::{
     settings::DmuxSettings,
     skills::{discover_skills, skill_prompt_prefix},
     theme::Speaker,
+    todo::{Todo, TodoError, TodoStatus, TodoStore},
+    web::commands::{DashboardCommand, RunMode, RunTodoError},
 };
 
 use crate::agent::{
@@ -210,6 +213,7 @@ struct ConversationPicker {
     cursor: usize,
 }
 
+#[derive(Clone)]
 struct ActiveTurn {
     conversation_id: StoredConversationId,
     turn_id: StoredTurnId,
@@ -371,6 +375,7 @@ struct DeferredTurn {
     conversation_id: StoredConversationId,
     agent: Agent,
     prompt: String,
+    todo_id: Option<String>,
 }
 
 struct PendingSummary {
@@ -453,6 +458,10 @@ pub struct App {
     dashboard: Option<dmuxai::web::DashboardHub>,
     last_graph_run: Option<dmuxai::graph::GraphRun>,
     pub(crate) dirty: bool,
+    todo_store: Option<Arc<TodoStore>>,
+    dashboard_commands: Option<mpsc::Receiver<DashboardCommand>>,
+    todo_turns: HashMap<(Agent, StoredTurnId), String>,
+    graph_todo: Option<(String, String)>,
 }
 
 impl App {
@@ -575,6 +584,10 @@ impl App {
             dashboard: None,
             last_graph_run: None,
             dirty: false,
+            todo_store: None,
+            dashboard_commands: None,
+            todo_turns: HashMap::new(),
+            graph_todo: None,
         };
         app.restore_snapshot(snapshot);
         Ok(app)
@@ -619,8 +632,9 @@ impl App {
                 last_busy_tick = Instant::now();
             }
 
+            let cmd_changed = self.drain_dashboard_commands();
             let drain = self.drain_agent_events();
-            dirty |= drain.changed || self.dirty;
+            dirty |= cmd_changed || drain.changed || self.dirty;
             self.dirty = false;
 
             // FR-530: publish on completed turns immediately, coalesce other
@@ -690,7 +704,48 @@ impl App {
         self.busy_agents.clear();
         self.active_turns.clear();
         self.streaming_messages.clear();
+
+        if let Some(store) = self.todo_store.clone() {
+            let mut ids_to_finish: HashSet<String> =
+                self.todo_turns.drain().map(|(_, id)| id).collect();
+            if let Some((_plan_id, todo_id)) = self.graph_todo.take() {
+                ids_to_finish.insert(todo_id);
+            }
+            let changed = !ids_to_finish.is_empty();
+            for todo_id in ids_to_finish {
+                if let Err(err) =
+                    store.finish_run(&todo_id, false, Some("dmuxai exited".to_owned()))
+                {
+                    self.push_system(format!("Failed to finish to-do run on shutdown: {err}"));
+                }
+            }
+            if changed {
+                self.publish_todos();
+            }
+        }
+
         let _ = self.engine.close_session();
+    }
+
+    fn drain_dashboard_commands(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(mut rx) = self.dashboard_commands.take() {
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    DashboardCommand::RunTodo {
+                        todo_id,
+                        mode,
+                        reply,
+                    } => {
+                        let result = self.run_todo(&todo_id, mode);
+                        let _ = reply.send(result);
+                        changed = true;
+                    }
+                }
+            }
+            self.dashboard_commands = Some(rx);
+        }
+        changed
     }
 
     fn drain_agent_events(&mut self) -> DrainEventsOutcome {
@@ -743,7 +798,13 @@ impl App {
                         AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_)
                     );
                     if terminal {
-                        self.finish_turn(output.agent);
+                        let success = matches!(output.event, AgentEvent::Completed);
+                        let error = match &output.event {
+                            AgentEvent::Error(err) => Some(err.clone()),
+                            AgentEvent::Cancelled => Some("cancelled".to_owned()),
+                            _ => None,
+                        };
+                        self.finish_turn_outcome_with_error(output.agent, success, error);
                     }
                     self.show_conversation_notice(
                         &StoredConversationId::new(conversation_id.as_str()),
@@ -760,7 +821,13 @@ impl App {
                 if visible {
                     self.apply_agent_event(output.agent, output.event);
                 } else if terminal {
-                    self.finish_turn(output.agent);
+                    let success = matches!(output.event, AgentEvent::Completed);
+                    let error = match &output.event {
+                        AgentEvent::Error(err) => Some(err.clone()),
+                        AgentEvent::Cancelled => Some("cancelled".to_owned()),
+                        _ => None,
+                    };
+                    self.finish_turn_outcome_with_error(output.agent, success, error);
                 } else if matches!(output.event, AgentEvent::Started) {
                     self.busy_agents.insert(output.agent);
                 }
@@ -1695,6 +1762,15 @@ impl App {
     }
 
     fn submit_to_agent(&mut self, agent: Agent, prompt: String, restore_input_on_failure: bool) {
+        let _ = self.try_submit_to_agent(agent, prompt, restore_input_on_failure);
+    }
+
+    fn try_submit_to_agent(
+        &mut self,
+        agent: Agent,
+        prompt: String,
+        restore_input_on_failure: bool,
+    ) -> Result<StoredTurnId, RunTodoError> {
         if self.busy_agents.contains(&agent) {
             if restore_input_on_failure {
                 self.input = prompt;
@@ -1702,7 +1778,7 @@ impl App {
             self.push_system(format!(
                 "{agent} is busy; cancel the active turn before sending another prompt."
             ));
-            return;
+            return Err(RunTodoError::Busy(format!("{agent} is busy")));
         }
 
         let adapter_index = adapter_index(agent);
@@ -1712,7 +1788,9 @@ impl App {
                 self.input = prompt;
             }
             self.push_system(format!("Could not start {agent} in {mode} mode: {error}"));
-            return;
+            return Err(RunTodoError::Internal(format!(
+                "Could not start {agent} in {mode} mode: {error}"
+            )));
         }
 
         if agent == Agent::Cursor {
@@ -1765,17 +1843,22 @@ impl App {
                         conversation_id: self.conversation_id.clone(),
                         agent,
                         prompt,
+                        todo_id: None,
                     }),
                     None,
                 );
-                return;
+                return Err(RunTodoError::Busy(format!(
+                    "{agent} requires conversation summary"
+                )));
             }
             Err(error) => {
                 if restore_input_on_failure {
                     self.input = prompt;
                 }
                 self.push_system(format!("Could not start {agent} turn: {error}"));
-                return;
+                return Err(RunTodoError::Internal(format!(
+                    "Could not start {agent} turn: {error}"
+                )));
             }
         };
 
@@ -1789,7 +1872,7 @@ impl App {
             if restore_input_on_failure {
                 self.input = prompt;
             }
-            return;
+            return Err(RunTodoError::Internal(message.to_owned()));
         }
         let adapter_request = adapter_request(request, image_paths);
         self.messages.push(Message::new(Role::User, prompt.clone()));
@@ -1800,7 +1883,7 @@ impl App {
                     agent,
                     ActiveTurn {
                         conversation_id: stored_conversation_id,
-                        turn_id: stored_turn_id,
+                        turn_id: stored_turn_id.clone(),
                     },
                 );
                 self.busy_agents.insert(agent);
@@ -1808,6 +1891,7 @@ impl App {
                     agent,
                     AgentActivity::queued(ActivityKind::Turn, Instant::now()),
                 );
+                Ok(stored_turn_id)
             }
             Err(error) => {
                 let failed = TurnOutput {
@@ -1826,6 +1910,9 @@ impl App {
                     self.input = prompt;
                 }
                 self.push_system(format!("Could not send to {agent}: {error}"));
+                Err(RunTodoError::Internal(format!(
+                    "Could not send to {agent}: {error}"
+                )))
             }
         }
     }
@@ -1845,7 +1932,16 @@ impl App {
         }
 
         if was_tracking {
-            self.finish_turn_outcome(agent, false);
+            if let Some(active) = self.active_turns.get(&agent) {
+                let stored_output = TurnOutput {
+                    conversation_id: active.conversation_id.clone(),
+                    turn_id: active.turn_id.clone(),
+                    agent: agent_key(agent),
+                    event: TurnEvent::Cancelled,
+                };
+                let _ = self.engine.record_turn_outputs(&[stored_output]);
+            }
+            self.finish_turn_outcome_with_error(agent, false, Some("cancelled".to_owned()));
         }
     }
 
@@ -2274,9 +2370,9 @@ impl App {
             } => self.apply_tool_progress(agent, item_id, summary, state),
             AgentEvent::Activity(item) => self.apply_activity(agent, item),
             AgentEvent::Status(status) => self.apply_status(agent, status),
-            AgentEvent::Completed => self.finish_turn_outcome(agent, true),
+            AgentEvent::Completed => self.finish_turn_outcome_with_error(agent, true, None),
             AgentEvent::Cancelled => {
-                self.finish_turn_outcome(agent, false);
+                self.finish_turn_outcome_with_error(agent, false, Some("cancelled".to_owned()));
                 self.messages.push(Message::new(
                     Role::System,
                     format!("{agent} turn cancelled."),
@@ -2286,7 +2382,7 @@ impl App {
                 if let Some(catalog) = self.model_catalogs.get_mut(&agent) {
                     catalog.loading = false;
                 }
-                self.finish_turn_outcome(agent, false);
+                self.finish_turn_outcome_with_error(agent, false, Some(error.clone()));
                 self.messages.push(Message::new(
                     Role::System,
                     format!("{agent} error: {error}"),
@@ -2390,20 +2486,45 @@ impl App {
         self.streaming_messages.insert(agent, index);
     }
 
+    #[allow(dead_code)]
     fn finish_turn(&mut self, agent: Agent) {
         self.finish_turn_outcome(agent, true);
     }
 
+    #[allow(dead_code)]
     fn finish_turn_outcome(&mut self, agent: Agent, success: bool) {
+        let error = if success {
+            None
+        } else {
+            Some("turn failed".to_owned())
+        };
+        self.finish_turn_outcome_with_error(agent, success, error);
+    }
+
+    fn finish_turn_outcome_with_error(
+        &mut self,
+        agent: Agent,
+        success: bool,
+        error: Option<String>,
+    ) {
         self.busy_agents.remove(&agent);
         self.activities.remove(&agent);
-        self.active_turns.remove(&agent);
+        let active_turn = self.active_turns.remove(&agent);
         self.streaming_messages.remove(&agent);
         self.tool_messages.remove(&agent);
         if let Some((_, single_agent, _)) = self.single_graph_plan
             && single_agent == agent
         {
             self.single_graph_plan = None;
+        }
+        if let Some(active) = active_turn
+            && let Some(todo_id) = self.todo_turns.remove(&(agent, active.turn_id))
+            && let Some(store) = self.todo_store.clone()
+        {
+            if let Err(err) = store.finish_run(&todo_id, success, error) {
+                self.push_system(format!("Failed to finish to-do run: {err}"));
+            }
+            self.publish_todos();
         }
         if let Some(node_id) = self.graph_active_turn_node.take()
             && let Some(session) = self.graph_session.as_mut()
@@ -2528,9 +2649,53 @@ impl App {
                     self.graph_session = None;
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
+                    if let Some((_plan_id, todo_id)) = self.graph_todo.take()
+                        && let Some(store) = self.todo_store.clone()
+                    {
+                        if let Err(err) = store.finish_run(&todo_id, true, None) {
+                            self.push_system(format!("Failed to finish to-do run: {err}"));
+                        }
+                        self.publish_todos();
+                    }
                 }
                 GraphAction::Failed(message) => {
                     self.push_system(format!("Graph failed: {message}"));
+                    if let Some(node_id) = self.graph_active_turn_node.take() {
+                        let runner = self
+                            .graph_session
+                            .as_ref()
+                            .and_then(|s| s.run().plan.nodes.iter().find(|n| n.id == node_id))
+                            .map(|n| n.runner.clone());
+                        if let Some(runner) = runner
+                            && let Some(agent) = runner_from_str(&runner)
+                        {
+                            let _ = self.adapters[adapter_index(agent)].cancel();
+                            if let Some(active) = self.active_turns.remove(&agent) {
+                                let stored_output = TurnOutput {
+                                    conversation_id: active.conversation_id,
+                                    turn_id: active.turn_id,
+                                    agent: agent_key(agent),
+                                    event: TurnEvent::Cancelled,
+                                };
+                                let _ = self.engine.record_turn_outputs(&[stored_output]);
+                            }
+                            self.busy_agents.remove(&agent);
+                            self.streaming_messages.remove(&agent);
+                            self.activities.remove(&agent);
+                            self.tool_messages.remove(&agent);
+                        }
+                    }
+                    self.graph_session = None;
+                    self.graph_assignment_line.clear();
+                    self.single_graph_plan = None;
+                    if let Some((_plan_id, todo_id)) = self.graph_todo.take()
+                        && let Some(store) = self.todo_store.clone()
+                    {
+                        if let Err(err) = store.finish_run(&todo_id, false, Some(message)) {
+                            self.push_system(format!("Failed to finish to-do run: {err}"));
+                        }
+                        self.publish_todos();
+                    }
                 }
             }
         }
@@ -2543,6 +2708,10 @@ impl App {
         let Some(agent) = self.apply_runner_and_model(&assignment.runner, &assignment.model_id)
         else {
             self.push_system(format!("Unknown graph runner: {}", assignment.runner));
+            self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
+                "unknown graph runner: {}",
+                assignment.runner
+            ))]);
             return;
         };
         self.graph_active_turn_node = Some(assignment.node_id.clone());
@@ -2569,7 +2738,12 @@ impl App {
             "Graph node {} via {} model {}",
             assignment.node_id, agent, shown_model
         ));
-        self.submit_to_agent(agent, prompt, false);
+        if let Err(err) = self.try_submit_to_agent(agent, prompt, false) {
+            self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
+                "failed to start node {}: {err:?}",
+                assignment.node_id
+            ))]);
+        }
     }
 
     fn show_graph_status(&mut self) {
@@ -2763,6 +2937,7 @@ impl App {
     pub fn attach_dashboard(&mut self, hub: dmuxai::web::DashboardHub) {
         self.dashboard = Some(hub);
         self.publish_dashboard();
+        self.publish_todos();
     }
 
     /// Publishes agent and graph state to the attached dashboard, if any (FR-530).
@@ -2812,7 +2987,218 @@ impl App {
         hub.publish(agents, graph);
     }
 
+    /// Attaches the to-do store and dashboard command channel, reconciles any
+    /// stale running to-dos from a previous session, and publishes the to-do list
+    /// to the dashboard hub (FR-542).
+    pub fn attach_dashboard_services(
+        &mut self,
+        store: Arc<TodoStore>,
+        commands: mpsc::Receiver<DashboardCommand>,
+    ) {
+        if let Ok(todos) = store.list() {
+            for todo in todos {
+                if todo.status == TodoStatus::Running
+                    && let Err(err) = store.finish_run(
+                        &todo.id,
+                        false,
+                        Some("interrupted (dmuxai restarted)".to_owned()),
+                    )
+                {
+                    self.push_system(format!("Failed to reconcile stale to-do: {err}"));
+                }
+            }
+        }
+        self.todo_store = Some(store);
+        self.dashboard_commands = Some(commands);
+        self.publish_todos();
+    }
+
+    /// Publishes the current to-do list to the dashboard hub, if attached (FR-542).
+    fn publish_todos(&mut self) {
+        let (Some(hub), Some(store)) = (&self.dashboard, &self.todo_store) else {
+            return;
+        };
+        match store.list() {
+            Ok(todos) => {
+                hub.set_todos(todos);
+            }
+            Err(err) => {
+                self.push_system(format!("Failed to list to-dos: {err}"));
+            }
+        }
+    }
+
+    /// Runs a to-do either through an agent or through the graph planner (FR-542).
+    pub fn run_todo(&mut self, todo_id: &str, mode: RunMode) -> Result<Todo, RunTodoError> {
+        let Some(store) = self.todo_store.clone() else {
+            return Err(RunTodoError::Internal(
+                "to-do store not attached".to_owned(),
+            ));
+        };
+
+        if self.graph_session.is_some() {
+            return Err(RunTodoError::Busy(
+                "a graph session is already active".to_owned(),
+            ));
+        }
+
+        let todo = store.get(todo_id).map_err(|err| match err {
+            TodoError::NotFound => RunTodoError::NotFound,
+            other => {
+                self.push_system(format!("Failed to load to-do: {other}"));
+                RunTodoError::Internal(other.to_string())
+            }
+        })?;
+
+        if todo.status == TodoStatus::Running {
+            return Err(RunTodoError::AlreadyRunning);
+        }
+
+        let body_trimmed = todo.body.trim();
+        let prompt = if body_trimmed.is_empty() {
+            todo.title.clone()
+        } else {
+            format!("{}\n\n{body_trimmed}", todo.title)
+        };
+
+        match mode {
+            RunMode::Agent { agent } => self.run_todo_agent(&store, todo_id, &agent, prompt),
+            RunMode::Graph => {
+                if self
+                    .settings
+                    .graph_allowed_runners
+                    .as_ref()
+                    .is_some_and(|runners| runners.is_empty())
+                {
+                    return Err(RunTodoError::Forbidden("no allowed runners".to_owned()));
+                }
+
+                match plan_request(&prompt, &self.workspace_root, &self.settings) {
+                    ExecutionPlan::Graph(mut plan) => {
+                        plan.limits.max_parallel = self.settings.graph_max_parallel;
+                        plan.limits.max_retries = self.settings.graph_max_retries;
+
+                        let candidate_run = GraphRun {
+                            plan: plan.clone(),
+                            conversation_id: self.conversation_id.as_str().to_owned(),
+                            phase: GraphRunPhase::Active,
+                            waiting_gate_node: None,
+                        };
+                        let mut candidate_session = GraphRunSession::new(candidate_run);
+                        let initial_actions = candidate_session.schedule();
+                        for action in &initial_actions {
+                            let assignment = match action {
+                                GraphAction::StartNode(a) | GraphAction::PauseForGate(a) => a,
+                                _ => continue,
+                            };
+                            if let Some(allowed) = &self.settings.graph_allowed_runners {
+                                if allowed.is_empty() {
+                                    return Err(RunTodoError::Forbidden(
+                                        "no allowed runners".to_owned(),
+                                    ));
+                                }
+                                if !allowed.iter().any(|r| {
+                                    r.trim().eq_ignore_ascii_case(assignment.runner.trim())
+                                }) {
+                                    return Err(RunTodoError::Forbidden(format!(
+                                        "runner '{}' is not in allowed_runners",
+                                        assignment.runner
+                                    )));
+                                }
+                            }
+                            let Some(agent) = runner_from_str(&assignment.runner) else {
+                                return Err(RunTodoError::UnknownAgent(assignment.runner.clone()));
+                            };
+                            if self.busy_agents.contains(&agent) {
+                                return Err(RunTodoError::Busy(format!(
+                                    "runner '{}' is busy",
+                                    assignment.runner
+                                )));
+                            }
+                        }
+
+                        let plan_id = plan.id.clone();
+                        self.graph_todo = Some((plan_id.clone(), todo_id.to_owned()));
+                        let updated =
+                            store
+                                .mark_running(todo_id, "graph", &plan_id)
+                                .map_err(|err| {
+                                    self.graph_todo = None;
+                                    self.push_system(format!(
+                                        "Failed to mark to-do running: {err}"
+                                    ));
+                                    RunTodoError::Internal(err.to_string())
+                                })?;
+                        self.start_graph_run(plan);
+                        self.publish_todos();
+                        Ok(updated)
+                    }
+                    ExecutionPlan::Single(plan) => {
+                        self.run_todo_agent(&store, todo_id, &plan.runner, prompt)
+                    }
+                }
+            }
+        }
+    }
+
+    fn run_todo_agent(
+        &mut self,
+        store: &Arc<TodoStore>,
+        todo_id: &str,
+        runner_req: &str,
+        prompt: String,
+    ) -> Result<Todo, RunTodoError> {
+        let runner_clean = runner_req.trim().to_ascii_lowercase();
+        let adapter = self
+            .adapters
+            .iter()
+            .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean)
+            .ok_or_else(|| RunTodoError::UnknownAgent(runner_req.to_owned()))?;
+        let target_agent = adapter.agent();
+        let runner_id = runner_name(target_agent);
+
+        if let Some(allowed) = &self.settings.graph_allowed_runners {
+            if allowed.is_empty() {
+                return Err(RunTodoError::Forbidden("no allowed runners".to_owned()));
+            }
+            if !allowed
+                .iter()
+                .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim()))
+            {
+                return Err(RunTodoError::Forbidden(format!(
+                    "runner '{runner_id}' is not in allowed_runners"
+                )));
+            }
+        }
+
+        if self.busy_agents.contains(&target_agent) {
+            return Err(RunTodoError::Busy(format!("agent '{runner_id}' is busy")));
+        }
+
+        let turn_id = self.try_submit_to_agent(target_agent, prompt, false)?;
+        self.todo_turns
+            .insert((target_agent, turn_id), todo_id.to_owned());
+        let updated = store
+            .mark_running(todo_id, "agent", runner_id)
+            .map_err(|err| {
+                self.push_system(format!("Failed to mark to-do running: {err}"));
+                RunTodoError::Internal(err.to_string())
+            })?;
+        self.publish_todos();
+        Ok(updated)
+    }
+
     fn restore_deferred_input(&mut self, deferred: DeferredTurn) {
+        if let Some(todo_id) = deferred.todo_id
+            && let Some(store) = self.todo_store.clone()
+        {
+            if let Err(err) =
+                store.finish_run(&todo_id, false, Some("deferred turn dropped".to_owned()))
+            {
+                self.push_system(format!("Failed to finish to-do run: {err}"));
+            }
+            self.publish_todos();
+        }
         if deferred.conversation_id == self.conversation_id {
             self.input = deferred.prompt;
         } else {
@@ -4409,6 +4795,441 @@ mod tests {
             hub.snapshot().graph.is_none(),
             "the previous conversation's graph must not leak into a new one"
         );
+    }
+
+    // TC-542 / FR-542: run to-do as agent or through graph planner;
+    // status transitions and allowed_runners / busy enforcement.
+    #[test]
+    fn dashboard_run_todo_with_agent_and_graph() {
+        let (mut app, sent) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/test-workspace".to_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("todos.db");
+        let store = Arc::new(TodoStore::open(&db_path).unwrap());
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        app.attach_dashboard_services(store.clone(), cmd_rx);
+
+        // (a) agent run on "agy" sends the prompt containing the title and body
+        // to the AGY recording adapter, to-do becomes running with run_kind agent
+        let todo1 = store
+            .create(dmuxai::todo::NewTodo {
+                title: "Fix bug in parser".to_owned(),
+                body: "Make sure all tokens are preserved".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+
+        let run_res = app.run_todo(
+            &todo1.id,
+            RunMode::Agent {
+                agent: "agy".to_owned(),
+            },
+        );
+        let running1 = run_res.expect("run_todo on agy should succeed");
+        assert_eq!(running1.status, TodoStatus::Running);
+        assert_eq!(running1.run_kind.as_deref(), Some("agent"));
+        assert_eq!(running1.run_ref.as_deref(), Some("agy"));
+
+        {
+            let requests = sent.lock().unwrap();
+            let last_req = requests
+                .iter()
+                .rev()
+                .find(|(agent, _)| *agent == Agent::Agy)
+                .expect("expected request sent to AGY");
+            let req = &last_req.1;
+            assert!(req.prompt.contains("Fix bug in parser"));
+            assert!(req.prompt.contains("Make sure all tokens are preserved"));
+        }
+
+        // finishing the turn via apply_agent_output(AgentEvent::Completed) makes it done
+        // and the hub snapshot todos reflect it
+        let active = app
+            .active_turns
+            .get(&Agent::Agy)
+            .cloned()
+            .expect("active turn for agy");
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(active.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(active.turn_id.as_str())),
+            event: AgentEvent::Completed,
+        }));
+        let done1 = store.get(&todo1.id).unwrap();
+        assert_eq!(done1.status, TodoStatus::Done);
+        let snap_todos = hub.snapshot().todos;
+        let snap1 = snap_todos
+            .iter()
+            .find(|t| t.id == todo1.id)
+            .expect("todo in hub snapshot");
+        assert_eq!(snap1.status, TodoStatus::Done);
+
+        // (b) a second run while AGY is busy -> Busy
+        let todo2 = store
+            .create(dmuxai::todo::NewTodo {
+                title: "Second task".to_owned(),
+                body: String::new(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        app.busy_agents.insert(Agent::Agy);
+        let busy_res = app.run_todo(
+            &todo2.id,
+            RunMode::Agent {
+                agent: "agy".to_owned(),
+            },
+        );
+        assert!(matches!(busy_res, Err(RunTodoError::Busy(_))));
+        app.busy_agents.remove(&Agent::Agy);
+
+        // (c) with settings.graph_allowed_runners = Some(vec!["opencode".into()]) running on agy -> Forbidden
+        app.settings.graph_allowed_runners = Some(vec!["opencode".to_owned()]);
+        let forbid_res = app.run_todo(
+            &todo2.id,
+            RunMode::Agent {
+                agent: "agy".to_owned(),
+            },
+        );
+        assert!(matches!(forbid_res, Err(RunTodoError::Forbidden(_))));
+        app.settings.graph_allowed_runners = None;
+
+        // (d) unknown agent -> UnknownAgent
+        let unknown_res = app.run_todo(
+            &todo2.id,
+            RunMode::Agent {
+                agent: "nonexistent".to_owned(),
+            },
+        );
+        assert!(matches!(unknown_res, Err(RunTodoError::UnknownAgent(_))));
+
+        // (e) graph mode with a prompt that plans a Graph (look at plan_request/infer_roles for keywords,
+        // e.g. "research, test, review and implement the change") starts a graph session
+        // and the to-do run_ref equals the plan id; dispatching GraphAction::Completed marks it done.
+        let todo_graph = store
+            .create(dmuxai::todo::NewTodo {
+                title: "research, test, review and implement the change".to_owned(),
+                body: "all steps together".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let running_graph = app
+            .run_todo(&todo_graph.id, RunMode::Graph)
+            .expect("graph mode should succeed");
+        assert_eq!(running_graph.status, TodoStatus::Running);
+        assert_eq!(running_graph.run_kind.as_deref(), Some("graph"));
+        assert!(app.graph_session.is_some());
+        let plan_id = app.graph_session.as_ref().unwrap().run().plan.id.clone();
+        assert_eq!(running_graph.run_ref.as_deref(), Some(plan_id.as_str()));
+
+        // dispatching GraphAction::Completed marks it done
+        app.dispatch_graph_actions(vec![GraphAction::Completed]);
+        let done_graph = store.get(&todo_graph.id).unwrap();
+        assert_eq!(done_graph.status, TodoStatus::Done);
+        let snap_graph = hub
+            .snapshot()
+            .todos
+            .into_iter()
+            .find(|t| t.id == todo_graph.id)
+            .expect("graph todo in hub snapshot");
+        assert_eq!(snap_graph.status, TodoStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn dashboard_run_todo_review_round_1_edge_cases() {
+        let (mut app, _sent) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/test-workspace".to_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("todos.db");
+        let store = Arc::new(TodoStore::open(&db_path).unwrap());
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        app.attach_dashboard_services(store.clone(), cmd_rx);
+
+        // 1. NotFound:
+        let err_nf = app
+            .run_todo(
+                "non-existent",
+                RunMode::Agent {
+                    agent: "agy".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err_nf, RunTodoError::NotFound));
+
+        // 2. AlreadyRunning:
+        let todo_ar = store
+            .create(dmuxai::todo::NewTodo {
+                title: "Task Already Running".to_owned(),
+                body: "".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let _ = app
+            .run_todo(
+                &todo_ar.id,
+                RunMode::Agent {
+                    agent: "agy".into(),
+                },
+            )
+            .unwrap();
+        let err_ar = app
+            .run_todo(
+                &todo_ar.id,
+                RunMode::Agent {
+                    agent: "agy".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err_ar, RunTodoError::AlreadyRunning));
+
+        // Finish todo_ar so AGY is not busy
+        let active = app.active_turns.get(&Agent::Agy).cloned().unwrap();
+        app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(active.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(active.turn_id.as_str())),
+            event: AgentEvent::Completed,
+        });
+
+        // 3. Ctrl+C cancel (cancel_selected) -> open with "cancelled":
+        let todo_can = store
+            .create(dmuxai::todo::NewTodo {
+                title: "Task to cancel".to_owned(),
+                body: "".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let _ = app
+            .run_todo(
+                &todo_can.id,
+                RunMode::Agent {
+                    agent: "agy".into(),
+                },
+            )
+            .unwrap();
+        app.selected = adapter_index(Agent::Agy);
+        app.cancel_selected();
+        let cancelled_todo = store.get(&todo_can.id).unwrap();
+        assert_eq!(cancelled_todo.status, TodoStatus::Open);
+        assert_eq!(cancelled_todo.last_error.as_deref(), Some("cancelled"));
+        assert!(!app.busy_agents.contains(&Agent::Agy));
+
+        // 4. Adapter Error -> open with the error message:
+        let todo_err = store
+            .create(dmuxai::todo::NewTodo {
+                title: "Task to error".to_owned(),
+                body: "".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let _ = app
+            .run_todo(
+                &todo_err.id,
+                RunMode::Agent {
+                    agent: "agy".into(),
+                },
+            )
+            .unwrap();
+        let active_err = app.active_turns.get(&Agent::Agy).cloned().unwrap();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(active_err.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(active_err.turn_id.as_str())),
+            event: AgentEvent::Error("provider disconnected".to_owned()),
+        }));
+        let errored_todo = store.get(&todo_err.id).unwrap();
+        assert_eq!(errored_todo.status, TodoStatus::Open);
+        assert_eq!(
+            errored_todo.last_error.as_deref(),
+            Some("provider disconnected")
+        );
+        assert!(!app.busy_agents.contains(&Agent::Agy));
+
+        // 5. Graph mode: graph Failed -> open with error:
+        let todo_gfail = store
+            .create(dmuxai::todo::NewTodo {
+                title: "research, test, review and implement the change".to_owned(),
+                body: "step failure".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let _ = app.run_todo(&todo_gfail.id, RunMode::Graph).unwrap();
+        assert!(app.graph_session.is_some());
+        app.dispatch_graph_actions(vec![GraphAction::Failed("pipeline exploded".to_owned())]);
+        let failed_todo = store.get(&todo_gfail.id).unwrap();
+        assert_eq!(failed_todo.status, TodoStatus::Open);
+        assert_eq!(failed_todo.last_error.as_deref(), Some("pipeline exploded"));
+        assert!(app.graph_session.is_none());
+
+        // 6. Agent-mode while a graph is active -> Busy:
+        let todo_gactive = store
+            .create(dmuxai::todo::NewTodo {
+                title: "research, test, review and implement the change".to_owned(),
+                body: "graph run".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let _ = app.run_todo(&todo_gactive.id, RunMode::Graph).unwrap();
+        assert!(app.graph_session.is_some());
+        let todo_ablocked = store
+            .create(dmuxai::todo::NewTodo {
+                title: "agent while graph active".to_owned(),
+                body: "".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let busy_err = app
+            .run_todo(
+                &todo_ablocked.id,
+                RunMode::Agent {
+                    agent: "cursor".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(busy_err, RunTodoError::Busy(_)));
+        // Finish graph
+        app.dispatch_graph_actions(vec![GraphAction::Completed]);
+        assert!(app.graph_session.is_none());
+
+        // 7. graph_allowed_runners = Some([]) in graph mode: return Forbidden("no allowed runners"):
+        app.settings.graph_allowed_runners = Some(vec![]);
+        let todo_empty_allowed = store
+            .create(dmuxai::todo::NewTodo {
+                title: "research, test, review and implement the change".to_owned(),
+                body: "graph with no allowed runners".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let empty_err = app
+            .run_todo(&todo_empty_allowed.id, RunMode::Graph)
+            .unwrap_err();
+        match empty_err {
+            RunTodoError::Forbidden(ref msg) => assert_eq!(msg, "no allowed runners"),
+            other => panic!("expected Forbidden(\"no allowed runners\"), got {other:?}"),
+        }
+        app.settings.graph_allowed_runners = None;
+
+        // 8. shutdown() finalization:
+        let todo_shut = store
+            .create(dmuxai::todo::NewTodo {
+                title: "shutdown agent task".to_owned(),
+                body: "".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let _ = app
+            .run_todo(
+                &todo_shut.id,
+                RunMode::Agent {
+                    agent: "agy".into(),
+                },
+            )
+            .unwrap();
+        app.shutdown().await;
+        let shut_todo = store.get(&todo_shut.id).unwrap();
+        assert_eq!(shut_todo.status, TodoStatus::Open);
+        assert_eq!(shut_todo.last_error.as_deref(), Some("dmuxai exited"));
+        let snap_shut = hub
+            .snapshot()
+            .todos
+            .into_iter()
+            .find(|t| t.id == todo_shut.id)
+            .unwrap();
+        assert_eq!(snap_shut.status, TodoStatus::Open);
+        assert_eq!(snap_shut.last_error.as_deref(), Some("dmuxai exited"));
+
+        // 9. attach_dashboard_services restart reconciliation:
+        let todo_stale = store
+            .create(dmuxai::todo::NewTodo {
+                title: "stale running task".to_owned(),
+                body: "".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        store
+            .mark_running(&todo_stale.id, "agent", "cursor")
+            .unwrap();
+        assert_eq!(
+            store.get(&todo_stale.id).unwrap().status,
+            TodoStatus::Running
+        );
+
+        let (mut new_app, _sent_new) = test_app();
+        let new_hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/test-workspace".to_owned(),
+        );
+        new_app.attach_dashboard(new_hub.clone());
+        let (_new_cmd_tx, new_cmd_rx) = tokio::sync::mpsc::channel(16);
+        new_app.attach_dashboard_services(store.clone(), new_cmd_rx);
+
+        let reconciled = store.get(&todo_stale.id).unwrap();
+        assert_eq!(reconciled.status, TodoStatus::Open);
+        assert_eq!(
+            reconciled.last_error.as_deref(),
+            Some("interrupted (dmuxai restarted)")
+        );
+        let snap_rec = new_hub
+            .snapshot()
+            .todos
+            .into_iter()
+            .find(|t| t.id == todo_stale.id)
+            .unwrap();
+        assert_eq!(snap_rec.status, TodoStatus::Open);
+        assert_eq!(
+            snap_rec.last_error.as_deref(),
+            Some("interrupted (dmuxai restarted)")
+        );
+
+        // 10. BLOCKER 1 test: submit failure (e.g. queue full / fail_send) leaves to-do Open:
+        let engine = ConversationEngine::open(
+            std::path::Path::new(":memory:"),
+            &std::env::current_dir().unwrap_or_default(),
+        )
+        .unwrap();
+        let (mut fail_app, _sent_fail) = test_app_with_engine_and_failure(engine, Some(Agent::Agy));
+        let fail_store = Arc::new(TodoStore::open(&temp_dir.path().join("fail_todos.db")).unwrap());
+        let (_tx3, rx3) = tokio::sync::mpsc::channel(16);
+        fail_app.attach_dashboard_services(fail_store.clone(), rx3);
+
+        let todo_fail_send = fail_store
+            .create(dmuxai::todo::NewTodo {
+                title: "fail send task".to_owned(),
+                body: "".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let fail_res = fail_app.run_todo(
+            &todo_fail_send.id,
+            RunMode::Agent {
+                agent: "agy".into(),
+            },
+        );
+        assert!(matches!(fail_res, Err(RunTodoError::Internal(_))));
+        let todo_after_fail = fail_store.get(&todo_fail_send.id).unwrap();
+        assert_eq!(todo_after_fail.status, TodoStatus::Open);
     }
 
     #[test]

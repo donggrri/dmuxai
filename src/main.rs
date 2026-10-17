@@ -7,6 +7,7 @@ use std::{
     io::{self, IsTerminal, Stdout, Write},
     net::{IpAddr, Ipv4Addr},
     path::Path,
+    sync::Arc,
     time::Duration,
 };
 
@@ -18,9 +19,11 @@ use crossterm::{
 };
 use dmuxai::conversation::ConversationEngine;
 use dmuxai::settings::DmuxSettings;
+use dmuxai::todo::TodoStore;
+use dmuxai::web::commands::DashboardCommand;
 use dmuxai::web::{
-    DEFAULT_PORT, DashboardHub, DashboardServer, FileGraphSource, ServerConfig, SnapshotSource,
-    check_bind, generate_token, start_server,
+    DEFAULT_PORT, DashboardHub, DashboardServer, DashboardServices, FileGraphSource, ServerConfig,
+    SnapshotSource, check_bind, generate_token, start_server,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
@@ -196,6 +199,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// Opens the per-repo to-do store (FR-540). Callers report the error as a
+/// warning (`serve`) or a startup notice (`--web`).
+fn open_todo_store(workspace_root: &Path) -> Result<Arc<TodoStore>, String> {
+    let db_path = dmuxai::state_path::repo_db_path(workspace_root).map_err(|e| e.to_string())?;
+    TodoStore::open(&db_path)
+        .map(Arc::new)
+        .map_err(|e| e.to_string())
+}
+
+/// Publishes the persisted to-do list into the hub once at startup so `serve`
+/// (which never runs the TUI's `publish_todos`) shows existing to-dos.
+fn seed_hub_todos(hub: &DashboardHub, store: &TodoStore) {
+    if let Ok(todos) = store.list() {
+        hub.set_todos(todos);
+    }
+}
+
 /// `dmuxai serve`: read-only dashboard over persisted graph runs (FR-520, FR-524).
 async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
     let workspace_root = dmuxai::workspace::resolve_workspace_root()?;
@@ -207,12 +227,29 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     }
 
+    let services = match open_todo_store(&workspace_root) {
+        Ok(store) => DashboardServices {
+            todos: Some(store),
+            commands: None,
+            web_attached: false,
+        },
+        Err(error) => {
+            eprintln!("warning: to-do board disabled: {error}");
+            DashboardServices::default()
+        }
+    };
     let hub = DashboardHub::new(SnapshotSource::Files, workspace);
+    // Seed once so `GET /api/state` / SSE show persisted to-dos before the
+    // first mutation (FR-540/FR-541).
+    if let Some(store) = services.todos.as_ref() {
+        seed_hub_todos(&hub, store);
+    }
     let config = ServerConfig {
         bind: options.bind,
         port: options.port,
         allow_remote: options.allow_remote,
         token: generate_token(),
+        services,
     };
     let server = match start_server(config, hub.clone()).await {
         Ok(server) => server,
@@ -309,17 +346,38 @@ async fn attach_web_dashboard(
 ) -> Option<DashboardServer> {
     let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
         .unwrap_or_else(|_| workspace_root.display().to_string());
+
+    let (todos, receiver) = match open_todo_store(workspace_root) {
+        Ok(store) => {
+            let (sender, receiver) = tokio::sync::mpsc::channel::<DashboardCommand>(16);
+            (Some((store, sender)), Some(receiver))
+        }
+        Err(error) => {
+            app.push_startup_notice(format!("to-do board unavailable: {error}"));
+            (None, None)
+        }
+    };
+    let services = DashboardServices {
+        todos: todos.as_ref().map(|(store, _)| store.clone()),
+        commands: todos.as_ref().map(|(_, sender)| sender.clone()),
+        web_attached: true,
+    };
+
     let hub = DashboardHub::new(SnapshotSource::Tui, workspace);
     let config = ServerConfig {
         bind: options.bind,
         port: options.port,
         allow_remote: options.allow_remote,
         token: generate_token(),
+        services,
     };
 
     match start_server(config, hub.clone()).await {
         Ok(server) => {
             app.attach_dashboard(hub);
+            if let (Some((store, _)), Some(receiver)) = (todos, receiver) {
+                app.attach_dashboard_services(store.clone(), receiver);
+            }
             app.push_startup_notice(format!("dmuxai dashboard: {}", server.url));
             if let Some(warning) = server.warning.clone() {
                 app.push_startup_notice(warning);
@@ -517,5 +575,30 @@ mod tests {
         );
         // With --web present, --version wins.
         assert_eq!(parse_cli(["--version", "--web"]), CliAction::Version);
+    }
+
+    // FR-540/FR-541: `serve` seeds the hub with persisted to-dos at startup so
+    // `GET /api/state` shows them before any mutation.
+    #[test]
+    fn serve_seeds_hub_with_persisted_todos() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TodoStore::open(&dir.path().join("conversations.sqlite3")).unwrap();
+        store
+            .create(dmuxai::todo::NewTodo {
+                title: "seeded to-do".to_owned(),
+                body: "from a previous session".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+
+        let hub = DashboardHub::new(SnapshotSource::Files, "/workspace".to_owned());
+        assert!(hub.snapshot().todos.is_empty());
+
+        seed_hub_todos(&hub, &store);
+
+        let todos = hub.snapshot().todos;
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].title, "seeded to-do");
     }
 }

@@ -1,6 +1,6 @@
 # SPEC: Local web dashboard (live graph, to-do board, MCP import)
 
-Status: In progress (slice A implemented; slices B and C planned)
+Status: In progress (slices A and B implemented; slice C planned)
 Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `5ff8c93`
@@ -50,9 +50,9 @@ client and Jira/Confluence import, mock-tested only).
 
 | ID | Assumption or question | Owner | Needed by |
 | --- | --- | --- | --- |
-| OQ-520 | Default port is 7420; if taken, an ephemeral port is used and printed. | Dongjin | Slice A review |
-| OQ-521 | `dmuxai serve` (standalone) cannot start agents; "run" actions in slice B require `dmuxai --web`. | Dongjin | Slice B |
-| OQ-522 | Which MCP servers Dongjin will configure for Jira/Confluence. They stay config entries only; tests use the in-repo mock or `server-everything`/`server-filesystem`. | Dongjin | Slice C |
+| OQ-520 | Resolved (Dongjin, 2026-10-17): default port 7420; if taken, an ephemeral port is used and the actual URL is printed. | Dongjin | Done |
+| OQ-521 | Resolved (Dongjin, 2026-10-17): `dmuxai serve` is view-only; running to-dos requires `dmuxai --web`, and the page disables the run controls with a hint in serve mode (UX-540). | Dongjin | Done |
+| OQ-522 | Resolved (Dongjin, 2026-10-17): Jira/Confluence stay config entries only (documented example: the Atlassian remote MCP over streamable HTTP with env-var auth); no real connection; tests use the in-repo mock or `server-everything`. | Dongjin | Done |
 
 ## 3. Terms and state model
 
@@ -86,14 +86,14 @@ client and Jira/Confluence import, mock-tested only).
 | NFR-520 | Must | Given the build | No frontend toolchain is needed: assets are embedded with `include_str!`; Linux and Windows (`cargo clippy -D warnings`) both build | Windows CI stays green | TC-529, CI |
 | NFR-521 | Must | Given any snapshot or log line | The access token is never included in `/api/state` or SSE payloads | Only the startup URL contains it | TC-525 |
 
-### Slice B: to-do board (planned)
+### Slice B: to-do board
 
 | ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| FR-540 | Must | Given the per-repo DB | To-dos persist (`id`, `title`, `body`, `status`, `source`, `source_ref`, `created_at`, `updated_at`) and survive restart | Schema migration is additive; existing DBs open unchanged | TC-540 |
-| FR-541 | Must | Given `POST/PATCH/DELETE /api/todos` with a valid token and JSON body | Create, edit title/body, mark done/reopen, delete; the list appears in the snapshot and SSE | Empty title -> 400; unknown id -> 404; non-JSON content type -> 415 | TC-541 |
-| FR-542 | Must | Given `POST /api/todos/{id}/run` with `{ "mode": "agent", "agent": <id> }` or `{ "mode": "graph" }` in `--web` mode | The to-do is submitted as a prompt to that agent or through the graph planner, its status becomes `running`, and the graph/turn links back to the to-do | `serve` mode -> 409 "requires dmuxai --web"; busy agent -> 409; disallowed runner (`allowed_runners`) -> 403 | TC-542 |
-| UX-540 | Should | Given the page | A to-do panel with add form, inline edit, done checkbox and Run buttons | Errors show inline | TC-543 |
+| FR-540 | Must | Given the per-repo DB | To-dos persist in an additive `todos` table (`id`, `title`, `body`, `status` `open`/`running`/`done`, `source` `manual`/`jira`/`confluence`, `source_ref`, `run_kind`, `run_ref`, `last_error`, `created_at_ms`, `updated_at_ms`) and survive restart; list order is open/running first, then by `created_at_ms` | Table created with `CREATE TABLE IF NOT EXISTS` without bumping `user_version`, so older binaries still open the DB; `(source, source_ref)` is unique when `source_ref` is set | TC-540 |
+| FR-541 | Must | Given `GET/POST /api/todos`, `PATCH/DELETE /api/todos/{id}` with a valid token, and a JSON body | List, create (`title`, optional `body`), edit `title`/`body`, set `status` to `open` or `done`, delete; the to-do list appears in the snapshot `todos[]` and on SSE | Empty/whitespace title or title > 200 chars -> 400; body > 20000 chars -> 400; unknown id -> 404; non-JSON content type -> 415; setting `running` directly -> 400; all mutating routes need the token and the Origin/Host checks of FR-522/FR-523 | TC-541, TC-544 |
+| FR-542 | Must | Given `POST /api/todos/{id}/run` with `{ "mode": "agent", "agent": "<runner id>" }` or `{ "mode": "graph" }` in `--web` mode | The prompt `title` + blank line + `body` is submitted to that agent, or through the graph planner, exactly like a TUI prompt; the to-do becomes `running` with `run_kind`/`run_ref` (agent id, or graph id); when the turn or graph completes it becomes `done`, and on failure or cancel it returns to `open` with `last_error` | `serve` mode -> 409 `requires dmuxai --web`; unknown agent -> 404; agent busy or a graph already active -> 409; runner not in `[graph] allowed_runners` -> 403; already running -> 409. The run never bypasses the agent's current mode (Ask/Plan/Implement) | TC-542, TC-545 |
+| UX-540 | Should | Given the page | A to-do panel: add form (title, optional body), list with inline edit, done checkbox, delete, and `Run` controls (agent select from snapshot agents, `Run as graph`); running to-dos show their run link and the graph view | Errors show inline next to the item. When the snapshot `source` is `files` (`dmuxai serve`), the run controls are disabled and a hint says to start `dmuxai --web`; add/edit/done/delete stay enabled | TC-543 |
 
 ### Slice C: shared MCP config, per-runner propagation, dashboard MCP client and Jira/Confluence import (planned)
 
@@ -123,10 +123,12 @@ MCP servers are defined once and used by every runner and by the dashboard.
 | TC-529 | FR-529, NFR-520 | integration | router | `GET /`, `/assets/app.js`, `/assets/app.css` without token | 200, `Cache-Control: no-store`, CSP header; HTML references `/assets/app.js`; JS references `/api/events`, `/api/state` and `token` | `src/web` `static_page_is_embedded_and_hardened` |
 | TC-530 | FR-530 | unit | App test helper with an active graph session running `step-1` on a custom agent | `publish_dashboard` | hub snapshot has source `tui`, graph `current_nodes == ["step-1"]`, the agent busy | `src/app.rs` `app_publishes_graph_state_to_dashboard` |
 | TC-531 | FR-520, FR-521 | integration | temp workspace, binary | spawn `dmuxai serve --port 0`, read first stdout URL line, raw HTTP GET `/api/state` with and without token | URL has token; 200 JSON with `"schema":"dmuxai.dashboard/v1"`; 401 without | `tests/web_serve.rs` `serve_prints_token_url_and_serves_state` |
-| TC-540 | FR-540 | unit | temp DB | create, reopen, list | persisted | slice B |
-| TC-541 | FR-541 | integration | router + temp DB | CRUD requests | statuses and snapshot | slice B |
-| TC-542 | FR-542 | unit | App helper | run to-do as agent / graph; serve mode; busy agent | prompt submitted / 409 / 403 | slice B |
-| TC-543 | UX-540 | integration | router | GET page | to-do panel markup present | slice B |
+| TC-540 | FR-540 | unit | temp DB file | create, update, reopen store, list; duplicate `(source, source_ref)` upsert | persisted fields and order; upsert updates instead of duplicating; DB opened by `ConversationEngine` afterwards still works | `src/todo.rs` `todo_store_persists_and_orders` |
+| TC-541 | FR-541 | integration | router with token + temp store, no command channel | POST, GET, PATCH title/body/status, DELETE; snapshot after each | 201/200/200/204 and `todos[]` in `/api/state` reflects each change with a higher revision | `src/web` `todo_routes_crud_and_snapshot` |
+| TC-542 | FR-542 | unit | App test helper with a hub, a store and the command channel | run a to-do as agent, then complete the turn; run as graph and finish the graph; run while busy; run a disallowed runner | prompt sent to the agent with title/body; status running -> done; graph links run_ref; 409; 403 | `src/app.rs` `dashboard_run_todo_with_agent_and_graph` |
+| TC-543 | UX-540 | integration | router | GET `/` and `/assets/app.js` | markup has `id="todos"` and the add form; JS calls `/api/todos` and contains the serve-mode view-only hint (`dmuxai --web`) | `src/web` `static_page_has_todo_panel` |
+| TC-544 | FR-541 | integration | router | invalid bodies: empty title, 201-char title, non-JSON, unknown id, status `running`, missing token, foreign Origin | 400/400/415/404/400/401/403 | `src/web` `todo_routes_reject_invalid_requests` |
+| TC-545 | FR-542 | integration | router without a command channel (`serve`) and with a channel whose App replies busy | POST run | 409 with `requires dmuxai --web`; 409 busy | `src/web` `todo_run_requires_web_mode` |
 | TC-560 | INT-560, NFR-560 | unit | user + repo TOML fixtures | merge | override by name, `enabled=false` removal, env refs resolved, missing env disables with warning, no secret in `Debug`/serialized output | slice C |
 | TC-561 | INT-562, NFR-560 | integration | in-repo mock MCP server over stdio and over streamable HTTP on 127.0.0.1:0 | initialize, tools/list, tools/call | parsed results; timeout/crash error names the server; optional `#[ignore]` smoke with `npx @modelcontextprotocol/server-everything` | slice C |
 | TC-562 | FR-561, NFR-560 | integration | mock MCP with Jira/Confluence fixture tools | import twice; tool error | to-dos created once, `source_ref` set; 502 | slice C |
@@ -158,7 +160,7 @@ MCP servers are defined once and used by every runner and by the dashboard.
 
 | ID | Assumption or question | Owner | Needed by |
 | --- | --- | --- | --- |
-| OQ-523 | Should DmuxAI run `agy mcp add` itself (mutates AGY's user config), or keep printing the commands? Default: print only. | Dongjin | Slice C |
+| OQ-523 | Resolved (Dongjin, 2026-10-17): print the `agy mcp add` commands only; DmuxAI never modifies AGY's user-level config. | Dongjin | Done |
 
 ## 7. Implementation plan
 

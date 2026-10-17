@@ -120,4 +120,16 @@ mod tests {
                 .contains("text/css")
         );
     }
+
+    // TC-543: static_page_has_todo_panel (SPEC-web-dashboard UX-540)
+    #[test]
+    fn static_page_has_todo_panel() {
+        assert!(INDEX_HTML.contains("id=\"todos\""));
+        assert!(INDEX_HTML.contains("id=\"todo-form\""));
+        assert!(APP_JS.contains("/api/todos"));
+        // OQ-521: serve mode is view-only; the page explains how to run to-dos.
+        assert!(INDEX_HTML.contains("id=\"todo-view-only\""));
+        assert!(INDEX_HTML.contains("dmuxai --web"));
+        assert!(APP_JS.contains("=== 'files'"));
+    }
 }

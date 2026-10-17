@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::graph::{GraphEdge, GraphNodeStatus, GraphRun, GraphRunPhase, NodeRole};
+use crate::todo::Todo;
 
 pub const SNAPSHOT_SCHEMA: &str = "dmuxai.dashboard/v1";
 
@@ -25,6 +26,8 @@ pub struct DashboardSnapshot {
     pub workspace: String,
     pub agents: Vec<AgentView>,
     pub graph: Option<GraphView>,
+    #[serde(default)]
+    pub todos: Vec<Todo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +243,7 @@ mod tests {
                 model: Some("o3-mini".to_string()),
             }],
             graph: Some(view),
+            todos: Vec::new(),
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();

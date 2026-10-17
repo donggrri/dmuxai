@@ -294,6 +294,454 @@ function renderAgents(agents) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// To-dos (SPEC-web-dashboard FR-541 / FR-542 / UX-540, TC-543).
+// ---------------------------------------------------------------------------
+
+var TODO_TITLE_MAX = 200;
+// Transient per-item errors from our own requests, and the id of the item
+// currently being inline-edited. Both survive snapshot re-renders: the item
+// under edit is never destroyed, the other items are re-rendered (UX-540).
+var todoItemErrors = {};
+var todoEditId = null;
+
+function todoUrl(id) {
+  return '/api/todos/' + encodeURIComponent(id);
+}
+
+function todoApi(method, path, body) {
+  var headers = { Authorization: 'Bearer ' + token };
+  var init = { method: method, headers: headers, cache: 'no-store' };
+  if (body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(body);
+  }
+  return fetch(path, init).then(function(res) {
+    if (res.status === 401) {
+      var fatal = new Error('unauthorized');
+      fatal.fatal = true;
+      throw fatal;
+    }
+    return res.text().then(function(text) {
+      var payload = null;
+      if (text) {
+        try {
+          payload = JSON.parse(text);
+        } catch (err) {
+          payload = null;
+        }
+      }
+      if (!res.ok) {
+        var message = payload && typeof payload.error === 'string'
+          ? payload.error
+          : 'HTTP ' + res.status;
+        var hint = message.indexOf('dmuxai --web') !== -1;
+        if (hint) {
+          message = message + ' To-do runs need `dmuxai --web` ' +
+            '(open the dashboard URL printed by `dmuxai --web`).';
+        }
+        var failure = new Error(message);
+        failure.status = res.status;
+        failure.webModeHint = hint;
+        throw failure;
+      }
+      return payload;
+    });
+  });
+}
+
+function refreshTodos() {
+  // One immediate state fetch so a mutation shows up even without SSE;
+  // regular snapshot pushes keep updating the list afterwards.
+  poll();
+}
+
+function submitNewTodo() {
+  var titleInput = $('todo-title');
+  var bodyInput = $('todo-body');
+  var title = titleInput.value.trim();
+  if (!title) {
+    showMsg('To-do title is required.', true);
+    titleInput.focus();
+    return;
+  }
+  todoApi('POST', '/api/todos', { title: title, body: bodyInput.value })
+    .then(function() {
+      titleInput.value = '';
+      bodyInput.value = '';
+      titleInput.focus();
+      refreshTodos();
+    })
+    .catch(function(err) {
+      if (err && err.fatal) {
+        onUnauthorized();
+        return;
+      }
+      showMsg('Could not add to-do: ' + err.message, true);
+    });
+}
+
+function setTodoItemError(id, message) {
+  todoItemErrors[id] = { message: message };
+  renderTodos();
+}
+
+function todoErrorRow(id) {
+  var row = el('p', 'todo-error');
+  var err = todoItemErrors[id];
+  if (err) {
+    row.hidden = false;
+    row.textContent = err.message;
+  }
+  return row;
+}
+
+function refreshItemErrorRow(container, id) {
+  var row = container.querySelector('.todo-error');
+  if (!row) { return; }
+  var err = todoItemErrors[id];
+  row.hidden = !err;
+  row.textContent = err ? err.message : '';
+}
+
+function patchTodo(id, patch, clearEdit) {
+  todoApi('PATCH', todoUrl(id), patch)
+    .then(function() {
+      delete todoItemErrors[id];
+      if (clearEdit && todoEditId === id) { todoEditId = null; }
+      refreshTodos();
+    })
+    .catch(function(err) {
+      if (err && err.fatal) {
+        onUnauthorized();
+        return;
+      }
+      setTodoItemError(id, err.message);
+    });
+}
+
+function runTodo(id, body) {
+  todoApi('POST', todoUrl(id) + '/run', body)
+    .then(function() {
+      delete todoItemErrors[id];
+      refreshTodos();
+    })
+    .catch(function(err) {
+      if (err && err.fatal) {
+        onUnauthorized();
+        return;
+      }
+      setTodoItemError(id, err.message);
+    });
+}
+
+function deleteTodo(id) {
+  todoApi('DELETE', todoUrl(id))
+    .then(function() {
+      delete todoItemErrors[id];
+      if (todoEditId === id) { todoEditId = null; }
+      refreshTodos();
+    })
+    .catch(function(err) {
+      if (err && err.fatal) {
+        onUnauthorized();
+        return;
+      }
+      setTodoItemError(id, err.message);
+    });
+}
+
+function startEdit(id) {
+  todoEditId = id;
+  renderTodos();
+}
+
+function cancelEdit() {
+  delete todoItemErrors[todoEditId];
+  todoEditId = null;
+  renderTodos();
+}
+
+function todoButton(className, label, handler) {
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn ' + className;
+  btn.textContent = label;
+  btn.addEventListener('click', handler);
+  return btn;
+}
+
+function todoDoneCheckbox(id, status) {
+  var box = document.createElement('input');
+  box.type = 'checkbox';
+  box.className = 'todo-done';
+  box.checked = status === 'done';
+  var label = status === 'done' ? 'Mark to-do open' : 'Mark to-do done';
+  box.setAttribute('aria-label', label);
+  box.title = label;
+  box.addEventListener('change', function() {
+    patchTodo(id, { status: box.checked ? 'done' : 'open' }, false);
+  });
+  return box;
+}
+
+function todoSourceBadge(todo) {
+  var source = String(todo.source || 'manual');
+  if (source === 'manual') {
+    return null;
+  }
+  var wrap = el('span', 'todo-source-wrap');
+  wrap.appendChild(el('span', 'badge badge-src', source));
+  if (todo.source_ref) {
+    var ref = el('span', 'todo-source-ref', String(todo.source_ref));
+    ref.title = String(todo.source_ref);
+    wrap.appendChild(ref);
+  }
+  return wrap;
+}
+
+function todoRunInfoRow(todo) {
+  var kind = todo.run_kind ? String(todo.run_kind) : '';
+  var ref = todo.run_ref ? String(todo.run_ref) : '';
+  var row = el('p', 'todo-runinfo');
+  row.textContent = 'run: ' + (kind || 'unknown') + (ref ? ' \u00b7 ' + ref : '');
+  if (ref) { row.title = ref; }
+  return row;
+}
+
+function todoViewActions(id, todo) {
+  var wrap = el('span', 'todo-actions');
+  wrap.appendChild(todoButton('btn-edit', 'Edit', function() {
+    startEdit(id);
+  }));
+  wrap.appendChild(todoButton('btn-delete btn-danger', 'Delete', function() {
+    if (window.confirm('Delete to-do "' + String(todo.title || '') + '"?')) {
+      deleteTodo(id);
+    }
+  }));
+  return wrap;
+}
+
+function todoRunControls(id, status) {
+  var row = el('div', 'todo-controls');
+  var locked = status === 'running' || status === 'done';
+
+  var snap = snapshot || {};
+  // OQ-521: serve mode publishes source "files"; runs are refused there with
+  // 409, so the controls are disabled up front (the inline 409 stays as a
+  // fallback for a stale server mode). Add/edit/done/delete stay enabled.
+  var viewOnly = String(snap.source || '') === 'files';
+  var viewTitle = 'View-only dashboard: start `dmuxai --web` to run to-dos from the browser';
+
+  var agents = Array.isArray(snap.agents) ? snap.agents : [];
+
+  var select = el('select', 'todo-agent-select');
+  select.setAttribute('aria-label', 'Agent to run this to-do');
+  for (var i = 0; i < agents.length; i++) {
+    var agent = agents[i] || {};
+    var opt = document.createElement('option');
+    opt.value = String(agent.id || '');
+    opt.textContent = String(agent.label || agent.id || '');
+    if (agent.busy) { opt.disabled = true; }
+    select.appendChild(opt);
+  }
+  row.appendChild(select);
+
+  var runBtn = todoButton('btn-run', 'Run', function() {
+    var chosen = select.value;
+    var active = select.selectedIndex >= 0
+      ? select.options[select.selectedIndex]
+      : null;
+    if (!chosen || (active && active.disabled)) { return; }
+    runTodo(id, { mode: 'agent', agent: chosen });
+  });
+  var graphBtn = todoButton('btn-graph', 'Run as graph', function() {
+    runTodo(id, { mode: 'graph' });
+  });
+
+  function syncRunDisabled() {
+    var active = select.selectedIndex >= 0
+      ? select.options[select.selectedIndex]
+      : null;
+    var runDisabled = locked || viewOnly || !select.value || Boolean(active && active.disabled);
+    var graphDisabled = locked || viewOnly;
+    runBtn.disabled = runDisabled;
+    runBtn.setAttribute('aria-disabled', runDisabled ? 'true' : 'false');
+    graphBtn.disabled = graphDisabled;
+    graphBtn.setAttribute('aria-disabled', graphDisabled ? 'true' : 'false');
+    select.setAttribute('aria-disabled', viewOnly ? 'true' : 'false');
+    if (viewOnly) {
+      row.title = viewTitle;
+      select.title = viewTitle;
+      runBtn.title = viewTitle;
+      graphBtn.title = viewTitle;
+    }
+  }
+  select.addEventListener('change', syncRunDisabled);
+  syncRunDisabled();
+
+  row.appendChild(runBtn);
+  row.appendChild(graphBtn);
+  return row;
+}
+
+function buildTodoEditor(item, todo) {
+  var id = String(todo.id || '');
+
+  var titleField = el('label', 'todo-field todo-field-title');
+  titleField.appendChild(el('span', 'field-label', 'Title'));
+  var titleInput = document.createElement('input');
+  titleInput.type = 'text';
+  titleInput.className = 'todo-edit-title';
+  titleInput.maxLength = TODO_TITLE_MAX;
+  titleInput.value = String(todo.title || '');
+  titleField.appendChild(titleInput);
+  item.appendChild(titleField);
+
+  var bodyField = el('label', 'todo-field');
+  bodyField.appendChild(el('span', 'field-label', 'Body'));
+  var bodyInput = document.createElement('textarea');
+  bodyInput.className = 'todo-edit-body';
+  bodyInput.rows = 3;
+  bodyInput.value = String(todo.body || '');
+  bodyField.appendChild(bodyInput);
+  item.appendChild(bodyField);
+
+  var actions = el('div', 'todo-actions');
+  actions.appendChild(todoButton('btn-save', 'Save', function() {
+    var title = titleInput.value.trim();
+    if (!title) {
+      setTodoItemError(id, 'Title is required.');
+      titleInput.focus();
+      return;
+    }
+    patchTodo(id, { title: title, body: bodyInput.value }, true);
+  }));
+  actions.appendChild(todoButton('btn-cancel', 'Cancel', function() {
+    cancelEdit();
+  }));
+  item.appendChild(actions);
+
+  item.appendChild(todoErrorRow(id));
+
+  titleInput.focus();
+}
+
+function buildTodoView(item, todo) {
+  var id = String(todo.id || '');
+  var status = String(todo.status || 'open');
+
+  var head = el('div', 'todo-head');
+  head.appendChild(todoDoneCheckbox(id, status));
+  head.appendChild(badge(status));
+  var sourceBadge = todoSourceBadge(todo);
+  if (sourceBadge) { head.appendChild(sourceBadge); }
+  var title = el('span', 'todo-title', String(todo.title || ''));
+  title.title = String(todo.title || '');
+  head.appendChild(title);
+  head.appendChild(todoViewActions(id, todo));
+  item.appendChild(head);
+
+  if (status === 'running') {
+    item.appendChild(todoRunInfoRow(todo));
+  }
+  if (todo.last_error) {
+    item.appendChild(el('p', 'todo-last-error', String(todo.last_error)));
+  }
+  item.appendChild(todoErrorRow(id));
+  item.appendChild(todoRunControls(id, status));
+}
+
+function renderTodoItem(todo) {
+  var id = String(todo.id || '');
+  var status = String(todo.status || 'open');
+  var item = el('article', 'todo todo-status-' + status);
+  item.setAttribute('data-todo-id', id);
+
+  if (todoEditId !== null && id === todoEditId) {
+    item.classList.add('todo-editing');
+    buildTodoEditor(item, todo);
+    return item;
+  }
+  buildTodoView(item, todo);
+  return item;
+}
+
+function updateTodoViewOnlyHint(snap) {
+  // OQ-521: `dmuxai serve` (snapshot source "files") is a view-only dashboard;
+  // to-do runs need `dmuxai --web` (TUI-attached dashboard, source "tui").
+  var hint = $('todo-view-only');
+  if (!hint) { return; }
+  var viewOnly = Boolean(snap) && String(snap.source || '') === 'files';
+  hint.hidden = !viewOnly;
+}
+
+function renderTodos(snap) {
+  var list = $('todo-list');
+  if (!list) { return; }
+  updateTodoViewOnlyHint(snap);
+  var todos = snap && Array.isArray(snap.todos) ? snap.todos : [];
+
+  var i;
+  var alive = {};
+  for (i = 0; i < todos.length; i++) {
+    var todo = todos[i];
+    if (todo && todo.id) { alive[String(todo.id)] = true; }
+  }
+  if (todoEditId && !alive[todoEditId]) { todoEditId = null; }
+  for (var key in todoItemErrors) {
+    if (Object.prototype.hasOwnProperty.call(todoItemErrors, key) && !alive[key]) {
+      delete todoItemErrors[key];
+    }
+  }
+
+  // Preserve the DOM of the item being inline-edited so focus and unsaved
+  // input survive snapshot re-renders; rebuild the other items (UX-540).
+  var preserved = null;
+  var oldById = {};
+  for (i = 0; i < list.children.length; i++) {
+    var child = list.children[i];
+    var childId = child.getAttribute('data-todo-id');
+    if (childId) { oldById[childId] = child; }
+  }
+  if (todoEditId) {
+    var candidate = oldById[todoEditId];
+    if (candidate && candidate.classList.contains('todo-editing')) {
+      preserved = candidate;
+    }
+  }
+
+  var frag = document.createDocumentFragment();
+  var preservedTodo = null;
+  for (var j = 0; j < todos.length; j++) {
+    var current = todos[j];
+    var tid = current && current.id ? String(current.id) : '';
+    if (preserved && tid === todoEditId) {
+      frag.appendChild(preserved);
+      preservedTodo = current;
+    } else {
+      frag.appendChild(renderTodoItem(current));
+    }
+  }
+
+  list.replaceChildren();
+  if (todos.length === 0) {
+    list.appendChild(el('p', 'empty', 'no to-dos yet'));
+    return;
+  }
+  list.appendChild(frag);
+  if (preservedTodo) {
+    refreshItemErrorRow(preserved, todoEditId);
+  }
+}
+
+function bindTodoForm() {
+  $('todo-form').addEventListener('submit', function(e) {
+    e.preventDefault();
+    submitNewTodo();
+  });
+}
+
 function render(nowMs) {
   var snap = snapshot;
   if (!snap || typeof snap.revision !== 'number') { return; }
@@ -360,6 +808,7 @@ function applySnapshot(snap) {
   snapshot = snap;
   lastRendered = Date.now();
   render(lastRendered);
+  renderTodos(snap);
   scheduleTick();
 }
 
@@ -498,6 +947,7 @@ function init() {
   }
 
   render(Date.now());
+  bindTodoForm();
   startSse();
 }
 

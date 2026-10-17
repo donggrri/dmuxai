@@ -174,6 +174,12 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8 | SPEC-web-dashboard | FR-528 | TC-528 | `file_source_picks_latest_valid_run` | unit | ✅ | web dashboard slice A |
 | M8 | SPEC-web-dashboard | FR-529,NFR-520 | TC-529 | `static_page_is_embedded_and_hardened` | integration | ✅ | web dashboard slice A |
 | M8,M2 | SPEC-web-dashboard | FR-530 | TC-530 | `app_publishes_graph_state_to_dashboard`, `app_dashboard_clears_last_graph_on_new_conversation` | unit | ✅ | web dashboard slice A |
+| M8,M2 | SPEC-web-dashboard | FR-540 | TC-540 | `todo_store_persists_and_orders` | unit | ⏳ | web dashboard slice B |
+| M8,M2 | SPEC-web-dashboard | FR-541 | TC-541 | `todo_routes_crud_and_snapshot` | integration | ⏳ | web dashboard slice B |
+| M8,M6 | SPEC-web-dashboard | FR-542 | TC-542 | `dashboard_run_todo_with_agent_and_graph` | unit | ⏳ | web dashboard slice B |
+| M8,M2 | SPEC-web-dashboard | UX-540 | TC-543 | `static_page_has_todo_panel` | unit | ⏳ | web dashboard slice B |
+| M8,M2 | SPEC-web-dashboard | FR-541 | TC-544 | `todo_routes_reject_invalid_requests` | integration | ⏳ | web dashboard slice B |
+| M8,M6 | SPEC-web-dashboard | FR-542 | TC-545 | `todo_run_requires_web_mode` | integration | ⏳ | web dashboard slice B |
 
 
 ### 1.1 주의할 ⚠️ 항목

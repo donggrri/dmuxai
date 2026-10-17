@@ -16,6 +16,18 @@ Spec: [SPEC-web-dashboard.md](../specs/SPEC-web-dashboard.md)
 | [x] | App publishing | FR-530 | `cargo test --bin dmuxai app_publishes_graph_state_to_dashboard` |
 | [x] | Docs, TEST-PLAN rows, review | all | `bash scripts/spec-index.sh`; `cargo test --test spec_index` |
 
-## Slice B (to-do board) and slice C (shared MCP)
+## Slice B (to-do board)
 
-Planned; see SPEC sections 4 and 5.
+| Done | Owner | Task | Requirement IDs | Test command |
+| --- | --- | --- | --- | --- |
+| [ ] | opencode deepseek | `TodoStore` persistence and ordering | FR-540 | `cargo test --lib todo_store_persists_and_orders` |
+| [ ] | opencode deepseek | Router: `/api/todos` CRUD + snapshot/SSE wiring | FR-541 | `cargo test --lib todo_routes_crud_and_snapshot` |
+| [ ] | opencode deepseek | Route validation and error mapping (400/404/415) | FR-541 | `cargo test --lib todo_routes_reject_invalid_requests` |
+| [ ] | opencode deepseek | Run route + `DashboardServices`/`set_todos` wiring (409 web-mode) | FR-542 | `cargo test --lib todo_run_requires_web_mode` |
+| [ ] | AGY | App `RunTodo` command handling and run lifecycle | FR-542 | `cargo test --bin dmuxai dashboard_run_todo_with_agent_and_graph` |
+| [ ] | opencode glm | Page to-do panel (add/edit/done/delete/run controls) | UX-540, FR-541, FR-542 | `node --check src/web/assets/app.js`; `cargo test --lib static_page_has_todo_panel` |
+| [ ] | opencode glm | Docs: TEST-PLAN rows, tasks, review | FR-540..UX-540 | `bash scripts/spec-index.sh`; `cargo test --test spec_index` |
+
+## Slice C (shared MCP)
+
+Planned; see SPEC section 4 (INT-560..NFR-560).

@@ -3,21 +3,40 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Json;
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::header::HeaderName;
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, patch, post};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::WatchStream;
 
+use crate::todo::{NewTodo, TodoError, TodoPatch, TodoSource, TodoStatus};
 use crate::web::DEFAULT_PORT;
 use crate::web::auth::{BindCheck, check_bind, dashboard_url, token_matches};
+use crate::web::commands::{DashboardCommand, RunMode, RunTodoError};
 use crate::web::hub::DashboardHub;
+
+/// Slice B dependencies injected into the router (FR-541, FR-542).
+#[derive(Clone, Default)]
+pub struct DashboardServices {
+    pub todos: Option<Arc<crate::todo::TodoStore>>,
+    pub commands: Option<mpsc::Sender<DashboardCommand>>,
+    /// True for a `dmuxai --web` server (in-process command channel by design),
+    /// false for `dmuxai serve`. Lets a run request distinguish "this build has
+    /// no to-do board because the store failed to open" (503) from "serves can
+    /// never run to-dos" (409).
+    pub web_attached: bool,
+}
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -25,6 +44,7 @@ pub struct ServerConfig {
     pub port: u16,
     pub allow_remote: bool,
     pub token: String,
+    pub services: DashboardServices,
 }
 
 #[derive(Clone)]
@@ -32,6 +52,7 @@ struct AppState {
     hub: DashboardHub,
     token: Arc<String>,
     allowed_hosts: Option<Arc<Vec<String>>>,
+    services: DashboardServices,
 }
 
 pub struct DashboardServer {
@@ -44,6 +65,87 @@ pub struct DashboardServer {
 impl DashboardServer {
     pub fn abort(&self) {
         self.handle.abort();
+    }
+}
+
+fn error_json(status: StatusCode, message: &str) -> Response {
+    let body = serde_json::json!({ "error": message }).to_string();
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn json_ok<T: Serialize>(status: StatusCode, value: &T) -> Response {
+    match serde_json::to_string(value) {
+        Ok(body) => (
+            status,
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CACHE_CONTROL, "no-store"),
+                (HeaderName::from_static("x-content-type-options"), "nosniff"),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+fn todo_error_response(error: TodoError) -> Response {
+    match error {
+        TodoError::NotFound => error_json(StatusCode::NOT_FOUND, "to-do not found"),
+        TodoError::Invalid(message) => error_json(StatusCode::BAD_REQUEST, &message),
+        TodoError::Storage(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+fn todo_store(state: &AppState) -> Option<Arc<crate::todo::TodoStore>> {
+    state.services.todos.clone()
+}
+
+fn refresh_todos(state: &AppState, store: &crate::todo::TodoStore) {
+    if let Ok(todos) = store.list() {
+        state.hub.set_todos(todos);
+    }
+}
+
+/// JSON extractor that maps a missing/wrong content type to 415 and a bad
+/// body to 400, both with an `{"error": "..."}` body (FR-541).
+struct ApiJson<T>(T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => {
+                let (status, message) = match rejection {
+                    JsonRejection::MissingJsonContentType(_) => {
+                        (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported media type")
+                    }
+                    JsonRejection::JsonSyntaxError(_) | JsonRejection::JsonDataError(_) => {
+                        (StatusCode::BAD_REQUEST, "invalid json")
+                    }
+                    JsonRejection::BytesRejection(_) => {
+                        (StatusCode::PAYLOAD_TOO_LARGE, "request too large")
+                    }
+                    _ => (StatusCode::BAD_REQUEST, "invalid request"),
+                };
+                Err(error_json(status, message))
+            }
+        }
     }
 }
 
@@ -132,6 +234,171 @@ async fn get_events(
             .map(|json| Ok(Event::default().event("snapshot").data(json)))
     });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
+#[derive(serde::Deserialize)]
+struct NewTodoBody {
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PatchTodoBody {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RunTodoBody {
+    mode: String,
+    #[serde(default)]
+    agent: Option<String>,
+}
+
+async fn list_todos(State(state): State<AppState>) -> Response {
+    let Some(store) = todo_store(&state) else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-dos unavailable");
+    };
+    match store.list() {
+        Ok(todos) => json_ok(StatusCode::OK, &todos),
+        Err(error) => todo_error_response(error),
+    }
+}
+
+async fn create_todo(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<NewTodoBody>,
+) -> Response {
+    let Some(store) = todo_store(&state) else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-dos unavailable");
+    };
+    let new = NewTodo {
+        title: body.title,
+        body: body.body,
+        source: TodoSource::Manual,
+        source_ref: None,
+    };
+    match store.create(new) {
+        Ok(todo) => {
+            refresh_todos(&state, &store);
+            json_ok(StatusCode::CREATED, &todo)
+        }
+        Err(error) => todo_error_response(error),
+    }
+}
+
+async fn update_todo(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<PatchTodoBody>,
+) -> Response {
+    let Some(store) = todo_store(&state) else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-dos unavailable");
+    };
+    let status = match body.status.as_deref() {
+        None => None,
+        Some("open") => Some(TodoStatus::Open),
+        Some("done") => Some(TodoStatus::Done),
+        Some("running") => Some(TodoStatus::Running),
+        Some(_) => return error_json(StatusCode::BAD_REQUEST, "invalid status"),
+    };
+    let patch = TodoPatch {
+        title: body.title,
+        body: body.body,
+        status,
+    };
+    match store.update(&id, patch) {
+        Ok(todo) => {
+            refresh_todos(&state, &store);
+            json_ok(StatusCode::OK, &todo)
+        }
+        Err(error) => todo_error_response(error),
+    }
+}
+
+async fn delete_todo(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some(store) = todo_store(&state) else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-dos unavailable");
+    };
+    match store.delete(&id) {
+        Ok(()) => {
+            refresh_todos(&state, &store);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => todo_error_response(error),
+    }
+}
+
+async fn run_todo(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<RunTodoBody>,
+) -> Response {
+    let mode = match body.mode.as_str() {
+        "agent" => match body.agent {
+            Some(agent) if !agent.trim().is_empty() => RunMode::Agent {
+                agent: agent.trim().to_owned(),
+            },
+            _ => return error_json(StatusCode::BAD_REQUEST, "mode agent requires an agent id"),
+        },
+        "graph" => RunMode::Graph,
+        _ => return error_json(StatusCode::BAD_REQUEST, "invalid mode"),
+    };
+
+    // `--web` without a store could not be made runnable; report the missing
+    // board (503) rather than the `serve` "requires dmuxai --web" hint.
+    if state.services.todos.is_none() && state.services.web_attached {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-do board unavailable");
+    }
+
+    let Some(sender) = state.services.commands.clone() else {
+        return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
+    };
+
+    let (reply, rx) = oneshot::channel();
+    if sender
+        .send(DashboardCommand::RunTodo {
+            todo_id: id,
+            mode,
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
+    }
+
+    let result = match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Err(_) => return error_json(StatusCode::GATEWAY_TIMEOUT, "run request timed out"),
+        Ok(Err(_)) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        Ok(Ok(Err(error))) => return run_error_response(error),
+        Ok(Ok(Ok(todo))) => todo,
+    };
+
+    if let Some(store) = state.services.todos.clone()
+        && let Ok(todos) = store.list()
+    {
+        state.hub.set_todos(todos);
+    }
+    json_ok(StatusCode::ACCEPTED, &result)
+}
+
+fn run_error_response(error: RunTodoError) -> Response {
+    match error {
+        RunTodoError::Busy(message) => error_json(StatusCode::CONFLICT, &message),
+        RunTodoError::AlreadyRunning => {
+            error_json(StatusCode::CONFLICT, "to-do is already running")
+        }
+        RunTodoError::Forbidden(message) => error_json(StatusCode::FORBIDDEN, &message),
+        RunTodoError::UnknownAgent(message) => error_json(StatusCode::NOT_FOUND, &message),
+        RunTodoError::NotFound => error_json(StatusCode::NOT_FOUND, "to-do not found"),
+        RunTodoError::Internal(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
 }
 
 async fn security_and_auth_middleware(
@@ -228,10 +495,20 @@ pub fn build_router(
     token: String,
     allowed_hosts: Option<Vec<String>>,
 ) -> Router {
+    build_router_with(hub, token, allowed_hosts, DashboardServices::default())
+}
+
+pub fn build_router_with(
+    hub: DashboardHub,
+    token: String,
+    allowed_hosts: Option<Vec<String>>,
+    services: DashboardServices,
+) -> Router {
     let state = AppState {
         hub,
         token: Arc::new(token),
         allowed_hosts: allowed_hosts.map(Arc::new),
+        services,
     };
 
     Router::new()
@@ -240,6 +517,9 @@ pub fn build_router(
         .route("/assets/app.css", get(get_app_css))
         .route("/api/state", get(get_state))
         .route("/api/events", get(get_events))
+        .route("/api/todos", get(list_todos).post(create_todo))
+        .route("/api/todos/{id}", patch(update_todo).delete(delete_todo))
+        .route("/api/todos/{id}/run", post(run_todo))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_and_auth_middleware,
@@ -282,7 +562,8 @@ pub async fn start_server(
     };
 
     let url = dashboard_url(addr, &config.token);
-    let router = build_router(hub, config.token, allowed_hosts);
+    let services = config.services.clone();
+    let router = build_router_with(hub, config.token, allowed_hosts, services);
 
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
@@ -304,6 +585,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::graph::{GraphEdge, GraphNodeStatus, GraphRunPhase, NodeRole};
+    use crate::todo::{Todo, TodoStore};
     use crate::web::auth::generate_token;
     use crate::web::snapshot::{GraphCounts, GraphView, NodeView, SnapshotSource};
 
@@ -506,6 +788,7 @@ mod tests {
             port: 0,
             allow_remote: false,
             token: token.clone(),
+            services: DashboardServices::default(),
         };
 
         let server = start_server(config, hub.clone()).await.unwrap();
@@ -606,5 +889,497 @@ mod tests {
 
         // Test server abort
         server.abort();
+    }
+
+    // ---- slice B test helpers -------------------------------------------
+
+    fn test_hub() -> DashboardHub {
+        DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string())
+    }
+
+    fn allowed_localhost() -> Option<Vec<String>> {
+        Some(vec!["localhost:7420".to_string()])
+    }
+
+    fn json_request(
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: &str,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Host", "localhost:7420")
+            .header("Origin", "http://localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    async fn read_body(response: Response) -> String {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn revision_of(body: &str) -> Option<u64> {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value.get("revision").and_then(|r| r.as_u64()))
+    }
+
+    fn test_todo() -> Todo {
+        Todo {
+            id: "abc".to_owned(),
+            title: "run me".to_owned(),
+            body: String::new(),
+            status: TodoStatus::Running,
+            source: TodoSource::Manual,
+            source_ref: None,
+            run_kind: Some("agent".to_owned()),
+            run_ref: Some("codex".to_owned()),
+            last_error: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    fn spawn_reply(outcome: Result<Todo, RunTodoError>) -> mpsc::Sender<DashboardCommand> {
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                let DashboardCommand::RunTodo { reply, .. } = command;
+                let _ = reply.send(outcome.clone());
+            }
+        });
+        tx
+    }
+
+    fn spawn_recording_reply(
+        outcome: Result<Todo, RunTodoError>,
+        seen: Arc<std::sync::Mutex<Vec<RunMode>>>,
+    ) -> mpsc::Sender<DashboardCommand> {
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                let DashboardCommand::RunTodo { mode, reply, .. } = command;
+                seen.lock().unwrap().push(mode);
+                let _ = reply.send(outcome.clone());
+            }
+        });
+        tx
+    }
+
+    // TC-541 / FR-541: CRUD routes and the snapshot reflect every mutation.
+    #[tokio::test]
+    async fn todo_routes_crud_and_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TodoStore::open(&dir.path().join("conversations.sqlite3")).unwrap());
+        let hub = test_hub();
+        let token = "todo-token-123".to_string();
+        let services = DashboardServices {
+            todos: Some(store.clone()),
+            commands: None,
+            web_attached: false,
+        };
+        let router = build_router_with(hub.clone(), token.clone(), allowed_localhost(), services);
+
+        // POST create -> 201 and the snapshot gains the to-do with a higher revision.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/todos",
+                &token,
+                r#"{"title":"buy milk","body":"2%"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created = read_body(resp).await;
+        let created_json: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let id = created_json["id"].as_str().unwrap().to_owned();
+        assert_eq!(created_json["status"], "open");
+        assert_eq!(created_json["source"], "manual");
+
+        let state = read_body(
+            router
+                .clone()
+                .oneshot(json_request("GET", "/api/state", &token, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let state_json: serde_json::Value = serde_json::from_str(&state).unwrap();
+        assert_eq!(state_json["todos"].as_array().unwrap().len(), 1);
+        assert_eq!(state_json["todos"][0]["title"], "buy milk");
+        let rev_after_create = revision_of(&state).unwrap();
+        assert!(rev_after_create >= 1);
+
+        // GET list -> 200.
+        let resp = router
+            .clone()
+            .oneshot(json_request("GET", "/api/todos", &token, ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let list = read_body(resp).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&list)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // PATCH title -> 200.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/api/todos/{id}"),
+                &token,
+                r#"{"title":"buy oat milk"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let patched = read_body(resp).await;
+        assert!(patched.contains("buy oat milk"));
+
+        // PATCH body -> 200.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/api/todos/{id}"),
+                &token,
+                r#"{"body":"shelf 3"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(read_body(resp).await.contains("shelf 3"));
+
+        // PATCH status done -> 200 and snapshot revision increased.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/api/todos/{id}"),
+                &token,
+                r#"{"status":"done"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(read_body(resp).await.contains("\"done\""));
+
+        let state = read_body(
+            router
+                .clone()
+                .oneshot(json_request("GET", "/api/state", &token, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(revision_of(&state).unwrap() > rev_after_create);
+        assert!(state.contains("buy oat milk"));
+
+        // DELETE -> 204, then the list is empty.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "DELETE",
+                &format!("/api/todos/{id}"),
+                &token,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = router
+            .oneshot(json_request("GET", "/api/todos", &token, ""))
+            .await
+            .unwrap();
+        let list = read_body(resp).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&list)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    // TC-544 / FR-541: invalid and unauthorized requests get the exact codes.
+    #[tokio::test]
+    async fn todo_routes_reject_invalid_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TodoStore::open(&dir.path().join("conversations.sqlite3")).unwrap());
+        let token = "todo-token-123".to_string();
+        let services = DashboardServices {
+            todos: Some(store),
+            commands: None,
+            web_attached: false,
+        };
+        let router = build_router_with(test_hub(), token.clone(), allowed_localhost(), services);
+
+        // empty title -> 400
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/todos",
+                &token,
+                r#"{"title":"   "}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // 201-character title -> 400
+        let long_title = "x".repeat(201);
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/todos",
+                &token,
+                &format!(r#"{{"title":"{long_title}"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // non-JSON content type -> 415
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/todos")
+            .header("Host", "localhost:7420")
+            .header("Origin", "http://localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "text/plain")
+            .body(axum::body::Body::from(r#"{"title":"ok"}"#))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // body over axum's default limit -> 413 request too large
+        let oversized = "x".repeat(3 * 1024 * 1024);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/todos")
+            .header("Host", "localhost:7420")
+            .header("Origin", "http://localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(format!(
+                r#"{{"title":"{oversized}"}}"#
+            )))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(read_body(resp).await.contains("request too large"));
+
+        // unknown id -> 404
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                "/api/todos/does-not-exist",
+                &token,
+                r#"{"title":"x"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // status "running" -> 400 (create one first for a valid id)
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/todos",
+                &token,
+                r#"{"title":"valid"}"#,
+            ))
+            .await
+            .unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&read_body(resp).await).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/api/todos/{id}"),
+                &token,
+                r#"{"status":"running"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // missing token -> 401
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/todos")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // foreign Origin -> 403
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/todos")
+            .header("Host", "localhost:7420")
+            .header("Origin", "http://evil.example")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // TC-545 / FR-542: running a to-do needs the --web command channel.
+    #[tokio::test]
+    async fn todo_run_requires_web_mode() {
+        let token = "todo-token-123".to_string();
+
+        // No command channel (`dmuxai serve`) -> 409 with the web-mode hint.
+        let serve_router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices::default(),
+        );
+        let resp = serve_router
+            .oneshot(json_request(
+                "POST",
+                "/api/todos/abc/run",
+                &token,
+                r#"{"mode":"graph"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(read_body(resp).await.contains("requires dmuxai --web"));
+
+        // A channel whose receiver replies Busy -> 409.
+        let busy_router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                todos: None,
+                commands: Some(spawn_reply(Err(RunTodoError::Busy(
+                    "agent busy".to_owned(),
+                )))),
+                web_attached: false,
+            },
+        );
+        let resp = busy_router
+            .oneshot(json_request(
+                "POST",
+                "/api/todos/abc/run",
+                &token,
+                r#"{"mode":"agent","agent":"codex"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // A successful reply -> 202 with the running to-do.
+        let ok_router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                todos: None,
+                commands: Some(spawn_reply(Ok(test_todo()))),
+                web_attached: false,
+            },
+        );
+        let resp = ok_router
+            .oneshot(json_request(
+                "POST",
+                "/api/todos/abc/run",
+                &token,
+                r#"{"mode":"graph"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert!(read_body(resp).await.contains("\"running\""));
+    }
+
+    // TC-545 / FR-542: a `--web` server whose store failed to open answers 503
+    // "to-do board unavailable" instead of the `serve` 409 hint.
+    #[tokio::test]
+    async fn todo_run_web_without_store_is_503() {
+        let token = "todo-token-123".to_string();
+        let router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                todos: None,
+                commands: None,
+                web_attached: true,
+            },
+        );
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/todos/abc/run",
+                &token,
+                r#"{"mode":"graph"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(read_body(resp).await.contains("to-do board unavailable"));
+    }
+
+    // TC-545 / FR-542: the agent id is trimmed before it is forwarded.
+    #[tokio::test]
+    async fn todo_run_trims_agent_id() {
+        let token = "todo-token-123".to_string();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                todos: None,
+                commands: Some(spawn_recording_reply(Ok(test_todo()), seen.clone())),
+                web_attached: false,
+            },
+        );
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/todos/abc/run",
+                &token,
+                r#"{"mode":"agent","agent":"  codex  "}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let modes = seen.lock().unwrap();
+        assert_eq!(modes.len(), 1);
+        match &modes[0] {
+            RunMode::Agent { agent } => assert_eq!(agent, "codex"),
+            other => panic!("expected agent mode, got {other:?}"),
+        }
     }
 }

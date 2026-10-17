@@ -136,3 +136,50 @@ impl FileGraphSource { pub fn new(workspace: &Path) -> Self; pub fn poll(&mut se
 ## Rollback
 
 Remove `src/web`, the CLI branches and `attach_dashboard`; no persistence change in slice A.
+
+## Slice B contract (to-do board)
+
+`src/todo.rs` (FR-540): `TodoStore` (own `rusqlite::Connection` behind a `Mutex`, WAL,
+`busy_timeout` 5 s) on the per-repo DB file (`state_path::repo_db_path`); additive
+`CREATE TABLE IF NOT EXISTS todos (...)` + unique index on `(source, source_ref)` where
+`source_ref IS NOT NULL`; no `user_version` change. Types `Todo`, `TodoStatus`,
+`TodoSource`, `NewTodo`, `TodoPatch`, `TodoError` and the method list are fixed in the stub.
+
+`src/web/commands.rs` (FR-542): `DashboardCommand::RunTodo { todo_id, mode: RunMode, reply }`
+with `RunTodoError` -> HTTP mapping documented in the file.
+
+`src/web` (FR-541, FR-542):
+
+```rust
+pub struct DashboardServices { pub todos: Option<Arc<TodoStore>>, pub commands: Option<mpsc::Sender<DashboardCommand>> }
+impl Default for DashboardServices // both None
+pub fn build_router_with(hub, token, allowed_hosts, services: DashboardServices) -> Router; // build_router = with Default
+pub struct ServerConfig { ..., pub services: DashboardServices }
+impl DashboardHub { pub fn set_todos(&self, todos: Vec<Todo>) } // revision bump only on change
+DashboardSnapshot { ..., #[serde(default)] pub todos: Vec<Todo> }
+```
+
+Routes (token + Host/Origin checks as slice A): `GET /api/todos` (200 list),
+`POST /api/todos` (`{"title","body"?}` -> 201 todo), `PATCH /api/todos/{id}`
+(`{"title"?,"body"?,"status"?: "open"|"done"}` -> 200), `DELETE /api/todos/{id}` (204),
+`POST /api/todos/{id}/run` (`{"mode":"agent","agent":"..."}` | `{"mode":"graph"}`;
+no sender -> 409 `{"error":"requires dmuxai --web"}`; reply timeout 10 s -> 504; ok -> 202 todo).
+Non-JSON content type -> 415; validation -> 400; store errors -> 500 `{"error":"internal"}`.
+No todo store -> 503. After every successful mutation the router calls `hub.set_todos(store.list())`.
+
+`src/main.rs`: both modes open `TodoStore` on `repo_db_path(workspace)`; `serve` passes
+`commands: None`; `--web` creates `mpsc::channel(16)`, passes the sender to the server and
+`app.attach_dashboard_services(store, receiver)`.
+
+`src/app.rs` (FR-542): `pub fn attach_dashboard_services(&mut self, store: Arc<TodoStore>, commands: mpsc::Receiver<DashboardCommand>)`;
+the run loop drains commands with `try_recv`; `RunTodo` resolves the to-do (`NotFound`,
+`AlreadyRunning`), the agent by runner id (`UnknownAgent`), `[graph] allowed_runners`
+(`Forbidden`), busy/graph-active (`Busy`), then submits `title\n\nbody` through the same
+paths as a typed prompt (agent: `submit_to_agent`; graph: `plan_request` -> `start_graph_run`,
+or the single-plan agent path), marks the to-do running and remembers the link
+(agent -> todo id; graph id -> todo id). `finish_turn_outcome` and graph `Completed`/`Failed`
+call `finish_run`; every change calls `hub.set_todos`.
+
+Owners: AGY -> `src/app.rs` command handling + TC-542; opencode deepseek -> `src/todo.rs`,
+`src/web` routes/hub/snapshot, `src/main.rs` wiring + TC-540, TC-541, TC-544, TC-545;
+opencode glm -> page to-do panel + TC-543 + docs; cross-review deepseek <-> glm, AGY reviewed by deepseek.

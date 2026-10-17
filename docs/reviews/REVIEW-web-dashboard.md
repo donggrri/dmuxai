@@ -132,3 +132,122 @@ Test state at review time (run by me, foreground): `cargo test --bin dmuxai pars
 Note: findings 1-5 are for the deepseek/AGY agents to fix; I changed only
 `docs/reviews/REVIEW-web-dashboard.md` in this round (no `.rs` or Cargo files
 touched, `cargo fmt` not run, nothing committed).
+
+## Slice B compliance (to-do board) — in progress
+
+Statuses stay `Pending` until slice B evidence (TC-540..TC-545) passes on the
+merged tree. This round (opencode glm) delivered the page panel and docs only;
+`src/todo.rs`, `src/web/server.rs`/`hub.rs`/`snapshot.rs` and `src/app.rs` were
+being edited by other agents and were not touched.
+
+| Requirement | Status | Notes |
+| --- | --- | --- |
+| FR-540 | Pending | persistence + ordering land in `src/todo.rs` (deepseek); page renders `snapshot.todos[]` in delivered order (open/running first) |
+| FR-541 | Pending | CRUD routes (deepseek); page POSTs/PATCHes/DELETEs `/api/todos` with `Content-Type: application/json` + Bearer token |
+| FR-542 | Pending | run routing (deepseek routes + AGY App command handling); page sends `{"mode":"agent","agent":id}` / `{"mode":"graph"}` and maps 409 `requires dmuxai --web` to an inline hint |
+| UX-540 | Pending | to-do panel: add form (title maxlength 200 required, optional body), status badge, source badge + `source_ref` for non-manual, done checkbox -> PATCH, inline edit (Edit/Save/Cancel), Delete with `confirm()`, agent select from `snapshot.agents` (busy disabled) + Run / Run as graph (disabled for running/done), `run_kind`/`run_ref` and red `last_error` for running items, per-item inline errors; edit/focus state preserved across snapshot re-renders (the item under edit is never destroyed) |
+
+### Slice B evidence (page + docs, this round)
+
+```text
+node --check src/web/assets/app.js                # syntax OK
+cargo test --lib static_page                      # TC-543 contains-checks added
+                                                  # (run result recorded after the
+                                                  # shared tree compiles; slice B
+                                                  # route/store tests are still in
+                                                  # flight by other owners)
+```
+
+Test mapping: TC-543 `static_page_has_todo_panel` asserts `index.html` contains
+`id="todos"` and `id="todo-form"`, and `app.js` references `/api/todos`.
+TC-540/541/542/544/545 are owned by deepseek/AGY and tracked as ⏳ in
+[TEST-PLAN](../TEST-PLAN.md) with note "web dashboard slice B".
+
+Residual risks / open items for slice B review:
+
+- Client renders `todos[]` as delivered and does not re-sort; ordering is the
+  store's contract (FR-540).
+- Checkbox on a `running` item can PATCH `done`/`open` (FR-541 allows both);
+  the run lifecycle (`finish_run`) may override it — server-side rule, not
+  enforced client-side beyond disabling Run controls.
+- Agent select options refresh on every snapshot; a busy agent chosen just
+  before a run can still answer 409 — surfaced inline via the parsed
+  `{"error": ...}` message.
+
+## Slice B cross-review (glm)
+
+Scope: `git diff src/web src/main.rs` + full read of `src/todo.rs` against
+FR-540, FR-541, FR-542 (router side) and TC-540, TC-541, TC-544, TC-545, plus
+the PLAN "Slice B contract" (TodoStore, `DashboardServices`, route table, App
+command handling read for the run flow). Read-only for Rust — findings only,
+fixes belong to deepseek (todo.rs / web) and AGY (app.rs). My page
+(`src/web/assets/*`) needed no changes.
+
+Test state at review time (run by me, foreground):
+
+```text
+cargo test --lib todo_                    # 5 passed, 0 failed
+cargo test --bin dmuxai dashboard_run_todo  # 1 passed, 0 failed (TC-542)
+```
+
+### Findings
+
+| # | Location | Severity | Finding and concrete fix |
+| --- | --- | --- | --- |
+| 1 | `src/main.rs:222-232` (`run_serve`) | Major | `serve` never seeds the hub: `open_todo_store` opens a store whose rows exist, but `hub.set_todos` is only called from route handlers and by the App (`attach_dashboard_services` -> `publish_todos`, app.rs:2887), which serve never runs. So `GET /api/state` reports `todos: []` and the page shows "no to-dos yet" even though persisted to-dos exist — FR-540/FR-541's "the to-do list appears in the snapshot `todos[]` and on SSE" only becomes true after the first mutation. Fix: after building the hub in `run_serve`, seed once: `if let Ok(todos) = store.list() { hub.set_todos(todos); }` (also covers `serve` opened after a previous TUI session). |
+| 2 | `src/todo.rs:308-351` (`update`) | Minor | A PATCH with title+body+status runs up to three separate UPDATE statements. Each is atomic but the patch is not: a concurrent `store.list()` feeding `hub.set_todos` (or the TUI) can observe a half-applied patch (new status, old title). Fix: single statement — `UPDATE todos SET title = COALESCE(?2, title), body = COALESCE(?3, body), status = COALESCE(?4, status), updated_at_ms = ?5 WHERE id = ?1` (keep the pre-validation and the NotFound check). |
+| 3 | `src/todo.rs:275-293` (`create` upsert) | Minor | Upsert-by-`(source, source_ref)` is SELECT-then-UPDATE. Inside one process the store Mutex serializes, but two processes on the same DB (TUI plus `serve`, realistic when slice C import lands) can both pass the SELECT; the loser's INSERT then hits the unique index and becomes `TodoError::Storage` -> HTTP 500 instead of updating. Fix: on a SQLite unique-index constraint failure, fall back to fetch-by-`(source, source_ref)` + update (or use `ON CONFLICT`).
+| 4 | `src/app.rs:2940-2957` (Graph) / `src/app.rs:2994-3003` (agent) | Minor | The App starts the side effect before recording it: for a graph plan, `start_graph_run(plan)` runs *before* `mark_running`; the agent path calls `submit_to_agent` *before* `mark_running`. If `mark_running` fails (e.g. DB busy beyond 5 s), the route answers 500 while the turn/graph is already in flight and the to-do never becomes `running` (the graph branch also leaves `graph_todo` unset, so completion cannot transition the to-do). Fix (owner AGY): mark running first, then start, and abort the just-created run if marking failed. Low frequency, but the run-link state machine depends on the order. |
+| 5 | `src/web/server.rs:332-339` (`run_todo`) | Minor | `agent.trim()` is used only for the emptiness test; the untrimmed value is forwarded, so `" codex "` reaches `run_todo_agent` -> `UnknownAgent` -> 404. Fix: `let agent = body.agent.map(str::trim).filter(|a| !a.is_empty())` and forward the trimmed id. (My page always sends snapshot-provided `agent.id`, so clients are unaffected.) |
+| 6 | `src/app.rs:2430-2453`, `src/app.rs:2311-2316` | Minor | FR-542 distinguishes "failure or cancel" for the return-to-open transition. `Cancelled` is funneled through `finish_turn_outcome(agent, false)` and always records `last_error = "turn failed"` — the to-do returns to open correctly, but the stored reason is misleading (a user cancel ends up as a failure). Fix: pass the outcome kind through (`("failed", Some(msg))` vs `("cancelled", None/Some("turn cancelled")))`) or map `AgentEvent::Cancelled` before calling `finish_run`. |
+| 7 | `src/web/server.rs:88-115` (`ApiJson`) | Minor | A request body above axum's default 2 MB limit surfaces as `JsonRejection::BytesRejection` and falls into the `_` arm -> 400 `invalid request`. Spec-wise safe (both FR-541 char limits still gate the parsed value and 400 is allowed for a bad body), but 413 would be precise. Fix: add a `JsonRejection::BytesRejection` arm if axum 0.8 exposes it, or set a small explicit `DefaultBodyLimit`. |
+| 8 | `src/web/server.rs:341-355` + `src/main.rs:344-356` (`attach_web_dashboard` None path) | Minor | In `--web` mode with a failed store open, `commands` is also `None`, so a run POST answers 409 `requires dmuxai --web` even though the dashboard IS from `--web`. Confusing for the user (my page faithfully appends the "runs need `dmuxai --web`" hint to that text). Fix: when `todos` is `None` in a `--web` server, prefer 503 `{"error":"to-do board unavailable"}` for run too (e.g. add a `web_attached: bool` to `DashboardServices`), or include the startup error text in the startup notice only (already done in main.rs) and document. |
+| 9 | Todo handlers (`server.rs:253-371`) | Info | All store calls run synchronously inside async axum handlers; under contention with the TUI's `ConversationEngine` connection the shared `busy_timeout` (5 s) can block an HTTP worker up to 5 s per call. Route work also holds the store `Mutex` while fetching after writes. Acceptable for a loopback dashboard, but if hardening is wanted, wrap store calls in `tokio::task::spawn_blocking` (`TodoStore` is `Send + Sync`). |
+| 10 | `src/todo.rs:365-407` | Info | `finish_run` leaves `run_kind`/`run_ref` set after completion. Only the page hides them for non-running items (UX-540), so nothing leaks; if the spec later wants the last run link visible on done items these columns are already there — informational, no change needed. |
+
+### Checked and OK (no change requested)
+
+- SQL: every statement is parameterized (`params![]`, `?1` style); no string
+  interpolation of ids or bodies anywhere in `src/todo.rs`; schema SQL is a
+  static batch. No injection vector found.
+- Validation: title is trimmed, empty rejected, length checked in chars not
+  bytes (`todo.rs:163-174`); body limit 20 000 chars (`todo.rs:176-183`);
+  PATCH `running` -> 400 at both route (`server.rs:297` -> store `todo.rs:316-320`)
+  and the message reaches the body as `cannot set status to running directly`;
+  `done -> open` allowed; editing a running to-do allowed (spec silent); unknown
+  status string -> 400 `invalid status` (`server.rs:298`).
+- Status codes: 201 create, 200 list/patch, 204 delete, 202 run, 415 wrong
+  content type, 400 bad/missing JSON + validation, 404 unknown id/agent, 403
+  forbidden runner + foreign Origin, 409 serve/busy/already-running, 503 no
+  store, 504 reply timeout 10 s, 500 storage — all match the SPEC table and
+  TC-541/TC-544/TC-545 assertions, and all error bodies are `{"error": "..."}`
+  with `Storage` reduced to `internal` (no DB internals leaked).
+- Auth/CSRF: the middleware layer wraps the three new routes (`server.rs:502-508`),
+  so Host/Origin checks and the Bearer/`?token=` requirement run before the
+  JSON extractor; a cross-site form POST has neither a valid token nor JSON
+  content type and fails closed (403 with a foreign Origin, 401 without the
+  token) — state-changing routes are not form-abusable.
+- Concurrency: store connection sets `busy_timeout` before `journal_mode = WAL`
+  (`todo.rs:232-239`), table is additive with no `user_version` touch (pinned by
+  the store test), and the same file is reopened by `ConversationEngine` in the
+  test; poisoned mutex recovered (`todo.rs:245-249`).
+- Serve-mode DB creation: `TodoStore::open` creates the parent dir + DB for a
+  repo that never ran the TUI; a failing `state_base` (no env) degrades to a
+  serve warning plus 503 responses, and `run` still answers the correct
+  409 web-mode message.
+- Windows: no unix-only APIs in the new code; `journal_mode = WAL` is
+  cross-platform SQLite; per-repo path uses `%LOCALAPPDATA%\DmuxAI` on Windows.
+- Flakiness: fresh temp DB per test, no sleeps, the 10 s timeout path is not
+  exercised, `spawn_reply` replies synchronously, hub revision assertions are
+  content-driven; I ran the lib tests twice without flakes.
+- Client contract (`src/web/assets/app.js`, glm-owned): POST `/api/todos`
+  `(title, body)` JSON+Bearer; PATCH `{status}` from the checkbox and
+  `{title, body}` from Save; DELETE; run bodies exactly
+  `{"mode":"agent","agent":<agent_id>}` / `{"mode":"graph"}` with the agent id
+  taken from `snapshot.agents[].id` (matching the App's runner-name lookup);
+  200/201/202/204 treated as success, 401 -> re-auth notice, everything else
+  inline via the parsed `error` field; `encodeURIComponent` id matches axum's
+  `Path<String>` decoding. No page fix required.
+- Cancel/failure edge on the page: an inline PATCH of a `running` to-do to
+  `done`/`open` is allowed by FR-541 and later reconciled by `finish_run`;
+  page does not special-case it (spec silent).
