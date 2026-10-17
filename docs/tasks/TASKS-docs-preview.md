@@ -9,3 +9,5 @@
 | [x] | Cursor (composer-2.5); AGY hit its quota | App per-turn change tracking and TUI file links (OSC 8 + click) | FR-748, FR-750 | `cargo test --bin dmuxai tui_file_link` |
 | [x] | Grok Bot | Headless Chrome e2e (python Playwright) and screenshots | UX-753 | `cargo test --test web_docs_preview -- --ignored` |
 | [x] | glm <-> deepseek, Cursor (composer-2.5) reviewer | Cross-reviews (lib/UI, backend security, TUI); fixes by the runners and Grok Bot | all | `cargo test --all-targets` |
+| [x] | Cursor (composer-2.5) impl + review, Grok Bot hardening | Token kept out of TUI links (open tickets) and client-side `sanitizeInto` | FR-743, FR-750, NFR-751 | `cargo test --lib open_ticket_is_single_use` |
+| [ ] deferred | – | OQ-740 per-turn attribution for overlapping turns, OQ-741 scripted HTML preview, OQ-742 stronger LibreOffice network isolation (see SPEC §2 open questions) | FR-746..FR-748 | – |

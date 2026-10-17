@@ -18,13 +18,15 @@ Status: in progress
   `pub docs: Option<Arc<DocsService>>`; no docs service -> docs routes 503.
 - **Assets**: `src/web/assets/docs.js`, `src/web/assets/docs.css` served at
   `/assets/docs.js` and `/assets/docs.css` (same headers as app.js/app.css).
-  `index.html` only gains the two tags and one `<section id="docs">`. No edits
-  to `app.js`/`app.css` beyond nothing (isolation from parallel PRs C/E/G/H).
+  `index.html` only gains the two tags and one `<section id="docs">`. `app.js`
+  gets two small hooks only (keep `#doc=` when stripping `?token=`, and a
+  `dmuxai:snapshot` window event), to stay isolated from parallel PRs C/E/G/H.
 - **`src/main.rs`**: builds `DocsService` (serve: read_only = true; `--web`:
   false, shares its `ChangeLog` with the App).
 - **`src/app.rs`**: on turn start, scan workspace on a worker thread; on turn
   end, scan again, diff, push `TurnChanges` (agent, graph/node id, output tail,
-  links). TUI transcript: file links get OSC 8 + click-to-open (FR-750).
+  links). TUI transcript: file links get OSC 8 `file://` targets + click-to-open
+  through a single-use open ticket; the App never holds the API token (FR-750).
 
 ## HTTP API (all under the dashboard token)
 
@@ -39,6 +41,7 @@ Status: in progress
 | GET | `/docs/view/{ticket}` | – | raw bytes (html: sandbox CSP; pdf: `application/pdf` inline) | 404 |
 | GET | `/docs/download/{ticket}` | – | raw bytes, `Content-Disposition: attachment` | 404 |
 | GET | `/api/docs/changes` | `?node=` | `{turns:[TurnChanges]}` newest first | – |
+| GET | `/docs/open/{ticket}` | – (single-use, 60 s, minted by the TUI click) | no-store page that stores the token in sessionStorage and replaces itself with `/#doc=<path>` (nonce CSP) | 404 |
 
 Error bodies are `{"error": "..."}` as in slice B. Tickets: 128-bit random hex,
 5-minute expiry, bound to one canonical path and one purpose (view/download),
@@ -51,3 +54,5 @@ is not needed; the ticket is the capability.
 The module reads the token the same way `app.js` does (sessionStorage key used
 by app.js), renders the file browser, the per-turn changes list (with output
 tail linkified by `links`), and the preview pane. Deep link `#doc=<path>`.
+Server HTML is inserted only through `sanitizeInto`, a client-side allowlist
+sanitizer layered on top of ammonia.
