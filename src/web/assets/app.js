@@ -2106,6 +2106,9 @@ function applySnapshot(snap) {
   render(lastRendered);
   renderTodos(snap);
   scheduleTick();
+  // Optional modules (session.js) reuse this connection instead of opening
+  // their own SSE stream (SPEC-dashboard-parity NFR-780).
+  document.dispatchEvent(new CustomEvent('dmuxai:snapshot', { detail: snap }));
 }
 
 function onUnauthorized() {

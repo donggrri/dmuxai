@@ -54,7 +54,11 @@ use dmuxai::{
     skills::{discover_skills, skill_prompt_prefix},
     theme::{Speaker, Theme},
     todo::{Todo, TodoError, TodoStatus, TodoStore},
-    web::commands::{DashboardCommand, PromptAccepted, RunMode, RunTodoError},
+    web::commands::{DashboardCommand, PromptAccepted, RunMode, RunTodoError, SessionCommand},
+    web::{
+        SessionAgent, SessionCommandInfo, SessionConversation, SessionMessage, SessionModel,
+        SessionView, cap_session_transcript,
+    },
 };
 
 use crate::agent::{
@@ -717,6 +721,9 @@ pub struct App {
     mcp_registry: Arc<McpRegistry>,
     agy_mcp_notice_shown: bool,
     agent_lifecycle: HashMap<Agent, AgentLifecycleState>,
+    /// Recent conversations for the dashboard session, refreshed at most every
+    /// few seconds or when the active conversation changes (FR-780).
+    session_conversations: Option<(Instant, String, Vec<SessionConversation>)>,
 }
 
 impl App {
@@ -884,6 +891,7 @@ impl App {
             mcp_registry,
             agy_mcp_notice_shown: false,
             agent_lifecycle: HashMap::new(),
+            session_conversations: None,
         };
         app.restore_snapshot(snapshot);
         Ok(app)
@@ -1047,6 +1055,11 @@ impl App {
                         let _ = reply.send(result);
                         changed = true;
                     }
+                    DashboardCommand::Session { command, reply } => {
+                        let result = self.handle_session_command(command);
+                        let _ = reply.send(result);
+                        changed = true;
+                    }
                 }
             }
             self.dashboard_commands = Some(rx);
@@ -1089,7 +1102,10 @@ impl App {
             }
         }
 
-        if self.busy_agents.contains(&target_agent) {
+        // Slash commands (except the `//` escape) are allowed while the agent
+        // works, exactly like typing them in the TUI (SPEC-dashboard-parity FR-783).
+        let is_slash = text.starts_with('/') && !text.starts_with("//");
+        if !is_slash && self.busy_agents.contains(&target_agent) {
             return Err(RunTodoError::Busy(format!("agent '{runner_id}' is busy")));
         }
 
@@ -1108,13 +1124,374 @@ impl App {
         }
 
         self.selected = adapter_index(target_agent);
-        self.input = text;
+        // Keep whatever the TUI user is typing; the dashboard text is submitted
+        // on its own (SPEC-dashboard-parity FR-782).
+        let tui_draft = mem::replace(&mut self.input, text);
         self.submit_prompt();
+        self.input = tui_draft;
 
         Ok(PromptAccepted {
             conversation_id: self.conversation_id.as_str().to_owned(),
             agent: runner_id.to_owned(),
         })
+    }
+
+    /// Whether `[graph] allowed_runners` permits a runner (unset = every runner).
+    fn runner_is_allowed(&self, runner_id: &str) -> bool {
+        match &self.settings.graph_allowed_runners {
+            None => true,
+            Some(allowed) => allowed
+                .iter()
+                .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim())),
+        }
+    }
+
+    /// The refusal for a runner outside `allowed_runners`, worded like the
+    /// prompt route (FR-781).
+    fn runner_forbidden(&self, runner_id: &str) -> RunTodoError {
+        match &self.settings.graph_allowed_runners {
+            Some(allowed) if allowed.is_empty() => {
+                RunTodoError::Forbidden("no allowed runners".to_owned())
+            }
+            _ => RunTodoError::Forbidden(format!("runner '{runner_id}' is not in allowed_runners")),
+        }
+    }
+
+    /// Maps a dashboard agent id to an adapter; `None` means the selected agent.
+    fn resolve_dashboard_agent(&self, agent: Option<&str>) -> Result<Agent, RunTodoError> {
+        let Some(raw) = agent.map(str::trim).filter(|raw| !raw.is_empty()) else {
+            return Ok(self.adapters[self.selected].agent());
+        };
+        self.adapters
+            .iter()
+            .map(|adapter| adapter.agent())
+            .find(|candidate| self.agent_runner_name(*candidate).eq_ignore_ascii_case(raw))
+            .ok_or_else(|| RunTodoError::UnknownAgent(format!("unknown agent '{raw}'")))
+    }
+
+    /// The live chat session for the dashboard (SPEC-dashboard-parity FR-780).
+    fn session_view(&mut self) -> SessionView {
+        let conversation_id = self.conversation_id.as_str().to_owned();
+        let refresh = match &self.session_conversations {
+            Some((at, id, _)) => *id != conversation_id || at.elapsed() >= Duration::from_secs(5),
+            None => true,
+        };
+        if refresh {
+            let list = self
+                .engine
+                .list()
+                .map(|cards| {
+                    cards
+                        .into_iter()
+                        .take(50)
+                        .map(|card| SessionConversation {
+                            id: card.id.as_str().to_owned(),
+                            title: card.title,
+                            updated_at_ms: card.updated_at_ms.max(0) as u64,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.session_conversations = Some((Instant::now(), conversation_id.clone(), list));
+        }
+        let conversations = self
+            .session_conversations
+            .as_ref()
+            .map(|(_, _, list)| list.clone())
+            .unwrap_or_default();
+
+        let streaming: HashSet<usize> = self.streaming_messages.values().copied().collect();
+        let start = self
+            .messages
+            .len()
+            .saturating_sub(dmuxai::web::SESSION_TRANSCRIPT_MAX_MESSAGES);
+        let messages = self.messages[start..]
+            .iter()
+            .enumerate()
+            .map(|(offset, message)| {
+                let index = start + offset;
+                let (role, agent, content) = match &message.role {
+                    Role::User => ("user", None, message.content.clone()),
+                    Role::Agent(agent) => (
+                        "agent",
+                        Some(self.agent_runner_name(*agent)),
+                        message.content.clone(),
+                    ),
+                    Role::System => ("system", None, message.content.clone()),
+                    Role::Activity(item) => {
+                        ("activity", None, dmuxai::activity::collapsed_line(item))
+                    }
+                };
+                SessionMessage {
+                    id: format!("{conversation_id}:{index}"),
+                    role: role.to_owned(),
+                    agent,
+                    content,
+                    streaming: streaming.contains(&index),
+                }
+            })
+            .collect();
+        let (transcript, omitted) = cap_session_transcript(messages);
+
+        let agents = self
+            .adapters
+            .iter()
+            .map(|adapter| {
+                let agent = adapter.agent();
+                let id = self.agent_runner_name(agent);
+                let catalog = self.model_catalogs.get(&agent);
+                SessionAgent {
+                    allowed: self.runner_is_allowed(&id),
+                    label: agent.name().to_owned(),
+                    mode: self
+                        .modes
+                        .get(&agent)
+                        .copied()
+                        .unwrap_or_default()
+                        .name()
+                        .to_ascii_lowercase(),
+                    modes: ExecutionMode::ALL
+                        .iter()
+                        .filter(|mode| adapter.validate_mode(**mode).is_ok())
+                        .map(|mode| mode.name().to_ascii_lowercase())
+                        .collect(),
+                    model: catalog.and_then(|catalog| catalog.selected.clone()),
+                    effort: catalog.and_then(|catalog| catalog.selected_effort.clone()),
+                    busy: self.busy_agents.contains(&agent),
+                    models_loading: catalog.is_some_and(|catalog| catalog.loading),
+                    models: catalog
+                        .map(|catalog| {
+                            catalog
+                                .models
+                                .iter()
+                                .map(|model| SessionModel {
+                                    id: model.id.clone(),
+                                    label: model.label.clone(),
+                                    efforts: model.efforts.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    id,
+                }
+            })
+            .collect();
+
+        let mut commands: Vec<SessionCommandInfo> = SLASH_COMMANDS
+            .iter()
+            .map(|command| SessionCommandInfo {
+                name: command.name.to_owned(),
+                description: command.description.to_owned(),
+            })
+            .collect();
+        commands.push(SessionCommandInfo {
+            name: "/graph".to_owned(),
+            description: "Graph status, continue, or override with text".to_owned(),
+        });
+
+        SessionView {
+            conversation_id,
+            conversation_title: self.conversation_title.clone(),
+            selected_agent: self.agent_runner_name(self.adapters[self.selected].agent()),
+            details_expanded: self.all_details_expanded,
+            agents,
+            transcript,
+            transcript_omitted: start + omitted,
+            conversations,
+            commands,
+        }
+    }
+
+    /// Runs one dashboard picker or lifecycle action the way the matching TUI
+    /// command does and returns the updated session (SPEC-dashboard-parity FR-781).
+    fn handle_session_command(
+        &mut self,
+        command: SessionCommand,
+    ) -> Result<SessionView, RunTodoError> {
+        match command {
+            SessionCommand::SelectAgent { agent } => {
+                let target = self.resolve_dashboard_agent(Some(&agent))?;
+                let id = self.agent_runner_name(target);
+                if !self.runner_is_allowed(&id) {
+                    return Err(self.runner_forbidden(&id));
+                }
+                self.selected = adapter_index(target);
+                self.push_system(format!("Active agent: {target}."));
+            }
+            SessionCommand::SetMode { agent, mode } => {
+                let target = self.resolve_dashboard_agent(agent.as_deref())?;
+                let Some(mode) = ExecutionMode::ALL
+                    .into_iter()
+                    .find(|candidate| candidate.name().eq_ignore_ascii_case(mode.trim()))
+                else {
+                    return Err(RunTodoError::Invalid(
+                        "mode must be ask, plan or implement".to_owned(),
+                    ));
+                };
+                if self.busy_agents.contains(&target) {
+                    return Err(RunTodoError::Busy(format!(
+                        "Finish or cancel the {target} turn before changing modes."
+                    )));
+                }
+                let changed = self
+                    .set_agent_mode(target, mode)
+                    .map_err(RunTodoError::Invalid)?;
+                self.push_system(if changed {
+                    format!(
+                        "{target} mode selected: {mode}. The next prompt opens a new session with shared context."
+                    )
+                } else {
+                    format!("{target} mode is already selected: {mode}.")
+                });
+            }
+            SessionCommand::LoadModels { agent } => {
+                let target = self.resolve_dashboard_agent(agent.as_deref())?;
+                let index = adapter_index(target);
+                let catalog = self.model_catalogs.entry(target).or_default();
+                if catalog.models.is_empty() && !catalog.loading {
+                    catalog.loading = true;
+                    if let Err(error) = self.adapters[index].request_models() {
+                        catalog.loading = false;
+                        return Err(RunTodoError::Internal(format!(
+                            "could not load {target} models: {error}"
+                        )));
+                    }
+                }
+            }
+            SessionCommand::SelectModel { agent, model } => {
+                let target = self.resolve_dashboard_agent(agent.as_deref())?;
+                if self.busy_agents.contains(&target) {
+                    return Err(RunTodoError::Busy(format!(
+                        "Finish or cancel the {target} turn before changing models."
+                    )));
+                }
+                let Some(info) = self
+                    .model_catalogs
+                    .get(&target)
+                    .and_then(|catalog| catalog.models.iter().find(|m| m.id == model.trim()))
+                    .cloned()
+                else {
+                    return Err(RunTodoError::Missing(format!(
+                        "unknown model '{}' for {target}",
+                        model.trim()
+                    )));
+                };
+                let index = adapter_index(target);
+                // Same Cursor model pin as the TUI picker (SPEC-cursor-model-pin).
+                if target == Agent::Cursor
+                    && let Err(error) =
+                        dmuxai::model_policy::validate_model_for_runner("cursor", &info.id)
+                {
+                    self.push_system(format!(
+                        "Model {} rejected for Cursor ({error}); replaced with {}",
+                        info.label,
+                        dmuxai::model_policy::ALLOWED_MODEL
+                    ));
+                    let _ = self.adapters[index]
+                        .select_model(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                    if let Some(catalog) = self.model_catalogs.get_mut(&target) {
+                        catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                    }
+                } else {
+                    self.adapters[index]
+                        .select_model(info.id.clone())
+                        .map_err(|error| {
+                            RunTodoError::Invalid(format!(
+                                "Could not select {} for {target}: {error}",
+                                info.label
+                            ))
+                        })?;
+                    if let Some(catalog) = self.model_catalogs.get_mut(&target) {
+                        catalog.selected = Some(info.id.clone());
+                        catalog.selected_effort = info.default_effort.clone();
+                    }
+                }
+            }
+            SessionCommand::SetEffort { agent, effort } => {
+                let target = self.resolve_dashboard_agent(agent.as_deref())?;
+                if target != Agent::Codex {
+                    return Err(RunTodoError::Invalid(
+                        "Reasoning effort is available for Codex only.".to_owned(),
+                    ));
+                }
+                if self.busy_agents.contains(&target) {
+                    return Err(RunTodoError::Busy(
+                        "Finish or cancel the Codex turn before changing effort.".to_owned(),
+                    ));
+                }
+                let effort = effort.trim().to_owned();
+                let options = self
+                    .model_catalogs
+                    .get(&target)
+                    .map(selected_effort_options)
+                    .unwrap_or_default();
+                if !options.contains(&effort) {
+                    return Err(RunTodoError::Invalid(format!(
+                        "effort '{effort}' is not offered by the selected model"
+                    )));
+                }
+                self.adapters[adapter_index(target)]
+                    .select_effort(effort.clone())
+                    .map_err(|error| {
+                        RunTodoError::Invalid(format!(
+                            "Could not select Codex effort {effort}: {error}"
+                        ))
+                    })?;
+                // The adapter confirms with `EffortSelected`; reflect the choice in
+                // the response right away so the picker does not flick back.
+                if let Some(catalog) = self.model_catalogs.get_mut(&target) {
+                    catalog.selected_effort = Some(effort);
+                }
+            }
+            SessionCommand::Cancel { agent } => {
+                let target = self.resolve_dashboard_agent(agent.as_deref())?;
+                let previous = self.selected;
+                self.selected = adapter_index(target);
+                self.cancel_selected();
+                self.selected = previous;
+            }
+            SessionCommand::NewConversation { title } => {
+                let title = title
+                    .map(|title| title.trim().to_owned())
+                    .filter(|title| !title.is_empty());
+                self.create_conversation(title);
+                self.session_conversations = None;
+            }
+            SessionCommand::LoadConversation { id } => {
+                let cards = self
+                    .engine
+                    .list()
+                    .map_err(|error| RunTodoError::Internal(error.to_string()))?;
+                let Some(card) = cards.into_iter().find(|card| card.id.as_str() == id.trim())
+                else {
+                    return Err(RunTodoError::Missing(format!(
+                        "unknown conversation '{}'",
+                        id.trim()
+                    )));
+                };
+                self.select_conversation(card.id);
+                self.session_conversations = None;
+            }
+            SessionCommand::Share { target } => {
+                let agent = self.resolve_dashboard_agent(Some(&target))?;
+                let id = self.agent_runner_name(agent);
+                if parse_agent(&id).is_none() {
+                    return Err(RunTodoError::Invalid(
+                        "share target must be codex, cursor or agy".to_owned(),
+                    ));
+                }
+                if !self.runner_is_allowed(&id) {
+                    return Err(self.runner_forbidden(&id));
+                }
+                // Busy targets get the TUI's system message rather than an error.
+                self.share_conversation(&id);
+            }
+            SessionCommand::Status => self.request_status(),
+            SessionCommand::ToggleDetails => self.toggle_all_activity_details(),
+            SessionCommand::Quit => self.exit = true,
+        }
+        self.dirty = true;
+        Ok(self.session_view())
     }
 
     fn drain_agent_events(&mut self) -> DrainEventsOutcome {
@@ -3750,6 +4127,12 @@ impl App {
         }
 
         hub.publish(agents, graph);
+        // Only `dmuxai --web` (which has a command channel) exposes the chat
+        // session; headless runs and plain TUI sessions skip the work.
+        if self.dashboard_commands.is_some() {
+            let session = self.session_view();
+            hub.set_session(Some(session));
+        }
     }
 
     /// Attaches the to-do store without reconciling stale runs or attaching a command channel.
@@ -3878,6 +4261,8 @@ impl App {
                     RunTodoError::AlreadyRunning => (4, "to-do is already running".to_owned()),
                     RunTodoError::Busy(msg) => (4, msg),
                     RunTodoError::Forbidden(msg) => (5, msg),
+                    RunTodoError::Missing(msg) => (3, msg),
+                    RunTodoError::Invalid(msg) => (2, msg),
                     RunTodoError::Internal(msg) => (6, msg),
                 };
                 return HeadlessOutcome {
@@ -4117,6 +4502,8 @@ impl App {
         self.todo_store = Some(store);
         self.dashboard_commands = Some(commands);
         self.publish_todos();
+        // The chat session appears with the first snapshot (FR-780).
+        self.publish_dashboard();
     }
 
     /// Publishes the current to-do list to the dashboard hub, if attached (FR-542).
@@ -5979,6 +6366,10 @@ mod tests {
         }
 
         fn select_model(&self, _model: String) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
+        fn select_effort(&self, _effort: String) -> Result<(), AdapterError> {
             Ok(())
         }
 
@@ -10882,6 +11273,546 @@ mod tests {
         assert_eq!(requests[0].0, Agent::Codex);
         assert!(requests[0].1.prompt.contains("hello from dashboard"));
         assert_eq!(app.modes[&Agent::Codex], ExecutionMode::Ask);
+    }
+
+    fn web_app() -> (App, SentRequests, dmuxai::web::DashboardHub) {
+        let (mut app, sent) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/test-workspace".to_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+        let (_tx, rx) = mpsc::channel(4);
+        app.dashboard_commands = Some(rx);
+        (app, sent, hub)
+    }
+
+    fn codex_catalog() -> ModelCatalog {
+        ModelCatalog {
+            models: vec![ModelInfo {
+                id: "m1".to_owned(),
+                label: "Model One".to_owned(),
+                efforts: vec!["low".to_owned(), "high".to_owned()],
+                default_effort: Some("low".to_owned()),
+            }],
+            selected: None,
+            selected_effort: None,
+            loading: false,
+        }
+    }
+
+    // TC-780 (FR-780): `--web` snapshots carry the session with every contract key;
+    // a TUI without the dashboard command channel publishes none.
+    #[test]
+    fn dashboard_session_snapshot_has_contract_keys() {
+        let (mut app, _sent, hub) = web_app();
+        app.publish_dashboard();
+        let snapshot = serde_json::to_value(hub.snapshot()).unwrap();
+        let session = &snapshot["session"];
+        for key in [
+            "conversation_id",
+            "conversation_title",
+            "selected_agent",
+            "details_expanded",
+            "agents",
+            "transcript",
+            "transcript_omitted",
+            "conversations",
+            "commands",
+        ] {
+            assert!(session.get(key).is_some(), "missing session.{key}");
+        }
+        assert_eq!(session["conversation_id"], app.conversation_id.as_str());
+        assert_eq!(session["selected_agent"], "codex");
+        let agents = session["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), app.adapters.len());
+        for key in [
+            "id",
+            "label",
+            "mode",
+            "modes",
+            "model",
+            "effort",
+            "busy",
+            "allowed",
+            "models_loading",
+            "models",
+        ] {
+            assert!(agents[0].get(key).is_some(), "missing agents[].{key}");
+        }
+        let names: Vec<&str> = session["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .collect();
+        for command in SLASH_COMMANDS.iter() {
+            assert!(names.contains(&command.name), "{}", command.name);
+        }
+        assert!(names.contains(&"/graph"));
+
+        let (mut plain, _sent) = test_app();
+        let plain_hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/test-workspace".to_owned(),
+        );
+        plain.attach_dashboard(plain_hub.clone());
+        plain.publish_dashboard();
+        assert!(plain_hub.snapshot().session.is_none());
+    }
+
+    // TC-781 (FR-780, OQ-781): the transcript keeps the newest messages within
+    // the count/byte limits and marks cut messages; `serve` has no session.
+    #[test]
+    fn dashboard_session_transcript_is_capped() {
+        let (mut app, _sent, _hub) = web_app();
+        app.messages.clear();
+        for index in 0..250 {
+            let content = if index == 240 {
+                "x".repeat(100 * 1024)
+            } else {
+                format!("message {index}")
+            };
+            app.messages.push(Message::new(Role::User, content));
+        }
+        let session = app.session_view();
+        assert_eq!(
+            session.transcript.len(),
+            dmuxai::web::SESSION_TRANSCRIPT_MAX_MESSAGES
+        );
+        assert_eq!(session.transcript_omitted, 150);
+        let last = session.transcript.last().unwrap();
+        assert!(last.id.ends_with(":249"), "{}", last.id);
+        let big = session
+            .transcript
+            .iter()
+            .find(|message| message.id.ends_with(":240"))
+            .unwrap();
+        assert!(big.content.ends_with(dmuxai::web::SESSION_TRUNCATED_MARKER));
+        assert!(
+            big.content.len()
+                <= dmuxai::web::SESSION_MESSAGE_MAX_BYTES
+                    + dmuxai::web::SESSION_TRUNCATED_MARKER.len()
+        );
+        let total: usize = session.transcript.iter().map(|m| m.content.len()).sum();
+        assert!(total <= dmuxai::web::SESSION_TRANSCRIPT_MAX_BYTES);
+
+        let serve_hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Files,
+            "/test-workspace".to_owned(),
+        );
+        assert!(serve_hub.snapshot().session.is_none());
+    }
+
+    // TC-782 (FR-782): a dashboard prompt shows the user message and a streaming
+    // agent reply that settles on completion; the TUI draft is kept.
+    #[tokio::test]
+    async fn dashboard_prompt_streams_into_transcript() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let (tx, rx) = mpsc::channel(4);
+        app.dashboard_commands = Some(rx);
+        app.input = "tui draft".to_owned();
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(DashboardCommand::SubmitPrompt {
+            text: "line one\nline two".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            reply,
+        })
+        .await
+        .unwrap();
+        app.drain_dashboard_commands();
+        reply_rx.await.unwrap().unwrap();
+        assert_eq!(app.input, "tui draft");
+
+        let (agent, request) = sent.lock().unwrap()[0].clone();
+        assert!(request.prompt.contains("line one\nline two"));
+        event_tx
+            .send(AgentOutput {
+                agent,
+                conversation_id: Some(request.conversation_id.clone()),
+                turn_id: Some(request.turn_id.clone()),
+                event: AgentEvent::TextDelta("partial".to_owned()),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        app.drain_agent_events();
+        let session = app.session_view();
+        assert!(
+            session
+                .transcript
+                .iter()
+                .any(|m| m.role == "user" && m.content.contains("line one\nline two"))
+        );
+        let reply = session
+            .transcript
+            .iter()
+            .find(|m| m.role == "agent")
+            .expect("agent message");
+        assert!(reply.streaming);
+        assert_eq!(reply.agent.as_deref(), Some("codex"));
+        assert!(reply.content.contains("partial"));
+
+        event_tx
+            .send(AgentOutput {
+                agent,
+                conversation_id: Some(request.conversation_id),
+                turn_id: Some(request.turn_id),
+                event: AgentEvent::Completed,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        app.drain_agent_events();
+        let session = app.session_view();
+        assert!(
+            session
+                .transcript
+                .iter()
+                .filter(|m| m.role == "agent")
+                .all(|m| !m.streaming)
+        );
+    }
+
+    // TC-783 (FR-781, UX-780): picker and lifecycle commands do what the TUI
+    // command does, with the documented refusals.
+    #[test]
+    fn dashboard_commands_match_tui_actions() {
+        let (mut app, _sent, _hub) = web_app();
+
+        let session = app
+            .handle_session_command(SessionCommand::SelectAgent {
+                agent: "agy".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(session.selected_agent, "agy");
+        assert_eq!(app.adapters[app.selected].agent(), Agent::Agy);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.role == Role::System && m.content == "Active agent: AGY.")
+        );
+        assert!(matches!(
+            app.handle_session_command(SessionCommand::SelectAgent {
+                agent: "nope".to_owned()
+            }),
+            Err(RunTodoError::UnknownAgent(_))
+        ));
+
+        app.handle_session_command(SessionCommand::SetMode {
+            agent: Some("codex".to_owned()),
+            mode: "plan".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(app.modes[&Agent::Codex], ExecutionMode::Plan);
+        assert!(matches!(
+            app.handle_session_command(SessionCommand::SetMode {
+                agent: Some("codex".to_owned()),
+                mode: "turbo".to_owned(),
+            }),
+            Err(RunTodoError::Invalid(_))
+        ));
+
+        app.model_catalogs.insert(Agent::Codex, codex_catalog());
+        let session = app
+            .handle_session_command(SessionCommand::SelectModel {
+                agent: Some("codex".to_owned()),
+                model: "m1".to_owned(),
+            })
+            .unwrap();
+        let codex = session.agents.iter().find(|a| a.id == "codex").unwrap();
+        assert_eq!(codex.model.as_deref(), Some("m1"));
+        assert_eq!(codex.effort.as_deref(), Some("low"));
+        assert_eq!(codex.models[0].efforts, vec!["low", "high"]);
+        assert!(matches!(
+            app.handle_session_command(SessionCommand::SelectModel {
+                agent: Some("codex".to_owned()),
+                model: "missing".to_owned(),
+            }),
+            Err(RunTodoError::Missing(_))
+        ));
+        assert!(matches!(
+            app.handle_session_command(SessionCommand::SetEffort {
+                agent: Some("codex".to_owned()),
+                effort: "ultra".to_owned(),
+            }),
+            Err(RunTodoError::Invalid(message)) if message.contains("not offered")
+        ));
+        assert!(matches!(
+            app.handle_session_command(SessionCommand::SetEffort {
+                agent: Some("agy".to_owned()),
+                effort: "low".to_owned(),
+            }),
+            Err(RunTodoError::Invalid(message)) if message.contains("Codex only")
+        ));
+
+        // UX-780: a busy agent refuses mode/model/effort changes.
+        app.busy_agents.insert(Agent::Codex);
+        for command in [
+            SessionCommand::SetMode {
+                agent: Some("codex".to_owned()),
+                mode: "ask".to_owned(),
+            },
+            SessionCommand::SelectModel {
+                agent: Some("codex".to_owned()),
+                model: "m1".to_owned(),
+            },
+            SessionCommand::SetEffort {
+                agent: Some("codex".to_owned()),
+                effort: "high".to_owned(),
+            },
+        ] {
+            assert!(matches!(
+                app.handle_session_command(command),
+                Err(RunTodoError::Busy(_))
+            ));
+        }
+        let session = app.session_view();
+        assert!(
+            session
+                .agents
+                .iter()
+                .find(|a| a.id == "codex")
+                .unwrap()
+                .busy
+        );
+        app.busy_agents.remove(&Agent::Codex);
+
+        app.settings.graph_allowed_runners = Some(vec!["codex".to_owned()]);
+        assert!(matches!(
+            app.handle_session_command(SessionCommand::SelectAgent {
+                agent: "cursor".to_owned()
+            }),
+            Err(RunTodoError::Forbidden(_))
+        ));
+        let session = app.session_view();
+        assert!(
+            !session
+                .agents
+                .iter()
+                .find(|a| a.id == "cursor")
+                .unwrap()
+                .allowed
+        );
+        app.settings.graph_allowed_runners = None;
+
+        let before = app.all_details_expanded;
+        let session = app
+            .handle_session_command(SessionCommand::ToggleDetails)
+            .unwrap();
+        assert_eq!(session.details_expanded, !before);
+        app.handle_session_command(SessionCommand::Quit).unwrap();
+        assert!(app.exit);
+    }
+
+    // TC-783 (FR-781): effort, model loading, the Cursor model pin, share and an
+    // empty allowed_runners list behave like the TUI.
+    #[test]
+    fn dashboard_commands_cover_models_share_and_policy() {
+        let (mut app, sent, _hub) = web_app();
+        app.model_catalogs.insert(Agent::Codex, codex_catalog());
+        app.handle_session_command(SessionCommand::SelectModel {
+            agent: Some("codex".to_owned()),
+            model: "m1".to_owned(),
+        })
+        .unwrap();
+        let session = app
+            .handle_session_command(SessionCommand::SetEffort {
+                agent: None,
+                effort: "high".to_owned(),
+            })
+            .unwrap();
+        let codex = session.agents.iter().find(|a| a.id == "codex").unwrap();
+        assert_eq!(codex.effort.as_deref(), Some("high"));
+
+        app.model_catalogs
+            .insert(Agent::Agy, ModelCatalog::default());
+        let session = app
+            .handle_session_command(SessionCommand::LoadModels {
+                agent: Some("agy".to_owned()),
+            })
+            .unwrap();
+        assert!(
+            session
+                .agents
+                .iter()
+                .find(|a| a.id == "agy")
+                .unwrap()
+                .models_loading
+        );
+
+        app.model_catalogs.insert(
+            Agent::Cursor,
+            ModelCatalog {
+                models: vec![ModelInfo::new("other-model", "Other")],
+                ..ModelCatalog::default()
+            },
+        );
+        app.handle_session_command(SessionCommand::SelectModel {
+            agent: Some("cursor".to_owned()),
+            model: "other-model".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            app.model_catalogs[&Agent::Cursor].selected.as_deref(),
+            Some(dmuxai::model_policy::ALLOWED_MODEL)
+        );
+
+        // Share: busy target answers like the TUI (system message, no request).
+        app.busy_agents.insert(Agent::Agy);
+        app.handle_session_command(SessionCommand::Share {
+            target: "agy".to_owned(),
+        })
+        .unwrap();
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("the transcript was not shared"))
+        );
+        assert!(sent.lock().unwrap().is_empty());
+        app.busy_agents.remove(&Agent::Agy);
+        assert!(matches!(
+            app.handle_session_command(SessionCommand::Share {
+                target: "nope".to_owned()
+            }),
+            Err(RunTodoError::UnknownAgent(_))
+        ));
+
+        app.settings.graph_allowed_runners = Some(Vec::new());
+        for command in [
+            SessionCommand::SelectAgent {
+                agent: "agy".to_owned(),
+            },
+            SessionCommand::Share {
+                target: "agy".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                app.handle_session_command(command).unwrap_err(),
+                RunTodoError::Forbidden("no allowed runners".to_owned())
+            );
+        }
+    }
+
+    // TC-783 (FR-781): cancel targets the named agent like Ctrl+C on it.
+    #[test]
+    fn dashboard_cancel_targets_the_named_agent() {
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (mut app, _sent, cancelled) = test_app_runtime(engine, None);
+        let (_tx, rx) = mpsc::channel(4);
+        app.dashboard_commands = Some(rx);
+        app.busy_agents.insert(Agent::Agy);
+        let selected = app.selected;
+        app.handle_session_command(SessionCommand::Cancel {
+            agent: Some("agy".to_owned()),
+        })
+        .unwrap();
+        assert_eq!(cancelled.lock().unwrap().as_slice(), &[Agent::Agy]);
+        assert_eq!(app.selected, selected);
+    }
+
+    // TC-784 (FR-781): new and load conversation switch the active conversation.
+    #[test]
+    fn dashboard_new_and_load_conversation() {
+        let (mut app, _sent, _hub) = web_app();
+        let first = app.conversation_id.as_str().to_owned();
+        let session = app
+            .handle_session_command(SessionCommand::NewConversation {
+                title: Some("Second".to_owned()),
+            })
+            .unwrap();
+        assert_ne!(session.conversation_id, first);
+        assert_eq!(session.conversation_title, "Second");
+        assert!(session.conversations.iter().any(|c| c.id == first));
+        let session = app
+            .handle_session_command(SessionCommand::LoadConversation { id: first.clone() })
+            .unwrap();
+        assert_eq!(session.conversation_id, first);
+        assert!(matches!(
+            app.handle_session_command(SessionCommand::LoadConversation {
+                id: "does-not-exist".to_owned()
+            }),
+            Err(RunTodoError::Missing(_))
+        ));
+    }
+
+    // TC-785 (FR-783): slash commands sent as prompts behave like typing them,
+    // including while the agent is busy.
+    #[tokio::test]
+    async fn dashboard_slash_commands_via_prompt() {
+        let (mut app, sent, _hub) = web_app();
+        let (tx, rx) = mpsc::channel(8);
+        app.dashboard_commands = Some(rx);
+        app.busy_agents.insert(Agent::Codex);
+        let before = app.all_details_expanded;
+        for text in [
+            "/details",
+            "/graph status",
+            "/image missing-file.png",
+            "/summarize",
+        ] {
+            let (reply, reply_rx) = tokio::sync::oneshot::channel();
+            tx.send(DashboardCommand::SubmitPrompt {
+                text: text.to_owned(),
+                agent: Some("codex".to_owned()),
+                mode: None,
+                reply,
+            })
+            .await
+            .unwrap();
+            app.drain_dashboard_commands();
+            assert!(reply_rx.await.unwrap().is_ok(), "{text}");
+        }
+        assert_eq!(app.all_details_expanded, !before);
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(app.messages.iter().any(|m| m.role == Role::System));
+
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(DashboardCommand::SubmitPrompt {
+            text: "plain text".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            reply,
+        })
+        .await
+        .unwrap();
+        app.drain_dashboard_commands();
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            Err(RunTodoError::Busy(_))
+        ));
+    }
+
+    // TC-787 (FR-784): every TUI slash command has a dashboard control.
+    #[test]
+    fn tui_commands_have_dashboard_controls() {
+        let js = dmuxai::web::assets::SESSION_JS;
+        for name in SLASH_COMMANDS
+            .iter()
+            .map(|command| command.name)
+            .chain(["/graph"])
+        {
+            let control = dmuxai::web::parity::control_for(name)
+                .unwrap_or_else(|| panic!("{name} has no dashboard mapping in src/web/parity.rs"));
+            assert!(
+                dmuxai::web::parity::page_has_control(js, control),
+                "{name} maps to {control}, which session.js does not declare"
+            );
+        }
+        for key in [
+            "Enter",
+            "Shift+Enter",
+            "F2",
+            "F3",
+            "Ctrl+C",
+            "Ctrl+O",
+            "Esc",
+        ] {
+            assert!(dmuxai::web::parity::control_for(key).is_some(), "{key}");
+        }
     }
 }
 

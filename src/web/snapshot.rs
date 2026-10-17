@@ -35,6 +35,118 @@ pub struct DashboardSnapshot {
     /// resolved link for a typed key without a round trip (FR-564, UX-561).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jira_base_url: Option<String>,
+    /// Live chat session of the `dmuxai --web` TUI (SPEC-dashboard-parity
+    /// FR-780); absent for `serve` and headless runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionView>,
+}
+
+/// Transcript limits for the snapshot (SPEC-dashboard-parity OQ-781).
+pub const SESSION_TRANSCRIPT_MAX_MESSAGES: usize = 100;
+pub const SESSION_MESSAGE_MAX_BYTES: usize = 32 * 1024;
+pub const SESSION_TRANSCRIPT_MAX_BYTES: usize = 512 * 1024;
+/// Marker appended to a message cut at `SESSION_MESSAGE_MAX_BYTES`.
+pub const SESSION_TRUNCATED_MARKER: &str = "\n… [truncated in the dashboard; full text in the TUI]";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionView {
+    pub conversation_id: String,
+    pub conversation_title: String,
+    pub selected_agent: String,
+    pub details_expanded: bool,
+    pub agents: Vec<SessionAgent>,
+    pub transcript: Vec<SessionMessage>,
+    /// Messages dropped from the front of the transcript by the limits.
+    #[serde(default)]
+    pub transcript_omitted: usize,
+    pub conversations: Vec<SessionConversation>,
+    pub commands: Vec<SessionCommandInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionAgent {
+    pub id: String,
+    pub label: String,
+    pub mode: String,
+    pub modes: Vec<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub busy: bool,
+    pub allowed: bool,
+    pub models_loading: bool,
+    pub models: Vec<SessionModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionModel {
+    pub id: String,
+    pub label: String,
+    pub efforts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionMessage {
+    /// Stable within one conversation: `<conversation id>:<index>`.
+    pub id: String,
+    /// `user`, `agent`, `system` or `activity`.
+    pub role: String,
+    pub agent: Option<String>,
+    pub content: String,
+    pub streaming: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionConversation {
+    pub id: String,
+    pub title: String,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionCommandInfo {
+    pub name: String,
+    pub description: String,
+}
+
+/// Cuts `content` to `SESSION_MESSAGE_MAX_BYTES` on a char boundary and
+/// appends the marker; returns the input unchanged when it fits.
+pub fn cap_session_message(content: &str) -> String {
+    if content.len() <= SESSION_MESSAGE_MAX_BYTES {
+        return content.to_owned();
+    }
+    let mut end = SESSION_MESSAGE_MAX_BYTES;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &content[..end], SESSION_TRUNCATED_MARKER)
+}
+
+/// Keeps the newest messages within the count and total byte limits; returns
+/// the kept messages and how many were dropped from the front.
+pub fn cap_session_transcript(messages: Vec<SessionMessage>) -> (Vec<SessionMessage>, usize) {
+    let total = messages.len();
+    let mut kept: Vec<SessionMessage> = Vec::new();
+    let mut bytes = 0usize;
+    for mut message in messages.into_iter().rev() {
+        if kept.len() >= SESSION_TRANSCRIPT_MAX_MESSAGES {
+            break;
+        }
+        message.content = cap_session_message(&message.content);
+        if !kept.is_empty() && bytes + message.content.len() > SESSION_TRANSCRIPT_MAX_BYTES {
+            break;
+        }
+        bytes += message.content.len();
+        kept.push(message);
+    }
+    kept.reverse();
+    let omitted = total - kept.len();
+    (kept, omitted)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,6 +447,7 @@ mod tests {
             graph: Some(view),
             todos: Vec::new(),
             jira_base_url: None,
+            session: None,
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();

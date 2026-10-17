@@ -1,0 +1,47 @@
+/* session: dashboard chat parity (SPEC-dashboard-parity NFR-780).
+   Kept in its own file so parallel dashboard work never touches it. */
+.session-head { display: flex; align-items: baseline; gap: .75rem; }
+.session-title { color: var(--muted); font-size: .85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-bar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: .5rem .75rem; margin: .5rem 0; }
+.session-picker { display: flex; flex-direction: column; gap: .15rem; min-width: 8rem; }
+.session-picker[hidden] { display: none; }
+.session-select { background: var(--bg-chip); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: .3rem .4rem; }
+.session-select:disabled { opacity: .55; }
+.session-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-left: auto; }
+.session-actions .btn-on { border-color: var(--accent); color: var(--accent); }
+.session-body { display: grid; grid-template-columns: minmax(0, 1fr) 15rem; gap: .75rem; }
+@media (max-width: 760px) { .session-body { grid-template-columns: 1fr; } }
+.session-transcript { list-style: none; margin: 0; padding: .5rem; height: 26rem; overflow-y: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; }
+.session-transcript .msg { padding: .35rem .5rem; border-radius: 6px; margin-bottom: .35rem; border-left: 3px solid transparent; }
+.session-transcript .msg-who { display: block; font-size: .75rem; font-weight: 600; color: var(--muted); text-transform: lowercase; }
+.session-transcript .msg-text { white-space: pre-wrap; word-break: break-word; }
+.session-transcript .msg-user { background: var(--bg-chip); }
+.session-transcript .msg-agent { background: var(--bg-panel); border-left-color: var(--accent); }
+.session-transcript .msg-system .msg-text,
+.session-transcript .msg-activity .msg-text { color: var(--muted); font-size: .85rem; }
+.session-transcript .msg-streaming .msg-text::after { content: "▍"; color: var(--accent); animation: session-blink 1s steps(2, start) infinite; }
+@keyframes session-blink { to { visibility: hidden; } }
+@media (prefers-reduced-motion: reduce) { .session-transcript .msg-streaming .msg-text::after { animation: none; } }
+.session-empty { color: var(--faint); padding: .5rem; list-style: none; }
+.session-conversations { border: 1px solid var(--line); border-radius: 8px; padding: .5rem; max-height: 26rem; overflow-y: auto; }
+.session-subtitle { font-size: .85rem; margin: 0 0 .4rem; color: var(--muted); }
+.session-conv-list { list-style: none; margin: 0; padding: 0; }
+.session-conv { display: flex; align-items: center; justify-content: space-between; gap: .4rem; padding: .25rem 0; border-bottom: 1px solid var(--line); }
+.session-conv-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .85rem; }
+.session-conv-active .session-conv-title { color: var(--accent); font-weight: 600; }
+.session .btn-small { padding: .1rem .45rem; font-size: .75rem; }
+.session-notice { margin: .4rem 0 0; font-size: .85rem; color: var(--muted); }
+.session-notice-error { color: var(--error-text); }
+.session-prompt { display: flex; gap: .5rem; align-items: flex-end; margin-top: .5rem; }
+.session-input { flex: 1; resize: vertical; min-height: 3.5rem; background: var(--bg-chip); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: .5rem; font: inherit; }
+.session-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.session-disabled .session-bar, .session-disabled .session-prompt { opacity: .6; }
+.session-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, .45); display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; z-index: 50; }
+.session-dialog { background: var(--bg-panel); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: .75rem; width: min(32rem, 92vw); max-height: 70vh; overflow-y: auto; box-shadow: 0 10px 40px rgba(0, 0, 0, .4); }
+.session-filter { width: 100%; box-sizing: border-box; margin-bottom: .5rem; background: var(--bg-chip); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: .4rem; }
+.session-filter[hidden] { display: none; }
+.session-options { list-style: none; margin: 0; padding: 0; }
+.session-option { display: flex; justify-content: space-between; gap: .75rem; padding: .35rem .5rem; border-radius: 6px; cursor: pointer; }
+.session-option-hint { color: var(--muted); font-size: .8rem; text-align: right; }
+.session-option-active { background: var(--current-bg); outline: 1px solid var(--accent); }
+.session-option-disabled { opacity: .45; cursor: not-allowed; }

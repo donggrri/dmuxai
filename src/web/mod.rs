@@ -3,13 +3,14 @@
 //! API contract shared by `src/main.rs` (CLI/startup) and `src/app.rs`
 //! (in-process publishing). Implementation lives in the submodules.
 
-mod assets;
+pub mod assets;
 mod auth;
 pub mod commands;
 pub mod discovery;
 mod file_source;
 mod hub;
 pub mod layout;
+pub mod parity;
 mod server;
 mod snapshot;
 
@@ -21,8 +22,11 @@ pub use server::{
     DashboardServer, DashboardServices, ServerConfig, build_router, build_router_with, start_server,
 };
 pub use snapshot::{
-    AgentView, DashboardSnapshot, GraphCounts, GraphView, NodeDetail, NodeView, SNAPSHOT_SCHEMA,
-    SnapshotSource, UiTheme, snapshot_from_run, truncate_with_ellipsis,
+    AgentView, DashboardSnapshot, GraphCounts, GraphView, NodeDetail, NodeView,
+    SESSION_MESSAGE_MAX_BYTES, SESSION_TRANSCRIPT_MAX_BYTES, SESSION_TRANSCRIPT_MAX_MESSAGES,
+    SESSION_TRUNCATED_MARKER, SNAPSHOT_SCHEMA, SessionAgent, SessionCommandInfo,
+    SessionConversation, SessionMessage, SessionModel, SessionView, SnapshotSource, UiTheme,
+    cap_session_message, cap_session_transcript, snapshot_from_run, truncate_with_ellipsis,
 };
 
 /// Default dashboard port (OQ-520). If it is taken, an ephemeral port is used.
