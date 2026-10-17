@@ -125,13 +125,13 @@ mod tests {
         // a.json (older valid)
         let a_path = graphs_dir.join("a.json");
         fs::write(&a_path, make_run_json("run-a")).unwrap();
-        let a_file = File::open(&a_path).unwrap();
+        let a_file = File::options().write(true).open(&a_path).unwrap();
         a_file.set_modified(base_time).unwrap();
 
         // b.json (newer valid)
         let b_path = graphs_dir.join("b.json");
         fs::write(&b_path, make_run_json("run-b")).unwrap();
-        let b_file = File::open(&b_path).unwrap();
+        let b_file = File::options().write(true).open(&b_path).unwrap();
         b_file
             .set_modified(base_time + Duration::from_secs(10))
             .unwrap();
@@ -143,7 +143,7 @@ mod tests {
         // Write a newer malformed c while an older valid a exists
         let c_path = graphs_dir.join("c.json");
         fs::write(&c_path, "{ malformed json").unwrap();
-        let c_file = File::open(&c_path).unwrap();
+        let c_file = File::options().write(true).open(&c_path).unwrap();
         c_file
             .set_modified(base_time + Duration::from_secs(20))
             .unwrap();
