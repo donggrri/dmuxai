@@ -375,7 +375,6 @@ struct DeferredTurn {
     conversation_id: StoredConversationId,
     agent: Agent,
     prompt: String,
-    todo_id: Option<String>,
 }
 
 struct PendingSummary {
@@ -1762,7 +1761,7 @@ impl App {
     }
 
     fn submit_to_agent(&mut self, agent: Agent, prompt: String, restore_input_on_failure: bool) {
-        let _ = self.try_submit_to_agent(agent, prompt, restore_input_on_failure);
+        let _ = self.try_submit_to_agent(agent, prompt, restore_input_on_failure, true);
     }
 
     fn try_submit_to_agent(
@@ -1770,6 +1769,7 @@ impl App {
         agent: Agent,
         prompt: String,
         restore_input_on_failure: bool,
+        allow_defer: bool,
     ) -> Result<StoredTurnId, RunTodoError> {
         if self.busy_agents.contains(&agent) {
             if restore_input_on_failure {
@@ -1779,6 +1779,27 @@ impl App {
                 "{agent} is busy; cancel the active turn before sending another prompt."
             ));
             return Err(RunTodoError::Busy(format!("{agent} is busy")));
+        }
+
+        if !allow_defer && self.pending_summary.is_some() {
+            return Err(RunTodoError::Busy(
+                "conversation summary is in progress".to_owned(),
+            ));
+        }
+
+        if !allow_defer
+            && (self
+                .deferred_turns
+                .iter()
+                .any(|t| t.agent == agent || t.conversation_id == self.conversation_id)
+                || self
+                    .pending_summary
+                    .as_ref()
+                    .is_some_and(|p| p.deferred.is_some()))
+        {
+            return Err(RunTodoError::Busy(
+                "a deferred prompt is pending".to_owned(),
+            ));
         }
 
         let adapter_index = adapter_index(agent);
@@ -1837,16 +1858,19 @@ impl App {
         let request = match outcome {
             Ok(BeginTurnOutcome::Ready(request)) => request,
             Ok(BeginTurnOutcome::NeedsSummary(job)) => {
-                self.start_summary(
-                    job,
-                    Some(DeferredTurn {
-                        conversation_id: self.conversation_id.clone(),
-                        agent,
-                        prompt,
-                        todo_id: None,
-                    }),
-                    None,
-                );
+                if allow_defer {
+                    self.start_summary(
+                        job,
+                        Some(DeferredTurn {
+                            conversation_id: self.conversation_id.clone(),
+                            agent,
+                            prompt,
+                        }),
+                        None,
+                    );
+                } else {
+                    self.start_summary(job, None, None);
+                }
                 return Err(RunTodoError::Busy(format!(
                     "{agent} requires conversation summary"
                 )));
@@ -1932,15 +1956,6 @@ impl App {
         }
 
         if was_tracking {
-            if let Some(active) = self.active_turns.get(&agent) {
-                let stored_output = TurnOutput {
-                    conversation_id: active.conversation_id.clone(),
-                    turn_id: active.turn_id.clone(),
-                    agent: agent_key(agent),
-                    event: TurnEvent::Cancelled,
-                };
-                let _ = self.engine.record_turn_outputs(&[stored_output]);
-            }
             self.finish_turn_outcome_with_error(agent, false, Some("cancelled".to_owned()));
         }
     }
@@ -2635,8 +2650,13 @@ impl App {
 
     fn dispatch_graph_actions(&mut self, actions: Vec<GraphAction>) {
         for action in actions {
+            if self.graph_session.is_none() {
+                break;
+            }
             match action {
-                GraphAction::StartNode(assignment) => self.start_graph_node(assignment),
+                GraphAction::StartNode(assignment) => {
+                    let _ = self.start_graph_node(assignment);
+                }
                 GraphAction::PauseForGate(assignment) => {
                     self.push_system(format!(
                         "Gate: confirm sensitive step {} ({}) with /graph continue",
@@ -2657,6 +2677,7 @@ impl App {
                         }
                         self.publish_todos();
                     }
+                    break;
                 }
                 GraphAction::Failed(message) => {
                     self.push_system(format!("Graph failed: {message}"));
@@ -2696,7 +2717,11 @@ impl App {
                         }
                         self.publish_todos();
                     }
+                    break;
                 }
+            }
+            if self.graph_session.is_none() {
+                break;
             }
         }
         if let Some(session) = self.graph_session.as_ref() {
@@ -2704,7 +2729,10 @@ impl App {
         }
     }
 
-    fn start_graph_node(&mut self, assignment: NodeAssignment) {
+    fn start_graph_node(&mut self, assignment: NodeAssignment) -> Result<(), String> {
+        if self.graph_session.is_none() {
+            return Err("no active graph session".to_owned());
+        }
         let Some(agent) = self.apply_runner_and_model(&assignment.runner, &assignment.model_id)
         else {
             self.push_system(format!("Unknown graph runner: {}", assignment.runner));
@@ -2712,7 +2740,7 @@ impl App {
                 "unknown graph runner: {}",
                 assignment.runner
             ))]);
-            return;
+            return Err(format!("unknown graph runner: {}", assignment.runner));
         };
         self.graph_active_turn_node = Some(assignment.node_id.clone());
         let mut prompt = assignment.prompt;
@@ -2738,12 +2766,17 @@ impl App {
             "Graph node {} via {} model {}",
             assignment.node_id, agent, shown_model
         ));
-        if let Err(err) = self.try_submit_to_agent(agent, prompt, false) {
+        if let Err(err) = self.try_submit_to_agent(agent, prompt, false, false) {
             self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
                 "failed to start node {}: {err:?}",
                 assignment.node_id
             ))]);
+            return Err(format!(
+                "failed to start node {}: {err:?}",
+                assignment.node_id
+            ));
         }
+        Ok(())
     }
 
     fn show_graph_status(&mut self) {
@@ -3042,6 +3075,23 @@ impl App {
             ));
         }
 
+        if self.pending_summary.is_some() {
+            return Err(RunTodoError::Busy(
+                "conversation summary is in progress".to_owned(),
+            ));
+        }
+
+        if !self.deferred_turns.is_empty()
+            || self
+                .pending_summary
+                .as_ref()
+                .is_some_and(|p| p.deferred.is_some())
+        {
+            return Err(RunTodoError::Busy(
+                "a deferred prompt is pending".to_owned(),
+            ));
+        }
+
         let todo = store.get(todo_id).map_err(|err| match err {
             TodoError::NotFound => RunTodoError::NotFound,
             other => {
@@ -3175,7 +3225,27 @@ impl App {
             return Err(RunTodoError::Busy(format!("agent '{runner_id}' is busy")));
         }
 
-        let turn_id = self.try_submit_to_agent(target_agent, prompt, false)?;
+        if self.pending_summary.is_some() {
+            return Err(RunTodoError::Busy(
+                "conversation summary is in progress".to_owned(),
+            ));
+        }
+
+        if self
+            .deferred_turns
+            .iter()
+            .any(|t| t.agent == target_agent || t.conversation_id == self.conversation_id)
+            || self
+                .pending_summary
+                .as_ref()
+                .is_some_and(|p| p.deferred.is_some())
+        {
+            return Err(RunTodoError::Busy(
+                "a deferred prompt is pending".to_owned(),
+            ));
+        }
+
+        let turn_id = self.try_submit_to_agent(target_agent, prompt, false, false)?;
         self.todo_turns
             .insert((target_agent, turn_id), todo_id.to_owned());
         let updated = store
@@ -3189,16 +3259,6 @@ impl App {
     }
 
     fn restore_deferred_input(&mut self, deferred: DeferredTurn) {
-        if let Some(todo_id) = deferred.todo_id
-            && let Some(store) = self.todo_store.clone()
-        {
-            if let Err(err) =
-                store.finish_run(&todo_id, false, Some("deferred turn dropped".to_owned()))
-            {
-                self.push_system(format!("Failed to finish to-do run: {err}"));
-            }
-            self.publish_todos();
-        }
         if deferred.conversation_id == self.conversation_id {
             self.input = deferred.prompt;
         } else {
@@ -5021,12 +5081,20 @@ mod tests {
                 },
             )
             .unwrap();
+        let active_can = app.active_turns.get(&Agent::Agy).cloned().unwrap();
         app.selected = adapter_index(Agent::Agy);
         app.cancel_selected();
         let cancelled_todo = store.get(&todo_can.id).unwrap();
         assert_eq!(cancelled_todo.status, TodoStatus::Open);
         assert_eq!(cancelled_todo.last_error.as_deref(), Some("cancelled"));
         assert!(!app.busy_agents.contains(&Agent::Agy));
+        // Simulated adapter terminal event delivery into conversation engine:
+        let _ = app.engine.record_turn_outputs(&[TurnOutput {
+            conversation_id: active_can.conversation_id,
+            turn_id: active_can.turn_id,
+            agent: agent_key(Agent::Agy),
+            event: TurnEvent::Cancelled,
+        }]);
 
         // 4. Adapter Error -> open with the error message:
         let todo_err = store
@@ -5230,6 +5298,219 @@ mod tests {
         assert!(matches!(fail_res, Err(RunTodoError::Internal(_))));
         let todo_after_fail = fail_store.get(&todo_fail_send.id).unwrap();
         assert_eq!(todo_after_fail.status, TodoStatus::Open);
+    }
+
+    #[test]
+    fn dispatch_graph_actions_aborts_on_failure_without_orphan_agent() {
+        let (mut app, _sent) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/test-workspace".to_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("todos.db");
+        let store = Arc::new(TodoStore::open(&db_path).unwrap());
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        app.attach_dashboard_services(store.clone(), cmd_rx);
+
+        let todo = store
+            .create(dmuxai::todo::NewTodo {
+                title: "multi-node task".to_owned(),
+                body: "".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+
+        let plan_id = "test-abort-run";
+        store.mark_running(&todo.id, "graph", plan_id).unwrap();
+        app.graph_todo = Some((plan_id.to_owned(), todo.id.clone()));
+
+        let plan = dmuxai::graph::GraphPlan {
+            schema: "cursor-agent-graph/v1".to_owned(),
+            id: plan_id.to_owned(),
+            orchestrator_model: "composer-2.5".to_owned(),
+            user_prompt: "multi-step task".to_owned(),
+            nodes: vec![
+                dmuxai::graph::GraphNode {
+                    id: "node-a".to_owned(),
+                    role: NodeRole::Implement,
+                    job: "job a".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Pending,
+                    attempt: 0,
+                },
+                dmuxai::graph::GraphNode {
+                    id: "node-b".to_owned(),
+                    role: NodeRole::Review,
+                    job: "job b".to_owned(),
+                    runner: "agy".to_owned(),
+                    model_id: "opencode-default".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Pending,
+                    attempt: 0,
+                },
+            ],
+            edges: vec![],
+            limits: dmuxai::graph::GraphLimits {
+                max_parallel: 1,
+                max_retries: 2,
+            },
+        };
+
+        app.graph_session = Some(GraphRunSession::new(GraphRun {
+            plan,
+            conversation_id: app.conversation_id.as_str().to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+        }));
+
+        // Batch: [StartNode(a), Failed, StartNode(b)]
+        let batch = vec![
+            GraphAction::StartNode(NodeAssignment {
+                node_id: "node-a".to_owned(),
+                role: NodeRole::Implement,
+                prompt: "prompt a".to_owned(),
+                runner: "cursor".to_owned(),
+                model_id: "composer-2.5".to_owned(),
+            }),
+            GraphAction::Failed("pipeline exploded mid-batch".to_owned()),
+            GraphAction::StartNode(NodeAssignment {
+                node_id: "node-b".to_owned(),
+                role: NodeRole::Review,
+                prompt: "prompt b".to_owned(),
+                runner: "agy".to_owned(),
+                model_id: "opencode-default".to_owned(),
+            }),
+        ];
+
+        app.dispatch_graph_actions(batch);
+
+        // Verification for N1:
+        assert!(app.graph_session.is_none());
+        assert!(app.busy_agents.is_empty(), "no busy agent should remain");
+        assert!(!app.busy_agents.contains(&Agent::Cursor));
+        assert!(!app.busy_agents.contains(&Agent::Agy));
+
+        let final_todo = store.get(&todo.id).unwrap();
+        assert_eq!(final_todo.status, TodoStatus::Open);
+        assert_eq!(
+            final_todo.last_error.as_deref(),
+            Some("pipeline exploded mid-batch")
+        );
+
+        // start_graph_node is a no-op that returns an error when there is no live session
+        let noop_res = app.start_graph_node(NodeAssignment {
+            node_id: "node-c".to_owned(),
+            role: NodeRole::Implement,
+            prompt: "prompt c".to_owned(),
+            runner: "cursor".to_owned(),
+            model_id: "composer-2.5".to_owned(),
+        });
+        assert!(noop_res.is_err());
+        assert!(app.busy_agents.is_empty());
+    }
+
+    #[test]
+    fn dashboard_run_todo_never_defers_prompt_on_summary() {
+        let (mut app, sent) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/test-workspace".to_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("todos.db");
+        let store = Arc::new(TodoStore::open(&db_path).unwrap());
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        app.attach_dashboard_services(store.clone(), cmd_rx);
+
+        let todo = store
+            .create(dmuxai::todo::NewTodo {
+                title: "task during summary".to_owned(),
+                body: "body of task".to_owned(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+
+        // 1. Establish context large enough to trigger summary on next turn
+        app.input = "large context".to_owned();
+        app.submit_prompt();
+        let first = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(first.conversation_id.clone()),
+            turn_id: Some(first.turn_id.clone()),
+            event: AgentEvent::TextDelta("x".repeat(33_000)),
+        }));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(first.conversation_id),
+            turn_id: Some(first.turn_id),
+            event: AgentEvent::Completed,
+        }));
+
+        // 2. Dashboard to-do run hits NeedsSummary; must return Busy WITHOUT queueing prompt
+        let run_err = app
+            .run_todo(
+                &todo.id,
+                RunMode::Agent {
+                    agent: "codex".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(run_err, RunTodoError::Busy(_)));
+
+        // Summary started, but deferred is None and deferred_turns is empty
+        assert!(app.pending_summary.is_some());
+        assert!(app.pending_summary.as_ref().unwrap().deferred.is_none());
+        assert!(app.deferred_turns.is_empty());
+        assert_eq!(store.get(&todo.id).unwrap().status, TodoStatus::Open);
+
+        // 3. Second run while summary in progress returns Busy up front
+        let run_err2 = app
+            .run_todo(
+                &todo.id,
+                RunMode::Agent {
+                    agent: "codex".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(run_err2, RunTodoError::Busy(_)));
+        assert!(app.deferred_turns.is_empty());
+
+        // 4. Complete summary; no deferred prompt was queued, so no 3rd turn runs
+        let summary = sent.lock().unwrap()[1].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(summary.conversation_id.clone()),
+            turn_id: Some(summary.turn_id.clone()),
+            event: AgentEvent::TextDelta(
+                "{\"goal\":\"compressed\",\"constraints\":[],\"decisions\":[],\"facts\":[],\"files\":[],\"failed_attempts\":[],\"open_questions\":[]}"
+                    .to_owned(),
+            ),
+        }));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(summary.conversation_id),
+            turn_id: Some(summary.turn_id),
+            event: AgentEvent::Completed,
+        }));
+
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            2,
+            "no unlinked turn was executed"
+        );
+        assert_eq!(store.get(&todo.id).unwrap().status, TodoStatus::Open);
     }
 
     #[test]

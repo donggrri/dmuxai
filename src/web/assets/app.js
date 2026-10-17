@@ -337,8 +337,8 @@ function todoApi(method, path, body) {
           : 'HTTP ' + res.status;
         var hint = message.indexOf('dmuxai --web') !== -1;
         if (hint) {
-          message = message + ' To-do runs need `dmuxai --web` ' +
-            '(open the dashboard URL printed by `dmuxai --web`).';
+          message = message + ' To-do runs need "dmuxai --web" ' +
+            '(open the dashboard URL printed by "dmuxai --web").';
         }
         var failure = new Error(message);
         failure.status = res.status;
@@ -531,7 +531,7 @@ function todoRunControls(id, status) {
   // 409, so the controls are disabled up front (the inline 409 stays as a
   // fallback for a stale server mode). Add/edit/done/delete stay enabled.
   var viewOnly = String(snap.source || '') === 'files';
-  var viewTitle = 'View-only dashboard: start `dmuxai --web` to run to-dos from the browser';
+  var viewTitle = 'View-only dashboard: start "dmuxai --web" to run to-dos from the browser';
 
   var agents = Array.isArray(snap.agents) ? snap.agents : [];
 

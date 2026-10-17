@@ -133,19 +133,30 @@ Note: findings 1-5 are for the deepseek/AGY agents to fix; I changed only
 `docs/reviews/REVIEW-web-dashboard.md` in this round (no `.rs` or Cargo files
 touched, `cargo fmt` not run, nothing committed).
 
-## Slice B compliance (to-do board) — in progress
+## Slice B compliance (to-do board)
 
-Statuses stay `Pending` until slice B evidence (TC-540..TC-545) passes on the
-merged tree. This round (opencode glm) delivered the page panel and docs only;
-`src/todo.rs`, `src/web/server.rs`/`hub.rs`/`snapshot.rs` and `src/app.rs` were
-being edited by other agents and were not touched.
-
-| Requirement | Status | Notes |
+| Requirement | Status | Evidence |
 | --- | --- | --- |
-| FR-540 | Pending | persistence + ordering land in `src/todo.rs` (deepseek); page renders `snapshot.todos[]` in delivered order (open/running first) |
-| FR-541 | Pending | CRUD routes (deepseek); page POSTs/PATCHes/DELETEs `/api/todos` with `Content-Type: application/json` + Bearer token |
-| FR-542 | Pending | run routing (deepseek routes + AGY App command handling); page sends `{"mode":"agent","agent":id}` / `{"mode":"graph"}` and maps 409 `requires dmuxai --web` to an inline hint |
-| UX-540 | Pending | to-do panel: add form (title maxlength 200 required, optional body), status badge, source badge + `source_ref` for non-manual, done checkbox -> PATCH, inline edit (Edit/Save/Cancel), Delete with `confirm()`, agent select from `snapshot.agents` (busy disabled) + Run / Run as graph (disabled for running/done), `run_kind`/`run_ref` and red `last_error` for running items, per-item inline errors; edit/focus state preserved across snapshot re-renders (the item under edit is never destroyed) |
+| FR-540 | Met | `todo_store_persists_and_orders`, `todo_store_upsert_source_ref_is_atomic` (atomic `ON CONFLICT` upsert, single-statement PATCH) |
+| FR-541 | Met | `todo_routes_crud_and_snapshot`, `todo_routes_reject_invalid_requests` (400/404/413/415/401/403); `serve_seeds_hub_with_persisted_todos` |
+| FR-542 | Met | `dashboard_run_todo_with_agent_and_graph`, `dashboard_run_todo_review_round_1_edge_cases` (turn-keyed linkage, no silent submit, no deferral, graph failure stops the batch, cancel/error -> open, shutdown and restart reconciliation); `todo_run_requires_web_mode`, `todo_run_web_without_store_is_503`, `todo_run_trims_agent_id` |
+| UX-540 | Met | `static_page_has_todo_panel` (panel, form, serve view-only hint per OQ-521); screenshot `docs/images/web-todo.png` |
+
+Final gates (local, Linux): `cargo fmt --check` clean; `cargo clippy --all-targets
+--all-features --locked -- -D warnings` clean; `cargo test --all-targets --locked`
+320 passed, 0 failed, 5 ignored; `scripts/spec-index.sh` 30 specs, no duplicate IDs.
+
+Who did what (all through dmuxai runners in tmux): AGY (gemini-3.8-flash-high)
+App run lifecycle and three fix rounds; opencode deepseek `src/todo.rs`, routes,
+`main.rs` wiring, its fix round, and the cross-review + verification of AGY's code;
+opencode glm the page panel, the serve view-only UI, and the store/routes
+cross-review; planner (hand): spec/plan/contract, OQ resolutions, doc updates,
+the TC-543 assertion and the hint markup.
+
+Residual risks: restart reconciliation has no cross-process guard, so starting a
+second `dmuxai --web` in the same repo returns the other live process's running
+to-do to `open` (multi-instance is rare for `--web`; tracked for a follow-up);
+`dmuxai serve` cannot run to-dos by design (OQ-521).
 
 ### Slice B evidence (page + docs, this round)
 
