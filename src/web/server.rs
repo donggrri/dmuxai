@@ -44,6 +44,7 @@ pub struct DashboardServices {
     pub memory: Option<crate::memory::MemoryHandle>,
     /// Shared workspace event log for `GET /api/events/log` and SSE tailing.
     pub events_path: Option<std::path::PathBuf>,
+    pub docs: Option<Arc<crate::web::docs_api::DocsService>>,
 }
 
 #[derive(Clone)]
@@ -1074,6 +1075,7 @@ pub fn build_router_with(
         .route("/api/import", post(import_todos))
         .route("/api/prompt", post(post_prompt))
         .route("/api/command", post(post_command))
+        .merge(crate::web::docs_api::router(state.services.docs.clone()))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_and_auth_middleware,
@@ -1716,6 +1718,7 @@ mod tests {
             web_attached: false,
             events_path: None,
             memory: None,
+            docs: None,
         };
         let router = build_router_with(hub.clone(), token.clone(), allowed_localhost(), services);
 
@@ -1864,6 +1867,7 @@ mod tests {
             web_attached: false,
             events_path: None,
             memory: None,
+            docs: None,
         };
         let router = build_router_with(test_hub(), token.clone(), allowed_localhost(), services);
 
@@ -2005,6 +2009,7 @@ mod tests {
                 mcp: None,
                 web_attached: false,
                 memory: None,
+                docs: None,
             },
         );
 
@@ -2191,6 +2196,7 @@ mod tests {
                 web_attached: false,
                 events_path: None,
                 memory: None,
+                docs: None,
             },
         );
         let resp = busy_router
@@ -2216,6 +2222,7 @@ mod tests {
                 web_attached: false,
                 events_path: None,
                 memory: None,
+                docs: None,
             },
         );
         let resp = ok_router
@@ -2247,6 +2254,7 @@ mod tests {
                 web_attached: true,
                 events_path: None,
                 memory: None,
+                docs: None,
             },
         );
         let resp = router
@@ -2278,6 +2286,7 @@ mod tests {
                 web_attached: false,
                 events_path: None,
                 memory: None,
+                docs: None,
             },
         );
         let resp = router
@@ -2317,6 +2326,7 @@ mod tests {
                 web_attached: false,
                 events_path: None,
                 memory: None,
+                docs: None,
             },
         );
 
@@ -2463,6 +2473,7 @@ mod tests {
             web_attached: false,
             events_path: Some(events_file.clone()),
             memory: None,
+            docs: None,
         };
         let router = build_router_with(hub.clone(), token.clone(), allowed_localhost(), services);
 
@@ -2526,6 +2537,7 @@ mod tests {
                 web_attached: false,
                 events_path: Some(events_file.clone()),
                 memory: None,
+                docs: None,
             },
         };
         let server = start_server(config, hub).await.unwrap();
@@ -2631,6 +2643,7 @@ mod tests {
             mcp: None,
             memory: Some(memory.clone()),
             events_path: None,
+            docs: None,
         };
         let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
 
@@ -2885,6 +2898,7 @@ mod tests {
                 mcp: Some(Arc::new(registry)),
                 web_attached: false,
                 memory: None,
+                docs: None,
             },
         );
 
@@ -2981,6 +2995,7 @@ mod tests {
                 mcp: Some(registry.clone()),
                 web_attached: false,
                 memory: None,
+                docs: None,
             },
         );
 
@@ -3131,6 +3146,7 @@ mod tests {
                 mcp: Some(registry),
                 web_attached: false,
                 memory: None,
+                docs: None,
             },
         );
         let resp = no_store
@@ -3187,6 +3203,7 @@ mod tests {
                 mcp: Some(registry),
                 web_attached: false,
                 memory: None,
+                docs: None,
             },
         );
 

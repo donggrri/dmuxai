@@ -8,7 +8,9 @@
 <title>DmuxAI dashboard</title>
 <link rel="stylesheet" href="/assets/app.css">
 <link rel="stylesheet" href="/assets/session.css">
+<link rel="stylesheet" href="/assets/docs.css">
 <script src="/assets/app.js" defer></script>
+<script src="/assets/docs.js" defer></script>
 </head>
 <body>
 <header class="top">
@@ -83,6 +85,17 @@
       <p id="import-status" class="import-status" role="status" aria-live="polite" hidden></p>
     </div>
     <div id="todo-list" class="todo-list"></div>
+  </section>
+
+  <section id="docs" class="panel">
+    <h2 class="panel-title">Documents</h2>
+    <div class="docs-toolbar">
+      <label class="field-label" for="docs-filter">Filter</label>
+      <input id="docs-filter" class="docs-filter" type="search" autocomplete="off" placeholder="Filter files by path">
+    </div>
+    <ul id="docs-list" class="docs-list"></ul>
+    <h3 class="docs-sub">Changed by agents</h3>
+    <div id="docs-changes" class="docs-changes"></div>
   </section>
 
   <section id="graph" class="panel">

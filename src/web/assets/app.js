@@ -211,7 +211,7 @@ var token = (function () {
   var fromQuery = new URLSearchParams(location.search).get('token');
   if (fromQuery) {
     storageSet(TOKEN_KEY, fromQuery);
-    history.replaceState(null, '', location.pathname);
+    history.replaceState(null, '', location.pathname + location.hash);
     return fromQuery;
   }
   return storageGet(TOKEN_KEY);
@@ -2109,6 +2109,8 @@ function applySnapshot(snap) {
   // Optional modules (session.js) reuse this connection instead of opening
   // their own SSE stream (SPEC-dashboard-parity NFR-780).
   document.dispatchEvent(new CustomEvent('dmuxai:snapshot', { detail: snap }));
+  // SPEC-docs-preview INT-754: let isolated modules (docs.js) follow snapshots.
+  try { window.dispatchEvent(new CustomEvent('dmuxai:snapshot', { detail: snap })); } catch (err) { /* ignore */ }
 }
 
 function onUnauthorized() {

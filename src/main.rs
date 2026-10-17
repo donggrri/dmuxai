@@ -414,6 +414,22 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         .memory
         .as_ref()
         .map(|config| dmuxai::memory::MemoryHandle::from_config(config, &workspace_root));
+    let ws = dmuxai::docs::confine::Workspace::new(&workspace_root).ok();
+    let token = dashboard_token(|warning| eprintln!("warning: {warning}"));
+    let open_tickets = Arc::new(std::sync::Mutex::new(dmuxai::web::OpenTickets::new()));
+    let docs = ws.map(|workspace| {
+        let changes = dmuxai::docs::changes::ChangeLog::default();
+        let soffice = dmuxai::docs::office::find_soffice();
+        Arc::new(dmuxai::web::docs_api::DocsService::new(
+            workspace,
+            true, // read_only
+            changes,
+            soffice,
+            open_tickets.clone(),
+            token.clone(),
+        ))
+    });
+
     for warning in &settings.config_warnings {
         eprintln!("warning: {warning}");
     }
@@ -435,6 +451,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 web_attached: false,
                 memory: memory.clone(),
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
+                docs,
             }
         }
         Err(error) => {
@@ -447,6 +464,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 memory,
                 // The event log is independent of the to-do database (FR-766).
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
+                docs,
             }
         }
     };
@@ -467,7 +485,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         bind: options.bind,
         port: options.port,
         allow_remote: options.allow_remote,
-        token: dashboard_token(|warning| eprintln!("warning: {warning}")),
+        token: token.clone(),
         services,
     };
     let token = config.token.clone();
@@ -626,6 +644,24 @@ async fn attach_web_dashboard(
             (None, None)
         }
     };
+    let ws = dmuxai::docs::confine::Workspace::new(workspace_root).ok();
+    let doc_changes = dmuxai::docs::changes::ChangeLog::default();
+    let doc_changes_for_app = doc_changes.clone();
+    let open_tickets = Arc::new(std::sync::Mutex::new(dmuxai::web::OpenTickets::new()));
+    let mut token_warning = None;
+    let token = dashboard_token(|warning| token_warning = Some(warning));
+    let docs = ws.map(|workspace| {
+        let soffice = dmuxai::docs::office::find_soffice();
+        Arc::new(dmuxai::web::docs_api::DocsService::new(
+            workspace,
+            false, // read_only
+            doc_changes,
+            soffice,
+            open_tickets.clone(),
+            token.clone(),
+        ))
+    });
+
     let services = DashboardServices {
         todos: todos.as_ref().map(|(store, _)| store.clone()),
         commands: todos.as_ref().map(|(_, sender)| sender.clone()),
@@ -636,17 +672,17 @@ async fn attach_web_dashboard(
             .as_ref()
             .map(|config| dmuxai::memory::MemoryHandle::from_config(config, workspace_root)),
         events_path: Some(dmuxai::events::events_path(workspace_root)),
+        docs,
     };
 
     let sink = cli::build_event_sink(workspace_root, settings);
     let hub = DashboardHub::new(SnapshotSource::Tui, workspace).with_events(sink);
     hub.set_jira_base_url(settings.todo_jira_base_url.clone());
-    let mut token_warning = None;
     let config = ServerConfig {
         bind: options.bind,
         port: options.port,
         allow_remote: options.allow_remote,
-        token: dashboard_token(|warning| token_warning = Some(warning)),
+        token: token.clone(),
         services,
     };
     if let Some(warning) = token_warning {
@@ -660,6 +696,15 @@ async fn attach_web_dashboard(
                 app.push_startup_notice(warning);
             }
             app.attach_dashboard(hub);
+            app.attach_doc_changes(doc_changes_for_app);
+            app.attach_open_tickets(open_tickets);
+            let base_url = server
+                .url
+                .split("/?token=")
+                .next()
+                .unwrap_or(&server.url)
+                .to_string();
+            app.set_dashboard_base_url(base_url);
             if let (Some((store, _)), Some(receiver)) = (todos, receiver) {
                 app.attach_dashboard_services(store.clone(), receiver);
             }
