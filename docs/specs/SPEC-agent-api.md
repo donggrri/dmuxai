@@ -1,6 +1,6 @@
 # SPEC: Agent API — headless CLI, HTTP API, MCP server and state-change events
 
-Status: In progress
+Status: Implemented in v0.2.0 (slice G1)
 Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `1c1f692`

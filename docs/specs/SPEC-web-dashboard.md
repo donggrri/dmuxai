@@ -1,6 +1,6 @@
 # SPEC: Local web dashboard (live graph, to-do board, MCP import)
 
-Status: In progress (slices A, B and C implemented)
+Status: Implemented in v0.2.0 (slices A, B and C)
 Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `5ff8c93`

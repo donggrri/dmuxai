@@ -1,6 +1,6 @@
 # SPEC: Dashboard parity with the TUI
 
-Status: In progress
+Status: Implemented in v0.2.0 (slice G2)
 Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `feat/agent-api`
@@ -80,7 +80,7 @@ stays view-only.
 | FR-783 | Must | Given the command palette (Ctrl+K, or `/` in an empty prompt box) | Then every entry of `session.commands` is listed, filterable, and runs its mapped control | Commands needing an argument ask for it first | TC-785, TC-786 |
 | FR-784 | Must | Given the parity matrix | Then every TUI slash command has a dashboard mapping in `src/web/parity.rs`, and every mapped control id exists in the dashboard assets | A TUI command without a mapping fails `tui_commands_have_dashboard_controls` | TC-787 |
 | UX-780 | Should | Given a busy agent | Then its Cancel button is visible and mode/model pickers for it are disabled | — | TC-786 |
-| NFR-780 | Must | Given parallel dashboard work (MCP, memory, docs, graph) | Then the parity UI lives in its own `assets/session.js` and `assets/session.css`; `app.css` is untouched and `app.js` only re-dispatches each snapshot as a `dmuxai:snapshot` DOM event so the page keeps one SSE connection (`index.html` gains the container and two tags) | — | Manual review |
+| NFR-780 | Must | Given parallel dashboard work (MCP, memory, docs, graph) | Then the parity UI lives in its own `assets/session.js` and `assets/session.css`; `app.css` is untouched and `app.js` only re-dispatches each snapshot as a `dmuxai:snapshot` DOM event so the page keeps one SSE connection (`index.html` gains the container and two tags) | — | TC-786 (`session.js` opens no `EventSource`), manual review of the diff |
 
 ## 5. Acceptance scenarios and test design
 

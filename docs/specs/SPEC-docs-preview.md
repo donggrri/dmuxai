@@ -1,6 +1,6 @@
 # SPEC: Document preview and edit in the web dashboard
 
-Status: In progress
+Status: Implemented in v0.2.0 (slice F; OQ-740..742 deferred)
 Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `1c1f692`

@@ -240,6 +240,18 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-dashboard-parity | FR-783 | TC-785 | `dashboard_slash_commands_via_prompt` | unit | ✅ | dashboard parity (G2) |
 | M8,M2 | SPEC-dashboard-parity | FR-782,FR-783,UX-780 | TC-786 | `session_module_has_parity_controls`, `session_assets_are_served_hardened` | unit (asset) | ✅ | dashboard parity (G2) |
 | M8,M2 | SPEC-dashboard-parity | FR-784 | TC-787 | `tui_commands_have_dashboard_controls`, `parity_matrix_controls_exist_in_session_js` | unit | ✅ | dashboard parity (G2) |
+| M8,M2 | SPEC-obsidian-memory | FR-720 | TC-720 | `memory_settings_*` | unit | ✅ | Obsidian memory (slice E) |
+| M8,M2 | SPEC-obsidian-memory | FR-721 | TC-721 | `context_*` | unit | ✅ | Obsidian memory (slice E) |
+| M8,M2 | SPEC-obsidian-memory | FR-721 | TC-722 | `context_budget_*` | unit | ✅ | Obsidian memory (slice E) |
+| M8,M2 | SPEC-obsidian-memory | FR-723, NFR-731 | TC-723 | `validate_*` | unit | ✅ | Obsidian memory (slice E) |
+| M8,M2 | SPEC-obsidian-memory | FR-724 | TC-724 | `save_*` | unit | ✅ | Obsidian memory (slice E) |
+| M8,M2 | SPEC-obsidian-memory | FR-725, NFR-731 | TC-725 | `queue_*` | unit | ✅ | Obsidian memory (slice E) |
+| M8,M2 | SPEC-obsidian-memory | FR-722 | TC-726 | `memory_context_*` | unit | ✅ | Obsidian memory (slice E) |
+| M8,M2 | SPEC-obsidian-memory | FR-726 | TC-727 | `memory_slash_*` | unit | ✅ | Obsidian memory (slice E) |
+| M8,M2 | SPEC-obsidian-memory | FR-727 | TC-728 | `memory_routes_*` | integration | ✅ | Obsidian memory (slice E) |
+| M8,M2 | SPEC-obsidian-memory | INT-729 | TC-729 | `mcp_memory_serves_tools_against_a_vault`, `mcp_memory_reports_disabled_memory`, `mcp_memory_rejects_*`, `mcp_memory_null_id_notification_is_silent`, `mcp_memory_oversized_line_is_parse_error_and_serving_continues` | integration | ✅ | Obsidian memory (slice E) |
+| M8,M2 | SPEC-obsidian-memory | FR-730 | TC-730 | `search_*` | unit | ✅ | Obsidian memory (slice E) |
+| M8,M2 | SPEC-obsidian-memory | UX-728 | TC-731 | `memory_panel_assets_present` | unit + manual | ✅ | Obsidian memory (slice E) |
 | M8,M2 | SPEC-obsidian-memory | FR-733 | TC-733 | `builtin_memory_mcp_server_*` | unit | ✅ | shared memory MCP entry |
 | M8,M2 | SPEC-obsidian-memory | FR-733 | TC-734 | `builtin_memory_server_*` (propagate, registry) | unit | ✅ | shared memory MCP entry |
 | M8,M2 | SPEC-obsidian-memory | FR-733 | TC-735 | `builtin_memory_server_connects_via_shared_list` | integration | ✅ | shared memory MCP entry |

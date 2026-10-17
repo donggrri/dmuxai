@@ -95,8 +95,14 @@ Changes since v0.1.1 (2026-08-24), PRs #1-#38.
 - **Release workflow:** now also builds a static (musl)
   `dmuxai-linux-x86_64.tar.gz` with a SHA-256 checksum for WSL and Linux users. It is published to the same
   GitHub release as the Windows zip.
-- **Docs:** README section "Calling dmuxai from an agent", refreshed
-  screenshots, and personal paths removed from the README and review notes.
+- **Docs:**
+  - README section "Calling dmuxai from an agent", with Claude Desktop MCP
+    examples for Linux and for Windows via WSL (not yet tested with Claude
+    Desktop itself);
+  - refreshed dashboard screenshot and an updated code map;
+  - personal paths removed from the README and review notes;
+  - SPEC, PLAN and TASKS statuses for the v0.2.0 slices, recorded in
+    `docs/reviews/REVIEW-v0.2.0-release.md`.
 
 ### Fixed
 

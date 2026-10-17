@@ -1,7 +1,7 @@
 # PLAN: Obsidian memory
 
 Spec: [SPEC-obsidian-memory](../specs/SPEC-obsidian-memory.md)
-Status: implemented, in review
+Status: implemented in v0.2.0
 
 ## Architecture
 

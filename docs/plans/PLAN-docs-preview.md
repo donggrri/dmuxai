@@ -1,7 +1,7 @@
 # PLAN: Document preview and edit
 
 Spec: [SPEC-docs-preview](../specs/SPEC-docs-preview.md)
-Status: in progress
+Status: implemented in v0.2.0 (OQ-740..742 deferred)
 
 ## Architecture
 

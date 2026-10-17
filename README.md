@@ -20,9 +20,10 @@ TUI (`dmuxai` in a project directory; here AGY answering in Ask mode):
 
 ![DmuxAI TUI](docs/images/tui.png)
 
-Web dashboard (`dmuxai serve`, or `dmuxai --web` for TUI + dashboard), showing a
-graph run live: completed nodes with their runtime, the running node highlighted,
-and the runner/model for every node:
+Web dashboard (`dmuxai --web` for TUI + dashboard, or `dmuxai serve` view-only).
+From the top: the Chat panel (same session as the TUI), agents, to-dos,
+documents changed by agents, the live graph run as a subway map, and memory.
+The graph in this shot is demo data and the token is redacted:
 
 ![DmuxAI web dashboard](docs/images/web-dashboard.png)
 
@@ -211,6 +212,46 @@ command/args pair:
 ```json
 { "command": "dmuxai", "args": ["mcp"], "cwd": "<repo>" }
 ```
+
+The server works on the repo named by `DMUXAI_WORKSPACE`, or on its working
+directory when that is unset. Claude Desktop has no `cwd` field, so pass the
+repo explicitly. These configs are **not yet tested with Claude Desktop
+itself**. `dmuxai mcp` was checked with a raw stdio JSON-RPC session:
+`initialize` and `tools/list` (`todo_add`, `todo_list`, `run`, `status`,
+`events_since`) both answer.
+
+Claude Desktop on Linux (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "dmuxai": {
+      "command": "dmuxai",
+      "args": ["mcp"],
+      "env": { "DMUXAI_WORKSPACE": "/home/<user>/repo" }
+    }
+  }
+}
+```
+
+Claude Desktop on Windows, calling dmuxai inside WSL (`--cd` sets the repo):
+
+```json
+{
+  "mcpServers": {
+    "dmuxai": {
+      "command": "wsl.exe",
+      "args": ["-d", "Ubuntu", "--cd", "/home/<user>/repo", "--", "dmuxai", "mcp"]
+    }
+  }
+}
+```
+
+`wsl.exe ... -- dmuxai` does not run your shell profile. If `dmuxai` (for
+example `~/.local/bin`) or the agent CLIs and their environment variables are
+only set up in `~/.bashrc` or `~/.profile`, run it through a login shell
+instead: `"args": ["-d", "Ubuntu", "--cd", "/home/<user>/repo", "--", "bash",
+"-lc", "dmuxai mcp"]`.
 
 To drive a dashboard that is already running, read the discovery file it writes
 (`.dmuxai/web.json`: `base_url`, `port`, `pid`, `token`) and call the
@@ -723,6 +764,15 @@ similar to move-capturing owning C++ values in a task lambda.
 - `src/agent/cursor.rs`: Cursor NDJSON process and session adapter
 - `src/agent/agy.rs`: AGY NDJSON process and conversation adapter
 - `src/process/mod.rs`: Windows/Linux executable and headless-process boundary
+- `src/cli.rs`, `src/agent_api.rs`: headless `run`/`todo`/`status`/`events` subcommands, JSON output and exit codes
+- `src/mcp_server.rs`: `dmuxai mcp` stdio MCP server for other agents
+- `src/events.rs`, `src/notify.rs`: `.dmuxai/events.jsonl` state-change log, webhooks and command hooks
+- `src/graph/`: agent-graph planning and orchestration
+- `src/todo.rs`: persistent per-repo to-dos
+- `src/mcp/`: shared `[[mcp.servers]]` config, per-runner propagation, MCP client and registry
+- `src/memory.rs`, `src/memory_mcp.rs`: Obsidian memory and the `dmuxai mcp-memory` server
+- `src/theme.rs`: TUI and dashboard colors
+- `src/web/`: local dashboard (`serve`/`--web`): auth, snapshot hub, HTTP/SSE routes, graph layout, parity matrix, embedded assets
 
 Protocol references:
 

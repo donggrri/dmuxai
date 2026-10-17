@@ -1,5 +1,7 @@
 # PLAN: Dashboard node-graph view (slice H)
 
+Status: implemented in v0.2.0
+
 Spec: [SPEC-graph-view.md](../specs/SPEC-graph-view.md). Baseline: `1c1f692`.
 
 ## Modules

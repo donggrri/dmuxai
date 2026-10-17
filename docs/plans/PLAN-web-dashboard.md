@@ -1,6 +1,6 @@
 # PLAN: Local web dashboard
 
-Status: slice A complete; slices B and C planned
+Status: implemented in v0.2.0 (slices A, B and C)
 Spec: [SPEC-web-dashboard.md](../specs/SPEC-web-dashboard.md)
 
 ## Architecture

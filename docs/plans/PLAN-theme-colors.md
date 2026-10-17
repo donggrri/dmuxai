@@ -1,7 +1,7 @@
 # PLAN: Theme settings for the web dashboard and TUI colors
 
 Spec: [SPEC-theme-colors](../specs/SPEC-theme-colors.md)
-Status: implemented, in review
+Status: implemented in v0.2.0
 
 ## Architecture
 
