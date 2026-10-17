@@ -102,6 +102,31 @@ config warnings and the built-in default is used. `NO_COLOR` (without
 dashboard reuses the `[theme.agents]` agent colors for its agent chips.
 Details: [SPEC-theme-colors](docs/specs/SPEC-theme-colors.md).
 
+### Document preview and editing
+
+The dashboard's Documents panel lists the workspace files (`GET /api/docs`),
+shows a "Changed by agents" feed of what each agent turn created, modified or
+deleted, and opens a preview pane (also directly via `#doc=<path>` links in
+agent output). Markdown is rendered GitHub-style (tables, task lists, footnotes,
+code highlighting) and is editable in a split view with live preview; plain
+text, JSON, YAML, TOML, CSV and code files are editable in a plain editor. Save
+uses a hash-based check, so a stale editor answers with a conflict offer to
+reload or overwrite. Saved access is what the server grants in `dmuxai --web`.
+
+HTML files are preview-only in an intentionally sandboxed frame (no scripts),
+Office files (`docx`, `pptx`, `xlsx`, ...) are converted to PDF for preview
+through LibreOffice (`soffice`; without it only a download is offered), and
+binary files are download-only. `dmuxai serve` is read-only: editing is hidden
+with a hint to start `dmuxai --web`. Details:
+[SPEC-docs-preview](docs/specs/SPEC-docs-preview.md).
+
+![Rendered Markdown preview](docs/images/docs-preview.png)
+
+![Edit split view with live preview](docs/images/docs-edit-split.png)
+
+In the TUI, workspace file paths in agent output are OSC 8 hyperlinks; a plain
+left click opens the dashboard preview when `--web` runs, else the OS opener.
+
 ## Obsidian memory
 
 DmuxAI can keep durable notes in an Obsidian vault and prepend them to every

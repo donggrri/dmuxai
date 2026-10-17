@@ -4,6 +4,8 @@ pub const MEMORY_JS: &str = include_str!("assets/memory.js");
 pub const SESSION_JS: &str = include_str!("assets/session.js");
 pub const SESSION_CSS: &str = include_str!("assets/session.css");
 pub const APP_CSS: &str = include_str!("assets/app.css");
+pub const DOCS_JS: &str = include_str!("assets/docs.js");
+pub const DOCS_CSS: &str = include_str!("assets/docs.css");
 
 #[cfg(test)]
 mod tests {
@@ -293,6 +295,71 @@ mod tests {
         assert!(css.contains(":root[data-theme=\"light\"]"));
         // The palettes are chosen by data-theme set from JS, never hardcoded in HTML.
         assert!(!html.contains("data-theme"));
+    }
+
+    // TC-757: static_page_has_docs_panel (SPEC-docs-preview UX-753, INT-754)
+    #[test]
+    fn static_page_has_docs_panel() {
+        // index only gains the docs stylesheet, the deferred docs module and
+        // the docs panel section.
+        assert!(INDEX_HTML.contains(r#"<link rel="stylesheet" href="/assets/docs.css">"#));
+        assert!(INDEX_HTML.contains(r#"<script src="/assets/docs.js" defer></script>"#));
+        assert!(INDEX_HTML.contains(r#"<section id="docs" class="panel">"#));
+
+        // FR-746: the HTML preview iframe is set with an empty sandbox
+        // attribute (setAttribute('sandbox', '')) and never grants scripts or
+        // same-origin power.
+        assert!(DOCS_JS.contains("setAttribute('sandbox', '')"));
+        assert!(!DOCS_JS.contains("allow-same-origin"));
+        assert!(!DOCS_JS.contains("allow-scripts"));
+
+        // FR-743 render endpoints (GET by path and POST live-preview), the
+        // 409 conflict path, and the concurrency base hash all appear.
+        assert!(DOCS_JS.contains("/api/docs/render"));
+        assert!(DOCS_JS.contains("409"));
+        assert!(DOCS_JS.contains("base_sha256"));
+
+        // Review round: the change log's output_tail is a JSON array of
+        // lines and must be joined with real newlines before rendering.
+        assert!(DOCS_JS.contains("Array.isArray(turn.output_tail)"));
+        assert!(DOCS_JS.contains(".join('\\n')"));
+        // The sanitized markdown must keep its .md-body wrapper so the
+        // GitHub-like typography and hl-* rules in docs.css stay in effect
+        // (finding 1), and only .md-body links are routed (finding 2, so
+        // /docs/view and /docs/download anchors keep working).
+        assert!(DOCS_JS.contains("body.className = 'md-body';"));
+        assert!(DOCS_JS.contains("sanitizeInto(body, html);"));
+        assert!(DOCS_JS.contains("a.closest('.md-body')"));
+        // Ticket URLs carry only expiring /docs/view or /docs/download
+        // capabilities; the dashboard token must never be woven into them.
+        for line in DOCS_JS.lines() {
+            if line.contains("/docs/view") || line.contains("/docs/download") {
+                assert!(
+                    !line.contains("token"),
+                    "docs.js must not put the token into a ticket URL: {line}"
+                );
+            }
+        }
+    }
+
+    // TC-759: docs_module_exposes_api (SPEC-docs-preview INT-754)
+    #[test]
+    fn docs_module_exposes_api() {
+        assert!(DOCS_JS.contains("window.DmuxDocs = {"));
+        for member in [
+            "open: open",
+            "close: close",
+            "linkify: linkify",
+            "changes: changes",
+        ] {
+            assert!(DOCS_JS.contains(member), "missing DmuxDocs member {member}");
+        }
+        assert!(DOCS_JS.contains("function sanitizeInto("));
+        let inner_html_assigns = DOCS_JS.matches(".innerHTML =").count();
+        assert_eq!(
+            inner_html_assigns, 1,
+            "server HTML must use a single innerHTML assignment inside sanitizeInto"
+        );
     }
 
     // TC-608: theme_palettes_meet_wcag_contrast (SPEC-theme-colors NFR-600)

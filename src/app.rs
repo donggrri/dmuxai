@@ -1,12 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     io, mem,
+    ops::Range,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::event::{
@@ -26,6 +27,7 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, timeout},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use dmuxai::{
@@ -42,6 +44,12 @@ use dmuxai::{
         ConversationSelection, ConversationSnapshot, MessageRole, MessageState, SummaryDocument,
         SummaryJob, TranscriptMessage, TurnEvent, TurnId as StoredTurnId, TurnOutput, TurnSnapshot,
         TurnStatus,
+    },
+    docs::{
+        MAX_SCAN_FILES,
+        changes::{ChangeLog, TurnChanges, WorkspaceScan, diff_scans, output_tail},
+        confine::Workspace,
+        links,
     },
     events::EventDraft,
     graph::{
@@ -239,6 +247,11 @@ struct ConversationPicker {
 struct ActiveTurn {
     conversation_id: StoredConversationId,
     turn_id: StoredTurnId,
+    started_ms: u64,
+    workspace_scan: Arc<Mutex<Option<WorkspaceScan>>>,
+    /// Graph node this turn was dispatched for, captured at turn start so
+    /// FR-748 records keep the right node even if graph state moves on.
+    graph_node_id: Option<String>,
 }
 
 /// Last emitted agent lifecycle `to_state` and running-phase label (FR-768).
@@ -247,6 +260,34 @@ struct AgentLifecycleState {
     last_to_state: String,
     last_running_phase: Option<String>,
 }
+
+type MessageLinkSpans = Vec<(Range<usize>, String)>;
+type MessageLinkCache = HashMap<String, MessageLinkSpans>;
+
+const MESSAGE_LINK_CACHE_MAX: usize = 4096;
+
+/// Agent transcript line eligible for TUI file links (paragraph line index).
+#[derive(Clone)]
+struct AgentLinkLine {
+    text: String,
+    cacheable: bool,
+}
+
+/// A file link occupying terminal columns on one visible chat row (FR-750).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatFileLink {
+    start_column: usize,
+    end_column: usize,
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LinkTarget {
+    Url(String),
+    File(PathBuf),
+}
+
+const MAX_FILES_PER_TURN: usize = 200;
 
 const MAX_ACTIVITY_DETAIL_CHARS: usize = 72;
 const AGENT_LIFECYCLE_ERROR_CHARS: usize = 500;
@@ -724,6 +765,11 @@ pub struct App {
     /// Recent conversations for the dashboard session, refreshed at most every
     /// few seconds or when the active conversation changes (FR-780).
     session_conversations: Option<(Instant, String, Vec<SessionConversation>)>,
+    doc_changes: Option<ChangeLog>,
+    dashboard_doc_base: Option<String>,
+    doc_open_tickets: Option<Arc<Mutex<dmuxai::web::OpenTickets>>>,
+    message_link_cache: MessageLinkCache,
+    visible_chat_link_rows: Vec<Vec<ChatFileLink>>,
 }
 
 impl App {
@@ -892,6 +938,11 @@ impl App {
             agy_mcp_notice_shown: false,
             agent_lifecycle: HashMap::new(),
             session_conversations: None,
+            doc_changes: None,
+            dashboard_doc_base: None,
+            doc_open_tickets: None,
+            message_link_cache: HashMap::new(),
+            visible_chat_link_rows: Vec::new(),
         };
         app.restore_snapshot(snapshot);
         Ok(app)
@@ -1774,6 +1825,15 @@ impl App {
             if self.resizing_input {
                 self.resizing_input = false;
             } else if self.selecting_chat {
+                if !self.selection_dragged
+                    && let Some(selection) = self.chat_selection
+                {
+                    let (anchor, _) = selection.endpoints();
+                    self.open_file_link_at(anchor, |target| {
+                        spawn_open_link_target(target);
+                        Ok(())
+                    });
+                }
                 self.finish_chat_selection();
             }
             return;
@@ -2690,11 +2750,24 @@ impl App {
                         .insert((stored_conversation_id.clone(), agent), hash);
                 }
                 self.pending_images.clear();
+                let started_ms = unix_ms_now();
+                let workspace_scan = Arc::new(Mutex::new(None));
+                if self.doc_changes.is_some() {
+                    let root = self.workspace_root.clone();
+                    let slot = workspace_scan.clone();
+                    std::thread::spawn(move || {
+                        let scan = dmuxai::docs::changes::scan_workspace(&root, MAX_SCAN_FILES);
+                        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(scan);
+                    });
+                }
                 self.active_turns.insert(
                     agent,
                     ActiveTurn {
                         conversation_id: stored_conversation_id,
                         turn_id: stored_turn_id.clone(),
+                        started_ms,
+                        workspace_scan,
+                        graph_node_id: self.active_graph_node_for_agent(agent),
                     },
                 );
                 self.busy_agents.insert(agent);
@@ -2825,6 +2898,7 @@ impl App {
             ));
         }
         self.chat_scroll = 0;
+        self.message_link_cache.clear();
         self.clear_chat_selection();
         if let Some(prompt) = self.restored_inputs.remove(&self.conversation_id) {
             self.input = prompt;
@@ -3353,9 +3427,38 @@ impl App {
         self.agent_lifecycle.remove(&agent);
         self.busy_agents.remove(&agent);
         self.activities.remove(&agent);
+        let output_text = self.last_agent_output_text(agent);
         let active_turn = self.active_turns.remove(&agent);
         self.streaming_messages.remove(&agent);
         self.tool_messages.remove(&agent);
+        let graph_node_id = active_turn
+            .as_ref()
+            .and_then(|active| active.graph_node_id.clone());
+        let graph_id = graph_node_id.as_ref().and_then(|_| {
+            self.graph_session
+                .as_ref()
+                .map(|session| session.run().plan.id.clone())
+        });
+        if let (Some(active), Some(log)) = (active_turn.as_ref(), self.doc_changes.clone()) {
+            let workspace_root = self.workspace_root.clone();
+            let agent_id = self.agent_runner_name(agent);
+            let turn_id = active.turn_id.as_str().to_owned();
+            let started_ms = active.started_ms;
+            let workspace_scan = active.workspace_scan.clone();
+            std::thread::spawn(move || {
+                record_turn_doc_changes(
+                    log,
+                    turn_id,
+                    agent_id,
+                    graph_id,
+                    graph_node_id,
+                    started_ms,
+                    workspace_scan,
+                    &workspace_root,
+                    output_text,
+                );
+            });
+        }
         if let Some((_, single_agent, _)) = self.single_graph_plan
             && single_agent == agent
         {
@@ -3910,6 +4013,21 @@ impl App {
         Arc::clone(&self.mcp_registry)
     }
 
+    /// Shares the in-memory document change log with the web dashboard (FR-748).
+    pub fn attach_doc_changes(&mut self, log: ChangeLog) {
+        self.doc_changes = Some(log);
+    }
+
+    /// Sets the dashboard base URL used for TUI file-link open tickets (FR-750).
+    pub fn set_dashboard_base_url(&mut self, url_without_token: String) {
+        self.dashboard_doc_base = Some(url_without_token);
+    }
+
+    /// Shares open-ticket minting with the web dashboard (token stays on the server).
+    pub fn attach_open_tickets(&mut self, tickets: Arc<Mutex<dmuxai::web::OpenTickets>>) {
+        self.doc_open_tickets = Some(tickets);
+    }
+
     /// Attaches the dashboard hub and publishes the current state (FR-530).
     pub fn attach_dashboard(&mut self, hub: dmuxai::web::DashboardHub) {
         hub.set_ui(dmuxai::web::UiTheme {
@@ -3923,6 +4041,69 @@ impl App {
 
     pub fn colors_enabled(&self) -> bool {
         self.color_enabled
+    }
+
+    fn dashboard_base_url(&self) -> Option<&str> {
+        self.dashboard_doc_base.as_deref()
+    }
+
+    fn last_agent_output_text(&self, agent: Agent) -> String {
+        if let Some(index) = self.streaming_messages.get(&agent)
+            && let Some(message) = self.messages.get(*index)
+        {
+            return message.content.clone();
+        }
+        for message in self.messages.iter().rev() {
+            if message.role == Role::Agent(agent) {
+                return message.content.clone();
+            }
+        }
+        String::new()
+    }
+
+    fn open_file_link_at(
+        &mut self,
+        position: CellPosition,
+        open: impl FnOnce(&LinkTarget) -> Result<(), String>,
+    ) {
+        let Some(links) = self.visible_chat_link_rows.get(position.row) else {
+            return;
+        };
+        let column = position.column;
+        let Some(link) = links
+            .iter()
+            .find(|link| column >= link.start_column && column < link.end_column)
+        else {
+            return;
+        };
+        let workspace = match Workspace::new(&self.workspace_root) {
+            Ok(ws) => ws,
+            Err(_) => {
+                self.push_system("Could not open file link: invalid workspace");
+                return;
+            }
+        };
+        let Some(target) = file_link_click_target(
+            self.dashboard_base_url(),
+            self.doc_open_tickets.as_ref(),
+            &workspace,
+            &link.path,
+        ) else {
+            self.push_system("Could not open file link: path outside workspace");
+            return;
+        };
+        if let Err(error) = open(&target) {
+            self.push_system(format!("Could not open file link: {error}"));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_link_path_at(&self, position: CellPosition) -> Option<String> {
+        let links = self.visible_chat_link_rows.get(position.row)?;
+        links
+            .iter()
+            .find(|link| position.column >= link.start_column && position.column < link.end_column)
+            .map(|link| link.path.clone())
     }
 
     pub(crate) fn custom_spec(&self, index: u8) -> Option<dmuxai::custom_agent::CustomAgentSpec> {
@@ -4858,6 +5039,12 @@ impl App {
         };
 
         let mut lines = Vec::new();
+        let mut agent_link_lines: HashMap<usize, AgentLinkLine> = HashMap::new();
+        let docs_workspace = if colors {
+            Workspace::new(&self.workspace_root).ok()
+        } else {
+            None
+        };
 
         let mut i = 0;
         while i < self.messages.len() {
@@ -4901,12 +5088,23 @@ impl App {
                         label,
                         body_style.add_modifier(Modifier::BOLD),
                     )));
-                    lines.extend(
-                        message
-                            .content
-                            .lines()
-                            .map(|line| Line::from(Span::styled(line.to_owned(), body_style))),
-                    );
+                    let cacheable = !self
+                        .streaming_messages
+                        .get(agent)
+                        .is_some_and(|message_index| *message_index == i);
+                    for line in message.content.lines() {
+                        let line_index = lines.len();
+                        if docs_workspace.is_some() {
+                            agent_link_lines.insert(
+                                line_index,
+                                AgentLinkLine {
+                                    text: line.to_owned(),
+                                    cacheable,
+                                },
+                            );
+                        }
+                        lines.push(Line::from(Span::styled(line.to_owned(), body_style)));
+                    }
                     lines.push(Line::default());
                     i += 1;
                 }
@@ -4969,7 +5167,7 @@ impl App {
         if let Some(bg) = theme_bg {
             block = block.style(Style::default().bg(bg));
         }
-        let mut chat = Paragraph::new(lines)
+        let mut chat = Paragraph::new(lines.clone())
             .block(block)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
@@ -4991,6 +5189,20 @@ impl App {
             area.width.saturating_sub(2),
             area.height.saturating_sub(2),
         );
+        self.visible_chat_link_rows = if colors {
+            apply_chat_file_link_osc8(
+                frame,
+                self.chat_content_area,
+                content_width as usize,
+                scroll as usize,
+                &lines,
+                &agent_link_lines,
+                &mut self.message_link_cache,
+                docs_workspace.as_ref(),
+            )
+        } else {
+            vec![Vec::new(); usize::from(self.chat_content_area.height)]
+        };
         self.visible_chat_lines = visible_buffer_lines(frame, self.chat_content_area);
         if let Some(selection) = self.chat_selection {
             highlight_chat_selection(
@@ -5808,6 +6020,407 @@ impl App {
         let mut state = ListState::default()
             .with_selected(Some(preview.cursor.min(matches.len().saturating_sub(1))));
         frame.render_stateful_widget(list, area, &mut state);
+    }
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn wait_for_workspace_scan(slot: &Arc<Mutex<Option<WorkspaceScan>>>) -> Option<WorkspaceScan> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
+        if let Some(scan) = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Some(scan);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_turn_doc_changes(
+    log: ChangeLog,
+    turn_id: String,
+    agent_id: String,
+    graph_id: Option<String>,
+    node_id: Option<String>,
+    started_ms: u64,
+    workspace_scan: Arc<Mutex<Option<WorkspaceScan>>>,
+    workspace_root: &Path,
+    output_text: String,
+) {
+    let Some(before) = wait_for_workspace_scan(&workspace_scan) else {
+        return;
+    };
+    let after = dmuxai::docs::changes::scan_workspace(workspace_root, MAX_SCAN_FILES);
+    let (files, truncated_diff) = diff_scans(&before, &after, MAX_FILES_PER_TURN);
+    let truncated = before.truncated || after.truncated || truncated_diff;
+    let links = Workspace::new(workspace_root)
+        .map(|ws| links::extract_doc_links(&ws, &output_text))
+        .unwrap_or_default();
+    let finished_ms = unix_ms_now();
+    log.push(TurnChanges {
+        id: turn_id,
+        agent: agent_id,
+        graph_id,
+        node_id,
+        started_ms,
+        finished_ms,
+        files,
+        truncated,
+        output_tail: output_tail(&output_text),
+        links,
+    });
+}
+
+/// OSC 8 hyperlink target (always a workspace `file://` URI, never the API token).
+pub(crate) fn file_link_osc8_target(workspace: &Workspace, rel: &str) -> Option<String> {
+    workspace
+        .resolve(rel)
+        .ok()
+        .map(|resolved| file_uri_from_path(&resolved.absolute))
+}
+
+/// Target for click-to-open (open ticket when the dashboard runs, else `file://`).
+pub(crate) fn file_link_click_target(
+    dashboard_base: Option<&str>,
+    open_tickets: Option<&Arc<Mutex<dmuxai::web::OpenTickets>>>,
+    workspace: &Workspace,
+    rel: &str,
+) -> Option<LinkTarget> {
+    let resolved = workspace.resolve(rel).ok()?;
+    if let (Some(base), Some(store)) = (dashboard_base, open_tickets) {
+        let ticket = store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mint(resolved.relative.clone());
+        return Some(LinkTarget::Url(format!("{base}/docs/open/{ticket}")));
+    }
+    Some(LinkTarget::File(resolved.absolute))
+}
+
+fn spawn_open_link_target(target: &LinkTarget) {
+    let target = target.clone();
+    std::thread::spawn(move || {
+        let _ = open_link_target_process(&target);
+    });
+}
+
+fn open_link_target_process(target: &LinkTarget) -> Result<(), String> {
+    spawn_opener(&link_target_to_string(target))
+}
+
+fn spawn_opener(target: &str) -> Result<(), String> {
+    if target.is_empty() {
+        return Err("empty target".to_owned());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // ShellExecute via rundll32 avoids cmd.exe re-parsing `&`, `%`, `^`.
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", target])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(target)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(target)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn visual_line_byte_ranges(text: &str, width: usize) -> Vec<Range<usize>> {
+    if width == 0 {
+        return std::iter::once(0..text.len()).collect();
+    }
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut line_start = 0usize;
+    let mut col = 0usize;
+    let mut last_break = 0usize;
+    let mut idx = 0usize;
+    for g in text.graphemes(true) {
+        let g_start = idx;
+        idx += g.len();
+        let w = UnicodeWidthStr::width(g);
+        if w == 0 {
+            continue;
+        }
+        if col + w > width && col > 0 {
+            let break_at = if last_break > line_start {
+                last_break
+            } else {
+                g_start
+            };
+            ranges.push(line_start..break_at);
+            line_start = break_at;
+            col = 0;
+            last_break = line_start;
+            if line_start < g_start {
+                let segment = &text[line_start..g_start];
+                col = UnicodeWidthStr::width(segment);
+            }
+        }
+        if g.as_bytes().last() == Some(&b' ') {
+            last_break = idx;
+        }
+        col += w;
+    }
+    ranges.push(line_start..text.len());
+    ranges
+}
+
+#[allow(clippy::too_many_arguments)]
+fn link_spans_for_line(
+    cache: &mut MessageLinkCache,
+    workspace: &Workspace,
+    line: &str,
+    cacheable: bool,
+) -> MessageLinkSpans {
+    if cacheable {
+        if let Some(spans) = cache.get(line) {
+            return spans.clone();
+        }
+        let spans = links::find_link_spans(workspace, line);
+        if cache.len() >= MESSAGE_LINK_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(line.to_owned(), spans.clone());
+        spans
+    } else {
+        links::find_link_spans(workspace, line)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_chat_file_link_osc8(
+    frame: &mut Frame,
+    area: Rect,
+    content_width: usize,
+    scroll: usize,
+    lines: &[Line<'_>],
+    agent_link_lines: &HashMap<usize, AgentLinkLine>,
+    cache: &mut MessageLinkCache,
+    workspace: Option<&Workspace>,
+) -> Vec<Vec<ChatFileLink>> {
+    let visible_rows = usize::from(area.height);
+    let mut rendered_line = 0usize;
+    let mut visible_link_rows = vec![Vec::new(); visible_rows];
+    let buffer = frame.buffer_mut();
+
+    for (line_index, line) in lines.iter().enumerate() {
+        let plain = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let segments = visual_line_byte_ranges(&plain, content_width);
+        let line_first = rendered_line;
+        let line_last = rendered_line + segments.len();
+        if line_last <= scroll {
+            rendered_line = line_last;
+            continue;
+        }
+        if line_first >= scroll + visible_rows {
+            break;
+        }
+        let link_line = agent_link_lines.get(&line_index);
+        let spans = if let (Some(link_line), Some(ws)) = (link_line, workspace) {
+            link_spans_for_line(cache, ws, &link_line.text, link_line.cacheable)
+        } else {
+            Vec::new()
+        };
+        for segment in segments {
+            if rendered_line >= scroll && rendered_line < scroll + visible_rows {
+                let row = rendered_line - scroll;
+                let y = area.y + row as u16;
+                if !spans.is_empty() {
+                    let row_links = paint_link_spans_on_row(
+                        buffer,
+                        area,
+                        y,
+                        &plain[segment.start..segment.end],
+                        segment.start,
+                        &spans,
+                        workspace,
+                    );
+                    visible_link_rows[row].extend(row_links);
+                }
+            }
+            rendered_line += 1;
+        }
+    }
+    visible_link_rows
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_link_spans_on_row(
+    buffer: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    y: u16,
+    row_text: &str,
+    segment_offset: usize,
+    spans: &[(Range<usize>, String)],
+    workspace: Option<&Workspace>,
+) -> Vec<ChatFileLink> {
+    let mut row_links = Vec::new();
+    for (range, path) in spans {
+        if range.end <= segment_offset || range.start >= segment_offset + row_text.len() {
+            continue;
+        }
+        let local_start = range.start.saturating_sub(segment_offset);
+        let local_end = range
+            .end
+            .min(segment_offset + row_text.len())
+            .saturating_sub(segment_offset);
+        let link_text = row_text[local_start..local_end].to_owned();
+        if link_text.is_empty() {
+            continue;
+        }
+        let start_column = grapheme_column(&row_text[..local_start]);
+        let end_column = grapheme_column(&row_text[..local_end]);
+        row_links.push(ChatFileLink {
+            start_column,
+            end_column,
+            path: path.clone(),
+        });
+        let Some(target) = workspace.and_then(|ws| file_link_osc8_target(ws, path)) else {
+            continue;
+        };
+        paint_osc8_hyperlink(buffer, area, y, row_text, start_column, end_column, &target);
+    }
+    row_links
+}
+
+fn grapheme_column(prefix: &str) -> usize {
+    prefix.graphemes(true).map(UnicodeWidthStr::width).sum()
+}
+
+pub(crate) fn link_target_to_string(target: &LinkTarget) -> String {
+    match target {
+        LinkTarget::Url(url) => url.clone(),
+        LinkTarget::File(path) => file_uri_from_path(path),
+    }
+}
+
+fn file_uri_from_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        let mut normalized = path.replace('\\', "/");
+        // Drop the verbatim prefix canonicalize() adds (`\\?\C:\..`, `\\?\UNC\..`).
+        if let Some(rest) = normalized.strip_prefix("//?/UNC/") {
+            normalized = format!("//{rest}");
+        } else if let Some(rest) = normalized.strip_prefix("//?/") {
+            normalized = rest.to_owned();
+        }
+        if normalized.len() >= 2 && normalized.as_bytes()[1] == b':' {
+            format!("file:///{}", percent_encode_uri_path(normalized.as_ref()))
+        } else {
+            format!("file:{}", percent_encode_uri_path(normalized.as_ref()))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if path.starts_with('/') {
+            format!("file://{}", percent_encode_uri_path(path.as_ref()))
+        } else {
+            format!("file:///{}", percent_encode_uri_path(path.as_ref()))
+        }
+    }
+}
+
+fn percent_encode_uri_path(path: &str) -> String {
+    let mut encoded = String::new();
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                encoded.push(byte as char);
+            }
+            b':' => encoded.push(':'),
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
+}
+
+fn grapheme_at_display_column(text: &str, target_column: usize) -> Option<String> {
+    let mut column = 0usize;
+    for g in text.graphemes(true) {
+        let width = UnicodeWidthStr::width(g);
+        if width == 0 {
+            continue;
+        }
+        if target_column >= column && target_column < column + width {
+            return Some(g.to_owned());
+        }
+        column += width;
+    }
+    None
+}
+
+fn paint_osc8_hyperlink(
+    buffer: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    y: u16,
+    plain_row: &str,
+    start_column: usize,
+    end_column: usize,
+    target: &str,
+) {
+    // OSC 8 targets must not carry control bytes (ESC/BEL would end the
+    // sequence early and let text inject terminal escapes).
+    let target: String = target.chars().filter(|c| !c.is_control()).collect();
+    let underline = Style::default().add_modifier(Modifier::UNDERLINED);
+    for col in start_column..end_column {
+        let x = area.x.saturating_add(col as u16);
+        if x >= area.right() {
+            break;
+        }
+        let cell = &mut buffer[(x, y)];
+        let symbol = cell.symbol();
+        let display = if symbol.is_empty() {
+            grapheme_at_display_column(plain_row, col).unwrap_or_default()
+        } else {
+            symbol.to_owned()
+        };
+        let display: String = display.chars().filter(|c| !c.is_control()).collect();
+        if display.is_empty() {
+            continue;
+        }
+        cell.set_symbol(&format!("\x1b]8;;{target}\x1b\\{display}\x1b]8;;\x1b\\"));
+        cell.set_style(underline);
     }
 }
 
@@ -9438,6 +10051,9 @@ mod tests {
             ActiveTurn {
                 conversation_id: app.conversation_id.clone(),
                 turn_id: StoredTurnId::new("stale-turn"),
+                started_ms: 0,
+                workspace_scan: Arc::new(Mutex::new(None)),
+                graph_node_id: None,
             },
         );
 
@@ -10679,6 +11295,9 @@ mod tests {
             ActiveTurn {
                 conversation_id: StoredConversationId::new(app.conversation_id.as_str()),
                 turn_id: StoredTurnId::new("turn-1"),
+                started_ms: 0,
+                workspace_scan: Arc::new(Mutex::new(None)),
+                graph_node_id: None,
             },
         );
         app.busy_agents.insert(Agent::Cursor);
@@ -10722,6 +11341,9 @@ mod tests {
             ActiveTurn {
                 conversation_id: StoredConversationId::new(app.conversation_id.as_str()),
                 turn_id: StoredTurnId::new("turn-1"),
+                started_ms: 0,
+                workspace_scan: Arc::new(Mutex::new(None)),
+                graph_node_id: None,
             },
         );
         app.activities.insert(
@@ -11813,6 +12435,207 @@ mod tests {
         ] {
             assert!(dmuxai::web::parity::control_for(key).is_some(), "{key}");
         }
+    }
+
+    // TC-754: tui_file_link_open_target (FR-750)
+    #[test]
+    fn tui_file_link_open_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        std::fs::create_dir_all(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("a.md"), "hello").unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+
+        let open = Arc::new(Mutex::new(dmuxai::web::OpenTickets::new()));
+        let with_dashboard =
+            file_link_click_target(Some("http://127.0.0.1:8787"), Some(&open), &ws, "docs/a.md");
+        let url = match with_dashboard {
+            Some(LinkTarget::Url(url)) => url,
+            other => panic!("expected open ticket URL, got {other:?}"),
+        };
+        assert!(url.contains("/docs/open/"));
+        assert!(!url.contains("token"));
+
+        let osc = file_link_osc8_target(&ws, "docs/a.md").expect("osc target");
+        assert!(osc.starts_with("file://"));
+        assert!(!osc.contains("token"));
+
+        let file_only = file_link_click_target(None, None, &ws, "docs/a.md");
+        assert_eq!(
+            file_only,
+            Some(LinkTarget::File(ws.resolve("docs/a.md").unwrap().absolute))
+        );
+        assert!(file_link_click_target(None, None, &ws, "missing.md").is_none());
+
+        let resolved = ws.resolve("docs/a.md").unwrap().absolute;
+        let uri = link_target_to_string(&LinkTarget::File(resolved));
+        assert!(uri.starts_with("file://"));
+        assert!(uri.contains("docs"));
+        assert!(uri.contains("a.md"));
+
+        std::fs::write(docs_dir.join("spaced note.md"), "x").unwrap();
+        let spaced = ws.resolve("docs/spaced note.md").unwrap().absolute;
+        let spaced_uri = link_target_to_string(&LinkTarget::File(spaced));
+        assert!(spaced_uri.starts_with("file://"));
+        assert!(spaced_uri.contains("%20"));
+    }
+
+    // TC-755: tui_file_links_emit_osc8 (FR-750)
+    #[test]
+    fn tui_file_links_emit_osc8() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/a.md"), "x").unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), dir.path()).unwrap();
+        let (mut app, _) = test_app_with_engine(engine);
+        app.workspace_root = dir.path().to_path_buf();
+        app.color_enabled = true;
+        app.messages.clear();
+        app.messages.push(Message::new(
+            Role::Agent(Agent::Codex),
+            "see docs/a.md for details".to_owned(),
+        ));
+        app.messages.push(Message::new(
+            Role::Agent(Agent::Codex),
+            "no links here".to_owned(),
+        ));
+        app.chat_scroll = usize::MAX;
+        render_text_at(&mut app, 120, 40);
+        let link = app
+            .visible_chat_link_rows
+            .iter()
+            .flatten()
+            .find(|link| link.path == "docs/a.md")
+            .expect("link metadata");
+        assert!(
+            link.end_column - link.start_column >= "docs/a.md".len(),
+            "link columns {:?}..{:?}",
+            link.start_column,
+            link.end_column
+        );
+        let link_line = app
+            .visible_chat_lines
+            .iter()
+            .find(|line| line.contains("docs/a.md"))
+            .expect("link line rendered");
+        let osc8_count = link_line.matches("\x1b]8;;").count();
+        assert!(
+            osc8_count >= "docs/a.md".len(),
+            "expected every cell of the path to carry OSC 8, got {osc8_count}: {link_line}"
+        );
+        assert!(
+            link_line.contains("d\x1b]8;;\x1b\\"),
+            "expected last path cell to carry OSC 8: {link_line}"
+        );
+        assert!(
+            link_line.contains("\x1b]8;;file://"),
+            "OSC 8 target must be file://, not dashboard URL: {link_line}"
+        );
+        assert!(!link_line.contains("token"));
+
+        let plain_line = app
+            .visible_chat_lines
+            .iter()
+            .find(|line| line.contains("no links here"))
+            .expect("plain line rendered");
+        assert!(!plain_line.contains("\x1b]8;;"));
+    }
+
+    #[test]
+    fn tui_file_link_click_resolves_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/a.md"), "x").unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), dir.path()).unwrap();
+        let (mut app, _) = test_app_with_engine(engine);
+        app.workspace_root = dir.path().to_path_buf();
+        app.color_enabled = true;
+        app.messages.clear();
+        app.messages.push(Message::new(
+            Role::Agent(Agent::Codex),
+            "see docs/a.md".to_owned(),
+        ));
+        render_text_at(&mut app, 100, 30);
+
+        let path = app
+            .visible_chat_link_rows
+            .iter()
+            .flatten()
+            .find(|link| link.path == "docs/a.md")
+            .expect("link row metadata");
+        let resolved = app
+            .file_link_path_at(CellPosition::new(
+                app.visible_chat_link_rows
+                    .iter()
+                    .position(|row| row.iter().any(|l| l.path == "docs/a.md"))
+                    .expect("row"),
+                path.start_column,
+            ))
+            .expect("cell maps to link");
+        assert_eq!(resolved, "docs/a.md");
+
+        let mut opened = None;
+        app.open_file_link_at(
+            CellPosition::new(
+                app.visible_chat_link_rows
+                    .iter()
+                    .position(|row| row.iter().any(|l| l.path == "docs/a.md"))
+                    .expect("row"),
+                path.start_column,
+            ),
+            |target| {
+                opened = Some(target.clone());
+                Ok(())
+            },
+        );
+        assert!(matches!(opened, Some(LinkTarget::File(_))));
+    }
+
+    #[test]
+    fn doc_changes_recorded_after_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), dir.path()).unwrap();
+        let (mut app, sent) = test_app_with_engine(engine);
+        app.workspace_root = dir.path().to_path_buf();
+        let log = ChangeLog::default();
+        app.attach_doc_changes(log.clone());
+
+        app.input = "write a doc".to_owned();
+        app.submit_prompt();
+        let request = sent.lock().unwrap()[0].1.clone();
+        let agent = app.adapters[app.selected].agent();
+        let scan_slot = app
+            .active_turns
+            .get(&agent)
+            .expect("active turn")
+            .workspace_scan
+            .clone();
+        assert!(wait_for_workspace_scan(&scan_slot).is_some());
+
+        std::fs::write(dir.path().join("created.md"), "new content").unwrap();
+
+        app.messages.push(Message::new(
+            Role::Agent(app.adapters[app.selected].agent()),
+            "created created.md".to_owned(),
+        ));
+        app.finish_turn_outcome_with_error(agent, true, None);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut recorded = false;
+        while Instant::now() < deadline {
+            if log.list(None).iter().any(|turn| {
+                turn.id == request.turn_id.as_str()
+                    && turn.files.iter().any(|f| f.path == "created.md")
+            }) {
+                recorded = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(recorded, "expected created.md in change log for the turn");
     }
 }
 

@@ -243,6 +243,26 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-obsidian-memory | FR-733 | TC-733 | `builtin_memory_mcp_server_*` | unit | ✅ | shared memory MCP entry |
 | M8,M2 | SPEC-obsidian-memory | FR-733 | TC-734 | `builtin_memory_server_*` (propagate, registry) | unit | ✅ | shared memory MCP entry |
 | M8,M2 | SPEC-obsidian-memory | FR-733 | TC-735 | `builtin_memory_server_connects_via_shared_list` | integration | ✅ | shared memory MCP entry |
+| M8,M2 | SPEC-docs-preview | FR-740 | TC-740 | `rejects_traversal_and_absolute_paths` | unit | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-740 | TC-741 | `rejects_symlink_escape` (unix) | unit | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-741 | TC-742 | `list_skips_ignored_dirs_and_truncates` | unit | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-742,NFR-752 | TC-743 | `read_file_contract` | integration | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-743 | TC-744 | `renders_gfm_features` | unit | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-743 | TC-745 | `sanitizes_script_and_handlers` | unit | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-744,NFR-752 | TC-746 | `save_with_concurrency_check` | integration | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-745 | TC-747 | `save_rejections` | integration | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-746 | TC-748 | `html_view_ticket_is_sandboxed` | integration | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-747 | TC-749 | `office_falls_back_without_soffice` | integration | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-747 | TC-750 | `office_converts_with_soffice` (ignored) | integration | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-748 | TC-751 | `scan_diff_reports_created_modified_deleted` | unit | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-748,NFR-752 | TC-752 | `changes_api_filters_and_bounds` | integration | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-749 | TC-753 | `extracts_workspace_links_only` | unit | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-750 | TC-754 | `tui_file_link_open_target` | unit | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-750 | TC-755 | `tui_file_links_emit_osc8` | unit | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | NFR-751 | TC-756 | `docs_routes_require_auth` | integration | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | UX-753,INT-754 | TC-757 | `static_page_has_docs_panel` | unit | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | UX-753 | TC-758 | `docs_preview_renders_in_headless_chrome` (ignored) | e2e | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | INT-754 | TC-759 | `docs_module_exposes_api` | unit | ✅ | docs preview (PR F) |
 
 
 ### 1.1 주의할 ⚠️ 항목

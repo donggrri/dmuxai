@@ -7,6 +7,7 @@ pub mod assets;
 mod auth;
 pub mod commands;
 pub mod discovery;
+pub mod docs_api;
 mod file_source;
 mod hub;
 pub mod layout;
@@ -15,6 +16,7 @@ mod server;
 mod snapshot;
 
 pub use auth::{BindCheck, check_bind, dashboard_url, generate_token};
+pub use docs_api::{DocsService, OpenTickets};
 pub use file_source::FileGraphSource;
 pub use hub::DashboardHub;
 pub use layout::{NodeLayout, layout_graph};
