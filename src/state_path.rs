@@ -27,15 +27,15 @@ pub fn state_base() -> io::Result<PathBuf> {
     }
     #[cfg(windows)]
     {
-        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-            if !base.is_empty() {
-                return Ok(PathBuf::from(base).join("DmuxAI"));
-            }
+        if let Some(base) = std::env::var_os("LOCALAPPDATA")
+            && !base.is_empty()
+        {
+            return Ok(PathBuf::from(base).join("DmuxAI"));
         }
-        return Err(io::Error::new(
+        Err(io::Error::new(
             io::ErrorKind::NotFound,
             "neither DMUXAI_STATE_DIR nor LOCALAPPDATA is configured",
-        ));
+        ))
     }
     #[cfg(not(windows))]
     {
