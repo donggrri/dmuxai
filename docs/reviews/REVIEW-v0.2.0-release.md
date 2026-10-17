@@ -57,7 +57,7 @@ No orphan TEST-PLAN rows were found in these ID bands.
 | --- | --- | --- |
 | 1 | SPEC-obsidian-memory TC-720..TC-731 had no `docs/TEST-PLAN.md` rows | Rows added, generated from the SPEC TC table |
 | 2 | TC-729 named only `tests/memory_mcp.rs`, no test functions | Test names added to the SPEC row and the TEST-PLAN row |
-| 3 | NFR-780 (parity UI isolation) was "Manual review" only | Linked to TC-786 (`session_assets_are_served_hardened` asserts `session.js` has no `EventSource`), plus manual review |
+| 3 | NFR-780 (parity UI isolation) was "Manual review" only | Linked to TC-786 (`session_module_has_parity_controls` asserts `session.js` has no `EventSource`), plus manual review |
 | 4 | No `docs/tasks/TASKS-dashboard-parity.md` | Added, with TC-to-test mapping |
 | 5 | TASKS-agent-api had no done column | Added a Done column; all rows done |
 | 6 | Status lines still said "In progress" or "planned" (SPEC web-dashboard, theme-colors, agent-api, dashboard-parity, docs-preview; PLAN web-dashboard, theme-colors, obsidian-memory, docs-preview), or were missing (PLAN graph-view, agent-api, dashboard-parity) | Set to "Implemented in v0.2.0"; docs-preview notes OQ-740..742 as deferred |
@@ -65,6 +65,7 @@ No orphan TEST-PLAN rows were found in these ID bands.
 | 8 | README top dashboard screenshot dated from slice A | Replaced with the current page: Chat panel, agents, to-dos, documents, graph view, memory. Demo graph, token redacted |
 | 9 | README had no Claude Desktop MCP config | Linux and Windows/WSL examples added, marked untested with Claude Desktop. `dmuxai mcp` answers `initialize` (`protocolVersion` 2024-11-05, `serverInfo` dmuxai 0.2.0) and `tools/list` (`todo_add`, `todo_list`, `run`, `status`, `events_since`); a `status` tool call returns data |
 | 10 | Personal Windows paths in README and review notes | Removed (release commits) |
+| 11 | `dashboard_commands_cover_models_share_and_policy` was not in the TC-783 rows (found in cursor review) | Added to the SPEC and TEST-PLAN rows; TASKS mapping corrected |
 
 No code gaps were found, so nothing needed opencode-haiku.
 

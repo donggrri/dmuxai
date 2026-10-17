@@ -3,7 +3,7 @@
 All notable changes to dmuxai are listed here. Versions follow
 [Semantic Versioning](https://semver.org/); dates are Asia/Seoul.
 
-## [0.2.0] - unreleased
+## [0.2.0] - 2026-10-17
 
 Changes since v0.1.1 (2026-08-24), PRs #1-#38.
 
@@ -94,7 +94,9 @@ Changes since v0.1.1 (2026-08-24), PRs #1-#38.
   - a terminal lifecycle fix (#26)
 - **Release workflow:** now also builds a static (musl)
   `dmuxai-linux-x86_64.tar.gz` with a SHA-256 checksum for WSL and Linux users. It is published to the same
-  GitHub release as the Windows zip.
+  GitHub release as the Windows zip. The tarball holds only `dmuxai` (run it
+  inside WSL or on Linux). The Windows zip adds `dmuxai-launcher.exe`, which
+  opens DmuxAI inside WSL.
 - **Docs:**
   - README section "Calling dmuxai from an agent", with Claude Desktop MCP
     examples for Linux and for Windows via WSL (not yet tested with Claude
@@ -116,9 +118,9 @@ Changes since v0.1.1 (2026-08-24), PRs #1-#38.
 - **Implement mode (#26):** plan-only detection, and cancelling while busy.
 - **F2 model selection (#6):** the model is honored per runner, and colors
   can be forced under `NO_COLOR`.
-- **Event log on Windows (#37):** a contended `.dmuxai/events.jsonl`
-  append no longer fails while another handle is deleting the lock file
-  (delete pending reports "Access is denied").
+- **Event log on Windows (#37):** an append no longer fails when it finds the
+  `.dmuxai/events.lock` file pending deletion by another handle (Windows
+  reports "Access is denied"). It now retries.
 - **Builds:**
   - the non-Windows `dmuxai-launcher` stub (#17)
   - bash-only spec-index tests are gated on Windows (#24)

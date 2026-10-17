@@ -235,7 +235,7 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-dashboard-parity | FR-780 | TC-780 | `dashboard_session_snapshot_has_contract_keys` | unit | ✅ | dashboard parity (G2) |
 | M8,M2 | SPEC-dashboard-parity | FR-780 | TC-781 | `dashboard_session_transcript_is_capped` | unit | ✅ | dashboard parity (G2) |
 | M8,M2 | SPEC-dashboard-parity | FR-782 | TC-782 | `dashboard_prompt_streams_into_transcript` | unit | ✅ | dashboard parity (G2) |
-| M8,M2 | SPEC-dashboard-parity | FR-781 | TC-783 | `command_route_contract`, `dashboard_commands_match_tui_actions`, `dashboard_cancel_targets_the_named_agent` | integration | ✅ | dashboard parity (G2) |
+| M8,M2 | SPEC-dashboard-parity | FR-781 | TC-783 | `command_route_contract`, `dashboard_commands_match_tui_actions`, `dashboard_cancel_targets_the_named_agent`, `dashboard_commands_cover_models_share_and_policy` | integration | ✅ | dashboard parity (G2) |
 | M8,M2 | SPEC-dashboard-parity | FR-781 | TC-784 | `dashboard_new_and_load_conversation` | unit | ✅ | dashboard parity (G2) |
 | M8,M2 | SPEC-dashboard-parity | FR-783 | TC-785 | `dashboard_slash_commands_via_prompt` | unit | ✅ | dashboard parity (G2) |
 | M8,M2 | SPEC-dashboard-parity | FR-782,FR-783,UX-780 | TC-786 | `session_module_has_parity_controls`, `session_assets_are_served_hardened` | unit (asset) | ✅ | dashboard parity (G2) |
