@@ -16,7 +16,7 @@ Decision: move the to-do UI into a toggleable sidebar panel, opened from a heade
 | --- | --- | --- | --- |
 | FR-840 | Must | The header has a `To-dos` button with a count badge of open to-dos. It toggles a sidebar panel that holds the whole to-do UI (list, add form, Jira field, MCP import). The panel is closed by default, and its open state persists in `localStorage` | TC-840, TC-841 |
 | FR-841 | Must | The to-do list in the panel can be filtered by state (`open` / `done` / `all`) and by a text search. Each item keeps its run/done/delete actions and view-only mode exactly as before | TC-840, TC-841 |
-| FR-842 | Must | The Files and To-dos sidebars share one right-hand sidebar region with tabs: opening one switches to its tab, and the toggle buttons show which is active. `Esc` closes the sidebar when focus is not in a text field or the docs editor, so the existing preview/editor Esc handling wins (SPEC-docs-tree FR-833 owns the shell) | TC-840, TC-842 |
+| FR-842 | Must | The Files and To-dos sidebars share one right-hand sidebar region with tabs: opening one switches to its tab, and the toggle buttons show which is active. `Esc` closes the sidebar when focus is not in a text field or the docs editor, so the existing preview/editor Esc handling wins (the shell is owned by SPEC-docs-tree FR-833) | TC-840, TC-842 |
 | UX-840 | Must | The badge and buttons have accessible names (`aria-controls`, `aria-expanded`). Below 900px the sidebar is an overlay drawer, consistent with UX-830 | TC-840 |
 
 ## 3. Tests

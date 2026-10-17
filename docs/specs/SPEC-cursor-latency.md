@@ -21,7 +21,7 @@ Findings:
 
 - dmuxai adds no measurable overhead. It does not resend history on resumed turns (the stdin size is the prompt only), and nothing in dmuxai polls or sleeps on the cursor path.
 - A Cursor turn costs a cold `cursor-agent` start plus model latency. There is no persistent server mode, so dmuxai starts a new process for every turn.
-- cursor-agent starts up before it reads stdin. A process spawned 8 s ahead answers **1.4–2.1 s sooner** (about 30%) than one spawned when the prompt is sent (3.2–3.8 s vs 5.2–5.3 s to first text). That is 2 runs each on one box, so treat it as indicative.
+- cursor-agent starts up before it reads stdin. A process spawned 8 s ahead answers **1.4–2.1 s sooner** (27–40%) than one spawned when the prompt is sent (3.2–3.8 s vs 5.2–5.3 s to first text). That is 2 runs each on one box, so treat it as indicative.
 - A warm process whose stdin reaches EOF without a prompt (for example because dmuxai crashed) exits on its own (`Error: No prompt provided for print mode`, exit 1, about 2.6 s). It makes no model call and creates no session.
 - The wait before the first token has no on-screen marker. This is handled by SPEC-running-indicators.
 

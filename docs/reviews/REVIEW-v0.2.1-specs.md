@@ -15,4 +15,13 @@ Reviewer: opencode-haiku (`dmuxai run --agent opencode-haiku --mode ask`). Curso
 | 7 | ROADMAP/PLAN/TASKS order and kill triggers disagree | The release waits for 1–7; PLAN lists agent removal |
 | nits | Cancelled pill; "next interaction"; NFR-820 test; template oracle; TC-815 oracle; benchmark baseline; tab shell ownership and Esc; TASKS UX-821 | All applied |
 
+## Round 2: REQUEST_CHANGES
+
+| # | Finding | Resolution |
+| --- | --- | --- |
+| 1 | FR-813 contradicts SPEC-graph-allowed-runners (unset = every runner) | Reworded as an explicit exception with code paths, rationale and a CHANGELOG note |
+| 2 | SPEC-cursor-stream-dedupe links dangle | PR #39 merges first; this PR is rebased onto it before merging |
+| 3 | No evidence for the delta | `cargo test --test spec_index` rerun on the final tree: 3/3 |
+| nits | Shell ownership; ignored-dir status; 27–40% range; timeout parameter | SPEC-docs-tree owns the shell; ignored dir → 404 `NotFound`; range quoted; timeout is a parameter |
+
 `scripts/check-spec.ps1` needs PowerShell, which is not installed on this box; `tests/spec_index.rs` passes (3/3).
