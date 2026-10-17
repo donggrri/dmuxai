@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default)]
 use dmuxai::graph::{
     ExecutionPlan, GraphRun, GraphRunPhase, GraphRunSession, NodeRole, ORCHESTRATOR_MODEL,
     plan_request, save_run, validate_model_id,
@@ -135,4 +136,83 @@ fn discover_skills_finds_agent_graph_engineering() {
             .any(|skill| skill.id == "agent-graph-engineering"),
         "expected agent-graph-engineering skill in repo"
     );
+}
+
+#[test]
+fn allowed_list_excludes_cursor_every_node_runner_is_agy() {
+    // TC-430, FR-430, FR-431, FR-432
+    let dir = tempdir().unwrap();
+    let mut settings = DmuxSettings::default();
+    settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
+
+    let plan = plan_request(
+        "research auth, plan database migration, implement merge to main and test",
+        dir.path(),
+        &settings,
+    );
+    let graph = match plan {
+        ExecutionPlan::Graph(graph) => graph,
+        ExecutionPlan::Single(_) => panic!("expected multi-node graph"),
+    };
+    assert!(!graph.nodes.is_empty());
+    for node in &graph.nodes {
+        assert_eq!(
+            node.runner, "agy",
+            "node {} has runner {}, expected agy",
+            node.id, node.runner
+        );
+    }
+}
+
+#[test]
+fn routing_default_not_allowed_falls_back() {
+    // TC-431, FR-431
+    let dir = tempdir().unwrap();
+    let mut settings = DmuxSettings::default();
+    settings.routing_default_agent = Some("codex".to_owned());
+    settings.graph_allowed_runners = Some(vec!["cursor".to_owned(), "agy".to_owned()]);
+
+    let plan = plan_request(
+        "research auth, plan database migration, implement fix and test",
+        dir.path(),
+        &settings,
+    );
+    let graph = match plan {
+        ExecutionPlan::Graph(graph) => graph,
+        ExecutionPlan::Single(_) => panic!("expected multi-node graph"),
+    };
+    for node in &graph.nodes {
+        assert_eq!(node.runner, "cursor");
+    }
+
+    // When cursor is also excluded, falls back to first allowed runner
+    settings.routing_default_agent = Some("cursor".to_owned());
+    settings.graph_allowed_runners = Some(vec!["agy".to_owned(), "codex".to_owned()]);
+    let plan2 = plan_request(
+        "research auth, plan database migration, implement fix and test",
+        dir.path(),
+        &settings,
+    );
+    let graph2 = match plan2 {
+        ExecutionPlan::Graph(graph) => graph,
+        ExecutionPlan::Single(_) => panic!("expected multi-node graph"),
+    };
+    for node in &graph2.nodes {
+        assert_eq!(node.runner, "agy");
+    }
+}
+
+#[test]
+fn empty_allowed_runners_planner_falls_back_to_single() {
+    // TC-433, INT-430
+    let dir = tempdir().unwrap();
+    let mut settings = DmuxSettings::default();
+    settings.graph_allowed_runners = Some(Vec::new());
+
+    let plan = plan_request(
+        "research auth, plan database migration, implement fix and test",
+        dir.path(),
+        &settings,
+    );
+    assert!(matches!(plan, ExecutionPlan::Single(_)));
 }

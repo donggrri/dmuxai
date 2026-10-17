@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -14,6 +14,7 @@ pub struct DmuxSettings {
     pub graph_enabled: bool,
     pub graph_max_parallel: usize,
     pub graph_max_retries: u32,
+    pub graph_allowed_runners: Option<Vec<String>>,
     pub theme: Theme,
     pub theme_force_color: Option<bool>,
     /// `[[agents.custom]]` headless agents (installed into the registry at startup).
@@ -45,6 +46,7 @@ struct GraphToml {
     enabled: Option<bool>,
     max_parallel: Option<usize>,
     max_retries: Option<u32>,
+    allowed_runners: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -60,57 +62,108 @@ struct RoutingToml {
 
 impl DmuxSettings {
     pub fn load(workspace: &Path) -> Self {
+        Self::load_with_user_config(workspace, default_user_config_path().as_deref())
+    }
+
+    pub fn load_with_user_config(workspace: &Path, user_config_path: Option<&Path>) -> Self {
         let mut settings = Self::default();
         if env_flag("DMUXAI_CURSOR_WINDOWS_UNSANDBOXED") {
             settings.cursor_windows_unsandboxed = true;
         }
+
+        if let Some(user_path) = user_config_path
+            && let Ok(contents) = std::fs::read_to_string(user_path)
+        {
+            match toml::from_str::<DmuxToml>(&contents) {
+                Ok(parsed) => settings.apply_toml(parsed),
+                Err(error) => settings.config_warnings.push(format!(
+                    "user config {} ignored: {error}",
+                    user_path.display()
+                )),
+            }
+        }
+
         let config_path = workspace.join("dmuxai.toml");
-        let parsed = std::fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|contents| match toml::from_str::<DmuxToml>(&contents) {
-                Ok(parsed) => Some(parsed),
+        if let Ok(contents) = std::fs::read_to_string(&config_path) {
+            match toml::from_str::<DmuxToml>(&contents) {
+                Ok(parsed) => {
+                    settings.apply_toml(parsed);
+                }
                 Err(error) => {
                     settings
                         .config_warnings
                         .push(format!("dmuxai.toml ignored: {error}"));
-                    None
                 }
-            });
-        if let Some(parsed) = parsed {
-            if let Some(agents) = parsed.agents {
-                settings.custom_agents = agents.custom;
-            }
-            if parsed
-                .cursor
-                .and_then(|cursor| cursor.windows_unsandboxed)
-                .unwrap_or(false)
-            {
-                settings.cursor_windows_unsandboxed = true;
-            }
-            if let Some(routing) = parsed.routing {
-                settings.routing_default_agent = routing.default_agent;
-                settings.routing_cursor_models = routing.cursor_models.unwrap_or_default();
-            }
-            if let Some(theme) = &parsed.theme {
-                settings.theme = Theme::from_toml(theme);
-                settings.theme_force_color = theme.force_color;
-            }
-            if let Some(graph) = parsed.graph {
-                if let Some(enabled) = graph.enabled {
-                    settings.graph_enabled = enabled;
-                }
-                if let Some(max_parallel) = graph.max_parallel {
-                    settings.graph_max_parallel = max_parallel;
-                }
-                if let Some(max_retries) = graph.max_retries {
-                    settings.graph_max_retries = max_retries;
-                }
-            }
-            if let Some(ui) = parsed.ui {
-                settings.ui = ui;
             }
         }
+
         settings
+    }
+
+    fn apply_toml(&mut self, parsed: DmuxToml) {
+        if let Some(agents) = parsed.agents {
+            self.custom_agents = agents.custom;
+        }
+        if parsed
+            .cursor
+            .and_then(|cursor| cursor.windows_unsandboxed)
+            .unwrap_or(false)
+        {
+            self.cursor_windows_unsandboxed = true;
+        }
+        if let Some(routing) = parsed.routing {
+            if let Some(default_agent) = routing.default_agent {
+                self.routing_default_agent = Some(default_agent);
+            }
+            if let Some(cursor_models) = routing.cursor_models {
+                self.routing_cursor_models = cursor_models;
+            }
+        }
+        if let Some(theme) = &parsed.theme {
+            self.theme.apply_toml(theme);
+            if let Some(force_color) = theme.force_color {
+                self.theme_force_color = Some(force_color);
+            }
+        }
+        if let Some(graph) = parsed.graph {
+            if let Some(enabled) = graph.enabled {
+                self.graph_enabled = enabled;
+            }
+            if let Some(max_parallel) = graph.max_parallel {
+                self.graph_max_parallel = max_parallel;
+            }
+            if let Some(max_retries) = graph.max_retries {
+                self.graph_max_retries = max_retries;
+            }
+            if let Some(runners) = graph.allowed_runners {
+                let mut valid = Vec::new();
+                for runner in runners {
+                    let lower = runner.trim().to_ascii_lowercase();
+                    if lower.is_empty() {
+                        continue;
+                    }
+                    if matches!(lower.as_str(), "agy" | "codex" | "cursor")
+                        || self
+                            .custom_agents
+                            .iter()
+                            .any(|spec| spec.name.eq_ignore_ascii_case(&lower))
+                        || crate::custom_agent::index_of(&lower).is_some()
+                    {
+                        if !valid.contains(&lower) {
+                            valid.push(lower);
+                        }
+                    } else {
+                        self.config_warnings.push(format!(
+                            "unknown runner '{runner}' in graph.allowed_runners ignored"
+                        ));
+                    }
+                }
+                self.graph_allowed_runners = Some(valid);
+            }
+        }
+        if let Some(ui) = parsed.ui {
+            self.ui = ui;
+        }
     }
 }
 
@@ -123,6 +176,7 @@ impl Default for DmuxSettings {
             graph_enabled: true,
             graph_max_parallel: 2,
             graph_max_retries: 2,
+            graph_allowed_runners: None,
             theme: Theme::default(),
             theme_force_color: None,
             custom_agents: Vec::new(),
@@ -140,6 +194,22 @@ fn env_flag(name: &str) -> bool {
         ),
         Err(_) => false,
     }
+}
+
+fn default_user_config_path() -> Option<PathBuf> {
+    if let Some(base) = std::env::var_os("XDG_CONFIG_HOME") {
+        let base_path = PathBuf::from(base);
+        if !base_path.as_os_str().is_empty() {
+            return Some(base_path.join("dmuxai").join("dmuxai.toml"));
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_path = PathBuf::from(home);
+        if !home_path.as_os_str().is_empty() {
+            return Some(home_path.join(".config").join("dmuxai").join("dmuxai.toml"));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -220,5 +290,105 @@ mod theme_config_tests {
     #[test]
     fn ui_config_activity_rendering_parsing() {
         parses_ui_section();
+    }
+
+    #[test]
+    fn user_config_merged_and_overridden_by_workspace() {
+        // TC-434, FR-433
+        let temp_base =
+            std::env::temp_dir().join(format!("dmuxai-user-cfg-{}", std::process::id()));
+        let user_dir = temp_base.join("user");
+        let ws_dir = temp_base.join("workspace");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let user_toml = user_dir.join("dmuxai.toml");
+        std::fs::write(
+            &user_toml,
+            r#"
+[graph]
+allowed_runners = ["agy", "cursor"]
+max_retries = 5
+
+[theme]
+user = "blue"
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            ws_dir.join("dmuxai.toml"),
+            r#"
+[graph]
+allowed_runners = ["agy"]
+max_parallel = 4
+
+[theme]
+cursor = "green"
+"#,
+        )
+        .unwrap();
+
+        let settings = DmuxSettings::load_with_user_config(&ws_dir, Some(&user_toml));
+        // Workspace overrides allowed_runners and sets max_parallel
+        assert_eq!(settings.graph_allowed_runners, Some(vec!["agy".to_owned()]));
+        assert_eq!(settings.graph_max_parallel, 4);
+        // User config max_retries is preserved
+        assert_eq!(settings.graph_max_retries, 5);
+        // Theme merges user and cursor colors
+        assert_eq!(settings.theme.user, Color::Blue);
+        assert_eq!(settings.theme.cursor, Color::Green);
+
+        // Also test missing user config falls back gracefully
+        let settings_no_user = DmuxSettings::load_with_user_config(&ws_dir, None);
+        assert_eq!(
+            settings_no_user.graph_allowed_runners,
+            Some(vec!["agy".to_owned()])
+        );
+        assert_eq!(settings_no_user.graph_max_parallel, 4);
+        assert_eq!(settings_no_user.graph_max_retries, 2);
+
+        std::fs::remove_dir_all(&temp_base).ok();
+    }
+
+    #[test]
+    fn allowed_runners_parsing_and_unknown_runner_warning() {
+        // TC-430, TC-433, FR-430
+        let dir = std::env::temp_dir().join(format!("dmuxai-runners-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("dmuxai.toml"),
+            r#"
+[graph]
+allowed_runners = ["AGY", "bogus_agent", "cursor"]
+"#,
+        )
+        .unwrap();
+
+        let settings = DmuxSettings::load_with_user_config(&dir, None);
+        assert_eq!(
+            settings.graph_allowed_runners,
+            Some(vec!["agy".to_owned(), "cursor".to_owned()])
+        );
+        assert!(
+            settings.config_warnings.iter().any(
+                |w| w.contains("unknown runner 'bogus_agent' in graph.allowed_runners ignored")
+            )
+        );
+
+        // Empty list produces Some(vec![]) with no warnings
+        std::fs::write(
+            dir.join("dmuxai.toml"),
+            r#"
+[graph]
+allowed_runners = []
+"#,
+        )
+        .unwrap();
+        let settings_empty = DmuxSettings::load_with_user_config(&dir, None);
+        assert_eq!(settings_empty.graph_allowed_runners, Some(Vec::new()));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

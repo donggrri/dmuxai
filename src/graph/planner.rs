@@ -16,7 +16,12 @@ pub fn plan_request(
     settings: &DmuxSettings,
 ) -> ExecutionPlan {
     let roles = infer_roles(prompt);
-    if roles.len() <= 2 {
+    if roles.len() <= 2
+        || settings
+            .graph_allowed_runners
+            .as_ref()
+            .is_some_and(|r| r.is_empty())
+    {
         let role = roles.last().copied().unwrap_or(NodeRole::Implement);
         let model_id = model_for_role(role);
         let _ = validate_model_id(model_id);

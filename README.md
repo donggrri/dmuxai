@@ -241,6 +241,20 @@ max_parallel = 2
 max_retries = 2
 ```
 
+### Graph allowed runners and user-level config
+
+A machine or workspace can constrain which runners are permitted to execute graph nodes with `allowed_runners`:
+
+```toml
+[graph]
+allowed_runners = ["agy", "opencode"]
+```
+
+A machine can exclude `cursor` from the graph globally across all workspaces by setting `[graph] allowed_runners = ["agy", "opencode"]` in the user-level configuration:
+- `$XDG_CONFIG_HOME/dmuxai/dmuxai.toml` (fallback `~/.config/dmuxai/dmuxai.toml`)
+
+User-level configuration is read first, and any keys in the workspace `dmuxai.toml` override user configuration per key.
+
 ## Custom headless agents
 
 Any headless agent CLI (opencode, hermes, pi, ...) can be added via `[[agents.custom]]`

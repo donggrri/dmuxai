@@ -7,7 +7,8 @@ mod types;
 pub use executor::{GraphAction, GraphRunSession, NodeAssignment};
 pub use planner::plan_request;
 pub use policy::{
-    ORCHESTRATOR_MODEL, assign_runner, default_limits, model_for_role, validate_model_id,
+    ORCHESTRATOR_MODEL, assign_runner, default_limits, is_runner_allowed, model_for_role,
+    validate_model_id,
 };
 pub use store::{GraphStore, load_run, save_run};
 pub use types::{

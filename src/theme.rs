@@ -49,35 +49,41 @@ pub struct ThemeToml {
 }
 
 impl Theme {
-    /// Build a theme from a serialized TOML mapping, keeping defaults for any
+    /// Apply serialized TOML colors onto this theme, keeping current colors for any
     /// missing or invalid color name.
-    pub fn from_toml(t: &ThemeToml) -> Self {
-        let mut theme = Self::default();
+    pub fn apply_toml(&mut self, t: &ThemeToml) {
         if let Some(s) = &t.user
             && let Some(c) = parse_color(s)
         {
-            theme.user = c;
+            self.user = c;
         }
         if let Some(s) = &t.cursor
             && let Some(c) = parse_color(s)
         {
-            theme.cursor = c;
+            self.cursor = c;
         }
         if let Some(s) = &t.agy
             && let Some(c) = parse_color(s)
         {
-            theme.agy = c;
+            self.agy = c;
         }
         if let Some(s) = &t.other
             && let Some(c) = parse_color(s)
         {
-            theme.other = c;
+            self.other = c;
         }
         if let Some(s) = &t.system
             && let Some(c) = parse_color(s)
         {
-            theme.system = c;
+            self.system = c;
         }
+    }
+
+    /// Build a theme from a serialized TOML mapping, keeping defaults for any
+    /// missing or invalid color name.
+    pub fn from_toml(t: &ThemeToml) -> Self {
+        let mut theme = Self::default();
+        theme.apply_toml(t);
         theme
     }
 

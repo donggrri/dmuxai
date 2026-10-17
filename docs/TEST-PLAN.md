@@ -36,6 +36,7 @@ Status: draft · 기준 커밋: `73e3f4d` (main, PR #6 이후) · 작성일: 202
 | [SPEC-activity-rendering](specs/SPEC-activity-rendering.md) | Implemented | FR-360~365, UX-360~362, TC-360~367 | FR-ACTIVITY-*, TC-ACTIVITY-* |
 | [SPEC-cursor-model-pin](specs/SPEC-cursor-model-pin.md) | Implemented | FR-410~412, UX-410, INT-410, TC-410~414 | dogfood #18 |
 | [SPEC-input-redraw](specs/SPEC-input-redraw.md) | Implemented | FR-420~425, TC-420~426 | dogfood #15, #17, #19 |
+| [SPEC-graph-allowed-runners](specs/SPEC-graph-allowed-runners.md) | Implemented | FR-430~433, UX-430, INT-430, TC-430~435 | dogfood #20 |
 
 SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없는 것은 `*proposed*`로 표시했다. 확인된 실제 테스트: `user_selected_agy_model_wins_over_graph_default`, `graph_default_model_only_applies_to_cursor`, `chat_lines_render_with_speaker_theme_colors`, `explicit_summary_is_internal_and_the_next_turn_uses_it_fresh` 등 (§2 표의 일부 제안 이름은 이 실제 이름으로 대체된다).
 
@@ -155,6 +156,12 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M6 (TUI) | SPEC-input-redraw | FR-423 | TC-424 | `drain_agent_events_completion_triggers_immediate_draw` | unit | ✅ |  |
 | M6 (TUI) | SPEC-input-redraw | FR-424 | TC-425 | `tick_marks_dirty_while_busy` | unit | ✅ |  |
 | M2,M6 | SPEC-input-redraw | FR-425 | TC-426 | `activity_event_resets_last_event_age` | unit | ✅ |  |
+| M1,M2 | SPEC-graph-allowed-runners | FR-430, FR-431, FR-432 | TC-430 | `allowed_list_excludes_cursor_every_node_runner_is_agy`, `assign_runner_honors_allowed_runners_and_order` | unit | ✅ | dogfood #20 |
+| M1,M2 | SPEC-graph-allowed-runners | FR-431 | TC-431 | `routing_default_not_allowed_falls_back`, `assign_runner_honors_allowed_runners_and_order` | unit | ✅ | dogfood #20 |
+| M1,M2 | SPEC-graph-allowed-runners | FR-432 | TC-432 | `graph_override_rejects_disallowed_runner` | unit | ✅ | dogfood #20 |
+| M1,M2 | SPEC-graph-allowed-runners | FR-430, INT-430 | TC-433 | `allowed_runners_parsing_and_unknown_runner_warning`, `empty_allowed_runners_planner_falls_back_to_single`, `empty_allowed_runners_falls_back_to_single_agent_with_notice` | unit | ✅ | dogfood #20 |
+| M1,M2 | SPEC-graph-allowed-runners | FR-433 | TC-434 | `user_config_merged_and_overridden_by_workspace` | unit | ✅ | dogfood #20 |
+| M1,M2 | SPEC-graph-allowed-runners | UX-430 | TC-435 | `graph_status_shows_allowed_runners` | unit | ✅ | dogfood #20 |
 
 
 ### 1.1 주의할 ⚠️ 항목
