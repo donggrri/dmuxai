@@ -168,6 +168,7 @@ pub struct SubstitutionContext {
     pub images: Vec<String>,
     pub session_id: Option<String>,
     pub temp_config: Option<String>,
+    pub mcp_config: Option<String>,
     pub mode: &'static str,
     pub edit: &'static str,
 }
@@ -186,6 +187,7 @@ impl SubstitutionContext {
             images: Vec::new(),
             session_id: None,
             temp_config: None,
+            mcp_config: None,
             mode,
             edit,
         }
@@ -218,6 +220,7 @@ fn substitute_internal(
             "image" => Some(image?),
             "session_id" => Some(ctx.session_id.as_deref()?),
             "temp_config" => Some(ctx.temp_config.as_deref()?),
+            "mcp_config" => Some(ctx.mcp_config.as_deref()?),
             "mode" => Some(ctx.mode),
             "edit" => Some(ctx.edit),
             _ => None,
@@ -625,6 +628,7 @@ command = ["pi", "run"]
             images: vec!["/tmp/shot.png".to_string()],
             session_id: Some("sess-99".to_string()),
             temp_config: Some("/tmp/config.json".to_string()),
+            mcp_config: Some("/tmp/mcp.json".to_string()),
             mode: "implement",
             edit: "allow",
         };
@@ -651,6 +655,10 @@ command = ["pi", "run"]
             Some("CONF=/tmp/config.json")
         );
         assert_eq!(
+            substitute("MCP={mcp_config}", &ctx).as_deref(),
+            Some("MCP=/tmp/mcp.json")
+        );
+        assert_eq!(
             substitute("mode={mode},edit={edit}", &ctx).as_deref(),
             Some("mode=implement,edit=allow")
         );
@@ -665,6 +673,7 @@ command = ["pi", "run"]
             images: Vec::new(),
             session_id: None,
             temp_config: None,
+            mcp_config: None,
             mode: "ask",
             edit: "deny",
         };
@@ -672,6 +681,7 @@ command = ["pi", "run"]
         assert_eq!(substitute("-m {model}", &ctx), None);
         assert_eq!(substitute("{session_id}", &ctx), None);
         assert_eq!(substitute("{temp_config}", &ctx), None);
+        assert_eq!(substitute("{mcp_config}", &ctx), None);
         assert_eq!(substitute("{image}", &ctx), None);
         assert_eq!(
             substitute("static text", &ctx).as_deref(),
@@ -690,6 +700,7 @@ command = ["pi", "run"]
             images: Vec::new(),
             session_id: None,
             temp_config: None,
+            mcp_config: None,
             mode: "ask",
             edit: "deny",
         };
@@ -723,6 +734,7 @@ command = ["pi", "run"]
             images: Vec::new(),
             session_id: None,
             temp_config: None,
+            mcp_config: None,
             mode: "ask",
             edit: "deny",
         };
@@ -758,6 +770,7 @@ prompt_via = "stdin"
             images: Vec::new(),
             session_id: None,
             temp_config: None,
+            mcp_config: None,
             mode: "ask",
             edit: "deny",
         };
@@ -788,6 +801,7 @@ implement = ["--mode", "implement"]
             images: vec!["img1.png".to_string(), "img2.png".to_string()],
             session_id: Some("sess-123".to_string()),
             temp_config: None,
+            mcp_config: None,
             mode: "implement",
             edit: "allow",
         };
@@ -825,6 +839,7 @@ image_arg = []
             images: vec!["a.png".to_string(), "b.png".to_string()],
             session_id: None,
             temp_config: None,
+            mcp_config: None,
             mode: "ask",
             edit: "deny",
         };

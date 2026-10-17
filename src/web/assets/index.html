@@ -56,7 +56,29 @@
         <span class="field-label">Body (optional)</span>
         <textarea id="todo-body" name="body" rows="2"></textarea>
       </label>
+      <label class="todo-field todo-field-jira">
+        <span class="field-label">Jira ticket (optional) &mdash; key or URL</span>
+        <span class="jira-in">
+          <input id="todo-jira" name="jira" type="text" maxlength="2048" autocomplete="off">
+          <span id="todo-jira-preview" class="todo-jira-preview" role="status" aria-live="polite" hidden></span>
+        </span>
+      </label>
     </form>
+    <div id="import-panel" class="import-panel" hidden>
+      <h3 class="import-title">Import from Jira / Confluence</h3>
+      <form id="import-form" class="import-form">
+        <label class="todo-field import-field-server">
+          <span class="field-label">Server</span>
+          <select id="import-server" aria-label="MCP server to import from"></select>
+        </label>
+        <label class="todo-field import-field-query">
+          <span class="field-label">Query (issue key, JQL, page id or CQL)</span>
+          <input id="import-query" name="query" type="text" maxlength="500" autocomplete="off">
+        </label>
+        <button id="import-submit" type="submit" class="btn btn-primary">Import</button>
+      </form>
+      <p id="import-status" class="import-status" role="status" aria-live="polite" hidden></p>
+    </div>
     <div id="todo-list" class="todo-list"></div>
   </section>
 

@@ -7,6 +7,7 @@ pub mod conversation;
 pub mod custom_agent;
 pub mod graph;
 pub mod launcher;
+pub mod mcp;
 pub mod memory;
 pub mod memory_mcp;
 pub mod model_policy;

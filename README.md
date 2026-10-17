@@ -165,13 +165,78 @@ allowed_runners = ["agy", "opencode-glm"]   # restrict which runners graph nodes
 More fields and ready-made presets: [docs/agents/custom-agents.md](docs/agents/custom-agents.md),
 [docs/agents/presets.toml](docs/agents/presets.toml).
 
-**Shared MCP servers (planned, slice C of SPEC-web-dashboard):** MCP servers are
-defined once under `[[mcp.servers]]` (user config, optionally overridden per repo)
-and apply to every agent: DmuxAI hands them to each CLI in its native per-run form
-(opencode config, Codex `-c mcp_servers.*`, a generated `mcpServers` JSON for custom
-agents; Cursor/AGY per the runner matrix in the spec), and the dashboard's own MCP
-client uses the same list (e.g. Jira/Confluence import into to-dos). Secrets are
-referenced by env var name, never stored.
+## Shared MCP servers (all agents)
+
+Define MCP servers once under `[[mcp.servers]]` in `~/.config/dmuxai/dmuxai.toml`
+(user). A repo `dmuxai.toml` overrides an entry with the same `name`, and
+`enabled = false` removes it from the merged list. DmuxAI hands every runner the
+merged list per run in that CLI's own native form — it never edits user-owned
+agent config files. Secrets are env var names only (`{ env = "VAR" }`); values
+are never stored, logged, or shown by the dashboard, and a missing env var
+disables that server with a warning.
+
+```toml
+[[mcp.servers]]
+name = "everything"                  # stdio transport
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-everything"]
+
+[[mcp.servers]]
+name = "atlassian"                   # example config only: DmuxAI never
+url = "https://mcp.atlassian.com/v1/mcp"   # connects to anything on its own;
+kind = "jira"                        # this is the remote Atlassian MCP over
+headers = { Authorization = { env = "ATLASSIAN_MCP_AUTH" } }   # streamable HTTP
+```
+
+Optional per entry: `kind = "generic" | "jira" | "confluence"` and a `runners`
+allow-list (absent = every runner):
+
+```toml
+runners = ["codex", "opencode-glm"]
+```
+
+How each runner receives the servers (all per run, nothing persisted into
+agent-owned config):
+
+| Runner | How DmuxAI passes MCP servers |
+| --- | --- |
+| opencode | merged into the per-run `OPENCODE_CONFIG` temp file under `mcp` (`type: local` / `remote`) |
+| Codex | per-run `-c mcp_servers.<name>.command/args` (or `.url`) overrides; secret values go into the Codex child's environment and are referenced by name (`env_vars`, `env_http_headers`), never placed in argv |
+| Custom agents | a per-run `{"mcpServers":{...}}` JSON file via the `{mcp_config}` placeholder + `DMUXAI_MCP_CONFIG` env var, removed after the turn |
+| Cursor | writes `.cursor/mcp.json` for the run only if that file does not exist and removes it after the turn; if it exists, one notice instead |
+| AGY | DmuxAI only prints the equivalent `agy mcp add` commands; AGY's user-level config is never modified |
+
+The dashboard's own MCP client uses the same list: with a `kind = "jira"` or
+`"confluence"` server configured, the to-do board shows an Import form that
+pulls issues or pages into to-dos (read-only; re-importing updates instead of
+duplicating). Details and the runner matrix:
+[SPEC-web-dashboard](docs/specs/SPEC-web-dashboard.md).
+
+The MCP client never follows HTTP redirects (so auth headers cannot leak to
+another host), runs stdio servers in their own process group and kills the
+whole group on timeout or exit, and bounds every request with a timeout.
+
+### Jira links on to-dos
+
+Set a base URL once and a to-do can carry a Jira ticket:
+
+```toml
+[todo]
+jira_base_url = "https://example.atlassian.net"
+```
+
+Type a key such as `PROJ-123` in the add form's **Jira ticket** field and the
+link becomes `https://example.atlassian.net/browse/PROJ-123`; paste a full
+Jira URL and the key is extracted. Linked cards get a thin ticket strip on
+top (key link, status chip, assignee or Unassigned, imported/manual tag, link
+host); cards without a link show a dashed **+ Jira** button. Only `http`/`https`
+links are accepted (validated on the server) and they open in a new tab with
+`rel="noopener noreferrer"`. Importing Jira issues over MCP fills the key,
+link, status, and assignee, and re-importing updates the card instead of
+duplicating it. The screenshot below uses the built-in mock MCP server and
+fake fixture data only.
+
+![To-do cards with Jira ticket strips (mock data)](docs/images/web-jira.png)
 
 ## Requirements
 

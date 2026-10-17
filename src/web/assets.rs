@@ -354,6 +354,22 @@ mod tests {
                 (contrast(on_accent, accent) - best).abs() < 1e-9,
                 "{theme}: --on-accent is not the higher-contrast choice on --accent"
             );
+
+            // UX-561: Jira chip text on its chip background >= 4.5:1 and the
+            // key link on the strip background >= 4.5:1 (both palettes).
+            for chip in ["todo", "progress", "done"] {
+                let chip_text = var_value(&vars, &format!("jira-chip-{chip}-text"));
+                let chip_bg = var_value(&vars, &format!("jira-chip-{chip}-bg"));
+                assert!(
+                    contrast(chip_text, chip_bg) >= 4.5,
+                    "{theme}: jira chip {chip} text below 4.5"
+                );
+            }
+            let strip_bg = var_value(&vars, "jira-strip-bg");
+            assert!(
+                contrast(var_value(&vars, "jira-key"), strip_bg) >= 4.5,
+                "{theme}: --jira-key on --jira-strip-bg below 4.5"
+            );
         }
 
         // NFR-600: the JS on-accent algorithm must compare both black and white
@@ -422,5 +438,42 @@ mod tests {
             // Any accent keeps text readable: the better side is always >= ~4.58:1.
             assert!(best >= 4.5, "accent {accent_hex}");
         }
+    }
+
+    // TC-572: static_page_has_todo_links (SPEC-web-dashboard UX-561)
+    #[test]
+    fn static_page_has_todo_links() {
+        assert!(INDEX_HTML.contains("id=\"todos\""));
+        assert!(INDEX_HTML.contains("id=\"todo-list\""));
+        // UX-561: form has the Jira ticket field and preview element.
+        assert!(INDEX_HTML.contains("id=\"todo-jira\""));
+        assert!(INDEX_HTML.contains("id=\"todo-jira-preview\""));
+        // JS builds the strip with the key link (noopener + http/https check).
+        assert!(APP_JS.contains("'todo-jira-strip'"));
+        assert!(APP_JS.contains("noopener noreferrer"));
+        assert!(APP_JS.contains("'^https?:\\\\/\\\\/.+'i") || APP_JS.contains("https?:"));
+        // Status chip category classes (todo/progress/done/neutral).
+        assert!(APP_JS.contains("todo-jira-chip-todo"));
+        assert!(APP_JS.contains("todo-jira-chip-progress"));
+        assert!(APP_JS.contains("todo-jira-chip-done"));
+        assert!(APP_JS.contains("todo-jira-chip-neutral"));
+        // Assignee or Unassigned, imported/manual tag, dashed + Jira affordance.
+        assert!(APP_JS.contains("'Unassigned'"));
+        assert!(APP_JS.contains("'imported'"));
+        assert!(APP_JS.contains("manual"));
+        assert!(APP_JS.contains("'+ Jira'"));
+        assert!(APP_CSS.contains("todo-jira-strip"));
+        assert!(APP_CSS.contains(".todo-jira-chip-todo"));
+        // The collapsed "+ Jira" form must stay hidden (display rule must not
+        // override the `hidden` attribute).
+        assert!(APP_CSS.contains(".todo-jira-form[hidden]"));
+    }
+
+    // TC-568: static_page_has_import_panel (SPEC-web-dashboard UX-560)
+    #[test]
+    fn static_page_has_import_panel() {
+        assert!(INDEX_HTML.contains("id=\"import-form\""));
+        assert!(APP_JS.contains("/api/import"));
+        assert!(APP_JS.contains("/api/mcp/servers"));
     }
 }

@@ -55,6 +55,7 @@ enum CliAction {
     Serve(WebOptions),
     RunWeb(WebOptions),
     McpMemory(MemoryOptions),
+    MockMcp,
     Unknown(String),
 }
 
@@ -108,6 +109,13 @@ where
         .into_iter()
         .map(|arg| arg.as_ref().to_owned())
         .collect();
+
+    if args.first().map(String::as_str) == Some("__mock-mcp") {
+        if args.len() == 1 {
+            return CliAction::MockMcp;
+        }
+        return CliAction::Unknown(args[1].clone());
+    }
 
     let serve = args.first().map(String::as_str) == Some("serve");
     let web = args.iter().any(|arg| arg == "--web");
@@ -256,6 +264,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("error: unexpected argument '{flag}'\n\n{USAGE}");
             std::process::exit(2);
         }
+        CliAction::MockMcp => {
+            dmuxai::mcp::mock::serve_stdio().await;
+            return Ok(());
+        }
         CliAction::Serve(options) => return run_serve(options).await,
         CliAction::RunWeb(options) => return run_tui(Some(options)).await,
         CliAction::McpMemory(options) => return run_mcp_memory(options),
@@ -355,29 +367,45 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         .memory
         .as_ref()
         .map(|config| dmuxai::memory::MemoryHandle::from_config(config, &workspace_root));
-    let services = match open_todo_store(&workspace_root) {
-        Ok(store) => DashboardServices {
-            todos: Some(store),
-            commands: None,
-            web_attached: false,
-            memory,
-        },
-        Err(error) => {
-            eprintln!("warning: to-do board disabled: {error}");
-            DashboardServices {
-                memory,
-                ..DashboardServices::default()
-            }
-        }
-    };
     for warning in &settings.config_warnings {
         eprintln!("warning: {warning}");
     }
+    let mcp_registry = Arc::new(dmuxai::mcp::registry::McpRegistry::from_specs(
+        &settings.mcp_servers,
+        |k| std::env::var(k).ok(),
+    ));
+    for warning in mcp_registry.warnings() {
+        eprintln!("warning: {warning}");
+    }
+
+    let services = match open_todo_store(&workspace_root) {
+        Ok(store) => {
+            store.set_jira_base_url(settings.todo_jira_base_url.clone());
+            DashboardServices {
+                todos: Some(store),
+                commands: None,
+                mcp: Some(mcp_registry),
+                web_attached: false,
+                memory,
+            }
+        }
+        Err(error) => {
+            eprintln!("warning: to-do board disabled: {error}");
+            DashboardServices {
+                todos: None,
+                commands: None,
+                mcp: Some(mcp_registry),
+                web_attached: false,
+                memory,
+            }
+        }
+    };
     let hub = DashboardHub::new(SnapshotSource::Files, workspace);
     hub.set_ui(dmuxai::web::UiTheme {
         theme: settings.web_theme.theme,
         accent: settings.web_theme.accent,
     });
+    hub.set_jira_base_url(settings.todo_jira_base_url.clone());
     // Seed once so `GET /api/state` / SSE show persisted to-dos before the
     // first mutation (FR-540/FR-541).
     if let Some(store) = services.todos.as_ref() {
@@ -445,7 +473,7 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     crossterm::style::force_color_output(color_enabled);
     let custom_warnings = dmuxai::custom_agent::install_registry(settings.custom_agents.clone());
     let config_warnings = settings.config_warnings.clone();
-    let mut app = App::new(engine, workspace_root.clone(), settings)?;
+    let mut app = App::new(engine, workspace_root.clone(), settings.clone())?;
     for warning in config_warnings.into_iter().chain(custom_warnings) {
         app.push_startup_notice(warning);
     }
@@ -461,7 +489,7 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
         app.push_startup_notice(warning);
     }
     let dashboard = if let Some(options) = web {
-        attach_web_dashboard(&mut app, &workspace_root, options).await
+        attach_web_dashboard(&mut app, &workspace_root, &settings, options).await
     } else {
         None
     };
@@ -481,6 +509,7 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
 async fn attach_web_dashboard(
     app: &mut App,
     workspace_root: &Path,
+    settings: &DmuxSettings,
     options: WebOptions,
 ) -> Option<DashboardServer> {
     let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
@@ -488,6 +517,7 @@ async fn attach_web_dashboard(
 
     let (todos, receiver) = match open_todo_store(workspace_root) {
         Ok(store) => {
+            store.set_jira_base_url(settings.todo_jira_base_url.clone());
             let (sender, receiver) = tokio::sync::mpsc::channel::<DashboardCommand>(16);
             (Some((store, sender)), Some(receiver))
         }
@@ -499,6 +529,7 @@ async fn attach_web_dashboard(
     let services = DashboardServices {
         todos: todos.as_ref().map(|(store, _)| store.clone()),
         commands: todos.as_ref().map(|(_, sender)| sender.clone()),
+        mcp: Some(app.mcp_registry()),
         web_attached: true,
         memory: DmuxSettings::load(workspace_root)
             .memory
@@ -507,6 +538,7 @@ async fn attach_web_dashboard(
     };
 
     let hub = DashboardHub::new(SnapshotSource::Tui, workspace);
+    hub.set_jira_base_url(settings.todo_jira_base_url.clone());
     let config = ServerConfig {
         bind: options.bind,
         port: options.port,
@@ -793,5 +825,14 @@ mod tests {
         let todos = hub.snapshot().todos;
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].title, "seeded to-do");
+    }
+
+    #[test]
+    fn parse_cli_mock_mcp_hidden_subcommand() {
+        assert_eq!(parse_cli(["__mock-mcp"]), CliAction::MockMcp);
+        assert!(matches!(
+            parse_cli(["__mock-mcp", "unexpected"]),
+            CliAction::Unknown(_)
+        ));
     }
 }

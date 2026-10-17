@@ -57,6 +57,21 @@
   --btn-text: #dbe4ee;
   --btn-primary-text: #4aa8ff;
   --btn-primary-line: #274b73;
+  /* Jira ticket strip (UX-561): keeps the mockup-3 look in dark. */
+  --jira-strip-bg: #0f1f36;
+  --jira-strip-bg-running: #123052;
+  --jira-strip-bg-done: #13202c;
+  --jira-strip-line: #1f3a5f;
+  --jira-strip-text: #8b98a9;
+  --jira-key: #9fcbff;
+  --jira-chip-todo-text: #c2cfe0;
+  --jira-chip-todo-bg: #2a3340;
+  --jira-chip-progress-text: #8ec5ff;
+  --jira-chip-progress-bg: #0c2d57;
+  --jira-chip-done-text: #7fe0a8;
+  --jira-chip-done-bg: #12301f;
+  --jira-tag-line: #274b73;
+  --jira-tag-text: #8ec5ff;
 }
 
 :root[data-theme="light"] {
@@ -108,6 +123,21 @@
   --btn-text: #1b2430;
   --btn-primary-text: #0b57d0;
   --btn-primary-line: #7fa8dd;
+  /* Jira ticket strip (UX-561) in the light palette. */
+  --jira-strip-bg: #e3edfb;
+  --jira-strip-bg-running: #d3e5fa;
+  --jira-strip-bg-done: #e8ecf1;
+  --jira-strip-line: #c5d7ec;
+  --jira-strip-text: #4a5a70;
+  --jira-key: #0b57d0;
+  --jira-chip-todo-text: #4e5a6a;
+  --jira-chip-todo-bg: #e8ecf1;
+  --jira-chip-progress-text: #144a8f;
+  --jira-chip-progress-bg: #d3e5fa;
+  --jira-chip-done-text: #0f6428;
+  --jira-chip-done-bg: #e2f5e9;
+  --jira-tag-line: #a7c4ec;
+  --jira-tag-text: #0b57d0;
 }
 
 /* Pre-init light default: mirrors the light palette above — keep in sync. */
@@ -161,6 +191,21 @@
     --btn-text: #1b2430;
     --btn-primary-text: #0b57d0;
     --btn-primary-line: #7fa8dd;
+    /* Jira ticket strip (UX-561) — same light values, pre-init default. */
+    --jira-strip-bg: #e3edfb;
+    --jira-strip-bg-running: #d3e5fa;
+    --jira-strip-bg-done: #e8ecf1;
+    --jira-strip-line: #c5d7ec;
+    --jira-strip-text: #4a5a70;
+    --jira-key: #0b57d0;
+    --jira-chip-todo-text: #4e5a6a;
+    --jira-chip-todo-bg: #e8ecf1;
+    --jira-chip-progress-text: #144a8f;
+    --jira-chip-progress-bg: #d3e5fa;
+    --jira-chip-done-text: #0f6428;
+    --jira-chip-done-bg: #e2f5e9;
+    --jira-tag-line: #a7c4ec;
+    --jira-tag-text: #0b57d0;
   }
 }
 
@@ -790,6 +835,272 @@ main {
   max-width: 14em;
 }
 
+/* Import panel (SPEC-web-dashboard FR-561, FR-562, UX-560). */
+
+.import-panel {
+  margin: 12px 0 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+}
+
+.import-title {
+  margin: 0 0 8px;
+  font-size: 0.8em;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.import-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+.import-field-server {
+  flex: 0 1 12em;
+  min-width: 9em;
+}
+
+.import-field-query {
+  flex: 1 1 14em;
+  min-width: 10em;
+}
+
+.import-form select,
+.import-form input[type="text"] {
+  width: 100%;
+  background: var(--bg-chip);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.95em;
+  padding: 6px 8px;
+}
+
+.import-form select:focus,
+.import-form input[type="text"]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.import-status {
+  margin: 8px 0 0;
+  font-size: 0.85em;
+  color: var(--ok);
+  overflow-wrap: anywhere;
+}
+
+.import-status-error {
+  color: var(--err);
+}
+
+.import-panel[hidden],
+.import-status[hidden] {
+  display: none;
+}
+
+/* Jira ticket strip (SPEC-web-dashboard UX-561, TC-572; mockup #3). */
+
+.todo.has-jira {
+  padding-top: 0;
+  overflow: hidden;
+}
+
+.todo-jira-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 -12px 8px;
+  padding: 4px 12px;
+  background: var(--jira-strip-bg);
+  border-bottom: 1px solid var(--jira-strip-line);
+  font-size: 0.8em;
+  color: var(--jira-strip-text);
+}
+
+.todo-status-running .todo-jira-strip {
+  background: var(--jira-strip-bg-running);
+}
+
+.todo-status-done .todo-jira-strip {
+  background: var(--jira-strip-bg-done);
+}
+
+.todo-jira-key {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 700;
+  color: var(--jira-key);
+  min-width: 0;
+}
+
+.todo-jira-link {
+  color: inherit;
+  text-decoration: none;
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+}
+
+.todo-jira-sep {
+  color: var(--faint);
+}
+
+.todo-jira-chip {
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-size: 0.9em;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.todo-jira-chip-todo {
+  color: var(--jira-chip-todo-text);
+  background: var(--jira-chip-todo-bg);
+}
+
+.todo-jira-chip-progress {
+  color: var(--jira-chip-progress-text);
+  background: var(--jira-chip-progress-bg);
+}
+
+.todo-jira-chip-done {
+  color: var(--jira-chip-done-text);
+  background: var(--jira-chip-done-bg);
+}
+
+.todo-jira-chip-neutral {
+  color: var(--muted);
+  background: var(--bg-badge);
+}
+
+.todo-jira-assignee {
+  color: var(--muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.todo-jira-unassigned {
+  color: var(--faint);
+  font-style: italic;
+}
+
+.todo-jira-tag {
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 0.9em;
+  color: var(--muted);
+  white-space: nowrap;
+  flex: none;
+}
+
+.todo-jira-tag-jira {
+  border-color: var(--jira-tag-line);
+  color: var(--jira-tag-text);
+}
+
+.todo-jira-host {
+  margin-left: auto;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 12em;
+}
+
+.todo-jira-linker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.btn-jira {
+  border-style: dashed;
+  color: var(--accent);
+}
+
+.todo-jira-form[hidden] {
+  display: none;
+}
+
+.todo-jira-form {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.todo-jira-edit-input {
+  flex: 1 1 14em;
+  min-width: 10em;
+  background: var(--bg-chip);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.85em;
+  padding: 4px 8px;
+}
+
+.todo-jira-edit-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.todo-field-jira {
+  margin-top: 2px;
+}
+
+.jira-in {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-chip);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 8px;
+  min-width: 0;
+}
+
+.jira-in:focus-within {
+  border-color: var(--accent);
+}
+
+.jira-in input[type="text"] {
+  border: 0;
+  background: transparent;
+  padding: 6px 0;
+}
+
+.todo-jira-preview {
+  font-size: 0.72em;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
+}
+
+.todo-jira-preview-error {
+  color: var(--err);
+}
+
+.todo-jira-preview[hidden] {
+  display: none;
+}
+
 @media (max-width: 560px) {
   body { font-size: 14px; }
   .top { position: static; }
@@ -802,8 +1113,11 @@ main {
   .node-time { margin-left: auto; }
   .todo-form-row { flex-direction: column; }
   .todo-form-row .btn-primary { align-self: flex-start; }
+  .import-form { flex-direction: column; align-items: stretch; }
+  .import-form .btn-primary { align-self: flex-start; }
   .todo { padding: 8px 10px; }
   .todo-actions { margin-left: 0; width: 100%; }
+  .todo-jira-host { margin-left: 0; max-width: 9em; }
 }
 
 /* memory panel (SPEC-obsidian-memory) */

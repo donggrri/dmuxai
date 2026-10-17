@@ -89,10 +89,17 @@ pub fn spawn_cursor_adapter(
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
     settings: DmuxSettings,
+    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
 ) -> SpawnedAdapter {
     let windows_unsandboxed = settings.cursor_windows_unsandboxed;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-    let worker = tokio::spawn(runtime_loop(command_rx, event_tx, cwd, windows_unsandboxed));
+    let worker = tokio::spawn(runtime_loop(
+        command_rx,
+        event_tx,
+        cwd,
+        windows_unsandboxed,
+        mcp_servers,
+    ));
     (
         Box::new(CursorAdapter {
             command_tx,
@@ -107,7 +114,13 @@ async fn runtime_loop(
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
     windows_unsandboxed: bool,
+    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
 ) {
+    let applicable: Vec<dmuxai::mcp::ResolvedMcpServer> = mcp_servers
+        .into_iter()
+        .filter(|s| s.applies_to("cursor"))
+        .collect();
+    let cursor_notice_emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut active: Option<ActiveTurn> = None;
     let mut selected_model: Option<String> = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
     let mut selected_mode = ExecutionMode::default();
@@ -135,6 +148,8 @@ async fn runtime_loop(
                             cwd.clone(),
                             event_tx.clone(),
                             windows_unsandboxed,
+                            applicable.clone(),
+                            cursor_notice_emitted.clone(),
                         ));
                     }
                 }
@@ -244,6 +259,7 @@ async fn runtime_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_turn(
     request: AgentRequest,
     selected_model: Option<String>,
@@ -251,6 +267,8 @@ fn spawn_turn(
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
     windows_unsandboxed: bool,
+    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
+    cursor_notice_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> ActiveTurn {
     let context = OutputContext::from(&request);
     let error_context = context.clone();
@@ -262,6 +280,8 @@ fn spawn_turn(
             &cwd,
             &event_tx,
             windows_unsandboxed,
+            &mcp_servers,
+            &cursor_notice_emitted,
         )
         .await
         {
@@ -289,6 +309,7 @@ async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     request: &AgentRequest,
     selected_model: Option<String>,
@@ -296,9 +317,43 @@ async fn run_turn(
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     windows_unsandboxed: bool,
+    mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
+    cursor_notice_emitted: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Option<String>> {
     validate_cursor_mode(mode, windows_unsandboxed)
         .map_err(|error| io::Error::other(error.to_string()))?;
+
+    let context = OutputContext::from(request);
+    let _guard = if !mcp_servers.is_empty() {
+        match dmuxai::mcp::propagate::cursor_mcp_guard(cwd, mcp_servers) {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) => {
+                if !cursor_notice_emitted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    send_event(
+                        event_tx,
+                        Some(&context),
+                        AgentEvent::Notice(
+                            "Workspace .cursor/mcp.json already exists; shared MCP servers were not written for this Cursor turn.".to_owned(),
+                        ),
+                    )
+                    .await;
+                }
+                None
+            }
+            Err(e) => {
+                send_event(
+                    event_tx,
+                    Some(&context),
+                    AgentEvent::Notice(format!("Failed to write .cursor/mcp.json: {e}")),
+                )
+                .await;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut command = cursor_command()?;
     configure_command(
         &mut command,
@@ -842,6 +897,7 @@ mod tests {
             event_tx,
             PathBuf::from("workspace"),
             dmuxai::settings::DmuxSettings::default(),
+            Vec::new(),
         );
 
         adapter.select_mode(ExecutionMode::Plan).unwrap();
@@ -864,6 +920,7 @@ mod tests {
             event_tx,
             PathBuf::from("workspace"),
             dmuxai::settings::DmuxSettings::default(),
+            Vec::new(),
         );
         let expected = AdapterError::UnsupportedMode {
             agent: Agent::Cursor,
@@ -905,6 +962,8 @@ mod tests {
             Path::new("missing-workspace"),
             &event_tx,
             false,
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .expect_err("Windows Cursor Implement must be blocked");
@@ -940,6 +999,8 @@ mod tests {
                 &cwd,
                 &event_tx,
                 false,
+                &[],
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .await
         });
@@ -976,5 +1037,118 @@ mod tests {
             .expect("real Cursor turn should return a session ID");
         assert!(!session.is_empty());
         assert!(answer.contains("CURSOR_OK"), "unexpected answer: {answer}");
+    }
+
+    #[tokio::test]
+    async fn cursor_mcp_notice_once_per_session() {
+        // TC-578, INT-561: Cursor runner with an existing user .cursor/mcp.json; two turns.
+        // The "not propagated" notice is emitted once per session; the user file is untouched.
+        use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
+        use std::collections::BTreeMap;
+        use std::sync::atomic::AtomicBool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cursor_dir = temp.path().join(".cursor");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        let user_file = cursor_dir.join("mcp.json");
+        std::fs::write(&user_file, r#"{"user": "pre-existing"}"#).unwrap();
+
+        let server = ResolvedMcpServer {
+            name: "test-server".to_owned(),
+            kind: ServerKind::Generic,
+            transport: Transport::Stdio {
+                command: "echo".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+            },
+            runners: None,
+            tools: ToolNames::default(),
+        };
+
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let notice_shown = AtomicBool::new(false);
+
+        let req1 = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conv-1"),
+            turn_id: super::super::TurnId::new("turn-1"),
+            prompt: "prompt 1".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+
+        // Override cursor binary so the test does not spawn a live external cursor-agent CLI
+        unsafe {
+            std::env::set_var("DMUXAI_CURSOR_BIN", "nonexistent-cursor-bin");
+        }
+
+        // Turn 1
+        let _ = run_turn(
+            &req1,
+            None,
+            ExecutionMode::Plan,
+            temp.path(),
+            &event_tx,
+            false,
+            std::slice::from_ref(&server),
+            &notice_shown,
+        )
+        .await;
+
+        let mut turn1_notices = Vec::new();
+        while let Ok(output) = event_rx.try_recv() {
+            if let AgentEvent::Notice(msg) = output.event
+                && msg.contains(".cursor/mcp.json already exists")
+            {
+                turn1_notices.push(msg);
+            }
+        }
+        assert_eq!(
+            turn1_notices.len(),
+            1,
+            "turn 1 should emit exactly one notice"
+        );
+
+        let req2 = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conv-1"),
+            turn_id: super::super::TurnId::new("turn-2"),
+            prompt: "prompt 2".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+
+        // Turn 2
+        let _ = run_turn(
+            &req2,
+            None,
+            ExecutionMode::Plan,
+            temp.path(),
+            &event_tx,
+            false,
+            std::slice::from_ref(&server),
+            &notice_shown,
+        )
+        .await;
+
+        unsafe {
+            std::env::remove_var("DMUXAI_CURSOR_BIN");
+        }
+
+        let mut turn2_notices = Vec::new();
+        while let Ok(output) = event_rx.try_recv() {
+            if let AgentEvent::Notice(msg) = output.event
+                && msg.contains(".cursor/mcp.json already exists")
+            {
+                turn2_notices.push(msg);
+            }
+        }
+        assert_eq!(
+            turn2_notices.len(),
+            0,
+            "turn 2 must not emit the notice again (once per session)"
+        );
+
+        // User file remains untouched
+        let content = std::fs::read_to_string(&user_file).unwrap();
+        assert_eq!(content, r#"{"user": "pre-existing"}"#);
     }
 }

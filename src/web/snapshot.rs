@@ -30,6 +30,10 @@ pub struct DashboardSnapshot {
     pub graph: Option<GraphView>,
     #[serde(default)]
     pub todos: Vec<Todo>,
+    /// Configured `[todo] jira_base_url`, if any; lets the page preview a
+    /// resolved link for a typed key without a round trip (FR-564, UX-561).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jira_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +262,7 @@ mod tests {
             }],
             graph: Some(view),
             todos: Vec::new(),
+            jira_base_url: None,
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();

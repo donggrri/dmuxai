@@ -96,11 +96,42 @@ fn map_send_error(error: mpsc::error::TrySendError<CodexCommand>) -> AdapterErro
     }
 }
 
-pub fn spawn_codex_adapter(event_tx: mpsc::Sender<AgentOutput>, cwd: PathBuf) -> SpawnedAdapter {
+pub fn spawn_codex_adapter(
+    event_tx: mpsc::Sender<AgentOutput>,
+    cwd: PathBuf,
+    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
+) -> SpawnedAdapter {
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-    let worker = tokio::spawn(runtime_loop(command_rx, event_tx, cwd));
+    let worker = tokio::spawn(runtime_loop(command_rx, event_tx, cwd, mcp_servers));
 
     (Box::new(CodexAdapter { command_tx }), worker)
+}
+
+#[cfg(test)]
+pub(crate) fn build_codex_app_server_args(
+    servers: &[dmuxai::mcp::ResolvedMcpServer],
+) -> Vec<String> {
+    let (args, _, _) = build_codex_app_server_args_and_env(servers);
+    args
+}
+
+pub(crate) fn build_codex_app_server_args_and_env(
+    servers: &[dmuxai::mcp::ResolvedMcpServer],
+) -> (
+    Vec<String>,
+    std::collections::BTreeMap<String, String>,
+    Vec<String>,
+) {
+    let applicable: Vec<dmuxai::mcp::ResolvedMcpServer> = servers
+        .iter()
+        .filter(|s| s.applies_to("codex"))
+        .cloned()
+        .collect();
+    let (mut args, env, notices) =
+        dmuxai::mcp::propagate::codex_config_overrides_and_env(&applicable);
+    args.push("app-server".to_owned());
+    args.push("--stdio".to_owned());
+    (args, env, notices)
 }
 
 struct CodexClient {
@@ -128,11 +159,20 @@ enum RawMessage {
 }
 
 impl CodexClient {
-    async fn start(_cwd: &Path, event_tx: &mpsc::Sender<AgentOutput>) -> io::Result<Self> {
+    async fn start(
+        _cwd: &Path,
+        event_tx: &mpsc::Sender<AgentOutput>,
+        mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
+    ) -> io::Result<Self> {
         let program = resolve_program(CODEX_BINARY_OVERRIDE, "codex.exe", "codex");
         let mut command = headless_command(program);
+        let (args, env, notices) = build_codex_app_server_args_and_env(mcp_servers);
+        for notice in notices {
+            send_event(event_tx, None, AgentEvent::Notice(notice)).await;
+        }
         command
-            .args(["app-server", "--stdio"])
+            .args(&args)
+            .envs(&env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -523,9 +563,10 @@ async fn connect_for_request(
     mode: ExecutionMode,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
+    mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
 ) -> Option<CodexClient> {
     let context = OutputContext::from(request);
-    match CodexClient::start(cwd, event_tx).await {
+    match CodexClient::start(cwd, event_tx, mcp_servers).await {
         Ok(mut started) => {
             if let Err(error) = begin_request(
                 &mut started,
@@ -566,6 +607,7 @@ async fn runtime_loop(
     mut command_rx: mpsc::Receiver<CodexCommand>,
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
+    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
 ) {
     let mut client: Option<CodexClient> = None;
     let mut selected_model: Option<String> = None;
@@ -584,6 +626,7 @@ async fn runtime_loop(
                         selected_mode,
                         &cwd,
                         &event_tx,
+                        &mcp_servers,
                     )
                     .await;
                 }
@@ -600,49 +643,53 @@ async fn runtime_loop(
                     selected_mode = mode;
                     send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
                 }
-                Some(CodexCommand::ListModels) => match CodexClient::start(&cwd, &event_tx).await {
-                    Ok(mut started) => match started.list_models(&event_tx).await {
-                        Ok((models, default_model)) => {
-                            model_catalog = models.clone();
-                            if selected_model.is_none() {
-                                selected_model = default_model;
+                Some(CodexCommand::ListModels) => {
+                    match CodexClient::start(&cwd, &event_tx, &mcp_servers).await {
+                        Ok(mut started) => match started.list_models(&event_tx).await {
+                            Ok((models, default_model)) => {
+                                model_catalog = models.clone();
+                                if selected_model.is_none() {
+                                    selected_model = default_model;
+                                }
+                                if selected_effort.is_none() {
+                                    selected_effort =
+                                        selected_model.as_ref().and_then(|selected| {
+                                            model_catalog
+                                                .iter()
+                                                .find(|model| &model.id == selected)
+                                                .and_then(|model| model.default_effort.clone())
+                                        });
+                                }
+                                send_event(
+                                    &event_tx,
+                                    None,
+                                    AgentEvent::ModelsListed {
+                                        models,
+                                        selected: selected_model.clone(),
+                                        selected_effort: selected_effort.clone(),
+                                    },
+                                )
+                                .await;
+                                client = Some(started);
                             }
-                            if selected_effort.is_none() {
-                                selected_effort = selected_model.as_ref().and_then(|selected| {
-                                    model_catalog
-                                        .iter()
-                                        .find(|model| &model.id == selected)
-                                        .and_then(|model| model.default_effort.clone())
-                                });
+                            Err(error) => {
+                                send_event(&event_tx, None, AgentEvent::Error(error.to_string()))
+                                    .await;
+                                started.shutdown().await;
                             }
+                        },
+                        Err(error) => {
                             send_event(
                                 &event_tx,
                                 None,
-                                AgentEvent::ModelsListed {
-                                    models,
-                                    selected: selected_model.clone(),
-                                    selected_effort: selected_effort.clone(),
-                                },
+                                AgentEvent::Error(format!("could not start Codex: {error}")),
                             )
                             .await;
-                            client = Some(started);
                         }
-                        Err(error) => {
-                            send_event(&event_tx, None, AgentEvent::Error(error.to_string())).await;
-                            started.shutdown().await;
-                        }
-                    },
-                    Err(error) => {
-                        send_event(
-                            &event_tx,
-                            None,
-                            AgentEvent::Error(format!("could not start Codex: {error}")),
-                        )
-                        .await;
                     }
-                },
+                }
                 Some(CodexCommand::RequestStatus) => {
-                    match CodexClient::start(&cwd, &event_tx).await {
+                    match CodexClient::start(&cwd, &event_tx, &mcp_servers).await {
                         Ok(mut started) => {
                             let status = started.status(&event_tx).await;
                             send_event(&event_tx, None, AgentEvent::Status(status)).await;
@@ -858,6 +905,7 @@ async fn runtime_loop(
                 selected_mode,
                 &cwd,
                 &event_tx,
+                &mcp_servers,
             )
             .await;
         }
@@ -1684,7 +1732,7 @@ mod tests {
     async fn real_codex_app_server_handshake() {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let cwd = std::env::current_dir().unwrap();
-        let client = CodexClient::start(&cwd, &event_tx)
+        let client = CodexClient::start(&cwd, &event_tx, &[])
             .await
             .expect("the installed Codex app-server should complete its handshake");
 
@@ -1700,7 +1748,7 @@ mod tests {
     async fn real_codex_turn_streams_to_completion() {
         let (event_tx, mut event_rx) = mpsc::channel(128);
         let cwd = std::env::current_dir().unwrap();
-        let mut client = CodexClient::start(&cwd, &event_tx)
+        let mut client = CodexClient::start(&cwd, &event_tx, &[])
             .await
             .expect("the installed Codex app-server should complete its handshake");
         let request = request("Reply with exactly CODEX_OK. Do not use tools or modify files.");
@@ -1758,7 +1806,7 @@ mod tests {
     async fn real_codex_turn_can_be_interrupted() {
         let (event_tx, mut event_rx) = mpsc::channel(128);
         let cwd = std::env::current_dir().unwrap();
-        let mut client = CodexClient::start(&cwd, &event_tx)
+        let mut client = CodexClient::start(&cwd, &event_tx, &[])
             .await
             .expect("the installed Codex app-server should complete its handshake");
         let request = request(
@@ -1812,5 +1860,160 @@ mod tests {
         .expect("Codex should acknowledge turn/interrupt within 30 seconds");
 
         client.shutdown().await;
+    }
+
+    #[test]
+    fn codex_argv_includes_mcp_config_overrides() {
+        // TC-564, INT-561: Codex receives -c mcp_servers.* overrides before app-server --stdio.
+        use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
+        use std::collections::BTreeMap;
+
+        // With no servers, defaults to app-server --stdio exactly
+        assert_eq!(
+            build_codex_app_server_args(&[]),
+            vec!["app-server", "--stdio"]
+        );
+
+        let mut env = BTreeMap::new();
+        env.insert("API_KEY".to_owned(), "secret".to_owned());
+
+        let stdio_server = ResolvedMcpServer {
+            name: "local".to_owned(),
+            kind: ServerKind::Generic,
+            transport: Transport::Stdio {
+                command: "npx".to_owned(),
+                args: vec!["-y".to_owned(), "server-pkg".to_owned()],
+                env,
+            },
+            runners: None,
+            tools: ToolNames::default(),
+        };
+
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_owned(), "bearer-token".to_owned());
+
+        let http_server = ResolvedMcpServer {
+            name: "remote".to_owned(),
+            kind: ServerKind::Jira,
+            transport: Transport::Http {
+                url: "https://example.invalid/mcp".to_owned(),
+                headers,
+            },
+            runners: Some(vec!["codex".to_owned(), "cursor".to_owned()]),
+            tools: ToolNames::default(),
+        };
+
+        let cursor_only = ResolvedMcpServer {
+            name: "cursor_only".to_owned(),
+            kind: ServerKind::Generic,
+            transport: Transport::Stdio {
+                command: "cursor-tool".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+            },
+            runners: Some(vec!["cursor".to_owned()]),
+            tools: ToolNames::default(),
+        };
+
+        let servers = vec![stdio_server, http_server, cursor_only];
+        let args = build_codex_app_server_args(&servers);
+
+        assert_eq!(args[args.len() - 2], "app-server");
+        assert_eq!(args[args.len() - 1], "--stdio");
+
+        assert!(args.contains(&"-c".to_owned()));
+        assert!(args.contains(&"mcp_servers.local.command=\"npx\"".to_owned()));
+        assert!(
+            args.contains(&"mcp_servers.remote.url=\"https://example.invalid/mcp\"".to_owned())
+        );
+
+        // Filtered out because runners does not include codex
+        assert!(!args.iter().any(|arg| arg.contains("cursor_only")));
+    }
+
+    #[test]
+    fn codex_mcp_secrets_not_in_argv() {
+        // TC-577, NFR-561, INT-561: servers with secret env (stdio) and secret headers (http).
+        // Build Codex spawn argv and env: no secret value in argv; the values are in the child env;
+        // config uses env-var-name keys.
+        use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
+        use std::collections::BTreeMap;
+
+        let mut env = BTreeMap::new();
+        env.insert(
+            "SECRET_KEY".to_owned(),
+            "super-secret-stdio-token".to_owned(),
+        );
+
+        let stdio_server = ResolvedMcpServer {
+            name: "vault".to_owned(),
+            kind: ServerKind::Generic,
+            transport: Transport::Stdio {
+                command: "vault-tool".to_owned(),
+                args: vec![],
+                env,
+            },
+            runners: None,
+            tools: ToolNames::default(),
+        };
+
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "Authorization".to_owned(),
+            "Bearer super-secret-http-token".to_owned(),
+        );
+
+        let http_server = ResolvedMcpServer {
+            name: "remote-vault".to_owned(),
+            kind: ServerKind::Generic,
+            transport: Transport::Http {
+                url: "https://vault.example.invalid/mcp".to_owned(),
+                headers,
+            },
+            runners: None,
+            tools: ToolNames::default(),
+        };
+
+        let servers = vec![stdio_server, http_server];
+        let (args, child_env, notices) = build_codex_app_server_args_and_env(&servers);
+
+        assert!(notices.is_empty(), "expected no notices for valid servers");
+
+        // 1. No secret value in argv!
+        let full_argv = args.join(" ");
+        assert!(
+            !full_argv.contains("super-secret-stdio-token"),
+            "secret stdio token found in argv: {full_argv}"
+        );
+        assert!(
+            !full_argv.contains("super-secret-http-token"),
+            "secret http token found in argv: {full_argv}"
+        );
+
+        // 2. Secret values are in child env
+        assert_eq!(
+            child_env.get("SECRET_KEY").map(String::as_str),
+            Some("super-secret-stdio-token")
+        );
+        assert!(
+            child_env
+                .values()
+                .any(|v| v == "Bearer super-secret-http-token"),
+            "child_env should contain the http secret value: {child_env:?}"
+        );
+
+        // 3. Config uses env-var-name keys (env_vars and env_http_headers)
+        assert!(
+            args.iter().any(|arg| arg.contains("mcp_servers.vault.env_vars")
+                && arg.contains("SECRET_KEY")),
+            "expected mcp_servers.vault.env_vars in argv: {args:?}"
+        );
+        assert!(
+            args.iter().any(
+                |arg| arg.contains("mcp_servers.remote-vault.env_http_headers")
+                    && arg.contains("Authorization")
+            ),
+            "expected mcp_servers.remote-vault.env_http_headers in argv: {args:?}"
+        );
     }
 }

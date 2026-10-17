@@ -543,6 +543,65 @@ function refreshTodos() {
   poll();
 }
 
+function jiraPreviewParts(rawValue) {
+  var value = String(rawValue || '').trim();
+  if (!value) { return null; }
+  var key = null;
+  var url = null;
+  if (TODO_KEY_RE.test(value)) {
+    key = value;
+    var base = String((snapshot || {}).jira_base_url || '').replace(new RegExp(/\/+$/), '');
+    if (TODO_URL_RE.test(base)) {
+      url = base + '/browse/' + encodeURIComponent(key);
+    }
+  } else if (TODO_URL_RE.test(value)) {
+    url = value;
+    var m = value.match(new RegExp(/\/browse\/([A-Za-z][A-Za-z0-9_]*-\d+)/));
+    if (m) { key = m[1]; }
+  } else {
+    return { error: 'Jira ticket: expected KEY-123 or http(s) URL.' };
+  }
+  var existing = key ? ticketByExternalKey(key) : null;
+  return { key: key, url: url, existing: existing };
+}
+
+function updateJiraPreview() {
+  var preview = $('todo-jira-preview');
+  var input = $('todo-jira');
+  if (!preview || !input) { return; }
+  var parts = jiraPreviewParts(input.value);
+  preview.replaceChildren();
+  if (!parts) {
+    preview.hidden = true;
+    return;
+  }
+  preview.hidden = false;
+  if (parts.error) {
+    preview.classList.add('todo-jira-preview-error');
+    preview.textContent = parts.error;
+    return;
+  }
+  preview.classList.remove('todo-jira-preview-error');
+  var resolved = el('span', 'todo-jira-key', parts.key || '');
+  if (parts.url) {
+    var link = jiraTicketLink(parts.url);
+    link.textContent = parts.key || parts.url;
+    resolved.replaceChildren(link);
+    preview.title = parts.url;
+  } else {
+    preview.title = 'No [todo] jira_base_url configured; the key is stored without a link.';
+  }
+  preview.appendChild(resolved);
+  if (parts.existing) {
+    var chip = el('span', jiraTicketClass(parts.existing.external_status), '');
+    chip.appendChild(document.createTextNode(
+      String(parts.existing.external_status || '?') + ' \u00b7 ' + String(parts.existing.title || '')
+    ));
+    preview.appendChild(document.createTextNode(' \u2014 existing: '));
+    preview.appendChild(chip);
+  }
+}
+
 function submitNewTodo() {
   var titleInput = $('todo-title');
   var bodyInput = $('todo-body');
@@ -552,10 +611,23 @@ function submitNewTodo() {
     titleInput.focus();
     return;
   }
-  todoApi('POST', '/api/todos', { title: title, body: bodyInput.value })
+  var body = { title: title, body: bodyInput.value };
+  var parts = jiraPreviewParts($('todo-jira').value);
+  if (parts && parts.error) {
+    showMsg(parts.error, true);
+    $('todo-jira').focus();
+    return;
+  }
+  if (parts) {
+    if (parts.key) { body.external_key = parts.key; }
+    if (parts.url) { body.link_url = parts.url; }
+  }
+  todoApi('POST', '/api/todos', body)
     .then(function() {
       titleInput.value = '';
       bodyInput.value = '';
+      $('todo-jira').value = '';
+      updateJiraPreview();
       titleInput.focus();
       refreshTodos();
     })
@@ -687,6 +759,157 @@ function todoSourceBadge(todo) {
   return wrap;
 }
 
+// ---------------------------------------------------------------------------
+// Jira ticket strip (SPEC-web-dashboard UX-561, TC-572). A thin Jira-blue
+// strip above the card body shows the resolved key/link, status chip by
+// category, assignee, source tag and link host; cards without a key/link get
+// a dashed "+ Jira" affordance for inline key/URL editing.
+// ---------------------------------------------------------------------------
+
+var TODO_URL_RE = new RegExp(/^https?:\/\/.+/i);
+var TODO_KEY_RE = new RegExp(/^[A-Za-z][A-Za-z0-9_]*-\d+$/);
+
+function ticketByExternalKey(key) {
+  var snap = snapshot || null;
+  var todos = snap && Array.isArray(snap.todos) ? snap.todos : [];
+  for (var i = 0; i < todos.length; i++) {
+    var other = todos[i] || {};
+    if (String(other.external_key || '') === key) { return other; }
+  }
+  return null;
+}
+
+function jiraTicketClass(status) {
+  var s = String(status || '');
+  if (s === 'To Do' || s === 'Open' || s === 'Backlog' || s === 'Selected for Development') {
+    return 'todo-jira-chip todo-jira-chip-todo';
+  }
+  if (s === 'In Progress' || s === 'In Review' || s === 'Reopened') {
+    return 'todo-jira-chip todo-jira-chip-progress';
+  }
+  if (s === 'Done' || s === 'Closed' || s === 'Resolved') {
+    return 'todo-jira-chip todo-jira-chip-done';
+  }
+  return 'todo-jira-chip todo-jira-chip-neutral';
+}
+
+function jiraTicketLink(href) {
+  var a = document.createElement('a');
+  a.className = 'todo-jira-link';
+  a.href = href;
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  return a;
+}
+
+function todoStrip(todo) {
+  var key = String(todo.external_key || '');
+  var url = String(todo.link_url || '');
+  var strip = el('div', 'todo-jira-strip');
+  var parts = [];
+  var i;
+
+  if (key) {
+    var linked = url && TODO_URL_RE.test(url);
+    var keyNode = linked ? jiraTicketLink(url) : el('span', 'todo-jira-key');
+    keyNode.classList.add('todo-jira-key');
+    keyNode.textContent = key;
+    if (linked) { keyNode.title = url; }
+    parts.push(keyNode);
+  }
+
+  var status = String(todo.external_status || '').trim();
+  if (status) {
+    parts.push(el('span', jiraTicketClass(status), status));
+  }
+
+  var assignee = String(todo.external_assignee || '').trim();
+  if (assignee) {
+    parts.push(el('span', 'todo-jira-assignee', assignee));
+  } else {
+    parts.push(el('span', 'todo-jira-assignee todo-jira-unassigned', 'Unassigned'));
+  }
+
+  if (todo.source === 'jira') {
+    parts.push(el('span', 'todo-jira-tag todo-jira-tag-jira', 'imported'));
+  } else {
+    parts.push(el('span', 'todo-jira-tag', 'manual'));
+  }
+
+  for (i = 0; i < parts.length; i++) {
+    if (i > 0) {
+      strip.appendChild(el('span', 'todo-jira-sep', '\u00b7'));
+    }
+    strip.appendChild(parts[i]);
+  }
+
+  if (url && TODO_URL_RE.test(url)) {
+    var host = '';
+    try { host = new URL(url).host || ''; } catch (err) { host = ''; }
+    if (host) {
+      strip.appendChild(el('span', 'todo-jira-host', host + ' \u2197'));
+    }
+  }
+
+  return strip;
+}
+
+function todoLinker(id) {
+  var wrap = el('div', 'todo-jira-linker');
+  var trigger = todoButton('btn btn-jira', '+ Jira', function() {
+    trigger.hidden = true;
+    form.hidden = false;
+    input.focus();
+  });
+  var form = el('span', 'todo-jira-form');
+  form.hidden = true;
+  var input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'todo-jira-edit-input';
+  input.maxLength = 2048;
+  input.placeholder = 'KEY-123 or https://jira.example.com/browse/KEY-123';
+  input.setAttribute('aria-label', 'Jira ticket key or URL');
+  var apply = todoButton('btn btn-primary btn-jira-apply', 'Apply', addJira);
+  var cancel = todoButton('btn btn-jira-cancel', 'Cancel', unboltEdit);
+
+  function addJira() {
+    var value = input.value.trim();
+    if (!value) {
+      setTodoItemError(id, 'Jira ticket: enter a KEY-N or URL.');
+      return;
+    }
+    if (TODO_KEY_RE.test(value)) {
+      patchTodo(id, { external_key: value }, false);
+      return;
+    }
+    if (TODO_URL_RE.test(value)) {
+      patchTodo(id, { link_url: value }, false);
+      return;
+    }
+    setTodoItemError(id, 'Jira ticket: expected KEY-123 or http(s) URL.');
+  }
+
+  function unboltEdit() {
+    delete todoItemErrors[id];
+    input.value = '';
+    form.hidden = true;
+    trigger.hidden = false;
+    renderTodos();
+  }
+
+  form.appendChild(input);
+  form.appendChild(apply);
+  form.appendChild(cancel);
+  wrap.appendChild(trigger);
+  wrap.appendChild(form);
+
+  input.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { addJira(); }
+    if (e.key === 'Escape') { unboltEdit(); }
+  });
+  return wrap;
+}
+
 function todoRunInfoRow(todo) {
   var kind = todo.run_kind ? String(todo.run_kind) : '';
   var ref = todo.run_ref ? String(todo.run_ref) : '';
@@ -814,15 +1037,34 @@ function buildTodoEditor(item, todo) {
   titleInput.focus();
 }
 
+function todoNearBrowseable(viewOnly) {
+  return String((snapshot || {}).source || '') === 'files' ? true : viewOnly;
+}
+
 function buildTodoView(item, todo) {
   var id = String(todo.id || '');
   var status = String(todo.status || 'open');
 
+  // UX-561: key/link cards get the strip; cards without one offer "+ Jira"
+  // for inline key/URL editing (allowed in serve mode too: it edits the
+  // to-do, it does not run anything).
+  var hasStrip = Boolean(todo.external_key || todo.link_url);
+  if (hasStrip) {
+    item.classList.add('has-jira');
+    item.appendChild(todoStrip(todo));
+  } else {
+    item.appendChild(todoLinker(id));
+  }
+
   var head = el('div', 'todo-head');
   head.appendChild(todoDoneCheckbox(id, status));
   head.appendChild(badge(status));
-  var sourceBadge = todoSourceBadge(todo);
-  if (sourceBadge) { head.appendChild(sourceBadge); }
+  // The strip already shows key/link + source tag; without it the legacy
+  // source badge/source-ref key would duplicate the strip contents.
+  if (!hasStrip) {
+    var sourceBadge = todoSourceBadge(todo);
+    if (sourceBadge) { head.appendChild(sourceBadge); }
+  }
   var title = el('span', 'todo-title', String(todo.title || ''));
   title.title = String(todo.title || '');
   head.appendChild(title);
@@ -926,6 +1168,121 @@ function bindTodoForm() {
   $('todo-form').addEventListener('submit', function(e) {
     e.preventDefault();
     submitNewTodo();
+  });
+  var jiraInput = $('todo-jira');
+  if (jiraInput) {
+    jiraInput.addEventListener('input', updateJiraPreview);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Import from Jira/Confluence (SPEC-web-dashboard FR-561 / FR-562 / UX-560,
+// TC-568). The form appears only when at least one enabled MCP server of kind
+// "jira" or "confluence" is configured (GET /api/mcp/servers); imports land in
+// the to-do list with their source badge and source_ref (kept as text).
+// ---------------------------------------------------------------------------
+
+var importServers = [];
+
+function importCapableServers(servers) {
+  var out = [];
+  for (var i = 0; i < servers.length; i++) {
+    var server = servers[i] || {};
+    if (
+      (server.kind === 'jira' || server.kind === 'confluence') &&
+      server.enabled !== false
+    ) {
+      out.push(server);
+    }
+  }
+  return out;
+}
+
+function loadImportServers() {
+  todoApi('GET', '/api/mcp/servers')
+    .then(function(payload) {
+      // FR-562 shape is {"servers":[...]}; tolerate a bare array too.
+      var servers = payload && Array.isArray(payload.servers)
+        ? payload.servers
+        : (Array.isArray(payload) ? payload : []);
+      importServers = importCapableServers(servers);
+      renderImportPanel();
+    })
+    .catch(function(err) {
+      if (err && err.fatal) {
+        onUnauthorized();
+        return;
+      }
+      // Without a server list the import panel simply stays hidden; the board
+      // and graph keep working. Warn for diagnosis only.
+      console.warn('dashboard: MCP server list unavailable: ' + err.message);
+    });
+}
+
+function renderImportPanel() {
+  var panel = $('import-panel');
+  var select = $('import-server');
+  if (!panel || !select) { return; }
+  select.replaceChildren();
+  if (importServers.length === 0) {
+    panel.hidden = true;
+    return;
+  }
+  for (var i = 0; i < importServers.length; i++) {
+    var server = importServers[i];
+    var name = String(server.name || '');
+    var opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name + ' (' + String(server.kind || '') + ')';
+    select.appendChild(opt);
+  }
+  panel.hidden = false;
+}
+
+function setImportBusy(busy) {
+  var button = $('import-submit');
+  if (button) { button.disabled = busy; }
+}
+
+function showImportStatus(text, isError) {
+  var status = $('import-status');
+  if (!status) { return; }
+  status.hidden = false;
+  status.textContent = text;
+  status.classList.toggle('import-status-error', Boolean(isError));
+}
+
+function submitImport() {
+  var select = $('import-server');
+  var queryInput = $('import-query');
+  var server = select.value;
+  if (!server) { return; }
+  setImportBusy(true);
+  todoApi('POST', '/api/import', { server: server, query: queryInput.value.trim() })
+    .then(function(result) {
+      setImportBusy(false);
+      var imported = result && typeof result.imported === 'number' ? result.imported : 0;
+      var updated = result && typeof result.updated === 'number' ? result.updated : 0;
+      showImportStatus('imported ' + imported + ', updated ' + updated, false);
+      refreshTodos();
+    })
+    .catch(function(err) {
+      setImportBusy(false);
+      if (err && err.fatal) {
+        onUnauthorized();
+        return;
+      }
+      // Inline error from the server's {"error": ...} body (UX-560).
+      showImportStatus(err.message, true);
+    });
+}
+
+function bindImportForm() {
+  var form = $('import-form');
+  if (!form) { return; }
+  form.addEventListener('submit', function(e) {
+    e.preventDefault();
+    submitImport();
   });
 }
 
@@ -1156,6 +1513,8 @@ function init() {
 
   render(Date.now());
   bindTodoForm();
+  bindImportForm();
+  loadImportServers();
   startSse();
 }
 
