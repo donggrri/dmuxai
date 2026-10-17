@@ -167,6 +167,11 @@
   var currentWorkspace = null;
   var treeIdSeq = 0;
   var pendingOpen = null;
+  // Active sidebar tab: 'files' or 'todos' (SPEC-todo-sidebar FR-842).
+  var SIDEBAR_TABS = ['files', 'todos'];
+  var SIDEBAR_TOGGLES = { files: 'sidebar-toggle-files', todos: 'todos-toggle' };
+  var activeTab = 'files';
+  var pendingTab = null;
   var pendingExpanded = null;
   var pendingFocusPath = null;
 
@@ -189,6 +194,12 @@
         saveSidebarOpen(pendingOpen);
         pendingOpen = null;
       }
+      if (pendingTab !== null) {
+        state.tab = pendingTab;
+        saveSidebarTab(pendingTab);
+        pendingTab = null;
+      }
+      setActiveTab(state.tab, true);
       if (pendingExpanded !== null) {
         state.expanded = pendingExpanded;
         saveExpandedFolders(pendingExpanded);
@@ -210,12 +221,48 @@
       var ws = currentWorkspace;
       var openVal = window.localStorage.getItem('dmuxai.sidebar.open.' + ws);
       var expVal = window.localStorage.getItem('dmuxai.sidebar.expanded.' + ws);
+      var tabVal = window.localStorage.getItem('dmuxai.sidebar.tab.' + ws);
       var open = openVal === 'true';
       var exp = expVal ? JSON.parse(expVal) : [];
-      return { open: open, expanded: Array.isArray(exp) ? exp : [] };
+      return {
+        open: open,
+        expanded: Array.isArray(exp) ? exp : [],
+        tab: SIDEBAR_TABS.indexOf(tabVal) !== -1 ? tabVal : 'files'
+      };
     } catch (e) {
-      return { open: false, expanded: [] };
+      return { open: false, expanded: [], tab: 'files' };
     }
+  }
+
+  function saveSidebarTab(tab) {
+    if (!currentWorkspace) {
+      pendingTab = tab;
+      return;
+    }
+    try {
+      window.localStorage.setItem('dmuxai.sidebar.tab.' + currentWorkspace, tab);
+    } catch (e) {}
+  }
+
+  // Switches the visible tab panel; the toggle buttons follow in updateSidebarUI.
+  function setActiveTab(tab, skipSave) {
+    if (SIDEBAR_TABS.indexOf(tab) === -1) { tab = 'files'; }
+    activeTab = tab;
+    for (var i = 0; i < SIDEBAR_TABS.length; i++) {
+      var name = SIDEBAR_TABS[i];
+      var tabBtn = $('tab-' + name);
+      var panel = $('tab-panel-' + name);
+      var on = name === tab;
+      if (tabBtn) {
+        tabBtn.classList.toggle('active', on);
+        tabBtn.setAttribute('aria-selected', on ? 'true' : 'false');
+        tabBtn.setAttribute('tabindex', on ? '0' : '-1');
+      }
+      if (panel) { panel.hidden = !on; }
+    }
+    if (!skipSave) { saveSidebarTab(tab); }
+    var aside = $('sidebar');
+    updateSidebarUI(Boolean(aside && aside.classList.contains('open')));
   }
 
   function saveSidebarOpen(open) {
@@ -240,7 +287,6 @@
 
   function updateSidebarUI(open) {
     var aside = $('sidebar');
-    var btn = $('sidebar-toggle-files');
     var backdrop = $('sidebar-backdrop');
     if (aside) {
       if (open) {
@@ -253,8 +299,13 @@
         document.body.classList.remove('sidebar-open');
       }
     }
-    if (btn) {
-      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    // Each toggle is "expanded" only while the sidebar shows its tab.
+    for (var t = 0; t < SIDEBAR_TABS.length; t++) {
+      var btn = $(SIDEBAR_TOGGLES[SIDEBAR_TABS[t]]);
+      if (!btn) { continue; }
+      var shown = open && activeTab === SIDEBAR_TABS[t];
+      btn.setAttribute('aria-expanded', shown ? 'true' : 'false');
+      btn.classList.toggle('active', shown);
     }
     if (backdrop) {
       if (open) {
@@ -270,7 +321,7 @@
     updateSidebarUI(true);
     var isNarrow = (window.innerWidth <= 900) || (window.matchMedia && window.matchMedia('(max-width: 900px)').matches);
     if (isNarrow) {
-      var focusTarget = $('docs-filter') || $('sidebar-close');
+      var focusTarget = (activeTab === 'todos' ? $('todo-search') : $('docs-filter')) || $('sidebar-close');
       if (focusTarget && typeof focusTarget.focus === 'function') {
         focusTarget.focus();
       }
@@ -280,20 +331,41 @@
   function closeSidebar() {
     saveSidebarOpen(false);
     updateSidebarUI(false);
-    var toggleBtn = $('sidebar-toggle-files');
+    var toggleBtn = $(SIDEBAR_TOGGLES[activeTab]);
     if (toggleBtn && typeof toggleBtn.focus === 'function') {
       toggleBtn.focus();
     }
   }
 
-  function toggleSidebar() {
+  // A header toggle closes the sidebar when it already shows that tab and
+  // otherwise opens it on that tab (FR-842).
+  function toggleSidebarTab(tab) {
     var aside = $('sidebar');
     var isOpen = aside ? aside.classList.contains('open') : false;
-    if (isOpen) {
+    if (isOpen && activeTab === tab) {
       closeSidebar();
     } else {
+      setActiveTab(tab);
       openSidebar();
     }
+  }
+
+  // Esc closes the sidebar unless focus is in a text field or the docs
+  // editor, or a modal (the preview) is open: those handle Esc themselves.
+  function escapeClosesSidebar(e) {
+    if (e.defaultPrevented) { return false; }
+    var target = e.target;
+    if (target && target.nodeType === 1) {
+      var tag = target.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) {
+        return false;
+      }
+    }
+    var modals = document.querySelectorAll('[aria-modal="true"]');
+    for (var i = 0; i < modals.length; i++) {
+      if (!modals[i].hidden && modals[i].getClientRects().length > 0) { return false; }
+    }
+    return true;
   }
 
   function fetchDir(dir) {
@@ -770,12 +842,27 @@
   function initSidebar() {
     var state = loadSidebarState();
     expandedFolders = state.expanded;
+    setActiveTab(state.tab, true);
     updateSidebarUI(state.open);
 
-    var toggleBtn = $('sidebar-toggle-files');
-    if (toggleBtn) {
-      toggleBtn.addEventListener('click', toggleSidebar);
-    }
+    SIDEBAR_TABS.forEach(function (tab) {
+      var toggleBtn = $(SIDEBAR_TOGGLES[tab]);
+      if (toggleBtn) {
+        toggleBtn.addEventListener('click', function () { toggleSidebarTab(tab); });
+      }
+      var tabBtn = $('tab-' + tab);
+      if (tabBtn) {
+        tabBtn.addEventListener('click', function () { setActiveTab(tab); });
+        tabBtn.addEventListener('keydown', function (e) {
+          if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') { return; }
+          e.preventDefault();
+          var next = SIDEBAR_TABS[(SIDEBAR_TABS.indexOf(tab) + 1) % SIDEBAR_TABS.length];
+          setActiveTab(next);
+          var nextBtn = $('tab-' + next);
+          if (nextBtn) { nextBtn.focus(); }
+        });
+      }
+    });
 
     var closeBtn = $('sidebar-close');
     if (closeBtn) {
@@ -788,7 +875,7 @@
     }
 
     document.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && escapeClosesSidebar(e)) {
         var aside = $('sidebar');
         if (aside && aside.classList.contains('open')) {
           closeSidebar();

@@ -1,6 +1,6 @@
 # SPEC: todo-sidebar
 
-Status: Draft (v0.2.1)
+Status: Implemented (v0.2.1)
 Created: 2026-10-17
 Related: Dongjin dogfood 2026-10-17 23:38 ("let me open/browse the to-do list via a button or sidebar"); SPEC-web-dashboard to-do routes
 
@@ -19,10 +19,18 @@ Decision: move the to-do UI into a toggleable sidebar panel, opened from a heade
 | FR-842 | Must | The Files and To-dos sidebars share one right-hand sidebar region with tabs: opening one switches to its tab, and the toggle buttons show which is active. `Esc` closes the sidebar when focus is not in a text field or the docs editor, so the existing preview/editor Esc handling wins (the shell is owned by SPEC-docs-tree FR-833) | TC-840, TC-842 |
 | UX-840 | Must | The badge and buttons have accessible names (`aria-controls`, `aria-expanded`). Below 900px the sidebar is an overlay drawer, consistent with UX-830 | TC-840 |
 
+### Implementation decisions (v0.2.1)
+
+- The `open` filter shows every to-do that is not `done` (so `running` counts as open), and the header badge counts the same set. Search matches the title, body and Jira key, case-insensitively.
+- An item being edited inline stays visible even when the filter would hide it, so unsaved input is never lost.
+- The active tab is stored per workspace (`dmuxai.sidebar.tab.<workspace>`) next to the open state. A header toggle closes the sidebar only when it already shows that toggle's tab; otherwise it switches tabs.
+- Esc closes the sidebar unless focus is in an input, textarea, select or editable element, or a modal (`aria-modal="true"`, e.g. the document preview) is visible.
+- TC-842 lives in `tests/web_todo_sidebar.rs` (next to the other headless Chrome tests), not in `src/web/server.rs`.
+
 ## 3. Tests
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |
 | TC-840 | FR-840..FR-842, UX-840 | unit (asset) | index.html, JS and CSS assets | Header `To-dos` button with badge and `aria-controls`; the to-do form/list live inside the sidebar tab panel; state filter and search; Esc handler | `src/web/assets.rs` `todo_sidebar_assets` |
 | TC-841 | FR-840, FR-841 | unit | `web::parity` matrix | To-do actions keep their parity rows (create/run/done/delete/import) after the move | `src/web/parity.rs` `todo_actions_still_covered` |
-| TC-842 | FR-840..FR-842 | e2e (ignored, headless Chrome) | demo snapshot with to-dos | Clicking `To-dos` opens the panel with items; the `done` filter and a search term reduce the visible items to the expected ones (FR-841 behaviour); switching to Files changes the tab; screenshot captured | `src/web/server.rs` `todo_sidebar_renders_in_headless_chrome` |
+| TC-842 | FR-840..FR-842 | e2e (ignored, headless Chrome) | demo snapshot with to-dos | Clicking `To-dos` opens the panel with items; the `done` filter and a search term reduce the visible items to the expected ones (FR-841 behaviour); switching to Files changes the tab; screenshot captured | `tests/web_todo_sidebar.rs` `todo_sidebar_renders_in_headless_chrome` |
