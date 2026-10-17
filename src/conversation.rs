@@ -7,7 +7,7 @@
 use std::{
     error::Error,
     fmt, fs,
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -136,6 +136,10 @@ PRAGMA user_version = 1;
 /// CHECK, so each affected table is rebuilt from its own stored definition.
 fn migrate_to_v2(connection: &mut Connection) -> Result<(), ConversationError> {
     connection.pragma_update(None, "foreign_keys", "OFF")?;
+    let db_path = connection
+        .path()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("<unknown>"));
     let result = (|| -> Result<(), ConversationError> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (table, column) in [
@@ -188,7 +192,10 @@ fn migrate_to_v2(connection: &mut Connection) -> Result<(), ConversationError> {
                 row.get(0)
             })?;
         if violations != 0 {
-            return Err(ConversationError::UnsupportedSchema(-1));
+            return Err(ConversationError::UnsupportedSchema {
+                version: -1,
+                db_path,
+            });
         }
         transaction.commit()?;
         Ok(())
@@ -264,7 +271,10 @@ pub enum ConversationError {
         actual_chars: usize,
         maximum_chars: usize,
     },
-    UnsupportedSchema(i64),
+    UnsupportedSchema {
+        version: i64,
+        db_path: PathBuf,
+    },
     ClockBeforeUnixEpoch,
 }
 
@@ -286,12 +296,12 @@ impl fmt::Display for ConversationError {
                 formatter,
                 "summary is {actual_chars} characters; maximum is {maximum_chars}"
             ),
-            Self::UnsupportedSchema(version) => {
-                write!(
-                    formatter,
-                    "conversation database schema {version} is newer than supported"
-                )
-            }
+            Self::UnsupportedSchema { version, db_path } => write!(
+                formatter,
+                "conversation database {} has schema {version}, which was written by a newer \
+                 dmuxai; point DMUXAI_STATE_DIR at a directory this dmuxai wrote",
+                db_path.display()
+            ),
             Self::ClockBeforeUnixEpoch => {
                 formatter.write_str("system clock is before the Unix epoch")
             }
@@ -763,7 +773,10 @@ impl ConversationEngine {
 
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > SCHEMA_VERSION {
-            return Err(ConversationError::UnsupportedSchema(version));
+            return Err(ConversationError::UnsupportedSchema {
+                version,
+                db_path: db_path.to_path_buf(),
+            });
         }
         if version < 1 {
             let transaction =
