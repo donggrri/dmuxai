@@ -36,6 +36,7 @@ fn agents_md_documents_agent_test_helpers() {
 #[test]
 fn app_tests_module_doc_lists_helpers() {
     let app_rs = fs::read_to_string("src/app.rs").expect("src/app.rs readable");
+    let app_rs = app_rs.replace("\r\n", "\n");
     let marker = "#[cfg(test)]\nmod tests {";
     let start = app_rs.find(marker).expect("app tests module present") + marker.len();
     let rest = &app_rs[start..];
