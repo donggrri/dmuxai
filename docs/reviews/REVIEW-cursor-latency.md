@@ -47,7 +47,7 @@ Tasks: [TASKS-cursor-latency](../tasks/TASKS-cursor-latency.md)
 
 1. Cancelling a graph-node turn spawned a warm process. The Cancel arm now skips it for graph turns.
 2. `reap_warm_process` only sent group `SIGKILL` on timeout, so TERM-ignoring descendants leaked. It now always kills the group after the TERM grace period. Test: `reaping_warm_process_kills_term_ignoring_grandchild`.
-3. `reset()` used `try_send` and could drop the reset on a full queue. A full queue now falls back to an async send.
+3. `reset()` used `try_send` and could drop the reset on a full queue. On re-review, an async fallback could be reordered behind a later prompt. Final fix: `reset()` bumps a shared atomic counter synchronously, and the runtime applies any pending reset before handling each command (the `Reset` message is only a wake-up).
 4. `stop_turn` sent `SIGKILL` right after `SIGTERM`. It now uses `terminate_group` (TERM, poll up to 500 ms, then KILL).
 
 Not changed: warm stdout/stderr are not drained while idle (cursor-agent prints nothing before it reads the prompt). After a restart, a selection pre-start has no `--resume`, so the first resumed turn discards it; this is wasteful but correct. Cold turns still stop via task abort, as before.

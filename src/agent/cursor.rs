@@ -90,6 +90,10 @@ impl CursorAdapterConfig {
 pub struct CursorAdapter {
     command_tx: mpsc::Sender<CursorCommand>,
     windows_unsandboxed: bool,
+    /// Bumped synchronously by `reset()`. The runtime applies a pending reset
+    /// before handling any later command, so a reset is never lost or
+    /// reordered behind a prompt sent after `/new` (FR-807).
+    reset_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AgentAdapter for CursorAdapter {
@@ -151,20 +155,13 @@ impl AgentAdapter for CursorAdapter {
     }
 
     fn reset(&self) -> Result<(), AdapterError> {
+        self.reset_requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Only a wake-up: a full queue is fine because the runtime checks
+        // `reset_requests` before every command it handles.
         match self.command_tx.try_send(CursorCommand::Reset) {
-            // A full queue must not drop the reset (FR-807: /new kills the warm
-            // process and invalidates --resume), so deliver it asynchronously.
-            Err(mpsc::error::TrySendError::Full(command)) => {
-                let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                    return Err(map_send_error(mpsc::error::TrySendError::Full(command)));
-                };
-                let tx = self.command_tx.clone();
-                handle.spawn(async move {
-                    let _ = tx.send(command).await;
-                });
-                Ok(())
-            }
-            other => other.map_err(map_send_error),
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(error) => Err(map_send_error(error)),
         }
     }
 
@@ -191,11 +188,20 @@ pub fn spawn_cursor_adapter(
     let config = config.into();
     let windows_unsandboxed = config.windows_unsandboxed;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-    let worker = tokio::spawn(runtime_loop(command_rx, event_tx, cwd, config, mcp_servers));
+    let reset_requests = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let worker = tokio::spawn(runtime_loop(
+        command_rx,
+        event_tx,
+        cwd,
+        config,
+        mcp_servers,
+        reset_requests.clone(),
+    ));
     (
         Box::new(CursorAdapter {
             command_tx,
             windows_unsandboxed,
+            reset_requests,
         }),
         worker,
     )
@@ -320,6 +326,7 @@ async fn runtime_loop(
     cwd: PathBuf,
     config: CursorAdapterConfig,
     mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
+    reset_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let windows_unsandboxed = config.windows_unsandboxed;
     let idle_limit = std::time::Duration::from_secs(config.prewarm_idle_secs);
@@ -335,8 +342,26 @@ async fn runtime_loop(
     let mut latest_session_id: Option<String> = None;
     let mut reset_epoch: u64 = 0;
     let mut warm_process: Option<WarmProcess> = None;
+    let mut resets_seen: u64 = 0;
+
+    // Applies resets requested via `CursorAdapter::reset` since the last check:
+    // forget the --resume session, bump the epoch, and discard the warm process.
+    macro_rules! apply_pending_reset {
+        () => {
+            let requested = reset_requests.load(std::sync::atomic::Ordering::SeqCst);
+            if requested != resets_seen {
+                resets_seen = requested;
+                latest_session_id = None;
+                reset_epoch = reset_epoch.wrapping_add(1);
+                if let Some(warm) = warm_process.take() {
+                    reap_warm_process(warm).await;
+                }
+            }
+        };
+    }
 
     loop {
+        apply_pending_reset!();
         if let Some(warm) = &warm_process
             && warm.spawned_at.elapsed() >= idle_limit
         {
@@ -367,6 +392,7 @@ async fn runtime_loop(
                     }
                 }
             };
+            apply_pending_reset!();
 
             match command {
                 CursorCommand::Send { request, is_graph } => {
@@ -544,13 +570,8 @@ async fn runtime_loop(
                         .ok();
                     }
                 }
-                CursorCommand::Reset => {
-                    latest_session_id = None;
-                    reset_epoch = reset_epoch.wrapping_add(1);
-                    if let Some(warm) = warm_process.take() {
-                        reap_warm_process(warm).await;
-                    }
-                }
+                // Wake-up only; handled by apply_pending_reset! above.
+                CursorCommand::Reset => {}
                 CursorCommand::Tick => {}
             }
             continue;
@@ -559,6 +580,7 @@ async fn runtime_loop(
         let turn = &mut active.as_mut().expect("checked above").handle;
         tokio::select! {
             res = turn => {
+                apply_pending_reset!();
                 let completed_turn = active.take().expect("turn was active");
                 if completed_turn.reset_epoch == reset_epoch
                     && let Ok(Ok(Some(session_id))) = &res
@@ -577,6 +599,7 @@ async fn runtime_loop(
                 }
             }
             command = command_rx.recv() => {
+                apply_pending_reset!();
                 match command {
                     Some(CursorCommand::Cancel) => {
                         let cancelled_turn = active.take();
@@ -634,10 +657,8 @@ async fn runtime_loop(
                         ).await;
                     }
                     Some(CursorCommand::Prewarm | CursorCommand::Tick) => {}
-                    Some(CursorCommand::Reset) => {
-                        latest_session_id = None;
-                        reset_epoch = reset_epoch.wrapping_add(1);
-                    }
+                    // Wake-up only; handled by apply_pending_reset! above.
+                    Some(CursorCommand::Reset) => {}
                     None => {
                         stop_turn(active.take(), &event_tx).await;
                         if let Some(warm) = warm_process.take() {
