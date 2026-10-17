@@ -1,6 +1,11 @@
 //! Runtime for `[[agents.custom]]` headless agents (see docs/agents/custom-agents.md).
 
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 
 use dmuxai::custom_agent::{
     CustomAgentOutput, CustomAgentSpec, PromptVia, SubstitutionContext, build_argv, failure_reason,
@@ -69,9 +74,10 @@ pub fn spawn_custom_adapter(
     index: u8,
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
+    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
 ) -> SpawnedAdapter {
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-    let worker = tokio::spawn(runtime_loop(index, command_rx, event_tx, cwd));
+    let worker = tokio::spawn(runtime_loop(index, command_rx, event_tx, cwd, mcp_servers));
     (Box::new(CustomAdapter { index, command_tx }), worker)
 }
 
@@ -86,14 +92,20 @@ async fn runtime_loop(
     mut command_rx: mpsc::Receiver<CustomCommand>,
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
+    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
 ) {
     let agent = Agent::Custom(index);
     let Some(spec) = spec_at(index) else {
         return;
     };
+    let applicable: Vec<dmuxai::mcp::ResolvedMcpServer> = mcp_servers
+        .into_iter()
+        .filter(|s| s.applies_to(&spec.name))
+        .collect();
     let mut active: Option<ActiveTurn> = None;
     let mut selected_model = spec.default_model.clone();
     let mut selected_mode = ExecutionMode::default();
+    let mcp_notice_shown = Arc::new(AtomicBool::new(false));
 
     loop {
         let command = if let Some(turn) = active.as_mut() {
@@ -131,6 +143,8 @@ async fn runtime_loop(
                     selected_mode,
                     cwd.clone(),
                     event_tx.clone(),
+                    applicable.clone(),
+                    mcp_notice_shown.clone(),
                 ));
             }
             CustomCommand::Cancel => stop_turn(agent, active.take(), &event_tx).await,
@@ -199,6 +213,7 @@ fn mode_names(mode: ExecutionMode) -> (&'static str, &'static str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_turn(
     agent: Agent,
     spec: &'static CustomAgentSpec,
@@ -207,6 +222,8 @@ fn spawn_turn(
     mode: ExecutionMode,
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
+    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
+    mcp_notice_shown: Arc<AtomicBool>,
 ) -> ActiveTurn {
     let context = OutputContext::from(&request);
     let pgid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -224,6 +241,8 @@ fn spawn_turn(
             &event_tx,
             &turn_context,
             &turn_pgid,
+            &mcp_servers,
+            &mcp_notice_shown,
         )
         .await
         {
@@ -249,6 +268,35 @@ impl Drop for TempFile {
     }
 }
 
+/// Writes content to a private temp file with 0600 permissions on unix (create_new).
+fn write_private_temp_file(path: &Path, content: &str, label: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("{label}: {e}"))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("{label}: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| format!("{label}: {e}"))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("{label}: {e}"))?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_turn(
     agent: Agent,
@@ -260,6 +308,8 @@ async fn run_turn(
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
     pgid: &std::sync::atomic::AtomicU32,
+    mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
+    mcp_notice_shown: &AtomicBool,
 ) -> Result<(), String> {
     let (mode_name, edit) = mode_names(mode);
     let mut ctx = SubstitutionContext::new(
@@ -283,10 +333,39 @@ async fn run_turn(
             spec.name,
             uuid::Uuid::new_v4()
         ));
-        let body = substitute(template, &ctx).unwrap_or_else(|| template.clone());
-        std::fs::write(&path, body).map_err(|error| format!("temp config: {error}"))?;
+        let mut body = substitute(template, &ctx).unwrap_or_else(|| template.clone());
+        if !mcp_servers.is_empty() {
+            let (merged, applied) = dmuxai::mcp::propagate::merge_opencode_mcp(&body, mcp_servers);
+            body = merged;
+            if !applied && !mcp_notice_shown.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                send(
+                    event_tx,
+                    agent,
+                    Some(context),
+                    AgentEvent::Notice(format!(
+                        "{}: could not merge MCP servers into config; temp_config_template is not a JSON object or its 'mcp' key is not an object",
+                        spec.label()
+                    )),
+                )
+                .await;
+            }
+        }
+        write_private_temp_file(&path, &body, "temp config")?;
         ctx.temp_config = Some(path.display().to_string());
         temp.0 = Some(path);
+    }
+
+    let mut mcp_temp = TempFile(None);
+    if !mcp_servers.is_empty() {
+        let path = std::env::temp_dir().join(format!(
+            "dmuxai-mcp-{}-{}.json",
+            spec.name,
+            uuid::Uuid::new_v4()
+        ));
+        let body = dmuxai::mcp::propagate::custom_mcp_json(mcp_servers);
+        write_private_temp_file(&path, &body, "mcp config")?;
+        ctx.mcp_config = Some(path.display().to_string());
+        mcp_temp.0 = Some(path);
     }
 
     let argv = build_argv(spec, &ctx);
@@ -305,6 +384,11 @@ async fn run_turn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+
+    if let Some(mcp_path) = &ctx.mcp_config {
+        command.env("DMUXAI_MCP_CONFIG", mcp_path);
+    }
+
     for (key, value) in &spec.env {
         if let Some(value) = substitute(value, &ctx) {
             command.env(key, value);
@@ -462,6 +546,14 @@ mod tests {
     }
 
     async fn run(spec: &CustomAgentSpec, model: Option<&str>) -> (Result<(), String>, String) {
+        run_with_mcp(spec, model, &[]).await
+    }
+
+    async fn run_with_mcp(
+        spec: &CustomAgentSpec,
+        model: Option<&str>,
+        mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
+    ) -> (Result<(), String>, String) {
         let (tx, mut rx) = mpsc::channel(64);
         let request = AgentRequest {
             conversation_id: ConversationId::new("c"),
@@ -473,6 +565,7 @@ mod tests {
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
         let cwd = std::env::temp_dir();
+        let notice_shown = AtomicBool::new(false);
         let result = run_turn(
             Agent::Custom(0),
             spec,
@@ -483,6 +576,8 @@ mod tests {
             &tx,
             &context,
             &pgid,
+            mcp_servers,
+            &notice_shown,
         )
         .await;
         drop(tx);
@@ -565,5 +660,191 @@ mod tests {
         let (result, _) = run(spec, None).await;
         assert!(result.unwrap_err().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn custom_turn_gets_mcp_config_file_and_env() {
+        // TC-565, INT-561: custom agent turn merges mcp into rendered temp_config,
+        // writes custom_mcp_json to a per-turn temp file exposed as {mcp_config}
+        // and DMUXAI_MCP_CONFIG, and removes it after the turn.
+        use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
+        let server = ResolvedMcpServer {
+            name: "demo".to_owned(),
+            kind: ServerKind::Generic,
+            transport: Transport::Stdio {
+                command: "echo".to_owned(),
+                args: vec!["test".to_owned()],
+                env: [("API_KEY".to_owned(), "secret".to_owned())]
+                    .into_iter()
+                    .collect(),
+            },
+            runners: None,
+            tools: ToolNames::default(),
+        };
+
+        let toml = r#"
+name = "mcp-agent"
+command = ["sh", "-c", "echo env=$DMUXAI_MCP_CONFIG arg=$1; echo \"---mcp---\"; cat \"$DMUXAI_MCP_CONFIG\"; echo \"---cfg---\"; cat \"$FAKE_CFG\"", "--", "{mcp_config}"]
+temp_config_template = '{"permission":{"edit":"allow"}}'
+env = { FAKE_CFG = "{temp_config}" }
+"#;
+        let test_spec: &'static CustomAgentSpec =
+            Box::leak(Box::new(toml::from_str(toml).unwrap()));
+        let (result, text) = run_with_mcp(test_spec, None, &[server]).await;
+        assert_eq!(result, Ok(()));
+        assert!(
+            text.contains("---mcp---"),
+            "output must contain separator: {text}"
+        );
+        assert!(
+            text.contains("mcpServers"),
+            "mcp config must contain mcpServers: {text}"
+        );
+        assert!(
+            text.contains("demo"),
+            "mcp config must contain server: {text}"
+        );
+        assert!(
+            text.contains("\"permission\""),
+            "temp config must retain permission: {text}"
+        );
+        assert!(
+            text.contains("\"mcp\""),
+            "temp config must contain merged mcp: {text}"
+        );
+
+        // Extract mcp file path
+        let env_prefix = "env=";
+        let env_pos = text.find(env_prefix).expect("env= in output");
+        let after_env = &text[env_pos + env_prefix.len()..];
+        let path = after_env.split(' ').next().unwrap().trim();
+        assert!(!path.is_empty());
+        assert!(text.contains(&format!("arg={path}")));
+        assert!(
+            !std::path::Path::new(path).exists(),
+            "temp mcp config must be removed after turn"
+        );
+
+        // When no MCP servers are configured, no mcp config is written and placeholder flag is dropped
+        let toml_clean = r#"
+name = "clean-agent"
+command = ["sh", "-c", "echo count=$# env=$DMUXAI_MCP_CONFIG", "--", "{mcp_config}"]
+temp_config_template = '{"permission":{"edit":"allow"}}'
+env = { FAKE_CFG = "{temp_config}" }
+"#;
+        let clean_spec: &'static CustomAgentSpec =
+            Box::leak(Box::new(toml::from_str(toml_clean).unwrap()));
+        let (res_clean, text_clean) = run_with_mcp(clean_spec, None, &[]).await;
+        assert_eq!(res_clean, Ok(()));
+        assert!(text_clean.contains("env="));
+        assert!(!text_clean.contains("dmuxai-mcp-"));
+    }
+
+    async fn run_turn_capture_events(
+        spec: &CustomAgentSpec,
+        mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
+        notice_shown: &AtomicBool,
+    ) -> (Result<(), String>, Vec<AgentEvent>) {
+        let (tx, mut rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: ConversationId::new("c"),
+            turn_id: TurnId::new("t"),
+            prompt: "hi --model x".to_owned(),
+            resume_session: None,
+            image_paths: Vec::new(),
+        };
+        let context = OutputContext::from(&request);
+        let pgid = std::sync::atomic::AtomicU32::new(0);
+        let cwd = std::env::temp_dir();
+        let result = run_turn(
+            Agent::Custom(0),
+            spec,
+            &request,
+            None,
+            ExecutionMode::Implement,
+            &cwd,
+            &tx,
+            &context,
+            &pgid,
+            mcp_servers,
+            notice_shown,
+        )
+        .await;
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(output) = rx.recv().await {
+            events.push(output.event);
+        }
+        (result, events)
+    }
+
+    #[tokio::test]
+    async fn mcp_merge_unsupported_json_emits_notice_once_per_session() {
+        use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
+        let server = ResolvedMcpServer {
+            name: "demo".to_owned(),
+            kind: ServerKind::Generic,
+            transport: Transport::Stdio {
+                command: "echo".to_owned(),
+                args: vec![],
+                env: Default::default(),
+            },
+            runners: None,
+            tools: ToolNames::default(),
+        };
+        let toml = r#"
+name = "bad-json"
+label = "Bad Json Agent"
+command = ["echo", "hello"]
+temp_config_template = '{"mcp": "not-an-object"}'
+"#;
+        let test_spec: &'static CustomAgentSpec =
+            Box::leak(Box::new(toml::from_str(toml).unwrap()));
+        let notice_shown = AtomicBool::new(false);
+
+        // Turn 1: should emit Notice naming the runner
+        let (res1, events1) =
+            run_turn_capture_events(test_spec, std::slice::from_ref(&server), &notice_shown).await;
+        assert_eq!(res1, Ok(()));
+        let notices1: Vec<_> = events1
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Notice(msg) => Some(msg.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices1.len(), 1, "expected 1 notice, got: {notices1:?}");
+        assert!(
+            notices1[0].contains("Bad Json Agent"),
+            "notice must name runner: {}",
+            notices1[0]
+        );
+
+        // Turn 2: same session (same notice_shown) -> no notice emitted
+        let (res2, events2) =
+            run_turn_capture_events(test_spec, std::slice::from_ref(&server), &notice_shown).await;
+        assert_eq!(res2, Ok(()));
+        let notices2: Vec<_> = events2
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Notice(msg) => Some(msg.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices2.len(),
+            0,
+            "notice should only be emitted once per session"
+        );
+    }
+
+    #[test]
+    fn private_temp_file_has_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-private.json");
+        write_private_temp_file(&path, "secret-data", "test").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     }
 }

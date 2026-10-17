@@ -262,3 +262,174 @@ cargo test --bin dmuxai dashboard_run_todo  # 1 passed, 0 failed (TC-542)
 - Cancel/failure edge on the page: an inline PATCH of a `running` to-do to
   `done`/`open` is allowed by FR-541 and later reconciled by `finish_run`;
   page does not special-case it (spec silent).
+
+## Slice C part 4: import panel (page) and shared-MCP docs
+
+Scope: `src/web/assets/*`, `README.md`, this review file only. Slice C routes
+(`/api/mcp/servers`, `/api/import`) and the MCP config/client are owned by the
+other slice C agents; this is the UX-560 page plus the README section.
+
+### Spec compliance (page + docs)
+
+| Requirement | Status | Notes |
+| --- | --- | --- |
+| UX-560 | Met (page half) | Import panel inside the to-do section: server select, query input, Import button; `GET /api/mcp/servers` (Bearer, like every call) fills the select and the panel stays `hidden` unless at least one enabled server has `kind` `jira`/`confluence`; success shows `imported N, updated M` from `{imported, updated}`; 404/400/502/503 errors show the server's `{"error": ...}` message inline (`#import-status`, `role="status"`); 401 keeps the existing re-auth flow. Imported to-dos render the source badge + `source_ref` via the existing slice B code; `source_ref` stays plain text (explicitly not a link in this slice). |
+| FR-561/FR-562 (client side) | Met | Page sends exactly `{server, query}` to `POST /api/import` and reads `{servers[]}` (tolerates a bare array) from `/api/mcp/servers`; it renders only `name`/`kind` and never receives secrets by contract (TC-567 guards that server-side). |
+| OQ-522 | Respected | README shows the Atlassian remote MCP (`https://mcp.atlassian.com/v1/mcp`, `kind = "jira"`, `Authorization` from an env var) as an example config only; the text states DmuxAI never connects on its own and secrets are env var names only. |
+| OQ-523 | Respected | README runner table: AGY gets the `agy mcp add` commands printed; AGY's user-level config is never modified. |
+| Section 6 runner matrix | Documented | README table matches the spec matrix row-for-row: opencode per-run `OPENCODE_CONFIG` `mcp` key; Codex `-c mcp_servers.<name>.*`; custom agents `{mcp_config}`/`DMUXAI_MCP_CONFIG` temp file removed after the turn; Cursor `.cursor/mcp.json` only-if-absent guard; AGY print-only. |
+| CSP / a11y / NFR-520 | Met | No inline script or style added (all behavior in `app.js`, all styling in `app.css`); labeled fields, `aria-label` on the select, `role="status"` live region; no new external resources, no frontend build. |
+
+### Test evidence
+
+```text
+node --check src/web/assets/app.js                # syntax OK
+```
+
+TC-568 (`static_page_has_import_panel`: markup has the import form; `app.js`
+references `/api/import` and `/api/mcp/servers`) is a `src/web` integration test
+owned by the slice C routes agent; the string assertions it needs are in place
+(`id="import-form"`, `id="import-panel"`, `'/api/import'`, `'/api/mcp/servers'`).
+`cargo fmt` was not run and nothing was committed, per instructions.
+
+### Residual risks / notes
+
+- The servers list is fetched once at page load; MCP config edits need a page
+  reload to appear in the select (acceptable for a loopback dashboard).
+- If `GET /api/mcp/servers` fails for a non-401 reason (e.g. an older binary
+  without the route), the panel stays hidden and only `console.warn` reports it —
+  "hidden when no import-capable server" degrades gracefully, but there is no
+  visible banner.
+- Empty query is sent as-is; the server decides (per the PLAN import contract),
+  so no client-side validation was invented beyond the spec.
+
+## Slice C cross-review (glm)
+
+Scope: `src/mcp/config.rs`, `src/mcp/propagate.rs`, `src/mcp/registry.rs`, MCP
+routes in `src/web/server.rs` against INT-560..563, FR-561/562, NFR-560 and
+TC-560..569, plus the PLAN "Slice C contract". Read-only for Rust — findings
+only; fixes belong to the owning agents (deepseek: config/propagate/registry/
+web wiring, AGY: client.rs, still in flight).
+
+Review-time state: `cargo build` / `cargo test --lib` do not compile —
+`src/custom_agent.rs` test initializers are missing the new `mcp_config` field
+(hourly in-flight edits, not a finding against slice C). Verified empirically
+instead where noted.
+
+### Findings
+
+| # | Location | Severity | Finding and concrete fix |
+| --- | --- | --- | --- |
+| 1 | `src/mcp/propagate.rs:241-244` (`cursor_mcp_guard`, non-unix arm) | Major | On Windows the file is written with `std::fs::write`, which truncates and overwrites — a user-created `.cursor/mcp.json` appearing between the `exists()` check and the write is clobbered (unix uses `create_new(true)` and fails closed). Violates "only write when absent". Fix: use `OpenOptions::new().write(true).create_new(true)` + `write_all` on all platforms; keep mode 0600 unix-only. |
+| 2 | `src/mcp/propagate.rs:264-284` (`agy_mcp_notice`) | Major | The emitted commands are rejected by the real CLI (verified against `agy mcp add --help` on this box): (a) stdio put flags after `<name>` — agy requires "Flags must come before <name>"; (b) `--header` is emitted as `Key=$VAR` instead of the required `"Key: Value"` form. Fix: emit `agy mcp add [--env K=$K]... <name> -- <command> [args...]` and `agy mcp add --header "K: $K"... <name> <url>`; extend the `cursor_guard_writes_only_when_absent_and_agy_notice` assertions to pin flag-before-name and the colon header form. |
+| 3 | `src/agent/custom.rs:300` (owner: deepseek) | Major | The opencode per-run temp config (`temp_config_template` path) is written with plain `std::fs::write` (umask-dependent, commonly world-readable in the shared temp dir) — and since slice C that file always carries MCP `environment` secret values via `merge_opencode_mcp`. Fix: create it mode 0600 with `create_new(true)` exactly like the MCP temp file at `custom.rs:313-325`. (Windows user temp ACL is user-scoped; acceptable.) |
+| 4 | `src/mcp/config.rs:258-262` (`Transport::Debug`) and `:172-184` (`McpServerSpec::Debug`) | Minor | Debug prints `url` in full including any query string (`?token=...`, `?api-key=...`). `servers_view` is clean (FR-562), but INT-560 says secrets never reach logs, and any future `debug!("{resolved:?}")` would leak a query-string credential. Fix: strip the query (`url.split(['?', '#']).next()`) in both Debug impls; same for the URL printed by `agy_mcp_notice` (`propagate.rs:280`). |
+| 5 | `src/mcp/registry.rs:189-202` (+ `src/mcp/client.rs:290-291, 322-323, 401-405`) | Minor | The 502 body embeds server-controlled text: MCP server stderr tails and remote HTTP error bodies reach the browser verbatim. PLAN sanctions the 4 KB stderr tail for diagnosis, but a misbehaving server could echo env/header values into its own stderr. Fix: truncate the surfaced text (e.g. 500 chars; client side) and keep the page rendering it via `textContent` (already the case — no XSS). |
+| 6 | `src/mcp/registry.rs:191-202` vs `src/mcp/client.rs:58-62` and `src/web/server.rs:456-458` | Minor | The server name is tripled in the surfaced error: `McpError::to_string()` is already `"{server}: {message}"`, `ImportError::Tool` Displays it again as `"{server}: {message}"`, and the route formats `"{server}: {message}"` once more → the user sees `jira: jira: connect failed`. Fix: `message: error.message()` in the two registry `map_err` closures. |
+| 7 | `src/mcp/registry.rs:204-244` (import loop) | Minor | (a) No cap on item count: a broad JQL/CQL can create tens of thousands of to-dos and monopolize the store (blocking route handlers). Suggest a cap (e.g. 200 items) reported to the caller. (b) `was_existing` uses the pre-import `existing` snapshot: a duplicate id inside one result counts twice as "imported" and `todos[]` can contain a stale copy; dedupe by id or refresh the seen-set after each create. (c) The per-item `existing.iter().any(...)` is O(items × existing); use a `HashSet<(TodoSource, String)>`. |
+| 8 | `src/mcp/registry.rs:220-225` (title fallback) | Minor | When `title` trims empty, the raw `item.id` becomes the title without truncation, so an over-long id from a remote server fails `store.create` validation and makes the whole import answer 400 for one weird item. Fix: `truncate(item.id.clone(), MAX_TITLE_CHARS)` (also compare trimmed length, not `is_empty()` on the truncated string). |
+| 9 | wiring (INT-562/INT-563 production path) | Info (in flight) | As of review time: `main.rs` has no `__mock-mcp` subcommand and never constructs `McpRegistry` (`DashboardServices.mcp` is `None`, so `/api/mcp/servers` and `/api/import` answer 503 in production); `agy_mcp_notice` has no adapter caller; `tests/mcp_client.rs` (TC-561) and `tests/web_mcp_import.rs` (TC-569) do not exist yet. Confirm the wiring owner before review sign-off; TC-568's `static_page_has_import_panel` is also still pending in `src/web/server.rs` tests. |
+| 10 | `src/mcp/propagate.rs:47-50` (`merge_opencode_mcp`) | Info | A per-run config whose `mcp` key is a non-object is returned unchanged and all DmuxAI servers are silently dropped (INT-561 promises a once-per-session notice naming the runner when MCP cannot be applied). Fix option: return an indicator (enum/Option) so the custom.rs caller can raise the notice. |
+| 11 | `src/mcp/config.rs:313-335` (`resolve_servers`) | Info | `command`/`url` are only checked for emptiness; surrounding whitespace is kept verbatim (`" npx"`, `" https://..."`) → obscure spawn/URL errors later. Trim when building `Transport`. |
+
+### Checked and OK (no change requested)
+
+- **Merge semantics (INT-560/TC-560)**: user config loaded first, repo
+  `apply_toml` merges by name (`settings.rs:116-117, 184-203`); repo replaces
+  the user entry, `enabled = false` removes it (even when the repo entry is
+  otherwise invalid — name is validated before the enabled check), invalid
+  entries warn and skip without displacing the user entry. Verified by the
+  passing-shape of `mcp_config_merges_user_and_repo_by_name` (assertions as
+  written; could not re-run due to the in-flight build break above).
+- **Codex `-c` encoding (TC-564)**: server names are validated to
+  `[A-Za-z0-9_-]{1,64}` before any override is built, so no key/quote injection
+  via `name`; field names are hardcoded; values are TOML-encoded. I verified
+  empirically at the pinned toml 0.8.23 (scratch crate): `Value::Table::to_string()`
+  emits a valid inline table with quoted keys (`{ "B.KEY" = '...' }`),
+  `Value::Array::to_string()` emits `['a"b']`, and all forms round-trip through
+  `toml::from_str`. The round-trip assertions in
+  `codex_overrides_encode_mcp_servers` match this behavior.
+- **opencode/custom JSON (TC-563/TC-565)**: serde_json escaping covers quotes,
+  newlines, backslashes and non-ASCII; existing `mcp.<name>` wins; existing
+  non-`mcp` keys preserved; non-object config returned unchanged.
+- **Cursor guard (TC-566, unix)**: `exists()` -> `Ok(None)` (no write, caller
+  raises a notice — wired at `src/agent/cursor.rs:314-332` with notices for the
+  owned-file and write-failure paths); `create_new(true)` fails closed on a
+  TOCTOU race; drop removes only the file it wrote and the `.cursor` dir only
+  when it created it and it is still empty (re-checked via `read_dir`).
+- **Secret redaction (NFR-560/INT-560)**: `SecretValue`, `McpServerSpec`,
+  `Transport`, `ResolvedMcpServer` Debug impls redact env/header values; resolve
+  warnings name only the env var; `servers_view`/`McpServerView` carry name,
+  kind, transport, enabled, runners only (registry + server.rs tests assert no
+  `demo-token`/`demo-header`/`demo-query`/`example.invalid` in output).
+- **Import route status codes (FR-561)**: 404 unknown server, 400 wrong kind /
+  invalid query / weird item, 502 tool error, 500 storage (reduced to
+  `internal`), 503 for missing registry/store, 200 with
+  `{imported, updated, todos}`; matched against FR-562's list shapes in
+  `servers_view_omits_secrets_and_query_strings` and
+  `import_creates_todos_from_mock_jira_and_confluence`.
+- **Upsert across processes**: `store.create` uses an atomic
+  `ON CONFLICT(source, source_ref)` INSERT (todo.rs:279-281) — the slice B
+  cross-review finding is fixed; two live windows re-importing the same ref
+  update instead of 500.
+- **NFR-560**: no real Atlassian anywhere; config/propagate/registry tests use
+  `example.invalid` and demo fixtures only; no new network-enabled test hits a
+  real host (the registry test URL is never fetched).
+- **Windows build**: no unix-only APIs outside `#[cfg]` blocks in the reviewed
+  files; reqwest+rustls (no native-tls); `LazyLock`, let-chains, edition 2024
+  are current-toolchain features; mock/stdio client is cross-platform. The only
+  Windows-specific issues are findings 1 (overwrite race) and the guard's
+  silently-ignored `remove_file` failure documented below.
+- **Mock/client interop (TC-561 read-through)**: client echoes
+  `Mcp-Session-Id` for `notifications/initialized` and later requests (matches
+  the mock's 202/400 behavior); SSE parsing takes the first `data:` frame whose
+  id matches, matching the mock's single-frame format.
+
+### Residual risks
+
+- On Windows, if Cursor keeps `.cursor/mcp.json` open at guard-drop time,
+  `remove_file` fails silently (`let _ =`) and DmuxAI's file persists; the next
+  turn then sees "file exists" and propagates nothing (fail-safe, but silent).
+  A worn-out notice path or a rename-then-delete strategy could improve this.
+- `GET /api/mcp/servers` embeds the full global warning list; warnings are
+  value-free by construction, but any future warning message format must keep
+  that invariant (document in the spec if warnings ever include user data).
+
+## Slice C cross-review 2 (deepseek on AGY: client, adapters, wiring)
+
+opencode deepseek reviewed AGY's MCP client, runner adapters, and `main.rs`
+wiring and reported 9 findings; all were treated as blockers.
+
+| # | Severity | Finding | Fix | Test |
+| --- | --- | --- | --- | --- |
+| 1 | Major | `jira_base_url` missing from the startup snapshot | hub seeded in `run_serve` and `attach_web_dashboard` | TC-579 `serve_snapshot_has_jira_base_url_at_startup` |
+| 2 | Major | `cargo fmt --check` failed in `src/web/assets.rs` | formatted | gate |
+| 3 | Minor (security) | HTTP client followed redirects and could re-send auth headers to another host | `redirect::Policy::none()`, a 3xx is an error naming the server | TC-574 `mcp_client_refuses_redirects` |
+| 4 | Minor | SSE response read as a whole body | stream-parsed, returns at the first matching id | TC-576 `mcp_client_bounds_writes_and_streams_sse` |
+| 5 | Minor | stdio write/flush outside the request timeout | write + flush inside the timeout, child killed on timeout | TC-576 |
+| 6 | Minor | stdio child not killed as a process group | `process_group(0)` + group kill on drop/timeout (unix) | TC-575 `mcp_client_kills_stdio_process_group` |
+| 7 | Minor | Cursor "owned file exists" notice repeated every turn | once per session | TC-578 `cursor_mcp_notice_once_per_session` |
+| 8 | Info (spec tension) | resolved secrets in Codex argv | values in the child env, referenced by name (`env_vars`, `env_http_headers`; keys verified in the installed codex binary) | TC-577 `codex_mcp_secrets_not_in_argv` |
+| 9 | Minor | test gaps hid 1 and the Cursor guard lifetime | tests added | TC-578, TC-579 |
+
+Verification round (deepseek, read-only): all 9 FIXED, tests assert observable
+outcomes. New findings: (A) Jira strip used pre-D token names
+`--text-dim`/`--text-faint` and hardcoded dark colors — glm moved the strip to
+`--jira-*` variables in both palettes with ≥ 4.5:1 contrast, covered by
+`theme_palettes_meet_wcag_contrast`; (B) SSE chunks decoded with
+`from_utf8_lossy` corrupted multi-byte characters split across chunks — AGY
+buffers bytes and decodes complete lines, TC-576 gained a split-character case;
+(C) `run_serve` loaded settings twice — loaded once.
+
+## Slice C rebase onto main (after slice D)
+
+Rebased onto `1c1f692` (slice D). Conflicts were additive (settings structs,
+App fields, hub seeding, `TEST-PLAN.md` rows, asset tests) and kept both sides;
+`run_serve` seeds both `set_ui` and `set_jira_base_url`.
+
+## Slice C dogfood
+
+DmuxAI issues seen while building slice C are #34–#42 in
+[docs/dogfood/README.md](../dogfood/README.md) (AGY network cut-offs, AGY ending
+a turn while "waiting for cargo check", opencode context compaction, multi-line
+paste splitting, stale "active turn" after cancel).

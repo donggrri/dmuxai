@@ -31,6 +31,16 @@ Spec: [SPEC-web-dashboard.md](../specs/SPEC-web-dashboard.md)
 | [x] | opencode glm | Cross-review of store/routes (10 findings) and the serve view-only UI (OQ-521) | FR-541, UX-540 | `cargo test --lib web::` |
 | [x] | AGY | Fix rounds: turn-keyed linkage, no silent submit, graph failure, shutdown/restart finalization | FR-542 | `cargo test --bin dmuxai dashboard_run_todo` |
 
-## Slice C (shared MCP)
+## Slice C (shared MCP, import, Jira links)
 
-Planned; see SPEC section 4 (INT-560..NFR-560).
+| Done | Owner | Task | Requirement IDs | Test command |
+| --- | --- | --- | --- | --- |
+| [x] | opencode deepseek | `[[mcp.servers]]` config, merge, env-ref resolution, redaction | INT-560 | `cargo test --lib mcp_config_merges_user_and_repo_by_name` |
+| [x] | opencode deepseek | Per-runner propagation helpers (opencode, Codex, custom, Cursor guard, AGY notice) | INT-561 | `cargo test --lib mcp::propagate` |
+| [x] | opencode glm | Deterministic mock MCP server (stdio + streamable HTTP) and `__mock-mcp` fixtures | NFR-560 | `cargo test --lib mcp::mock` |
+| [x] | AGY | MCP client (stdio + streamable HTTP), adapter hooks, `__mock-mcp`, wiring | INT-562, INT-563 | `cargo test --test mcp_client` |
+| [x] | AGY | Client hardening: no redirects, process groups, bounded writes, streamed SSE, no secrets in Codex argv, once-per-session Cursor notice | NFR-561 | `cargo test --test mcp_client`; `cargo test --bin dmuxai codex_mcp_secrets_not_in_argv` |
+| [x] | opencode deepseek | Registry, `/api/mcp/servers`, `/api/import`, Jira link/status/assignee fields | FR-561..FR-564 | `cargo test --lib import_` |
+| [x] | opencode glm | Import panel, Jira ticket strip (mockup #3), README "Shared MCP servers" | UX-560, UX-561 | `cargo test --lib web::assets` |
+| [x] | AGY | End-to-end serve + mock import, startup `jira_base_url` | INT-563, FR-564 | `cargo test --test web_mcp_import` |
+| [x] | glm / deepseek | Cross-reviews (glm on deepseek: 11 findings; deepseek on AGY: 9 findings) and fix rounds | all | `cargo test --all-targets` |

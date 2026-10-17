@@ -37,6 +37,11 @@ pub struct DmuxSettings {
     pub theme_force_color: Option<bool>,
     /// `[[agents.custom]]` headless agents (installed into the registry at startup).
     pub custom_agents: Vec<crate::custom_agent::CustomAgentSpec>,
+    /// `[[mcp.servers]]` merged from user and repo configs by name (repo wins).
+    pub mcp_servers: Vec<crate::mcp::McpServerSpec>,
+    /// `[todo] jira_base_url` (user or repo, repo wins) used to derive links
+    /// for to-dos that carry a Jira issue key (FR-564).
+    pub todo_jira_base_url: Option<String>,
     /// Activity rendering settings (tool calls and model thinking).
     pub ui: UiSettings,
     /// Web dashboard theme settings from `[web]`.
@@ -59,6 +64,13 @@ struct DmuxToml {
     ui: Option<UiSettings>,
     web: Option<WebToml>,
     memory: Option<MemoryToml>,
+    mcp: Option<McpToml>,
+    todo: Option<TodoToml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TodoToml {
+    jira_base_url: Option<String>,
 }
 
 /// `[memory]` (FR-720).
@@ -80,6 +92,12 @@ struct WebToml {
 struct AgentsToml {
     #[serde(default)]
     custom: Vec<crate::custom_agent::CustomAgentSpec>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct McpToml {
+    #[serde(default)]
+    servers: Vec<crate::mcp::McpServerSpec>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -241,6 +259,19 @@ impl DmuxSettings {
             }
             self.custom_agents = agents.custom;
         }
+        if let Some(mcp) = parsed.mcp {
+            self.merge_mcp_servers(mcp.servers);
+        }
+        if let Some(todo) = parsed.todo
+            && let Some(base) = todo.jira_base_url
+        {
+            match normalize_jira_base_url(&base) {
+                Ok(normalized) => self.todo_jira_base_url = Some(normalized),
+                Err(message) => self
+                    .config_warnings
+                    .push(format!("[todo] jira_base_url ignored: {message}")),
+            }
+        }
         if parsed
             .cursor
             .and_then(|cursor| cursor.windows_unsandboxed)
@@ -327,6 +358,30 @@ impl DmuxSettings {
             }
         }
     }
+
+    /// Merges `[[mcp.servers]]` entries by name: a later (repo) entry replaces
+    /// an earlier (user) one, `enabled = false` removes it, and invalid entries
+    /// become config warnings without reaching the resolved list.
+    fn merge_mcp_servers(&mut self, incoming: Vec<crate::mcp::McpServerSpec>) {
+        for spec in incoming {
+            if let Err(error) = spec.validate() {
+                self.config_warnings.push(error);
+                continue;
+            }
+            if !spec.enabled {
+                self.mcp_servers.retain(|server| server.name != spec.name);
+                continue;
+            }
+            match self
+                .mcp_servers
+                .iter_mut()
+                .find(|server| server.name == spec.name)
+            {
+                Some(existing) => *existing = spec,
+                None => self.mcp_servers.push(spec),
+            }
+        }
+    }
 }
 
 impl Default for DmuxSettings {
@@ -342,6 +397,8 @@ impl Default for DmuxSettings {
             theme: Theme::default(),
             theme_force_color: None,
             custom_agents: Vec::new(),
+            mcp_servers: Vec::new(),
+            todo_jira_base_url: None,
             ui: UiSettings::default(),
             web_theme: WebThemeSettings::default(),
             config_warnings: Vec::new(),
@@ -391,6 +448,30 @@ fn normalize_accent(value: &str) -> Option<String> {
         return None;
     }
     Some(format!("#{}", hex.to_ascii_lowercase()))
+}
+
+/// Validates `[todo] jira_base_url` (FR-564): an absolute `http(s)` URL with a
+/// host and no query/fragment; a trailing slash is trimmed.
+fn normalize_jira_base_url(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("http://")
+        .map(|_| &trimmed["http://".len()..])
+        .or_else(|| {
+            lower
+                .strip_prefix("https://")
+                .map(|_| &trimmed["https://".len()..])
+        })
+        .ok_or_else(|| "must be an absolute http(s) URL".to_owned())?;
+    if trimmed.contains('?') || trimmed.contains('#') {
+        return Err("must not contain a query or fragment".to_owned());
+    }
+    let end = rest.find('/').unwrap_or(rest.len());
+    if rest[..end].is_empty() {
+        return Err("must include a host".to_owned());
+    }
+    Ok(trimmed.trim_end_matches('/').to_owned())
 }
 
 fn env_flag(name: &str) -> bool {
@@ -786,6 +867,74 @@ allowed_runners = []
         assert_eq!(settings_empty.graph_allowed_runners, Some(Vec::new()));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // FR-564: `[todo] jira_base_url` is validated, slash-trimmed, merged
+    // user-then-repo, and an invalid value warns and is ignored.
+    #[test]
+    fn todo_jira_base_url_is_validated_and_merged() {
+        let base = std::env::temp_dir().join(format!("dmuxai-todo-cfg-{}", std::process::id()));
+        let user_dir = base.join("user");
+        let ws_dir = base.join("workspace");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let user_toml = user_dir.join("dmuxai.toml");
+        std::fs::write(
+            &user_toml,
+            "[todo]\njira_base_url = \"https://user.atlassian.net/\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws_dir.join("dmuxai.toml"),
+            "[todo]\njira_base_url = \"https://example.atlassian.net\"\n",
+        )
+        .unwrap();
+
+        let settings = DmuxSettings::load_with_user_config(&ws_dir, Some(&user_toml));
+        assert_eq!(
+            settings.todo_jira_base_url.as_deref(),
+            Some("https://example.atlassian.net"),
+            "repo config wins"
+        );
+
+        // Invalid repo value warns and keeps the (trimmed) user value.
+        std::fs::write(
+            ws_dir.join("dmuxai.toml"),
+            "[todo]\njira_base_url = \"javascript:alert(1)\"\n",
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(&ws_dir, Some(&user_toml));
+        assert_eq!(
+            settings.todo_jira_base_url.as_deref(),
+            Some("https://user.atlassian.net"),
+            "invalid repo value is ignored"
+        );
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|warning| warning.contains("[todo] jira_base_url ignored"))
+        );
+
+        // Query strings and fragments are rejected too.
+        for bad in [
+            "https://example.atlassian.net/?x=1",
+            "https://example.atlassian.net/#frag",
+        ] {
+            std::fs::write(
+                ws_dir.join("dmuxai.toml"),
+                format!("[todo]\njira_base_url = \"{bad}\"\n"),
+            )
+            .unwrap();
+            let settings = DmuxSettings::load_with_user_config(&ws_dir, None);
+            assert!(
+                settings.todo_jira_base_url.is_none(),
+                "{bad} must be rejected"
+            );
+        }
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }
 

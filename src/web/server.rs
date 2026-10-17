@@ -20,6 +20,7 @@ use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::WatchStream;
 
+use crate::mcp::registry::{ImportError, McpRegistry};
 use crate::memory::{MemoryError, MemoryHandle, Proposal, SaveOutcome};
 use crate::todo::{NewTodo, TodoError, TodoPatch, TodoSource, TodoStatus};
 use crate::web::DEFAULT_PORT;
@@ -32,6 +33,9 @@ use crate::web::hub::DashboardHub;
 pub struct DashboardServices {
     pub todos: Option<Arc<crate::todo::TodoStore>>,
     pub commands: Option<mpsc::Sender<DashboardCommand>>,
+    /// Merged MCP servers for `GET /api/mcp/servers` and `POST /api/import`
+    /// (slice C); present in both `serve` and `--web`.
+    pub mcp: Option<Arc<McpRegistry>>,
     /// True for a `dmuxai --web` server (in-process command channel by design),
     /// false for `dmuxai serve`. Lets a run request distinguish "this build has
     /// no to-do board because the store failed to open" (503) from "serves can
@@ -114,6 +118,7 @@ fn todo_store(state: &AppState) -> Option<Arc<crate::todo::TodoStore>> {
 }
 
 fn refresh_todos(state: &AppState, store: &crate::todo::TodoStore) {
+    state.hub.set_jira_base_url(store.jira_base_url());
     if let Ok(todos) = store.list() {
         state.hub.set_todos(todos);
     }
@@ -415,6 +420,15 @@ struct NewTodoBody {
     title: String,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    external_key: Option<String>,
+    #[serde(default)]
+    link_url: Option<String>,
+    /// Import-only (FR-563); presence of either field is a 400.
+    #[serde(default)]
+    external_status: Option<serde_json::Value>,
+    #[serde(default)]
+    external_assignee: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -425,6 +439,47 @@ struct PatchTodoBody {
     body: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    external_key: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    link_url: Option<Option<String>>,
+    /// Import-only (FR-563); presence of either field is a 400.
+    #[serde(default)]
+    external_status: Option<serde_json::Value>,
+    #[serde(default)]
+    external_assignee: Option<serde_json::Value>,
+}
+
+/// FR-563: `external_status`/`external_assignee` are set by import only; a
+/// user POST/PATCH that includes either is rejected. Returns the 400 response
+/// to send, or `None` when the body is fine.
+fn reject_import_only_fields(
+    status: &Option<serde_json::Value>,
+    assignee: &Option<serde_json::Value>,
+) -> Option<Response> {
+    if status.is_some() {
+        return Some(error_json(
+            StatusCode::BAD_REQUEST,
+            "external_status is set by import",
+        ));
+    }
+    if assignee.is_some() {
+        return Some(error_json(
+            StatusCode::BAD_REQUEST,
+            "external_assignee is set by import",
+        ));
+    }
+    None
+}
+
+/// Distinguishes an absent field (`None`) from an explicit `null`
+/// (`Some(None)`) so PATCH can clear `external_key`/`link_url` (FR-563).
+fn double_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(Some(value))
 }
 
 #[derive(serde::Deserialize)]
@@ -451,13 +506,18 @@ async fn create_todo(
     let Some(store) = todo_store(&state) else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-dos unavailable");
     };
+    if let Some(response) =
+        reject_import_only_fields(&body.external_status, &body.external_assignee)
+    {
+        return response;
+    }
     let new = NewTodo {
         title: body.title,
         body: body.body,
         source: TodoSource::Manual,
         source_ref: None,
     };
-    match store.create(new) {
+    match store.create_with_link(new, body.external_key, body.link_url) {
         Ok(todo) => {
             refresh_todos(&state, &store);
             json_ok(StatusCode::CREATED, &todo)
@@ -474,6 +534,11 @@ async fn update_todo(
     let Some(store) = todo_store(&state) else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-dos unavailable");
     };
+    if let Some(response) =
+        reject_import_only_fields(&body.external_status, &body.external_assignee)
+    {
+        return response;
+    }
     let status = match body.status.as_deref() {
         None => None,
         Some("open") => Some(TodoStatus::Open),
@@ -485,6 +550,8 @@ async fn update_todo(
         title: body.title,
         body: body.body,
         status,
+        external_key: body.external_key,
+        link_url: body.link_url,
     };
     match store.update(&id, patch) {
         Ok(todo) => {
@@ -572,6 +639,61 @@ fn run_error_response(error: RunTodoError) -> Response {
         RunTodoError::UnknownAgent(message) => error_json(StatusCode::NOT_FOUND, &message),
         RunTodoError::NotFound => error_json(StatusCode::NOT_FOUND, "to-do not found"),
         RunTodoError::Internal(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ImportBody {
+    server: String,
+    query: String,
+}
+
+/// GET /api/mcp/servers (FR-562): redacted merged server list.
+async fn list_mcp_servers(State(state): State<AppState>) -> Response {
+    let Some(registry) = state.services.mcp.clone() else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "mcp unavailable");
+    };
+    json_ok(StatusCode::OK, &registry.servers_view())
+}
+
+/// POST /api/import (FR-561): import Jira/Confluence items as to-dos.
+async fn import_todos(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<ImportBody>,
+) -> Response {
+    let Some(registry) = state.services.mcp.clone() else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "mcp unavailable");
+    };
+    let Some(store) = todo_store(&state) else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-dos unavailable");
+    };
+    match registry
+        .import(body.server.trim(), body.query.trim(), &store)
+        .await
+    {
+        Ok(result) => {
+            refresh_todos(&state, &store);
+            json_ok(StatusCode::OK, &result)
+        }
+        Err(error) => import_error_response(error),
+    }
+}
+
+fn import_error_response(error: ImportError) -> Response {
+    match error {
+        ImportError::UnknownServer(server) => error_json(
+            StatusCode::NOT_FOUND,
+            &format!("unknown mcp server: {server}"),
+        ),
+        ImportError::WrongKind { server, kind } => error_json(
+            StatusCode::BAD_REQUEST,
+            &format!("mcp server {server} is kind {kind}, not jira/confluence"),
+        ),
+        ImportError::Invalid(message) => error_json(StatusCode::BAD_REQUEST, &message),
+        ImportError::Tool { server, message } => {
+            error_json(StatusCode::BAD_GATEWAY, &format!("{server}: {message}"))
+        }
+        ImportError::Storage(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
 }
 
@@ -705,6 +827,8 @@ pub fn build_router_with(
         .route("/api/todos", get(list_todos).post(create_todo))
         .route("/api/todos/{id}", patch(update_todo).delete(delete_todo))
         .route("/api/todos/{id}/run", post(run_todo))
+        .route("/api/mcp/servers", get(list_mcp_servers))
+        .route("/api/import", post(import_todos))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_and_auth_middleware,
@@ -770,6 +894,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::graph::{GraphEdge, GraphNodeStatus, GraphRunPhase, NodeRole};
+    use crate::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
     use crate::todo::{Todo, TodoStore};
     use crate::web::auth::generate_token;
     use crate::web::snapshot::{GraphCounts, GraphView, NodeView, SnapshotSource};
@@ -1122,6 +1247,10 @@ mod tests {
             status: TodoStatus::Running,
             source: TodoSource::Manual,
             source_ref: None,
+            external_key: None,
+            link_url: None,
+            external_status: None,
+            external_assignee: None,
             run_kind: Some("agent".to_owned()),
             run_ref: Some("codex".to_owned()),
             last_error: None,
@@ -1166,6 +1295,7 @@ mod tests {
         let services = DashboardServices {
             todos: Some(store.clone()),
             commands: None,
+            mcp: None,
             web_attached: false,
             memory: None,
         };
@@ -1312,6 +1442,7 @@ mod tests {
         let services = DashboardServices {
             todos: Some(store),
             commands: None,
+            mcp: None,
             web_attached: false,
             memory: None,
         };
@@ -1437,6 +1568,171 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
+    // TC-570 / FR-563: link fields validate on POST/PATCH (400), round-trip in
+    // the API and snapshot, and PATCH null clears them.
+    #[tokio::test]
+    async fn todo_routes_validate_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TodoStore::open(&dir.path().join("conversations.sqlite3")).unwrap());
+        let token = "todo-token-123".to_string();
+        let router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                todos: Some(store.clone()),
+                commands: None,
+                mcp: None,
+                web_attached: false,
+                memory: None,
+            },
+        );
+
+        // Valid key + link -> 201 with both fields echoed.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/todos",
+                &token,
+                r#"{"title":"linked","external_key":"PROJ-123","link_url":"https://example.invalid/browse/PROJ-123"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        let id = created["id"].as_str().unwrap().to_owned();
+        assert_eq!(created["external_key"], "PROJ-123");
+        assert_eq!(
+            created["link_url"],
+            "https://example.invalid/browse/PROJ-123"
+        );
+
+        // Key without a link or base URL -> key kept, link null.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/todos",
+                &token,
+                r#"{"title":"key only","external_key":"PROJ-9"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let key_only: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(key_only["external_key"], "PROJ-9");
+        assert!(key_only["link_url"].is_null());
+
+        // Invalid links and keys -> 400.
+        for body in [
+            r#"{"title":"x","link_url":"javascript:alert(1)"}"#,
+            r#"{"title":"x","link_url":"/relative/path"}"#,
+            r#"{"title":"x","external_key":"123"}"#,
+            r#"{"title":"x","external_key":"PROJ"}"#,
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(json_request("POST", "/api/todos", &token, body))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {body}");
+        }
+
+        // FR-563: import-only status/assignee cannot be user-set.
+        for (body, expected) in [
+            (
+                r#"{"title":"x","external_status":"Done"}"#,
+                "external_status is set by import",
+            ),
+            (
+                r#"{"title":"x","external_assignee":"Demo User"}"#,
+                "external_assignee is set by import",
+            ),
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(json_request("POST", "/api/todos", &token, body))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {body}");
+            assert_eq!(
+                read_body(resp).await,
+                format!("{{\"error\":\"{expected}\"}}")
+            );
+        }
+        let overlong = format!(
+            r#"{{"title":"x","link_url":"https://example.invalid/{}"}}"#,
+            "a".repeat(2048)
+        );
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/todos", &token, &overlong))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // PATCH a browse URL onto a key-less to-do -> the key is extracted.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/todos",
+                &token,
+                r#"{"title":"unkeyed"}"#,
+            ))
+            .await
+            .unwrap();
+        let unkeyed_id = serde_json::from_str::<serde_json::Value>(&read_body(resp).await).unwrap()
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/api/todos/{unkeyed_id}"),
+                &token,
+                r#"{"link_url":"https://example.atlassian.net/browse/PROJ-456"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let patched: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(patched["external_key"], "PROJ-456");
+        assert_eq!(
+            patched["link_url"],
+            "https://example.atlassian.net/browse/PROJ-456"
+        );
+
+        // PATCH null clears a field.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/api/todos/{id}"),
+                &token,
+                r#"{"external_key":null,"link_url":null}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cleared: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert!(cleared["external_key"].is_null());
+        assert!(cleared["link_url"].is_null());
+
+        // The snapshot carries the fields too.
+        let state = read_body(
+            router
+                .oneshot(json_request("GET", "/api/state", &token, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(state.contains("PROJ-9"));
+    }
+
     // TC-545 / FR-542: running a to-do needs the --web command channel.
     #[tokio::test]
     async fn todo_run_requires_web_mode() {
@@ -1471,6 +1767,7 @@ mod tests {
                 commands: Some(spawn_reply(Err(RunTodoError::Busy(
                     "agent busy".to_owned(),
                 )))),
+                mcp: None,
                 web_attached: false,
                 memory: None,
             },
@@ -1494,6 +1791,7 @@ mod tests {
             DashboardServices {
                 todos: None,
                 commands: Some(spawn_reply(Ok(test_todo()))),
+                mcp: None,
                 web_attached: false,
                 memory: None,
             },
@@ -1523,6 +1821,7 @@ mod tests {
             DashboardServices {
                 todos: None,
                 commands: None,
+                mcp: None,
                 web_attached: true,
                 memory: None,
             },
@@ -1552,6 +1851,7 @@ mod tests {
             DashboardServices {
                 todos: None,
                 commands: Some(spawn_recording_reply(Ok(test_todo()), seen.clone())),
+                mcp: None,
                 web_attached: false,
                 memory: None,
             },
@@ -1593,6 +1893,7 @@ mod tests {
             todos: None,
             commands: None,
             web_attached: false,
+            mcp: None,
             memory: Some(memory.clone()),
         };
         let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
@@ -1774,5 +2075,466 @@ mod tests {
                 .await
                 .contains("memory is not configured")
         );
+    }
+
+    // ---- slice C test helpers -------------------------------------------
+
+    fn mcp_stdio(name: &str, kind: ServerKind, env: &[(&str, &str)]) -> ResolvedMcpServer {
+        ResolvedMcpServer {
+            name: name.to_owned(),
+            kind,
+            transport: Transport::Stdio {
+                command: "npx".to_owned(),
+                args: vec!["-y".to_owned(), "server".to_owned()],
+                env: env
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+            },
+            runners: None,
+            tools: ToolNames::default(),
+        }
+    }
+
+    fn mcp_http(
+        name: &str,
+        kind: ServerKind,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> ResolvedMcpServer {
+        ResolvedMcpServer {
+            name: name.to_owned(),
+            kind,
+            transport: Transport::Http {
+                url: url.to_owned(),
+                headers: headers
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+            },
+            runners: None,
+            tools: ToolNames::default(),
+        }
+    }
+
+    // TC-567 / FR-562: the server listing redacts env values, header values and
+    // URL query strings; a missing registry is 503.
+    #[tokio::test]
+    async fn mcp_servers_route_redacts_secrets() {
+        let token = "mcp-token-123".to_string();
+        let registry = McpRegistry::new(
+            vec![
+                mcp_stdio(
+                    "everything",
+                    ServerKind::Generic,
+                    &[("API_TOKEN", "demo-env-secret")],
+                ),
+                mcp_http(
+                    "jira",
+                    ServerKind::Jira,
+                    "http://127.0.0.1:9/mcp?key=demo-query-secret",
+                    &[("Authorization", "demo-header-secret")],
+                ),
+            ],
+            vec!["mcp server gone disabled: env var MISSING is not set".to_owned()],
+        );
+        let router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                todos: None,
+                commands: None,
+                mcp: Some(Arc::new(registry)),
+                web_attached: false,
+                memory: None,
+            },
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(json_request("GET", "/api/mcp/servers", &token, ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp).await;
+        assert!(body.contains("\"name\":\"everything\""));
+        assert!(body.contains("\"name\":\"jira\""));
+        assert!(body.contains("\"transport\":\"stdio\""));
+        assert!(body.contains("\"transport\":\"http\""));
+        assert!(body.contains("\"kind\":\"jira\""));
+        assert!(!body.contains("demo-env-secret"));
+        assert!(!body.contains("demo-header-secret"));
+        assert!(!body.contains("demo-query-secret"));
+        assert!(!body.contains("key="));
+        assert!(!body.contains("example.invalid"));
+
+        // No registry at all -> 503.
+        let bare = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices::default(),
+        );
+        let resp = bare
+            .oneshot(json_request("GET", "/api/mcp/servers", &token, ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // TC-562 / FR-561, NFR-560: import from the in-repo mock over streamable
+    // HTTP for a Jira search, a Confluence page id, and the failure paths.
+    #[tokio::test]
+    async fn import_creates_todos_from_mock_jira_and_confluence() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = tokio::spawn(crate::mcp::mock::serve_http(listener));
+
+        let url = format!("http://{addr}/mcp");
+        let jira = ResolvedMcpServer {
+            name: "jira".to_owned(),
+            kind: ServerKind::Jira,
+            transport: Transport::Http {
+                url: url.clone(),
+                headers: std::collections::BTreeMap::new(),
+            },
+            runners: None,
+            tools: ToolNames {
+                search: "jira_search".to_owned(),
+                get: "jira_get".to_owned(),
+            },
+        };
+        let confluence = ResolvedMcpServer {
+            name: "confluence".to_owned(),
+            kind: ServerKind::Confluence,
+            transport: Transport::Http {
+                url,
+                headers: std::collections::BTreeMap::new(),
+            },
+            runners: None,
+            tools: ToolNames {
+                search: "confluence_search".to_owned(),
+                get: "confluence_get".to_owned(),
+            },
+        };
+        let generic = mcp_http(
+            "generic",
+            ServerKind::Generic,
+            "http://127.0.0.1:9/mcp",
+            &[],
+        );
+        let registry = Arc::new(McpRegistry::new(
+            vec![jira, confluence, generic],
+            Vec::new(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TodoStore::open(&dir.path().join("conversations.sqlite3")).unwrap());
+        let hub = test_hub();
+        let token = "mcp-token-123".to_string();
+        let router = build_router_with(
+            hub,
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                todos: Some(store.clone()),
+                commands: None,
+                mcp: Some(registry.clone()),
+                web_attached: false,
+                memory: None,
+            },
+        );
+
+        // Jira search -> two new to-dos with source_ref set.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/import",
+                &token,
+                r#"{"server":"jira","query":"DEMO"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(value["imported"], 2);
+        assert_eq!(value["updated"], 0);
+        let todos = value["todos"].as_array().unwrap();
+        assert_eq!(todos.len(), 2);
+        assert!(todos.iter().all(|todo| todo["source"] == "jira"));
+        assert!(todos.iter().any(|todo| todo["source_ref"] == "DEMO-1"));
+        assert!(todos.iter().any(|todo| todo["source_ref"] == "DEMO-2"));
+        // TC-571 / FR-563/FR-564: the item key/url land on the to-do.
+        let demo1 = todos
+            .iter()
+            .find(|todo| todo["source_ref"] == "DEMO-1")
+            .unwrap();
+        assert_eq!(demo1["external_key"], "DEMO-1");
+        assert_eq!(demo1["link_url"], "https://example.invalid/jira/DEMO-1");
+
+        // Re-import -> updated, never duplicated.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/import",
+                &token,
+                r#"{"server":"jira","query":"DEMO"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(value["imported"], 0);
+        assert_eq!(value["updated"], 2);
+        assert_eq!(store.list().unwrap().len(), 2);
+
+        // A numeric Confluence page id selects tools.get.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/import",
+                &token,
+                r#"{"server":"confluence","query":"1001"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(value["imported"], 1);
+        assert_eq!(value["todos"][0]["source"], "confluence");
+        assert_eq!(value["todos"][0]["source_ref"], "1001");
+
+        // Imported to-dos reach the hub.
+        let state = read_body(
+            router
+                .clone()
+                .oneshot(json_request("GET", "/api/state", &token, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(state.contains("DEMO-1"));
+        assert!(state.contains("confluence"));
+
+        // Unknown server -> 404.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/import",
+                &token,
+                r#"{"server":"nope","query":"x"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Non-importable kind -> 400.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/import",
+                &token,
+                r#"{"server":"generic","query":"x"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Tool error -> 502 naming the server exactly once (finding 6).
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/import",
+                &token,
+                r#"{"server":"jira","query":"NOPE-9"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = read_body(resp).await;
+        assert_eq!(
+            body.matches("jira").count(),
+            1,
+            "server name must appear once: {body}"
+        );
+        assert!(body.contains("unknown id: NOPE-9"));
+
+        // Non-JSON content type -> 415.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/import")
+            .header("Host", "localhost:7420")
+            .header("Origin", "http://localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "text/plain")
+            .body(axum::body::Body::from(
+                r#"{"server":"jira","query":"DEMO"}"#,
+            ))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // No store -> 503.
+        let no_store = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                todos: None,
+                commands: None,
+                mcp: Some(registry),
+                web_attached: false,
+                memory: None,
+            },
+        );
+        let resp = no_store
+            .oneshot(json_request(
+                "POST",
+                "/api/import",
+                &token,
+                r#"{"server":"jira","query":"DEMO"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        mock.abort();
+    }
+
+    // TC-573 / FR-563, UX-561: import stores the mock Jira status/assignee,
+    // re-import refreshes them, user PATCH is rejected, and the snapshot carries
+    // the configured base URL for link previews.
+    #[tokio::test]
+    async fn import_updates_external_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = tokio::spawn(crate::mcp::mock::serve_http(listener));
+
+        let jira = ResolvedMcpServer {
+            name: "jira".to_owned(),
+            kind: ServerKind::Jira,
+            transport: Transport::Http {
+                url: format!("http://{addr}/mcp"),
+                headers: std::collections::BTreeMap::new(),
+            },
+            runners: None,
+            tools: ToolNames {
+                search: "jira_search".to_owned(),
+                get: "jira_get".to_owned(),
+            },
+        };
+        let registry = Arc::new(McpRegistry::new(vec![jira], Vec::new()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TodoStore::open(&dir.path().join("conversations.sqlite3")).unwrap());
+        let base = "https://example.atlassian.net";
+        store.set_jira_base_url(Some(base.to_owned()));
+        let token = "mcp-token-123".to_string();
+        let router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                todos: Some(store.clone()),
+                commands: None,
+                mcp: Some(registry),
+                web_attached: false,
+                memory: None,
+            },
+        );
+
+        // Import -> status/assignee stored from the fixtures.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/import",
+                &token,
+                r#"{"server":"jira","query":"DEMO"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let demo1_id = {
+            let todos = store.list().unwrap();
+            let demo1 = todos
+                .iter()
+                .find(|t| t.source_ref.as_deref() == Some("DEMO-1"))
+                .unwrap();
+            assert_eq!(demo1.external_status.as_deref(), Some("In Progress"));
+            assert_eq!(demo1.external_assignee.as_deref(), Some("Demo User"));
+            let demo2 = todos
+                .iter()
+                .find(|t| t.source_ref.as_deref() == Some("DEMO-2"))
+                .unwrap();
+            assert_eq!(demo2.external_status.as_deref(), Some("To Do"));
+            assert!(demo2.external_assignee.is_none());
+            demo1.id.clone()
+        };
+
+        // The snapshot previews links from the configured base URL.
+        let state = read_body(
+            router
+                .clone()
+                .oneshot(json_request("GET", "/api/state", &token, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            state.contains(&format!("\"jira_base_url\":\"{base}\"")),
+            "snapshot must carry the base URL: {state}"
+        );
+        assert!(state.contains("\"external_status\":\"In Progress\""));
+
+        // Re-import with the changed fixture -> same rows, updated status.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/import",
+                &token,
+                &format!(
+                    r#"{{"server":"jira","query":"{}"}}"#,
+                    crate::mcp::mock::JIRA_STATUS_KEYWORD
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(value["imported"], 0);
+        assert_eq!(value["updated"], 2);
+        let todos = store.list().unwrap();
+        assert_eq!(todos.len(), 2, "re-import never duplicates");
+        let demo1 = todos.iter().find(|t| t.id == demo1_id).unwrap();
+        assert_eq!(demo1.external_status.as_deref(), Some("Done"));
+        assert_eq!(demo1.external_assignee.as_deref(), Some("Demo Reviewer"));
+
+        // A user PATCH of `external_status` is rejected with the fixed 400.
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                &format!("/api/todos/{demo1_id}"),
+                &token,
+                r#"{"external_status":"Open"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            read_body(resp).await,
+            r#"{"error":"external_status is set by import"}"#
+        );
+
+        mock.abort();
     }
 }

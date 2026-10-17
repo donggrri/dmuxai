@@ -134,5 +134,35 @@ Format: id, status, repro, cause, fix.
 ## #33 opencode turns show no progress for minutes — open
 - opencode `--format json` turns showed `responding · last event 4m ago` with no tool activity until the final text, so a long glm run looks hung.
 
+## #34 An AGY network error ends a long turn with no retry — open
+- After 134 tool calls, an AGY turn ended with `stream reading error ... connection timed out` (`retryable: true`). dmuxai shows the error and goes idle. Its edits stay on disk, but the turn is not retried or resumed automatically, so the user has to re-prompt with "continue". dmuxai could offer a resume for errors the provider marks retryable.
+
+## #35 One of several dmuxai instances started together exits silently — open
+- Three `dmuxai` instances were started in tmux windows within the same second in one worktree. One exited at once with no message (`EXIT=` stayed unset until the pane was restarted). Starting them a few seconds apart works. This suggests a race on the per-repo DB or state files at startup.
+
+## #36 opencode deepseek ended a turn without writing anything — open
+- The turn ended right after "Let me implement src/todo.rs", with no tool calls, no file writes and no error. dmuxai showed it as a normal completion. A "Continue" prompt in the same session resumed it. dmuxai could flag Implement turns that end without any edit or tool call.
+
+## #37 AGY in Ask mode is denied RunCommand — open (by design?)
+- A read-only Ask prompt led AGY to run `ls`, and the call was denied ("denied permission for RunCommand"), so the turn failed instead of answering. Ask mode could tell AGY up front that it has no shell, or allow read-only commands.
+
+## #38 opencode context compaction ends the turn with a summary — open
+- A long glm turn auto-compacted its context, then stopped and printed a "Next Move / Relevant Files" summary ending with "Continue if you have next steps". dmuxai showed this as a normal completion with no edits, and the work resumed only after a manual "continue". dmuxai could detect the compaction marker and continue automatically, or at least label the turn as compacted.
+
+## #25 (recurrence) Pasted prompts still need 2-3 Enter presses
+- This was seen again in every dispatch while building slices B and C. The scripts work around it by sending C-m in a loop until the status shows RUNNING.
+
+## #39 AGY ends an Implement turn while "waiting for cargo check" — open
+- AGY started `cargo check` in the background, replied "I have started `cargo check` and am waiting for it to finish." and the turn ended. DmuxAI then reported "implement mode completed without any observed file changes". A follow-up prompt was needed.
+
+## #40 Provider network errors cut runner turns — open
+- AGY turns ended with `There was a network issue connecting to the server` (retryable gRPC error) after 81 tool calls with only partial edits, and an opencode glm turn exited non-zero after repeated `AI_APICallError: Upstream ...` stream errors. DmuxAI does not retry retryable provider errors; the work was resumed or reassigned by hand.
+
+## #41 Multi-line paste submits line by line while the runner is busy — open
+- A multi-line prompt pasted with tmux bracketed paste (`paste-buffer -p`) into an opencode pane was split: the first line was submitted as a prompt, the next lines were rejected with "is busy; cancel the active turn", and the rest stayed in the input box. A `.png` path inside the text was also attached as an image. Workaround: collapse the prompt to one line.
+
+## #42 "already has an active turn" after cancel while the status shows IDLE — open
+- After Ctrl+C on an opencode turn, the status bar showed IDLE but every submit failed with "Could not start opencode-deepseek turn: opencode-deepseek already has an active turn" and no opencode process was running. Restarting DmuxAI was the only fix.
+
 ## Process note
 #2, #3 (PR #6) and #7 (PR #8) were fixed directly (not through DmuxAI), because #3 blocked the AGY flash runner that dogfooding needs.

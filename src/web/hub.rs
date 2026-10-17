@@ -45,6 +45,7 @@ impl DashboardHub {
             agents: Vec::new(),
             graph: None,
             todos: Vec::new(),
+            jira_base_url: None,
         };
 
         let (tx, _) = watch::channel(initial_snapshot.clone());
@@ -165,6 +166,23 @@ impl DashboardHub {
 
     pub fn snapshot(&self) -> DashboardSnapshot {
         self.state.lock().unwrap().snapshot.clone()
+    }
+
+    /// Records the configured Jira base URL so the snapshot can preview links
+    /// (FR-564). Bumps the revision only when the value changes.
+    pub fn set_jira_base_url(&self, base: Option<String>) {
+        let mut state = self.state.lock().unwrap();
+        if state.snapshot.jira_base_url == base {
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        state.snapshot.jira_base_url = base;
+        state.snapshot.revision += 1;
+        state.snapshot.generated_at_ms = now_ms;
+        let _ = self.watch_tx.send_replace(state.snapshot.clone());
     }
 
     pub fn subscribe(&self) -> watch::Receiver<DashboardSnapshot> {

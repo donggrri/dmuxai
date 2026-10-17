@@ -44,6 +44,8 @@ use dmuxai::{
         ExecutionPlan, GraphAction, GraphRun, GraphRunPhase, GraphRunSession, NodeAssignment,
         NodeRole, plan_request, save_run,
     },
+    mcp::config::ResolvedMcpServer,
+    mcp::registry::McpRegistry,
     settings::DmuxSettings,
     skills::{discover_skills, skill_prompt_prefix},
     theme::{Speaker, Theme},
@@ -480,6 +482,9 @@ pub struct App {
     memory: Option<dmuxai::memory::MemoryHandle>,
     /// Hash of the memory context each agent last received (FR-722).
     memory_injected: HashMap<(StoredConversationId, Agent), u64>,
+    pub(crate) mcp_servers: Vec<ResolvedMcpServer>,
+    mcp_registry: Arc<McpRegistry>,
+    agy_mcp_notice_shown: bool,
 }
 
 impl App {
@@ -488,36 +493,55 @@ impl App {
         workspace_root: PathBuf,
         settings: DmuxSettings,
     ) -> Result<Self, ConversationError> {
+        let (mcp_servers, mcp_warnings) =
+            dmuxai::mcp::config::resolve_servers(&settings.mcp_servers, |k| std::env::var(k).ok());
         let (event_tx, event_rx) = event_channel();
         let mut adapters = Vec::with_capacity(Agent::all().len());
         let mut workers = Vec::with_capacity(Agent::all().len());
 
         for agent in Agent::all() {
             let (adapter, worker) = match agent {
-                Agent::Codex => spawn_codex_adapter(event_tx.clone(), workspace_root.clone()),
-                Agent::Cursor => {
-                    spawn_cursor_adapter(event_tx.clone(), workspace_root.clone(), settings.clone())
-                }
+                Agent::Codex => spawn_codex_adapter(
+                    event_tx.clone(),
+                    workspace_root.clone(),
+                    mcp_servers.clone(),
+                ),
+                Agent::Cursor => spawn_cursor_adapter(
+                    event_tx.clone(),
+                    workspace_root.clone(),
+                    settings.clone(),
+                    mcp_servers.clone(),
+                ),
                 Agent::Agy => spawn_agy_adapter(event_tx.clone(), workspace_root.clone()),
-                Agent::Custom(index) => {
-                    spawn_custom_adapter(index, event_tx.clone(), workspace_root.clone())
-                }
+                Agent::Custom(index) => spawn_custom_adapter(
+                    index,
+                    event_tx.clone(),
+                    workspace_root.clone(),
+                    mcp_servers.clone(),
+                ),
             };
             adapters.push(adapter);
             workers.push(worker);
         }
         drop(event_tx);
 
-        Self::with_runtime(
+        let mut app = Self::with_runtime(
             adapters,
             event_rx,
             workers,
             engine,
             workspace_root,
             settings,
-        )
+            mcp_servers,
+            mcp_warnings.clone(),
+        )?;
+        for warning in mcp_warnings {
+            app.push_startup_notice(warning);
+        }
+        Ok(app)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_runtime(
         adapters: Vec<Box<dyn AgentAdapter>>,
         event_rx: mpsc::Receiver<AgentOutput>,
@@ -525,6 +549,8 @@ impl App {
         mut engine: ConversationEngine,
         workspace_root: PathBuf,
         settings: DmuxSettings,
+        mcp_servers: Vec<ResolvedMcpServer>,
+        mcp_warnings: Vec<String>,
     ) -> Result<Self, ConversationError> {
         engine.recover_workspace()?;
         let snapshot = if engine.has_live_peer()? {
@@ -546,6 +572,7 @@ impl App {
             .memory
             .as_ref()
             .map(|config| dmuxai::memory::MemoryHandle::from_config(config, &workspace_root));
+        let mcp_registry = Arc::new(McpRegistry::new(mcp_servers.clone(), mcp_warnings));
         let mut app = Self {
             memory,
             memory_injected: HashMap::new(),
@@ -620,6 +647,9 @@ impl App {
             color_enabled,
             cached_agent_colors: HashMap::new(),
             cached_theme: None,
+            mcp_servers,
+            mcp_registry,
+            agy_mcp_notice_shown: false,
         };
         app.restore_snapshot(snapshot);
         Ok(app)
@@ -1892,6 +1922,19 @@ impl App {
             }
         }
 
+        if agent == Agent::Agy && !self.agy_mcp_notice_shown {
+            let applicable: Vec<ResolvedMcpServer> = self
+                .mcp_servers
+                .iter()
+                .filter(|s| s.applies_to("agy"))
+                .cloned()
+                .collect();
+            if let Some(notice) = dmuxai::mcp::propagate::agy_mcp_notice(&applicable) {
+                self.push_system(notice);
+            }
+            self.agy_mcp_notice_shown = true;
+        }
+
         self.chat_scroll = 0;
         let model_id = self
             .model_catalogs
@@ -3129,6 +3172,10 @@ impl App {
 
     pub fn push_startup_notice(&mut self, content: impl Into<String>) {
         self.push_system(content);
+    }
+
+    pub fn mcp_registry(&self) -> Arc<McpRegistry> {
+        Arc::clone(&self.mcp_registry)
     }
 
     /// Attaches the dashboard hub and publishes the current state (FR-530).
@@ -5194,6 +5241,8 @@ mod tests {
             engine,
             std::env::current_dir().unwrap_or_default(),
             DmuxSettings::default(),
+            Vec::new(),
+            Vec::new(),
         )
         .unwrap();
         // Most unit tests were authored with Codex as the implicit active runner.
@@ -5231,6 +5280,8 @@ mod tests {
             engine,
             std::env::current_dir().unwrap_or_default(),
             DmuxSettings::default(),
+            Vec::new(),
+            Vec::new(),
         )
         .unwrap();
         app.selected = adapter_index(Agent::Codex);
@@ -9257,6 +9308,51 @@ mod tests {
         )));
         // Prompt submitted directly to selected agent
         assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agy_mcp_notice_shown_once_when_used_and_servers_exist() {
+        let (mut app, _sent) = test_app();
+        app.selected = adapter_index(Agent::Agy);
+
+        // Without MCP servers, no notice is pushed.
+        let before_count = app.messages.len();
+        app.input = "hello".to_owned();
+        app.submit_prompt();
+        assert_eq!(app.messages.len(), before_count + 1);
+
+        // With an applicable MCP server, notice is shown once.
+        let (mut app2, _sent2) = test_app();
+        app2.selected = adapter_index(Agent::Agy);
+        app2.mcp_servers = vec![ResolvedMcpServer {
+            name: "test-server".to_owned(),
+            transport: dmuxai::mcp::config::Transport::Stdio {
+                command: "echo".to_owned(),
+                args: vec![],
+                env: std::collections::BTreeMap::new(),
+            },
+            kind: dmuxai::mcp::config::ServerKind::Generic,
+            runners: None,
+            tools: dmuxai::mcp::config::ToolNames::default(),
+        }];
+
+        app2.input = "turn 1".to_owned();
+        app2.submit_prompt();
+        let has_notice = app2
+            .messages
+            .iter()
+            .any(|m| m.role == Role::System && m.content.contains("agy mcp add test-server"));
+        assert!(has_notice, "AGY notice should be shown");
+
+        // Second turn does not repeat notice.
+        app2.input = "turn 2".to_owned();
+        app2.submit_prompt();
+        let notice_count = app2
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::System && m.content.contains("agy mcp add test-server"))
+            .count();
+        assert_eq!(notice_count, 1, "AGY notice should only be shown once");
     }
 }
 

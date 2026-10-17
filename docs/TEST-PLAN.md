@@ -190,6 +190,26 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-theme-colors | UX-600 | TC-607 | `static_page_has_theme_controls` | integration | ✅ | theme settings (PR D) |
 | M8,M2 | SPEC-theme-colors | NFR-600 | TC-608 | `theme_palettes_meet_wcag_contrast` | unit | ✅ | theme settings (PR D) |
 | M8,M2 | SPEC-theme-colors | FR-604 | TC-609 | `dashboard_agents_carry_tui_colors` | unit | ✅ | theme settings (PR D) |
+| M8,M2 | SPEC-web-dashboard | INT-560 | TC-560 | `mcp_config_merges_user_and_repo_by_name` | unit | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | INT-562 | TC-561 | `mcp_client_stdio_and_http_against_mock` | integration | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | FR-561 | TC-562 | `import_creates_todos_from_mock_jira_and_confluence` | integration | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | INT-561 | TC-563 | `opencode_config_gets_mcp_key` | unit | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | INT-561 | TC-564 | `codex_overrides_encode_mcp_servers` | unit | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | INT-561 | TC-565 | `custom_agent_mcp_json_shape` | unit | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | INT-561 | TC-566 | `cursor_guard_writes_only_when_absent_and_agy_notice` | unit | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | FR-562 | TC-567 | `mcp_servers_route_redacts_secrets` | integration | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | UX-560 | TC-568 | `static_page_has_import_panel` | integration | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | INT-563 | TC-569 | `serve_imports_from_mock_mcp_end_to_end` | e2e | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | FR-563 | TC-570 | `todo_link_columns_migrate_and_validate` | unit + integration | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | FR-564 | TC-571 | `todo_jira_key_and_url_derivation` | unit | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | UX-561 | TC-572 | `static_page_has_todo_links` | integration | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | FR-563 | TC-573 | `import_updates_external_status` | unit + integration | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | NFR-561 | TC-574 | `mcp_client_refuses_redirects` | integration | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | NFR-561 | TC-575 | `mcp_client_kills_stdio_process_group` | integration (unix) | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | NFR-561 | TC-576 | `mcp_client_bounds_writes_and_streams_sse` | integration | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | NFR-561 | TC-577 | `codex_mcp_secrets_not_in_argv` | unit | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | INT-561 | TC-578 | `cursor_mcp_notice_once_per_session` | unit | ✅ | web dashboard slice C (MCP) |
+| M8,M2 | SPEC-web-dashboard | FR-564 | TC-579 | `serve_snapshot_has_jira_base_url_at_startup` | integration | ✅ | web dashboard slice C (MCP) |
 
 
 ### 1.1 주의할 ⚠️ 항목

@@ -183,3 +183,106 @@ call `finish_run`; every change calls `hub.set_todos`.
 Owners: AGY -> `src/app.rs` command handling + TC-542; opencode deepseek -> `src/todo.rs`,
 `src/web` routes/hub/snapshot, `src/main.rs` wiring + TC-540, TC-541, TC-544, TC-545;
 opencode glm -> page to-do panel + TC-543 + docs; cross-review deepseek <-> glm, AGY reviewed by deepseek.
+## Slice C contract (shared MCP config, propagation, client, import)
+
+### Config (`src/mcp/config.rs`, wired in `src/settings.rs`)
+
+```toml
+[[mcp.servers]]
+name = "everything"                 # unique key, [A-Za-z0-9_-]{1,64}
+command = "npx"                     # stdio transport (exclusive with url)
+args = ["-y", "@modelcontextprotocol/server-everything"]
+env = { API_TOKEN = { env = "MY_TOKEN" }, MODE = "demo" }   # literal or {env="VAR"}
+# url = "https://mcp.example/mcp"   # streamable HTTP transport
+# headers = { Authorization = { env = "JIRA_AUTH" } }
+kind = "generic"                    # generic | jira | confluence
+runners = ["codex", "opencode-glm"] # optional allow-list; absent = all runners
+enabled = true
+[mcp.servers.tools]                 # import tool names (jira/confluence only)
+search = "search"
+get = "get"
+```
+
+- `McpServerSpec` (Deserialize) is parsed from user and repo TOML. Merge in
+  `DmuxSettings::apply_toml`: by `name`; later (repo) replaces earlier (user);
+  `enabled = false` removes. Invalid entries (both/neither command and url, bad
+  name, empty command) -> `config_warnings`, entry skipped.
+- `resolve_servers(&[McpServerSpec], env: impl Fn(&str)->Option<String>) ->
+  (Vec<ResolvedMcpServer>, Vec<String> warnings)`. A missing env var disables
+  that server with warning `mcp server <name> disabled: env var <VAR> is not
+  set` (never the value). `ResolvedMcpServer` implements `Debug` by hand with
+  values redacted (`env`/`headers` values shown as `***`).
+- `ResolvedMcpServer::applies_to(runner_id) -> bool`.
+
+### Propagation (`src/mcp/propagate.rs`), pure functions + adapter hooks
+
+| Runner | Function | Native form |
+| --- | --- | --- |
+| opencode presets / custom with `temp_config_template` whose JSON is an object | `merge_opencode_mcp(config_json: &str, servers) -> String` | adds `"mcp": {"<name>": {"type":"local","command":[cmd,..args],"environment":{..},"enabled":true}}` or `{"type":"remote","url":..,"headers":{..},"enabled":true}`; existing keys preserved; existing `mcp.<name>` wins |
+| Codex | `codex_config_overrides(servers) -> Vec<String>` | pairs `-c`, `mcp_servers.<name>.command="npx"`, `-c`, `mcp_servers.<name>.args=["-y","x"]`, `-c`, `mcp_servers.<name>.env={K="v"}` or `mcp_servers.<name>.url="..."`; values TOML-encoded; inserted before the prompt / subcommand args |
+| custom agents | `custom_mcp_json(servers) -> String` | `{"mcpServers":{"<name>":{"command":..,"args":[..],"env":{..}}|{"url":..,"headers":{..}}}}` written per turn to a temp file; `{mcp_config}` placeholder + env `DMUXAI_MCP_CONFIG=<path>`; removed after the turn (same lifecycle as `temp_config`) |
+| Cursor | `cursor_mcp_guard(workspace, servers) -> Option<CursorMcpGuard>` | writes `<ws>/.cursor/mcp.json` (`mcpServers` shape) only if it does not exist; guard removes the file (and `.cursor` if it created it and it is empty) on drop; if the file exists -> no write and one notice |
+| AGY | `agy_mcp_notice(servers) -> String` | AGY only has user-level `agy mcp add`; dmuxai never runs it (OQ-523); one session notice listing the `agy mcp add ...` commands |
+
+Each adapter filters by `applies_to(runner_id)`. Secrets are passed only via the
+child env / per-run temp file (mode 0600 on unix), never logged.
+
+### Client (`src/mcp/client.rs`)
+
+`McpClient::connect(&ResolvedMcpServer, timeout) -> Result<McpClient, McpError>`;
+`list_tools() -> Vec<McpTool{name, description}>`; `call_tool(name, args:
+Value) -> Value` (the `result`), all with a per-request timeout (default 20 s).
+JSON-RPC 2.0, protocol version `2025-06-18`, `initialize` then
+`notifications/initialized`.
+- stdio: spawn with resolved env, newline-delimited JSON on stdin/stdout,
+  stderr drained (kept last 4 KB for errors), kill_on_drop.
+- streamable HTTP: POST JSON with `Accept: application/json, text/event-stream`,
+  configured headers, `Mcp-Session-Id` echoed after initialize; response either
+  JSON or SSE (`data:` lines; first message whose `id` matches).
+- `McpError` always contains the server name; tool `isError: true` -> error.
+
+### Mock (`src/bin/dmuxai-mock-mcp.rs` not shipped? -> `tests/support` or `src/mcp/mock.rs` cfg(test))
+
+Deterministic in-repo mock with tools `echo`, `jira_search`, `jira_get`,
+`confluence_search`, `confluence_get`, `fail`; fixture issues `DEMO-1`, `DEMO-2`
+and page `1001` with fake text only. Served over stdio (test binary via
+`std::env::current_exe` helper or a `dmuxai mcp-mock` hidden subcommand) and over
+streamable HTTP on 127.0.0.1:0 (axum).
+
+### Import (`POST /api/import`)
+
+Body `{ "server": "<name>", "query": "<key|JQL|page id|CQL>" }`. Server must be
+`kind` jira/confluence. Calls `tools.search` with `{ "query": q }` (or
+`tools.get` with `{ "id": q }` when q looks like a key `^[A-Z][A-Z0-9]+-\d+$` or a
+numeric page id); expects `structuredContent.items[]` or JSON text content with
+`items[]` of `{ id, title, url?, body? }`; upserts to-dos with `source`
+jira/confluence, `source_ref` = id, body = url + body (truncated). Response
+`{ imported, updated, todos }`. Unknown server 404, wrong kind 400, tool error
+502 `{ "error": "<server>: <message>" }`, no store 503. `GET /api/mcp/servers`
+lists `name`, `kind`, `transport` (no env/headers/url query strings).
+
+### Slice C implementation decisions
+
+- **HTTP client:** `reqwest` with `default-features = false` and
+  `rustls-no-provider`, plus `rustls` with the `ring` provider installed once
+  (`install_default`, errors ignored). This avoids aws-lc (cmake/NASM on
+  Windows) and keeps the static musl release build working. Both `http://` and
+  `https://` are supported.
+- **Mock entry point:** a hidden `dmuxai __mock-mcp` subcommand runs
+  `mcp::mock::serve_stdio()`. It is not listed in `--help`. Tests use
+  `env!("CARGO_BIN_EXE_dmuxai")`.
+- **Settings to runtime:** `App` and `run_serve` resolve the list with
+  `resolve_servers(&settings.mcp_servers, |k| std::env::var(k).ok())` and
+  surface the warnings as config notices.
+- **Adapter hooks** (INT-563):
+  - The custom adapter gets the resolved list at spawn. Each turn:
+    - merges `mcp` into the rendered `temp_config` when the template is JSON;
+    - writes `custom_mcp_json` to a second temp file for `{mcp_config}` and
+      `DMUXAI_MCP_CONFIG`, removed with the turn.
+  - Codex adds the `codex_config_overrides` args to `app-server --stdio` at
+    spawn.
+  - Cursor holds a `cursor_mcp_guard` for the duration of each turn.
+  - AGY: the App shows `agy_mcp_notice` once per session.
+- **Import:** a `DashboardServices.mcp` (`Arc<McpRegistry>`, holding the
+  resolved list and connecting lazily per request with a 20 s timeout) serves
+  `/api/mcp/servers` and `/api/import`, in both `serve` and `--web`.
