@@ -216,6 +216,22 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-graph-view | FR-702 | TC-703 | `dashboard_nodes_carry_log_tail_and_changed_files` | unit | ✅ | graph view slice H |
 | M8,M2 | SPEC-graph-view | UX-700 | TC-704 | `graph_view_svg_structure` | unit | ✅ | graph view slice H |
 | M8,M2 | SPEC-graph-view | UX-700 | TC-705 | `graph_view_renders_in_headless_chrome` (`--ignored`) | e2e | ✅ | graph view slice H, opt-in |
+| M6,M8 | SPEC-agent-api | FR-760 | TC-760 | `parse_cli_agent_api_subcommands` | unit | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-761,NFR-760 | TC-761 | `headless_run_json_success_and_failure`, `headless_run_returns_agent_text`, `headless_run_reports_agent_error`, `headless_run_cancel_exits_130` | integration | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-761,NFR-762 | TC-762 | `headless_run_respects_allowed_runners` | integration | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-762 | TC-763 | `todo_cli_add_list_run` | integration | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-763 | TC-764 | `status_json_has_contract_keys` | integration | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-764,NFR-760 | TC-765 | `read_since_skips_malformed_and_filters`, `events_cli_since_json` | unit + integration | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-765 | TC-766 | `prompt_route_contract` | integration | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-766 | TC-767 | `events_log_and_sse_state_change` | integration | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-767 | TC-768 | `mcp_stdio_protocol_and_tools` | unit | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-768 | TC-769 | `tracker_emits_one_event_per_transition` | unit | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-768 | TC-770 | `event_log_seq_is_monotonic_across_handles` | unit | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-769 | TC-771 | `stall_detector_emits_once_and_resets` | unit | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-770,FR-772,NFR-761 | TC-772 | `webhook_posts_json_with_secret_no_redirect` | integration | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-771 | TC-773 | `command_hook_receives_event_on_stdin` | integration | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-773 | TC-774 | `discovery_file_and_token_env` | unit | ✅ | agent API (G1) |
+| M6,M8 | SPEC-agent-api | FR-768 | TC-775 | `app_emits_agent_lifecycle_events` | unit | ✅ | agent API (G1) |
 
 
 ### 1.1 주의할 ⚠️ 항목

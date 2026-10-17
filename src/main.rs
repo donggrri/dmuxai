@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod cli;
 mod process;
 
 use std::{
@@ -56,6 +57,10 @@ enum CliAction {
     RunWeb(WebOptions),
     McpMemory(MemoryOptions),
     MockMcp,
+    /// Agent-facing subcommand (SPEC-agent-api FR-760).
+    Agent(cli::AgentCommand),
+    /// A usage error in an agent-facing subcommand (exit 2).
+    Usage(String),
     Unknown(String),
 }
 
@@ -76,6 +81,13 @@ Usage:
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
+  dmuxai run <prompt|-> [--agent ID] [--mode ask|plan|implement] [--graph] [--json]
+  dmuxai todo add <title> [--body TEXT] [--json]
+  dmuxai todo list [--status open|running|done] [--json]
+  dmuxai todo run <id> [--agent ID | --graph] [--mode M] [--json]
+  dmuxai status [--json]
+  dmuxai events [--since N] [--limit N] [--follow] [--json]
+  dmuxai mcp
 
 Options:
   -h, --help       Print this help message and exit
@@ -90,6 +102,14 @@ Options:
   --vault PATH     Obsidian vault for mcp-memory (overrides dmuxai.toml)
   --dir DIR        Memory directory inside the vault
   --project NAME   Project name for mcp-memory
+  run              Run one prompt headless and exit (exit codes: 0 ok, 1 failed,
+                   2 usage, 3 not found, 4 busy, 5 runner not allowed, 6 internal,
+                   130 cancelled)
+  todo             Add, list or run to-dos without the TUI
+  status           Print workspace status (agents, to-dos, last graph, events)
+  events           Print state-change events from .dmuxai/events.jsonl
+  mcp              Serve DmuxAI as an MCP server over stdio
+  --json           Print machine-readable JSON on stdout
 
 Configuration:
   dmuxai.toml      Optional configuration file in the workspace root or parent directories
@@ -98,6 +118,7 @@ Environment variables:
   DMUXAI_FORCE_COLOR  Force color output on (1) or off (0)
   NO_COLOR            Disable color output unless forced
   XDG_STATE_HOME      Directory for application state and conversation history
+  DMUXAI_WEB_TOKEN    Fixed dashboard token (32-128 chars of A-Z a-z 0-9 _ -)
 ";
 
 fn parse_cli<I, S>(args: I) -> CliAction
@@ -115,6 +136,24 @@ where
             return CliAction::MockMcp;
         }
         return CliAction::Unknown(args[1].clone());
+    }
+    // Agent-facing subcommands (FR-760). `--help` anywhere prints usage.
+    if args
+        .first()
+        .is_some_and(|first| cli::SUBCOMMANDS.contains(&first.as_str()))
+    {
+        // Stop at `--`: anything after it is prompt text.
+        if args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| arg == "-h" || arg == "--help")
+        {
+            return CliAction::Help;
+        }
+        return match cli::parse(&args) {
+            Ok(command) => CliAction::Agent(command),
+            Err(message) => CliAction::Usage(message),
+        };
     }
 
     let serve = args.first().map(String::as_str) == Some("serve");
@@ -268,6 +307,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             dmuxai::mcp::mock::serve_stdio().await;
             return Ok(());
         }
+        CliAction::Usage(message) => {
+            eprintln!("error: {message}\n\n{USAGE}");
+            std::process::exit(dmuxai::agent_api::exit::USAGE);
+        }
+        CliAction::Agent(command) => {
+            let code = cli::execute(command).await;
+            std::process::exit(code);
+        }
         CliAction::Serve(options) => return run_serve(options).await,
         CliAction::RunWeb(options) => return run_tui(Some(options)).await,
         CliAction::McpMemory(options) => return run_mcp_memory(options),
@@ -386,7 +433,8 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 commands: None,
                 mcp: Some(mcp_registry),
                 web_attached: false,
-                memory,
+                memory: memory.clone(),
+                events_path: Some(dmuxai::events::events_path(&workspace_root)),
             }
         }
         Err(error) => {
@@ -397,9 +445,13 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 mcp: Some(mcp_registry),
                 web_attached: false,
                 memory,
+                // The event log is independent of the to-do database (FR-766).
+                events_path: Some(dmuxai::events::events_path(&workspace_root)),
             }
         }
     };
+    // `serve` never runs agents, so it does not write events itself (the
+    // processes that run agents do); it only streams the shared log (FR-766).
     let hub = DashboardHub::new(SnapshotSource::Files, workspace);
     hub.set_ui(dmuxai::web::UiTheme {
         theme: settings.web_theme.theme,
@@ -415,9 +467,10 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         bind: options.bind,
         port: options.port,
         allow_remote: options.allow_remote,
-        token: generate_token(),
+        token: dashboard_token(|warning| eprintln!("warning: {warning}")),
         services,
     };
+    let token = config.token.clone();
     let server = match start_server(config, hub.clone()).await {
         Ok(server) => server,
         Err(error) => {
@@ -428,6 +481,9 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
 
     println!("dmuxai dashboard: {}", server.url);
     io::stdout().flush()?;
+    if let Some(warning) = publish_discovery(&workspace_root, &server, &token) {
+        eprintln!("warning: {warning}");
+    }
     if let Some(warning) = &server.warning {
         eprintln!("{warning}");
     }
@@ -444,7 +500,45 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         }
     }
 
+    dmuxai::web::discovery::remove_discovery(&workspace_root);
     Ok(())
+}
+
+/// The dashboard token: `DMUXAI_WEB_TOKEN` when valid, else random (FR-773).
+fn dashboard_token(mut warn: impl FnMut(String)) -> String {
+    let env = std::env::var("DMUXAI_WEB_TOKEN").ok();
+    match dmuxai::web::discovery::token_from_env(env.as_deref()) {
+        Ok(Some(token)) => token,
+        Ok(None) => generate_token(),
+        Err(warning) => {
+            warn(warning);
+            generate_token()
+        }
+    }
+}
+
+/// Writes `.dmuxai/web.json` so local agents can find the dashboard (FR-773).
+fn publish_discovery(
+    workspace_root: &Path,
+    server: &DashboardServer,
+    token: &str,
+) -> Option<String> {
+    let host = if server.addr.ip().is_unspecified() {
+        "127.0.0.1".to_owned()
+    } else if server.addr.is_ipv6() {
+        format!("[{}]", server.addr.ip())
+    } else {
+        server.addr.ip().to_string()
+    };
+    let discovery = dmuxai::web::discovery::Discovery {
+        base_url: format!("http://{host}:{}", server.addr.port()),
+        port: server.addr.port(),
+        pid: std::process::id(),
+        token: token.to_owned(),
+    };
+    dmuxai::web::discovery::write_discovery(workspace_root, &discovery)
+        .err()
+        .map(|error| format!("could not write the dashboard discovery file: {error}"))
 }
 
 /// Run the TUI, optionally alongside the in-process dashboard (FR-520, FR-530).
@@ -491,6 +585,11 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     let dashboard = if let Some(options) = web {
         attach_web_dashboard(&mut app, &workspace_root, &settings, options).await
     } else {
+        // No server, but a hub still feeds the event log (FR-768).
+        let workspace = dmuxai::workspace::normalize_workspace_path(&workspace_root)
+            .unwrap_or_else(|_| workspace_root.display().to_string());
+        let sink = cli::build_event_sink(&workspace_root, &settings);
+        app.attach_dashboard(DashboardHub::new(SnapshotSource::Tui, workspace).with_events(sink));
         None
     };
     let mut session = TerminalSession::start()?;
@@ -498,6 +597,7 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     app.shutdown().await;
     if let Some(server) = dashboard {
         server.abort();
+        dmuxai::web::discovery::remove_discovery(&workspace_root);
     }
     result.map_err(Into::into)
 }
@@ -535,20 +635,30 @@ async fn attach_web_dashboard(
             .memory
             .as_ref()
             .map(|config| dmuxai::memory::MemoryHandle::from_config(config, workspace_root)),
+        events_path: Some(dmuxai::events::events_path(workspace_root)),
     };
 
-    let hub = DashboardHub::new(SnapshotSource::Tui, workspace);
+    let sink = cli::build_event_sink(workspace_root, settings);
+    let hub = DashboardHub::new(SnapshotSource::Tui, workspace).with_events(sink);
     hub.set_jira_base_url(settings.todo_jira_base_url.clone());
+    let mut token_warning = None;
     let config = ServerConfig {
         bind: options.bind,
         port: options.port,
         allow_remote: options.allow_remote,
-        token: generate_token(),
+        token: dashboard_token(|warning| token_warning = Some(warning)),
         services,
     };
+    if let Some(warning) = token_warning {
+        app.push_startup_notice(warning);
+    }
+    let token = config.token.clone();
 
     match start_server(config, hub.clone()).await {
         Ok(server) => {
+            if let Some(warning) = publish_discovery(workspace_root, &server, &token) {
+                app.push_startup_notice(warning);
+            }
             app.attach_dashboard(hub);
             if let (Some((store, _)), Some(receiver)) = (todos, receiver) {
                 app.attach_dashboard_services(store.clone(), receiver);
@@ -800,6 +910,25 @@ mod tests {
             parse_cli(["mcp-memory", "--web"]),
             CliAction::Unknown(_)
         ));
+    }
+
+    // TC-760 / FR-760: agent subcommands route through `cli::parse`; `--help`
+    // before `--` prints usage, after `--` it is prompt text.
+    #[test]
+    fn parse_cli_routes_agent_subcommands() {
+        assert!(matches!(
+            parse_cli(["status", "--json"]),
+            CliAction::Agent(_)
+        ));
+        assert_eq!(parse_cli(["run", "--help"]), CliAction::Help);
+        match parse_cli(["run", "--", "--help"]) {
+            CliAction::Agent(cli::AgentCommand::Run(options)) => {
+                assert_eq!(options.prompt, "--help")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(parse_cli(["todo"]), CliAction::Usage(_)));
+        assert!(matches!(parse_cli(["mcp", "x"]), CliAction::Usage(_)));
     }
 
     // FR-540/FR-541: `serve` seeds the hub with persisted to-dos at startup so

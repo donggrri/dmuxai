@@ -155,6 +155,36 @@ and it is only re-sent on a resumed session when it changed.
 
 Details: [SPEC-obsidian-memory](docs/specs/SPEC-obsidian-memory.md).
 
+## Calling dmuxai from an agent
+
+DmuxAI is usable without the terminal, from the repo it runs in. `--json` keeps
+stdout machine-readable and sends diagnostics to stderr:
+
+```bash
+dmuxai status --json                                  # agents, to-dos, last graph, last event seq
+dmuxai run "summarize this repo" --agent agy --json   # one-shot; add --graph for the planner
+dmuxai todo add "Write docs" --body "API.md first"
+dmuxai events --follow --json                         # tail .dmuxai/events.jsonl
+```
+
+MCP over stdio exposes the same operations as tools; most clients take a
+command/args pair:
+
+```json
+{ "command": "dmuxai", "args": ["mcp"], "cwd": "<repo>" }
+```
+
+To drive a dashboard that is already running, read the discovery file it writes
+(`.dmuxai/web.json`: `base_url`, `port`, `pid`, `token`) and call the
+token-authenticated HTTP API:
+
+```bash
+TOKEN="<token from .dmuxai/web.json>"
+curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:7420/api/state"
+```
+
+Full reference: [docs/API.md](docs/API.md) — CLI, HTTP, MCP, events and `[notify]`.
+
 ## Attach any agent CLI
 
 Built-in runners are Cursor (`cursor-agent`), AGY and Codex. **Any other headless

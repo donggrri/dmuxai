@@ -28,11 +28,23 @@ pub enum RunTodoError {
     Internal(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PromptAccepted {
+    pub conversation_id: String,
+    pub agent: String,
+}
+
 #[derive(Debug)]
 pub enum DashboardCommand {
     RunTodo {
         todo_id: String,
         mode: RunMode,
         reply: oneshot::Sender<Result<Todo, RunTodoError>>,
+    },
+    SubmitPrompt {
+        text: String,
+        agent: Option<String>,
+        mode: Option<String>,
+        reply: oneshot::Sender<Result<PromptAccepted, RunTodoError>>,
     },
 }

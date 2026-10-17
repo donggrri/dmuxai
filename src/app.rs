@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet},
     io, mem,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -40,6 +43,7 @@ use dmuxai::{
         SummaryJob, TranscriptMessage, TurnEvent, TurnId as StoredTurnId, TurnOutput, TurnSnapshot,
         TurnStatus,
     },
+    events::EventDraft,
     graph::{
         ExecutionPlan, GraphAction, GraphRun, GraphRunPhase, GraphRunSession, NodeAssignment,
         NodeRole, plan_request, save_run,
@@ -50,7 +54,7 @@ use dmuxai::{
     skills::{discover_skills, skill_prompt_prefix},
     theme::{Speaker, Theme},
     todo::{Todo, TodoError, TodoStatus, TodoStore},
-    web::commands::{DashboardCommand, RunMode, RunTodoError},
+    web::commands::{DashboardCommand, PromptAccepted, RunMode, RunTodoError},
 };
 
 use crate::agent::{
@@ -233,7 +237,15 @@ struct ActiveTurn {
     turn_id: StoredTurnId,
 }
 
+/// Last emitted agent lifecycle `to_state` and running-phase label (FR-768).
+#[derive(Debug, Clone, Default)]
+struct AgentLifecycleState {
+    last_to_state: String,
+    last_running_phase: Option<String>,
+}
+
 const MAX_ACTIVITY_DETAIL_CHARS: usize = 72;
+const AGENT_LIFECYCLE_ERROR_CHARS: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActivityKind {
@@ -414,10 +426,40 @@ struct UiAreas {
     status: Rect,
 }
 
+#[derive(Debug, Clone)]
+pub struct HeadlessRequest {
+    pub prompt: String,
+    pub agent: Option<String>,
+    pub mode: Option<ExecutionMode>,
+    pub graph: bool,
+    pub todo_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeadlessMessage {
+    pub role: String,
+    pub agent: Option<String>,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HeadlessOutcome {
+    pub ok: bool,
+    pub exit_code: i32,
+    pub conversation_id: String,
+    pub agent: Option<String>,
+    pub graph_id: Option<String>,
+    pub text: String,
+    pub messages: Vec<HeadlessMessage>,
+    pub error: Option<String>,
+    pub todo: Option<Todo>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DrainEventsOutcome {
     pub changed: bool,
     pub completed: bool,
+    pub errored: bool,
 }
 
 const NODE_DETAIL_MAX_BUFFER_LINES: usize = 100;
@@ -674,6 +716,7 @@ pub struct App {
     pub(crate) mcp_servers: Vec<ResolvedMcpServer>,
     mcp_registry: Arc<McpRegistry>,
     agy_mcp_notice_shown: bool,
+    agent_lifecycle: HashMap<Agent, AgentLifecycleState>,
 }
 
 impl App {
@@ -840,6 +883,7 @@ impl App {
             mcp_servers,
             mcp_registry,
             agy_mcp_notice_shown: false,
+            agent_lifecycle: HashMap::new(),
         };
         app.restore_snapshot(snapshot);
         Ok(app)
@@ -993,6 +1037,16 @@ impl App {
                         let _ = reply.send(result);
                         changed = true;
                     }
+                    DashboardCommand::SubmitPrompt {
+                        text,
+                        agent,
+                        mode,
+                        reply,
+                    } => {
+                        let result = self.handle_dashboard_submit_prompt(text, agent, mode);
+                        let _ = reply.send(result);
+                        changed = true;
+                    }
                 }
             }
             self.dashboard_commands = Some(rx);
@@ -1000,9 +1054,75 @@ impl App {
         changed
     }
 
+    fn handle_dashboard_submit_prompt(
+        &mut self,
+        text: String,
+        agent: Option<String>,
+        mode: Option<String>,
+    ) -> Result<PromptAccepted, RunTodoError> {
+        let target_agent = if let Some(ref agent_str) = agent {
+            let runner_clean = agent_str.trim().to_ascii_lowercase();
+            let adapter = self
+                .adapters
+                .iter()
+                .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean);
+            let Some(adapter) = adapter else {
+                return Err(RunTodoError::UnknownAgent(agent_str.clone()));
+            };
+            adapter.agent()
+        } else {
+            self.adapters[self.selected].agent()
+        };
+
+        let runner_id = runner_name(target_agent);
+        if let Some(allowed) = &self.settings.graph_allowed_runners {
+            if allowed.is_empty() {
+                return Err(RunTodoError::Forbidden("no allowed runners".to_owned()));
+            }
+            if !allowed
+                .iter()
+                .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim()))
+            {
+                return Err(RunTodoError::Forbidden(format!(
+                    "runner '{runner_id}' is not in allowed_runners"
+                )));
+            }
+        }
+
+        if self.busy_agents.contains(&target_agent) {
+            return Err(RunTodoError::Busy(format!("agent '{runner_id}' is busy")));
+        }
+
+        if let Some(ref mode_str) = mode {
+            let exec_mode = match mode_str.trim().to_ascii_lowercase().as_str() {
+                "ask" => Some(ExecutionMode::Ask),
+                "plan" => Some(ExecutionMode::Plan),
+                "implement" => Some(ExecutionMode::Implement),
+                _ => None,
+            };
+            if let Some(m) = exec_mode
+                && let Err(err) = self.set_agent_mode(target_agent, m)
+            {
+                return Err(RunTodoError::Internal(err));
+            }
+        }
+
+        self.selected = adapter_index(target_agent);
+        self.input = text;
+        self.submit_prompt();
+
+        Ok(PromptAccepted {
+            conversation_id: self.conversation_id.as_str().to_owned(),
+            agent: runner_id.to_owned(),
+        })
+    }
+
     fn drain_agent_events(&mut self) -> DrainEventsOutcome {
         let mut outcome = DrainEventsOutcome::default();
         while let Ok(output) = self.event_rx.try_recv() {
+            if matches!(output.event, AgentEvent::Error(_)) {
+                outcome.errored = true;
+            }
             let terminal = matches!(
                 output.event,
                 AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_)
@@ -1032,7 +1152,12 @@ impl App {
                     return false;
                 }
 
+                if let Some(hub) = &self.dashboard {
+                    hub.note_runner_activity(&self.agent_runner_name(output.agent));
+                }
+
                 self.observe_activity(output.agent, &output.event, Instant::now());
+                self.on_agent_lifecycle_event(output.agent, &output.event);
 
                 let Some(event) = stored_event(&output.event) else {
                     self.apply_agent_event(output.agent, output.event);
@@ -1826,7 +1951,7 @@ impl App {
         self.pending_images.paths()
     }
 
-    fn submit_prompt(&mut self) {
+    pub fn submit_prompt(&mut self) {
         if self.input.trim().is_empty() {
             return;
         }
@@ -2200,6 +2325,9 @@ impl App {
                     agent,
                     AgentActivity::queued(ActivityKind::Turn, Instant::now()),
                 );
+                self.agent_lifecycle
+                    .insert(agent, AgentLifecycleState::default());
+                self.emit_agent_lifecycle(agent, "pending", None);
                 Ok(stored_turn_id)
             }
             Err(error) => {
@@ -2829,6 +2957,23 @@ impl App {
         success: bool,
         error: Option<String>,
     ) {
+        if self
+            .activities
+            .get(&agent)
+            .is_some_and(|activity| activity.kind == ActivityKind::Turn)
+        {
+            if success {
+                self.emit_agent_lifecycle(agent, "completed", None);
+            } else if error.as_deref() == Some("cancelled") {
+                self.emit_agent_lifecycle(agent, "cancelled", None);
+            } else {
+                let message = error
+                    .as_ref()
+                    .map(|text| Self::truncate_agent_lifecycle_message(text.clone()));
+                self.emit_agent_lifecycle(agent, "error", message);
+            }
+        }
+        self.agent_lifecycle.remove(&agent);
         self.busy_agents.remove(&agent);
         self.activities.remove(&agent);
         let active_turn = self.active_turns.remove(&agent);
@@ -3423,6 +3568,105 @@ impl App {
         }
     }
 
+    fn truncate_agent_lifecycle_message(message: String) -> String {
+        if message.chars().count() <= AGENT_LIFECYCLE_ERROR_CHARS {
+            return message;
+        }
+        message.chars().take(AGENT_LIFECYCLE_ERROR_CHARS).collect()
+    }
+
+    fn emit_agent_lifecycle(&mut self, agent: Agent, to_state: &str, message: Option<String>) {
+        if self
+            .activities
+            .get(&agent)
+            .is_some_and(|activity| activity.kind == ActivityKind::Summary)
+        {
+            return;
+        }
+        let Some(hub) = self.dashboard.clone() else {
+            return;
+        };
+        let Some(active) = self.active_turns.get(&agent).cloned() else {
+            return;
+        };
+        let runner = self.agent_runner_name(agent);
+        let lifecycle = self.agent_lifecycle.entry(agent).or_default();
+        if lifecycle.last_to_state == to_state && to_state != "running" {
+            return;
+        }
+        let from_state = if lifecycle.last_to_state.is_empty() {
+            "idle".to_owned()
+        } else {
+            lifecycle.last_to_state.clone()
+        };
+        let todo = self
+            .todo_turns
+            .get(&(agent, active.turn_id.clone()))
+            .cloned();
+        let node = self.graph_agent_nodes.get(&agent).cloned();
+        let model = self
+            .model_catalogs
+            .get(&agent)
+            .and_then(|catalog| catalog.selected.clone());
+        hub.emit_event(EventDraft {
+            kind: "agent".to_owned(),
+            task: Some(active.conversation_id.as_str().to_owned()),
+            todo,
+            node,
+            runner: Some(runner),
+            model,
+            from_state: Some(from_state),
+            to_state: to_state.to_owned(),
+            message,
+        });
+        lifecycle.last_to_state = to_state.to_owned();
+    }
+
+    fn on_agent_lifecycle_event(&mut self, agent: Agent, event: &AgentEvent) {
+        if self
+            .activities
+            .get(&agent)
+            .is_some_and(|activity| activity.kind == ActivityKind::Summary)
+        {
+            return;
+        }
+        match event {
+            AgentEvent::Started => {
+                self.emit_agent_lifecycle(agent, "started", None);
+                if let Some(lifecycle) = self.agent_lifecycle.get_mut(&agent) {
+                    lifecycle.last_running_phase = None;
+                }
+            }
+            AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_) => {}
+            _ => self.maybe_emit_agent_running_phase(agent),
+        }
+    }
+
+    fn maybe_emit_agent_running_phase(&mut self, agent: Agent) {
+        if !self.busy_agents.contains(&agent) {
+            return;
+        }
+        let Some(activity) = self.activities.get(&agent) else {
+            return;
+        };
+        if activity.kind != ActivityKind::Turn {
+            return;
+        }
+        let phase = activity.phase.label().to_owned();
+        let duplicate = self
+            .agent_lifecycle
+            .get(&agent)
+            .and_then(|lifecycle| lifecycle.last_running_phase.as_deref())
+            == Some(&phase);
+        if duplicate {
+            return;
+        }
+        self.emit_agent_lifecycle(agent, "running", Some(phase.clone()));
+        if let Some(lifecycle) = self.agent_lifecycle.get_mut(&agent) {
+            lifecycle.last_running_phase = Some(phase);
+        }
+    }
+
     pub(crate) fn compute_agent_color(&self, agent: Agent) -> Color {
         let runner_name = self.agent_runner_name(agent);
         let custom_color = match agent {
@@ -3506,6 +3750,347 @@ impl App {
         }
 
         hub.publish(agents, graph);
+    }
+
+    /// Attaches the to-do store without reconciling stale runs or attaching a command channel.
+    pub fn attach_todo_store(&mut self, store: Arc<TodoStore>) {
+        self.todo_store = Some(store);
+    }
+
+    /// Runs a prompt or to-do headlessly without terminal I/O (SPEC-agent-api FR-761, FR-762).
+    pub async fn run_headless(
+        &mut self,
+        req: HeadlessRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> HeadlessOutcome {
+        if let Some(ref agent_str) = req.agent {
+            let runner_clean = agent_str.trim().to_ascii_lowercase();
+            let adapter = self
+                .adapters
+                .iter()
+                .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean);
+            let Some(adapter) = adapter else {
+                return HeadlessOutcome {
+                    ok: false,
+                    exit_code: 3,
+                    conversation_id: self.conversation_id.as_str().to_owned(),
+                    agent: Some(agent_str.clone()),
+                    graph_id: None,
+                    text: String::new(),
+                    messages: Vec::new(),
+                    error: Some(format!("unknown agent '{agent_str}'")),
+                    todo: None,
+                };
+            };
+            let target_agent = adapter.agent();
+            let runner_id = runner_name(target_agent);
+            if let Some(allowed) = &self.settings.graph_allowed_runners
+                && (allowed.is_empty()
+                    || !allowed
+                        .iter()
+                        .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim())))
+            {
+                return HeadlessOutcome {
+                    ok: false,
+                    exit_code: 5,
+                    conversation_id: self.conversation_id.as_str().to_owned(),
+                    agent: Some(runner_id.to_owned()),
+                    graph_id: None,
+                    text: String::new(),
+                    messages: Vec::new(),
+                    error: Some(format!("runner '{runner_id}' is not in allowed_runners")),
+                    todo: None,
+                };
+            }
+            self.selected = adapter_index(target_agent);
+        } else if !req.graph {
+            let target_agent = self.adapters[self.selected].agent();
+            let runner_id = runner_name(target_agent);
+            if let Some(allowed) = &self.settings.graph_allowed_runners
+                && (allowed.is_empty()
+                    || !allowed
+                        .iter()
+                        .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim())))
+            {
+                return HeadlessOutcome {
+                    ok: false,
+                    exit_code: 5,
+                    conversation_id: self.conversation_id.as_str().to_owned(),
+                    agent: Some(runner_id.to_owned()),
+                    graph_id: None,
+                    text: String::new(),
+                    messages: Vec::new(),
+                    error: Some(format!("runner '{runner_id}' is not in allowed_runners")),
+                    todo: None,
+                };
+            }
+        }
+
+        let target_agent = self.adapters[self.selected].agent();
+        if let Some(mode) = req.mode
+            && let Err(msg) = self.set_agent_mode(target_agent, mode)
+        {
+            return HeadlessOutcome {
+                ok: false,
+                exit_code: 6,
+                conversation_id: self.conversation_id.as_str().to_owned(),
+                agent: Some(runner_name(target_agent).to_owned()),
+                graph_id: None,
+                text: String::new(),
+                messages: Vec::new(),
+                error: Some(msg),
+                todo: None,
+            };
+        }
+
+        if req.graph {
+            self.settings.graph_enabled = true;
+        }
+        if req.agent.is_some() {
+            self.settings.graph_enabled = false;
+        }
+
+        let headless_title = {
+            let suffix = if let Some(todo_id) = &req.todo_id {
+                todo_id.chars().take(40).collect::<String>()
+            } else {
+                req.prompt.trim().chars().take(40).collect::<String>()
+            };
+            format!("headless: {suffix}")
+        };
+        self.create_conversation(Some(headless_title));
+        let headless_conversation_id = self.conversation_id.as_str().to_owned();
+
+        let start_msg_count = self.messages.len();
+
+        if let Some(ref todo_id) = req.todo_id {
+            let mode = if req.graph {
+                RunMode::Graph
+            } else {
+                RunMode::Agent {
+                    agent: runner_name(self.adapters[self.selected].agent()).to_owned(),
+                }
+            };
+            if let Err(err) = self.run_todo(todo_id, mode) {
+                let (exit_code, msg) = match err {
+                    RunTodoError::NotFound => (3, "to-do not found".to_owned()),
+                    RunTodoError::UnknownAgent(agent) => (3, format!("unknown agent '{agent}'")),
+                    RunTodoError::AlreadyRunning => (4, "to-do is already running".to_owned()),
+                    RunTodoError::Busy(msg) => (4, msg),
+                    RunTodoError::Forbidden(msg) => (5, msg),
+                    RunTodoError::Internal(msg) => (6, msg),
+                };
+                return HeadlessOutcome {
+                    ok: false,
+                    exit_code,
+                    conversation_id: self.conversation_id.as_str().to_owned(),
+                    agent: Some(runner_name(self.adapters[self.selected].agent()).to_owned()),
+                    graph_id: None,
+                    text: String::new(),
+                    messages: Vec::new(),
+                    error: Some(msg),
+                    todo: None,
+                };
+            }
+        } else {
+            self.input = req.prompt.clone();
+            self.submit_prompt();
+        }
+
+        let is_sync_slash = req.todo_id.is_none()
+            && req.prompt.trim_start().starts_with('/')
+            && !req.prompt.trim_start().starts_with("//")
+            && !first_token_is_path(req.prompt.trim_start());
+
+        let mut turn_started = req.todo_id.is_some()
+            || is_sync_slash
+            || !self.busy_agents.is_empty()
+            || self.graph_session.is_some()
+            || self.pending_summary.is_some()
+            || !self.deferred_turns.is_empty();
+
+        let mut last_session_heartbeat = Instant::now();
+        let mut last_busy_tick = Instant::now();
+        let mut last_publish = Instant::now();
+        let mut dashboard_dirty = false;
+        let mut dirty = false;
+        let mut had_agent_error = false;
+        let mut last_graph_id: Option<String> = None;
+        let mut cancelled = false;
+
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                cancelled = true;
+                for &agent in &self.busy_agents {
+                    let idx = adapter_index(agent);
+                    if idx < self.adapters.len() {
+                        let _ = self.adapters[idx].cancel();
+                    }
+                }
+                let drain_start = Instant::now();
+                while (!self.busy_agents.is_empty()
+                    || self.graph_session.is_some()
+                    || self.pending_summary.is_some()
+                    || !self.deferred_turns.is_empty())
+                    && drain_start.elapsed() < Duration::from_secs(5)
+                {
+                    self.drain_dashboard_commands();
+                    let drain = self.drain_agent_events();
+                    if drain.errored {
+                        had_agent_error = true;
+                    }
+                    self.tick();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                break;
+            }
+
+            if last_session_heartbeat.elapsed() >= Duration::from_secs(5) {
+                if let Err(error) = self.engine.touch_session() {
+                    self.push_system(format!(
+                        "Could not refresh the DmuxAI runtime session: {error}"
+                    ));
+                }
+                last_session_heartbeat = Instant::now();
+                dirty = true;
+            }
+
+            if last_busy_tick.elapsed() >= Duration::from_secs(1) {
+                if self.tick() {
+                    dirty = true;
+                }
+                last_busy_tick = Instant::now();
+            }
+
+            let cmd_changed = self.drain_dashboard_commands();
+            let drain = self.drain_agent_events();
+            if drain.errored {
+                had_agent_error = true;
+            }
+            dirty |= cmd_changed || drain.changed || self.dirty;
+            self.dirty = false;
+
+            dashboard_dirty |= drain.changed || dirty;
+            let busy = !self.busy_agents.is_empty();
+            if drain.completed
+                || (dashboard_dirty && last_publish.elapsed() >= DASHBOARD_PUBLISH_MIN_INTERVAL)
+                || (busy && last_publish.elapsed() >= DASHBOARD_BUSY_INTERVAL)
+            {
+                self.publish_dashboard();
+                last_publish = Instant::now();
+                dashboard_dirty = false;
+            }
+
+            if let Some(session) = &self.graph_session {
+                last_graph_id = Some(session.run().plan.id.clone());
+            }
+
+            if !self.busy_agents.is_empty()
+                || self.graph_session.is_some()
+                || self.pending_summary.is_some()
+                || !self.deferred_turns.is_empty()
+            {
+                turn_started = true;
+            }
+
+            let any_busy = !self.busy_agents.is_empty();
+            let has_graph = self.graph_session.is_some();
+            let has_summary = self.pending_summary.is_some();
+            let has_deferred = !self.deferred_turns.is_empty();
+
+            if (!any_busy && !has_graph && !has_summary && !has_deferred)
+                && (turn_started || self.messages.len() > start_msg_count)
+            {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let mut mapped_messages = Vec::new();
+        for msg in &self.messages[start_msg_count..] {
+            match &msg.role {
+                Role::User => mapped_messages.push(HeadlessMessage {
+                    role: "user".to_owned(),
+                    agent: None,
+                    content: msg.content.clone(),
+                }),
+                Role::Agent(agent) => mapped_messages.push(HeadlessMessage {
+                    role: "agent".to_owned(),
+                    agent: Some(runner_name(*agent).to_owned()),
+                    content: msg.content.clone(),
+                }),
+                Role::System => mapped_messages.push(HeadlessMessage {
+                    role: "system".to_owned(),
+                    agent: None,
+                    content: msg.content.clone(),
+                }),
+                Role::Activity(_) => {}
+            }
+        }
+
+        let agent_texts: Vec<&str> = mapped_messages
+            .iter()
+            .filter(|m| m.role == "agent")
+            .map(|m| m.content.as_str())
+            .collect();
+        let text = agent_texts.join("\n\n");
+
+        let todo = if let Some(ref todo_id) = req.todo_id {
+            if let Some(store) = self.todo_store.as_ref() {
+                if cancelled
+                    && let Ok(current_todo) = store.get(todo_id)
+                    && current_todo.status == TodoStatus::Running
+                {
+                    let _ = store.finish_run(todo_id, false, Some("cancelled".to_owned()));
+                }
+                store.get(todo_id).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let graph_failed = last_graph_id.as_ref().is_some_and(|graph_id| {
+            self.last_graph_run
+                .as_ref()
+                .is_some_and(|run| run.plan.id == *graph_id && run.phase == GraphRunPhase::Failed)
+        });
+
+        let last_system_error = self.messages[start_msg_count..]
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::System)
+            .map(|m| m.content.clone());
+
+        let (ok, exit_code, error) = if cancelled {
+            (
+                false,
+                130,
+                last_system_error.or_else(|| Some("cancelled".to_owned())),
+            )
+        } else if had_agent_error || graph_failed {
+            (
+                false,
+                1,
+                last_system_error.or_else(|| Some("run failed".to_owned())),
+            )
+        } else {
+            (true, 0, None)
+        };
+
+        HeadlessOutcome {
+            ok,
+            exit_code,
+            conversation_id: headless_conversation_id,
+            agent: Some(runner_name(self.adapters[self.selected].agent()).to_owned()),
+            graph_id: last_graph_id,
+            text,
+            messages: mapped_messages,
+            error,
+            todo,
+        }
     }
 
     /// Attaches the to-do store and dashboard command channel, reconciles any
@@ -5467,6 +6052,42 @@ mod tests {
         app.selected = adapter_index(Agent::Codex);
         app.color_enabled = true;
         (app, sent, cancelled)
+    }
+
+    fn test_app_with_event_sender() -> (App, SentRequests, mpsc::Sender<AgentOutput>) {
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let adapters = Agent::all()
+            .into_iter()
+            .map(|agent| {
+                Box::new(RecordingAdapter {
+                    agent,
+                    sent: Arc::clone(&sent),
+                    cancelled: Arc::clone(&cancelled),
+                    fail_send: false,
+                    unsupported_mode: None,
+                }) as Box<dyn AgentAdapter>
+            })
+            .collect();
+        let (event_tx, event_rx) = event_channel();
+
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            workspace,
+            DmuxSettings::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        app.selected = adapter_index(Agent::Codex);
+        app.color_enabled = true;
+        (app, sent, event_tx)
     }
 
     fn test_app_with_unsupported_mode(
@@ -9912,6 +10533,355 @@ mod tests {
             .filter(|m| m.role == Role::System && m.content.contains("agy mcp add test-server"))
             .count();
         assert_eq!(notice_count, 1, "AGY notice should only be shown once");
+    }
+
+    // TC-761 / FR-761: a completed turn yields ok=true, exit 0, text contains the streamed delta
+    #[tokio::test]
+    async fn headless_run_returns_agent_text() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let conv_before = app.conversation_id.as_str().to_owned();
+        app.last_graph_run = Some(GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "graph.v1".to_owned(),
+                id: "stale-graph".to_owned(),
+                orchestrator_model: "gpt".to_owned(),
+                user_prompt: "stale".to_owned(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                limits: dmuxai::graph::GraphLimits {
+                    max_parallel: 1,
+                    max_retries: 0,
+                },
+            },
+            conversation_id: conv_before.clone(),
+            phase: GraphRunPhase::Failed,
+            waiting_gate_node: None,
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("Hello from headless codex!".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "Say hello".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: Some(ExecutionMode::Ask),
+            graph: false,
+            todo_id: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(outcome.ok);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.agent.as_deref(), Some("codex"));
+        assert_ne!(outcome.conversation_id, conv_before);
+        assert!(outcome.text.contains("Hello from headless codex!"));
+        assert!(
+            outcome
+                .messages
+                .iter()
+                .any(|m| m.role == "agent" && m.content.contains("Hello from headless codex!"))
+        );
+    }
+
+    // TC-762 / NFR-762: rejects unknown and disallowed agent
+    #[tokio::test]
+    async fn headless_run_rejects_unknown_and_disallowed_agent() {
+        let (mut app, _sent) = test_app();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // Unknown agent -> exit 3
+        let req = HeadlessRequest {
+            prompt: "hello".to_owned(),
+            agent: Some("nonexistent_agent".to_owned()),
+            mode: None,
+            graph: false,
+            todo_id: None,
+        };
+        let outcome = app.run_headless(req, Arc::clone(&cancel)).await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.exit_code, 3);
+        assert!(outcome.error.as_deref().unwrap().contains("unknown agent"));
+
+        // Disallowed runner under allowed_runners -> exit 5
+        app.settings.graph_allowed_runners = Some(vec!["cursor".to_owned()]);
+        let req = HeadlessRequest {
+            prompt: "hello".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            todo_id: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.exit_code, 5);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("runner 'codex' is not in allowed_runners")
+        );
+    }
+
+    // TC-761 / FR-761: an agent error yields ok=false and exit 1.
+    #[tokio::test]
+    async fn headless_run_reports_agent_error() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Error("fatal adapter error".to_owned()),
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "Do work".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            todo_id: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.exit_code, 1);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("fatal adapter error")
+        );
+    }
+
+    // TC-761 / FR-761: cancelling a headless run cancels the busy agent and exits 130.
+    #[tokio::test]
+    async fn headless_run_cancel_exits_130() {
+        let (mut app, sent, _event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel);
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                if !sent_clone.lock().unwrap().is_empty() {
+                    cancel_clone.store(true, Ordering::Relaxed);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let req = HeadlessRequest {
+            prompt: "Never finishes".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: Some(ExecutionMode::Ask),
+            graph: false,
+            todo_id: None,
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(20), app.run_headless(req, cancel))
+            .await
+            .expect("cancelled run returns");
+        assert!(!outcome.ok);
+        assert_eq!(outcome.exit_code, 130);
+    }
+
+    // TC-775 / FR-768: agent lifecycle events are appended through the hub sink.
+    #[tokio::test]
+    async fn app_emits_agent_lifecycle_events() {
+        use dmuxai::events::{EventLog, EventSink, events_path, read_since};
+        use dmuxai::web::SnapshotSource;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::open(dir.path(), dir.path().display().to_string());
+        let sink = EventSink::new(log, Duration::ZERO, None);
+        let hub =
+            dmuxai::web::DashboardHub::new(SnapshotSource::Tui, dir.path().display().to_string())
+                .with_events(sink);
+
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        app.attach_dashboard(hub);
+
+        let sent_clone = Arc::clone(&sent);
+        let event_tx_error = event_tx.clone();
+        tokio::spawn(async move {
+            let mut saw_turn = false;
+            for _ in 0..200 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.get(if saw_turn { 1 } else { 0 }).cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    if !saw_turn {
+                        let _ = event_tx
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conv_id.clone()),
+                                turn_id: Some(turn_id.clone()),
+                                event: AgentEvent::Started,
+                            })
+                            .await;
+                        let _ = event_tx
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conv_id.clone()),
+                                turn_id: Some(turn_id.clone()),
+                                event: AgentEvent::TextDelta("working".to_owned()),
+                            })
+                            .await;
+                        let _ = event_tx
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conv_id),
+                                turn_id: Some(turn_id),
+                                event: AgentEvent::Completed,
+                            })
+                            .await;
+                        saw_turn = true;
+                    } else {
+                        let _ = event_tx_error
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conv_id),
+                                turn_id: Some(turn_id),
+                                event: AgentEvent::Error("boom".to_owned()),
+                            })
+                            .await;
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        app.input = "first turn".to_owned();
+        app.submit_prompt();
+        for _ in 0..200 {
+            app.drain_agent_events();
+            if app.busy_agents.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        app.input = "second turn".to_owned();
+        app.submit_prompt();
+        for _ in 0..200 {
+            app.drain_agent_events();
+            if app.busy_agents.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let events = read_since(&events_path(dir.path()), 0, None)
+            .into_iter()
+            .filter(|record| record.kind == "agent")
+            .collect::<Vec<_>>();
+        let states = events
+            .iter()
+            .map(|record| record.to_state.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            states,
+            &[
+                "pending",
+                "started",
+                "running",
+                "completed",
+                "pending",
+                "error",
+            ]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|record| record.runner.as_deref() == Some("codex"))
+        );
+        assert!(
+            events
+                .iter()
+                .find(|record| record.to_state == "error")
+                .and_then(|record| record.message.as_deref())
+                == Some("boom")
+        );
+    }
+
+    // TC-766: dashboard submit prompt behaves like Enter
+    #[tokio::test]
+    async fn dashboard_submit_prompt_runs_like_enter() {
+        let (mut app, sent) = test_app();
+        let (tx, rx_cmd) = mpsc::channel(16);
+        app.dashboard_commands = Some(rx_cmd);
+
+        let (reply, rx_reply) = tokio::sync::oneshot::channel();
+        tx.send(DashboardCommand::SubmitPrompt {
+            text: "hello from dashboard".to_string(),
+            agent: Some("codex".to_string()),
+            mode: Some("ask".to_string()),
+            reply,
+        })
+        .await
+        .unwrap();
+
+        assert!(app.drain_dashboard_commands());
+
+        let accepted = rx_reply.await.unwrap().unwrap();
+        assert_eq!(accepted.agent, "codex");
+        assert_eq!(accepted.conversation_id, app.conversation_id.as_str());
+
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, Agent::Codex);
+        assert!(requests[0].1.prompt.contains("hello from dashboard"));
+        assert_eq!(app.modes[&Agent::Codex], ExecutionMode::Ask);
     }
 }
 

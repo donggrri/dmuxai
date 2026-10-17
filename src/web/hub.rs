@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
+use crate::events::{EventDraft, EventSink};
 use crate::graph::GraphNodeStatus;
 use crate::todo::Todo;
 use crate::web::snapshot::{
@@ -25,6 +26,7 @@ struct HubState {
 pub struct DashboardHub {
     state: Arc<Mutex<HubState>>,
     watch_tx: Arc<watch::Sender<DashboardSnapshot>>,
+    events: Option<Arc<EventSink>>,
 }
 
 impl DashboardHub {
@@ -57,6 +59,7 @@ impl DashboardHub {
                 snapshot: initial_snapshot,
             })),
             watch_tx: Arc::new(tx),
+            events: None,
         }
     }
 
@@ -69,76 +72,121 @@ impl DashboardHub {
     }
 
     pub fn publish_at(&self, agents: Vec<AgentView>, mut graph: Option<GraphView>, now_ms: u64) {
-        let mut state = self.state.lock().unwrap();
+        let changed_snapshot = {
+            let mut state = self.state.lock().unwrap();
 
-        let new_graph_id = graph.as_ref().map(|g| g.id.clone());
-        if new_graph_id != state.current_graph_id {
-            state.timings.clear();
-            state.current_graph_id = new_graph_id;
-        }
-
-        if let Some(ref mut g) = graph {
-            for node in &mut g.nodes {
-                let timing = state
-                    .timings
-                    .entry(node.id.clone())
-                    .or_insert_with(|| NodeTiming {
-                        attempt: node.attempt,
-                        started_at_ms: None,
-                        finished_at_ms: None,
-                    });
-
-                if timing.attempt != node.attempt {
-                    timing.attempt = node.attempt;
-                    timing.started_at_ms = None;
-                    timing.finished_at_ms = None;
-                }
-
-                if node.status == GraphNodeStatus::Running && timing.started_at_ms.is_none() {
-                    timing.started_at_ms = Some(now_ms);
-                }
-                if matches!(
-                    node.status,
-                    GraphNodeStatus::Completed | GraphNodeStatus::Failed | GraphNodeStatus::Skipped
-                ) && timing.finished_at_ms.is_none()
-                {
-                    timing.finished_at_ms = Some(now_ms);
-                }
-
-                node.started_at_ms = timing.started_at_ms;
-                node.finished_at_ms = timing.finished_at_ms;
-                node.elapsed_ms = match (timing.started_at_ms, timing.finished_at_ms) {
-                    (Some(start), Some(finish)) => Some(finish.saturating_sub(start)),
-                    _ => None,
-                };
+            let new_graph_id = graph.as_ref().map(|g| g.id.clone());
+            if new_graph_id != state.current_graph_id {
+                state.timings.clear();
+                state.current_graph_id = new_graph_id;
             }
-        }
 
-        let content_changed = state.snapshot.agents != agents || state.snapshot.graph != graph;
-        if content_changed {
-            state.snapshot.revision += 1;
-            state.snapshot.generated_at_ms = now_ms;
-            state.snapshot.agents = agents;
-            state.snapshot.graph = graph;
-            let _ = self.watch_tx.send_replace(state.snapshot.clone());
+            if let Some(ref mut g) = graph {
+                for node in &mut g.nodes {
+                    let timing =
+                        state
+                            .timings
+                            .entry(node.id.clone())
+                            .or_insert_with(|| NodeTiming {
+                                attempt: node.attempt,
+                                started_at_ms: None,
+                                finished_at_ms: None,
+                            });
+
+                    if timing.attempt != node.attempt {
+                        timing.attempt = node.attempt;
+                        timing.started_at_ms = None;
+                        timing.finished_at_ms = None;
+                    }
+
+                    if node.status == GraphNodeStatus::Running && timing.started_at_ms.is_none() {
+                        timing.started_at_ms = Some(now_ms);
+                    }
+                    if matches!(
+                        node.status,
+                        GraphNodeStatus::Completed
+                            | GraphNodeStatus::Failed
+                            | GraphNodeStatus::Skipped
+                    ) && timing.finished_at_ms.is_none()
+                    {
+                        timing.finished_at_ms = Some(now_ms);
+                    }
+
+                    node.started_at_ms = timing.started_at_ms;
+                    node.finished_at_ms = timing.finished_at_ms;
+                    node.elapsed_ms = match (timing.started_at_ms, timing.finished_at_ms) {
+                        (Some(start), Some(finish)) => Some(finish.saturating_sub(start)),
+                        _ => None,
+                    };
+                }
+            }
+
+            let content_changed = state.snapshot.agents != agents || state.snapshot.graph != graph;
+            if content_changed {
+                state.snapshot.revision += 1;
+                state.snapshot.generated_at_ms = now_ms;
+                state.snapshot.agents = agents;
+                state.snapshot.graph = graph;
+                let _ = self.watch_tx.send_replace(state.snapshot.clone());
+                Some(state.snapshot.clone())
+            } else {
+                None
+            }
+        };
+
+        // State changes are observed after the state mutex is released so event
+        // writing can never stall the publisher (FR-768).
+        if let Some(snapshot) = changed_snapshot
+            && let Some(sink) = &self.events
+        {
+            sink.observe_snapshot(&snapshot);
         }
     }
 
     /// Replaces the to-do list, bumping the revision only when it changes
     /// (FR-541). Agent/graph content is preserved.
     pub fn set_todos(&self, todos: Vec<Todo>) {
-        let mut state = self.state.lock().unwrap();
-        if state.snapshot.todos == todos {
-            return;
+        let changed_snapshot = {
+            let mut state = self.state.lock().unwrap();
+            if state.snapshot.todos == todos {
+                return;
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            state.snapshot.todos = todos;
+            state.snapshot.revision += 1;
+            state.snapshot.generated_at_ms = now_ms;
+            let _ = self.watch_tx.send_replace(state.snapshot.clone());
+            state.snapshot.clone()
+        };
+
+        if let Some(sink) = &self.events {
+            sink.observe_snapshot(&changed_snapshot);
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        state.snapshot.todos = todos;
-        state.snapshot.revision += 1;
-        state.snapshot.generated_at_ms = now_ms;
-        let _ = self.watch_tx.send_replace(state.snapshot.clone());
+    }
+
+    /// Attaches an event sink so snapshot changes are appended to the log.
+    pub fn with_events(mut self, sink: Arc<EventSink>) -> Self {
+        self.events = Some(sink);
+        self
+    }
+
+    pub fn events(&self) -> Option<Arc<EventSink>> {
+        self.events.clone()
+    }
+
+    pub fn emit_event(&self, draft: EventDraft) {
+        if let Some(sink) = &self.events {
+            sink.emit(vec![draft]);
+        }
+    }
+
+    pub fn note_runner_activity(&self, runner: &str) {
+        if let Some(sink) = &self.events {
+            sink.note_activity(runner);
+        }
     }
 
     /// Sets or updates the UI theme preferences in the snapshot (FR-603).
@@ -398,5 +446,51 @@ mod tests {
             .find(|a| a["id"] == "cursor")
             .expect("cursor agent present");
         assert_eq!(cursor["color"], "#000080");
+    }
+
+    // TC-769 / FR-768: a content change on the hub feeds the attached event
+    // sink, while the baseline publish and repeats emit nothing.
+    #[test]
+    fn hub_with_events_emits_on_transition() {
+        use crate::events::{EventLog, EventSink, events_path, read_since};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::open(dir.path(), dir.path().display().to_string());
+        let sink = EventSink::new(log.clone(), Duration::ZERO, None);
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string())
+            .with_events(sink.clone());
+
+        assert_eq!(hub.events().map(|s| s.log().last_seq()), Some(0));
+
+        // Baseline publish establishes the tracker's starting state.
+        hub.publish_at(
+            Vec::new(),
+            Some(make_test_graph("g1", GraphNodeStatus::Ready)),
+            1000,
+        );
+        assert_eq!(log.last_seq(), 0, "baseline publish emits no event");
+
+        // Same content again: still no event.
+        hub.publish_at(
+            Vec::new(),
+            Some(make_test_graph("g1", GraphNodeStatus::Ready)),
+            2000,
+        );
+        assert_eq!(log.last_seq(), 0);
+
+        // Node ready -> running produces exactly one event.
+        hub.publish_at(
+            Vec::new(),
+            Some(make_test_graph("g1", GraphNodeStatus::Running)),
+            3000,
+        );
+
+        let events = read_since(&events_path(dir.path()), 0, None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "node");
+        assert_eq!(events[0].task.as_deref(), Some("g1"));
+        assert_eq!(events[0].node.as_deref(), Some("node-1"));
+        assert_eq!(events[0].to_state, "running");
     }
 }

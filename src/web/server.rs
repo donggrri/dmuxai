@@ -6,7 +6,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRequest, Path, Request, State};
+use axum::extract::{FromRequest, Path, Query, Request, State};
 use axum::http::header::HeaderName;
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
@@ -16,9 +16,8 @@ use axum::routing::{get, patch, post};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::Stream;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::WatchStream;
+use tokio_stream::wrappers::{UnboundedReceiverStream, WatchStream};
 
 use crate::mcp::registry::{ImportError, McpRegistry};
 use crate::memory::{MemoryError, MemoryHandle, Proposal, SaveOutcome};
@@ -43,6 +42,8 @@ pub struct DashboardServices {
     pub web_attached: bool,
     /// Obsidian memory (SPEC-obsidian-memory FR-727); `None` = disabled.
     pub memory: Option<crate::memory::MemoryHandle>,
+    /// Shared workspace event log for `GET /api/events/log` and SSE tailing.
+    pub events_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -403,16 +404,136 @@ async fn get_state(State(state): State<AppState>) -> Response {
     }
 }
 
+#[derive(serde::Deserialize, Default)]
+struct EventsQueryParams {
+    since: Option<String>,
+    limit: Option<String>,
+}
+
+fn parse_events_since(raw: Option<&str>, default: u64) -> Result<u64, StatusCode> {
+    match raw {
+        None | Some("") => Ok(default),
+        Some(value) => value.parse().map_err(|_| StatusCode::BAD_REQUEST),
+    }
+}
+
+fn parse_events_limit(raw: Option<&str>, default: usize, cap: usize) -> Result<usize, StatusCode> {
+    match raw {
+        None | Some("") => Ok(default),
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| StatusCode::BAD_REQUEST)
+            .map(|parsed| parsed.min(cap)),
+    }
+}
+
+fn state_change_sse_event(record: &crate::events::EventRecord) -> Result<Event, Infallible> {
+    let data = serde_json::to_string(record).unwrap_or_else(|_| "{}".to_owned());
+    Ok(Event::default()
+        .event("state-change")
+        .id(record.seq.to_string())
+        .data(data))
+}
+
+async fn get_events_log(
+    State(state): State<AppState>,
+    Query(params): Query<EventsQueryParams>,
+) -> Response {
+    let since = match parse_events_since(params.since.as_deref(), 0) {
+        Ok(since) => since,
+        Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid since"),
+    };
+    let limit = match parse_events_limit(params.limit.as_deref(), 200, 1000) {
+        Ok(limit) => limit,
+        Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid limit"),
+    };
+    let Some(path) = state.services.events_path.as_ref() else {
+        return json_ok(
+            StatusCode::OK,
+            &serde_json::json!({
+                "events": [],
+                "last_seq": since,
+            }),
+        );
+    };
+    let events = crate::events::read_since(path, since, Some(limit));
+    let last_seq = events.last().map(|record| record.seq).unwrap_or(since);
+    json_ok(
+        StatusCode::OK,
+        &serde_json::json!({
+            "events": events,
+            "last_seq": last_seq,
+        }),
+    )
+}
+
 async fn get_events(
     State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = WatchStream::new(state.hub.subscribe()).filter_map(|mut snapshot| {
-        snapshot.sent_at_ms = crate::web::snapshot::now_ms();
-        serde_json::to_string(&snapshot)
-            .ok()
-            .map(|json| Ok(Event::default().event("snapshot").data(json)))
+    Query(params): Query<EventsQueryParams>,
+) -> Response {
+    // Validate `since` even when no event log is configured.
+    let requested_since = match params.since.as_deref() {
+        None | Some("") => None,
+        Some(value) => match value.parse::<u64>() {
+            Ok(since) => Some(since),
+            Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid since"),
+        },
+    };
+    let tail = if let Some(path) = state.services.events_path.clone() {
+        let replay_since = requested_since.unwrap_or_else(|| crate::events::last_event_seq(&path));
+        Some((path, replay_since))
+    } else {
+        None
+    };
+
+    let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
+    let hub = state.hub.clone();
+    let snapshot_tx = tx.clone();
+    tokio::spawn(async move {
+        let mut watch_stream = WatchStream::new(hub.subscribe());
+        while let Some(mut snapshot) = watch_stream.next().await {
+            snapshot.sent_at_ms = crate::web::snapshot::now_ms();
+            if let Ok(json) = serde_json::to_string(&snapshot) {
+                let event = Event::default().event("snapshot").data(json);
+                if snapshot_tx.send(Ok(event)).is_err() {
+                    break;
+                }
+            }
+        }
     });
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+
+    if let Some((path, replay_since)) = tail {
+        tokio::spawn(async move {
+            let mut cursor = replay_since;
+            for record in crate::events::read_since(&path, cursor, None) {
+                cursor = record.seq;
+                if tx.send(state_change_sse_event(&record)).is_err() {
+                    return;
+                }
+            }
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            interval.tick().await;
+            loop {
+                // Stop polling once the client has gone away, even when no
+                // new events arrive to surface the closed channel.
+                if tx.is_closed() {
+                    return;
+                }
+                for record in crate::events::read_since(&path, cursor, None) {
+                    cursor = record.seq;
+                    if tx.send(state_change_sse_event(&record)).is_err() {
+                        return;
+                    }
+                }
+                interval.tick().await;
+            }
+        });
+    }
+
+    let stream = UnboundedReceiverStream::new(rx);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -629,6 +750,63 @@ async fn run_todo(
     json_ok(StatusCode::ACCEPTED, &result)
 }
 
+#[derive(serde::Deserialize)]
+struct PromptBody {
+    text: String,
+    agent: Option<String>,
+    mode: Option<String>,
+}
+
+async fn post_prompt(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<PromptBody>,
+) -> Response {
+    if body.text.trim().is_empty() {
+        return error_json(StatusCode::BAD_REQUEST, "text is required");
+    }
+
+    if let Some(ref mode) = body.mode {
+        let m = mode.trim().to_ascii_lowercase();
+        if !matches!(m.as_str(), "ask" | "plan" | "implement") {
+            return error_json(StatusCode::BAD_REQUEST, "invalid mode");
+        }
+    }
+
+    let Some(sender) = state.services.commands.clone() else {
+        return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
+    };
+
+    let (reply, rx) = oneshot::channel();
+    if sender
+        .send(DashboardCommand::SubmitPrompt {
+            text: body.text,
+            agent: body.agent,
+            mode: body.mode,
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
+    }
+
+    let result = match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Err(_) => return error_json(StatusCode::GATEWAY_TIMEOUT, "prompt accept timed out"),
+        Ok(Err(_)) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        Ok(Ok(Err(error))) => return run_error_response(error),
+        Ok(Ok(Ok(accepted))) => accepted,
+    };
+
+    json_ok(
+        StatusCode::ACCEPTED,
+        &serde_json::json!({
+            "accepted": true,
+            "conversation_id": result.conversation_id,
+            "agent": result.agent,
+        }),
+    )
+}
+
 fn run_error_response(error: RunTodoError) -> Response {
     match error {
         RunTodoError::Busy(message) => error_json(StatusCode::CONFLICT, &message),
@@ -824,11 +1002,13 @@ pub fn build_router_with(
             post(post_memory_proposal_reject),
         )
         .route("/api/events", get(get_events))
+        .route("/api/events/log", get(get_events_log))
         .route("/api/todos", get(list_todos).post(create_todo))
         .route("/api/todos/{id}", patch(update_todo).delete(delete_todo))
         .route("/api/todos/{id}/run", post(run_todo))
         .route("/api/mcp/servers", get(list_mcp_servers))
         .route("/api/import", post(import_todos))
+        .route("/api/prompt", post(post_prompt))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_and_auth_middleware,
@@ -897,6 +1077,7 @@ mod tests {
     use crate::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
     use crate::todo::{Todo, TodoStore};
     use crate::web::auth::generate_token;
+    use crate::web::commands::PromptAccepted;
     use crate::web::snapshot::{GraphCounts, GraphView, NodeDetail, NodeView, SnapshotSource};
 
     fn parse_sse_revisions(buf_str: &str) -> Vec<u64> {
@@ -1267,8 +1448,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         tokio::spawn(async move {
             while let Some(command) = rx.recv().await {
-                let DashboardCommand::RunTodo { reply, .. } = command;
-                let _ = reply.send(outcome.clone());
+                if let DashboardCommand::RunTodo { reply, .. } = command {
+                    let _ = reply.send(outcome.clone());
+                }
             }
         });
         tx
@@ -1281,9 +1463,24 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         tokio::spawn(async move {
             while let Some(command) = rx.recv().await {
-                let DashboardCommand::RunTodo { mode, reply, .. } = command;
-                seen.lock().unwrap().push(mode);
-                let _ = reply.send(outcome.clone());
+                if let DashboardCommand::RunTodo { mode, reply, .. } = command {
+                    seen.lock().unwrap().push(mode);
+                    let _ = reply.send(outcome.clone());
+                }
+            }
+        });
+        tx
+    }
+
+    fn spawn_prompt_reply(
+        outcome: Result<PromptAccepted, RunTodoError>,
+    ) -> mpsc::Sender<DashboardCommand> {
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                if let DashboardCommand::SubmitPrompt { reply, .. } = command {
+                    let _ = reply.send(outcome.clone());
+                }
             }
         });
         tx
@@ -1301,6 +1498,7 @@ mod tests {
             commands: None,
             mcp: None,
             web_attached: false,
+            events_path: None,
             memory: None,
         };
         let router = build_router_with(hub.clone(), token.clone(), allowed_localhost(), services);
@@ -1448,6 +1646,7 @@ mod tests {
             commands: None,
             mcp: None,
             web_attached: false,
+            events_path: None,
             memory: None,
         };
         let router = build_router_with(test_hub(), token.clone(), allowed_localhost(), services);
@@ -1584,6 +1783,7 @@ mod tests {
             token.clone(),
             allowed_localhost(),
             DashboardServices {
+                events_path: None,
                 todos: Some(store.clone()),
                 commands: None,
                 mcp: None,
@@ -1773,6 +1973,7 @@ mod tests {
                 )))),
                 mcp: None,
                 web_attached: false,
+                events_path: None,
                 memory: None,
             },
         );
@@ -1797,6 +1998,7 @@ mod tests {
                 commands: Some(spawn_reply(Ok(test_todo()))),
                 mcp: None,
                 web_attached: false,
+                events_path: None,
                 memory: None,
             },
         );
@@ -1827,6 +2029,7 @@ mod tests {
                 commands: None,
                 mcp: None,
                 web_attached: true,
+                events_path: None,
                 memory: None,
             },
         );
@@ -1857,6 +2060,7 @@ mod tests {
                 commands: Some(spawn_recording_reply(Ok(test_todo()), seen.clone())),
                 mcp: None,
                 web_attached: false,
+                events_path: None,
                 memory: None,
             },
         );
@@ -1876,6 +2080,317 @@ mod tests {
             RunMode::Agent { agent } => assert_eq!(agent, "codex"),
             other => panic!("expected agent mode, got {other:?}"),
         }
+    }
+
+    // TC-766 / FR-765: prompt route contract
+    #[tokio::test]
+    async fn prompt_route_contract() {
+        let token = "test-token-123".to_string();
+        let accepted = PromptAccepted {
+            conversation_id: "conv-1".to_string(),
+            agent: "codex".to_string(),
+        };
+        let router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                mcp: None,
+                todos: None,
+                commands: Some(spawn_prompt_reply(Ok(accepted))),
+                web_attached: false,
+                events_path: None,
+                memory: None,
+            },
+        );
+
+        // 1. 202 with a spawned reply double
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"hello world","agent":"codex","mode":"ask"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = read_body(resp).await;
+        let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(val["accepted"], true);
+        assert_eq!(val["conversation_id"], "conv-1");
+        assert_eq!(val["agent"], "codex");
+
+        // 2. 400 empty text
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"   "}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(read_body(resp).await.contains("text is required"));
+
+        // 3. 400 bad mode
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"hello","mode":"badmode"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(read_body(resp).await.contains("invalid mode"));
+
+        // 4. 409 without sender
+        let serve_router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices::default(),
+        );
+        let resp = serve_router
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"hello"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(read_body(resp).await.contains("requires dmuxai --web"));
+
+        // 5. 401 without token
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/prompt")
+            .header("Host", "localhost:7420")
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(r#"{"text":"hello"}"#))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 6. 403 foreign Origin
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/prompt")
+            .header("Host", "localhost:7420")
+            .header("Origin", "http://evil.example")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(r#"{"text":"hello"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // TC-767 / FR-766: REST catch-up and SSE `state-change` frames tail the log file.
+    #[tokio::test]
+    async fn events_log_and_sse_state_change() {
+        use crate::events::{EventDraft, EventLog, events_path, read_since};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::open(dir.path(), dir.path().display().to_string());
+        let events_file = events_path(dir.path());
+        let _ = log.append(vec![
+            EventDraft {
+                kind: "agent".to_owned(),
+                task: Some("task".to_owned()),
+                todo: None,
+                node: None,
+                runner: Some("codex".to_owned()),
+                model: None,
+                from_state: Some("idle".to_owned()),
+                to_state: "pending".to_owned(),
+                message: None,
+            },
+            EventDraft {
+                kind: "agent".to_owned(),
+                task: Some("task".to_owned()),
+                todo: None,
+                node: None,
+                runner: Some("codex".to_owned()),
+                model: None,
+                from_state: Some("pending".to_owned()),
+                to_state: "started".to_owned(),
+                message: None,
+            },
+            EventDraft {
+                kind: "agent".to_owned(),
+                task: Some("task".to_owned()),
+                todo: None,
+                node: None,
+                runner: Some("codex".to_owned()),
+                model: None,
+                from_state: Some("started".to_owned()),
+                to_state: "running".to_owned(),
+                message: Some("responding".to_owned()),
+            },
+        ]);
+
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        let token = "events-log-token-12345".to_string();
+        let services = DashboardServices {
+            mcp: None,
+            todos: None,
+            commands: None,
+            web_attached: false,
+            events_path: Some(events_file.clone()),
+            memory: None,
+        };
+        let router = build_router_with(hub.clone(), token.clone(), allowed_localhost(), services);
+
+        let resp = router
+            .clone()
+            .oneshot(json_request("GET", "/api/events/log?since=1", &token, ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let seqs = json["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(seqs, vec![2, 3]);
+        assert_eq!(json["last_seq"].as_u64(), Some(3));
+
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "GET",
+                "/api/events/log?since=0&limit=1",
+                &token,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["events"].as_array().unwrap().len(), 1);
+        assert_eq!(json["last_seq"].as_u64(), Some(1));
+
+        let resp = router
+            .clone()
+            .oneshot(json_request("GET", "/api/events/log?since=abc", &token, ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let req = axum::http::Request::builder()
+            .uri("/api/events/log?since=0")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let config = ServerConfig {
+            bind: "127.0.0.1".parse().unwrap(),
+            port: 0,
+            allow_remote: false,
+            token: token.clone(),
+            services: DashboardServices {
+                mcp: None,
+                todos: None,
+                commands: None,
+                web_attached: false,
+                events_path: Some(events_file.clone()),
+                memory: None,
+            },
+        };
+        let server = start_server(config, hub).await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        let req = format!(
+            "GET /api/events?since=1&token={token} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n\r\n",
+            server.addr
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+
+        let mut buf = Vec::new();
+        let mut temp_buf = [0u8; 4096];
+        let read_sse = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let n = stream.read(&mut temp_buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&temp_buf[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                let seqs = parse_state_change_seqs(&text);
+                if seqs.contains(&2) && seqs.contains(&3) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            read_sse.is_ok(),
+            "timed out waiting for replayed state-change frames"
+        );
+
+        let _ = log.append(vec![EventDraft {
+            kind: "agent".to_owned(),
+            task: Some("task".to_owned()),
+            todo: None,
+            node: None,
+            runner: Some("codex".to_owned()),
+            model: None,
+            from_state: Some("running".to_owned()),
+            to_state: "completed".to_owned(),
+            message: None,
+        }]);
+
+        let appended = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let n = stream.read(&mut temp_buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&temp_buf[..n]);
+                if parse_state_change_seqs(&String::from_utf8_lossy(&buf)).contains(&4) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(appended.is_ok(), "timed out waiting for appended seq 4");
+        assert_eq!(read_since(&events_file, 0, None).len(), 4);
+
+        server.abort();
+    }
+
+    fn parse_state_change_seqs(buf: &str) -> Vec<u64> {
+        let mut seqs = Vec::new();
+        let lines: Vec<&str> = buf.lines().collect();
+        let mut index = 0;
+        while index < lines.len() {
+            if lines[index] == "event: state-change" {
+                index += 1;
+                if index < lines.len()
+                    && let Some(id) = lines[index].strip_prefix("id: ")
+                    && let Ok(seq) = id.trim().parse::<u64>()
+                {
+                    seqs.push(seq);
+                }
+            }
+            index += 1;
+        }
+        seqs
     }
 
     // TC-728 (FR-727): memory API routes and auth.
@@ -1899,6 +2414,7 @@ mod tests {
             web_attached: false,
             mcp: None,
             memory: Some(memory.clone()),
+            events_path: None,
         };
         let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
 
@@ -2147,6 +2663,7 @@ mod tests {
             token.clone(),
             allowed_localhost(),
             DashboardServices {
+                events_path: None,
                 todos: None,
                 commands: None,
                 mcp: Some(Arc::new(registry)),
@@ -2242,6 +2759,7 @@ mod tests {
             token.clone(),
             allowed_localhost(),
             DashboardServices {
+                events_path: None,
                 todos: Some(store.clone()),
                 commands: None,
                 mcp: Some(registry.clone()),
@@ -2391,6 +2909,7 @@ mod tests {
             token.clone(),
             allowed_localhost(),
             DashboardServices {
+                events_path: None,
                 todos: None,
                 commands: None,
                 mcp: Some(registry),
@@ -2446,6 +2965,7 @@ mod tests {
             token.clone(),
             allowed_localhost(),
             DashboardServices {
+                events_path: None,
                 todos: Some(store.clone()),
                 commands: None,
                 mcp: Some(registry),
