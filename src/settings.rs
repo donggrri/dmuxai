@@ -43,6 +43,10 @@ pub struct DmuxSettings {
     pub web_theme: WebThemeSettings,
     /// Problems found while reading dmuxai.toml, shown at startup.
     pub config_warnings: Vec<String>,
+    /// Resolved `[memory]` (SPEC-obsidian-memory FR-720); `None` = disabled.
+    pub memory: Option<crate::memory::MemoryConfig>,
+    /// Raw `[memory]` keys merged per key (workspace wins), resolved in `load`.
+    memory_raw: MemoryToml,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -54,6 +58,16 @@ struct DmuxToml {
     agents: Option<AgentsToml>,
     ui: Option<UiSettings>,
     web: Option<WebToml>,
+    memory: Option<MemoryToml>,
+}
+
+/// `[memory]` (FR-720).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+struct MemoryToml {
+    vault: Option<String>,
+    dir: Option<String>,
+    project: Option<String>,
+    inject: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -143,8 +157,61 @@ impl DmuxSettings {
                 .push(format!("[theme.agents] unknown agent id '{id}' ignored"));
         }
 
+        settings.resolve_memory(workspace);
         settings.dedupe_warnings();
         settings
+    }
+
+    /// FR-720: turn the merged `[memory]` keys into a [`MemoryConfig`].
+    fn resolve_memory(&mut self, workspace: &Path) {
+        let raw = std::mem::take(&mut self.memory_raw);
+        let Some(vault) = raw
+            .vault
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        else {
+            self.memory = None;
+            return;
+        };
+        // A relative vault is relative to the workspace, not the process cwd.
+        let vault_path = expand_home(vault);
+        let vault_path = if vault_path.is_relative() {
+            workspace.join(vault_path)
+        } else {
+            vault_path
+        };
+        let (root, dir) = match crate::memory::resolve_root(&vault_path, raw.dir.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                let message = if vault_path.is_dir() {
+                    format!("[memory] {message}; memory disabled")
+                } else {
+                    format!(
+                        "[memory] vault = \"{vault}\" is not an existing directory; memory disabled"
+                    )
+                };
+                self.config_warnings.push(message);
+                self.memory = None;
+                return;
+            }
+        };
+        let project = match raw.project.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(name) if crate::memory::is_valid_name(name) => Some(name.to_owned()),
+            Some(name) => {
+                self.config_warnings.push(format!(
+                    "[memory] project = \"{name}\" must match [a-z0-9][a-z0-9_-]{{0,47}}; using the workspace name"
+                ));
+                None
+            }
+        };
+        self.memory = Some(crate::memory::MemoryConfig {
+            root,
+            dir,
+            project,
+            inject: raw.inject.unwrap_or(true),
+        });
     }
 
     /// Drop repeated warnings while preserving first-seen order.
@@ -154,6 +221,20 @@ impl DmuxSettings {
     }
 
     fn apply_toml(&mut self, parsed: DmuxToml, known_custom: &mut Vec<String>) {
+        if let Some(memory) = parsed.memory {
+            if memory.vault.is_some() {
+                self.memory_raw.vault = memory.vault;
+            }
+            if memory.dir.is_some() {
+                self.memory_raw.dir = memory.dir;
+            }
+            if memory.project.is_some() {
+                self.memory_raw.project = memory.project;
+            }
+            if memory.inject.is_some() {
+                self.memory_raw.inject = memory.inject;
+            }
+        }
         if let Some(agents) = parsed.agents {
             for spec in &agents.custom {
                 known_custom.push(spec.name.clone());
@@ -264,8 +345,31 @@ impl Default for DmuxSettings {
             ui: UiSettings::default(),
             web_theme: WebThemeSettings::default(),
             config_warnings: Vec::new(),
+            memory: None,
+            memory_raw: MemoryToml::default(),
         }
     }
+}
+
+/// Expand a leading `~/` (or `~\\`) with `HOME` / `USERPROFILE`.
+pub fn expand_home(path: &str) -> PathBuf {
+    let rest = path
+        .strip_prefix("~/")
+        .or_else(|| path.strip_prefix("~\\"))
+        .or_else(|| (path == "~").then_some(""));
+    if let Some(rest) = rest {
+        let home = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()));
+        if let Some(home) = home {
+            let mut p = PathBuf::from(home);
+            if !rest.is_empty() {
+                p.push(rest);
+            }
+            return p;
+        }
+    }
+    PathBuf::from(path)
 }
 
 /// Normalize a `[web] theme` value, or `None` when it is not light/dark/system.
@@ -682,5 +786,140 @@ allowed_runners = []
         assert_eq!(settings_empty.graph_allowed_runners, Some(Vec::new()));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod memory_settings_tests {
+    use super::*;
+
+    fn load(user: Option<&str>, workspace: Option<&str>, ws: &Path) -> DmuxSettings {
+        let user_path = ws.join("user.toml");
+        if let Some(u) = user {
+            std::fs::write(&user_path, u).unwrap();
+        }
+        if let Some(w) = workspace {
+            std::fs::write(ws.join("dmuxai.toml"), w).unwrap();
+        }
+        DmuxSettings::load_with_user_config(ws, Some(&user_path))
+    }
+
+    // TC-720 (FR-720): defaults, per-key workspace override, project, inject.
+    #[test]
+    fn memory_settings_resolve_root_dir_project_and_inject() {
+        let ws = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        let v = vault.path().display().to_string().replace('\\', "/");
+        let s = load(
+            Some(&format!("[memory]\nvault = \"{v}\"\n")),
+            None,
+            ws.path(),
+        );
+        let m = s.memory.expect("enabled");
+        assert_eq!(m.dir, "cursor-workflow/memory");
+        assert_eq!(m.root, vault.path().join("cursor-workflow").join("memory"));
+        assert_eq!(m.project, None);
+        assert!(m.inject);
+
+        let s = load(
+            Some(&format!("[memory]\nvault = \"{v}\"\ndir = \"notes\"\n")),
+            Some("[memory]\nproject = \"my-repo\"\ninject = false\n"),
+            ws.path(),
+        );
+        let m = s.memory.expect("enabled");
+        assert_eq!(m.root, vault.path().join("notes"));
+        assert_eq!(m.project.as_deref(), Some("my-repo"));
+        assert!(!m.inject);
+        assert!(s.config_warnings.is_empty(), "{:?}", s.config_warnings);
+    }
+
+    // TC-720 (FR-720): no [memory] or empty vault -> disabled without warnings.
+    #[test]
+    fn memory_settings_absent_is_disabled_silently() {
+        let ws = tempfile::tempdir().unwrap();
+        let s = load(Some("[web]\ntheme = \"dark\"\n"), None, ws.path());
+        assert!(s.memory.is_none());
+        let s = load(Some("[memory]\ndir = \"x\"\n"), None, ws.path());
+        assert!(s.memory.is_none());
+        assert!(s.config_warnings.iter().all(|w| !w.contains("[memory]")));
+    }
+
+    // TC-720 (FR-720): missing vault, absolute or `..` dir, invalid project.
+    #[test]
+    fn memory_settings_warn_on_invalid_values() {
+        let ws = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        let v = vault.path().display().to_string().replace('\\', "/");
+        let missing = vault
+            .path()
+            .join("nope")
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let s = load(
+            Some(&format!("[memory]\nvault = \"{missing}\"\n")),
+            None,
+            ws.path(),
+        );
+        assert!(s.memory.is_none());
+        assert!(
+            s.config_warnings
+                .iter()
+                .any(|w| w.contains("not an existing directory"))
+        );
+
+        for dir in ["../escape", "/abs/dir", "a/../../b"] {
+            let s = load(
+                Some(&format!("[memory]\nvault = \"{v}\"\ndir = \"{dir}\"\n")),
+                None,
+                ws.path(),
+            );
+            assert!(s.memory.is_none(), "{dir}");
+            assert!(
+                s.config_warnings.iter().any(|w| w.contains("[memory] dir")),
+                "{dir}"
+            );
+        }
+
+        let s = load(
+            Some(&format!(
+                "[memory]\nvault = \"{v}\"\nproject = \"Bad Name\"\n"
+            )),
+            None,
+            ws.path(),
+        );
+        assert_eq!(s.memory.as_ref().and_then(|m| m.project.clone()), None);
+        assert!(s.memory.is_some());
+        assert!(
+            s.config_warnings
+                .iter()
+                .any(|w| w.contains("[memory] project"))
+        );
+    }
+
+    // TC-720 (FR-720): a relative vault resolves against the workspace.
+    #[test]
+    fn memory_settings_relative_vault_is_workspace_relative() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir(ws.path().join("vault")).unwrap();
+        let s = load(None, Some("[memory]\nvault = \"vault\"\n"), ws.path());
+        let m = s.memory.expect("enabled");
+        assert_eq!(
+            m.root,
+            ws.path()
+                .join("vault")
+                .join("cursor-workflow")
+                .join("memory")
+        );
+    }
+
+    // TC-720 (FR-720): `~/` expands to HOME.
+    #[test]
+    fn memory_settings_expand_home_prefix() {
+        let p = expand_home("~/Obsidian/Vault");
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            assert_eq!(p, PathBuf::from(home).join("Obsidian/Vault"));
+        }
+        assert_eq!(expand_home("/x/y"), PathBuf::from("/x/y"));
     }
 }

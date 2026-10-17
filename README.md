@@ -86,6 +86,59 @@ config warnings and the built-in default is used. `NO_COLOR` (without
 dashboard reuses the `[theme.agents]` agent colors for its agent chips.
 Details: [SPEC-theme-colors](docs/specs/SPEC-theme-colors.md).
 
+## Obsidian memory
+
+DmuxAI can keep durable notes in an Obsidian vault and prepend them to every
+agent's prompt (Cursor, AGY, Codex, opencode and any custom agent, graph
+nodes included). It uses the same layout as the cursor-atomic-workflow
+memory, so an existing `cursor-workflow/memory` folder works as is.
+
+```toml
+# ~/.config/dmuxai/dmuxai.toml (or the repo's dmuxai.toml, which wins per key)
+[memory]
+vault = "~/Obsidian/Vault"       # an existing directory; memory is off without it
+dir = "cursor-workflow/memory"   # default; relative to the vault, no ".."
+# project = "my-repo"            # default: the workspace folder name
+# inject = false                 # keep saving/searching, stop prompt injection
+```
+
+```text
+<vault>/cursor-workflow/memory/
+  human.md                 # about you
+  projects/<project>.md    # this repo
+  decisions/<name>.md
+  gotchas/<name>.md
+  queue/proposals.json     # agent proposals waiting for approval
+```
+
+Each note is one line, `- [YYYY-MM-DD] text` (at most 200 characters). Text
+that looks like a password, token, API key or private key is refused. The
+injected `<memory>` block is limited to 3000 characters (900 per section),
+and it is only re-sent on a resumed session when it changed.
+
+- **Save:** `/remember <text>` in the TUI (project note), or
+  `/remember --human <text>`, `--decision <name> <text>`,
+  `--gotcha <name> <text>`; or the Save button in the dashboard Memory panel.
+- **Approve:** agents can only *propose* notes. Review them with `/memory`,
+  then `/memory approve <id>` or `/memory reject <id>`, or use the
+  Approve/Reject buttons in the dashboard.
+- **MCP:** `dmuxai mcp-memory` is a stdio MCP server with `memory_search`,
+  `memory_get_context` and `memory_propose`. Register it once in the shared
+  MCP list so every runner can use it:
+
+  ```toml
+  [[mcp.servers]]
+  name = "dmuxai-memory"
+  transport = "stdio"
+  command = "dmuxai"
+  args = ["mcp-memory"]
+  ```
+
+  It reads `[memory]` from the config (`--workspace DIR`, or override with
+  `--vault PATH --dir DIR --project NAME`).
+
+Details: [SPEC-obsidian-memory](docs/specs/SPEC-obsidian-memory.md).
+
 ## Attach any agent CLI
 
 Built-in runners are Cursor (`cursor-agent`), AGY and Codex. **Any other headless

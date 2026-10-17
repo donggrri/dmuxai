@@ -20,6 +20,7 @@ use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::WatchStream;
 
+use crate::memory::{MemoryError, MemoryHandle, Proposal, SaveOutcome};
 use crate::todo::{NewTodo, TodoError, TodoPatch, TodoSource, TodoStatus};
 use crate::web::DEFAULT_PORT;
 use crate::web::auth::{BindCheck, check_bind, dashboard_url, token_matches};
@@ -36,6 +37,8 @@ pub struct DashboardServices {
     /// no to-do board because the store failed to open" (503) from "serves can
     /// never run to-dos" (409).
     pub web_attached: bool,
+    /// Obsidian memory (SPEC-obsidian-memory FR-727); `None` = disabled.
+    pub memory: Option<crate::memory::MemoryHandle>,
 }
 
 #[derive(Clone)]
@@ -113,6 +116,161 @@ fn todo_store(state: &AppState) -> Option<Arc<crate::todo::TodoStore>> {
 fn refresh_todos(state: &AppState, store: &crate::todo::TodoStore) {
     if let Ok(todos) = store.list() {
         state.hub.set_todos(todos);
+    }
+}
+
+fn memory_handle(state: &AppState) -> Option<MemoryHandle> {
+    state.services.memory.clone()
+}
+
+fn memory_not_configured() -> Response {
+    error_json(StatusCode::CONFLICT, "memory is not configured")
+}
+
+fn memory_error_response(error: MemoryError) -> Response {
+    match error {
+        MemoryError::Rejected(reason) => error_json(StatusCode::BAD_REQUEST, &reason.to_string()),
+        MemoryError::NotFound(_) => error_json(StatusCode::NOT_FOUND, "not found"),
+        MemoryError::AlreadyDecided(status) => {
+            error_json(StatusCode::CONFLICT, &format!("already {status}"))
+        }
+        MemoryError::CorruptQueue(_) | MemoryError::Io(_) => {
+            error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct MemoryGetEnabled {
+    enabled: bool,
+    project: String,
+    dir: String,
+    context: String,
+    pending: Vec<Proposal>,
+}
+
+#[derive(serde::Deserialize)]
+struct MemorySaveBody {
+    text: String,
+    #[serde(default)]
+    target: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct MemorySaveResponse {
+    saved: bool,
+    target: String,
+    message: String,
+}
+
+#[derive(serde::Serialize)]
+struct MemoryActionResponse {
+    ok: bool,
+    message: String,
+}
+
+async fn get_memory(State(state): State<AppState>) -> Response {
+    let Some(memory) = memory_handle(&state) else {
+        return json_ok(StatusCode::OK, &serde_json::json!({ "enabled": false }));
+    };
+    let project = memory.project.clone();
+    let context = memory.store.build_context(&project);
+    let pending = match memory.store.list_pending() {
+        Ok(items) => items,
+        Err(error) => return memory_error_response(error),
+    };
+    json_ok(
+        StatusCode::OK,
+        &MemoryGetEnabled {
+            enabled: true,
+            project,
+            dir: memory.dir.clone(),
+            context,
+            pending,
+        },
+    )
+}
+
+async fn post_memory_save(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<MemorySaveBody>,
+) -> Response {
+    let Some(memory) = memory_handle(&state) else {
+        return memory_not_configured();
+    };
+    let target = body
+        .target
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| memory.project_target());
+    let today = crate::memory::today_utc();
+    match memory
+        .store
+        .save(&target, &body.text, &memory.src(), &today)
+    {
+        Ok(SaveOutcome::Saved { target }) => {
+            let message = format!("Saved to {target}");
+            json_ok(
+                StatusCode::OK,
+                &MemorySaveResponse {
+                    saved: true,
+                    target,
+                    message,
+                },
+            )
+        }
+        Ok(SaveOutcome::AlreadySaved { target }) => {
+            let message = format!("Already in {target}");
+            json_ok(
+                StatusCode::OK,
+                &MemorySaveResponse {
+                    saved: false,
+                    target,
+                    message,
+                },
+            )
+        }
+        Err(error) => memory_error_response(error),
+    }
+}
+
+async fn post_memory_proposal_approve(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(memory) = memory_handle(&state) else {
+        return memory_not_configured();
+    };
+    let today = crate::memory::today_utc();
+    match memory.store.approve(&id, &today) {
+        Ok(SaveOutcome::Saved { target }) => {
+            let message = format!("Approved {id}: saved to {target}");
+            json_ok(StatusCode::OK, &MemoryActionResponse { ok: true, message })
+        }
+        Ok(SaveOutcome::AlreadySaved { target }) => {
+            let message = format!("Approved {id}: already in {target}");
+            json_ok(StatusCode::OK, &MemoryActionResponse { ok: true, message })
+        }
+        Err(error) => memory_error_response(error),
+    }
+}
+
+async fn post_memory_proposal_reject(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(memory) = memory_handle(&state) else {
+        return memory_not_configured();
+    };
+    match memory.store.reject(&id) {
+        Ok(()) => json_ok(
+            StatusCode::OK,
+            &MemoryActionResponse {
+                ok: true,
+                message: format!("Rejected {id}"),
+            },
+        ),
+        Err(error) => memory_error_response(error),
     }
 }
 
@@ -194,6 +352,22 @@ async fn get_app_css() -> impl IntoResponse {
             (HeaderName::from_static("x-content-type-options"), "nosniff"),
         ],
         crate::web::assets::APP_CSS,
+    )
+}
+
+async fn get_memory_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::MEMORY_JS,
     )
 }
 
@@ -514,8 +688,19 @@ pub fn build_router_with(
     Router::new()
         .route("/", get(get_index))
         .route("/assets/app.js", get(get_app_js))
+        .route("/assets/memory.js", get(get_memory_js))
         .route("/assets/app.css", get(get_app_css))
         .route("/api/state", get(get_state))
+        .route("/api/memory", get(get_memory))
+        .route("/api/memory/save", post(post_memory_save))
+        .route(
+            "/api/memory/proposals/{id}/approve",
+            post(post_memory_proposal_approve),
+        )
+        .route(
+            "/api/memory/proposals/{id}/reject",
+            post(post_memory_proposal_reject),
+        )
         .route("/api/events", get(get_events))
         .route("/api/todos", get(list_todos).post(create_todo))
         .route("/api/todos/{id}", patch(update_todo).delete(delete_todo))
@@ -982,6 +1167,7 @@ mod tests {
             todos: Some(store.clone()),
             commands: None,
             web_attached: false,
+            memory: None,
         };
         let router = build_router_with(hub.clone(), token.clone(), allowed_localhost(), services);
 
@@ -1127,6 +1313,7 @@ mod tests {
             todos: Some(store),
             commands: None,
             web_attached: false,
+            memory: None,
         };
         let router = build_router_with(test_hub(), token.clone(), allowed_localhost(), services);
 
@@ -1285,6 +1472,7 @@ mod tests {
                     "agent busy".to_owned(),
                 )))),
                 web_attached: false,
+                memory: None,
             },
         );
         let resp = busy_router
@@ -1307,6 +1495,7 @@ mod tests {
                 todos: None,
                 commands: Some(spawn_reply(Ok(test_todo()))),
                 web_attached: false,
+                memory: None,
             },
         );
         let resp = ok_router
@@ -1335,6 +1524,7 @@ mod tests {
                 todos: None,
                 commands: None,
                 web_attached: true,
+                memory: None,
             },
         );
         let resp = router
@@ -1363,6 +1553,7 @@ mod tests {
                 todos: None,
                 commands: Some(spawn_recording_reply(Ok(test_todo()), seen.clone())),
                 web_attached: false,
+                memory: None,
             },
         );
         let resp = router
@@ -1381,5 +1572,207 @@ mod tests {
             RunMode::Agent { agent } => assert_eq!(agent, "codex"),
             other => panic!("expected agent mode, got {other:?}"),
         }
+    }
+
+    // TC-728 (FR-727): memory API routes and auth.
+    #[tokio::test]
+    async fn memory_routes_api() {
+        use crate::memory::{MemoryStore, ProposalInput};
+
+        let vault = tempfile::tempdir().unwrap();
+        let vault_path = vault.path().to_path_buf();
+        let memory = MemoryHandle {
+            store: MemoryStore::new(vault_path.clone()),
+            project: "demo".to_owned(),
+            dir: "cursor-workflow/memory".to_owned(),
+            inject: true,
+        };
+        let token = "memory-token-728".to_owned();
+        let hub = test_hub();
+        let services = DashboardServices {
+            todos: None,
+            commands: None,
+            web_attached: false,
+            memory: Some(memory.clone()),
+        };
+        let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
+
+        let no_auth = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/memory")
+            .header("Host", "localhost:7420")
+            .header("Origin", "http://localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(no_auth).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let get_resp = router
+            .clone()
+            .oneshot(json_request("GET", "/api/memory", &token, ""))
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let get_body = read_body(get_resp).await;
+        let get_json: serde_json::Value = serde_json::from_str(&get_body).unwrap();
+        assert_eq!(get_json["enabled"], true);
+        assert_eq!(get_json["project"], "demo");
+        assert_eq!(get_json["dir"], "cursor-workflow/memory");
+        assert!(get_json["context"].is_string());
+        assert!(get_json["pending"].is_array());
+        assert!(
+            !get_body.contains(vault_path.to_str().unwrap()),
+            "response must not leak vault path"
+        );
+
+        let save_resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/memory/save",
+                &token,
+                r#"{"text":"dashboard note line"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(save_resp.status(), StatusCode::OK);
+        let save_json: serde_json::Value =
+            serde_json::from_str(&read_body(save_resp).await).unwrap();
+        assert_eq!(save_json["saved"], true);
+        assert_eq!(save_json["target"], "projects/demo.md");
+
+        let after_save = router
+            .clone()
+            .oneshot(json_request("GET", "/api/memory", &token, ""))
+            .await
+            .unwrap();
+        let after_body = read_body(after_save).await;
+        assert!(after_body.contains("dashboard note line"));
+        assert!(!after_body.contains(vault_path.to_str().unwrap()));
+
+        let secret_resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/memory/save",
+                &token,
+                r#"{"text":"my password is hunter2"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(secret_resp.status(), StatusCode::BAD_REQUEST);
+
+        let proposal_id = memory
+            .store
+            .propose(
+                "demo",
+                "web-test",
+                &[ProposalInput {
+                    target: "projects/demo.md".to_owned(),
+                    text: "proposal from test".to_owned(),
+                }],
+            )
+            .unwrap()
+            .added
+            .first()
+            .map(|p| p.id.clone())
+            .expect("proposal added");
+
+        let approve_resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/memory/proposals/{proposal_id}/approve"),
+                &token,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(approve_resp.status(), StatusCode::OK);
+        let approve_json: serde_json::Value =
+            serde_json::from_str(&read_body(approve_resp).await).unwrap();
+        assert_eq!(approve_json["ok"], true);
+
+        let approve_again = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/memory/proposals/{proposal_id}/approve"),
+                &token,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(approve_again.status(), StatusCode::CONFLICT);
+
+        let reject_id = memory
+            .store
+            .propose(
+                "demo",
+                "reject-me",
+                &[ProposalInput {
+                    target: "human.md".to_owned(),
+                    text: "reject this one".to_owned(),
+                }],
+            )
+            .unwrap()
+            .added[0]
+            .id
+            .clone();
+
+        let reject_resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/memory/proposals/{reject_id}/reject"),
+                &token,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reject_resp.status(), StatusCode::OK);
+
+        let unknown = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/memory/proposals/does-not-exist/approve",
+                &token,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let disabled_router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices::default(),
+        );
+        let disabled_get = disabled_router
+            .clone()
+            .oneshot(json_request("GET", "/api/memory", &token, ""))
+            .await
+            .unwrap();
+        let disabled_json: serde_json::Value =
+            serde_json::from_str(&read_body(disabled_get).await).unwrap();
+        assert_eq!(disabled_json["enabled"], false);
+
+        let disabled_post = disabled_router
+            .oneshot(json_request(
+                "POST",
+                "/api/memory/save",
+                &token,
+                r#"{"text":"nope"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disabled_post.status(), StatusCode::CONFLICT);
+        assert!(
+            read_body(disabled_post)
+                .await
+                .contains("memory is not configured")
+        );
     }
 }

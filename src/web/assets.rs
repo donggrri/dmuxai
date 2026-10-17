@@ -1,5 +1,6 @@
 pub const INDEX_HTML: &str = include_str!("assets/index.html");
 pub const APP_JS: &str = include_str!("assets/app.js");
+pub const MEMORY_JS: &str = include_str!("assets/memory.js");
 pub const APP_CSS: &str = include_str!("assets/app.css");
 
 #[cfg(test)]
@@ -119,6 +120,17 @@ mod tests {
                 .unwrap()
                 .contains("text/css")
         );
+    }
+
+    // TC-731 (UX-728): Memory panel markup and client API paths.
+    #[test]
+    fn memory_panel_assets_present() {
+        assert!(INDEX_HTML.contains("id=\"memory-panel\""));
+        assert!(INDEX_HTML.contains("/assets/memory.js"));
+        assert!(MEMORY_JS.contains("/api/memory"));
+        assert!(MEMORY_JS.contains("/api/memory/save"));
+        assert!(MEMORY_JS.contains("/approve"));
+        assert!(MEMORY_JS.contains("/reject"));
     }
 
     // TC-543: static_page_has_todo_panel (SPEC-web-dashboard UX-540)
