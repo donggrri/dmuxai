@@ -52,18 +52,6 @@ impl DocKind {
     }
 }
 
-impl PartialEq<&str> for DocKind {
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
-    }
-}
-
-impl PartialEq<str> for DocKind {
-    fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
-    }
-}
-
 const TEXT_EXTENSIONS: &[&str] = &[
     "txt",
     "text",
@@ -235,6 +223,18 @@ pub fn mtime_ms(metadata: &std::fs::Metadata) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl PartialEq<&str> for DocKind {
+        fn eq(&self, other: &&str) -> bool {
+            self.as_str() == *other
+        }
+    }
+
+    impl PartialEq<str> for DocKind {
+        fn eq(&self, other: &str) -> bool {
+            self.as_str() == other
+        }
+    }
 
     #[test]
     fn kinds_follow_extensions() {

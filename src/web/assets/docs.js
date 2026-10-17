@@ -83,15 +83,6 @@
     );
   }
 
-  function fmtSize(bytes) {
-    if (typeof bytes !== 'number' || bytes < 0 || !isFinite(bytes)) {
-      return '';
-    }
-    if (bytes < 1024) { return bytes + ' B'; }
-    if (bytes < 1024 * 1024) { return (bytes / 1024).toFixed(1) + ' KB'; }
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-  }
-
   function fmtTime(ms) {
     var d = new Date(ms);
     if (isNaN(d.getTime())) { return ''; }
@@ -171,18 +162,50 @@
 
   var treeDirCache = {};
   var expandedFolders = [];
+  var currentWorkspace = null;
+  var treeIdSeq = 0;
+  var pendingOpen = null;
+  var pendingExpanded = null;
+  var pendingFocusPath = null;
 
-  function getWorkspaceKey() {
-    var wsEl = $('workspace');
-    var ws = (wsEl && wsEl.textContent && wsEl.textContent !== '\u2013' && wsEl.textContent !== '-')
-      ? wsEl.textContent.trim()
-      : 'default';
-    return ws;
+  function applyWorkspaceSnapshot(snap) {
+    if (!snap) { return; }
+    var ws = typeof snap.workspace === 'string' ? snap.workspace.trim() : '';
+    if (!ws || ws === '-' || ws === '\u2013') {
+      var wsEl = $('workspace');
+      if (wsEl && wsEl.textContent && wsEl.textContent !== '\u2013' && wsEl.textContent !== '-') {
+        ws = wsEl.textContent.trim();
+      }
+    }
+    if (ws && ws !== '-' && ws !== '\u2013' && ws !== currentWorkspace) {
+      currentWorkspace = ws;
+      treeDirCache = {};
+      pendingFocusPath = null;
+      var state = loadSidebarState();
+      if (pendingOpen !== null) {
+        state.open = pendingOpen;
+        saveSidebarOpen(pendingOpen);
+        pendingOpen = null;
+      }
+      if (pendingExpanded !== null) {
+        state.expanded = pendingExpanded;
+        saveExpandedFolders(pendingExpanded);
+        pendingExpanded = null;
+      }
+      expandedFolders = state.expanded;
+      updateSidebarUI(state.open);
+      if (!filterText) {
+        renderLazyTree();
+      }
+    }
   }
 
   function loadSidebarState() {
     try {
-      var ws = getWorkspaceKey();
+      if (!currentWorkspace) {
+        return { open: false, expanded: [] };
+      }
+      var ws = currentWorkspace;
       var openVal = window.localStorage.getItem('dmuxai.sidebar.open.' + ws);
       var expVal = window.localStorage.getItem('dmuxai.sidebar.expanded.' + ws);
       var open = openVal === 'true';
@@ -194,16 +217,22 @@
   }
 
   function saveSidebarOpen(open) {
+    if (!currentWorkspace) {
+      pendingOpen = open;
+      return;
+    }
     try {
-      var ws = getWorkspaceKey();
-      window.localStorage.setItem('dmuxai.sidebar.open.' + ws, open ? 'true' : 'false');
+      window.localStorage.setItem('dmuxai.sidebar.open.' + currentWorkspace, open ? 'true' : 'false');
     } catch (e) {}
   }
 
   function saveExpandedFolders(list) {
+    if (!currentWorkspace) {
+      pendingExpanded = list;
+      return;
+    }
     try {
-      var ws = getWorkspaceKey();
-      window.localStorage.setItem('dmuxai.sidebar.expanded.' + ws, JSON.stringify(list));
+      window.localStorage.setItem('dmuxai.sidebar.expanded.' + currentWorkspace, JSON.stringify(list));
     } catch (e) {}
   }
 
@@ -214,9 +243,11 @@
     if (aside) {
       if (open) {
         aside.classList.add('open');
+        aside.removeAttribute('inert');
         document.body.classList.add('sidebar-open');
       } else {
         aside.classList.remove('open');
+        aside.setAttribute('inert', '');
         document.body.classList.remove('sidebar-open');
       }
     }
@@ -232,17 +263,35 @@
     }
   }
 
-  function toggleSidebar() {
-    var aside = $('sidebar');
-    var isOpen = aside ? aside.classList.contains('open') : false;
-    var next = !isOpen;
-    saveSidebarOpen(next);
-    updateSidebarUI(next);
+  function openSidebar() {
+    saveSidebarOpen(true);
+    updateSidebarUI(true);
+    var isNarrow = (window.innerWidth <= 900) || (window.matchMedia && window.matchMedia('(max-width: 900px)').matches);
+    if (isNarrow) {
+      var focusTarget = $('docs-filter') || $('sidebar-close');
+      if (focusTarget && typeof focusTarget.focus === 'function') {
+        focusTarget.focus();
+      }
+    }
   }
 
   function closeSidebar() {
     saveSidebarOpen(false);
     updateSidebarUI(false);
+    var toggleBtn = $('sidebar-toggle-files');
+    if (toggleBtn && typeof toggleBtn.focus === 'function') {
+      toggleBtn.focus();
+    }
+  }
+
+  function toggleSidebar() {
+    var aside = $('sidebar');
+    var isOpen = aside ? aside.classList.contains('open') : false;
+    if (isOpen) {
+      closeSidebar();
+    } else {
+      openSidebar();
+    }
   }
 
   function fetchDir(dir) {
@@ -257,6 +306,40 @@
     });
   }
 
+  function entriesSignature(list) {
+    if (!Array.isArray(list)) { return ''; }
+    var s = [];
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i] || {};
+      s.push((e.path || '') + ':' + (e.mtime_ms || 0) + ':' + (e.has_children ? '1' : '0'));
+    }
+    return s.join(';');
+  }
+
+  function getFocusedTreePath() {
+    var active = document.activeElement;
+    if (active && active.classList.contains('tree-item') && active.dataset.path) {
+      return active.dataset.path;
+    }
+    return null;
+  }
+
+  function restoreFocusToPath(path) {
+    if (!path) { return false; }
+    var items = getVisibleTreeItems();
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].dataset.path === path) {
+        setFocusTreeItem(items[i]);
+        if (pendingFocusPath === path) { pendingFocusPath = null; }
+        return true;
+      }
+    }
+    // The item may live in a folder whose children are still loading; retry
+    // when that group finishes rendering (see toggleFolder).
+    pendingFocusPath = path;
+    return false;
+  }
+
   function createDirItem(entry, level) {
     var node = el('div', 'tree-node');
     node.setAttribute('role', 'none');
@@ -269,6 +352,9 @@
     item.dataset.path = entry.path;
     item.dataset.type = 'dir';
 
+    var groupId = 'tree-group-' + (++treeIdSeq);
+    item.id = 'tree-item-' + treeIdSeq;
+
     var toggle = el('span', 'tree-toggle', '\u25b6');
     var icon = el('span', 'tree-icon', '\ud83d\udcc1');
     var name = el('span', 'tree-name', entry.name || entry.path);
@@ -279,8 +365,10 @@
     node.appendChild(item);
 
     var group = el('div', 'tree-group');
+    group.id = groupId;
     group.setAttribute('role', 'group');
     group.setAttribute('hidden', '');
+    item.setAttribute('aria-owns', group.id);
     node.appendChild(group);
 
     item.addEventListener('click', function (e) {
@@ -346,14 +434,23 @@
       if (group) {
         group.removeAttribute('hidden');
         if (!group.hasChildNodes()) {
-          group.appendChild(el('div', 'tree-item hint', 'loading\u2026'));
+          group.appendChild(el('div', 'tree-hint', 'loading\u2026'));
           fetchDir(path).then(function (children) {
+            var groupSig = entriesSignature(children);
+            if (group._lastSig === groupSig && group.hasChildNodes()) {
+              return;
+            }
+            group._lastSig = groupSig;
+            var focusedPath = getFocusedTreePath() || pendingFocusPath;
             group.replaceChildren();
             renderChildrenInto(group, children, parseInt(item.getAttribute('aria-level') || '1', 10) + 1);
             updateRovingTabindex();
-          }).catch(function (err) {
+            if (focusedPath) {
+              restoreFocusToPath(focusedPath);
+            }
+          }).catch(function () {
             group.replaceChildren();
-            group.appendChild(el('div', 'tree-item hint', 'error loading'));
+            group.appendChild(el('div', 'tree-hint', 'error loading'));
           });
         }
       }
@@ -386,7 +483,7 @@
     }
   }
 
-  function renderLazyTree() {
+  function renderLazyTree(silent) {
     var tree = $('docs-tree');
     if (!tree) { return; }
     if (!currentToken()) {
@@ -394,10 +491,21 @@
       tree.appendChild(el('p', 'empty', 'documents need token'));
       return;
     }
-    tree.replaceChildren();
-    tree.appendChild(el('div', 'tree-item hint', 'loading\u2026'));
+    var focusedPath = getFocusedTreePath();
+    if (!silent && !tree.hasChildNodes()) {
+      tree.replaceChildren();
+      tree.appendChild(el('div', 'tree-hint', 'loading\u2026'));
+    }
 
-    fetchDir('').then(function (children) {
+    return fetchDir('').then(function (children) {
+      var sig = entriesSignature(children);
+      if (tree._lastSig === sig && tree.hasChildNodes()) {
+        if (focusedPath) {
+          restoreFocusToPath(focusedPath);
+        }
+        return;
+      }
+      tree._lastSig = sig;
       tree.replaceChildren();
       if (children.length === 0) {
         tree.appendChild(el('p', 'empty', 'no documents'));
@@ -405,15 +513,21 @@
       }
       renderChildrenInto(tree, children, 1);
       updateRovingTabindex();
+      if (focusedPath) {
+        restoreFocusToPath(focusedPath);
+      }
     }).catch(function (err) {
-      tree.replaceChildren();
-      tree.appendChild(el('p', 'empty', 'tree unavailable: ' + err.message));
+      if (!silent) {
+        tree.replaceChildren();
+        tree.appendChild(el('p', 'empty', 'tree unavailable: ' + err.message));
+      }
     });
   }
 
   function renderFilteredTree(needle) {
     var tree = $('docs-tree');
     if (!tree) { return; }
+    var focusedPath = getFocusedTreePath();
     tree.replaceChildren();
 
     var matches = [];
@@ -464,6 +578,9 @@
         item.dataset.path = dirData.path;
         item.dataset.type = 'dir';
 
+        var groupId = 'tree-group-' + (++treeIdSeq);
+        item.id = 'tree-item-' + treeIdSeq;
+
         var toggle = el('span', 'tree-toggle expanded', '\u25bc');
         var icon = el('span', 'tree-icon', '\ud83d\udcc1');
         var name = el('span', 'tree-name', dirData.name);
@@ -474,7 +591,9 @@
         node.appendChild(item);
 
         var group = el('div', 'tree-group');
+        group.id = groupId;
         group.setAttribute('role', 'group');
+        item.setAttribute('aria-owns', group.id);
         node.appendChild(group);
 
         item.addEventListener('click', function (e) {
@@ -505,6 +624,9 @@
 
     renderFilterNode(tree, rootObj, 1);
     updateRovingTabindex();
+    if (focusedPath) {
+      restoreFocusToPath(focusedPath);
+    }
   }
 
   function renderTree() {
@@ -648,7 +770,6 @@
         var aside = $('sidebar');
         if (aside && aside.classList.contains('open')) {
           closeSidebar();
-          if (toggleBtn) { toggleBtn.focus(); }
         }
       }
     });
@@ -661,14 +782,7 @@
   // -----------------------------------------------------------------------
 
   function refreshList() {
-    var list = $('docs-list');
     if (!currentToken()) {
-      if (list) {
-        list.replaceChildren();
-        list.appendChild(
-          el('p', 'empty', 'documents need the dashboard token (?token= URL)')
-        );
-      }
       renderTree();
       return;
     }
@@ -677,71 +791,11 @@
       .then(function (payload) {
         entries = payload && Array.isArray(payload.entries) ? payload.entries : [];
         listTruncated = Boolean(payload && payload.truncated);
-        renderList();
         renderTree();
       })
-      .catch(function (err) {
-        renderList();
+      .catch(function () {
         renderTree();
-        if (list) {
-          list.replaceChildren();
-          list.appendChild(
-            el('p', 'empty', 'documents unavailable: ' + err.message)
-          );
-        }
       });
-  }
-
-  // Only same-origin ticket URLs from the docs API reach iframe/anchor sinks.
-  function ticketUrl(url) {
-    var value = String(url || '');
-    return /^\/docs\/(view|download)\/[A-Za-z0-9-]+$/.test(value) ? value : 'about:blank';
-  }
-
-  function docRow(entry) {
-    var path = String(entry.path || '');
-    var li = el('li', 'doc-row');
-    li.appendChild(kindBadge(entry.kind));
-    var link = docLink(path);
-    li.appendChild(link);
-    if (entry.editable && !readOnly) {
-      li.appendChild(docBadge('editable', 'doc-editable-mark', 'editable in the browser'));
-    }
-    var size = fmtSize(entry.size);
-    if (size) {
-      var sizeSpan = el('span', 'doc-size', size);
-      if (typeof entry.mtime_ms === 'number') {
-        li.title = new Date(entry.mtime_ms).toLocaleString();
-      }
-      li.appendChild(sizeSpan);
-    }
-    return li;
-  }
-
-  function renderList() {
-    var list = $('docs-list');
-    if (!list) { return; }
-    list.replaceChildren();
-    var needle = filterText.toLowerCase();
-    var shown = 0;
-    var frag = document.createDocumentFragment();
-    for (var i = 0; i < entries.length; i++) {
-      var entry = entries[i] || {};
-      var path = String(entry.path || '');
-      if (needle && path.toLowerCase().indexOf(needle) === -1) {
-        continue;
-      }
-      frag.appendChild(docRow(entry));
-      shown++;
-    }
-    if (shown === 0) {
-      list.appendChild(el('p', 'empty', 'no documents' + (needle ? ' match the filter' : ' yet')));
-      return;
-    }
-    list.appendChild(frag);
-    if (listTruncated) {
-      list.appendChild(el('p', 'doc-note', 'list truncated at 5000 files'));
-    }
   }
 
   function bindFilter() {
@@ -749,9 +803,14 @@
     if (!input) { return; }
     input.addEventListener('input', function () {
       filterText = input.value;
-      renderList();
       renderTree();
     });
+  }
+
+  // Only same-origin ticket URLs from the docs API reach iframe/anchor sinks.
+  function ticketUrl(url) {
+    var value = String(url || '');
+    return /^\/docs\/(view|download)\/[A-Za-z0-9-]+$/.test(value) ? value : 'about:blank';
   }
 
   // -----------------------------------------------------------------------
@@ -768,9 +827,48 @@
     });
   }
 
+  var lastChangesSig = null;
+
+  function changesSignature(turns) {
+    if (!Array.isArray(turns)) { return ''; }
+    var parts = [];
+    for (var i = 0; i < turns.length; i++) {
+      var t = turns[i] || {};
+      var fileSig = [];
+      var files = Array.isArray(t.files) ? t.files : [];
+      for (var j = 0; j < files.length; j++) {
+        var f = files[j] || {};
+        fileSig.push(String(f.path || '') + ':' + String(f.change || ''));
+      }
+      parts.push(fileSig.join(','));
+    }
+    return parts.join(';');
+  }
+
   function refreshChanges() {
     changes(null)
-      .then(renderChanges)
+      .then(function (turns) {
+        var sig = changesSignature(turns);
+        var changed = (lastChangesSig !== null && sig !== lastChangesSig);
+        lastChangesSig = sig;
+        // The panel always re-renders so a running turn's output tail stays
+        // fresh; the signature only decides whether the tree is invalidated.
+        renderChanges(turns);
+        if (changed) {
+          treeDirCache = {};
+          var tree = $('docs-tree');
+          if (tree) { tree._lastSig = null; }
+          if (!filterText) {
+            renderLazyTree(true);
+          } else {
+            api('GET', '/api/docs').then(function (payload) {
+              entries = payload && Array.isArray(payload.entries) ? payload.entries : [];
+              listTruncated = Boolean(payload && payload.truncated);
+              renderFilteredTree(filterText.toLowerCase().trim());
+            }).catch(function () {});
+          }
+        }
+      })
       .catch(function (err) {
         if (err && err.fatal) {
           // 401/missing token: the interval is already stopped by api();
@@ -956,7 +1054,9 @@
   // -----------------------------------------------------------------------
 
   function applyServeState(snap) {
-    if (!snap || typeof snap.source !== 'string') { return; }
+    if (!snap) { return; }
+    applyWorkspaceSnapshot(snap);
+    if (typeof snap.source !== 'string') { return; }
     readOnly = snap.source === 'files';
     readOnlyKnown = true;
     if (current && docBodies.badges) { setBadges(current); }

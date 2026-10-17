@@ -164,7 +164,6 @@ pub fn list_children(ws: &Workspace, dir: &str, limit: usize) -> Result<TreeList
                 continue;
             }
             let mtime = entry.metadata().ok().map(|m| mtime_ms(&m)).unwrap_or(0);
-            let has_children = dir_has_children(ws, &entry.path());
             dir_entries.push(TreeEntry {
                 name,
                 path,
@@ -173,7 +172,7 @@ pub fn list_children(ws: &Workspace, dir: &str, limit: usize) -> Result<TreeList
                 size: 0,
                 mtime_ms: mtime,
                 editable: false,
-                has_children,
+                has_children: false,
             });
             continue;
         }
@@ -235,6 +234,17 @@ pub fn list_children(ws: &Workspace, dir: &str, limit: usize) -> Result<TreeList
     entries.extend(file_entries);
     if entries.len() > limit {
         entries.truncate(limit);
+    }
+
+    for entry in entries.iter_mut() {
+        if entry.entry_type == "dir" {
+            let child_path = if entry.path.is_empty() {
+                ws.root().to_path_buf()
+            } else {
+                ws.root().join(&entry.path)
+            };
+            entry.has_children = dir_has_children(ws, &child_path);
+        }
     }
 
     Ok(TreeList {

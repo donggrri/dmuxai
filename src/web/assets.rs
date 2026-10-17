@@ -377,21 +377,21 @@ mod tests {
         assert!(INDEX_HTML.contains("tab-files"));
 
         // 2. docs.js contains lazy-expand fetch of /api/docs/tree, role="treeitem",
-        // aria-expanded, localStorage persistence, keyboard handlers
+        // aria-expanded, localStorage persistence, keyboard handlers, and ticketUrl
         assert!(DOCS_JS.contains("/api/docs/tree"));
-        assert!(DOCS_JS.contains("role"));
-        assert!(DOCS_JS.contains("treeitem"));
-        assert!(DOCS_JS.contains("aria-expanded"));
-        assert!(DOCS_JS.contains("localStorage"));
-        assert!(DOCS_JS.contains("ArrowDown") || DOCS_JS.contains("Down"));
-        assert!(DOCS_JS.contains("ArrowUp") || DOCS_JS.contains("Up"));
-        assert!(DOCS_JS.contains("ArrowLeft") || DOCS_JS.contains("Left"));
-        assert!(DOCS_JS.contains("ArrowRight") || DOCS_JS.contains("Right"));
-        assert!(DOCS_JS.contains("Enter"));
+        assert!(DOCS_JS.contains("setAttribute('role', 'treeitem')"));
+        assert!(DOCS_JS.contains("setAttribute('aria-expanded'"));
+        assert!(DOCS_JS.contains("localStorage.getItem('dmuxai.sidebar."));
+        assert!(DOCS_JS.contains("key === 'ArrowDown'"));
+        assert!(DOCS_JS.contains("key === 'ArrowUp'"));
+        assert!(DOCS_JS.contains("key === 'ArrowLeft'"));
+        assert!(DOCS_JS.contains("key === 'ArrowRight'"));
+        assert!(DOCS_JS.contains("key === 'Enter'"));
+        assert!(DOCS_JS.contains("function ticketUrl("));
 
         // 3. docs.css contains sidebar container and narrow-width drawer media query
         assert!(DOCS_CSS.contains(".sidebar"));
-        assert!(DOCS_CSS.contains("900px"));
+        assert!(DOCS_CSS.contains("@media (max-width: 900px)"));
     }
 
     // TC-608: theme_palettes_meet_wcag_contrast (SPEC-theme-colors NFR-600)

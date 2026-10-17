@@ -34,41 +34,6 @@
   border-color: var(--accent);
 }
 
-.docs-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  max-height: 320px;
-  overflow: auto;
-}
-
-.doc-row {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 4px 6px;
-  border-bottom: 1px solid var(--line);
-  font-size: 0.9em;
-}
-
-.doc-row:last-child {
-  border-bottom: none;
-}
-
-.doc-size {
-  color: var(--faint);
-  font-size: 0.8em;
-  white-space: nowrap;
-  min-width: 3.5em;
-  text-align: right;
-}
-
-.doc-note {
-  margin: 6px 0 0;
-  color: var(--warn);
-  font-size: 0.8em;
-}
-
 /* Kind and state badges. */
 
 .doc-kind {
@@ -624,12 +589,14 @@
   flex-direction: column;
   z-index: 20;
   transform: translateX(100%);
-  transition: transform 0.2s ease-in-out;
+  visibility: hidden;
+  transition: transform 0.2s ease-in-out, visibility 0.2s ease-in-out;
   box-shadow: -4px 0 20px rgba(0, 0, 0, 0.35);
 }
 
 .sidebar.open {
   transform: translateX(0);
+  visibility: visible;
 }
 
 .sidebar-backdrop {
@@ -797,4 +764,11 @@
 
 .tree-group[hidden] {
   display: none;
+}
+
+.tree-hint {
+  padding: 4px 6px;
+  color: var(--muted);
+  font-size: 0.85em;
+  font-style: italic;
 }

@@ -1769,6 +1769,12 @@ mod tests {
         let names: Vec<&str> = tree.entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"docs"));
         assert!(names.contains(&"top.txt"));
+        #[cfg(unix)]
+        {
+            assert!(!names.contains(&"linkdir"));
+            assert!(!names.contains(&"link_out.md"));
+            assert!(names.contains(&"link_in.md"));
+        }
 
         // 200 for root with ?dir=
         let resp = router
@@ -1819,6 +1825,13 @@ mod tests {
             let resp = router
                 .clone()
                 .oneshot(make_req("/api/docs/tree?dir=link_out.md"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+            let resp = router
+                .clone()
+                .oneshot(make_req("/api/docs/tree?dir=linkdir"))
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::FORBIDDEN);
