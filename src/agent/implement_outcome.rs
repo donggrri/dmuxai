@@ -52,13 +52,16 @@ impl ImplementTurnTracker {
         stderr: &str,
         protocol_completed: bool,
         require_writes: bool,
+        exit_forced_after_result: bool,
     ) -> Result<(), String> {
         if self.mode != ExecutionMode::Implement {
-            if !status.success() && !stderr.trim().is_empty() {
-                return Err(stderr.trim().to_owned());
-            }
-            if !status.success() {
-                return Err(format!("provider exited with {status}"));
+            if !exit_forced_after_result {
+                if !status.success() && !stderr.trim().is_empty() {
+                    return Err(stderr.trim().to_owned());
+                }
+                if !status.success() {
+                    return Err(format!("provider exited with {status}"));
+                }
             }
             return Ok(());
         }
@@ -66,7 +69,7 @@ impl ImplementTurnTracker {
         if stderr_indicates_permission_denial(stderr) {
             return Err(stderr.trim().to_owned());
         }
-        if !status.success() {
+        if !status.success() && !exit_forced_after_result {
             return Err(if stderr.trim().is_empty() {
                 format!("implement mode failed: provider exited with {status}")
             } else {
@@ -158,6 +161,9 @@ fn provider_line_suggests_write(line: &str) -> bool {
         "strreplace",
         "create_file",
         "\"type\":\"write\"",
+        "edit_file",
+        "write_file",
+        "accept-edits",
     ]
     .iter()
     .any(|needle| haystack.contains(needle))
@@ -185,7 +191,7 @@ mod tests {
         let tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
         let status = ExitStatus::from_raw(0);
         let error = tracker
-            .finish(&status, "", true, true)
+            .finish(&status, "", true, true, false)
             .expect_err("should require writes");
         assert!(error.contains("without any observed file changes"));
     }
@@ -195,7 +201,35 @@ mod tests {
     fn ask_mode_does_not_require_writes() {
         let tracker = ImplementTurnTracker::new(ExecutionMode::Ask);
         let status = ExitStatus::from_raw(0);
-        assert!(tracker.finish(&status, "", true, true).is_ok());
+        assert!(tracker.finish(&status, "", true, true, false).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn finish_accepts_forced_kill_after_result_in_implement_mode() {
+        // FR-503 / TC-505: a successful result followed by a grace kill yields a
+        // signal exit status; `exit_forced_after_result` must skip only the
+        // `status.success()` checks in Implement mode.
+        let killed = ExitStatus::from_raw(9);
+
+        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        tracker.observe_provider_line(r#"{"name":"create_file"}"#);
+        assert!(tracker.writes_observed());
+        assert!(
+            tracker.finish(&killed, "", true, true, true).is_ok(),
+            "forced kill after a successful result should finish Ok"
+        );
+
+        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        tracker.observe_provider_line(r#"{"name":"run_command"}"#);
+        assert!(tracker.finish(&killed, "", true, true, true).is_err());
+
+        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        tracker.observe_provider_line(r#"{"name":"create_file"}"#);
+        assert!(
+            tracker.finish(&killed, "", true, true, false).is_err(),
+            "without the forced-kill flag a signal exit should still fail"
+        );
     }
 
     #[test]
@@ -241,6 +275,37 @@ mod tests {
     }
 
     #[test]
+    fn provider_line_write_needles_cover_cursor_and_custom() {
+        // FR-501 / TC-501: Cursor (and custom) providers are scanned as raw text
+        // via `observe_provider_line`, so their write tool names must be
+        // recognized. AGY uses `observe_agy_message` and never calls this scan,
+        // so its init tool list cannot trip these needles.
+        let cursor_edit = r#"{"type":"tool_call","tool":{"name":"edit_file","args":{}}}"#;
+        let cursor_write = r#"{"type":"tool_call","tool":{"name":"write_file","args":{}}}"#;
+        let assistant_text = r#"{"type":"assistant","text":"Updated the configuration file"}"#;
+
+        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        tracker.observe_provider_line(cursor_edit);
+        assert!(tracker.writes_observed(), "edit_file should mark a write");
+
+        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        tracker.observe_provider_line(cursor_write);
+        assert!(tracker.writes_observed(), "write_file should mark a write");
+
+        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        tracker.observe_provider_line(assistant_text);
+        assert!(
+            !tracker.writes_observed(),
+            "plain assistant text should not mark a write"
+        );
+
+        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Ask);
+        tracker.observe_provider_line(cursor_edit);
+        tracker.observe_provider_line(cursor_write);
+        assert!(!tracker.writes_observed(), "Ask mode never records writes");
+    }
+
+    #[test]
     fn plan_review_response_detection_covers_implement_plan_only() {
         assert!(is_plan_review_response(
             "I drafted the implementation plan in plan.md. Please review before I apply edits."
@@ -248,7 +313,9 @@ mod tests {
         assert!(is_plan_review_response(
             "Here is the plan. Shall I proceed with the file changes?"
         ));
-        assert!(!is_plan_review_response("Applied edits to src/lib.rs successfully."));
+        assert!(!is_plan_review_response(
+            "Applied edits to src/lib.rs successfully."
+        ));
     }
 
     #[test]

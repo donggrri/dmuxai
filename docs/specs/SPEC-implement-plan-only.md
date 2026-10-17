@@ -57,15 +57,15 @@ Implement mode must apply file edits, not plans. AGY write detection must use pa
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
 | TC-500 | FR-500 | unit | Implement prompt builder | Inspect `agy_prompt(Implement, …)` | Contains apply-edits and no-plan language | `src/agent/agy.rs` `implement_prompt_forbids_background_commands` |
-| TC-501 | FR-501 | unit | AGY tool `step_update` NDJSON | Parse write tools vs init line | Writes from tool names only | `src/agent/implement_outcome.rs` `agy_write_tools_are_detected_from_step_updates`, `init_line_does_not_count_as_write_via_text_scan` |
+| TC-501 | FR-501 | unit | AGY tool `step_update` NDJSON | Parse write tools vs init line | Writes from tool names only | `src/agent/implement_outcome.rs` `agy_write_tools_are_detected_from_step_updates`, `init_line_does_not_count_as_write_via_text_scan`, `provider_line_write_needles_cover_cursor_and_custom` |
 | TC-502 | FR-500 | unit | Implement prompt | Compare to Ask/Plan | Ask/Plan omit implement-only clauses | `implement_prompt_forbids_background_commands` |
 | TC-503 | FR-502 | unit | Plan-only classifier | Text fixtures | Detects plan.md / review patterns | `plan_review_response_detection_covers_implement_plan_only`, `plan_only_outcome_requires_missing_writes_and_plan_like_text` |
-| TC-504 | FR-502, FR-506 | integration | Fake AGY script returning plan-only twice | `run_turn` Implement | Second attempt returns error containing `plan-only` | `agy_plan_only_retries_once_then_fails` |
-| TC-505 | FR-503 | integration | Fake AGY prints `result` then sleeps | `run_turn` Ask | Completes within grace + kill window | `agy_result_grace_kills_lingering_child_after_result` |
+| TC-504 | FR-502, FR-506 | integration | Fake AGY script returning plan-only twice | `run_turn` Implement | Second attempt returns error containing `plan-only` | `implement_plan_only_retries_once_then_fails` |
+| TC-505 | FR-503 | integration | Fake AGY prints `result` then sleeps | `run_turn` Ask | Completes within grace + kill window | `agy_result_grace_kills_lingering_child_after_result`, `agy_implement_grace_kill_after_success_result_completes`, `finish_accepts_forced_kill_after_result_in_implement_mode`, `agy_grace_closes_when_grandchild_holds_stderr_after_exit` |
 | TC-506 | FR-504 | unit | Normalized `result` handling | `normalize_event` on `result` | No immediate terminal in event list | `result_event_defers_terminal_until_process_exit` |
 | TC-507 | FR-505 | unit | App with `active_turns` only | Ctrl+C cancel | Busy cleared; adapter cancel called | `cancel_clears_active_turn_even_when_busy_flag_was_cleared` |
 | TC-508 | FR-507 | unit | Plan mode plan-like `result` | `normalize_event` | Notice + deferred `Completed` | `marks_plan_review_responses_as_a_notice` |
-| TC-509 | FR-508 | unit | Implement tracker, no writes | `finish(..., require_writes: true)` | Fails with no observed file changes | `implement_without_writes_fails` |
+| TC-509 | FR-508 | unit | Implement tracker, no writes | `finish(..., require_writes: true)` | Fails with no observed file changes | `implement_without_writes_fails`, `implement_permission_denial_with_plan_like_response_is_not_a_plan_only_retry` |
 
 ## 6. Data, integration, and safety contracts
 

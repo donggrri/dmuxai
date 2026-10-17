@@ -458,11 +458,12 @@ async fn run_turn(
 
         resume_session = outcome.conversation_id.clone();
 
+        // A failed `finish` (permission denial, protocol, or status check)
+        // surfaces as an `Error` terminal; only a `Completed` turn with no
+        // writes and a plan-like reply counts as a plan-only retry.
         if mode != ExecutionMode::Implement
-            || !is_plan_only_implement_outcome(
-                outcome.writes_observed,
-                &outcome.response_text,
-            )
+            || !matches!(outcome.terminal, AgentEvent::Completed)
+            || !is_plan_only_implement_outcome(outcome.writes_observed, &outcome.response_text)
         {
             emit_terminal_event(event_tx, &context, outcome.terminal).await;
             return Ok(outcome.conversation_id);
@@ -509,13 +510,7 @@ async fn run_single_agy_process(
 ) -> io::Result<SingleAgyOutcome> {
     let program = resolve_program(AGY_BINARY_OVERRIDE, "agy.exe", "agy");
     let mut command = headless_command(program);
-    configure_command_for_resume(
-        &mut command,
-        request,
-        selected_model,
-        mode,
-        resume_session,
-    );
+    configure_command_for_resume(&mut command, request, selected_model, mode, resume_session);
     command
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -637,6 +632,7 @@ async fn stream_child(
     let mut stdout_open = true;
     let mut stderr_open = true;
     let mut exit_status = None;
+    let mut killed_after_result = false;
     let mut state = AgyStreamState::default();
     let mut implement_tracker = ImplementTurnTracker::new(mode);
 
@@ -663,7 +659,6 @@ async fn stream_child(
                         }
                         if state.result_received {
                             stdout_open = false;
-                            stderr_open = false;
                             if result_grace_deadline.is_none() {
                                 result_grace_deadline = Some(
                                     Instant::now() + Duration::from_secs(AGY_RESULT_GRACE_SECS),
@@ -690,11 +685,19 @@ async fn stream_child(
                     idle_secs.unwrap_or(AGY_IDLE_TIMEOUT_DEFAULT_SECS)
                 )));
             }
-            _ = tokio::time::sleep_until(grace_deadline_at), if result_grace_deadline.is_some() && exit_status.is_none() => {
-                child.kill().await.ok();
-                if let Ok(Some(status)) = child.try_wait() {
-                    exit_status = Some(status);
+            _ = tokio::time::sleep_until(grace_deadline_at), if result_grace_deadline.is_some() => {
+                // The result line arrived but the loop is still open. Either the
+                // child is lingering (kill and reap it) or it already exited
+                // while a grandchild keeps the stderr pipe open (just stop
+                // draining). Closing both pipes guarantees termination even
+                // when no idle timeout is configured.
+                if exit_status.is_none() {
+                    killed_after_result = true;
+                    child.kill().await.ok();
+                    exit_status = Some(child.wait().await?);
                 }
+                stdout_open = false;
+                stderr_open = false;
             }
         }
     }
@@ -714,6 +717,7 @@ async fn stream_child(
         &diagnostic,
         protocol_completed,
         require_writes,
+        killed_after_result,
     ) {
         return Ok(SingleAgyOutcome {
             conversation_id: state.conversation_id,
@@ -967,7 +971,10 @@ mod tests {
                 AgentEvent::TextDelta("AGY_OK".to_owned()),
             ]
         );
-        assert_eq!(normalize_event(&result, ExecutionMode::Ask, &mut state), vec![]);
+        assert_eq!(
+            normalize_event(&result, ExecutionMode::Ask, &mut state),
+            vec![]
+        );
         assert!(matches!(
             state.pending_terminal,
             Some(AgentEvent::Completed)
@@ -1506,7 +1513,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
     async fn agy_result_grace_kills_lingering_child_after_result() {
-        // FR-505 / TC-505: after the result line the adapter waits briefly for
+        // FR-503 / TC-505: after the result line the adapter waits briefly for
         // process exit, then kills the child and emits a single terminal event.
         let result_event = json!({
             "event": "result",
@@ -1514,34 +1521,193 @@ mod tests {
         });
         let line = result_event.to_string();
         let (_dir, fake) = write_fake_agy(|_| {
-            format!(
-                "#!/bin/sh\nread -r _dmuxai_user\nprintf '%s\\n' '{line}'\nsleep 60\n"
-            )
+            format!("#!/bin/sh\nread -r _dmuxai_user\nprintf '%s\\n' '{line}'\nsleep 60\n")
         });
 
-        let started = Instant::now();
-        let outcome = with_agy_spawn_env(&fake, "0", async {
-            timeout(
+        let (outcome, elapsed) = with_agy_spawn_env(&fake, "0", async {
+            // Measure inside the env lock; tests serialize on it, so an outer
+            // timer would include other tests' cleanup time.
+            let started = Instant::now();
+            let outcome = timeout(
                 Duration::from_secs(15),
                 run_fake_agy_turn(ExecutionMode::Ask),
             )
             .await
-            .expect("grace kill should finish quickly")
+            .expect("grace kill should finish quickly");
+            (outcome, started.elapsed())
         })
         .await;
 
         outcome.expect("result should succeed after grace kill");
         assert!(
-            started.elapsed() < Duration::from_secs(12),
+            elapsed < Duration::from_secs(12),
             "turn took too long: {}",
-            started.elapsed().as_secs()
+            elapsed.as_secs()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn agy_implement_grace_kill_after_success_result_completes() {
+        // FR-503 / TC-505: in Implement mode a child that lingers after a
+        // successful result is grace-killed; the forced signal exit must not be
+        // turned into an Error by `finish`. Exactly one terminal event,
+        // `Completed`, and the turn ends promptly.
+        let write_step = json!({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_name": "write_to_file"
+            }
+        });
+        let result_event = json!({
+            "event": "result",
+            "result": { "status": "SUCCESS", "response": "AGY_OK" }
+        });
+        let script = format!(
+            "#!/bin/sh\nread -r _dmuxai_user\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\nsleep 60\n",
+            write_step, result_event
+        );
+        let (_dir, fake) = write_fake_agy(|_| script);
+
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("grace-conversation"),
+            turn_id: super::super::TurnId::new("grace-turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let cwd = std::env::temp_dir();
+
+        let (outcome, terminals, elapsed) = with_agy_spawn_env(&fake, "0", async {
+            // Measure inside the env lock; AGY spawn tests serialize on it.
+            let started = Instant::now();
+            let turn = tokio::spawn(async move {
+                run_turn(&request, None, ExecutionMode::Implement, &cwd, &event_tx).await
+            });
+
+            let terminals = timeout(Duration::from_secs(10), async {
+                let mut terminals = Vec::new();
+                while let Some(output) = event_rx.recv().await {
+                    match output.event {
+                        AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_) => {
+                            terminals.push(output.event);
+                        }
+                        _ => {}
+                    }
+                }
+                terminals
+            })
+            .await
+            .expect("grace kill after a successful result should finish within 10s");
+
+            let outcome = turn.await.expect("turn task should not panic");
+            (outcome, terminals, started.elapsed())
+        })
+        .await;
+
+        outcome.expect("implement turn should succeed after the grace kill");
+        assert_eq!(
+            terminals.len(),
+            1,
+            "expected exactly one terminal event, got {terminals:?}"
+        );
+        assert!(
+            matches!(terminals[0], AgentEvent::Completed),
+            "terminal event should be Completed, got {:?}",
+            terminals[0]
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "turn took too long: {}",
+            elapsed.as_secs()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn agy_grace_closes_when_grandchild_holds_stderr_after_exit() {
+        // FR-503 / TC-505: after the result line the adapter stops reading
+        // stdout; if the AGY child exits but a grandchild inherits and holds the
+        // stderr pipe open, the grace deadline must still close the loop instead
+        // of hanging forever when no idle timeout is configured.
+        let write_step = json!({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_name": "write_to_file"
+            }
+        });
+        let result_event = json!({
+            "event": "result",
+            "result": { "status": "SUCCESS", "response": "AGY_OK" }
+        });
+        let script = format!(
+            "#!/bin/sh\nread -r _dmuxai_user\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\n( sleep 60 >&2 ) &\nexit 0\n",
+            write_step, result_event
+        );
+        let (_dir, fake) = write_fake_agy(|_| script);
+
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("grandchild-conversation"),
+            turn_id: super::super::TurnId::new("grandchild-turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let cwd = std::env::temp_dir();
+
+        let (outcome, terminals, elapsed) = with_agy_spawn_env(&fake, "0", async {
+            // Measure inside the env lock; AGY spawn tests serialize on it.
+            let started = Instant::now();
+            let turn = tokio::spawn(async move {
+                run_turn(&request, None, ExecutionMode::Implement, &cwd, &event_tx).await
+            });
+
+            let terminals = timeout(Duration::from_secs(10), async {
+                let mut terminals = Vec::new();
+                while let Some(output) = event_rx.recv().await {
+                    match output.event {
+                        AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_) => {
+                            terminals.push(output.event);
+                        }
+                        _ => {}
+                    }
+                }
+                terminals
+            })
+            .await
+            .expect("grace close should finish within 10s even with a stderr-holding grandchild");
+
+            let outcome = turn.await.expect("turn task should not panic");
+            (outcome, terminals, started.elapsed())
+        })
+        .await;
+
+        outcome.expect("implement turn should succeed");
+        assert_eq!(
+            terminals.len(),
+            1,
+            "expected exactly one terminal event, got {terminals:?}"
+        );
+        assert!(
+            matches!(terminals[0], AgentEvent::Completed),
+            "terminal event should be Completed, got {:?}",
+            terminals[0]
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "turn took too long: {}",
+            elapsed.as_secs()
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
     async fn implement_plan_only_retries_once_then_fails() {
-        // FR-504 / TC-504: plan-only Implement outcomes retry once, then fail.
+        // FR-506 / TC-506: plan-only Implement outcomes retry once, then fail.
         let plan_response = json!({
             "event": "result",
             "result": {
@@ -1569,6 +1735,78 @@ mod tests {
         assert!(
             error.to_string().contains("plan-only"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn implement_permission_denial_with_plan_like_response_is_not_a_plan_only_retry() {
+        // FR-508 / TC-509: a permission-denial `finish` failure must fail the
+        // Implement turn immediately, even when the (no-write) response text
+        // looks plan-only; the denial terminal must not be swallowed by the
+        // plan-only retry path.
+        let plan_response = json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "I saved the implementation plan to plan.md. Please review and approve before editing."
+            }
+        });
+        let plan_line = plan_response.to_string();
+        let (_dir, fake) = write_fake_agy(|_| {
+            format!(
+                "#!/bin/sh\nread -r _dmuxai_user\nprintf 'error: permission denied: sandbox\\n' >&2\nprintf '%s\\n' '{plan_line}'\n"
+            )
+        });
+
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("denial-conversation"),
+            turn_id: super::super::TurnId::new("denial-turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let cwd = std::env::temp_dir();
+
+        let (outcome, terminals) = with_agy_spawn_env(&fake, "0", async {
+            let turn = tokio::spawn(async move {
+                run_turn(&request, None, ExecutionMode::Implement, &cwd, &event_tx).await
+            });
+
+            let terminals = timeout(Duration::from_secs(10), async {
+                let mut terminals = Vec::new();
+                while let Some(output) = event_rx.recv().await {
+                    match output.event {
+                        AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_) => {
+                            terminals.push(output.event);
+                        }
+                        _ => {}
+                    }
+                }
+                terminals
+            })
+            .await
+            .expect("a denied Implement turn should finish within 10s");
+
+            let outcome = turn.await.expect("turn task should not panic");
+            (outcome, terminals)
+        })
+        .await;
+
+        assert_eq!(
+            terminals.len(),
+            1,
+            "expected exactly one terminal event, got {terminals:?}"
+        );
+        assert!(
+            matches!(&terminals[0], AgentEvent::Error(message) if message.contains("permission denied")),
+            "terminal event should carry the denial, got {:?}",
+            terminals[0]
+        );
+        assert!(
+            outcome.is_ok(),
+            "the turn returns conversation id; the denial is the terminal event"
         );
     }
 }

@@ -441,9 +441,13 @@ async fn stream_child(
 
     let status = exit_status.expect("child.wait runs before the loop can finish");
     let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
-    if let Err(reason) =
-        implement_tracker.finish(&status, &diagnostic, state.terminal, mode == ExecutionMode::Implement)
-    {
+    if let Err(reason) = implement_tracker.finish(
+        &status,
+        &diagnostic,
+        state.terminal,
+        mode == ExecutionMode::Implement,
+        false,
+    ) {
         return Err(io::Error::other(reason));
     }
     if !state.terminal {
