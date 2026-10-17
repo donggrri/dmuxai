@@ -25,3 +25,12 @@ Reviewer: opencode-haiku (`dmuxai run --agent opencode-haiku --mode ask`). Curso
 | nits | Shell ownership; ignored-dir status; 27–40% range; timeout parameter | SPEC-docs-tree owns the shell; ignored dir → 404 `NotFound`; range quoted; timeout is a parameter |
 
 `scripts/check-spec.ps1` needs PowerShell, which is not installed on this box; `tests/spec_index.rs` passes (3/3).
+
+## Round 3 (AGY, gemini-3.8-flash-high): APPROVE
+
+No blockers; every earlier blocker was confirmed resolved, and the IDs are unique.
+
+Nits, all applied:
+- TC-812 now also cites FR-813 (timeout).
+- ROADMAP lists the UX/NFR IDs.
+- FR-815 and FR-816 are both delivered in task 4 (one README PR) while tracked as issues #45 and #46.
