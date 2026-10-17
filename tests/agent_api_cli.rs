@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 struct Sandbox {
     _dir: tempfile::TempDir,
@@ -398,7 +398,7 @@ fn init_writes_starter_config() {
     // The starter parses cleanly: no config warnings, and the built-in runner
     // is still registered from PATH.
     let status = stdout_json(&sandbox.run_in_env(&["status", "--json"], None, &env));
-    assert_eq!(status["warnings"], json!([]), "{status}");
+    assert_eq!(status["warnings"], serde_json::json!([]), "{status}");
     let listed = status["agents"]
         .as_array()
         .unwrap()
