@@ -15,3 +15,10 @@ Reviewer: opencode-haiku (`openrouter/anthropic/claude-haiku-5.5`), run with `dm
 | 9 | The final aggregate was skipped whenever any text had been shown, so a last segment without partials would be lost | Fixed: segment and final aggregates share one rule (`aggregate_missing`). The fixture shows the final aggregate repeats only the last segment (445 of 488 chars) |
 
 Nits 7 (rustfmt) and 8 (redundant assert): `cargo fmt --check` is clean, and the assert is kept because it gives a clearer failure message.
+
+## Round 2: REQUEST_CHANGES
+
+| # | Finding | Resolution |
+| --- | --- | --- |
+| 1 | The turn-suffix check also applied to segment aggregates, so identical consecutive segments without partials collapsed (a regression) | Fixed: segment aggregates without partials are always shown in full. Only the final aggregate is compared with the turn. Tested |
+| 2 | A whole-turn final aggregate after a streamed last segment dropped its tail | Fixed: the final aggregate first tries the whole-turn prefix. Tested |

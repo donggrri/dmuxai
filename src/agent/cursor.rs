@@ -550,27 +550,34 @@ impl CursorStreamState {
         events.push(AgentEvent::TextDelta(text.to_owned()));
     }
 
-    /// The part of an aggregate (segment or final) that is not on screen yet
+    /// The part of an aggregate that is not on screen yet
     /// (SPEC-cursor-stream-dedupe FR-800, FR-801).
-    fn aggregate_missing<'a>(&mut self, text: &'a str) -> &'a str {
+    fn aggregate_missing<'a>(&mut self, text: &'a str, is_final: bool) -> &'a str {
         let segment = std::mem::take(&mut self.segment_text);
-        if !segment.is_empty() {
-            // Partials of this segment were streamed: add only an unstreamed
-            // tail. An aggregate that does not extend the streamed text (e.g.
-            // re-formatted) adds nothing: the segment is already visible.
-            return text.strip_prefix(segment.as_str()).unwrap_or("");
+        if is_final {
+            // A whole-turn aggregate: add the tail beyond everything shown.
+            if let Some(tail) = text.strip_prefix(self.turn_text.as_str()) {
+                return tail;
+            }
+            // Otherwise it repeats the last segment: add only what that
+            // segment's partials did not stream.
+            if !segment.is_empty() {
+                return text.strip_prefix(segment.as_str()).unwrap_or("");
+            }
+            return if self.turn_text.ends_with(text) {
+                ""
+            } else {
+                text
+            };
         }
-        if self.turn_text.is_empty() {
+        if segment.is_empty() {
+            // No partials for this segment: the aggregate is its only copy.
             return text;
         }
-        if self.turn_text.ends_with(text) {
-            // Already shown, e.g. a final aggregate repeating the last segment
-            // aggregate when the stream had no partials.
-            return "";
-        }
-        // A whole-turn aggregate extends what was shown: add the tail.
-        // Otherwise it is a new, never-streamed segment.
-        text.strip_prefix(self.turn_text.as_str()).unwrap_or(text)
+        // Partials were streamed: add only an unstreamed tail. An aggregate
+        // that does not extend them (e.g. re-formatted) adds nothing, since the
+        // segment is already visible.
+        text.strip_prefix(segment.as_str()).unwrap_or("")
     }
 }
 
@@ -601,8 +608,9 @@ fn normalize_event(message: &Value, state: &mut CursorStreamState) -> Vec<AgentE
             // - a final aggregate (neither key) repeating the last segment.
             // Deltas are shown as they arrive; an aggregate contributes only
             // text that is not on screen yet.
-            if message.get("model_call_id").is_some() || message.get("timestamp_ms").is_none() {
-                let missing = state.aggregate_missing(&text);
+            let has_model_call = message.get("model_call_id").is_some();
+            if has_model_call || message.get("timestamp_ms").is_none() {
+                let missing = state.aggregate_missing(&text, !has_model_call);
                 state.emit(&mut events, missing);
             } else {
                 state.segment_text.push_str(&text);
@@ -919,6 +927,21 @@ mod tests {
                 final_aggregate("Last.")
             ]),
             "One. Last."
+        );
+        // Identical consecutive segments without partials are both shown.
+        assert_eq!(
+            run(&[segment("Done. "), tool_call.clone(), segment("Done. ")]),
+            "Done. Done. "
+        );
+        // A whole-turn final aggregate after a streamed last segment adds its tail.
+        assert_eq!(
+            run(&[
+                segment("One. "),
+                tool_call.clone(),
+                partial("Two."),
+                final_aggregate("One. Two. Three.")
+            ]),
+            "One. Two. Three."
         );
         // Korean (multi-byte) tails split on character boundaries.
         assert_eq!(

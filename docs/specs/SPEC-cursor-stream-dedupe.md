@@ -24,7 +24,7 @@ The fix: segment aggregates contribute only text that was not streamed.
 
 | ID | Priority | Requirement | Tests |
 | --- | --- | --- | --- |
-| FR-800 | Must | Given cursor-agent `assistant` events, Then partial deltas (`timestamp_ms` without `model_call_id`) are shown as they arrive. A tool call ends the segment. Any aggregate, whether a segment aggregate (`model_call_id`) or the final aggregate (neither key, repeating the last segment), adds only text that is not on screen yet: the tail beyond that segment's streamed partials, or, when the segment had no partials, its text unless it was already shown. An aggregate that does not extend the streamed partials (for example re-formatted whitespace) adds nothing, because the segment is already visible | TC-800, TC-801 |
+| FR-800 | Must | Given cursor-agent `assistant` events, Then partial deltas (`timestamp_ms` without `model_call_id`) are shown as they arrive. A tool call ends the segment. A segment aggregate (`model_call_id`) adds only the tail beyond that segment's streamed partials. When the segment had no partials, it adds its whole text, even if it repeats an earlier segment. The final aggregate (neither key) is compared with the turn: as a whole-turn aggregate it adds the tail beyond everything shown; as a repeat of the last segment it adds only that segment's unstreamed tail, and nothing if that text was already shown. An aggregate that does not extend the streamed partials (for example re-formatted whitespace) adds nothing, because the segment is already visible | TC-800, TC-801 |
 | FR-801 | Must | Given a stream without partial deltas (older cursor-agent, or no `--stream-partial-output`), Then each segment aggregate's text is shown once. The final aggregate adds only the part that is not on screen yet: nothing when it repeats the last segment; the unseen tail when it is a whole-turn aggregate | TC-801 |
 
 ## 4. Tests
@@ -32,7 +32,7 @@ The fix: segment aggregates contribute only text that was not streamed.
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |
 | TC-800 | FR-800 | unit (recorded) | `tests/fixtures/cursor/stream-partial-tool-segments.jsonl`: a real composer-2.5 Plan turn with tool calls between segments. Tool payloads, session/request ids and paths are stripped. Random tool `call_id`s are kept | Concatenated deltas equal the `result` text; the first segment appears once; one `Completed` | `src/agent/cursor.rs` `recorded_cursor_stream_text_appears_once` |
-| TC-801 | FR-800, FR-801 | unit | synthetic events | Aggregates after partials add nothing, or only the unstreamed tail; without partials each segment shows once. Also covered: tool-call segment reset; a final aggregate repeating the last segment or the whole turn; an unstreamed last segment; Korean tails; a non-extending aggregate; an error after partials | `src/agent/cursor.rs` `cursor_segment_aggregates_add_only_missing_text`, `cursor_aggregate_edge_cases` |
+| TC-801 | FR-800, FR-801 | unit | synthetic events | Aggregates after partials add nothing, or only the unstreamed tail; without partials each segment shows once. Also covered: tool-call segment reset; identical consecutive segments; a whole-turn final aggregate after streamed partials; a final aggregate repeating the last segment or the whole turn; an unstreamed last segment; Korean tails; a non-extending aggregate; an error after partials | `src/agent/cursor.rs` `cursor_segment_aggregates_add_only_missing_text`, `cursor_aggregate_edge_cases` |
 
 ## 5. Verification
 
