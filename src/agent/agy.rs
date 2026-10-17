@@ -11,6 +11,7 @@ use tokio::{
     process::{ChildStderr, ChildStdout},
     sync::mpsc,
     task::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use super::{
@@ -26,6 +27,32 @@ const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const STDERR_HISTORY_CAPACITY: usize = 8;
 const AGY_BINARY_OVERRIDE: &str = "DMUXAI_AGY_BIN";
 const AGY_MODEL_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+const AGY_IDLE_TIMEOUT_ENV: &str = "DMUXAI_AGY_IDLE_TIMEOUT_SECS";
+const AGY_IDLE_TIMEOUT_DEFAULT_SECS: u64 = 300;
+
+/// Resolves the idle timeout from `DMUXAI_AGY_IDLE_TIMEOUT_SECS`.
+///
+/// `None` disables the timeout; `0` also disables it; any other value is used
+/// verbatim when positive and valid, and falls back to the default otherwise.
+fn parse_idle_timeout_secs(raw: Option<&str>) -> Option<u64> {
+    let Some(raw) = raw else {
+        return Some(AGY_IDLE_TIMEOUT_DEFAULT_SECS);
+    };
+    if raw.trim() == "0" {
+        return None;
+    }
+    Some(
+        raw.trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|secs| *secs > 0)
+            .unwrap_or(AGY_IDLE_TIMEOUT_DEFAULT_SECS),
+    )
+}
+
+fn agy_idle_timeout_secs() -> Option<u64> {
+    parse_idle_timeout_secs(std::env::var(AGY_IDLE_TIMEOUT_ENV).ok().as_deref())
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CachedAgyModels {
@@ -445,7 +472,9 @@ fn agy_prompt(mode: ExecutionMode, prompt: &str) -> String {
         ExecutionMode::Plan => format!(
             "Create a plan only. Do not modify files or execute implementation steps.\n\n{prompt}"
         ),
-        ExecutionMode::Implement => prompt.to_owned(),
+        ExecutionMode::Implement => format!(
+            "Run every command in the foreground with a bounded timeout. Do not start background or detached processes.\n\n{prompt}"
+        ),
     }
 }
 
@@ -501,11 +530,18 @@ async fn stream_child(
     let mut state = AgyStreamState::default();
     let mut implement_tracker = ImplementTurnTracker::new(mode);
 
+    let idle_secs = agy_idle_timeout_secs();
+    let mut idle_deadline = idle_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
+
     while stdout_open || stderr_open || exit_status.is_none() {
+        let deadline = idle_deadline.unwrap_or_else(Instant::now);
         tokio::select! {
             line = stdout_lines.next_line(), if stdout_open => {
                 match line? {
                     Some(line) => {
+                        if let Some(secs) = idle_secs {
+                            idle_deadline = Some(Instant::now() + Duration::from_secs(secs));
+                        }
                         implement_tracker.observe_provider_line(&line);
                         let message: Value = serde_json::from_str(&line).map_err(|error| {
                             io::Error::other(format!("invalid AGY NDJSON: {error}"))
@@ -525,6 +561,13 @@ async fn stream_child(
             }
             status = child.wait(), if exit_status.is_none() => {
                 exit_status = Some(status?);
+            }
+            _ = tokio::time::sleep_until(deadline), if idle_deadline.is_some() => {
+                child.kill().await.ok();
+                return Err(io::Error::other(format!(
+                    "AGY produced no events for {}s; it may be waiting on a background command. Run commands in the foreground with a bounded timeout.",
+                    idle_secs.unwrap_or(AGY_IDLE_TIMEOUT_DEFAULT_SECS)
+                )));
             }
         }
     }
@@ -872,7 +915,7 @@ mod tests {
                 .any(|args| args == ["--mode", "accept-edits"])
         );
         assert!(implement.iter().any(|arg| arg == "--sandbox"));
-        assert_eq!(agy_prompt(ExecutionMode::Implement, "hello"), "hello");
+        assert!(agy_prompt(ExecutionMode::Implement, "hello").ends_with("\n\nhello"));
     }
 
     #[test]
@@ -1056,5 +1099,212 @@ mod tests {
                 }
             )]
         );
+    }
+
+    #[test]
+    fn agy_idle_timeout_env_parsing() {
+        // FR-442 / TC-442: unset uses the default, "0" disables, a valid value
+        // overrides, and invalid or non-positive values use the default.
+        assert_eq!(parse_idle_timeout_secs(None), Some(300));
+        assert_eq!(parse_idle_timeout_secs(Some("0")), None);
+        assert_eq!(parse_idle_timeout_secs(Some("45")), Some(45));
+        assert_eq!(parse_idle_timeout_secs(Some(" 7 ")), Some(7));
+        assert_eq!(parse_idle_timeout_secs(Some(" 90 ")), Some(90));
+        assert_eq!(parse_idle_timeout_secs(Some("ABC")), Some(300));
+        assert_eq!(parse_idle_timeout_secs(Some("-5")), Some(300));
+        assert_eq!(parse_idle_timeout_secs(Some("1.5")), Some(300));
+        assert_eq!(parse_idle_timeout_secs(Some("")), Some(300));
+    }
+
+    #[test]
+    fn implement_prompt_forbids_background_commands() {
+        // FR-443 / TC-443: Implement mode must instruct AGY to keep commands in
+        // the foreground with a bounded timeout and to avoid background or
+        // detached processes; Ask/Plan stay untouched.
+        let wrapped = agy_prompt(ExecutionMode::Implement, "build the thing");
+        assert!(
+            wrapped.starts_with("Run every command in the foreground"),
+            "unexpected Implement prompt: {wrapped}"
+        );
+        assert!(
+            wrapped.contains("background"),
+            "unexpected Implement prompt: {wrapped}"
+        );
+        assert!(wrapped.ends_with("\n\nbuild the thing"));
+        assert!(!agy_prompt(ExecutionMode::Ask, "hi").contains("background"));
+        assert!(!agy_prompt(ExecutionMode::Plan, "hi").contains("background"));
+    }
+
+    #[cfg(unix)]
+    static AGY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[cfg(unix)]
+    async fn with_agy_spawn_env<F>(program: &Path, idle_secs: &str, work: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        let _guard = AGY_ENV_LOCK.lock().await;
+        let saved_bin = std::env::var(AGY_BINARY_OVERRIDE).ok();
+        let saved_idle = std::env::var(AGY_IDLE_TIMEOUT_ENV).ok();
+        unsafe {
+            std::env::set_var(AGY_BINARY_OVERRIDE, program);
+            std::env::set_var(AGY_IDLE_TIMEOUT_ENV, idle_secs);
+        }
+        let result = work.await;
+        unsafe {
+            match saved_bin {
+                Some(value) => std::env::set_var(AGY_BINARY_OVERRIDE, value),
+                None => std::env::remove_var(AGY_BINARY_OVERRIDE),
+            }
+            match saved_idle {
+                Some(value) => std::env::set_var(AGY_IDLE_TIMEOUT_ENV, value),
+                None => std::env::remove_var(AGY_IDLE_TIMEOUT_ENV),
+            }
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    fn write_fake_agy(build_script: impl FnOnce(&Path) -> String) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("fake AGY tempdir");
+        let script = build_script(dir.path());
+        let path = dir.path().join("agy");
+        std::fs::write(&path, script).expect("fake AGY script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("fake AGY chmod");
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    async fn run_fake_agy_turn(mode: ExecutionMode) -> io::Result<Option<String>> {
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("fake-conversation"),
+            turn_id: super::super::TurnId::new("fake-turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let cwd = std::env::temp_dir();
+        run_turn(&request, None, mode, &cwd, &event_tx).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn agy_idle_timeout_kills_silent_child() {
+        // FR-440 / TC-440: after one activity line the fake AGY goes silent, so
+        // the idle deadline must kill the child and fail the turn with a
+        // `no events for <N>s` error that calls out background commands.
+        let (dir, fake) = write_fake_agy(|tmp| {
+            let init_event = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "tool_name": "run",
+                    "tool_info": {"parameters": {"command": "cargo build &"}},
+                    "state": "ACTIVE"
+                }
+            });
+            format!(
+                "#!/bin/sh\necho $$ > {}\nprintf '%s\\n' '{}'\nsleep 600\n",
+                tmp.join("agy.pid").display(),
+                init_event
+            )
+        });
+        let pid_path = dir.path().join("agy.pid");
+
+        let outcome = with_agy_spawn_env(&fake, "1", async {
+            timeout(
+                Duration::from_secs(20),
+                run_fake_agy_turn(ExecutionMode::Implement),
+            )
+            .await
+            .expect("the idle timeout should end the turn far before the child settles")
+        })
+        .await;
+
+        let error = outcome.expect_err("a silent child should fail the turn");
+        let message = error.to_string();
+        assert!(
+            message.contains("no events for 1s"),
+            "unexpected timeout error: {message}"
+        );
+        assert!(
+            message.contains("background"),
+            "unexpected timeout error: {message}"
+        );
+
+        // The fake AGY recorded its PID only once it started, and the idle
+        // path must have killed it by now.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let pid = std::fs::read_to_string(&pid_path)
+            .expect("fake AGY should have written its PID")
+            .trim()
+            .to_owned();
+        assert!(!pid.is_empty());
+        let dead = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if std::process::Command::new("kill")
+                    .arg("-0")
+                    .arg(&pid)
+                    .status()
+                    .map(|status| !status.success())
+                    .unwrap_or(true)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            dead,
+            "fake AGY process {pid} should be killed on idle timeout"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn agy_idle_timer_resets_on_each_event() {
+        // FR-441 / TC-441: every stdout line re-arms the idle deadline, so the
+        // turn survives when the cumulative runtime exceeds the timeout while
+        // no single gap between stdout lines does.
+        let step = |delta: &str| {
+            json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "thinking",
+                    "thinking_delta": delta
+                }
+            })
+            .to_string()
+        };
+        let result_event = json!({
+            "event": "result",
+            "result": {"status": "SUCCESS", "response": "AGY_OK"}
+        });
+        let (_dir, fake) = write_fake_agy(|_| {
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\nsleep 0.7\nprintf '%s\\n' '{}'\nsleep 0.7\nprintf '%s\\n' '{}'\nsleep 0.7\nprintf '%s\\n' '{}'\n",
+                step("one"),
+                step("two"),
+                step("three"),
+                result_event
+            )
+        });
+
+        let outcome = with_agy_spawn_env(&fake, "2", async {
+            timeout(
+                Duration::from_secs(20),
+                run_fake_agy_turn(ExecutionMode::Ask),
+            )
+            .await
+            .expect("a continuously streaming child should finish promptly")
+        })
+        .await;
+
+        outcome.expect("stdout events within the timeout should keep the turn alive");
     }
 }
