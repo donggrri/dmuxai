@@ -216,8 +216,14 @@ impl Drop for LockGuard {
 }
 
 const LOCK_STALE: Duration = Duration::from_secs(5);
-const LOCK_TIMEOUT: Duration = Duration::from_millis(500);
+const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCK_RETRY: Duration = Duration::from_millis(5);
+
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    let kind = error.kind();
+    kind == std::io::ErrorKind::AlreadyExists
+        || (cfg!(windows) && kind == std::io::ErrorKind::PermissionDenied)
+}
 
 fn acquire_lock(lock_path: &Path) -> std::io::Result<LockGuard> {
     let start = Instant::now();
@@ -233,7 +239,10 @@ fn acquire_lock(lock_path: &Path) -> std::io::Result<LockGuard> {
                     file: Some(file),
                 });
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // On Windows, opening a lock file that another handle is deleting
+            // fails with ERROR_ACCESS_DENIED (delete pending) instead of
+            // AlreadyExists; both mean "held, retry".
+            Err(error) if lock_is_contended(&error) => {
                 if let Ok(metadata) = std::fs::metadata(lock_path)
                     && let Ok(modified) = metadata.modified()
                     && modified.elapsed().is_ok_and(|age| age > LOCK_STALE)
