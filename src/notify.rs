@@ -414,51 +414,55 @@ mod tests {
     /// with `response`, and hand the parsed request back to the test.
     async fn serve_one(listener: TcpListener, response: Vec<u8>) -> std::io::Result<MockRequest> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (mut stream, _) = listener.accept().await?;
-        let mut buf: Vec<u8> = Vec::new();
-        let header_end = loop {
-            if let Some(pos) = find(&buf, b"\r\n\r\n") {
-                break pos;
-            }
-            let mut chunk = [0u8; 4096];
-            let read = stream.read(&mut chunk).await?;
-            if read == 0 {
-                break usize::MAX; // peer hung up before the head was complete
-            }
-            buf.extend_from_slice(&chunk[..read]);
-        };
-        let (method, path, headers) = if header_end == usize::MAX {
-            (String::new(), String::new(), Vec::new())
-        } else {
-            parse_head(&buf, header_end)
-        };
-        let content_length = headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, value)| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        let body = if header_end == usize::MAX {
-            Vec::new()
-        } else {
-            let body_start = header_end + 4;
-            while buf.len() < body_start + content_length {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut stream, _) = listener.accept().await?;
+            let mut buf: Vec<u8> = Vec::new();
+            let header_end = loop {
+                if let Some(pos) = find(&buf, b"\r\n\r\n") {
+                    break pos;
+                }
                 let mut chunk = [0u8; 4096];
                 let read = stream.read(&mut chunk).await?;
                 if read == 0 {
-                    break;
+                    break usize::MAX; // peer hung up before the head was complete
                 }
                 buf.extend_from_slice(&chunk[..read]);
-            }
-            buf[body_start..].to_vec()
-        };
-        let _ = stream.write_all(&response).await;
-        let _ = stream.shutdown().await;
-        Ok(MockRequest {
-            method,
-            path,
-            headers,
-            body,
+            };
+            let (method, path, headers) = if header_end == usize::MAX {
+                (String::new(), String::new(), Vec::new())
+            } else {
+                parse_head(&buf, header_end)
+            };
+            let content_length = headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let body = if header_end == usize::MAX {
+                Vec::new()
+            } else {
+                let body_start = header_end + 4;
+                while buf.len() < body_start + content_length {
+                    let mut chunk = [0u8; 4096];
+                    let read = stream.read(&mut chunk).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..read]);
+                }
+                buf[body_start..].to_vec()
+            };
+            let _ = stream.write_all(&response).await;
+            let _ = stream.shutdown().await;
+            Ok(MockRequest {
+                method,
+                path,
+                headers,
+                body,
+            })
         })
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "mock server timed out"))?
     }
 
     fn sample_record(to_state: &str) -> EventRecord {
@@ -532,7 +536,11 @@ mod tests {
         notifier.notify(&filtered); // not in `events`: must never be delivered
         notifier.notify(&delivered);
 
-        let request = ok_server.await.unwrap().expect("mock served one request");
+        let request = tokio::time::timeout(Duration::from_secs(5), ok_server)
+            .await
+            .expect("ok_server timed out")
+            .unwrap()
+            .expect("mock served one request");
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/hook?query=secret-ish");
         assert_eq!(request.header("content-type"), Some("application/json"));
@@ -569,13 +577,17 @@ mod tests {
             Notifier::spawn(&redirect_settings, workspace.path()).expect("redirect notifier");
         redirect_notifier.notify(&sample_record("completed"));
 
-        let redirect_request = redirect_server
+        let redirect_request = tokio::time::timeout(Duration::from_secs(5), redirect_server)
             .await
+            .expect("redirect_server timed out")
             .unwrap()
             .expect("redirect mock served one request");
         assert_eq!(redirect_request.path, "/hook");
         assert!(
-            second_probe.await.unwrap(),
+            tokio::time::timeout(Duration::from_secs(5), second_probe)
+                .await
+                .expect("second_probe timed out")
+                .unwrap(),
             "302 Location target must not be contacted"
         );
         assert!(
@@ -587,8 +599,12 @@ mod tests {
         let slow_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let slow_addr = slow_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (_socket, _) = slow_listener.accept().await.unwrap();
-            std::future::pending::<()>().await; // hold the connection, never reply
+            if let Ok(Ok((_socket, _))) =
+                tokio::time::timeout(Duration::from_secs(5), slow_listener.accept()).await
+            {
+                let _ = tokio::time::timeout(Duration::from_secs(5), std::future::pending::<()>())
+                    .await;
+            }
         });
         let slow_settings = NotifySettings {
             webhook_url: Some(format!("http://{slow_addr}/hook")),

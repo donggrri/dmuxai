@@ -34,41 +34,6 @@
   border-color: var(--accent);
 }
 
-.docs-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  max-height: 320px;
-  overflow: auto;
-}
-
-.doc-row {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 4px 6px;
-  border-bottom: 1px solid var(--line);
-  font-size: 0.9em;
-}
-
-.doc-row:last-child {
-  border-bottom: none;
-}
-
-.doc-size {
-  color: var(--faint);
-  font-size: 0.8em;
-  white-space: nowrap;
-  min-width: 3.5em;
-  text-align: right;
-}
-
-.doc-note {
-  margin: 6px 0 0;
-  color: var(--warn);
-  font-size: 0.8em;
-}
-
 /* Kind and state badges. */
 
 .doc-kind {
@@ -607,3 +572,203 @@
 .md-body th[align="left"], .md-body td[align="left"] { text-align: left; }
 .md-body th[align="center"], .md-body td[align="center"] { text-align: center; }
 .md-body th[align="right"], .md-body td[align="right"] { text-align: right; }
+
+/*
+ * Sidebar shell and tree view (SPEC-docs-tree FR-832, FR-833, UX-830).
+ */
+
+.sidebar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 320px;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  z-index: 20;
+  transform: translateX(100%);
+  visibility: hidden;
+  transition: transform 0.2s ease-in-out, visibility 0.2s ease-in-out;
+  box-shadow: -4px 0 20px rgba(0, 0, 0, 0.35);
+}
+
+.sidebar.open {
+  transform: translateX(0);
+  visibility: visible;
+}
+
+.sidebar-backdrop {
+  display: none;
+}
+
+@media (max-width: 900px) {
+  .sidebar {
+    width: min(320px, 85vw);
+  }
+  .sidebar-backdrop.active {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 15;
+  }
+}
+
+@media (min-width: 901px) {
+  body.sidebar-open main {
+    margin-right: 320px;
+  }
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-chip);
+}
+
+.sidebar-tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.sidebar-tab {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.9em;
+  font-weight: 600;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.sidebar-tab:hover {
+  color: var(--text);
+}
+
+.sidebar-tab.active {
+  background: var(--bg-panel);
+  border-color: var(--line);
+  color: var(--accent);
+}
+
+.sidebar-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 1.2em;
+  cursor: pointer;
+  padding: 2px 6px;
+  line-height: 1;
+}
+
+.sidebar-close:hover {
+  color: var(--text);
+}
+
+.sidebar-tab-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 10px 12px;
+  overflow: hidden;
+}
+
+.docs-tree-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.docs-tree {
+  flex: 1 1 auto;
+  overflow: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.9em;
+}
+
+.tree-node {
+  margin: 0;
+  padding: 0;
+}
+
+.tree-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  color: var(--text);
+  outline: none;
+}
+
+.tree-item:hover {
+  background: var(--bg-chip);
+}
+
+.tree-item:focus {
+  background: var(--bg-chip);
+  outline: 1px solid var(--accent);
+}
+
+.tree-item.selected {
+  background: var(--current-bg);
+}
+
+.tree-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  font-size: 0.7em;
+  color: var(--muted);
+  flex: none;
+  transition: transform 0.15s ease;
+}
+
+.tree-toggle.expanded {
+  transform: rotate(90deg);
+}
+
+.tree-icon {
+  font-size: 0.8em;
+  flex: none;
+}
+
+.tree-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-group {
+  margin: 0;
+  padding-left: 14px;
+  list-style: none;
+}
+
+.tree-group[hidden] {
+  display: none;
+}
+
+.tree-hint {
+  padding: 4px 6px;
+  color: var(--muted);
+  font-size: 0.85em;
+  font-style: italic;
+}

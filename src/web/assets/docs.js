@@ -42,6 +42,8 @@
   var readOnly = false;
   var readOnlyKnown = false;
   var entries = [];
+  var entriesLoaded = false;
+  var entriesError = '';
   var listTruncated = false;
   var filterText = '';
   var changesTimer = null;
@@ -81,15 +83,6 @@
       'doc-kind doc-kind-' + key,
       'kind: ' + key
     );
-  }
-
-  function fmtSize(bytes) {
-    if (typeof bytes !== 'number' || bytes < 0 || !isFinite(bytes)) {
-      return '';
-    }
-    if (bytes < 1024) { return bytes + ' B'; }
-    if (bytes < 1024 * 1024) { return (bytes / 1024).toFixed(1) + ' KB'; }
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
   }
 
   function fmtTime(ms) {
@@ -166,84 +159,668 @@
   }
 
   // -----------------------------------------------------------------------
+  // Sidebar shell and collapsible files tree (SPEC-docs-tree FR-832, FR-833, UX-830).
+  // -----------------------------------------------------------------------
+
+  var treeDirCache = {};
+  var expandedFolders = [];
+  var currentWorkspace = null;
+  var treeIdSeq = 0;
+  var pendingOpen = null;
+  var pendingExpanded = null;
+  var pendingFocusPath = null;
+
+  function applyWorkspaceSnapshot(snap) {
+    if (!snap) { return; }
+    var ws = typeof snap.workspace === 'string' ? snap.workspace.trim() : '';
+    if (!ws || ws === '-' || ws === '\u2013') {
+      var wsEl = $('workspace');
+      if (wsEl && wsEl.textContent && wsEl.textContent !== '\u2013' && wsEl.textContent !== '-') {
+        ws = wsEl.textContent.trim();
+      }
+    }
+    if (ws && ws !== '-' && ws !== '\u2013' && ws !== currentWorkspace) {
+      currentWorkspace = ws;
+      treeDirCache = {};
+      pendingFocusPath = null;
+      var state = loadSidebarState();
+      if (pendingOpen !== null) {
+        state.open = pendingOpen;
+        saveSidebarOpen(pendingOpen);
+        pendingOpen = null;
+      }
+      if (pendingExpanded !== null) {
+        state.expanded = pendingExpanded;
+        saveExpandedFolders(pendingExpanded);
+        pendingExpanded = null;
+      }
+      expandedFolders = state.expanded;
+      updateSidebarUI(state.open);
+      if (!filterText) {
+        renderLazyTree();
+      }
+    }
+  }
+
+  function loadSidebarState() {
+    try {
+      if (!currentWorkspace) {
+        return { open: false, expanded: [] };
+      }
+      var ws = currentWorkspace;
+      var openVal = window.localStorage.getItem('dmuxai.sidebar.open.' + ws);
+      var expVal = window.localStorage.getItem('dmuxai.sidebar.expanded.' + ws);
+      var open = openVal === 'true';
+      var exp = expVal ? JSON.parse(expVal) : [];
+      return { open: open, expanded: Array.isArray(exp) ? exp : [] };
+    } catch (e) {
+      return { open: false, expanded: [] };
+    }
+  }
+
+  function saveSidebarOpen(open) {
+    if (!currentWorkspace) {
+      pendingOpen = open;
+      return;
+    }
+    try {
+      window.localStorage.setItem('dmuxai.sidebar.open.' + currentWorkspace, open ? 'true' : 'false');
+    } catch (e) {}
+  }
+
+  function saveExpandedFolders(list) {
+    if (!currentWorkspace) {
+      pendingExpanded = list;
+      return;
+    }
+    try {
+      window.localStorage.setItem('dmuxai.sidebar.expanded.' + currentWorkspace, JSON.stringify(list));
+    } catch (e) {}
+  }
+
+  function updateSidebarUI(open) {
+    var aside = $('sidebar');
+    var btn = $('sidebar-toggle-files');
+    var backdrop = $('sidebar-backdrop');
+    if (aside) {
+      if (open) {
+        aside.classList.add('open');
+        aside.removeAttribute('inert');
+        document.body.classList.add('sidebar-open');
+      } else {
+        aside.classList.remove('open');
+        aside.setAttribute('inert', '');
+        document.body.classList.remove('sidebar-open');
+      }
+    }
+    if (btn) {
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+    if (backdrop) {
+      if (open) {
+        backdrop.classList.add('active');
+      } else {
+        backdrop.classList.remove('active');
+      }
+    }
+  }
+
+  function openSidebar() {
+    saveSidebarOpen(true);
+    updateSidebarUI(true);
+    var isNarrow = (window.innerWidth <= 900) || (window.matchMedia && window.matchMedia('(max-width: 900px)').matches);
+    if (isNarrow) {
+      var focusTarget = $('docs-filter') || $('sidebar-close');
+      if (focusTarget && typeof focusTarget.focus === 'function') {
+        focusTarget.focus();
+      }
+    }
+  }
+
+  function closeSidebar() {
+    saveSidebarOpen(false);
+    updateSidebarUI(false);
+    var toggleBtn = $('sidebar-toggle-files');
+    if (toggleBtn && typeof toggleBtn.focus === 'function') {
+      toggleBtn.focus();
+    }
+  }
+
+  function toggleSidebar() {
+    var aside = $('sidebar');
+    var isOpen = aside ? aside.classList.contains('open') : false;
+    if (isOpen) {
+      closeSidebar();
+    } else {
+      openSidebar();
+    }
+  }
+
+  function fetchDir(dir) {
+    if (treeDirCache[dir]) {
+      return Promise.resolve(treeDirCache[dir]);
+    }
+    var url = '/api/docs/tree?dir=' + encodeURIComponent(dir);
+    return api('GET', url).then(function (payload) {
+      var dirEntries = payload && Array.isArray(payload.entries) ? payload.entries : [];
+      treeDirCache[dir] = dirEntries;
+      return dirEntries;
+    });
+  }
+
+  function entriesSignature(list) {
+    if (!Array.isArray(list)) { return ''; }
+    var s = [];
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i] || {};
+      s.push((e.path || '') + ':' + (e.mtime_ms || 0) + ':' + (e.has_children ? '1' : '0'));
+    }
+    return s.join(';');
+  }
+
+  function getFocusedTreePath() {
+    var active = document.activeElement;
+    if (active && active.classList.contains('tree-item') && active.dataset.path) {
+      return active.dataset.path;
+    }
+    return null;
+  }
+
+  function restoreFocusToPath(path) {
+    if (!path) { return false; }
+    var items = getVisibleTreeItems();
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].dataset.path === path) {
+        setFocusTreeItem(items[i]);
+        if (pendingFocusPath === path) { pendingFocusPath = null; }
+        return true;
+      }
+    }
+    // The item may live in a folder whose children are still loading; retry
+    // when that group finishes rendering (see toggleFolder).
+    pendingFocusPath = path;
+    return false;
+  }
+
+  function createDirItem(entry, level) {
+    var node = el('div', 'tree-node');
+    node.setAttribute('role', 'none');
+
+    var item = el('div', 'tree-item');
+    item.setAttribute('role', 'treeitem');
+    item.setAttribute('aria-expanded', 'false');
+    item.setAttribute('tabindex', '-1');
+    item.setAttribute('aria-level', String(level));
+    item.dataset.path = entry.path;
+    item.dataset.type = 'dir';
+
+    var groupId = 'tree-group-' + (++treeIdSeq);
+    item.id = 'tree-item-' + treeIdSeq;
+
+    var toggle = el('span', 'tree-toggle', '\u25b6');
+    var icon = el('span', 'tree-icon', '\ud83d\udcc1');
+    var name = el('span', 'tree-name', entry.name || entry.path);
+
+    item.appendChild(toggle);
+    item.appendChild(icon);
+    item.appendChild(name);
+    node.appendChild(item);
+
+    var group = el('div', 'tree-group');
+    group.id = groupId;
+    group.setAttribute('role', 'group');
+    group.setAttribute('hidden', '');
+    item.setAttribute('aria-owns', group.id);
+    node.appendChild(group);
+
+    item.addEventListener('click', function (e) {
+      e.stopPropagation();
+      setFocusTreeItem(item);
+      toggleFolder(item);
+    });
+
+    if (expandedFolders.indexOf(entry.path) !== -1) {
+      toggleFolder(item, true);
+    }
+
+    return node;
+  }
+
+  function createFileItem(entry, level) {
+    var node = el('div', 'tree-node');
+    node.setAttribute('role', 'none');
+
+    var item = el('div', 'tree-item');
+    item.setAttribute('role', 'treeitem');
+    item.setAttribute('tabindex', '-1');
+    item.setAttribute('aria-level', String(level));
+    item.dataset.path = entry.path;
+    item.dataset.type = 'file';
+
+    var placeholder = el('span', 'tree-toggle');
+    var badge = kindBadge(entry.kind);
+    var name = el('span', 'tree-name', entry.name || entry.path);
+
+    item.appendChild(placeholder);
+    item.appendChild(badge);
+    item.appendChild(name);
+    node.appendChild(item);
+
+    item.addEventListener('click', function (e) {
+      e.stopPropagation();
+      setFocusTreeItem(item);
+      open(entry.path);
+    });
+
+    return node;
+  }
+
+  function toggleFolder(item, forceExpand) {
+    var path = item.dataset.path;
+    var isExpanded = item.getAttribute('aria-expanded') === 'true';
+    var shouldExpand = typeof forceExpand === 'boolean' ? forceExpand : !isExpanded;
+    var node = item.closest('.tree-node');
+    var group = node ? node.querySelector(':scope > .tree-group') : null;
+    var toggle = item.querySelector('.tree-toggle');
+
+    if (shouldExpand) {
+      item.setAttribute('aria-expanded', 'true');
+      if (toggle) {
+        toggle.classList.add('expanded');
+        toggle.textContent = '\u25bc';
+      }
+      if (expandedFolders.indexOf(path) === -1) {
+        expandedFolders.push(path);
+        saveExpandedFolders(expandedFolders);
+      }
+      if (group) {
+        group.removeAttribute('hidden');
+        if (!group.hasChildNodes() || group._failed) {
+          group._failed = false;
+          group.replaceChildren();
+          group.appendChild(el('div', 'tree-hint', 'loading\u2026'));
+          fetchDir(path).then(function (children) {
+            var groupSig = entriesSignature(children);
+            if (group._lastSig === groupSig && group.hasChildNodes()) {
+              return;
+            }
+            group._lastSig = groupSig;
+            // Only restore a pending focus while focus is still on the page
+            // body or in the tree, never stealing it from the filter or preview.
+            var active = document.activeElement;
+            var treeEl = $('docs-tree');
+            var mayRestore = !active || active === document.body ||
+              (treeEl && treeEl.contains(active));
+            var focusedPath = getFocusedTreePath() || (mayRestore ? pendingFocusPath : null);
+            group.replaceChildren();
+            renderChildrenInto(group, children, parseInt(item.getAttribute('aria-level') || '1', 10) + 1);
+            updateRovingTabindex();
+            if (focusedPath) {
+              restoreFocusToPath(focusedPath);
+            }
+          }).catch(function () {
+            group.replaceChildren();
+            group._failed = true; // the next expand retries the fetch
+            group.appendChild(el('div', 'tree-hint', 'error loading'));
+          });
+        }
+      }
+    } else {
+      item.setAttribute('aria-expanded', 'false');
+      if (toggle) {
+        toggle.classList.remove('expanded');
+        toggle.textContent = '\u25b6';
+      }
+      var idx = expandedFolders.indexOf(path);
+      if (idx !== -1) {
+        expandedFolders.splice(idx, 1);
+        saveExpandedFolders(expandedFolders);
+      }
+      if (group) {
+        group.setAttribute('hidden', '');
+      }
+    }
+    updateRovingTabindex();
+  }
+
+  function renderChildrenInto(container, childEntries, level) {
+    for (var i = 0; i < childEntries.length; i++) {
+      var entry = childEntries[i];
+      if (entry.entry_type === 'dir' || entry.type === 'dir') {
+        container.appendChild(createDirItem(entry, level));
+      } else {
+        container.appendChild(createFileItem(entry, level));
+      }
+    }
+  }
+
+  function renderLazyTree(silent) {
+    var tree = $('docs-tree');
+    if (!tree) { return; }
+    if (!currentToken()) {
+      tree.replaceChildren();
+      tree.appendChild(el('p', 'empty', 'documents need token'));
+      return;
+    }
+    var focusedPath = getFocusedTreePath();
+    if (!silent && !tree.hasChildNodes()) {
+      tree.replaceChildren();
+      tree.appendChild(el('div', 'tree-hint', 'loading\u2026'));
+    }
+
+    return fetchDir('').then(function (children) {
+      var sig = entriesSignature(children);
+      if (tree._lastSig === sig && tree.hasChildNodes()) {
+        if (focusedPath) {
+          restoreFocusToPath(focusedPath);
+        }
+        return;
+      }
+      tree._lastSig = sig;
+      tree.replaceChildren();
+      if (children.length === 0) {
+        tree.appendChild(el('p', 'empty', 'no documents'));
+        return;
+      }
+      renderChildrenInto(tree, children, 1);
+      updateRovingTabindex();
+      if (focusedPath) {
+        restoreFocusToPath(focusedPath);
+      }
+    }).catch(function (err) {
+      if (!silent) {
+        tree.replaceChildren();
+        tree.appendChild(el('p', 'empty', 'tree unavailable: ' + err.message));
+      }
+    });
+  }
+
+  function renderFilteredTree(needle) {
+    var tree = $('docs-tree');
+    if (!tree) { return; }
+    var focusedPath = getFocusedTreePath();
+    tree.replaceChildren();
+    if (!entriesLoaded) {
+      tree.appendChild(entriesError
+        ? el('p', 'empty', 'documents unavailable: ' + entriesError)
+        : el('div', 'tree-hint', 'loading\u2026'));
+      return;
+    }
+    if (listTruncated) {
+      // The filter searches the capped /api/docs list; say so instead of
+      // silently missing files past the cap.
+      tree.appendChild(el('p', 'tree-hint', 'file list truncated; some files may not match'));
+    }
+
+    var matches = [];
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i] || {};
+      var p = String(entry.path || '');
+      if (p.toLowerCase().indexOf(needle) !== -1) {
+        matches.push(entry);
+      }
+    }
+
+    if (matches.length === 0) {
+      tree.appendChild(el('p', 'empty', 'no documents match the filter'));
+      return;
+    }
+
+    // Build hierarchical tree structure from matching paths
+    var rootObj = { dirs: {}, files: [] };
+    for (var j = 0; j < matches.length; j++) {
+      var match = matches[j];
+      var parts = match.path.split('/');
+      var curr = rootObj;
+      var curPath = '';
+      for (var k = 0; k < parts.length - 1; k++) {
+        var dirName = parts[k];
+        curPath = curPath ? curPath + '/' + dirName : dirName;
+        if (!curr.dirs[dirName]) {
+          curr.dirs[dirName] = { name: dirName, path: curPath, dirs: {}, files: [] };
+        }
+        curr = curr.dirs[dirName];
+      }
+      curr.files.push(match);
+    }
+
+    function renderFilterNode(container, obj, level) {
+      var dirKeys = Object.keys(obj.dirs);
+      dirKeys.sort();
+      for (var d = 0; d < dirKeys.length; d++) {
+        var dirData = obj.dirs[dirKeys[d]];
+        var node = el('div', 'tree-node');
+        node.setAttribute('role', 'none');
+
+        var item = el('div', 'tree-item');
+        item.setAttribute('role', 'treeitem');
+        item.setAttribute('aria-expanded', 'true');
+        item.setAttribute('tabindex', '-1');
+        item.setAttribute('aria-level', String(level));
+        item.dataset.path = dirData.path;
+        item.dataset.type = 'dir';
+
+        var groupId = 'tree-group-' + (++treeIdSeq);
+        item.id = 'tree-item-' + treeIdSeq;
+
+        var toggle = el('span', 'tree-toggle expanded', '\u25bc');
+        var icon = el('span', 'tree-icon', '\ud83d\udcc1');
+        var name = el('span', 'tree-name', dirData.name);
+
+        item.appendChild(toggle);
+        item.appendChild(icon);
+        item.appendChild(name);
+        node.appendChild(item);
+
+        var group = el('div', 'tree-group');
+        group.id = groupId;
+        group.setAttribute('role', 'group');
+        item.setAttribute('aria-owns', group.id);
+        node.appendChild(group);
+
+        item.addEventListener('click', function (e) {
+          e.stopPropagation();
+          setFocusTreeItem(item);
+          toggleFolder(item);
+        });
+
+        renderFilterNode(group, dirData, level + 1);
+        container.appendChild(node);
+      }
+
+      obj.files.sort(function (a, b) {
+        var na = a.path.split('/').pop();
+        var nb = b.path.split('/').pop();
+        return na.localeCompare(nb);
+      });
+      for (var f = 0; f < obj.files.length; f++) {
+        var fileEntry = obj.files[f];
+        var fileNode = createFileItem({
+          name: fileEntry.path.split('/').pop(),
+          path: fileEntry.path,
+          kind: fileEntry.kind
+        }, level);
+        container.appendChild(fileNode);
+      }
+    }
+
+    renderFilterNode(tree, rootObj, 1);
+    updateRovingTabindex();
+    if (focusedPath) {
+      restoreFocusToPath(focusedPath);
+    }
+  }
+
+  function renderTree() {
+    var needle = filterText.toLowerCase().trim();
+    if (needle) {
+      renderFilteredTree(needle);
+    } else {
+      renderLazyTree();
+    }
+  }
+
+  function getVisibleTreeItems() {
+    var tree = $('docs-tree');
+    if (!tree) { return []; }
+    var allItems = tree.querySelectorAll('.tree-item');
+    var visible = [];
+    for (var i = 0; i < allItems.length; i++) {
+      var item = allItems[i];
+      var group = item.closest('.tree-group[hidden]');
+      if (!group) {
+        visible.push(item);
+      }
+    }
+    return visible;
+  }
+
+  function updateRovingTabindex() {
+    var visibleItems = getVisibleTreeItems();
+    var hasFocusable = false;
+    for (var i = 0; i < visibleItems.length; i++) {
+      if (visibleItems[i].getAttribute('tabindex') === '0') {
+        hasFocusable = true;
+        break;
+      }
+    }
+    if (!hasFocusable && visibleItems.length > 0) {
+      visibleItems[0].setAttribute('tabindex', '0');
+    }
+  }
+
+  function setFocusTreeItem(target) {
+    var items = getVisibleTreeItems();
+    for (var i = 0; i < items.length; i++) {
+      items[i].setAttribute('tabindex', '-1');
+    }
+    target.setAttribute('tabindex', '0');
+    target.focus();
+  }
+
+  function focusNextTreeItem(current) {
+    var items = getVisibleTreeItems();
+    var idx = items.indexOf(current);
+    if (idx !== -1 && idx + 1 < items.length) {
+      setFocusTreeItem(items[idx + 1]);
+    }
+  }
+
+  function focusPrevTreeItem(current) {
+    var items = getVisibleTreeItems();
+    var idx = items.indexOf(current);
+    if (idx > 0) {
+      setFocusTreeItem(items[idx - 1]);
+    }
+  }
+
+  function bindTreeKeyboard() {
+    var tree = $('docs-tree');
+    if (!tree) { return; }
+
+    tree.addEventListener('keydown', function (e) {
+      var active = document.activeElement;
+      if (!active || !active.classList.contains('tree-item')) {
+        return;
+      }
+      var key = e.key;
+      if (key === 'ArrowDown' || key === 'Down') {
+        e.preventDefault();
+        focusNextTreeItem(active);
+      } else if (key === 'ArrowUp' || key === 'Up') {
+        e.preventDefault();
+        focusPrevTreeItem(active);
+      } else if (key === 'ArrowRight' || key === 'Right') {
+        e.preventDefault();
+        if (active.dataset.type === 'dir') {
+          var isExp = active.getAttribute('aria-expanded') === 'true';
+          if (!isExp) {
+            toggleFolder(active, true);
+          } else {
+            focusNextTreeItem(active);
+          }
+        }
+      } else if (key === 'ArrowLeft' || key === 'Left') {
+        e.preventDefault();
+        if (active.dataset.type === 'dir' && active.getAttribute('aria-expanded') === 'true') {
+          toggleFolder(active, false);
+        } else {
+          var parentGroup = active.closest('.tree-group');
+          if (parentGroup) {
+            var parentNode = parentGroup.closest('.tree-node');
+            if (parentNode) {
+              var parentItem = parentNode.querySelector(':scope > .tree-item');
+              if (parentItem) {
+                setFocusTreeItem(parentItem);
+              }
+            }
+          }
+        }
+      } else if (key === 'Enter') {
+        e.preventDefault();
+        if (active.dataset.type === 'dir') {
+          toggleFolder(active);
+        } else if (active.dataset.path) {
+          open(active.dataset.path);
+        }
+      }
+    });
+  }
+
+  function initSidebar() {
+    var state = loadSidebarState();
+    expandedFolders = state.expanded;
+    updateSidebarUI(state.open);
+
+    var toggleBtn = $('sidebar-toggle-files');
+    if (toggleBtn) {
+      toggleBtn.addEventListener('click', toggleSidebar);
+    }
+
+    var closeBtn = $('sidebar-close');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', closeSidebar);
+    }
+
+    var backdrop = $('sidebar-backdrop');
+    if (backdrop) {
+      backdrop.addEventListener('click', closeSidebar);
+    }
+
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') {
+        var aside = $('sidebar');
+        if (aside && aside.classList.contains('open')) {
+          closeSidebar();
+        }
+      }
+    });
+
+    bindTreeKeyboard();
+  }
+
+  // -----------------------------------------------------------------------
   // Document list (FR-741 over GET /api/docs).
   // -----------------------------------------------------------------------
 
   function refreshList() {
-    var list = $('docs-list');
-    if (!list) { return; }
     if (!currentToken()) {
-      list.replaceChildren();
-      list.appendChild(
-        el('p', 'empty', 'documents need the dashboard token (?token= URL)')
-      );
+      renderTree();
       return;
     }
+    treeDirCache = {};
     api('GET', '/api/docs')
       .then(function (payload) {
         entries = payload && Array.isArray(payload.entries) ? payload.entries : [];
+        entriesLoaded = true;
+        entriesError = '';
         listTruncated = Boolean(payload && payload.truncated);
-        renderList();
+        renderTree();
       })
       .catch(function (err) {
-        renderList();
-        list.replaceChildren();
-        list.appendChild(
-          el('p', 'empty', 'documents unavailable: ' + err.message)
-        );
+        entriesError = (err && err.message) || 'request failed';
+        renderTree();
       });
-  }
-
-  // Only same-origin ticket URLs from the docs API reach iframe/anchor sinks.
-  function ticketUrl(url) {
-    var value = String(url || '');
-    return /^\/docs\/(view|download)\/[A-Za-z0-9-]+$/.test(value) ? value : 'about:blank';
-  }
-
-  function docRow(entry) {
-    var path = String(entry.path || '');
-    var li = el('li', 'doc-row');
-    li.appendChild(kindBadge(entry.kind));
-    var link = docLink(path);
-    li.appendChild(link);
-    if (entry.editable && !readOnly) {
-      li.appendChild(docBadge('editable', 'doc-editable-mark', 'editable in the browser'));
-    }
-    var size = fmtSize(entry.size);
-    if (size) {
-      var sizeSpan = el('span', 'doc-size', size);
-      if (typeof entry.mtime_ms === 'number') {
-        li.title = new Date(entry.mtime_ms).toLocaleString();
-      }
-      li.appendChild(sizeSpan);
-    }
-    return li;
-  }
-
-  function renderList() {
-    var list = $('docs-list');
-    if (!list) { return; }
-    list.replaceChildren();
-    var needle = filterText.toLowerCase();
-    var shown = 0;
-    var frag = document.createDocumentFragment();
-    for (var i = 0; i < entries.length; i++) {
-      var entry = entries[i] || {};
-      var path = String(entry.path || '');
-      if (needle && path.toLowerCase().indexOf(needle) === -1) {
-        continue;
-      }
-      frag.appendChild(docRow(entry));
-      shown++;
-    }
-    if (shown === 0) {
-      list.appendChild(el('p', 'empty', 'no documents' + (needle ? ' match the filter' : ' yet')));
-      return;
-    }
-    list.appendChild(frag);
-    if (listTruncated) {
-      list.appendChild(el('p', 'doc-note', 'list truncated at 5000 files'));
-    }
   }
 
   function bindFilter() {
@@ -251,8 +828,14 @@
     if (!input) { return; }
     input.addEventListener('input', function () {
       filterText = input.value;
-      renderList();
+      renderTree();
     });
+  }
+
+  // Only same-origin ticket URLs from the docs API reach iframe/anchor sinks.
+  function ticketUrl(url) {
+    var value = String(url || '');
+    return /^\/docs\/(view|download)\/[A-Za-z0-9-]+$/.test(value) ? value : 'about:blank';
   }
 
   // -----------------------------------------------------------------------
@@ -269,9 +852,49 @@
     });
   }
 
+  var lastChangesSig = null;
+
+  function changesSignature(turns) {
+    if (!Array.isArray(turns)) { return ''; }
+    var parts = [];
+    for (var i = 0; i < turns.length; i++) {
+      var t = turns[i] || {};
+      var fileSig = [];
+      var files = Array.isArray(t.files) ? t.files : [];
+      for (var j = 0; j < files.length; j++) {
+        var f = files[j] || {};
+        fileSig.push(String(f.path || '') + ':' + String(f.change || ''));
+      }
+      parts.push(fileSig.join(','));
+    }
+    return parts.join(';');
+  }
+
   function refreshChanges() {
     changes(null)
-      .then(renderChanges)
+      .then(function (turns) {
+        var sig = changesSignature(turns);
+        var changed = (lastChangesSig !== null && sig !== lastChangesSig);
+        lastChangesSig = sig;
+        // The panel always re-renders so a running turn's output tail stays
+        // fresh; the signature only decides whether the tree is invalidated.
+        renderChanges(turns);
+        if (changed) {
+          treeDirCache = {};
+          var tree = $('docs-tree');
+          if (tree) { tree._lastSig = null; }
+          if (!filterText) {
+            renderLazyTree(true);
+          } else {
+            api('GET', '/api/docs').then(function (payload) {
+              entries = payload && Array.isArray(payload.entries) ? payload.entries : [];
+              entriesLoaded = true;
+              listTruncated = Boolean(payload && payload.truncated);
+              renderFilteredTree(filterText.toLowerCase().trim());
+            }).catch(function () {});
+          }
+        }
+      })
       .catch(function (err) {
         if (err && err.fatal) {
           // 401/missing token: the interval is already stopped by api();
@@ -457,7 +1080,9 @@
   // -----------------------------------------------------------------------
 
   function applyServeState(snap) {
-    if (!snap || typeof snap.source !== 'string') { return; }
+    if (!snap) { return; }
+    applyWorkspaceSnapshot(snap);
+    if (typeof snap.source !== 'string') { return; }
     readOnly = snap.source === 'files';
     readOnlyKnown = true;
     if (current && docBodies.badges) { setBadges(current); }
@@ -1205,6 +1830,7 @@
   }
 
   function init() {
+    initSidebar();
     bindFilter();
     if (!currentToken()) {
       refreshList();

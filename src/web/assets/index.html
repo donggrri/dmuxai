@@ -27,6 +27,7 @@
     <input id="accent-picker" class="accent-picker" type="color" value="#4aa8ff" title="Accent color">
     <button id="accent-reset" type="button" class="btn accent-reset">Reset</button>
   </div>
+  <button id="sidebar-toggle-files" type="button" class="btn sidebar-toggle" aria-controls="sidebar" aria-expanded="false" title="Toggle files sidebar">Files</button>
   <nav id="status" class="status" aria-label="dashboard status">
     <span id="run-status" class="run-status run-status-idle" role="status" aria-live="polite">Idle</span>
     <span class="stat"><span class="stat-k">workspace</span><span id="workspace" class="stat-v">&ndash;</span></span>
@@ -91,11 +92,6 @@
 
   <section id="docs" class="panel">
     <h2 class="panel-title">Documents</h2>
-    <div class="docs-toolbar">
-      <label class="field-label" for="docs-filter">Filter</label>
-      <input id="docs-filter" class="docs-filter" type="search" autocomplete="off" placeholder="Filter files by path">
-    </div>
-    <ul id="docs-list" class="docs-list"></ul>
     <h3 class="docs-sub">Changed by agents</h3>
     <div id="docs-changes" class="docs-changes"></div>
   </section>
@@ -141,6 +137,23 @@
 
   <section id="memory-panel" class="panel" aria-label="Memory"></section>
 </main>
+<aside id="sidebar" class="sidebar" aria-label="Sidebar" inert>
+  <div class="sidebar-header">
+    <nav class="sidebar-tabs" role="tablist" aria-label="Sidebar tabs">
+      <button id="tab-files" class="sidebar-tab active" role="tab" aria-selected="true" aria-controls="tab-panel-files" type="button">Files</button>
+      <!-- Extension point: SPEC-todo-sidebar adds To-dos tab here -->
+    </nav>
+    <button id="sidebar-close" type="button" class="btn sidebar-close" aria-label="Close sidebar">&times;</button>
+  </div>
+  <div id="tab-panel-files" class="sidebar-tab-panel" role="tabpanel" aria-labelledby="tab-files">
+    <div class="docs-tree-toolbar">
+      <label class="field-label" for="docs-filter">Filter</label>
+      <input id="docs-filter" class="docs-filter" type="search" autocomplete="off" placeholder="Filter files by path" aria-label="Filter files by path">
+    </div>
+    <div id="docs-tree" class="docs-tree" role="tree" aria-label="Files"></div>
+  </div>
+</aside>
+<div id="sidebar-backdrop" class="sidebar-backdrop"></div>
 <script src="/assets/memory.js" defer></script>
 <script src="/assets/session.js" defer></script>
 </body>

@@ -2,7 +2,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use super::DocsError;
+use super::{DocsError, IGNORED_DIRS};
 
 /// A canonical workspace root. Construct once per server/app.
 #[derive(Debug, Clone)]
@@ -79,10 +79,25 @@ impl Workspace {
             }
             Err(error) => return Err(DocsError::Io(error.to_string())),
         };
-        if !absolute.starts_with(&self.root) {
+        if !self.is_visible_target(&absolute) {
             return Err(DocsError::OutsideWorkspace);
         }
         Ok(ResolvedPath { absolute, relative })
+    }
+
+    /// Whether a canonical path lies inside the root and outside every
+    /// ignored directory (`.git`, `target`, `node_modules`, `.dmuxai`). Used to
+    /// vet symlink targets so a link cannot expose e.g. `.dmuxai/web.json`.
+    pub fn is_visible_target(&self, canonical: &Path) -> bool {
+        let Ok(rel) = canonical.strip_prefix(&self.root) else {
+            return false;
+        };
+        !rel.components().any(|c| match c {
+            Component::Normal(part) => part
+                .to_str()
+                .is_none_or(|part| IGNORED_DIRS.contains(&part)),
+            _ => true,
+        })
     }
 
     /// Maps an absolute path (e.g. from a `file://` URI) to a workspace path,
@@ -189,5 +204,26 @@ mod tests {
         let inner = ws.resolve("inner").unwrap();
         assert_eq!(inner.relative, "inner");
         assert!(inner.absolute.ends_with("sub/ok.md"));
+    }
+
+    // TC-830 / FR-831: a symlink into an ignored directory is not resolvable,
+    // so it can be neither read nor saved through the docs API.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_into_ignored_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".dmuxai")).unwrap();
+        std::fs::write(dir.path().join(".dmuxai/web.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join(".dmuxai/web.json"),
+            dir.path().join("notes.md"),
+        )
+        .unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        assert_eq!(ws.resolve("notes.md"), Err(DocsError::OutsideWorkspace));
+        assert_eq!(
+            ws.resolve(".dmuxai/web.json"),
+            Err(DocsError::OutsideWorkspace)
+        );
     }
 }

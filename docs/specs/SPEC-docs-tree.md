@@ -1,6 +1,6 @@
 # SPEC: docs-tree
 
-Status: Draft (v0.2.1)
+Status: Implemented (v0.2.1)
 Created: 2026-10-17
 Related: Dongjin dogfood 2026-10-17 23:38 ("Documents shows every file flat"); SPEC-docs-preview (FR-741..FR-759)
 
@@ -33,4 +33,4 @@ Decision:
 | TC-831 | FR-830, FR-831 | integration | axum router + temp workspace | `/api/docs/tree` 200 for root and subdir; 403 for `../`, absolute and escaping symlink; 404 for missing and ignored; 400 for a file; `list_children` with a cap of 3 sets `truncated` | `src/web/docs_api.rs` `tree_api_confined_and_bounded` |
 | TC-832 | FR-831 | integration | router without token | 401 for `/api/docs/tree` | `src/web/docs_api.rs` `docs_routes_require_auth` (extended) |
 | TC-833 | FR-832, FR-833, UX-830 | unit (asset) | index.html, docs.js, docs.css | Sidebar container with a toggle button, `role="tree"`, lazy-expand fetch of `/api/docs/tree`, `localStorage` persistence, keyboard handlers, a narrow-width drawer media query | `src/web/assets.rs` `docs_tree_sidebar_assets` |
-| TC-834 | FR-832, UX-830 | e2e (ignored, headless Chrome) | demo workspace | Expanding a folder shows children; clicking a file opens the preview; screenshot captured | `src/web/docs_api.rs` `docs_tree_renders_in_headless_chrome` |
+| TC-834 | FR-832, UX-830 | e2e (ignored, headless Chrome) | demo workspace | Expanding a folder shows children; clicking a file opens the preview; screenshot captured | `tests/web_docs_preview.rs` `docs_tree_renders_in_headless_chrome` |

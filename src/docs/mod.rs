@@ -25,16 +25,31 @@ pub const MAX_SCAN_FILES: usize = 20_000;
 /// Directory names never listed, scanned or linked (FR-741, FR-748).
 pub const IGNORED_DIRS: &[&str] = &[".git", "target", "node_modules", ".dmuxai"];
 
-/// Document kind derived from the file extension (SPEC §3).
+/// Document kind derived from the file extension (SPEC §3) or directory (SPEC-docs-tree).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DocKind {
+    Dir,
     Markdown,
     Text,
     Html,
     Pdf,
     Office,
     Binary,
+}
+
+impl DocKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DocKind::Dir => "dir",
+            DocKind::Markdown => "markdown",
+            DocKind::Text => "text",
+            DocKind::Html => "html",
+            DocKind::Pdf => "pdf",
+            DocKind::Office => "office",
+            DocKind::Binary => "binary",
+        }
+    }
 }
 
 const TEXT_EXTENSIONS: &[&str] = &[
@@ -208,6 +223,18 @@ pub fn mtime_ms(metadata: &std::fs::Metadata) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl PartialEq<&str> for DocKind {
+        fn eq(&self, other: &&str) -> bool {
+            self.as_str() == *other
+        }
+    }
+
+    impl PartialEq<str> for DocKind {
+        fn eq(&self, other: &str) -> bool {
+            self.as_str() == other
+        }
+    }
 
     #[test]
     fn kinds_follow_extensions() {

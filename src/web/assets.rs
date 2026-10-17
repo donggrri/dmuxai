@@ -366,6 +366,41 @@ mod tests {
         );
     }
 
+    // TC-833: docs_tree_sidebar_assets (SPEC-docs-tree FR-832, FR-833, UX-830)
+    #[test]
+    fn docs_tree_sidebar_assets() {
+        // 1. index.html contains sidebar container, toggle button, role="tree", tabs
+        assert!(INDEX_HTML.contains(r#"<aside id="sidebar" class="sidebar""#));
+        assert!(INDEX_HTML.contains(r#"aria-controls="sidebar""#));
+        assert!(INDEX_HTML.contains("Files"));
+        assert!(INDEX_HTML.contains(r#"role="tree""#));
+        assert!(INDEX_HTML.contains("tab-files"));
+
+        // 2. docs.js contains lazy-expand fetch of /api/docs/tree, role="treeitem",
+        // aria-expanded, localStorage persistence, keyboard handlers, and ticketUrl
+        assert!(DOCS_JS.contains("/api/docs/tree"));
+        assert!(DOCS_JS.contains("setAttribute('role', 'treeitem')"));
+        assert!(DOCS_JS.contains("setAttribute('aria-expanded'"));
+        assert!(DOCS_JS.contains("localStorage.getItem('dmuxai.sidebar."));
+        assert!(DOCS_JS.contains("key === 'ArrowDown'"));
+        assert!(DOCS_JS.contains("key === 'ArrowUp'"));
+        assert!(DOCS_JS.contains("key === 'ArrowLeft'"));
+        assert!(DOCS_JS.contains("key === 'ArrowRight'"));
+        assert!(DOCS_JS.contains("key === 'Enter'"));
+        assert!(DOCS_JS.contains("function ticketUrl("));
+        // Review fixes: changes panel always refreshes, nested focus restore
+        // never steals focus, filter reports truncation, failed loads retry.
+        assert!(DOCS_JS.contains("pendingFocusPath"));
+        assert!(DOCS_JS.contains("mayRestore"));
+        assert!(DOCS_JS.contains("file list truncated"));
+        assert!(DOCS_JS.contains("documents unavailable: "));
+        assert!(DOCS_JS.contains("group._failed"));
+
+        // 3. docs.css contains sidebar container and narrow-width drawer media query
+        assert!(DOCS_CSS.contains(".sidebar"));
+        assert!(DOCS_CSS.contains("@media (max-width: 900px)"));
+    }
+
     // TC-608: theme_palettes_meet_wcag_contrast (SPEC-theme-colors NFR-600)
     #[test]
     fn theme_palettes_meet_wcag_contrast() {
