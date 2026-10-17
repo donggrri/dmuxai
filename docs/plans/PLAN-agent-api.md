@@ -1,5 +1,7 @@
 # PLAN: Agent API (SPEC-agent-api, FR-760..FR-773)
 
+Status: implemented in v0.2.0
+
 ## Module contracts (shared names — do not rename)
 
 ### `src/events.rs` (lib, `pub mod events;`) — FR-764, FR-768, FR-769

@@ -38,10 +38,10 @@ Target: Windows (`x86_64-pc-windows-msvc`)
 
 - `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/SPEC-cursor-windows-implement-guard.md`: passed.
 - `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/DMUXAI-BASELINE.md`: passed.
-- `C:\Users\tlsfmswls\.cargo\bin\cargo.exe fmt --check`: passed.
-- `C:\Users\tlsfmswls\.cargo\bin\cargo.exe test --all-targets`: passed; 8 library tests, 93 binary tests, and 31 conversation integration tests passed; 5 authenticated provider smoke tests were ignored as intended.
+- `%USERPROFILE%\.cargo\bin\cargo.exe fmt --check`: passed.
+- `%USERPROFILE%\.cargo\bin\cargo.exe test --all-targets`: passed; 8 library tests, 93 binary tests, and 31 conversation integration tests passed; 5 authenticated provider smoke tests were ignored as intended.
 - Windows-specific tests passed: `windows_cursor_implement_mode_is_rejected_before_queueing`, `windows_cursor_implement_turn_is_rejected_before_process_spawn`, and `unsupported_mode_is_rejected_before_binding_retirement`.
-- `C:\Users\tlsfmswls\.cargo\bin\cargo.exe clippy --all-targets --all-features -- -D warnings`: passed.
+- `%USERPROFILE%\.cargo\bin\cargo.exe clippy --all-targets --all-features -- -D warnings`: passed.
 - Live Cursor smoke test: skipped; it requires a locally installed and authenticated Cursor Agent CLI and would make a real provider request.
 
 ## Residual risks and rollback

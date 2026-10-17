@@ -1,5 +1,7 @@
 # PLAN: Dashboard parity with the TUI
 
+Status: implemented in v0.2.0
+
 Spec: [SPEC-dashboard-parity](../specs/SPEC-dashboard-parity.md). Stacked on
 the agent API (`feat/agent-api`, SPEC-agent-api FR-765 `POST /api/prompt`).
 

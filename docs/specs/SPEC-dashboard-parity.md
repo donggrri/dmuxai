@@ -1,6 +1,6 @@
 # SPEC: Dashboard parity with the TUI
 
-Status: In progress
+Status: Implemented in v0.2.0 (slice G2)
 Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `feat/agent-api`
@@ -80,7 +80,7 @@ stays view-only.
 | FR-783 | Must | Given the command palette (Ctrl+K, or `/` in an empty prompt box) | Then every entry of `session.commands` is listed, filterable, and runs its mapped control | Commands needing an argument ask for it first | TC-785, TC-786 |
 | FR-784 | Must | Given the parity matrix | Then every TUI slash command has a dashboard mapping in `src/web/parity.rs`, and every mapped control id exists in the dashboard assets | A TUI command without a mapping fails `tui_commands_have_dashboard_controls` | TC-787 |
 | UX-780 | Should | Given a busy agent | Then its Cancel button is visible and mode/model pickers for it are disabled | — | TC-786 |
-| NFR-780 | Must | Given parallel dashboard work (MCP, memory, docs, graph) | Then the parity UI lives in its own `assets/session.js` and `assets/session.css`; `app.css` is untouched and `app.js` only re-dispatches each snapshot as a `dmuxai:snapshot` DOM event so the page keeps one SSE connection (`index.html` gains the container and two tags) | — | Manual review |
+| NFR-780 | Must | Given parallel dashboard work (MCP, memory, docs, graph) | Then the parity UI lives in its own `assets/session.js` and `assets/session.css`; `app.css` is untouched and `app.js` only re-dispatches each snapshot as a `dmuxai:snapshot` DOM event so the page keeps one SSE connection (`index.html` gains the container and two tags) | — | TC-786 (`session_module_has_parity_controls` asserts `session.js` opens no `EventSource`), manual review of the diff |
 
 ## 5. Acceptance scenarios and test design
 
@@ -89,7 +89,7 @@ stays view-only.
 | TC-780 | FR-780 | unit | App with test adapters and a hub | publish | snapshot `session` has all keys, selected agent and per-agent mode | `src/app.rs` `dashboard_session_snapshot_has_contract_keys` |
 | TC-781 | FR-780 | unit | 250 messages, one 100 KiB | build session | 100 messages, 32 KiB cap with marker, ≤ 512 KiB, `transcript_omitted` 150; `serve` snapshot has no session | `src/app.rs` `dashboard_session_transcript_is_capped` |
 | TC-782 | FR-782 | unit | App + `SubmitPrompt`, TUI draft in the input | submit multi-line text, stream deltas, complete | user message keeps newlines, agent message streams then settles; TUI draft kept | `src/app.rs` `dashboard_prompt_streams_into_transcript` |
-| TC-783 | FR-781 | integration | router with command double; App handlers | each command, unknown, disallowed, busy, serve | statuses 200/400/403/404/409; App state changed as in the TUI | `src/web/server.rs` `command_route_contract`; `src/app.rs` `dashboard_commands_match_tui_actions`, `dashboard_cancel_targets_the_named_agent` |
+| TC-783 | FR-781 | integration | router with command double; App handlers | each command, unknown, disallowed, busy, serve | statuses 200/400/403/404/409; App state changed as in the TUI | `src/web/server.rs` `command_route_contract`; `src/app.rs` `dashboard_commands_match_tui_actions`, `dashboard_cancel_targets_the_named_agent`, `dashboard_commands_cover_models_share_and_policy` |
 | TC-784 | FR-781 | unit | App with two conversations | `new_conversation`, `load_conversation` | active conversation switches and transcript restores | `src/app.rs` `dashboard_new_and_load_conversation` |
 | TC-785 | FR-783 | unit | App with a busy agent | `SubmitPrompt` with `/details`, `/graph status`, `/image p`, `/summarize`, then plain text | slash commands run like typed (allowed while busy, no agent request); plain text → busy | `src/app.rs` `dashboard_slash_commands_via_prompt` |
 | TC-786 | FR-782, FR-783, UX-780 | unit (asset) | embedded `session.js` | static checks | Enter/Shift+Enter handling, Ctrl+K palette, Esc close, cancel button, disabled pickers present | `src/web/assets.rs` `session_module_has_parity_controls`, `session_assets_are_served_hardened`; browser run in REVIEW |

@@ -43,8 +43,8 @@ compact indicators. Terminal events remove only the matching agent's activity.
 
 ## Test evidence
 
-All commands were run from `C:\Users\tlsfmswls\Desktop\DmuxAI` with the bundled
-Rust toolchain path `C:\Users\tlsfmswls\.cargo\bin\cargo.exe` where needed.
+All commands were run from `C:\path\to\DmuxAI` with the bundled
+Rust toolchain path `%USERPROFILE%\.cargo\bin\cargo.exe` where needed.
 
 - `cargo test --bin dmuxai` — passed: 93 passed, 5 ignored provider smoke tests.
 - `cargo test --all-targets` — passed: 8 library tests, 93 binary tests, and

@@ -30,9 +30,9 @@ Spec: [SPEC-codex-effort-tool-usage.md](../specs/SPEC-codex-effort-tool-usage.md
 
 - `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/SPEC-codex-effort-tool-usage.md`: passed.
 - `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/DMUXAI-BASELINE.md`: passed.
-- `C:\Users\tlsfmswls\.cargo\bin\cargo.exe fmt --check`: passed.
-- `C:\Users\tlsfmswls\.cargo\bin\cargo.exe test --all-targets`: passed: 96 tests; 5 authenticated-provider smoke tests ignored as intended.
-- `C:\Users\tlsfmswls\.cargo\bin\cargo.exe clippy --all-targets --all-features -- -D warnings`: passed.
+- `%USERPROFILE%\.cargo\bin\cargo.exe fmt --check`: passed.
+- `%USERPROFILE%\.cargo\bin\cargo.exe test --all-targets`: passed: 96 tests; 5 authenticated-provider smoke tests ignored as intended.
+- `%USERPROFILE%\.cargo\bin\cargo.exe clippy --all-targets --all-features -- -D warnings`: passed.
 - Live Codex smoke tests: skipped because the task does not require live account use;
   existing tests remain ignored and require a locally authenticated CLI.
 

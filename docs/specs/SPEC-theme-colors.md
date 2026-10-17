@@ -1,6 +1,6 @@
 # SPEC: Theme settings for the web dashboard and TUI colors
 
-Status: In progress
+Status: Implemented in v0.2.0 (slice D)
 Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `0c0c7fc`

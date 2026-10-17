@@ -23,12 +23,12 @@ Spec: [SPEC-codex-sandbox-policy.md](../specs/SPEC-codex-sandbox-policy.md)
 
 ## Test evidence
 
-- Red reproduction: `C:\Users\tlsfmswls\.cargo\bin\cargo.exe test codex_execution_modes_set_per_turn_sandbox_and_approval_policy` failed before the fix with `left: None`, `right: Some(String("readOnly"))` for `/params/sandboxPolicy/type`.
+- Red reproduction: `%USERPROFILE%\.cargo\bin\cargo.exe test codex_execution_modes_set_per_turn_sandbox_and_approval_policy` failed before the fix with `left: None`, `right: Some(String("readOnly"))` for `/params/sandboxPolicy/type`.
 - `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/SPEC-codex-sandbox-policy.md`: passed.
 - `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/DMUXAI-BASELINE.md`: passed.
-- `C:\Users\tlsfmswls\.cargo\bin\cargo.exe fmt --check`: passed.
-- `C:\Users\tlsfmswls\.cargo\bin\cargo.exe test --all-targets`: passed; 96 tests passed and 5 authenticated provider smoke tests were ignored as intended.
-- `C:\Users\tlsfmswls\.cargo\bin\cargo.exe clippy --all-targets --all-features -- -D warnings`: passed.
+- `%USERPROFILE%\.cargo\bin\cargo.exe fmt --check`: passed.
+- `%USERPROFILE%\.cargo\bin\cargo.exe test --all-targets`: passed; 96 tests passed and 5 authenticated provider smoke tests were ignored as intended.
+- `%USERPROFILE%\.cargo\bin\cargo.exe clippy --all-targets --all-features -- -D warnings`: passed.
 - Live Codex smoke test: skipped; it needs a locally authenticated Codex CLI and would make a real provider request. The deterministic regression test covers the malformed request shape.
 
 ## Residual risks and rollback

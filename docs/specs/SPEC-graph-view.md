@@ -1,6 +1,6 @@
 # SPEC: Dashboard node-graph view of graph runs
 
-Status: Implemented (slice H)
+Status: Implemented in v0.2.0 (slice H)
 Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `1c1f692`

@@ -25,7 +25,7 @@ shutdown implementation was changed.
 ## Test evidence
 
 All commands were run from the repository root. Cargo was invoked through
-`C:\Users\tlsfmswls\.cargo\bin\cargo.exe` because Cargo was not on the
+`%USERPROFILE%\.cargo\bin\cargo.exe` because Cargo was not on the
 PowerShell `PATH`.
 
 - `cargo fmt --check`: passed.

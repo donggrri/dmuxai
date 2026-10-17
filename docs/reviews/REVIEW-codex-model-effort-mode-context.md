@@ -32,9 +32,9 @@ Spec: [SPEC-codex-model-effort-mode-context.md](../specs/SPEC-codex-model-effort
 - Red reproduction: `cargo test mode_change_reopens_the_agent_with_shared_context` failed before the fix because the follow-up had a resume session.
 - `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/SPEC-codex-model-effort-mode-context.md`: passed.
 - `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/DMUXAI-BASELINE.md`: passed.
-- `C:\Users\tlsfmswls\.cargo\bin\cargo.exe fmt --check`: passed.
-- `C:\Users\tlsfmswls\.cargo\bin\cargo.exe test --all-targets` with an isolated temporary target directory: passed; 103 tests passed and 5 authenticated-provider smoke tests were ignored as intended.
-- `C:\Users\tlsfmswls\.cargo\bin\cargo.exe clippy --all-targets --all-features -- -D warnings` with an isolated temporary target directory: passed.
+- `%USERPROFILE%\.cargo\bin\cargo.exe fmt --check`: passed.
+- `%USERPROFILE%\.cargo\bin\cargo.exe test --all-targets` with an isolated temporary target directory: passed; 103 tests passed and 5 authenticated-provider smoke tests were ignored as intended.
+- `%USERPROFILE%\.cargo\bin\cargo.exe clippy --all-targets --all-features -- -D warnings` with an isolated temporary target directory: passed.
 - Live provider smoke tests: skipped because they require authenticated CLIs and can make real requests. The new behavior is covered by deterministic UI/conversation tests.
 
 ## Residual risks and rollback

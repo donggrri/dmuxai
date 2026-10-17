@@ -1,6 +1,6 @@
 # SPEC: Obsidian memory (approved notes injected into every runner)
 
-Status: Implemented (slice E + shared memory MCP follow-up)
+Status: Implemented in v0.2.0 (slice E + shared memory MCP follow-up)
 Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `1c1f692`
@@ -98,7 +98,7 @@ Both are terminal; deciding a non-pending proposal is an error.
 | TC-726 | FR-722 | unit | `test_app` with a temp memory root | submit prompts (fresh, resumed, changed, disabled) | adapter request prompt starts with the block only when required; stored prompt unchanged | `src/app.rs` `memory_context_*` |
 | TC-727 | FR-726 | unit | `test_app` with a temp memory root | `/remember …`, `/memory`, `/memory approve|reject` | files/queue changed, system lines, no agent request | `src/app.rs` `memory_slash_*` |
 | TC-728 | FR-727 | integration | router with a temp memory root | GET/POST routes with and without token | statuses and JSON per FR-727; no absolute path in body | `src/web/server.rs` `memory_routes_*` |
-| TC-729 | INT-729 | integration | built binary, temp vault | spawn `dmuxai mcp-memory --vault …`, send JSON-RPC lines | initialize, tools/list names, each tool result, `-32601`, `-32700`, disabled server `isError` | `tests/memory_mcp.rs` |
+| TC-729 | INT-729 | integration | built binary, temp vault | spawn `dmuxai mcp-memory --vault …`, send JSON-RPC lines | initialize, tools/list names, each tool result, `-32601`, `-32700`, disabled server `isError` | `tests/memory_mcp.rs` `mcp_memory_serves_tools_against_a_vault`, `mcp_memory_reports_disabled_memory`, `mcp_memory_rejects_*`, `mcp_memory_null_id_notification_is_silent`, `mcp_memory_oversized_line_is_parse_error_and_serving_continues` |
 | TC-730 | FR-730 | unit | temp root | search terms, limit, empty | hits, limit, error | `src/memory.rs` `search_*` |
 | TC-731 | UX-728 | unit + manual | embedded assets | read index/app assets | Memory panel ids and API paths exist; screenshot via headless Chromium recorded in the review | `src/web/assets.rs` `memory_panel_assets_present` |
 | TC-733 | FR-733 | unit | temp vault + user/workspace toml; injected executable path | load settings | memory on -> exactly one `dmuxai-memory` stdio entry with the exe and `["mcp-memory","--workspace",<root>]`, last in the list, vault path not in args; memory off -> absent; repo entry with that name replaces it; `enabled = false` removes it; unresolvable exe -> warning, absent | `src/settings.rs` `builtin_memory_mcp_server_*` |
