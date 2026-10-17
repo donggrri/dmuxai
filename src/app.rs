@@ -1083,6 +1083,50 @@ impl App {
         }
     }
 
+    /// Moves `agent` from `Running` to its terminal run state (FR-820/822),
+    /// keeping the start time and node of the run that just ended.
+    fn end_run_state(&mut self, agent: Agent, success: bool, cancelled: bool) {
+        if let Ok(mut starts) = self.busy_fallback_starts.lock() {
+            starts.remove(&agent);
+        }
+        let (started_at_ms, duration, node) = match self.run_states.get(&agent) {
+            Some(RunState::Running {
+                started_at,
+                started_at_ms,
+                node,
+            }) => (
+                Some(*started_at_ms),
+                Some(started_at.elapsed()),
+                node.clone(),
+            ),
+            _ => (None, None, None),
+        };
+        let ended_at_ms = unix_ms_now();
+        let end_state = if success {
+            RunState::Done {
+                duration,
+                started_at_ms,
+                ended_at_ms,
+                node,
+            }
+        } else if cancelled {
+            RunState::Cancelled {
+                duration,
+                started_at_ms,
+                ended_at_ms,
+                node,
+            }
+        } else {
+            RunState::Failed {
+                duration,
+                started_at_ms,
+                ended_at_ms,
+                node,
+            }
+        };
+        self.run_states.insert(agent, end_state);
+    }
+
     pub fn reduced_motion(&self) -> bool {
         self.settings.reduced_motion
             || self.settings.theme.reduced_motion
@@ -3238,6 +3282,7 @@ impl App {
                     let _ = self.adapters[adapter_index(pending.agent)].cancel();
                     self.busy_agents.remove(&pending.agent);
                     self.activities.remove(&pending.agent);
+                    self.end_run_state(pending.agent, false, false);
                     if let Some(deferred) = pending.deferred {
                         self.restore_deferred_input(deferred);
                     }
@@ -3259,6 +3304,7 @@ impl App {
                 };
                 self.busy_agents.remove(&pending.agent);
                 self.activities.remove(&pending.agent);
+                self.end_run_state(pending.agent, true, false);
                 let visible = pending.conversation_id == self.conversation_id;
                 match parse_summary_document(&pending.buffer)
                     .map_err(|error| error.to_string())
@@ -3302,6 +3348,8 @@ impl App {
                 };
                 self.busy_agents.remove(&pending.agent);
                 self.activities.remove(&pending.agent);
+                let cancelled = matches!(output.event, AgentEvent::Cancelled);
+                self.end_run_state(pending.agent, false, cancelled);
                 if let Some(deferred) = pending.deferred {
                     self.restore_deferred_input(deferred);
                 }
@@ -3622,42 +3670,7 @@ impl App {
             starts.remove(&agent);
         }
         self.activities.remove(&agent);
-        let (started_at_ms, duration, node) = match self.run_states.get(&agent) {
-            Some(RunState::Running {
-                started_at,
-                started_at_ms,
-                node,
-            }) => (
-                Some(*started_at_ms),
-                Some(started_at.elapsed()),
-                node.clone(),
-            ),
-            _ => (None, None, None),
-        };
-        let ended_at_ms = unix_ms_now();
-        let end_state = if success {
-            RunState::Done {
-                duration,
-                started_at_ms,
-                ended_at_ms,
-                node,
-            }
-        } else if error.as_deref() == Some("cancelled") {
-            RunState::Cancelled {
-                duration,
-                started_at_ms,
-                ended_at_ms,
-                node,
-            }
-        } else {
-            RunState::Failed {
-                duration,
-                started_at_ms,
-                ended_at_ms,
-                node,
-            }
-        };
-        self.run_states.insert(agent, end_state);
+        self.end_run_state(agent, success, error.as_deref() == Some("cancelled"));
         let output_text = self.last_agent_output_text(agent);
         let active_turn = self.active_turns.remove(&agent);
         self.streaming_messages.remove(&agent);
@@ -10167,6 +10180,44 @@ mod tests {
         assert!(!app.busy_agents.contains(&Agent::Codex));
         assert_eq!(&*cancelled.lock().unwrap(), &[Agent::Codex]);
         assert!(app.messages.last().unwrap().content.contains("exceeded"));
+        // FR-820: the summary run ends as failed, not stuck in running.
+        assert_eq!(app.run_state(Agent::Codex).to_view().state, "failed");
+        assert!(!app.needs_fast_redraw());
+    }
+
+    #[test]
+    // TC-820 / FR-820: summary turns end their run state on completion,
+    // error and cancel, so the spinner does not run forever.
+    fn summary_turns_end_their_run_state() {
+        for (event, expected) in [
+            (AgentEvent::Completed, "done"),
+            (AgentEvent::Error("boom".to_owned()), "failed"),
+            (AgentEvent::Cancelled, "cancelled"),
+        ] {
+            let (mut app, sent) = test_app();
+            app.input = "source".to_owned();
+            app.submit_prompt();
+            let first = sent.lock().unwrap()[0].1.clone();
+            assert!(app.apply_agent_output(AgentOutput {
+                agent: Agent::Codex,
+                conversation_id: Some(first.conversation_id),
+                turn_id: Some(first.turn_id),
+                event: AgentEvent::Completed,
+            }));
+            app.input = "/summarize".to_owned();
+            app.submit_prompt();
+            assert!(app.run_state(Agent::Codex).is_running());
+            let summary = sent.lock().unwrap()[1].1.clone();
+            assert!(app.apply_agent_output(AgentOutput {
+                agent: Agent::Codex,
+                conversation_id: Some(summary.conversation_id),
+                turn_id: Some(summary.turn_id),
+                event,
+            }));
+            assert!(app.pending_summary.is_none());
+            assert_eq!(app.run_state(Agent::Codex).to_view().state, expected);
+            assert!(!app.needs_fast_redraw());
+        }
     }
 
     #[test]

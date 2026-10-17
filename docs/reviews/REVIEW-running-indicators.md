@@ -46,6 +46,12 @@ Tasks: [TASKS-running-indicators](../tasks/TASKS-running-indicators.md)
    - `status_json` no longer carries a previous run's `node` into a new run that has none (regression assertion added).
    - Removed the unused `/favicon.ico` route; TC-824 oracle now includes the favicon href.
 
+8. **Round 3 (opencode-haiku review)**:
+   - Summary turns (`/summarize`, automatic summaries) set `Running` but their completion, error, cancel and size-limit paths never wrote a terminal state, so the spinner ran forever. They now share `App::end_run_state` with normal turns; `summary_turns_end_their_run_state` and the oversized-summary test cover it.
+   - `dmuxai status --json` now reports `ended_at_ms` and, when the start is known, `started_at_ms` and `duration_ms` for done/failed/cancelled (FR-820), asserted in `status_json_maps_pending_and_stalled_to_running_preserving_start_time`.
+   - Pill and chip elapsed now use `runElapsedMs`, which applies the same server-clock skew correction as graph nodes.
+   - Not changed: the e2e title/favicon test stays `#[ignore]` (needs Chrome); the pill keeping the last `✓ Done` until the next turn is intended (FR-824 says marks persist until the next turn).
+
 ## Test evidence
 
 Environment: Linux x86_64. `CARGO_TARGET_DIR=/workspace/dmux-wt/agent-api/target-me` is this worktree's isolated target directory (not a repo setting). Fresh results after round 2:
@@ -53,6 +59,6 @@ Environment: Linux x86_64. `CARGO_TARGET_DIR=/workspace/dmux-wt/agent-api/target
 - `node --check src/web/assets/app.js`: clean.
 - `cargo fmt --check`: clean.
 - `cargo clippy --locked --all-targets -- -D warnings`: clean.
-- `cargo test --locked --all-targets`: 547 passed, 0 failed, 10 ignored.
+- `cargo test --locked --all-targets`: 548 passed, 0 failed, 10 ignored (after round 3).
 - `cargo test --locked --test web_running -- --ignored`: 1 passed (headless Chrome, screenshot captured).
 - `scripts/spec-index.sh`: index unchanged.

@@ -380,6 +380,18 @@ function renderCounts(graph) {
   target.appendChild(document.createTextNode(parts.length > 0 ? parts.join(' \u00b7 ') : 'no nodes yet'));
 }
 
+// Elapsed ms of a running agent run, corrected for server/browser clock skew
+// the same way as nodeElapsed (FR-823).
+function runElapsedMs(run, nowMs) {
+  if (!run || typeof run.started_at_ms !== 'number') { return 0; }
+  var snap = snapshot;
+  if (snap && typeof snap.generated_at_ms === 'number' && typeof snap.receivedAt === 'number') {
+    var serverNow = snap.sent_at_ms > 0 ? snap.sent_at_ms : snap.generated_at_ms;
+    return Math.max(0, (serverNow - run.started_at_ms) + (nowMs - snap.receivedAt));
+  }
+  return Math.max(0, nowMs - run.started_at_ms);
+}
+
 function nodeElapsed(node, snap, nowMs) {
   if (node.status === 'running') {
     if (
@@ -1253,7 +1265,7 @@ function renderAgents(agents, nowMs) {
         if (chipEl) {
           var elapsedEl = chipEl.querySelector('.chip-run-elapsed');
           if (elapsedEl) {
-            var ms = Math.max(0, now - a.run.started_at_ms);
+            var ms = runElapsedMs(a.run, now);
             elapsedEl.textContent = ' ' + (fmtElapsed(ms) || '0s');
           }
         }
@@ -1299,9 +1311,7 @@ function renderAgents(agents, nowMs) {
         chip.classList.add('chip-running');
         var runEl = el('span', 'chip-run chip-run-running');
         runEl.appendChild(el('span', 'spinner'));
-        var ms = typeof agent.run.started_at_ms === 'number'
-          ? Math.max(0, now - agent.run.started_at_ms)
-          : 0;
+        var ms = runElapsedMs(agent.run, now);
         runEl.appendChild(el('span', 'chip-run-elapsed', ' ' + (fmtElapsed(ms) || '0s')));
         chip.appendChild(runEl);
       } else if (runState === 'done') {
@@ -2175,7 +2185,7 @@ function updateRunStatus(snap, nowMs) {
 
     var elapsedStr = '0s';
     if (first.run && typeof first.run.started_at_ms === 'number') {
-      var ms = Math.max(0, nowMs - first.run.started_at_ms);
+      var ms = runElapsedMs(first.run, nowMs);
       elapsedStr = fmtElapsed(ms) || '0s';
     }
 

@@ -154,6 +154,21 @@ pub fn status_json(workspace_root: &Path) -> Value {
                         })
                         .and_then(|prev| prev.get("started_at_ms").cloned());
                     run_val["started_at_ms"] = prev_start.unwrap_or_else(|| json!(rec.ts_ms));
+                } else if state != "idle" {
+                    // done / failed / cancelled carry ended_at and, when the
+                    // run's start is known, its duration (FR-820).
+                    run_val["ended_at_ms"] = json!(rec.ts_ms);
+                    if let Some(start) = last_agent_run
+                        .get(&runner)
+                        .filter(|prev| {
+                            prev.get("state").and_then(|s| s.as_str()) == Some("running")
+                        })
+                        .and_then(|prev| prev.get("started_at_ms"))
+                        .and_then(|v| v.as_u64())
+                    {
+                        run_val["started_at_ms"] = json!(start);
+                        run_val["duration_ms"] = json!(rec.ts_ms.saturating_sub(start));
+                    }
                 }
                 if let Some(node) = rec.node {
                     run_val["node"] = json!(node);
@@ -355,12 +370,25 @@ mod tests {
         rec5.ts_ms = 20000;
         rec5.from_state = Some("idle".to_string());
         rec5.to_state = "started".to_string();
+        let cursor_run = |val: &Value| {
+            val["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["id"] == "cursor")
+                .map(|a| a["run"].clone())
+                .unwrap()
+        };
         let mut content = std::fs::read_to_string(&events_file).unwrap();
-        content.push_str(&format!(
-            "{}\n{}\n",
-            serde_json::to_string(&rec4).unwrap(),
-            serde_json::to_string(&rec5).unwrap(),
-        ));
+        content.push_str(&format!("{}\n", serde_json::to_string(&rec4).unwrap()));
+        std::fs::write(&events_file, &content).unwrap();
+        let done = cursor_run(&status_json(dir.path()));
+        assert_eq!(done["state"], "done");
+        assert_eq!(done["started_at_ms"].as_u64(), Some(1000));
+        assert_eq!(done["ended_at_ms"].as_u64(), Some(12000));
+        assert_eq!(done["duration_ms"].as_u64(), Some(11000));
+
+        content.push_str(&format!("{}\n", serde_json::to_string(&rec5).unwrap()));
         std::fs::write(&events_file, content).unwrap();
         let val = status_json(dir.path());
         let run = val["agents"]

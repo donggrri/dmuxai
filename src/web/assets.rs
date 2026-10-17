@@ -785,6 +785,9 @@ mod tests {
         );
         assert!(APP_CSS.contains(".reduced-motion .graph-svg .station-spinner"));
         assert!(APP_JS.contains("classList.toggle('reduced-motion'"));
+        // Pill and chip elapsed use the same clock-skew correction as nodes.
+        assert!(APP_JS.contains("function runElapsedMs"));
+        assert!(!APP_JS.contains("now - a.run.started_at_ms"));
         assert!(APP_JS.contains("function tickDashboard"));
         assert!(APP_JS.contains("station-spinner"));
         assert!(APP_JS.contains("updateFavicon"));
