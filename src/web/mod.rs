@@ -6,6 +6,7 @@
 mod assets;
 mod auth;
 pub mod commands;
+pub mod discovery;
 mod file_source;
 mod hub;
 pub mod layout;

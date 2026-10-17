@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::activity::UiSettings;
+use crate::notify::NotifySettings;
 use crate::theme::{Theme, ThemeToml};
 
 /// Web dashboard theme settings loaded from `[web]`.
@@ -46,6 +47,8 @@ pub struct DmuxSettings {
     pub ui: UiSettings,
     /// Web dashboard theme settings from `[web]`.
     pub web_theme: WebThemeSettings,
+    /// Event delivery settings from `[notify]` (FR-770..FR-772).
+    pub notify: NotifySettings,
     /// Problems found while reading dmuxai.toml, shown at startup.
     pub config_warnings: Vec<String>,
     /// Resolved `[memory]` (SPEC-obsidian-memory FR-720); `None` = disabled.
@@ -63,6 +66,7 @@ struct DmuxToml {
     agents: Option<AgentsToml>,
     ui: Option<UiSettings>,
     web: Option<WebToml>,
+    notify: Option<NotifySettings>,
     memory: Option<MemoryToml>,
     mcp: Option<McpToml>,
     todo: Option<TodoToml>,
@@ -357,6 +361,12 @@ impl DmuxSettings {
                 }
             }
         }
+        if let Some(notify) = parsed.notify {
+            for warning in notify.validate() {
+                self.config_warnings.push(format!("notify: {warning}"));
+            }
+            self.notify = notify;
+        }
     }
 
     /// Merges `[[mcp.servers]]` entries by name: a later (repo) entry replaces
@@ -401,6 +411,7 @@ impl Default for DmuxSettings {
             todo_jira_base_url: None,
             ui: UiSettings::default(),
             web_theme: WebThemeSettings::default(),
+            notify: NotifySettings::default(),
             config_warnings: Vec::new(),
             memory: None,
             memory_raw: MemoryToml::default(),
@@ -525,10 +536,9 @@ mod theme_config_tests {
     #[test]
     fn web_theme_settings_parse_with_fallbacks() {
         // TC-605, FR-603
-        let temp_base =
-            std::env::temp_dir().join(format!("dmuxai-web-theme-{}", std::process::id()));
-        let user_dir = temp_base.join("user");
-        let ws_dir = temp_base.join("workspace");
+        let temp_base = tempfile::tempdir().unwrap();
+        let user_dir = temp_base.path().join("user");
+        let ws_dir = temp_base.path().join("workspace");
         std::fs::create_dir_all(&user_dir).unwrap();
         std::fs::create_dir_all(&ws_dir).unwrap();
 
@@ -549,14 +559,14 @@ mod theme_config_tests {
         assert_eq!(settings.web_theme.accent.as_deref(), Some("#3366ff"));
 
         // Defaults when `[web]` is absent.
-        let empty_dir = temp_base.join("empty");
+        let empty_dir = temp_base.path().join("empty");
         std::fs::create_dir_all(&empty_dir).unwrap();
         let defaults = DmuxSettings::load_with_user_config(&empty_dir, None);
         assert_eq!(defaults.web_theme.theme, "system");
         assert_eq!(defaults.web_theme.accent, None);
 
         // Invalid values fall back with warnings.
-        let bad_dir = temp_base.join("bad");
+        let bad_dir = temp_base.path().join("bad");
         std::fs::create_dir_all(&bad_dir).unwrap();
         std::fs::write(
             bad_dir.join("dmuxai.toml"),
@@ -578,7 +588,7 @@ mod theme_config_tests {
         );
 
         // Normalization: hex accent is lowercased and theme is lowercased.
-        let norm_dir = temp_base.join("norm");
+        let norm_dir = temp_base.path().join("norm");
         std::fs::create_dir_all(&norm_dir).unwrap();
         std::fs::write(
             norm_dir.join("dmuxai.toml"),
@@ -590,7 +600,7 @@ mod theme_config_tests {
         assert_eq!(norm.web_theme.accent.as_deref(), Some("#aabbcc"));
 
         // Only `#rrggbb` is a valid accent; a named color falls back with a warning.
-        let named_dir = temp_base.join("named");
+        let named_dir = temp_base.path().join("named");
         std::fs::create_dir_all(&named_dir).unwrap();
         std::fs::write(named_dir.join("dmuxai.toml"), "[web]\naccent = \"red\"\n").unwrap();
         let named = DmuxSettings::load_with_user_config(&named_dir, None);
@@ -601,8 +611,6 @@ mod theme_config_tests {
                 .iter()
                 .any(|w| w.contains("[web] accent = \"red\""))
         );
-
-        std::fs::remove_dir_all(&temp_base).ok();
     }
 
     #[test]
@@ -1070,5 +1078,82 @@ mod memory_settings_tests {
             assert_eq!(p, PathBuf::from(home).join("Obsidian/Vault"));
         }
         assert_eq!(expand_home("/x/y"), PathBuf::from("/x/y"));
+    }
+}
+
+#[cfg(test)]
+mod notify_config_tests {
+    use super::*;
+
+    #[test]
+    fn notify_table_parses_and_warns() {
+        // TC-772 config surface / FR-770..FR-772: `[notify]` parses into
+        // `DmuxSettings.notify` and `NotifySettings::validate` warnings join
+        // `config_warnings` prefixed with "notify: ".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dmuxai.toml"),
+            r#"
+[notify]
+webhook_url = "ftp://example.invalid/hook"
+command = []
+events = ["completed", "bogus_state"]
+timeout_secs = 0
+"#,
+        )
+        .unwrap();
+
+        let settings = DmuxSettings::load_with_user_config(dir.path(), None);
+        assert_eq!(
+            settings.notify.webhook_url.as_deref(),
+            Some("ftp://example.invalid/hook")
+        );
+        assert_eq!(settings.notify.timeout_secs, Some(0));
+        assert_eq!(
+            settings.notify.events.as_deref(),
+            Some(["completed".to_owned(), "bogus_state".to_owned()].as_slice())
+        );
+
+        let warnings = settings
+            .config_warnings
+            .iter()
+            .filter(|w| w.starts_with("notify: "))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("webhook_url must start with http:// or https://")),
+            "warnings: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("command must not be empty")),
+            "warnings: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("bogus_state") && w.contains("events")),
+            "warnings: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("timeout_secs must be greater than 0")),
+            "warnings: {warnings:?}"
+        );
+
+        // Defaults when `[notify]` is absent: no notify warnings.
+        let empty = tempfile::tempdir().unwrap();
+        let defaults = DmuxSettings::load_with_user_config(empty.path(), None);
+        assert_eq!(defaults.notify, NotifySettings::default());
+        assert!(
+            !defaults
+                .config_warnings
+                .iter()
+                .any(|w| w.starts_with("notify: "))
+        );
     }
 }
