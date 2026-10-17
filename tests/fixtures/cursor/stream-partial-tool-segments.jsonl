@@ -1,0 +1,302 @@
+{"type": "system", "subtype": "init", "model": "Composer 2.5", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "이 프로젝트 파악. README와 Cargo.toml만 보고 세 문장으로 요약해줘."}]}, "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "completed", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "README"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "와"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " Cargo"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ".toml"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "만"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 읽"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "어"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 프로"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "젝"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "트"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "를"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 세"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 문"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "장"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "으로"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 요"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978454}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "약"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978455}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "합니다"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978455}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ".\n"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247978455}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "README와 Cargo.toml만 읽어 프로젝트를 세 문장으로 요약합니다.\n"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "model_call_id": "mc-1", "timestamp_ms": 1792247978455}
+{"type": "tool_call", "subtype": "started", "call_id": "tool_3354afeb-ce21-4a5e-a026-81f3b87b057", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "tool_call", "subtype": "started", "call_id": "tool_7f13c684-d60c-41ba-8fe9-00c998c2520", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "tool_call", "subtype": "completed", "call_id": "tool_3354afeb-ce21-4a5e-a026-81f3b87b057", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "tool_call", "subtype": "completed", "call_id": "tool_7f13c684-d60c-41ba-8fe9-00c998c2520", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "completed", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "tool_call", "subtype": "started", "call_id": "tool_5e85ba31-59ad-4b2a-9b61-02db09e9d21", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "tool_call", "subtype": "completed", "call_id": "tool_5e85ba31-59ad-4b2a-9b61-02db09e9d21", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "delta", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "thinking", "subtype": "completed", "text": "…", "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "**"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982405}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "D"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982405}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "mux"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982405}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "AI"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982405}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "**"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982405}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "(`"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982406}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "dm"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982406}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ux"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ai"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "`"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " "}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "0"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "."}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "2"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "."}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "0"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ","}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " MIT"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ")"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "는"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " Rust"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "로"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 만"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982407}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "든"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982410}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 터"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982410}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "미"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982410}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "널"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982410}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 클라"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982411}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "이"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982411}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "언"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982411}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "트"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982411}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "로"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982411}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ","}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982411}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 한"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982411}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 프로"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982411}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "젝"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982413}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "트"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 워"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "크"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "스"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "페이"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "스"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "에서"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " Cod"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ex"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "·"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Cursor"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "·"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "AG"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Y"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982414}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 같은"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982417}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 헤"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982417}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "드"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982417}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "리"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982417}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "스"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982417}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 코"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982428}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "딩"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982429}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 에"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982429}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "이"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982429}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "전"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982429}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "트"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982429}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " CLI"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982429}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "를"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982429}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " Rat"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982429}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "at"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982429}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ui"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982429}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " T"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982429}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "UI"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982430}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "로"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982430}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 묶"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982430}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "어"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982430}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 쓰"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982430}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "며"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982430}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ","}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982430}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " ANSI"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982430}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 화"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982431}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "면"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982431}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "을"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982431}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 긁"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982431}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "지"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982431}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 않"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982431}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "고"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982431}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 각"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982431}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " CLI"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982431}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "의"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982431}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " JSON"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982433}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "/"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982433}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "JSON"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982433}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "L"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982434}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "·"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982434}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ND"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982434}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "JSON"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982434}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 프로"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982434}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "토"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982434}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "콜"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982434}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "로"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982434}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 대"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982434}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "화"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982434}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "를"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982434}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 이"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982434}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "어"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982434}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "갑"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982435}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "니다"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982435}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ".\n\n"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982435}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "`"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982435}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Cargo"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982435}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ".toml"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982435}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "`"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982436}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 기"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982436}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "준"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982436}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "으로"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982436}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "는"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982436}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " `"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982436}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "rat"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982436}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "at"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982436}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ui"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982456}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "`"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982456}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "·"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982456}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "`"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982456}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "c"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982456}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ros"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982456}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "st"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982456}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "erm"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982456}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "`"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982456}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " UI"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982456}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ","}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982456}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " `"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "rus"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ql"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ite"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "`"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "로"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 대"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "화"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "·"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "세"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "션"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 저장"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ","}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " `"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "tok"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "io"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "`"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 비"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "동"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "기"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 실행"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ","}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982457}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " `"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ax"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "um"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "`"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "으로"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 로"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "컬"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 웹"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 대"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "시"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "보"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "드"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "(`"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "--"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "web"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982458}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "`"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982459}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " /"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982459}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " `"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982459}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "serve"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982459}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "`)"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982459}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "를"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982459}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 제공"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982459}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "하는"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982459}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 구"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982459}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "조"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982459}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "입니다"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982459}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ".\n\n"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982462}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "README"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982463}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "에"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982463}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 따"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982463}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "르면"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982463}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 그"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982463}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "래"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982464}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "프"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982464}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "형"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982464}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 멀"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982464}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "티"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982464}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "스"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982464}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "텝"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982473}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 오"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982473}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "케"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982486}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "스트"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982486}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "레"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982487}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "이"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982488}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "션"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982497}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ","}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982497}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 투"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982510}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "두"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982511}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 보"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982511}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "드"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982523}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ","}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982523}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " Obs"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982523}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "idian"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982523}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 메"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982533}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "모"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982547}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "리"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982547}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ","}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982547}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 공"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982547}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "유"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982562}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " MCP"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982563}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 설정"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982563}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ","}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982563}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " `"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982573}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "dm"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982583}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ux"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982584}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ai"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982585}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ".toml"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982585}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "`"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982597}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "의"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982597}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 커"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982609}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "스"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982609}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "텀"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982622}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 에"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982622}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "이"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982622}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "전"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982622}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "트"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982635}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": ","}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982635}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " CLI"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982635}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "·"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982635}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "M"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982647}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "CP"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982647}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "·"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982647}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "HTTP"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982647}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " API"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982660}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "까지"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982660}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 같은"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982670}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 저장"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982670}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "소"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982682}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 상태"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982682}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "를"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982696}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": " 공"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982696}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "유"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982708}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "합니다"}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982709}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "."}]}, "session_id": "00000000-0000-4000-8000-000000000001", "timestamp_ms": 1792247982721}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "**DmuxAI**(`dmuxai` 0.2.0, MIT)는 Rust로 만든 터미널 클라이언트로, 한 프로젝트 워크스페이스에서 Codex·Cursor·AGY 같은 헤드리스 코딩 에이전트 CLI를 Ratatui TUI로 묶어 쓰며, ANSI 화면을 긁지 않고 각 CLI의 JSON/JSONL·NDJSON 프로토콜로 대화를 이어갑니다.\n\n`Cargo.toml` 기준으로는 `ratatui`·`crossterm` UI, `rusqlite`로 대화·세션 저장, `tokio` 비동기 실행, `axum`으로 로컬 웹 대시보드(`--web` / `serve`)를 제공하는 구조입니다.\n\nREADME에 따르면 그래프형 멀티스텝 오케스트레이션, 투두 보드, Obsidian 메모리, 공유 MCP 설정, `dmuxai.toml`의 커스텀 에이전트, CLI·MCP·HTTP API까지 같은 저장소 상태를 공유합니다."}]}, "session_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "result", "subtype": "success", "duration_ms": 7228, "duration_api_ms": 7228, "is_error": false, "result": "README와 Cargo.toml만 읽어 프로젝트를 세 문장으로 요약합니다.\n**DmuxAI**(`dmuxai` 0.2.0, MIT)는 Rust로 만든 터미널 클라이언트로, 한 프로젝트 워크스페이스에서 Codex·Cursor·AGY 같은 헤드리스 코딩 에이전트 CLI를 Ratatui TUI로 묶어 쓰며, ANSI 화면을 긁지 않고 각 CLI의 JSON/JSONL·NDJSON 프로토콜로 대화를 이어갑니다.\n\n`Cargo.toml` 기준으로는 `ratatui`·`crossterm` UI, `rusqlite`로 대화·세션 저장, `tokio` 비동기 실행, `axum`으로 로컬 웹 대시보드(`--web` / `serve`)를 제공하는 구조입니다.\n\nREADME에 따르면 그래프형 멀티스텝 오케스트레이션, 투두 보드, Obsidian 메모리, 공유 MCP 설정, `dmuxai.toml`의 커스텀 에이전트, CLI·MCP·HTTP API까지 같은 저장소 상태를 공유합니다.", "session_id": "00000000-0000-4000-8000-000000000001", "request_id": "redacted", "usage": {"inputTokens": 18729, "outputTokens": 710, "cacheReadTokens": 32506, "cacheWriteTokens": 0}}
