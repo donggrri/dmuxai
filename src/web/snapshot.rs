@@ -24,10 +24,20 @@ pub struct DashboardSnapshot {
     pub sent_at_ms: u64,
     pub source: SnapshotSource,
     pub workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<UiTheme>,
     pub agents: Vec<AgentView>,
     pub graph: Option<GraphView>,
     #[serde(default)]
     pub todos: Vec<Todo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct UiTheme {
+    pub theme: String,
+    #[serde(default)]
+    pub accent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +48,8 @@ pub struct AgentView {
     pub busy: bool,
     pub phase: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,12 +247,14 @@ mod tests {
             sent_at_ms: 0,
             source: SnapshotSource::Files,
             workspace: "/tmp/test".to_string(),
+            ui: None,
             agents: vec![AgentView {
                 id: "codex".to_string(),
                 label: "Codex".to_string(),
                 busy: false,
                 phase: None,
                 model: Some("o3-mini".to_string()),
+                color: None,
             }],
             graph: Some(view),
             todos: Vec::new(),

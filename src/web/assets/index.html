@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="dark light">
 <meta name="referrer" content="no-referrer">
 <title>DmuxAI dashboard</title>
 <link rel="stylesheet" href="/assets/app.css">
@@ -12,6 +12,17 @@
 <body>
 <header class="top">
   <h1 class="brand">DmuxAI<span class="brand-sub">dashboard</span></h1>
+  <div class="theme-controls">
+    <label class="theme-label" for="theme-select">Theme</label>
+    <select id="theme-select" class="theme-select">
+      <option value="light">Light</option>
+      <option value="dark">Dark</option>
+      <option value="system">System</option>
+    </select>
+    <label class="theme-label" for="accent-picker">Accent</label>
+    <input id="accent-picker" class="accent-picker" type="color" value="#4aa8ff" title="Accent color">
+    <button id="accent-reset" type="button" class="btn accent-reset">Reset</button>
+  </div>
   <nav id="status" class="status" aria-label="dashboard status">
     <span class="stat"><span class="stat-k">workspace</span><span id="workspace" class="stat-v">&ndash;</span></span>
     <span class="stat"><span class="stat-k">source</span><span id="source" class="stat-v">&ndash;</span></span>

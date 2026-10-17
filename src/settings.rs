@@ -5,6 +5,24 @@ use serde::Deserialize;
 use crate::activity::UiSettings;
 use crate::theme::{Theme, ThemeToml};
 
+/// Web dashboard theme settings loaded from `[web]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebThemeSettings {
+    /// One of `light`, `dark` or `system` (default `system`).
+    pub theme: String,
+    /// Normalized lowercase `#rrggbb` accent, if configured.
+    pub accent: Option<String>,
+}
+
+impl Default for WebThemeSettings {
+    fn default() -> Self {
+        Self {
+            theme: "system".to_owned(),
+            accent: None,
+        }
+    }
+}
+
 /// Workspace-local and environment overrides for DmuxAI behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DmuxSettings {
@@ -21,6 +39,8 @@ pub struct DmuxSettings {
     pub custom_agents: Vec<crate::custom_agent::CustomAgentSpec>,
     /// Activity rendering settings (tool calls and model thinking).
     pub ui: UiSettings,
+    /// Web dashboard theme settings from `[web]`.
+    pub web_theme: WebThemeSettings,
     /// Problems found while reading dmuxai.toml, shown at startup.
     pub config_warnings: Vec<String>,
 }
@@ -33,6 +53,13 @@ struct DmuxToml {
     theme: Option<ThemeToml>,
     agents: Option<AgentsToml>,
     ui: Option<UiSettings>,
+    web: Option<WebToml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WebToml {
+    theme: Option<String>,
+    accent: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -67,6 +94,10 @@ impl DmuxSettings {
 
     pub fn load_with_user_config(workspace: &Path, user_config_path: Option<&Path>) -> Self {
         let mut settings = Self::default();
+        // Custom agent names seen in *either* config, so an id defined only in
+        // the user config is not reported as unknown after the workspace config
+        // replaces `[[agents.custom]]`.
+        let mut known_custom: Vec<String> = Vec::new();
         if env_flag("DMUXAI_CURSOR_WINDOWS_UNSANDBOXED") {
             settings.cursor_windows_unsandboxed = true;
         }
@@ -75,7 +106,7 @@ impl DmuxSettings {
             && let Ok(contents) = std::fs::read_to_string(user_path)
         {
             match toml::from_str::<DmuxToml>(&contents) {
-                Ok(parsed) => settings.apply_toml(parsed),
+                Ok(parsed) => settings.apply_toml(parsed, &mut known_custom),
                 Err(error) => settings.config_warnings.push(format!(
                     "user config {} ignored: {error}",
                     user_path.display()
@@ -87,7 +118,7 @@ impl DmuxSettings {
         if let Ok(contents) = std::fs::read_to_string(&config_path) {
             match toml::from_str::<DmuxToml>(&contents) {
                 Ok(parsed) => {
-                    settings.apply_toml(parsed);
+                    settings.apply_toml(parsed, &mut known_custom);
                 }
                 Err(error) => {
                     settings
@@ -97,11 +128,36 @@ impl DmuxSettings {
             }
         }
 
+        let mut known: Vec<&str> = vec!["cursor", "agy", "codex"];
+        known.extend(known_custom.iter().map(String::as_str));
+        let unknown = settings.theme.unknown_agent_ids(&known);
+        drop(known);
+        // Actually drop the offending entries so the "ignored" warning is true.
+        settings
+            .theme
+            .agents
+            .retain(|id, _| !unknown.iter().any(|u| u == id));
+        for id in unknown {
+            settings
+                .config_warnings
+                .push(format!("[theme.agents] unknown agent id '{id}' ignored"));
+        }
+
+        settings.dedupe_warnings();
         settings
     }
 
-    fn apply_toml(&mut self, parsed: DmuxToml) {
+    /// Drop repeated warnings while preserving first-seen order.
+    fn dedupe_warnings(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.config_warnings.retain(|w| seen.insert(w.clone()));
+    }
+
+    fn apply_toml(&mut self, parsed: DmuxToml, known_custom: &mut Vec<String>) {
         if let Some(agents) = parsed.agents {
+            for spec in &agents.custom {
+                known_custom.push(spec.name.clone());
+            }
             self.custom_agents = agents.custom;
         }
         if parsed
@@ -120,7 +176,8 @@ impl DmuxSettings {
             }
         }
         if let Some(theme) = &parsed.theme {
-            self.theme.apply_toml(theme);
+            self.theme
+                .apply_toml_with_warnings(theme, &mut self.config_warnings);
             if let Some(force_color) = theme.force_color {
                 self.theme_force_color = Some(force_color);
             }
@@ -164,6 +221,30 @@ impl DmuxSettings {
         if let Some(ui) = parsed.ui {
             self.ui = ui;
         }
+        if let Some(web) = parsed.web {
+            if let Some(theme) = web.theme {
+                match normalize_web_theme(&theme) {
+                    Some(normalized) => self.web_theme.theme = normalized,
+                    None => {
+                        self.config_warnings.push(format!(
+                            "[web] theme = \"{theme}\" is not a valid theme; using \"system\""
+                        ));
+                        self.web_theme.theme = "system".to_owned();
+                    }
+                }
+            }
+            if let Some(accent) = web.accent {
+                match normalize_accent(&accent) {
+                    Some(normalized) => self.web_theme.accent = Some(normalized),
+                    None => {
+                        self.config_warnings.push(format!(
+                            "[web] accent = \"{accent}\" is not a valid color; using the default"
+                        ));
+                        self.web_theme.accent = None;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -181,9 +262,31 @@ impl Default for DmuxSettings {
             theme_force_color: None,
             custom_agents: Vec::new(),
             ui: UiSettings::default(),
+            web_theme: WebThemeSettings::default(),
             config_warnings: Vec::new(),
         }
     }
+}
+
+/// Normalize a `[web] theme` value, or `None` when it is not light/dark/system.
+fn normalize_web_theme(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "light" => Some("light".to_owned()),
+        "dark" => Some("dark".to_owned()),
+        "system" => Some("system".to_owned()),
+        _ => None,
+    }
+}
+
+/// Normalize a `[web] accent` value to lowercase `#rrggbb`, or `None` if invalid.
+///
+/// Only `#rrggbb` hex (case-insensitive) is accepted; named colors are rejected.
+fn normalize_accent(value: &str) -> Option<String> {
+    let hex = value.trim().strip_prefix('#')?;
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("#{}", hex.to_ascii_lowercase()))
 }
 
 fn env_flag(name: &str) -> bool {
@@ -232,6 +335,195 @@ mod theme_config_tests {
         assert_eq!(settings.theme.cursor, Color::Rgb(0, 255, 0));
         assert_eq!(settings.theme.agy, Theme::default().agy);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn web_theme_settings_parse_with_fallbacks() {
+        // TC-605, FR-603
+        let temp_base =
+            std::env::temp_dir().join(format!("dmuxai-web-theme-{}", std::process::id()));
+        let user_dir = temp_base.join("user");
+        let ws_dir = temp_base.join("workspace");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let user_toml = user_dir.join("dmuxai.toml");
+        std::fs::write(
+            &user_toml,
+            "[web]\ntheme = \"light\"\naccent = \"#AABBCC\"\n",
+        )
+        .unwrap();
+        // The workspace config overrides the user config.
+        std::fs::write(
+            ws_dir.join("dmuxai.toml"),
+            "[web]\ntheme = \"dark\"\naccent = \"#3366ff\"\n",
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(&ws_dir, Some(&user_toml));
+        assert_eq!(settings.web_theme.theme, "dark");
+        assert_eq!(settings.web_theme.accent.as_deref(), Some("#3366ff"));
+
+        // Defaults when `[web]` is absent.
+        let empty_dir = temp_base.join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let defaults = DmuxSettings::load_with_user_config(&empty_dir, None);
+        assert_eq!(defaults.web_theme.theme, "system");
+        assert_eq!(defaults.web_theme.accent, None);
+
+        // Invalid values fall back with warnings.
+        let bad_dir = temp_base.join("bad");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(
+            bad_dir.join("dmuxai.toml"),
+            "[web]\ntheme = \"neon\"\naccent = \"not-a-color\"\n",
+        )
+        .unwrap();
+        let bad = DmuxSettings::load_with_user_config(&bad_dir, None);
+        assert_eq!(bad.web_theme.theme, "system");
+        assert_eq!(bad.web_theme.accent, None);
+        assert!(
+            bad.config_warnings
+                .iter()
+                .any(|w| w.contains("[web] theme = \"neon\""))
+        );
+        assert!(
+            bad.config_warnings
+                .iter()
+                .any(|w| w.contains("[web] accent = \"not-a-color\""))
+        );
+
+        // Normalization: hex accent is lowercased and theme is lowercased.
+        let norm_dir = temp_base.join("norm");
+        std::fs::create_dir_all(&norm_dir).unwrap();
+        std::fs::write(
+            norm_dir.join("dmuxai.toml"),
+            "[web]\ntheme = \"DARK\"\naccent = \"#AABBCC\"\n",
+        )
+        .unwrap();
+        let norm = DmuxSettings::load_with_user_config(&norm_dir, None);
+        assert_eq!(norm.web_theme.theme, "dark");
+        assert_eq!(norm.web_theme.accent.as_deref(), Some("#aabbcc"));
+
+        // Only `#rrggbb` is a valid accent; a named color falls back with a warning.
+        let named_dir = temp_base.join("named");
+        std::fs::create_dir_all(&named_dir).unwrap();
+        std::fs::write(named_dir.join("dmuxai.toml"), "[web]\naccent = \"red\"\n").unwrap();
+        let named = DmuxSettings::load_with_user_config(&named_dir, None);
+        assert_eq!(named.web_theme.accent, None);
+        assert!(
+            named
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[web] accent = \"red\""))
+        );
+
+        std::fs::remove_dir_all(&temp_base).ok();
+    }
+
+    #[test]
+    fn theme_agents_real_nesting_and_unknown_ids() {
+        // TC-602, FR-601: parse `[theme]` + `[theme.agents]` through the real
+        // config path, honor custom agents from either config, and drop unknown
+        // ids with a truthful warning. Identical warnings are deduped.
+        let temp_base =
+            std::env::temp_dir().join(format!("dmuxai-theme-agents-{}", std::process::id()));
+        let user_dir = temp_base.join("user");
+        let ws_dir = temp_base.join("workspace");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        let user_toml = user_dir.join("dmuxai.toml");
+        std::fs::write(
+            &user_toml,
+            r##"
+[theme]
+background = "#101010"
+foreground = "dark-gray"
+border = "bogus"
+
+[theme.agents]
+cursor = "yellow"
+user-only = "#ff8800"
+
+[[agents.custom]]
+name = "user-only"
+command = ["user-only"]
+"##,
+        )
+        .unwrap();
+
+        // The workspace replaces `[[agents.custom]]`; theme colors still merge.
+        std::fs::write(
+            ws_dir.join("dmuxai.toml"),
+            r##"
+[theme]
+border = "bogus"
+
+[theme.agents]
+workspace-only = "#123456"
+mystery = "cyan"
+
+[[agents.custom]]
+name = "workspace-only"
+command = ["workspace-only"]
+"##,
+        )
+        .unwrap();
+
+        let settings = DmuxSettings::load_with_user_config(&ws_dir, Some(&user_toml));
+
+        // `[theme]` surface colors apply through the nested table.
+        assert_eq!(
+            settings.theme.background,
+            Some(Color::Rgb(0x10, 0x10, 0x10))
+        );
+        assert_eq!(settings.theme.foreground, Some(Color::DarkGray));
+        // Built-ins and custom ids from either config resolve.
+        assert_eq!(settings.theme.agent_color("cursor", None), Color::Yellow);
+        assert_eq!(
+            settings.theme.agent_color("user-only", None),
+            Color::Rgb(0xff, 0x88, 0x00)
+        );
+        assert_eq!(
+            settings.theme.agent_color("workspace-only", None),
+            Color::Rgb(0x12, 0x34, 0x56)
+        );
+        // An id that is neither built-in nor custom is warned about and dropped.
+        assert!(!settings.theme.agents.contains_key("mystery"));
+        assert_eq!(
+            settings.theme.agent_color("mystery", None),
+            settings.theme.other
+        );
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w == "[theme.agents] unknown agent id 'mystery' ignored"),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        // Known custom ids from either config are not flagged.
+        assert!(
+            !settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("user-only") || w.contains("workspace-only")),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        // The same invalid `[theme] border` in both configs warns exactly once.
+        let border_warnings = settings
+            .config_warnings
+            .iter()
+            .filter(|w| *w == "[theme] border = \"bogus\" is not a valid color; using the default")
+            .count();
+        assert_eq!(
+            border_warnings, 1,
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+
+        std::fs::remove_dir_all(&temp_base).ok();
     }
 
     #[test]

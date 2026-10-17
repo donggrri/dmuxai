@@ -46,7 +46,7 @@ use dmuxai::{
     },
     settings::DmuxSettings,
     skills::{discover_skills, skill_prompt_prefix},
-    theme::Speaker,
+    theme::{Speaker, Theme},
     todo::{Todo, TodoError, TodoStatus, TodoStore},
     web::commands::{DashboardCommand, RunMode, RunTodoError},
 };
@@ -461,6 +461,9 @@ pub struct App {
     dashboard_commands: Option<mpsc::Receiver<DashboardCommand>>,
     todo_turns: HashMap<(Agent, StoredTurnId), String>,
     graph_todo: Option<(String, String)>,
+    pub(crate) color_enabled: bool,
+    cached_agent_colors: HashMap<Agent, Color>,
+    cached_theme: Option<Theme>,
 }
 
 impl App {
@@ -518,6 +521,11 @@ impl App {
                 None => engine.select(ConversationSelection::New { title: None })?,
             }
         };
+        let color_enabled = dmuxai::theme::resolve_color_output(
+            std::env::var("NO_COLOR").ok().as_deref(),
+            std::env::var("DMUXAI_FORCE_COLOR").ok().as_deref(),
+            settings.theme_force_color,
+        );
         let mut app = Self {
             exit: false,
             selected: adapter_index(Agent::default()),
@@ -587,6 +595,9 @@ impl App {
             dashboard_commands: None,
             todo_turns: HashMap::new(),
             graph_todo: None,
+            color_enabled,
+            cached_agent_colors: HashMap::new(),
+            cached_theme: None,
         };
         app.restore_snapshot(snapshot);
         Ok(app)
@@ -2968,9 +2979,64 @@ impl App {
 
     /// Attaches the dashboard hub and publishes the current state (FR-530).
     pub fn attach_dashboard(&mut self, hub: dmuxai::web::DashboardHub) {
+        hub.set_ui(dmuxai::web::UiTheme {
+            theme: self.settings.web_theme.theme.clone(),
+            accent: self.settings.web_theme.accent.clone(),
+        });
         self.dashboard = Some(hub);
         self.publish_dashboard();
         self.publish_todos();
+    }
+
+    pub fn colors_enabled(&self) -> bool {
+        self.color_enabled
+    }
+
+    pub(crate) fn custom_spec(&self, index: u8) -> Option<dmuxai::custom_agent::CustomAgentSpec> {
+        self.settings
+            .custom_agents
+            .get(usize::from(index))
+            .cloned()
+            .or_else(|| dmuxai::custom_agent::spec_at(index).cloned())
+    }
+
+    pub(crate) fn agent_runner_name(&self, agent: Agent) -> String {
+        match agent {
+            Agent::Cursor => "cursor".to_owned(),
+            Agent::Agy => "agy".to_owned(),
+            Agent::Codex => "codex".to_owned(),
+            Agent::Custom(index) => self
+                .custom_spec(index)
+                .map(|spec| spec.name)
+                .unwrap_or_else(|| "custom".to_owned()),
+        }
+    }
+
+    pub(crate) fn compute_agent_color(&self, agent: Agent) -> Color {
+        let runner_name = self.agent_runner_name(agent);
+        let custom_color = match agent {
+            Agent::Custom(index) => self
+                .custom_spec(index)
+                .and_then(|spec| spec.color)
+                .and_then(|c| dmuxai::theme::parse_color(&c)),
+            _ => None,
+        };
+        self.settings.theme.agent_color(&runner_name, custom_color)
+    }
+
+    pub(crate) fn ensure_agent_colors(&mut self) {
+        if self.cached_theme.as_ref() != Some(&self.settings.theme) {
+            self.cached_agent_colors.clear();
+            self.cached_theme = Some(self.settings.theme.clone());
+        }
+        for msg in &self.messages {
+            if let Role::Agent(agent) = msg.role
+                && !self.cached_agent_colors.contains_key(&agent)
+            {
+                let color = self.compute_agent_color(agent);
+                self.cached_agent_colors.insert(agent, color);
+            }
+        }
     }
 
     /// Publishes agent and graph state to the attached dashboard, if any (FR-530).
@@ -2987,8 +3053,10 @@ impl App {
             .iter()
             .map(|adapter| {
                 let agent = adapter.agent();
+                let id = self.agent_runner_name(agent);
+                let color = self.compute_agent_color(agent);
                 dmuxai::web::AgentView {
-                    id: runner_name(agent).to_owned(),
+                    id,
                     label: agent.name().to_owned(),
                     busy: self.busy_agents.contains(&agent),
                     phase: self
@@ -2999,6 +3067,7 @@ impl App {
                         .model_catalogs
                         .get(&agent)
                         .and_then(|catalog| catalog.selected.clone()),
+                    color: dmuxai::theme::color_hex(color),
                 }
             })
             .collect();
@@ -3374,6 +3443,29 @@ impl App {
     }
 
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
+        self.ensure_agent_colors();
+        let colors = self.colors_enabled();
+        let theme_bg = if colors {
+            self.settings.theme.background
+        } else {
+            None
+        };
+        let theme_fg = if colors {
+            self.settings.theme.foreground
+        } else {
+            None
+        };
+        let theme_border = if colors {
+            self.settings.theme.border
+        } else {
+            None
+        };
+        let theme_accent = if colors {
+            self.settings.theme.accent
+        } else {
+            None
+        };
+
         let mut lines = Vec::new();
 
         let mut i = 0;
@@ -3382,8 +3474,14 @@ impl App {
             let theme = &self.settings.theme;
             match &message.role {
                 Role::User => {
-                    let (label, color) = ("You".to_owned(), theme.color_for(Speaker::User));
-                    let body_style = Style::default().fg(color);
+                    let (label, body_style) = if colors {
+                        (
+                            "You".to_owned(),
+                            Style::default().fg(theme.color_for(Speaker::User)),
+                        )
+                    } else {
+                        ("You".to_owned(), Style::default())
+                    };
                     lines.push(Line::from(Span::styled(
                         label,
                         body_style.add_modifier(Modifier::BOLD),
@@ -3398,8 +3496,16 @@ impl App {
                     i += 1;
                 }
                 Role::Agent(agent) => {
-                    let (label, color) = (agent.to_string(), theme.color_for(speaker_for(*agent)));
-                    let body_style = Style::default().fg(color);
+                    let (label, body_style) = if colors {
+                        let color = self
+                            .cached_agent_colors
+                            .get(agent)
+                            .copied()
+                            .unwrap_or_else(|| self.compute_agent_color(*agent));
+                        (agent.to_string(), Style::default().fg(color))
+                    } else {
+                        (agent.to_string(), Style::default())
+                    };
                     lines.push(Line::from(Span::styled(
                         label,
                         body_style.add_modifier(Modifier::BOLD),
@@ -3414,8 +3520,14 @@ impl App {
                     i += 1;
                 }
                 Role::System => {
-                    let (label, color) = ("DmuxAI".to_owned(), theme.color_for(Speaker::System));
-                    let body_style = Style::default().fg(color);
+                    let (label, body_style) = if colors {
+                        (
+                            "DmuxAI".to_owned(),
+                            Style::default().fg(theme.color_for(Speaker::System)),
+                        )
+                    } else {
+                        ("DmuxAI".to_owned(), Style::default())
+                    };
                     lines.push(Line::from(Span::styled(
                         label,
                         body_style.add_modifier(Modifier::BOLD),
@@ -3440,7 +3552,7 @@ impl App {
                     let is_last_group = !self.messages[i..]
                         .iter()
                         .any(|m| matches!(m.role, Role::Activity(_)));
-                    self.render_activity_group(chunk, is_last_group, &mut lines);
+                    self.render_activity_group(chunk, is_last_group, &mut lines, colors);
                 }
             }
         }
@@ -3459,10 +3571,27 @@ impl App {
             self.conversation_title,
             short_id(self.conversation_id.as_str())
         );
-        let chat = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(chat_title))
+        let mut block = Block::default().borders(Borders::ALL).title(chat_title);
+        if let Some(border) = theme_border {
+            block = block.border_style(Style::default().fg(border));
+        }
+        if let Some(bg) = theme_bg {
+            block = block.style(Style::default().bg(bg));
+        }
+        let mut chat = Paragraph::new(lines)
+            .block(block)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
+        let mut style = Style::default();
+        if let Some(bg) = theme_bg {
+            style = style.bg(bg);
+        }
+        if let Some(fg) = theme_fg {
+            style = style.fg(fg);
+        }
+        if style != Style::default() {
+            chat = chat.style(style);
+        }
         frame.render_widget(chat, area);
 
         self.chat_content_area = Rect::new(
@@ -3473,14 +3602,32 @@ impl App {
         );
         self.visible_chat_lines = visible_buffer_lines(frame, self.chat_content_area);
         if let Some(selection) = self.chat_selection {
-            highlight_chat_selection(frame, self.chat_content_area, selection);
+            highlight_chat_selection(
+                frame,
+                self.chat_content_area,
+                selection,
+                theme_accent,
+                colors,
+            );
         }
     }
 
     fn draw_graph_status(&self, frame: &mut Frame, area: Rect) {
         if let Some(status) = self.current_graph_status_line() {
-            let paragraph = Paragraph::new(status)
-                .style(Style::default().fg(self.settings.theme.color_for(Speaker::System)));
+            let colors = self.colors_enabled();
+            let mut style = Style::default();
+            if colors {
+                let fg = self
+                    .settings
+                    .theme
+                    .foreground
+                    .unwrap_or_else(|| self.settings.theme.color_for(Speaker::System));
+                style = style.fg(fg);
+                if let Some(bg) = self.settings.theme.background {
+                    style = style.bg(bg);
+                }
+            }
+            let paragraph = Paragraph::new(status).style(style);
             frame.render_widget(paragraph, area);
         }
     }
@@ -3490,6 +3637,7 @@ impl App {
         chunk: &[Message],
         is_last_group: bool,
         lines: &mut Vec<Line<'static>>,
+        colors: bool,
     ) {
         let theme = &self.settings.theme;
         let is_expanded = self.all_details_expanded || (is_last_group && self.last_group_expanded);
@@ -3524,7 +3672,7 @@ impl App {
             return;
         }
 
-        let system_color = theme.system;
+        let system_color = if colors { theme.system } else { Color::Reset };
 
         if is_expanded || self.settings.ui.show_tools == dmuxai::activity::ShowTools::Expanded {
             for item in visible {
@@ -3579,8 +3727,41 @@ impl App {
                 self.pending_images.chip_line()
             )
         };
-        let input = Paragraph::new(self.input.as_str())
-            .block(Block::default().borders(Borders::ALL).title(title));
+        let colors = self.colors_enabled();
+        let border = if colors {
+            self.settings.theme.border
+        } else {
+            None
+        };
+        let bg = if colors {
+            self.settings.theme.background
+        } else {
+            None
+        };
+        let fg = if colors {
+            self.settings.theme.foreground
+        } else {
+            None
+        };
+
+        let mut block = Block::default().borders(Borders::ALL).title(title);
+        if let Some(border) = border {
+            block = block.border_style(Style::default().fg(border));
+        }
+        if let Some(bg) = bg {
+            block = block.style(Style::default().bg(bg));
+        }
+        let mut input = Paragraph::new(self.input.as_str()).block(block);
+        let mut style = Style::default();
+        if let Some(bg) = bg {
+            style = style.bg(bg);
+        }
+        if let Some(fg) = fg {
+            style = style.fg(fg);
+        }
+        if style != Style::default() {
+            input = input.style(style);
+        }
         frame.render_widget(input, area);
 
         let cursor_offset = input_cursor_offset(self.input.as_str());
@@ -3678,32 +3859,100 @@ impl App {
 
         let status_line = fit_status_segments(&segments, area.width as usize);
         let badge = format!(" {selected} {state} ");
+        let colors = self.colors_enabled();
+        let bg = if colors {
+            self.settings.theme.background
+        } else {
+            None
+        };
+        let fg = if colors {
+            self.settings.theme.foreground
+        } else {
+            None
+        };
+        let accent = if colors {
+            self.settings.theme.accent
+        } else {
+            None
+        };
+
+        let mut rest_style = Style::default();
+        if let Some(fg) = fg {
+            rest_style = rest_style.fg(fg);
+        }
+        if let Some(bg) = bg {
+            rest_style = rest_style.bg(bg);
+        }
+        let badge_style = if colors {
+            let badge_bg = accent.unwrap_or(Color::Yellow);
+            let badge_fg = dmuxai::theme::text_on(badge_bg);
+            Style::default().fg(badge_fg).bg(badge_bg)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED)
+        };
         let status = if status_line.starts_with(&badge) {
             let rest = &status_line[badge.len()..];
             Line::from(vec![
-                Span::styled(badge, Style::default().fg(Color::Black).bg(Color::Yellow)),
-                Span::raw(rest.to_owned()),
+                Span::styled(badge, badge_style),
+                Span::styled(rest.to_owned(), rest_style),
             ])
         } else {
-            Line::from(vec![Span::raw(status_line)])
+            Line::from(vec![Span::styled(status_line, rest_style)])
         };
-        frame.render_widget(Paragraph::new(status), area);
+        let mut paragraph = Paragraph::new(status);
+        if let Some(bg) = bg {
+            paragraph = paragraph.style(Style::default().bg(bg));
+        }
+        frame.render_widget(paragraph, area);
     }
 
     fn draw_model_picker(&self, frame: &mut Frame, picker: &ModelPicker) {
         let area = centered_rect(72, 76, frame.area());
+        let colors = self.colors_enabled();
+        let border = if colors {
+            self.settings.theme.border
+        } else {
+            None
+        };
+        let bg = if colors {
+            self.settings.theme.background
+        } else {
+            None
+        };
+        let fg = if colors {
+            self.settings.theme.foreground
+        } else {
+            None
+        };
+        let accent = if colors {
+            self.settings.theme.accent
+        } else {
+            None
+        };
+
         frame.render_widget(Clear, area);
+        if let Some(bg) = bg {
+            frame.render_widget(Block::default().style(Style::default().bg(bg)), area);
+        }
+
         let catalog = self
             .model_catalogs
             .get(&picker.agent)
             .expect("every agent has a model catalog");
         let title = format!(" {} models ", picker.agent);
         if catalog.loading {
-            frame.render_widget(
-                Paragraph::new("Loading models from the provider CLI...")
-                    .block(Block::default().borders(Borders::ALL).title(title)),
-                area,
-            );
+            let mut block = Block::default().borders(Borders::ALL).title(title);
+            if let Some(border) = border {
+                block = block.border_style(Style::default().fg(border));
+            }
+            if let Some(bg) = bg {
+                block = block.style(Style::default().bg(bg));
+            }
+            let mut p = Paragraph::new("Loading models from the provider CLI...").block(block);
+            if let Some(fg) = fg {
+                p = p.style(Style::default().fg(fg));
+            }
+            frame.render_widget(p, area);
             return;
         }
 
@@ -3719,20 +3968,33 @@ impl App {
                 ListItem::new(format!("{marker} {}  [{}]", model.label, model.id))
             })
             .collect::<Vec<_>>();
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .title_bottom(" Up/Down move  Enter select  Tab model + effort  Esc close "),
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .title_bottom(" Up/Down move  Enter select  Tab model + effort  Esc close ");
+        if let Some(border) = border {
+            block = block.border_style(Style::default().fg(border));
+        }
+        if let Some(bg) = bg {
+            block = block.style(Style::default().bg(bg));
+        }
+        let highlight_style = if colors {
+            let hl_bg = accent.unwrap_or(Color::Yellow);
+            let hl_fg = dmuxai::theme::text_on(hl_bg);
+            Style::default()
+                .fg(hl_fg)
+                .bg(hl_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        };
+        let mut list = List::new(items)
+            .block(block)
+            .highlight_style(highlight_style)
             .highlight_symbol("> ");
+        if let Some(fg) = fg {
+            list = list.style(Style::default().fg(fg));
+        }
         let mut state = ListState::default().with_selected(
             (!catalog.models.is_empty()).then_some(picker.cursor.min(catalog.models.len() - 1)),
         );
@@ -3741,34 +4003,73 @@ impl App {
 
     fn draw_effort_picker(&self, frame: &mut Frame, picker: &EffortPicker) {
         let area = centered_fixed_rect(52, 7, frame.area());
+        let colors = self.colors_enabled();
+        let border = if colors {
+            self.settings.theme.border
+        } else {
+            None
+        };
+        let bg = if colors {
+            self.settings.theme.background
+        } else {
+            None
+        };
+        let fg = if colors {
+            self.settings.theme.foreground
+        } else {
+            None
+        };
+        let accent = if colors {
+            self.settings.theme.accent
+        } else {
+            None
+        };
+
         frame.render_widget(Clear, area);
+        if let Some(bg) = bg {
+            frame.render_widget(Block::default().style(Style::default().bg(bg)), area);
+        }
+
         let catalog = self
             .model_catalogs
             .get(&picker.agent)
             .expect("every agent has a model catalog");
         if catalog.loading {
-            frame.render_widget(
-                Paragraph::new("Loading Codex model effort options...").block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Codex effort "),
-                ),
-                area,
-            );
+            let mut block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Codex effort ");
+            if let Some(border) = border {
+                block = block.border_style(Style::default().fg(border));
+            }
+            if let Some(bg) = bg {
+                block = block.style(Style::default().bg(bg));
+            }
+            let mut p = Paragraph::new("Loading Codex model effort options...").block(block);
+            if let Some(fg) = fg {
+                p = p.style(Style::default().fg(fg));
+            }
+            frame.render_widget(p, area);
             return;
         }
         let options = selected_effort_options(catalog);
         if options.is_empty() {
-            frame.render_widget(
+            let mut block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Codex effort ")
+                .title_bottom(" Esc close ");
+            if let Some(border) = border {
+                block = block.border_style(Style::default().fg(border));
+            }
+            if let Some(bg) = bg {
+                block = block.style(Style::default().bg(bg));
+            }
+            let mut p =
                 Paragraph::new("The selected model does not advertise reasoning effort options.")
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Codex effort ")
-                            .title_bottom(" Esc close "),
-                    ),
-                area,
-            );
+                    .block(block);
+            if let Some(fg) = fg {
+                p = p.style(Style::default().fg(fg));
+            }
+            frame.render_widget(p, area);
             return;
         }
         let items = options
@@ -3782,20 +4083,33 @@ impl App {
                 ListItem::new(format!("{marker} {effort}"))
             })
             .collect::<Vec<_>>();
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Codex effort ")
-                    .title_bottom(" Up/Down move  Enter select  Esc close "),
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Codex effort ")
+            .title_bottom(" Up/Down move  Enter select  Esc close ");
+        if let Some(border) = border {
+            block = block.border_style(Style::default().fg(border));
+        }
+        if let Some(bg) = bg {
+            block = block.style(Style::default().bg(bg));
+        }
+        let highlight_style = if colors {
+            let hl_bg = accent.unwrap_or(Color::Yellow);
+            let hl_fg = dmuxai::theme::text_on(hl_bg);
+            Style::default()
+                .fg(hl_fg)
+                .bg(hl_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        };
+        let mut list = List::new(items)
+            .block(block)
+            .highlight_style(highlight_style)
             .highlight_symbol("> ");
+        if let Some(fg) = fg {
+            list = list.style(Style::default().fg(fg));
+        }
         let mut state =
             ListState::default().with_selected(Some(picker.cursor.min(options.len() - 1)));
         frame.render_stateful_widget(list, area, &mut state);
@@ -3803,7 +4117,33 @@ impl App {
 
     fn draw_agent_picker(&self, frame: &mut Frame, picker: &AgentPicker) {
         let area = centered_fixed_rect(48, 7, frame.area());
+        let colors = self.colors_enabled();
+        let border = if colors {
+            self.settings.theme.border
+        } else {
+            None
+        };
+        let bg = if colors {
+            self.settings.theme.background
+        } else {
+            None
+        };
+        let fg = if colors {
+            self.settings.theme.foreground
+        } else {
+            None
+        };
+        let accent = if colors {
+            self.settings.theme.accent
+        } else {
+            None
+        };
+
         frame.render_widget(Clear, area);
+        if let Some(bg) = bg {
+            frame.render_widget(Block::default().style(Style::default().bg(bg)), area);
+        }
+
         let items = Agent::all()
             .into_iter()
             .enumerate()
@@ -3813,20 +4153,33 @@ impl App {
                 ListItem::new(format!("{current} {agent}  [{mode}]"))
             })
             .collect::<Vec<_>>();
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Select agent ")
-                    .title_bottom(" Up/Down move  Enter select  Esc close "),
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Select agent ")
+            .title_bottom(" Up/Down move  Enter select  Esc close ");
+        if let Some(border) = border {
+            block = block.border_style(Style::default().fg(border));
+        }
+        if let Some(bg) = bg {
+            block = block.style(Style::default().bg(bg));
+        }
+        let highlight_style = if colors {
+            let hl_bg = accent.unwrap_or(Color::Yellow);
+            let hl_fg = dmuxai::theme::text_on(hl_bg);
+            Style::default()
+                .fg(hl_fg)
+                .bg(hl_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        };
+        let mut list = List::new(items)
+            .block(block)
+            .highlight_style(highlight_style)
             .highlight_symbol("> ");
+        if let Some(fg) = fg {
+            list = list.style(Style::default().fg(fg));
+        }
         let mut state = ListState::default().with_selected(Some(picker.cursor));
         frame.render_stateful_widget(list, area, &mut state);
     }
@@ -3834,7 +4187,33 @@ impl App {
     fn draw_conversation_picker(&self, frame: &mut Frame, picker: &ConversationPicker) {
         let height = (picker.conversations.len() as u16 + 2).clamp(5, 18);
         let area = centered_fixed_rect(76, height, frame.area());
+        let colors = self.colors_enabled();
+        let border = if colors {
+            self.settings.theme.border
+        } else {
+            None
+        };
+        let bg = if colors {
+            self.settings.theme.background
+        } else {
+            None
+        };
+        let fg = if colors {
+            self.settings.theme.foreground
+        } else {
+            None
+        };
+        let accent = if colors {
+            self.settings.theme.accent
+        } else {
+            None
+        };
+
         frame.render_widget(Clear, area);
+        if let Some(bg) = bg {
+            frame.render_widget(Block::default().style(Style::default().bg(bg)), area);
+        }
+
         let items = picker
             .conversations
             .iter()
@@ -3857,20 +4236,33 @@ impl App {
                 ))
             })
             .collect::<Vec<_>>();
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Conversations ")
-                    .title_bottom(" Up/Down move  Enter load  Esc close "),
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Conversations ")
+            .title_bottom(" Up/Down move  Enter load  Esc close ");
+        if let Some(border) = border {
+            block = block.border_style(Style::default().fg(border));
+        }
+        if let Some(bg) = bg {
+            block = block.style(Style::default().bg(bg));
+        }
+        let highlight_style = if colors {
+            let hl_bg = accent.unwrap_or(Color::Yellow);
+            let hl_fg = dmuxai::theme::text_on(hl_bg);
+            Style::default()
+                .fg(hl_fg)
+                .bg(hl_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        };
+        let mut list = List::new(items)
+            .block(block)
+            .highlight_style(highlight_style)
             .highlight_symbol("> ");
+        if let Some(fg) = fg {
+            list = list.style(Style::default().fg(fg));
+        }
         let mut state = ListState::default().with_selected(
             (!picker.conversations.is_empty())
                 .then_some(picker.cursor.min(picker.conversations.len() - 1)),
@@ -3880,7 +4272,33 @@ impl App {
 
     fn draw_mode_picker(&self, frame: &mut Frame, picker: &ModePicker) {
         let area = centered_fixed_rect(56, 7, frame.area());
+        let colors = self.colors_enabled();
+        let border = if colors {
+            self.settings.theme.border
+        } else {
+            None
+        };
+        let bg = if colors {
+            self.settings.theme.background
+        } else {
+            None
+        };
+        let fg = if colors {
+            self.settings.theme.foreground
+        } else {
+            None
+        };
+        let accent = if colors {
+            self.settings.theme.accent
+        } else {
+            None
+        };
+
         frame.render_widget(Clear, area);
+        if let Some(bg) = bg {
+            frame.render_widget(Block::default().style(Style::default().bg(bg)), area);
+        }
+
         let selected_mode = self.modes.get(&picker.agent).copied().unwrap_or_default();
         let items = ExecutionMode::ALL
             .into_iter()
@@ -3894,20 +4312,33 @@ impl App {
                 ListItem::new(format!("{current} {mode:<9} {description}"))
             })
             .collect::<Vec<_>>();
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" {} mode ", picker.agent))
-                    .title_bottom(" Up/Down move  Enter select  Esc close "),
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} mode ", picker.agent))
+            .title_bottom(" Up/Down move  Enter select  Esc close ");
+        if let Some(border) = border {
+            block = block.border_style(Style::default().fg(border));
+        }
+        if let Some(bg) = bg {
+            block = block.style(Style::default().bg(bg));
+        }
+        let highlight_style = if colors {
+            let hl_bg = accent.unwrap_or(Color::Yellow);
+            let hl_fg = dmuxai::theme::text_on(hl_bg);
+            Style::default()
+                .fg(hl_fg)
+                .bg(hl_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        };
+        let mut list = List::new(items)
+            .block(block)
+            .highlight_style(highlight_style)
             .highlight_symbol("> ");
+        if let Some(fg) = fg {
+            list = list.style(Style::default().fg(fg));
+        }
         let mut state = ListState::default().with_selected(Some(picker.cursor));
         frame.render_stateful_widget(list, area, &mut state);
     }
@@ -3928,20 +4359,61 @@ impl App {
             input_area.width.min(64),
             height,
         );
+        let colors = self.colors_enabled();
+        let border = if colors {
+            self.settings.theme.border
+        } else {
+            None
+        };
+        let bg = if colors {
+            self.settings.theme.background
+        } else {
+            None
+        };
+        let fg = if colors {
+            self.settings.theme.foreground
+        } else {
+            None
+        };
+        let accent = if colors {
+            self.settings.theme.accent
+        } else {
+            None
+        };
+
         frame.render_widget(Clear, area);
+        if let Some(bg) = bg {
+            frame.render_widget(Block::default().style(Style::default().bg(bg)), area);
+        }
+
         let items = matches
             .iter()
             .map(|command| ListItem::new(format!("{:<10} {}", command.name, command.description)))
             .collect::<Vec<_>>();
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" Commands "))
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+        let mut block = Block::default().borders(Borders::ALL).title(" Commands ");
+        if let Some(border) = border {
+            block = block.border_style(Style::default().fg(border));
+        }
+        if let Some(bg) = bg {
+            block = block.style(Style::default().bg(bg));
+        }
+        let highlight_style = if colors {
+            let hl_bg = accent.unwrap_or(Color::Yellow);
+            let hl_fg = dmuxai::theme::text_on(hl_bg);
+            Style::default()
+                .fg(hl_fg)
+                .bg(hl_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        };
+        let mut list = List::new(items)
+            .block(block)
+            .highlight_style(highlight_style)
             .highlight_symbol("> ");
+        if let Some(fg) = fg {
+            list = list.style(Style::default().fg(fg));
+        }
         let mut state = ListState::default()
             .with_selected(Some(preview.cursor.min(matches.len().saturating_sub(1))));
         frame.render_stateful_widget(list, area, &mut state);
@@ -4324,7 +4796,13 @@ fn visible_buffer_lines(frame: &mut Frame, area: Rect) -> Vec<String> {
         .collect()
 }
 
-fn highlight_chat_selection(frame: &mut Frame, area: Rect, selection: ChatSelection) {
+fn highlight_chat_selection(
+    frame: &mut Frame,
+    area: Rect,
+    selection: ChatSelection,
+    accent: Option<Color>,
+    colors: bool,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -4333,10 +4811,16 @@ fn highlight_chat_selection(frame: &mut Frame, area: Rect, selection: ChatSelect
     let last_row = usize::from(area.height.saturating_sub(1));
     let last_column = usize::from(area.width.saturating_sub(1));
     let end_row = end.row.min(last_row);
-    let style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::LightCyan)
-        .add_modifier(Modifier::BOLD);
+    let style = if colors {
+        let highlight_bg = accent.unwrap_or(Color::LightCyan);
+        let highlight_fg = dmuxai::theme::text_on(highlight_bg);
+        Style::default()
+            .fg(highlight_fg)
+            .bg(highlight_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::REVERSED)
+    };
     let buffer = frame.buffer_mut();
 
     for row in start.row.min(last_row)..=end_row {
@@ -4560,6 +5044,7 @@ mod tests {
         .unwrap();
         // Most unit tests were authored with Codex as the implicit active runner.
         app.selected = adapter_index(Agent::Codex);
+        app.color_enabled = true;
         (app, sent, cancelled)
     }
 
@@ -5673,11 +6158,175 @@ mod tests {
         ));
         app.messages
             .push(Message::new(Role::System, "zzsystemline".to_owned()));
-        let theme = app.settings.theme;
+        let theme = app.settings.theme.clone();
         assert_eq!(find_cell_fg(&mut app, "zzuserline"), Some(theme.user));
         assert_eq!(find_cell_fg(&mut app, "zzcursorline"), Some(theme.cursor));
         assert_eq!(find_cell_fg(&mut app, "zzagyline"), Some(theme.agy));
         assert_eq!(find_cell_fg(&mut app, "zzsystemline"), Some(theme.system));
+    }
+
+    // TC-601 / FR-600: tui_renders_theme_background_and_border
+    #[test]
+    fn tui_renders_theme_background_and_border() {
+        let (mut app, _sent) = test_app();
+        let bg = Color::Rgb(0x10, 0x20, 0x30);
+        let border = Color::Rgb(0x40, 0x50, 0x60);
+        app.settings.theme.background = Some(bg);
+        app.settings.theme.border = Some(border);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // 1. Block border cell uses `border`
+        let top_left = &buffer[(0, 0)];
+        assert_eq!(top_left.fg, border);
+
+        // 2. Interior cell in chat area uses `background`
+        let chat_cell = &buffer[(5, 5)];
+        assert_eq!(chat_cell.bg, bg);
+    }
+
+    // TC-603 / FR-601: tui_uses_per_agent_text_colors
+    #[test]
+    fn tui_uses_per_agent_text_colors() {
+        let (mut app, _sent) = test_app();
+        let codex_color = Color::Rgb(0xaa, 0x11, 0x22);
+        let custom_color = Color::Rgb(0x33, 0xbb, 0x44);
+        let spec_fallback_color = Color::Rgb(0x55, 0x66, 0x77);
+
+        app.settings
+            .theme
+            .agents
+            .insert("codex".to_owned(), codex_color);
+        app.settings
+            .theme
+            .agents
+            .insert("my-agent".to_owned(), custom_color);
+
+        app.settings.custom_agents = vec![
+            dmuxai::custom_agent::CustomAgentSpec {
+                name: "my-agent".to_owned(),
+                command: vec!["echo".to_owned()],
+                ..Default::default()
+            },
+            dmuxai::custom_agent::CustomAgentSpec {
+                name: "spec-colored-agent".to_owned(),
+                color: Some("#556677".to_owned()),
+                command: vec!["echo".to_owned()],
+                ..Default::default()
+            },
+        ];
+
+        app.messages.clear();
+        app.messages.push(Message::new(
+            Role::Agent(Agent::Codex),
+            "zzcodexmsg".to_owned(),
+        ));
+        app.messages.push(Message::new(
+            Role::Agent(Agent::Custom(0)),
+            "zzcustommsg".to_owned(),
+        ));
+        app.messages.push(Message::new(
+            Role::Agent(Agent::Custom(1)),
+            "zzspecmsg".to_owned(),
+        ));
+
+        assert_eq!(find_cell_fg(&mut app, "zzcodexmsg"), Some(codex_color));
+        assert_eq!(find_cell_fg(&mut app, "zzcustommsg"), Some(custom_color));
+        assert_eq!(
+            find_cell_fg(&mut app, "zzspecmsg"),
+            Some(spec_fallback_color)
+        );
+    }
+
+    #[test]
+    fn tui_renders_default_colors_when_colors_disabled() {
+        let (mut app, _sent) = test_app();
+        let bg = Color::Rgb(0x10, 0x20, 0x30);
+        let border = Color::Rgb(0x40, 0x50, 0x60);
+        let codex_color = Color::Rgb(0xaa, 0x11, 0x22);
+
+        app.settings.theme.background = Some(bg);
+        app.settings.theme.border = Some(border);
+        app.settings.theme.foreground = Some(Color::Rgb(0x70, 0x80, 0x90));
+        app.settings
+            .theme
+            .agents
+            .insert("codex".to_owned(), codex_color);
+
+        app.color_enabled = false;
+
+        app.messages.clear();
+        app.messages.push(Message::new(
+            Role::Agent(Agent::Codex),
+            "zzcodexdisabled".to_owned(),
+        ));
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // 1. Block border cell uses Color::Reset (terminal default), not `border`
+        let top_left = &buffer[(0, 0)];
+        assert_eq!(top_left.fg, Color::Reset);
+
+        // 2. Interior cell in chat area uses Color::Reset (terminal default), not `background`
+        let chat_cell = &buffer[(5, 5)];
+        assert_eq!(chat_cell.bg, Color::Reset);
+
+        // 3. Message text cell uses Color::Reset, not configured agent color
+        assert_eq!(
+            find_cell_fg(&mut app, "zzcodexdisabled"),
+            Some(Color::Reset)
+        );
+    }
+
+    // TC-609 / FR-604: dashboard_agents_carry_tui_colors
+    #[test]
+    fn dashboard_agents_carry_tui_colors() {
+        let (mut app, _sent) = test_app();
+        let hub =
+            dmuxai::web::DashboardHub::new(dmuxai::web::SnapshotSource::Tui, "/test".to_string());
+        app.settings.web_theme.theme = "dark".to_owned();
+        app.settings.web_theme.accent = Some("#3366ff".to_owned());
+        app.attach_dashboard(hub.clone());
+
+        let codex_rgb = Color::Rgb(0x12, 0x34, 0x56);
+        app.settings
+            .theme
+            .agents
+            .insert("codex".to_owned(), codex_rgb);
+
+        app.publish_dashboard();
+
+        let snapshot = hub.snapshot();
+        let json: serde_json::Value =
+            serde_json::to_value(&snapshot).expect("serializable snapshot");
+
+        // 1. Assert ui object with theme and accent
+        assert_eq!(json["ui"]["theme"], "dark");
+        assert_eq!(json["ui"]["accent"], "#3366ff");
+
+        // 2. Assert absence of token key
+        assert!(json.get("token").is_none());
+
+        // 3. Assert specific agents[].color values including a configured color and a fallback
+        let agents = json["agents"].as_array().expect("agents array");
+        let codex_view = agents
+            .iter()
+            .find(|a| a["id"] == "codex")
+            .expect("codex agent present");
+        assert_eq!(codex_view["color"], "#123456");
+
+        let cursor_view = agents
+            .iter()
+            .find(|a| a["id"] == "cursor")
+            .expect("cursor agent present");
+        let expected_cursor_hex = dmuxai::theme::color_hex(app.settings.theme.cursor).unwrap();
+        assert_eq!(cursor_view["color"], expected_cursor_hex);
     }
 
     fn render_text_at(app: &mut App, width: u16, height: u16) -> String {
@@ -8227,6 +8876,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 fn speaker_for(agent: Agent) -> Speaker {
     match agent {
         Agent::Cursor => Speaker::Cursor,

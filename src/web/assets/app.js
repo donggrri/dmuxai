@@ -22,6 +22,186 @@ function storageRemove(key) {
   try { window.sessionStorage.removeItem(key) ; } catch (err) { /* ignore */ }
 }
 
+// ---------------------------------------------------------------------------
+// Theme and accent (SPEC-theme-colors FR-603, UX-600, NFR-600).
+// Choices persist only in dmuxai.theme / dmuxai.accent localStorage keys
+// (never the token); styles are applied via element style properties only,
+// which the CSP allows.
+// ---------------------------------------------------------------------------
+
+var THEME_KEY = 'dmuxai.theme';
+var ACCENT_KEY = 'dmuxai.accent';
+var THEME_VALUES = ['light', 'dark', 'system'];
+var themePref = null;
+// FR-603: the snapshot ui.theme/ui.accent only apply until the user makes an
+// in-session choice. The flags are in-memory so also work when localStorage
+// is unavailable; a stored key counts as an already-made choice.
+var userThemeChosen = false;
+var userAccentChosen = false;
+// Latest valid snapshot values (from [web] config); the reset button falls
+// back to the snapshot accent once.
+var snapshotUiTheme = null;
+var snapshotAccent = null;
+
+var colorSchemeMedia = typeof window.matchMedia === 'function'
+  ? window.matchMedia('(prefers-color-scheme: dark)')
+  : null;
+
+var colorSchemeListener = function () {
+  if (themePref === 'system') { applyResolvedTheme(); }
+};
+
+function isHexColor(value) {
+  return typeof value === 'string' && /^#[0-9a-fA-F]{6}$/.test(value);
+}
+
+// WCAG 2.1 relative luminance of an #rrggbb color.
+function relativeLuminance(value) {
+  var channels = [
+    parseInt(value.slice(1, 3), 16),
+    parseInt(value.slice(3, 5), 16),
+    parseInt(value.slice(5, 7), 16)
+  ];
+  var total = 0;
+  var weights = [0.2126, 0.7152, 0.0722];
+  for (var i = 0; i < channels.length; i++) {
+    var c = channels[i] / 255;
+    var linear = c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    total += weights[i] * linear;
+  }
+  return total;
+}
+
+function contrastRatio(a, b) {
+  var la = relativeLuminance(a);
+  var lb = relativeLuminance(b);
+  var hi = Math.max(la, lb);
+  var lo = Math.min(la, lb);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+// NFR-600: text drawn on the accent uses black or white, whichever has the
+// higher WCAG contrast against the accent.
+function onAccentFor(value) {
+  var luminance = relativeLuminance(value);
+  var onBlack = (luminance + 0.05) / 0.05;        // black text on the accent
+  var onWhite = 1.05 / (luminance + 0.05);        // white text on the accent
+  return onBlack >= onWhite ? '#000000' : '#ffffff';
+}
+
+function validTheme(value) {
+  return THEME_VALUES.indexOf(value) !== -1;
+}
+
+function applyResolvedTheme() {
+  var resolved = themePref;
+  if (resolved === 'system') {
+    resolved = colorSchemeMedia && colorSchemeMedia.matches ? 'dark' : 'light';
+  }
+  if (resolved !== 'dark' && resolved !== 'light') { resolved = 'dark'; }
+  document.documentElement.dataset.theme = resolved;
+}
+
+function applyAccentOverride(value) {
+  var style = document.documentElement.style;
+  if (!isHexColor(value)) {
+    style.removeProperty('--accent');
+    style.removeProperty('--on-accent');
+    return;
+  }
+  var hex = value.toLowerCase();
+  style.setProperty('--accent', hex);
+  style.setProperty('--on-accent', onAccentFor(hex));
+}
+
+function syncAccentPicker() {
+  var picker = $('accent-picker');
+  if (!picker) { return; }
+  var current = window.getComputedStyle(document.documentElement)
+    .getPropertyValue('--accent').trim();
+  if (isHexColor(current)) { picker.value = current.toLowerCase(); }
+}
+
+// User picked a theme in the header; persist when the browser allows it.
+function setThemeChoice(pref) {
+  themePref = validTheme(pref) ? pref : 'system';
+  userThemeChosen = true;
+  try { window.localStorage.setItem(THEME_KEY, themePref); } catch (err) { /* ignore */ }
+  applyResolvedTheme();
+  setThemeSelect();
+}
+
+function setThemeSelect() {
+  var select = $('theme-select');
+  if (select) { select.value = validTheme(themePref) ? themePref : 'system'; }
+}
+
+// User picked an accent in the header; persist when the browser allows it.
+function setAccentChoice(value) {
+  var valid = isHexColor(value);
+  userAccentChosen = true;
+  try {
+    if (valid) { window.localStorage.setItem(ACCENT_KEY, value.toLowerCase()); }
+    else { window.localStorage.removeItem(ACCENT_KEY); }
+  } catch (err) { /* ignore */ }
+  applyAccentOverride(valid ? value : null);
+  syncAccentPicker();
+}
+
+// Reset: drop the stored accent once and fall back to the configured (snapshot)
+// accent immediately, so the palette default is never painted in between.
+function resetAccent() {
+  userAccentChosen = true;
+  try { window.localStorage.removeItem(ACCENT_KEY); } catch (err) { /* ignore */ }
+  applyAccentOverride(snapshotAccent);
+  syncAccentPicker();
+}
+
+function storedTheme() {
+  try { return window.localStorage.getItem(THEME_KEY); } catch (err) { return null; }
+}
+
+function storedAccent() {
+  try { return window.localStorage.getItem(ACCENT_KEY); } catch (err) { return null; }
+}
+
+function bindThemeControls() {
+  var select = $('theme-select');
+  var picker = $('accent-picker');
+  var reset = $('accent-reset');
+  if (!select || !picker || !reset) { return; }
+  select.addEventListener('change', function() {
+    setThemeChoice(select.value);
+  });
+  picker.addEventListener('input', function() {
+    setAccentChoice(picker.value);
+  });
+  reset.addEventListener('click', resetAccent);
+}
+
+// FR-603: while the user has made no in-session choice, the page follows the
+// snapshot ui.theme / ui.accent (from [web] config); missing or invalid values
+// are ignored. Once the user picks theme or accent, or hits Reset, the flags
+// above stop further snapshot applications.
+function applySnapshotUi(snap) {
+  var ui = snap && snap.ui ? snap.ui : null;
+  if (ui && validTheme(String(ui.theme || ''))) {
+    snapshotUiTheme = String(ui.theme);
+  }
+  if (ui && isHexColor(ui.accent)) {
+    snapshotAccent = String(ui.accent).toLowerCase();
+  }
+  if (!userThemeChosen && snapshotUiTheme) {
+    themePref = snapshotUiTheme;
+    applyResolvedTheme();
+    setThemeSelect();
+  }
+  if (!userAccentChosen) {
+    applyAccentOverride(snapshotAccent);
+    syncAccentPicker();
+  }
+}
+
 // Use the ?token= from the URL when present, stash it for refreshes, and hide
 // it from the address bar afterwards (deepseek cross-review finding 3).
 var token = (function () {
@@ -276,6 +456,13 @@ function renderAgents(agents) {
   for (var i = 0; i < list.length; i++) {
     var agent = list[i] || {};
     var chip = el('span', 'chip');
+    // FR-604: the snapshot carries the TUI agent color (#rrggbb or absent);
+    // use it as a colored dot on the chip when present.
+    if (isHexColor(agent.color)) {
+      var dot = el('span', 'chip-dot');
+      dot.style.backgroundColor = String(agent.color).toLowerCase();
+      chip.appendChild(dot);
+    }
     var name = el('span', 'chip-name', String(agent.label || agent.id || ''));
     chip.appendChild(name);
 
@@ -807,6 +994,7 @@ function applySnapshot(snap) {
   snap.receivedAt = Date.now();
   snapshot = snap;
   lastRendered = Date.now();
+  applySnapshotUi(snap);
   render(lastRendered);
   renderTodos(snap);
   scheduleTick();
@@ -937,6 +1125,26 @@ window.addEventListener('pagehide', function() {
 });
 
 function init() {
+  // Theme controls work even without a token (the panel is header-visible).
+  bindThemeControls();
+  // A stored choice counts as already-made: snapshot values must not override it.
+  var stored = storedTheme();
+  userThemeChosen = validTheme(stored);
+  themePref = userThemeChosen ? stored : 'system';
+  applyResolvedTheme();
+  setThemeSelect();
+
+  var accent = storedAccent();
+  if (isHexColor(accent)) {
+    applyAccentOverride(accent);
+    userAccentChosen = true;
+  }
+  syncAccentPicker();
+
+  if (colorSchemeMedia && typeof colorSchemeMedia.addEventListener === 'function') {
+    colorSchemeMedia.addEventListener('change', colorSchemeListener);
+  }
+
   if (!token) {
     showMsg(
       'Missing access token. Start DmuxAI and open the dashboard URL it prints ' +

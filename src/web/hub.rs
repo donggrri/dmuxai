@@ -5,7 +5,7 @@ use tokio::sync::watch;
 use crate::graph::GraphNodeStatus;
 use crate::todo::Todo;
 use crate::web::snapshot::{
-    AgentView, DashboardSnapshot, GraphView, SNAPSHOT_SCHEMA, SnapshotSource,
+    AgentView, DashboardSnapshot, GraphView, SNAPSHOT_SCHEMA, SnapshotSource, UiTheme,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -41,6 +41,7 @@ impl DashboardHub {
             sent_at_ms: 0,
             source,
             workspace,
+            ui: None,
             agents: Vec::new(),
             graph: None,
             todos: Vec::new(),
@@ -137,6 +138,29 @@ impl DashboardHub {
         state.snapshot.revision += 1;
         state.snapshot.generated_at_ms = now_ms;
         let _ = self.watch_tx.send_replace(state.snapshot.clone());
+    }
+
+    /// Sets or updates the UI theme preferences in the snapshot (FR-603).
+    pub fn set_ui(&self, ui: impl Into<Option<UiTheme>>) {
+        let ui = ui.into();
+        let mut state = self.state.lock().unwrap();
+        if state.snapshot.ui == ui {
+            return;
+        }
+        state.snapshot.ui = ui;
+        state.snapshot.revision += 1;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        state.snapshot.generated_at_ms = now_ms;
+        let _ = self.watch_tx.send_replace(state.snapshot.clone());
+    }
+
+    /// Builder helper to set the initial UI theme.
+    pub fn with_ui(self, ui: impl Into<Option<UiTheme>>) -> Self {
+        self.set_ui(ui);
+        self
     }
 
     pub fn snapshot(&self) -> DashboardSnapshot {
@@ -282,5 +306,75 @@ mod tests {
         let node_retry1 = &snap_retry1.graph.as_ref().unwrap().nodes[0];
         assert_eq!(node_retry1.started_at_ms, Some(10000));
         assert_eq!(node_retry1.finished_at_ms, None);
+    }
+
+    // TC-606 / FR-603: snapshot_exposes_ui_theme
+    #[tokio::test]
+    async fn snapshot_exposes_ui_theme() {
+        use crate::web::server::build_router;
+        use crate::web::snapshot::{AgentView, UiTheme};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        hub.set_ui(UiTheme {
+            theme: "dark".to_string(),
+            accent: Some("#3366ff".to_string()),
+        });
+        hub.publish(
+            vec![
+                AgentView {
+                    id: "codex".to_string(),
+                    label: "Codex".to_string(),
+                    busy: false,
+                    phase: None,
+                    model: None,
+                    color: Some("#123456".to_string()),
+                },
+                AgentView {
+                    id: "cursor".to_string(),
+                    label: "Cursor".to_string(),
+                    busy: false,
+                    phase: None,
+                    model: None,
+                    color: Some("#000080".to_string()),
+                },
+            ],
+            None,
+        );
+
+        let token = "test-token-secret-12345".to_string();
+        let allowed = Some(vec!["localhost:7420".to_string()]);
+        let router = build_router(hub, token.clone(), allowed);
+
+        let req = axum::http::Request::builder()
+            .uri("/api/state")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(json["ui"]["theme"], "dark");
+        assert_eq!(json["ui"]["accent"], "#3366ff");
+        assert!(json.get("token").is_none());
+        assert!(!String::from_utf8_lossy(&bytes).contains("test-token-secret-12345"));
+
+        let agents = json["agents"].as_array().expect("agents array in response");
+        let codex = agents
+            .iter()
+            .find(|a| a["id"] == "codex")
+            .expect("codex agent present");
+        assert_eq!(codex["color"], "#123456");
+        let cursor = agents
+            .iter()
+            .find(|a| a["id"] == "cursor")
+            .expect("cursor agent present");
+        assert_eq!(cursor["color"], "#000080");
     }
 }

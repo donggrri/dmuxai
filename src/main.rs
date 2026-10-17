@@ -238,7 +238,15 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
             DashboardServices::default()
         }
     };
+    let settings = DmuxSettings::load(&workspace_root);
+    for warning in &settings.config_warnings {
+        eprintln!("warning: {warning}");
+    }
     let hub = DashboardHub::new(SnapshotSource::Files, workspace);
+    hub.set_ui(dmuxai::web::UiTheme {
+        theme: settings.web_theme.theme,
+        accent: settings.web_theme.accent,
+    });
     // Seed once so `GET /api/state` / SSE show persisted to-dos before the
     // first mutation (FR-540/FR-541).
     if let Some(store) = services.todos.as_ref() {
