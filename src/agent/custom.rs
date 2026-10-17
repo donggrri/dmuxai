@@ -115,7 +115,7 @@ async fn runtime_loop(
                     &event_tx,
                     agent,
                     Some(&context),
-                    AgentEvent::Notice(format!(
+                    AgentEvent::Error(format!(
                         "{} is already running a turn; cancel it before sending another prompt",
                         spec.label()
                     )),

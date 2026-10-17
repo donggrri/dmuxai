@@ -1808,15 +1808,20 @@ impl App {
 
     fn cancel_selected(&mut self) {
         let agent = self.adapters[self.selected].agent();
-        if !self.busy_agents.contains(&agent) {
-            return;
-        }
+        let was_tracking =
+            self.busy_agents.contains(&agent) || self.active_turns.contains_key(&agent);
 
-        if let Err(error) = self.adapters[self.selected].cancel() {
+        if let Err(error) = self.adapters[self.selected].cancel()
+            && was_tracking
+        {
             self.messages.push(Message::new(
                 Role::System,
                 format!("Could not cancel {agent}: {error}"),
             ));
+        }
+
+        if was_tracking {
+            self.finish_turn_outcome(agent, false);
         }
     }
 
@@ -5628,6 +5633,105 @@ mod tests {
         assert!(!app.busy_agents.contains(&Agent::Agy));
         assert_eq!(app.messages.last().unwrap().role, Role::System);
         assert_eq!(app.messages.last().unwrap().content, "AGY turn cancelled.");
+    }
+
+    #[test]
+    fn already_running_adapter_error_clears_busy_state() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_enabled = false;
+
+        // Turn A is submitted and the adapter starts the turn.
+        app.input = "first".to_owned();
+        app.submit_prompt();
+        let first = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(first.conversation_id.clone()),
+            turn_id: Some(first.turn_id.clone()),
+            event: AgentEvent::Started,
+        }));
+        assert!(app.busy_agents.contains(&Agent::Codex));
+        assert!(app.active_turns.contains_key(&Agent::Codex));
+
+        // Real adapters build the "already running" `Error` from the context of
+        // the request that arrives while the adapter session still tracks an
+        // active turn (`OutputContext::from(&request)`, see the concurrent-send
+        // handling in `src/agent/codex.rs` and friends). The CLI session can
+        // still look busy to the adapter after DmuxAI has already observed and
+        // recorded turn A's terminal event, so drain A's completion first;
+        // that leaves `active_turns` empty of A, then the second submit gets
+        // fresh turn ids from `begin_turn` and reaches the adapter as
+        // request B.
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(first.conversation_id.clone()),
+            turn_id: Some(first.turn_id.clone()),
+            event: AgentEvent::Completed,
+        }));
+        assert!(!app.busy_agents.contains(&Agent::Codex));
+        assert!(!app.active_turns.contains_key(&Agent::Codex));
+
+        app.input = "second".to_owned();
+        app.submit_prompt();
+        let second = sent.lock().unwrap()[1].1.clone();
+        assert_eq!(
+            second.conversation_id.as_str(),
+            first.conversation_id.as_str()
+        );
+        assert_ne!(second.turn_id.as_str(), first.turn_id.as_str());
+        assert!(app.busy_agents.contains(&Agent::Codex));
+        // Request B is now the tracked turn; A no longer has an entry. This is
+        // the state the adapter's rejection is delivered against.
+        assert!(app.active_turns.contains_key(&Agent::Codex));
+
+        // The adapter rejects request B while its session is still busy,
+        // attributing the `Error` to B's ids. The current code matches B
+        // (the only tracked entry) and `finish_turn_outcome` closes exactly
+        // that entry: turn A's tracking was already removed with its own
+        // completion and A's outcome is durably recorded, so `active_turns`
+        // holds neither A nor B afterwards.
+        assert!(
+            app.apply_agent_output(AgentOutput {
+                agent: Agent::Codex,
+                conversation_id: Some(second.conversation_id),
+                turn_id: Some(second.turn_id),
+                event: AgentEvent::Error(
+                    "Codex is already running a turn; cancel it before sending another prompt"
+                        .to_owned(),
+                ),
+            })
+        );
+        // The agent is not stuck busy forever: the B entry is fully unwound
+        // and the rejection is surfaced to the user as a system message. If a
+        // terminal event for A were replayed afterwards it would be dropped
+        // (no matching entry), which is safe because A already finished.
+        assert!(!app.busy_agents.contains(&Agent::Codex));
+        assert!(!app.active_turns.contains_key(&Agent::Codex));
+        assert_eq!(
+            app.messages.last().unwrap().content,
+            "Codex error: Codex is already running a turn; cancel it before sending another prompt"
+        );
+    }
+
+    #[test]
+    fn cancel_clears_active_turn_even_when_busy_flag_was_cleared() {
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (mut app, _, cancelled) = test_app_runtime(engine, None);
+        app.active_turns.insert(
+            Agent::Codex,
+            ActiveTurn {
+                conversation_id: app.conversation_id.clone(),
+                turn_id: StoredTurnId::new("stale-turn"),
+            },
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(&*cancelled.lock().unwrap(), &[Agent::Codex]);
+        assert!(!app.active_turns.contains_key(&Agent::Codex));
+        assert!(!app.busy_agents.contains(&Agent::Codex));
     }
 
     #[test]
