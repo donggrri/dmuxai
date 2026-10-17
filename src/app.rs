@@ -81,6 +81,8 @@ enum SlashAction {
     Share,
     Image,
     Details,
+    Remember,
+    Memory,
 }
 
 #[derive(Clone, Copy)]
@@ -90,7 +92,7 @@ struct SlashCommand {
     action: SlashAction,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 13] = [
+const SLASH_COMMANDS: [SlashCommand; 15] = [
     SlashCommand {
         name: "/agent",
         description: "Switch the active agent",
@@ -155,6 +157,16 @@ const SLASH_COMMANDS: [SlashCommand; 13] = [
         name: "/details",
         description: "Toggle expanded tool and activity details",
         action: SlashAction::Details,
+    },
+    SlashCommand {
+        name: "/remember",
+        description: "Save a note to Obsidian memory (--human/--decision/--gotcha)",
+        action: SlashAction::Remember,
+    },
+    SlashCommand {
+        name: "/memory",
+        description: "List memory proposals; /memory approve|reject <id>",
+        action: SlashAction::Memory,
     },
 ];
 
@@ -464,6 +476,10 @@ pub struct App {
     pub(crate) color_enabled: bool,
     cached_agent_colors: HashMap<Agent, Color>,
     cached_theme: Option<Theme>,
+    /// Obsidian memory (SPEC-obsidian-memory); `None` = disabled.
+    memory: Option<dmuxai::memory::MemoryHandle>,
+    /// Hash of the memory context each agent last received (FR-722).
+    memory_injected: HashMap<(StoredConversationId, Agent), u64>,
 }
 
 impl App {
@@ -526,7 +542,13 @@ impl App {
             std::env::var("DMUXAI_FORCE_COLOR").ok().as_deref(),
             settings.theme_force_color,
         );
+        let memory = settings
+            .memory
+            .as_ref()
+            .map(|config| dmuxai::memory::MemoryHandle::from_config(config, &workspace_root));
         let mut app = Self {
+            memory,
+            memory_injected: HashMap::new(),
             exit: false,
             selected: adapter_index(Agent::default()),
             workspace_root,
@@ -1018,6 +1040,10 @@ impl App {
             SlashAction::Share => self.push_system("Usage: /share <codex|cursor|agy>"),
             SlashAction::Image => self.push_system("Usage: /image <path>"),
             SlashAction::Details => self.toggle_all_activity_details(),
+            SlashAction::Remember => self.push_system(
+                "Usage: /remember [--human | --decision <name> | --gotcha <name>] <text>",
+            ),
+            SlashAction::Memory => self.memory_command(""),
         }
     }
 
@@ -1695,6 +1721,16 @@ impl App {
                     self.execute_slash_action(SlashAction::Details);
                     return;
                 }
+                "/remember" => {
+                    let rest = prompt.strip_prefix("/remember").unwrap().trim().to_owned();
+                    self.remember_command(&rest);
+                    return;
+                }
+                "/memory" => {
+                    let rest = prompt.strip_prefix("/memory").unwrap().trim().to_owned();
+                    self.memory_command(&rest);
+                    return;
+                }
                 "/graph" => {
                     let rest = prompt.strip_prefix("/graph").unwrap().trim();
                     if rest.is_empty() {
@@ -1909,10 +1945,15 @@ impl App {
             }
             return Err(RunTodoError::Internal(message.to_owned()));
         }
-        let adapter_request = adapter_request(request, image_paths);
+        let mut adapter_request = adapter_request(request, image_paths);
+        let injected_memory = self.inject_memory(agent, &mut adapter_request);
         self.messages.push(Message::new(Role::User, prompt.clone()));
         match self.adapters[adapter_index].send(adapter_request) {
             Ok(()) => {
+                if let Some(hash) = injected_memory {
+                    self.memory_injected
+                        .insert((stored_conversation_id.clone(), agent), hash);
+                }
                 self.pending_images.clear();
                 self.active_turns.insert(
                     agent,
@@ -2967,6 +3008,119 @@ impl App {
             "Codex status\nModel: {model}\nEffort: {effort}\n{}",
             status.strip_prefix("Codex status\n").unwrap_or(&status)
         ));
+    }
+
+    /// FR-722: prepend the `<memory>` block on a fresh provider session, or on
+    /// a resumed one when the context changed since this agent last got it.
+    /// Returns the context hash to record once the send succeeds; the record
+    /// is keyed by conversation and agent so a resumed session in another
+    /// conversation still gets the block.
+    fn inject_memory(&self, agent: Agent, request: &mut AgentRequest) -> Option<u64> {
+        let memory = self.memory.as_ref().filter(|memory| memory.inject)?;
+        let context = memory.store.build_context(&memory.project);
+        if context.is_empty() {
+            return None;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&context, &mut hasher);
+        let hash = std::hash::Hasher::finish(&hasher);
+        let key = (
+            StoredConversationId::new(request.conversation_id.as_str()),
+            agent,
+        );
+        if request.resume_session.is_some() && self.memory_injected.get(&key) == Some(&hash) {
+            return None;
+        }
+        request.prompt = format!("{context}\n\n{}", request.prompt);
+        Some(hash)
+    }
+
+    const MEMORY_OFF: &'static str = "Memory is off. Set [memory] vault = \"~/Obsidian/Vault\" in ~/.config/dmuxai/dmuxai.toml (dir defaults to cursor-workflow/memory).";
+
+    /// FR-726: `/remember [--human | --decision <name> | --gotcha <name>] <text>`.
+    fn remember_command(&mut self, args: &str) {
+        let Some(memory) = self.memory.clone() else {
+            self.push_system(Self::MEMORY_OFF);
+            return;
+        };
+        const USAGE: &str =
+            "Usage: /remember [--human | --decision <name> | --gotcha <name>] <text>";
+        // A flag must be the whole first word (`--humanitarian` is text).
+        let flag = |name: &str| {
+            args.strip_prefix(name)
+                .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        };
+        let (target, text) = if let Some(rest) = flag("--human") {
+            ("human.md".to_owned(), rest.trim())
+        } else if let Some((kind, rest)) = flag("--decision")
+            .map(|rest| ("decisions", rest))
+            .or_else(|| flag("--gotcha").map(|rest| ("gotchas", rest)))
+        {
+            let rest = rest.trim_start();
+            let (name, text) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            if name.is_empty() {
+                self.push_system(USAGE);
+                return;
+            }
+            (format!("{kind}/{name}.md"), text.trim())
+        } else {
+            (memory.project_target(), args.trim())
+        };
+        if text.is_empty() {
+            self.push_system(USAGE);
+            return;
+        }
+        let today = dmuxai::memory::today_utc();
+        match memory.store.save(&target, text, &memory.src(), &today) {
+            Ok(dmuxai::memory::SaveOutcome::Saved { target }) => {
+                self.push_system(format!("Saved to memory: {target}"));
+            }
+            Ok(dmuxai::memory::SaveOutcome::AlreadySaved { target }) => {
+                self.push_system(format!("Already in memory: {target}"));
+            }
+            Err(error) => self.push_system(format!("Memory not saved: {error}")),
+        }
+    }
+
+    /// FR-726: `/memory`, `/memory approve <id>`, `/memory reject <id>`.
+    fn memory_command(&mut self, args: &str) {
+        let Some(memory) = self.memory.clone() else {
+            self.push_system(Self::MEMORY_OFF);
+            return;
+        };
+        let mut parts = args.split_whitespace();
+        match (parts.next(), parts.next(), parts.next()) {
+            (None, _, _) | (Some("list"), None, _) => match memory.store.list_pending() {
+                Ok(pending) if pending.is_empty() => {
+                    self.push_system("No pending memory proposals.");
+                }
+                Ok(pending) => {
+                    let mut lines = vec![format!("Pending memory proposals ({}):", pending.len())];
+                    for item in pending {
+                        lines.push(format!("  {}  {}  {}", item.id, item.target, item.text));
+                    }
+                    lines.push("Use /memory approve <id> or /memory reject <id>.".to_owned());
+                    self.push_system(lines.join("\n"));
+                }
+                Err(error) => self.push_system(format!("Could not read memory queue: {error}")),
+            },
+            (Some("approve"), Some(id), None) => {
+                match memory.store.approve(id, &dmuxai::memory::today_utc()) {
+                    Ok(dmuxai::memory::SaveOutcome::Saved { target }) => {
+                        self.push_system(format!("Approved {id}: saved to {target}"));
+                    }
+                    Ok(dmuxai::memory::SaveOutcome::AlreadySaved { target }) => {
+                        self.push_system(format!("Approved {id}: already in {target}"));
+                    }
+                    Err(error) => self.push_system(format!("Could not approve {id}: {error}")),
+                }
+            }
+            (Some("reject"), Some(id), None) => match memory.store.reject(id) {
+                Ok(()) => self.push_system(format!("Rejected {id}")),
+                Err(error) => self.push_system(format!("Could not reject {id}: {error}")),
+            },
+            _ => self.push_system("Usage: /memory [approve <id> | reject <id>]"),
+        }
     }
 
     fn push_system(&mut self, content: impl Into<String>) {
@@ -8543,6 +8697,236 @@ mod tests {
         let text = render_test_buffer(&mut app);
         assert!(!text.contains("src/hidden.rs"));
         assert!(!text.contains("hidden thinking stream"));
+    }
+
+    fn memory_test_app(dir: &std::path::Path) -> (App, SentRequests) {
+        let (mut app, sent) = test_app();
+        app.memory = Some(dmuxai::memory::MemoryHandle {
+            store: dmuxai::memory::MemoryStore::new(dir.to_path_buf()),
+            project: "demo".to_owned(),
+            dir: "cursor-workflow/memory".to_owned(),
+            inject: true,
+        });
+        (app, sent)
+    }
+
+    #[test]
+    // TC-726 (FR-722): a fresh turn gets the <memory> block; the stored prompt does not.
+    fn memory_context_is_prepended_to_fresh_turns_only_in_the_request() {
+        let vault = tempfile::tempdir().unwrap();
+        let (mut app, sent) = memory_test_app(vault.path());
+        app.input = "/remember Use cargo nextest here".to_owned();
+        app.submit_prompt();
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "/remember never reaches an agent"
+        );
+
+        for agent in [Agent::Codex, Agent::Agy] {
+            app.selected = adapter_index(agent);
+            app.input = "hello".to_owned();
+            app.submit_prompt();
+        }
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (_, request) in requests.iter() {
+            assert!(
+                request.prompt.starts_with("<memory>\n"),
+                "{}",
+                request.prompt
+            );
+            assert!(request.prompt.contains("Use cargo nextest here"));
+            assert!(request.prompt.ends_with("\n\nhello"));
+        }
+        drop(requests);
+        let users: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.content.clone())
+            .collect();
+        assert!(users.iter().all(|p| p == "hello"), "{users:?}");
+    }
+
+    fn inject_and_record(app: &mut App, agent: Agent, request: &mut AgentRequest) {
+        if let Some(hash) = app.inject_memory(agent, request) {
+            let key = (
+                StoredConversationId::new(request.conversation_id.as_str()),
+                agent,
+            );
+            app.memory_injected.insert(key, hash);
+        }
+    }
+
+    #[test]
+    // TC-726 (FR-722): resumed sessions get the block again only when it changed.
+    fn memory_context_reinjected_on_resume_only_when_changed() {
+        let vault = tempfile::tempdir().unwrap();
+        let (mut app, _) = memory_test_app(vault.path());
+        let request = |resume: Option<&str>| AgentRequest {
+            conversation_id: ConversationId::new("conv-a"),
+            turn_id: TurnId::new("t"),
+            prompt: "next".to_owned(),
+            resume_session: resume.map(str::to_owned),
+            image_paths: vec![],
+        };
+        // Empty memory: unchanged.
+        let mut r = request(None);
+        inject_and_record(&mut app, Agent::Agy, &mut r);
+        assert_eq!(r.prompt, "next");
+
+        app.remember_command("first note");
+        let mut r = request(None);
+        inject_and_record(&mut app, Agent::Agy, &mut r);
+        assert!(r.prompt.starts_with("<memory>"));
+        let mut r = request(Some("s1"));
+        inject_and_record(&mut app, Agent::Agy, &mut r);
+        assert_eq!(
+            r.prompt, "next",
+            "unchanged context is not repeated on resume"
+        );
+        // Another agent never received it: a resumed turn still gets it.
+        let mut r = request(Some("s2"));
+        inject_and_record(&mut app, Agent::Codex, &mut r);
+        assert!(r.prompt.starts_with("<memory>"));
+        // Same agent, other conversation: still gets it.
+        let mut r = request(Some("s3"));
+        r.conversation_id = ConversationId::new("conv-b");
+        inject_and_record(&mut app, Agent::Agy, &mut r);
+        assert!(r.prompt.starts_with("<memory>"));
+        // An unrecorded injection (send failed) is repeated next time.
+        let mut r = request(Some("s4"));
+        r.conversation_id = ConversationId::new("conv-c");
+        assert!(app.inject_memory(Agent::Agy, &mut r).is_some());
+        let mut r = request(Some("s4"));
+        r.conversation_id = ConversationId::new("conv-c");
+        assert!(app.inject_memory(Agent::Agy, &mut r).is_some());
+
+        app.remember_command("second note");
+        let mut r = request(Some("s1"));
+        inject_and_record(&mut app, Agent::Agy, &mut r);
+        assert!(
+            r.prompt.contains("second note"),
+            "changed context is re-sent"
+        );
+    }
+
+    #[test]
+    // TC-726 (FR-722): a failed send records nothing, so the block is re-sent.
+    fn memory_context_not_recorded_when_send_fails() {
+        let vault = tempfile::tempdir().unwrap();
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (mut app, _) = test_app_with_engine_and_failure(engine, Some(Agent::Codex));
+        app.memory = Some(dmuxai::memory::MemoryHandle {
+            store: dmuxai::memory::MemoryStore::new(vault.path().to_path_buf()),
+            project: "demo".to_owned(),
+            dir: "cursor-workflow/memory".to_owned(),
+            inject: true,
+        });
+        app.remember_command("a note");
+        app.selected = adapter_index(Agent::Codex);
+        app.input = "hello".to_owned();
+        app.submit_prompt();
+        assert!(app.memory_injected.is_empty());
+    }
+
+    #[test]
+    // TC-726 (FR-722): disabled memory or inject = false leaves prompts byte-identical.
+    fn memory_context_disabled_leaves_prompt_unchanged() {
+        let vault = tempfile::tempdir().unwrap();
+        let (mut app, sent) = memory_test_app(vault.path());
+        app.remember_command("a note");
+        app.memory.as_mut().unwrap().inject = false;
+        app.input = "hi".to_owned();
+        app.submit_prompt();
+        app.memory = None;
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "hi".to_owned();
+        app.submit_prompt();
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|(_, r)| r.prompt == "hi"));
+    }
+
+    #[test]
+    // TC-727 (FR-726): /remember targets, /memory list/approve/reject, disabled message.
+    fn memory_slash_commands_save_list_and_decide() {
+        let vault = tempfile::tempdir().unwrap();
+        let (mut app, sent) = memory_test_app(vault.path());
+        let last = |app: &App| app.messages.last().unwrap().content.clone();
+
+        app.input = "/remember project fact".to_owned();
+        app.submit_prompt();
+        assert_eq!(last(&app), "Saved to memory: projects/demo.md");
+        app.input = "/remember --human likes short answers".to_owned();
+        app.submit_prompt();
+        assert_eq!(last(&app), "Saved to memory: human.md");
+        app.input = "/remember --decision web-ui use axum".to_owned();
+        app.submit_prompt();
+        assert_eq!(last(&app), "Saved to memory: decisions/web-ui.md");
+        app.input = "/remember --gotcha windows CRLF in specs".to_owned();
+        app.submit_prompt();
+        assert_eq!(last(&app), "Saved to memory: gotchas/windows.md");
+        let gotcha = std::fs::read_to_string(vault.path().join("gotchas/windows.md")).unwrap();
+        assert!(gotcha.contains("] CRLF in specs <!-- src: dmuxai/demo -->"));
+        app.input = "/remember project fact".to_owned();
+        app.submit_prompt();
+        assert_eq!(last(&app), "Already in memory: projects/demo.md");
+        app.input = "/remember my api key is abc".to_owned();
+        app.submit_prompt();
+        assert!(
+            last(&app).starts_with("Memory not saved:"),
+            "{}",
+            last(&app)
+        );
+        app.input = "/remember --decision".to_owned();
+        app.submit_prompt();
+        assert!(last(&app).starts_with("Usage: /remember"));
+        app.input = "/remember    ".to_owned();
+        app.submit_prompt();
+        assert!(last(&app).starts_with("Usage: /remember"));
+        // A flag must be a whole word: this is project text.
+        app.input = "/remember --humanitarian aid".to_owned();
+        app.submit_prompt();
+        assert_eq!(last(&app), "Saved to memory: projects/demo.md");
+
+        app.input = "/memory".to_owned();
+        app.submit_prompt();
+        assert_eq!(last(&app), "No pending memory proposals.");
+        let store = app.memory.as_ref().unwrap().store.clone();
+        let items = [
+            dmuxai::memory::ProposalInput {
+                target: "projects/demo.md".to_owned(),
+                text: "proposed one".to_owned(),
+            },
+            dmuxai::memory::ProposalInput {
+                target: "projects/demo.md".to_owned(),
+                text: "proposed two".to_owned(),
+            },
+        ];
+        let added = store.propose("demo", "mcp", &items).unwrap().added;
+        app.input = "/memory".to_owned();
+        app.submit_prompt();
+        assert!(last(&app).contains(&added[0].id) && last(&app).contains("proposed two"));
+        app.input = format!("/memory approve {}", added[0].id);
+        app.submit_prompt();
+        assert!(last(&app).starts_with("Approved"), "{}", last(&app));
+        app.input = format!("/memory reject {}", added[1].id);
+        app.submit_prompt();
+        assert_eq!(last(&app), format!("Rejected {}", added[1].id));
+        app.input = format!("/memory reject {}", added[1].id);
+        app.submit_prompt();
+        assert!(last(&app).starts_with("Could not reject"));
+        let project = std::fs::read_to_string(vault.path().join("projects/demo.md")).unwrap();
+        assert!(project.contains("proposed one") && !project.contains("proposed two"));
+        assert!(sent.lock().unwrap().is_empty());
+
+        app.memory = None;
+        app.input = "/remember x".to_owned();
+        app.submit_prompt();
+        assert!(last(&app).starts_with("Memory is off."));
     }
 
     #[test]

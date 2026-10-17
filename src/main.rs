@@ -6,7 +6,7 @@ use std::{
     error::Error,
     io::{self, IsTerminal, Stdout, Write},
     net::{IpAddr, Ipv4Addr},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -54,7 +54,17 @@ enum CliAction {
     Run,
     Serve(WebOptions),
     RunWeb(WebOptions),
+    McpMemory(MemoryOptions),
     Unknown(String),
+}
+
+/// CLI options for `dmuxai mcp-memory` (INT-729).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MemoryOptions {
+    workspace: Option<PathBuf>,
+    vault: Option<PathBuf>,
+    dir: Option<String>,
+    project: Option<String>,
 }
 
 const USAGE: &str = "\
@@ -64,6 +74,7 @@ Usage:
   dmuxai [--help|--version]
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote]
+  dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
 
 Options:
   -h, --help       Print this help message and exit
@@ -73,6 +84,11 @@ Options:
   --port N         Dashboard port (default 7420)
   --bind ADDR      Dashboard bind address (default 127.0.0.1)
   --allow-remote   Allow binding to a non-loopback address
+  mcp-memory       Run the Obsidian memory MCP server on stdio
+  --workspace DIR  Workspace directory for mcp-memory (default: current dir)
+  --vault PATH     Obsidian vault for mcp-memory (overrides dmuxai.toml)
+  --dir DIR        Memory directory inside the vault
+  --project NAME   Project name for mcp-memory
 
 Configuration:
   dmuxai.toml      Optional configuration file in the workspace root or parent directories
@@ -95,8 +111,9 @@ where
 
     let serve = args.first().map(String::as_str) == Some("serve");
     let web = args.iter().any(|arg| arg == "--web");
+    let mcp = args.first().map(String::as_str) == Some("mcp-memory");
 
-    if !serve && !web {
+    if !serve && !web && !mcp {
         // Preserve the original single-action semantics exactly: `--help`
         // returns immediately, `--version` is honored only while the action is
         // still `Run`, and any other argument returns `Unknown` at that point.
@@ -115,13 +132,17 @@ where
         return action;
     }
 
-    // With `serve`/`--web` present, `--help` and `--version` win from any
-    // position (FR-520).
+    // With `serve`/`--web`/`mcp-memory` present, `--help` and `--version` win
+    // from any position (FR-520).
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         return CliAction::Help;
     }
     if args.iter().any(|arg| arg == "-V" || arg == "--version") {
         return CliAction::Version;
+    }
+
+    if mcp {
+        return parse_mcp_memory_cli(&args);
     }
 
     // `serve` and `--web` are mutually exclusive, and `serve` is only valid as
@@ -177,6 +198,48 @@ where
     }
 }
 
+/// Parse `dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]`
+/// (INT-729). The subcommand is only valid as the first argument.
+fn parse_mcp_memory_cli(args: &[String]) -> CliAction {
+    let mut options = MemoryOptions::default();
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => options.workspace = Some(PathBuf::from(value)),
+                    None => return CliAction::Unknown("--workspace".to_owned()),
+                }
+            }
+            "--vault" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => options.vault = Some(PathBuf::from(value)),
+                    None => return CliAction::Unknown("--vault".to_owned()),
+                }
+            }
+            "--dir" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => options.dir = Some(value.clone()),
+                    None => return CliAction::Unknown("--dir".to_owned()),
+                }
+            }
+            "--project" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => options.project = Some(value.clone()),
+                    None => return CliAction::Unknown("--project".to_owned()),
+                }
+            }
+            other => return CliAction::Unknown(other.to_owned()),
+        }
+        index += 1;
+    }
+    CliAction::McpMemory(options)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let action = parse_cli(std::env::args().skip(1));
@@ -195,8 +258,68 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         CliAction::Serve(options) => return run_serve(options).await,
         CliAction::RunWeb(options) => return run_tui(Some(options)).await,
+        CliAction::McpMemory(options) => return run_mcp_memory(options),
         CliAction::Run => return run_tui(None).await,
     }
+}
+
+/// `dmuxai mcp-memory`: run the Obsidian memory MCP server on stdio (INT-729).
+///
+/// Never starts the TUI; stdin/stdout carry only JSON-RPC. Config warnings go to
+/// stderr. A `--vault` that is not an existing directory, a `--dir` that escapes
+/// the vault, or an invalid `--project` all exit 2.
+fn run_mcp_memory(options: MemoryOptions) -> Result<(), Box<dyn Error>> {
+    let workspace = match &options.workspace {
+        Some(path) => path.clone(),
+        None => std::env::current_dir()?,
+    };
+    // `--project` overrides apply to both the `--vault` and settings path, so
+    // validate once up front (FR-720 name rules).
+    if let Some(project) = options.project.as_deref()
+        && !dmuxai::memory::is_valid_name(project)
+    {
+        eprintln!("error: --project \"{project}\" must match [a-z0-9][a-z0-9_-]{{0,47}}");
+        std::process::exit(2);
+    }
+    let config = match &options.vault {
+        Some(vault) => {
+            let vault = dmuxai::settings::expand_home(&vault.to_string_lossy());
+            let (root, dir) = match dmuxai::memory::resolve_root(&vault, options.dir.as_deref()) {
+                Ok(resolved) => resolved,
+                Err(message) => {
+                    eprintln!("error: --vault/--dir: {message}");
+                    std::process::exit(2);
+                }
+            };
+            Some(dmuxai::memory::MemoryConfig {
+                root,
+                dir,
+                project: options.project.clone(),
+                inject: true,
+            })
+        }
+        None => {
+            let settings = DmuxSettings::load(&workspace);
+            for warning in &settings.config_warnings {
+                eprintln!("warning: {warning}");
+            }
+            let mut config = settings.memory;
+            // Apply the `--project` override on top of `[memory]` (if enabled).
+            match (options.project.as_ref(), config.as_mut()) {
+                (Some(project), Some(config)) => config.project = Some(project.clone()),
+                (Some(_), None) => {
+                    eprintln!("warning: --project ignored: memory is not configured");
+                }
+                _ => {}
+            }
+            config
+        }
+    };
+    let memory = config
+        .as_ref()
+        .map(|config| dmuxai::memory::MemoryHandle::from_config(config, &workspace));
+    dmuxai::memory_mcp::serve(memory, io::stdin().lock(), io::stdout().lock())?;
+    Ok(())
 }
 
 /// Opens the per-repo to-do store (FR-540). Callers report the error as a
@@ -227,18 +350,26 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     }
 
+    let settings = DmuxSettings::load(&workspace_root);
+    let memory = settings
+        .memory
+        .as_ref()
+        .map(|config| dmuxai::memory::MemoryHandle::from_config(config, &workspace_root));
     let services = match open_todo_store(&workspace_root) {
         Ok(store) => DashboardServices {
             todos: Some(store),
             commands: None,
             web_attached: false,
+            memory,
         },
         Err(error) => {
             eprintln!("warning: to-do board disabled: {error}");
-            DashboardServices::default()
+            DashboardServices {
+                memory,
+                ..DashboardServices::default()
+            }
         }
     };
-    let settings = DmuxSettings::load(&workspace_root);
     for warning in &settings.config_warnings {
         eprintln!("warning: {warning}");
     }
@@ -369,6 +500,10 @@ async fn attach_web_dashboard(
         todos: todos.as_ref().map(|(store, _)| store.clone()),
         commands: todos.as_ref().map(|(_, sender)| sender.clone()),
         web_attached: true,
+        memory: DmuxSettings::load(workspace_root)
+            .memory
+            .as_ref()
+            .map(|config| dmuxai::memory::MemoryHandle::from_config(config, workspace_root)),
     };
 
     let hub = DashboardHub::new(SnapshotSource::Tui, workspace);
@@ -583,6 +718,56 @@ mod tests {
         );
         // With --web present, --version wins.
         assert_eq!(parse_cli(["--version", "--web"]), CliAction::Version);
+    }
+
+    // TC-729 (INT-729): `mcp-memory` and its options parse like the other
+    // subcommands; it is only valid as the first argument.
+    #[test]
+    fn parse_cli_mcp_memory_flags() {
+        assert_eq!(
+            parse_cli(["mcp-memory"]),
+            CliAction::McpMemory(MemoryOptions::default())
+        );
+        assert_eq!(
+            parse_cli(["mcp-memory", "--workspace", "/tmp/ws"]),
+            CliAction::McpMemory(MemoryOptions {
+                workspace: Some(PathBuf::from("/tmp/ws")),
+                ..MemoryOptions::default()
+            })
+        );
+        assert_eq!(
+            parse_cli([
+                "mcp-memory",
+                "--workspace",
+                "/tmp/ws",
+                "--vault",
+                "/tmp/vault",
+                "--dir",
+                "notes/memory",
+                "--project",
+                "demo",
+            ]),
+            CliAction::McpMemory(MemoryOptions {
+                workspace: Some(PathBuf::from("/tmp/ws")),
+                vault: Some(PathBuf::from("/tmp/vault")),
+                dir: Some("notes/memory".to_owned()),
+                project: Some("demo".to_owned()),
+            })
+        );
+        assert_eq!(parse_cli(["mcp-memory", "--help"]), CliAction::Help);
+        assert_eq!(parse_cli(["mcp-memory", "-V"]), CliAction::Version);
+        assert!(matches!(
+            parse_cli(["mcp-memory", "--vault"]),
+            CliAction::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_cli(["mcp-memory", "--nope"]),
+            CliAction::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_cli(["mcp-memory", "--web"]),
+            CliAction::Unknown(_)
+        ));
     }
 
     // FR-540/FR-541: `serve` seeds the hub with persisted to-dos at startup so
