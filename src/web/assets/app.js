@@ -32,6 +32,18 @@ function storageRemove(key) {
 // which the CSP allows.
 // ---------------------------------------------------------------------------
 
+var baseDocumentTitle = document.title || 'DmuxAI dashboard';
+var lastObservedRunState = 'idle';
+
+if (typeof window.addEventListener === 'function') {
+  window.addEventListener('focus', function () {
+    if (document.title.indexOf('✓ ') === 0 || document.title.indexOf('✗ ') === 0) {
+      document.title = baseDocumentTitle;
+      lastObservedRunState = 'idle';
+    }
+  });
+}
+
 var THEME_KEY = 'dmuxai.theme';
 var ACCENT_KEY = 'dmuxai.accent';
 var THEME_VALUES = ['light', 'dark', 'system'];
@@ -277,7 +289,14 @@ function el(tag, className, text) {
 
 function badge(status) {
   var label = String(status || 'pending');
-  return el('span', 'badge badge-' + label, label);
+  var b = el('span', 'badge badge-' + label);
+  if (label === 'running') {
+    b.appendChild(el('span', 'spinner'));
+    b.appendChild(document.createTextNode(' ' + label));
+  } else {
+    b.textContent = label;
+  }
+  return b;
 }
 
 function graphCounts(graph) {
@@ -699,7 +718,9 @@ function graphStation(entry, nowMs) {
   group.appendChild(title);
 
   if (status === 'running') {
-    group.appendChild(graphCircle('ring ring-outer', 0, 0, GRAPH_R + 9));
+    classes += ' spinner';
+    group.setAttribute('class', classes);
+    group.appendChild(graphCircle('ring ring-outer spinner', 0, 0, GRAPH_R + 9));
     group.appendChild(graphCircle('ring ring-inner', 0, 0, GRAPH_R + 4));
     group.appendChild(graphCircle('core', 0, 0, GRAPH_R));
     group.appendChild(graphCircle('dot', 0, 0, 5));
@@ -1173,7 +1194,7 @@ function renderGateHint(graph) {
     '". Type /graph continue in the TUI to proceed.';
 }
 
-function renderAgents(agents) {
+function renderAgents(agents, nowMs) {
   var wrap = $('agents');
   wrap.replaceChildren();
   var list = Array.isArray(agents) ? agents : [];
@@ -1181,6 +1202,7 @@ function renderAgents(agents) {
     wrap.appendChild(el('p', 'empty', 'no agents'));
     return;
   }
+  var now = typeof nowMs === 'number' ? nowMs : Date.now();
   for (var i = 0; i < list.length; i++) {
     var agent = list[i] || {};
     var chip = el('span', 'chip');
@@ -1205,6 +1227,32 @@ function renderAgents(agents) {
       var detail = bits.join(' \u00b7 ');
       chip.appendChild(el('span', 'chip-meta', detail));
     }
+
+    if (agent.run) {
+      var runState = agent.run.state;
+      if (runState === 'running') {
+        chip.classList.add('chip-running');
+        var runEl = el('span', 'chip-run chip-run-running');
+        runEl.appendChild(el('span', 'spinner'));
+        var ms = typeof agent.run.started_at_ms === 'number'
+          ? Math.max(0, now - agent.run.started_at_ms)
+          : 0;
+        runEl.appendChild(document.createTextNode(' ' + (fmtElapsed(ms) || '0s')));
+        chip.appendChild(runEl);
+      } else if (runState === 'done') {
+        chip.classList.add('chip-done');
+        var dur = typeof agent.run.duration_ms === 'number' ? fmtElapsed(agent.run.duration_ms) : '';
+        chip.appendChild(el('span', 'chip-run chip-run-done', '✓' + (dur ? ' ' + dur : '')));
+      } else if (runState === 'failed') {
+        chip.classList.add('chip-failed');
+        var dur = typeof agent.run.duration_ms === 'number' ? fmtElapsed(agent.run.duration_ms) : '';
+        chip.appendChild(el('span', 'chip-run chip-run-failed', '✗' + (dur ? ' ' + dur : '')));
+      } else if (runState === 'cancelled') {
+        chip.classList.add('chip-cancelled');
+        chip.appendChild(el('span', 'chip-run chip-run-cancelled', '■ cancelled'));
+      }
+    }
+
     wrap.appendChild(chip);
   }
 }
@@ -2014,6 +2062,140 @@ function bindImportForm() {
   });
 }
 
+function getRunningAgents(snapshot) {
+  var agents = snapshot && Array.isArray(snapshot.agents) ? snapshot.agents : [];
+  return agents.filter(function (a) {
+    return (a && a.run && a.run.state === 'running') || (a && a.busy);
+  });
+}
+
+function getMostRecentEndedRun(snapshot) {
+  var agents = snapshot && Array.isArray(snapshot.agents) ? snapshot.agents : [];
+  var ended = [];
+  for (var i = 0; i < agents.length; i++) {
+    var a = agents[i];
+    if (a && a.run && (a.run.state === 'done' || a.run.state === 'failed' || a.run.state === 'cancelled')) {
+      ended.push(a.run);
+    }
+  }
+  if (ended.length === 0) { return null; }
+  ended.sort(function (x, y) {
+    var tx = typeof x.ended_at_ms === 'number' ? x.ended_at_ms : (x.started_at_ms || 0);
+    var ty = typeof y.ended_at_ms === 'number' ? y.ended_at_ms : (y.started_at_ms || 0);
+    return ty - tx;
+  });
+  return ended[0];
+}
+
+function updateRunStatus(snap, nowMs) {
+  var pill = $('run-status');
+  if (!pill) { return; }
+  var runningAgents = getRunningAgents(snap);
+  pill.className = 'run-status';
+
+  if (runningAgents.length > 0) {
+    pill.classList.add('run-status-running');
+    pill.replaceChildren();
+    pill.appendChild(el('span', 'spinner'));
+
+    var first = runningAgents[0];
+    var firstLabel = first.label || first.id || 'agent';
+    var agentText = runningAgents.length > 1
+      ? firstLabel + ' +' + (runningAgents.length - 1)
+      : firstLabel;
+
+    var elapsedStr = '0s';
+    if (first.run && typeof first.run.started_at_ms === 'number') {
+      var ms = Math.max(0, nowMs - first.run.started_at_ms);
+      elapsedStr = fmtElapsed(ms) || '0s';
+    }
+
+    pill.appendChild(document.createTextNode('Running \u00b7 ' + agentText + ' \u00b7 ' + elapsedStr));
+  } else {
+    var lastEnded = getMostRecentEndedRun(snap);
+    if (lastEnded && lastEnded.state === 'done') {
+      pill.classList.add('run-status-done');
+      pill.replaceChildren();
+      var dur = typeof lastEnded.duration_ms === 'number'
+        ? fmtElapsed(lastEnded.duration_ms)
+        : (typeof lastEnded.ended_at_ms === 'number' && typeof lastEnded.started_at_ms === 'number'
+          ? fmtElapsed(lastEnded.ended_at_ms - lastEnded.started_at_ms)
+          : null);
+      var text = dur ? '✓ Done \u00b7 ' + dur : '✓ Done';
+      pill.textContent = text;
+    } else if (lastEnded && lastEnded.state === 'failed') {
+      pill.classList.add('run-status-failed');
+      pill.replaceChildren();
+      var dur = typeof lastEnded.duration_ms === 'number'
+        ? fmtElapsed(lastEnded.duration_ms)
+        : (typeof lastEnded.ended_at_ms === 'number' && typeof lastEnded.started_at_ms === 'number'
+          ? fmtElapsed(lastEnded.ended_at_ms - lastEnded.started_at_ms)
+          : null);
+      var text = dur ? '✗ Failed \u00b7 ' + dur : '✗ Failed';
+      pill.textContent = text;
+    } else if (lastEnded && lastEnded.state === 'cancelled') {
+      pill.classList.add('run-status-cancelled');
+      pill.replaceChildren();
+      pill.textContent = '■ Cancelled';
+    } else {
+      pill.classList.add('run-status-idle');
+      pill.replaceChildren();
+      pill.textContent = 'Idle';
+    }
+  }
+}
+
+function updateTabTitle(snap) {
+  var runningAgents = getRunningAgents(snap);
+  if (runningAgents.length > 0) {
+    document.title = '⏳ ' + baseDocumentTitle;
+    lastObservedRunState = 'running';
+  } else {
+    var lastEnded = getMostRecentEndedRun(snap);
+    if (lastObservedRunState === 'running') {
+      if (lastEnded && lastEnded.state === 'done') {
+        document.title = '✓ ' + baseDocumentTitle;
+        lastObservedRunState = 'done';
+      } else if (lastEnded && lastEnded.state === 'failed') {
+        document.title = '✗ ' + baseDocumentTitle;
+        lastObservedRunState = 'failed';
+      } else {
+        document.title = baseDocumentTitle;
+        lastObservedRunState = 'idle';
+      }
+    } else if (lastObservedRunState !== 'done' && lastObservedRunState !== 'failed') {
+      document.title = baseDocumentTitle;
+    }
+  }
+}
+
+function isSomethingRunning(snap) {
+  if (!snap) { return false; }
+  var agents = Array.isArray(snap.agents) ? snap.agents : [];
+  for (var i = 0; i < agents.length; i++) {
+    if (agents[i] && agents[i].run && agents[i].run.state === 'running') {
+      return true;
+    }
+    if (agents[i] && agents[i].busy) {
+      return true;
+    }
+  }
+  var graph = snap.graph;
+  if (graph) {
+    if (Array.isArray(graph.current_nodes) && graph.current_nodes.length > 0) {
+      return true;
+    }
+    if (Array.isArray(graph.nodes)) {
+      for (var j = 0; j < graph.nodes.length; j++) {
+        if (graphNodeStatus(graph.nodes[j]) === 'running') {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 function render(nowMs) {
   var snap = snapshot;
   if (!snap || typeof snap.revision !== 'number') { return; }
@@ -2022,7 +2204,9 @@ function render(nowMs) {
   $('source').textContent = String(snap.source || '-');
   $('revision').textContent = String(snap.revision);
 
-  renderAgents(snap.agents);
+  renderAgents(snap.agents, nowMs);
+  updateRunStatus(snap, nowMs);
+  updateTabTitle(snap);
 
   var graph = snap.graph;
   if (!graph) {
@@ -2063,6 +2247,16 @@ function tickDashboard() {
   var snap = snapshot;
   if (!snap || typeof snap.receivedAt !== 'number') { return; }
   var now = Date.now();
+  if (!isSomethingRunning(snap)) {
+    stopTickTimer();
+    updateRunStatus(snap, now);
+    updateTabTitle(snap);
+    renderAgents(snap.agents, now);
+    return;
+  }
+  updateRunStatus(snap, now);
+  updateTabTitle(snap);
+  renderAgents(snap.agents, now);
   var graph = snap.graph;
   if (!graph) { return; }
   renderGraphSummary(graph);
@@ -2077,7 +2271,9 @@ function tickDashboard() {
 
 function scheduleTick() {
   if (tickTimer !== null) { return; }
-  tickTimer = setInterval(tickDashboard, TICK_MS);
+  if (isSomethingRunning(snapshot)) {
+    tickTimer = setInterval(tickDashboard, TICK_MS);
+  }
 }
 
 function onSnapshotEvent(e) {
@@ -2105,7 +2301,11 @@ function applySnapshot(snap) {
   applySnapshotUi(snap);
   render(lastRendered);
   renderTodos(snap);
-  scheduleTick();
+  if (isSomethingRunning(snap)) {
+    scheduleTick();
+  } else {
+    stopTickTimer();
+  }
   // Optional modules (session.js) reuse this connection instead of opening
   // their own SSE stream (SPEC-dashboard-parity NFR-780).
   document.dispatchEvent(new CustomEvent('dmuxai:snapshot', { detail: snap }));

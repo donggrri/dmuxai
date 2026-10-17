@@ -418,6 +418,7 @@ mod tests {
                     phase: None,
                     model: None,
                     color: Some("#123456".to_string()),
+                    run: None,
                 },
                 AgentView {
                     id: "cursor".to_string(),
@@ -426,6 +427,7 @@ mod tests {
                     phase: None,
                     model: None,
                     color: Some("#000080".to_string()),
+                    run: None,
                 },
             ],
             None,

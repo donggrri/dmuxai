@@ -325,6 +325,111 @@ impl ActivityPhase {
     }
 }
 
+pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+pub fn spinner_frame(elapsed: Duration, reduced_motion: bool) -> &'static str {
+    if reduced_motion {
+        "●"
+    } else {
+        let frame_index = (elapsed.as_millis() / 100) as usize % SPINNER_FRAMES.len();
+        SPINNER_FRAMES[frame_index]
+    }
+}
+
+/// Per-agent run state (SPEC-running-indicators FR-820).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunState {
+    Idle,
+    Running {
+        started_at: Instant,
+        started_at_ms: u64,
+        node: Option<String>,
+    },
+    Done {
+        duration: Duration,
+        started_at_ms: Option<u64>,
+        ended_at_ms: u64,
+        node: Option<String>,
+    },
+    Failed {
+        duration: Duration,
+        started_at_ms: Option<u64>,
+        ended_at_ms: u64,
+        node: Option<String>,
+    },
+    Cancelled {
+        duration: Duration,
+        started_at_ms: Option<u64>,
+        ended_at_ms: u64,
+        node: Option<String>,
+    },
+}
+
+impl RunState {
+    pub fn is_running(&self) -> bool {
+        matches!(self, RunState::Running { .. })
+    }
+
+    pub fn to_view(&self) -> dmuxai::web::RunStateView {
+        match self {
+            RunState::Idle => dmuxai::web::RunStateView {
+                state: "idle".to_owned(),
+                started_at_ms: None,
+                ended_at_ms: None,
+                duration_ms: None,
+                node: None,
+            },
+            RunState::Running {
+                started_at_ms,
+                node,
+                ..
+            } => dmuxai::web::RunStateView {
+                state: "running".to_owned(),
+                started_at_ms: Some(*started_at_ms),
+                ended_at_ms: None,
+                duration_ms: None,
+                node: node.clone(),
+            },
+            RunState::Done {
+                duration,
+                started_at_ms,
+                ended_at_ms,
+                node,
+            } => dmuxai::web::RunStateView {
+                state: "done".to_owned(),
+                started_at_ms: *started_at_ms,
+                ended_at_ms: Some(*ended_at_ms),
+                duration_ms: Some(duration.as_millis() as u64),
+                node: node.clone(),
+            },
+            RunState::Failed {
+                duration,
+                started_at_ms,
+                ended_at_ms,
+                node,
+            } => dmuxai::web::RunStateView {
+                state: "failed".to_owned(),
+                started_at_ms: *started_at_ms,
+                ended_at_ms: Some(*ended_at_ms),
+                duration_ms: Some(duration.as_millis() as u64),
+                node: node.clone(),
+            },
+            RunState::Cancelled {
+                duration,
+                started_at_ms,
+                ended_at_ms,
+                node,
+            } => dmuxai::web::RunStateView {
+                state: "cancelled".to_owned(),
+                started_at_ms: *started_at_ms,
+                ended_at_ms: Some(*ended_at_ms),
+                duration_ms: Some(duration.as_millis() as u64),
+                node: node.clone(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AgentActivity {
     kind: ActivityKind,
@@ -770,6 +875,8 @@ pub struct App {
     doc_open_tickets: Option<Arc<Mutex<dmuxai::web::OpenTickets>>>,
     message_link_cache: MessageLinkCache,
     visible_chat_link_rows: Vec<Vec<ChatFileLink>>,
+    pub(crate) run_states: HashMap<Agent, RunState>,
+    pub(crate) injected_now: Option<Instant>,
 }
 
 impl App {
@@ -943,9 +1050,47 @@ impl App {
             doc_open_tickets: None,
             message_link_cache: HashMap::new(),
             visible_chat_link_rows: Vec::new(),
+            run_states: HashMap::new(),
+            injected_now: None,
         };
         app.restore_snapshot(snapshot);
         Ok(app)
+    }
+
+    pub fn run_state(&self, agent: Agent) -> RunState {
+        if let Some(state) = self.run_states.get(&agent) {
+            state.clone()
+        } else if self.busy_agents.contains(&agent) {
+            RunState::Running {
+                started_at: Instant::now(),
+                started_at_ms: unix_ms_now(),
+                node: self.active_graph_node_for_agent(agent),
+            }
+        } else {
+            RunState::Idle
+        }
+    }
+
+    pub fn reduced_motion(&self) -> bool {
+        self.settings.reduced_motion
+            || self.settings.theme.reduced_motion
+            || std::env::var("DMUXAI_REDUCED_MOTION").is_ok_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+    }
+
+    pub fn needs_fast_redraw(&self) -> bool {
+        if self.reduced_motion() {
+            return false;
+        }
+        self.run_states.values().any(RunState::is_running)
+            || self
+                .busy_agents
+                .iter()
+                .any(|a| self.run_state(*a).is_running())
     }
 
     pub fn tick(&mut self) -> bool {
@@ -966,6 +1111,7 @@ impl App {
         let mut last_render = Instant::now();
         let mut last_session_heartbeat = Instant::now();
         let mut last_busy_tick = Instant::now();
+        let mut last_fast_tick = Instant::now();
         let mut last_publish = Instant::now();
         let mut dashboard_dirty = false;
 
@@ -985,6 +1131,11 @@ impl App {
                     dirty = true;
                 }
                 last_busy_tick = Instant::now();
+            }
+
+            if self.needs_fast_redraw() && last_fast_tick.elapsed() >= Duration::from_millis(100) {
+                dirty = true;
+                last_fast_tick = Instant::now();
             }
 
             let cmd_changed = self.drain_dashboard_commands();
@@ -1324,6 +1475,7 @@ impl App {
                         })
                         .unwrap_or_default(),
                     id,
+                    run: Some(self.run_state(agent).to_view()),
                 }
             })
             .collect();
@@ -2771,6 +2923,15 @@ impl App {
                     },
                 );
                 self.busy_agents.insert(agent);
+                let node = self.active_graph_node_for_agent(agent);
+                self.run_states.insert(
+                    agent,
+                    RunState::Running {
+                        started_at: Instant::now(),
+                        started_at_ms: started_ms,
+                        node,
+                    },
+                );
                 self.activities.insert(
                     agent,
                     AgentActivity::queued(ActivityKind::Turn, Instant::now()),
@@ -2999,6 +3160,14 @@ impl App {
         match self.adapters[adapter_index(agent)].send(request) {
             Ok(()) => {
                 self.busy_agents.insert(agent);
+                self.run_states.insert(
+                    agent,
+                    RunState::Running {
+                        started_at: Instant::now(),
+                        started_at_ms: unix_ms_now(),
+                        node: None,
+                    },
+                );
                 self.activities.insert(
                     agent,
                     AgentActivity::queued(ActivityKind::Summary, Instant::now()),
@@ -3171,6 +3340,17 @@ impl App {
             AgentEvent::Started => {
                 self.busy_agents.insert(agent);
                 self.streaming_messages.remove(&agent);
+                if !matches!(self.run_states.get(&agent), Some(RunState::Running { .. })) {
+                    let node = self.active_graph_node_for_agent(agent);
+                    self.run_states.insert(
+                        agent,
+                        RunState::Running {
+                            started_at: Instant::now(),
+                            started_at_ms: unix_ms_now(),
+                            node,
+                        },
+                    );
+                }
             }
             AgentEvent::ProviderSessionBound(session_id) => {
                 let _ = session_id;
@@ -3427,6 +3607,38 @@ impl App {
         self.agent_lifecycle.remove(&agent);
         self.busy_agents.remove(&agent);
         self.activities.remove(&agent);
+        let (started_at_ms, duration, node) = match self.run_states.get(&agent) {
+            Some(RunState::Running {
+                started_at,
+                started_at_ms,
+                node,
+            }) => (Some(*started_at_ms), started_at.elapsed(), node.clone()),
+            _ => (None, Duration::ZERO, None),
+        };
+        let ended_at_ms = unix_ms_now();
+        let end_state = if success {
+            RunState::Done {
+                duration,
+                started_at_ms,
+                ended_at_ms,
+                node,
+            }
+        } else if error.as_deref() == Some("cancelled") {
+            RunState::Cancelled {
+                duration,
+                started_at_ms,
+                ended_at_ms,
+                node,
+            }
+        } else {
+            RunState::Failed {
+                duration,
+                started_at_ms,
+                ended_at_ms,
+                node,
+            }
+        };
+        self.run_states.insert(agent, end_state);
         let output_text = self.last_agent_output_text(agent);
         let active_turn = self.active_turns.remove(&agent);
         self.streaming_messages.remove(&agent);
@@ -3822,14 +4034,30 @@ impl App {
         )
     }
 
-    fn other_activity_summary(&self, selected: Agent) -> String {
+    fn other_activity_summary(&self, selected: Agent, now: Instant) -> String {
         Agent::all()
             .into_iter()
             .filter(|agent| *agent != selected)
             .filter_map(|agent| {
-                self.activities
+                let activity_label = self
+                    .activities
                     .get(&agent)
-                    .map(|activity| format!("{agent} {}", activity.compact_label()))
+                    .map(|activity| activity.compact_label());
+                match self.run_state(agent) {
+                    RunState::Running { started_at, .. } => {
+                        let elapsed = now.saturating_duration_since(started_at);
+                        let frame = spinner_frame(elapsed, self.reduced_motion());
+                        let label = activity_label.unwrap_or("RUNNING");
+                        Some(format!(
+                            "{frame} {agent} {label} {}",
+                            format_elapsed(elapsed)
+                        ))
+                    }
+                    _ => self
+                        .activities
+                        .get(&agent)
+                        .map(|activity| format!("{agent} {}", activity.compact_label())),
+                }
             })
             .collect::<Vec<_>>()
             .join(" | ")
@@ -4284,6 +4512,7 @@ impl App {
                         .get(&agent)
                         .and_then(|catalog| catalog.selected.clone()),
                     color: dmuxai::theme::color_hex(color),
+                    run: Some(self.run_state(agent).to_view()),
                 }
             })
             .collect();
@@ -5149,6 +5378,38 @@ impl App {
             }
         }
 
+        let now = self.injected_now.unwrap_or_else(Instant::now);
+        for agent in Agent::all() {
+            if !self.streaming_messages.contains_key(&agent)
+                && let RunState::Running { started_at, .. } = self.run_state(agent)
+            {
+                let is_current = self
+                    .active_turns
+                    .get(&agent)
+                    .map(|at| at.conversation_id.as_str() == self.conversation_id.as_str())
+                    .unwrap_or(true);
+                if is_current {
+                    let elapsed = now.saturating_duration_since(started_at);
+                    let frame = spinner_frame(elapsed, self.reduced_motion());
+                    let body_style = if colors {
+                        let color = self
+                            .cached_agent_colors
+                            .get(&agent)
+                            .copied()
+                            .unwrap_or_else(|| self.compute_agent_color(agent));
+                        Style::default().fg(color)
+                    } else {
+                        Style::default()
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("{frame} {agent} working… {}", format_elapsed(elapsed)),
+                        body_style,
+                    )));
+                    lines.push(Line::default());
+                }
+            }
+        }
+
         let visible_height = area.height.saturating_sub(2) as usize;
         let content_width = area.width.saturating_sub(2);
         let rendered_height = Paragraph::new(lines.clone())
@@ -5388,7 +5649,7 @@ impl App {
 
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
         let selected = self.adapters[self.selected].agent();
-        let now = Instant::now();
+        let now = self.injected_now.unwrap_or_else(Instant::now);
         let state = self
             .activities
             .get(&selected)
@@ -5409,7 +5670,7 @@ impl App {
         } else {
             state.to_owned()
         };
-        let other_activity = self.other_activity_summary(selected);
+        let other_activity = self.other_activity_summary(selected, now);
         let model = if selected == Agent::Cursor {
             self.model_catalogs
                 .get(&selected)
@@ -5451,9 +5712,28 @@ impl App {
             .unwrap_or("provider default");
         let notice_name = self.copy_notice.as_deref().unwrap_or("");
 
+        let badge_content = match self.run_state(selected) {
+            RunState::Running { started_at, .. } => {
+                let elapsed = now.saturating_duration_since(started_at);
+                let frame = spinner_frame(elapsed, self.reduced_motion());
+                format!("{frame} {selected} {state} {}", format_elapsed(elapsed))
+            }
+            RunState::Done { duration, .. } => {
+                format!("✓ done {}", format_elapsed(duration))
+            }
+            RunState::Failed { duration, .. } => {
+                format!("✗ failed {}", format_elapsed(duration))
+            }
+            RunState::Cancelled { .. } => "■ cancelled".to_owned(),
+            RunState::Idle => {
+                format!("{selected} {state}")
+            }
+        };
+
         let segments = StatusSegments {
             agent: selected.name(),
             state,
+            badge: Some(&badge_content),
             model,
             mode: &mode_name,
             effort: effort_name,
@@ -5464,7 +5744,7 @@ impl App {
         };
 
         let status_line = fit_status_segments(&segments, area.width as usize);
-        let badge = format!(" {selected} {state} ");
+        let badge = format!(" {badge_content} ");
         let colors = self.colors_enabled();
         let bg = if colors {
             self.settings.theme.background
@@ -6527,6 +6807,7 @@ fn prompt_should_attach_only(prompt: &str) -> bool {
 pub(crate) struct StatusSegments<'a> {
     pub agent: &'a str,
     pub state: &'a str,
+    pub badge: Option<&'a str>,
     pub model: &'a str,
     pub mode: &'a str,
     pub effort: &'a str,
@@ -6541,7 +6822,11 @@ pub(crate) fn fit_status_segments(segments: &StatusSegments<'_>, width: usize) -
         return String::new();
     }
 
-    let agent_state = format!(" {} {} ", segments.agent, segments.state);
+    let agent_state = if let Some(badge) = segments.badge {
+        format!(" {badge} ")
+    } else {
+        format!(" {} {} ", segments.agent, segments.state)
+    };
     let other = if segments.other_activity.is_empty() {
         String::new()
     } else {
@@ -10718,6 +11003,7 @@ mod tests {
         let segments = StatusSegments {
             agent: "Cursor",
             state: "IDLE",
+            badge: None,
             model: "composer-2.5",
             mode: "ask",
             effort: "provider default",
@@ -12639,6 +12925,206 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         assert!(recorded, "expected created.md in change log for the turn");
+    }
+
+    #[test]
+    // TC-820 / FR-820, NFR-820: run_state_transitions_follow_turn_events
+    fn run_state_transitions_follow_turn_events() {
+        let (mut app, _) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/workspace".to_string(),
+        );
+        app.attach_dashboard(hub.clone());
+
+        // Baseline: agent is idle
+        assert_eq!(app.run_state(Agent::Codex).to_view().state, "idle");
+
+        // Turn start: submit prompt
+        app.input = "test run".to_owned();
+        app.submit_prompt();
+        app.publish_dashboard();
+
+        let running_state = app.run_state(Agent::Codex);
+        assert!(running_state.is_running());
+        let view1 = running_state.to_view();
+        assert_eq!(view1.state, "running");
+        assert!(view1.started_at_ms.is_some());
+        assert!(view1.ended_at_ms.is_none());
+        assert!(view1.duration_ms.is_none());
+
+        // Snapshot carries run state
+        let snap1 = hub.snapshot();
+        let codex_view1 = snap1.agents.iter().find(|a| a.id == "codex").unwrap();
+        assert_eq!(
+            codex_view1.run.as_ref().map(|r| r.state.as_str()),
+            Some("running")
+        );
+
+        // Two snapshots taken 2s apart while running are identical (NFR-820)
+        let start = match running_state {
+            RunState::Running { started_at, .. } => started_at,
+            _ => unreachable!(),
+        };
+        app.injected_now = Some(start + Duration::from_secs(2));
+        app.publish_dashboard();
+        let snap2 = hub.snapshot();
+        assert_eq!(snap1.agents, snap2.agents);
+        assert_eq!(snap1, snap2);
+
+        // Turn complete: Done with duration
+        let active1 = app
+            .active_turns
+            .get(&Agent::Codex)
+            .cloned()
+            .expect("active turn");
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(ConversationId::new(active1.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(active1.turn_id.as_str())),
+            event: AgentEvent::Completed,
+        }));
+        let done_state = app.run_state(Agent::Codex);
+        let view_done = done_state.to_view();
+        assert_eq!(view_done.state, "done");
+        assert!(view_done.duration_ms.is_some());
+        assert!(view_done.ended_at_ms.is_some());
+
+        // Next turn: error -> failed
+        app.input = "second run".to_owned();
+        app.submit_prompt();
+        assert_eq!(app.run_state(Agent::Codex).to_view().state, "running");
+        let active2 = app
+            .active_turns
+            .get(&Agent::Codex)
+            .cloned()
+            .expect("active turn 2");
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(ConversationId::new(active2.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(active2.turn_id.as_str())),
+            event: AgentEvent::Error("provider failure".to_owned()),
+        }));
+        let failed_state = app.run_state(Agent::Codex);
+        let view_failed = failed_state.to_view();
+        assert_eq!(view_failed.state, "failed");
+        assert!(view_failed.duration_ms.is_some());
+
+        // Next turn: cancel -> cancelled
+        app.input = "third run".to_owned();
+        app.submit_prompt();
+        assert_eq!(app.run_state(Agent::Codex).to_view().state, "running");
+        let active3 = app
+            .active_turns
+            .get(&Agent::Codex)
+            .cloned()
+            .expect("active turn 3");
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(ConversationId::new(active3.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(active3.turn_id.as_str())),
+            event: AgentEvent::Cancelled,
+        }));
+        let cancelled_state = app.run_state(Agent::Codex);
+        let view_cancelled = cancelled_state.to_view();
+        assert_eq!(view_cancelled.state, "cancelled");
+        assert!(view_cancelled.duration_ms.is_some());
+    }
+
+    #[test]
+    // TC-821 / FR-821, FR-822, UX-820: status_bar_spinner_and_end_marks
+    fn status_bar_spinner_and_end_marks() {
+        let (mut app, _) = test_app();
+        app.color_enabled = false;
+        assert!(!app.colors_enabled());
+
+        // Start a turn
+        let start = Instant::now();
+        app.run_states.insert(
+            Agent::Codex,
+            RunState::Running {
+                started_at: start,
+                started_at_ms: 1000,
+                node: None,
+            },
+        );
+        app.busy_agents.insert(Agent::Codex);
+        // Inject 12.2s -> frame 2 is '⠹', elapsed is 12s
+        app.injected_now = Some(start + Duration::from_millis(12200));
+
+        let text = render_test_buffer(&mut app);
+        assert!(text.contains('⠹'), "expected braille frame in: {text}");
+        assert!(text.contains("12s"), "expected 12s in: {text}");
+
+        // Turn completes: shows ✓ done
+        app.finish_turn_outcome_with_error(Agent::Codex, true, None);
+        let text_done = render_test_buffer(&mut app);
+        assert!(
+            text_done.contains("✓ done"),
+            "expected '✓ done' in: {text_done}"
+        );
+
+        // Failed turn: shows ✗ failed
+        app.run_states.insert(
+            Agent::Codex,
+            RunState::Failed {
+                duration: Duration::from_secs(3),
+                started_at_ms: Some(1000),
+                ended_at_ms: 4000,
+                node: None,
+            },
+        );
+        let text_failed = render_test_buffer(&mut app);
+        assert!(
+            text_failed.contains("✗ failed"),
+            "expected '✗ failed' in: {text_failed}"
+        );
+        assert!(text_failed.contains("3s"), "expected 3s in: {text_failed}");
+    }
+
+    #[test]
+    // TC-822 / FR-821, UX-821: spinner_frames_and_reduced_motion
+    fn spinner_frames_and_reduced_motion() {
+        // Frame advances with elapsed time
+        assert_eq!(spinner_frame(Duration::from_millis(0), false), "⠋");
+        assert_eq!(spinner_frame(Duration::from_millis(100), false), "⠙");
+        assert_eq!(spinner_frame(Duration::from_millis(200), false), "⠹");
+        assert_eq!(spinner_frame(Duration::from_millis(300), false), "⠸");
+        assert_eq!(spinner_frame(Duration::from_millis(400), false), "⠼");
+        assert_eq!(spinner_frame(Duration::from_millis(500), false), "⠴");
+        assert_eq!(spinner_frame(Duration::from_millis(600), false), "⠦");
+        assert_eq!(spinner_frame(Duration::from_millis(700), false), "⠧");
+        assert_eq!(spinner_frame(Duration::from_millis(800), false), "⠇");
+        assert_eq!(spinner_frame(Duration::from_millis(900), false), "⠏");
+        assert_eq!(spinner_frame(Duration::from_millis(1000), false), "⠋");
+
+        // Reduced motion returns static mark
+        assert_eq!(spinner_frame(Duration::from_millis(200), true), "●");
+
+        // App idle produces no fast redraw
+        let (mut app, _) = test_app();
+        assert!(!app.needs_fast_redraw());
+
+        // When running, fast redraw is needed
+        let start = Instant::now();
+        app.run_states.insert(
+            Agent::Codex,
+            RunState::Running {
+                started_at: start,
+                started_at_ms: 1000,
+                node: None,
+            },
+        );
+        app.busy_agents.insert(Agent::Codex);
+        assert!(app.needs_fast_redraw());
+
+        // Under reduced motion, fast redraw is disabled and static mark renders
+        app.settings.reduced_motion = true;
+        assert!(app.reduced_motion());
+        assert!(!app.needs_fast_redraw());
+
+        let text = render_test_buffer(&mut app);
+        assert!(text.contains('●'), "expected static mark '●' in: {text}");
     }
 }
 

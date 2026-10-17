@@ -353,6 +353,59 @@ h1.brand {
 .conn-error { border-color: var(--err); color: var(--err); }
 .conn-connecting { color: var(--muted); }
 
+.run-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 0.8em;
+  background: var(--bg-chip);
+  color: var(--muted);
+}
+
+.run-status-idle { color: var(--muted); border-color: var(--line); }
+.run-status-running {
+  color: var(--badge-running-text);
+  border-color: var(--badge-running-line);
+  background: var(--badge-running-bg);
+}
+.run-status-done { color: var(--ok); border-color: var(--ok); }
+.run-status-failed { color: var(--err); border-color: var(--err); }
+.run-status-cancelled { color: var(--muted); border-color: var(--line); }
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  display: inline-block;
+  width: 0.75em;
+  height: 0.75em;
+  vertical-align: -0.1em;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  box-sizing: border-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+    border: none;
+    width: auto;
+    height: auto;
+    line-height: 1;
+  }
+  .spinner::before {
+    content: "●";
+    color: var(--accent);
+  }
+}
+
 main {
   padding: 0 14px 40px;
   max-width: 880px;
@@ -435,6 +488,21 @@ main {
 }
 
 .chip-busy .chip-name { font-weight: 600; }
+
+.chip-run {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.85em;
+  color: var(--muted);
+}
+.chip-running {
+  border-color: var(--accent);
+}
+.chip-run-running { color: var(--accent); }
+.chip-run-done { color: var(--ok); }
+.chip-run-failed { color: var(--err); }
+.chip-run-cancelled { color: var(--muted); }
 
 .graph-meta {
   display: flex;

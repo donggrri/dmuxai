@@ -1,6 +1,6 @@
 # SPEC: running-indicators
 
-Status: Draft (v0.2.1)
+Status: Implemented (v0.2.1)
 Created: 2026-10-17
 Related: Dongjin dogfood 2026-10-17 23:38/23:41 (`dmuxai --web` on Linux: "running state is not clearly visible"; wants a spinner in both TUI and web)
 
@@ -28,6 +28,9 @@ It applies to the TUI and the dashboard, and respects `NO_COLOR` and `prefers-re
 | UX-821 | Must | Reduced motion: the TUI accepts `[theme] reduced_motion = true` or `DMUXAI_REDUCED_MOTION=1`, and the web follows `prefers-reduced-motion: reduce`. Either way the spinner becomes a static `●`/`…` running mark while elapsed time still updates | TC-822, TC-823 |
 | NFR-820 | Should | The spinner adds no dashboard publish traffic beyond the existing busy interval. The snapshot carries `started_at`, not frames or elapsed time, so it is identical across ticks while nothing else changes. Frames and elapsed time are rendered client-side | TC-820, TC-823 |
 
+> [!NOTE]
+> Deviation on FR-824: The dashboard Content-Security-Policy enforces `default-src 'self'` without `data:` scheme allowance for images. Dynamic favicon data-URL replacement is skipped to preserve CSP compliance, keeping tab title prefix updates (`⏳`, `✓`, `✗`) active.
+
 ## 3. Tests
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
@@ -36,4 +39,4 @@ It applies to the TUI and the dashboard, and respects `NO_COLOR` and `prefers-re
 | TC-821 | FR-821, FR-822, UX-820 | unit (TestBackend) | busy agent, then completed and failed turns, with `NO_COLOR` | The status bar contains a braille frame and `12s`; after completion `✓ done`, after failure `✗ failed`; glyphs are present without color | `src/app.rs` `status_bar_spinner_and_end_marks` |
 | TC-822 | FR-821, UX-821 | unit | busy agent, injected clock | The frame advances with time; reduced motion gives a static mark; there are no redraw ticks while idle | `src/app.rs` `spinner_frames_and_reduced_motion` |
 | TC-823 | FR-823, UX-821, NFR-820 | unit (asset) | index.html, session.js and css assets | Header status pill element, `.spinner` CSS with a `prefers-reduced-motion` override, a client-side elapsed ticker, run-state rendering for chips and the graph node | `src/web/assets.rs` `dashboard_has_run_status_indicators` |
-| TC-824 | FR-823, FR-824 | e2e (ignored, headless Chrome) | demo snapshot with one running agent | Pill reads `Running`; chip has the spinner; title starts with `⏳`; screenshot captured | `src/web/server.rs` `running_indicator_renders_in_headless_chrome` |
+| TC-824 | FR-823, FR-824 | e2e (ignored, headless Chrome) | demo snapshot with one running agent | Pill reads `Running`; chip has the spinner; title starts with `⏳`; screenshot captured | `tests/web_running.rs` `running_indicator_renders_in_headless_chrome` |

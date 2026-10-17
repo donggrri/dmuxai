@@ -129,11 +129,43 @@ pub fn status_json(workspace_root: &Path) -> Value {
     let workspace = crate::workspace::normalize_workspace_path(workspace_root)
         .unwrap_or_else(|_| workspace_root.display().to_string());
 
+    let mut last_agent_run: std::collections::HashMap<String, Value> =
+        std::collections::HashMap::new();
+    let events_path = crate::events::events_path(workspace_root);
+    if let Ok(records) = std::fs::read_to_string(&events_path) {
+        for line in records.lines() {
+            if let Ok(rec) = serde_json::from_str::<crate::events::EventRecord>(line)
+                && rec.kind == "agent"
+                && let Some(runner) = rec.runner
+            {
+                let state = match rec.to_state.as_str() {
+                    "started" | "running" => "running",
+                    "completed" => "done",
+                    "error" => "failed",
+                    "cancelled" => "cancelled",
+                    _ => "idle",
+                };
+                let mut run_val = json!({ "state": state });
+                if state == "running" {
+                    run_val["started_at_ms"] = json!(rec.ts_ms);
+                }
+                if let Some(node) = rec.node {
+                    run_val["node"] = json!(node);
+                }
+                last_agent_run.insert(runner, run_val);
+            }
+        }
+    }
+
     let agents: Vec<Value> = runner_ids(&settings)
         .into_iter()
         .map(|(id, label)| {
             let allowed = runner_allowed(&settings, &id);
-            json!({ "id": id, "label": label, "allowed": allowed })
+            let run = last_agent_run
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| json!({ "state": "idle" }));
+            json!({ "id": id, "label": label, "allowed": allowed, "run": run })
         })
         .collect();
 

@@ -77,6 +77,22 @@ pub struct SessionAgent {
     pub allowed: bool,
     pub models_loading: bool,
     pub models: Vec<SessionModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunStateView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct RunStateView {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -167,6 +183,8 @@ pub struct AgentView {
     pub model: Option<String>,
     #[serde(default)]
     pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunStateView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -443,6 +461,7 @@ mod tests {
                 phase: None,
                 model: Some("o3-mini".to_string()),
                 color: None,
+                run: None,
             }],
             graph: Some(view),
             todos: Vec::new(),

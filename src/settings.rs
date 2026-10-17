@@ -39,6 +39,7 @@ pub struct DmuxSettings {
     pub graph_allowed_runners: Option<Vec<String>>,
     pub theme: Theme,
     pub theme_force_color: Option<bool>,
+    pub reduced_motion: bool,
     /// `[[agents.custom]]` headless agents (installed into the registry at startup).
     pub custom_agents: Vec<crate::custom_agent::CustomAgentSpec>,
     /// `[agents] builtin_opencode` (default true). `false` hides the built-in
@@ -285,6 +286,10 @@ impl DmuxSettings {
 
         settings.resolve_memory(workspace);
         settings.add_builtin_memory_server(workspace, exe);
+        if env_flag("DMUXAI_REDUCED_MOTION") {
+            settings.reduced_motion = true;
+            settings.theme.reduced_motion = true;
+        }
         settings.dedupe_warnings();
         settings
     }
@@ -421,6 +426,9 @@ impl DmuxSettings {
             if let Some(force_color) = theme.force_color {
                 self.theme_force_color = Some(force_color);
             }
+            if let Some(rm) = theme.reduced_motion {
+                self.reduced_motion = rm;
+            }
         }
         if let Some(graph) = parsed.graph {
             if let Some(enabled) = graph.enabled {
@@ -552,6 +560,7 @@ impl Default for DmuxSettings {
             graph_allowed_runners: None,
             theme: Theme::default(),
             theme_force_color: None,
+            reduced_motion: false,
             custom_agents: Vec::new(),
             builtin_opencode: true,
             mcp_servers: Vec::new(),

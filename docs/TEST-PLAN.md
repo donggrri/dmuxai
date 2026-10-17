@@ -284,11 +284,11 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-first-run | FR-814 | TC-813 | `init_writes_starter_config` | integration | ✅ | v0.2.1 |
 | M8,M2 | SPEC-first-run | FR-814 | TC-814 | `starter_config_parses` | unit | ✅ | v0.2.1 |
 | M8,M2 | SPEC-first-run | FR-815,FR-816 | TC-815 | `readme_matches_release_layout` | unit | ✅ | v0.2.1 |
-| M8,M2 | SPEC-running-indicators | FR-820,NFR-820 | TC-820 | `run_state_transitions_follow_turn_events` | unit | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-running-indicators | FR-821,FR-822,UX-820 | TC-821 | `status_bar_spinner_and_end_marks` | unit | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-running-indicators | FR-821,UX-821 | TC-822 | `spinner_frames_and_reduced_motion` | unit | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-running-indicators | FR-823,UX-821,NFR-820 | TC-823 | `dashboard_has_run_status_indicators` | unit | ⏳ | v0.2.1 |
-| M8,M2 | SPEC-running-indicators | FR-823,FR-824 | TC-824 | `running_indicator_renders_in_headless_chrome` (ignored) | e2e | ⏳ | v0.2.1 |
+| M8,M2 | SPEC-running-indicators | FR-820,NFR-820 | TC-820 | `run_state_transitions_follow_turn_events` | unit | ✅ | v0.2.1 |
+| M8,M2 | SPEC-running-indicators | FR-821,FR-822,UX-820 | TC-821 | `status_bar_spinner_and_end_marks` | unit | ✅ | v0.2.1 |
+| M8,M2 | SPEC-running-indicators | FR-821,UX-821 | TC-822 | `spinner_frames_and_reduced_motion` | unit | ✅ | v0.2.1 |
+| M8,M2 | SPEC-running-indicators | FR-823,UX-821,NFR-820 | TC-823 | `dashboard_has_run_status_indicators` | unit | ✅ | v0.2.1 |
+| M8,M2 | SPEC-running-indicators | FR-823,FR-824 | TC-824 | `running_indicator_renders_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.1 |
 | M8,M2 | SPEC-docs-tree | FR-830 | TC-830 | `tree_children_lists_one_level` | unit | ⏳ | v0.2.1 |
 | M8,M2 | SPEC-docs-tree | FR-830,FR-831 | TC-831 | `tree_api_confined_and_bounded` | integration | ⏳ | v0.2.1 |
 | M8,M2 | SPEC-docs-tree | FR-831 | TC-832 | `docs_routes_require_auth` (extended) | integration | ⏳ | v0.2.1 |

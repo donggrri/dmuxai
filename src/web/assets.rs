@@ -744,4 +744,20 @@ mod tests {
         assert!(APP_CSS.contains("min-height: 320px;"));
         assert!(APP_CSS.contains("max-height: 70vh;"));
     }
+
+    #[test]
+    // TC-823 / FR-823, UX-821, NFR-820: dashboard_has_run_status_indicators
+    fn dashboard_has_run_status_indicators() {
+        assert!(INDEX_HTML.contains("id=\"run-status\""));
+        assert!(INDEX_HTML.contains("role=\"status\""));
+        assert!(APP_CSS.contains(".run-status"));
+        assert!(APP_CSS.contains(".spinner"));
+        assert!(APP_CSS.contains("@media (prefers-reduced-motion: reduce)"));
+        assert!(APP_JS.contains("started_at_ms"));
+        assert!(APP_JS.contains("document.title"));
+        assert!(APP_JS.contains("running"));
+        assert!(APP_JS.contains("done"));
+        assert!(APP_JS.contains("failed"));
+        assert!(APP_JS.contains("cancelled"));
+    }
 }
