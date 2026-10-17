@@ -8,7 +8,7 @@ Source: Dongjin's dogfooding of the v0.2.0 release binary on Linux (`dmuxai --we
 
 | # | Item | Kind | SPEC (IDs) | Issue | Status |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Cursor assistant text shown twice | bug | [SPEC-cursor-stream-dedupe](specs/SPEC-cursor-stream-dedupe.md) (FR-800..801) | [#40](https://github.com/donggrri/dmuxai/issues/40) | PR #39 |
+| 1 | Cursor assistant text shown twice | bug | [SPEC-cursor-stream-dedupe](specs/SPEC-cursor-stream-dedupe.md) (FR-800..801) | [#40](https://github.com/donggrri/dmuxai/issues/40) | merged #39 (049dc68) |
 | 2 | Opencode missing on a fresh install: built-in preset, `dmuxai init`, first-run docs | bug | [SPEC-first-run](specs/SPEC-first-run.md) (FR-810..815) | [#45](https://github.com/donggrri/dmuxai/issues/45) | planned |
 | 3 | README: release tarball layout and install steps | docs | [SPEC-first-run](specs/SPEC-first-run.md) (FR-816) | [#46](https://github.com/donggrri/dmuxai/issues/46) | planned |
 | 4 | Running state: spinner and elapsed time in TUI and dashboard | UX | [SPEC-running-indicators](specs/SPEC-running-indicators.md) (FR-820..824) | [#42](https://github.com/donggrri/dmuxai/issues/42) | planned |
