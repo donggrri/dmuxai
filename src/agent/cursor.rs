@@ -61,7 +61,7 @@ impl From<DmuxSettings> for CursorAdapterConfig {
     fn from(settings: DmuxSettings) -> Self {
         Self {
             windows_unsandboxed: settings.cursor_windows_unsandboxed,
-            prewarm: false,
+            prewarm: settings.cursor_prewarm,
             prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
         }
     }
@@ -71,7 +71,7 @@ impl From<&DmuxSettings> for CursorAdapterConfig {
     fn from(settings: &DmuxSettings) -> Self {
         Self {
             windows_unsandboxed: settings.cursor_windows_unsandboxed,
-            prewarm: false,
+            prewarm: settings.cursor_prewarm,
             prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
         }
     }
@@ -190,23 +190,59 @@ pub fn spawn_cursor_adapter(
 }
 
 struct WarmProcess {
+    program: OsString,
     argv: Vec<OsString>,
-    child: tokio::process::Child,
+    cwd: PathBuf,
+    env_bin: Option<OsString>,
+    child: Option<tokio::process::Child>,
     spawned_at: Instant,
 }
 
-async fn reap_warm_process(mut warm: WarmProcess) {
-    #[cfg(unix)]
-    if let Some(id) = warm.child.id() {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &format!("-{id}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+impl Drop for WarmProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            #[cfg(unix)]
+            if let Some(id) = child.id() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &format!("-{id}")])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = child.start_kill();
+        }
     }
-    let _ = warm.child.start_kill();
-    let _ = warm.child.wait().await;
+}
+
+async fn reap_warm_process(mut warm: WarmProcess) {
+    if let Some(mut child) = warm.child.take() {
+        #[cfg(unix)]
+        if let Some(id) = child.id() {
+            let _ = tokio::process::Command::new("kill")
+                .args(["-TERM", &format!("-{id}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
+        let exit_status = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+        if exit_status.is_err() {
+            #[cfg(unix)]
+            if let Some(id) = child.id() {
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-KILL", &format!("-{id}")])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
+            }
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
 }
 
 fn spawn_warm_process(
@@ -225,11 +261,13 @@ fn spawn_warm_process(
         cwd,
         windows_unsandboxed,
     );
+    let program = command.as_std().get_program().to_os_string();
     let argv = command
         .as_std()
         .get_args()
         .map(|s| s.to_os_string())
         .collect::<Vec<_>>();
+    let env_bin = std::env::var_os("DMUXAI_CURSOR_BIN");
     #[cfg(unix)]
     command.process_group(0);
     command
@@ -240,8 +278,11 @@ fn spawn_warm_process(
         .kill_on_drop(true);
     let child = command.spawn()?;
     Ok(WarmProcess {
+        program,
         argv,
-        child,
+        cwd: cwd.to_path_buf(),
+        env_bin,
+        child: Some(child),
         spawned_at: Instant::now(),
     })
 }
@@ -259,24 +300,14 @@ async fn runtime_loop(
         .into_iter()
         .filter(|s| s.applies_to("cursor"))
         .collect();
+    let can_prewarm = config.prewarm && applicable.is_empty();
     let cursor_notice_emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut active: Option<ActiveTurn> = None;
     let mut selected_model: Option<String> = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
     let mut selected_mode = ExecutionMode::default();
     let mut latest_session_id: Option<String> = None;
-
-    let mut warm_process: Option<WarmProcess> = if config.prewarm {
-        spawn_warm_process(
-            None,
-            selected_model.as_deref(),
-            selected_mode,
-            &cwd,
-            windows_unsandboxed,
-        )
-        .ok()
-    } else {
-        None
-    };
+    let mut reset_epoch: u64 = 0;
+    let mut warm_process: Option<WarmProcess> = None;
 
     loop {
         if let Some(warm) = &warm_process
@@ -335,6 +366,7 @@ async fn runtime_loop(
                             applicable.clone(),
                             cursor_notice_emitted.clone(),
                             true,
+                            reset_epoch,
                         ));
                     } else {
                         let mut check_cmd = cursor_command().ok();
@@ -348,7 +380,11 @@ async fn runtime_loop(
                                 windows_unsandboxed,
                             );
                         }
+                        let turn_program = check_cmd
+                            .as_ref()
+                            .map(|cmd| cmd.as_std().get_program().to_os_string());
                         let turn_argv = check_cmd
+                            .as_ref()
                             .map(|cmd| {
                                 cmd.as_std()
                                     .get_args()
@@ -356,26 +392,36 @@ async fn runtime_loop(
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
+                        let turn_env_bin = std::env::var_os("DMUXAI_CURSOR_BIN");
 
                         let warm_child = match warm_process.take() {
-                            Some(mut warm) => match warm.child.try_wait() {
-                                Ok(Some(_)) => {
-                                    let _ = warm.child.wait().await;
-                                    None
-                                }
-                                Ok(None) => {
-                                    if warm.argv == turn_argv {
-                                        Some(warm.child)
-                                    } else {
+                            Some(mut warm) => {
+                                let mut child = warm.child.take().unwrap();
+                                match child.try_wait() {
+                                    Ok(Some(_)) => {
+                                        let _ = child.wait().await;
+                                        None
+                                    }
+                                    Ok(None) => {
+                                        let matches = Some(&warm.program) == turn_program.as_ref()
+                                            && warm.argv == turn_argv
+                                            && warm.cwd == cwd
+                                            && warm.env_bin == turn_env_bin;
+                                        if matches {
+                                            Some(child)
+                                        } else {
+                                            warm.child = Some(child);
+                                            reap_warm_process(warm).await;
+                                            None
+                                        }
+                                    }
+                                    Err(_) => {
+                                        warm.child = Some(child);
                                         reap_warm_process(warm).await;
                                         None
                                     }
                                 }
-                                Err(_) => {
-                                    reap_warm_process(warm).await;
-                                    None
-                                }
-                            },
+                            }
                             None => None,
                         };
 
@@ -390,6 +436,7 @@ async fn runtime_loop(
                             applicable.clone(),
                             cursor_notice_emitted.clone(),
                             false,
+                            reset_epoch,
                         ));
                     }
                 }
@@ -427,7 +474,7 @@ async fn runtime_loop(
                     selected_model = Some(model.clone());
                     if changed && let Some(warm) = warm_process.take() {
                         reap_warm_process(warm).await;
-                        if config.prewarm {
+                        if can_prewarm {
                             warm_process = spawn_warm_process(
                                 latest_session_id.as_deref(),
                                 selected_model.as_deref(),
@@ -445,7 +492,7 @@ async fn runtime_loop(
                     selected_mode = mode;
                     if changed && let Some(warm) = warm_process.take() {
                         reap_warm_process(warm).await;
-                        if config.prewarm {
+                        if can_prewarm {
                             warm_process = spawn_warm_process(
                                 latest_session_id.as_deref(),
                                 selected_model.as_deref(),
@@ -459,7 +506,7 @@ async fn runtime_loop(
                     send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
                 }
                 CursorCommand::Prewarm => {
-                    if warm_process.is_none() && config.prewarm {
+                    if warm_process.is_none() && can_prewarm {
                         warm_process = spawn_warm_process(
                             latest_session_id.as_deref(),
                             selected_model.as_deref(),
@@ -472,18 +519,9 @@ async fn runtime_loop(
                 }
                 CursorCommand::Reset => {
                     latest_session_id = None;
+                    reset_epoch = reset_epoch.wrapping_add(1);
                     if let Some(warm) = warm_process.take() {
                         reap_warm_process(warm).await;
-                        if config.prewarm {
-                            warm_process = spawn_warm_process(
-                                None,
-                                selected_model.as_deref(),
-                                selected_mode,
-                                &cwd,
-                                windows_unsandboxed,
-                            )
-                            .ok();
-                        }
                     }
                 }
                 CursorCommand::Tick => {}
@@ -495,26 +533,37 @@ async fn runtime_loop(
         tokio::select! {
             res = turn => {
                 let completed_turn = active.take().expect("turn was active");
-                if let Ok(Ok(session_id)) = res {
-                    if let Some(session_id) = session_id {
-                        latest_session_id = Some(session_id);
-                    }
-                    if config.prewarm && !completed_turn.is_graph {
-                        warm_process = spawn_warm_process(
-                            latest_session_id.as_deref(),
-                            selected_model.as_deref(),
-                            selected_mode,
-                            &cwd,
-                            windows_unsandboxed,
-                        )
-                        .ok();
-                    }
+                if completed_turn.reset_epoch == reset_epoch
+                    && let Ok(Ok(Some(session_id))) = &res
+                {
+                    latest_session_id = Some(session_id.clone());
+                }
+                if can_prewarm && !completed_turn.is_graph {
+                    warm_process = spawn_warm_process(
+                        latest_session_id.as_deref(),
+                        selected_model.as_deref(),
+                        selected_mode,
+                        &cwd,
+                        windows_unsandboxed,
+                    )
+                    .ok();
                 }
             }
             command = command_rx.recv() => {
                 match command {
                     Some(CursorCommand::Cancel) => {
-                        stop_turn(active.take(), &event_tx).await;
+                        let cancelled_turn = active.take();
+                        stop_turn(cancelled_turn, &event_tx).await;
+                        if can_prewarm {
+                            warm_process = spawn_warm_process(
+                                latest_session_id.as_deref(),
+                                selected_model.as_deref(),
+                                selected_mode,
+                                &cwd,
+                                windows_unsandboxed,
+                            )
+                            .ok();
+                        }
                     }
                     Some(CursorCommand::Send { request, .. }) => {
                         let context = OutputContext::from(&request);
@@ -559,6 +608,7 @@ async fn runtime_loop(
                     Some(CursorCommand::Prewarm | CursorCommand::Tick) => {}
                     Some(CursorCommand::Reset) => {
                         latest_session_id = None;
+                        reset_epoch = reset_epoch.wrapping_add(1);
                     }
                     None => {
                         stop_turn(active.take(), &event_tx).await;
@@ -585,7 +635,9 @@ fn spawn_turn(
     mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
     cursor_notice_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     is_graph: bool,
+    reset_epoch: u64,
 ) -> ActiveTurn {
+    let warm_pgid = warm_child.as_ref().and_then(|c| c.id());
     let context = OutputContext::from(&request);
     let error_context = context.clone();
     let handle = tokio::spawn(async move {
@@ -618,6 +670,8 @@ fn spawn_turn(
         handle,
         context,
         is_graph,
+        reset_epoch,
+        warm_pgid,
     }
 }
 
@@ -625,10 +679,29 @@ struct ActiveTurn {
     handle: JoinHandle<io::Result<Option<String>>>,
     context: OutputContext,
     is_graph: bool,
+    reset_epoch: u64,
+    warm_pgid: Option<u32>,
 }
 
 async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
     if let Some(turn) = turn {
+        #[cfg(unix)]
+        if let Some(pgid) = turn.warm_pgid {
+            let _ = tokio::process::Command::new("kill")
+                .args(["-TERM", &format!("-{pgid}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+            let _ = tokio::process::Command::new("kill")
+                .args(["-KILL", &format!("-{pgid}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
         turn.handle.abort();
         let _ = turn.handle.await;
         send_event(event_tx, Some(&turn.context), AgentEvent::Cancelled).await;
@@ -719,8 +792,6 @@ async fn run_turn_with_child(
                 cwd,
                 windows_unsandboxed,
             );
-            #[cfg(unix)]
-            command.process_group(0);
             command
                 .current_dir(cwd)
                 .stdin(Stdio::piped())
@@ -1073,7 +1144,7 @@ async fn send_event(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::json;
     use tokio::time::{Duration, timeout};
 
@@ -1664,6 +1735,9 @@ mod tests {
         assert!(answer.contains("CURSOR_OK"), "unexpected answer: {answer}");
     }
 
+    #[cfg(unix)]
+    pub(crate) static TEST_CURSOR_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn cursor_mcp_notice_once_per_session() {
         // TC-578, INT-561: Cursor runner with an existing user .cursor/mcp.json; two turns.
@@ -1671,6 +1745,9 @@ mod tests {
         use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
         use std::collections::BTreeMap;
         use std::sync::atomic::AtomicBool;
+
+        #[cfg(unix)]
+        let _guard = TEST_CURSOR_MUTEX.lock().await;
 
         let temp = tempfile::tempdir().unwrap();
         let cursor_dir = temp.path().join(".cursor");
@@ -1778,26 +1855,23 @@ mod tests {
     }
 
     #[cfg(unix)]
-    static TEST_CURSOR_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    #[cfg(unix)]
-    struct FakeCursorFixture {
-        _guard: tokio::sync::MutexGuard<'static, ()>,
-        _dir: tempfile::TempDir,
-        log_path: PathBuf,
-        exit_once_marker: PathBuf,
+    pub(crate) struct FakeCursorFixture {
+        pub(crate) _guard: tokio::sync::MutexGuard<'static, ()>,
+        pub(crate) _dir: tempfile::TempDir,
+        pub(crate) log_path: PathBuf,
+        pub(crate) exit_once_marker: PathBuf,
     }
 
     #[cfg(unix)]
     #[derive(Debug, Clone)]
-    struct SpawnEntry {
-        pid: u32,
-        argv: Vec<String>,
+    pub(crate) struct SpawnEntry {
+        pub(crate) pid: u32,
+        pub(crate) argv: Vec<String>,
     }
 
     #[cfg(unix)]
     impl FakeCursorFixture {
-        async fn new() -> Self {
+        pub(crate) async fn new() -> Self {
             use std::os::unix::fs::PermissionsExt;
             let guard = TEST_CURSOR_MUTEX.lock().await;
             let dir = tempfile::tempdir().expect("tempdir");
@@ -1842,7 +1916,7 @@ mod tests {
             }
         }
 
-        fn read_log_lines(&self) -> Vec<String> {
+        pub(crate) fn read_log_lines(&self) -> Vec<String> {
             if let Ok(content) = std::fs::read_to_string(&self.log_path) {
                 content
                     .lines()
@@ -1855,7 +1929,7 @@ mod tests {
             }
         }
 
-        fn read_spawns(&self) -> Vec<SpawnEntry> {
+        pub(crate) fn read_spawns(&self) -> Vec<SpawnEntry> {
             self.read_log_lines()
                 .into_iter()
                 .filter_map(|line| {
@@ -1871,7 +1945,11 @@ mod tests {
                 .collect()
         }
 
-        async fn wait_for_spawns(&self, count: usize, timeout_dur: Duration) -> Vec<SpawnEntry> {
+        pub(crate) async fn wait_for_spawns(
+            &self,
+            count: usize,
+            timeout_dur: Duration,
+        ) -> Vec<SpawnEntry> {
             let start = Instant::now();
             while start.elapsed() < timeout_dur {
                 let spawns = self.read_spawns();
@@ -1883,7 +1961,7 @@ mod tests {
             self.read_spawns()
         }
 
-        fn prompts_received(&self) -> Vec<(u32, String)> {
+        pub(crate) fn prompts_received(&self) -> Vec<(u32, String)> {
             self.read_log_lines()
                 .into_iter()
                 .filter_map(|line| {
@@ -1899,7 +1977,7 @@ mod tests {
                 .collect()
         }
 
-        fn is_pid_alive(&self, pid: u32) -> bool {
+        pub(crate) fn is_pid_alive(&self, pid: u32) -> bool {
             let proc_stat = format!("/proc/{pid}/stat");
             if let Ok(content) = std::fs::read_to_string(&proc_stat) {
                 if let Some(idx) = content.rfind(')') {
@@ -1921,7 +1999,7 @@ mod tests {
             }
         }
 
-        async fn wait_for_pid_gone(&self, pid: u32, timeout_dur: Duration) -> bool {
+        pub(crate) async fn wait_for_pid_gone(&self, pid: u32, timeout_dur: Duration) -> bool {
             let start = Instant::now();
             while start.elapsed() < timeout_dur {
                 if !self.is_pid_alive(pid) {
@@ -1943,7 +2021,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn wait_for_turn_completion(event_rx: &mut mpsc::Receiver<AgentOutput>) {
+    pub(crate) async fn wait_for_turn_completion(event_rx: &mut mpsc::Receiver<AgentOutput>) {
         let timeout_dur = Duration::from_secs(5);
         let start = Instant::now();
         while start.elapsed() < timeout_dur {
@@ -2012,6 +2090,16 @@ mod tests {
             "only turn 1 prompt was received so far"
         );
         assert_eq!(prompts_before[0].0, spawns[0].pid);
+        let warm_logs_before = fixture
+            .read_log_lines()
+            .into_iter()
+            .filter(|l| l.contains(&warm_pid.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            warm_logs_before,
+            vec![format!("SPAWN {} {}", warm_pid, spawns[1].argv.join(" "))],
+            "no stdin bytes before prompt sent to warm process"
+        );
 
         // Turn 2: matching arguments (--resume sess-1)
         let req2 = AgentRequest {
@@ -2024,7 +2112,7 @@ mod tests {
         adapter.send(req2).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
 
-        // Turn 2 reused the warm process: prompt 2 was received by warm_pid
+        // Turn 2 reused the warm process: exactly one spawn handled turn 2 (the warm process itself)
         let prompts_after = fixture.prompts_received();
         assert_eq!(prompts_after.len(), 2);
         assert_eq!(
@@ -2032,6 +2120,62 @@ mod tests {
             "turn 2 prompt should be handled by warm process"
         );
         assert_eq!(prompts_after[1].1, "prompt 2");
+
+        // Exactly 3 spawns total: turn 1, warm process for turn 2 (reused), and warm process for turn 3
+        let spawns_after = fixture.wait_for_spawns(3, Duration::from_secs(3)).await;
+        assert_eq!(
+            spawns_after.len(),
+            3,
+            "one spawn total for turn 2 (reused warm process), plus next pre-start"
+        );
+
+        drop(adapter);
+        let _ = worker.await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    // Review fix: When MCP servers apply to Cursor, prewarm is skipped to avoid writing guard prematurely.
+    async fn prewarm_skipped_when_mcp_servers_apply() {
+        use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
+        use std::collections::BTreeMap;
+
+        let fixture = FakeCursorFixture::new().await;
+        let (event_tx, _) = mpsc::channel(64);
+        let config = CursorAdapterConfig {
+            windows_unsandboxed: false,
+            prewarm: true,
+            prewarm_idle_secs: 300,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+
+        let server = ResolvedMcpServer {
+            name: "test-server".to_owned(),
+            kind: ServerKind::Generic,
+            transport: Transport::Stdio {
+                command: "echo".to_owned(),
+                args: vec![],
+                env: BTreeMap::new(),
+            },
+            runners: Some(vec!["cursor".to_owned()]),
+            tools: ToolNames::default(),
+        };
+
+        let (adapter, worker) = spawn_cursor_adapter(
+            event_tx,
+            workspace.path().to_path_buf(),
+            config,
+            vec![server],
+        );
+
+        // Prewarm call should be a no-op because applicable MCP servers exist
+        adapter.prewarm().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            fixture.read_spawns().len(),
+            0,
+            "prewarm must be skipped when MCP servers apply to Cursor"
+        );
 
         drop(adapter);
         let _ = worker.await;
@@ -2098,7 +2242,6 @@ mod tests {
 
         // 4. /new (reset)
         adapter.reset().unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             fixture
                 .wait_for_pid_gone(pid3, Duration::from_secs(3))

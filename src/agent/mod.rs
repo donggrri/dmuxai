@@ -13,6 +13,10 @@ pub use codex::spawn_codex_adapter;
 pub use cursor::{CursorAdapterConfig, spawn_cursor_adapter};
 pub use custom::spawn_custom_adapter;
 
+#[cfg(test)]
+#[cfg(unix)]
+pub(crate) use cursor::tests::FakeCursorFixture;
+
 /// An AI provider that can own conversations and produce messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Agent {

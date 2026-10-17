@@ -410,8 +410,8 @@ impl DmuxSettings {
             }
         }
         if let Some(cursor) = parsed.cursor {
-            if let Some(windows_unsandboxed) = cursor.windows_unsandboxed {
-                self.cursor_windows_unsandboxed = windows_unsandboxed;
+            if cursor.windows_unsandboxed.unwrap_or(false) {
+                self.cursor_windows_unsandboxed = true;
             }
             if let Some(prewarm) = cursor.prewarm {
                 self.cursor_prewarm = prewarm;

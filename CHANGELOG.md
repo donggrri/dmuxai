@@ -37,11 +37,12 @@ All notable changes to dmuxai are listed here. Versions follow
 
 - **Cursor pre-start (SPEC-cursor-latency FR-805..FR-807).** In the TUI and
   dashboard, DmuxAI starts the next `cursor-agent` process while you type and
-  hands it the prompt on send, saving about 1.4–2.1 s per turn. The process is
-  reused only when its arguments match, and is stopped on a mode or model
-  change, `/new`, idle expiry (`[cursor] prewarm_idle_secs`, default 300) or
-  quit. Headless `dmuxai run` and graph nodes never pre-start;
-  `[cursor] prewarm = false` turns it off.
+  hands it the prompt on send, saving an indicative ~1.4–2.1 s of measured
+  latency per turn (depending on typing and idle time between turns). The process
+  is reused only when its program, arguments, working directory and environment
+  match, and is reaped on a mode or model change, `/new`, idle expiry
+  (`[cursor] prewarm_idle_secs`, default 300) or quit. Headless `dmuxai run` and
+  graph nodes never pre-start; `[cursor] prewarm = false` turns it off.
 
 ### Changed
 
