@@ -627,6 +627,7 @@ body {
 .top {
   margin-left: calc(-1 * var(--left-dock));
   margin-right: calc(-1 * var(--right-dock));
+  transition: margin 0.2s ease-in-out;
 }
 
 main {
@@ -644,12 +645,14 @@ main {
 
 @media (prefers-reduced-motion: reduce) {
   body,
+  .top,
   .sidebar {
     transition: none;
   }
 }
 
 .reduced-motion body,
+.reduced-motion .top,
 .reduced-motion .sidebar {
   transition: none;
 }
