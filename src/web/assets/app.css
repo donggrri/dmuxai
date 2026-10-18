@@ -1532,7 +1532,7 @@ main {
 
 .graph-svg .node:focus .card-box,
 .graph-svg .node:hover .card-box { stroke-width: 2.5; }
-.graph-svg .node-selected .card-box { stroke: var(--warn); stroke-width: 2.5; stroke-dasharray: none; }
+.graph-svg .node.node-selected .card-box { stroke: var(--warn); stroke-width: 2.5; stroke-dasharray: none; }
 
 .graph-svg .edge {
   fill: none;

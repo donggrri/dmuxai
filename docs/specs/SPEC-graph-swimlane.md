@@ -1,6 +1,6 @@
 # SPEC: graph-swimlane
 
-Status: Draft (v0.2.2)
+Status: Implemented (v0.2.2)
 Created: 2026-10-18
 Related: issue #61; Dongjin 2026-10-18 (picked mockup B, "horizontal swimlane", over the subway map); SPEC-graph-view (UX-700..UX-703, superseded for the Graph drawing only); SPEC-theme-colors
 
@@ -35,6 +35,15 @@ It replaces the subway drawing inside the existing Graph view. The data (`NodeVi
 - Arrow routing (FR-884): when `x2 - x1 >= 24`, a cubic curve right then left. Otherwise an orthogonal path down (or up) to the lane gap, left of the target's x minus 12px, then into the target's left edge. This fixes the loop-back seen on short `plan → spec` steps.
 - Same-lane dependencies (consecutive steps on one runner): when the gap is ≥ 24px, a straight horizontal arrow. When it is smaller, cards in one lane closer than 24px are already moved to separate sub-rows (FR-881), so the arrow uses the gap between those sub-rows, never the space behind the source card.
 - Edge cases: no nodes shows the existing "No graph run yet" or empty state; one node draws one lane and no arrows; an all-pending run uses now as zero, and every card shows estimates.
+
+### Implementation decisions
+
+- **Timestamps.** The data was not fully in the snapshot: `serve` builds node views from the persisted run file, which had no times. `GraphNode` therefore gains optional `started_at_ms` / `finished_at_ms` (serde default, omitted when empty). The executor sets them when a node starts and finishes; a retry keeps the first start. Older run files still load, and their finished nodes without times are placed after their dependencies with the estimate.
+- **Card width.** A card is at least as wide as its id plus status chip, and as its second line (role or `est. start`, plus the time), capped at 260px. If these minimum widths push the last cards past the axis, the time scale shrinks (at most twice) so they fit. The timeline width follows the canvas width and is re-laid on resize. Fit therefore uses scale 1 (the 11px floor), aligns left, and wider timelines pan.
+- **Arrows.** In the orthogonal case, the vertical leg moves to the nearest column (beside a card edge) that crosses no other card. The horizontal legs run in the row gaps, which are free of cards.
+- **Blocked** shows as the chip text `BLOCKED` (instead of `PENDING`), so the estimate line keeps room.
+- **Live updates.** Running cards update their elapsed time every tick. The whole timeline is rebuilt every 5s (never while the pointer is down), so the now line and the tails move, and keyboard focus is kept across rebuilds.
+- **Screenshots.** Light and dark screenshots come from the demo-run fixture (`swim-shot.sh` in the maintainer flow, committed under `docs/images/`), not from the Rust e2e test.
 
 ## 3. Tests
 
