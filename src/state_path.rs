@@ -122,20 +122,20 @@ pub fn prepare_repo_db(workspace_root: &Path) -> io::Result<(PathBuf, Option<Str
 }
 
 #[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        sync::{Mutex, MutexGuard},
-        time::Duration,
-    };
-
-    // Serializes tests that touch process-wide environment variables.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use std::{sync::MutexGuard, time::Duration};
 
     fn lock_env() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        test_env_lock()
     }
 
     fn set_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {

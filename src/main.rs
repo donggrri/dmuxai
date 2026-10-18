@@ -78,6 +78,7 @@ DmuxAI - One terminal. Multiple AI coding agents.
 
 Usage:
   dmuxai [--help|--version]
+  dmuxai [-C DIR | --workspace-dir DIR] [subcommand...]
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
@@ -91,8 +92,9 @@ Usage:
   dmuxai init [--workspace] [--force]
 
 Options:
-  -h, --help       Print this help message and exit
-  -V, --version    Print version information and exit
+  -h, --help             Print this help message and exit
+  -V, --version          Print version information and exit
+  -C, --workspace-dir DIR  Run in DIR instead of the current directory
   serve            Run the local dashboard server without the TUI
   --web            Run the TUI and the local dashboard server
   --port N         Dashboard port (default 7420)
@@ -290,9 +292,39 @@ fn parse_mcp_memory_cli(args: &[String]) -> CliAction {
     CliAction::McpMemory(options)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let action = parse_cli(std::env::args().skip(1));
+fn main() -> Result<(), Box<dyn Error>> {
+    let (workspace_flag, remaining_args) =
+        match dmuxai::workspace::extract_workspace_dir_flag(std::env::args().skip(1)) {
+            Ok(res) => res,
+            Err(raw) => {
+                eprintln!("error: -C {raw}: invalid path");
+                std::process::exit(2);
+            }
+        };
+    if let Some(raw_path) = workspace_flag {
+        match dmuxai::workspace::validate_workspace_dir(Path::new(&raw_path)) {
+            Ok(canonical) => {
+                // SAFETY: called at the very start of main before the tokio
+                // runtime or any background threads are spawned.
+                unsafe {
+                    std::env::set_var("DMUXAI_WORKSPACE", &canonical);
+                }
+            }
+            Err(reason) => {
+                eprintln!("error: -C {raw_path}: {reason}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main(remaining_args))
+}
+
+async fn async_main(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let action = parse_cli(args);
     match action {
         CliAction::Help => {
             print!("{USAGE}");
@@ -333,7 +365,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 fn run_mcp_memory(options: MemoryOptions) -> Result<(), Box<dyn Error>> {
     let workspace = match &options.workspace {
         Some(path) => path.clone(),
-        None => std::env::current_dir()?,
+        None => dmuxai::workspace::resolve_workspace_root()?,
     };
     // `--project` overrides apply to both the `--vault` and settings path, so
     // validate once up front (FR-720 name rules).
@@ -403,7 +435,14 @@ fn seed_hub_todos(hub: &DashboardHub, store: &TodoStore) {
 
 /// `dmuxai serve`: read-only dashboard over persisted graph runs (FR-520, FR-524).
 async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
-    let workspace_root = dmuxai::workspace::resolve_workspace_root()?;
+    let workspace_root = match dmuxai::workspace::resolve_workspace_root() {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+    let _ = dmuxai::workspace::record_recent_workspace(&workspace_root);
     let workspace = dmuxai::workspace::normalize_workspace_path(&workspace_root)
         .unwrap_or_else(|_| workspace_root.display().to_string());
 
@@ -571,8 +610,15 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
         );
         std::process::exit(1);
     }
-    let workspace_root = dmuxai::workspace::resolve_workspace_root()?;
+    let workspace_root = match dmuxai::workspace::resolve_workspace_root() {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
     dmuxai::workspace::ensure_directory_writable(&workspace_root)?;
+    let _ = dmuxai::workspace::record_recent_workspace(&workspace_root);
     let settings = DmuxSettings::load(&workspace_root);
     let startup_warning = dmuxai::workspace::normalize_workspace_path(&workspace_root)
         .ok()

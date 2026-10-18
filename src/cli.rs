@@ -283,7 +283,11 @@ pub async fn execute(command: AgentCommand) -> i32 {
         Ok(root) => root,
         Err(error) => {
             eprintln!("error: {error}");
-            return exit::INTERNAL;
+            return if error.kind() == io::ErrorKind::InvalidInput {
+                exit::USAGE
+            } else {
+                exit::INTERNAL
+            };
         }
     };
     match command {
