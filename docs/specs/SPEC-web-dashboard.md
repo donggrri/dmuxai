@@ -158,7 +158,7 @@ MCP servers are defined once and used by every runner and by the dashboard.
 | TC-578 | INT-561 | unit | Cursor runner with an existing user `.cursor/mcp.json`; two turns | run turns | the "not propagated" notice is emitted once per session; the user file is untouched | `src/agent/cursor.rs` `cursor_mcp_notice_once_per_session` |
 | TC-579 | FR-564, UX-561 | integration | `dmuxai serve` with `[todo] jira_base_url` | first GET `/api/state` before any mutation | snapshot has `jira_base_url` | `tests/web_mcp_import.rs` `serve_snapshot_has_jira_base_url_at_startup` |
 | TC-986 | FR-984 | unit | App with the dashboard hub; `push_startup_notice` with a URL containing a fixed token, then a turn | The TUI message list (rendered buffer) contains the token; the JSON of `dashboard_snapshot()` / session view never contains the token, before and after the turn and after switching conversations | `src/app.rs` `dashboard_snapshot_never_contains_startup_token` |
-| TC-987 | FR-984 | integration | `dmuxai --web`-style startup path that registers the token notice; router | `GET /api/state` and the session endpoint with the token as Bearer | Response bodies do not contain the token string | `src/web/server.rs` `api_snapshots_do_not_echo_token` |
+| TC-987 | FR-984 | integration | `dmuxai --web`-style startup path that registers the token notice; router | `GET /api/state` and the session endpoint with the token as Bearer | Response bodies do not contain the token string | `src/app.rs` `api_snapshots_do_not_echo_token` |
 
 ## 6. Data, integration, and safety contracts
 

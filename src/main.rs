@@ -811,7 +811,7 @@ async fn attach_web_dashboard(
             if let (Some((store, _)), Some(receiver)) = (todos, receiver) {
                 app.attach_dashboard_services(store.clone(), receiver);
             }
-            app.push_startup_notice(format!("dmuxai dashboard: {}", server.url));
+            app.push_local_notice(format!("dmuxai dashboard: {}", server.url));
             if let Some(warning) = server.warning.clone() {
                 app.push_startup_notice(warning);
             }
