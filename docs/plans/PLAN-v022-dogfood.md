@@ -18,7 +18,7 @@ Source: dogfooding notes in `docs/reviews/REVIEW-dashboard-full-parity.md` (PR #
 
 ## Risks
 
-- Conflicts with PR #72, which edits the same read loop in `src/agent/custom.rs` and `ParsedLine`. The tracker lives in its own module and `ParsedLine` is not touched; the loop gets one insertion. Rebase onto main if #72 merges first.
+- PR #72 (merged as a5de430) changed the same read loop in `src/agent/custom.rs` (`done_when`, `text_break_when`). The tracker lives in its own module and `ParsedLine` is not touched; the loop gets one insertion. Text breaks after tool calls are #72's FR-916 and are not duplicated.
 - Cancel: the adapter's late `Cancelled` event is dropped today because `cancel_selected` already removed the active turn. The note must not be duplicated if that changes.
 - Token: the notice must stay visible in the TUI. A flag on the message (local-only) is filtered out wherever messages leave the TUI (snapshot, session view, share/context, persistence).
 
