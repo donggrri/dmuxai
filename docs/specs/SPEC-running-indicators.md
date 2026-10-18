@@ -2,7 +2,7 @@
 
 Status: Implemented (v0.2.1)
 Created: 2026-10-17
-Related: Dongjin dogfood 2026-10-17 23:38/23:41 (`dmuxai --web` on Linux: "running state is not clearly visible"; wants a spinner in both TUI and web)
+Related: v0.2.2 dogfood 2026-10-19 (FR-981, FR-982; [PLAN-v022-dogfood](../plans/PLAN-v022-dogfood.md)); Dongjin dogfood 2026-10-17 23:38/23:41 (`dmuxai --web` on Linux: "running state is not clearly visible"; wants a spinner in both TUI and web)
 
 ## 1. Decision summary
 
@@ -27,6 +27,8 @@ It applies to the TUI and the dashboard, and respects `NO_COLOR` and `prefers-re
 | UX-820 | Must | Idle, running, done and failed are told apart by symbol and text, not by color alone. Under `NO_COLOR` the TUI still shows the spinner glyphs and marks | TC-821 |
 | UX-821 | Must | Reduced motion: the TUI accepts `[theme] reduced_motion = true` or `DMUXAI_REDUCED_MOTION=1`, and the web follows `prefers-reduced-motion: reduce`. Either way the spinner becomes a static `●`/`…` running mark while elapsed time still updates | TC-822, TC-823 |
 | NFR-820 | Should | The spinner adds no dashboard publish traffic beyond the existing busy interval. The snapshot carries `started_at`, not frames or elapsed time, so it is identical across ticks while nothing else changes. Frames and elapsed time are rendered client-side | TC-820, TC-823 |
+| FR-981 | Must | Dashboard parity for the activity detail: while an agent is running, `DashboardSnapshot` `agents[].activity` carries the same bounded detail the TUI status bar shows (latest tool or progress line, for example `▸ read src/app.rs`), or null when there is none. The agent chip and the header `Running` pill show it after the elapsed time. It is cleared when the turn ends | TC-982, TC-983 |
+| FR-982 | Must | Cancel notice, all runners: when a running turn is cancelled (TUI Ctrl+C, dashboard cancel, `/api/command cancel`), the visible transcript gets exactly one system line `<agent> turn cancelled.` after the partial reply, in the TUI and in the dashboard transcript. The stored turn status becomes `cancelled`, so reopening the conversation shows the same line. A later `Cancelled` event from the adapter for the same turn adds no second line | TC-984, TC-985 |
 
 ## 3. Tests
 
@@ -37,3 +39,7 @@ It applies to the TUI and the dashboard, and respects `NO_COLOR` and `prefers-re
 | TC-822 | FR-821, UX-821 | unit | busy agent, injected clock | The frame advances with time; reduced motion gives a static mark; there are no redraw ticks while idle | `src/app.rs` `spinner_frames_and_reduced_motion` |
 | TC-823 | FR-823, UX-821, NFR-820 | unit (asset) | index.html, session.js and css assets | Header status pill element, `.spinner` CSS with a `prefers-reduced-motion` override, a client-side elapsed ticker, run-state rendering for chips and the graph node | `src/web/assets.rs` `dashboard_has_run_status_indicators` |
 | TC-824 | FR-823, FR-824 | e2e (ignored, headless Chrome) | demo snapshot with one running agent | Pill reads `Running`; chip has the spinner; title starts with `⏳`; `#favicon` href points at `favicon-running.svg`; screenshot captured | `tests/web_running.rs` `running_indicator_renders_in_headless_chrome` |
+| TC-982 | FR-981 | unit | App with a running agent that received `Activity(Tool)` and then `Completed` | `agents[].activity` is `▸ read src/app.rs` while running and null after completion; the TUI status bar shows the same text | `src/app.rs` `dashboard_agent_activity_matches_tui_status` |
+| TC-983 | FR-981 | unit (asset) | app.js and session.js assets | Chip and status pill render `agent.activity`; `computeAgentsKey` includes it | `src/web/assets.rs` `dashboard_shows_agent_activity_detail` |
+| TC-984 | FR-982 | unit | App for each runner (codex, cursor, agy, custom) with a running turn and partial text, then `cancel_selected`, then the adapter's late `Cancelled` | Exactly one `<agent> turn cancelled.` system message after the partial agent message; the dashboard snapshot transcript has it; the stored turn status is `cancelled` and a reopened conversation shows the line | `src/app.rs` `cancel_appends_one_cancelled_notice_for_every_runner` |
+| TC-985 | FR-982 | unit | App with the dashboard hub, running turn, `SessionCommand::Cancel` | Snapshot transcript ends with the cancelled system line | `src/app.rs` `dashboard_cancel_shows_cancelled_notice` |

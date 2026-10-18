@@ -184,3 +184,16 @@ Root cause (grok 1.0.62): when a shell command outlives `block_until_ms` it move
 | TC-918 | FR-916 | integration | Mock `linger` mode | Run a turn | Streamed text is `Checking\n\nDone.` | `src/agent/custom.rs` `grok_text_after_tool_call_starts_new_paragraph` |
 
 Mock modes added to `tests/fixtures/fake-grok.sh`: `linger`, `orphan`, and `noend`, as described in the script header.
+
+## 10. v0.2.2 dogfood follow-up: tool-call activity
+
+Source: dogfooding grok inside dmuxai on 2026-10-19 (PR #68 review, issue 2). A turn made 83 tool calls and the TUI and dashboard showed only "running" for 3-4 minutes. Plan, tasks and review: [PLAN-v022-dogfood](../plans/PLAN-v022-dogfood.md), [TASKS-v022-dogfood](../tasks/TASKS-v022-dogfood.md), [REVIEW-v022-dogfood](../reviews/REVIEW-v022-dogfood.md).
+
+| ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
+| --- | --- | --- | --- | --- | --- |
+| FR-980 | Must | A built-in grok turn prints streaming-json lines with `/type` `tool_call` (fields `toolCallId`, `toolName`, `kind`, `rawInput`) or `tool_call_update` (fields `toolCallId`, `status`). | Each `tool_call` emits `AgentEvent::Activity(ActivityItem::Tool)` with status `Running`, the same event other runners (agy, cursor) use, so the TUI activity row, TUI status detail and dashboard transcript all show it. `name` is a short verb from `kind`: `read`→`read`, `edit`→`edit`, `write`→`write`, `execute`→`run`, `search`→`search`, `list`→`list`, `plan`→`todo`, otherwise the `toolName`. `target` is the first non-empty of `rawInput` `target_file`, `file_path`, `target_directory`, `command`, `pattern`, `query`, `url`, with the workspace prefix stripped, made single-line, and cut to 80 chars with `…`. `detail` is the pretty `rawInput`, cut to 4 KiB. A `tool_call_update` with `status` `completed` or `failed` emits the same tool with `Ok` or `Failed` and the duration since its `tool_call`. | Updates with `status` null or `in_progress`, unknown `toolCallId`s, malformed lines and other types emit nothing. Tool lines never add reply text or change the session id (FR-893 unchanged). User-configured custom agents are not affected. | TC-980, TC-981 |
+
+| ID | Requirement | Level | Fixture | Oracle | Test |
+| --- | --- | --- | --- | --- | --- |
+| TC-980 | FR-980 | unit | Saved grok `tool_call`/`tool_call_update` lines: read, execute, edit with a large `rawInput`, unknown kind, failed, in-progress, unknown id, malformed | Tracker output | Read gives `read src/app.rs` (workspace prefix stripped); execute gives `run cargo test`; long command cut to 80 chars with `…`; detail ≤ 4 KiB; completed → `Ok` with a duration, failed → `Failed`; in-progress, unknown id and malformed give nothing | `src/grok_activity.rs` `grok_tool_lines_map_to_activity_items` |
+| TC-981 | FR-980 | integration (unix) | `fake-grok.sh` mode that prints a `tool_call`, its `completed` update, then text and `end` | Run one turn through `CustomAdapter` | The events contain a running then an ok `Activity(Tool)` for the call before `Completed`; the reply text is unchanged | `src/agent/custom.rs` `grok_tool_calls_emit_activity_events` |
