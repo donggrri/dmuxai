@@ -200,6 +200,9 @@ enum Role {
 struct Message {
     role: Role,
     content: String,
+    /// Shown in the TUI only. Dashboard snapshots, HTTP payloads, headless
+    /// output, and agent context skip these messages (FR-984).
+    local_only: bool,
 }
 
 impl Message {
@@ -207,8 +210,34 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            local_only: false,
         }
     }
+
+    fn local_only(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            local_only: true,
+        }
+    }
+}
+
+/// First-session help. Runners follow adapter / picker order (FR-983).
+fn welcome_message(runners: &[String]) -> String {
+    format!(
+        "Runners: {}. Completed turns are shared automatically with every agent; /share is optional. If another DmuxAI window is already running in this workspace, this window starts a separate conversation. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /image to attach screenshots, /effort to choose Codex reasoning effort, /status to view Codex usage, /quit to exit, F2 to choose a model, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
+        runners.join(", ")
+    )
+}
+
+/// Empty-conversation help after a switch. Same runner list, F3 instead of the
+/// new-window /image /quit notes (FR-983).
+fn restored_welcome_message(runners: &[String]) -> String {
+    format!(
+        "Runners: {}. Completed turns are shared automatically with every agent; /share is optional. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /effort to choose Codex reasoning effort, /status to view Codex usage, F2 to choose a model, F3 to load a conversation, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
+        runners.join(", ")
+    )
 }
 
 #[derive(Default)]
@@ -997,10 +1026,7 @@ impl App {
             settings,
             pending_images: ImageAttachmentStore::new(),
             input: String::new(),
-            messages: vec![Message::new(
-                Role::System,
-                "Codex, Cursor, and AGY use real structured headless protocols. Completed turns are shared automatically with every agent; /share is optional. If another DmuxAI window is already running in this workspace, this window starts a separate conversation. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /image to attach screenshots, /effort to choose Codex reasoning effort, /status to view Codex usage, /quit to exit, F2 to choose a model, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
-            )],
+            messages: Vec::new(),
             adapters,
             event_rx,
             workers,
@@ -1079,6 +1105,9 @@ impl App {
             switch_pending: None,
             switch_ready: None,
         };
+        let runners = app.registered_runner_names();
+        app.messages
+            .push(Message::new(Role::System, welcome_message(&runners)));
         app.restore_snapshot(snapshot);
         Ok(app)
     }
@@ -1577,7 +1606,10 @@ impl App {
         let messages = self.messages[start..]
             .iter()
             .enumerate()
+            .filter(|(_, message)| !message.local_only)
             .map(|(offset, message)| {
+                // Ids stay the index in `self.messages`, so a local-only notice
+                // does not shift streaming updates (FR-984).
                 let index = start + offset;
                 let (role, agent, content) = match &message.role {
                     Role::User => ("user", None, message.content.clone()),
@@ -3180,7 +3212,28 @@ impl App {
         }
 
         if was_tracking {
-            self.finish_turn_outcome_with_error(agent, false, Some("cancelled".to_owned()));
+            // Record the terminal status before dropping the active turn. A later
+            // adapter `Cancelled` then finds no match and cannot add a second line.
+            // Summary runs are busy without an active turn and keep their own notice.
+            if let Some(active) = self.active_turns.get(&agent).cloned() {
+                let stored_output = TurnOutput {
+                    conversation_id: active.conversation_id.clone(),
+                    turn_id: active.turn_id.clone(),
+                    agent: agent_key(agent),
+                    event: TurnEvent::Cancelled,
+                };
+                if let Err(error) = self.engine.record_turn_outputs(&[stored_output]) {
+                    self.show_conversation_notice(
+                        &active.conversation_id,
+                        format!("Could not save {agent} output: {error}"),
+                    );
+                }
+                let conversation_id = active.conversation_id;
+                self.finish_turn_outcome_with_error(agent, false, Some("cancelled".to_owned()));
+                self.show_conversation_notice(&conversation_id, format!("{agent} turn cancelled."));
+            } else {
+                self.finish_turn_outcome_with_error(agent, false, Some("cancelled".to_owned()));
+            }
         }
     }
 
@@ -3257,9 +3310,10 @@ impl App {
             }
         }
         if self.messages.is_empty() {
+            let runners = self.registered_runner_names();
             self.messages.push(Message::new(
                 Role::System,
-                "Codex, Cursor, and AGY use real structured headless protocols. Completed turns are shared automatically with every agent; /share is optional. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /effort to choose Codex reasoning effort, /status to view Codex usage, F2 to choose a model, F3 to load a conversation, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
+                restored_welcome_message(&runners),
             ));
         }
         self.chat_scroll = 0;
@@ -3291,7 +3345,8 @@ impl App {
             .messages
             .iter()
             .filter(|message| {
-                message.role != Role::System
+                !message.local_only
+                    && message.role != Role::System
                     && !matches!(message.role, Role::Activity(_))
                     && !message
                         .content
@@ -3763,6 +3818,7 @@ impl App {
             && let Some(Message {
                 role: Role::Agent(message_agent),
                 content,
+                ..
             }) = self.messages.get_mut(index)
             && *message_agent == agent
         {
@@ -4431,6 +4487,13 @@ impl App {
         self.push_system(content);
     }
 
+    /// TUI-only notice. The dashboard URL (with `?token=`) uses this so the
+    /// secret never enters snapshots, HTTP bodies, or the conversation store.
+    pub fn push_local_notice(&mut self, content: impl Into<String>) {
+        self.messages
+            .push(Message::local_only(Role::System, content));
+    }
+
     pub fn mcp_registry(&self) -> Arc<McpRegistry> {
         Arc::clone(&self.mcp_registry)
     }
@@ -4535,6 +4598,13 @@ impl App {
             .get(usize::from(index))
             .cloned()
             .or_else(|| dmuxai::custom_agent::spec_at(index).cloned())
+    }
+
+    fn registered_runner_names(&self) -> Vec<String> {
+        self.adapters
+            .iter()
+            .map(|adapter| self.agent_runner_name(adapter.agent()))
+            .collect()
     }
 
     pub(crate) fn agent_runner_name(&self, agent: Agent) -> String {
@@ -4705,6 +4775,11 @@ impl App {
                         .and_then(|catalog| catalog.selected.clone()),
                     color: dmuxai::theme::color_hex(color),
                     run: Some(self.run_state(agent).to_view()),
+                    // Cleared when the turn ends and the activity record is removed.
+                    activity: self
+                        .activities
+                        .get(&agent)
+                        .and_then(|activity| activity.detail.clone()),
                 }
             })
             .collect();
@@ -4999,6 +5074,9 @@ impl App {
 
         let mut mapped_messages = Vec::new();
         for msg in &self.messages[start_msg_count..] {
+            if msg.local_only {
+                continue;
+            }
             match &msg.role {
                 Role::User => mapped_messages.push(HeadlessMessage {
                     role: "user".to_owned(),
@@ -5051,7 +5129,7 @@ impl App {
         let last_system_error = self.messages[start_msg_count..]
             .iter()
             .rev()
-            .find(|m| m.role == Role::System)
+            .find(|m| m.role == Role::System && !m.local_only)
             .map(|m| m.content.clone());
 
         let (ok, exit_code, error) = if cancelled {
@@ -9590,6 +9668,60 @@ mod tests {
     }
 
     #[test]
+    // TC-982 / FR-981: dashboard activity matches the TUI status-bar detail.
+    fn dashboard_agent_activity_matches_tui_status() {
+        let (mut app, sent) = test_app();
+        let hub =
+            dmuxai::web::DashboardHub::new(dmuxai::web::SnapshotSource::Tui, "/test".to_owned());
+        app.attach_dashboard(hub.clone());
+        app.input = "read the app".to_owned();
+        app.submit_prompt();
+        let request = sent.lock().unwrap()[0].1.clone();
+
+        let output = |event| AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(request.conversation_id.clone()),
+            turn_id: Some(request.turn_id.clone()),
+            event,
+        };
+        assert!(app.apply_agent_output(output(AgentEvent::Started)));
+        assert!(app.apply_agent_output(output(AgentEvent::Activity(
+            dmuxai::activity::ActivityItem::Tool {
+                name: "read".to_owned(),
+                target: "src/app.rs".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            },
+        ))));
+
+        app.publish_dashboard();
+        let running = hub
+            .snapshot()
+            .agents
+            .into_iter()
+            .find(|agent| agent.id == "codex")
+            .expect("codex agent");
+        assert_eq!(running.activity.as_deref(), Some("▸ read src/app.rs"));
+
+        let rendered = render_text_at(&mut app, 320, 24);
+        assert!(
+            rendered.contains("▸ read src/app.rs"),
+            "TUI status bar missing activity detail:\n{rendered}"
+        );
+
+        assert!(app.apply_agent_output(output(AgentEvent::Completed)));
+        app.publish_dashboard();
+        let finished = hub
+            .snapshot()
+            .agents
+            .into_iter()
+            .find(|agent| agent.id == "codex")
+            .expect("codex agent");
+        assert_eq!(finished.activity, None);
+    }
+
+    #[test]
     fn enqueue_failure_is_durable_and_restores_the_input() {
         let workspace = std::env::current_dir().unwrap();
         let engine =
@@ -10689,6 +10821,158 @@ mod tests {
         assert!(!app.busy_agents.contains(&Agent::Codex));
     }
 
+    // TC-984 (FR-982): cancel writes one notice for every runner, and a late
+    // adapter Cancelled does not write a second one.
+    #[test]
+    fn cancel_appends_one_cancelled_notice_for_every_runner() {
+        // First install wins process-wide; the other test installs the same grok preset.
+        let _ =
+            dmuxai::custom_agent::install_registry(vec![dmuxai::custom_agent::grok_preset("grok")]);
+        assert!(dmuxai::custom_agent::index_of("grok").is_some());
+        let (mut app, sent) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/test-workspace".to_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+        let (_tx, rx) = mpsc::channel(4);
+        app.dashboard_commands = Some(rx);
+
+        let agents: Vec<Agent> = app.adapters.iter().map(|adapter| adapter.agent()).collect();
+        assert!(agents.contains(&Agent::Codex));
+        assert!(agents.contains(&Agent::Cursor));
+        assert!(agents.contains(&Agent::Agy));
+        assert!(agents.iter().any(|agent| matches!(agent, Agent::Custom(_))));
+
+        for agent in agents {
+            app.create_conversation(Some(format!("cancel {agent}")));
+            let (conversation_id, turn_id) = start_partial_turn(&mut app, &sent, agent);
+            let notice = format!("{agent} turn cancelled.");
+            app.cancel_selected();
+
+            let notice_at = system_message_positions(&app, &notice);
+            assert_eq!(notice_at.len(), 1, "{agent}");
+            let partial_at = app
+                .messages
+                .iter()
+                .position(|message| {
+                    message.role == Role::Agent(agent) && message.content == partial_text(agent)
+                })
+                .unwrap_or_else(|| panic!("{agent} partial reply missing"));
+            assert!(partial_at < notice_at[0], "{agent}");
+
+            assert!(
+                !app.apply_agent_output(AgentOutput {
+                    agent,
+                    conversation_id: Some(conversation_id.clone()),
+                    turn_id: Some(turn_id.clone()),
+                    event: AgentEvent::Cancelled,
+                }),
+                "{agent} late Cancelled should be ignored"
+            );
+            assert_eq!(system_message_positions(&app, &notice).len(), 1, "{agent}");
+
+            let stored = app
+                .engine
+                .select(ConversationSelection::Existing(app.conversation_id.clone()))
+                .unwrap();
+            assert_eq!(
+                stored
+                    .turns
+                    .iter()
+                    .find(|turn| turn.id.as_str() == turn_id.as_str())
+                    .unwrap()
+                    .status,
+                TurnStatus::Cancelled,
+                "{agent}"
+            );
+
+            app.publish_dashboard();
+            let snapshot = hub.snapshot();
+            let transcript = snapshot
+                .session
+                .as_ref()
+                .expect("dashboard session")
+                .transcript
+                .as_slice();
+            assert_eq!(transcript.last().unwrap().role, "system", "{agent}");
+            assert_eq!(transcript.last().unwrap().content, notice, "{agent}");
+
+            let reopened_id = app.conversation_id.clone();
+            app.create_conversation(Some(format!("away {agent}")));
+            app.select_conversation(StoredConversationId::new(reopened_id.as_str()));
+            assert_eq!(system_message_positions(&app, &notice).len(), 1, "{agent}");
+            assert!(
+                app.messages.iter().any(|message| {
+                    message.role == Role::Agent(agent) && message.content == partial_text(agent)
+                }),
+                "{agent} partial missing after reopen"
+            );
+        }
+
+        // Adapter-reported Cancelled, with no cancel_selected, is still one line.
+        app.create_conversation(Some("adapter cancel".to_owned()));
+        let agent = Agent::Codex;
+        let (conversation_id, turn_id) = start_partial_turn(&mut app, &sent, agent);
+        let notice = format!("{agent} turn cancelled.");
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(conversation_id.clone()),
+            turn_id: Some(turn_id.clone()),
+            event: AgentEvent::Cancelled,
+        }));
+        assert_eq!(system_message_positions(&app, &notice).len(), 1);
+        assert!(!app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(conversation_id),
+            turn_id: Some(turn_id),
+            event: AgentEvent::Cancelled,
+        }));
+        assert_eq!(system_message_positions(&app, &notice).len(), 1);
+    }
+
+    fn partial_text(agent: Agent) -> String {
+        format!("partial {agent}")
+    }
+
+    fn system_message_positions(app: &App, notice: &str) -> Vec<usize> {
+        app.messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                (message.role == Role::System && message.content == notice).then_some(index)
+            })
+            .collect()
+    }
+
+    fn start_partial_turn(
+        app: &mut App,
+        sent: &SentRequests,
+        agent: Agent,
+    ) -> (ConversationId, TurnId) {
+        app.selected = app
+            .adapters
+            .iter()
+            .position(|adapter| adapter.agent() == agent)
+            .unwrap_or_else(|| panic!("{agent} has no adapter"));
+        let before = sent.lock().unwrap().len();
+        app.input = format!("prompt {agent}");
+        app.submit_prompt();
+        let request = sent.lock().unwrap()[before].1.clone();
+        let conversation_id = request.conversation_id;
+        let turn_id = request.turn_id;
+        assert!(
+            app.apply_agent_output(AgentOutput {
+                agent,
+                conversation_id: Some(conversation_id.clone()),
+                turn_id: Some(turn_id.clone()),
+                event: AgentEvent::TextDelta(partial_text(agent)),
+            }),
+            "{agent}"
+        );
+        (conversation_id, turn_id)
+    }
+
     #[test]
     fn errors_become_visible_system_messages() {
         let (mut app, _) = test_app();
@@ -11157,7 +11441,7 @@ mod tests {
             .chat_selection
             .expect("drag should create a selection")
             .text(&app.visible_chat_lines);
-        assert_eq!(selected, "Codex");
+        assert_eq!(selected, "Runne");
         assert!(app.selection_dragged);
     }
 
@@ -12968,6 +13252,63 @@ mod tests {
         assert_eq!(app.selected, selected);
     }
 
+    // TC-985 (FR-982): dashboard cancel ends the session transcript with one notice.
+    #[test]
+    fn dashboard_cancel_shows_cancelled_notice() {
+        let (mut app, sent, hub) = web_app();
+        app.input = "cancel from dashboard".to_owned();
+        app.submit_prompt();
+        let request = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(request.conversation_id.clone()),
+            turn_id: Some(request.turn_id.clone()),
+            event: AgentEvent::TextDelta("partial reply".to_owned()),
+        }));
+
+        let session = app
+            .handle_session_command(SessionCommand::Cancel {
+                agent: Some("codex".to_owned()),
+            })
+            .unwrap();
+        let partial_at = session
+            .transcript
+            .iter()
+            .position(|message| message.role == "agent" && message.content == "partial reply")
+            .expect("partial agent reply");
+        let last = session.transcript.last().unwrap();
+        assert_eq!(last.role, "system");
+        assert_eq!(last.content, "Codex turn cancelled.");
+        assert!(partial_at < session.transcript.len() - 1);
+        assert_eq!(
+            session
+                .transcript
+                .iter()
+                .filter(|message| message.content == "Codex turn cancelled.")
+                .count(),
+            1
+        );
+
+        assert!(!app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(request.conversation_id),
+            turn_id: Some(request.turn_id),
+            event: AgentEvent::Cancelled,
+        }));
+        app.publish_dashboard();
+        let snapshot = hub.snapshot();
+        let transcript = &snapshot.session.expect("dashboard session").transcript;
+        assert_eq!(transcript.last().unwrap().role, "system");
+        assert_eq!(transcript.last().unwrap().content, "Codex turn cancelled.");
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|message| message.content == "Codex turn cancelled.")
+                .count(),
+            1
+        );
+    }
+
     // TC-784 (FR-781): new and load conversation switch the active conversation.
     #[test]
     fn dashboard_new_and_load_conversation() {
@@ -13971,6 +14312,262 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn app_with_runner_agents(agents: Vec<Agent>, settings: DmuxSettings) -> App {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let adapters = agents
+            .into_iter()
+            .map(|agent| {
+                Box::new(RecordingAdapter {
+                    agent,
+                    sent: Arc::clone(&sent),
+                    cancelled: Arc::clone(&cancelled),
+                    fail_send: false,
+                    unsupported_mode: None,
+                }) as Box<dyn AgentAdapter>
+            })
+            .collect();
+        let (event_tx, event_rx) = event_channel();
+        drop(event_tx);
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            workspace,
+            settings,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        app.selected = adapter_index(Agent::Codex);
+        app
+    }
+
+    // TC-816 (FR-983): the welcome line names adapters in picker order.
+    #[test]
+    fn welcome_lists_registered_runners() {
+        let mut with_custom = DmuxSettings::default();
+        with_custom.custom_agents = vec![
+            dmuxai::custom_agent::opencode_preset("opencode"),
+            dmuxai::custom_agent::grok_preset("grok"),
+        ];
+        let mut agents = Agent::BUILTIN.to_vec();
+        agents.push(Agent::Custom(0));
+        agents.push(Agent::Custom(1));
+        let app = app_with_runner_agents(agents, with_custom);
+        let first = &app.messages[0].content;
+        let listed = "Runners: cursor, agy, codex, opencode, grok.";
+        assert!(first.starts_with(listed), "{first}");
+        assert!(first.contains("F3 to load a conversation"), "{first}");
+        assert!(first.contains("/agent"), "{first}");
+        assert!(first.contains("/mode"), "{first}");
+        assert!(first.contains("Implement mode"), "{first}");
+        assert!(
+            first.contains("Completed turns are shared automatically"),
+            "{first}"
+        );
+        assert!(!first.contains("Codex, Cursor, and AGY use"), "{first}");
+        assert!(!first.contains("structured headless protocols"), "{first}");
+
+        let startup = welcome_message(&app.registered_runner_names());
+        assert!(startup.starts_with(listed), "{startup}");
+        assert!(
+            startup.contains("this window starts a separate conversation"),
+            "{startup}"
+        );
+        assert!(startup.contains("/image"), "{startup}");
+        assert!(startup.contains("/quit"), "{startup}");
+        assert!(startup.contains("F2 to choose a model"), "{startup}");
+        assert!(startup.contains("Ctrl+C"), "{startup}");
+
+        let plain = app_with_runner_agents(Agent::BUILTIN.to_vec(), DmuxSettings::default());
+        let plain_first = &plain.messages[0].content;
+        assert!(
+            plain_first.starts_with("Runners: cursor, agy, codex."),
+            "{plain_first}"
+        );
+        assert!(!plain_first.contains("grok"), "{plain_first}");
+        assert!(!plain_first.contains("opencode"), "{plain_first}");
+        assert!(
+            !plain_first.contains("Codex, Cursor, and AGY use"),
+            "{plain_first}"
+        );
+    }
+
+    fn assert_snapshot_omits_token(app: &mut App, hub: &dmuxai::web::DashboardHub, token: &str) {
+        app.publish_dashboard();
+        let session = serde_json::to_string(&app.session_view()).unwrap();
+        assert!(!session.contains(token), "{session}");
+        let snapshot = serde_json::to_string(&hub.snapshot()).unwrap();
+        assert!(!snapshot.contains(token), "{snapshot}");
+    }
+
+    // TC-986 (FR-984): the dashboard URL stays on the TUI and out of snapshots.
+    #[test]
+    fn dashboard_snapshot_never_contains_startup_token() {
+        const TOKEN: &str = "tc986-token-9f3a7c";
+        let (mut app, _sent, hub) = web_app();
+        app.push_startup_notice("ordinary startup notice".to_owned());
+        app.push_local_notice(format!(
+            "dmuxai dashboard: http://127.0.0.1:7420/?token={TOKEN}"
+        ));
+
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.content.contains(TOKEN))
+        );
+        let rendered = render_text_at(&mut app, 160, 40);
+        assert!(rendered.contains(TOKEN), "{rendered}");
+        assert_snapshot_omits_token(&mut app, &hub, TOKEN);
+        let snapshot = serde_json::to_string(&hub.snapshot()).unwrap();
+        assert!(snapshot.contains("ordinary startup notice"), "{snapshot}");
+
+        app.settings.graph_enabled = false;
+        app.input = "hello from the turn".to_owned();
+        app.submit_prompt();
+        app.append_delta(Agent::Codex, "partial reply".to_owned());
+        let user_at = app
+            .messages
+            .iter()
+            .position(|message| message.content == "hello from the turn")
+            .unwrap();
+        let agent_at = app
+            .messages
+            .iter()
+            .position(|message| message.content == "partial reply")
+            .unwrap();
+        assert!(user_at > 1, "local notice should keep its own slot");
+        let session = app.session_view();
+        let user = session
+            .transcript
+            .iter()
+            .find(|message| message.content == "hello from the turn")
+            .unwrap();
+        assert_eq!(user.id, format!("{}:{user_at}", app.conversation_id));
+        let agent = session
+            .transcript
+            .iter()
+            .find(|message| message.role == "agent")
+            .unwrap();
+        assert!(agent.streaming);
+        assert_eq!(agent.id, format!("{}:{agent_at}", app.conversation_id));
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.content.contains(TOKEN))
+        );
+        let rendered = render_text_at(&mut app, 160, 40);
+        assert!(rendered.contains(TOKEN), "{rendered}");
+        assert_snapshot_omits_token(&mut app, &hub, TOKEN);
+
+        let original = app.conversation_id.clone();
+        app.create_conversation(Some("switched away".to_owned()));
+        assert_snapshot_omits_token(&mut app, &hub, TOKEN);
+        app.select_conversation(original);
+        assert!(
+            app.messages
+                .iter()
+                .all(|message| !message.content.contains(TOKEN))
+        );
+        assert_snapshot_omits_token(&mut app, &hub, TOKEN);
+    }
+
+    // TC-987 (FR-984): `/api/state` and `POST /api/command` (session body) omit the token.
+    #[tokio::test]
+    async fn api_snapshots_do_not_echo_token() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        const TOKEN: &str = "tc987-startup-secret";
+        let bearer = "bearer-for-tc987";
+        let (mut app, _sent, hub) = web_app();
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        app.dashboard_commands = Some(cmd_rx);
+        app.push_local_notice(format!(
+            "dmuxai dashboard: http://127.0.0.1:7420/?token={TOKEN}"
+        ));
+        app.publish_dashboard();
+
+        let router = dmuxai::web::build_router_with(
+            hub,
+            bearer.to_owned(),
+            Some(vec!["localhost:7420".to_owned()]),
+            dmuxai::web::DashboardServices {
+                commands: Some(cmd_tx),
+                web_attached: true,
+                ..dmuxai::web::DashboardServices::default()
+            },
+        );
+
+        let state_response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/state")
+                    .header("Host", "localhost:7420")
+                    .header("Authorization", format!("Bearer {bearer}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state_response.status(), axum::http::StatusCode::OK);
+        let state_body = String::from_utf8(
+            state_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(state_body.contains("\"session\""));
+        assert!(!state_body.contains(TOKEN), "{state_body}");
+
+        let session_router = router.clone();
+        let session_response = tokio::spawn(async move {
+            session_router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/command")
+                        .header("Host", "localhost:7420")
+                        .header("Content-Type", "application/json")
+                        .header("Authorization", format!("Bearer {bearer}"))
+                        .body(axum::body::Body::from(r#"{"command":"toggle_details"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !session_response.is_finished() && std::time::Instant::now() < deadline {
+            app.drain_dashboard_commands();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let session_response = session_response.await.unwrap();
+        assert_eq!(session_response.status(), axum::http::StatusCode::OK);
+        let session_body = String::from_utf8(
+            session_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(session_body.contains("\"session\""));
+        assert!(!session_body.contains(TOKEN), "{session_body}");
     }
 }
 

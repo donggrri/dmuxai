@@ -193,6 +193,11 @@ pub struct AgentView {
     pub color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunStateView>,
+    /// Bounded activity detail the TUI status bar shows while the turn is
+    /// running (FR-981), for example `▸ read src/app.rs`. `None` when the
+    /// agent has no live detail, including after the turn ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,6 +488,7 @@ mod tests {
                 model: Some("o3-mini".to_string()),
                 color: None,
                 run: None,
+                activity: None,
             }],
             graph: Some(view),
             todos: Vec::new(),

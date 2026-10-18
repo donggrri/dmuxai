@@ -379,6 +379,16 @@ h1.brand {
 .run-status-failed { color: var(--err); border-color: var(--err); }
 .run-status-cancelled { color: var(--muted); border-color: var(--line); }
 
+/* FR-981: activity suffix on the running pill. Color is inherited, so the
+   same ellipsis works in the light and dark palettes. */
+.run-status-activity {
+  max-width: 28ch;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @keyframes spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }

@@ -1714,6 +1714,7 @@ function computeAgentsKey(list) {
       a.busy ? 1 : 0,
       a.phase,
       a.model,
+      a.activity,
       r.state,
       r.started_at_ms,
       r.ended_at_ms,
@@ -1773,6 +1774,7 @@ function renderAgents(agents, nowMs) {
     }
     if (agent.phase) { bits.push(String(agent.phase)); }
     if (agent.model) { bits.push(String(agent.model)); }
+    if (agent.activity) { bits.push(String(agent.activity)); }
     if (bits.length > 0) {
       var detail = bits.join(' \u00b7 ');
       chip.appendChild(el('span', 'chip-meta', detail));
@@ -2701,19 +2703,20 @@ function updateRunStatus(snap, nowMs) {
   var runningAgents = getRunningAgents(snap);
 
   if (runningAgents.length > 0) {
-    var first = runningAgents[0];
-    var firstLabel = first.label || first.id || 'agent';
+    var agent = runningAgents[0];
+    var firstLabel = agent.label || agent.id || 'agent';
     var agentText = runningAgents.length > 1
       ? firstLabel + ' +' + (runningAgents.length - 1)
       : firstLabel;
+    var activityText = agent.activity ? String(agent.activity) : '';
 
     var elapsedStr = '0s';
-    if (first.run && typeof first.run.started_at_ms === 'number') {
-      var ms = runElapsedMs(first.run, nowMs);
+    if (agent.run && typeof agent.run.started_at_ms === 'number') {
+      var ms = runElapsedMs(agent.run, nowMs);
       elapsedStr = fmtElapsed(ms) || '0s';
     }
 
-    var statusKey = 'running:' + agentText;
+    var statusKey = 'running:' + agentText + ':' + activityText;
     if (lastRunStatusKey === statusKey && pill.classList.contains('run-status-running')) {
       var textEl = pill.querySelector('.run-status-text');
       if (textEl) {
@@ -2727,6 +2730,9 @@ function updateRunStatus(snap, nowMs) {
     pill.replaceChildren();
     pill.appendChild(el('span', 'spinner'));
     pill.appendChild(el('span', 'run-status-text', 'Running \u00b7 ' + agentText + ' \u00b7 ' + elapsedStr));
+    if (activityText) {
+      pill.appendChild(el('span', 'run-status-activity', ' \u00b7 ' + activityText));
+    }
   } else {
     var lastEnded = getMostRecentEndedRun(snap);
     var statusKey = 'idle';

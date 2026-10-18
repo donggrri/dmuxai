@@ -962,6 +962,44 @@ mod tests {
         assert!(APP_JS.contains("cancelled"));
     }
 
+    #[test]
+    // TC-983 / FR-981: dashboard_shows_agent_activity_detail
+    fn dashboard_shows_agent_activity_detail() {
+        let key_at = APP_JS
+            .find("function computeAgentsKey")
+            .expect("computeAgentsKey");
+        let render_at = APP_JS.find("function renderAgents").expect("renderAgents");
+        let status_at = APP_JS
+            .find("function updateRunStatus")
+            .expect("updateRunStatus");
+        let tab_at = APP_JS
+            .find("function updateTabTitle")
+            .expect("updateTabTitle");
+        assert!(key_at < render_at && render_at < status_at && status_at < tab_at);
+
+        let key_body = &APP_JS[key_at..render_at];
+        assert!(
+            key_body.contains("a.activity"),
+            "computeAgentsKey must include a.activity"
+        );
+
+        let chip_body = &APP_JS[render_at..status_at];
+        assert!(
+            chip_body.contains("agent.activity"),
+            "agent chip must render agent.activity"
+        );
+
+        let pill_body = &APP_JS[status_at..tab_at];
+        assert!(
+            pill_body.contains("agent.activity"),
+            "run-status pill must render agent.activity"
+        );
+        assert!(pill_body.contains("run-status-activity"));
+        assert!(pill_body.contains("textContent"));
+        assert!(!pill_body.contains("innerHTML"));
+        assert!(APP_CSS.contains(".run-status-activity"));
+    }
+
     // TC-850: prompt_centering_assets (SPEC-centered-prompt FR-850, UX-850)
     #[test]
     fn prompt_centering_assets() {

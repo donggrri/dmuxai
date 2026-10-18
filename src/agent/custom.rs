@@ -475,6 +475,8 @@ async fn run_turn(
     let mut jsonl_error: Option<String> = None;
     let mut bound_session: Option<String> = None;
     let mut break_pending = false;
+    let mut grok_tools = dmuxai::custom_agent::is_builtin_grok(spec)
+        .then(|| dmuxai::grok_activity::GrokToolTracker::new(cwd));
     let mut done = false;
     let mut lines = BufReader::new(stdout).lines();
     let pgid_value = || pgid.load(std::sync::atomic::Ordering::SeqCst);
@@ -487,6 +489,11 @@ async fn run_turn(
                     send(event_tx, agent, Some(context), AgentEvent::TextDelta(chunk)).await;
                 }
                 CustomAgentOutput::Jsonl => {
+                    if let Some(tracker) = grok_tools.as_mut()
+                        && let Some(item) = tracker.observe(&line)
+                    {
+                        send(event_tx, agent, Some(context), AgentEvent::Activity(item)).await;
+                    }
                     let parsed = parse_jsonl_line(spec, &line);
                     if let Some(session) = parsed.session_id
                         && bound_session.as_deref() != Some(session.as_str())
@@ -1260,6 +1267,58 @@ temp_config_template = '{"mcp": "not-an-object"}'
         events
             .iter()
             .any(|event| matches!(event, AgentEvent::Completed))
+    }
+
+    // TC-981 / FR-980
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_tool_calls_emit_activity_events() {
+        let spec = grok_spec(&[("GROK_FAKE_MODE", "tools")]);
+        let (tx, mut rx, worker) = drive(spec).await;
+        tx.send(CustomCommand::Send(request("read src/app.rs", None)))
+            .await
+            .unwrap();
+        let events = until_terminal(&mut rx).await;
+        let tools: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                    name,
+                    target,
+                    status,
+                    ..
+                }) => Some((name.as_str(), target.as_str(), *status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tools,
+            vec![
+                ("read", "src/app.rs", dmuxai::activity::ToolStatus::Running),
+                ("read", "src/app.rs", dmuxai::activity::ToolStatus::Ok),
+            ],
+            "{events:?}"
+        );
+        let completed_at = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Completed))
+            .expect("completed");
+        assert!(
+            events.iter().rposition(|event| {
+                matches!(
+                    event,
+                    AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool { .. })
+                )
+            }) < Some(completed_at),
+            "{events:?}"
+        );
+        // FR-916 adds "\n\n" only when a break is pending and the reply is
+        // already non-empty. The tool_call precedes the first text, so the
+        // streamed reply is "OK" with no leading break.
+        assert_eq!(texts(&events), "OK");
+        assert!(completed(&events));
+        drop(tx);
+        worker.await.unwrap();
     }
 
     #[cfg(target_os = "linux")]

@@ -71,6 +71,26 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
+- **grok tool calls show as activity (SPEC-grok-runner FR-980).** grok's
+  streaming-json `tool_call` / `tool_call_update` lines now become activity
+  rows (`▸ read src/app.rs`, `▸ run cargo test ✓ 4.2s`) and the TUI status
+  detail, the same way agy and cursor tools do. A long grok turn no longer
+  shows only "running".
+- **Dashboard shows the live activity (SPEC-running-indicators FR-981).**
+  `agents[].activity` carries the TUI status detail; the agent chip and the
+  `Running` pill show it while the turn runs.
+- **Cancelled turns are marked (SPEC-running-indicators FR-982).** After a
+  cancel (Ctrl+C, dashboard Cancel, `/api/command cancel`) the transcript gets
+  one `<agent> turn cancelled.` line after the partial reply, for every runner,
+  and the stored turn is `cancelled`. Before, the adapter's late `Cancelled`
+  event was dropped and no line appeared.
+- **Welcome text lists the registered runners (SPEC-first-run FR-983)**, for
+  example `Runners: cursor, agy, codex, grok.`, instead of a hardcoded
+  "Codex, Cursor, and AGY".
+- **The dashboard token stays in the TUI (SPEC-web-dashboard FR-984).** The
+  `dmuxai dashboard: http://…/?token=…` notice is TUI-only; it is no longer in
+  dashboard snapshots, `/api/state`, SSE, headless output or agent context.
+
 - **grok turns no longer hang after the final reply (SPEC-grok-runner FR-913..FR-916).**
   In grok 1.0.62, a background command that finished during a turn queued an
   auto-wake prompt that headless `grok -p` never ran, so the process idled
