@@ -6277,7 +6277,46 @@ impl App {
 
     fn draw_conversation_picker(&self, frame: &mut Frame, picker: &ConversationPicker) {
         let height = (picker.conversations.len() as u16 + 2).clamp(5, 18);
-        let area = centered_fixed_rect(76, height, frame.area());
+        // FR-865: split each row into prefix, title and suffix so only the title is shortened.
+        let rows = picker
+            .conversations
+            .iter()
+            .map(|card| {
+                let current = if card.id == self.conversation_id {
+                    "*"
+                } else {
+                    " "
+                };
+                let agent = card
+                    .last_agent
+                    .map(|agent| self.agent_key_display_name(agent))
+                    .unwrap_or_else(|| "none".to_owned());
+                // FR-864: the running mark leads the row so a narrow picker never cuts it off.
+                let running = if card.running { "● running  " } else { "" };
+                let prefix = format!("{current} {running}");
+                let suffix = format!(
+                    "  [{}]  {} turns  {agent}  {}",
+                    short_id(card.id.as_str()),
+                    card.turn_count,
+                    updated_description(card.updated_at_ms),
+                );
+                (prefix, card.title.clone(), suffix)
+            })
+            .collect::<Vec<_>>();
+        let natural = rows
+            .iter()
+            .map(|(prefix, title, suffix)| {
+                UnicodeWidthStr::width(prefix.as_str())
+                    + UnicodeWidthStr::width(title.as_str())
+                    + UnicodeWidthStr::width(suffix.as_str())
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(PICKER_CHROME_WIDTH as usize)
+            .min(u16::MAX as usize) as u16;
+        let width = conversation_picker_width(frame.area().width, natural);
+        let area = centered_fixed_rect(width, height, frame.area());
+        let inner_width = width.saturating_sub(PICKER_CHROME_WIDTH) as usize;
         let colors = self.colors_enabled();
         let border = if colors {
             self.settings.theme.border
@@ -6305,28 +6344,13 @@ impl App {
             frame.render_widget(Block::default().style(Style::default().bg(bg)), area);
         }
 
-        let items = picker
-            .conversations
-            .iter()
-            .map(|card| {
-                let current = if card.id == self.conversation_id {
-                    "*"
-                } else {
-                    " "
-                };
-                let agent = card
-                    .last_agent
-                    .map(|agent| self.agent_key_display_name(agent))
-                    .unwrap_or_else(|| "none".to_owned());
-                // FR-864: the running mark leads the row so a narrow picker never cuts it off.
-                let running = if card.running { "● running  " } else { "" };
-                ListItem::new(format!(
-                    "{current} {running}{}  [{}]  {} turns  {agent}  {}",
-                    card.title,
-                    short_id(card.id.as_str()),
-                    card.turn_count,
-                    updated_description(card.updated_at_ms),
-                ))
+        let items = rows
+            .into_iter()
+            .map(|(prefix, title, suffix)| {
+                let fixed = UnicodeWidthStr::width(prefix.as_str())
+                    + UnicodeWidthStr::width(suffix.as_str());
+                let title = ellipsize_to_width(&title, inner_width.saturating_sub(fixed));
+                ListItem::new(format!("{prefix}{title}{suffix}"))
             })
             .collect::<Vec<_>>();
         let mut block = Block::default()
@@ -7407,6 +7431,44 @@ fn centered_rect(horizontal_percent: u16, vertical_percent: u16, area: Rect) -> 
         Constraint::Percentage((100 - horizontal_percent) / 2),
     ])
     .split(vertical[1])[1]
+}
+
+/// Borders (2) plus the `> ` highlight symbol (2) around each picker row.
+const PICKER_CHROME_WIDTH: u16 = 4;
+const PICKER_MIN_WIDTH: u16 = 60;
+const PICKER_MAX_WIDTH: u16 = 160;
+
+/// FR-865: about 90% of the terminal, clamped to 60..=160 columns, no wider than the
+/// rows need (but at least the minimum, so the footer hint fits) and never wider than
+/// the terminal.
+fn conversation_picker_width(terminal_width: u16, natural_width: u16) -> u16 {
+    let target = (u32::from(terminal_width) * 9 / 10) as u16;
+    target
+        .clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH)
+        .min(natural_width.max(PICKER_MIN_WIDTH))
+        .min(terminal_width)
+}
+
+/// Shortens `text` to at most `max_width` display columns, ending with `…` when cut.
+fn ellipsize_to_width(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        let w = UnicodeWidthStr::width(grapheme);
+        if used + w > max_width - 1 {
+            break;
+        }
+        out.push_str(grapheme);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
 fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -11360,7 +11422,11 @@ mod tests {
     }
 
     fn render_test_buffer(app: &mut App) -> String {
-        let backend = TestBackend::new(120, 60);
+        render_test_buffer_sized(app, 120, 60)
+    }
+
+    fn render_test_buffer_sized(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -13841,6 +13907,70 @@ mod tests {
         .expect("chat selection stays available");
         assert_eq!(probed.lock().unwrap().as_slice(), &[Agent::Custom(0)]);
         assert!(!dmuxai::graph::is_runner_allowed("grok", &app.settings));
+    }
+
+    #[test]
+    // TC-865 / FR-865: conversation_picker_scales_with_terminal_width
+    fn conversation_picker_scales_with_terminal_width() {
+        assert_eq!(conversation_picker_width(80, 500), 72);
+        assert_eq!(conversation_picker_width(120, 500), 108);
+        assert_eq!(conversation_picker_width(200, 500), 160);
+        assert_eq!(conversation_picker_width(200, 90), 90);
+        assert_eq!(conversation_picker_width(200, 20), 60);
+        assert_eq!(conversation_picker_width(50, 500), 50);
+        assert_eq!(ellipsize_to_width("abcdef", 4), "abc…");
+        assert_eq!(ellipsize_to_width("abc", 4), "abc");
+        assert_eq!(ellipsize_to_width("한국어제목", 5), "한국…");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("conversations.sqlite3");
+        let engine = ConversationEngine::open(&db_path, dir.path()).unwrap();
+        let (mut app, _sent) = test_app_with_engine(engine);
+        app.create_conversation(Some("Short task".to_owned()));
+        app.create_conversation(Some(
+            "Add a CSV export button to the reports page and wire it to the new export API endpoint"
+                .to_owned(),
+        ));
+        app.selected = adapter_index(Agent::Codex);
+        app.input = "still working".to_owned();
+        app.submit_prompt();
+        app.open_conversation_picker();
+
+        for (width, height) in [(80u16, 24u16), (120, 40), (200, 50)] {
+            let rendered = render_test_buffer_sized(&mut app, width, height);
+            let top = rendered
+                .lines()
+                .find(|line| line.contains("Conversations"))
+                .unwrap_or_else(|| panic!("no picker at {width}x{height}:\n{rendered}"));
+            let chars: Vec<char> = top.chars().collect();
+            let left = chars.iter().position(|c| *c == '┌').expect("left corner");
+            let right = chars.iter().rposition(|c| *c == '┐').expect("right corner");
+            let picker_width = right - left + 1;
+            assert!(picker_width <= width as usize, "{width}: {picker_width}");
+            if width >= 120 {
+                assert!(
+                    picker_width > 76,
+                    "{width}: picker still {picker_width} wide"
+                );
+            }
+            let row = rendered
+                .lines()
+                .find(|line| line.contains("running") && line.contains("turns"))
+                .unwrap_or_else(|| panic!("no running row at {width}x{height}:\n{rendered}"));
+            let row_chars: Vec<char> = row.chars().collect();
+            let inside: String = row_chars[left + 1..right].iter().collect();
+            assert!(inside.contains("Codex"), "{width}: agent cut off: {inside}");
+            assert!(
+                inside.contains("just now"),
+                "{width}: time cut off: {inside}"
+            );
+            if width <= 120 {
+                assert!(
+                    inside.contains('…'),
+                    "{width}: long title not shortened: {inside}"
+                );
+            }
+        }
     }
 }
 
