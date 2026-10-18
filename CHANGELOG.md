@@ -8,7 +8,7 @@ All notable changes to dmuxai are listed here. Versions follow
 ## [0.2.2] - 2026-10-18
 
 Dashboard layout, workspace and graph view changes requested by Dongjin on
-2026-10-18, PRs #57-#60, #62-#66, #70, #72 and #74 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
+2026-10-18, PRs #57-#60, #62-#66, #70-#72 and #74 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
 issues #54-#56 and #61, plus the grok runner Dongjin added on 2026-10-19). Linux is the supported platform. The Windows target
 still compiles and passes clippy, but the live workspace switch returns 501 on
 Windows (see ROADMAP "Later").
@@ -68,6 +68,17 @@ Windows (see ROADMAP "Later").
   (capped at 200, 2s cache TTL while any conversation is running), and the TUI
   conversation picker (`F3` / `/conversations`) shows a `● running` mark on
   in-flight conversations.
+
+- **Resizable dashboard sidebars (SPEC-sidebar-resize FR-970..FR-974, UX-970..UX-971, #71).**
+  On viewports wider than 900px, the left sessions sidebar and the right
+  Files/To-dos sidebar each get a drag handle on their inner edge (pointer,
+  pen or touch). Widths are clamped to 180px..min(50% of the viewport, the
+  space left after the other sidebar and a 360px content area), re-clamped on
+  window resize, and stored in `localStorage` (`dmuxai.sidebar.width.left` /
+  `.right`). The prompt box stays centered between the open sidebars at any
+  width. Handles are keyboard accessible (`role="separator"`, arrows 16px,
+  Shift 64px, Home/End, Enter or double-click resets to 320px). At 900px and
+  below the handles are hidden and the overlay drawers are unchanged.
 
 ### Changed
 
