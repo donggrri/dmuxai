@@ -9,12 +9,22 @@
   var MODES = ['ask', 'plan', 'implement'];
   var SHARE_TARGETS = ['codex', 'cursor', 'agy'];
 
+  var SESSIONS_OPEN_PREFIX = 'dmuxai.sessions.open.';
+
   function storageGet(key) {
     try { return window.sessionStorage.getItem(key); } catch (err) { return null; }
   }
 
   function storageSet(key, value) {
     try { window.sessionStorage.setItem(key, value); } catch (err) { /* ignore */ }
+  }
+
+  function localGet(key) {
+    try { return window.localStorage.getItem(key); } catch (err) { return null; }
+  }
+
+  function localSet(key, value) {
+    try { window.localStorage.setItem(key, value); } catch (err) { /* ignore */ }
   }
 
   var token = (function () {
@@ -35,6 +45,69 @@
   var messageNodes = {};
   var stickToBottom = true;
   var palette = null;
+  var workspaceKey = '';
+  var workspaceInitialized = null;
+  var sessionsOpen = false;
+  var sessionsFilter = '';
+
+  function sessionsStorageKey() {
+    return SESSIONS_OPEN_PREFIX + (workspaceKey || 'default');
+  }
+
+  function syncSessionsBackdrop() {
+    if (!ui.sessionsBackdrop) { return; }
+    var narrow = window.innerWidth <= 900;
+    ui.sessionsBackdrop.classList.toggle('active', sessionsOpen && narrow);
+  }
+
+  function setSessionsOpen(open, persist) {
+    sessionsOpen = !!open;
+    if (ui.sessionsSidebar) {
+      ui.sessionsSidebar.classList.toggle('open', sessionsOpen);
+      if (sessionsOpen) {
+        ui.sessionsSidebar.removeAttribute('inert');
+      } else {
+        ui.sessionsSidebar.setAttribute('inert', '');
+      }
+    }
+    if (ui.sessionsToggle) {
+      ui.sessionsToggle.classList.toggle('active', sessionsOpen);
+      ui.sessionsToggle.setAttribute('aria-expanded', sessionsOpen ? 'true' : 'false');
+    }
+    document.body.classList.toggle('left-sidebar-open', sessionsOpen);
+    syncSessionsBackdrop();
+    if (persist) {
+      localSet(sessionsStorageKey(), sessionsOpen ? '1' : '0');
+    }
+  }
+
+  function initSessionsSidebarForWorkspace(ws) {
+    var key = ws || 'default';
+    if (workspaceInitialized === key) { return; }
+    workspaceKey = key;
+    workspaceInitialized = key;
+    var saved = localGet(sessionsStorageKey());
+    if (saved === '1') {
+      setSessionsOpen(true, false);
+    } else if (saved === '0') {
+      setSessionsOpen(false, false);
+    } else {
+      setSessionsOpen(window.innerWidth > 1200, false);
+    }
+  }
+
+  function relativeTime(ms) {
+    var ts = Number(ms) || 0;
+    if (!ts) { return ''; }
+    var diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+    if (diffSec < 60) { return diffSec + 's ago'; }
+    var diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) { return diffMin + 'm ago'; }
+    var diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) { return diffHr + 'h ago'; }
+    var diffDay = Math.floor(diffHr / 24);
+    return diffDay + 'd ago';
+  }
 
   function el(tag, className, text) {
     var node = document.createElement(tag);
@@ -120,9 +193,50 @@
 
   // ---- layout -----------------------------------------------------------
 
+  function bindSessionsSidebar() {
+    ui.sessionsSidebar = document.getElementById('sessions-sidebar');
+    ui.sessionsToggle = document.getElementById('sessions-toggle');
+    ui.sessionsNew = document.getElementById('sessions-new');
+    ui.sessionsClose = document.getElementById('sessions-close');
+    ui.sessionsFilter = document.getElementById('sessions-filter');
+    ui.sessionsViewOnly = document.getElementById('sessions-view-only');
+    ui.sessionsList = document.getElementById('sessions-list');
+    ui.sessionsBackdrop = document.getElementById('sessions-backdrop');
+
+    if (ui.sessionsToggle) {
+      ui.sessionsToggle.addEventListener('click', function () {
+        setSessionsOpen(!sessionsOpen, true);
+      });
+    }
+    if (ui.sessionsClose) {
+      ui.sessionsClose.addEventListener('click', function () {
+        setSessionsOpen(false, true);
+      });
+    }
+    if (ui.sessionsBackdrop) {
+      ui.sessionsBackdrop.addEventListener('click', function () {
+        setSessionsOpen(false, true);
+      });
+    }
+    if (ui.sessionsNew) {
+      ui.sessionsNew.addEventListener('click', function () {
+        command({ command: 'new_conversation' });
+      });
+    }
+    if (ui.sessionsFilter) {
+      ui.sessionsFilter.addEventListener('input', function () {
+        sessionsFilter = ui.sessionsFilter.value || '';
+        renderConversations();
+      });
+    }
+    window.addEventListener('resize', syncSessionsBackdrop);
+    initSessionsSidebarForWorkspace('default');
+  }
+
   function build() {
     root.textContent = '';
     root.classList.add('session');
+    bindSessionsSidebar();
 
     var head = el('div', 'session-head');
     head.appendChild(el('h2', 'panel-title', 'Chat'));
@@ -192,13 +306,6 @@
       stickToBottom = t.scrollHeight - t.scrollTop - t.clientHeight < 40;
     });
     body.appendChild(ui.transcript);
-
-    var side = el('aside', 'session-conversations');
-    side.setAttribute('data-parity', 'conversations');
-    side.appendChild(el('h3', 'session-subtitle', 'Conversations'));
-    ui.conversations = el('ul', 'session-conv-list');
-    side.appendChild(ui.conversations);
-    body.appendChild(side);
     root.appendChild(body);
 
     ui.notice = el('p', 'session-notice');
@@ -228,6 +335,18 @@
       if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
         e.preventDefault();
         openPalette('');
+        return;
+      }
+      if (e.key === 'F3') {
+        e.preventDefault();
+        openSessionsAndFocusFilter();
+        return;
+      }
+      if (e.key === 'Escape' && sessionsOpen && !palette) {
+        var tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : '';
+        if (e.target === ui.sessionsFilter || (tag !== 'input' && tag !== 'textarea' && tag !== 'select')) {
+          setSessionsOpen(false, true);
+        }
       }
     });
   }
@@ -418,22 +537,94 @@
     if (stickToBottom) { ui.transcript.scrollTop = ui.transcript.scrollHeight; }
   }
 
+  function openSessionsAndFocusFilter() {
+    setSessionsOpen(true, true);
+    if (ui.sessionsFilter) { ui.sessionsFilter.focus(); }
+  }
+
   function renderConversations() {
-    var key = JSON.stringify(session.conversations) + session.conversation_id;
-    if (ui.conversations.getAttribute('data-key') === key) { return; }
-    ui.conversations.setAttribute('data-key', key);
-    ui.conversations.textContent = '';
-    session.conversations.forEach(function (c) {
-      var li = el('li', 'session-conv' + (c.id === session.conversation_id ? ' session-conv-active' : ''));
-      li.appendChild(el('span', 'session-conv-title', c.title || c.id.slice(0, 8)));
-      if (c.id !== session.conversation_id) {
-        var load = button('Load', 'resume', function () {
-          command({ command: 'load_conversation', id: c.id });
-        }, 'btn-small');
-        load.disabled = viewOnly;
-        li.appendChild(load);
+    if (!ui.sessionsList) { return; }
+    if (ui.sessionsNew) { ui.sessionsNew.disabled = viewOnly || !session; }
+    if (ui.sessionsViewOnly) { ui.sessionsViewOnly.hidden = !viewOnly; }
+    if (!session || !session.conversations) {
+      ui.sessionsList.removeAttribute('data-key');
+      ui.sessionsList.textContent = '';
+      ui.sessionsList.appendChild(el('li', 'sessions-empty', 'No conversations yet.'));
+      return;
+    }
+    var q = (sessionsFilter || '').trim().toLowerCase();
+    var key = JSON.stringify(session.conversations) + '|' + session.conversation_id + '|' + q + '|' + (viewOnly ? '1' : '0');
+    if (ui.sessionsList.getAttribute('data-key') === key) { return; }
+    ui.sessionsList.setAttribute('data-key', key);
+    ui.sessionsList.textContent = '';
+
+    var filtered = session.conversations.filter(function (c) {
+      if (!q) { return true; }
+      var title = (c.title || '').toLowerCase();
+      var id = (c.id || '').toLowerCase();
+      var agent = (c.last_agent || '').toLowerCase();
+      return title.indexOf(q) >= 0 || id.indexOf(q) >= 0 || agent.indexOf(q) >= 0;
+    });
+
+    if (!filtered.length) {
+      ui.sessionsList.appendChild(el('li', 'sessions-empty', q ? 'No matching sessions.' : 'No conversations yet.'));
+      return;
+    }
+
+    filtered.forEach(function (c) {
+      var isActive = c.id === session.conversation_id;
+      var li = el('li', 'sessions-row' + (isActive ? ' active' : '') + (viewOnly ? ' disabled' : ''));
+      li.tabIndex = 0;
+      li.setAttribute('data-id', c.id);
+      li.setAttribute('data-parity', 'resume');
+      if (isActive) {
+        li.setAttribute('aria-current', 'true');
       }
-      ui.conversations.appendChild(li);
+
+      var top = el('div', 'sessions-row-top');
+      if (c.running) {
+        var spin = el('span', 'spinner');
+        spin.setAttribute('aria-label', 'running');
+        top.appendChild(spin);
+      }
+      var titleText = c.title || c.id.slice(0, 8);
+      var titleEl = el('span', 'sessions-row-title', titleText);
+      titleEl.title = titleText;
+      top.appendChild(titleEl);
+      li.appendChild(top);
+
+      var meta = el('div', 'sessions-row-meta');
+      meta.appendChild(el('span', 'sessions-row-agent', c.last_agent || 'none'));
+      var timeEl = el('span', 'sessions-row-time', relativeTime(c.updated_at_ms));
+      if (c.updated_at_ms) {
+        try { timeEl.title = new Date(c.updated_at_ms).toISOString(); } catch (err) { /* ignore */ }
+      }
+      meta.appendChild(timeEl);
+      li.appendChild(meta);
+
+      function activateRow() {
+        if (viewOnly || isActive) { return; }
+        command({ command: 'load_conversation', id: c.id });
+      }
+
+      li.addEventListener('click', activateRow);
+      li.addEventListener('keydown', function (e) {
+        if (e.isComposing || e.keyCode === 229) { return; }
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          activateRow();
+        } else if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          var next = li.nextElementSibling;
+          if (next && next.classList.contains('sessions-row')) { next.focus(); }
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          var prev = li.previousElementSibling;
+          if (prev && prev.classList.contains('sessions-row')) { prev.focus(); }
+        }
+      });
+
+      ui.sessionsList.appendChild(li);
     });
   }
 
@@ -454,7 +645,7 @@
     '/status': function () { command({ command: 'status' }); },
     '/quit': function () { ui.quit.click(); },
     '/new': function () { command({ command: 'new_conversation' }); },
-    '/conversations': function () { ui.conversations.scrollIntoView({ block: 'nearest' }); },
+    '/conversations': function () { openSessionsAndFocusFilter(); },
     '/resume': function () {
       ask('Conversation', session.conversations.map(function (c) {
         return { value: c.id, label: (c.title || c.id.slice(0, 8)) + ' · ' + c.id.slice(0, 8) };
@@ -635,10 +826,15 @@
 
   function applySnapshot(snap) {
     if (!snap) { return; }
+    if (snap.workspace) {
+      initSessionsSidebarForWorkspace(snap.workspace);
+    }
     var colors = {};
     (snap.agents || []).forEach(function (a) { if (a.color) { colors[a.id] = a.color; } });
     window.__dmuxSessionAgents = colors;
     viewOnly = snap.source === 'files';
+    if (ui.sessionsNew) { ui.sessionsNew.disabled = viewOnly || !snap.session; }
+    if (ui.sessionsViewOnly) { ui.sessionsViewOnly.hidden = !viewOnly; }
     // `--web` publishes the session with its first snapshot; wait for it.
     root.hidden = !viewOnly && !snap.session;
     ui.viewOnly.hidden = !viewOnly;
@@ -648,6 +844,7 @@
       root.classList.add('session-disabled');
       session = null;
       [ui.agent, ui.mode, ui.model, ui.effort, ui.input, ui.send].forEach(function (c) { c.disabled = true; });
+      renderConversations();
     }
   }
 

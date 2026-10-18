@@ -923,4 +923,45 @@ mod tests {
         assert!(DOCS_CSS.contains(".reduced-motion body"));
         assert!(DOCS_CSS.contains("transition: none;"));
     }
+
+    // TC-862: session_sidebar_assets (SPEC-session-sidebar FR-861, FR-862, FR-863, UX-860)
+    #[test]
+    fn session_sidebar_assets() {
+        assert!(INDEX_HTML.contains("id=\"sessions-toggle\""));
+        assert!(INDEX_HTML.contains("aria-controls=\"sessions-sidebar\""));
+        assert!(INDEX_HTML.contains("id=\"sessions-sidebar\""));
+        assert!(INDEX_HTML.contains("aria-label=\"Sessions\""));
+        assert!(INDEX_HTML.contains("data-parity=\"conversations\""));
+        assert!(INDEX_HTML.contains("id=\"sessions-new\""));
+        assert!(INDEX_HTML.contains("id=\"sessions-filter\""));
+        assert!(INDEX_HTML.contains("id=\"sessions-list\""));
+
+        // Toggle button appears before the Files button in the header.
+        let sessions_pos = INDEX_HTML
+            .find("id=\"sessions-toggle\"")
+            .expect("sessions-toggle button");
+        let files_pos = INDEX_HTML
+            .find("id=\"sidebar-toggle-files\"")
+            .expect("sidebar-toggle-files button");
+        assert!(
+            sessions_pos < files_pos,
+            "#sessions-toggle must appear before #sidebar-toggle-files"
+        );
+
+        // Old in-panel aside.session-conversations is removed.
+        assert!(!SESSION_JS.contains("session-conversations"));
+        assert!(!SESSION_CSS.contains(".session-conversations"));
+        assert!(!SESSION_CSS.contains("minmax(0, 1fr) 240px"));
+
+        // Sidebar wiring, persistence, and reduced-motion spinner.
+        assert!(SESSION_JS.contains("dmuxai.sessions.open."));
+        assert!(SESSION_JS.contains("left-sidebar-open"));
+        assert!(SESSION_JS.contains("aria-current"));
+        assert!(SESSION_JS.contains("load_conversation"));
+        assert!(SESSION_JS.contains("new_conversation"));
+        assert!(SESSION_JS.contains("spinner"));
+        assert!(DOCS_CSS.contains(".sessions-sidebar"));
+        assert!(APP_CSS.contains(".spinner"));
+        assert!(APP_CSS.contains("@media (prefers-reduced-motion: reduce)"));
+    }
 }

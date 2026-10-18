@@ -27,6 +27,7 @@
     <input id="accent-picker" class="accent-picker" type="color" value="#4aa8ff" title="Accent color">
     <button id="accent-reset" type="button" class="btn accent-reset">Reset</button>
   </div>
+  <button id="sessions-toggle" type="button" class="btn sidebar-toggle" aria-controls="sessions-sidebar" aria-expanded="false" title="Toggle sessions sidebar">Sessions</button>
   <button id="sidebar-toggle-files" type="button" class="btn sidebar-toggle" aria-controls="sidebar" aria-expanded="false" title="Toggle files sidebar">Files</button>
   <button id="todos-toggle" type="button" class="btn sidebar-toggle" aria-controls="sidebar" aria-expanded="false" title="Toggle to-dos sidebar" aria-label="To-dos, 0 open">To-dos <span id="todos-count" class="todos-count" aria-hidden="true">0</span></button>
   <nav id="status" class="status" aria-label="dashboard status">
@@ -96,6 +97,24 @@
 
   <section id="memory-panel" class="panel" aria-label="Memory"></section>
 </main>
+<nav id="sessions-sidebar" class="sessions-sidebar" aria-label="Sessions" data-parity="conversations" inert>
+  <div class="sidebar-header sessions-header">
+    <h2 class="sessions-heading">Sessions</h2>
+    <div class="sessions-header-actions">
+      <button id="sessions-new" type="button" class="btn btn-primary btn-small" data-parity="new">New</button>
+      <button id="sessions-close" type="button" class="btn sidebar-close" aria-label="Close sessions sidebar">&times;</button>
+    </div>
+  </div>
+  <div class="sessions-toolbar">
+    <label class="field-label" for="sessions-filter">Filter</label>
+    <input id="sessions-filter" class="sessions-filter" type="search" autocomplete="off" placeholder="Filter sessions by title" aria-label="Filter sessions by title">
+  </div>
+  <p id="sessions-view-only" class="hint sessions-hint" hidden>
+    View-only: start <code>dmuxai --web</code> to switch or start sessions.
+  </p>
+  <ul id="sessions-list" class="sessions-list"></ul>
+</nav>
+<div id="sessions-backdrop" class="sidebar-backdrop sessions-backdrop"></div>
 <aside id="sidebar" class="sidebar" aria-label="Sidebar" inert>
   <div class="sidebar-header">
     <nav class="sidebar-tabs" role="tablist" aria-label="Sidebar tabs">

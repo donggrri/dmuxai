@@ -111,20 +111,9 @@ def rect_of(pg, sel):
     }""")
 
 def set_left_dock(pg, enabled):
-    pg.evaluate("""enabled => {
-        document.body.classList.toggle('left-sidebar-open', enabled);
-        let probe = document.getElementById('left-dock-probe');
-        if (enabled) {
-            if (!probe) {
-                probe = document.createElement('aside');
-                probe.id = 'left-dock-probe';
-                probe.style.cssText = 'position:fixed;top:0;left:0;bottom:0;width:320px;z-index:20;pointer-events:none;';
-                document.body.appendChild(probe);
-            }
-        } else if (probe) {
-            probe.remove();
-        }
-    }""", enabled)
+    is_open = pg.eval_on_selector("#sessions-sidebar", "e => e.classList.contains('open')")
+    if is_open != enabled:
+        pg.eval_on_selector("#sessions-toggle", "e => e.click()")
 
 def close_right_sidebar(pg, width):
     is_open = pg.eval_on_selector("#sidebar", "e => e.classList.contains('open')")
@@ -140,6 +129,7 @@ with sync_playwright() as p:
     pg.goto(sys.argv[2])
     pg.wait_for_selector("#session:not([hidden]) .session-prompt", timeout=15000)
     pg.wait_for_selector("#sidebar-toggle-files", timeout=15000)
+    pg.wait_for_selector("#sessions-toggle", timeout=15000)
 
     # Enable input in view-only serve mode so we can type into .session-input and verify text preservation.
     pg.eval_on_selector(".session-input", "e => { e.disabled = false; }")
@@ -169,22 +159,23 @@ with sync_playwright() as p:
             "right_sidebar": rect_of(pg, "#sidebar"),
         }
 
-        # 3. left (close right, open simulated left dock)
+        # 3. left (close right, open real left sessions sidebar)
         close_right_sidebar(pg, width)
         set_left_dock(pg, True)
+        pg.wait_for_selector("#sessions-sidebar.open", timeout=15000)
         pg.wait_for_timeout(300)
         out["measurements"][w_key]["left"] = {
             "prompt": rect_of(pg, ".session-prompt"),
-            "left_sidebar": rect_of(pg, "#left-dock-probe"),
+            "left_sidebar": rect_of(pg, "#sessions-sidebar"),
         }
 
         # 4. both (open right while left is open)
-        pg.click("#sidebar-toggle-files")
+        pg.eval_on_selector("#sidebar-toggle-files", "e => e.click()")
         pg.wait_for_selector("#sidebar.open", timeout=15000)
         pg.wait_for_timeout(300)
         out["measurements"][w_key]["both"] = {
             "prompt": rect_of(pg, ".session-prompt"),
-            "left_sidebar": rect_of(pg, "#left-dock-probe"),
+            "left_sidebar": rect_of(pg, "#sessions-sidebar"),
             "right_sidebar": rect_of(pg, "#sidebar"),
         }
 

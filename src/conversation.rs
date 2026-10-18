@@ -554,6 +554,7 @@ pub struct ConversationCard {
     pub updated_at_ms: i64,
     pub turn_count: u64,
     pub last_agent: Option<AgentKey>,
+    pub running: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -872,7 +873,13 @@ impl ConversationEngine {
                        FROM turns latest
                       WHERE latest.conversation_id = c.id
                       ORDER BY latest.seq DESC
-                      LIMIT 1)
+                      LIMIT 1),
+                    EXISTS(
+                        SELECT 1
+                          FROM turns active
+                         WHERE active.conversation_id = c.id
+                           AND active.status IN ('queued', 'running')
+                    )
                FROM conversations c
                LEFT JOIN turns t ON t.conversation_id = c.id
               WHERE c.workspace_root = ?1 AND c.archived_at_ms IS NULL
@@ -889,6 +896,7 @@ impl ConversationEngine {
                     rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(error))
                 })?,
                 last_agent: last_agent.as_deref().map(AgentKey::from_db).transpose()?,
+                running: row.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
