@@ -319,9 +319,9 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-workspace-dir | FR-875 | TC-877 | `runner_cwd_is_workspace` | unit | ✅ | v0.2.2 |
 | M8,M2 | SPEC-graph-swimlane | FR-880,FR-881,FR-883 | TC-880 | `graph_swimlane_assets` | unit | ✅ | v0.2.2 |
 | M8,M2 | SPEC-graph-swimlane | FR-882,FR-884,UX-880 | TC-881 | `graph_swimlane_math_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.2 |
-| M8,M2 | SPEC-sidebar-resize | FR-970,FR-971,FR-973,FR-974,UX-970,UX-971 | TC-970 | `sidebar_resize_assets` | unit | ⏳ | v0.2.2 |
-| M8,M2 | SPEC-sidebar-resize | FR-970,FR-972,FR-973,UX-970 | TC-971 | `sidebar_resize_in_headless_chrome` (ignored) | e2e | ⏳ | v0.2.2 |
-| M8,M2 | SPEC-sidebar-resize | FR-971,FR-972,FR-974 | TC-972 | `sidebar_resize_clamps_and_narrow_layout` (ignored) | e2e | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-sidebar-resize | FR-970,FR-971,FR-973,FR-974,UX-970,UX-971 | TC-970 | `sidebar_resize_assets` | unit | ✅ | v0.2.2 |
+| M8,M2 | SPEC-sidebar-resize | FR-970,FR-972,FR-973,UX-970 | TC-971 | `sidebar_resize_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.2 |
+| M8,M2 | SPEC-sidebar-resize | FR-971,FR-972,FR-974 | TC-972 | `sidebar_resize_clamps_and_narrow_layout` (ignored) | e2e | ✅ | v0.2.2 |
 | M8,M2 | SPEC-graph-swimlane | FR-880..885,UX-880,UX-881 | TC-882 | `graph_swimlane_renders_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.2 |
 | M8 | SPEC-graph-swimlane | FR-883 | TC-883 | `hub_clears_stale_finish_when_node_runs_again` | unit | ✅ | v0.2.2 |
 | M8 | SPEC-graph-swimlane | FR-881,FR-884 | TC-884 | `graph_swimlane_one_head_per_target_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.2 |

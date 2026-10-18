@@ -1,6 +1,6 @@
 # SPEC: sidebar-resize
 
-Status: Draft (v0.2.2)
+Status: Implemented (v0.2.2)
 Created: 2026-10-18
 Related: Dongjin 2026-10-18 KST ("sidebar 크기 조절할 수 있어야한다", "사이드바 크기 조절 v0.2.2에 넣어"); SPEC-session-sidebar (left Sessions sidebar), SPEC-docs-tree UX-830 and SPEC-todo-sidebar (right Files/To-dos sidebar), SPEC-centered-prompt (dock variables, centered prompt)
 
@@ -29,6 +29,15 @@ The graph node detail pane (`#graph-detail`) is part of the Graph panel, not a d
 - One small script (`assets/sidebar-resize.js`, served like the other assets) owns both handles. It sets `--left-sidebar-width` / `--right-sidebar-width` on `document.documentElement`; CSS uses them for `.sessions-sidebar` / `.sidebar` widths and for `--left-dock` / `--right-dock` under `body.left-sidebar-open` / `body.sidebar-open` above 900px. Open/close stays owned by `session.js` and `docs.js`.
 - SPEC-centered-prompt FR-851 (both sidebars 320px) becomes "default 320px"; FR-850 centering holds for any width.
 - The handle sits inside its sidebar (absolutely positioned on the inner edge), so it is hidden and inert together with a closed sidebar.
+
+### Implementation decisions
+
+- Widths are whole pixels. A pointer position is rounded, then clamped.
+- `localStorage` is written on pointer-up and after a handled key, and the key is removed on Enter or a double-click reset. Resizing the window, or the other sidebar opening or closing, reclamps the displayed width and the ARIA values and does not rewrite storage. A non-numeric stored value is ignored (default 320). A numeric value outside the current range stays stored and is clamped only for display, so a wide preference survives a narrower window.
+- A closed sidebar counts as zero width for the other sidebar's maximum. Its own preferred width is clamped only by the solo maximum (half the viewport, and the viewport minus 360px) until it opens. When both are open and both preferences do not fit, the left sidebar is clamped first, then the right, for a few passes.
+- At 900px and below the script does not set the width variables and does not touch storage. The existing narrow rule keeps the drawers at `min(320px, 85vw)` and hides the handles.
+- A second pointer-up within 500ms, with movement of 3px or less, also resets that sidebar. Pointer capture can suppress the `dblclick` event; the `dblclick` listener still resets.
+- Above 900px, an open sidebar sets its dock variable to `var(--left-sidebar-width)` or `var(--right-sidebar-width)`. The defaults stay 320px. `prompt_centering_assets` checks those variable references.
 
 ## 3. Tests
 

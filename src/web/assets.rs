@@ -3,6 +3,7 @@ pub const APP_JS: &str = include_str!("assets/app.js");
 pub const MEMORY_JS: &str = include_str!("assets/memory.js");
 pub const SESSION_JS: &str = include_str!("assets/session.js");
 pub const WORKSPACE_JS: &str = include_str!("assets/workspace.js");
+pub const SIDEBAR_RESIZE_JS: &str = include_str!("assets/sidebar-resize.js");
 pub const SESSION_CSS: &str = include_str!("assets/session.css");
 pub const APP_CSS: &str = include_str!("assets/app.css");
 pub const DOCS_JS: &str = include_str!("assets/docs.js");
@@ -1003,14 +1004,18 @@ mod tests {
     // TC-850: prompt_centering_assets (SPEC-centered-prompt FR-850, UX-850)
     #[test]
     fn prompt_centering_assets() {
-        // Dock custom properties default to 0px and expand to 320px above 900px.
+        // Dock custom properties default to 0px. Above 900px an open sidebar
+        // reserves its width. The default width is still 320px (FR-851); the
+        // dock follows --left/right-sidebar-width so a resize stays centered.
         assert!(DOCS_CSS.contains("--left-dock: 0px;"));
         assert!(DOCS_CSS.contains("--right-dock: 0px;"));
+        assert!(DOCS_CSS.contains("--left-sidebar-width: 320px;"));
+        assert!(DOCS_CSS.contains("--right-sidebar-width: 320px;"));
         assert!(DOCS_CSS.contains("@media (min-width: 901px)"));
         assert!(DOCS_CSS.contains("body.left-sidebar-open"));
-        assert!(DOCS_CSS.contains("--left-dock: 320px;"));
+        assert!(DOCS_CSS.contains("--left-dock: var(--left-sidebar-width);"));
         assert!(DOCS_CSS.contains("body.sidebar-open"));
-        assert!(DOCS_CSS.contains("--right-dock: 320px;"));
+        assert!(DOCS_CSS.contains("--right-dock: var(--right-sidebar-width);"));
 
         // Dock space is reserved on body and main stays centered via margin-inline: auto.
         assert!(DOCS_CSS.contains("padding-left: var(--left-dock);"));
@@ -1114,5 +1119,134 @@ mod tests {
         assert_eq!(headers["x-content-type-options"], "nosniff");
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(bytes.as_ref(), WORKSPACE_JS.as_bytes());
+    }
+
+    // TC-970: sidebar_resize_assets (FR-970, FR-971, FR-973, FR-974, UX-970, UX-971)
+    #[tokio::test]
+    async fn sidebar_resize_assets() {
+        assert!(INDEX_HTML.contains("id=\"sessions-resize\""));
+        assert!(INDEX_HTML.contains("id=\"sidebar-resize\""));
+        assert!(INDEX_HTML.contains("class=\"sidebar-resize-handle\""));
+        assert!(INDEX_HTML.contains("role=\"separator\""));
+        assert!(INDEX_HTML.contains("aria-orientation=\"vertical\""));
+        assert!(INDEX_HTML.contains("tabindex=\"0\""));
+        assert!(INDEX_HTML.contains("aria-controls=\"sessions-sidebar\""));
+        assert!(INDEX_HTML.contains("aria-controls=\"sidebar\""));
+        assert!(INDEX_HTML.contains("aria-label=\"Resize sessions sidebar\""));
+        assert!(INDEX_HTML.contains("aria-label=\"Resize files sidebar\""));
+        assert!(INDEX_HTML.contains("aria-valuenow=\"320\""));
+        assert!(INDEX_HTML.contains("aria-valuemin=\"180\""));
+        assert!(INDEX_HTML.contains("aria-valuemax=\"320\""));
+        assert!(INDEX_HTML.contains("<script src=\"/assets/sidebar-resize.js\" defer></script>"));
+        let workspace_js = INDEX_HTML
+            .find("/assets/workspace.js")
+            .expect("workspace.js script");
+        let resize_js = INDEX_HTML
+            .find("/assets/sidebar-resize.js")
+            .expect("sidebar-resize.js script");
+        assert!(
+            workspace_js < resize_js,
+            "sidebar-resize.js must be linked after workspace.js"
+        );
+
+        let sessions_at = INDEX_HTML
+            .find("id=\"sessions-sidebar\"")
+            .expect("sessions sidebar");
+        let sessions_end = INDEX_HTML
+            .find("id=\"sessions-backdrop\"")
+            .expect("sessions backdrop");
+        let sessions_handle = INDEX_HTML
+            .find("id=\"sessions-resize\"")
+            .expect("sessions handle");
+        assert!(
+            sessions_at < sessions_handle && sessions_handle < sessions_end,
+            "#sessions-resize must sit inside #sessions-sidebar"
+        );
+        let files_at = INDEX_HTML.find("id=\"sidebar\"").expect("files sidebar");
+        let files_end = INDEX_HTML
+            .find("id=\"sidebar-backdrop\"")
+            .expect("files backdrop");
+        let files_handle = INDEX_HTML
+            .find("id=\"sidebar-resize\"")
+            .expect("files handle");
+        assert!(
+            files_at < files_handle && files_handle < files_end,
+            "#sidebar-resize must sit inside #sidebar"
+        );
+
+        assert!(DOCS_CSS.contains("--left-sidebar-width: 320px;"));
+        assert!(DOCS_CSS.contains("--right-sidebar-width: 320px;"));
+        assert!(DOCS_CSS.contains("width: var(--left-sidebar-width);"));
+        assert!(DOCS_CSS.contains("width: var(--right-sidebar-width);"));
+        assert!(DOCS_CSS.contains("--left-dock: var(--left-sidebar-width);"));
+        assert!(DOCS_CSS.contains("--right-dock: var(--right-sidebar-width);"));
+        assert!(DOCS_CSS.contains("cursor: col-resize;"));
+        assert!(DOCS_CSS.contains(":focus-visible"));
+        assert!(DOCS_CSS.contains("sidebar-resizing"));
+        assert!(DOCS_CSS.contains("user-select: none;"));
+        assert!(DOCS_CSS.contains("transition: none;"));
+        let narrow = DOCS_CSS
+            .find("@media (max-width: 900px)")
+            .expect("narrow media");
+        let narrow_end = DOCS_CSS[narrow..]
+            .find("\nbody {")
+            .expect("body rule follows the narrow media query")
+            + narrow;
+        let narrow_css = &DOCS_CSS[narrow..narrow_end];
+        assert!(
+            narrow_css.contains("width: min(320px, 85vw);"),
+            "narrow drawers keep min(320px, 85vw): {narrow_css}"
+        );
+        assert!(
+            narrow_css.contains(".sidebar-resize-handle"),
+            "narrow layout must mention the handle"
+        );
+        assert!(
+            narrow_css.contains("display: none;"),
+            "handles must be hidden at max-width 900px"
+        );
+
+        assert!(SIDEBAR_RESIZE_JS.contains("dmuxai.sidebar.width.left"));
+        assert!(SIDEBAR_RESIZE_JS.contains("dmuxai.sidebar.width.right"));
+        assert!(SIDEBAR_RESIZE_JS.contains("180"));
+        assert!(SIDEBAR_RESIZE_JS.contains("0.5"));
+        assert!(SIDEBAR_RESIZE_JS.contains("50%"));
+        assert!(SIDEBAR_RESIZE_JS.contains("dblclick"));
+        assert!(SIDEBAR_RESIZE_JS.contains("removeItem"));
+        assert!(SIDEBAR_RESIZE_JS.contains("ArrowRight"));
+        assert!(SIDEBAR_RESIZE_JS.contains("ArrowLeft"));
+        assert!(SIDEBAR_RESIZE_JS.contains("Home"));
+        assert!(SIDEBAR_RESIZE_JS.contains("End"));
+        assert!(SIDEBAR_RESIZE_JS.contains("Enter"));
+        assert!(SIDEBAR_RESIZE_JS.contains("setPointerCapture"));
+        assert!(SIDEBAR_RESIZE_JS.contains("sidebar-resizing"));
+        assert!(SIDEBAR_RESIZE_JS.contains("MutationObserver"));
+        assert!(SIDEBAR_RESIZE_JS.contains("shiftKey"));
+        assert!(SIDEBAR_RESIZE_JS.contains("64"));
+        assert!(!SIDEBAR_RESIZE_JS.contains("innerHTML"));
+        assert!(!SIDEBAR_RESIZE_JS.contains("onclick"));
+
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        let router = build_router(hub, "testtoken123".to_string(), None);
+        let req = axum::http::Request::builder()
+            .uri("/assets/sidebar-resize.js")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let headers = resp.headers().clone();
+        assert!(
+            headers["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/javascript")
+        );
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(headers["content-security-policy"], "default-src 'self'");
+        assert_eq!(headers["referrer-policy"], "no-referrer");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), SIDEBAR_RESIZE_JS.as_bytes());
     }
 }
