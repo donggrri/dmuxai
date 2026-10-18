@@ -36,7 +36,7 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 - ✅ SPEC에 적힌 테스트 이름이 `src/`·`tests/`에 `fn <name>`으로 실제 존재 (또는 `cargo test` 필터 문자열로 매칭됨)
 - ⚠️ SPEC에는 있으나 이름 붙은 자동 테스트가 없음(수동/이름 없는 증거) 또는 코드에서 찾지 못함
 - ❌ SPEC도 테스트도 없음 → §2 갭으로 다룸
-- ⏳ v0.2.1 계획(SPEC 확정, 구현 PR에서 ✅로 전환) — [ROADMAP](ROADMAP.md)
+- ⏳ v0.2.1·v0.2.2 계획(SPEC 확정, 구현 PR에서 ✅로 전환) — [ROADMAP](ROADMAP.md)
 
 검증 방법: 각 SPEC의 `| TC-… |` 행(그래프/이미지 SPEC은 `| FR-… |` 요구사항 행의 Tests 열)에서 백틱 안 식별자를 뽑아 `rg 'fn <name>' src tests`로 확인했다.
 
@@ -301,6 +301,21 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-cursor-latency | FR-806,FR-807 | TC-806 | `prewarm_discarded_on_arg_change` | unit | ✅ | v0.2.1 |
 | M8,M2 | SPEC-cursor-latency | FR-807,NFR-805 | TC-807 | `prewarm_disabled_and_expiry` | unit | ✅ | v0.2.1 |
 | M8,M2 | SPEC-cursor-latency | FR-806 | TC-808 | `prewarm_exited_process_is_replaced` | unit | ✅ | v0.2.1 |
+| M8,M2 | SPEC-centered-prompt | FR-850,UX-850 | TC-850 | `prompt_centering_assets` | unit | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-centered-prompt | FR-850..852,UX-850 | TC-851 | `prompt_stays_centered_in_headless_chrome` (ignored) | e2e | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-session-sidebar | FR-860 | TC-860 | `session_conversation_fields_roundtrip` | unit | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-session-sidebar | FR-860 | TC-861 | `session_conversations_report_running_and_agent` | unit | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-session-sidebar | FR-861..863,UX-860 | TC-862 | `session_sidebar_assets` | unit | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-session-sidebar | FR-861..863,UX-860 | TC-863 | `session_sidebar_renders_in_headless_chrome` (ignored) | e2e | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-session-sidebar | FR-864 | TC-864 | `conversation_picker_shows_agent_time_running` | unit | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-workspace-dir | FR-870,FR-873 | TC-870 | `workspace_dir_precedence_and_validation` | unit | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-workspace-dir | FR-870 | TC-871 | `workspace_dir_flag_sets_workspace` | integration | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-workspace-dir | FR-871 | TC-872 | `workspace_dir_assets` | unit | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-workspace-dir | FR-872,FR-873,NFR-870 | TC-873 | `workspace_api_lists_dirs_and_validates` | integration | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-workspace-dir | FR-871,FR-872 | TC-874 | `workspace_dialog_renders_in_headless_chrome` (ignored) | e2e | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-workspace-dir | FR-874 | TC-875 | `workspace_switch_guards` | integration | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-workspace-dir | FR-874 | TC-876 | `workspace_switch_reexecs_serve` (ignored) | e2e | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-workspace-dir | FR-875 | TC-877 | `runner_cwd_is_workspace` | unit | ⏳ | v0.2.2 |
 
 ### 1.1 주의할 ⚠️ 항목
 

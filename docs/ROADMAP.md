@@ -1,8 +1,20 @@
 # dmuxai roadmap
 
-Release history is in [CHANGELOG.md](../CHANGELOG.md). Each item links its SPEC (the contract) and its GitHub issue (status). GitHub milestone: [v0.2.1](https://github.com/donggrri/dmuxai/milestone/1).
+Release history is in [CHANGELOG.md](../CHANGELOG.md). Each item links its SPEC (the contract) and its GitHub issue (status). GitHub milestones: [v0.2.1](https://github.com/donggrri/dmuxai/milestone/1) (released), [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2).
 
-## v0.2.1 (in progress)
+## v0.2.2 (in progress)
+
+Source: Dongjin, 2026-10-18 09:42 KST.
+
+| # | Item | Kind | SPEC (IDs) | Issue | Status |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Prompt box stays centered with sidebars open | UX | [SPEC-centered-prompt](specs/SPEC-centered-prompt.md) (FR-850..852, UX-850) | [#54](https://github.com/donggrri/dmuxai/issues/54) | planned |
+| 2 | Left sidebar of sessions/conversations (ChatGPT-style), TUI picker parity | UX | [SPEC-session-sidebar](specs/SPEC-session-sidebar.md) (FR-860..864, UX-860) | [#55](https://github.com/donggrri/dmuxai/issues/55) | planned |
+| 3 | Set the project working directory (CLI, config, dashboard) | feature | [SPEC-workspace-dir](specs/SPEC-workspace-dir.md) (FR-870..875, NFR-870) | [#56](https://github.com/donggrri/dmuxai/issues/56) | planned |
+
+Order: 1 → 2 → 3 (1 and 2 share the layout; 2 and 3 both touch the header). No release in this round.
+
+## v0.2.1 (released 2026-10-18)
 
 Source: Dongjin's dogfooding of the v0.2.0 release binary on Linux (`dmuxai --web`, Cursor and opencode runners), 2026-10-17 23:38–23:51 KST.
 
@@ -23,4 +35,5 @@ Order: 1 → 2+3 → 4 → 5 → 6 (4–6 share the web assets, so they go in se
 
 - Persistent cursor-agent session server, if cursor-agent ever ships one (would remove the cold start that pre-warm only hides).
 - Tree view in the TUI file picker (the dashboard tree comes first).
-- Windows compatibility (postponed in v0.2.1): job objects for Cursor warm processes (SPEC-cursor-latency FR-807), and re-check v0.2.1 features on Windows.
+- TUI workspace switcher (v0.2.2 switches from the dashboard and with `-C`).
+- Windows compatibility (postponed in v0.2.1; v0.2.2 workspace switch answers 501 on Windows): job objects for Cursor warm processes (SPEC-cursor-latency FR-807), and re-check v0.2.1 features on Windows.
