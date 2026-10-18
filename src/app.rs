@@ -3180,7 +3180,28 @@ impl App {
         }
 
         if was_tracking {
-            self.finish_turn_outcome_with_error(agent, false, Some("cancelled".to_owned()));
+            // Record the terminal status before dropping the active turn. A later
+            // adapter `Cancelled` then finds no match and cannot add a second line.
+            // Summary runs are busy without an active turn and keep their own notice.
+            if let Some(active) = self.active_turns.get(&agent).cloned() {
+                let stored_output = TurnOutput {
+                    conversation_id: active.conversation_id.clone(),
+                    turn_id: active.turn_id.clone(),
+                    agent: agent_key(agent),
+                    event: TurnEvent::Cancelled,
+                };
+                if let Err(error) = self.engine.record_turn_outputs(&[stored_output]) {
+                    self.show_conversation_notice(
+                        &active.conversation_id,
+                        format!("Could not save {agent} output: {error}"),
+                    );
+                }
+                let conversation_id = active.conversation_id;
+                self.finish_turn_outcome_with_error(agent, false, Some("cancelled".to_owned()));
+                self.show_conversation_notice(&conversation_id, format!("{agent} turn cancelled."));
+            } else {
+                self.finish_turn_outcome_with_error(agent, false, Some("cancelled".to_owned()));
+            }
         }
     }
 
@@ -10689,6 +10710,162 @@ mod tests {
         assert!(!app.busy_agents.contains(&Agent::Codex));
     }
 
+    // TC-984 (FR-982): cancel writes one notice for every runner, and a late
+    // adapter Cancelled does not write a second one.
+    #[test]
+    fn cancel_appends_one_cancelled_notice_for_every_runner() {
+        // Custom runners persist under their registry name. Install the preset
+        // only when nothing else has claimed the process-wide registry.
+        if dmuxai::custom_agent::registry().is_empty() {
+            let _ =
+                dmuxai::custom_agent::install_registry(vec![dmuxai::custom_agent::grok_preset(
+                    "grok",
+                )]);
+        }
+        let (mut app, sent) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/test-workspace".to_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+        let (_tx, rx) = mpsc::channel(4);
+        app.dashboard_commands = Some(rx);
+
+        let agents: Vec<Agent> = app.adapters.iter().map(|adapter| adapter.agent()).collect();
+        assert!(agents.contains(&Agent::Codex));
+        assert!(agents.contains(&Agent::Cursor));
+        assert!(agents.contains(&Agent::Agy));
+        assert!(agents.iter().any(|agent| matches!(agent, Agent::Custom(_))));
+
+        for agent in agents {
+            app.create_conversation(Some(format!("cancel {agent}")));
+            let (conversation_id, turn_id) = start_partial_turn(&mut app, &sent, agent);
+            let notice = format!("{agent} turn cancelled.");
+            app.cancel_selected();
+
+            let notice_at = system_message_positions(&app, &notice);
+            assert_eq!(notice_at.len(), 1, "{agent}");
+            let partial_at = app
+                .messages
+                .iter()
+                .position(|message| {
+                    message.role == Role::Agent(agent) && message.content == partial_text(agent)
+                })
+                .unwrap_or_else(|| panic!("{agent} partial reply missing"));
+            assert!(partial_at < notice_at[0], "{agent}");
+
+            assert!(
+                !app.apply_agent_output(AgentOutput {
+                    agent,
+                    conversation_id: Some(conversation_id.clone()),
+                    turn_id: Some(turn_id.clone()),
+                    event: AgentEvent::Cancelled,
+                }),
+                "{agent} late Cancelled should be ignored"
+            );
+            assert_eq!(system_message_positions(&app, &notice).len(), 1, "{agent}");
+
+            let stored = app
+                .engine
+                .select(ConversationSelection::Existing(app.conversation_id.clone()))
+                .unwrap();
+            assert_eq!(
+                stored
+                    .turns
+                    .iter()
+                    .find(|turn| turn.id.as_str() == turn_id.as_str())
+                    .unwrap()
+                    .status,
+                TurnStatus::Cancelled,
+                "{agent}"
+            );
+
+            app.publish_dashboard();
+            let snapshot = hub.snapshot();
+            let transcript = snapshot
+                .session
+                .as_ref()
+                .expect("dashboard session")
+                .transcript
+                .as_slice();
+            assert_eq!(transcript.last().unwrap().role, "system", "{agent}");
+            assert_eq!(transcript.last().unwrap().content, notice, "{agent}");
+
+            let reopened_id = app.conversation_id.clone();
+            app.create_conversation(Some(format!("away {agent}")));
+            app.select_conversation(StoredConversationId::new(reopened_id.as_str()));
+            assert_eq!(system_message_positions(&app, &notice).len(), 1, "{agent}");
+            assert!(
+                app.messages.iter().any(|message| {
+                    message.role == Role::Agent(agent) && message.content == partial_text(agent)
+                }),
+                "{agent} partial missing after reopen"
+            );
+        }
+
+        // Adapter-reported Cancelled, with no cancel_selected, is still one line.
+        app.create_conversation(Some("adapter cancel".to_owned()));
+        let agent = Agent::Codex;
+        let (conversation_id, turn_id) = start_partial_turn(&mut app, &sent, agent);
+        let notice = format!("{agent} turn cancelled.");
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(conversation_id.clone()),
+            turn_id: Some(turn_id.clone()),
+            event: AgentEvent::Cancelled,
+        }));
+        assert_eq!(system_message_positions(&app, &notice).len(), 1);
+        assert!(!app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(conversation_id),
+            turn_id: Some(turn_id),
+            event: AgentEvent::Cancelled,
+        }));
+        assert_eq!(system_message_positions(&app, &notice).len(), 1);
+    }
+
+    fn partial_text(agent: Agent) -> String {
+        format!("partial {agent}")
+    }
+
+    fn system_message_positions(app: &App, notice: &str) -> Vec<usize> {
+        app.messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                (message.role == Role::System && message.content == notice).then_some(index)
+            })
+            .collect()
+    }
+
+    fn start_partial_turn(
+        app: &mut App,
+        sent: &SentRequests,
+        agent: Agent,
+    ) -> (ConversationId, TurnId) {
+        app.selected = app
+            .adapters
+            .iter()
+            .position(|adapter| adapter.agent() == agent)
+            .unwrap_or_else(|| panic!("{agent} has no adapter"));
+        let before = sent.lock().unwrap().len();
+        app.input = format!("prompt {agent}");
+        app.submit_prompt();
+        let request = sent.lock().unwrap()[before].1.clone();
+        let conversation_id = request.conversation_id;
+        let turn_id = request.turn_id;
+        assert!(
+            app.apply_agent_output(AgentOutput {
+                agent,
+                conversation_id: Some(conversation_id.clone()),
+                turn_id: Some(turn_id.clone()),
+                event: AgentEvent::TextDelta(partial_text(agent)),
+            }),
+            "{agent}"
+        );
+        (conversation_id, turn_id)
+    }
+
     #[test]
     fn errors_become_visible_system_messages() {
         let (mut app, _) = test_app();
@@ -12966,6 +13143,63 @@ mod tests {
         .unwrap();
         assert_eq!(cancelled.lock().unwrap().as_slice(), &[Agent::Agy]);
         assert_eq!(app.selected, selected);
+    }
+
+    // TC-985 (FR-982): dashboard cancel ends the session transcript with one notice.
+    #[test]
+    fn dashboard_cancel_shows_cancelled_notice() {
+        let (mut app, sent, hub) = web_app();
+        app.input = "cancel from dashboard".to_owned();
+        app.submit_prompt();
+        let request = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(request.conversation_id.clone()),
+            turn_id: Some(request.turn_id.clone()),
+            event: AgentEvent::TextDelta("partial reply".to_owned()),
+        }));
+
+        let session = app
+            .handle_session_command(SessionCommand::Cancel {
+                agent: Some("codex".to_owned()),
+            })
+            .unwrap();
+        let partial_at = session
+            .transcript
+            .iter()
+            .position(|message| message.role == "agent" && message.content == "partial reply")
+            .expect("partial agent reply");
+        let last = session.transcript.last().unwrap();
+        assert_eq!(last.role, "system");
+        assert_eq!(last.content, "Codex turn cancelled.");
+        assert!(partial_at < session.transcript.len() - 1);
+        assert_eq!(
+            session
+                .transcript
+                .iter()
+                .filter(|message| message.content == "Codex turn cancelled.")
+                .count(),
+            1
+        );
+
+        assert!(!app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(request.conversation_id),
+            turn_id: Some(request.turn_id),
+            event: AgentEvent::Cancelled,
+        }));
+        app.publish_dashboard();
+        let snapshot = hub.snapshot();
+        let transcript = &snapshot.session.expect("dashboard session").transcript;
+        assert_eq!(transcript.last().unwrap().role, "system");
+        assert_eq!(transcript.last().unwrap().content, "Codex turn cancelled.");
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|message| message.content == "Codex turn cancelled.")
+                .count(),
+            1
+        );
     }
 
     // TC-784 (FR-781): new and load conversation switch the active conversation.
