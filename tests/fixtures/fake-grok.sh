@@ -5,7 +5,8 @@
 # or GROK_FAKE_AUTH=fail (exit 1, "not logged in" on stderr) or
 # GROK_FAKE_AUTH=fast (logged in, only a fast id).
 # Prompt mode (-p) prints canned streaming-json unless GROK_FAKE_MODE is
-# fail, empty, sleep, linger, orphan, or noend:
+# fail, empty, sleep, linger, orphan, noend, or tools:
+#   tools   prints a tool_call, its completed update, then text and end.
 #   linger  prints text, a tool_call, more text and the end line, then leaves a
 #           child holding stdout and idles (grok 1.0.62 after a stranded
 #           auto-wake prompt). The child's pid goes to GROK_FAKE_PIDFILE.
@@ -100,6 +101,16 @@ EOF
     ;;
   noend)
     printf '%s\n' '{"type":"text","data":"OK"}'
+    exit 0
+    ;;
+  tools)
+    cat <<'EOF'
+{"type":"tool_call","toolCallId":"t1","title":"read_file","kind":"read","status":"pending","toolName":"read_file","rawInput":{"target_file":"src/app.rs"},"content":[],"locations":[]}
+{"type":"tool_call_update","toolCallId":"t1","status":"in_progress","content":[],"rawOutput":null,"locations":[]}
+{"type":"tool_call_update","toolCallId":"t1","status":"completed","content":[],"rawOutput":null,"locations":[]}
+{"type":"text","data":"OK"}
+{"type":"end","stopReason":"end_turn","sessionId":"11111111-1111-1111-1111-111111111111","cwd":"/tmp","num_turns":1}
+EOF
     exit 0
     ;;
   *)
