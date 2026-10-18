@@ -7532,7 +7532,9 @@ fn picker_char_is_space(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{200B}'..='\u{200F}'
+            '\u{061C}'
+                | '\u{200B}'
+                | '\u{200E}'..='\u{200F}'
                 | '\u{202A}'..='\u{202E}'
                 | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{2069}'
@@ -15054,6 +15056,8 @@ mod tests {
         assert_eq!(sanitize_picker_text("a\r\nb\tc"), "a b c");
         assert_eq!(sanitize_picker_text("  x  "), "x");
         assert_eq!(sanitize_picker_text("a\u{200B}b\u{202E}c"), "a b c");
+        assert_eq!(sanitize_picker_text("a\u{061C}b"), "a b");
+        assert_eq!(sanitize_picker_text("👨\u{200D}👩"), "👨\u{200D}👩");
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("conversations.sqlite3");
