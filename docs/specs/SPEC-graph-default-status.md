@@ -5,6 +5,7 @@ Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `73e3f4d`
 Related: SPEC-agent-graph-orchestration, SPEC-model-policy, docs/TEST-PLAN.md
+Superseded in part: the `[graph] enabled` toggle (FR-370) and the keyword split of FR-371 are replaced by [SPEC-plan-gate](SPEC-plan-gate.md) FR-930, FR-931 and FR-937 once that spec is implemented.
 
 ## 1. Decision summary
 

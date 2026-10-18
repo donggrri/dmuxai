@@ -2,7 +2,8 @@
 
 Status: draft  
 Baseline: image-attachment PR  
-Related: MISSION.md, agent-graph-engineering skill
+Related: MISSION.md, agent-graph-engineering skill  
+Superseded in part: keyword role inference (`infer_roles`) becomes the fallback only; the selected agent judges and plans per [SPEC-plan-gate](SPEC-plan-gate.md).
 
 ## Decision summary
 
