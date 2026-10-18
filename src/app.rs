@@ -2269,8 +2269,11 @@ impl App {
         let Some(spec) = self.custom_spec(index) else {
             return;
         };
-        if spec.builtin && spec.name.eq_ignore_ascii_case("grok") {
-            let _ = self.adapters[adapter_index(agent)].request_models();
+        if spec.builtin
+            && spec.name.eq_ignore_ascii_case("grok")
+            && let Some(adapter) = self.adapters.get(adapter_index(agent))
+        {
+            let _ = adapter.request_models();
         }
     }
 
@@ -13722,6 +13725,7 @@ mod tests {
     #[test]
     fn grok_effective_model_skips_composer_default() {
         let (mut app, _) = test_app();
+        app.settings.custom_agents = vec![dmuxai::custom_agent::grok_preset("grok")];
         assert_eq!(
             app.effective_model_for(Agent::Custom(0), "composer-2.5"),
             None

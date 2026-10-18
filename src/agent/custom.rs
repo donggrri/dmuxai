@@ -893,10 +893,8 @@ temp_config_template = '{"mcp": "not-an-object"}'
     }
 
     fn fake_grok() -> String {
-        let path = format!("{}/tests/fixtures/fake-grok.sh", env!("CARGO_MANIFEST_DIR"));
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
-        path
+        // The fixture is committed with mode 100755; tests never rewrite it.
+        format!("{}/tests/fixtures/fake-grok.sh", env!("CARGO_MANIFEST_DIR"))
     }
 
     fn grok_spec(env: &[(&str, &str)]) -> &'static CustomAgentSpec {
@@ -958,6 +956,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
         events
     }
 
+    #[cfg(target_os = "linux")]
     fn pgrp(pid: u32) -> Option<u32> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let rest = stat.rsplit_once(')')?.1;
@@ -967,6 +966,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
         fields.next()?.parse().ok()
     }
 
+    #[cfg(target_os = "linux")]
     fn still_running(pid: u32) -> bool {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             return false;
@@ -1118,6 +1118,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
     }
 
     // TC-898 / FR-897
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn grok_cancel_kills_the_process_group() {
         let dir = tempfile::tempdir().unwrap();

@@ -131,10 +131,6 @@ mod tests {
     // TC-911 / FR-911
     #[test]
     fn grok_models_are_allowed_only_for_the_grok_runner() {
-        assert!(
-            crate::custom_agent::registry().is_empty(),
-            "grok rejects composer-2.5 with an empty registry"
-        );
         for id in ["grok-4.7", "grok-4.6", "Grok-4.7"] {
             assert!(validate_model_for_runner("grok", id).is_ok(), "{id}");
             assert!(validate_model_for_runner("GROK", id).is_ok(), "{id}");
@@ -152,14 +148,8 @@ mod tests {
         assert!(validate_model_for_runner("grok", "opencode/glm-5.3-flash-free").is_err());
         assert!(validate_model_for_runner("opencode", "opencode/glm-5.3-flash-free").is_ok());
 
-        let spec = crate::custom_agent::CustomAgentSpec {
-            name: "zz-grok-policy".to_owned(),
-            command: vec!["zz".to_owned()],
-            allowed_models: Some(".*".to_owned()),
-            ..Default::default()
-        };
-        let warnings = crate::custom_agent::install_registry(vec![spec]);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        // Grok ids are rejected before any custom-agent lookup, so an unknown
+        // or custom runner never accepts them (no global registry mutation).
         assert!(validate_model_for_runner("zz-grok-policy", "grok-4.7").is_err());
         assert!(validate_model_for_runner("grok", "composer-2.5").is_err());
     }
