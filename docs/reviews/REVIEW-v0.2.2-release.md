@@ -1,6 +1,6 @@
 # REVIEW: v0.2.2 release audit
 
-Date: 2026-10-18 (Asia/Seoul). Base: `main` at 54637b5 (#71), plus the release PR.
+Date: 2026-10-18 (Asia/Seoul). Base: `main` at f0a6ae0 (#73), plus the release PR.
 
 ## Scope
 
@@ -17,6 +17,7 @@ Milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2): issues #54-#
 | grok turns no longer hang after the final reply; text around tool calls is separated | SPEC-grok-runner FR-913..917 | #72 (a5de430) |
 | grok tool-call activity, dashboard activity detail, cancel notice for all runners, welcome lists runners, dashboard token kept out of snapshots | SPEC-grok-runner FR-980, SPEC-running-indicators FR-981..982, SPEC-first-run FR-983, SPEC-web-dashboard FR-984 | #74 (c6a12b8) |
 | Resizable left and right dashboard sidebars (drag, keyboard, clamp, persisted width, prompt stays centered) | SPEC-sidebar-resize FR-970..974, UX-970..971 | #71 (54637b5) |
+| TUI picker rows never overflow: fixed give-way order keeps time and running mark (post-merge review of #70) | SPEC-session-sidebar FR-865 | #73 (f0a6ae0) |
 
 The SPECs, PLAN, TASKS and ROADMAP landed in #57 (2374989) and #62 (2d776d5). Also in this release: CI on `ubuntu-latest` (#63, 77ef270) and the `kill -- -<pgid>` fix (MCP server in #63; custom agent, Cursor and Office in #64, 787436b).
 
@@ -46,6 +47,7 @@ Then: CHANGELOG checked against the merged PRs, `scripts/spec-index.sh`, and `te
 - grok exit fix (#72): root cause was grok 1.0.62 auto-wake queueing a prompt that headless mode never runs after the turn; the preset now sets `GROK_AUTO_WAKE=0` and `--no-wait-for-background`, and the `end` line ends the turn. TEST-PLAN rows TC-913..918 were added in this PR. Evidence, smoke turns and reviewer notes: REVIEW-grok-runner-exit.md.
 - v0.2.2 dogfood fixes (#74): adds FR-980..984 (5 requirements) and TC-980..987 plus TC-816 (9 TCs) across SPEC-grok-runner, SPEC-running-indicators, SPEC-first-run and SPEC-web-dashboard, on top of the counts above. TEST-PLAN rows were added in this PR. Implementation by Grok Build (grok-4.7), review by opencode beam-free (follow-up approved by nemotron-3-ultra-free), live grok-4.7 verification inside dmuxai: see docs/reviews/REVIEW-v022-dogfood.md.
 - Resizable sidebars (#71): adds SPEC-sidebar-resize with FR-970..974 and UX-970..971 (7 requirements) and TC-970..972 (3 TCs), on top of the counts above; SPEC Status `Implemented (v0.2.2)` and TEST-PLAN rows were added in that PR. Implementation by Grok Build (grok-4.7); review by cursor-agent claude-sonnet-5-5-high after the opencode free models timed out (two rounds, approved): see docs/reviews/REVIEW-sidebar-resize.md. Light screenshots: `v022-sidebar-resize-default.png`, `-wide.png`, `-narrow.png`.
+- Picker overflow (#73): no new requirements; FR-865 wording tightened and TC-866..869 (4 TCs) added to SPEC-session-sidebar, on top of the counts above, with ✅ TEST-PLAN rows from that PR. Also a test-only CI flake fix in `tests/mcp_client.rs` (mock HTTP server sends `Connection: close`). Implementation by Grok Build (grok-4.7); review by cursor-agent claude-sonnet-5-5-high (two rounds) and, on the final diff, opencode nemotron-3-ultra-free and beam-free (no blocking issues). Light screenshots: `v022-tui-picker-overflow-50.png`, `-120.png`.
 - Screens: light-theme screenshots of each user-visible change were taken from the release binary with demo data and shown to Dongjin before the tag.
 
 ## Review

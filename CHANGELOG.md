@@ -8,7 +8,7 @@ All notable changes to dmuxai are listed here. Versions follow
 ## [0.2.2] - 2026-10-18
 
 Dashboard layout, workspace and graph view changes requested by Dongjin on
-2026-10-18, PRs #57-#60, #62-#66, #70-#72 and #74 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
+2026-10-18, PRs #57-#60, #62-#66 and #70-#74 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
 issues #54-#56 and #61, plus the grok runner Dongjin added on 2026-10-19). Linux is the supported platform. The Windows target
 still compiles and passes clippy, but the live workspace switch returns 501 on
 Windows (see ROADMAP "Later").
@@ -98,6 +98,14 @@ Windows (see ROADMAP "Later").
   never wider than the terminal or the rows need) and shortens long titles
   with `…`, so the running mark, id, turn count, agent and time stay visible
   at 80, 120 and 200 columns.
+
+- **TUI picker rows never overflow (SPEC-session-sidebar FR-865, #73).** With a
+  long custom agent label or a terminal under 60 columns, the agent and time
+  were still clipped. Fields now give way in a fixed order (title, then the
+  agent label with `…`, then the id, the turn count, the title, the agent, and
+  `● running` becomes `●`), so the time and the running mark always fit.
+  Control, zero-width and bidi characters in titles become spaces, so each
+  conversation stays on one row.
 
 - **Process-group kill on Unix (#63 for the MCP server, #64 for the rest).** `kill` now receives `--` before
   the negative process-group id when DmuxAI stops a custom agent, a Cursor
