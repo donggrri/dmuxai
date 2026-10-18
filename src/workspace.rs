@@ -115,6 +115,20 @@ pub fn check_workspace_denied(canonical: &Path) -> Result<(), WorkspaceDirError>
 /// permissions), and enforces the deny list (`/` root, DmuxAI state dir,
 /// DmuxAI user config dir, and credential directories).
 pub fn validate_workspace_dir(path: &Path) -> Result<PathBuf, WorkspaceDirError> {
+    validate_workspace_dir_inner(path, true)
+}
+
+/// Like [`validate_workspace_dir`] but never creates a probe file: only the
+/// mode bits and `read_dir` are checked. Used where validation must stay
+/// read-only (listing recent paths on every `GET /api/workspace`).
+pub fn validate_workspace_dir_no_probe(path: &Path) -> Result<PathBuf, WorkspaceDirError> {
+    validate_workspace_dir_inner(path, false)
+}
+
+fn validate_workspace_dir_inner(
+    path: &Path,
+    write_probe: bool,
+) -> Result<PathBuf, WorkspaceDirError> {
     let raw_os = path.as_os_str();
     if raw_os.is_empty() || raw_os.len() > 4096 {
         return Err(WorkspaceDirError::InvalidPath);
@@ -164,6 +178,10 @@ pub fn validate_workspace_dir(path: &Path) -> Result<PathBuf, WorkspaceDirError>
 
     // Must be readable and writable without creating directories.
     fs::read_dir(&canonical).map_err(|_| WorkspaceDirError::NotWritable)?;
+
+    if !write_probe {
+        return Ok(canonical);
+    }
 
     static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -361,7 +379,7 @@ pub fn load_recent_workspaces() -> Vec<String> {
     };
     let mut valid = Vec::new();
     for entry in raw_list {
-        if let Ok(canon) = validate_workspace_dir(Path::new(&entry)) {
+        if let Ok(canon) = validate_workspace_dir_no_probe(Path::new(&entry)) {
             let s = canon.to_string_lossy().into_owned();
             if !valid.contains(&s) {
                 valid.push(s);
@@ -446,6 +464,44 @@ pub fn ensure_directory_writable(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    // TC-873 (FR-872): listing recents (every GET /api/workspace) must not
+    // write probe files into the listed directories.
+    #[test]
+    fn load_recent_workspaces_does_not_write_probes() {
+        let _guard = crate::state_path::test_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let state_dir = root.join("state");
+        let recent = root.join("recent-project");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&recent).unwrap();
+        fs::write(
+            state_dir.join("recent-workspaces.json"),
+            serde_json::to_string(&vec![recent.to_string_lossy().into_owned()]).unwrap(),
+        )
+        .unwrap();
+        let prev_state = std::env::var_os("DMUXAI_STATE_DIR");
+        // SAFETY: serialized by test_env_lock().
+        unsafe { std::env::set_var("DMUXAI_STATE_DIR", &state_dir) };
+        let before = fs::metadata(&recent).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let listed = load_recent_workspaces();
+        let after = fs::metadata(&recent).unwrap().modified().unwrap();
+        // SAFETY: serialized by test_env_lock().
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("DMUXAI_STATE_DIR", v),
+                None => std::env::remove_var("DMUXAI_STATE_DIR"),
+            }
+        }
+        assert_eq!(listed, vec![recent.to_string_lossy().into_owned()]);
+        assert_eq!(
+            before, after,
+            "listing recents must not touch the directory"
+        );
+    }
+
     use super::*;
     use tempfile::tempdir;
 

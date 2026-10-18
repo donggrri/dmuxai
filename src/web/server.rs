@@ -1353,6 +1353,22 @@ async fn post_workspace_switch(
         Err(reason) => return error_json(StatusCode::BAD_REQUEST, &reason.to_string()),
     };
 
+    // Run the rest in its own task: once the App has set switch-pending, the
+    // flag must be committed or cancelled even if the client disconnects and
+    // axum drops this handler future.
+    tokio::spawn(workspace_switch_task(state, canonical))
+        .await
+        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+}
+
+/// How long `POST /api/workspace/switch` waits for the App (shortened in tests).
+const SWITCH_REPLY_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(10)
+};
+
+async fn workspace_switch_task(state: AppState, canonical: std::path::PathBuf) -> Response {
     let Some(sender) = state.services.commands.clone() else {
         return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
     };
@@ -1367,9 +1383,20 @@ async fn post_workspace_switch(
     {
         return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
     }
-    match tokio::time::timeout(Duration::from_secs(10), rx).await {
-        Err(_) => return error_json(StatusCode::GATEWAY_TIMEOUT, "workspace switch timed out"),
-        Ok(Err(_)) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    match tokio::time::timeout(SWITCH_REPLY_TIMEOUT, rx).await {
+        Err(_) | Ok(Err(_)) => {
+            // The App may still set switch-pending after we give up; cancel so
+            // prompts are not refused until restart.
+            let notice = "Workspace switch failed: the app did not respond".to_owned();
+            let _ = tokio::time::timeout(
+                SWITCH_REPLY_TIMEOUT,
+                sender.send(DashboardCommand::CancelSwitchWorkspace {
+                    notice: notice.clone(),
+                }),
+            )
+            .await;
+            return error_json(StatusCode::GATEWAY_TIMEOUT, &notice);
+        }
         Ok(Ok(Err(error))) => return run_error_response(error),
         Ok(Ok(Ok(()))) => {}
     }
@@ -1385,8 +1412,9 @@ async fn post_workspace_switch(
                     notice: notice.clone(),
                 })
                 .await;
-            state.hub.push_notice(notice);
+            state.hub.push_notice(notice.clone());
             tokio::task::yield_now().await;
+            return error_json(StatusCode::INTERNAL_SERVER_ERROR, &notice);
         }
         Ok(exe) => {
             let reexec_args =
@@ -4009,6 +4037,54 @@ mod tests {
         }
     }
 
+    // TC-875 (FR-874): if the App never answers, the handler cancels the
+    // switch so switch-pending cannot stay set until restart.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn workspace_switch_timeout_sends_cancel() {
+        let _env_guard = crate::state_path::test_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let target = std::fs::canonicalize(tmp.path()).unwrap();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let hub = test_hub();
+        hub.set_switch_config(WorkspaceSwitchConfig {
+            unix_supported: Some(true),
+            ..WorkspaceSwitchConfig::default()
+        });
+        let token = "switch-timeout-token".to_owned();
+        let router = build_router_with(
+            hub,
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                web_attached: true,
+                commands: Some(cmd_tx),
+                ..DashboardServices::default()
+            },
+        );
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/workspace/switch",
+                &token,
+                &serde_json::json!({ "path": target.to_string_lossy() }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        // First the switch request (its reply is held, never answered)...
+        let first = cmd_rx.recv().await.expect("switch command");
+        let _held_reply = match first {
+            DashboardCommand::SwitchWorkspace { reply, .. } => reply,
+            _ => panic!("expected SwitchWorkspace first"),
+        };
+        // ...then the cancel that clears switch-pending.
+        assert!(matches!(
+            cmd_rx.recv().await,
+            Some(DashboardCommand::CancelSwitchWorkspace { .. })
+        ));
+    }
+
     // TC-875 (FR-874)
     #[tokio::test]
     // The env lock must span the whole test (HOME/state dir are process-wide);
@@ -4260,7 +4336,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(
             !switch_pending_flag.load(std::sync::atomic::Ordering::SeqCst),
             "failing preflight must clear switch_pending"

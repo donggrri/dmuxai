@@ -38,6 +38,11 @@ Re-exec is simpler and safer than re-wiring the live App, which holds about 40 w
 
 - Because `dmuxai serve` is view-only and FR-872/FR-874 refuse `/api/workspace/dirs` and `/api/workspace/switch` with 403 in view-only mode, `TC-874` and `TC-876` launch `dmuxai --web` under a pseudo-terminal (`pty.fork()`) so both directory browsing and Unix `exec` re-execution run against the interactive web server while view-only 403 enforcement remains covered by `TC-873` and `TC-875`.
 - Deny-list checks (`check_workspace_denied`) run before the write probe in `validate_workspace_dir` so `/`, the state/config dirs, and read-only credential directories report their `denied: ...` reason and never have a probe file created inside them.
+- The switch handler runs its post-validation work in a spawned task. If the App does not answer within 10s, or drops the reply, it sends `CancelSwitchWorkspace` and answers 504. A dropped client connection can therefore never leave switch-pending set (`workspace_switch_timeout_sends_cancel`).
+- A failing preflight answers 500 with the notice text, and also publishes it as a dashboard notice. It used to answer 202 although nothing was switched.
+- Recent paths are filtered on every `GET /api/workspace` with `validate_workspace_dir_no_probe`: the same checks except the write probe, so a read-only request never creates files. A recent directory that has since become read-only still fails with `not writable` when you switch to it (`load_recent_workspaces_does_not_write_probes`).
+- `POST /api/workspace/validate` stays available in view-only mode, and works for paths outside the browse roots, as FR-872 specifies. It needs the dashboard token, returns only ok or a reason (never directory contents), and uses the same write probe as the CLI.
+- The header path button shows a `▾` caret, so you can tell it opens the dialog.
 
 ## 3. Tests
 
