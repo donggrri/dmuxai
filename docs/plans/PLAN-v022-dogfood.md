@@ -1,7 +1,7 @@
 # PLAN: v0.2.2 dogfood fixes
 
 Status: in progress
-Specs: [SPEC-grok-runner §9](../specs/SPEC-grok-runner.md) (FR-980), [SPEC-running-indicators](../specs/SPEC-running-indicators.md) (FR-981, FR-982), [SPEC-first-run](../specs/SPEC-first-run.md) (FR-983), [SPEC-web-dashboard](../specs/SPEC-web-dashboard.md) (FR-984)
+Specs: [SPEC-grok-runner §10](../specs/SPEC-grok-runner.md) (FR-980), [SPEC-running-indicators](../specs/SPEC-running-indicators.md) (FR-981, FR-982), [SPEC-first-run](../specs/SPEC-first-run.md) (FR-983), [SPEC-web-dashboard](../specs/SPEC-web-dashboard.md) (FR-984)
 Source: dogfooding notes in `docs/reviews/REVIEW-dashboard-full-parity.md` (PR #68), issues 2-5. Issue 1 (missing separator between grok text segments) is handled by PR #72 (`fix/grok-runner-exit`).
 
 ## Order
