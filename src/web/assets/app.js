@@ -386,7 +386,9 @@ function runElapsedMs(run, nowMs) {
   if (!run || typeof run.started_at_ms !== 'number') { return 0; }
   var snap = snapshot;
   if (snap && typeof snap.generated_at_ms === 'number' && typeof snap.receivedAt === 'number') {
-    var serverNow = snap.sent_at_ms > 0 ? snap.sent_at_ms : snap.generated_at_ms;
+    var serverNow = typeof snap.sent_at_ms === 'number' && snap.sent_at_ms > 0
+      ? snap.sent_at_ms
+      : snap.generated_at_ms;
     return Math.max(0, (serverNow - run.started_at_ms) + (nowMs - snap.receivedAt));
   }
   return Math.max(0, nowMs - run.started_at_ms);
@@ -403,7 +405,9 @@ function nodeElapsed(node, snap, nowMs) {
     ) {
       // Server and browser clocks may disagree; interpolate from the
       // server send time (sent_at_ms) plus the time our page held the snapshot.
-      var serverNow = snap.sent_at_ms > 0 ? snap.sent_at_ms : snap.generated_at_ms;
+      var serverNow = typeof snap.sent_at_ms === 'number' && snap.sent_at_ms > 0
+      ? snap.sent_at_ms
+      : snap.generated_at_ms;
       return Math.max(
         0,
         (serverNow - node.started_at_ms) + (nowMs - snap.receivedAt)
@@ -648,7 +652,9 @@ function graphNodeElementById(id) {
 function graphServerNow(snap, nowMs) {
   var now = typeof nowMs === 'number' ? nowMs : Date.now();
   if (snap && typeof snap.generated_at_ms === 'number' && typeof snap.receivedAt === 'number') {
-    var serverNow = snap.sent_at_ms > 0 ? snap.sent_at_ms : snap.generated_at_ms;
+    var serverNow = typeof snap.sent_at_ms === 'number' && snap.sent_at_ms > 0
+      ? snap.sent_at_ms
+      : snap.generated_at_ms;
     return serverNow + Math.max(0, now - snap.receivedAt);
   }
   return now;
@@ -786,8 +792,8 @@ function graphEstimate(graph, serverNow) {
   return out;
 }
 
-// FR-880: the smallest "nice" step giving at most 10 ticks; runs shorter than
-// three minutes use 30s steps.
+// FR-880: the smallest "nice" step giving at most 10 intervals (11 tick
+// marks counting both ends); runs shorter than three minutes use 30s steps.
 function graphTickStep(spanMs) {
   if (spanMs < 180000) { return 30000; }
   for (var i = 0; i < GRAPH_TICK_STEPS.length; i++) {
