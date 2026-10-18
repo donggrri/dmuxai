@@ -582,6 +582,8 @@ async fn mcp_client_bounds_writes_and_streams_sse() {
     );
 
     // 2. HTTP server whose SSE stream stays open after response and splits over two data: lines
+    // The mock answers one request per connection, so it says `Connection: close`;
+    // otherwise reqwest may reuse a pooled socket the mock already dropped (CI flake).
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -597,13 +599,13 @@ async fn mcp_client_bounds_writes_and_streams_sse() {
                 {
                     let init_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"serverInfo\":{\"name\":\"mock\",\"version\":\"1\"}}}";
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                         init_body.len(),
                         init_body
                     );
                     let _ = socket.write_all(resp.as_bytes()).await;
                 } else if req_text.contains("notifications/initialized") {
-                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                    let resp = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
                     let _ = socket.write_all(resp.as_bytes()).await;
                 } else if req_text.contains("split_unicode") {
                     let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";

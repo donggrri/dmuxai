@@ -309,6 +309,10 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-session-sidebar | FR-861..863,UX-860 | TC-863 | `session_sidebar_renders_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.2 |
 | M8,M2 | SPEC-session-sidebar | FR-864 | TC-864 | `conversation_picker_shows_agent_time_running` | unit | ✅ | v0.2.2 |
 | M8,M2 | SPEC-session-sidebar | FR-865 | TC-865 | `conversation_picker_scales_with_terminal_width` | unit | ✅ | v0.2.2 |
+| M8,M2 | SPEC-session-sidebar | FR-865 | TC-866 | `conversation_picker_width_borders` | unit | ✅ | v0.2.2 |
+| M8,M2 | SPEC-session-sidebar | FR-865 | TC-867 | `ellipsize_to_width_edge_cases` | unit | ✅ | v0.2.2 |
+| M8,M2 | SPEC-session-sidebar | FR-865 | TC-868 | `conversation_picker_overflow_keeps_time_and_running` | unit | ✅ | v0.2.2 |
+| M8,M2 | SPEC-session-sidebar | FR-865 | TC-869 | `conversation_picker_sanitizes_title_newlines` | unit | ✅ | v0.2.2 |
 | M8,M2 | SPEC-workspace-dir | FR-870,FR-873 | TC-870 | `workspace_dir_precedence_and_validation` | unit | ✅ | v0.2.2 |
 | M8,M2 | SPEC-workspace-dir | FR-870 | TC-871 | `workspace_dir_flag_sets_workspace` | integration | ✅ | v0.2.2 |
 | M8,M2 | SPEC-workspace-dir | FR-871 | TC-872 | `workspace_dir_assets` | unit | ✅ | v0.2.2 |

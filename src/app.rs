@@ -6355,39 +6355,33 @@ impl App {
 
     fn draw_conversation_picker(&self, frame: &mut Frame, picker: &ConversationPicker) {
         let height = (picker.conversations.len() as u16 + 2).clamp(5, 18);
-        // FR-865: split each row into prefix, title and suffix so only the title is shortened.
+        // FR-865: fit each row so the clock stays on screen as the terminal narrows.
         let rows = picker
             .conversations
             .iter()
             .map(|card| {
-                let current = if card.id == self.conversation_id {
-                    "*"
-                } else {
-                    " "
-                };
                 let agent = card
                     .last_agent
                     .map(|agent| self.agent_key_display_name(agent))
                     .unwrap_or_else(|| "none".to_owned());
-                // FR-864: the running mark leads the row so a narrow picker never cuts it off.
-                let running = if card.running { "● running  " } else { "" };
-                let prefix = format!("{current} {running}");
-                let suffix = format!(
-                    "  [{}]  {} turns  {agent}  {}",
-                    short_id(card.id.as_str()),
-                    card.turn_count,
-                    updated_description(card.updated_at_ms),
-                );
-                (prefix, card.title.clone(), suffix)
+                PickerRowText {
+                    current: if card.id == self.conversation_id {
+                        "*"
+                    } else {
+                        " "
+                    },
+                    running: card.running,
+                    title: sanitize_picker_text(&card.title),
+                    id: short_id(card.id.as_str()).to_owned(),
+                    turns: usize::try_from(card.turn_count).unwrap_or(usize::MAX),
+                    agent: sanitize_picker_text(&agent),
+                    time: updated_description(card.updated_at_ms),
+                }
             })
             .collect::<Vec<_>>();
         let natural = rows
             .iter()
-            .map(|(prefix, title, suffix)| {
-                UnicodeWidthStr::width(prefix.as_str())
-                    + UnicodeWidthStr::width(title.as_str())
-                    + UnicodeWidthStr::width(suffix.as_str())
-            })
+            .map(|row| UnicodeWidthStr::width(fit_picker_row(&row.view(), usize::MAX).as_str()))
             .max()
             .unwrap_or(0)
             .saturating_add(PICKER_CHROME_WIDTH as usize)
@@ -6423,13 +6417,8 @@ impl App {
         }
 
         let items = rows
-            .into_iter()
-            .map(|(prefix, title, suffix)| {
-                let fixed = UnicodeWidthStr::width(prefix.as_str())
-                    + UnicodeWidthStr::width(suffix.as_str());
-                let title = ellipsize_to_width(&title, inner_width.saturating_sub(fixed));
-                ListItem::new(format!("{prefix}{title}{suffix}"))
-            })
+            .iter()
+            .map(|row| ListItem::new(fit_picker_row(&row.view(), inner_width)))
             .collect::<Vec<_>>();
         let mut block = Block::default()
             .borders(Borders::ALL)
@@ -7527,6 +7516,66 @@ fn conversation_picker_width(terminal_width: u16, natural_width: u16) -> u16 {
         .min(terminal_width)
 }
 
+/// Collapses control characters, zero-width and bidi format marks, and runs of
+/// whitespace so a picker row stays one line.
+fn sanitize_picker_text(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| if picker_char_is_space(c) { ' ' } else { c })
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Control characters plus Unicode format, zero-width, and bidi marks that must
+/// not change how a picker row is drawn.
+fn picker_char_is_space(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200B}'
+                | '\u{200E}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+struct PickerRow<'a> {
+    current: &'a str,
+    running: bool,
+    title: &'a str,
+    id: &'a str,
+    turns: usize,
+    agent: &'a str,
+    time: &'a str,
+}
+
+struct PickerRowText {
+    current: &'static str,
+    running: bool,
+    title: String,
+    id: String,
+    turns: usize,
+    agent: String,
+    time: String,
+}
+
+impl PickerRowText {
+    fn view(&self) -> PickerRow<'_> {
+        PickerRow {
+            current: self.current,
+            running: self.running,
+            title: &self.title,
+            id: &self.id,
+            turns: self.turns,
+            agent: &self.agent,
+            time: &self.time,
+        }
+    }
+}
+
 /// Shortens `text` to at most `max_width` display columns, ending with `…` when cut.
 fn ellipsize_to_width(text: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(text) <= max_width {
@@ -7547,6 +7596,122 @@ fn ellipsize_to_width(text: &str, max_width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+fn render_picker_row(
+    row: &PickerRow<'_>,
+    short_mark: bool,
+    title_max: usize,
+    show_id: bool,
+    show_turns: bool,
+    agent_max: usize,
+) -> String {
+    let mut out = format!("{} ", row.current);
+    if row.running {
+        out.push_str(if short_mark { "● " } else { "● running  " });
+    }
+    let title_part = ellipsize_to_width(row.title, title_max);
+    let title_empty = title_part.is_empty();
+    if !title_empty {
+        out.push_str(&title_part);
+    }
+
+    let mut parts = Vec::new();
+    if show_id {
+        parts.push(format!("  [{}]", row.id));
+    }
+    if show_turns {
+        parts.push(format!("  {} turns", row.turns));
+    }
+    let agent_short = ellipsize_to_width(row.agent, agent_max);
+    if !agent_short.is_empty() {
+        parts.push(format!("  {agent_short}"));
+    }
+    parts.push(format!("  {}", row.time));
+    if title_empty && !parts.is_empty() {
+        let stripped = parts[0].strip_prefix("  ").map(ToOwned::to_owned);
+        if let Some(stripped) = stripped {
+            parts[0] = stripped;
+        }
+    }
+    for part in &parts {
+        out.push_str(part);
+    }
+    out
+}
+
+fn picker_row_within(
+    row: &PickerRow<'_>,
+    max_width: usize,
+    short_mark: bool,
+    title_max: usize,
+    show_id: bool,
+    show_turns: bool,
+    agent_max: usize,
+) -> Option<String> {
+    let rendered = render_picker_row(row, short_mark, title_max, show_id, show_turns, agent_max);
+    (UnicodeWidthStr::width(rendered.as_str()) <= max_width).then_some(rendered)
+}
+
+/// Fits one conversation row into `max_width` columns. Later attempts drop the id, the
+/// turn count, then the title and agent, and finally shorten the running mark. The time
+/// is always last.
+fn fit_picker_row(row: &PickerRow<'_>, max_width: usize) -> String {
+    let tw = UnicodeWidthStr::width(row.title);
+    let aw = UnicodeWidthStr::width(row.agent);
+    let tf = tw.min(12);
+    let af = aw.min(6);
+
+    // (1) Keep id, turns, and the full agent. Shrink the title down to 12 columns.
+    // Width of the row with an empty title, plus the "  " separator that comes back
+    // once the title is non-empty. One check covers every title width in this step.
+    let rest = UnicodeWidthStr::width(render_picker_row(row, false, 0, true, true, aw).as_str())
+        + usize::from(!row.title.is_empty()) * 2;
+    if max_width >= rest + tf
+        && let Some(hit) = picker_row_within(
+            row,
+            max_width,
+            false,
+            tw.min(max_width - rest),
+            true,
+            true,
+            aw,
+        )
+    {
+        return hit;
+    }
+    // (2) Title stays at that floor. Shrink the agent down to 6 columns.
+    for agent_max in (af..=aw).rev() {
+        if let Some(hit) = picker_row_within(row, max_width, false, tf, true, true, agent_max) {
+            return hit;
+        }
+    }
+    // (3) Drop the id. The agent may grow back to its full width.
+    for agent_max in (af..=aw).rev() {
+        if let Some(hit) = picker_row_within(row, max_width, false, tf, false, true, agent_max) {
+            return hit;
+        }
+    }
+    // (4) Drop the turn count as well.
+    for agent_max in (af..=aw).rev() {
+        if let Some(hit) = picker_row_within(row, max_width, false, tf, false, false, agent_max) {
+            return hit;
+        }
+    }
+    // (5) Agent stays at its 6-column floor. Shrink the title from 12 down to nothing.
+    for title_max in (0..=tf).rev() {
+        if let Some(hit) = picker_row_within(row, max_width, false, title_max, false, false, af) {
+            return hit;
+        }
+    }
+    // (6) No title. Shrink the agent from 6 columns down to nothing.
+    for agent_max in (0..=af).rev() {
+        if let Some(hit) = picker_row_within(row, max_width, false, 0, false, false, agent_max) {
+            return hit;
+        }
+    }
+    // (7) Last resort: a short running mark, no title, no agent.
+    render_picker_row(row, true, 0, false, false, 0)
 }
 
 fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -11725,6 +11890,48 @@ mod tests {
         text
     }
 
+    /// Box width and the text inside the conversation picker, one string per row.
+    fn picker_box(app: &mut App, width: u16, height: u16) -> (u16, Vec<String>) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut found = None;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                if buffer[(x, y)].symbol() != "┌" || x + 15 >= buffer.area.width {
+                    continue;
+                }
+                let title: String = (1..=15).map(|dx| buffer[(x + dx, y)].symbol()).collect();
+                if title != " Conversations " {
+                    continue;
+                }
+                let right = ((x + 1)..buffer.area.width)
+                    .find(|rx| buffer[(*rx, y)].symbol() == "┐")
+                    .unwrap_or_else(|| panic!("picker at ({x},{y}) has no right corner"));
+                found = Some((x, y, right));
+                break;
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let (left, top, right) =
+            found.unwrap_or_else(|| panic!("no conversation picker in {width}x{height} buffer"));
+        let bottom = ((top + 1)..buffer.area.height)
+            .find(|y| buffer[(left, *y)].symbol() == "└")
+            .unwrap_or_else(|| panic!("picker at ({left},{top}) has no bottom border"));
+        let rows = ((top + 1)..bottom)
+            .map(|y| {
+                let line: String = ((left + 1)..right)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                line.trim_end_matches(' ').to_owned()
+            })
+            .collect();
+        (right - left + 1, rows)
+    }
+
     #[test]
     // TC-360 / FR-360: Tool calls render as single collapsed lines with status symbols.
     fn tool_call_collapsed_rendering() {
@@ -14250,19 +14457,17 @@ mod tests {
         assert!(!dmuxai::graph::is_runner_allowed("grok", &app.settings));
     }
 
+    fn picker_row_body_width(row: &str) -> usize {
+        let body = row
+            .strip_prefix("> ")
+            .or_else(|| row.strip_prefix("  "))
+            .unwrap_or(row);
+        UnicodeWidthStr::width(body)
+    }
+
     #[test]
     // TC-865 / FR-865: conversation_picker_scales_with_terminal_width
     fn conversation_picker_scales_with_terminal_width() {
-        assert_eq!(conversation_picker_width(80, 500), 72);
-        assert_eq!(conversation_picker_width(120, 500), 108);
-        assert_eq!(conversation_picker_width(200, 500), 160);
-        assert_eq!(conversation_picker_width(200, 90), 90);
-        assert_eq!(conversation_picker_width(200, 20), 60);
-        assert_eq!(conversation_picker_width(50, 500), 50);
-        assert_eq!(ellipsize_to_width("abcdef", 4), "abc…");
-        assert_eq!(ellipsize_to_width("abc", 4), "abc");
-        assert_eq!(ellipsize_to_width("한국어제목", 5), "한국…");
-
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("conversations.sqlite3");
         let engine = ConversationEngine::open(&db_path, dir.path()).unwrap();
@@ -14277,39 +14482,61 @@ mod tests {
         app.submit_prompt();
         app.open_conversation_picker();
 
+        // Observed at 200x50: the box is the widest fitted row plus the 4-column chrome.
+        const WIDE_BOX: u16 = 141;
+        let has_short_hex_id = |row: &str| -> bool {
+            row.as_bytes().windows(10).any(|window| {
+                window[0] == b'['
+                    && window[9] == b']'
+                    && window[1..9].iter().all(u8::is_ascii_hexdigit)
+            })
+        };
+
         for (width, height) in [(80u16, 24u16), (120, 40), (200, 50)] {
-            let rendered = render_test_buffer_sized(&mut app, width, height);
-            let top = rendered
-                .lines()
-                .find(|line| line.contains("Conversations"))
-                .unwrap_or_else(|| panic!("no picker at {width}x{height}:\n{rendered}"));
-            let chars: Vec<char> = top.chars().collect();
-            let left = chars.iter().position(|c| *c == '┌').expect("left corner");
-            let right = chars.iter().rposition(|c| *c == '┐').expect("right corner");
-            let picker_width = right - left + 1;
-            assert!(picker_width <= width as usize, "{width}: {picker_width}");
-            if width >= 120 {
-                assert!(
-                    picker_width > 76,
-                    "{width}: picker still {picker_width} wide"
-                );
+            let (box_width, rows) = picker_box(&mut app, width, height);
+            assert!(box_width <= width, "{width}: box {box_width}");
+            match width {
+                80 => assert_eq!(box_width, 72, "{rows:?}"),
+                120 => assert_eq!(box_width, 108, "{rows:?}"),
+                200 => {
+                    let widest = rows
+                        .iter()
+                        .map(|row| picker_row_body_width(row))
+                        .max()
+                        .unwrap();
+                    assert_eq!(box_width, u16::try_from(widest).unwrap() + 4, "{rows:?}");
+                    assert_eq!(box_width, WIDE_BOX, "{rows:?}");
+                }
+                _ => unreachable!(),
             }
-            let row = rendered
-                .lines()
-                .find(|line| line.contains("running") && line.contains("turns"))
-                .unwrap_or_else(|| panic!("no running row at {width}x{height}:\n{rendered}"));
-            let row_chars: Vec<char> = row.chars().collect();
-            let inside: String = row_chars[left + 1..right].iter().collect();
-            assert!(inside.contains("Codex"), "{width}: agent cut off: {inside}");
+            let running = rows
+                .iter()
+                .find(|row| row.contains('●'))
+                .unwrap_or_else(|| panic!("no running row at {width}x{height}: {rows:?}"));
+            let short = rows
+                .iter()
+                .find(|row| row.contains("Short task"))
+                .unwrap_or_else(|| panic!("no short row at {width}x{height}: {rows:?}"));
+            assert!(running.contains("Codex"), "{width}: {running}");
+            assert!(running.contains("just now"), "{width}: {running}");
+            assert!(running.contains("1 turns"), "{width}: {running}");
             assert!(
-                inside.contains("just now"),
-                "{width}: time cut off: {inside}"
+                has_short_hex_id(running),
+                "{width}: missing short id: {running}"
             );
-            if width <= 120 {
-                assert!(
-                    inside.contains('…'),
-                    "{width}: long title not shortened: {inside}"
-                );
+            assert!(short.contains("none"), "{width}: short row agent: {short}");
+            assert!(short.contains("just now"), "{width}: {short}");
+            assert!(
+                rows.iter().all(|row| {
+                    row.contains("just now") && (row.contains("Codex") || row.contains("none"))
+                }),
+                "{width}: {rows:?}"
+            );
+            let ellipsis = rows.iter().any(|row| row.contains('…'));
+            if width == 200 {
+                assert!(!ellipsis, "{width}: {rows:?}");
+            } else {
+                assert!(ellipsis, "{width}: {rows:?}");
             }
         }
     }
@@ -14568,6 +14795,293 @@ mod tests {
         .unwrap();
         assert!(session_body.contains("\"session\""));
         assert!(!session_body.contains(TOKEN), "{session_body}");
+    }
+
+    #[test]
+    // TC-866 / FR-865: conversation_picker_width_borders
+    fn conversation_picker_width_borders() {
+        for (terminal, natural, expected) in [
+            (50, 500, 50),
+            (59, 500, 59),
+            (60, 500, 60),
+            (61, 500, 60),
+            (67, 500, 60),
+            (68, 500, 61),
+            (160, 500, 144),
+            (178, 500, 160),
+            (179, 500, 160),
+            (200, 500, 160),
+            (200, 90, 90),
+            (200, 20, 60),
+            (50, 20, 50),
+        ] {
+            assert_eq!(
+                conversation_picker_width(terminal, natural),
+                expected,
+                "terminal {terminal} natural {natural}"
+            );
+        }
+    }
+
+    #[test]
+    // TC-867 / FR-865: ellipsize_to_width_edge_cases
+    fn ellipsize_to_width_edge_cases() {
+        let cases = [
+            ("", 0, ""),
+            ("", 5, ""),
+            ("abc", 0, ""),
+            ("abc", 1, "…"),
+            ("abc", 3, "abc"),
+            ("abcd", 3, "ab…"),
+            ("한국어", 4, "한…"),
+            ("한국어", 3, "한…"),
+            ("한국어", 2, "…"),
+            ("한국어", 6, "한국어"),
+        ];
+        for (text, budget, expected) in cases {
+            let got = ellipsize_to_width(text, budget);
+            assert_eq!(got, expected, "{text:?} budget {budget}");
+            assert!(
+                UnicodeWidthStr::width(got.as_str()) <= budget,
+                "{text:?} budget {budget}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    // TC-868 / FR-865: conversation_picker_overflow_keeps_time_and_running
+    fn conversation_picker_overflow_keeps_time_and_running() {
+        let agent_label = "opencode-deepseek-v4.1-flash-free-review";
+        assert_eq!(
+            UnicodeWidthStr::width(agent_label),
+            40,
+            "pad/trim the label to 40"
+        );
+        let row = PickerRow {
+            current: "*",
+            running: true,
+            title: "Ship the conversation picker overflow fix",
+            id: "abc12345",
+            turns: 4,
+            agent: agent_label,
+            time: "just now",
+        };
+        let check = |max_width: usize, rendered: &str| {
+            let width = UnicodeWidthStr::width(rendered);
+            assert!(
+                width <= max_width,
+                "max {max_width}: width {width}: {rendered}"
+            );
+            assert!(
+                rendered.ends_with("just now"),
+                "max {max_width}: {rendered}"
+            );
+            assert!(rendered.contains('●'), "max {max_width}: {rendered}");
+        };
+
+        let full = fit_picker_row(&row, 200);
+        check(200, &full);
+        assert_eq!(
+            full,
+            "* ● running  Ship the conversation picker overflow fix  [abc12345]  4 turns  opencode-deepseek-v4.1-flash-free-review  just now"
+        );
+
+        // Title shortens first. The agent stays whole, and the title stays wider than 12.
+        let title_cut = fit_picker_row(&row, 110);
+        check(110, &title_cut);
+        let title_shown = "Ship the conversation p…";
+        assert!(
+            row.title.starts_with(title_shown.trim_end_matches('…')),
+            "{title_shown}"
+        );
+        assert!(UnicodeWidthStr::width(title_shown) > 12, "{title_shown}");
+        assert_eq!(
+            title_cut,
+            "* ● running  Ship the conversation p…  [abc12345]  4 turns  opencode-deepseek-v4.1-flash-free-review  just now"
+        );
+
+        // Title is pinned at 12 columns and the agent is cut, still ending in ….
+        let agent_cut = fit_picker_row(&row, 80);
+        check(80, &agent_cut);
+        let title_12 = ellipsize_to_width(row.title, 12);
+        let agent_shown = "opencode-deepseek-v4.…";
+        assert_eq!(title_12, "Ship the co…");
+        assert!(agent_cut.contains(&title_12), "{agent_cut}");
+        assert!(agent_shown.ends_with('…'));
+        assert!(UnicodeWidthStr::width(agent_shown) >= 6);
+        assert!(agent_label.starts_with(agent_shown.trim_end_matches('…')));
+        assert!(agent_cut.contains("[abc12345]"), "{agent_cut}");
+        assert!(agent_cut.contains("4 turns"), "{agent_cut}");
+        assert_eq!(
+            agent_cut,
+            "* ● running  Ship the co…  [abc12345]  4 turns  opencode-deepseek-v4.…  just now"
+        );
+
+        let no_id = fit_picker_row(&row, 56);
+        check(56, &no_id);
+        assert!(!no_id.contains("[abc12345]"), "{no_id}");
+        assert!(no_id.contains("4 turns"), "{no_id}");
+        assert!(no_id.contains(&title_12), "{no_id}");
+        assert_eq!(
+            no_id,
+            "* ● running  Ship the co…  4 turns  opencode-…  just now"
+        );
+
+        let no_turns = fit_picker_row(&row, 48);
+        check(48, &no_turns);
+        assert!(!no_turns.contains("[abc12345]"), "{no_turns}");
+        assert!(!no_turns.contains("turns"), "{no_turns}");
+        assert!(no_turns.contains(&title_12), "{no_turns}");
+        assert_eq!(no_turns, "* ● running  Ship the co…  opencode-d…  just now");
+
+        // Agent is pinned at 6 columns and the title drops below 12.
+        let title_shrinking = fit_picker_row(&row, 42);
+        check(42, &title_shrinking);
+        let agent_6 = ellipsize_to_width(row.agent, 6);
+        assert_eq!(agent_6, "openc…");
+        assert!(title_shrinking.contains(&agent_6), "{title_shrinking}");
+        assert!(!title_shrinking.contains(&title_12), "{title_shrinking}");
+        let shrunk_title = "Ship the c…";
+        assert!(UnicodeWidthStr::width(shrunk_title) < 12);
+        assert!(title_shrinking.contains(shrunk_title), "{title_shrinking}");
+        assert_eq!(
+            title_shrinking,
+            "* ● running  Ship the c…  openc…  just now"
+        );
+
+        let no_title = fit_picker_row(&row, 30);
+        check(30, &no_title);
+        assert!(!no_title.contains("Ship"), "{no_title}");
+        assert!(!no_title.contains("[abc12345]"), "{no_title}");
+        assert!(!no_title.contains("turns"), "{no_title}");
+        assert!(no_title.contains(&agent_6), "{no_title}");
+        assert!(UnicodeWidthStr::width(agent_6.as_str()) <= 6);
+        assert_eq!(no_title, "* ● running  openc…  just now");
+
+        // "* ● running  just now" is 21 columns and does not fit; "* ● just now" is 12 and does.
+        assert_eq!(UnicodeWidthStr::width("* ● running  just now"), 21);
+        assert_eq!(UnicodeWidthStr::width("* ● just now"), 12);
+        let short_mark = fit_picker_row(&row, 15);
+        check(15, &short_mark);
+        assert_eq!(short_mark, "* ● just now");
+        assert!(!short_mark.contains("running"), "{short_mark}");
+
+        let cjk = PickerRow {
+            current: "*",
+            running: true,
+            title: "한국어 제목이 아주 긴 대화입니다",
+            id: "abc12345",
+            turns: 4,
+            agent: "검토-에이전트-라벨-아주-김",
+            time: "just now",
+        };
+        for max_width in [60, 40, 30] {
+            let rendered = fit_picker_row(&cjk, max_width);
+            let width = UnicodeWidthStr::width(rendered.as_str());
+            assert!(
+                width <= max_width,
+                "max {max_width}: width {width}: {rendered}"
+            );
+            assert!(rendered.ends_with("just now"), "{rendered}");
+            assert!(
+                rendered.chars().all(|ch| {
+                    cjk.title.contains(ch)
+                        || cjk.agent.contains(ch)
+                        || cjk.id.contains(ch)
+                        || " *●[]turnsrunningjustnow…".contains(ch)
+                }),
+                "broken char in {rendered:?}"
+            );
+        }
+
+        let quiet = PickerRow {
+            current: " ",
+            running: false,
+            title: "Short task",
+            id: "abc12345",
+            turns: 0,
+            agent: "none",
+            time: "just now",
+        };
+        let tiny = fit_picker_row(&quiet, 10);
+        assert!(tiny.ends_with("just now"), "{tiny}");
+        assert!(UnicodeWidthStr::width(tiny.as_str()) <= 10, "{tiny}");
+
+        let _ =
+            dmuxai::custom_agent::install_registry(vec![dmuxai::custom_agent::grok_preset("grok")]);
+        let (mut app, _sent) = test_app();
+        app.settings.custom_agents = vec![dmuxai::custom_agent::CustomAgentSpec {
+            name: "grok".to_owned(),
+            label: Some(agent_label.to_owned()),
+            command: vec!["grok".to_owned()],
+            ..Default::default()
+        }];
+        app.settings.graph_enabled = false;
+        app.selected = adapter_index(Agent::Custom(0));
+        app.create_conversation(Some("Ship the conversation picker overflow fix".to_owned()));
+        app.input = "still working".to_owned();
+        app.submit_prompt();
+        app.open_conversation_picker();
+
+        for (width, height) in [(60u16, 20u16), (40, 20)] {
+            let (box_width, rows) = picker_box(&mut app, width, height);
+            assert!(box_width <= width, "{width}: box {box_width} rows {rows:?}");
+            let running = rows
+                .iter()
+                .find(|row| row.contains('●'))
+                .unwrap_or_else(|| panic!("no running row at {width}x{height}: {rows:?}"));
+            assert!(running.contains("just now"), "{width}: {running}");
+            let label_prefix = (5..agent_label.len())
+                .rev()
+                .map(|end| &agent_label[..end])
+                .find(|prefix| running.contains(&format!("  {prefix}…  just now")));
+            let prefix = label_prefix.unwrap_or_else(|| {
+                panic!("{width}: label not anchored before the clock in {running}")
+            });
+            assert!(prefix.len() >= 5, "{width}: {prefix} in {running}");
+            assert!(
+                prefix.starts_with("openc"),
+                "{width}: {prefix} in {running}"
+            );
+        }
+    }
+
+    #[test]
+    // TC-869 / FR-865: conversation_picker_sanitizes_title_newlines
+    fn conversation_picker_sanitizes_title_newlines() {
+        assert_eq!(
+            sanitize_picker_text("first line\nsecond"),
+            "first line second"
+        );
+        assert_eq!(sanitize_picker_text("a\r\nb\tc"), "a b c");
+        assert_eq!(sanitize_picker_text("  x  "), "x");
+        assert_eq!(sanitize_picker_text("a\u{200B}b\u{202E}c"), "a b c");
+        assert_eq!(sanitize_picker_text("a\u{061C}b"), "a b");
+        assert_eq!(sanitize_picker_text("👨\u{200D}👩"), "👨\u{200D}👩");
+        assert_eq!(sanitize_picker_text("a\u{200C}b"), "a\u{200C}b");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("conversations.sqlite3");
+        let engine = ConversationEngine::open(&db_path, dir.path()).unwrap();
+        let (mut app, _sent) = test_app_with_engine(engine);
+        app.create_conversation(Some("first line\nsecond".to_owned()));
+        app.create_conversation(Some("a\r\nb\tc".to_owned()));
+        app.create_conversation(Some("next".to_owned()));
+        // Startup opens one empty "New conversation" before these three.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE conversations SET archived_at_ms = 1 WHERE title = 'New conversation'",
+            [],
+        )
+        .unwrap();
+        app.open_conversation_picker();
+
+        let (_box_width, rows) = picker_box(&mut app, 120, 40);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        let joined = rows.join("\n");
+        assert!(joined.contains("first line second"), "{rows:?}");
+        assert!(joined.contains("a b c"), "{rows:?}");
+        assert!(joined.contains("next"), "{rows:?}");
     }
 }
 
