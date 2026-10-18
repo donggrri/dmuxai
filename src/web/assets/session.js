@@ -49,6 +49,9 @@
   var workspaceInitialized = null;
   var sessionsOpen = false;
   var sessionsFilter = '';
+  // A toggle made before the first snapshot names the workspace is kept here
+  // and saved under the real workspace key once it is known.
+  var pendingSessionsOpen = null;
 
   function sessionsStorageKey() {
     return SESSIONS_OPEN_PREFIX + (workspaceKey || 'default');
@@ -77,7 +80,11 @@
     document.body.classList.toggle('left-sidebar-open', sessionsOpen);
     syncSessionsBackdrop();
     if (persist) {
-      localSet(sessionsStorageKey(), sessionsOpen ? '1' : '0');
+      if (workspaceInitialized === 'default') {
+        pendingSessionsOpen = sessionsOpen;
+      } else {
+        localSet(sessionsStorageKey(), sessionsOpen ? '1' : '0');
+      }
     }
   }
 
@@ -86,6 +93,12 @@
     if (workspaceInitialized === key) { return; }
     workspaceKey = key;
     workspaceInitialized = key;
+    if (key !== 'default' && pendingSessionsOpen !== null) {
+      var pending = pendingSessionsOpen;
+      pendingSessionsOpen = null;
+      setSessionsOpen(pending, true);
+      return;
+    }
     var saved = localGet(sessionsStorageKey());
     if (saved === '1') {
       setSessionsOpen(true, false);
@@ -573,7 +586,7 @@
 
     filtered.forEach(function (c) {
       var isActive = c.id === session.conversation_id;
-      var li = el('li', 'sessions-row' + (isActive ? ' active' : '') + (viewOnly ? ' disabled' : ''));
+      var li = el('li', 'sessions-row' + (isActive ? ' sessions-row-active' : '') + (viewOnly ? ' sessions-row-disabled' : ''));
       li.tabIndex = 0;
       li.setAttribute('data-id', c.id);
       li.setAttribute('data-parity', 'resume');
@@ -581,9 +594,10 @@
         li.setAttribute('aria-current', 'true');
       }
 
-      var top = el('div', 'sessions-row-top');
+      var top = el('div', 'sessions-row-head');
       if (c.running) {
         var spin = el('span', 'spinner');
+        spin.setAttribute('role', 'img');
         spin.setAttribute('aria-label', 'running');
         top.appendChild(spin);
       }

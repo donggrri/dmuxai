@@ -33,6 +33,10 @@ Decision: move the list into a collapsible **left sidebar**, like ChatGPT's. It 
 - `SessionConversation` (`src/web/snapshot.rs`) carries `#[serde(default)]` on `last_agent`, `turn_count` and `running` so older snapshots deserialize cleanly.
 - Per-workspace sidebar open state is persisted in `localStorage` under `dmuxai.sessions.open.<workspace>` (`'1'` or `'0'`), defaulting to open when `window.innerWidth > 1200`. Toggling syncs `body.left-sidebar-open` so SPEC-centered-prompt reserves `--left-dock: 320px` above 900px.
 - Because `dmuxai serve` is view-only (`load_conversation` and `new_conversation` disabled), `TC-863` launches interactive `dmuxai --web --port <port>` under a pseudo-terminal (`pty.openpty()`) after seeding conversations with `dmuxai run`.
+- `running` reflects queued or running turn rows. A turn left `running` by a crashed peer stays marked until the startup recovery of SPEC-multi-instance-workspace resets it.
+- The dashboard header sits inside the dock padding too, wrapping when narrow, so the left sidebar never covers the brand and controls. This replaces the full-width header counter-margins from #54.
+- The TUI picker puts `● running` at the start of the row, so a narrow picker never cuts it off.
+- A sidebar toggle made before the first snapshot names the workspace is held and saved under the real workspace key, never under a placeholder key.
 
 ## 3. Tests
 
