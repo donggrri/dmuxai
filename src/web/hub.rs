@@ -509,6 +509,7 @@ mod tests {
                     model: None,
                     color: Some("#123456".to_string()),
                     run: None,
+                    activity: None,
                 },
                 AgentView {
                     id: "cursor".to_string(),
@@ -518,6 +519,7 @@ mod tests {
                     model: None,
                     color: Some("#000080".to_string()),
                     run: None,
+                    activity: None,
                 },
             ],
             None,

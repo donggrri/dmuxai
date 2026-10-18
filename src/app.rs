@@ -4726,6 +4726,11 @@ impl App {
                         .and_then(|catalog| catalog.selected.clone()),
                     color: dmuxai::theme::color_hex(color),
                     run: Some(self.run_state(agent).to_view()),
+                    // Cleared when the turn ends and the activity record is removed.
+                    activity: self
+                        .activities
+                        .get(&agent)
+                        .and_then(|activity| activity.detail.clone()),
                 }
             })
             .collect();
@@ -9608,6 +9613,60 @@ mod tests {
         assert!(!after.contains("Codex RUNNING"));
         assert!(!app.activities.contains_key(&Agent::Codex));
         assert!(app.activities.contains_key(&Agent::Cursor));
+    }
+
+    #[test]
+    // TC-982 / FR-981: dashboard activity matches the TUI status-bar detail.
+    fn dashboard_agent_activity_matches_tui_status() {
+        let (mut app, sent) = test_app();
+        let hub =
+            dmuxai::web::DashboardHub::new(dmuxai::web::SnapshotSource::Tui, "/test".to_owned());
+        app.attach_dashboard(hub.clone());
+        app.input = "read the app".to_owned();
+        app.submit_prompt();
+        let request = sent.lock().unwrap()[0].1.clone();
+
+        let output = |event| AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(request.conversation_id.clone()),
+            turn_id: Some(request.turn_id.clone()),
+            event,
+        };
+        assert!(app.apply_agent_output(output(AgentEvent::Started)));
+        assert!(app.apply_agent_output(output(AgentEvent::Activity(
+            dmuxai::activity::ActivityItem::Tool {
+                name: "read".to_owned(),
+                target: "src/app.rs".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            },
+        ))));
+
+        app.publish_dashboard();
+        let running = hub
+            .snapshot()
+            .agents
+            .into_iter()
+            .find(|agent| agent.id == "codex")
+            .expect("codex agent");
+        assert_eq!(running.activity.as_deref(), Some("▸ read src/app.rs"));
+
+        let rendered = render_text_at(&mut app, 320, 24);
+        assert!(
+            rendered.contains("▸ read src/app.rs"),
+            "TUI status bar missing activity detail:\n{rendered}"
+        );
+
+        assert!(app.apply_agent_output(output(AgentEvent::Completed)));
+        app.publish_dashboard();
+        let finished = hub
+            .snapshot()
+            .agents
+            .into_iter()
+            .find(|agent| agent.id == "codex")
+            .expect("codex agent");
+        assert_eq!(finished.activity, None);
     }
 
     #[test]
