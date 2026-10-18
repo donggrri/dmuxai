@@ -10825,14 +10825,10 @@ mod tests {
     // adapter Cancelled does not write a second one.
     #[test]
     fn cancel_appends_one_cancelled_notice_for_every_runner() {
-        // Custom runners persist under their registry name. Install the preset
-        // only when nothing else has claimed the process-wide registry.
-        if dmuxai::custom_agent::registry().is_empty() {
-            let _ =
-                dmuxai::custom_agent::install_registry(vec![dmuxai::custom_agent::grok_preset(
-                    "grok",
-                )]);
-        }
+        // First install wins process-wide; the other test installs the same grok preset.
+        let _ =
+            dmuxai::custom_agent::install_registry(vec![dmuxai::custom_agent::grok_preset("grok")]);
+        assert!(dmuxai::custom_agent::index_of("grok").is_some());
         let (mut app, sent) = test_app();
         let hub = dmuxai::web::DashboardHub::new(
             dmuxai::web::SnapshotSource::Tui,

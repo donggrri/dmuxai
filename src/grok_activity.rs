@@ -142,8 +142,14 @@ fn strip_workspace_prefix(target: &str, workspace: &str) -> String {
     if target == workspace {
         return String::new();
     }
-    let prefix = format!("{workspace}/");
-    target.strip_prefix(&prefix).unwrap_or(target).to_string()
+    let Some(rest) = target.strip_prefix(workspace) else {
+        return target.to_string();
+    };
+    // Child path on either separator (`/ws/src` or `C:\ws\src`).
+    if !rest.starts_with(['/', '\\']) {
+        return target.to_string();
+    }
+    rest.trim_start_matches(['/', '\\']).to_string()
 }
 
 fn collapse_whitespace(text: &str) -> String {
@@ -170,17 +176,21 @@ fn detail_from(raw: Option<&Value>) -> String {
     cut_bytes(&pretty, DETAIL_MAX_BYTES)
 }
 
-/// Cut to `max` bytes on a char boundary and append `…` when anything was removed.
+/// Cut so the result is at most `max` bytes. When anything is removed, reserve
+/// space for `…` and append it on a char boundary.
 fn cut_bytes(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
-    let mut end = max.min(text.len());
+    let ellipsis = '…'.len_utf8();
+    let mut end = max.saturating_sub(ellipsis).min(text.len());
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
     let mut out = text[..end].to_string();
-    out.push('…');
+    if out.len() + ellipsis <= max {
+        out.push('…');
+    }
     out
 }
 
@@ -218,6 +228,18 @@ mod tests {
         assert_eq!(status, ToolStatus::Running);
         assert_eq!(duration_ms, None);
         assert!(!read_detail.is_empty());
+
+        let windows = serde_json::json!({
+            "type": "tool_call",
+            "toolCallId": "win",
+            "kind": "read",
+            "toolName": "read_file",
+            "rawInput": {"target_file": r"C:\ws\src\app.rs"}
+        })
+        .to_string();
+        let mut windows_tracker = GrokToolTracker::new(r"C:\ws");
+        let (_, target, _, _, _) = expect_tool(windows_tracker.observe_at(&windows, start));
+        assert_eq!(target, r"src\app.rs");
 
         let execute = r#"{"type":"tool_call","toolCallId":"b","kind":"execute","toolName":"run_terminal_command","rawInput":{"command":"cargo test","description":"Run tests"}}"#;
         let (name, target, status, duration_ms, _) =
@@ -258,7 +280,7 @@ mod tests {
         let (name, target, _, _, detail) = expect_tool(tracker.observe_at(&edit, start));
         assert_eq!(name, "edit");
         assert_eq!(target, "src/x.rs");
-        assert!(detail.len() <= 4096 + '…'.len_utf8());
+        assert!(detail.len() <= 4096);
         assert!(detail.ends_with('…'));
 
         let other = r#"{"type":"tool_call","toolCallId":"d","kind":"other","toolName":"web_fetch","rawInput":{"url":"https://example.com"}}"#;
