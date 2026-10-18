@@ -9,7 +9,7 @@ Source: dogfooding notes in `docs/reviews/REVIEW-dashboard-full-parity.md` (PR #
 | Order | Change | Files | IDs | Tests |
 | --- | --- | --- | --- | --- |
 | 1 | Grok tool-call tracker (pure, no I/O) | new `src/grok_activity.rs`, `src/lib.rs` | FR-980 | TC-980 |
-| 2 | Wire the tracker into the custom adapter read loop for the built-in grok preset only; fixture mode | `src/agent/custom.rs` (one insertion before `parse_jsonl_line`), `tests/fixtures/fake-grok.sh` | FR-980 | TC-981 |
+| 2 | Wire the tracker into the custom adapter read loop for the built-in grok preset only; fixture mode | `src/agent/custom.rs` (one insertion before `parse_jsonl_line`), `tests/fixtures/fake-grok-tools.sh` | FR-980 | TC-981 |
 | 3 | `AgentView.activity` from the TUI activity detail; chip and status pill | `src/web/snapshot.rs`, `src/app.rs`, `src/web/assets/*.js` | FR-981 | TC-982, TC-983 |
 | 4 | Cancel notice: `cancel_selected` records the cancelled turn and appends the line once | `src/app.rs` | FR-982 | TC-984, TC-985 |
 | 5 | Welcome text from the runner registry | `src/app.rs` | FR-983 | TC-816 |
