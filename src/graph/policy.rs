@@ -26,8 +26,8 @@ pub fn default_limits() -> super::types::GraphLimits {
     super::types::GraphLimits::default()
 }
 
-/// Whether a runner may take graph nodes (FR-813: the built-in opencode preset
-/// is excluded while `allowed_runners` is unset).
+/// Whether a runner may take graph nodes (FR-813, FR-899: built-in presets are
+/// excluded while `allowed_runners` is unset).
 pub fn is_runner_allowed(runner: &str, settings: &DmuxSettings) -> bool {
     settings.graph_runner_allowed(runner)
 }
@@ -122,5 +122,29 @@ mod tests {
         settings.graph_allowed_runners = Some(vec!["opencode".to_owned()]);
         assert!(is_runner_allowed("opencode", &settings));
         assert_eq!(assign_runner(NodeRole::Implement, &settings), "opencode");
+    }
+
+    // TC-901 / FR-899
+    #[test]
+    fn builtin_grok_is_not_graph_routed_unless_listed() {
+        let mut settings = DmuxSettings::default();
+        settings
+            .custom_agents
+            .push(crate::custom_agent::grok_preset("grok"));
+        settings.routing_default_agent = Some("grok".to_owned());
+        assert!(!is_runner_allowed("grok", &settings));
+        assert_eq!(assign_runner(NodeRole::Implement, &settings), "cursor");
+
+        settings.graph_allowed_runners = Some(vec!["grok".to_owned()]);
+        assert!(is_runner_allowed("grok", &settings));
+        assert_eq!(assign_runner(NodeRole::Implement, &settings), "grok");
+
+        let mut custom = DmuxSettings::default();
+        let mut spec = crate::custom_agent::grok_preset("grok");
+        spec.builtin = false;
+        custom.custom_agents.push(spec);
+        custom.routing_default_agent = Some("grok".to_owned());
+        assert!(is_runner_allowed("grok", &custom));
+        assert_eq!(assign_runner(NodeRole::Implement, &custom), "grok");
     }
 }

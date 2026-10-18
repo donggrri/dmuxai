@@ -45,3 +45,7 @@ a jsonl `error_path` hit, or stderr matching `failure_stderr`.
 Process: own process group; Ctrl+C kills the whole group. The temp config is deleted after the turn.
 
 Presets: see `docs/agents/presets.toml` (opencode tested; hermes tested; pi untested).
+
+The built-in grok runner is this same preset shape: `grok -p` with
+`--output-format streaming-json`, not a separate integration. `grok agent stdio`
+is not the built-in path.

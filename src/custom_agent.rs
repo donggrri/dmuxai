@@ -92,7 +92,7 @@ pub struct CustomAgentSpec {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub modes: CustomAgentModes,
-    /// True only for the built-in opencode preset (FR-810). Not configurable.
+    /// True for a built-in preset (opencode, grok). Not configurable.
     #[serde(skip)]
     pub builtin: bool,
 }
@@ -144,6 +144,124 @@ pub fn opencode_preset(program: &str) -> CustomAgentSpec {
         builtin: true,
         ..Default::default()
     }
+}
+
+/// Preferred grok model when `grok models` lists it (SPEC-grok-runner FR-895).
+pub const GROK_DEFAULT_MODEL: &str = "grok-4.7";
+
+/// The built-in `grok` runner (SPEC-grok-runner FR-892..FR-898). `program` is
+/// the executable that was found. `default_model` stays unset so a missing id
+/// is never invented; selection prefers [`GROK_DEFAULT_MODEL`] when listed.
+pub fn grok_preset(program: &str) -> CustomAgentSpec {
+    let words = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    CustomAgentSpec {
+        name: "grok".to_owned(),
+        label: Some("grok".to_owned()),
+        color: Some("#6366f1".to_owned()),
+        command: [
+            program,
+            "-p",
+            "{prompt}",
+            "-m",
+            "{model}",
+            "--cwd",
+            "{workspace}",
+            "--output-format",
+            "streaming-json",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+        prompt_via: PromptVia::Arg,
+        default_model: None,
+        models_command: words(&[program, "models"]),
+        allowed_models: Some(r"(?i)^grok-[a-z0-9][a-z0-9._-]*$".to_owned()),
+        output: CustomAgentOutput::Jsonl,
+        text_path: Some("/data".to_owned()),
+        text_when: Some(TextWhen {
+            path: "/type".to_owned(),
+            equals: "text".to_owned(),
+        }),
+        session_id_path: Some("/sessionId".to_owned()),
+        resume_arg: words(&["-r", "{session_id}"]),
+        timeout_secs: Some(900),
+        modes: CustomAgentModes {
+            ask: words(&["--permission-mode", "plan"]),
+            plan: words(&["--permission-mode", "plan"]),
+            implement: words(&["--always-approve"]),
+        },
+        builtin: true,
+        ..Default::default()
+    }
+}
+
+/// The built-in grok preset, as opposed to a user agent that happens to be named grok.
+pub fn is_builtin_grok(spec: &CustomAgentSpec) -> bool {
+    spec.builtin && spec.name.eq_ignore_ascii_case("grok")
+}
+
+/// `(?i)^grok-[a-z0-9][a-z0-9._-]*$` on the trimmed id. Does not apply the `fast` rule.
+pub fn is_grok_model_id(model_id: &str) -> bool {
+    static PATTERN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)^grok-[a-z0-9][a-z0-9._-]*$").expect("grok model id pattern")
+    });
+    pattern.is_match(model_id.trim())
+}
+
+/// Parse `grok models` stdout into allowed ids (FR-895). Order is kept.
+/// `fast` ids and lines that are not a single grok token are dropped.
+pub fn parse_grok_model_ids(stdout: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for line in stdout.lines() {
+        let mut token = line.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if token.starts_with('*') || token.starts_with('-') {
+            token = token[1..].trim_start();
+        }
+        if let Some(stripped) = token.strip_suffix("(default)") {
+            token = stripped.trim_end();
+        }
+        if token.split_whitespace().nth(1).is_some() {
+            continue;
+        }
+        if !is_grok_model_id(token) || token.to_ascii_lowercase().contains("fast") {
+            continue;
+        }
+        if !ids.iter().any(|id| id == token) {
+            ids.push(token.to_owned());
+        }
+    }
+    ids
+}
+
+/// Keep `current` when it is still listed. Otherwise prefer [`GROK_DEFAULT_MODEL`],
+/// then the first allowed id. Never invent an id that was not listed.
+pub fn select_grok_model(ids: &[String], current: Option<&str>) -> Option<String> {
+    if let Some(current) = current.filter(|id| ids.iter().any(|listed| listed == id)) {
+        return Some(current.to_owned());
+    }
+    if ids.iter().any(|id| id == GROK_DEFAULT_MODEL) {
+        return Some(GROK_DEFAULT_MODEL.to_owned());
+    }
+    ids.first().cloned()
+}
+
+/// Authenticated iff the models command exited 0 and stdout contains `logged in`
+/// (ASCII case-insensitive). Takes no path (NFR-890, A-3).
+pub fn grok_models_authenticated(stdout: &str, exit_ok: bool) -> bool {
+    exit_ok && stdout.to_ascii_lowercase().contains("logged in")
+}
+
+/// Shown when `grok models` is missing, fails, times out, or is not logged in (FR-896).
+pub fn grok_login_message() -> String {
+    "grok: not logged in. Run `grok login`.".to_owned()
+}
+
+/// Shown when an authenticated listing has no allowed id (FR-895).
+pub fn grok_no_allowed_model_message() -> String {
+    "grok: no allowed models (ids must match ^grok-; ids containing fast are rejected)".to_owned()
 }
 
 impl CustomAgentSpec {
@@ -626,14 +744,21 @@ pub fn policy_message(spec: &CustomAgentSpec, reason: Option<&str>) -> String {
     )
 }
 
-/// Runs `models_command` and returns the filtered model ids (no policy applied).
-async fn run_models_command(
+struct ModelsOutput {
+    stdout: String,
+    stderr: String,
+    status: std::process::ExitStatus,
+}
+
+/// Runs `models_command`. Spawn and timeout failures are errors. A non-zero
+/// exit is still [`Ok`] so the grok auth check can read stdout and status.
+async fn run_models_output(
     spec: &CustomAgentSpec,
     cwd: &Path,
     timeout: Option<Duration>,
-) -> Result<Vec<String>, String> {
+) -> Result<ModelsOutput, String> {
     let Some((program, args)) = spec.models_command.split_first() else {
-        return Ok(Vec::new());
+        return Err(format!("{} models: command is empty", spec.label()));
     };
     let mut command = tokio::process::Command::new(program);
     command
@@ -641,6 +766,16 @@ async fn run_models_command(
         .current_dir(cwd)
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    // Test fixtures set GROK_FAKE_* on the preset. Production grok env is empty.
+    // Opencode keeps its models command free of OPENCODE_CONFIG substitution.
+    if is_builtin_grok(spec) {
+        let ctx = SubstitutionContext::new(String::new(), String::new(), "ask", "deny");
+        for (key, value) in &spec.env {
+            if let Some(value) = substitute(value, &ctx) {
+                command.env(key, value);
+            }
+        }
+    }
     let run = command.output();
     let output = match timeout {
         Some(limit) => match tokio::time::timeout(limit, run).await {
@@ -656,9 +791,25 @@ async fn run_models_command(
         None => run.await,
     }
     .map_err(|error| format!("{} models: {error}", spec.label()))?;
+    Ok(ModelsOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        status: output.status,
+    })
+}
+
+/// Runs `models_command` and returns the filtered model ids (no policy applied).
+async fn run_models_command(
+    spec: &CustomAgentSpec,
+    cwd: &Path,
+    timeout: Option<Duration>,
+) -> Result<Vec<String>, String> {
+    if spec.models_command.is_empty() {
+        return Ok(Vec::new());
+    }
+    let output = run_models_output(spec, cwd, timeout).await?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = match stderr.trim() {
+        let detail = match output.stderr.trim() {
             "" => format!(
                 "exited with {} and printed nothing on stderr",
                 output.status
@@ -667,22 +818,46 @@ async fn run_models_command(
         };
         return Err(format!("{} models failed: {detail}", spec.label()));
     }
-    Ok(filter_models(
-        spec,
-        &String::from_utf8_lossy(&output.stdout),
-    ))
+    Ok(filter_models(spec, &output.stdout))
+}
+
+/// `grok models`: any probe failure is the login message. An authenticated
+/// listing with no allowed id is the fast/`^grok-` message (FR-895, FR-896).
+async fn list_grok_model_ids(
+    spec: &CustomAgentSpec,
+    cwd: &Path,
+    timeout: Option<Duration>,
+) -> Result<Vec<String>, String> {
+    let timeout = timeout.or(Some(BUILTIN_MODELS_TIMEOUT));
+    let output = match run_models_output(spec, cwd, timeout).await {
+        Ok(output) => output,
+        Err(_) => return Err(grok_login_message()),
+    };
+    if !grok_models_authenticated(&output.stdout, output.status.success()) {
+        return Err(grok_login_message());
+    }
+    let ids = parse_grok_model_ids(&output.stdout);
+    if ids.is_empty() {
+        Err(grok_no_allowed_model_message())
+    } else {
+        Ok(ids)
+    }
 }
 
 /// Lists the model ids for `spec`, honouring the model policy (FR-812).
 ///
-/// For the built-in preset (`spec.builtin`) a failure, a timeout, or a listing
-/// with no `allowed_models` match is an error that names the policy and how to
-/// override it. Other agents keep the plain listing.
+/// For the built-in opencode preset a failure, a timeout, or a listing with no
+/// `allowed_models` match is an error that names the policy and how to override
+/// it. The built-in grok preset uses the login and `^grok-` messages instead.
+/// Other agents keep the plain listing.
 pub async fn list_model_ids(
     spec: &CustomAgentSpec,
     cwd: &Path,
     timeout: Option<Duration>,
 ) -> Result<Vec<String>, String> {
+    if is_builtin_grok(spec) {
+        return list_grok_model_ids(spec, cwd, timeout).await;
+    }
     let listed = run_models_command(spec, cwd, timeout).await;
     if !spec.builtin {
         return listed;
@@ -1237,5 +1412,171 @@ image_arg = []
             .await
             .unwrap();
         assert_eq!(model_lines, vec![ws_str.into_owned()]);
+    }
+
+    // TC-892 / FR-892, FR-894, NFR-890
+    #[test]
+    fn grok_preset_argv_is_headless_and_not_a_shell() {
+        let spec = grok_preset("grok");
+        let prompt = "hello; $(rm)";
+        let base = [
+            "grok",
+            "-p",
+            prompt,
+            "-m",
+            "grok-4.7",
+            "--cwd",
+            "/ws",
+            "--output-format",
+            "streaming-json",
+        ];
+        for (mode, edit, extra) in [
+            ("ask", "deny", &["--permission-mode", "plan"][..]),
+            ("plan", "deny", &["--permission-mode", "plan"][..]),
+            ("implement", "allow", &["--always-approve"][..]),
+        ] {
+            let mut ctx = SubstitutionContext::new(prompt, "/ws", mode, edit);
+            ctx.model = Some("grok-4.7".to_owned());
+            let argv = build_argv(&spec, &ctx);
+            let mut expected: Vec<String> = base.iter().map(|s| (*s).to_owned()).collect();
+            expected.extend(extra.iter().map(|s| (*s).to_owned()));
+            assert_eq!(argv, expected, "{mode}");
+            assert_eq!(argv.iter().filter(|arg| arg.as_str() == prompt).count(), 1);
+            assert!(
+                argv.iter()
+                    .all(|arg| arg != "sh" && arg != "cmd" && arg != "cmd.exe")
+            );
+            if mode == "implement" {
+                assert!(argv.iter().any(|arg| arg == "--always-approve"));
+                assert!(!argv.iter().any(|arg| arg == "--permission-mode"));
+            } else {
+                assert!(!argv.iter().any(|arg| arg == "--always-approve"));
+                assert!(
+                    argv.windows(2)
+                        .any(|pair| pair == ["--permission-mode", "plan"])
+                );
+            }
+        }
+        let mut resumed = SubstitutionContext::new(prompt, "/ws", "implement", "allow");
+        resumed.model = Some("grok-4.7".to_owned());
+        resumed.session_id = Some("11111111-1111-1111-1111-111111111111".to_owned());
+        let argv = build_argv(&spec, &resumed);
+        assert_eq!(
+            argv[argv.len() - 2..],
+            ["-r".to_owned(), resumed.session_id.clone().unwrap()]
+        );
+    }
+
+    // TC-893 / FR-893, FR-894
+    #[test]
+    fn grok_streaming_json_extracts_text_and_session() {
+        let spec = grok_preset("grok");
+        let lines = [
+            r#"{"type":"thought","data":"thinking"}"#,
+            r#"{"type":"text","data":"OK"}"#,
+            "{not json",
+            r#"{"type":"text","data":"!"}"#,
+            r#"{"type":"usage","usage":{"input":1}}"#,
+            r#"{"type":"end","stopReason":"end_turn","sessionId":"11111111-1111-1111-1111-111111111111"}"#,
+        ];
+        let mut reply = String::new();
+        let mut session = None;
+        for line in lines {
+            let parsed = parse_jsonl_line(&spec, line);
+            if let Some(text) = parsed.text {
+                reply.push_str(&text);
+            }
+            if parsed.session_id.is_some() {
+                session = parsed.session_id;
+            }
+            assert!(parsed.error.is_none());
+        }
+        assert_eq!(reply, "OK!");
+        assert_eq!(
+            session.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert!(!reply.contains("thinking"));
+        assert!(!reply.contains("usage"));
+    }
+
+    // TC-895 / FR-895
+    #[test]
+    fn grok_models_parse_default_filter_and_fast() {
+        let listed = parse_grok_model_ids(
+            "You are logged in with grok.com.\n* grok-4.7 (default)\n- grok-4.6\n- grok-4.7-build-fast\n- grok-4.7\n",
+        );
+        assert_eq!(listed, vec!["grok-4.7".to_owned(), "grok-4.6".to_owned()]);
+        assert_eq!(
+            select_grok_model(&listed, None).as_deref(),
+            Some(GROK_DEFAULT_MODEL)
+        );
+
+        let default_on_other = parse_grok_model_ids("- grok-4.6 (default)\n* grok-4.7\n");
+        assert_eq!(
+            default_on_other,
+            vec!["grok-4.6".to_owned(), "grok-4.7".to_owned()]
+        );
+        assert_eq!(
+            select_grok_model(&default_on_other, None).as_deref(),
+            Some(GROK_DEFAULT_MODEL)
+        );
+
+        let no_preferred = parse_grok_model_ids("- grok-4.6\n- grok-4.5\n");
+        assert_eq!(
+            select_grok_model(&no_preferred, None).as_deref(),
+            Some("grok-4.6")
+        );
+        assert_eq!(
+            select_grok_model(&no_preferred, Some("grok-4.5")).as_deref(),
+            Some("grok-4.5")
+        );
+
+        let flash = parse_grok_model_ids("- grok-4.7-flash\n");
+        assert_eq!(flash, vec!["grok-4.7-flash".to_owned()]);
+
+        let fast_only =
+            parse_grok_model_ids("You are logged in with grok.com.\n- grok-4.7-build-fast\n");
+        assert!(fast_only.is_empty());
+        let message = grok_no_allowed_model_message();
+        assert!(message.contains("^grok-"), "{message}");
+        assert!(message.contains("fast"), "{message}");
+    }
+
+    // TC-896 / FR-896, NFR-890
+    #[test]
+    fn grok_auth_is_models_stdout_only() {
+        assert!(grok_models_authenticated(
+            "You are logged in with grok.com.\n",
+            true
+        ));
+        assert!(grok_models_authenticated("prefix LOGGED IN suffix", true));
+        assert!(!grok_models_authenticated(
+            "You are logged in with grok.com.\n",
+            false
+        ));
+        assert!(!grok_models_authenticated(
+            "Available models:\n* grok-4.7 (default)\n",
+            true
+        ));
+        let login = grok_login_message();
+        assert!(login.contains("grok login"), "{login}");
+        assert_ne!(login, grok_no_allowed_model_message());
+    }
+
+    // TC-899 / FR-898
+    #[test]
+    fn grok_preset_color_is_distinct() {
+        let color = grok_preset("grok").color.expect("preset color");
+        assert_eq!(color, "#6366f1");
+        let parsed = crate::theme::parse_color(&color).expect("hex color");
+        for other in [
+            "cyan", "green", "magenta", "white", "gray", "#ffa500", "#d4af37", "#40e0d0",
+            "#ff8800", "#4aa8ff", "#0b57d0",
+        ] {
+            let other_color = crate::theme::parse_color(other).expect(other);
+            assert_ne!(parsed, other_color, "{other}");
+            assert_ne!(color.as_str(), other);
+        }
     }
 }

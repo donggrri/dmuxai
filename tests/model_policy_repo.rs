@@ -37,6 +37,24 @@ fn dmuxai_graph_yaml_declares_composer_only_policy() {
     );
 }
 
+// TC-912 / FR-912
+#[test]
+fn dmuxai_graph_yaml_keeps_grok_disallow_and_explains_why() {
+    let yaml = fs::read_to_string("docs/dmuxai-graph.yaml").expect("graph yaml");
+    assert!(yaml.contains("allowed_only: composer-2.5"));
+    assert!(yaml.contains("*-fast"));
+    assert!(yaml.contains("*grok*"));
+    assert!(!yaml.contains("model: grok"));
+    let disallow_at = yaml.find("disallow_patterns:").expect("disallow_patterns");
+    let before = yaml[..disallow_at].trim_end();
+    assert!(
+        before.ends_with("*grok* stays here so this file does not assign a grok model."),
+        "comment must sit immediately above disallow_patterns:\n{before}"
+    );
+    assert!(before.contains("composer-2.5"));
+    assert!(before.contains("grok runner"));
+}
+
 #[test]
 fn mission_doc_states_composer_policy() {
     let mission = fs::read_to_string("MISSION.md").expect("MISSION.md");

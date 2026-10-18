@@ -402,7 +402,8 @@ fn init_config(workspace_root: &Path, workspace: bool, force: bool) -> i32 {
     };
     let detected = dmuxai::init::detected_runners();
     let opencode = detected.contains(&"opencode");
-    if let Err(error) = dmuxai::init::write_starter_config(&path, opencode, force) {
+    let grok = detected.contains(&"grok");
+    if let Err(error) = dmuxai::init::write_starter_config(&path, opencode, grok, force) {
         eprintln!("error: {error}");
         return exit::FAILED;
     }

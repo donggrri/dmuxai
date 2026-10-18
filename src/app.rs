@@ -1687,6 +1687,7 @@ impl App {
                 }
                 self.selected = adapter_index(target);
                 let _ = self.adapters[self.selected].prewarm();
+                self.request_builtin_grok_models(target);
                 self.push_system(format!("Active agent: {target}."));
             }
             SessionCommand::SetMode { agent, mode } => {
@@ -2260,6 +2261,22 @@ impl App {
         self.input_height = clamp_input_height(requested_height, self.terminal_area.height);
     }
 
+    /// Confirming the built-in grok runner probes `grok models` (FR-896).
+    fn request_builtin_grok_models(&mut self, agent: Agent) {
+        let Agent::Custom(index) = agent else {
+            return;
+        };
+        let Some(spec) = self.custom_spec(index) else {
+            return;
+        };
+        if spec.builtin
+            && spec.name.eq_ignore_ascii_case("grok")
+            && let Some(adapter) = self.adapters.get(adapter_index(agent))
+        {
+            let _ = adapter.request_models();
+        }
+    }
+
     fn open_agent_picker(&mut self) {
         self.agent_picker = Some(AgentPicker {
             cursor: self.selected,
@@ -2325,6 +2342,7 @@ impl App {
                 self.selected = picker.cursor;
                 let _ = self.adapters[self.selected].prewarm();
                 let agent = Agent::all()[self.selected];
+                self.request_builtin_grok_models(agent);
                 self.messages.push(Message::new(
                     Role::System,
                     format!("Active agent: {agent}."),
@@ -4088,10 +4106,20 @@ impl App {
         let allowed_str = match &self.settings.graph_allowed_runners {
             Some(runners) if runners.is_empty() => "none (graph disabled)".to_owned(),
             Some(runners) => runners.join(", "),
-            None if self.settings.custom_agents.iter().any(|spec| spec.builtin) => {
-                "all except the built-in opencode".to_owned()
+            None => {
+                let names: Vec<&str> = self
+                    .settings
+                    .custom_agents
+                    .iter()
+                    .filter(|spec| spec.builtin)
+                    .map(|spec| spec.name.as_str())
+                    .collect();
+                if names.is_empty() {
+                    "all".to_owned()
+                } else {
+                    format!("all except {}", names.join(", "))
+                }
             }
-            None => "all".to_owned(),
         };
         if self.graph_assignment_line.is_empty() {
             self.push_system("No active graph assignment. Send a multi-step prompt to plan one.");
@@ -13632,6 +13660,225 @@ mod tests {
             !done_line.contains("running"),
             "completed row must not show running mark: {done_line}"
         );
+    }
+
+    // TC-900 / FR-898
+    #[test]
+    fn grok_chat_and_dashboard_use_preset_color() {
+        let (mut app, sent) = test_app();
+        app.settings.custom_agents = vec![dmuxai::custom_agent::grok_preset("grok")];
+        if !app
+            .adapters
+            .iter()
+            .any(|adapter| adapter.agent() == Agent::Custom(0))
+        {
+            let cancelled = Arc::new(Mutex::new(Vec::new()));
+            app.adapters.push(Box::new(RecordingAdapter {
+                agent: Agent::Custom(0),
+                sent,
+                cancelled,
+                fail_send: false,
+                unsupported_mode: None,
+            }));
+        }
+        app.messages.clear();
+        app.messages.push(Message::new(
+            Role::Agent(Agent::Custom(0)),
+            "zzgrokline".to_owned(),
+        ));
+        assert_eq!(
+            find_cell_fg(&mut app, "zzgrokline"),
+            Some(Color::Rgb(0x63, 0x66, 0xf1))
+        );
+
+        let hub =
+            dmuxai::web::DashboardHub::new(dmuxai::web::SnapshotSource::Tui, "/test".to_owned());
+        app.attach_dashboard(hub.clone());
+        app.publish_dashboard();
+        let grok = hub
+            .snapshot()
+            .agents
+            .into_iter()
+            .find(|agent| agent.id == "grok")
+            .expect("dashboard lists grok");
+        assert_eq!(grok.color.as_deref(), Some("#6366f1"));
+
+        app.settings.theme.agents.insert(
+            "grok".to_owned(),
+            dmuxai::theme::parse_color("#112233").unwrap(),
+        );
+        assert_eq!(
+            find_cell_fg(&mut app, "zzgrokline"),
+            Some(Color::Rgb(0x11, 0x22, 0x33))
+        );
+        app.publish_dashboard();
+        let grok = hub
+            .snapshot()
+            .agents
+            .into_iter()
+            .find(|agent| agent.id == "grok")
+            .expect("dashboard lists grok");
+        assert_eq!(grok.color.as_deref(), Some("#112233"));
+    }
+
+    // TC-902 / FR-899
+    #[test]
+    fn grok_effective_model_skips_composer_default() {
+        let (mut app, _) = test_app();
+        app.settings.custom_agents = vec![dmuxai::custom_agent::grok_preset("grok")];
+        assert_eq!(
+            app.effective_model_for(Agent::Custom(0), "composer-2.5"),
+            None
+        );
+        app.model_catalogs
+            .entry(Agent::Custom(0))
+            .or_default()
+            .selected = Some("grok-4.6".to_owned());
+        assert_eq!(
+            app.effective_model_for(Agent::Custom(0), "composer-2.5")
+                .as_deref(),
+            Some("grok-4.6")
+        );
+    }
+
+    // TC-903 / FR-899
+    #[test]
+    fn graph_status_names_builtin_grok_exception() {
+        let (mut app, _) = test_app();
+        app.settings
+            .custom_agents
+            .push(dmuxai::custom_agent::grok_preset("grok"));
+        app.input = "/graph status".to_owned();
+        app.submit_prompt();
+        let line = app
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.content.starts_with("Allowed runners:"))
+            .expect("status line")
+            .content
+            .clone();
+        assert_ne!(line, "Allowed runners: all");
+        assert!(line.contains("except"), "{line}");
+        assert!(line.contains("grok"), "{line}");
+        assert!(!line.contains("opencode"), "{line}");
+
+        app.messages.clear();
+        app.settings
+            .custom_agents
+            .insert(0, dmuxai::custom_agent::opencode_preset("opencode"));
+        app.input = "/graph status".to_owned();
+        app.submit_prompt();
+        let line = app
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.content.starts_with("Allowed runners:"))
+            .expect("status line")
+            .content
+            .clone();
+        assert_ne!(line, "Allowed runners: all");
+        assert!(line.contains("grok"), "{line}");
+        assert!(line.contains("opencode"), "{line}");
+    }
+
+    // TC-904 / FR-896
+    #[test]
+    fn selecting_grok_requests_a_model_probe() {
+        let warnings =
+            dmuxai::custom_agent::install_registry(vec![dmuxai::custom_agent::grok_preset("grok")]);
+        assert_eq!(
+            dmuxai::custom_agent::index_of("grok"),
+            Some(0),
+            "warnings {warnings:?}"
+        );
+        let probed = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let adapters = Agent::all()
+            .into_iter()
+            .map(|agent| {
+                Box::new(ProbeAdapter {
+                    agent,
+                    probed: Arc::clone(&probed),
+                    sent: Arc::clone(&sent),
+                    cancelled: Arc::clone(&cancelled),
+                }) as Box<dyn AgentAdapter>
+            })
+            .collect();
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (event_tx, event_rx) = event_channel();
+        drop(event_tx);
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            workspace,
+            DmuxSettings::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        app.settings.custom_agents = vec![dmuxai::custom_agent::grok_preset("grok")];
+        app.color_enabled = true;
+        assert!(!dmuxai::graph::is_runner_allowed("grok", &app.settings));
+
+        app.selected = adapter_index(Agent::Codex);
+        app.input = "/agent".to_owned();
+        app.submit_prompt();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.adapters[app.selected].agent(), Agent::Custom(0));
+        assert_eq!(probed.lock().unwrap().as_slice(), &[Agent::Custom(0)]);
+
+        probed.lock().unwrap().clear();
+        app.handle_session_command(SessionCommand::SelectAgent {
+            agent: "grok".to_owned(),
+        })
+        .expect("chat selection stays available");
+        assert_eq!(probed.lock().unwrap().as_slice(), &[Agent::Custom(0)]);
+        assert!(!dmuxai::graph::is_runner_allowed("grok", &app.settings));
+    }
+}
+
+#[cfg(test)]
+struct ProbeAdapter {
+    agent: Agent,
+    probed: std::sync::Arc<std::sync::Mutex<Vec<Agent>>>,
+    sent: std::sync::Arc<std::sync::Mutex<Vec<(Agent, AgentRequest)>>>,
+    cancelled: std::sync::Arc<std::sync::Mutex<Vec<Agent>>>,
+}
+
+#[cfg(test)]
+impl AgentAdapter for ProbeAdapter {
+    fn agent(&self) -> Agent {
+        self.agent
+    }
+
+    fn send(&self, request: AgentRequest) -> Result<(), crate::agent::AdapterError> {
+        self.sent.lock().unwrap().push((self.agent, request));
+        Ok(())
+    }
+
+    fn cancel(&self) -> Result<(), crate::agent::AdapterError> {
+        self.cancelled.lock().unwrap().push(self.agent);
+        Ok(())
+    }
+
+    fn request_models(&self) -> Result<(), crate::agent::AdapterError> {
+        self.probed.lock().unwrap().push(self.agent);
+        Ok(())
+    }
+
+    fn select_model(&self, _model: String) -> Result<(), crate::agent::AdapterError> {
+        Ok(())
+    }
+
+    fn select_mode(&self, _mode: ExecutionMode) -> Result<(), crate::agent::AdapterError> {
+        Ok(())
     }
 }
 

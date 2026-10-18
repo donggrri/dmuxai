@@ -7,6 +7,16 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Added
 
+- **Built-in grok runner (SPEC-grok-runner FR-890..FR-900).** When `grok` is on
+  `PATH`, `DMUXAI_GROK_BIN` names it, or `~/.grok/bin/grok` is executable, DmuxAI
+  adds a headless `grok` chat runner (`grok -p` with streaming-json). Models are
+  `grok-*` without `fast` and default to `grok-4.7`. A logged-out CLI still lists
+  the runner and asks for `grok login`. `[agents] builtin_grok = false` hides it,
+  and an `[[agents.custom]]` entry named `grok` replaces it. With
+  `allowed_runners` unset, this built-in preset takes no graph nodes until
+  `grok` is listed. A machine that has grok installed gains the chat runner and
+  does not gain grok graph nodes until that list includes it.
+
 - **Horizontal swimlane graph view (SPEC-graph-swimlane FR-880..FR-885, UX-880, UX-881, #61).**
   The Graph view's subway map is replaced by a timeline: one lane per runner
   (with its latest model), time left to right with nice ticks, and each step as
