@@ -575,8 +575,9 @@
 
 /*
  * Sidebar shell and tree view (SPEC-docs-tree FR-832, FR-833, UX-830).
- * Widths are resizable (SPEC-sidebar-resize FR-970). The handle hangs 4px
- * past the inner edge, so the sidebar itself must not clip overflow.
+ * Widths are resizable (SPEC-sidebar-resize FR-970). Each handle is 8px
+ * and sits fully outside the inner edge. Overflow stays at its initial
+ * value (visible); nothing here clips the handle.
  */
 
 :root {
@@ -595,7 +596,6 @@
   display: flex;
   flex-direction: column;
   z-index: 20;
-  overflow: visible;
   transform: translateX(100%);
   visibility: hidden;
   transition: transform 0.2s ease-in-out, visibility 0.2s ease-in-out;
@@ -618,7 +618,6 @@
   display: flex;
   flex-direction: column;
   z-index: 20;
-  overflow: visible;
   transform: translateX(-100%);
   visibility: hidden;
   transition: transform 0.2s ease-in-out, visibility 0.2s ease-in-out;
@@ -697,6 +696,13 @@ body.sidebar-resizing .sessions-sidebar {
   cursor: col-resize;
 }
 
+/* Programmatic width changes skip the padding slide. Open/close stays animated. */
+body.sidebar-resize-instant,
+body.sidebar-resize-instant .sidebar,
+body.sidebar-resize-instant .sessions-sidebar {
+  transition: none;
+}
+
 .sidebar-resize-handle {
   position: absolute;
   top: 0;
@@ -713,11 +719,11 @@ body.sidebar-resizing .sessions-sidebar {
 }
 
 #sessions-resize {
-  right: -4px;
+  right: -8px;
 }
 
 #sidebar-resize {
-  left: -4px;
+  left: -8px;
 }
 
 .sidebar-resize-handle::after {
@@ -725,16 +731,37 @@ body.sidebar-resizing .sessions-sidebar {
   position: absolute;
   top: 0;
   bottom: 0;
-  left: 3px;
   width: 2px;
   background: transparent;
   pointer-events: none;
 }
 
-.sidebar-resize-handle:hover::after,
+/* 2px accent sits just outside the sidebar's 1px border, on the handle's inner edge: sessions line is the handle's left edge, files line its right edge. */
+#sessions-resize::after {
+  left: 0;
+}
+
+#sidebar-resize::after {
+  right: 0;
+}
+
 .sidebar-resize-handle:focus-visible::after,
 body.sidebar-resizing .sidebar-resize-handle.is-dragging::after {
   background: var(--accent);
+}
+
+@media (hover: hover) {
+  .sidebar-resize-handle:hover::after {
+    background: var(--accent);
+  }
+}
+
+@media (forced-colors: active) {
+  .sidebar-resize-handle:hover::after,
+  .sidebar-resize-handle:focus-visible::after,
+  body.sidebar-resizing .sidebar-resize-handle.is-dragging::after {
+    background: Highlight;
+  }
 }
 
 .sidebar-resize-handle:focus {

@@ -160,40 +160,41 @@ fn approx(label: &str, actual: f64, expected: f64, tol: f64) {
     );
 }
 
-fn max_width(inner: f64, other: f64) -> f64 {
-    let cap = (inner * 0.5).floor().min(inner - other - 360.0);
-    cap.max(180.0)
-}
-
-fn clamp_w(value: f64, max: f64) -> f64 {
-    value.round().clamp(180.0, max)
-}
-
-/// Mirrors sidebar-resize.js `relayout` for a known preference.
-fn settle(
-    inner: f64,
-    left_pref: f64,
-    right_pref: f64,
-    left_open: bool,
-    right_open: bool,
-) -> (f64, f64) {
-    let mut left = clamp_w(left_pref, max_width(inner, 0.0));
-    let mut right = clamp_w(right_pref, max_width(inner, 0.0));
-    if left_open && right_open {
-        for _ in 0..3 {
-            left = clamp_w(left_pref, max_width(inner, right));
-            right = clamp_w(right_pref, max_width(inner, left));
-        }
-    } else if left_open {
-        left = clamp_w(left_pref, max_width(inner, 0.0));
-    } else if right_open {
-        right = clamp_w(right_pref, max_width(inner, 0.0));
+/// 180 <= width <= floor(viewport/2). When both sidebars are open and they are
+/// not both at the minimum, left + right <= viewport - 360.
+fn assert_resize_bounds(label: &str, step: &Value) {
+    let vw = num(step, "clientWidth");
+    if vw <= 900.0 {
+        return;
     }
-    (left, right)
+    let half = (vw * 0.5).floor();
+    let left = num(step, "leftAria");
+    let right = num(step, "rightAria");
+    assert!(left + 0.01 >= 180.0, "{label} left {left} < 180");
+    assert!(right + 0.01 >= 180.0, "{label} right {right} < 180");
+    assert!(
+        left <= half + 0.01,
+        "{label} left {left} > floor(vw/2) {half}"
+    );
+    assert!(
+        right <= half + 0.01,
+        "{label} right {right} > floor(vw/2) {half}"
+    );
+    let left_open = step["leftOpen"].as_bool().expect("leftOpen");
+    let right_open = step["rightOpen"].as_bool().expect("rightOpen");
+    let both_min = left <= 180.5 && right <= 180.5;
+    if left_open && right_open && !both_min {
+        let limit = vw - 360.0;
+        assert!(
+            left + right <= limit + 0.5,
+            "{label} left+right {} exceeds vw-360 {limit}",
+            left + right
+        );
+    }
 }
 
 fn assert_prompt(label: &str, step: &Value) {
-    let iw = num(step, "innerWidth");
+    let vw = num(step, "clientWidth");
     let prompt = &step["prompt"];
     let p_left = num(prompt, "left");
     let p_right = num(prompt, "right");
@@ -215,7 +216,7 @@ fn assert_prompt(label: &str, step: &Value) {
     let pad_r = num(step, "paddingRight");
     approx(&format!("{label} padding-left"), pad_l, left_dock, 1.5);
     approx(&format!("{label} padding-right"), pad_r, right_dock, 1.5);
-    let content_center = (pad_l + (iw - pad_r)) / 2.0;
+    let content_center = (pad_l + (vw - pad_r)) / 2.0;
     approx(
         &format!("{label} prompt center"),
         center,
@@ -263,8 +264,6 @@ const PROBE_COMMON: &str = r##"
 import sys, json
 from playwright.sync_api import sync_playwright
 
-SETTLE = 450
-
 SNAPSHOT = """() => {
   function rect(sel) {
     var e = document.querySelector(sel);
@@ -299,6 +298,7 @@ SNAPSHOT = """() => {
   }
   return {
     innerWidth: window.innerWidth,
+    clientWidth: document.documentElement.clientWidth,
     paddingLeft: parseFloat(cs.paddingLeft) || 0,
     paddingRight: parseFloat(cs.paddingRight) || 0,
     leftOpen: document.body.classList.contains('left-sidebar-open'),
@@ -346,6 +346,46 @@ def snap(pg, out, label, extra=None):
     out["steps"][label] = data
     return data
 
+def wait_settled(pg):
+    pg.wait_for_function(
+        """() => {
+          var narrow = window.matchMedia('(max-width: 900px)').matches;
+          var body = document.body;
+          if (body.classList.contains('sidebar-resizing')) return false;
+          var cs = getComputedStyle(body);
+          var padL = parseFloat(cs.paddingLeft) || 0;
+          var padR = parseFloat(cs.paddingRight) || 0;
+          if (narrow) return padL < 1 && padR < 1;
+          var leftOpen = body.classList.contains('left-sidebar-open');
+          var rightOpen = body.classList.contains('sidebar-open');
+          var lw = document.getElementById('sessions-sidebar').getBoundingClientRect().width;
+          var rw = document.getElementById('sidebar').getBoundingClientRect().width;
+          var ariaL = Number(document.getElementById('sessions-resize').getAttribute('aria-valuenow'));
+          var ariaR = Number(document.getElementById('sidebar-resize').getAttribute('aria-valuenow'));
+          if (Math.abs(ariaL - lw) > 1.5 || Math.abs(ariaR - rw) > 1.5) return false;
+          if (leftOpen ? Math.abs(padL - lw) > 1.5 : padL > 1) return false;
+          if (rightOpen ? Math.abs(padR - rw) > 1.5 : padR > 1) return false;
+          return true;
+        }""",
+        timeout=8000,
+    )
+
+def wait_aria(pg, side, value):
+    handle = "sessions-resize" if side == "left" else "sidebar-resize"
+    pad_prop = "paddingLeft" if side == "left" else "paddingRight"
+    open_cls = "left-sidebar-open" if side == "left" else "sidebar-open"
+    pg.wait_for_function(
+        f"""() => {{
+          if (document.body.classList.contains('sidebar-resizing')) return false;
+          var aria = Number(document.getElementById('{handle}').getAttribute('aria-valuenow'));
+          if (Math.abs(aria - {value}) > 0.5) return false;
+          if (!document.body.classList.contains('{open_cls}')) return true;
+          var pad = parseFloat(getComputedStyle(document.body).{pad_prop}) || 0;
+          return Math.abs(pad - aria) < 1.5;
+        }}""",
+        timeout=8000,
+    )
+
 def ensure_left(pg, open_):
     is_open = pg.eval_on_selector("#sessions-sidebar", "e => e.classList.contains('open')")
     if bool(is_open) == bool(open_):
@@ -356,7 +396,7 @@ def ensure_left(pg, open_):
     else:
         pg.click("#sessions-close")
         pg.wait_for_selector("#sessions-sidebar:not(.open)", timeout=8000)
-    pg.wait_for_timeout(SETTLE)
+    wait_settled(pg)
 
 def ensure_right(pg, open_):
     is_open = pg.eval_on_selector("#sidebar", "e => e.classList.contains('open')")
@@ -367,22 +407,70 @@ def ensure_right(pg, open_):
         pg.wait_for_selector("#sidebar.open", timeout=8000)
     else:
         pg.wait_for_selector("#sidebar:not(.open)", timeout=8000)
-    pg.wait_for_timeout(SETTLE)
+    wait_settled(pg)
 
-def drag(pg, sel, x):
+def handle_xy(pg, sel):
     box = pg.locator(sel).bounding_box()
     if not box:
         raise Exception("no bounding box for " + sel)
-    y = box["y"] + box["height"] / 2
-    start = box["x"] + box["width"] / 2
-    pg.mouse.move(start, y)
+    return box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+def drag(pg, sel, delta):
+    # delta is a clientX change. The handle keeps the pointer offset, so the
+    # left sidebar's width changes by +delta and the right sidebar's by -delta.
+    x, y = handle_xy(pg, sel)
+    pg.mouse.move(x, y)
     pg.mouse.down()
-    pg.mouse.move((start + x) / 2.0, y, steps=4)
+    pg.mouse.move(x + delta / 2.0, y, steps=4)
     resizing = pg.evaluate("() => document.body.classList.contains('sidebar-resizing')")
-    pg.mouse.move(x, y, steps=8)
+    pg.mouse.move(x + delta, y, steps=8)
     pg.mouse.up()
-    pg.wait_for_timeout(SETTLE)
+    wait_settled(pg)
     return resizing
+
+def click_handle(pg, sel):
+    x, y = handle_xy(pg, sel)
+    pg.mouse.move(x, y)
+    pg.mouse.down()
+    pg.mouse.up()
+    wait_settled(pg)
+
+def cancel_drag(pg, sel, delta):
+    pg.evaluate(
+        """(sel) => {
+          var h = document.querySelector(sel);
+          if (h.__cap) return;
+          h.__cap = true;
+          h.addEventListener('pointerdown', function (e) {
+            window.__resizePointerId = e.pointerId;
+          }, true);
+        }""",
+        sel,
+    )
+    x, y = handle_xy(pg, sel)
+    pg.mouse.move(x, y)
+    pg.mouse.down()
+    pg.mouse.move(x + delta, y, steps=8)
+    during = pg.evaluate(SNAPSHOT)
+    pg.evaluate(
+        """(sel) => {
+          var h = document.querySelector(sel);
+          if (window.__resizePointerId == null) throw new Error('no pointer id');
+          h.dispatchEvent(new PointerEvent('pointercancel', {
+            bubbles: true,
+            cancelable: true,
+            pointerId: window.__resizePointerId,
+            clientX: 0,
+            clientY: 0,
+            pointerType: 'mouse',
+            isPrimary: true
+          }));
+        }""",
+        sel,
+    )
+    pg.mouse.up()
+    wait_settled(pg)
+    return during
 
 def boot(pg, width, height):
     pg.set_viewport_size({"width": width, "height": height})
@@ -390,7 +478,12 @@ def boot(pg, width, height):
     pg.wait_for_selector("#session:not([hidden]) .session-prompt", timeout=15000)
     pg.wait_for_selector("#sessions-toggle", timeout=15000)
     pg.wait_for_selector("#sessions-resize", timeout=15000)
-    pg.wait_for_timeout(SETTLE)
+    pg.wait_for_function(
+        "(w) => document.documentElement.clientWidth === w",
+        arg=width,
+        timeout=8000,
+    )
+    wait_settled(pg)
 "##;
 
 // TC-971: sidebar_resize_in_headless_chrome (FR-970, FR-972, FR-973, UX-970)
@@ -413,51 +506,67 @@ with sync_playwright() as p:
     ensure_right(pg, True)
     snap(pg, out, "base")
 
-    resizing = drag(pg, "#sessions-resize", 480)
+    click_handle(pg, "#sessions-resize")
+    wait_aria(pg, "left", 320)
+    snap(pg, out, "click_noop")
+
+    during = cancel_drag(pg, "#sessions-resize", 140)
+    out["steps"]["cancel_during"] = during
+    wait_aria(pg, "left", 320)
+    snap(pg, out, "cancel")
+
+    resizing = drag(pg, "#sessions-resize", 160)
+    wait_aria(pg, "left", 480)
     snap(pg, out, "drag_left", {"resizingDuring": resizing})
-    iw = pg.evaluate("() => window.innerWidth")
-    resizing = drag(pg, "#sidebar-resize", iw - 400)
+    resizing = drag(pg, "#sidebar-resize", -80)
+    wait_aria(pg, "right", 400)
     snap(pg, out, "drag_right", {"resizingDuring": resizing})
 
     pg.reload()
     pg.wait_for_selector("#session:not([hidden]) .session-prompt", timeout=15000)
-    pg.wait_for_timeout(SETTLE)
+    wait_aria(pg, "left", 480)
+    wait_aria(pg, "right", 400)
     ensure_left(pg, True)
     ensure_right(pg, True)
     snap(pg, out, "reloaded")
 
     pg.focus("#sessions-resize")
     pg.keyboard.press("ArrowRight")
-    pg.wait_for_timeout(SETTLE)
+    wait_aria(pg, "left", 496)
     snap(pg, out, "left_arrow_right")
     pg.keyboard.press("ArrowLeft")
-    pg.wait_for_timeout(SETTLE)
+    wait_aria(pg, "left", 480)
     snap(pg, out, "left_arrow_left")
 
     pg.focus("#sidebar-resize")
     pg.keyboard.press("ArrowLeft")
-    pg.wait_for_timeout(SETTLE)
+    wait_aria(pg, "right", 416)
     snap(pg, out, "right_arrow_left")
     pg.keyboard.press("ArrowRight")
-    pg.wait_for_timeout(SETTLE)
+    wait_aria(pg, "right", 400)
     snap(pg, out, "right_arrow_right")
 
     pg.focus("#sessions-resize")
     pg.keyboard.press("Shift+ArrowRight")
-    pg.wait_for_timeout(SETTLE)
+    wait_aria(pg, "left", 544)
     snap(pg, out, "shift_right")
     pg.keyboard.press("Home")
-    pg.wait_for_timeout(SETTLE)
+    wait_aria(pg, "left", 180)
     snap(pg, out, "home")
     pg.keyboard.press("End")
-    pg.wait_for_timeout(SETTLE)
+    wait_aria(pg, "left", 680)
     snap(pg, out, "end")
     pg.keyboard.press("Enter")
-    pg.wait_for_timeout(SETTLE)
+    wait_aria(pg, "left", 320)
     snap(pg, out, "enter_reset")
 
+    pg.focus("#sidebar-resize")
+    pg.keyboard.press("End")
+    wait_aria(pg, "right", 720)
+    snap(pg, out, "right_end")
+
     pg.dblclick("#sidebar-resize")
-    pg.wait_for_timeout(SETTLE)
+    wait_aria(pg, "right", 320)
     snap(pg, out, "dbl_reset")
 
     print(json.dumps(out))
@@ -474,35 +583,48 @@ with sync_playwright() as p:
     approx("right min", num(base, "rightMin"), 180.0, 0.1);
     assert_width("base", base, "left", 320.0);
     assert_width("base", base, "right", 320.0);
-    assert!(num(&base["leftHandle"], "width") >= 6.0, "left hit area");
-    assert!(num(&base["rightHandle"], "width") >= 6.0, "right hit area");
+    approx("viewport", num(base, "clientWidth"), 1440.0, 0.1);
     approx(
-        "left handle center",
-        num(&base["leftHandle"], "center"),
-        num(base, "leftEdge"),
-        2.0,
+        "left handle width",
+        num(&base["leftHandle"], "width"),
+        8.0,
+        0.5,
     );
     approx(
-        "right handle center",
-        num(&base["rightHandle"], "center"),
-        num(base, "rightEdge"),
-        2.0,
+        "right handle width",
+        num(&base["rightHandle"], "width"),
+        8.0,
+        0.5,
+    );
+    let left_edge = num(base, "leftEdge");
+    let right_edge = num(base, "rightEdge");
+    let left_center = num(&base["leftHandle"], "center");
+    let right_center = num(&base["rightHandle"], "center");
+    approx("left handle center", left_center, left_edge + 4.0, 1.0);
+    approx("right handle center", right_center, right_edge - 4.0, 1.0);
+    assert!(
+        left_center > left_edge + 2.0,
+        "left handle sits fully outside the border: center {left_center} edge {left_edge}"
+    );
+    assert!(
+        right_center < right_edge - 2.0,
+        "right handle sits fully outside the border: center {right_center} edge {right_edge}"
     );
     assert_eq!(base["leftHandle"]["cursor"], "col-resize");
     assert_eq!(base["rightHandle"]["cursor"], "col-resize");
     assert_eq!(base["leftHandle"]["display"], "block");
     assert_ne!(base["leftHandle"]["display"], "none");
     assert!(
-        base["hitLeftInner"].as_bool().unwrap(),
-        "left handle inner hit"
+        !base["hitLeftInner"].as_bool().unwrap(),
+        "left handle does not cover the sidebar interior"
     );
     assert!(
         base["hitLeftOuter"].as_bool().unwrap(),
         "left handle outer hit"
     );
     assert!(
-        base["hitRightInner"].as_bool().unwrap(),
-        "right handle inner hit"
+        !base["hitRightInner"].as_bool().unwrap(),
+        "right handle does not cover the sidebar interior"
     );
     assert!(
         base["hitRightOuter"].as_bool().unwrap(),
@@ -511,6 +633,26 @@ with sync_playwright() as p:
     assert_prompt("base", base);
     storage_is(base, "leftStorage", None);
     storage_is(base, "rightStorage", None);
+
+    let click = &steps["click_noop"];
+    assert_width("click", click, "left", 320.0);
+    assert_width("click right", click, "right", 320.0);
+    storage_is(click, "leftStorage", None);
+    storage_is(click, "rightStorage", None);
+
+    let during = &steps["cancel_during"];
+    assert_eq!(during["resizing"], true, "pointercancel is mid-drag");
+    approx("cancel during", num(during, "leftAria"), 460.0, 2.0);
+    let cancel = &steps["cancel"];
+    assert_eq!(
+        cancel["resizing"], false,
+        "pointercancel clears sidebar-resizing"
+    );
+    assert_width("cancel reverts", cancel, "left", 320.0);
+    assert_width("cancel right stays", cancel, "right", 320.0);
+    storage_is(cancel, "leftStorage", None);
+    storage_is(cancel, "rightStorage", None);
+    assert_prompt("cancel", cancel);
 
     let drag_left = &steps["drag_left"];
     assert_eq!(
@@ -561,9 +703,10 @@ with sync_playwright() as p:
     assert_prompt("home", home);
 
     let end = &steps["end"];
-    let end_max = max_width(num(end, "innerWidth"), 400.0);
-    assert_width("end", end, "left", end_max);
-    approx("end aria max", num(end, "leftMax"), end_max, 0.1);
+    approx("end viewport", num(end, "clientWidth"), 1440.0, 0.1);
+    // Right sidebar is 400, so the left max is min(720, 1440 - 400 - 360) = 680.
+    assert_width("end", end, "left", 680.0);
+    approx("end aria max", num(end, "leftMax"), 680.0, 0.1);
     assert_width("end right stays", end, "right", 400.0);
     assert_prompt("end", end);
 
@@ -572,12 +715,30 @@ with sync_playwright() as p:
     storage_is(enter, "leftStorage", None);
     assert_width("enter right stays", enter, "right", 400.0);
 
+    let right_end = &steps["right_end"];
+    approx(
+        "right end viewport",
+        num(right_end, "clientWidth"),
+        1440.0,
+        0.1,
+    );
+    // Left sidebar is 320, so the right max is min(720, 1440 - 320 - 360) = 720.
+    assert_width("right end", right_end, "right", 720.0);
+    approx("right end aria max", num(right_end, "rightMax"), 720.0, 0.1);
+    assert_width("right end left stays", right_end, "left", 320.0);
+    storage_is(right_end, "rightStorage", Some("720"));
+    assert_prompt("right end", right_end);
+
     let dbl = &steps["dbl_reset"];
     assert_width("dblclick", dbl, "right", 320.0);
     assert_width("dblclick left stays", dbl, "left", 320.0);
     storage_is(dbl, "rightStorage", None);
     storage_is(dbl, "leftStorage", None);
     assert_prompt("dblclick", dbl);
+
+    for (name, step) in steps.as_object().expect("steps") {
+        assert_resize_bounds(name, step);
+    }
 }
 
 // TC-972: sidebar_resize_clamps_and_narrow_layout (FR-971, FR-972, FR-974)
@@ -599,14 +760,27 @@ with sync_playwright() as p:
     ensure_left(pg, True)
     ensure_right(pg, True)
 
-    drag(pg, "#sessions-resize", 12)
+    drag(pg, "#sessions-resize", -200)
+    wait_aria(pg, "left", 180)
     snap(pg, out, "min_left")
-    iw = pg.evaluate("() => window.innerWidth")
-    drag(pg, "#sidebar-resize", iw - 500)
+    drag(pg, "#sidebar-resize", -180)
+    wait_aria(pg, "right", 500)
     snap(pg, out, "right_500")
-    drag(pg, "#sessions-resize", iw - 8)
+
+    drag(pg, "#sidebar-resize", 400)
+    wait_aria(pg, "right", 180)
+    snap(pg, out, "right_min")
+    drag(pg, "#sidebar-resize", -800)
+    wait_aria(pg, "right", 720)
+    snap(pg, out, "right_max")
+    drag(pg, "#sidebar-resize", 220)
+    wait_aria(pg, "right", 500)
+
+    drag(pg, "#sessions-resize", 500)
+    wait_aria(pg, "left", 580)
     snap(pg, out, "left_max")
-    drag(pg, "#sessions-resize", 420)
+    drag(pg, "#sessions-resize", -160)
+    wait_aria(pg, "left", 420)
     snap(pg, out, "left_420")
 
     ensure_left(pg, False)
@@ -619,15 +793,52 @@ with sync_playwright() as p:
     snap(pg, out, "right_reopened")
 
     ensure_right(pg, False)
-    drag(pg, "#sessions-resize", 700)
+    drag(pg, "#sessions-resize", 280)
+    wait_aria(pg, "left", 700)
     snap(pg, out, "left_700")
     pg.set_viewport_size({"width": 1200, "height": 900})
-    pg.wait_for_timeout(SETTLE)
+    pg.wait_for_function(
+        """() => {
+          var aria = Number(document.getElementById('sessions-resize').getAttribute('aria-valuenow'));
+          var pad = parseFloat(getComputedStyle(document.body).paddingLeft) || 0;
+          return document.documentElement.clientWidth === 1200 && aria === 600 && Math.abs(pad - 600) < 1.5;
+        }""",
+        timeout=8000,
+    )
     snap(pg, out, "resized_narrower")
+    click_handle(pg, "#sessions-resize")
+    pg.wait_for_function(
+        """() => {
+          var aria = Number(document.getElementById('sessions-resize').getAttribute('aria-valuenow'));
+          var pad = parseFloat(getComputedStyle(document.body).paddingLeft) || 0;
+          var stored = localStorage.getItem('dmuxai.sidebar.width.left');
+          return aria === 600 && Math.abs(pad - 600) < 1.5 && stored === '700';
+        }""",
+        timeout=8000,
+    )
+    snap(pg, out, "click_keeps")
     pg.set_viewport_size({"width": 1440, "height": 900})
-    pg.wait_for_timeout(SETTLE)
+    pg.wait_for_function(
+        """() => {
+          var aria = Number(document.getElementById('sessions-resize').getAttribute('aria-valuenow'));
+          var pad = parseFloat(getComputedStyle(document.body).paddingLeft) || 0;
+          return document.documentElement.clientWidth === 1440 && aria === 700 && Math.abs(pad - 700) < 1.5;
+        }""",
+        timeout=8000,
+    )
     snap(pg, out, "resized_back")
     ensure_right(pg, True)
+    pg.wait_for_function(
+        """() => {
+          var l = Number(document.getElementById('sessions-resize').getAttribute('aria-valuenow'));
+          var r = Number(document.getElementById('sidebar-resize').getAttribute('aria-valuenow'));
+          var cs = getComputedStyle(document.body);
+          var padL = parseFloat(cs.paddingLeft) || 0;
+          var padR = parseFloat(cs.paddingRight) || 0;
+          return l === 580 && r === 500 && Math.abs(padL - 580) < 1.5 && Math.abs(padR - 500) < 1.5;
+        }""",
+        timeout=8000,
+    )
     snap(pg, out, "other_opened")
 
     pg.evaluate("""() => {
@@ -635,18 +846,38 @@ with sync_playwright() as p:
       localStorage.setItem('dmuxai.sidebar.width.right', '500');
     }""")
     pg.set_viewport_size({"width": 800, "height": 900})
+    pg.wait_for_function(
+        "(w) => document.documentElement.clientWidth === w",
+        arg=800,
+        timeout=8000,
+    )
     pg.reload()
     pg.wait_for_selector("#session:not([hidden]) .session-prompt", timeout=15000)
-    pg.wait_for_timeout(SETTLE)
+    pg.wait_for_function(
+        """() => getComputedStyle(document.getElementById('sessions-resize')).display === 'none'
+          && document.documentElement.clientWidth === 800""",
+        timeout=8000,
+    )
+    wait_settled(pg)
     snap(pg, out, "narrow")
     ensure_left(pg, True)
     ensure_right(pg, True)
     snap(pg, out, "narrow_open")
 
     pg.set_viewport_size({"width": 1440, "height": 900})
-    pg.wait_for_timeout(SETTLE)
+    pg.wait_for_function(
+        """() => {
+          if (document.documentElement.clientWidth !== 1440) return false;
+          var l = Number(document.getElementById('sessions-resize').getAttribute('aria-valuenow'));
+          var r = Number(document.getElementById('sidebar-resize').getAttribute('aria-valuenow'));
+          return l === 500 && r === 500;
+        }""",
+        timeout=8000,
+    )
     ensure_left(pg, True)
     ensure_right(pg, True)
+    wait_aria(pg, "left", 500)
+    wait_aria(pg, "right", 500)
     snap(pg, out, "wide_again")
 
     pg.evaluate("""() => {
@@ -655,7 +886,8 @@ with sync_playwright() as p:
     }""")
     pg.reload()
     pg.wait_for_selector("#session:not([hidden]) .session-prompt", timeout=15000)
-    pg.wait_for_timeout(SETTLE)
+    wait_aria(pg, "left", 320)
+    wait_aria(pg, "right", 180)
     snap(pg, out, "bad_storage")
 
     print(json.dumps(out))
@@ -676,16 +908,45 @@ with sync_playwright() as p:
     storage_is(right_500, "rightStorage", Some("500"));
     assert_prompt("right 500", right_500);
 
-    let left_max = &steps["left_max"];
-    let iw = num(left_max, "innerWidth");
-    let expected_max = max_width(iw, 500.0);
-    assert!(
-        expected_max < iw * 0.5,
-        "fixture should bind on the other sidebar, not only the 50% cap: max {expected_max} iw {iw}"
+    let right_min = &steps["right_min"];
+    approx(
+        "right min viewport",
+        num(right_min, "clientWidth"),
+        1440.0,
+        0.1,
     );
-    assert_width("left max", left_max, "left", expected_max);
+    assert_width("right min", right_min, "right", 180.0);
+    assert_width("right min left stays", right_min, "left", 180.0);
+    storage_is(right_min, "rightStorage", Some("180"));
+    assert_prompt("right min", right_min);
+
+    let right_max = &steps["right_max"];
+    approx(
+        "right max viewport",
+        num(right_max, "clientWidth"),
+        1440.0,
+        0.1,
+    );
+    // Other sidebar is 180, so min(720, 1440 - 180 - 360) = 720. The 50% cap binds
+    // because 720 < 1440 - 180 - 360.
+    assert_width("right max", right_max, "right", 720.0);
+    assert_width("right max left stays", right_max, "left", 180.0);
+    approx("right max aria", num(right_max, "rightMax"), 720.0, 0.1);
+    storage_is(right_max, "rightStorage", Some("720"));
+    assert_prompt("right max", right_max);
+
+    let left_max = &steps["left_max"];
+    approx(
+        "left max viewport",
+        num(left_max, "clientWidth"),
+        1440.0,
+        0.1,
+    );
+    // Other sidebar is 500, so min(720, 1440 - 500 - 360) = 580. The other sidebar binds
+    // because 580 < 720.
+    assert_width("left max", left_max, "left", 580.0);
     assert_width("left max right stays", left_max, "right", 500.0);
-    approx("left aria max", num(left_max, "leftMax"), expected_max, 0.1);
+    approx("left aria max", num(left_max, "leftMax"), 580.0, 0.1);
     assert_prompt("left max", left_max);
 
     let left_420 = &steps["left_420"];
@@ -719,7 +980,7 @@ with sync_playwright() as p:
         1.0,
     );
     assert!(
-        num(&right_closed["right"], "left") >= num(right_closed, "innerWidth") - 2.0,
+        num(&right_closed["right"], "left") >= num(right_closed, "clientWidth") - 2.0,
         "closed right sidebar still on screen: {}",
         right_closed["right"]
     );
@@ -738,33 +999,42 @@ with sync_playwright() as p:
     assert_prompt("700", left_700);
 
     let resized = &steps["resized_narrower"];
-    let resized_iw = num(resized, "innerWidth");
-    let (expect_left, _) = settle(resized_iw, 700.0, 500.0, true, false);
-    assert_width("resized", resized, "left", expect_left);
-    assert!(
-        expect_left < 700.0,
-        "narrower viewport should clamp 700, got {expect_left} at {resized_iw}"
-    );
+    approx("resized viewport", num(resized, "clientWidth"), 1200.0, 0.1);
+    // Solo cap at 1200 is min(600, 1200 - 360) = 600. The stored 700 stays stored
+    // because 600 < 700.
+    assert_width("resized", resized, "left", 600.0);
     storage_is(resized, "leftStorage", Some("700"));
     storage_is(resized, "rightStorage", Some("500"));
     assert_prompt("resized", resized);
 
+    let click_keeps = &steps["click_keeps"];
+    assert_width("click keeps display", click_keeps, "left", 600.0);
+    storage_is(click_keeps, "leftStorage", Some("700"));
+    storage_is(click_keeps, "rightStorage", Some("500"));
+    assert_prompt("click keeps", click_keeps);
+
     let back = &steps["resized_back"];
-    let back_iw = num(back, "innerWidth");
-    let (expect_back, _) = settle(back_iw, 700.0, 500.0, true, false);
-    assert_width("resized back", back, "left", expect_back);
+    approx(
+        "resized back viewport",
+        num(back, "clientWidth"),
+        1440.0,
+        0.1,
+    );
+    assert_width("resized back", back, "left", 700.0);
     storage_is(back, "leftStorage", Some("700"));
     assert_prompt("resized back", back);
 
     let opened = &steps["other_opened"];
-    let opened_iw = num(opened, "innerWidth");
-    let (expect_l, expect_r) = settle(opened_iw, 700.0, 500.0, true, true);
-    assert_width("other opened left", opened, "left", expect_l);
-    assert_width("other opened right", opened, "right", expect_r);
-    assert!(
-        expect_l < 700.0,
-        "opening the other sidebar should reclamp 700, got {expect_l}"
+    approx(
+        "other opened viewport",
+        num(opened, "clientWidth"),
+        1440.0,
+        0.1,
     );
+    // Both open: left preference 700 clamps to 1440 - 500 - 360 = 580 (580 < 700).
+    // Right 500 fits.
+    assert_width("other opened left", opened, "left", 580.0);
+    assert_width("other opened right", opened, "right", 500.0);
     storage_is(opened, "leftStorage", Some("700"));
     storage_is(opened, "rightStorage", Some("500"));
     assert_prompt("other opened", opened);
@@ -791,7 +1061,7 @@ with sync_playwright() as p:
     );
     storage_is(narrow, "leftStorage", Some("500"));
     storage_is(narrow, "rightStorage", Some("500"));
-    let n_iw = num(narrow, "innerWidth");
+    let n_iw = num(narrow, "clientWidth");
     let n_prompt = &narrow["prompt"];
     let n_center = num(n_prompt, "left") + num(n_prompt, "width") / 2.0;
     approx("narrow prompt center", n_center, n_iw / 2.0, 2.0);
@@ -837,33 +1107,24 @@ with sync_playwright() as p:
     approx(
         "narrow open prompt",
         o_center,
-        num(narrow_open, "innerWidth") / 2.0,
+        num(narrow_open, "clientWidth") / 2.0,
         2.0,
     );
 
     let wide = &steps["wide_again"];
-    let wide_iw = num(wide, "innerWidth");
-    let (wide_l, wide_r) = settle(wide_iw, 500.0, 500.0, true, true);
-    assert_width("wide again left", wide, "left", wide_l);
-    assert_width("wide again right", wide, "right", wide_r);
+    approx("wide again viewport", num(wide, "clientWidth"), 1440.0, 0.1);
+    assert_width("wide again left", wide, "left", 500.0);
+    assert_width("wide again right", wide, "right", 500.0);
     storage_is(wide, "leftStorage", Some("500"));
     storage_is(wide, "rightStorage", Some("500"));
     assert_ne!(wide["leftHandle"]["display"], "none");
     assert_prompt("wide again", wide);
 
     let bad = &steps["bad_storage"];
-    let bad_iw = num(bad, "innerWidth");
-    let left_open = bad["leftOpen"].as_bool().unwrap();
-    let right_open = bad["rightOpen"].as_bool().unwrap();
-    let (bad_l, bad_r) = settle(bad_iw, 320.0, 12.0, left_open, right_open);
-    assert_width("non-numeric left", bad, "left", bad_l);
-    assert_width("below-min right", bad, "right", bad_r);
-    assert!(
-        (bad_l - 320.0).abs() < 1.0,
-        "non-numeric left should fall back to 320, got {bad_l}"
-    );
-    assert!(
-        (bad_r - 180.0).abs() < 1.0,
-        "below-min right should clamp to 180, got {bad_r}"
-    );
+    assert_width("non-numeric left", bad, "left", 320.0);
+    assert_width("below-min right", bad, "right", 180.0);
+
+    for (name, step) in steps.as_object().expect("steps") {
+        assert_resize_bounds(name, step);
+    }
 }

@@ -1136,7 +1136,7 @@ mod tests {
         assert!(INDEX_HTML.contains("aria-label=\"Resize files sidebar\""));
         assert!(INDEX_HTML.contains("aria-valuenow=\"320\""));
         assert!(INDEX_HTML.contains("aria-valuemin=\"180\""));
-        assert!(INDEX_HTML.contains("aria-valuemax=\"320\""));
+        // aria-valuemax in the HTML is a static placeholder; the script overwrites it.
         assert!(INDEX_HTML.contains("<script src=\"/assets/sidebar-resize.js\" defer></script>"));
         let workspace_js = INDEX_HTML
             .find("/assets/workspace.js")
@@ -1182,9 +1182,34 @@ mod tests {
         assert!(DOCS_CSS.contains("--right-dock: var(--right-sidebar-width);"));
         assert!(DOCS_CSS.contains("cursor: col-resize;"));
         assert!(DOCS_CSS.contains(":focus-visible"));
-        assert!(DOCS_CSS.contains("sidebar-resizing"));
-        assert!(DOCS_CSS.contains("user-select: none;"));
-        assert!(DOCS_CSS.contains("transition: none;"));
+        let resizing_at = DOCS_CSS
+            .find("body.sidebar-resizing")
+            .expect("body.sidebar-resizing rule");
+        let resizing_end = resizing_at
+            + DOCS_CSS[resizing_at..]
+                .find('}')
+                .expect("end of sidebar-resizing block");
+        let resizing_css = &DOCS_CSS[resizing_at..=resizing_end];
+        assert!(
+            resizing_css.contains("transition: none;"),
+            "sidebar-resizing block disables transition: {resizing_css}"
+        );
+        assert!(
+            resizing_css.contains("user-select: none;"),
+            "sidebar-resizing block suppresses selection: {resizing_css}"
+        );
+        let instant_at = DOCS_CSS
+            .find("body.sidebar-resize-instant")
+            .expect("sidebar-resize-instant rule");
+        let instant_end = instant_at
+            + DOCS_CSS[instant_at..]
+                .find('}')
+                .expect("end of sidebar-resize-instant block");
+        let instant_css = &DOCS_CSS[instant_at..=instant_end];
+        assert!(
+            instant_css.contains("transition: none;"),
+            "sidebar-resize-instant block disables transition: {instant_css}"
+        );
         let narrow = DOCS_CSS
             .find("@media (max-width: 900px)")
             .expect("narrow media");
@@ -1197,32 +1222,38 @@ mod tests {
             narrow_css.contains("width: min(320px, 85vw);"),
             "narrow drawers keep min(320px, 85vw): {narrow_css}"
         );
+        let handle_at = narrow_css
+            .find(".sidebar-resize-handle")
+            .expect("narrow layout must mention the handle");
+        let handle_end = handle_at
+            + narrow_css[handle_at..]
+                .find('}')
+                .expect("end of narrow handle rule");
+        let handle_css = &narrow_css[handle_at..=handle_end];
         assert!(
-            narrow_css.contains(".sidebar-resize-handle"),
-            "narrow layout must mention the handle"
-        );
-        assert!(
-            narrow_css.contains("display: none;"),
-            "handles must be hidden at max-width 900px"
+            handle_css.contains("display: none;"),
+            "@media (max-width: 900px) must hide .sidebar-resize-handle: {handle_css}"
         );
 
         assert!(SIDEBAR_RESIZE_JS.contains("dmuxai.sidebar.width.left"));
         assert!(SIDEBAR_RESIZE_JS.contains("dmuxai.sidebar.width.right"));
-        assert!(SIDEBAR_RESIZE_JS.contains("180"));
-        assert!(SIDEBAR_RESIZE_JS.contains("0.5"));
-        assert!(SIDEBAR_RESIZE_JS.contains("50%"));
+        assert!(SIDEBAR_RESIZE_JS.contains("var MIN_WIDTH = 180"));
+        assert!(SIDEBAR_RESIZE_JS.contains("Math.floor(vw * 0.5)"));
+        assert!(SIDEBAR_RESIZE_JS.contains("var SHIFT_STEP = 64"));
+        assert!(SIDEBAR_RESIZE_JS.contains("key === 'Home'"));
+        assert!(SIDEBAR_RESIZE_JS.contains("key === 'End'"));
+        assert!(SIDEBAR_RESIZE_JS.contains("key === 'Enter'"));
         assert!(SIDEBAR_RESIZE_JS.contains("dblclick"));
+        assert!(SIDEBAR_RESIZE_JS.contains("addEventListener('pointercancel'"));
+        assert!(SIDEBAR_RESIZE_JS.contains("addEventListener('lostpointercapture'"));
+        assert!(SIDEBAR_RESIZE_JS.contains("document.documentElement.clientWidth"));
         assert!(SIDEBAR_RESIZE_JS.contains("removeItem"));
         assert!(SIDEBAR_RESIZE_JS.contains("ArrowRight"));
         assert!(SIDEBAR_RESIZE_JS.contains("ArrowLeft"));
-        assert!(SIDEBAR_RESIZE_JS.contains("Home"));
-        assert!(SIDEBAR_RESIZE_JS.contains("End"));
-        assert!(SIDEBAR_RESIZE_JS.contains("Enter"));
         assert!(SIDEBAR_RESIZE_JS.contains("setPointerCapture"));
         assert!(SIDEBAR_RESIZE_JS.contains("sidebar-resizing"));
         assert!(SIDEBAR_RESIZE_JS.contains("MutationObserver"));
         assert!(SIDEBAR_RESIZE_JS.contains("shiftKey"));
-        assert!(SIDEBAR_RESIZE_JS.contains("64"));
         assert!(!SIDEBAR_RESIZE_JS.contains("innerHTML"));
         assert!(!SIDEBAR_RESIZE_JS.contains("onclick"));
 

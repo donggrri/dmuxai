@@ -3,6 +3,8 @@
 // docked Sessions (left) and Files (right) sidebars. Sets
 // --left-sidebar-width / --right-sidebar-width on <html>. Open/close stays
 // in session.js and docs.js. At 900px and below this script does not write.
+// Viewport width for the max is documentElement.clientWidth (scrollbar gutter
+// excluded). A click with |dx| <= 3px does not write storage or preferred.
 
 (function () {
   var LEFT_KEY = 'dmuxai.sidebar.width.left';
@@ -14,11 +16,14 @@
   var STEP = 16;
   var SHIFT_STEP = 64;
   var DBLCLICK_MS = 500;
+  var CLICK_SLOP = 3;
 
   var preferred = { left: DEFAULT_WIDTH, right: DEFAULT_WIDTH };
   var shown = { left: DEFAULT_WIDTH, right: DEFAULT_WIDTH };
   var drag = null;
   var lastClick = null;
+  var windowDrag = false;
+  var instantToken = 0;
 
   function storageGet(key) {
     try { return window.localStorage.getItem(key); } catch (err) { return null; }
@@ -45,7 +50,7 @@
   }
 
   function isNarrow() {
-    return window.innerWidth <= NARROW_MAX;
+    return window.matchMedia('(max-width: ' + NARROW_MAX + 'px)').matches;
   }
 
   function isLeftOpen() {
@@ -64,9 +69,17 @@
     return document.getElementById(side === 'left' ? 'sessions-resize' : 'sidebar-resize');
   }
 
+  function sidebarEl(side) {
+    return document.getElementById(side === 'left' ? 'sessions-sidebar' : 'sidebar');
+  }
+
+  function viewportWidth() {
+    return document.documentElement.clientWidth;
+  }
+
   // max = max(180, min(floor(viewport * 50%), viewport - otherOpenWidth - 360))
   function maxFor(otherWidth) {
-    var vw = window.innerWidth;
+    var vw = viewportWidth();
     var other = otherWidth > 0 ? otherWidth : 0;
     var cap = Math.min(Math.floor(vw * 0.5), vw - other - CONTENT_RESERVE);
     if (cap < MIN_WIDTH) { return MIN_WIDTH; }
@@ -85,6 +98,30 @@
       return isRightOpen() ? shown.right : 0;
     }
     return isLeftOpen() ? shown.left : 0;
+  }
+
+  // Drop the dock/width transition for a programmatic change. Open/close
+  // still animates because this class is not applied for that slide.
+  // Removed after two animation frames so a later open/close can transition.
+  // Without requestAnimationFrame, drop the class after 50ms so it cannot stick.
+  function beginInstant() {
+    instantToken += 1;
+    var token = instantToken;
+    document.body.classList.add('sidebar-resize-instant');
+    function clearInstant() {
+      if (token !== instantToken) { return; }
+      document.body.classList.remove('sidebar-resize-instant');
+    }
+    var raf = window.requestAnimationFrame;
+    if (!raf) {
+      window.setTimeout(clearInstant, 50);
+      return;
+    }
+    raf(function () {
+      raf(function () {
+        clearInstant();
+      });
+    });
   }
 
   function paint() {
@@ -106,10 +143,14 @@
 
   // Re-clamp from the stored preference. A closed sidebar keeps its own
   // width (it reserves no space); both open sidebars share the viewport.
-  // Does not write storage.
-  function relayout() {
+  // Does not write storage. instantIfChanged adds the instant class only
+  // when a displayed width changes, so body padding does not lag that width
+  // and an unchanged open/close slide is left alone.
+  function relayout(instantIfChanged) {
     if (isNarrow()) { return; }
     if (drag) { return; }
+    var prevLeft = shown.left;
+    var prevRight = shown.right;
     var leftOpen = isLeftOpen();
     var rightOpen = isRightOpen();
     var left = clamp(preferred.left, maxFor(0));
@@ -124,6 +165,9 @@
       left = clamp(preferred.left, maxFor(0));
     } else if (rightOpen) {
       right = clamp(preferred.right, maxFor(0));
+    }
+    if (instantIfChanged && (left !== prevLeft || right !== prevRight)) {
+      beginInstant();
     }
     shown.left = left;
     shown.right = right;
@@ -148,66 +192,131 @@
     paint();
   }
 
+  // Left sidebar is docked at x = 0, so its width is clientX.
+  // Right width is the sidebar's right edge minus clientX (not innerWidth,
+  // so a classic scrollbar does not shift the handle).
   function widthFromPointer(side, clientX) {
-    // Left sidebar is docked at x = 0, so its width is clientX.
-    // Right sidebar is docked at the viewport's right edge.
     if (side === 'left') { return Math.round(clientX); }
-    return Math.round(window.innerWidth - clientX);
+    var el = sidebarEl(side);
+    var rightEdge = el ? el.getBoundingClientRect().right : viewportWidth();
+    return Math.round(rightEdge - clientX);
+  }
+
+  function addWindowDragListeners() {
+    if (windowDrag) { return; }
+    windowDrag = true;
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', abortDrag);
+  }
+
+  function removeWindowDragListeners() {
+    if (!windowDrag) { return; }
+    windowDrag = false;
+    window.removeEventListener('pointermove', onPointerMove);
+    window.removeEventListener('pointerup', onPointerUp);
+    window.removeEventListener('pointercancel', abortDrag);
+  }
+
+  function clearDragChrome(side) {
+    removeWindowDragListeners();
+    drag = null;
+    document.body.classList.remove('sidebar-resizing');
+    var handle = handleFor(side);
+    if (handle) { handle.classList.remove('is-dragging'); }
   }
 
   function onPointerDown(side, e) {
-    if (drag) { return; }
+    // A missed pointerup leaves drag set and the handle dead. Abort it first.
+    if (drag) { abortDrag(); }
     if (typeof e.button === 'number' && e.button !== 0) { return; }
     if (isNarrow()) { return; }
     if (e.preventDefault) { e.preventDefault(); }
+    var pointerWidth = widthFromPointer(side, e.clientX);
     drag = {
       side: side,
       pointerId: e.pointerId,
       startX: e.clientX,
+      startWidth: shown[side],
+      startPreferred: preferred[side],
+      offset: shown[side] - pointerWidth,
       moved: false
     };
     document.body.classList.add('sidebar-resizing');
     var handle = handleFor(side);
-    if (handle) {
-      handle.classList.add('is-dragging');
-      if (handle.setPointerCapture) {
-        try { handle.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    if (handle) { handle.classList.add('is-dragging'); }
+    var captured = false;
+    if (handle && handle.setPointerCapture) {
+      try {
+        handle.setPointerCapture(e.pointerId);
+        captured = true;
+      } catch (err) {
+        captured = false;
       }
     }
+    // Capture failed: follow the pointer on window until the drag ends,
+    // including pointercancel so a cancel still aborts.
+    if (!captured) { addWindowDragListeners(); }
   }
 
   function onPointerMove(e) {
     if (!drag || e.pointerId !== drag.pointerId) { return; }
-    if (Math.abs(e.clientX - drag.startX) > 3) { drag.moved = true; }
-    commit(drag.side, widthFromPointer(drag.side, e.clientX), false);
+    if (Math.abs(e.clientX - drag.startX) > CLICK_SLOP) { drag.moved = true; }
+    // Sub-slop jitter stays a click: do not change width or preferred.
+    if (!drag.moved) { return; }
+    commit(drag.side, widthFromPointer(drag.side, e.clientX) + drag.offset, false);
   }
 
-  function finishDrag(e, persist) {
+  function onPointerUp(e) {
+    finishDrag(e);
+  }
+
+  // pointercancel / lostpointercapture: ignore coordinates, revert, do not persist.
+  function abortDrag(e) {
+    if (!drag) { return; }
+    if (e && e.pointerId !== drag.pointerId) { return; }
+    var side = drag.side;
+    var startWidth = drag.startWidth;
+    var startPreferred = drag.startPreferred;
+    clearDragChrome(side);
+    preferred[side] = startPreferred;
+    shown[side] = startWidth;
+    beginInstant();
+    relayout();
+  }
+
+  function finishDrag(e) {
     if (!drag) { return; }
     if (e && e.pointerId !== drag.pointerId) { return; }
     var side = drag.side;
     var moved = drag.moved;
-    var handle = handleFor(side);
-    drag = null;
-    document.body.classList.remove('sidebar-resizing');
-    if (handle) { handle.classList.remove('is-dragging'); }
-    if (!persist) { return; }
-    if (moved && e) {
-      commit(side, widthFromPointer(side, e.clientX), false);
-    }
-    var now = Date.now();
-    if (!moved && lastClick && lastClick.side === side && (now - lastClick.at) < DBLCLICK_MS) {
-      lastClick = null;
-      reset(side);
+    var startWidth = drag.startWidth;
+    var offset = drag.offset;
+    clearDragChrome(side);
+    if (!moved) {
+      // A click must not overwrite a wider stored preference with the
+      // clamped display width, and must not store the default.
+      shown[side] = startWidth;
+      var now = Date.now();
+      if (lastClick && lastClick.side === side && (now - lastClick.at) < DBLCLICK_MS) {
+        lastClick = null;
+        beginInstant();
+        reset(side);
+      } else {
+        lastClick = { side: side, at: now };
+      }
+      beginInstant();
+      relayout();
       return;
     }
-    if (!moved) {
-      lastClick = { side: side, at: now };
-    } else {
-      lastClick = null;
+    lastClick = null;
+    if (e) {
+      commit(side, widthFromPointer(side, e.clientX) + offset, false);
     }
     storageSet(keyFor(side), shown[side]);
     preferred[side] = shown[side];
+    beginInstant();
+    relayout();
   }
 
   function onKeyDown(side, e) {
@@ -230,6 +339,7 @@
       next = max;
     } else if (key === 'Enter') {
       e.preventDefault();
+      beginInstant();
       reset(side);
       return;
     } else {
@@ -237,6 +347,7 @@
     }
     if (!handled) { return; }
     e.preventDefault();
+    beginInstant();
     commit(side, next, true);
   }
 
@@ -245,11 +356,13 @@
     if (!handle) { return; }
     handle.addEventListener('pointerdown', function (e) { onPointerDown(side, e); });
     handle.addEventListener('pointermove', onPointerMove);
-    handle.addEventListener('pointerup', function (e) { finishDrag(e, true); });
-    handle.addEventListener('pointercancel', function (e) { finishDrag(e, true); });
+    handle.addEventListener('pointerup', onPointerUp);
+    handle.addEventListener('pointercancel', abortDrag);
+    handle.addEventListener('lostpointercapture', abortDrag);
     handle.addEventListener('dblclick', function (e) {
       if (e.preventDefault) { e.preventDefault(); }
       lastClick = null;
+      beginInstant();
       reset(side);
     });
     handle.addEventListener('keydown', function (e) { onKeyDown(side, e); });
@@ -264,11 +377,14 @@
 
   bind('left');
   bind('right');
+  beginInstant();
   relayout();
 
-  window.addEventListener('resize', relayout);
+  window.addEventListener('resize', function () {
+    relayout(true);
+  });
   if (window.MutationObserver) {
-    var observer = new MutationObserver(relayout);
+    var observer = new MutationObserver(function () { relayout(true); });
     observer.observe(document.body, { attributes: true, attributeFilter: ['class'] });
   }
 })();
