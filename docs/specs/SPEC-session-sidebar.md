@@ -19,6 +19,7 @@ Decision: move the list into a collapsible **left sidebar**, like ChatGPT's. It 
 | FR-862 | Must | Clicking a row (or Enter/Space on it) sends `load_conversation`; the `New` button sends `new_conversation`. Both are disabled in view-only mode, with the same hint as other actions. Switching while a turn runs is allowed; the running turn keeps going in its conversation, as in the TUI | TC-862, TC-863 |
 | FR-863 | Must | The sidebar is collapsible. Its open state persists per workspace in `localStorage`, and it is open by default above 1200px. Below 900px it is an overlay drawer with a backdrop. A filter box narrows the list by title | TC-862, TC-863 |
 | FR-864 | Should | The TUI conversation picker (F3, `/conversations`) shows the same last agent, relative time and running mark per row. No new TUI pane | TC-864 |
+| FR-865 | Should | The F3 picker scales with the terminal: its width is about 90% of the terminal, at least 60 columns (or the whole terminal when it is narrower) and at most 160, and it is never wider than the content needs. When a row does not fit, the title is shortened with `…` so the running mark, short id, turn count, agent and relative time stay visible. At 120 and 200 columns the agent and time of a typical row are not cut off; at 80x24 the picker still fits inside the terminal | TC-865 |
 | UX-860 | Must | The list is a keyboard-navigable `nav` with `aria-label="Sessions"` (Up/Down move, Enter opens). The spinner follows `prefers-reduced-motion` and `[theme] reduced_motion` (SPEC-running-indicators UX-821). The old in-panel conversation box is removed, and `/conversations` in the palette focuses the sidebar | TC-862, TC-863 |
 
 ### Design notes
@@ -36,6 +37,7 @@ Decision: move the list into a collapsible **left sidebar**, like ChatGPT's. It 
 - `running` reflects queued or running turn rows. A turn left `running` by a crashed peer stays marked until the startup recovery of SPEC-multi-instance-workspace resets it.
 - The dashboard header sits inside the dock padding too, wrapping when narrow, so the left sidebar never covers the brand and controls. This replaces the full-width header counter-margins from #54.
 - The TUI picker puts `● running` at the start of the row, so a narrow picker never cuts it off.
+- The picker width (FR-865) is `clamp(90% of the terminal, 60, 160)`, capped by the widest row and by the terminal width. The title is the only part that is shortened.
 - A sidebar toggle made before the first snapshot names the workspace is held and saved under the real workspace key, never under a placeholder key.
 
 ## 3. Tests
@@ -47,3 +49,4 @@ Decision: move the list into a collapsible **left sidebar**, like ChatGPT's. It 
 | TC-862 | FR-861..FR-863, UX-860 | unit (asset) | index.html, JS and CSS assets | `#sessions-sidebar` nav with `aria-label`, toggle with `aria-controls`/`aria-expanded`, `New` button, filter, spinner class, reduced-motion rule; the old `.session-conversations` box is gone | `src/web/assets.rs` `session_sidebar_assets` |
 | TC-863 | FR-861..FR-863, UX-860 | e2e (ignored, headless Chrome) | `dmuxai --web` on a workspace with two stored conversations | The sidebar lists both with agent and time, active first; clicking the other row makes it active (`aria-current`); `New` adds a row; collapse persists across reload; screenshot captured | `tests/web_session_sidebar.rs` `session_sidebar_renders_in_headless_chrome` |
 | TC-864 | FR-864 | unit (TUI render) | App with two conversations, one running | The picker rows contain the agent name, relative time and the running mark | `src/app.rs` `conversation_picker_shows_agent_time_running` |
+| TC-865 | FR-865 | unit (TUI render) | App with a running conversation that has a long title, rendered at 80x24, 120x40 and 200x50 | The picker fits inside the terminal; at 120 and 200 columns it is wider than the old fixed 76 columns; every row ends with the agent and relative time inside the border; an over-long title is shortened with `…` | `src/app.rs` `conversation_picker_scales_with_terminal_width` |
