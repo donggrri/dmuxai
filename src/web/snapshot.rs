@@ -348,6 +348,13 @@ pub fn snapshot_from_run(run: &GraphRun) -> GraphView {
             .map(|sources| sources.iter().map(|(id, _)| (*id).to_string()).collect())
             .unwrap_or_default();
 
+        let started_at_ms = node.started_at_ms;
+        let finished_at_ms = node.finished_at_ms;
+        let elapsed_ms = match (started_at_ms, finished_at_ms) {
+            (Some(start), Some(finish)) => Some(finish.saturating_sub(start)),
+            _ => None,
+        };
+
         nodes.push(NodeView {
             id: node.id.clone(),
             role: node.role,
@@ -356,9 +363,9 @@ pub fn snapshot_from_run(run: &GraphRun) -> GraphView {
             model_id: node.model_id.clone(),
             status: node.status,
             attempt: node.attempt,
-            started_at_ms: None,
-            finished_at_ms: None,
-            elapsed_ms: None,
+            started_at_ms,
+            finished_at_ms,
+            elapsed_ms,
             deps,
             layout: layout.get(node.id.as_str()).copied(),
             detail: NodeDetail::default(),
@@ -406,6 +413,8 @@ mod tests {
                         requires_gate: false,
                         status: GraphNodeStatus::Completed,
                         attempt: 1,
+                        started_at_ms: None,
+                        finished_at_ms: None,
                     },
                     GraphNode {
                         id: "step-2".to_string(),
@@ -417,6 +426,8 @@ mod tests {
                         requires_gate: false,
                         status: GraphNodeStatus::Running,
                         attempt: 1,
+                        started_at_ms: None,
+                        finished_at_ms: None,
                     },
                     GraphNode {
                         id: "step-3".to_string(),
@@ -428,6 +439,8 @@ mod tests {
                         requires_gate: false,
                         status: GraphNodeStatus::Pending,
                         attempt: 0,
+                        started_at_ms: None,
+                        finished_at_ms: None,
                     },
                 ],
                 edges: vec![GraphEdge {
@@ -507,6 +520,8 @@ mod tests {
             requires_gate: false,
             status: GraphNodeStatus::Pending,
             attempt: 0,
+            started_at_ms: None,
+            finished_at_ms: None,
         };
         let run = GraphRun {
             plan: GraphPlan {

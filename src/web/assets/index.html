@@ -78,17 +78,19 @@
       </div>
       <div class="graph-toolbar">
         <button id="graph-fit" type="button" class="btn">Fit</button>
-        <span class="graph-hint">wheel to zoom &middot; drag to pan &middot; click a node for details</span>
+        <span class="graph-hint">wheel to zoom &middot; drag to pan &middot; click a step for details</span>
       </div>
       <div id="graph-stage" class="graph-stage">
         <div id="graph-canvas" class="graph-canvas"></div>
         <aside id="graph-detail" class="graph-detail" hidden aria-label="Node details"></aside>
       </div>
       <div class="graph-legend">
-        <span class="legend-item"><i class="legend-swatch legend-pending"></i>pending</span>
+        <span class="legend-item"><i class="legend-swatch legend-completed"></i>done</span>
         <span class="legend-item"><i class="legend-swatch legend-running"></i>running</span>
-        <span class="legend-item"><i class="legend-swatch legend-completed"></i>completed</span>
+        <span class="legend-item"><i class="legend-swatch legend-pending"></i>pending</span>
         <span class="legend-item"><i class="legend-swatch legend-failed"></i>failed</span>
+        <span class="legend-item"><i class="legend-line legend-line-solid"></i>solid arrow: dependency done or running</span>
+        <span class="legend-item"><i class="legend-line legend-line-dashed"></i>dashed: waiting</span>
       </div>
       <ol id="nodes" class="nodes"></ol>
     </div>

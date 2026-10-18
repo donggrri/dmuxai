@@ -577,6 +577,23 @@ mod tests {
                 );
             }
 
+            // SPEC-graph-swimlane UX-880: pending card borders and dashed
+            // arrows >= 3:1, and graph text >= 4.5:1, on the canvas, the card
+            // fill and the lane label background.
+            for surface in ["graph-canvas", "graph-node-fill", "bg-chip"] {
+                let bg = var_value(&vars, surface);
+                assert!(
+                    contrast(var_value(&vars, "graph-pending"), bg) >= 3.0,
+                    "{theme}: --graph-pending/--{surface} below 3.0"
+                );
+                for text in ["text", "muted", "faint"] {
+                    assert!(
+                        contrast(var_value(&vars, text), bg) >= 4.5,
+                        "{theme}: --{text}/--{surface} below 4.5"
+                    );
+                }
+            }
+
             // NFR-600: button text on the button background >= 3:1.
             let btn_bg = var_value(&vars, "btn-bg");
             assert!(contrast(var_value(&vars, "btn-text"), btn_bg) >= 3.0);
@@ -715,8 +732,9 @@ mod tests {
         assert!(APP_JS.contains("/api/mcp/servers"));
     }
 
-    // TC-704 / UX-700..UX-703, NFR-700: the embedded page builds the inline SVG
-    // subway map (g.node[data-id] stations, path.edge lines, state- classes), a
+    // TC-704 / UX-702..UX-703, NFR-700 (drawing per SPEC-graph-swimlane): the
+    // embedded page builds the inline SVG timeline (g.node[data-id] cards,
+    // path.edge lines, state- classes), a
     // percentage progress bar with a timing-guarded ETA, a persisted List/Graph
     // toggle, a running pulse with a reduced-motion override, and no external
     // resources.
@@ -725,10 +743,9 @@ mod tests {
         // The renderer creates SVG nodes in the SVG namespace.
         assert!(APP_JS.contains("document.createElementNS(SVG_NS"));
         assert!(APP_JS.contains("var SVG_NS = 'http://www.w3.org/2000/svg';"));
-        // Stations: g.node[data-id] with circle stations and state- classes,
-        // focusable and labelled.
+        // Cards: g.node[data-id] with state- classes, focusable and labelled.
         assert!(APP_JS.contains("svgEl('g')"));
-        assert!(APP_JS.contains("'node state-'"));
+        assert!(APP_JS.contains("'node card state-'"));
         assert!(APP_JS.contains("svgEl('circle')"));
         assert!(APP_JS.contains("setAttribute('data-id'"));
         assert!(APP_JS.contains("setAttribute('role', 'button')"));
@@ -766,8 +783,8 @@ mod tests {
         assert!(INDEX_HTML.contains("class=\"graph-legend\""));
 
         // CSS: state classes, edge colors, pulse keyframes, reduced-motion.
-        assert!(APP_CSS.contains(".graph-svg .node.state-completed .station"));
-        assert!(APP_CSS.contains(".graph-svg .node.state-running .ring"));
+        assert!(APP_CSS.contains(".graph-svg .node.state-completed .card-box"));
+        assert!(APP_CSS.contains(".graph-svg .node.state-running .card-box"));
         assert!(APP_CSS.contains("@keyframes dmuxai-node-pulse"));
         assert!(APP_CSS.contains("@media (prefers-reduced-motion: reduce)"));
         assert!(APP_CSS.contains(".graph-svg .edge-completed"));
@@ -805,8 +822,8 @@ mod tests {
         );
     }
 
-    // UX-700/UX-703: bar segment order, station sublabels, auto-fit and lane
-    // routing match mockup #5.
+    // UX-702/UX-703: bar segment order, card state words, auto-fit, and the
+    // canvas bounds of the swimlane view.
     #[test]
     fn graph_view_progress_labels_fit_and_routing() {
         // Progress bar order: completed, running, failed, then pending last.
@@ -814,34 +831,83 @@ mod tests {
             "'completed', 'running', 'failed', 'pending', 'ready', 'waiting_gate', 'skipped'"
         ));
 
-        // Station sublabels: short runner names and a state word when elapsed is
-        // unknown, plus the failed-attempt suffix.
+        // Short runner names in the detail panel, full names on lanes, and
+        // state words on the card chips.
         assert!(APP_JS.contains("function runnerShortName"));
         assert!(APP_JS.contains("replace(/^opencode-/i, '')"));
-        assert!(APP_JS.contains("=== 'agy'") || APP_JS.contains("=== \"agy\""));
+        assert!(APP_JS.contains("=== 'agy'"));
+        assert!(APP_JS.contains("function runnerLaneName"));
         assert!(APP_JS.contains("STATION_STATE_WORDS"));
         assert!(APP_JS.contains("completed: 'done'"));
         assert!(APP_JS.contains("waiting_gate: 'waiting'"));
         assert!(APP_JS.contains("stationStateWord"));
-        assert!(APP_JS.contains(r"'\u00d7' + node.attempt"));
 
-        // Auto-fit on first render / node-set change; user pan/zoom preserved.
+        // Auto-fit on first render; user pan/zoom preserved; live rebuilds.
         assert!(APP_JS.contains("function autoFitGraph"));
         assert!(APP_JS.contains("function graphGeometryKey"));
         assert!(APP_JS.contains("function syncGraphCanvas"));
-        assert!(APP_JS.contains("function updateRunningGraphStationMeta"));
+        assert!(APP_JS.contains("function updateRunningGraphCards"));
         assert!(APP_JS.contains("function tickDashboard"));
         assert!(APP_JS.contains("function graphCanvasHeight"));
         assert!(APP_JS.contains("graphUserInteracted"));
 
-        // Long edges detour onto a half-row lane; short edges stay straight.
-        assert!(APP_JS.contains("function longEdgePath"));
-        assert!(APP_JS.contains("GRAPH_ROW_H / 2"));
-        assert!(APP_JS.contains("span > 1"));
-
         // Canvas bounds.
-        assert!(APP_CSS.contains("min-height: 320px;"));
+        assert!(APP_CSS.contains("min-height: 180px;"));
         assert!(APP_CSS.contains("max-height: 70vh;"));
+    }
+
+    // TC-880 (SPEC-graph-swimlane FR-880, FR-881, FR-883, FR-885): the
+    // swimlane renderer pieces exist, the subway station code is gone, and the
+    // detail panel is an overlay drawer.
+    #[test]
+    fn graph_swimlane_assets() {
+        for needle in [
+            "function buildSwimlaneGeometry",
+            "function graphEstimate",
+            "function graphTickStep",
+            "function graphArrowPath",
+            "function graphFreeColumn",
+            "function graphCard(",
+            "function graphServerNow",
+            "LANE_LABEL_W = 170",
+            "LANE_ROW_H = 104",
+            "CARD_H = 56",
+            "SUBROW_GAP = 24",
+            "ARROW_MIN_GAP = 24",
+            "GRAPH_TEXT_FLOOR = 11",
+            "'lane lane-c'",
+            "'card-tail'",
+            "'now-line'",
+            "'graph-future'",
+            "est. start +",
+            "window.dmuxaiGraph",
+        ] {
+            assert!(APP_JS.contains(needle), "app.js is missing {needle:?}");
+        }
+        for gone in [
+            "function graphStation",
+            "function longEdgePath",
+            "station-spinner",
+        ] {
+            assert!(
+                !APP_JS.contains(gone),
+                "subway code left in app.js: {gone:?}"
+            );
+        }
+        assert!(!APP_CSS.contains(".station"), "subway CSS left in app.css");
+        // FR-885: overlay drawer, not a flex sibling that squeezes the canvas.
+        let detail = APP_CSS
+            .find("\n.graph-detail {")
+            .expect("graph-detail rule");
+        let rule = &APP_CSS[detail..detail + 400];
+        assert!(rule.contains("position: absolute;"));
+        assert!(rule.contains("right: 0;"));
+        // Running tail, pulsing dot and its reduced-motion override.
+        assert!(APP_CSS.contains(".graph-svg .stripe"));
+        assert!(APP_CSS.contains(".graph-svg .run-dot"));
+        assert!(APP_CSS.contains(".reduced-motion .graph-svg .run-dot"));
+        // UX-880: dedicated pending color in both palettes.
+        assert!(APP_CSS.matches("--graph-pending:").count() >= 3);
     }
 
     #[test]
@@ -853,14 +919,14 @@ mod tests {
         assert!(APP_CSS.contains(".run-status"));
         assert!(APP_CSS.contains(".spinner"));
         assert!(APP_CSS.contains("@media (prefers-reduced-motion: reduce)"));
-        assert!(APP_CSS.contains(".station-spinner"));
+        assert!(APP_CSS.contains(".graph-svg .run-dot"));
         assert!(APP_CSS.contains(".chip-failed"));
         assert!(APP_CSS.contains(".chip-cancelled"));
         // The reduced-motion block must come after the base spinner rules so
         // it wins the cascade, and it must stop the graph spinner.
         let base_spinner = APP_CSS
-            .find(".graph-svg .station-spinner {")
-            .expect("base station-spinner rule");
+            .find(".graph-svg .run-dot {")
+            .expect("base run-dot rule");
         let rm_block = APP_CSS
             .rfind("@media (prefers-reduced-motion: reduce) {")
             .expect("reduced-motion block");
@@ -870,21 +936,21 @@ mod tests {
         );
         let rm_tail = &APP_CSS[rm_block..];
         let rm_spinner = rm_tail
-            .find(".graph-svg .station-spinner {")
-            .expect("reduced-motion overrides station-spinner");
+            .find(".graph-svg .run-dot {")
+            .expect("reduced-motion overrides run-dot");
         assert!(
             rm_tail[rm_spinner..]
-                .trim_start_matches(".graph-svg .station-spinner {")
+                .trim_start_matches(".graph-svg .run-dot {")
                 .trim_start()
                 .starts_with("animation: none")
         );
-        assert!(APP_CSS.contains(".reduced-motion .graph-svg .station-spinner"));
+        assert!(APP_CSS.contains(".reduced-motion .graph-svg .run-dot"));
         assert!(APP_JS.contains("classList.toggle('reduced-motion'"));
         // Pill and chip elapsed use the same clock-skew correction as nodes.
         assert!(APP_JS.contains("function runElapsedMs"));
         assert!(!APP_JS.contains("now - a.run.started_at_ms"));
         assert!(APP_JS.contains("function tickDashboard"));
-        assert!(APP_JS.contains("station-spinner"));
+        assert!(APP_JS.contains("run-dot"));
         assert!(APP_JS.contains("updateFavicon"));
         assert!(APP_JS.contains("baseDocumentTitle"));
         assert!(APP_JS.contains("window.addEventListener('focus'"));

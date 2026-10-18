@@ -7661,6 +7661,8 @@ mod tests {
             requires_gate: false,
             status: dmuxai::graph::GraphNodeStatus::Completed,
             attempt: 0,
+            started_at_ms: None,
+            finished_at_ms: None,
         }];
         nodes.extend(extra_nodes);
         app.settings.graph_enabled = true;
@@ -7697,6 +7699,8 @@ mod tests {
                 requires_gate: false,
                 status: dmuxai::graph::GraphNodeStatus::Pending,
                 attempt: 0,
+                started_at_ms: None,
+                finished_at_ms: None,
             }],
         );
 
@@ -7735,6 +7739,8 @@ mod tests {
                 requires_gate: false,
                 status: dmuxai::graph::GraphNodeStatus::Pending,
                 attempt: 0,
+                started_at_ms: None,
+                finished_at_ms: None,
             }],
         );
         assert!(
@@ -7779,6 +7785,8 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Running,
                     attempt: 1,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 }],
                 edges: vec![],
             },
@@ -7885,6 +7893,8 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Running,
                     attempt: 1,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 }],
                 edges: vec![],
             },
@@ -8040,6 +8050,8 @@ mod tests {
                         requires_gate: false,
                         status: dmuxai::graph::GraphNodeStatus::Running,
                         attempt: 1,
+                        started_at_ms: None,
+                        finished_at_ms: None,
                     },
                     dmuxai::graph::GraphNode {
                         id: "node-b".to_owned(),
@@ -8051,6 +8063,8 @@ mod tests {
                         requires_gate: false,
                         status: dmuxai::graph::GraphNodeStatus::Running,
                         attempt: 1,
+                        started_at_ms: None,
+                        finished_at_ms: None,
                     },
                 ],
                 edges: vec![],
@@ -8133,6 +8147,8 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Running,
                     attempt: 2,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 }],
                 edges: vec![],
             },
@@ -8685,6 +8701,8 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Pending,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "node-b".to_owned(),
@@ -8696,6 +8714,8 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Pending,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
             ],
             edges: vec![],
@@ -8882,6 +8902,8 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Completed,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
@@ -8893,6 +8915,8 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Completed,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-2".to_owned(),
@@ -8904,6 +8928,8 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Running,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-3".to_owned(),
@@ -8915,6 +8941,8 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Pending,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-4".to_owned(),
@@ -8926,6 +8954,8 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Pending,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
             ],
             edges: vec![],
@@ -11960,6 +11990,8 @@ mod tests {
                 requires_gate: false,
                 status: dmuxai::graph::GraphNodeStatus::Pending,
                 attempt: 0,
+                started_at_ms: None,
+                finished_at_ms: None,
             }],
             edges: Vec::new(),
             limits: dmuxai::graph::default_limits(),
