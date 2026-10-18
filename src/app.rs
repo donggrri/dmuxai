@@ -6227,9 +6227,10 @@ impl App {
                     .last_agent
                     .map(|agent| self.agent_key_display_name(agent))
                     .unwrap_or_else(|| "none".to_owned());
-                let running = if card.running { "  ● running" } else { "" };
+                // FR-864: the running mark leads the row so a narrow picker never cuts it off.
+                let running = if card.running { "● running  " } else { "" };
                 ListItem::new(format!(
-                    "{current} {}  [{}]  {} turns  {agent}  {}{running}",
+                    "{current} {running}{}  [{}]  {} turns  {agent}  {}",
                     card.title,
                     short_id(card.id.as_str()),
                     card.turn_count,

@@ -647,11 +647,7 @@ body {
   transition: padding 0.2s ease-in-out;
 }
 
-.top {
-  margin-left: calc(-1 * var(--left-dock));
-  margin-right: calc(-1 * var(--right-dock));
-  transition: margin 0.2s ease-in-out;
-}
+/* The header sits inside the dock padding too, so a docked sidebar never covers it (it wraps when narrow). */
 
 main {
   margin-inline: auto;
@@ -668,7 +664,6 @@ main {
 
 @media (prefers-reduced-motion: reduce) {
   body,
-  .top,
   .sidebar,
   .sessions-sidebar {
     transition: none;
@@ -676,7 +671,6 @@ main {
 }
 
 .reduced-motion body,
-.reduced-motion .top,
 .reduced-motion .sidebar,
 .reduced-motion .sessions-sidebar {
   transition: none;
