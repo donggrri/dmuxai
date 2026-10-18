@@ -11445,7 +11445,7 @@ mod tests {
             .chat_selection
             .expect("drag should create a selection")
             .text(&app.visible_chat_lines);
-        assert_eq!(selected, "Codex");
+        assert_eq!(selected, "Runne");
         assert!(app.selection_dragged);
     }
 
