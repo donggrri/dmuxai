@@ -222,7 +222,7 @@ impl Drop for WarmProcess {
             #[cfg(unix)]
             if let Some(id) = child.id() {
                 let _ = std::process::Command::new("kill")
-                    .args(["-KILL", &format!("-{id}")])
+                    .args(["-KILL", "--", &format!("-{id}")])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())

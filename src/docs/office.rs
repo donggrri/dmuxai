@@ -97,7 +97,7 @@ fn kill_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let _ = std::process::Command::new("kill")
-            .args(["-KILL", &format!("-{}", child.id())])
+            .args(["-KILL", "--", &format!("-{}", child.id())])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
