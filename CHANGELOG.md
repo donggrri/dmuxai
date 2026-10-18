@@ -69,6 +69,20 @@ All notable changes to dmuxai are listed here. Versions follow
   margin. At 900px and below, sidebars stay overlay drawers and the prompt box
   remains centered in the viewport.
 
+### Fixed
+
+- **grok turns no longer hang after the final reply (SPEC-grok-runner FR-913..FR-916).**
+  In grok 1.0.62, a background command that finished during a turn queued an
+  auto-wake prompt that headless `grok -p` never ran, so the process idled
+  forever after its `end` line. The grok preset now sets `GROK_AUTO_WAKE=0` and
+  passes `--no-wait-for-background`. Custom agents gain `done_when`: the grok
+  `end` line now ends the turn, and DmuxAI then stops the process group, so a
+  child left holding stdout cannot keep the turn open. The 900 s timeout
+  remains only as a last resort. Text before and after a tool call is now
+  separated by a blank line instead of running together (`text_break_when`).
+  [docs/agents/grok-build-delegation.md](docs/agents/grok-build-delegation.md)
+  explains how to delegate work to Grok Build with fewer tokens.
+
 ## [0.2.1] - 2026-10-18
 
 Dogfood fixes from the 2026-10-17 Linux trial of v0.2.0, PRs #39 and #47-#52

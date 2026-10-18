@@ -5,7 +5,14 @@
 # or GROK_FAKE_AUTH=fail (exit 1, "not logged in" on stderr) or
 # GROK_FAKE_AUTH=fast (logged in, only a fast id).
 # Prompt mode (-p) prints canned streaming-json unless GROK_FAKE_MODE is
-# fail, empty, or sleep. GROK_FAKE_ARGV, when set, receives each invocation's
+# fail, empty, sleep, linger, orphan, or noend:
+#   linger  prints text, a tool_call, more text and the end line, then leaves a
+#           child holding stdout and idles (grok 1.0.62 after a stranded
+#           auto-wake prompt). The child's pid goes to GROK_FAKE_PIDFILE.
+#   orphan  prints text and the end line, leaves a child holding stdout, and
+#           exits 0 at once (a background command outliving the runner).
+#   noend   prints text and exits 0 without an end line.
+# GROK_FAKE_ARGV, when set, receives each invocation's
 # argv, one element per line. The prompt is never executed.
 
 if [ -n "${GROK_FAKE_ARGV:-}" ]; then
@@ -67,6 +74,32 @@ case "${GROK_FAKE_MODE:-}" in
       wait
     ) &
     sleep 120
+    exit 0
+    ;;
+  linger)
+    cat <<'EOF'
+{"type":"text","data":"Checking"}
+{"type":"tool_call","toolCallId":"t1","title":"run_command","kind":"execute"}
+{"type":"tool_call_update","toolCallId":"t1","status":"completed"}
+{"type":"text","data":"Done."}
+{"type":"end","stopReason":"end_turn","sessionId":"11111111-1111-1111-1111-111111111111","cwd":"/tmp","num_turns":1}
+EOF
+    sleep 120 &
+    echo "$!" > "${GROK_FAKE_PIDFILE:-/dev/null}"
+    sleep 120
+    exit 0
+    ;;
+  orphan)
+    cat <<'EOF'
+{"type":"text","data":"OK"}
+{"type":"end","stopReason":"end_turn","sessionId":"11111111-1111-1111-1111-111111111111","cwd":"/tmp","num_turns":1}
+EOF
+    sleep 120 &
+    echo "$!" > "${GROK_FAKE_PIDFILE:-/dev/null}"
+    exit 0
+    ;;
+  noend)
+    printf '%s\n' '{"type":"text","data":"OK"}'
     exit 0
     ;;
   *)
