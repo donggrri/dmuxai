@@ -8,14 +8,14 @@ Related: issue #54; Dongjin 2026-10-18 09:42 KST ("keep the prompt input box cen
 
 The chat column (`main`, max 880px) is centered with `margin: auto`. When the right sidebar opens on a wide screen, `main` gets `margin-right: 320px`, so the column, and the prompt box with it, moves left and is no longer centered. The left sessions sidebar (SPEC-session-sidebar) would make this worse.
 
-Decision: the layout reserves space for each open docked sidebar. The chat column, and so the prompt box, is centered in the space between them, and is never covered by a docked sidebar. With no sidebars, or with both open (equal widths), that is the viewport center. Overlay drawers (narrow screens) do not move the column. A headless Chrome test measures the geometry, so the centering cannot regress silently.
+Decision: the layout reserves space for each open docked sidebar. The chat column, and so the prompt box, is centered in the space between them, and is never covered by a docked sidebar. Both docked sidebars are 320px wide, so with no sidebars or with both open the content center is the viewport center. Overlay drawers (narrow screens) do not move the column. A headless Chrome test measures the geometry, so the centering cannot regress silently.
 
 ## 2. Requirements
 
 | ID | Priority | Requirement | Tests |
 | --- | --- | --- | --- |
 | FR-850 | Must | On viewports wider than 900px, the prompt box (`.session-prompt`) is horizontally centered in the content area: the viewport minus each open docked sidebar (left sessions, right Files/To-dos). Its center is within 2px of the content area's center, and no docked sidebar overlaps it. This holds for the four states: none, left only, right only, both | TC-850, TC-851 |
-| FR-851 | Must | With no sidebar, or with both sidebars open, the prompt box center is within 2px of the viewport center at widths 1280, 1440 and 1920 | TC-851 |
+| FR-851 | Must | Both docked sidebars are 320px wide. With no sidebar, or with both sidebars open, the prompt box center is within 2px of the viewport center at widths 1280, 1440 and 1920 | TC-851 |
 | FR-852 | Must | At 900px and below, sidebars are overlay drawers. The prompt box stays centered in the viewport (within 2px) and keeps a width of at least min(100% - 20px, 320px) | TC-851 |
 | UX-850 | Should | Opening or closing a sidebar moves the column with the existing 0.2s transition (none under `prefers-reduced-motion`). The prompt keeps focus and its text | TC-850, TC-851 |
 
