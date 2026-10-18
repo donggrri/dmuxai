@@ -16,4 +16,4 @@
 | [x] | 11 | Swimlane renderer (lanes, axis, now line, cards, estimates, arrows without loop-back) | FR-880..FR-884 | maintainer | opencode free models | TC-880, TC-881 |
 | [x] | 12 | Detail drawer overlay, Fit text floor, light contrast | FR-885, UX-880, UX-881 | maintainer | opencode free models | TC-881, TC-882 |
 | [x] | 13 | Light and dark screenshots (demo run) | UX-880 | maintainer | — | PR body |
-| [ ] | 14 | Release v0.2.2: version bump, CHANGELOG, ROADMAP, release audit, light screenshots | — | maintainer | opencode free models | `--version`, release review |
+| [x] | 14 | Release v0.2.2: version bump, CHANGELOG, ROADMAP, release audit, light screenshots | — | maintainer | opencode free models | `--version`, release review |

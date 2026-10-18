@@ -5,7 +5,7 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
-## [0.2.2] - 2026-10-18
+## [0.2.2] - 2026-10-19
 
 Dashboard layout, workspace and graph view changes requested by Dongjin on
 2026-10-18, PRs #57-#60, #62-#66 and #70-#74 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),

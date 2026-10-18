@@ -1,6 +1,6 @@
 # PLAN: v0.2.2
 
-Status: implemented in v0.2.2 (release PR open)
+Status: implemented in v0.2.2 (released 2026-10-19)
 Specs: SPEC-centered-prompt, SPEC-session-sidebar, SPEC-workspace-dir, SPEC-graph-swimlane. Roadmap: [docs/ROADMAP.md](../ROADMAP.md)
 
 ## Process
