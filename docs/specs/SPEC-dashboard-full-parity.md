@@ -22,7 +22,9 @@ v0.2.4 does three things, in order:
 1. **Headless interactive serve.** `dmuxai serve` runs the full session core
    (agents, graph, to-do runs, memory, notify, conversation store) without a
    terminal, so the dashboard can do everything `dmuxai --web` does today.
-   Today `serve` is view-only (§3.1).
+   Today `serve` has no session: prompts and session commands answer 409
+   and Docs are read-only; only the to-do board (CRUD, import) and memory are
+   writable there (§3.1).
 2. **Close every gap in §3** by moving the behavior into the shared Rust core
    (App/session layer, `src/web/*`) and adding the dashboard control. No
    feature logic is written only in JavaScript.
@@ -78,10 +80,11 @@ equivalent, or a TUI-only concern that disappears with the TUI.
 
 | # | TUI / CLI feature | TUI source | Dashboard today | Status | Gap → requirement |
 | --- | --- | --- | --- | --- | --- |
-| R1 | Interactive session without a terminal | `src/main.rs:606` `run_tui` always builds a ratatui `Terminal`; `src/app.rs:1187-1279` `App::run` mixes the core loop with `event::poll` and `terminal.draw` | `dmuxai serve` (`src/main.rs:437-566`) is **view-only**: `SnapshotSource::Files`, `commands: None` (`:491`), Docs `read_only = true` (`:467`), no agents; `POST /api/prompt` and `/api/command` answer 409 "requires dmuxai --web" (`src/web/server.rs:929-930`, `:970-971`; test `:2607`) | **missing** | headless interactive serve, FR-1000..1004 |
-| R2 | `dmuxai --web` (TUI + dashboard) | `src/main.rs:99`, `:729-830` `attach_web_dashboard` | the only interactive dashboard mode; needs a TTY | partial | becomes `serve`, FR-1000, FR-1031 |
+| R1 | Interactive session without a terminal | `src/main.rs:606` `run_tui` always builds a ratatui `Terminal`; `src/app.rs:1187-1279` `App::run` mixes the core loop with `event::poll` and `terminal.draw` | `dmuxai serve` (`src/main.rs:437-566`) has **no session**: `SnapshotSource::Files`, `commands: None` (`:491`), Docs `read_only = true` (`:467`), no App and no agents (to-do CRUD/import and memory save/approve/reject do work, `:486-512`); `POST /api/prompt` and `/api/command` answer 409 "requires dmuxai --web" (`src/web/server.rs:929-931`, `:970-972`); to-do Run 409 (`:875-876`) | **missing** | headless interactive serve, FR-1000..1004 |
+| R2 | `dmuxai --web` (TUI + dashboard) | `src/main.rs:164-165` parse, `:354` dispatch, `:729-830` `attach_web_dashboard` | the only interactive dashboard mode; needs a TTY | partial | becomes `serve`, FR-1000, FR-1031 |
 | R3 | Dashboard command channel | `src/main.rs:738-747`: the `DashboardCommand` channel is created only when the to-do DB opens | if the to-do DB fails, prompts and pickers are 409 even under `--web` | partial (coupling bug) | FR-1003 |
-| R4 | Headless one-shot CLI: `run`, `todo add/list/run`, `status`, `events`, `mcp`, `mcp-memory`, `init` | `src/cli.rs`, `src/app.rs:4721` `App::run_headless`, `src/main.rs:365` | not a TUI feature; already terminal-free | full | keep; `run_headless` is the model for FR-1001 |
+| R4 | Headless one-shot CLI: `run`, `todo add/list/run`, `status`, `events`, `mcp`, `mcp-memory`, `init` | `src/main.rs:349-356` dispatch, `src/cli.rs:523-611`, `src/app.rs:4721` `App::run_headless` | not a TUI feature; already terminal-free | full | keep; `run_headless` is the model for FR-1001 |
+| R5 | Workspace switch (dashboard dialog, re-exec) and directory browse | no TUI switcher (`-C` only, `src/main.rs:296-317`); re-exec `:678-724` | works only under `--web`; `serve` answers 403 (`server.rs:1199`, `:1228`, `:1341`) | partial | FR-1000 (switch re-execs `serve`) |
 
 ### 3.2 Slash commands (`SLASH_COMMANDS`, `src/app.rs:113-189`, plus `/graph` at `:2842`)
 
@@ -120,7 +123,7 @@ palette (`src/web/assets/session.js:650-705`).
 | K6 | F2 | model picker (`app.rs:2040`, `:2437`) | Model picker click only | partial | shortcut, UX-1000 |
 | K7 | F3 | conversation picker (`app.rs:2041`) | sessions sidebar click only | partial | shortcut, UX-1000 |
 | K8 | Ctrl+V / Alt+V | attach clipboard image (`app.rs:2029-2035`, `:2686`, `src/clipboard_image.rs`) | none | **missing** | FR-1010 |
-| K9 | `/` + Up/Down/Tab/Enter | slash preview (`app.rs:2059-2090`, draw `:6411`) | `/` in an empty box opens the palette with filter and arrows (`session.js:797-823`) | full | — |
+| K9 | `/` + Up/Down/Tab/Enter | slash preview (`app.rs:2059-2090`, draw `:6411`) | `/` in an empty box opens the palette (`session.js:336-341`), filter and arrows (`:797-823`); Tab does not run a row | full | — |
 | K10 | Picker Up/Down/Enter/Esc; Tab in the Codex model picker jumps to effort (`app.rs:2499-2541`) | native `<select>` pickers; effort is its own picker | full | — |
 | K11 | Backspace, typing | edit the input | native textarea | n/a | — |
 
@@ -178,13 +181,13 @@ all of it moves to the session host (FR-1001).
 
 | Area | full | partial | missing | n/a |
 | --- | --- | --- | --- | --- |
-| Run modes (R1-R4) | 1 | 2 | 1 | 0 |
+| Run modes (R1-R5) | 1 | 3 | 1 | 0 |
 | Slash commands (S1-S17) | 14 | 3 | 0 | 0 |
 | Keys (K1-K11) | 4 | 4 | 1 | 2 |
 | Mouse/paste (M1-M6) | 0 | 0 | 2 | 4 |
 | Panels (P1-P9) | 5 | 3 | 1 | 0 |
 | Settings (C1-C4) | 2 | 0 | 1 | 1 |
-| **Total (51 rows)** | **26** | **12** | **6** | **7** |
+| **Total (52 rows)** | **26** | **13** | **6** | **7** |
 
 C4 is counted as full (it works under `--web`); its `serve` gap is R1.
 Key gaps: R1 headless interactive serve; image attach from the browser
@@ -197,17 +200,17 @@ keyboard shortcuts (K4-K7); the `--web` command channel tied to the to-do DB
 
 | ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| FR-1000 | Must | Given `dmuxai serve` with no TTY (stdin/stdout redirected, `setsid`) | Then the server starts the session host (built like `App::new_interactive`, so Cursor pre-warm stays on; `App::new` turns it off, `app.rs:891`), prints the dashboard URL, writes `.dmuxai/web.json`, pushes config warnings into the transcript as startup notices as well as stderr, and `POST /api/prompt` and `POST /api/command` behave as under `dmuxai --web` (200, streaming transcript in snapshots) | `serve --read-only` (OQ-1000) keeps today's 409 and read-only Docs; a second interactive `serve` in the same workspace exits 2 with the URL of the running one | TC-1000, TC-1001 |
+| FR-1000 | Must | Given `dmuxai serve` with no TTY (stdin/stdout redirected, `setsid`) | Then the server starts the session host (built like `App::new_interactive`, so Cursor pre-warm stays on; `App::new` turns it off, `app.rs:891`), prints the dashboard URL, writes `.dmuxai/web.json`, pushes config warnings into the transcript as startup notices as well as stderr, and `POST /api/prompt` (202 Accepted) and `POST /api/command` (200 with `session`) behave as under `dmuxai --web`, with the transcript streaming in snapshots; workspace switch re-execs `serve` with the same port | `serve --read-only` (OQ-1000) is exactly today's `serve` (prompt/command 409, read-only Docs, to-dos and memory writable). A second interactive `serve` in the same workspace exits 2 with the running URL when `.dmuxai/web.json` names a live pid whose `GET /api/state` answers within 1 s; a dead pid or no answer counts as stale and is overwritten | TC-1000, TC-1001 |
 | FR-1001 | Must | Given the session host | Then one terminal-independent loop runs heartbeat, tick, command drain, agent event drain, publish throttling (FR-530), pre-warm, to-do runs, graph ticks and shutdown; `App::run` (TUI) calls the same step function and only adds input polling and drawing | The host never touches crossterm or ratatui; it builds and runs with no terminal attached | TC-1002, NFR-1000 |
 | FR-1002 | Must | Given Ctrl+C or SIGTERM to `serve` | Then running turns are cancelled with the existing process-group kill, running to-dos are finished as the TUI shutdown does (`app.rs:1281-1310`), and `web.json` is removed | A second signal within 2 s exits immediately | TC-1003 |
 | FR-1003 | Must | Given the to-do DB fails to open | Then the dashboard command channel still exists: prompts, pickers and conversations work; only `/api/todos*` answer 503 with the error | — | TC-1004 |
 | FR-1004 | Must | Given `/quit` or the Quit button under interactive `serve` | Then after the confirm dialog the server shuts down as in FR-1002 and the page shows "DmuxAI stopped" | — | TC-1005 |
-| FR-1010 | Must | Given the dashboard prompt box | Then an image can be attached by file picker, drag-and-drop, or pasting an image (clipboard) or a single image path; the server saves the upload in `attachments_dir` exactly like clipboard paste (`src/clipboard_image.rs:77-83`) with the same type/size checks as `/image` (`src/attachments.rs`); the snapshot lists `session.pending_images[]` (`name`, `bytes`) and the prompt box shows chips with remove | Unsupported type or oversize → 400 with the TUI's message; uploads need the dashboard token; non-loopback binds accept uploads only with `--allow-remote` (already required) | TC-1010, TC-1011 |
-| FR-1011 | Must | Given activity in the transcript | Then the snapshot carries activity groups (`id`, `kind` tool/thinking, `summary`, `lines`, `expanded`) built by the same core function the TUI uses, honoring `[ui] show_tools` and `show_thinking`; each group expands on click; `toggle_details` toggles all; `toggle_last_details` (Ctrl+O) toggles the last group | Hidden groups are omitted from the snapshot | TC-1012 |
-| FR-1012 | Should | Given a workspace file path or link in an agent message | Then the dashboard renders it as a link (same detector as `open_file_link_at`) that opens the Docs preview (OQ-1004); URLs open in a new tab with `rel=noopener` | Paths outside the workspace are not linked (`docs::confine`) | TC-1013 |
-| FR-1013 | Should | Given the selected agent | Then the dashboard header shows the same status segments as the TUI status bar: badge (state, spinner, elapsed), model, mode, effort, current activity detail, other agents' activity and the graph assignment line, from one core `StatusSegments` builder | Narrow widths truncate in the same order as `fit_status_segments` | TC-1014 |
+| FR-1010 | Must | Given the dashboard prompt box | Then an image can be attached by file picker, drag-and-drop, or pasting an image (clipboard) or a single image path. `POST /api/attachments` first validates like `/image` (extension and sniffed type png/jpg/jpeg/webp, at most `DEFAULT_MAX_IMAGE_BYTES` 10 MiB, `src/attachments.rs:9`, `:81-113`), then writes the bytes into `attachments_dir` through one shared helper that also replaces the PNG-only, unvalidated `save_attachment` (`src/clipboard_image.rs:78-84`). The snapshot lists `session.pending_images[]` (`id`, `name`, `bytes`) and the prompt box shows chips; `SessionCommand::RemoveAttachment { id }` removes one | Unsupported type or oversize → 400 with the TUI's message; unknown attachment id → 404; uploads need the dashboard token; non-loopback binds accept uploads only with `--allow-remote` (already required) | TC-1010, TC-1011 |
+| FR-1011 | Must | Given activity in the transcript | Then the snapshot carries activity groups (`id`, `kind` tool/thinking, `summary`, `lines`, `expanded`) built by the same core function the TUI uses. State model (same as `render_activity_group`, `app.rs:5671-5750`): a group is shown expanded when its own flag is set, or `details_expanded` is on, or `show_tools = expanded`; `show_tools = hidden` omits tool groups; `show_thinking = live` shows thinking while streaming and collapses it when the turn ends, `collapsed` always collapses, `hidden` omits. Click toggles the group's own flag (`toggle_group {id}`); `toggle_details` flips `details_expanded`; `toggle_last_details` (Ctrl+O) flips the last group's own flag | Hidden groups are omitted from the snapshot | TC-1012 |
+| FR-1012 | Should | Given a workspace file path or link in an agent message | Then the snapshot marks it as a link (same detector as `open_file_link_at`) and the dashboard opens it in the Docs preview (OQ-1004); http(s) URLs are links too (new-tab behavior checked in the manual browser run) | Paths outside the workspace are not linked (`docs::confine`) | TC-1013 |
+| FR-1013 | Should | Given the selected agent | Then the dashboard header shows the same status segments as the TUI status bar: badge (state, spinner, elapsed), model, mode, effort, current activity detail, other agents' activity and the graph assignment line, by moving the existing `StatusSegments` / `fit_status_segments` (`app.rs:5910-5923`) into the core and reusing them, not a second API | Narrow widths truncate in the same order as `fit_status_segments` | TC-1014 |
 | FR-1014 | Must | Given a graph waiting at a sensitive-step gate | Then the graph view shows the gate reason (the hint no longer mentions the TUI) and the allowed-runners line, with **Continue** and **Override…** (runner + model pickers limited by `allowed_runners` and model policy), calling the same core paths as `/graph continue` and `/graph override` | No gate → buttons hidden; disallowed runner or model → 403 with the policy message | TC-1015 |
-| FR-1020 | Must | Given the parity table in `src/web/parity.rs` | Then it gains rows for keys, mouse, panels and settings with status `full`/`n-a`; `tui_features_have_dashboard_controls` fails when a TUI key or panel listed in `TUI_FEATURES` has no row or a row's control id is missing from the assets | Rows marked `n-a` need a reason string | TC-1020 |
+| FR-1020 | Must | Given the parity table in `src/web/parity.rs` | Then it gains rows for keys, mouse, panels and settings with status `full`/`n-a`/`pending`; `tui_features_have_dashboard_controls` fails when a `TUI_FEATURES` entry has no row or a `full` row's control id is missing from the assets. Because `TUI_FEATURES` is hand-written, a second test scans `handle_key`, `handle_mouse` and `handle_paste` in `src/app.rs` for `KeyCode::`/`MouseEventKind::` arms and fails when one is not in `TUI_FEATURES` | `n-a` rows need a reason; `pending` rows are allowed until the removal PR, which requires zero `pending` | TC-1020 |
 | FR-1021 | Must | Given features merged after this spec (grok runner #66, plan gate #67, diff review sidebar, world model) | Then each has a dashboard control and a parity row before the TUI removal PR may merge | The removal PR's checklist lists them | TC-1020, manual review |
 | FR-1030 | Must | Given the deprecation release (OQ-1002) | Then plain `dmuxai` and `dmuxai --web` still start the TUI but print once: `The terminal UI is deprecated and will be removed in the next release; use dmuxai serve` | `DMUXAI_NO_DEPRECATION_NOTICE=1` hides it | TC-1030 |
 | FR-1031 | Must | Given the removal release | Then `ratatui`/`crossterm` TUI code (`App::draw*`, pickers, `handle_key`, `handle_mouse`, `chat_selection.rs`, TUI `theme` rendering, `ui_png.rs` if only used for TUI shots) is deleted; `dmuxai` with no arguments behaves per OQ-1001; `--web` prints a one-line migration error and exits 2 | `cargo tree` no longer lists `ratatui`; `crossterm` stays only if another module needs it | TC-1031 |
@@ -219,17 +222,17 @@ keyboard shortcuts (K4-K7); the `--web` command channel tied to the to-do DB
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-1000 | FR-1000 | integration | `serve` with test adapters, no TTY | `POST /api/prompt "hi"` | 200; snapshot transcript gets the agent reply; `web.json` written | `src/main.rs` or `tests/serve_interactive.rs` `serve_runs_prompts_without_tty` |
-| TC-1001 | FR-1000 | integration | `serve --read-only`; a second `serve` | prompt; start second | 409; second exits 2 naming the first URL | `serve_read_only_and_single_instance` |
-| TC-1002 | FR-1001, NFR-1000 | unit | App with test adapters | drive `step()` without a terminal | same events, publish cadence and to-do updates as the TUI loop | `src/app.rs` `session_host_step_matches_tui_loop` |
+| TC-1000 | FR-1000 | integration | `serve` with test adapters, no TTY | `POST /api/prompt "hi"`; `POST /api/command select_agent` | 202; 200 with `session`; snapshot transcript gets the agent reply; `web.json` written | `src/main.rs` or `tests/serve_interactive.rs` `serve_runs_prompts_without_tty` |
+| TC-1001 | FR-1000 | integration | `serve --read-only`; a second `serve` | prompt; start second | 409; second exits 2 naming the first URL; with a stale `web.json` (dead pid) the second starts | `serve_read_only_and_single_instance` |
+| TC-1002 | FR-1001, NFR-1000 | unit | App with test adapters, injected clock, recording hub | drive `step()` for 6 s simulated with a busy agent | `touch_session` called at 5 s, `tick` once per second, publishes coalesced to ≥ 200 ms apart and at least once per second while busy, a completed turn publishes immediately; no crossterm call | `src/app.rs` `session_host_step_matches_tui_loop` |
 | TC-1003 | FR-1002 | integration | busy agent under `serve` | SIGTERM | child process group killed, to-do finished, `web.json` removed | `serve_shutdown_cancels_and_cleans_up` |
 | TC-1004 | FR-1003 | unit | to-do DB path unwritable | `POST /api/command select_agent` | 200; `/api/todos` 503 | `command_channel_without_todo_store` |
 | TC-1005 | FR-1004 | integration | `serve` | `quit` command | server exits cleanly | `serve_quit_stops_server` |
 | TC-1010 | FR-1010 | integration | `serve` | upload png; upload `.exe`; oversize | 200 + `pending_images`; 400; 400 | `src/web/server.rs` `image_upload_contract` |
-| TC-1011 | FR-1010 | unit (asset) | `session.js` | static checks | file input, drop and paste handlers, chip remove control | `src/web/assets.rs` `session_module_has_image_attach` |
-| TC-1012 | FR-1011 | unit | App with tool and thinking events; `[ui]` variants | build snapshot; toggle last; toggle all | groups match TUI grouping; hidden omitted; toggles flip `expanded` | `dashboard_activity_groups_match_tui` |
-| TC-1013 | FR-1012 | unit | messages with an in-workspace path, an outside path, a URL | render links | only the in-workspace path and URL are linked | `dashboard_transcript_links_confined` |
-| TC-1014 | FR-1013 | unit | busy Codex + idle Cursor + single graph plan | build status view | same segments and order as `draw_status` | `dashboard_status_segments_match_tui` |
+| TC-1011 | FR-1010 | unit (asset) | `session.js` | static checks + manual browser run (REVIEW) | file input, drop and paste handlers, chip remove control | `src/web/assets.rs` `session_module_has_image_attach` |
+| TC-1012 | FR-1011 | unit | App with tool and thinking events; `[ui]` variants | build snapshot; toggle last; toggle all | literal expected group vectors per `[ui]` variant (pinned in the test, not computed by the builder); hidden omitted; toggles flip `expanded` | `dashboard_activity_groups_match_tui` |
+| TC-1013 | FR-1012 | unit | messages with an in-workspace path, an outside path, a URL | render links | only the in-workspace path and URL are linked; rendering checked in the manual browser run | `dashboard_transcript_links_confined` |
+| TC-1014 | FR-1013 | unit | busy Codex + idle Cursor + single graph plan | build status view | pinned literal segment strings and order at widths 120 and 60 | `dashboard_status_segments_match_tui` |
 | TC-1015 | FR-1014 | integration | graph paused at a gate | Continue; Override allowed; Override disallowed | resumes; node reassigned; 403 | `graph_gate_controls_contract` |
 | TC-1016 | UX-1000 | unit (asset) + browser run | `session.js` | static checks; REVIEW browser run | shortcuts present and listed | `session_module_has_shortcuts` |
 | TC-1020 | FR-1020, FR-1021 | unit | `TUI_FEATURES`, `PARITY` | compare | every feature mapped; control ids exist; `n-a` rows have reasons | `src/web/parity.rs` `tui_features_have_dashboard_controls` |
@@ -245,7 +248,7 @@ keyboard shortcuts (K4-K7); the `--web` command channel tied to the to-do DB
 | Security | All new routes (image upload, gate controls) use the #27 token, Host and Origin checks; uploads are size-capped and type-checked; non-loopback binds still need `--allow-remote` | Unchanged auth model | TC-1010, TC-1015 |
 | Persistence | Uploaded images go to `attachments_dir` (same as clipboard paste); no schema change | — | TC-1010 |
 | Processes | Interactive `serve` owns agent child processes; shutdown uses the existing process-group kill | Same as TUI shutdown | TC-1003 |
-| Snapshot | New optional fields: `session.pending_images`, `session.activity_groups`, `session.status` | Older pages ignore them | TC-1012, TC-1014 |
+| Snapshot | New optional fields: `session.pending_images`, `session.activity_groups`, `session.status`, transcript message `links[]`, `graph.gate {node, reason}` | Older pages ignore them | TC-1012, TC-1014 |
 
 ## 7. Implementation plan
 

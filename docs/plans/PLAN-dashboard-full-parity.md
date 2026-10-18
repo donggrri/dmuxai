@@ -23,10 +23,10 @@ Baseline: `origin/main` 787436b. Rebase on v0.2.3 (plan gate #67, grok runner
 | Session host | `src/app.rs` → new `src/session_host.rs` | `App::step(&mut self, now) -> StepOutcome { changed, completed }` holds the body of `App::run` (`app.rs:1201-1242`, `1263-1275` minus input/draw). `App::run` (TUI) = `step` + `event::poll` + `terminal.draw`. `session_host::run(app, shutdown)` = `step` + `sleep(EVENT_LOOP_PAUSE)` + signal handling, then `App::shutdown` |
 | CLI | `src/main.rs` | `run_serve` builds the same `App::new_interactive` + `attach_web_dashboard` wiring as `run_tui(Some(..))` without `Terminal`; `serve --read-only` keeps today's `run_serve` body; single-instance check through `.dmuxai/web.json` |
 | Command channel | `src/main.rs:738-747` | create the `DashboardCommand` channel unconditionally; the to-do store becomes optional inside `DashboardServices` (FR-1003) |
-| Images | `src/web/server.rs`, `src/attachments.rs`, `src/clipboard_image.rs` | `POST /api/attachments` (multipart or raw body + `Content-Type`), reuse `attachments_dir` and the `/image` validation; `SessionCommand::RemoveAttachment { index }`; `SessionView.pending_images` |
+| Images | `src/web/server.rs`, `src/attachments.rs`, `src/clipboard_image.rs` | `POST /api/attachments` (multipart or raw body + `Content-Type`), reuse `attachments_dir` and the `/image` validation; one shared validate-and-save helper also used by clipboard paste; `SessionCommand::RemoveAttachment { id }`; `SessionView.pending_images` |
 | Activity | `src/activity.rs`, `src/app.rs:5671-5750` | split `render_activity_group` into a core `activity_groups(&[..], &UiSettings) -> Vec<ActivityGroupView>` used by both the TUI renderer and `session_view()`; `SessionCommand::ToggleGroup { id }`, `ToggleLastDetails` |
 | Links | `src/app.rs:4459`, `src/docs/links.rs` | move the link detector into `docs::links`; snapshot messages carry `links[] {start, end, target}` confined by `docs::confine` |
-| Status | `src/app.rs:5819-5970` | core `status_segments(&self, now) -> StatusSegments` (owned strings) reused by `draw_status` and `SessionView.status` |
+| Status | `src/app.rs:5819-5970` | move the existing `StatusSegments` and `fit_status_segments` (`app.rs:5910-5923`) into the core with owned strings; `draw_status` and `SessionView.status` both use them |
 | Graph gate | `src/app.rs:4087-4122`, `src/web/snapshot.rs` | `GraphView.gate { node, reason }`; `SessionCommand::GraphContinue`, `GraphOverride { node, runner, model }` validated by `allowed_runners` and `model_policy` |
 | Parity guard | `src/web/parity.rs` | `TUI_FEATURES` list (keys, mouse, panels, settings) with status and reason; `tui_features_have_dashboard_controls` |
 | Page | `src/web/assets/session.js`, `session.css`, `app.js` (graph view) | attach UI (file input, drop, paste, chips), activity group expand, status header, link rendering, gate controls, shortcuts (OQ-1003) |
@@ -37,7 +37,7 @@ Baseline: `origin/main` 787436b. Rebase on v0.2.3 (plan gate #67, grok runner
 | # | Slice | Requirements | Depends on | Notes |
 | --- | --- | --- | --- | --- |
 | 1 | Session host + interactive `serve` + command channel decoupling | FR-1000..1004, NFR-1000 | v0.2.3 merged | Highest risk; refactor only, behavior under `--web` unchanged. Gap list item #1 |
-| 2 | Parity guard (`TUI_FEATURES`, TC-1020) | FR-1020, FR-1021 | 1 | Lands early so later slices turn rows green |
+| 2 | Parity guard harness (`TUI_FEATURES`, source scan, TC-1020) | FR-1020, FR-1021 | 1 | Lands with today's rows; gaps are `pending`. Each later slice flips its rows to `full` in the same PR; the removal PR requires zero `pending` |
 | 3 | Image attach from the browser | FR-1010 | 1 | Closes K8, M5, P5, S12 |
 | 4 | Activity groups + `[ui]` settings + Ctrl+O | FR-1011 | 1 | Closes P2, C2, K5 |
 | 5 | Graph gate controls | FR-1014 | 1; plan gate #67 | Shares the approval panel area from #67 |
