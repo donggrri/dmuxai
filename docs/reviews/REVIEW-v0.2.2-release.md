@@ -39,6 +39,11 @@ Then: CHANGELOG checked against the merged PRs, `scripts/spec-index.sh`, and `te
 - Platform: only Linux was checked by hand. The Windows target compiles and passes clippy in CI. The live workspace switch returns 501 on Windows (ROADMAP "Later").
 - Screens: light-theme screenshots of each user-visible change were taken from the release binary with demo data and shown to Dongjin before the tag.
 
+## Review
+
+- opencode `deepseek-v4.1-flash-free` reviewed the release diff: no factual blockers after the fixes above (it flagged the PR range, which included issue #61, the `kill --` attribution across #63 and #64, and TASKS row 14 being checked before the tag).
+- opencode `glm-5.3-flash-free` timed out after 400 seconds without an answer.
+
 ## Release checks
 
 - `cargo fmt --check`.
