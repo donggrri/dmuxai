@@ -1,6 +1,6 @@
 # SPEC: centered-prompt
 
-Status: Draft (v0.2.2)
+Status: Implemented (v0.2.2)
 Created: 2026-10-18
 Related: issue #54; Dongjin 2026-10-18 09:42 KST ("keep the prompt input box centered"); SPEC-docs-tree UX-830 (right sidebar), SPEC-session-sidebar (left sidebar)
 

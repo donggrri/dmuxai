@@ -5,6 +5,16 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Changed
+
+- **Centered prompt box across sidebar states (SPEC-centered-prompt FR-850..FR-852, UX-850, #54).**
+  On viewports above 900px, the dashboard reserves space for open docked
+  sidebars via `--left-dock` and `--right-dock` on `body` and keeps `main`
+  (`max-width: 880px; margin-inline: auto`) and `.session-prompt` centered in
+  the remaining content area instead of shifting off-centre with a fixed right
+  margin. At 900px and below, sidebars stay overlay drawers and the prompt box
+  remains centered in the viewport.
+
 ## [0.2.1] - 2026-10-18
 
 Dogfood fixes from the 2026-10-17 Linux trial of v0.2.0, PRs #39 and #47-#52

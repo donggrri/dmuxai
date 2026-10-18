@@ -894,4 +894,33 @@ mod tests {
         assert!(APP_JS.contains("failed"));
         assert!(APP_JS.contains("cancelled"));
     }
+
+    // TC-850: prompt_centering_assets (SPEC-centered-prompt FR-850, UX-850)
+    #[test]
+    fn prompt_centering_assets() {
+        // Dock custom properties default to 0px and expand to 320px above 900px.
+        assert!(DOCS_CSS.contains("--left-dock: 0px;"));
+        assert!(DOCS_CSS.contains("--right-dock: 0px;"));
+        assert!(DOCS_CSS.contains("@media (min-width: 901px)"));
+        assert!(DOCS_CSS.contains("body.left-sidebar-open"));
+        assert!(DOCS_CSS.contains("--left-dock: 320px;"));
+        assert!(DOCS_CSS.contains("body.sidebar-open"));
+        assert!(DOCS_CSS.contains("--right-dock: 320px;"));
+
+        // Dock space is reserved on body and main stays centered via margin-inline: auto.
+        assert!(DOCS_CSS.contains("padding-left: var(--left-dock);"));
+        assert!(DOCS_CSS.contains("padding-right: var(--right-dock);"));
+        assert!(DOCS_CSS.contains("margin-inline: auto;"));
+        assert!(APP_CSS.contains("max-width: 880px;"));
+
+        // The old per-state margin rule is gone.
+        assert!(!DOCS_CSS.contains("margin-right: 320px"));
+        assert!(!APP_CSS.contains("margin-right: 320px"));
+
+        // Transition and reduced-motion override (media query + .reduced-motion class).
+        assert!(DOCS_CSS.contains("transition: padding 0.2s ease-in-out;"));
+        assert!(DOCS_CSS.contains("@media (prefers-reduced-motion: reduce)"));
+        assert!(DOCS_CSS.contains(".reduced-motion body"));
+        assert!(DOCS_CSS.contains("transition: none;"));
+    }
 }
