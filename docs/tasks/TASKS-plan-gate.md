@@ -16,7 +16,7 @@ Plan: [PLAN-plan-gate](../plans/PLAN-plan-gate.md)
   `cargo test --locked --lib graph::plan_doc`, `cargo test --locked --lib graph::store::tests::run_record_triage_and_approval_round_trip`
 - [ ] T4 — App triage state machine: judge turn, timeout/fallback, 1-node run, plan turn, repair, approval, edit, reject, `/plan`, `/direct`, `/graph approve|edit|reject`.
   Requirements: FR-932, FR-935, FR-937, FR-938, FR-940, FR-941, FR-942, FR-943, FR-944, FR-945. Verify:
-  `cargo test --locked --bin dmuxai judge_ simple_verdict direct_override complex_verdict invalid_plan plan_fallback awaiting_approval stale_awaiting approve_starts edit_replans reject_stops sensitive_gate_kept slash_list_has_plan`
+  `cargo test --locked --bin dmuxai judge_ simple_verdict concurrent_plan_decisions direct_override complex_verdict invalid_plan plan_fallback awaiting_approval stale_awaiting approve_starts edit_replans reject_stops sensitive_gate_kept slash_list_has_plan`
 - [ ] T5 — TUI judge line and approval panel.
   Requirements: UX-930, UX-931. Verify:
   `cargo test --locked --bin dmuxai judge_reason_line_renders plan_approval_panel_renders`
