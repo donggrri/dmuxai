@@ -27,7 +27,7 @@ Baseline: `origin/main` 787436b. Rebase on v0.2.3 (plan gate #67, grok runner
 | Activity | `src/activity.rs`, `src/app.rs:5671-5750` | split `render_activity_group` into a core `activity_groups(&[..], &UiSettings) -> Vec<ActivityGroupView>` used by both the TUI renderer and `session_view()`; `SessionCommand::ToggleGroup { id }`, `ToggleLastDetails` |
 | Links | `src/app.rs:4459`, `src/docs/links.rs` | move the link detector into `docs::links`; snapshot messages carry `links[] {start, end, target}` confined by `docs::confine` |
 | Status | `src/app.rs:5819-5970` | move the existing `StatusSegments` and `fit_status_segments` (`app.rs:5910-5923`) into the core with owned strings; `draw_status` and `SessionView.status` both use them |
-| Graph gate | `src/app.rs:4087-4122`, `src/web/snapshot.rs` | `GraphView.gate { node, reason }`; `SessionCommand::GraphContinue`, `GraphOverride { node, runner, model }` validated by `allowed_runners` and `model_policy` |
+| Graph gate | `src/app.rs:4087-4122`, `src/web/snapshot.rs` | reuse `GraphView.waiting_gate_node` (`snapshot.rs:206`) and add `gate_reason`; `SessionCommand::GraphContinue`, `GraphOverride { node, runner, model }` validated by `allowed_runners` and `model_policy` |
 | Parity guard | `src/web/parity.rs` | `TUI_FEATURES` list (keys, mouse, panels, settings) with status and reason; `tui_features_have_dashboard_controls` |
 | Page | `src/web/assets/session.js`, `session.css`, `app.js` (graph view) | attach UI (file input, drop, paste, chips), activity group expand, status header, link rendering, gate controls, shortcuts (OQ-1003) |
 | Removal | `src/app.rs`, `src/chat_selection.rs`, `src/theme.rs`, `src/ui_png.rs`, `Cargo.toml` | delete TUI code paths after the deprecation release (OQ-1002) |
