@@ -386,7 +386,9 @@ function runElapsedMs(run, nowMs) {
   if (!run || typeof run.started_at_ms !== 'number') { return 0; }
   var snap = snapshot;
   if (snap && typeof snap.generated_at_ms === 'number' && typeof snap.receivedAt === 'number') {
-    var serverNow = snap.sent_at_ms > 0 ? snap.sent_at_ms : snap.generated_at_ms;
+    var serverNow = typeof snap.sent_at_ms === 'number' && snap.sent_at_ms > 0
+      ? snap.sent_at_ms
+      : snap.generated_at_ms;
     return Math.max(0, (serverNow - run.started_at_ms) + (nowMs - snap.receivedAt));
   }
   return Math.max(0, nowMs - run.started_at_ms);
@@ -403,7 +405,9 @@ function nodeElapsed(node, snap, nowMs) {
     ) {
       // Server and browser clocks may disagree; interpolate from the
       // server send time (sent_at_ms) plus the time our page held the snapshot.
-      var serverNow = snap.sent_at_ms > 0 ? snap.sent_at_ms : snap.generated_at_ms;
+      var serverNow = typeof snap.sent_at_ms === 'number' && snap.sent_at_ms > 0
+      ? snap.sent_at_ms
+      : snap.generated_at_ms;
       return Math.max(
         0,
         (serverNow - node.started_at_ms) + (nowMs - snap.receivedAt)
@@ -486,28 +490,44 @@ function renderNodes(graph, nowMs) {
 }
 
 // ---------------------------------------------------------------------------
-// Graph view (SPEC-graph-view UX-700..UX-703, NFR-700, TC-704).
-// Inline SVG "subway map": x = layout layer column, y = order row. Stations are
-// circles colored by state via theme CSS variables; edges are thick rounded
-// paths from dependency to dependent, colored by the source node's state.
-// No external resources, no inline style attributes (SVG attributes only).
+// Graph view: horizontal swimlane timeline (SPEC-graph-swimlane FR-880..885,
+// UX-880, UX-881; replaces the SPEC-graph-view subway drawing).
+// One lane per runner, time runs left to right, each node is a card placed at
+// its start and as wide as its duration, a "now" line, estimated starts on
+// pending cards, and dependency arrows that never loop back over their source.
+// Inline SVG only, no external resources, colors from theme CSS variables.
 // ---------------------------------------------------------------------------
 
 var GRAPH_VIEW_KEY = 'dmuxai.graphView';
 // Standard SVG namespace; not a fetched resource.
 var SVG_NS = 'http://www.w3.org/2000/svg';
-var GRAPH_PAD = 70;
-var GRAPH_COL_W = 190;
-var GRAPH_ROW_H = 130;
-var GRAPH_R = 13;
 var GRAPH_MIN_SCALE = 0.25;
 var GRAPH_MAX_SCALE = 3;
-// UX-700/UX-703: long edges detour onto a lane offset half a row from the
-// source, and the canvas auto-fits the map within these height bounds.
-var GRAPH_LANE_K = 40;
-var GRAPH_FIT_PAD = 6;
-var GRAPH_MIN_H = 320;
+var LANE_LABEL_W = 170;
+var LANE_ROW_H = 104;
+var CARD_H = 56;
+var CARD_MIN_W = 120;
+var AXIS_H = 30;
+var TIMELINE_PAD_R = 28;
+var TIMELINE_MIN_W = 640;
+// FR-881 / FR-884: cards closer than this stack into sub-rows, and arrows
+// with less room than this take the orthogonal route through the lane gap.
+var SUBROW_GAP = 24;
+var ARROW_MIN_GAP = 24;
+// UX-881: the smallest SVG font size the swimlane uses, and the rendered
+// floor Fit never goes below (so Fit never scales under 1).
+var GRAPH_MIN_FONT = 11;
+var GRAPH_TEXT_FLOOR = 11;
+var GRAPH_DEFAULT_EST_MS = 120000;
+var GRAPH_MIN_H = 180;
 var GRAPH_MAX_H_RATIO = 0.7;
+// Running timelines are rebuilt this often so the now line and tails move.
+var GRAPH_REBUILD_MS = 5000;
+var GRAPH_LANE_COLORS = 6;
+var GRAPH_TICK_STEPS = [
+  30000, 60000, 120000, 300000, 600000, 900000, 1800000,
+  3600000, 7200000, 10800000, 21600000, 43200000, 86400000
+];
 
 // graphViewPref is the stored user choice (or null before one exists, in which
 // case the default follows the layer count: Graph when layers > 1).
@@ -516,177 +536,75 @@ var graphViewMode = 'graph';
 var graphTransform = { scale: 1, x: 0, y: 0 };
 var graphSelectedId = null;
 var graphPan = null;
+var graphPointerDown = false;
 var graphZoomGroup = null;
-// Set once the user pans/zooms; auto-fit still re-runs when the node set
-// changes so a growing graph is always fully visible (UX-703).
+// Set once the user pans/zooms; Fit re-enables auto-fit (UX-703).
 var graphUserInteracted = false;
 var lastGraphGeometryKey = null;
 var lastGraphCanvasRevision = null;
 var lastGraphCanvasGeometryKey = null;
 var graphGeometry = null;
+var graphLastBuildAt = 0;
 
 function svgEl(tag) { return document.createElementNS(SVG_NS, tag); }
 
-function svgText(x, y, text, className) {
+function svgText(x, y, text, className, anchor) {
   var node = svgEl('text');
   node.setAttribute('x', x);
   node.setAttribute('y', y);
-  node.setAttribute('text-anchor', 'middle');
+  node.setAttribute('text-anchor', anchor || 'start');
   node.setAttribute('class', className);
   node.textContent = text;
   return node;
 }
 
-function graphCircle(className, cx, cy, r) {
-  var circle = svgEl('circle');
-  circle.setAttribute('class', className);
-  circle.setAttribute('cx', cx);
-  circle.setAttribute('cy', cy);
-  circle.setAttribute('r', r);
-  return circle;
+function svgRect(className, x, y, w, h, rx) {
+  var rect = svgEl('rect');
+  rect.setAttribute('class', className);
+  rect.setAttribute('x', x);
+  rect.setAttribute('y', y);
+  rect.setAttribute('width', Math.max(0, w));
+  rect.setAttribute('height', Math.max(0, h));
+  if (rx) { rect.setAttribute('rx', rx); }
+  return rect;
+}
+
+function svgLine(className, x1, y1, x2, y2) {
+  var line = svgEl('line');
+  line.setAttribute('class', className);
+  line.setAttribute('x1', x1);
+  line.setAttribute('y1', y1);
+  line.setAttribute('x2', x2);
+  line.setAttribute('y2', y2);
+  return line;
 }
 
 function graphNodeStatus(node) {
   return node && typeof node.status === 'string' ? node.status : 'pending';
 }
 
-// Deterministic fallback layering from deps, used only if a snapshot has no
-// server-side layout (FR-700 already computes it server-side).
-function computeDepsLayers(nodes) {
-  var layer = {};
-  var i;
-  for (i = 0; i < nodes.length; i++) { layer[String(nodes[i].id)] = 0; }
-  for (var pass = 0; pass < nodes.length; pass++) {
-    var changed = false;
-    for (i = 0; i < nodes.length; i++) {
-      var deps = Array.isArray(nodes[i].deps) ? nodes[i].deps : [];
-      var best = 0;
-      for (var d = 0; d < deps.length; d++) {
-        var dep = layer[String(deps[d])];
-        if (typeof dep === 'number' && dep + 1 > best) { best = dep + 1; }
-      }
-      var key = String(nodes[i].id);
-      if (best > layer[key]) { layer[key] = best; changed = true; }
-    }
-    if (!changed) { break; }
-  }
-  return layer;
+function graphIsFinished(status) {
+  return status === 'completed' || status === 'failed' || status === 'skipped';
 }
 
-function buildGraphGeometry(graph) {
-  var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
-  var entries = [];
-  var missingLayout = false;
-  var i;
-  for (i = 0; i < nodes.length; i++) {
-    var node = nodes[i];
-    var hasLayout = node && node.layout &&
-      typeof node.layout.layer === 'number' && typeof node.layout.order === 'number';
-    if (!hasLayout) { missingLayout = true; }
-    entries.push({
-      node: node,
-      id: String(node.id),
-      layer: hasLayout ? node.layout.layer : 0,
-      order: hasLayout ? node.layout.order : 0,
-      index: i
-    });
-  }
-  if (missingLayout) {
-    var fallback = computeDepsLayers(nodes);
-    for (i = 0; i < entries.length; i++) {
-      var depth = fallback[entries[i].id];
-      entries[i].layer = typeof depth === 'number' ? depth : 0;
-    }
-    var orderInLayer = {};
-    var byPlan = entries.slice().sort(function (a, b) { return a.index - b.index; });
-    for (i = 0; i < byPlan.length; i++) {
-      var planned = byPlan[i];
-      var ord = orderInLayer[planned.layer] || 0;
-      orderInLayer[planned.layer] = ord + 1;
-      planned.order = ord;
-    }
-  }
-  entries.sort(function (a, b) {
-    if (a.layer !== b.layer) { return a.layer - b.layer; }
-    if (a.order !== b.order) { return a.order - b.order; }
-    return a.index - b.index;
-  });
-
-  var rowInLayer = {};
-  var maxLayer = 0;
-  var maxRow = 0;
-  var positions = {};
-  for (i = 0; i < entries.length; i++) {
-    var entry = entries[i];
-    var row = rowInLayer[entry.layer] || 0;
-    rowInLayer[entry.layer] = row + 1;
-    entry.x = GRAPH_PAD + entry.layer * GRAPH_COL_W;
-    entry.y = GRAPH_PAD + row * GRAPH_ROW_H;
-    positions[entry.id] = entry;
-    if (entry.layer > maxLayer) { maxLayer = entry.layer; }
-    if (row > maxRow) { maxRow = row; }
-  }
-  return {
-    entries: entries,
-    positions: positions,
-    width: GRAPH_PAD * 2 + maxLayer * GRAPH_COL_W,
-    height: GRAPH_PAD * 2 + maxRow * GRAPH_ROW_H
-  };
+function graphIsWaiting(status) {
+  return status === 'pending' || status === 'ready' || status === 'waiting_gate';
 }
 
-// Subway-style rounded elbow: leave the source horizontally, cross at the
-// midpoint, and enter the target horizontally.
-function edgePath(from, to) {
-  var sx = from.x + GRAPH_R;
-  var sy = from.y;
-  var tx = to.x - GRAPH_R;
-  var ty = to.y;
-  if (tx <= sx + 4) {
-    var mid = (sx + tx) / 2;
-    return 'M' + sx + ',' + sy + ' L' + mid + ',' + sy +
-      ' L' + mid + ',' + ty + ' L' + tx + ',' + ty;
-  }
-  var span = (typeof to.layer === 'number' && typeof from.layer === 'number')
-    ? to.layer - from.layer
-    : 1;
-  if (span > 1) {
-    return longEdgePath(sx, sy, tx, ty);
-  }
-  var mx1 = sx + (tx - sx) * 0.4;
-  var mx2 = sx + (tx - sx) * 0.6;
-  return 'M' + sx + ',' + sy +
-    ' L' + mx1 + ',' + sy +
-    ' L' + mx2 + ',' + ty +
-    ' L' + tx + ',' + ty;
-}
-
-// UX-700: an edge that spans more than one layer detours onto a horizontal
-// lane halfway between the source row and its neighbour, so it never runs
-// through the stations of an intermediate layer. The corner joins are rounded
-// by the .edge stroke-linejoin rule.
-function longEdgePath(sx, sy, tx, ty) {
-  var k = Math.min(GRAPH_LANE_K, (tx - sx) / 3);
-  var laneY = ty >= sy ? sy + GRAPH_ROW_H / 2 : sy - GRAPH_ROW_H / 2;
-  var a = sx + k;
-  var b = tx - k;
-  return 'M' + sx + ',' + sy +
-    ' L' + a + ',' + sy +
-    ' L' + a + ',' + laneY +
-    ' L' + b + ',' + laneY +
-    ' L' + b + ',' + ty +
-    ' L' + tx + ',' + ty;
-}
-
-// UX-700: collapse long runner ids to the short label used by mockup #5
-// (`opencode-glm` -> `glm`, `agy` -> `AGY`).
+// UX-700: collapse long runner ids to the short label (`opencode-glm` -> `glm`,
+// `agy` -> `AGY`). Lane labels keep the full runner name.
 function runnerShortName(name) {
   var short = String(name || '').replace(/^opencode-/i, '');
   if (short.toLowerCase() === 'agy') { return 'AGY'; }
   return short;
 }
 
-// UX-700: without a measured elapsed time the station sublabel shows the state
-// word instead (mockup #5: done / failed / running / pending / waiting / skipped).
+function runnerLaneName(name) {
+  var full = String(name || '');
+  return full.toLowerCase() === 'agy' ? 'AGY' : (full || 'runner');
+}
+
+// Status words shown on the card chip and in place of an unknown elapsed time.
 var STATION_STATE_WORDS = {
   completed: 'done',
   failed: 'failed',
@@ -700,6 +618,15 @@ var STATION_STATE_WORDS = {
 function stationStateWord(status) {
   return STATION_STATE_WORDS[status] || 'pending';
 }
+
+var CARD_ICONS = {
+  completed: '\u2713',
+  failed: '\u00d7',
+  skipped: '\u2013',
+  waiting_gate: '\u23f8',
+  pending: '\u25cb',
+  ready: '\u25cb'
+};
 
 function nodeAriaLabel(node) {
   return String(node.id) + ': ' + String(node.role || '') + ', ' +
@@ -719,26 +646,447 @@ function graphNodeElementById(id) {
   return null;
 }
 
-function nodeMetaLabel(node, nowMs) {
-  var parts = [];
-  if (node.runner) { parts.push(runnerShortName(node.runner)); }
-  var status = graphNodeStatus(node);
-  var ms = nodeElapsed(node, snapshot, nowMs);
-  parts.push(ms === null ? stationStateWord(status) : fmtElapsed(ms));
-  if (status === 'failed' && typeof node.attempt === 'number' && node.attempt > 1) {
-    parts.push('\u00d7' + node.attempt);
+// FR-882: "now" on the server clock, from the snapshot's send time plus the
+// time this page has held it (the same correction as runElapsedMs). A
+// negative offset (browser clock behind) clamps to 0.
+function graphServerNow(snap, nowMs) {
+  var now = typeof nowMs === 'number' ? nowMs : Date.now();
+  if (snap && typeof snap.generated_at_ms === 'number' && typeof snap.receivedAt === 'number') {
+    var serverNow = typeof snap.sent_at_ms === 'number' && snap.sent_at_ms > 0
+      ? snap.sent_at_ms
+      : snap.generated_at_ms;
+    return serverNow + Math.max(0, now - snap.receivedAt);
   }
-  return parts.join(' \u00b7 ');
+  return now;
 }
 
-function graphStation(entry, nowMs) {
+function graphMedian(values) {
+  var sorted = values.slice().sort(function (a, b) { return a - b; });
+  var mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+}
+
+function graphFinishedDuration(node) {
+  if (typeof node.started_at_ms === 'number' && typeof node.finished_at_ms === 'number') {
+    return Math.max(0, node.finished_at_ms - node.started_at_ms);
+  }
+  if (typeof node.elapsed_ms === 'number') { return Math.max(0, node.elapsed_ms); }
+  return null;
+}
+
+// Dependencies of every node: `deps` from the snapshot plus `edges`.
+function graphDepsMap(graph) {
+  var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+  var edges = graph && Array.isArray(graph.edges) ? graph.edges : [];
+  var deps = {};
+  var i;
+  function add(to, from) {
+    var list = deps[to] || (deps[to] = []);
+    if (from !== to && list.indexOf(from) === -1) { list.push(from); }
+  }
+  for (i = 0; i < nodes.length; i++) {
+    var id = String(nodes[i].id);
+    if (!deps[id]) { deps[id] = []; }
+    var own = Array.isArray(nodes[i].deps) ? nodes[i].deps : [];
+    for (var d = 0; d < own.length; d++) { add(id, String(own[d])); }
+  }
+  for (i = 0; i < edges.length; i++) {
+    if (edges[i] && edges[i].from != null && edges[i].to != null) {
+      add(String(edges[i].to), String(edges[i].from));
+    }
+  }
+  return deps;
+}
+
+// FR-882: start/end of every node on the server clock. Timed nodes use their
+// timestamps; running nodes end at now on the card and at
+// max(now, start + estimate) for their dependents; pending nodes start at
+// max(now, latest dependency end) and last the estimate (median finished
+// duration of the same role, else of all finished nodes, else 2 minutes).
+function graphEstimate(graph, serverNow) {
+  var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+  var depsMap = graphDepsMap(graph);
+  var byId = {};
+  var byRole = {};
+  var all = [];
+  var knownMin = null;
+  var i;
+  for (i = 0; i < nodes.length; i++) {
+    var n = nodes[i];
+    byId[String(n.id)] = n;
+    if (typeof n.started_at_ms === 'number') {
+      knownMin = knownMin === null ? n.started_at_ms : Math.min(knownMin, n.started_at_ms);
+    }
+    if (graphIsFinished(graphNodeStatus(n))) {
+      var dur = graphFinishedDuration(n);
+      if (dur !== null) {
+        all.push(dur);
+        var role = String(n.role || '');
+        (byRole[role] = byRole[role] || []).push(dur);
+      }
+    }
+  }
+  function estDuration(node) {
+    var same = byRole[String(node.role || '')];
+    if (same && same.length) { return graphMedian(same); }
+    if (all.length) { return graphMedian(all); }
+    return GRAPH_DEFAULT_EST_MS;
+  }
+  var out = {};
+  var visiting = {};
+  function resolve(id) {
+    if (out[id]) { return out[id]; }
+    var node = byId[id];
+    if (!node || visiting[id]) { return null; }
+    visiting[id] = true;
+    var status = graphNodeStatus(node);
+    var est = estDuration(node);
+    var depEnd = null;
+    var blocked = false;
+    var deps = depsMap[id] || [];
+    for (var d = 0; d < deps.length; d++) {
+      var depId = deps[d];
+      var dep = resolve(depId);
+      if (!dep) { continue; }
+      if (graphNodeStatus(byId[depId]) === 'failed') { blocked = true; }
+      depEnd = depEnd === null ? dep.planEnd : Math.max(depEnd, dep.planEnd);
+    }
+    var hasStart = typeof node.started_at_ms === 'number';
+    var hasFinish = typeof node.finished_at_ms === 'number';
+    var r = { estDurMs: est, estimated: false, blocked: false, untimed: false };
+    if (status === 'running') {
+      r.start = hasStart ? node.started_at_ms : (depEnd !== null ? Math.min(depEnd, serverNow) : serverNow);
+      r.untimed = !hasStart;
+      r.end = Math.max(serverNow, r.start);
+      r.planEnd = Math.max(serverNow, r.start + est);
+    } else if (graphIsFinished(status) && hasStart && hasFinish) {
+      r.start = node.started_at_ms;
+      r.end = Math.max(node.finished_at_ms, r.start);
+      r.planEnd = r.end;
+    } else if (status === 'skipped' || (status === 'failed' && !hasStart)) {
+      // Never ran: counts as ending now (or at its finish time).
+      r.start = depEnd !== null ? Math.min(depEnd, serverNow) : serverNow;
+      r.end = hasFinish ? Math.max(node.finished_at_ms, r.start) : r.start;
+      r.planEnd = hasFinish ? r.end : serverNow;
+      r.untimed = true;
+    } else if (status === 'completed' || status === 'failed') {
+      // Finished without timestamps (older runs): place it after its
+      // dependencies, or just before the earliest timed node, with the estimate.
+      var origin = knownMin !== null ? Math.min(knownMin, serverNow) : serverNow;
+      r.start = depEnd !== null ? depEnd : origin - est;
+      r.end = r.start + est;
+      r.planEnd = r.end;
+      r.untimed = true;
+    } else {
+      r.start = Math.max(serverNow, depEnd !== null ? depEnd : serverNow);
+      r.end = r.start + est;
+      r.planEnd = r.end;
+      r.estimated = true;
+      r.blocked = blocked;
+    }
+    visiting[id] = false;
+    out[id] = r;
+    return r;
+  }
+  for (i = 0; i < nodes.length; i++) { resolve(String(nodes[i].id)); }
+  return out;
+}
+
+// FR-880: the smallest "nice" step giving at most 10 intervals (11 tick
+// marks counting both ends); runs shorter than three minutes use 30s steps.
+function graphTickStep(spanMs) {
+  if (spanMs < 180000) { return 30000; }
+  for (var i = 0; i < GRAPH_TICK_STEPS.length; i++) {
+    if (spanMs / GRAPH_TICK_STEPS[i] <= 10) { return GRAPH_TICK_STEPS[i]; }
+  }
+  return GRAPH_TICK_STEPS[GRAPH_TICK_STEPS.length - 1];
+}
+
+function fmtTick(ms) {
+  var total = Math.round(ms / 1000);
+  var h = Math.floor(total / 3600);
+  var m = Math.floor((total % 3600) / 60);
+  var s = total % 60;
+  if (h > 0) { return h + 'h' + (m ? m + 'm' : ''); }
+  if (m > 0) { return m + 'm' + (s ? s + 's' : ''); }
+  return s === 0 ? '0m' : s + 's';
+}
+
+function graphTimelineWidth() {
+  var canvas = $('graph-canvas');
+  var cw = canvas && canvas.clientWidth ? canvas.clientWidth : 1000;
+  return Math.max(TIMELINE_MIN_W, cw - LANE_LABEL_W - TIMELINE_PAD_R - 2);
+}
+
+// FR-880..FR-883: lanes, cards (with sub-rows), axis and now line positions.
+function buildSwimlaneGeometry(graph, serverNow, timelineW, pass) {
+  var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+  var est = graphEstimate(graph, serverNow);
+  var phase = graph && typeof graph.phase === 'string' ? graph.phase : 'active';
+  var ended = phase === 'completed' || phase === 'failed';
+  var entries = [];
+  var i;
+  var t0 = null;
+  var lastEnd = null;
+  for (i = 0; i < nodes.length; i++) {
+    var id = String(nodes[i].id);
+    var e = est[id];
+    if (!e) { continue; }
+    entries.push({ node: nodes[i], id: id, index: i, est: e });
+    t0 = t0 === null ? e.start : Math.min(t0, e.start);
+    var reach = Math.max(e.end, e.planEnd);
+    lastEnd = lastEnd === null ? reach : Math.max(lastEnd, reach);
+  }
+  if (t0 === null) { t0 = serverNow; }
+  if (lastEnd === null) { lastEnd = serverNow; }
+  var endAt = ended ? lastEnd : Math.max(serverNow, lastEnd);
+  var span = Math.max(60000, endAt - t0);
+  if (!isFinite(span)) { span = 60000; }
+  var tickStep = graphTickStep(span);
+  var spanDraw = span * 1.04;
+  var pxPerMs = timelineW / spanDraw;
+  function xAt(t) { return LANE_LABEL_W + (t - t0) * pxPerMs; }
+
+  // Lanes in first-use order (by start, then plan order).
+  entries.sort(function (a, b) {
+    if (a.est.start !== b.est.start) { return a.est.start - b.est.start; }
+    return a.index - b.index;
+  });
+  var lanes = [];
+  var laneByRunner = {};
+  for (i = 0; i < entries.length; i++) {
+    var entry = entries[i];
+    var runner = String(entry.node.runner || '');
+    var lane = laneByRunner[runner];
+    if (!lane) {
+      lane = { runner: runner, index: lanes.length, entries: [], rows: [], model: '' };
+      laneByRunner[runner] = lane;
+      lanes.push(lane);
+    }
+    lane.entries.push(entry);
+    if (entry.node.model_id) { lane.model = String(entry.node.model_id); }
+    entry.x = xAt(entry.est.start);
+    var durMs = Math.max(0, entry.est.end - entry.est.start);
+    entry.w = Math.max(graphCardMinWidth(entry, t0), durMs * pxPerMs);
+    entry.h = CARD_H;
+    entry.lane = lane.index;
+    // FR-881: stack into the first sub-row with at least SUBROW_GAP of room.
+    var row = 0;
+    while (row < lane.rows.length && lane.rows[row] + SUBROW_GAP > entry.x) { row += 1; }
+    lane.rows[row] = entry.x + entry.w;
+    entry.subrow = row;
+  }
+
+  var top = AXIS_H;
+  var maxRight = LANE_LABEL_W + timelineW;
+  var positions = {};
+  for (i = 0; i < lanes.length; i++) {
+    lanes[i].top = top;
+    lanes[i].height = Math.max(1, lanes[i].rows.length) * LANE_ROW_H;
+    for (var j = 0; j < lanes[i].entries.length; j++) {
+      var ent = lanes[i].entries[j];
+      ent.y = top + ent.subrow * LANE_ROW_H + (LANE_ROW_H - CARD_H) / 2;
+      positions[ent.id] = ent;
+      maxRight = Math.max(maxRight, ent.x + ent.w);
+    }
+    top += lanes[i].height;
+  }
+
+  // Minimum card widths can push the last cards past the axis; shrink the
+  // time scale until they fit inside the requested width.
+  var overflow = maxRight - (LANE_LABEL_W + timelineW);
+  var passNo = pass || 0;
+  if (overflow > 1 && passNo < 2 && timelineW - overflow >= TIMELINE_MIN_W / 2) {
+    return buildSwimlaneGeometry(graph, serverNow, timelineW - overflow, passNo + 1);
+  }
+
+  var nowT = ended ? endAt : serverNow;
+  return {
+    entries: entries,
+    positions: positions,
+    lanes: lanes,
+    width: Math.ceil(maxRight + TIMELINE_PAD_R),
+    height: top + 2,
+    t0: t0,
+    timelineW: timelineW,
+    pxPerMs: pxPerMs,
+    spanDraw: spanDraw,
+    tickStep: tickStep,
+    ended: ended,
+    nowX: xAt(nowT),
+    nowLabel: (ended ? 'ended ' : 'now ') + fmtElapsed(Math.max(0, nowT - t0)),
+    serverNow: serverNow
+  };
+}
+
+// Text metrics for the card layout (SVG units, matching the CSS font sizes).
+var CARD_ID_CHAR = 8;
+var CARD_SUB_CHAR = 6.4;
+var CARD_TIME_CHAR = 7.2;
+var CARD_CHIP_CHAR = 7;
+var CARD_MAX_MIN_W = 260;
+
+function graphChipText(entry) {
+  if (entry.est.blocked) { return 'BLOCKED'; }
+  return stationStateWord(graphNodeStatus(entry.node)).toUpperCase();
+}
+
+// FR-881: a card is at least wide enough for its id and status chip, and for
+// its second line (role or estimate, and time), whichever is wider.
+function graphCardMinWidth(entry, t0) {
+  var chipW = graphChipText(entry).length * CARD_CHIP_CHAR + 12;
+  var tailW = graphNodeStatus(entry.node) === 'running' ? 30 : 0;
+  var top = 26 + String(entry.id).length * CARD_ID_CHAR + 8 + chipW + 8 + tailW;
+  var sub = graphCardSub(entry, { t0: t0 });
+  var time = graphCardTime(entry, null);
+  var bottom = 12 + sub.length * CARD_SUB_CHAR + 14 + time.length * CARD_TIME_CHAR + 10;
+  return Math.min(CARD_MAX_MIN_W, Math.max(CARD_MIN_W, top, bottom));
+}
+
+// FR-884: an arrow from the right edge of the source card to the left edge of
+// the target. With at least ARROW_MIN_GAP of room it is a straight line (same
+// row) or a cubic curve. Otherwise it leaves the source's bottom (or top),
+// runs through the gap between rows, and enters the target from the left, so
+// it never curves back over the source card. Its long vertical leg is moved
+// to a column free of other cards when `obstacles` (card rects) are given.
+function graphArrowPath(s, t, obstacles) {
+  var x1 = s.x + s.w;
+  var y1 = s.y + s.h / 2;
+  var x2 = t.x;
+  var y2 = t.y + t.h / 2;
+  if (x2 - x1 >= ARROW_MIN_GAP && !graphDirectBlocked(x1, y1, x2, y2, obstacles, s, t)) {
+    if (Math.abs(y2 - y1) < 1) { return 'M' + x1 + ',' + y1 + ' L' + x2 + ',' + y2; }
+    var dx = (x2 - x1) / 2;
+    return 'M' + x1 + ',' + y1 + ' C' + (x1 + dx) + ',' + y1 + ' ' +
+      (x2 - dx) + ',' + y2 + ' ' + x2 + ',' + y2;
+  }
+  var down = t.y >= s.y;
+  var gap = (LANE_ROW_H - CARD_H) / 2;
+  var sx = s.x + Math.min(24, s.w / 2);
+  var sy = down ? s.y + s.h : s.y;
+  var gapS = down ? s.y + s.h + gap : s.y - gap;
+  var gapT = down ? t.y - gap : t.y + t.h + gap;
+  var vx = x2 - 12;
+  var xv = graphFreeColumn(vx, sx, Math.min(gapS, gapT), Math.max(gapS, gapT), obstacles, s, t);
+  if (xv === vx) {
+    return 'M' + sx + ',' + sy + ' L' + sx + ',' + gapS + ' L' + vx + ',' + gapS +
+      ' L' + vx + ',' + y2 + ' L' + x2 + ',' + y2;
+  }
+  return 'M' + sx + ',' + sy + ' L' + sx + ',' + gapS + ' L' + xv + ',' + gapS +
+    ' L' + xv + ',' + gapT + ' L' + vx + ',' + gapT + ' L' + vx + ',' + y2 +
+    ' L' + x2 + ',' + y2;
+}
+
+// Whether the direct line or curve from (x1,y1) to (x2,y2) (same control
+// points as graphArrowPath) passes over a card other than its source and
+// target; such arrows take the routed path through the row gaps instead.
+function graphDirectBlocked(x1, y1, x2, y2, obstacles, s, t) {
+  if (!obstacles || !obstacles.length) { return false; }
+  var dx = (x2 - x1) / 2;
+  for (var k = 1; k < 24; k++) {
+    var u = k / 24;
+    var v = 1 - u;
+    var px = v * v * v * x1 + 3 * v * v * u * (x1 + dx) + 3 * v * u * u * (x2 - dx) + u * u * u * x2;
+    var py = v * v * v * y1 + 3 * v * v * u * y1 + 3 * v * u * u * y2 + u * u * u * y2;
+    for (var i = 0; i < obstacles.length; i++) {
+      var o = obstacles[i];
+      if (o === s || o === t) { continue; }
+      if (px > o.x - 2 && px < o.x + o.w + 2 && py > o.y - 2 && py < o.y + o.h + 2) { return true; }
+    }
+  }
+  return false;
+}
+
+// The x closest to `preferred` whose vertical segment [ya, yb] crosses no
+// card other than the arrow's own source and target.
+function graphFreeColumn(preferred, alt, ya, yb, obstacles, s, t) {
+  if (!obstacles || !obstacles.length) { return preferred; }
+  function blocked(x) {
+    for (var i = 0; i < obstacles.length; i++) {
+      var o = obstacles[i];
+      if (o === s || o === t) { continue; }
+      if (x > o.x - 2 && x < o.x + o.w + 2 && yb > o.y && ya < o.y + o.h) { return true; }
+    }
+    return false;
+  }
+  if (!blocked(preferred)) { return preferred; }
+  var candidates = [alt];
+  for (var i = 0; i < obstacles.length; i++) {
+    candidates.push(obstacles[i].x - 12, obstacles[i].x + obstacles[i].w + 12);
+  }
+  var best = preferred;
+  var bestDist = Infinity;
+  for (var c = 0; c < candidates.length; c++) {
+    var x = candidates[c];
+    if (x < LANE_LABEL_W + 4 || blocked(x)) { continue; }
+    var dist = Math.abs(x - preferred);
+    if (dist < bestDist) { best = x; bestDist = dist; }
+  }
+  return best;
+}
+
+// The shared arrowhead of a node takes the most blocking source state:
+// failed, then running, then any other unfinished state, then completed.
+function graphHeadState(states) {
+  if (states.indexOf('failed') !== -1) { return 'failed'; }
+  if (states.indexOf('running') !== -1) { return 'running'; }
+  for (var i = 0; i < states.length; i++) {
+    if (states[i] !== 'completed') { return states[i]; }
+  }
+  return 'completed';
+}
+
+function graphArrowHead(t, className) {
+  var x = t.x;
+  var y = t.y + t.h / 2;
+  var head = svgEl('path');
+  head.setAttribute('class', className);
+  head.setAttribute('d', 'M' + (x - 7) + ',' + (y - 4) + ' L' + x + ',' + y +
+    ' L' + (x - 7) + ',' + (y + 4) + ' Z');
+  return head;
+}
+
+function graphFitText(text, maxPx, charPx) {
+  var str = String(text || '');
+  var max = Math.max(1, Math.floor(maxPx / charPx));
+  if (str.length <= max) { return str; }
+  return max <= 1 ? '\u2026' : str.slice(0, max - 1) + '\u2026';
+}
+
+function graphCardTime(entry, nowMs) {
+  var node = entry.node;
+  var status = graphNodeStatus(node);
+  if (graphIsWaiting(status)) { return '~' + fmtElapsed(entry.est.estDurMs); }
+  var ms = nodeElapsed(node, snapshot, nowMs);
+  if (ms === null && !entry.est.untimed) { ms = Math.max(0, entry.est.end - entry.est.start); }
+  return ms === null ? stationStateWord(status) : fmtElapsed(ms);
+}
+
+function graphCardSub(entry, geometry) {
+  var node = entry.node;
+  var status = graphNodeStatus(node);
+  if (graphIsWaiting(status)) {
+    return 'est. start +' + fmtElapsed(Math.max(0, entry.est.start - geometry.t0));
+  }
+  if (status === 'failed' && typeof node.attempt === 'number' && node.attempt > 1) {
+    return 'try ' + node.attempt + ' \u00b7 ' + String(node.role || '');
+  }
+  return String(node.role || '');
+}
+
+// FR-881: one card. Running cards get a pulsing dot and a striped tail.
+function graphCard(entry, geometry, nowMs) {
   var node = entry.node;
   var status = graphNodeStatus(node);
   var group = svgEl('g');
-  var classes = 'node state-' + status;
+  var classes = 'node card state-' + status;
+  if (entry.est.blocked) { classes += ' card-blocked'; }
   if (graphSelectedId === entry.id) { classes += ' node-selected'; }
   group.setAttribute('class', classes);
   group.setAttribute('data-id', entry.id);
+  group.setAttribute('data-lane', String(entry.lane));
+  group.setAttribute('data-subrow', String(entry.subrow));
+  group.setAttribute('data-runner', String(node.runner || ''));
   group.setAttribute('transform', 'translate(' + entry.x + ',' + entry.y + ')');
   group.setAttribute('tabindex', '0');
   group.setAttribute('role', 'button');
@@ -748,32 +1096,35 @@ function graphStation(entry, nowMs) {
   title.textContent = nodeTitleText(node);
   group.appendChild(title);
 
+  var w = entry.w;
+  group.appendChild(svgRect('card-box', 0, 0, w, CARD_H, 8));
+  group.appendChild(svgRect('card-accent', 0, 0, 4, CARD_H, 2));
   if (status === 'running') {
-    group.setAttribute('class', classes);
-    var spinnerG = svgEl('g');
-    spinnerG.setAttribute('class', 'station-spinner');
-    spinnerG.appendChild(graphCircle('ring ring-outer', 0, 0, GRAPH_R + 9));
-    group.appendChild(spinnerG);
-    group.appendChild(graphCircle('ring ring-inner', 0, 0, GRAPH_R + 4));
-    group.appendChild(graphCircle('core', 0, 0, GRAPH_R));
-    group.appendChild(graphCircle('dot', 0, 0, 5));
+    var tail = svgRect('card-tail', w - 34, 1, 33, CARD_H - 2, 7);
+    tail.setAttribute('fill', 'url(#graph-stripe)');
+    group.appendChild(tail);
+    var dot = svgEl('circle');
+    dot.setAttribute('class', 'run-dot');
+    dot.setAttribute('cx', 16);
+    dot.setAttribute('cy', 18);
+    dot.setAttribute('r', 4);
+    group.appendChild(dot);
   } else {
-    group.appendChild(graphCircle('station', 0, 0, GRAPH_R));
-    if (status === 'completed') {
-      var check = svgEl('path');
-      check.setAttribute('class', 'check');
-      check.setAttribute('d', 'M-6,0 L-2,4 L6,-5');
-      group.appendChild(check);
-    } else if (status === 'failed') {
-      var cross = svgEl('path');
-      cross.setAttribute('class', 'cross');
-      cross.setAttribute('d', 'M-5,-5 L5,5 M5,-5 L-5,5');
-      group.appendChild(cross);
-    }
+    group.appendChild(svgText(12, 22, CARD_ICONS[status] || '\u25cb', 'card-icon'));
   }
 
-  group.appendChild(svgText(0, -(GRAPH_R + 12), entry.id, 'node-label'));
-  group.appendChild(svgText(0, GRAPH_R + 20, nodeMetaLabel(node, nowMs), 'node-meta'));
+  var chipText = graphChipText(entry);
+  var chipW = chipText.length * CARD_CHIP_CHAR + 12;
+  var chipX = w - chipW - 8 - (status === 'running' ? 30 : 0);
+  group.appendChild(svgRect('card-chip', chipX, 9, chipW, 17, 4));
+  group.appendChild(svgText(chipX + chipW / 2, 21.5, chipText, 'card-chip-text', 'middle'));
+
+  var idText = svgText(26, 22, graphFitText(entry.id, chipX - 32, CARD_ID_CHAR), 'card-id');
+  group.appendChild(idText);
+  var timeText = graphCardTime(entry, nowMs);
+  var timeW = timeText.length * CARD_TIME_CHAR;
+  group.appendChild(svgText(w - 10, 45, timeText, 'card-time', 'end'));
+  group.appendChild(svgText(12, 45, graphFitText(graphCardSub(entry, geometry), w - timeW - 30, CARD_SUB_CHAR), 'card-sub'));
 
   group.addEventListener('click', function () { selectGraphNode(entry.id); });
   group.addEventListener('keydown', function (e) {
@@ -785,6 +1136,19 @@ function graphStation(entry, nowMs) {
   return group;
 }
 
+function graphDefs() {
+  var defs = svgEl('defs');
+  var pattern = svgEl('pattern');
+  pattern.setAttribute('id', 'graph-stripe');
+  pattern.setAttribute('patternUnits', 'userSpaceOnUse');
+  pattern.setAttribute('width', 12);
+  pattern.setAttribute('height', 12);
+  pattern.setAttribute('patternTransform', 'rotate(45)');
+  pattern.appendChild(svgRect('stripe', 0, 0, 6, 12));
+  defs.appendChild(pattern);
+  return defs;
+}
+
 function applyGraphTransform() {
   if (!graphZoomGroup) { return; }
   graphZoomGroup.setAttribute(
@@ -793,45 +1157,49 @@ function applyGraphTransform() {
   );
 }
 
-// UX-703: key the node set by ids and layout so a pan/zoom is only dropped
-// when the map itself changes, not on every status tick or detail re-render.
+// Key the timeline by ids, lanes and sub-rows, so a pan/zoom is kept across
+// status ticks and only reset when the layout itself changes.
 function graphGeometryKey(geometry) {
   var parts = [];
   for (var i = 0; i < geometry.entries.length; i++) {
     var entry = geometry.entries[i];
-    parts.push(entry.id + '@' + entry.layer + ',' + entry.order);
+    parts.push(entry.id + '@' + entry.lane + ',' + entry.subrow);
   }
   return parts.join('|');
 }
 
-// UX-700: the canvas grows with the map but stays within [320px, 70vh].
+// The canvas grows with the lanes but stays within [180px, 70vh].
 function graphCanvasHeight(geometry) {
   var viewportMax = Math.round(window.innerHeight * GRAPH_MAX_H_RATIO);
   var maxH = Math.max(GRAPH_MIN_H, viewportMax);
-  return Math.max(GRAPH_MIN_H, Math.min(geometry.height, maxH));
+  return Math.max(GRAPH_MIN_H, Math.min(geometry.height + 2, maxH));
 }
 
-// UX-703: scale and center the whole map inside the canvas. Returns false when
-// the canvas has no measured size (e.g. while the List view hides it).
+// UX-703 / UX-881: Fit frames the timeline but never scales text below
+// GRAPH_TEXT_FLOOR px; wider timelines pan horizontally instead. Returns false
+// when the canvas has no measured size (e.g. while the List view hides it).
 function autoFitGraph(geometry) {
   var canvas = $('graph-canvas');
   if (!canvas) { return false; }
   var cw = canvas.clientWidth;
   var ch = canvas.clientHeight;
   if (!cw || !ch) { return false; }
-  var availW = Math.max(1, cw - GRAPH_FIT_PAD * 2);
-  var availH = Math.max(1, ch - GRAPH_FIT_PAD * 2);
-  var scale = Math.min(availW / geometry.width, availH / geometry.height, 1);
-  scale = Math.max(GRAPH_MIN_SCALE, Math.min(GRAPH_MAX_SCALE, scale));
+  var floor = GRAPH_TEXT_FLOOR / GRAPH_MIN_FONT;
+  var scale = Math.min(cw / geometry.width, ch / geometry.height, 1);
+  scale = Math.max(floor, Math.max(GRAPH_MIN_SCALE, Math.min(GRAPH_MAX_SCALE, scale)));
   graphTransform.scale = scale;
-  graphTransform.x = (cw - geometry.width * scale) / 2;
-  graphTransform.y = (ch - geometry.height * scale) / 2;
+  graphTransform.x = 0;
+  graphTransform.y = 0;
   return true;
 }
 
 function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
   var canvas = $('graph-canvas');
   if (!canvas) { return; }
+  var active = document.activeElement;
+  var focusId = active && active.closest && active.closest('.graph-svg g.node[data-id]')
+    ? active.closest('.graph-svg g.node[data-id]').getAttribute('data-id')
+    : null;
   graphZoomGroup = null;
   canvas.replaceChildren();
   var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
@@ -840,41 +1208,105 @@ function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
     return;
   }
 
-  var geometry = geometryOpt || buildGraphGeometry(graph);
+  var geometry = geometryOpt ||
+    buildSwimlaneGeometry(graph, graphServerNow(snapshot, nowMs), graphTimelineWidth());
   graphGeometry = geometry;
+  graphLastBuildAt = Date.now();
   var width = geometry.width;
   var height = geometry.height;
   canvas.style.height = graphCanvasHeight(geometry) + 'px';
   var svg = svgEl('svg');
-  svg.setAttribute('class', 'graph-svg');
-  svg.setAttribute('width', width);
-  svg.setAttribute('height', height);
-  svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+  svg.setAttribute('class', 'graph-svg swimlane');
+  // The svg fills the canvas; the zoom group carries the pan/zoom transform,
+  // so panning never clips the timeline at the svg edge.
+  var svgW = Math.max(width, canvas.clientWidth || 0);
+  var svgH = Math.max(height, graphCanvasHeight(geometry));
+  svg.setAttribute('width', svgW);
+  svg.setAttribute('height', svgH);
+  svg.setAttribute('viewBox', '0 0 ' + svgW + ' ' + svgH);
   svg.setAttribute('role', 'img');
-  svg.setAttribute('aria-label', 'Dependency graph, ' + nodes.length + ' nodes');
+  svg.setAttribute('aria-label', 'Run timeline, ' + geometry.lanes.length + ' runners, ' +
+    nodes.length + ' nodes');
+  svg.appendChild(graphDefs());
 
   var zoom = svgEl('g');
   zoom.setAttribute('class', 'graph-zoom');
   graphZoomGroup = zoom;
-
-  var edges = graph && Array.isArray(graph.edges) ? graph.edges : [];
   var i;
-  for (i = 0; i < edges.length; i++) {
-    var edge = edges[i] || {};
-    var from = geometry.positions[String(edge.from)];
-    var to = geometry.positions[String(edge.to)];
-    if (!from || !to || from.id === to.id) { continue; }
-    var path = svgEl('path');
-    path.setAttribute('class', 'edge edge-' + graphNodeStatus(from.node));
-    path.setAttribute('d', edgePath(from, to));
-    zoom.appendChild(path);
+
+  // Axis: ticks, labels and vertical grid lines (FR-880).
+  var axis = svgEl('g');
+  axis.setAttribute('class', 'graph-axis');
+  for (var t = 0; t <= geometry.spanDraw + 1; t += geometry.tickStep) {
+    var tx = LANE_LABEL_W + t * geometry.pxPerMs;
+    axis.appendChild(svgLine('axis-grid', tx, AXIS_H, tx, height));
+    axis.appendChild(svgText(tx, AXIS_H - 10, fmtTick(t), 'axis-label', t === 0 ? 'start' : 'middle'));
+  }
+  axis.appendChild(svgLine('axis-base', LANE_LABEL_W, AXIS_H, width, AXIS_H));
+  zoom.appendChild(axis);
+
+  // FR-883: shade the future while the run is active.
+  if (!geometry.ended) {
+    zoom.appendChild(svgRect('graph-future', geometry.nowX, AXIS_H, Math.max(0, width - geometry.nowX), height - AXIS_H));
+  }
+
+  // Lanes: label column (runner + latest model) and separators (FR-880).
+  for (i = 0; i < geometry.lanes.length; i++) {
+    var lane = geometry.lanes[i];
+    var laneG = svgEl('g');
+    laneG.setAttribute('class', 'lane lane-c' + (lane.index % GRAPH_LANE_COLORS));
+    laneG.setAttribute('data-runner', lane.runner);
+    laneG.appendChild(svgRect('lane-label', 0, lane.top, LANE_LABEL_W, lane.height));
+    laneG.appendChild(svgRect('lane-accent', 0, lane.top, 4, lane.height));
+    var mid = lane.top + lane.height / 2;
+    laneG.appendChild(svgText(16, mid - 3, graphFitText(runnerLaneName(lane.runner), 145, 8), 'lane-name'));
+    laneG.appendChild(svgText(16, mid + 15, graphFitText(lane.model, 145, 6.4), 'lane-model'));
+    laneG.appendChild(svgLine('lane-sep', 0, lane.top + lane.height, width, lane.top + lane.height));
+    zoom.appendChild(laneG);
+  }
+
+  // FR-884: dependency arrows, colored (and dashed) by the source state.
+  var depsMap = graphDepsMap(graph);
+  for (var targetId in depsMap) {
+    if (!Object.prototype.hasOwnProperty.call(depsMap, targetId)) { continue; }
+    var to = geometry.positions[targetId];
+    if (!to) { continue; }
+    var deps = depsMap[targetId];
+    var headStates = [];
+    for (var d = 0; d < deps.length; d++) {
+      var from = geometry.positions[deps[d]];
+      if (!from || from.id === to.id) { continue; }
+      var state = graphNodeStatus(from.node);
+      var path = svgEl('path');
+      path.setAttribute('class', 'edge edge-' + state);
+      path.setAttribute('data-from', from.id);
+      path.setAttribute('data-to', to.id);
+      path.setAttribute('d', graphArrowPath(from, to, geometry.entries));
+      zoom.appendChild(path);
+      headStates.push(state);
+    }
+    // One head per target (TC-884): all incoming arrows end at the same point.
+    if (headStates.length) {
+      var head = graphArrowHead(to, 'edge-head edge-head-' + graphHeadState(headStates));
+      head.setAttribute('data-to', to.id);
+      zoom.appendChild(head);
+    }
   }
 
   for (i = 0; i < geometry.entries.length; i++) {
-    zoom.appendChild(graphStation(geometry.entries[i], nowMs));
+    zoom.appendChild(graphCard(geometry.entries[i], geometry, nowMs));
   }
 
-  // Auto-fit only until the user pans/zooms; geometry changes do not refit (UX-703).
+  // FR-883: the now (or ended) line on top, with its label in the axis band.
+  var nowG = svgEl('g');
+  nowG.setAttribute('class', 'now-line' + (geometry.ended ? ' now-ended' : ''));
+  nowG.appendChild(svgLine('now-rule', geometry.nowX, 4, geometry.nowX, height));
+  var labelW = geometry.nowLabel.length * 6.6 + 12;
+  var labelX = Math.max(0, Math.min(geometry.nowX, width - labelW - 2));
+  nowG.appendChild(svgRect('now-tag', labelX, 4, labelW, 18, 4));
+  nowG.appendChild(svgText(labelX + 6, 17, geometry.nowLabel, 'now-text'));
+  zoom.appendChild(nowG);
+
   var key = geometryKeyOpt || graphGeometryKey(geometry);
   if (!graphUserInteracted) {
     autoFitGraph(geometry);
@@ -884,6 +1316,10 @@ function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
   svg.appendChild(zoom);
   canvas.appendChild(svg);
   applyGraphTransform();
+  if (focusId) {
+    var again = graphNodeElementById(focusId);
+    if (again) { again.focus(); }
+  }
 }
 
 function updateGraphNodeSelection() {
@@ -894,21 +1330,31 @@ function updateGraphNodeSelection() {
   }
 }
 
-function updateRunningGraphStationMeta(graph, nowMs) {
-  var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+// Called every tick while something runs: refresh the running cards' elapsed
+// text, and rebuild the timeline every GRAPH_REBUILD_MS so the now line and
+// running tails move (never while the pointer is down, so clicks land).
+function updateRunningGraphCards(graph, nowMs) {
+  if (!graph || !graphGeometry) { return; }
+  if (Date.now() - graphLastBuildAt >= GRAPH_REBUILD_MS && !graphPointerDown && !graphPan) {
+    renderGraphCanvas(graph, nowMs);
+    updateGraphNodeSelection();
+    return;
+  }
+  var nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
   for (var i = 0; i < nodes.length; i++) {
     var node = nodes[i];
     if (graphNodeStatus(node) !== 'running') { continue; }
+    var entry = graphGeometry.positions[String(node.id)];
     var group = graphNodeElementById(String(node.id));
-    if (!group) { continue; }
-    var meta = group.querySelector('.node-meta');
-    if (meta) { meta.textContent = nodeMetaLabel(node, nowMs); }
+    if (!entry || !group) { continue; }
+    var time = group.querySelector('.card-time');
+    if (time) { time.textContent = graphCardTime(entry, nowMs); }
   }
 }
 
 function syncGraphCanvas(graph, nowMs, revision) {
   if (!graph) { return; }
-  var geometry = buildGraphGeometry(graph);
+  var geometry = buildSwimlaneGeometry(graph, graphServerNow(snapshot, nowMs), graphTimelineWidth());
   var key = graphGeometryKey(geometry);
   var needsBuild = lastGraphCanvasRevision !== revision ||
     lastGraphCanvasGeometryKey !== key ||
@@ -920,10 +1366,20 @@ function syncGraphCanvas(graph, nowMs, revision) {
     updateGraphNodeSelection();
     return;
   }
-  graphGeometry = geometry;
-  updateRunningGraphStationMeta(graph, nowMs);
+  updateRunningGraphCards(graph, nowMs);
   updateGraphNodeSelection();
 }
+
+// TC-881: pure helpers for the headless-Chrome math checks.
+window.dmuxaiGraph = {
+  estimate: graphEstimate,
+  arrowPath: graphArrowPath,
+  tickStep: graphTickStep,
+  headState: graphHeadState,
+  fitText: graphFitText,
+  layout: buildSwimlaneGeometry,
+  contrast: contrastRatio
+};
 
 function selectGraphNode(id) {
   graphSelectedId = id;
@@ -1160,6 +1616,7 @@ function onGraphWheel(e) {
 }
 
 function onGraphDragStart(e) {
+  graphPointerDown = true;
   if (!graphZoomGroup) { return; }
   if (e.target && e.target.closest && e.target.closest('.node')) { return; }
   graphUserInteracted = true;
@@ -1175,6 +1632,21 @@ function onGraphDragMove(e) {
 
 function onGraphDragEnd() {
   graphPan = null;
+  graphPointerDown = false;
+}
+
+// The timeline width follows the canvas width, so re-lay it out on resize.
+var graphResizeTimer = null;
+function onGraphResize() {
+  if (graphResizeTimer !== null) { clearTimeout(graphResizeTimer); }
+  graphResizeTimer = setTimeout(function () {
+    graphResizeTimer = null;
+    var graph = snapshot && snapshot.graph ? snapshot.graph : null;
+    if (graph && graphViewMode === 'graph') {
+      renderGraphCanvas(graph, lastRendered || Date.now());
+      updateGraphNodeSelection();
+    }
+  }, 150);
 }
 
 function onGraphKeydown(e) {
@@ -1207,6 +1679,7 @@ function bindGraphControls() {
     canvas.addEventListener('mouseup', onGraphDragEnd);
     canvas.addEventListener('mouseleave', onGraphDragEnd);
   }
+  window.addEventListener('resize', onGraphResize);
   document.addEventListener('keydown', onGraphKeydown);
 
   var stored = null;
@@ -2430,7 +2903,7 @@ function tickDashboard() {
   renderGraphSummary(graph);
   renderNodes(graph, now);
   if (graphViewMode === 'graph') {
-    updateRunningGraphStationMeta(graph, now);
+    updateRunningGraphCards(graph, now);
     if (graphSelectedId) {
       renderGraphDetail(graph, now);
     }

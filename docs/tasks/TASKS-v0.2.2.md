@@ -12,7 +12,7 @@
 | [x] | 7 | Workspace API (`dirs`, `validate`, `switch`) with re-exec | FR-872..FR-874, NFR-870 | AGY | opencode-haiku | TC-873, TC-875, TC-876 |
 | [x] | 8 | Header path button and workspace dialog | FR-871, FR-872 | AGY | opencode-haiku | TC-872, TC-874 |
 | [x] | 9 | Runner cwd guard | FR-875 | opencode-glm / maintainer | opencode-haiku | TC-877 |
-| [ ] | 10 | Before/after screenshots (demo data) per UI PR | UX items | maintainer | — | PR bodies |
-| [ ] | 11 | Swimlane renderer (lanes, axis, now line, cards, estimates, arrows without loop-back) | FR-880..FR-884 | AGY / maintainer | opencode-haiku | TC-880, TC-881 |
-| [ ] | 12 | Detail drawer overlay, Fit text floor, light contrast | FR-885, UX-880, UX-881 | AGY / maintainer | opencode-haiku | TC-881, TC-882 |
-| [ ] | 13 | Light and dark screenshots (demo run) | UX-880 | maintainer | — | PR body |
+| [x] | 10 | Before/after screenshots (demo data) per UI PR | UX items | maintainer | — | PR bodies |
+| [x] | 11 | Swimlane renderer (lanes, axis, now line, cards, estimates, arrows without loop-back) | FR-880..FR-884 | maintainer | opencode free models | TC-880, TC-881 |
+| [x] | 12 | Detail drawer overlay, Fit text floor, light contrast | FR-885, UX-880, UX-881 | maintainer | opencode free models | TC-881, TC-882 |
+| [x] | 13 | Light and dark screenshots (demo run) | UX-880 | maintainer | — | PR body |

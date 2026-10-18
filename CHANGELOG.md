@@ -17,6 +17,19 @@ All notable changes to dmuxai are listed here. Versions follow
   `grok` is listed. A machine that has grok installed gains the chat runner and
   does not gain grok graph nodes until that list includes it.
 
+- **Horizontal swimlane graph view (SPEC-graph-swimlane FR-880..FR-885, UX-880, UX-881, #61).**
+  The Graph view's subway map is replaced by a timeline: one lane per runner
+  (with its latest model), time left to right with nice ticks, and each step as
+  a card placed at its start and as wide as its duration. Close cards stack
+  into sub-rows. A "now" line shades the future; running cards pulse and have
+  a striped tail. Pending cards show `est. start +…` and `~duration` (median of
+  finished steps of the same role), and a step after a failed dependency is
+  marked `BLOCKED`. Dependency arrows never loop back over their source card,
+  and their vertical legs avoid other cards. The detail panel is now an overlay
+  drawer, so the timeline keeps its width. Fit never shrinks text below 11px.
+  The light theme gets a dedicated pending color (`--graph-pending`, at least
+  3:1). Graph nodes now persist `started_at_ms` / `finished_at_ms`.
+
 - **Workspace directory selection and live switch (SPEC-workspace-dir FR-870..FR-875, NFR-870, #56).**
   A global `-C DIR` / `--workspace-dir DIR` flag and user-config `[workspace] dir`
   set the active workspace for every mode (flag > `DMUXAI_WORKSPACE` > user
