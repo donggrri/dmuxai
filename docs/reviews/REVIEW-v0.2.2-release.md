@@ -1,6 +1,6 @@
 # REVIEW: v0.2.2 release audit
 
-Date: 2026-10-18 (Asia/Seoul). Base: `main` at a4c50ae (#66), plus the release PR.
+Date: 2026-10-18 (Asia/Seoul). Base: `main` at f1b36ae (#70), plus the release PR.
 
 ## Scope
 
@@ -13,6 +13,7 @@ Milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2): issues #54-#
 | #56 Workspace directory (`-C`, header path, switch dialog) | SPEC-workspace-dir | #60 (e0c988f) |
 | #61 Horizontal swimlane graph view | SPEC-graph-swimlane | #65 (8c6b999) |
 | Built-in grok (Grok Build) runner, grok/fast model policy | SPEC-grok-runner, SPEC-model-policy FR-910..912 | #66 (a4c50ae) |
+| TUI conversation picker width (found while preparing the release screens) | SPEC-session-sidebar FR-865 | #70 (f1b36ae) |
 
 The SPECs, PLAN, TASKS and ROADMAP landed in #57 (2374989) and #62 (2d776d5). Also in this release: CI on `ubuntu-latest` (#63, 77ef270) and the `kill -- -<pgid>` fix (MCP server in #63; custom agent, Cursor and Office in #64, 787436b).
 
@@ -31,7 +32,7 @@ Then: CHANGELOG checked against the merged PRs, `scripts/spec-index.sh`, and `te
 
 ## Result
 
-- Five SPECs, 37 requirements, 41 TCs (four SPECs with 25 requirements and 23 TCs, plus SPEC-grok-runner with 12 requirements and 18 TCs), and SPEC-model-policy FR-910..912 / TC-910..912. Each TC has a ✅ TEST-PLAN row and each named test exists. All five SPECs say `Implemented (v0.2.2)`, and TASKS-v0.2.2 rows 0-13 are done (row 14, the release itself, is checked off after the tag).
+- Five SPECs, 38 requirements, 42 TCs (four SPECs with 26 requirements and 24 TCs, including FR-865/TC-865 from #70, plus SPEC-grok-runner with 12 requirements and 18 TCs), and SPEC-model-policy FR-910..912 / TC-910..912. Each TC has a ✅ TEST-PLAN row and each named test exists. All five SPECs say `Implemented (v0.2.2)`, and TASKS-v0.2.2 rows 0-13 are done (row 14, the release itself, is checked off after the tag).
 - Fixed in this PR:
   - the CHANGELOG had no entry for the `kill --` fix or the CI change, so it gets `Fixed` and `CI` sections;
   - the Unreleased section becomes `[0.2.2] - 2026-10-18`, with a Linux-only platform note and a compare link;
