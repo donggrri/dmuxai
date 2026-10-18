@@ -1047,6 +1047,7 @@ function graphCard(entry, geometry, nowMs) {
   group.setAttribute('data-id', entry.id);
   group.setAttribute('data-lane', String(entry.lane));
   group.setAttribute('data-subrow', String(entry.subrow));
+  group.setAttribute('data-runner', String(node.runner || ''));
   group.setAttribute('transform', 'translate(' + entry.x + ',' + entry.y + ')');
   group.setAttribute('tabindex', '0');
   group.setAttribute('role', 'button');

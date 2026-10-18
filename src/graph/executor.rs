@@ -467,6 +467,27 @@ mod tests {
             session.status_line().as_deref(),
             Some("Graph 2/4 · step-2 implement · agy gemini-3.8-flash-medium · failed")
         );
+        // SPEC-graph-swimlane FR-881: start/finish times are recorded.
+        let node = |id: &str| {
+            session
+                .run()
+                .plan
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .cloned()
+                .unwrap()
+        };
+        let step1 = node("step-1");
+        let (s1, f1) = (step1.started_at_ms.unwrap(), step1.finished_at_ms.unwrap());
+        assert!(s1 > 0 && f1 >= s1);
+        let step2 = node("step-2");
+        assert!(step2.started_at_ms.unwrap() >= s1);
+        assert!(
+            step2.finished_at_ms.is_some(),
+            "failed node gets a finish time"
+        );
+        assert_eq!(node("step-3").started_at_ms, None);
     }
 
     #[test]

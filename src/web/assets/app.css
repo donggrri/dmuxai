@@ -77,7 +77,6 @@
   --graph-node-fill: #0e1116;
   --graph-edge-idle: #5d6c80;
   --graph-pending: #6b7a8f;
-  --graph-future: rgba(139, 152, 169, 0.06);
 }
 
 :root[data-theme="light"] {
@@ -150,7 +149,6 @@
   --graph-edge-idle: #8fa1b5;
   /* UX-880: >= 3:1 against the canvas and card backgrounds. */
   --graph-pending: #687890;
-  --graph-future: rgba(95, 110, 132, 0.06);
 }
 
 /* Pre-init light default: mirrors the light palette above — keep in sync. */
@@ -224,7 +222,6 @@
     --graph-node-fill: #ffffff;
     --graph-edge-idle: #8fa1b5;
     --graph-pending: #687890;
-    --graph-future: rgba(95, 110, 132, 0.06);
   }
 }
 
@@ -1453,7 +1450,7 @@ main {
 }
 .graph-svg .axis-grid { stroke: var(--graph-grid); stroke-width: 1; }
 .graph-svg .axis-base { stroke: var(--line); stroke-width: 1; }
-.graph-svg .graph-future { fill: var(--graph-future); }
+.graph-svg .graph-future { fill: var(--muted); opacity: 0.07; }
 
 .graph-svg .lane-label { fill: var(--bg-chip); }
 .graph-svg .lane-sep { stroke: var(--line); stroke-width: 1; }
