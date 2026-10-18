@@ -835,6 +835,7 @@ function buildSwimlaneGeometry(graph, serverNow, timelineW, pass) {
   if (lastEnd === null) { lastEnd = serverNow; }
   var endAt = ended ? lastEnd : Math.max(serverNow, lastEnd);
   var span = Math.max(60000, endAt - t0);
+  if (!isFinite(span)) { span = 60000; }
   var tickStep = graphTickStep(span);
   var spanDraw = span * 1.04;
   var pxPerMs = timelineW / spanDraw;
@@ -996,6 +997,17 @@ function graphFreeColumn(preferred, alt, ya, yb, obstacles, s, t) {
     if (dist < bestDist) { best = x; bestDist = dist; }
   }
   return best;
+}
+
+// The shared arrowhead of a node takes the most blocking source state:
+// failed, then running, then any other unfinished state, then completed.
+function graphHeadState(states) {
+  if (states.indexOf('failed') !== -1) { return 'failed'; }
+  if (states.indexOf('running') !== -1) { return 'running'; }
+  for (var i = 0; i < states.length; i++) {
+    if (states[i] !== 'completed') { return states[i]; }
+  }
+  return 'completed';
 }
 
 function graphArrowHead(t, className) {
@@ -1208,7 +1220,7 @@ function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
 
   // FR-883: shade the future while the run is active.
   if (!geometry.ended) {
-    zoom.appendChild(svgRect('graph-future', geometry.nowX, AXIS_H, width - geometry.nowX, height - AXIS_H));
+    zoom.appendChild(svgRect('graph-future', geometry.nowX, AXIS_H, Math.max(0, width - geometry.nowX), height - AXIS_H));
   }
 
   // Lanes: label column (runner + latest model) and separators (FR-880).
@@ -1233,6 +1245,7 @@ function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
     var to = geometry.positions[targetId];
     if (!to) { continue; }
     var deps = depsMap[targetId];
+    var headStates = [];
     for (var d = 0; d < deps.length; d++) {
       var from = geometry.positions[deps[d]];
       if (!from || from.id === to.id) { continue; }
@@ -1243,7 +1256,13 @@ function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
       path.setAttribute('data-to', to.id);
       path.setAttribute('d', graphArrowPath(from, to, geometry.entries));
       zoom.appendChild(path);
-      zoom.appendChild(graphArrowHead(to, 'edge-head edge-head-' + state));
+      headStates.push(state);
+    }
+    // One head per target (TC-884): all incoming arrows end at the same point.
+    if (headStates.length) {
+      var head = graphArrowHead(to, 'edge-head edge-head-' + graphHeadState(headStates));
+      head.setAttribute('data-to', to.id);
+      zoom.appendChild(head);
     }
   }
 
@@ -1256,7 +1275,7 @@ function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
   nowG.setAttribute('class', 'now-line' + (geometry.ended ? ' now-ended' : ''));
   nowG.appendChild(svgLine('now-rule', geometry.nowX, 4, geometry.nowX, height));
   var labelW = geometry.nowLabel.length * 6.6 + 12;
-  var labelX = Math.min(geometry.nowX, width - labelW - 2);
+  var labelX = Math.max(0, Math.min(geometry.nowX, width - labelW - 2));
   nowG.appendChild(svgRect('now-tag', labelX, 4, labelW, 18, 4));
   nowG.appendChild(svgText(labelX + 6, 17, geometry.nowLabel, 'now-text'));
   zoom.appendChild(nowG);
@@ -1329,6 +1348,7 @@ window.dmuxaiGraph = {
   estimate: graphEstimate,
   arrowPath: graphArrowPath,
   tickStep: graphTickStep,
+  headState: graphHeadState,
   layout: buildSwimlaneGeometry,
   contrast: contrastRatio
 };

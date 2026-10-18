@@ -961,3 +961,58 @@ fn graph_swimlane_renders_in_headless_chrome() {
         .unwrap();
     assert!(smallest >= 10.99, "smallest rendered text {smallest}px");
 }
+
+// TC-884 (SPEC-graph-swimlane FR-884): a node with several dependencies gets a
+// single arrowhead, colored by the most blocking source state (review waits on
+// a running, a failed and a finished implementation: the head is failed).
+#[test]
+#[ignore]
+fn graph_swimlane_one_head_per_target_in_headless_chrome() {
+    let Some(chrome_bin) = find_chrome_binary() else {
+        println!(
+            "skipping graph_swimlane_one_head_per_target_in_headless_chrome: chrome binary not found"
+        );
+        return;
+    };
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    write_swimlane_fixture(workspace.path());
+    let mut dash = start_dashboard(&chrome_bin, workspace.path(), 1280, 900);
+    assert!(
+        wait_for(
+            &mut dash.cdp,
+            "!!document.querySelector('.graph-svg g.node')"
+        ),
+        "swimlane did not render"
+    );
+    let result = eval_json(
+        &mut dash.cdp,
+        r#"(() => {
+  const heads = [...document.querySelectorAll('.graph-svg .edge-head')];
+  const targets = new Set([...document.querySelectorAll('.graph-svg path.edge')].map(e => e.dataset.to));
+  const review = heads.filter(h => h.dataset.to === 'review');
+  const G = window.dmuxaiGraph;
+  return JSON.stringify({
+    heads: heads.length, targets: targets.size,
+    reviewHeads: review.length,
+    reviewClass: review.length ? review[0].getAttribute('class') : '',
+    mixed: G.headState(['completed', 'running', 'pending']),
+    failed: G.headState(['running', 'failed']),
+    done: G.headState(['completed', 'completed']),
+    waiting: G.headState(['completed', 'pending'])
+  });
+})()"#,
+    );
+    assert_eq!(result["heads"], result["targets"], "{result}");
+    assert_eq!(result["reviewHeads"], 1, "{result}");
+    assert!(
+        result["reviewClass"]
+            .as_str()
+            .unwrap()
+            .contains("edge-head-failed"),
+        "{result}"
+    );
+    assert_eq!(result["mixed"], "running");
+    assert_eq!(result["failed"], "failed");
+    assert_eq!(result["done"], "completed");
+    assert_eq!(result["waiting"], "pending");
+}
