@@ -579,6 +579,7 @@ async fn finish_after_done(
         Ok(Ok(status)) => status,
         _ => {
             kill_group_with(pgid, "-KILL");
+            // The group signal is Unix-only; this also stops the leader elsewhere.
             let _ = child.start_kill();
             child.wait().await.unwrap_or_else(|_| exit_status_ok())
         }
@@ -1324,7 +1325,8 @@ temp_config_template = '{"mcp": "not-an-object"}'
     async fn grok_end_line_finishes_turn_and_reaps_group() {
         let (events, elapsed, child) = lingering_turn("linger").await;
         assert!(completed(&events), "{events:?}");
-        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+        // 3 s grace, then TERM; generous margin for loaded CI machines.
+        assert!(elapsed < Duration::from_secs(8), "took {elapsed:?}");
         assert_gone(child).await;
     }
 
@@ -1337,7 +1339,8 @@ temp_config_template = '{"mcp": "not-an-object"}'
         let (events, elapsed, child) = lingering_turn("orphan").await;
         assert_eq!(texts(&events), "OK");
         assert!(completed(&events), "{events:?}");
-        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        // Below the 3 s grace: the leader's own exit ends the turn.
+        assert!(elapsed < Duration::from_millis(2500), "took {elapsed:?}");
         assert_gone(child).await;
     }
 

@@ -597,11 +597,7 @@ pub fn parse_jsonl_line(spec: &CustomAgentSpec, line: &str) -> ParsedLine {
     let text = if let Some(text_path) = &spec.text_path {
         let condition_met = match &spec.text_when {
             None => true,
-            Some(when) => match val.pointer(&when.path) {
-                Some(serde_json::Value::String(s)) => s == &when.equals,
-                Some(v) => *v == when.equals,
-                None => false,
-            },
+            Some(when) => json_matches(&val, when),
         };
 
         if condition_met {

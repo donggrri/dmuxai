@@ -85,3 +85,26 @@ Process groups: commands that grok runs get their own session and group (observe
 
 ## Reviewer input and decisions
 
+Reviewers: opencode free models only. `nemotron-3-ultra-free` answered both rounds. `space-bunny-free` answered neither: it was killed after 10 min in round 1 and timed out at 7 min (exit 124) in round 2. `deepseek-v4.1-flash-free`, `glm-5.3-flash-free`, and `beam-free` were unresponsive or IP-flagged earlier the same night, so they were not retried. The cursor-agent `sonnet-5.5-high` fallback was not needed.
+
+### Round 1: root-cause second opinion (nemotron-3-ultra-free)
+
+Input: this evidence (ps/lsof/strace, the unified log excerpts, the session statistics) and both hypotheses.
+
+| Point raised | Decision |
+| --- | --- |
+| A and B are strongly supported. Gap: is it one wake per background command? | Agreed. Each repro variant logged one `task-completed` prompt for its one background command. |
+| Killing the process group will not reach grok's background commands, because grok puts them in a separate group | **Confirmed by experiment** (each command gets `setsid`). Documented in FR-914 and above. With `--no-wait-for-background`, grok stops its own background tasks when it exits (verified). The group signal remains for children in the runner's own group. |
+| Lower the effort, avoid background cargo, scope reads, trigger compaction earlier | Adopted in the delegation guide, then measured (before/after table). DmuxAI does not change the preset's effort level; that is left to the user. |
+| Have DmuxAI cache or summarize tool output | Rejected: grok's tool loop runs inside grok, and DmuxAI only sees streaming-json. |
+
+### Round 2: diff review (nemotron-3-ultra-free)
+
+| Finding | Decision |
+| --- | --- |
+| H: a second `child.wait()` after a timed-out one may be unsafe | Rejected: tokio documents `Child::wait` as cancel-safe and callable again. |
+| H: on Windows the group kill does nothing | Pre-existing (FR-897 non-Unix cancel matches the other runners). After the end line, `start_kill` still stops the leader. The comment now says so. Windows is not a supported platform for v0.2.x runtime checks. |
+| M: timing thresholds are tight | Accepted: linger is now under 8 s; orphan is under 2.5 s, still below the 3 s grace so the test proves no grace wait. |
+| M: the 2 s stderr cap may lose output | Rejected: stderr is read from spawn onward, and the cap only starts after the process has exited, when its stderr is already in the pipe. |
+| M: `json_matches` never matches non-string values | Same semantics as the existing `text_when`. `text_when` now calls `json_matches`, so there is one rule. |
+| L: tests are Linux-only; `start_kill` is redundant; the `pgid_value` closure | Linux-only, like TC-898, because they read `/proc`. `start_kill` is kept for non-Unix. The closure stays (readability). |
