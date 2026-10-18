@@ -46,3 +46,11 @@ Date: 2026-10-18/19 (KST). Scope: SPEC, PLAN and TASKS for dashboard full parity
 
 - `App::run` refactor (slice 1) is the riskiest step; see PLAN risks.
 - Gap counts are a judgment call at row granularity (52 rows here vs 87 in the Grok inventory); Dongjin's review of §3 decides the final list.
+
+## Round 2 (2026-10-19 00:15-00:27 KST): stopped
+
+- Rebased on origin/main a4c50ae (#65, #66). The script `remap.py` (difflib) remapped the `app.rs`, `app.js`, `snapshot.rs`, `settings.rs` and `cli.rs` line refs. Spot-checks match.
+- Added §3.0, which records what each mode does without the TUI.
+- Added rows P10 (grok runner, full under `--web`) and P11 (#70, n/a), and recorded #71 as a dashboard-only feature.
+- The new counts were checked with a script: 54 rows, 27 full, 13 partial, 6 missing, 8 n/a.
+- The delta review on deepseek-v4.1-flash-free and glm-5.3-flash-free gave no output in about 12 minutes. Both processes were killed when work stopped for the day. **This review is still to do.**
