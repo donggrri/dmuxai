@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::settings::{default_user_config_path, find_on_path, find_opencode_bin};
+use crate::settings::{default_user_config_path, find_grok_bin, find_on_path, find_opencode_bin};
 
 /// Starter config. Every setting is commented out, so the file parses to
 /// `DmuxSettings::default()` (SPEC-first-run TC-814).
@@ -28,8 +28,8 @@ const STARTER_CONFIG: &str = r##"# DmuxAI configuration (dmuxai.toml). Everythin
 # enabled = true
 # max_parallel = 2
 # max_retries = 2
-# Unset: every runner may take graph nodes, except the built-in opencode preset.
-# The preset is never graph-routed unless it is listed here.
+# Unset: every runner may take graph nodes, except built-in presets (opencode
+# and grok). A built-in preset is never graph-routed unless it is listed here.
 # allowed_runners = ["cursor", "agy", "codex"]
 
 # [cursor]
@@ -45,6 +45,13 @@ const STARTER_CONFIG: &str = r##"# DmuxAI configuration (dmuxai.toml). Everythin
 # "opencode". It uses the free-model policy: only opencode/*-free models.
 # Set to false to hide it.
 # builtin_opencode = true
+# The built-in grok runner is registered when `grok` is on PATH, DMUXAI_GROK_BIN
+# names an existing file, or ~/.grok/bin/grok is executable, and no
+# [[agents.custom]] entry is named "grok". Models match grok-* and must not
+# contain fast. The default is grok-4.7. A logged-out CLI still lists the runner
+# and asks you to run `grok login`. Set to false to hide it. Graph nodes need
+# allowed_runners to include grok.
+# builtin_grok = true
 "##;
 
 /// Commented copy of the built-in opencode preset (FR-814). It is only written
@@ -75,15 +82,44 @@ const OPENCODE_EXAMPLE: &str = r##"# Built-in opencode runner, as an editable [[
 # env = { OPENCODE_CONFIG = "{temp_config}" }
 "##;
 
-/// Runner executables reported by `dmuxai init`, in report order.
-const RUNNER_BINARIES: [&str; 4] = ["cursor-agent", "agy", "codex", "opencode"];
+/// Commented copy of the built-in grok preset (FR-900). It is only written when
+/// grok is detected. Uncommenting it replaces the built-in preset. The example
+/// does not set `builtin`.
+const GROK_EXAMPLE: &str = r##"# Built-in grok runner, as an editable [[agents.custom]] entry. Uncommenting
+# it replaces the built-in preset. The command is `grok -p` with streaming-json.
+# [[agents.custom]]
+# name = "grok"
+# label = "grok"
+# color = "#6366f1"
+# command = ["grok", "-p", "{prompt}", "-m", "{model}", "--cwd", "{workspace}", "--output-format", "streaming-json"]
+# prompt_via = "arg"
+# models_command = ["grok", "models"]
+# allowed_models = "(?i)^grok-[a-z0-9][a-z0-9._-]*$"
+# output = "jsonl"
+# text_path = "/data"
+# text_when = { path = "/type", equals = "text" }
+# session_id_path = "/sessionId"
+# resume_arg = ["-r", "{session_id}"]
+# timeout_secs = 900
+# [agents.custom.modes]
+# ask = ["--permission-mode", "plan"]
+# plan = ["--permission-mode", "plan"]
+# implement = ["--always-approve"]
+"##;
 
-/// The starter config text. The opencode example is added when `opencode_detected`.
-pub fn starter_config(opencode_detected: bool) -> String {
+/// Runner executables reported by `dmuxai init`, in report order.
+const RUNNER_BINARIES: [&str; 5] = ["cursor-agent", "agy", "codex", "opencode", "grok"];
+
+/// The starter config text. Each example is added only when that runner is detected.
+pub fn starter_config(opencode_detected: bool, grok_detected: bool) -> String {
     let mut text = STARTER_CONFIG.to_owned();
     if opencode_detected {
         text.push('\n');
         text.push_str(OPENCODE_EXAMPLE);
+    }
+    if grok_detected {
+        text.push('\n');
+        text.push_str(GROK_EXAMPLE);
     }
     text
 }
@@ -104,6 +140,7 @@ pub fn target_path(workspace: bool, workspace_root: &Path) -> Result<PathBuf, St
 pub fn write_starter_config(
     path: &Path,
     opencode_detected: bool,
+    grok_detected: bool,
     force: bool,
 ) -> Result<(), String> {
     if path.exists() && !force {
@@ -116,21 +153,19 @@ pub fn write_starter_config(
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     }
-    std::fs::write(path, starter_config(opencode_detected))
+    std::fs::write(path, starter_config(opencode_detected, grok_detected))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 /// Runners whose executables are found on `PATH` (opencode honours
-/// `DMUXAI_OPENCODE_BIN`).
+/// `DMUXAI_OPENCODE_BIN`; grok honours `DMUXAI_GROK_BIN` and `~/.grok/bin`).
 pub fn detected_runners() -> Vec<&'static str> {
     RUNNER_BINARIES
         .into_iter()
-        .filter(|name| {
-            if *name == "opencode" {
-                find_opencode_bin().is_some()
-            } else {
-                find_on_path(name).is_some()
-            }
+        .filter(|name| match *name {
+            "opencode" => find_opencode_bin().is_some(),
+            "grok" => find_grok_bin().is_some(),
+            _ => find_on_path(name).is_some(),
         })
         .collect()
 }
@@ -138,7 +173,7 @@ pub fn detected_runners() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_agent::{CustomAgentSpec, opencode_preset};
+    use crate::custom_agent::{CustomAgentSpec, grok_preset, opencode_preset};
 
     #[derive(serde::Deserialize)]
     struct Doc {
@@ -178,19 +213,78 @@ mod tests {
     #[test]
     fn starter_config_only_adds_example_when_detected() {
         let example = "# name = \"opencode\"";
-        assert!(!starter_config(false).contains(example));
-        assert!(starter_config(true).contains(example));
+        assert!(!starter_config(false, false).contains(example));
+        assert!(starter_config(true, false).contains(example));
+    }
+
+    // TC-906 / FR-900
+    #[test]
+    fn starter_config_mentions_builtin_grok() {
+        let detected = starter_config(false, true);
+        let undetected = starter_config(true, false);
+        for text in [&detected, &undetected] {
+            assert!(text.contains("# builtin_grok = true"), "{text}");
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dmuxai.toml");
+            std::fs::write(&path, text).unwrap();
+            let settings = crate::settings::DmuxSettings::load_with_runners(
+                dir.path(),
+                Some(&path),
+                None,
+                None,
+                None,
+            );
+            assert_eq!(settings, crate::settings::DmuxSettings::default());
+        }
+        assert!(detected.contains("# name = \"grok\""));
+        assert!(
+            !undetected.contains("name = \"grok\""),
+            "undetected starter must not include a grok custom example"
+        );
+
+        let uncommented: String = GROK_EXAMPLE
+            .lines()
+            .filter_map(|line| line.strip_prefix('#')?.strip_prefix(' '))
+            .filter(|line| {
+                line.starts_with('[')
+                    || line
+                        .split_once(" = ")
+                        .is_some_and(|(key, _)| !key.contains(' '))
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let doc: Doc = toml::from_str(&uncommented).expect("grok example parses");
+        let [example] = doc.agents.custom.as_slice() else {
+            panic!("one grok example entry");
+        };
+        let mut expected = grok_preset("grok");
+        expected.builtin = false;
+        assert_eq!(example, &expected);
+
+        let docs = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/agents/custom-agents.md"
+        ))
+        .unwrap();
+        assert!(
+            docs.contains("grok agent stdio"),
+            "custom-agents.md must name grok agent stdio"
+        );
+        assert!(
+            docs.contains("not the built-in path"),
+            "custom-agents.md must say grok agent stdio is not the built-in path"
+        );
     }
 
     #[test]
     fn write_refuses_overwrite_without_force() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("dmuxai.toml");
-        write_starter_config(&path, false, false).unwrap();
+        write_starter_config(&path, false, false, false).unwrap();
         assert!(path.is_file());
-        let error = write_starter_config(&path, false, false).unwrap_err();
+        let error = write_starter_config(&path, false, false, false).unwrap_err();
         assert!(error.contains("--force"), "{error}");
-        write_starter_config(&path, true, true).unwrap();
+        write_starter_config(&path, true, false, true).unwrap();
         assert!(
             std::fs::read_to_string(&path)
                 .unwrap()

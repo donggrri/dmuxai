@@ -20,6 +20,9 @@ model_policy:
   orchestrate: composer-2.5
   implement: composer-2.5
   research_test: composer-2.5
+  # This repo graph stays composer-2.5 on every node. Runtime policy allows
+  # ^grok- models on the grok runner only (SPEC-model-policy FR-911).
+  # *grok* stays here so this file does not assign a grok model.
   disallow_patterns: ["*-fast", "*haiku*", "*grok*", "*sonnet*", "*gpt*", "*gemini*"]
 
 nodes:

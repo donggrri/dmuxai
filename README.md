@@ -480,6 +480,14 @@ DmuxAI needs no configuration to start. Run `dmuxai` in a project folder:
 - **Override:** an `[[agents.custom]]` entry named `opencode` in `dmuxai.toml`
   replaces the built-in runner with your own command and model policy.
   `[agents] builtin_opencode = false` hides it.
+- **grok:** when `grok` is on `PATH`, `DMUXAI_GROK_BIN` names an existing file,
+  or `~/.grok/bin/grok` is executable, DmuxAI adds a `grok` runner. Models must
+  match `grok-*` and must not contain `fast`. The default is `grok-4.7`. A
+  logged-out CLI still lists the runner, and choosing it or sending a prompt
+  asks you to run `grok login`. `[agents] builtin_grok = false` hides it. An
+  `[[agents.custom]]` entry named `grok` replaces the built-in runner. The
+  built-in grok runner takes no graph nodes unless you list `grok` in
+  `[graph] allowed_runners`.
 
 To start from a commented config that lists the runners it detected:
 
@@ -707,8 +715,8 @@ A machine can exclude `cursor` from the graph globally across all workspaces by 
 - `$XDG_CONFIG_HOME/dmuxai/dmuxai.toml` (fallback `~/.config/dmuxai/dmuxai.toml`)
 
 Exception: when `allowed_runners` is unset, every runner may take graph nodes
-except the built-in opencode runner (see [First run](#first-run)). List
-`opencode` explicitly to allow it.
+except the built-in opencode and grok runners (see [First run](#first-run)).
+List `opencode` or `grok` explicitly to allow that runner.
 
 User-level configuration is read first, and any keys in the workspace `dmuxai.toml` override user configuration per key.
 

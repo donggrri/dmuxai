@@ -57,6 +57,9 @@ pub struct DmuxSettings {
     /// `[agents] builtin_opencode` (default true). `false` hides the built-in
     /// opencode preset (SPEC-first-run FR-811).
     pub builtin_opencode: bool,
+    /// `[agents] builtin_grok` (default true). `false` hides the built-in
+    /// grok preset (SPEC-grok-runner FR-891).
+    pub builtin_grok: bool,
     /// `[[mcp.servers]]` merged from user and repo configs by name (repo wins).
     pub mcp_servers: Vec<crate::mcp::McpServerSpec>,
     /// `[todo] jira_base_url` (user or repo, repo wins) used to derive links
@@ -157,9 +160,11 @@ struct WebToml {
 #[derive(Debug, Default, Deserialize)]
 struct AgentsToml {
     /// `None` when the table has no `[[agents.custom]]`, so a `[agents]` table
-    /// that only sets `builtin_opencode` keeps the other config's agents.
+    /// that only sets `builtin_opencode` or `builtin_grok` keeps the other
+    /// config's agents.
     custom: Option<Vec<crate::custom_agent::CustomAgentSpec>>,
     builtin_opencode: Option<bool>,
+    builtin_grok: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -201,22 +206,45 @@ impl DmuxSettings {
 
     /// Like [`Self::load_with_user_config`] with the DmuxAI executable injected
     /// for the built-in `dmuxai-memory` entry (FR-733), so tests are deterministic.
-    /// The opencode executable is looked up in the environment (FR-810).
+    /// The opencode and grok executables are looked up in the environment.
     pub(crate) fn load_with_exe(
         workspace: &Path,
         user_config_path: Option<&Path>,
         exe: Option<&Path>,
     ) -> Self {
-        Self::load_with_opencode(workspace, user_config_path, exe, find_opencode_bin())
+        Self::load_with_runners(
+            workspace,
+            user_config_path,
+            exe,
+            find_opencode_bin(),
+            find_grok_bin(),
+        )
     }
 
     /// Loads settings with the opencode executable injected (`None` = not
-    /// installed), so the preset decision is deterministic in tests (FR-810).
+    /// installed) and no grok executable, so preset decisions stay deterministic
+    /// in tests that predate the grok runner (FR-810).
+    ///
+    /// Production loading goes through [`Self::load_with_exe`]. This entry point
+    /// is for tests, so the non-test build allows it to look unused.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn load_with_opencode(
         workspace: &Path,
         user_config_path: Option<&Path>,
         exe: Option<&Path>,
         opencode_bin: Option<PathBuf>,
+    ) -> Self {
+        Self::load_with_runners(workspace, user_config_path, exe, opencode_bin, None)
+    }
+
+    /// Loads settings with both runner executables injected (`None` = not
+    /// installed), so preset registration is deterministic in tests (FR-810, FR-890).
+    pub(crate) fn load_with_runners(
+        workspace: &Path,
+        user_config_path: Option<&Path>,
+        exe: Option<&Path>,
+        opencode_bin: Option<PathBuf>,
+        grok_bin: Option<PathBuf>,
     ) -> Self {
         let mut settings = Self::default();
         if env_flag("DMUXAI_CURSOR_WINDOWS_UNSANDBOXED") {
@@ -253,42 +281,70 @@ impl DmuxSettings {
             }
         }
 
-        // FR-810/FR-811: the preset is registered only when `builtin_opencode` is
-        // not false in either config, no config names its own `opencode` agent,
-        // and the executable exists. This is decided before `allowed_runners` is
-        // validated, so `allowed_runners = ["opencode"]` is accepted.
+        // FR-810/FR-811 and FR-890/FR-891: a built-in preset is registered only
+        // when its flag is not false, no config names that agent, and the
+        // executable exists. This is decided before `allowed_runners` is
+        // validated, so `allowed_runners = ["opencode"]` or `["grok"]` is accepted.
+        // The last config's flag wins. A custom name in either file blocks the
+        // preset even when the winning custom list no longer contains it.
         let agents = || configs.iter().filter_map(|parsed| parsed.agents.as_ref());
         settings.builtin_opencode = agents()
             .filter_map(|agents| agents.builtin_opencode)
             .next_back()
             .unwrap_or(true);
+        settings.builtin_grok = agents()
+            .filter_map(|agents| agents.builtin_grok)
+            .next_back()
+            .unwrap_or(true);
         let names_opencode = agents()
             .flat_map(|agents| agents.custom.iter().flatten())
             .any(|spec| spec.name.eq_ignore_ascii_case("opencode"));
-        let preset_bin = opencode_bin.filter(|_| settings.builtin_opencode && !names_opencode);
+        let names_grok = agents()
+            .flat_map(|agents| agents.custom.iter().flatten())
+            .any(|spec| spec.name.eq_ignore_ascii_case("grok"));
+        let opencode_preset_bin =
+            opencode_bin.filter(|_| settings.builtin_opencode && !names_opencode);
+        let grok_preset_bin = grok_bin.filter(|_| settings.builtin_grok && !names_grok);
 
         // Custom agent names seen in *either* config, so an id defined only in
         // the user config is not reported as unknown after the workspace config
-        // replaces `[[agents.custom]]`.
+        // replaces `[[agents.custom]]`. Pending presets are known too.
         let mut known_custom: Vec<String> = Vec::new();
-        if preset_bin.is_some() {
+        let mut pending_presets: Vec<&str> = Vec::new();
+        if opencode_preset_bin.is_some() {
             known_custom.push("opencode".to_owned());
+            pending_presets.push("opencode");
+        }
+        if grok_preset_bin.is_some() {
+            known_custom.push("grok".to_owned());
+            pending_presets.push("grok");
         }
         for parsed in configs {
-            settings.apply_toml(parsed, &mut known_custom, preset_bin.is_some());
+            settings.apply_toml(parsed, &mut known_custom, &pending_presets);
         }
-        if let Some(program) = preset_bin
+        // Appended last so existing custom agent indices do not move.
+        // Opencode stays before grok.
+        if let Some(program) = opencode_preset_bin
             && !settings
                 .custom_agents
                 .iter()
                 .any(|spec| spec.name.eq_ignore_ascii_case("opencode"))
         {
-            // Appended last so existing custom agent indices do not move.
             settings
                 .custom_agents
                 .push(crate::custom_agent::opencode_preset(
                     &program.to_string_lossy(),
                 ));
+        }
+        if let Some(program) = grok_preset_bin
+            && !settings
+                .custom_agents
+                .iter()
+                .any(|spec| spec.name.eq_ignore_ascii_case("grok"))
+        {
+            settings
+                .custom_agents
+                .push(crate::custom_agent::grok_preset(&program.to_string_lossy()));
         }
 
         let mut known: Vec<&str> = vec!["cursor", "agy", "codex"];
@@ -390,7 +446,7 @@ impl DmuxSettings {
         &mut self,
         parsed: DmuxToml,
         known_custom: &mut Vec<String>,
-        preset_pending: bool,
+        pending_presets: &[&str],
     ) {
         if let Some(memory) = parsed.memory {
             if memory.vault.is_some() {
@@ -474,7 +530,9 @@ impl DmuxSettings {
                         continue;
                     }
                     if matches!(lower.as_str(), "agy" | "codex" | "cursor")
-                        || (preset_pending && lower == "opencode")
+                        || pending_presets
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(&lower))
                         || self
                             .custom_agents
                             .iter()
@@ -557,9 +615,9 @@ impl DmuxSettings {
 }
 
 impl DmuxSettings {
-    /// Whether `runner` may take graph nodes (SPEC-first-run FR-813). An unset
-    /// `allowed_runners` admits every runner except the built-in opencode
-    /// preset; a listed runner, including the preset, is admitted.
+    /// Whether `runner` may take graph nodes (SPEC-first-run FR-813,
+    /// SPEC-grok-runner FR-899). An unset `allowed_runners` admits every runner
+    /// except built-in presets; a listed runner, including a preset, is admitted.
     pub fn graph_runner_allowed(&self, runner: &str) -> bool {
         let runner = runner.trim();
         match &self.graph_allowed_runners {
@@ -591,6 +649,7 @@ impl Default for DmuxSettings {
             reduced_motion: false,
             custom_agents: Vec::new(),
             builtin_opencode: true,
+            builtin_grok: true,
             mcp_servers: Vec::new(),
             todo_jira_base_url: None,
             ui: UiSettings::default(),
@@ -703,10 +762,51 @@ pub fn find_opencode_bin() -> Option<PathBuf> {
     }
 }
 
-/// Searches `PATH` for the first file called `name` (`name.exe` or `name.cmd`
-/// on Windows). No shell is involved.
+/// Finds the grok executable (SPEC-grok-runner FR-890). A non-empty
+/// `DMUXAI_GROK_BIN` is authoritative and does not fall through. Otherwise the
+/// first `grok` on `PATH`, then `~/.grok/bin/grok` (`grok.exe` on Windows) when
+/// that file is executable.
+pub fn find_grok_bin() -> Option<PathBuf> {
+    let explicit = std::env::var_os("DMUXAI_GROK_BIN").filter(|value| !value.is_empty());
+    find_grok_bin_from(explicit, std::env::var_os("PATH"), home_dir())
+}
+
+/// Lookup used by [`find_grok_bin`]. `grok_bin` `Some` is authoritative even
+/// when the path is missing. `path_var` and `home` are injected so tests do not
+/// mutate the process environment.
+fn find_grok_bin_from(
+    grok_bin: Option<std::ffi::OsString>,
+    path_var: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(raw) = grok_bin {
+        let path = PathBuf::from(raw);
+        return path.is_file().then_some(path);
+    }
+    if let Some(found) = find_on_path_in("grok", path_var.as_deref()) {
+        return Some(found);
+    }
+    let home = home?;
+    let file_name = if cfg!(windows) { "grok.exe" } else { "grok" };
+    let candidate = home.join(".grok").join("bin").join(file_name);
+    is_executable_file(&candidate).then_some(candidate)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()))
+        .map(PathBuf::from)
+}
+
+/// Searches `PATH` for the first file called `name` (`name.exe`, `name.cmd`,
+/// or `name.bat` on Windows). No shell is involved.
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
+    find_on_path_in(name, std::env::var_os("PATH").as_deref())
+}
+
+fn find_on_path_in(name: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path_var = path_var?;
     let file_names: Vec<String> = if cfg!(windows) {
         vec![
             format!("{name}.exe"),
@@ -717,7 +817,7 @@ pub fn find_on_path(name: &str) -> Option<PathBuf> {
     } else {
         vec![name.to_owned()]
     };
-    std::env::split_paths(&path_var)
+    std::env::split_paths(path_var)
         .flat_map(|dir| {
             file_names
                 .iter()
@@ -1840,22 +1940,30 @@ mod builtin_opencode_tests {
     fn starter_config_parses() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dmuxai.toml");
-        for detected in [false, true] {
-            let text = crate::init::starter_config(detected);
-            for key in [
-                "[theme]",
-                "[routing]",
-                "[graph]",
-                "[cursor]",
-                "[agents]",
-                "builtin_opencode",
-            ] {
-                assert!(text.contains(key), "missing {key}");
+        for opencode in [false, true] {
+            for grok in [false, true] {
+                let text = crate::init::starter_config(opencode, grok);
+                for key in [
+                    "[theme]",
+                    "[routing]",
+                    "[graph]",
+                    "[cursor]",
+                    "[agents]",
+                    "builtin_opencode",
+                    "builtin_grok",
+                ] {
+                    assert!(text.contains(key), "missing {key}");
+                }
+                std::fs::write(&path, &text).unwrap();
+                // No opencode executable here: the example stays a comment.
+                let settings =
+                    DmuxSettings::load_with_opencode(dir.path(), Some(&path), None, None);
+                assert_eq!(
+                    settings,
+                    DmuxSettings::default(),
+                    "opencode={opencode} grok={grok}"
+                );
             }
-            std::fs::write(&path, &text).unwrap();
-            // No opencode executable here: the example stays a comment.
-            let settings = DmuxSettings::load_with_opencode(dir.path(), Some(&path), None, None);
-            assert_eq!(settings, DmuxSettings::default(), "detected={detected}");
         }
     }
 
@@ -1897,5 +2005,220 @@ mod builtin_opencode_tests {
         };
         assert!(settings_env.reduced_motion);
         assert!(settings_env.theme.reduced_motion);
+    }
+}
+
+#[cfg(test)]
+mod builtin_grok_tests {
+    use super::*;
+    use crate::custom_agent::grok_preset;
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn bin_name() -> &'static str {
+        if cfg!(windows) { "grok.exe" } else { "grok" }
+    }
+
+    // TC-890 / FR-890, FR-891
+    #[test]
+    fn builtin_grok_preset_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let user = dir.path().join("user.toml");
+        std::fs::write(&user, "").unwrap();
+
+        let path_dir = dir.path().join("pathbin");
+        let path_bin = path_dir.join(bin_name());
+        touch(&path_bin);
+        let home = dir.path().join("home");
+        let home_bin = home.join(".grok").join("bin").join(bin_name());
+        touch(&home_bin);
+        let explicit = dir.path().join("explicit-grok");
+        touch(&explicit);
+
+        let path_var = Some(std::ffi::OsString::from(path_dir.as_os_str()));
+        let home_only = Some(home.clone());
+
+        // PATH beats the home install.
+        let from_path = find_grok_bin_from(None, path_var.clone(), home_only.clone()).unwrap();
+        assert_eq!(from_path, path_bin);
+
+        // Home is used when PATH misses.
+        let from_home = find_grok_bin_from(None, None, home_only.clone()).unwrap();
+        assert_eq!(from_home, home_bin);
+
+        // An explicit path wins over PATH and home.
+        let from_explicit = find_grok_bin_from(
+            Some(explicit.as_os_str().to_owned()),
+            path_var.clone(),
+            home_only.clone(),
+        )
+        .unwrap();
+        assert_eq!(from_explicit, explicit);
+
+        // A missing DMUXAI_GROK_BIN does not fall through.
+        let missing = dir.path().join("missing-grok");
+        assert!(
+            find_grok_bin_from(
+                Some(missing.as_os_str().to_owned()),
+                path_var.clone(),
+                home_only
+            )
+            .is_none()
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let quiet_home = dir.path().join("quiet-home");
+            let quiet = quiet_home.join(".grok").join("bin").join("grok");
+            touch(&quiet);
+            std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(find_grok_bin_from(None, None, Some(quiet_home)).is_none());
+        }
+
+        let load = |bin: Option<PathBuf>| {
+            DmuxSettings::load_with_runners(&ws, Some(&user), None, None, bin)
+        };
+
+        let settings = load(Some(path_bin.clone()));
+        assert!(settings.builtin_grok);
+        assert_eq!(
+            settings.custom_agents.len(),
+            1,
+            "{:?}",
+            settings.custom_agents
+        );
+        let preset = &settings.custom_agents[0];
+        assert!(preset.builtin);
+        assert_eq!(preset.name, "grok");
+        assert_eq!(preset.command[0], path_bin.to_string_lossy());
+        assert_eq!(
+            preset.command,
+            grok_preset(&path_bin.to_string_lossy()).command
+        );
+        assert_eq!(preset.color.as_deref(), Some("#6366f1"));
+        assert!(
+            settings.config_warnings.is_empty(),
+            "{:?}",
+            settings.config_warnings
+        );
+
+        // Missing binary: no preset and no error.
+        let missing_settings = load(None);
+        assert!(missing_settings.custom_agents.is_empty());
+        assert!(missing_settings.config_warnings.is_empty());
+
+        // A custom entry named grok replaces the preset.
+        std::fs::write(
+            &user,
+            "[[agents.custom]]\nname = \"grok\"\ncommand = [\"my-grok\"]\n",
+        )
+        .unwrap();
+        let replaced = load(Some(path_bin.clone()));
+        assert_eq!(replaced.custom_agents.len(), 1);
+        assert!(!replaced.custom_agents[0].builtin);
+        assert_eq!(replaced.custom_agents[0].command, vec!["my-grok"]);
+
+        // An invalid custom grok still blocks the preset.
+        std::fs::write(&user, "[[agents.custom]]\nname = \"grok\"\n").unwrap();
+        let invalid = load(Some(path_bin.clone()));
+        assert!(invalid.custom_agents.iter().any(|spec| spec.name == "grok"));
+        assert!(invalid.custom_agents.iter().all(|spec| !spec.builtin));
+
+        // builtin_grok = false registers nothing and shows no error.
+        std::fs::write(&user, "").unwrap();
+        std::fs::write(ws.join("dmuxai.toml"), "[agents]\nbuiltin_grok = false\n").unwrap();
+        let disabled = load(Some(path_bin.clone()));
+        assert!(!disabled.builtin_grok);
+        assert!(disabled.custom_agents.is_empty());
+        assert!(
+            disabled.config_warnings.is_empty(),
+            "{:?}",
+            disabled.config_warnings
+        );
+
+        // A flag-only workspace file keeps the user's custom agents.
+        // pi stays before opencode and grok.
+        let opencode_bin = dir.path().join("opencode-bin");
+        touch(&opencode_bin);
+        std::fs::write(
+            &user,
+            "[[agents.custom]]\nname = \"pi\"\ncommand = [\"pi\"]\n",
+        )
+        .unwrap();
+        std::fs::write(ws.join("dmuxai.toml"), "[agents]\nbuiltin_grok = true\n").unwrap();
+        let kept = DmuxSettings::load_with_runners(
+            &ws,
+            Some(&user),
+            None,
+            Some(opencode_bin.clone()),
+            Some(path_bin.clone()),
+        );
+        let names: Vec<&str> = kept
+            .custom_agents
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        assert_eq!(names, ["pi", "opencode", "grok"]);
+        assert!(kept.custom_agents[2].builtin);
+
+        // Workspace flag wins over the user flag.
+        std::fs::write(&user, "[agents]\nbuiltin_grok = false\n").unwrap();
+        std::fs::write(ws.join("dmuxai.toml"), "[agents]\nbuiltin_grok = true\n").unwrap();
+        let workspace_on = load(Some(path_bin.clone()));
+        assert!(workspace_on.builtin_grok);
+        assert!(
+            workspace_on
+                .custom_agents
+                .iter()
+                .any(|spec| spec.builtin && spec.name == "grok")
+        );
+
+        std::fs::write(&user, "[agents]\nbuiltin_grok = true\n").unwrap();
+        std::fs::write(ws.join("dmuxai.toml"), "[agents]\nbuiltin_grok = false\n").unwrap();
+        let workspace_off = load(Some(path_bin.clone()));
+        assert!(!workspace_off.builtin_grok);
+        assert!(workspace_off.custom_agents.is_empty());
+
+        // allowed_runners = ["grok"] is accepted when the preset will be registered.
+        std::fs::write(&user, "").unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            "[graph]\nallowed_runners = [\"grok\", \"cursor\"]\n[theme.agents]\ngrok = \"#112233\"\n",
+        )
+        .unwrap();
+        let listed = load(Some(path_bin.clone()));
+        assert_eq!(
+            listed.graph_allowed_runners,
+            Some(vec!["grok".to_owned(), "cursor".to_owned()])
+        );
+        assert!(
+            listed.config_warnings.is_empty(),
+            "{:?}",
+            listed.config_warnings
+        );
+        assert!(listed.theme.agents.contains_key("grok"));
+
+        let unknown = load(None);
+        assert!(
+            unknown
+                .config_warnings
+                .iter()
+                .any(|warning| warning.contains("unknown runner 'grok'")),
+            "{:?}",
+            unknown.config_warnings
+        );
     }
 }

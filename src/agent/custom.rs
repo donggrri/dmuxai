@@ -8,7 +8,8 @@ use std::{
 
 use dmuxai::custom_agent::{
     BUILTIN_MODELS_TIMEOUT, CustomAgentOutput, CustomAgentSpec, SubstitutionContext, build_argv,
-    failure_reason, list_model_ids, parse_jsonl_line, policy_message, spec_at, substitute,
+    failure_reason, grok_no_allowed_model_message, is_builtin_grok, list_model_ids,
+    parse_jsonl_line, policy_message, select_grok_model, spec_at, substitute,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -88,15 +89,33 @@ struct ActiveTurn {
 
 async fn runtime_loop(
     index: u8,
+    command_rx: mpsc::Receiver<CustomCommand>,
+    event_tx: mpsc::Sender<AgentOutput>,
+    cwd: PathBuf,
+    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
+) {
+    let Some(spec) = spec_at(index) else {
+        return;
+    };
+    runtime_loop_with_spec(
+        Agent::Custom(index),
+        spec,
+        command_rx,
+        event_tx,
+        cwd,
+        mcp_servers,
+    )
+    .await;
+}
+
+async fn runtime_loop_with_spec(
+    agent: Agent,
+    spec: &'static CustomAgentSpec,
     mut command_rx: mpsc::Receiver<CustomCommand>,
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
     mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
 ) {
-    let agent = Agent::Custom(index);
-    let Some(spec) = spec_at(index) else {
-        return;
-    };
     let applicable: Vec<dmuxai::mcp::ResolvedMcpServer> = mcp_servers
         .into_iter()
         .filter(|s| s.applies_to(&spec.name))
@@ -134,7 +153,12 @@ async fn runtime_loop(
                 .await;
             }
             CustomCommand::Send(request) => {
-                if let Err(error) = ensure_builtin_model(spec, &cwd, &mut selected_model).await {
+                let ensured = if is_builtin_grok(spec) {
+                    ensure_grok_model(spec, &cwd, &mut selected_model).await
+                } else {
+                    ensure_builtin_model(spec, &cwd, &mut selected_model).await
+                };
+                if let Err(error) = ensured {
                     let context = OutputContext::from(&request);
                     send(&event_tx, agent, Some(&context), AgentEvent::Error(error)).await;
                     continue;
@@ -155,7 +179,11 @@ async fn runtime_loop(
             CustomCommand::ListModels => {
                 let event = match list_models(spec, &cwd).await {
                     Ok(models) => {
-                        if spec.builtin && selected_model.is_none() {
+                        if is_builtin_grok(spec) {
+                            let ids: Vec<String> =
+                                models.iter().map(|model| model.id.clone()).collect();
+                            selected_model = select_grok_model(&ids, selected_model.as_deref());
+                        } else if spec.builtin && selected_model.is_none() {
                             selected_model = models.first().map(|model| model.id.clone());
                         }
                         AgentEvent::ModelsListed {
@@ -169,7 +197,12 @@ async fn runtime_loop(
                 send(&event_tx, agent, None, event).await;
             }
             CustomCommand::SelectModel(model) => {
-                if let Err(error) = dmuxai::custom_agent::validate_custom_model(spec, &model) {
+                let validated = if is_builtin_grok(spec) {
+                    dmuxai::model_policy::validate_model_for_runner("grok", &model)
+                } else {
+                    dmuxai::custom_agent::validate_custom_model(spec, &model)
+                };
+                if let Err(error) = validated {
                     send(&event_tx, agent, None, AgentEvent::Error(error)).await;
                     continue;
                 }
@@ -189,7 +222,9 @@ async fn runtime_loop(
 async fn list_models(spec: &CustomAgentSpec, cwd: &Path) -> Result<Vec<ModelInfo>, String> {
     let timeout = spec.builtin.then_some(BUILTIN_MODELS_TIMEOUT);
     let mut ids = list_model_ids(spec, cwd, timeout).await?;
-    if let Some(default) = &spec.default_model
+    // Grok never inserts an id that `grok models` did not list (FR-895).
+    if !is_builtin_grok(spec)
+        && let Some(default) = &spec.default_model
         && !ids.contains(default)
     {
         ids.insert(0, default.clone());
@@ -217,6 +252,24 @@ async fn ensure_builtin_model(
         .ok_or_else(|| policy_message(spec, None))?;
     *selected = Some(first);
     Ok(())
+}
+
+/// Grok probes `grok models` on every send, even when a model string is already
+/// filled in (FR-896). Auth and the allowed-id filter run before `grok -p`.
+async fn ensure_grok_model(
+    spec: &CustomAgentSpec,
+    cwd: &Path,
+    selected: &mut Option<String>,
+) -> Result<(), String> {
+    let models = list_models(spec, cwd).await?;
+    let ids: Vec<String> = models.into_iter().map(|model| model.id).collect();
+    match select_grok_model(&ids, selected.as_deref()) {
+        Some(id) => {
+            *selected = Some(id);
+            Ok(())
+        }
+        None => Err(grok_no_allowed_model_message()),
+    }
 }
 
 fn mode_names(mode: ExecutionMode) -> (&'static str, &'static str) {
@@ -837,5 +890,327 @@ temp_config_template = '{"mcp": "not-an-object"}'
         write_private_temp_file(&path, "secret-data", "test").unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    fn fake_grok() -> String {
+        let path = format!("{}/tests/fixtures/fake-grok.sh", env!("CARGO_MANIFEST_DIR"));
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+        path
+    }
+
+    fn grok_spec(env: &[(&str, &str)]) -> &'static CustomAgentSpec {
+        let mut spec = dmuxai::custom_agent::grok_preset(&fake_grok());
+        for (key, value) in env {
+            spec.env.insert((*key).to_owned(), (*value).to_owned());
+        }
+        Box::leak(Box::new(spec))
+    }
+
+    fn request(prompt: &str, resume: Option<&str>) -> AgentRequest {
+        AgentRequest {
+            conversation_id: ConversationId::new("c"),
+            turn_id: TurnId::new("t"),
+            prompt: prompt.to_owned(),
+            resume_session: resume.map(str::to_owned),
+            image_paths: Vec::new(),
+        }
+    }
+
+    async fn drive(
+        spec: &'static CustomAgentSpec,
+    ) -> (
+        mpsc::Sender<CustomCommand>,
+        mpsc::Receiver<AgentOutput>,
+        JoinHandle<()>,
+    ) {
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let worker = tokio::spawn(runtime_loop_with_spec(
+            Agent::Custom(0),
+            spec,
+            command_rx,
+            event_tx,
+            std::env::temp_dir(),
+            Vec::new(),
+        ));
+        (command_tx, event_rx, worker)
+    }
+
+    async fn until_terminal(rx: &mut mpsc::Receiver<AgentOutput>) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let output = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .expect("grok runtime timed out")
+                .expect("grok runtime closed");
+            let done = matches!(
+                output.event,
+                AgentEvent::Completed | AgentEvent::Error(_) | AgentEvent::Cancelled
+            );
+            events.push(output.event);
+            if done {
+                break;
+            }
+        }
+        events
+    }
+
+    fn pgrp(pid: u32) -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = stat.rsplit_once(')')?.1;
+        let mut fields = rest.split_whitespace();
+        let _state = fields.next()?;
+        let _ppid = fields.next()?;
+        fields.next()?.parse().ok()
+    }
+
+    fn still_running(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        matches!(rest.split_whitespace().next(), Some("S" | "R" | "D"))
+    }
+
+    // TC-894 / FR-893, FR-894, FR-895
+    #[tokio::test]
+    async fn grok_mock_turn_returns_text_and_reports_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv_path = dir.path().join("argv.txt");
+        let spec = grok_spec(&[(
+            "GROK_FAKE_ARGV",
+            argv_path.to_str().expect("utf8 temp path"),
+        )]);
+        assert!(spec.builtin && spec.name == "grok");
+        let prompt = "hello; $(rm)";
+        let (tx, mut rx, worker) = drive(spec).await;
+        tx.send(CustomCommand::Send(request(prompt, None)))
+            .await
+            .unwrap();
+        let events = until_terminal(&mut rx).await;
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "OK");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Completed))
+        );
+        let session = "11111111-1111-1111-1111-111111111111";
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ProviderSessionBound(id) if id == session
+            )),
+            "{events:?}"
+        );
+        let argv = std::fs::read_to_string(&argv_path).unwrap();
+        assert!(argv.contains(prompt), "{argv}");
+        assert!(argv.contains("\n-m\ngrok-4.7\n"), "{argv}");
+        assert!(!argv.contains("grok-4.7-build-fast"), "{argv}");
+        assert!(argv.lines().all(|line| line != "sh" && line != "cmd"));
+
+        tx.send(CustomCommand::Send(request(prompt, Some(session))))
+            .await
+            .unwrap();
+        let second = until_terminal(&mut rx).await;
+        assert!(
+            second
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Completed)),
+            "{second:?}"
+        );
+        let argv = std::fs::read_to_string(&argv_path).unwrap();
+        assert!(argv.contains(&format!("\n-r\n{session}\n")), "{argv}");
+        drop(tx);
+        worker.await.unwrap();
+
+        for (mode, needle) in [("fail", "boom"), ("empty", "empty reply")] {
+            let spec = grok_spec(&[("GROK_FAKE_MODE", mode)]);
+            let (tx, mut rx, worker) = drive(spec).await;
+            tx.send(CustomCommand::Send(request(prompt, None)))
+                .await
+                .unwrap();
+            let events = until_terminal(&mut rx).await;
+            let error = events.iter().find_map(|event| match event {
+                AgentEvent::Error(error) => Some(error.as_str()),
+                _ => None,
+            });
+            assert!(
+                error.is_some_and(|error| error.contains(needle)),
+                "{mode}: {events:?}"
+            );
+            drop(tx);
+            worker.await.unwrap();
+        }
+    }
+
+    // TC-897 / FR-896
+    #[tokio::test]
+    async fn grok_unauthenticated_send_explains_login() {
+        let dir = tempfile::tempdir().unwrap();
+        for auth in ["0", "fail"] {
+            let argv_path = dir.path().join(format!("argv-{auth}.txt"));
+            let spec = grok_spec(&[
+                ("GROK_FAKE_AUTH", auth),
+                (
+                    "GROK_FAKE_ARGV",
+                    argv_path.to_str().expect("utf8 temp path"),
+                ),
+            ]);
+            assert!(spec.builtin);
+            assert_eq!(spec.name, "grok");
+            assert!(spec.command.iter().any(|arg| arg == "-p"));
+            let (tx, mut rx, worker) = drive(spec).await;
+            tx.send(CustomCommand::ListModels).await.unwrap();
+            let listed = until_terminal(&mut rx).await;
+            let list_error = listed.iter().find_map(|event| match event {
+                AgentEvent::Error(error) => Some(error.clone()),
+                _ => None,
+            });
+            let list_error = list_error.expect("models error");
+            assert!(list_error.contains("grok login"), "{auth}: {list_error}");
+
+            tx.send(CustomCommand::Send(request("hello; $(rm)", None)))
+                .await
+                .unwrap();
+            let sent = until_terminal(&mut rx).await;
+            let send_error = sent.iter().find_map(|event| match event {
+                AgentEvent::Error(error) => Some(error.clone()),
+                _ => None,
+            });
+            let send_error = send_error.expect("send error");
+            assert!(send_error.contains("grok login"), "{auth}: {send_error}");
+            let argv = std::fs::read_to_string(&argv_path).unwrap_or_default();
+            assert!(!argv.lines().any(|line| line == "-p"), "{auth}: {argv}");
+            drop(tx);
+            worker.await.unwrap();
+        }
+
+        let fast = grok_spec(&[("GROK_FAKE_AUTH", "fast")]);
+        let (tx, mut rx, worker) = drive(fast).await;
+        tx.send(CustomCommand::Send(request("hello", None)))
+            .await
+            .unwrap();
+        let events = until_terminal(&mut rx).await;
+        let error = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::Error(error) => Some(error.as_str()),
+                _ => None,
+            })
+            .expect("fast-only error");
+        assert!(!error.contains("grok login"), "{error}");
+        assert!(error.contains("fast"), "{error}");
+        assert_ne!(error, dmuxai::custom_agent::grok_login_message());
+        drop(tx);
+        worker.await.unwrap();
+    }
+
+    // TC-898 / FR-897
+    #[tokio::test]
+    async fn grok_cancel_kills_the_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let spec = grok_spec(&[
+            ("GROK_FAKE_MODE", "sleep"),
+            (
+                "GROK_FAKE_PIDFILE",
+                pidfile.to_str().expect("utf8 temp path"),
+            ),
+        ]);
+        let (tx, mut rx, worker) = drive(spec).await;
+        tx.send(CustomCommand::Send(request("hello", None)))
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let grandchild = loop {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && pid > 0
+            {
+                break pid;
+            }
+            if started.elapsed() > Duration::from_secs(2) {
+                panic!("grandchild pid was not written");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let leader = pgrp(grandchild).expect("process group");
+        assert!(leader > 0);
+        assert!(still_running(leader));
+        assert!(still_running(grandchild));
+
+        tx.send(CustomCommand::Cancel).await.unwrap();
+        let events = until_terminal(&mut rx).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Cancelled)),
+            "{events:?}"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while still_running(leader) || still_running(grandchild) {
+            if std::time::Instant::now() > deadline {
+                panic!("leader {leader} or grandchild {grandchild} still running");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(tx);
+        worker.await.unwrap();
+    }
+
+    // TC-907 / FR-892, FR-893. Ignored: needs a real logged-in grok. Default
+    // `cargo test` does not run it and must not count it as passed.
+    #[tokio::test]
+    #[ignore = "live grok smoke; requires a logged-in grok binary"]
+    async fn grok_live_smoke_headless_turn() {
+        let Some(bin) = dmuxai::settings::find_grok_bin() else {
+            panic!("grok binary not found");
+        };
+        let spec: &'static CustomAgentSpec = Box::leak(Box::new(
+            dmuxai::custom_agent::grok_preset(&bin.to_string_lossy()),
+        ));
+        let cwd = std::env::temp_dir();
+        let ids = list_model_ids(spec, &cwd, Some(BUILTIN_MODELS_TIMEOUT))
+            .await
+            .unwrap_or_else(|error| panic!("grok models failed: {error}"));
+        assert!(!ids.is_empty(), "logged-in grok listed no allowed model");
+        let (tx, mut rx, worker) = drive(spec).await;
+        tx.send(CustomCommand::Send(request(
+            "Reply with the single word pong.",
+            None,
+        )))
+        .await
+        .unwrap();
+        let events = until_terminal(&mut rx).await;
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!text.trim().is_empty(), "{events:?}");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ProviderSessionBound(id) if !id.is_empty()
+            )),
+            "{events:?}"
+        );
+        drop(tx);
+        worker.await.unwrap();
     }
 }

@@ -57,3 +57,42 @@ fn readme_matches_release_layout() {
         assert!(readme.contains(step), "README is missing: {step}");
     }
 }
+
+// TC-905 / FR-900
+#[test]
+fn readme_and_changelog_mention_builtin_grok() {
+    let readme = read("README.md");
+    let first_run = readme
+        .split("## First run")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("First run section");
+    for needle in [
+        "DMUXAI_GROK_BIN",
+        "~/.grok/bin/grok",
+        "grok-4.7",
+        "fast",
+        "grok login",
+        "builtin_grok",
+        "allowed_runners",
+    ] {
+        assert!(
+            first_run.contains(needle),
+            "First run is missing {needle}: {first_run}"
+        );
+    }
+    let changelog = read("CHANGELOG.md");
+    let unreleased = changelog
+        .split("## Unreleased")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("Unreleased section");
+    assert!(
+        unreleased.contains("grok"),
+        "CHANGELOG must state the new runner"
+    );
+    assert!(
+        unreleased.to_ascii_lowercase().contains("graph"),
+        "CHANGELOG must state the graph exception"
+    );
+}

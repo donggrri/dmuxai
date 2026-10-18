@@ -58,6 +58,7 @@ impl Sandbox {
             .env("HOME", self.root.join("home"))
             .env_remove("DMUXAI_WEB_TOKEN")
             .env_remove("DMUXAI_OPENCODE_BIN")
+            .env_remove("DMUXAI_GROK_BIN")
             .envs(env.iter().map(|(key, value)| (*key, value.clone())))
             .stdin(if stdin.is_some() {
                 Stdio::piped()
@@ -361,6 +362,49 @@ fn fresh_install_lists_opencode() {
         agents.iter().all(|agent| agent["id"] != "opencode"),
         "{json}"
     );
+}
+
+// TC-891 / FR-890, FR-899: a fresh install with grok on PATH lists it and marks
+// it not graph-allowed. An empty PATH and a home without ~/.grok/bin/grok drops it.
+#[cfg(unix)]
+#[test]
+fn fresh_install_lists_grok() {
+    let sandbox = Sandbox::bare();
+    let bin = fake_grok(&sandbox.root);
+    let with_grok = [("PATH", path_with(&bin))];
+    let output = sandbox.run_in_env(&["status", "--json"], None, &with_grok);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = stdout_json(&output);
+    let agents = json["agents"].as_array().unwrap();
+    let grok = agents
+        .iter()
+        .find(|agent| agent["id"] == "grok")
+        .unwrap_or_else(|| panic!("grok missing: {json}"));
+    assert_eq!(grok["allowed"], false, "{json}");
+    let cursor = agents.iter().find(|agent| agent["id"] == "cursor").unwrap();
+    assert_eq!(cursor["allowed"], true);
+
+    let empty_path = [("PATH", OsString::new())];
+    let json = stdout_json(&sandbox.run_in_env(&["status", "--json"], None, &empty_path));
+    let agents = json["agents"].as_array().unwrap();
+    assert!(agents.iter().all(|agent| agent["id"] != "grok"), "{json}");
+}
+
+/// Writes a fake `grok` executable. Registration only checks that the file exists.
+#[cfg(unix)]
+fn fake_grok(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("grok");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
 }
 
 // TC-813 / FR-814: `init` writes the starter file, the file parses cleanly, a
