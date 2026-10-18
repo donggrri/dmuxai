@@ -8,7 +8,7 @@ All notable changes to dmuxai are listed here. Versions follow
 ## [0.2.2] - 2026-10-18
 
 Dashboard layout, workspace and graph view changes requested by Dongjin on
-2026-10-18, PRs #57-#60, #62-#66, #70 and #72 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
+2026-10-18, PRs #57-#60, #62-#66, #70, #72 and #74 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
 issues #54-#56 and #61, plus the grok runner Dongjin added on 2026-10-19). Linux is the supported platform. The Windows target
 still compiles and passes clippy, but the live workspace switch returns 501 on
 Windows (see ROADMAP "Later").
@@ -104,6 +104,26 @@ Windows (see ROADMAP "Later").
   separated by a blank line instead of running together (`text_break_when`).
   [docs/agents/grok-build-delegation.md](docs/agents/grok-build-delegation.md)
   explains how to delegate work to Grok Build with fewer tokens.
+
+- **grok tool calls show as activity (SPEC-grok-runner FR-980, #74).** grok's
+  streaming-json `tool_call` / `tool_call_update` lines now become activity
+  rows (`▸ read src/app.rs`, `▸ run cargo test ✓ 4.2s`) and the TUI status
+  detail, the same way agy and cursor tools do. A long grok turn no longer
+  shows only "running".
+- **Dashboard shows the live activity (SPEC-running-indicators FR-981, #74).**
+  `agents[].activity` carries the TUI status detail; the agent chip and the
+  `Running` pill show it while the turn runs.
+- **Cancelled turns are marked (SPEC-running-indicators FR-982, #74).** After a
+  cancel (Ctrl+C, dashboard Cancel, `/api/command cancel`) the transcript gets
+  one `<agent> turn cancelled.` line after the partial reply, for every runner,
+  and the stored turn is `cancelled`. Before, the adapter's late `Cancelled`
+  event was dropped and no line appeared.
+- **Welcome text lists the registered runners (SPEC-first-run FR-983, #74)**, for
+  example `Runners: cursor, agy, codex, grok.`, instead of a hardcoded
+  "Codex, Cursor, and AGY".
+- **The dashboard token stays in the TUI (SPEC-web-dashboard FR-984, #74).** The
+  `dmuxai dashboard: http://…/?token=…` notice is TUI-only; it is no longer in
+  dashboard snapshots, `/api/state`, SSE, headless output or agent context.
 
 ### CI
 

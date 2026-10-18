@@ -1,6 +1,6 @@
 # REVIEW: v0.2.2 release audit
 
-Date: 2026-10-18 (Asia/Seoul). Base: `main` at a5de430 (#72), plus the release PR.
+Date: 2026-10-18 (Asia/Seoul). Base: `main` at c6a12b8 (#74), plus the release PR.
 
 ## Scope
 
@@ -15,6 +15,7 @@ Milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2): issues #54-#
 | Built-in grok (Grok Build) runner, grok/fast model policy | SPEC-grok-runner, SPEC-model-policy FR-910..912 | #66 (a4c50ae) |
 | TUI conversation picker width (found while preparing the release screens) | SPEC-session-sidebar FR-865 | #70 (f1b36ae) |
 | grok turns no longer hang after the final reply; text around tool calls is separated | SPEC-grok-runner FR-913..917 | #72 (a5de430) |
+| grok tool-call activity, dashboard activity detail, cancel notice for all runners, welcome lists runners, dashboard token kept out of snapshots | SPEC-grok-runner FR-980, SPEC-running-indicators FR-981..982, SPEC-first-run FR-983, SPEC-web-dashboard FR-984 | #74 (c6a12b8) |
 
 The SPECs, PLAN, TASKS and ROADMAP landed in #57 (2374989) and #62 (2d776d5). Also in this release: CI on `ubuntu-latest` (#63, 77ef270) and the `kill -- -<pgid>` fix (MCP server in #63; custom agent, Cursor and Office in #64, 787436b).
 
@@ -42,6 +43,7 @@ Then: CHANGELOG checked against the merged PRs, `scripts/spec-index.sh`, and `te
 - Platform: only Linux was checked by hand. The Windows target compiles and passes clippy in CI. The live workspace switch returns 501 on Windows (ROADMAP "Later").
 - Grok runner (#66): TEST-PLAN rows TC-890..907 and TC-910..912 and the SPEC Status `Implemented (v0.2.2)` were added in this PR. Verified end to end before merge with real grok-4.7 inside `dmuxai --web` (TUI picker and F2 list, dashboard prompt streamed and completed, cancel left no `grok` process); evidence in REVIEW-grok-runner.md, screenshots `grok-runner-*.png`.
 - grok exit fix (#72): root cause was grok 1.0.62 auto-wake queueing a prompt that headless mode never runs after the turn; the preset now sets `GROK_AUTO_WAKE=0` and `--no-wait-for-background`, and the `end` line ends the turn. TEST-PLAN rows TC-913..918 were added in this PR. Evidence, smoke turns and reviewer notes: REVIEW-grok-runner-exit.md.
+- v0.2.2 dogfood fixes (#74): adds FR-980..984 (5 requirements) and TC-980..987 plus TC-816 (9 TCs) across SPEC-grok-runner, SPEC-running-indicators, SPEC-first-run and SPEC-web-dashboard, on top of the counts above. TEST-PLAN rows were added in this PR. Implementation by Grok Build (grok-4.7), review by opencode beam-free (follow-up approved by nemotron-3-ultra-free), live grok-4.7 verification inside dmuxai: see docs/reviews/REVIEW-v022-dogfood.md.
 - Screens: light-theme screenshots of each user-visible change were taken from the release binary with demo data and shown to Dongjin before the tag.
 
 ## Review

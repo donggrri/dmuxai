@@ -352,6 +352,15 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8 | SPEC-grok-runner | FR-915 | TC-916 | `grok_turn_without_end_line_completes_at_exit` | integration | ✅ | v0.2.2 (#72) |
 | M8 | SPEC-grok-runner | FR-916 | TC-917 | `append_reply_text_breaks_paragraphs_once` | unit | ✅ | v0.2.2 (#72) |
 | M8 | SPEC-grok-runner | FR-916 | TC-918 | `grok_text_after_tool_call_starts_new_paragraph` | integration | ✅ | v0.2.2 (#72) |
+| M8 | SPEC-grok-runner | FR-980 | TC-980 | `grok_tool_lines_map_to_activity_items` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-grok-runner | FR-980 | TC-981 | `grok_tool_calls_emit_activity_events` | integration | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-running-indicators | FR-981 | TC-982 | `dashboard_agent_activity_matches_tui_status` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-running-indicators | FR-981 | TC-983 | `dashboard_shows_agent_activity_detail` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-running-indicators | FR-982 | TC-984 | `cancel_appends_one_cancelled_notice_for_every_runner` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-running-indicators | FR-982 | TC-985 | `dashboard_cancel_shows_cancelled_notice` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-first-run | FR-983 | TC-816 | `welcome_lists_registered_runners` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-web-dashboard | FR-984 | TC-986 | `dashboard_snapshot_never_contains_startup_token` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-web-dashboard | FR-984 | TC-987 | `api_snapshots_do_not_echo_token` | integration | ✅ | v0.2.2 (#74) |
 | M8 | SPEC-model-policy | FR-910 | TC-910 | `fast_models_are_rejected_for_every_runner` | unit | ✅ | v0.2.2 |
 | M8 | SPEC-model-policy | FR-911 | TC-911 | `grok_models_are_allowed_only_for_the_grok_runner` | unit | ✅ | v0.2.2 |
 | M8 | SPEC-model-policy | FR-912 | TC-912 | `dmuxai_graph_yaml_keeps_grok_disallow_and_explains_why` | integration | ✅ | v0.2.2 |
