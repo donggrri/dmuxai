@@ -183,9 +183,5 @@ fn workspace_dir_flag_sets_workspace() {
         1,
         "expected exactly one stderr line, got: {stderr:?}"
     );
-    assert_eq!(
-        lines[0],
-        format!("error: -C {missing_str}: does not exist")
-    );
+    assert_eq!(lines[0], format!("error: -C {missing_str}: does not exist"));
 }
-

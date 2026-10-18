@@ -205,7 +205,12 @@ pub fn resolve_workspace_root_with(flag: Option<&Path>) -> io::Result<PathBuf> {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()));
     }
     let user_ws = crate::settings::load_user_workspace_settings();
-    if let Some(dir) = user_ws.dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(dir) = user_ws
+        .dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let expanded = crate::settings::expand_home(dir);
         return validate_workspace_dir(&expanded)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()));
@@ -304,9 +309,7 @@ pub fn build_reexec_args(
         out.push(stripped[i].clone());
         i += 1;
     }
-    if !saw_port
-        && let Some(port) = bound_port
-    {
+    if !saw_port && let Some(port) = bound_port {
         out.push("--port".to_owned());
         out.push(port.to_string());
     }
@@ -586,7 +589,9 @@ mod tests {
 
         // `/` -> `denied: filesystem root`.
         assert_eq!(
-            validate_workspace_dir(Path::new("/")).unwrap_err().to_string(),
+            validate_workspace_dir(Path::new("/"))
+                .unwrap_err()
+                .to_string(),
             "denied: filesystem root"
         );
 
@@ -598,7 +603,9 @@ mod tests {
             "denied: DmuxAI state directory"
         );
         assert_eq!(
-            validate_workspace_dir(&state_child).unwrap_err().to_string(),
+            validate_workspace_dir(&state_child)
+                .unwrap_err()
+                .to_string(),
             "denied: DmuxAI state directory"
         );
 
@@ -606,7 +613,9 @@ mod tests {
         let cfg_child = dmux_cfg_dir.join("sub");
         fs::create_dir_all(&cfg_child).unwrap();
         assert_eq!(
-            validate_workspace_dir(&dmux_cfg_dir).unwrap_err().to_string(),
+            validate_workspace_dir(&dmux_cfg_dir)
+                .unwrap_err()
+                .to_string(),
             "denied: DmuxAI config directory"
         );
         assert_eq!(
@@ -653,8 +662,16 @@ mod tests {
         assert_eq!(
             recent,
             vec![
-                dir_env.canonicalize().unwrap().to_string_lossy().into_owned(),
-                dir_flag.canonicalize().unwrap().to_string_lossy().into_owned(),
+                dir_env
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                dir_flag
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
             ]
         );
 

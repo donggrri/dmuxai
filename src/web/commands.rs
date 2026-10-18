@@ -113,4 +113,3 @@ pub enum DashboardCommand {
         path: std::path::PathBuf,
     },
 }
-

@@ -203,13 +203,15 @@ impl DashboardHub {
             .session
             .get_or_insert_with(SessionView::default);
         let idx = session.transcript.len();
-        session.transcript.push(crate::web::snapshot::SessionMessage {
-            id: format!("notice:{idx}"),
-            role: "system".to_owned(),
-            agent: None,
-            content: notice,
-            streaming: false,
-        });
+        session
+            .transcript
+            .push(crate::web::snapshot::SessionMessage {
+                id: format!("notice:{idx}"),
+                role: "system".to_owned(),
+                agent: None,
+                content: notice,
+                streaming: false,
+            });
         state.snapshot.revision += 1;
         state.snapshot.generated_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -2,7 +2,6 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
@@ -319,7 +318,7 @@ async fn run_turn(
     request: &AgentRequest,
     model: Option<String>,
     mode: ExecutionMode,
-    cwd: &PathBuf,
+    cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
     pgid: &std::sync::atomic::AtomicU32,
@@ -481,9 +480,9 @@ fn kill_group(pgid: u32) {
     if pgid > 0 {
         let _ = std::process::Command::new("kill")
             .args(["-TERM", &format!("-{pgid}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
     }
     #[cfg(not(unix))]

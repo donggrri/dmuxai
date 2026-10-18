@@ -328,11 +328,11 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     match action {
         CliAction::Help => {
             print!("{USAGE}");
-            return Ok(());
+            Ok(())
         }
         CliAction::Version => {
             println!("dmuxai {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
+            Ok(())
         }
         CliAction::Unknown(flag) => {
             eprintln!("error: unexpected argument '{flag}'\n\n{USAGE}");
@@ -340,7 +340,7 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         }
         CliAction::MockMcp => {
             dmuxai::mcp::mock::serve_stdio().await;
-            return Ok(());
+            Ok(())
         }
         CliAction::Usage(message) => {
             eprintln!("error: {message}\n\n{USAGE}");
@@ -350,10 +350,10 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             let code = cli::execute(command).await;
             std::process::exit(code);
         }
-        CliAction::Serve(options) => return run_serve(options).await,
-        CliAction::RunWeb(options) => return run_tui(Some(options)).await,
-        CliAction::McpMemory(options) => return run_mcp_memory(options),
-        CliAction::Run => return run_tui(None).await,
+        CliAction::Serve(options) => run_serve(options).await,
+        CliAction::RunWeb(options) => run_tui(Some(options)).await,
+        CliAction::McpMemory(options) => run_mcp_memory(options),
+        CliAction::Run => run_tui(None).await,
     }
 }
 

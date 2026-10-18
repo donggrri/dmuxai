@@ -1524,10 +1524,12 @@ pub async fn start_server(
     };
 
     let url = dashboard_url(addr, &config.token);
-    let mut switch_cfg = hub.switch_config().unwrap_or_else(|| WorkspaceSwitchConfig {
-        orig_args: std::env::args().skip(1).collect(),
-        ..WorkspaceSwitchConfig::default()
-    });
+    let mut switch_cfg = hub
+        .switch_config()
+        .unwrap_or_else(|| WorkspaceSwitchConfig {
+            orig_args: std::env::args().skip(1).collect(),
+            ..WorkspaceSwitchConfig::default()
+        });
     switch_cfg.bound_port = Some(port);
     hub.set_switch_config(switch_cfg);
     let router = build_router_with(hub, config.token, allowed_hosts, config.services);
@@ -3708,6 +3710,9 @@ mod tests {
 
     // TC-873 (FR-872, FR-873, NFR-870)
     #[tokio::test]
+    // The env lock must span the whole test (HOME/state dir are process-wide);
+    // a current-thread test runtime never contends on it across awaits.
+    #[allow(clippy::await_holding_lock)]
     async fn workspace_api_lists_dirs_and_validates() {
         let _env_guard = crate::state_path::test_env_lock();
         let tmp = tempfile::tempdir().unwrap();
@@ -4006,6 +4011,9 @@ mod tests {
 
     // TC-875 (FR-874)
     #[tokio::test]
+    // The env lock must span the whole test (HOME/state dir are process-wide);
+    // a current-thread test runtime never contends on it across awaits.
+    #[allow(clippy::await_holding_lock)]
     async fn workspace_switch_guards() {
         let _env_guard = crate::state_path::test_env_lock();
         let tmp = tempfile::tempdir().unwrap();
@@ -4258,14 +4266,10 @@ mod tests {
             "failing preflight must clear switch_pending"
         );
         assert!(
-            bad_exe_hub
-                .snapshot()
-                .session
-                .as_ref()
-                .is_some_and(|s| s
-                    .transcript
-                    .iter()
-                    .any(|m| m.content.contains("Workspace switch failed"))),
+            bad_exe_hub.snapshot().session.as_ref().is_some_and(|s| s
+                .transcript
+                .iter()
+                .any(|m| m.content.contains("Workspace switch failed"))),
             "failing preflight must raise a dashboard notice"
         );
 
@@ -4313,7 +4317,10 @@ mod tests {
         let (exit_code, stderr_msg) = recorded_exit.lock().unwrap().clone().unwrap();
         assert_eq!(exit_code, 1);
         assert!(stderr_msg.contains("simulated exec failure"));
-        assert!(stderr_msg.contains(&format!("dmuxai -C {} --web --port 7432", target_ws.display())));
+        assert!(stderr_msg.contains(&format!(
+            "dmuxai -C {} --web --port 7432",
+            target_ws.display()
+        )));
 
         loop_handle.abort();
         match prev_home {
