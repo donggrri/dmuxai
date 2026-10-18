@@ -63,7 +63,7 @@ v0.2.4 does three things, in order:
 
 | ID | Assumption or question | Owner | Needed by |
 | --- | --- | --- | --- |
-| OQ-1000 | `dmuxai serve` becomes interactive by default and `serve --read-only` keeps today's view-only behavior. Alternative: a new `dmuxai web` subcommand and `serve` unchanged. Proposed: default interactive. | Dongjin | Spec approval |
+| OQ-1000 | `dmuxai serve` becomes interactive by default and `serve --read-only` keeps today's behavior (no session; to-dos and memory writable, Docs read-only). Alternative: a new `dmuxai web` subcommand and `serve` unchanged. Proposed: default interactive. | Dongjin | Spec approval |
 | OQ-1001 | `dmuxai` with no arguments: after removal it starts `serve` and opens the browser (like the Windows launcher), or prints usage. Proposed: start `serve` and print the URL; open the browser only with `--open`. | Dongjin | Before FR-1031 |
 | OQ-1002 | Deprecation length: one release (v0.2.4 deprecates, v0.2.5 removes) or remove in v0.2.4 once the parity test is green. Proposed: deprecate in v0.2.4, remove in the next release. | Dongjin | Before FR-1030 |
 | OQ-1003 | Keyboard shortcuts in the browser: F2/F3 are often taken by the browser/OS. Proposed: `Alt+M` model, `Alt+C` conversations, `Esc` twice or `Ctrl+.` cancel, `Ctrl+O` details; all shown in the palette hints. | Dongjin | UX-1000 |
@@ -104,7 +104,7 @@ palette (`src/web/assets/session.js:650-705`).
 | S9 | `/summarize` | `app.rs:7200` `summary_prompt` | palette | full | — |
 | S10 | `/compact [focus]` | alias of S9 | palette | full | — |
 | S11 | `/share` | `app.rs:3263` | Share menu `session.js:301` | full | — |
-| S12 | `/image <path>` | `app.rs:2643` `attach_image_path` | palette asks for a **workspace path** only (`session.js:671`) | partial | browser upload / drop / paste, FR-1010 |
+| S12 | `/image <path>` | `app.rs:2643` `attach_image_path` | palette asks for a **workspace path** (`session.js:671`), which the core attaches like the TUI; no file picker, drop or paste upload | partial | browser upload / drop / paste, FR-1010 |
 | S13 | `/details` | `app.rs:3739` `toggle_all_activity_details` | Details button `session.js:300` flips the flag and the button state, but `session_view` always sends each activity's collapsed line (`app.rs:1590-1592`), so nothing expands in the browser | partial | FR-1011 |
 | S14 | `/remember` | `app.rs:4313` | palette + Memory panel (`memory.js`) | full | — |
 | S15 | `/memory [approve\|reject]` | `app.rs:4358` | palette + Memory panel approve/reject routes (`server.rs:1495-1502`) | full | — |
