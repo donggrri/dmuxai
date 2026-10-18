@@ -1,10 +1,10 @@
 # REVIEW: v0.2.2 release audit
 
-Date: 2026-10-18 (Asia/Seoul). Base: `main` at 8c6b999 (#65), plus the release PR.
+Date: 2026-10-18 (Asia/Seoul). Base: `main` at a4c50ae (#66), plus the release PR.
 
 ## Scope
 
-Milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2): issues #54-#56 and #61.
+Milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2): issues #54-#56 and #61, plus the built-in grok runner (#66, added to v0.2.2 by Dongjin on 2026-10-19 00:00 KST).
 
 | Issue | SPEC | PR (squash SHA) |
 | --- | --- | --- |
@@ -12,14 +12,15 @@ Milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2): issues #54-#
 | #55 Left sessions sidebar, TUI picker running mark | SPEC-session-sidebar | #59 (6147561) |
 | #56 Workspace directory (`-C`, header path, switch dialog) | SPEC-workspace-dir | #60 (e0c988f) |
 | #61 Horizontal swimlane graph view | SPEC-graph-swimlane | #65 (8c6b999) |
+| Built-in grok (Grok Build) runner, grok/fast model policy | SPEC-grok-runner, SPEC-model-policy FR-910..912 | #66 (a4c50ae) |
 
 The SPECs, PLAN, TASKS and ROADMAP landed in #57 (2374989) and #62 (2d776d5). Also in this release: CI on `ubuntu-latest` (#63, 77ef270) and the `kill -- -<pgid>` fix (MCP server in #63; custom agent, Cursor and Office in #64, 787436b).
 
-Not in this release: the grok runner (#66), the plan approval gate (#67) and the dashboard parity spec (#68). They are open PRs and are not on `main`.
+Not in this release: the plan approval gate (#67) and the dashboard parity spec (#68). They are open PRs and are not on `main`.
 
 ## Method
 
-These are the v0.2.1 checks 1-4, run by a throwaway script over the four SPECs:
+These are the v0.2.1 checks 1-4, run by a throwaway script over the five SPECs (plus the SPEC-model-policy FR-910..912 rows):
 
 1. Every FR/NFR/UX row names a TC.
 2. Every TC has a TEST-PLAN row that is not ⏳.
@@ -30,13 +31,14 @@ Then: CHANGELOG checked against the merged PRs, `scripts/spec-index.sh`, and `te
 
 ## Result
 
-- Four SPECs, 25 requirements, 23 TCs. Each TC has a ✅ TEST-PLAN row and each named test exists. All four SPECs say `Implemented (v0.2.2)`, and TASKS-v0.2.2 rows 0-13 are done (row 14, the release itself, is checked off after the tag).
+- Five SPECs, 37 requirements, 41 TCs (four SPECs with 25 requirements and 23 TCs, plus SPEC-grok-runner with 12 requirements and 18 TCs), and SPEC-model-policy FR-910..912 / TC-910..912. Each TC has a ✅ TEST-PLAN row and each named test exists. All five SPECs say `Implemented (v0.2.2)`, and TASKS-v0.2.2 rows 0-13 are done (row 14, the release itself, is checked off after the tag).
 - Fixed in this PR:
   - the CHANGELOG had no entry for the `kill --` fix or the CI change, so it gets `Fixed` and `CI` sections;
   - the Unreleased section becomes `[0.2.2] - 2026-10-18`, with a Linux-only platform note and a compare link;
   - ROADMAP rows 1-3 said `planned` although #58-#60 had merged; they now name the PR and SHA, and row 5 (release) is added;
   - the PLAN-v0.2.2 Status and Specs line (SPEC-graph-swimlane was missing), and TASKS-v0.2.2 row 14 (release, open until the tag).
 - Platform: only Linux was checked by hand. The Windows target compiles and passes clippy in CI. The live workspace switch returns 501 on Windows (ROADMAP "Later").
+- Grok runner (#66): TEST-PLAN rows TC-890..907 and TC-910..912 and the SPEC Status `Implemented (v0.2.2)` were added in this PR. Verified end to end before merge with real grok-4.7 inside `dmuxai --web` (TUI picker and F2 list, dashboard prompt streamed and completed, cancel left no `grok` process); evidence in REVIEW-grok-runner.md, screenshots `grok-runner-*.png`.
 - Screens: light-theme screenshots of each user-visible change were taken from the release binary with demo data and shown to Dongjin before the tag.
 
 ## Review

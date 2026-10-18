@@ -1,6 +1,6 @@
 # SPEC: Built-in grok runner
 
-Status: Implemented
+Status: Implemented (v0.2.2)
 Owner: DmuxAI
 Created: 2026-10-18
 Baseline: `787436b`

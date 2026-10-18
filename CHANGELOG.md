@@ -8,14 +8,14 @@ All notable changes to dmuxai are listed here. Versions follow
 ## [0.2.2] - 2026-10-18
 
 Dashboard layout, workspace and graph view changes requested by Dongjin on
-2026-10-18, PRs #57-#60 and #62-#65 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
-issues #54-#56 and #61). Linux is the supported platform. The Windows target
+2026-10-18, PRs #57-#60 and #62-#66 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
+issues #54-#56 and #61, plus the grok runner Dongjin added on 2026-10-19). Linux is the supported platform. The Windows target
 still compiles and passes clippy, but the live workspace switch returns 501 on
 Windows (see ROADMAP "Later").
 
 ### Added
 
-- **Built-in grok runner (SPEC-grok-runner FR-890..FR-900).** When `grok` is on
+- **Built-in grok runner (SPEC-grok-runner FR-890..FR-900, SPEC-model-policy FR-910..FR-912, #66).** When `grok` is on
   `PATH`, `DMUXAI_GROK_BIN` names it, or `~/.grok/bin/grok` is executable, DmuxAI
   adds a headless `grok` chat runner (`grok -p` with streaming-json). Models are
   `grok-*` without `fast` and default to `grok-4.7`. A logged-out CLI still lists
@@ -23,7 +23,9 @@ Windows (see ROADMAP "Later").
   and an `[[agents.custom]]` entry named `grok` replaces it. With
   `allowed_runners` unset, this built-in preset takes no graph nodes until
   `grok` is listed. A machine that has grok installed gains the chat runner and
-  does not gain grok graph nodes until that list includes it.
+  does not gain grok graph nodes until that list includes it. Model policy:
+  any id containing `fast` is rejected for every runner, `grok-*` ids only on
+  the grok runner, and Cursor stays `composer-2.5` only.
 
 - **Horizontal swimlane graph view (SPEC-graph-swimlane FR-880..FR-885, UX-880, UX-881, #61).**
   The Graph view's subway map is replaced by a timeline: one lane per runner
