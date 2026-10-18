@@ -91,7 +91,7 @@ const GROK_EXAMPLE: &str = r##"# Built-in grok runner, as an editable [[agents.c
 # name = "grok"
 # label = "grok"
 # color = "#6366f1"
-# command = ["grok", "-p", "{prompt}", "-m", "{model}", "--cwd", "{workspace}", "--output-format", "streaming-json"]
+# command = ["grok", "-p", "{prompt}", "-m", "{model}", "--cwd", "{workspace}", "--output-format", "streaming-json", "--no-wait-for-background"]
 # prompt_via = "arg"
 # models_command = ["grok", "models"]
 # allowed_models = "(?i)^grok-[a-z0-9][a-z0-9._-]*$"
@@ -101,6 +101,10 @@ const GROK_EXAMPLE: &str = r##"# Built-in grok runner, as an editable [[agents.c
 # session_id_path = "/sessionId"
 # resume_arg = ["-r", "{session_id}"]
 # timeout_secs = 900
+# done_when = { path = "/type", equals = "end" }
+# text_break_when = { path = "/type", equals = "tool_call" }
+# [agents.custom.env]
+# GROK_AUTO_WAKE = "0"
 # [agents.custom.modes]
 # ask = ["--permission-mode", "plan"]
 # plan = ["--permission-mode", "plan"]

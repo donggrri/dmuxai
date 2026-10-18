@@ -474,7 +474,10 @@ async fn run_turn(
     let mut reply = String::new();
     let mut jsonl_error: Option<String> = None;
     let mut bound_session: Option<String> = None;
+    let mut break_pending = false;
+    let mut done = false;
     let mut lines = BufReader::new(stdout).lines();
+    let pgid_value = || pgid.load(std::sync::atomic::Ordering::SeqCst);
     let read = async {
         while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
             match spec.output {
@@ -498,14 +501,30 @@ async fn run_turn(
                         .await;
                     }
                     if let Some(text) = parsed.text {
-                        reply.push_str(&text);
-                        send(event_tx, agent, Some(context), AgentEvent::TextDelta(text)).await;
+                        let chunk = dmuxai::custom_agent::append_reply_text(
+                            &mut reply,
+                            &text,
+                            &mut break_pending,
+                        );
+                        send(event_tx, agent, Some(context), AgentEvent::TextDelta(chunk)).await;
+                    }
+                    if parsed.text_break {
+                        break_pending = true;
                     }
                     if let Some(error) = parsed.error {
                         jsonl_error = Some(error);
                     }
+                    if parsed.done {
+                        // FR-914: the provider said the turn is over. Do not wait
+                        // for EOF: a leftover child can hold stdout open.
+                        done = true;
+                        break;
+                    }
                 }
             }
+        }
+        if done {
+            return Ok(finish_after_done(&mut child, pgid_value()).await);
         }
         child.wait().await.map_err(|e| e.to_string())
     };
@@ -515,10 +534,14 @@ async fn run_turn(
             kill_group(pgid.load(std::sync::atomic::Ordering::SeqCst));
             format!("{} timed out after {}s", spec.label(), spec.timeout_secs())
         })??;
-    let stderr_text = stderr_task.await.unwrap_or_default();
+    // A leftover child that inherited stderr must not block the turn either.
+    let stderr_text = match tokio::time::timeout(STDERR_DRAIN_GRACE, stderr_task).await {
+        Ok(joined) => joined.unwrap_or_default(),
+        Err(_) => String::new(),
+    };
     match failure_reason(
         spec,
-        status.success(),
+        done || status.success(),
         &reply,
         &stderr_text,
         jsonl_error.as_deref(),
@@ -528,18 +551,68 @@ async fn run_turn(
     }
 }
 
+/// How long the process may take to exit on its own after its `done_when` line.
+const DONE_EXIT_GRACE: Duration = Duration::from_secs(3);
+/// How long SIGTERM gets before SIGKILL when stopping a finished turn's group.
+const TERM_GRACE: Duration = Duration::from_secs(2);
+/// How long stderr may stay open after the process exited.
+const STDERR_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// After the `done_when` line (FR-914): wait briefly for a normal exit, then
+/// stop the whole process group (TERM, then KILL) so neither the runner nor a
+/// child it left behind keeps the turn open. The turn's success does not
+/// depend on how the process ended, because the provider already finished it.
+async fn finish_after_done(
+    child: &mut tokio::process::Child,
+    pgid: u32,
+) -> std::process::ExitStatus {
+    let status = match tokio::time::timeout(DONE_EXIT_GRACE, child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        _ => None,
+    };
+    // Reap leftovers in the group even after a clean exit of the leader.
+    kill_group(pgid);
+    if let Some(status) = status {
+        return status;
+    }
+    match tokio::time::timeout(TERM_GRACE, child.wait()).await {
+        Ok(Ok(status)) => status,
+        _ => {
+            kill_group_with(pgid, "-KILL");
+            let _ = child.start_kill();
+            child.wait().await.unwrap_or_else(|_| exit_status_ok())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn exit_status_ok() -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(0)
+}
+
+#[cfg(not(unix))]
+fn exit_status_ok() -> std::process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(0)
+}
+
 fn kill_group(pgid: u32) {
+    kill_group_with(pgid, "-TERM");
+}
+
+fn kill_group_with(pgid: u32, signal: &str) {
     #[cfg(unix)]
     if pgid > 0 {
         let _ = std::process::Command::new("kill")
-            .args(["-TERM", "--", &format!("-{pgid}")])
+            .args([signal, "--", &format!("-{pgid}")])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
     }
     #[cfg(not(unix))]
-    let _ = pgid;
+    let _ = (pgid, signal);
 }
 
 async fn stop_turn(agent: Agent, turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
@@ -1170,6 +1243,126 @@ temp_config_template = '{"mcp": "not-an-object"}'
         }
         drop(tx);
         worker.await.unwrap();
+    }
+
+    fn texts(events: &[AgentEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn completed(events: &[AgentEvent]) -> bool {
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Completed))
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn read_pid(pidfile: &std::path::Path) -> u32 {
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(pidfile)
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && pid > 0
+            {
+                return pid;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "child pid was not written"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_gone(pid: u32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while still_running(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process {pid} still running after the turn"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Runs one mock turn in `mode` and returns its events, the elapsed time,
+    /// and the pid of the child the mock left holding stdout.
+    #[cfg(target_os = "linux")]
+    async fn lingering_turn(mode: &str) -> (Vec<AgentEvent>, Duration, u32) {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        let spec = grok_spec(&[
+            ("GROK_FAKE_MODE", mode),
+            (
+                "GROK_FAKE_PIDFILE",
+                pidfile.to_str().expect("utf8 temp path"),
+            ),
+        ]);
+        let (tx, mut rx, worker) = drive(spec).await;
+        let started = std::time::Instant::now();
+        tx.send(CustomCommand::Send(request("hello", None)))
+            .await
+            .unwrap();
+        let events = until_terminal(&mut rx).await;
+        let elapsed = started.elapsed();
+        let child = read_pid(&pidfile).await;
+        drop(tx);
+        worker.await.unwrap();
+        (events, elapsed, child)
+    }
+
+    // TC-914 / FR-914: the end line finishes the turn although the runner
+    // idles afterwards and a child still holds stdout. Both are stopped.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn grok_end_line_finishes_turn_and_reaps_group() {
+        let (events, elapsed, child) = lingering_turn("linger").await;
+        assert!(completed(&events), "{events:?}");
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+        assert_gone(child).await;
+    }
+
+    // TC-915 / FR-914: a runner that exits right after the end line while a
+    // child keeps stdout open completes without the grace period, and the
+    // child is stopped.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn grok_orphan_holding_stdout_does_not_block_turn() {
+        let (events, elapsed, child) = lingering_turn("orphan").await;
+        assert_eq!(texts(&events), "OK");
+        assert!(completed(&events), "{events:?}");
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        assert_gone(child).await;
+    }
+
+    // TC-916 / FR-915: without an end line the turn still ends at EOF and exit.
+    #[tokio::test]
+    async fn grok_turn_without_end_line_completes_at_exit() {
+        let spec = grok_spec(&[("GROK_FAKE_MODE", "noend")]);
+        let (tx, mut rx, worker) = drive(spec).await;
+        tx.send(CustomCommand::Send(request("hello", None)))
+            .await
+            .unwrap();
+        let events = until_terminal(&mut rx).await;
+        assert_eq!(texts(&events), "OK");
+        assert!(completed(&events), "{events:?}");
+        drop(tx);
+        worker.await.unwrap();
+    }
+
+    // TC-918 / FR-916: text split around a tool call streams with a paragraph
+    // break, so "Checking" and "Done." do not run together.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn grok_text_after_tool_call_starts_new_paragraph() {
+        let (events, _, _) = lingering_turn("linger").await;
+        assert_eq!(texts(&events), "Checking\n\nDone.");
     }
 
     // TC-907 / FR-892, FR-893. Ignored: needs a real logged-in grok. Default
