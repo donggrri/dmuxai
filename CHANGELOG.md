@@ -7,10 +7,10 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## [0.2.2] - 2026-10-18
 
-Dashboard layout and workspace release from Dongjin's 2026-10-18 requests,
-PRs #57-#65 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
+Dashboard layout, workspace and graph view changes requested by Dongjin on
+2026-10-18, PRs #57-#60 and #62-#65 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
 issues #54-#56 and #61). Linux is the supported platform. The Windows target
-still compiles and passes clippy, but the live workspace switch answers 501 on
+still compiles and passes clippy, but the live workspace switch returns 501 on
 Windows (see ROADMAP "Later").
 
 ### Added
@@ -79,7 +79,7 @@ Windows (see ROADMAP "Later").
 
 ### Fixed
 
-- **Process-group kill on Unix (#63, #64).** `kill` now receives `--` before
+- **Process-group kill on Unix (#63 for the MCP server, #64 for the rest).** `kill` now receives `--` before
   the negative process-group id when DmuxAI stops a custom agent, a Cursor
   warm process, the MCP server's children, or an Office conversion. Without
   it, some `kill` builds read `-<pgid>` as an option and left the group running.
