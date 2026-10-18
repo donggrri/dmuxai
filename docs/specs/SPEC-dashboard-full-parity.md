@@ -83,81 +83,81 @@ equivalent, or a TUI-only concern that disappears with the TUI.
 | R1 | Interactive session without a terminal | `src/main.rs:606` `run_tui` always builds a ratatui `Terminal`; `src/app.rs:1187-1279` `App::run` mixes the core loop with `event::poll` and `terminal.draw` | `dmuxai serve` (`src/main.rs:437-566`) has **no session**: `SnapshotSource::Files`, `commands: None` (`:491`), Docs `read_only = true` (`:467`), no App and no agents (to-do CRUD/import and memory save/approve/reject do work, `:486-512`); `POST /api/prompt` and `/api/command` answer 409 "requires dmuxai --web" (`src/web/server.rs:929-931`, `:970-972`); to-do Run 409 (`:875-876`) | **missing** | headless interactive serve, FR-1000..1004 |
 | R2 | `dmuxai --web` (TUI + dashboard) | `src/main.rs:164-165` parse, `:354` dispatch, `:729-830` `attach_web_dashboard` | the only interactive dashboard mode; needs a TTY | partial | becomes `serve`, FR-1000, FR-1031 |
 | R3 | Dashboard command channel | `src/main.rs:738-747`: the `DashboardCommand` channel is created only when the to-do DB opens | if the to-do DB fails, prompts and pickers are 409 even under `--web` | partial (coupling bug) | FR-1003 |
-| R4 | Headless one-shot CLI: `run`, `todo add/list/run`, `status`, `events`, `mcp`, `mcp-memory`, `init` | `src/main.rs:349-356` dispatch, `src/cli.rs:523-611`, `src/app.rs:4721` `App::run_headless` | not a TUI feature; already terminal-free | full | keep; `run_headless` is the model for FR-1001 |
+| R4 | Headless one-shot CLI: `run`, `todo add/list/run`, `status`, `events`, `mcp`, `mcp-memory`, `init` | `src/main.rs:349-356` dispatch, `src/cli.rs:524-612`, `src/app.rs:4749` `App::run_headless` | not a TUI feature; already terminal-free | full | keep; `run_headless` is the model for FR-1001 |
 | R5 | Workspace switch (dashboard dialog, re-exec) and directory browse | no TUI switcher (`-C` only, `src/main.rs:296-317`); re-exec `:678-724` | works only under `--web`; `serve` answers 403 (`server.rs:1199`, `:1228`, `:1341`) | partial | FR-1000 (switch re-execs `serve`) |
 
-### 3.2 Slash commands (`SLASH_COMMANDS`, `src/app.rs:113-189`, plus `/graph` at `:2842`)
+### 3.2 Slash commands (`SLASH_COMMANDS`, `src/app.rs:113-189`, plus `/graph` at `:2860`)
 
 All are mapped in `src/web/parity.rs:20-136` and reachable from the Ctrl+K
 palette (`src/web/assets/session.js:650-705`).
 
 | # | Command | TUI source | Dashboard | Status | Gap |
 | --- | --- | --- | --- | --- | --- |
-| S1 | `/agent` | `app.rs:2263` | Agent picker `session.js:266` | full | — |
-| S2 | `/mode` | `app.rs:2337` | Mode picker `session.js:269` | full | — |
-| S3 | `/effort` | `app.rs:2565` | Effort picker `session.js:287` | full | — |
+| S1 | `/agent` | `app.rs:2280` | Agent picker `session.js:266` | full | — |
+| S2 | `/mode` | `app.rs:2355` | Mode picker `session.js:269` | full | — |
+| S3 | `/effort` | `app.rs:2583` | Effort picker `session.js:287` | full | — |
 | S4 | `/status` | `SessionCommand::Status` | Status button `session.js:299` | full | — |
-| S5 | `/quit` | `SessionCommand::Quit` (`app.rs:1862`) | Quit button + confirm `session.js:303` | full | semantics in serve, FR-1004 |
+| S5 | `/quit` | `SessionCommand::Quit` (`app.rs:1863`) | Quit button + confirm `session.js:303` | full | semantics in serve, FR-1004 |
 | S6 | `/new` | `create_conversation` | New button `session.js:298`, sessions sidebar | full | — |
-| S7 | `/conversations` | `app.rs:2269` | sessions sidebar (SPEC-session-sidebar) | full | — |
+| S7 | `/conversations` | `app.rs:2286` | sessions sidebar (SPEC-session-sidebar) | full | — |
 | S8 | `/resume <id>` | `select_conversation` | sidebar Load (`resume`) `session.js:592` | full | — |
-| S9 | `/summarize` | `app.rs:7200` `summary_prompt` | palette | full | — |
+| S9 | `/summarize` | `app.rs:7228` `summary_prompt` | palette | full | — |
 | S10 | `/compact [focus]` | alias of S9 | palette | full | — |
-| S11 | `/share` | `app.rs:3263` | Share menu `session.js:301` | full | — |
-| S12 | `/image <path>` | `app.rs:2643` `attach_image_path` | palette asks for a **workspace path** (`session.js:671`), which the core attaches like the TUI; no file picker, drop or paste upload | partial | browser upload / drop / paste, FR-1010 |
-| S13 | `/details` | `app.rs:3739` `toggle_all_activity_details` | Details button `session.js:300` flips the flag and the button state, but `session_view` always sends each activity's collapsed line (`app.rs:1590-1592`), so nothing expands in the browser | partial | FR-1011 |
-| S14 | `/remember` | `app.rs:4313` | palette + Memory panel (`memory.js`) | full | — |
-| S15 | `/memory [approve\|reject]` | `app.rs:4358` | palette + Memory panel approve/reject routes (`server.rs:1495-1502`) | full | — |
-| S16 | `/graph [status\|continue\|override]` | `app.rs:2842-2854`, `:4087-4122` | palette only (`session.js:688-695`); the graph view has no Continue button or override form, and its gate hint says `Type /graph continue in the TUI to proceed.` (`app.js:1217-1227`); the `Allowed runners:` line exists only as the `/graph` system message | partial | gate controls in the graph view, FR-1014 |
-| S17 | `//text` (send a literal leading slash) | `app.rs:2732` | handled by the same core path via `POST /api/prompt` | full | — |
+| S11 | `/share` | `app.rs:3281` | Share menu `session.js:301` | full | — |
+| S12 | `/image <path>` | `app.rs:2661` `attach_image_path` | palette asks for a **workspace path** (`session.js:671`), which the core attaches like the TUI; no file picker, drop or paste upload | partial | browser upload / drop / paste, FR-1010 |
+| S13 | `/details` | `app.rs:3757` `toggle_all_activity_details` | Details button `session.js:300` flips the flag and the button state, but `session_view` always sends each activity's collapsed line (`app.rs:1590-1592`), so nothing expands in the browser | partial | FR-1011 |
+| S14 | `/remember` | `app.rs:4341` | palette + Memory panel (`memory.js`) | full | — |
+| S15 | `/memory [approve\|reject]` | `app.rs:4386` | palette + Memory panel approve/reject routes (`server.rs:1495-1502`) | full | — |
+| S16 | `/graph [status\|continue\|override]` | `app.rs:2860-2872`, `:4105-4150` | palette only (`session.js:688-695`); the graph view has no Continue button or override form, and its gate hint says `Type /graph continue in the TUI to proceed.` (`app.js:1690-1700`); the `Allowed runners:` line exists only as the `/graph` system message | partial | gate controls in the graph view, FR-1014 |
+| S17 | `//text` (send a literal leading slash) | `app.rs:2750` | handled by the same core path via `POST /api/prompt` | full | — |
 
-### 3.3 Key bindings (`App::handle_key`, `src/app.rs:1995-2057`, pickers `:2059-2620`)
+### 3.3 Key bindings (`App::handle_key`, `src/app.rs:1996-2058`, pickers `:2060-2638`)
 
 | # | Key | TUI action | Dashboard | Status | Gap |
 | --- | --- | --- | --- | --- | --- |
-| K1 | Enter | submit (`app.rs:2042`) | Enter sends (`session.js:393`) | full | — |
-| K2 | Shift+Enter | not a TUI binding: `handle_key` submits on Enter regardless of Shift (`app.rs:2042`); multiline only via paste. `parity.rs:26-30` lists it as a TUI key by mistake | dashboard inserts a newline | n/a | fix the `parity.rs` row label in FR-1020 |
+| K1 | Enter | submit (`app.rs:2043`) | Enter sends (`session.js:393`) | full | — |
+| K2 | Shift+Enter | not a TUI binding: `handle_key` submits on Enter regardless of Shift (`app.rs:2043`); multiline only via paste. `parity.rs:26-30` lists it as a TUI key by mistake | dashboard inserts a newline | n/a | fix the `parity.rs` row label in FR-1020 |
 | K3 | Esc | close overlay | closes palette/pickers/sidebar (`session.js:358,396,760,815`) | full | — |
-| K4 | Ctrl+C | cancel the selected agent's turn (`app.rs:1996`, `:3150`) | Cancel button only (`session.js:295`) | partial | shortcut, UX-1000 |
-| K5 | Ctrl+O | toggle the **last** activity group (`app.rs:2000`, `:3728`) | Details toggles **all** groups (`app.rs:1861`) | partial | per-group expand + shortcut, FR-1011, UX-1000 |
-| K6 | F2 | model picker (`app.rs:2040`, `:2437`) | Model picker click only | partial | shortcut, UX-1000 |
-| K7 | F3 | conversation picker (`app.rs:2041`) | sessions sidebar click only | partial | shortcut, UX-1000 |
-| K8 | Ctrl+V / Alt+V | attach clipboard image (`app.rs:2029-2035`, `:2686`, `src/clipboard_image.rs`) | none | **missing** | FR-1010 |
-| K9 | `/` + Up/Down/Tab/Enter | slash preview (`app.rs:2059-2090`, draw `:6411`) | `/` in an empty box opens the palette (`session.js:336-341`), filter and arrows (`:797-823`); Tab does not run a row | full | — |
-| K10 | Picker Up/Down/Enter/Esc; Tab in the Codex model picker jumps to effort (`app.rs:2499-2541`) | native `<select>` pickers; effort is its own picker | full | — |
+| K4 | Ctrl+C | cancel the selected agent's turn (`app.rs:1997`, `:3168`) | Cancel button only (`session.js:295`) | partial | shortcut, UX-1000 |
+| K5 | Ctrl+O | toggle the **last** activity group (`app.rs:2001`, `:3746`) | Details toggles **all** groups (`app.rs:1862`) | partial | per-group expand + shortcut, FR-1011, UX-1000 |
+| K6 | F2 | model picker (`app.rs:2041`, `:2455`) | Model picker click only | partial | shortcut, UX-1000 |
+| K7 | F3 | conversation picker (`app.rs:2042`) | sessions sidebar click only | partial | shortcut, UX-1000 |
+| K8 | Ctrl+V / Alt+V | attach clipboard image (`app.rs:2030-2036`, `:2704`, `src/clipboard_image.rs`) | none | **missing** | FR-1010 |
+| K9 | `/` + Up/Down/Tab/Enter | slash preview (`app.rs:2060-2091`, draw `:6439`) | `/` in an empty box opens the palette (`session.js:336-341`), filter and arrows (`:797-823`); Tab does not run a row | full | — |
+| K10 | Picker Up/Down/Enter/Esc; Tab in the Codex model picker jumps to effort (`app.rs:2517-2559`) | native `<select>` pickers; effort is its own picker | full | — |
 | K11 | Backspace, typing | edit the input | native textarea | n/a | — |
 
-### 3.4 Mouse and paste (`App::handle_mouse` `src/app.rs:2143-2207`, `handle_paste` `:1976-1993`)
+### 3.4 Mouse and paste (`App::handle_mouse` `src/app.rs:2144-2208`, `handle_paste` `:1977-1994`)
 
 | # | Feature | TUI source | Dashboard | Status | Gap |
 | --- | --- | --- | --- | --- | --- |
-| M1 | Drag-select chat text, copy to clipboard, "Copied N characters" notice | `app.rs:2229-2249`, `src/chat_selection.rs`, `src/clipboard.rs:8` | native browser selection and copy | n/a | — |
-| M2 | Click a file path/link in the chat to open it | `app.rs:2152`, `:4459` `open_file_link_at`, `:6579` | transcript is plain text (`session.js:483-551`, `textContent`); no links | **missing** | FR-1012 |
-| M3 | Drag the input's top border to resize | `app.rs:2257` | textarea `resize: vertical` (`session.css:30`) | n/a | — |
-| M4 | Wheel scroll | `app.rs:2197-2204` | native scroll with stick-to-bottom (`session.js:317`) | n/a | — |
-| M5 | Paste a single image path → attach it | `app.rs:1978-1984` | pasted as text | **missing** | FR-1010 |
-| M6 | Paste ending with a newline auto-submits | `app.rs:1986-1992` | — | n/a | — |
+| M1 | Drag-select chat text, copy to clipboard, "Copied N characters" notice | `app.rs:2230-2250`, `src/chat_selection.rs`, `src/clipboard.rs:8` | native browser selection and copy | n/a | — |
+| M2 | Click a file path/link in the chat to open it | `app.rs:2153`, `:4487` `open_file_link_at`, `:6607` | transcript is plain text (`session.js:483-551`, `textContent`); no links | **missing** | FR-1012 |
+| M3 | Drag the input's top border to resize | `app.rs:2258` | textarea `resize: vertical` (`session.css:30`) | n/a | — |
+| M4 | Wheel scroll | `app.rs:2198-2205` | native scroll with stick-to-bottom (`session.js:317`) | n/a | — |
+| M5 | Paste a single image path → attach it | `app.rs:1979-1985` | pasted as text | **missing** | FR-1010 |
+| M6 | Paste ending with a newline auto-submits | `app.rs:1987-1993` | — | n/a | — |
 
-### 3.5 Panels and display (`App::draw`, `src/app.rs:5320-5343`)
+### 3.5 Panels and display (`App::draw`, `src/app.rs:5348-5371`)
 
 | # | Panel | TUI source | Dashboard | Status | Gap |
 | --- | --- | --- | --- | --- | --- |
-| P1 | Chat transcript, agent colors, streaming | `draw_chat` `app.rs:5418` | transcript with agent color edge and streaming class (`session.js:483-551`) | full | — |
-| P2 | Activity groups (tools/thinking) with collapse/expand and `[ui] show_tools`/`show_thinking` | `render_activity_group` `app.rs:5671-5750` | activity messages are plain text; no per-group expand; `[ui]` settings ignored | partial | FR-1011 |
-| P3 | Graph status line above the input (`Graph i/n · role · runner model · state`) | `app.rs:5345-5368`, `:5651` | graph view / swimlane (`app.js`, SPEC-graph-swimlane) | full | — |
-| P4 | Status bar: state badge with spinner and elapsed, model, mode, effort, **activity detail**, **other agents' activity**, **graph assignment line**, **notice slot** (`copy_notice`, also used for background-conversation notices such as a failed save, `app.rs:5312-5316`) | `draw_status` `app.rs:5819-5970` | agent chips with running/elapsed (`app.js:1266-1315`), pickers show model/mode/effort; no activity detail, no other-agents summary, no assignment line, background-conversation notices never reach the page | partial | FR-1013 |
-| P5 | Attachments chip line in the prompt title | `draw_input` `app.rs:5757-5765` | none (no `pending_images` in the snapshot) | **missing** | FR-1010 |
-| P6 | Model picker with catalog loading, policy filter, Codex effort | `app.rs:5972`, `:2437-2560` | Model picker + "Load models…" | full | — |
-| P7 | Effort / agent / mode / conversation pickers | `app.rs:6067`, `:6181`, `:6338`, `:6250` | pickers + sidebar with running mark | full | — |
+| P1 | Chat transcript, agent colors, streaming | `draw_chat` `app.rs:5446` | transcript with agent color edge and streaming class (`session.js:483-551`) | full | — |
+| P2 | Activity groups (tools/thinking) with collapse/expand and `[ui] show_tools`/`show_thinking` | `render_activity_group` `app.rs:5699-5778` | activity messages are plain text; no per-group expand; `[ui]` settings ignored | partial | FR-1011 |
+| P3 | Graph status line above the input (`Graph i/n · role · runner model · state`) | `app.rs:5373-5396`, `:5679` | graph view / swimlane (`app.js`, SPEC-graph-swimlane) | full | — |
+| P4 | Status bar: state badge with spinner and elapsed, model, mode, effort, **activity detail**, **other agents' activity**, **graph assignment line**, **notice slot** (`copy_notice`, also used for background-conversation notices such as a failed save, `app.rs:5340-5344`) | `draw_status` `app.rs:5847-5998` | agent chips with running/elapsed (`app.js:1739-1788`), pickers show model/mode/effort; no activity detail, no other-agents summary, no assignment line, background-conversation notices never reach the page | partial | FR-1013 |
+| P5 | Attachments chip line in the prompt title | `draw_input` `app.rs:5785-5793` | none (no `pending_images` in the snapshot) | **missing** | FR-1010 |
+| P6 | Model picker with catalog loading, policy filter, Codex effort | `app.rs:6000`, `:2455-2578` | Model picker + "Load models…" | full | — |
+| P7 | Effort / agent / mode / conversation pickers | `app.rs:6095`, `:6209`, `:6366`, `:6278` | pickers + sidebar with running mark | full | — |
 | P8 | Startup notices, welcome/help text, system messages | `push_startup_notice`, `app.rs:1002` | transcript `system` messages | full | help text names TUI keys, FR-1032 |
-| P9 | Sensitive-step gate prompt (`Gate: confirm … with /graph continue`) | `app.rs:3971`, `:4108` | system message + palette `/graph continue` | partial | FR-1014 |
+| P9 | Sensitive-step gate prompt (`Gate: confirm … with /graph continue`) | `app.rs:3989`, `:4136` | system message + palette `/graph continue` | partial | FR-1014 |
 
 ### 3.6 Settings (`src/settings.rs`)
 
 | # | Setting | Used by | Status | Gap |
 | --- | --- | --- | --- | --- |
 | C1 | `[theme]` TUI colors, `force_color`, `DMUXAI_FORCE_COLOR`, `NO_COLOR` (`settings.rs:52-53`, `src/theme.rs`) | TUI rendering only; `[web] theme/accent` is the dashboard's | n/a | deprecate with the TUI, FR-1032 |
-| C2 | `[ui] show_tools`, `show_thinking` (`src/activity.rs:110-115`) | TUI activity rendering only (`app.rs:5686-5713`) | **missing** | FR-1011 |
+| C2 | `[ui] show_tools`, `show_thinking` (`src/activity.rs:110-115`) | TUI activity rendering only (`app.rs:5714-5741`) | **missing** | FR-1011 |
 | C3 | `reduced_motion` | TUI spinner and dashboard (`hub.set_ui`, `main.rs:516-520`) | full | — |
 | C4 | `[cursor] prewarm*`, `[graph]`, `[routing]`, `[memory]`, `[notify]` delivery, `[[agents.custom]]`, `builtin_opencode`, `[mcp]`, `[todo]`, `[workspace]` | core (App) | full under `--web`; **not running** under `serve` (no App, no `EventSink`, so no webhook/command hooks and no custom agents; workspace browse/switch answer 403, `server.rs:1228`, `:1341`). The TUI never edited these either, so no settings editor is required | full | covered by R1 / FR-1001. Side finding: `[routing] cursor_models` is parsed but never read |
 
@@ -206,9 +206,9 @@ keyboard shortcuts (K4-K7); the `--web` command channel tied to the to-do DB
 | FR-1003 | Must | Given the to-do DB fails to open | Then the dashboard command channel still exists: prompts, pickers and conversations work; only `/api/todos*` answer 503 with the error | — | TC-1004 |
 | FR-1004 | Must | Given `/quit` or the Quit button under interactive `serve` | Then after the confirm dialog the server shuts down as in FR-1002 and the page shows "DmuxAI stopped" | — | TC-1005 |
 | FR-1010 | Must | Given the dashboard prompt box | Then an image can be attached by file picker, drag-and-drop, or pasting an image (clipboard) or a single image path. `POST /api/attachments` first validates like `/image` (extension and sniffed type png/jpg/jpeg/webp, at most `DEFAULT_MAX_IMAGE_BYTES` 10 MiB, `src/attachments.rs:9`, `:81-113`), then writes the bytes into `attachments_dir` through one shared helper that also replaces the PNG-only, unvalidated `save_attachment` (`src/clipboard_image.rs:78-84`). The snapshot lists `session.pending_images[]` (`id`, `name`, `bytes`) and the prompt box shows chips; `SessionCommand::RemoveAttachment { id }` removes one | Unsupported type or oversize → 400 with the TUI's message; unknown attachment id → 404; uploads need the dashboard token; non-loopback binds accept uploads only with `--allow-remote` (already required) | TC-1010, TC-1011 |
-| FR-1011 | Must | Given activity in the transcript | Then the snapshot carries activity groups (`id`, `kind` tool/thinking, `summary`, `lines`, `expanded`) built by the same core function the TUI uses. State model (same as `render_activity_group`, `app.rs:5671-5750`): a group is shown expanded when its own flag is set, or `details_expanded` is on, or `show_tools = expanded`; `show_tools = hidden` omits tool groups; `show_thinking = live` includes thinking items while they stream and after, `collapsed` includes them only once finished (`finished_ms` set, `app.rs:5693-5697`), `hidden` omits them. Click toggles the group's own flag (`toggle_group {id}`); `toggle_details` flips `details_expanded`; `toggle_last_details` (Ctrl+O) flips the last group's own flag | Hidden groups are omitted from the snapshot | TC-1012 |
+| FR-1011 | Must | Given activity in the transcript | Then the snapshot carries activity groups (`id`, `kind` tool/thinking, `summary`, `lines`, `expanded`) built by the same core function the TUI uses. State model (same as `render_activity_group`, `app.rs:5699-5778`): a group is shown expanded when its own flag is set, or `details_expanded` is on, or `show_tools = expanded`; `show_tools = hidden` omits tool groups; `show_thinking = live` includes thinking items while they stream and after, `collapsed` includes them only once finished (`finished_ms` set, `app.rs:5721-5725`), `hidden` omits them. Click toggles the group's own flag (`toggle_group {id}`); `toggle_details` flips `details_expanded`; `toggle_last_details` (Ctrl+O) flips the last group's own flag | Hidden groups are omitted from the snapshot | TC-1012 |
 | FR-1012 | Should | Given a workspace file path or link in an agent message | Then the snapshot marks it as a link (same detector as `open_file_link_at`) and the dashboard opens it in the Docs preview (OQ-1004); http(s) URLs are links too (new-tab behavior checked in the manual browser run) | Paths outside the workspace are not linked (`docs::confine`) | TC-1013 |
-| FR-1013 | Should | Given the selected agent | Then the dashboard header shows the same status segments as the TUI status bar: badge (state, spinner, elapsed), model, mode, effort, current activity detail, other agents' activity and the graph assignment line, by moving the existing `StatusSegments` / `fit_status_segments` (`app.rs:5910-5923`) into the core and reusing them, not a second API | Narrow widths truncate in the same order as `fit_status_segments` | TC-1014 |
+| FR-1013 | Should | Given the selected agent | Then the dashboard header shows the same status segments as the TUI status bar: badge (state, spinner, elapsed), model, mode, effort, current activity detail, other agents' activity and the graph assignment line, by moving the existing `StatusSegments` / `fit_status_segments` (`app.rs:5938-5951`) into the core and reusing them, not a second API | Narrow widths truncate in the same order as `fit_status_segments` | TC-1014 |
 | FR-1014 | Must | Given a graph waiting at a sensitive-step gate | Then the graph view shows the gate reason (the hint no longer mentions the TUI) and the allowed-runners line, with **Continue** and **Override…** (runner + model pickers limited by `allowed_runners` and model policy), calling the same core paths as `/graph continue` and `/graph override` | No gate → buttons hidden; disallowed runner or model → 403 with the policy message | TC-1015 |
 | FR-1020 | Must | Given the parity table in `src/web/parity.rs` | Then it gains rows for keys, mouse, panels and settings with status `full`/`n-a`/`pending`; `tui_features_have_dashboard_controls` fails when a `TUI_FEATURES` entry has no row or a `full` row's control id is missing from the assets. Because `TUI_FEATURES` is hand-written, a second test scans `handle_key`, `handle_mouse` and `handle_paste` in `src/app.rs` for `KeyCode::`/`MouseEventKind::` arms and fails when one is not in `TUI_FEATURES` | `n-a` rows need a reason; `pending` rows are allowed until the removal PR, which requires zero `pending` | TC-1020 |
 | FR-1021 | Must | Given features merged after this spec (grok runner #66, plan gate #67, diff review sidebar, world model) | Then each has a dashboard control and a parity row before the TUI removal PR may merge | The removal PR's checklist lists them | TC-1020, manual review |
