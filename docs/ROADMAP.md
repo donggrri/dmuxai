@@ -1,19 +1,20 @@
 # dmuxai roadmap
 
-Release history is in [CHANGELOG.md](../CHANGELOG.md). Each item links its SPEC (the contract) and its GitHub issue (status). GitHub milestones: [v0.2.1](https://github.com/donggrri/dmuxai/milestone/1) (released), [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2).
+Release history is in [CHANGELOG.md](../CHANGELOG.md). Each item links its SPEC (the contract) and its GitHub issue (status). GitHub milestones: [v0.2.1](https://github.com/donggrri/dmuxai/milestone/1) (released), [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2) (release PR open).
 
-## v0.2.2 (in progress)
+## v0.2.2 (release PR open; tag after Dongjin's OK)
 
 Source: Dongjin, 2026-10-18 09:42 KST.
 
 | # | Item | Kind | SPEC (IDs) | Issue | Status |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Prompt box stays centered with sidebars open | UX | [SPEC-centered-prompt](specs/SPEC-centered-prompt.md) (FR-850..852, UX-850) | [#54](https://github.com/donggrri/dmuxai/issues/54) | planned |
-| 2 | Left sidebar of sessions/conversations (ChatGPT-style), TUI picker parity | UX | [SPEC-session-sidebar](specs/SPEC-session-sidebar.md) (FR-860..864, UX-860) | [#55](https://github.com/donggrri/dmuxai/issues/55) | planned |
-| 3 | Set the project working directory (CLI, config, dashboard) | feature | [SPEC-workspace-dir](specs/SPEC-workspace-dir.md) (FR-870..875, NFR-870) | [#56](https://github.com/donggrri/dmuxai/issues/56) | planned |
-| 4 | Graph view: horizontal swimlane timeline (replaces the subway map) | UX | [SPEC-graph-swimlane](specs/SPEC-graph-swimlane.md) (FR-880..885, UX-880..881) | [#61](https://github.com/donggrri/dmuxai/issues/61) | merged ([#65](https://github.com/donggrri/dmuxai/pull/65)) |
+| 1 | Prompt box stays centered with sidebars open | UX | [SPEC-centered-prompt](specs/SPEC-centered-prompt.md) (FR-850..852, UX-850) | [#54](https://github.com/donggrri/dmuxai/issues/54) | merged #58 (b224c50) |
+| 2 | Left sidebar of sessions/conversations (ChatGPT-style), TUI picker parity | UX | [SPEC-session-sidebar](specs/SPEC-session-sidebar.md) (FR-860..864, UX-860) | [#55](https://github.com/donggrri/dmuxai/issues/55) | merged #59 (6147561) |
+| 3 | Set the project working directory (CLI, config, dashboard) | feature | [SPEC-workspace-dir](specs/SPEC-workspace-dir.md) (FR-870..875, NFR-870) | [#56](https://github.com/donggrri/dmuxai/issues/56) | merged #60 (e0c988f) |
+| 4 | Graph view: horizontal swimlane timeline (replaces the subway map) | UX | [SPEC-graph-swimlane](specs/SPEC-graph-swimlane.md) (FR-880..885, UX-880..881) | [#61](https://github.com/donggrri/dmuxai/issues/61) | merged #65 (8c6b999) |
+| 5 | Release v0.2.2: CHANGELOG, version bump, release audit, tag, verify the Linux asset | release | — | — | release PR; tag `v0.2.2` on its merge commit after Dongjin reviews the screens |
 
-Order: 1 → 2 → 3 → 4 (1 and 2 share the layout; 2 and 3 both touch the header). No release in this round.
+Order: 1 → 2 → 3 → 4 (1 and 2 share the layout; 2 and 3 both touch the header). The release waits for all of 1–4 and for Dongjin's OK on the screens.
 
 ## v0.2.1 (released 2026-10-18)
 

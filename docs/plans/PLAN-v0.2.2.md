@@ -1,7 +1,7 @@
 # PLAN: v0.2.2
 
-Status: Draft (v0.2.2)
-Specs: SPEC-centered-prompt, SPEC-session-sidebar, SPEC-workspace-dir. Roadmap: [docs/ROADMAP.md](../ROADMAP.md)
+Status: implemented in v0.2.2 (release PR open)
+Specs: SPEC-centered-prompt, SPEC-session-sidebar, SPEC-workspace-dir, SPEC-graph-swimlane. Roadmap: [docs/ROADMAP.md](../ROADMAP.md)
 
 ## Process
 

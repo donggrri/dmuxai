@@ -5,6 +5,14 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+## [0.2.2] - 2026-10-18
+
+Dashboard layout and workspace release from Dongjin's 2026-10-18 requests,
+PRs #57-#65 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
+issues #54-#56 and #61). Linux is the supported platform. The Windows target
+still compiles and passes clippy, but the live workspace switch answers 501 on
+Windows (see ROADMAP "Later").
+
 ### Added
 
 - **Built-in grok runner (SPEC-grok-runner FR-890..FR-900).** When `grok` is on
@@ -71,27 +79,12 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
-- **grok tool calls show as activity (SPEC-grok-runner FR-980).** grok's
-  streaming-json `tool_call` / `tool_call_update` lines now become activity
-  rows (`▸ read src/app.rs`, `▸ run cargo test ✓ 4.2s`) and the TUI status
-  detail, the same way agy and cursor tools do. A long grok turn no longer
-  shows only "running".
-- **Dashboard shows the live activity (SPEC-running-indicators FR-981).**
-  `agents[].activity` carries the TUI status detail; the agent chip and the
-  `Running` pill show it while the turn runs.
-- **Cancelled turns are marked (SPEC-running-indicators FR-982).** After a
-  cancel (Ctrl+C, dashboard Cancel, `/api/command cancel`) the transcript gets
-  one `<agent> turn cancelled.` line after the partial reply, for every runner,
-  and the stored turn is `cancelled`. Before, the adapter's late `Cancelled`
-  event was dropped and no line appeared.
-- **Welcome text lists the registered runners (SPEC-first-run FR-983)**, for
-  example `Runners: cursor, agy, codex, grok.`, instead of a hardcoded
-  "Codex, Cursor, and AGY".
-- **The dashboard token stays in the TUI (SPEC-web-dashboard FR-984).** The
-  `dmuxai dashboard: http://…/?token=…` notice is TUI-only; it is no longer in
-  dashboard snapshots, `/api/state`, SSE, headless output or agent context.
+- **Process-group kill on Unix (#63, #64).** `kill` now receives `--` before
+  the negative process-group id when DmuxAI stops a custom agent, a Cursor
+  warm process, the MCP server's children, or an Office conversion. Without
+  it, some `kill` builds read `-<pgid>` as an option and left the group running.
 
-- **grok turns no longer hang after the final reply (SPEC-grok-runner FR-913..FR-916).**
+- **grok turns no longer hang after the final reply (SPEC-grok-runner FR-913..FR-917, #72).**
   In grok 1.0.62, a background command that finished during a turn queued an
   auto-wake prompt that headless `grok -p` never ran, so the process idled
   forever after its `end` line. The grok preset now sets `GROK_AUTO_WAKE=0` and
@@ -102,6 +95,12 @@ All notable changes to dmuxai are listed here. Versions follow
   separated by a blank line instead of running together (`text_break_when`).
   [docs/agents/grok-build-delegation.md](docs/agents/grok-build-delegation.md)
   explains how to delegate work to Grok Build with fewer tokens.
+
+### CI
+
+- Verify runs on `ubuntu-latest`, cancels superseded runs, and skips the Rust
+  job for docs-only changes and for draft PRs (it runs when a PR is marked
+  ready) (#63).
 
 ## [0.2.1] - 2026-10-18
 
@@ -309,5 +308,6 @@ Changes since v0.1.1 (2026-08-24), PRs #1-#38.
   - the non-Windows `dmuxai-launcher` stub (#17)
   - bash-only spec-index tests are gated on Windows (#24)
 
+[0.2.2]: https://github.com/donggrri/dmuxai/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/donggrri/dmuxai/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/donggrri/dmuxai/compare/v0.1.1...v0.2.0
