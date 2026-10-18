@@ -121,6 +121,12 @@ pub struct SessionConversation {
     pub id: String,
     pub title: String,
     pub updated_at_ms: u64,
+    #[serde(default)]
+    pub last_agent: Option<String>,
+    #[serde(default)]
+    pub turn_count: u64,
+    #[serde(default)]
+    pub running: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -563,5 +569,40 @@ mod tests {
         assert_eq!(truncated.chars().count(), 201);
         assert!(truncated.ends_with('…'));
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    // TC-860 / FR-860: SessionConversation new fields serialize and legacy JSON without them deserializes.
+    #[test]
+    fn session_conversation_fields_roundtrip() {
+        let conv = SessionConversation {
+            id: "conv-123".to_string(),
+            title: "Refactor sidebar".to_string(),
+            updated_at_ms: 1_700_000_000_000,
+            last_agent: Some("Cursor".to_string()),
+            turn_count: 4,
+            running: true,
+        };
+        let json = serde_json::to_string(&conv).unwrap();
+        assert!(json.contains("\"last_agent\":\"Cursor\""), "{json}");
+        assert!(json.contains("\"turn_count\":4"), "{json}");
+        assert!(json.contains("\"running\":true"), "{json}");
+
+        let roundtrip: SessionConversation = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, conv);
+
+        // Legacy payload without last_agent, turn_count, running still deserializes with defaults.
+        let legacy = r#"{"id":"conv-old","title":"Legacy chat","updated_at_ms":42}"#;
+        let parsed: SessionConversation = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            parsed,
+            SessionConversation {
+                id: "conv-old".to_string(),
+                title: "Legacy chat".to_string(),
+                updated_at_ms: 42,
+                last_agent: None,
+                turn_count: 0,
+                running: false,
+            }
+        );
     }
 }

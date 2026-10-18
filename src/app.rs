@@ -1450,11 +1450,29 @@ impl App {
             .ok_or_else(|| RunTodoError::UnknownAgent(format!("unknown agent '{raw}'")))
     }
 
+    fn agent_key_display_name(&self, key: AgentKey) -> String {
+        match key {
+            AgentKey::Codex | AgentKey::Cursor | AgentKey::Agy => key.to_string(),
+            AgentKey::Custom(index) => self
+                .custom_spec(index)
+                .map(|spec| spec.label().to_owned())
+                .unwrap_or_else(|| key.to_string()),
+        }
+    }
+
     /// The live chat session for the dashboard (SPEC-dashboard-parity FR-780).
     fn session_view(&mut self) -> SessionView {
+        const SESSION_CONVERSATIONS_MAX: usize = 200;
         let conversation_id = self.conversation_id.as_str().to_owned();
         let refresh = match &self.session_conversations {
-            Some((at, id, _)) => *id != conversation_id || at.elapsed() >= Duration::from_secs(5),
+            Some((at, id, list)) => {
+                let ttl = if list.iter().any(|c| c.running) {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_secs(5)
+                };
+                *id != conversation_id || at.elapsed() >= ttl
+            }
             None => true,
         };
         if refresh {
@@ -1462,15 +1480,31 @@ impl App {
                 .engine
                 .list()
                 .map(|cards| {
-                    cards
-                        .into_iter()
-                        .take(50)
-                        .map(|card| SessionConversation {
+                    let mut ordered =
+                        Vec::with_capacity(cards.len().min(SESSION_CONVERSATIONS_MAX));
+                    let mut rest = Vec::with_capacity(cards.len());
+                    for card in cards {
+                        let entry = SessionConversation {
                             id: card.id.as_str().to_owned(),
                             title: card.title,
                             updated_at_ms: card.updated_at_ms.max(0) as u64,
-                        })
-                        .collect()
+                            last_agent: card
+                                .last_agent
+                                .map(|agent| self.agent_key_display_name(agent)),
+                            turn_count: card.turn_count,
+                            running: card.running,
+                        };
+                        if entry.id == conversation_id && ordered.is_empty() {
+                            ordered.push(entry);
+                        } else {
+                            rest.push(entry);
+                        }
+                    }
+                    ordered.extend(
+                        rest.into_iter()
+                            .take(SESSION_CONVERSATIONS_MAX.saturating_sub(ordered.len())),
+                    );
+                    ordered
                 })
                 .unwrap_or_default();
             self.session_conversations = Some((Instant::now(), conversation_id.clone(), list));
@@ -3011,6 +3045,7 @@ impl App {
                     },
                 );
                 self.busy_agents.insert(agent);
+                self.session_conversations = None;
                 let node = self.active_graph_node_for_agent(agent);
                 self.run_states.insert(
                     agent,
@@ -3042,6 +3077,7 @@ impl App {
                 if let Err(save_error) = self.engine.record_turn_outputs(&[failed]) {
                     self.push_system(format!("Could not save send failure: {save_error}"));
                 }
+                self.session_conversations = None;
                 if restore_input_on_failure {
                     self.input = prompt;
                 }
@@ -3112,6 +3148,7 @@ impl App {
     fn restore_snapshot(&mut self, snapshot: ConversationSnapshot) {
         self.conversation_id = snapshot.id;
         self.conversation_title = snapshot.title;
+        self.session_conversations = None;
         for adapter in &self.adapters {
             let _ = adapter.reset();
         }
@@ -3701,6 +3738,7 @@ impl App {
         }
         self.agent_lifecycle.remove(&agent);
         self.busy_agents.remove(&agent);
+        self.session_conversations = None;
         if let Ok(mut starts) = self.busy_fallback_starts.lock() {
             starts.remove(&agent);
         }
@@ -6187,10 +6225,12 @@ impl App {
                 };
                 let agent = card
                     .last_agent
-                    .map(|agent| agent.to_string())
+                    .map(|agent| self.agent_key_display_name(agent))
                     .unwrap_or_else(|| "none".to_owned());
+                // FR-864: the running mark leads the row so a narrow picker never cuts it off.
+                let running = if card.running { "● running  " } else { "" };
                 ListItem::new(format!(
-                    "{current} {}  [{}]  {} turns  {agent}  {}",
+                    "{current} {running}{}  [{}]  {} turns  {agent}  {}",
                     card.title,
                     short_id(card.id.as_str()),
                     card.turn_count,
@@ -13369,6 +13409,133 @@ mod tests {
             fixture.read_spawns().len(),
             1,
             "headless run executed exactly 1 turn and spawned no warm process afterwards"
+        );
+    }
+
+    #[test]
+    // TC-861 / FR-860: session_conversations_report_running_and_agent
+    fn session_conversations_report_running_and_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("conversations.sqlite3");
+        let engine = ConversationEngine::open(&db_path, dir.path()).unwrap();
+        let (mut app, _sent) = test_app_with_engine(engine);
+        let first_id = app.conversation_id.clone();
+
+        // Complete a Cursor turn in the first conversation.
+        app.selected = adapter_index(Agent::Cursor);
+        app.input = "first conversation prompt".to_owned();
+        app.submit_prompt();
+        let active_first = app
+            .active_turns
+            .get(&Agent::Cursor)
+            .cloned()
+            .expect("cursor turn active");
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Cursor,
+            conversation_id: Some(ConversationId::new(active_first.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(active_first.turn_id.as_str())),
+            event: AgentEvent::Completed,
+        }));
+
+        // Start a second conversation with an in-flight Codex turn.
+        std::thread::sleep(Duration::from_millis(5));
+        app.create_conversation(Some("running conversation".to_owned()));
+        let second_id = app.conversation_id.clone();
+        app.selected = adapter_index(Agent::Codex);
+        app.input = "in flight prompt".to_owned();
+        app.submit_prompt();
+
+        // Switch back to the older first conversation so it is active while the second is running.
+        app.select_conversation(first_id.clone());
+        let view = app.session_view();
+        assert_eq!(view.conversations.len(), 2);
+        assert_eq!(view.conversations[0].id, first_id.as_str());
+        assert_eq!(view.conversations[0].last_agent.as_deref(), Some("Cursor"));
+        assert_eq!(view.conversations[0].turn_count, 1);
+        assert!(!view.conversations[0].running);
+
+        assert_eq!(view.conversations[1].id, second_id.as_str());
+        assert_eq!(view.conversations[1].last_agent.as_deref(), Some("Codex"));
+        assert_eq!(view.conversations[1].turn_count, 1);
+        assert!(view.conversations[1].running);
+
+        // Add more than 200 conversations and verify active-first ordering, updated_at desc for the rest, and cap of 200.
+        for index in 0..205 {
+            let _ = app
+                .engine
+                .select(ConversationSelection::New {
+                    title: Some(format!("extra-{index}")),
+                })
+                .unwrap();
+        }
+        app.select_conversation(first_id.clone());
+        let capped = app.session_view();
+        assert_eq!(capped.conversations.len(), 200);
+        assert_eq!(capped.conversations[0].id, first_id.as_str());
+        for pair in capped.conversations[1..].windows(2) {
+            assert!(
+                pair[0].updated_at_ms >= pair[1].updated_at_ms,
+                "expected descending updated_at_ms: {:?} vs {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    // TC-864 / FR-864: conversation_picker_shows_agent_time_running
+    fn conversation_picker_shows_agent_time_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("conversations.sqlite3");
+        let engine = ConversationEngine::open(&db_path, dir.path()).unwrap();
+        let (mut app, _sent) = test_app_with_engine(engine);
+
+        // First conversation: completed Cursor turn.
+        app.selected = adapter_index(Agent::Cursor);
+        app.input = "done task".to_owned();
+        app.submit_prompt();
+        let active_first = app
+            .active_turns
+            .get(&Agent::Cursor)
+            .cloned()
+            .expect("cursor turn active");
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Cursor,
+            conversation_id: Some(ConversationId::new(active_first.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(active_first.turn_id.as_str())),
+            event: AgentEvent::Completed,
+        }));
+
+        // Second conversation: in-flight Codex turn.
+        app.create_conversation(Some("busy task".to_owned()));
+        app.selected = adapter_index(Agent::Codex);
+        app.input = "still working".to_owned();
+        app.submit_prompt();
+
+        app.open_conversation_picker();
+        assert!(app.conversation_picker.is_some());
+
+        let rendered = render_test_buffer(&mut app);
+        let busy_line = rendered
+            .lines()
+            .find(|line| line.contains("busy task") && line.contains("turns"))
+            .unwrap_or_else(|| panic!("missing busy task row in:\n{rendered}"));
+        assert!(busy_line.contains("Codex"), "{busy_line}");
+        assert!(busy_line.contains("just now"), "{busy_line}");
+        assert!(
+            busy_line.contains('●') && busy_line.contains("running"),
+            "expected running mark on busy row: {busy_line}"
+        );
+
+        let done_line = rendered
+            .lines()
+            .find(|line| line.contains("done task") && line.contains("turns"))
+            .unwrap_or_else(|| panic!("missing done task row in:\n{rendered}"));
+        assert!(done_line.contains("Cursor"), "{done_line}");
+        assert!(done_line.contains("just now"), "{done_line}");
+        assert!(
+            !done_line.contains("running"),
+            "completed row must not show running mark: {done_line}"
         );
     }
 }

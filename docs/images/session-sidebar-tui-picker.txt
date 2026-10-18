@@ -1,0 +1,30 @@
+┌ New conversation [1568c4b7] ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│DmuxAI                                                                                                                                    │
+│Codex, Cursor, and AGY use real structured headless protocols. Completed turns are shared automatically with every agent; /share is       │
+│optional. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /effort to choose Codex reasoning effort, /status to  │
+│view Codex usage, F2 to choose a model, F3 to load a conversation, or Ctrl+C to cancel the selected turn. Implement mode may modify files │
+│inside the workspace.                                                                                                                     │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                               ┌ Conversations ───────────────────────────────────────────────────────────┐                               │
+│                               │> * New conversation  [1568c4b7]  0 turns  none  just now                 │                               │
+│                               │    ● running  headless: Fix flaky table test  [ecdd3343]  1 turns  demo-a│                               │
+│                               │    headless: Fix flaky table test  [d45e5e77]  1 turns  demo-agent  just │                               │
+│                               │    headless: Add CSV export to reports  [3a7ae96d]  1 turns  demo-agent  │                               │
+│                               │    New conversation  [cca7a2f6]  0 turns  none  just now                 │                               │
+│                               │    New conversation  [ce6443b8]  0 turns  none  just now                 │                               │
+│                               │    New conversation  [b84d8e92]  0 turns  none  1m ago                   │                               │
+│                               │    headless: Write the SPEC for PDF export  [5cd55935]  1 turns  demo-age│                               │
+│                               │    headless: Why is the table test flaky?  [b802903a]  1 turns  demo-agen│                               │
+│                               │    headless: Plan the CSV export for reports  [3de7458b]  1 turns  demo-a│                               │
+│                               │    New conversation  [6eb04869]  0 turns  none  1m ago                   │                               │
+│                               └ Up/Down move  Enter load  Esc close ─────────────────────────────────────┘                               │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Prompt (drag top border) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Cursor IDLE   IDLE  Model: composer-2.5  Effort: provider default  Mode: Ask  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close

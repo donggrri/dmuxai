@@ -1,6 +1,6 @@
 # SPEC: session-sidebar
 
-Status: Draft (v0.2.2)
+Status: Implemented (v0.2.2)
 Created: 2026-10-18
 Related: issue #55; Dongjin 2026-10-18 09:42 KST ("a left sidebar listing sessions like ChatGPT"); SPEC-dashboard-parity (session panel, `load_conversation`, `new_conversation`); SPEC-multi-instance-workspace (shared conversation list, live turns per process); SPEC-running-indicators (run state)
 
@@ -27,6 +27,17 @@ Decision: move the list into a collapsible **left sidebar**, like ChatGPT's. It 
 - The `data-parity="conversations"` marker (SPEC-dashboard-parity TC-786, TC-787) moves with the list to the new sidebar.
 - The left sidebar uses the same shell pattern as the right one (`.sidebar`, but docked on the left, 320px like the right one), so SPEC-centered-prompt can reserve its width.
 
+### Implementation decisions
+
+- `ConversationCard` (`src/conversation.rs`) computes `running: bool` via an `EXISTS` subquery on `turns.status IN ('queued', 'running')`, matching `agent_is_busy`.
+- `SessionConversation` (`src/web/snapshot.rs`) carries `#[serde(default)]` on `last_agent`, `turn_count` and `running` so older snapshots deserialize cleanly.
+- Per-workspace sidebar open state is persisted in `localStorage` under `dmuxai.sessions.open.<workspace>` (`'1'` or `'0'`), defaulting to open when `window.innerWidth > 1200`. Toggling syncs `body.left-sidebar-open` so SPEC-centered-prompt reserves `--left-dock: 320px` above 900px.
+- Because `dmuxai serve` is view-only (`load_conversation` and `new_conversation` disabled), `TC-863` launches interactive `dmuxai --web --port <port>` under a pseudo-terminal (`pty.openpty()`) after seeding conversations with `dmuxai run`.
+- `running` reflects queued or running turn rows. A turn left `running` by a crashed peer stays marked until the startup recovery of SPEC-multi-instance-workspace resets it.
+- The dashboard header sits inside the dock padding too, wrapping when narrow, so the left sidebar never covers the brand and controls. This replaces the full-width header counter-margins from #54.
+- The TUI picker puts `● running` at the start of the row, so a narrow picker never cuts it off.
+- A sidebar toggle made before the first snapshot names the workspace is held and saved under the real workspace key, never under a placeholder key.
+
 ## 3. Tests
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
@@ -34,5 +45,5 @@ Decision: move the list into a collapsible **left sidebar**, like ChatGPT's. It 
 | TC-860 | FR-860 | unit | `SessionConversation` serde | New fields serialize as `last_agent`, `turn_count` and `running`; old snapshots without them still deserialize (defaults) | `src/web/snapshot.rs` `session_conversation_fields_roundtrip` |
 | TC-861 | FR-860 | unit | conversation engine with two conversations and one in-flight turn | The listed card for that conversation has `running = true` and its `last_agent`; the list is capped, keeps the active conversation first and orders the rest by `updated_at` descending | `src/app.rs` `session_conversations_report_running_and_agent` |
 | TC-862 | FR-861..FR-863, UX-860 | unit (asset) | index.html, JS and CSS assets | `#sessions-sidebar` nav with `aria-label`, toggle with `aria-controls`/`aria-expanded`, `New` button, filter, spinner class, reduced-motion rule; the old `.session-conversations` box is gone | `src/web/assets.rs` `session_sidebar_assets` |
-| TC-863 | FR-861..FR-863, UX-860 | e2e (ignored, headless Chrome) | `dmuxai serve` on a workspace with two stored conversations | The sidebar lists both with agent and time, active first; clicking the other row makes it active (`aria-current`); `New` adds a row; collapse persists across reload; screenshot captured | `tests/web_session_sidebar.rs` `session_sidebar_renders_in_headless_chrome` |
+| TC-863 | FR-861..FR-863, UX-860 | e2e (ignored, headless Chrome) | `dmuxai --web` on a workspace with two stored conversations | The sidebar lists both with agent and time, active first; clicking the other row makes it active (`aria-current`); `New` adds a row; collapse persists across reload; screenshot captured | `tests/web_session_sidebar.rs` `session_sidebar_renders_in_headless_chrome` |
 | TC-864 | FR-864 | unit (TUI render) | App with two conversations, one running | The picker rows contain the agent name, relative time and the running mark | `src/app.rs` `conversation_picker_shows_agent_time_running` |

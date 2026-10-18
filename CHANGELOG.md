@@ -5,6 +5,21 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Added
+
+- **Left sessions sidebar and running conversation marks (SPEC-session-sidebar FR-860..FR-864, UX-860, #55).**
+  The conversation list moves from the in-panel box into a collapsible 320px
+  left sidebar (`#sessions-sidebar`, header toggle `Sessions`) with a filter
+  input and `New` button. Each row shows the conversation title, last agent,
+  relative updated time (with ISO timestamp tooltip), and a reduced-motion-aware
+  spinner while a turn is running; the active conversation is listed first with
+  `aria-current="true"`. Collapse state persists per workspace in `localStorage`
+  (default open above 1200px, overlay drawer at 900px and below). Snapshot
+  `SessionConversation` entries gain `last_agent`, `turn_count` and `running`
+  (capped at 200, 2s cache TTL while any conversation is running), and the TUI
+  conversation picker (`F3` / `/conversations`) shows a `● running` mark on
+  in-flight conversations.
+
 ### Changed
 
 - **Centered prompt box across sidebar states (SPEC-centered-prompt FR-850..FR-852, UX-850, #54).**
