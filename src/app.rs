@@ -7516,13 +7516,28 @@ fn conversation_picker_width(terminal_width: u16, natural_width: u16) -> u16 {
         .min(terminal_width)
 }
 
-/// Collapses control characters and runs of whitespace so a picker row stays one line.
+/// Collapses control characters, zero-width and bidi format marks, and runs of
+/// whitespace so a picker row stays one line.
 fn sanitize_picker_text(text: &str) -> String {
     let cleaned: String = text
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if picker_char_is_space(c) { ' ' } else { c })
         .collect();
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Control characters plus Unicode format, zero-width, and bidi marks that must
+/// not change how a picker row is drawn.
+fn picker_char_is_space(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
 }
 
 struct PickerRow<'a> {
@@ -7662,11 +7677,6 @@ fn fit_picker_row(row: &PickerRow<'_>, max_width: usize) -> String {
         )
     {
         return hit;
-    }
-    for title_max in (tf..=tw).rev() {
-        if let Some(hit) = picker_row_within(row, max_width, false, title_max, true, true, aw) {
-            return hit;
-        }
     }
     // (2) Title stays at that floor. Shrink the agent down to 6 columns.
     for agent_max in (af..=aw).rev() {
@@ -14472,6 +14482,13 @@ mod tests {
 
         // Observed at 200x50: the box is the widest fitted row plus the 4-column chrome.
         const WIDE_BOX: u16 = 141;
+        let has_short_hex_id = |row: &str| -> bool {
+            row.as_bytes().windows(10).any(|window| {
+                window[0] == b'['
+                    && window[9] == b']'
+                    && window[1..9].iter().all(u8::is_ascii_hexdigit)
+            })
+        };
 
         for (width, height) in [(80u16, 24u16), (120, 40), (200, 50)] {
             let (box_width, rows) = picker_box(&mut app, width, height);
@@ -14500,6 +14517,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("no short row at {width}x{height}: {rows:?}"));
             assert!(running.contains("Codex"), "{width}: {running}");
             assert!(running.contains("just now"), "{width}: {running}");
+            assert!(running.contains("1 turns"), "{width}: {running}");
+            assert!(
+                has_short_hex_id(running),
+                "{width}: missing short id: {running}"
+            );
             assert!(short.contains("none"), "{width}: short row agent: {short}");
             assert!(short.contains("just now"), "{width}: {short}");
             assert!(
@@ -14857,68 +14879,118 @@ mod tests {
 
         let full = fit_picker_row(&row, 200);
         check(200, &full);
-        assert!(!full.contains('…'), "{full}");
-        assert!(
-            full.contains("Ship the conversation picker overflow fix"),
-            "{full}"
+        assert_eq!(
+            full,
+            "* ● running  Ship the conversation picker overflow fix  [abc12345]  4 turns  opencode-deepseek-v4.1-flash-free-review  just now"
         );
-        assert!(full.contains("[abc12345]"), "{full}");
-        assert!(full.contains("4 turns"), "{full}");
-        assert!(full.contains(agent_label), "{full}");
 
+        // Title shortens first. The agent stays whole, and the title stays wider than 12.
         let title_cut = fit_picker_row(&row, 110);
         check(110, &title_cut);
-        assert!(title_cut.contains("[abc12345]"), "{title_cut}");
-        assert!(title_cut.contains("4 turns"), "{title_cut}");
-        assert!(title_cut.contains(agent_label), "{title_cut}");
+        let title_shown = "Ship the conversation p…";
         assert!(
-            title_cut.contains("…  [abc12345]"),
-            "title should end in …: {title_cut}"
+            row.title.starts_with(title_shown.trim_end_matches('…')),
+            "{title_shown}"
         );
-        assert!(
-            !title_cut.contains("Ship the conversation picker overflow fix"),
-            "{title_cut}"
+        assert!(UnicodeWidthStr::width(title_shown) > 12, "{title_shown}");
+        assert_eq!(
+            title_cut,
+            "* ● running  Ship the conversation p…  [abc12345]  4 turns  opencode-deepseek-v4.1-flash-free-review  just now"
         );
 
+        // Title is pinned at 12 columns and the agent is cut, still ending in ….
         let agent_cut = fit_picker_row(&row, 80);
         check(80, &agent_cut);
+        let title_12 = ellipsize_to_width(row.title, 12);
+        let agent_shown = "opencode-deepseek-v4.…";
+        assert_eq!(title_12, "Ship the co…");
+        assert!(agent_cut.contains(&title_12), "{agent_cut}");
+        assert!(agent_shown.ends_with('…'));
+        assert!(UnicodeWidthStr::width(agent_shown) >= 6);
+        assert!(agent_label.starts_with(agent_shown.trim_end_matches('…')));
         assert!(agent_cut.contains("[abc12345]"), "{agent_cut}");
         assert!(agent_cut.contains("4 turns"), "{agent_cut}");
-        assert!(!agent_cut.contains(agent_label), "{agent_cut}");
-        let before_time = agent_cut
-            .strip_suffix("  just now")
-            .unwrap_or_else(|| panic!("time separator missing: {agent_cut}"));
-        assert!(
-            before_time.ends_with('…'),
-            "agent should end in …: {agent_cut}"
+        assert_eq!(
+            agent_cut,
+            "* ● running  Ship the co…  [abc12345]  4 turns  opencode-deepseek-v4.…  just now"
         );
 
         let no_id = fit_picker_row(&row, 56);
         check(56, &no_id);
         assert!(!no_id.contains("[abc12345]"), "{no_id}");
         assert!(no_id.contains("4 turns"), "{no_id}");
+        assert!(no_id.contains(&title_12), "{no_id}");
+        assert_eq!(
+            no_id,
+            "* ● running  Ship the co…  4 turns  opencode-…  just now"
+        );
 
         let no_turns = fit_picker_row(&row, 48);
         check(48, &no_turns);
         assert!(!no_turns.contains("[abc12345]"), "{no_turns}");
         assert!(!no_turns.contains("turns"), "{no_turns}");
-        assert!(no_turns.contains("Ship"), "{no_turns}");
+        assert!(no_turns.contains(&title_12), "{no_turns}");
+        assert_eq!(no_turns, "* ● running  Ship the co…  opencode-d…  just now");
+
+        // Agent is pinned at 6 columns and the title drops below 12.
+        let title_shrinking = fit_picker_row(&row, 42);
+        check(42, &title_shrinking);
+        let agent_6 = ellipsize_to_width(row.agent, 6);
+        assert_eq!(agent_6, "openc…");
+        assert!(title_shrinking.contains(&agent_6), "{title_shrinking}");
+        assert!(!title_shrinking.contains(&title_12), "{title_shrinking}");
+        let shrunk_title = "Ship the c…";
+        assert!(UnicodeWidthStr::width(shrunk_title) < 12);
+        assert!(title_shrinking.contains(shrunk_title), "{title_shrinking}");
+        assert_eq!(
+            title_shrinking,
+            "* ● running  Ship the c…  openc…  just now"
+        );
 
         let no_title = fit_picker_row(&row, 30);
         check(30, &no_title);
         assert!(!no_title.contains("Ship"), "{no_title}");
         assert!(!no_title.contains("[abc12345]"), "{no_title}");
         assert!(!no_title.contains("turns"), "{no_title}");
-        assert!(no_title.contains('…'), "{no_title}");
+        assert!(no_title.contains(&agent_6), "{no_title}");
+        assert!(UnicodeWidthStr::width(agent_6.as_str()) <= 6);
+        assert_eq!(no_title, "* ● running  openc…  just now");
 
-        let mark_and_time = fit_picker_row(&row, 13 + 8);
-        check(13 + 8, &mark_and_time);
-        assert!(mark_and_time.contains('●'), "{mark_and_time}");
-        assert!(mark_and_time.ends_with("just now"), "{mark_and_time}");
-        assert!(!mark_and_time.contains("Ship"), "{mark_and_time}");
-        assert!(!mark_and_time.contains("opencode"), "{mark_and_time}");
-        assert!(!mark_and_time.contains('['), "{mark_and_time}");
-        assert!(!mark_and_time.contains("turns"), "{mark_and_time}");
+        // "* ● running  just now" is 21 columns and does not fit; "* ● just now" is 12 and does.
+        assert_eq!(UnicodeWidthStr::width("* ● running  just now"), 21);
+        assert_eq!(UnicodeWidthStr::width("* ● just now"), 12);
+        let short_mark = fit_picker_row(&row, 15);
+        check(15, &short_mark);
+        assert_eq!(short_mark, "* ● just now");
+        assert!(!short_mark.contains("running"), "{short_mark}");
+
+        let cjk = PickerRow {
+            current: "*",
+            running: true,
+            title: "한국어 제목이 아주 긴 대화입니다",
+            id: "abc12345",
+            turns: 4,
+            agent: "검토-에이전트-라벨-아주-김",
+            time: "just now",
+        };
+        for max_width in [60, 40, 30] {
+            let rendered = fit_picker_row(&cjk, max_width);
+            let width = UnicodeWidthStr::width(rendered.as_str());
+            assert!(
+                width <= max_width,
+                "max {max_width}: width {width}: {rendered}"
+            );
+            assert!(rendered.ends_with("just now"), "{rendered}");
+            assert!(
+                rendered.chars().all(|ch| {
+                    cjk.title.contains(ch)
+                        || cjk.agent.contains(ch)
+                        || cjk.id.contains(ch)
+                        || " *●[]turnsrunningjustnow…".contains(ch)
+                }),
+                "broken char in {rendered:?}"
+            );
+        }
 
         let quiet = PickerRow {
             current: " ",
@@ -14957,10 +15029,17 @@ mod tests {
                 .find(|row| row.contains('●'))
                 .unwrap_or_else(|| panic!("no running row at {width}x{height}: {rows:?}"));
             assert!(running.contains("just now"), "{width}: {running}");
+            let label_prefix = (5..agent_label.len())
+                .rev()
+                .map(|end| &agent_label[..end])
+                .find(|prefix| running.contains(&format!("  {prefix}…  just now")));
+            let prefix = label_prefix.unwrap_or_else(|| {
+                panic!("{width}: label not anchored before the clock in {running}")
+            });
+            assert!(prefix.len() >= 5, "{width}: {prefix} in {running}");
             assert!(
-                (1..agent_label.len())
-                    .any(|end| { running.contains(&format!("{}…", &agent_label[..end])) }),
-                "{width}: label not shortened in {running}"
+                prefix.starts_with("openc"),
+                "{width}: {prefix} in {running}"
             );
         }
     }
@@ -14974,6 +15053,7 @@ mod tests {
         );
         assert_eq!(sanitize_picker_text("a\r\nb\tc"), "a b c");
         assert_eq!(sanitize_picker_text("  x  "), "x");
+        assert_eq!(sanitize_picker_text("a\u{200B}b\u{202E}c"), "a b c");
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("conversations.sqlite3");
