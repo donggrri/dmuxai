@@ -85,7 +85,7 @@ impl StdioClient {
         #[cfg(unix)]
         if self.pgid > 0 {
             let _ = std::process::Command::new("kill")
-                .args(["-KILL", &format!("-{}", self.pgid)])
+                .args(["-KILL", "--", &format!("-{}", self.pgid)])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

@@ -440,7 +440,19 @@ done
     }
     assert!(
         gone_a,
-        "grandchild {pid_a} was not killed within 2s after drop"
+        "grandchild {pid_a} was not killed within 2s after drop; ps: {}",
+        String::from_utf8_lossy(
+            &std::process::Command::new("ps")
+                .args([
+                    "-o",
+                    "pid,ppid,pgid,sid,stat,comm",
+                    "-p",
+                    &pid_a.to_string()
+                ])
+                .output()
+                .map(|o| o.stdout)
+                .unwrap_or_default()
+        )
     );
 
     // Part B: separately hit a timeout
