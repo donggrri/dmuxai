@@ -102,4 +102,14 @@ pub enum DashboardCommand {
         command: SessionCommand,
         reply: oneshot::Sender<Result<crate::web::SessionView, RunTodoError>>,
     },
+    SwitchWorkspace {
+        path: std::path::PathBuf,
+        reply: oneshot::Sender<Result<(), RunTodoError>>,
+    },
+    CancelSwitchWorkspace {
+        notice: String,
+    },
+    CommitSwitchWorkspace {
+        path: std::path::PathBuf,
+    },
 }

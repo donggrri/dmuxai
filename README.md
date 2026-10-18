@@ -29,11 +29,26 @@ The graph in this shot is demo data and the token is redacted:
 
 ```bash
 cd /path/to/project
-dmuxai                 # TUI
-dmuxai --web           # TUI + local dashboard; the URL with its access token is shown as a notice
-dmuxai serve           # dashboard only (no TTY needed); prints: dmuxai dashboard: http://127.0.0.1:7420/?token=...
-dmuxai serve --port 0  # pick a free port
+dmuxai                          # TUI
+dmuxai -C /path/to/project      # run in /path/to/project from any directory (also --workspace-dir DIR)
+dmuxai --web                    # TUI + local dashboard; the URL with its access token is shown as a notice
+dmuxai serve                    # dashboard only (no TTY needed); prints: dmuxai dashboard: http://127.0.0.1:7420/?token=...
+dmuxai serve --port 0           # pick a free port
 ```
+
+You can also set a default workspace and extra dashboard browse roots in your
+user config (`~/.config/dmuxai/dmuxai.toml`; precedence is `-C` /
+`--workspace-dir`, then `DMUXAI_WORKSPACE`, then user-config `[workspace] dir`,
+then the current directory):
+
+```toml
+[workspace]
+dir = "~/projects/my-repo"
+browse_roots = ["~/projects", "/srv/repos"]
+```
+
+In `dmuxai --web`, click the `workspace` path in the dashboard header to validate
+or browse directories and switch the running session to another workspace.
 
 The dashboard binds `127.0.0.1` only and needs the per-start token printed at
 startup; other origins/hosts are rejected. Binding elsewhere requires

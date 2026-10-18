@@ -160,7 +160,7 @@ enum RawMessage {
 
 impl CodexClient {
     async fn start(
-        _cwd: &Path,
+        cwd: &Path,
         event_tx: &mpsc::Sender<AgentOutput>,
         mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     ) -> io::Result<Self> {
@@ -173,6 +173,7 @@ impl CodexClient {
         command
             .args(&args)
             .envs(&env)
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

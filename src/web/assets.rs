@@ -2,6 +2,7 @@ pub const INDEX_HTML: &str = include_str!("assets/index.html");
 pub const APP_JS: &str = include_str!("assets/app.js");
 pub const MEMORY_JS: &str = include_str!("assets/memory.js");
 pub const SESSION_JS: &str = include_str!("assets/session.js");
+pub const WORKSPACE_JS: &str = include_str!("assets/workspace.js");
 pub const SESSION_CSS: &str = include_str!("assets/session.css");
 pub const APP_CSS: &str = include_str!("assets/app.css");
 pub const DOCS_JS: &str = include_str!("assets/docs.js");
@@ -963,5 +964,51 @@ mod tests {
         assert!(DOCS_CSS.contains(".sessions-sidebar"));
         assert!(APP_CSS.contains(".spinner"));
         assert!(APP_CSS.contains("@media (prefers-reduced-motion: reduce)"));
+    }
+
+    // TC-872: workspace_dir_assets (SPEC-workspace-dir FR-871, FR-872)
+    #[tokio::test]
+    async fn workspace_dir_assets() {
+        assert!(INDEX_HTML.contains("id=\"workspace-button\""));
+        assert!(INDEX_HTML.contains("aria-haspopup=\"dialog\""));
+        assert!(INDEX_HTML.contains("title=\"\""));
+        assert!(INDEX_HTML.contains("id=\"workspace-dialog\""));
+        assert!(INDEX_HTML.contains("role=\"dialog\""));
+        assert!(INDEX_HTML.contains("aria-modal=\"true\""));
+        assert!(INDEX_HTML.contains("id=\"workspace-path\""));
+        assert!(INDEX_HTML.contains("id=\"workspace-reason\""));
+        assert!(INDEX_HTML.contains("id=\"workspace-recent\""));
+        assert!(INDEX_HTML.contains("id=\"workspace-browser\""));
+        assert!(INDEX_HTML.contains("id=\"workspace-switch\""));
+        assert!(INDEX_HTML.contains("/assets/workspace.js"));
+
+        assert!(WORKSPACE_JS.contains("function middleEllipsis"));
+        assert!(WORKSPACE_JS.contains("function abbreviateHome"));
+        assert!(WORKSPACE_JS.contains("/api/workspace/dirs"));
+        assert!(WORKSPACE_JS.contains("/api/workspace/validate"));
+        assert!(WORKSPACE_JS.contains("/api/workspace/switch"));
+        assert!(!WORKSPACE_JS.contains("innerHTML"));
+        assert!(!WORKSPACE_JS.contains("onclick"));
+
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        let router = build_router(hub, "testtoken123".to_string(), None);
+        let req = axum::http::Request::builder()
+            .uri("/assets/workspace.js")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let headers = resp.headers().clone();
+        assert!(
+            headers["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/javascript")
+        );
+        assert_eq!(headers["content-security-policy"], "default-src 'self'");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), WORKSPACE_JS.as_bytes());
     }
 }

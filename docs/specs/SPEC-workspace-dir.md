@@ -1,6 +1,6 @@
 # SPEC: workspace-dir
 
-Status: Draft (v0.2.2)
+Status: Implemented (v0.2.2)
 Created: 2026-10-18
 Related: issue #56; Dongjin 2026-10-18 09:42 KST ("let the user set the project working directory"); `workspace::resolve_workspace_root` (`DMUXAI_WORKSPACE` or cwd); SPEC-state-per-repo (per-repo DB); SPEC-multi-instance-workspace
 
@@ -34,6 +34,16 @@ Re-exec is simpler and safer than re-wiring the live App, which holds about 40 w
 - Recent paths live in the state dir, not in a workspace, so they are not committed with a project.
 - The TUI header and status line already show the workspace name. The TUI does not get a switch command in v0.2.2; you restart with `-C`. A TUI picker is listed under "Later".
 
+### Implementation decisions
+
+- Because `dmuxai serve` is view-only and FR-872/FR-874 refuse `/api/workspace/dirs` and `/api/workspace/switch` with 403 in view-only mode, `TC-874` and `TC-876` launch `dmuxai --web` under a pseudo-terminal (`pty.fork()`) so both directory browsing and Unix `exec` re-execution run against the interactive web server while view-only 403 enforcement remains covered by `TC-873` and `TC-875`.
+- Deny-list checks (`check_workspace_denied`) run before the write probe in `validate_workspace_dir` so `/`, the state/config dirs, and read-only credential directories report their `denied: ...` reason and never have a probe file created inside them.
+- The switch handler runs its post-validation work in a spawned task. If the App does not answer within 10s, or drops the reply, it sends `CancelSwitchWorkspace` and answers 504. A dropped client connection can therefore never leave switch-pending set (`workspace_switch_timeout_sends_cancel`).
+- A failing preflight answers 500 with the notice text, and also publishes it as a dashboard notice. It used to answer 202 although nothing was switched.
+- Recent paths are filtered on every `GET /api/workspace` with `validate_workspace_dir_no_probe`: the same checks except the write probe, so a read-only request never creates files. A recent directory that has since become read-only still fails with `not writable` when you switch to it (`load_recent_workspaces_does_not_write_probes`).
+- `POST /api/workspace/validate` stays available in view-only mode, and works for paths outside the browse roots, as FR-872 specifies. It needs the dashboard token, returns only ok or a reason (never directory contents), and uses the same write probe as the CLI.
+- The header path button shows a `▾` caret, so you can tell it opens the dialog.
+
 ## 3. Tests
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
@@ -42,7 +52,7 @@ Re-exec is simpler and safer than re-wiring the live App, which holds about 40 w
 | TC-871 | FR-870 | integration (CLI) | built binary, two temp dirs | `dmuxai -C <a> status --json` reports `<a>` while run from `<b>`; `-C /nonexistent` exits 2 with one line on stderr | `tests/cli.rs` `workspace_dir_flag_sets_workspace` |
 | TC-872 | FR-871 | unit (asset) | index.html and JS | Header workspace button with `title` and `aria-haspopup="dialog"`; dialog markup with path input, recent list and browser; middle-ellipsis helper | `src/web/assets.rs` `workspace_dir_assets` |
 | TC-873 | FR-872, FR-873, NFR-870 | integration | axum router, temp tree with files, dotdirs and a symlink to a denied dir | `dirs` lists child directories only, hides dotdirs, caps at 500, refuses denied paths and paths outside the browse roots, and drops a child symlink that points into a denied dir; `validate` reasons; auth required; view-only refuses `dirs` and `switch`; the token never appears in bodies | `src/web/server.rs` `workspace_api_lists_dirs_and_validates` |
-| TC-874 | FR-871, FR-872 | e2e (ignored, headless Chrome) | `dmuxai serve` | The header shows the path; the dialog lists recent paths and subdirectories; an invalid path shows the reason inline; screenshot captured | `tests/web_workspace_dir.rs` `workspace_dialog_renders_in_headless_chrome` |
+| TC-874 | FR-871, FR-872 | e2e (ignored, headless Chrome) | `dmuxai --web` (pty) | The header shows the path; the dialog lists recent paths and subdirectories; an invalid path shows the reason inline; screenshot captured | `tests/web_workspace_dir.rs` `workspace_dialog_renders_in_headless_chrome` |
 | TC-875 | FR-874 | integration | router with a fake busy turn | `switch` answers 409 while busy, 202 when idle (the re-exec hook is a test double), 403 view-only, and 501 on non-Unix (cfg-gated); after a 202 a new prompt gets 409; a failing preflight clears the flag and raises a notice; a failing exec double exits with code 1 and prints the restart command; the re-exec argv has exactly one `-C` (also when the original used `--workspace-dir=DIR`) | `src/web/server.rs` `workspace_switch_guards` |
-| TC-876 | FR-874 | e2e (ignored, Unix) | `dmuxai serve --port 0` with a fixed token | After `switch` to a second temp dir, the same URL serves a snapshot whose `workspace` is the new path within 15s | `tests/web_workspace_dir.rs` `workspace_switch_reexecs_serve` |
+| TC-876 | FR-874 | e2e (ignored, Unix) | `dmuxai --web` (pty) with a fixed token | After `switch` to a second temp dir, the same URL serves a snapshot whose `workspace` is the new path within 15s | `tests/web_workspace_dir.rs` `workspace_switch_reexecs_serve` |
 | TC-877 | FR-875 | unit | custom agent with `command = ["pwd"]`-style probe, graph node runner | The spawned process cwd and `{workspace}` both equal the resolved workspace, not the test process cwd | `src/custom_agent.rs` `runner_cwd_is_workspace` |

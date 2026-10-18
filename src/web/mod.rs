@@ -21,7 +21,8 @@ pub use file_source::FileGraphSource;
 pub use hub::DashboardHub;
 pub use layout::{NodeLayout, layout_graph};
 pub use server::{
-    DashboardServer, DashboardServices, ServerConfig, build_router, build_router_with, start_server,
+    DashboardServer, DashboardServices, ExecFn, ServerConfig, WorkspaceSwitchConfig, build_router,
+    build_router_with, format_reexec_failure, start_server,
 };
 pub use snapshot::{
     AgentView, DashboardSnapshot, GraphCounts, GraphView, NodeDetail, NodeView, RunStateView,

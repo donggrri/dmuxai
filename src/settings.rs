@@ -27,6 +27,16 @@ impl Default for WebThemeSettings {
     }
 }
 
+/// User-config `[workspace]` settings (FR-870, FR-872). Read only from the
+/// user config, never from a workspace's `dmuxai.toml`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+pub struct WorkspaceSettings {
+    #[serde(default)]
+    pub dir: Option<String>,
+    #[serde(default)]
+    pub browse_roots: Vec<String>,
+}
+
 /// Workspace-local and environment overrides for DmuxAI behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DmuxSettings {
@@ -58,6 +68,8 @@ pub struct DmuxSettings {
     pub web_theme: WebThemeSettings,
     /// Event delivery settings from `[notify]` (FR-770..FR-772).
     pub notify: NotifySettings,
+    /// User-config `[workspace]` settings (FR-870, FR-872).
+    pub workspace: WorkspaceSettings,
     /// Problems found while reading dmuxai.toml, shown at startup.
     pub config_warnings: Vec<String>,
     /// Resolved `[memory]` (SPEC-obsidian-memory FR-720); `None` = disabled.
@@ -119,6 +131,7 @@ struct DmuxToml {
     memory: Option<MemoryToml>,
     mcp: Option<McpToml>,
     todo: Option<TodoToml>,
+    workspace: Option<WorkspaceSettings>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -215,7 +228,12 @@ impl DmuxSettings {
             && let Ok(contents) = std::fs::read_to_string(user_path)
         {
             match toml::from_str::<DmuxToml>(&contents) {
-                Ok(parsed) => configs.push(parsed),
+                Ok(mut parsed) => {
+                    if let Some(ws) = parsed.workspace.take() {
+                        settings.workspace = ws;
+                    }
+                    configs.push(parsed);
+                }
                 Err(error) => settings.config_warnings.push(format!(
                     "user config {} ignored: {error}",
                     user_path.display()
@@ -578,12 +596,32 @@ impl Default for DmuxSettings {
             ui: UiSettings::default(),
             web_theme: WebThemeSettings::default(),
             notify: NotifySettings::default(),
+            workspace: WorkspaceSettings::default(),
             config_warnings: Vec::new(),
             memory: None,
             memory_raw: MemoryToml::default(),
             memory_server_configured: false,
         }
     }
+}
+
+/// Loads `[workspace]` from the user config (`default_user_config_path()`) only (FR-870, FR-872).
+pub fn load_user_workspace_settings() -> WorkspaceSettings {
+    load_user_workspace_settings_from(default_user_config_path().as_deref())
+}
+
+/// Loads `[workspace]` from the given user config path (never from a workspace's `dmuxai.toml`).
+pub fn load_user_workspace_settings_from(user_config_path: Option<&Path>) -> WorkspaceSettings {
+    let Some(user_path) = user_config_path else {
+        return WorkspaceSettings::default();
+    };
+    let Ok(contents) = std::fs::read_to_string(user_path) else {
+        return WorkspaceSettings::default();
+    };
+    toml::from_str::<DmuxToml>(&contents)
+        .ok()
+        .and_then(|parsed| parsed.workspace)
+        .unwrap_or_default()
 }
 
 /// Expand a leading `~/` (or `~\\`) with `HOME` / `USERPROFILE`.

@@ -20,6 +20,7 @@ struct HubState {
     timings: HashMap<String, NodeTiming>,
     current_graph_id: Option<String>,
     snapshot: DashboardSnapshot,
+    switch_config: Option<crate::web::WorkspaceSwitchConfig>,
 }
 
 #[derive(Clone)]
@@ -58,10 +59,19 @@ impl DashboardHub {
                 timings: HashMap::new(),
                 current_graph_id: None,
                 snapshot: initial_snapshot,
+                switch_config: None,
             })),
             watch_tx: Arc::new(tx),
             events: None,
         }
+    }
+
+    pub fn set_switch_config(&self, config: crate::web::WorkspaceSwitchConfig) {
+        self.state.lock().unwrap().switch_config = Some(config);
+    }
+
+    pub fn switch_config(&self) -> Option<crate::web::WorkspaceSwitchConfig> {
+        self.state.lock().unwrap().switch_config.clone()
     }
 
     pub fn publish(&self, agents: Vec<AgentView>, graph: Option<GraphView>) {
@@ -177,6 +187,31 @@ impl DashboardHub {
             return;
         }
         state.snapshot.session = session;
+        state.snapshot.revision += 1;
+        state.snapshot.generated_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let _ = self.watch_tx.send_replace(state.snapshot.clone());
+    }
+
+    /// Appends a system notice to the snapshot session transcript and bumps the revision (FR-874).
+    pub fn push_notice(&self, notice: String) {
+        let mut state = self.state.lock().unwrap();
+        let session = state
+            .snapshot
+            .session
+            .get_or_insert_with(SessionView::default);
+        let idx = session.transcript.len();
+        session
+            .transcript
+            .push(crate::web::snapshot::SessionMessage {
+                id: format!("notice:{idx}"),
+                role: "system".to_owned(),
+                agent: None,
+                content: notice,
+                streaming: false,
+            });
         state.snapshot.revision += 1;
         state.snapshot.generated_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

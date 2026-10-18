@@ -2,15 +2,13 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
 
 use dmuxai::custom_agent::{
-    BUILTIN_MODELS_TIMEOUT, CustomAgentOutput, CustomAgentSpec, PromptVia, SubstitutionContext,
-    build_argv, failure_reason, list_model_ids, parse_jsonl_line, policy_message, spec_at,
-    substitute,
+    BUILTIN_MODELS_TIMEOUT, CustomAgentOutput, CustomAgentSpec, SubstitutionContext, build_argv,
+    failure_reason, list_model_ids, parse_jsonl_line, policy_message, spec_at, substitute,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -320,7 +318,7 @@ async fn run_turn(
     request: &AgentRequest,
     model: Option<String>,
     mode: ExecutionMode,
-    cwd: &PathBuf,
+    cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
     pgid: &std::sync::atomic::AtomicU32,
@@ -385,33 +383,10 @@ async fn run_turn(
     }
 
     let argv = build_argv(spec, &ctx);
-    let (program, args) = argv
-        .split_first()
+    let program = argv
+        .first()
         .ok_or_else(|| format!("{}: empty command", spec.label()))?;
-    let mut command = tokio::process::Command::new(program);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .stdin(if spec.prompt_via == PromptVia::Stdin {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    if let Some(mcp_path) = &ctx.mcp_config {
-        command.env("DMUXAI_MCP_CONFIG", mcp_path);
-    }
-
-    for (key, value) in &spec.env {
-        if let Some(value) = substitute(value, &ctx) {
-            command.env(key, value);
-        }
-    }
-    #[cfg(unix)]
-    command.process_group(0);
+    let mut command = dmuxai::custom_agent::build_custom_command(spec, &ctx, cwd)?;
 
     let mut child = command
         .spawn()
@@ -505,9 +480,9 @@ fn kill_group(pgid: u32) {
     if pgid > 0 {
         let _ = std::process::Command::new("kill")
             .args(["-TERM", &format!("-{pgid}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
     }
     #[cfg(not(unix))]

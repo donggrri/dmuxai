@@ -122,3 +122,66 @@ fn non_tty_start_fails_with_clear_message() {
         "stderr should not mention Os code 6, got: {stderr}"
     );
 }
+
+/// TC-871 / FR-870: `dmuxai -C <a> status --json` from cwd `<b>` reports `<a>`;
+/// `-C /nonexistent` exits 2 with one line on stderr.
+#[test]
+fn workspace_dir_flag_sets_workspace() {
+    let dir_a = tempfile::tempdir().expect("tempdir a");
+    let dir_b = tempfile::tempdir().expect("tempdir b");
+    let state_dir = tempfile::tempdir().expect("state dir");
+    let canon_a = dir_a
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // Test `-C <dir>`, `--workspace-dir <dir>`, and `--workspace-dir=<dir>`.
+    for flag_args in [
+        vec!["-C", &canon_a, "status", "--json"],
+        vec!["--workspace-dir", &canon_a, "status", "--json"],
+        vec![&format!("--workspace-dir={canon_a}"), "status", "--json"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
+            .args(&flag_args)
+            .current_dir(dir_b.path())
+            .env("DMUXAI_STATE_DIR", state_dir.path())
+            .env_remove("DMUXAI_WORKSPACE")
+            .stdin(Stdio::null())
+            .output()
+            .expect("execute dmuxai");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "expected exit 0 for {flag_args:?}, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("status json");
+        assert_eq!(parsed["workspace"].as_str(), Some(canon_a.as_str()));
+    }
+
+    // Missing directory exits 2 with a single line on stderr.
+    let missing = dir_b.path().join("nonexistent-dir-871");
+    let missing_str = missing.to_string_lossy().into_owned();
+    let bad = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
+        .args(["-C", &missing_str, "status", "--json"])
+        .current_dir(dir_b.path())
+        .env("DMUXAI_STATE_DIR", state_dir.path())
+        .env_remove("DMUXAI_WORKSPACE")
+        .stdin(Stdio::null())
+        .output()
+        .expect("execute dmuxai");
+
+    assert_eq!(bad.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one stderr line, got: {stderr:?}"
+    );
+    assert_eq!(lines[0], format!("error: -C {missing_str}: does not exist"));
+}
