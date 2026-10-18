@@ -185,6 +185,29 @@ impl DashboardHub {
         let _ = self.watch_tx.send_replace(state.snapshot.clone());
     }
 
+    /// Appends a system notice to the snapshot session transcript and bumps the revision (FR-874).
+    pub fn push_notice(&self, notice: String) {
+        let mut state = self.state.lock().unwrap();
+        let session = state
+            .snapshot
+            .session
+            .get_or_insert_with(SessionView::default);
+        let idx = session.transcript.len();
+        session.transcript.push(crate::web::snapshot::SessionMessage {
+            id: format!("notice:{idx}"),
+            role: "system".to_owned(),
+            agent: None,
+            content: notice,
+            streaming: false,
+        });
+        state.snapshot.revision += 1;
+        state.snapshot.generated_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let _ = self.watch_tx.send_replace(state.snapshot.clone());
+    }
+
     /// Attaches an event sink so snapshot changes are appended to the log.
     pub fn with_events(mut self, sink: Arc<EventSink>) -> Self {
         self.events = Some(sink);

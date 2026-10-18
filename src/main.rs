@@ -494,6 +494,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 memory: memory.clone(),
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
+                switch_config: None,
             }
         }
         Err(error) => {
@@ -507,6 +508,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 // The event log is independent of the to-do database (FR-766).
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
+                switch_config: None,
             }
         }
     };
@@ -662,12 +664,64 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     };
     let mut session = TerminalSession::start()?;
     let result = app.run(session.terminal_mut()).await;
+    let switch_target = app.take_switch_ready();
     app.shutdown().await;
+    drop(session);
+    let mut bound_port = None;
+    let mut dashboard_tok = None;
     if let Some(server) = dashboard {
-        server.abort();
+        bound_port = Some(server.addr.port());
+        dashboard_tok = server.url.split("/?token=").nth(1).map(str::to_owned);
+        server.stop().await;
         dmuxai::web::discovery::remove_discovery(&workspace_root);
     }
+    if let Some(target_workspace) = switch_target {
+        exec_workspace_switch(&target_workspace, bound_port, dashboard_tok.as_deref());
+    }
     result.map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn exec_workspace_switch(
+    target_workspace: &Path,
+    bound_port: Option<u16>,
+    token: Option<&str>,
+) -> ! {
+    use std::os::unix::process::CommandExt;
+
+    let orig_args: Vec<String> = std::env::args().skip(1).collect();
+    let new_args = dmuxai::workspace::build_reexec_args(&orig_args, target_workspace, bound_port);
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            let msg = dmuxai::web::format_reexec_failure(Path::new("dmuxai"), &new_args, &err);
+            eprint!("{msg}");
+            std::process::exit(1);
+        }
+    };
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(&new_args);
+    if let Some(tok) = token {
+        cmd.env("DMUXAI_WEB_TOKEN", tok);
+    }
+    cmd.env("DMUXAI_WORKSPACE", target_workspace);
+    let err = cmd.exec();
+    let msg = dmuxai::web::format_reexec_failure(&exe, &new_args, &err);
+    eprint!("{msg}");
+    std::process::exit(1);
+}
+
+#[cfg(not(unix))]
+fn exec_workspace_switch(
+    target_workspace: &Path,
+    _bound_port: Option<u16>,
+    _token: Option<&str>,
+) -> ! {
+    eprintln!(
+        "error: workspace switch is only supported on Unix\nrestart command: dmuxai -C {}",
+        target_workspace.display()
+    );
+    std::process::exit(1);
 }
 
 /// Start the TUI-source dashboard and attach it to `app` (FR-521, FR-524, FR-530).
@@ -723,6 +777,7 @@ async fn attach_web_dashboard(
             .map(|config| dmuxai::memory::MemoryHandle::from_config(config, workspace_root)),
         events_path: Some(dmuxai::events::events_path(workspace_root)),
         docs,
+        switch_config: None,
     };
 
     let sink = cli::build_event_sink(workspace_root, settings);

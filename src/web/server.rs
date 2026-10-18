@@ -27,6 +27,46 @@ use crate::web::auth::{BindCheck, check_bind, dashboard_url, token_matches};
 use crate::web::commands::{DashboardCommand, RunMode, RunTodoError, SessionCommand};
 use crate::web::hub::DashboardHub;
 
+/// Injectable re-execution hook for `POST /api/workspace/switch` (FR-874, TC-875).
+/// Arguments are `(executable, argv_after_arg0, dashboard_token)`.
+pub type ExecFn =
+    Arc<dyn Fn(&std::path::Path, &[String], &str) -> std::io::Result<()> + Send + Sync>;
+
+/// Configuration and test hooks for workspace switching (FR-874).
+#[derive(Clone, Default)]
+pub struct WorkspaceSwitchConfig {
+    /// Override for `std::env::current_exe()` (used by tests to simulate a missing binary).
+    pub current_exe: Option<std::path::PathBuf>,
+    /// Original CLI arguments after `argv[0]`.
+    pub orig_args: Vec<String>,
+    /// Bound port of the dashboard server (replaces `--port 0`).
+    pub bound_port: Option<u16>,
+    /// Override for platform support (`None` uses `cfg!(unix)`).
+    pub unix_supported: Option<bool>,
+    /// Optional exec hook called after preflight succeeds in router tests (TC-875).
+    /// When `None`, sends `DashboardCommand::CommitSwitchWorkspace` so `main.rs` performs shutdown + exec.
+    pub exec_hook: Option<ExecFn>,
+    /// Optional exit hook called with `(exit_code, stderr_message)` when `exec_hook` returns `Err` (TC-875).
+    pub on_exec_error: Option<Arc<dyn Fn(i32, String) + Send + Sync>>,
+}
+
+/// Formats the fatal stderr message when `exec` fails after clean shutdown (FR-874).
+pub fn format_reexec_failure(
+    exe: &std::path::Path,
+    args: &[String],
+    error: &std::io::Error,
+) -> String {
+    let prog = exe
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "dmuxai".to_owned());
+    let restart = std::iter::once(prog)
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("error: failed to re-execute dmuxai: {error}\nrestart command: {restart}\n")
+}
+
 /// Slice B dependencies injected into the router (FR-541, FR-542).
 #[derive(Clone, Default)]
 pub struct DashboardServices {
@@ -45,6 +85,8 @@ pub struct DashboardServices {
     /// Shared workspace event log for `GET /api/events/log` and SSE tailing.
     pub events_path: Option<std::path::PathBuf>,
     pub docs: Option<Arc<crate::web::docs_api::DocsService>>,
+    /// Workspace switch configuration and test hooks (FR-874).
+    pub switch_config: Option<WorkspaceSwitchConfig>,
 }
 
 #[derive(Clone)]
@@ -74,6 +116,11 @@ pub struct DashboardServer {
 impl DashboardServer {
     pub fn abort(&self) {
         self.handle.abort();
+    }
+
+    pub async fn stop(self) {
+        self.handle.abort();
+        let _ = self.handle.await;
     }
 }
 
@@ -1091,6 +1138,282 @@ async fn security_and_auth_middleware(
     next.run(req).await
 }
 
+fn is_unix_switch_supported(state: &AppState) -> bool {
+    state
+        .services
+        .switch_config
+        .as_ref()
+        .and_then(|c| c.unix_supported)
+        .unwrap_or(cfg!(unix))
+}
+
+fn preflight_workspace_switch(
+    exe_override: Option<&std::path::Path>,
+    target: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let exe = match exe_override {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?,
+    };
+    let meta = std::fs::metadata(&exe)
+        .map_err(|_| format!("executable does not exist: {}", exe.display()))?;
+    if !meta.is_file() {
+        return Err(format!("executable is not a file: {}", exe.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(format!("executable is not executable: {}", exe.display()));
+        }
+    }
+    crate::workspace::validate_workspace_dir(target)
+        .map_err(|e| format!("target workspace invalid: {e}"))?;
+    Ok(exe)
+}
+
+#[derive(serde::Serialize)]
+struct WorkspaceInfoResponse {
+    current: String,
+    recent: Vec<String>,
+    browse_roots: Vec<String>,
+    can_switch: bool,
+}
+
+async fn get_workspace(State(state): State<AppState>) -> Response {
+    let current = state.hub.snapshot().workspace;
+    let recent = crate::workspace::load_recent_workspaces();
+    let browse_roots = crate::workspace::resolve_browse_roots()
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let can_switch = state.services.web_attached && is_unix_switch_supported(&state);
+    json_ok(
+        StatusCode::OK,
+        &WorkspaceInfoResponse {
+            current,
+            recent,
+            browse_roots,
+            can_switch,
+        },
+    )
+}
+
+#[derive(serde::Deserialize, Default)]
+struct WorkspaceDirsQuery {
+    path: Option<String>,
+    hidden: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct WorkspaceDirsResponse {
+    path: String,
+    parent: Option<String>,
+    dirs: Vec<String>,
+}
+
+async fn get_workspace_dirs(
+    State(state): State<AppState>,
+    Query(params): Query<WorkspaceDirsQuery>,
+) -> Response {
+    if !state.services.web_attached {
+        return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
+    }
+    let roots = crate::workspace::resolve_browse_roots();
+    let raw_path = params
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| roots.first().map(|p| p.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| state.hub.snapshot().workspace);
+
+    if raw_path.as_bytes().contains(&0) || raw_path.len() > 4096 {
+        return error_json(StatusCode::BAD_REQUEST, "invalid path");
+    }
+    let expanded = crate::settings::expand_home(&raw_path);
+    let metadata = match std::fs::metadata(&expanded) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return error_json(StatusCode::BAD_REQUEST, "does not exist");
+        }
+        Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid path"),
+    };
+    if !metadata.is_dir() {
+        return error_json(StatusCode::BAD_REQUEST, "not a directory");
+    }
+    let canonical = match std::fs::canonicalize(&expanded) {
+        Ok(c) => c,
+        Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid path"),
+    };
+    if let Err(denied) = crate::workspace::check_workspace_denied(&canonical) {
+        return error_json(StatusCode::FORBIDDEN, &denied.to_string());
+    }
+    if !roots.iter().any(|root| canonical.starts_with(root)) {
+        return error_json(StatusCode::FORBIDDEN, "outside browse roots");
+    }
+
+    let entries = match std::fs::read_dir(&canonical) {
+        Ok(rd) => rd,
+        Err(_) => return error_json(StatusCode::FORBIDDEN, "not writable"),
+    };
+    let show_hidden = matches!(params.hidden.as_deref(), Some("1") | Some("true"));
+    let mut dirs = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.is_empty() || (!show_hidden && name.starts_with('.')) {
+            continue;
+        }
+        let Ok(canon_child) = std::fs::canonicalize(entry.path()) else {
+            continue;
+        };
+        if !canon_child.is_dir() {
+            continue;
+        }
+        if !roots.iter().any(|root| canon_child.starts_with(root)) {
+            continue;
+        }
+        if crate::workspace::check_workspace_denied(&canon_child).is_err() {
+            continue;
+        }
+        dirs.push(name);
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs.truncate(500);
+
+    let parent = canonical
+        .parent()
+        .filter(|p| {
+            roots.iter().any(|root| p.starts_with(root))
+                && crate::workspace::check_workspace_denied(p).is_ok()
+        })
+        .map(|p| p.to_string_lossy().into_owned());
+
+    json_ok(
+        StatusCode::OK,
+        &WorkspaceDirsResponse {
+            path: canonical.to_string_lossy().into_owned(),
+            parent,
+            dirs,
+        },
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct WorkspacePathBody {
+    path: String,
+}
+
+async fn post_workspace_validate(ApiJson(body): ApiJson<WorkspacePathBody>) -> Response {
+    match crate::workspace::validate_workspace_dir(std::path::Path::new(&body.path)) {
+        Ok(canonical) => json_ok(
+            StatusCode::OK,
+            &serde_json::json!({
+                "ok": true,
+                "path": canonical.to_string_lossy(),
+            }),
+        ),
+        Err(reason) => json_ok(
+            StatusCode::OK,
+            &serde_json::json!({
+                "ok": false,
+                "reason": reason.to_string(),
+            }),
+        ),
+    }
+}
+
+async fn post_workspace_switch(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<WorkspacePathBody>,
+) -> Response {
+    if !state.services.web_attached {
+        return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
+    }
+    if !is_unix_switch_supported(&state) {
+        return error_json(
+            StatusCode::NOT_IMPLEMENTED,
+            "workspace switch is not supported on this platform",
+        );
+    }
+    let canonical = match crate::workspace::validate_workspace_dir(std::path::Path::new(&body.path))
+    {
+        Ok(path) => path,
+        Err(reason) => return error_json(StatusCode::BAD_REQUEST, &reason.to_string()),
+    };
+
+    let Some(sender) = state.services.commands.clone() else {
+        return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
+    };
+    let (reply, rx) = oneshot::channel();
+    if sender
+        .send(DashboardCommand::SwitchWorkspace {
+            path: canonical.clone(),
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
+    }
+    match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Err(_) => return error_json(StatusCode::GATEWAY_TIMEOUT, "workspace switch timed out"),
+        Ok(Err(_)) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        Ok(Ok(Err(error))) => return run_error_response(error),
+        Ok(Ok(Ok(()))) => {}
+    }
+
+    let _ = crate::workspace::record_recent_workspace(&canonical);
+
+    let cfg = state.services.switch_config.clone().unwrap_or_default();
+    match preflight_workspace_switch(cfg.current_exe.as_deref(), &canonical) {
+        Err(reason) => {
+            let notice = format!("Workspace switch failed: {reason}");
+            let _ = sender
+                .send(DashboardCommand::CancelSwitchWorkspace {
+                    notice: notice.clone(),
+                })
+                .await;
+            state.hub.push_notice(notice);
+        }
+        Ok(exe) => {
+            let reexec_args =
+                crate::workspace::build_reexec_args(&cfg.orig_args, &canonical, cfg.bound_port);
+            if let Some(exec_hook) = cfg.exec_hook {
+                if let Err(err) = exec_hook(&exe, &reexec_args, &state.token) {
+                    let msg = format_reexec_failure(&exe, &reexec_args, &err);
+                    if let Some(on_err) = cfg.on_exec_error {
+                        on_err(1, msg);
+                    } else {
+                        eprint!("{msg}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                let canonical_for_commit = canonical.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let _ = sender
+                        .send(DashboardCommand::CommitSwitchWorkspace {
+                            path: canonical_for_commit,
+                        })
+                        .await;
+                });
+            }
+        }
+    }
+
+    json_ok(
+        StatusCode::ACCEPTED,
+        &serde_json::json!({
+            "ok": true,
+            "path": canonical.to_string_lossy(),
+        }),
+    )
+}
+
 pub fn build_router(
     hub: DashboardHub,
     token: String,
@@ -1124,6 +1447,10 @@ pub fn build_router_with(
         .route("/assets/favicon-done.svg", get(get_favicon_done))
         .route("/assets/favicon-failed.svg", get(get_favicon_failed))
         .route("/api/state", get(get_state))
+        .route("/api/workspace", get(get_workspace))
+        .route("/api/workspace/dirs", get(get_workspace_dirs))
+        .route("/api/workspace/validate", post(post_workspace_validate))
+        .route("/api/workspace/switch", post(post_workspace_switch))
         .route("/api/memory", get(get_memory))
         .route("/api/memory/save", post(post_memory_save))
         .route(
@@ -1186,7 +1513,14 @@ pub async fn start_server(
     };
 
     let url = dashboard_url(addr, &config.token);
-    let services = config.services.clone();
+    let mut services = config.services.clone();
+    services
+        .switch_config
+        .get_or_insert_with(|| WorkspaceSwitchConfig {
+            orig_args: std::env::args().skip(1).collect(),
+            ..WorkspaceSwitchConfig::default()
+        })
+        .bound_port = Some(port);
     let router = build_router_with(hub, config.token, allowed_hosts, services);
 
     let handle = tokio::spawn(async move {

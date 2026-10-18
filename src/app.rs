@@ -878,6 +878,8 @@ pub struct App {
     pub(crate) run_states: HashMap<Agent, RunState>,
     busy_fallback_starts: Mutex<HashMap<Agent, (Instant, u64)>>,
     pub(crate) injected_now: Option<Instant>,
+    pub(crate) switch_pending: Option<PathBuf>,
+    pub(crate) switch_ready: Option<PathBuf>,
 }
 
 impl App {
@@ -1074,6 +1076,8 @@ impl App {
             run_states: HashMap::new(),
             busy_fallback_starts: Mutex::new(HashMap::new()),
             injected_now: None,
+            switch_pending: None,
+            switch_ready: None,
         };
         app.restore_snapshot(snapshot);
         Ok(app)
@@ -1341,11 +1345,56 @@ impl App {
                         let _ = reply.send(result);
                         changed = true;
                     }
+                    DashboardCommand::SwitchWorkspace { path, reply } => {
+                        let result = self.begin_workspace_switch(path);
+                        let _ = reply.send(result);
+                        changed = true;
+                    }
+                    DashboardCommand::CancelSwitchWorkspace { notice } => {
+                        self.cancel_workspace_switch(notice);
+                        changed = true;
+                    }
+                    DashboardCommand::CommitSwitchWorkspace { path } => {
+                        self.switch_ready = Some(path);
+                        self.exit = true;
+                        changed = true;
+                    }
                 }
             }
             self.dashboard_commands = Some(rx);
         }
         changed
+    }
+
+    pub fn take_switch_ready(&mut self) -> Option<PathBuf> {
+        self.switch_ready.take()
+    }
+
+    pub fn begin_workspace_switch(&mut self, path: PathBuf) -> Result<(), RunTodoError> {
+        if self.switch_pending.is_some() {
+            return Err(RunTodoError::Busy(
+                "workspace switch in progress".to_owned(),
+            ));
+        }
+        if !self.busy_agents.is_empty()
+            || !self.active_turns.is_empty()
+            || self.graph_session.is_some()
+            || self.pending_summary.is_some()
+            || !self.deferred_turns.is_empty()
+        {
+            return Err(RunTodoError::Busy(
+                "a turn or graph run is in progress".to_owned(),
+            ));
+        }
+        self.switch_pending = Some(path);
+        Ok(())
+    }
+
+    pub fn cancel_workspace_switch(&mut self, notice: String) {
+        self.switch_pending = None;
+        self.switch_ready = None;
+        self.push_system(notice);
+        self.publish_dashboard();
     }
 
     fn handle_dashboard_submit_prompt(
@@ -1354,6 +1403,11 @@ impl App {
         agent: Option<String>,
         mode: Option<String>,
     ) -> Result<PromptAccepted, RunTodoError> {
+        if self.switch_pending.is_some() {
+            return Err(RunTodoError::Busy(
+                "workspace switch in progress".to_owned(),
+            ));
+        }
         let target_agent = if let Some(ref agent_str) = agent {
             let runner_clean = agent_str.trim().to_ascii_lowercase();
             let adapter = self
@@ -2656,6 +2710,10 @@ impl App {
     }
 
     pub fn submit_prompt(&mut self) {
+        if self.switch_pending.is_some() {
+            self.push_system("Workspace switch in progress.".to_owned());
+            return;
+        }
         if self.input.trim().is_empty() {
             return;
         }
@@ -5042,6 +5100,11 @@ impl App {
 
     /// Runs a to-do either through an agent or through the graph planner (FR-542).
     pub fn run_todo(&mut self, todo_id: &str, mode: RunMode) -> Result<Todo, RunTodoError> {
+        if self.switch_pending.is_some() {
+            return Err(RunTodoError::Busy(
+                "workspace switch in progress".to_owned(),
+            ));
+        }
         let Some(store) = self.todo_store.clone() else {
             return Err(RunTodoError::Internal(
                 "to-do store not attached".to_owned(),
