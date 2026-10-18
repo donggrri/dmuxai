@@ -948,7 +948,7 @@ function graphArrowPath(s, t, obstacles) {
   var y1 = s.y + s.h / 2;
   var x2 = t.x;
   var y2 = t.y + t.h / 2;
-  if (x2 - x1 >= ARROW_MIN_GAP) {
+  if (x2 - x1 >= ARROW_MIN_GAP && !graphDirectBlocked(x1, y1, x2, y2, obstacles, s, t)) {
     if (Math.abs(y2 - y1) < 1) { return 'M' + x1 + ',' + y1 + ' L' + x2 + ',' + y2; }
     var dx = (x2 - x1) / 2;
     return 'M' + x1 + ',' + y1 + ' C' + (x1 + dx) + ',' + y1 + ' ' +
@@ -969,6 +969,26 @@ function graphArrowPath(s, t, obstacles) {
   return 'M' + sx + ',' + sy + ' L' + sx + ',' + gapS + ' L' + xv + ',' + gapS +
     ' L' + xv + ',' + gapT + ' L' + vx + ',' + gapT + ' L' + vx + ',' + y2 +
     ' L' + x2 + ',' + y2;
+}
+
+// Whether the direct line or curve from (x1,y1) to (x2,y2) (same control
+// points as graphArrowPath) passes over a card other than its source and
+// target; such arrows take the routed path through the row gaps instead.
+function graphDirectBlocked(x1, y1, x2, y2, obstacles, s, t) {
+  if (!obstacles || !obstacles.length) { return false; }
+  var dx = (x2 - x1) / 2;
+  for (var k = 1; k < 24; k++) {
+    var u = k / 24;
+    var v = 1 - u;
+    var px = v * v * v * x1 + 3 * v * v * u * (x1 + dx) + 3 * v * u * u * (x2 - dx) + u * u * u * x2;
+    var py = v * v * v * y1 + 3 * v * v * u * y1 + 3 * v * u * u * y2 + u * u * u * y2;
+    for (var i = 0; i < obstacles.length; i++) {
+      var o = obstacles[i];
+      if (o === s || o === t) { continue; }
+      if (px > o.x - 2 && px < o.x + o.w + 2 && py > o.y - 2 && py < o.y + o.h + 2) { return true; }
+    }
+  }
+  return false;
 }
 
 // The x closest to `preferred` whose vertical segment [ya, yb] crosses no

@@ -1023,3 +1023,54 @@ fn graph_swimlane_one_head_per_target_in_headless_chrome() {
     assert_eq!(result["fitFour"], "abc\u{2026}");
     assert_eq!(result["fitAll"], "abc");
 }
+
+// TC-885 (SPEC-graph-swimlane FR-884): a direct arrow that would pass over an
+// unrelated card is routed through the row gaps instead.
+#[test]
+#[ignore]
+fn graph_swimlane_direct_arrow_avoids_cards_in_headless_chrome() {
+    let Some(chrome_bin) = find_chrome_binary() else {
+        println!(
+            "skipping graph_swimlane_direct_arrow_avoids_cards_in_headless_chrome: chrome binary not found"
+        );
+        return;
+    };
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    write_swimlane_fixture(workspace.path());
+    let mut dash = start_dashboard(&chrome_bin, workspace.path(), 1280, 900);
+    assert!(
+        wait_for(&mut dash.cdp, "!!window.dmuxaiGraph"),
+        "dashboard did not load"
+    );
+    let result = eval_json(
+        &mut dash.cdp,
+        r#"(() => {
+  const G = window.dmuxaiGraph;
+  const s = { x: 200, y: 54, w: 120, h: 56 };
+  const t = { x: 600, y: 54, w: 120, h: 56 };
+  const mid = { x: 380, y: 54, w: 120, h: 56 };
+  const far = { x: 380, y: 400, w: 120, h: 56 };
+  const pts = d => (d.match(/-?[0-9.]+,-?[0-9.]+/g) || []).map(p => p.split(',').map(Number));
+  const hits = (d, o) => {
+    const p = pts(d);
+    for (let i = 1; i < p.length; i++) {
+      const [ax, ay] = p[i - 1], [bx, by] = p[i];
+      for (let k = 0; k <= 20; k++) {
+        const x = ax + (bx - ax) * k / 20, y = ay + (by - ay) * k / 20;
+        if (x > o.x && x < o.x + o.w && y > o.y && y < o.y + o.h) { return true; }
+      }
+    }
+    return false;
+  };
+  const blockedPath = G.arrowPath(s, t, [s, t, mid]);
+  const clearPath = G.arrowPath(s, t, [s, t, far]);
+  return JSON.stringify({
+    blockedPath, clearPath,
+    blockedHits: hits(blockedPath, mid),
+    clearStraight: clearPath.indexOf('L') !== -1 && pts(clearPath).length === 2
+  });
+})()"#,
+    );
+    assert_eq!(result["blockedHits"], false, "{result}");
+    assert_eq!(result["clearStraight"], true, "{result}");
+}
