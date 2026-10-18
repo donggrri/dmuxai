@@ -72,12 +72,16 @@ impl GraphRunSession {
         if let Some(node) = self.run.plan.nodes.iter_mut().find(|n| n.id == node_id) {
             if success {
                 node.status = GraphNodeStatus::Completed;
+                node.finished_at_ms = Some(unix_now_ms());
             } else if node.attempt + 1 < self.run.plan.limits.max_retries {
                 node.attempt += 1;
                 node.status = GraphNodeStatus::Ready;
+                // Keep the first attempt's start so the card spans every try.
+                node.finished_at_ms = None;
                 return self.schedule();
             } else {
                 node.status = GraphNodeStatus::Failed;
+                node.finished_at_ms = Some(unix_now_ms());
             }
         }
         if !success {
@@ -149,6 +153,11 @@ impl GraphRunSession {
             }
 
             self.run.plan.nodes[index].status = GraphNodeStatus::Running;
+            // SPEC-graph-swimlane FR-881: persisted start time for the timeline.
+            if self.run.plan.nodes[index].started_at_ms.is_none() {
+                self.run.plan.nodes[index].started_at_ms = Some(unix_now_ms());
+            }
+            self.run.plan.nodes[index].finished_at_ms = None;
             self.active.insert(node_id);
             actions.push(GraphAction::StartNode(assignment));
             index += 1;
@@ -315,6 +324,14 @@ impl RoleShort for GraphNode {
     }
 }
 
+/// Milliseconds since the Unix epoch (0 if the clock is before it).
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +355,8 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Completed,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
                 GraphNode {
                     id: "step-1".to_owned(),
@@ -349,6 +368,8 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
                 GraphNode {
                     id: "step-2".to_owned(),
@@ -360,6 +381,8 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
                 GraphNode {
                     id: "step-3".to_owned(),
@@ -371,6 +394,8 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
                 GraphNode {
                     id: "step-4".to_owned(),
@@ -382,6 +407,8 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
             ],
             edges: vec![
@@ -463,6 +490,8 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Completed,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
                 GraphNode {
                     id: "impl-1".to_owned(),
@@ -474,6 +503,8 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
                 GraphNode {
                     id: "research-1".to_owned(),
@@ -485,6 +516,8 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    started_at_ms: None,
+                    finished_at_ms: None,
                 },
             ],
             edges: vec![],

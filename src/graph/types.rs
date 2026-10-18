@@ -44,6 +44,10 @@ pub struct GraphNode {
     pub requires_gate: bool,
     pub status: GraphNodeStatus,
     pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,4 +123,42 @@ pub enum GraphRunPhase {
     WaitingGate,
     Completed,
     Failed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_node_timestamps_roundtrip_and_back_compat() {
+        let legacy_json = r#"{
+            "id": "plan",
+            "role": "plan",
+            "job": "Split CSV export",
+            "runner": "agy",
+            "model_id": "gemini-3.8-flash-high",
+            "skill": null,
+            "requires_gate": false,
+            "status": "completed",
+            "attempt": 1
+        }"#;
+        let parsed_legacy: GraphNode = serde_json::from_str(legacy_json).expect("parse legacy");
+        assert_eq!(parsed_legacy.started_at_ms, None);
+        assert_eq!(parsed_legacy.finished_at_ms, None);
+
+        let reserialized_legacy = serde_json::to_string(&parsed_legacy).expect("serialize legacy");
+        assert!(!reserialized_legacy.contains("started_at_ms"));
+        assert!(!reserialized_legacy.contains("finished_at_ms"));
+
+        let timed = GraphNode {
+            started_at_ms: Some(1_700_000_000_000),
+            finished_at_ms: Some(1_700_000_120_000),
+            ..parsed_legacy
+        };
+        let json = serde_json::to_string(&timed).expect("serialize timed");
+        assert!(json.contains("\"started_at_ms\":1700000000000"));
+        assert!(json.contains("\"finished_at_ms\":1700000120000"));
+        let roundtrip: GraphNode = serde_json::from_str(&json).expect("roundtrip timed");
+        assert_eq!(roundtrip, timed);
+    }
 }

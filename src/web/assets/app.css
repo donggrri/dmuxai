@@ -76,6 +76,8 @@
   --graph-grid: #1c2532;
   --graph-node-fill: #0e1116;
   --graph-edge-idle: #5d6c80;
+  --graph-pending: #6b7a8f;
+  --graph-future: rgba(139, 152, 169, 0.06);
 }
 
 :root[data-theme="light"] {
@@ -146,6 +148,9 @@
   --graph-grid: #e2e8f0;
   --graph-node-fill: #ffffff;
   --graph-edge-idle: #8fa1b5;
+  /* UX-880: >= 3:1 against the canvas and card backgrounds. */
+  --graph-pending: #687890;
+  --graph-future: rgba(95, 110, 132, 0.06);
 }
 
 /* Pre-init light default: mirrors the light palette above — keep in sync. */
@@ -218,6 +223,8 @@
     --graph-grid: #e2e8f0;
     --graph-node-fill: #ffffff;
     --graph-edge-idle: #8fa1b5;
+    --graph-pending: #687890;
+    --graph-future: rgba(95, 110, 132, 0.06);
   }
 }
 
@@ -1193,8 +1200,6 @@ main {
   .todo { padding: 8px 10px; }
   .todo-actions { margin-left: 0; width: 100%; }
   .todo-jira-host { margin-left: 0; max-width: 9em; }
-  .graph-stage { flex-direction: column; }
-  .graph-detail { flex-basis: auto; }
 }
 
 /* memory panel (SPEC-obsidian-memory) */
@@ -1416,9 +1421,7 @@ main {
 }
 
 .graph-stage {
-  display: flex;
-  gap: 10px;
-  align-items: stretch;
+  position: relative;
   margin-top: 6px;
 }
 
@@ -1428,14 +1431,12 @@ main {
   position: relative;
   flex: 1 1 auto;
   min-width: 0;
-  min-height: 320px;
+  min-height: 180px;
   max-height: 70vh;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--graph-canvas);
-  background-image: radial-gradient(var(--graph-grid) 1px, transparent 1px);
-  background-size: 18px 18px;
   cursor: grab;
 }
 
@@ -1444,114 +1445,146 @@ main {
 
 .graph-svg { display: block; }
 
+/* Swimlane timeline (SPEC-graph-swimlane FR-880..FR-884, UX-880). */
+.graph-svg .axis-label {
+  fill: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.graph-svg .axis-grid { stroke: var(--graph-grid); stroke-width: 1; }
+.graph-svg .axis-base { stroke: var(--line); stroke-width: 1; }
+.graph-svg .graph-future { fill: var(--graph-future); }
+
+.graph-svg .lane-label { fill: var(--bg-chip); }
+.graph-svg .lane-sep { stroke: var(--line); stroke-width: 1; }
+.graph-svg .lane-name { fill: var(--text); font-size: 13px; font-weight: 700; }
+.graph-svg .lane-model { fill: var(--muted); font-size: 11px; }
+.graph-svg .lane-accent { fill: var(--lane-color, var(--muted)); }
+.graph-svg .lane-c0 { --lane-color: #8b5cf6; }
+.graph-svg .lane-c1 { --lane-color: #e8590c; }
+.graph-svg .lane-c2 { --lane-color: #0f8b8d; }
+.graph-svg .lane-c3 { --lane-color: #64748b; }
+.graph-svg .lane-c4 { --lane-color: #2f9e44; }
+.graph-svg .lane-c5 { --lane-color: #d6336c; }
+
 .graph-svg .node { cursor: pointer; }
 .graph-svg .node:focus { outline: none; }
-.graph-svg .node:focus .station,
-.graph-svg .node:focus .core {
-  stroke: var(--accent);
-  stroke-width: 4;
-}
-
-.graph-svg .station {
+.graph-svg .card-box {
   fill: var(--graph-node-fill);
-  stroke: var(--graph-edge-idle);
-  stroke-width: 4;
+  stroke: var(--line);
+  stroke-width: 1.5;
 }
-
-.graph-svg .node.state-completed .station { fill: var(--ok); stroke: var(--ok); }
-.graph-svg .node.state-failed .station { fill: var(--err); stroke: var(--err); }
-.graph-svg .node.state-waiting_gate .station { stroke: var(--gate); }
-.graph-svg .node.state-skipped .station { stroke: var(--skip); opacity: 0.75; }
-.graph-svg .node.state-pending .station,
-.graph-svg .node.state-ready .station { stroke: var(--graph-edge-idle); }
-
-.graph-svg .node.state-running .core {
-  fill: var(--graph-node-fill);
-  stroke: var(--accent);
-  stroke-width: 4;
-}
-.graph-svg .station-spinner {
-  transform-box: fill-box;
-  transform-origin: center;
-  animation: spin 0.8s linear infinite;
-}
-.graph-svg .node.state-running .dot { fill: var(--accent); }
-.graph-svg .node.state-running .ring { fill: none; stroke: var(--accent); }
-.graph-svg .node.state-running .ring-outer { stroke-width: 2; opacity: 0.8; stroke-dasharray: 24 50; }
-.graph-svg .node.state-running .ring-inner { stroke-width: 2; opacity: 0.6; }
-
-.graph-svg .check {
-  fill: none;
-  stroke: var(--graph-node-fill);
-  stroke-width: 3;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.graph-svg .cross {
-  fill: none;
-  stroke: var(--graph-node-fill);
-  stroke-width: 3;
-  stroke-linecap: round;
-}
-
-.graph-svg .node-selected .station,
-.graph-svg .node-selected .core { stroke: var(--warn); }
-
-.graph-svg .node-label {
+.graph-svg .card-accent { fill: var(--graph-pending); }
+.graph-svg .card-icon { fill: var(--muted); font-size: 13px; font-weight: 700; }
+.graph-svg .card-id {
   fill: var(--text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-weight: 700;
   font-size: 13px;
 }
-
-.graph-svg .node-meta {
-  fill: var(--muted);
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  font-size: 11.5px;
+.graph-svg .card-sub { fill: var(--faint); font-size: 11px; }
+.graph-svg .card-time {
+  fill: var(--faint);
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.graph-svg .card-chip { fill: var(--badge-pending-bg); stroke: var(--badge-pending-line); stroke-width: 1; }
+.graph-svg .card-chip-text {
+  fill: var(--badge-pending-text);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
 }
 
-.graph-svg .node.state-completed .node-meta { fill: var(--ok); }
-.graph-svg .node.state-running .node-meta { fill: var(--accent); }
-.graph-svg .node.state-failed .node-meta { fill: var(--err); }
+.graph-svg .node.state-completed .card-box { stroke: var(--badge-completed-line); }
+.graph-svg .node.state-completed .card-accent,
+.graph-svg .node.state-completed .card-icon { fill: var(--ok); }
+.graph-svg .node.state-completed .card-time { fill: var(--ok); }
+.graph-svg .node.state-completed .card-chip { fill: var(--badge-completed-bg); stroke: var(--badge-completed-line); }
+.graph-svg .node.state-completed .card-chip-text { fill: var(--badge-completed-text); }
+
+.graph-svg .node.state-running .card-box { stroke: var(--accent); stroke-width: 2; }
+.graph-svg .node.state-running .card-accent { fill: var(--accent); }
+.graph-svg .node.state-running .card-time { fill: var(--accent); }
+.graph-svg .node.state-running .card-chip { fill: var(--badge-running-bg); stroke: var(--badge-running-line); }
+.graph-svg .node.state-running .card-chip-text { fill: var(--badge-running-text); }
+.graph-svg .run-dot { fill: var(--accent); animation: dmuxai-node-pulse 1.6s ease-in-out infinite; }
+.graph-svg .stripe { fill: var(--accent); opacity: 0.18; }
+
+.graph-svg .node.state-failed .card-box { stroke: var(--err); }
+.graph-svg .node.state-failed .card-accent,
+.graph-svg .node.state-failed .card-icon { fill: var(--err); }
+.graph-svg .node.state-failed .card-time { fill: var(--err); }
+.graph-svg .node.state-failed .card-chip { fill: var(--badge-failed-bg); stroke: var(--badge-failed-line); }
+.graph-svg .node.state-failed .card-chip-text { fill: var(--badge-failed-text); }
+
+.graph-svg .node.state-pending .card-box,
+.graph-svg .node.state-ready .card-box,
+.graph-svg .node.state-waiting_gate .card-box {
+  stroke: var(--graph-pending);
+  stroke-dasharray: 5 4;
+}
+.graph-svg .node.state-waiting_gate .card-accent { fill: var(--gate); }
+.graph-svg .node.state-pending .card-sub,
+.graph-svg .node.state-ready .card-sub,
+.graph-svg .node.state-waiting_gate .card-sub { font-style: italic; }
+.graph-svg .node.card-blocked .card-chip { fill: var(--badge-failed-bg); stroke: var(--badge-failed-line); }
+.graph-svg .node.card-blocked .card-chip-text { fill: var(--badge-failed-text); }
+.graph-svg .node.state-skipped { opacity: 0.75; }
+
+.graph-svg .node:focus .card-box,
+.graph-svg .node:hover .card-box { stroke-width: 2.5; }
+.graph-svg .node-selected .card-box { stroke: var(--warn); stroke-width: 2.5; stroke-dasharray: none; }
 
 .graph-svg .edge {
   fill: none;
+  stroke-width: 2;
   stroke-linejoin: round;
   stroke-linecap: round;
 }
-
-.graph-svg .edge-completed { stroke: var(--ok); stroke-width: 6; }
-.graph-svg .edge-running { stroke: var(--accent); stroke-width: 6; }
-.graph-svg .edge-failed { stroke: var(--err); stroke-width: 4; stroke-dasharray: 4 4; }
+.graph-svg .edge-completed { stroke: var(--ok); }
+.graph-svg .edge-running { stroke: var(--accent); }
+.graph-svg .edge-failed { stroke: var(--err); }
 .graph-svg .edge-pending,
 .graph-svg .edge-ready,
 .graph-svg .edge-waiting_gate,
 .graph-svg .edge-skipped {
-  stroke: var(--graph-edge-idle);
-  stroke-width: 4;
+  stroke: var(--graph-pending);
   stroke-dasharray: 5 4;
 }
+.graph-svg .edge-head { stroke: none; fill: var(--graph-pending); }
+.graph-svg .edge-head-completed { fill: var(--ok); }
+.graph-svg .edge-head-running { fill: var(--accent); }
+.graph-svg .edge-head-failed { fill: var(--err); }
+
+.graph-svg .now-line { pointer-events: none; }
+.graph-svg .now-rule { stroke: var(--accent); stroke-width: 2; }
+.graph-svg .now-tag { fill: var(--accent); }
+.graph-svg .now-text { fill: var(--on-accent); font-size: 11px; font-weight: 700; }
+.graph-svg .now-ended .now-rule { stroke: var(--muted); stroke-dasharray: 4 3; }
+.graph-svg .now-ended .now-tag { fill: var(--muted); }
+.graph-svg .now-ended .now-text { fill: var(--bg-panel); }
 
 @keyframes dmuxai-node-pulse {
-  0%, 100% { opacity: 0.25; }
-  50% { opacity: 0.7; }
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
 }
 
-.graph-svg .node.state-running .ring {
-  animation: dmuxai-node-pulse 1.6s ease-in-out infinite;
-}
-
-.graph-svg .node.state-running .ring-inner { animation-delay: 0.4s; }
-
+/* FR-885: the detail panel is an overlay drawer, so the timeline keeps its width. */
 .graph-detail {
-  flex: 0 0 260px;
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 5;
+  width: min(340px, 90%);
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--bg-chip);
+  box-shadow: -6px 0 18px rgba(0, 0, 0, 0.18);
   padding: 10px 12px;
   overflow: auto;
-  max-height: 520px;
 }
 
 .graph-detail[hidden] { display: none; }
@@ -1648,7 +1681,9 @@ main {
   display: inline-block;
 }
 
-.legend-pending { border: 2px solid var(--graph-edge-idle); }
+.legend-pending { border: 2px dashed var(--graph-pending); }
+.legend-line { display: inline-block; width: 18px; height: 0; border-top: 2px solid var(--muted); }
+.legend-line-dashed { border-top: 2px dashed var(--graph-pending); }
 .legend-running { border: 2px solid var(--accent); }
 .legend-completed { background: var(--ok); }
 .legend-failed { background: var(--err); }
@@ -1667,15 +1702,8 @@ main {
     content: "●";
     color: var(--accent);
   }
-  .graph-svg .station-spinner {
+  .graph-svg .run-dot {
     animation: none;
-  }
-  .graph-svg .node.state-running .ring {
-    animation: none;
-  }
-  .graph-svg .node.state-running .ring-outer {
-    stroke-dasharray: none;
-    opacity: 0.35;
   }
 }
 
@@ -1690,15 +1718,8 @@ main {
   content: "●";
   color: var(--accent);
 }
-.reduced-motion .graph-svg .station-spinner {
+.reduced-motion .graph-svg .run-dot {
   animation: none;
-}
-.reduced-motion .graph-svg .node.state-running .ring {
-  animation: none;
-}
-.reduced-motion .graph-svg .node.state-running .ring-outer {
-  stroke-dasharray: none;
-  opacity: 0.35;
 }
 
 /* ---------------------------------------------------------------------------

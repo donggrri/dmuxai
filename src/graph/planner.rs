@@ -47,6 +47,8 @@ pub fn plan_request(
         requires_gate: false,
         status: GraphNodeStatus::Completed,
         attempt: 0,
+        started_at_ms: None,
+        finished_at_ms: None,
     });
 
     for (index, role) in roles
@@ -67,6 +69,8 @@ pub fn plan_request(
             requires_gate,
             status: GraphNodeStatus::Pending,
             attempt: 0,
+            started_at_ms: None,
+            finished_at_ms: None,
         });
     }
 

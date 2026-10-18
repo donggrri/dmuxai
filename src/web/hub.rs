@@ -110,10 +110,16 @@ impl DashboardHub {
                         timing.finished_at_ms = None;
                     }
 
-                    if node.status == GraphNodeStatus::Running && timing.started_at_ms.is_none() {
+                    if let Some(started) = node.started_at_ms {
+                        timing.started_at_ms = Some(started);
+                    } else if node.status == GraphNodeStatus::Running
+                        && timing.started_at_ms.is_none()
+                    {
                         timing.started_at_ms = Some(now_ms);
                     }
-                    if matches!(
+                    if let Some(finished) = node.finished_at_ms {
+                        timing.finished_at_ms = Some(finished);
+                    } else if matches!(
                         node.status,
                         GraphNodeStatus::Completed
                             | GraphNodeStatus::Failed
@@ -123,9 +129,9 @@ impl DashboardHub {
                         timing.finished_at_ms = Some(now_ms);
                     }
 
-                    node.started_at_ms = timing.started_at_ms;
-                    node.finished_at_ms = timing.finished_at_ms;
-                    node.elapsed_ms = match (timing.started_at_ms, timing.finished_at_ms) {
+                    node.started_at_ms = node.started_at_ms.or(timing.started_at_ms);
+                    node.finished_at_ms = node.finished_at_ms.or(timing.finished_at_ms);
+                    node.elapsed_ms = match (node.started_at_ms, node.finished_at_ms) {
                         (Some(start), Some(finish)) => Some(finish.saturating_sub(start)),
                         _ => None,
                     };
