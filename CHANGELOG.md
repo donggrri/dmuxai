@@ -8,7 +8,7 @@ All notable changes to dmuxai are listed here. Versions follow
 ## [0.2.2] - 2026-10-18
 
 Dashboard layout, workspace and graph view changes requested by Dongjin on
-2026-10-18, PRs #57-#60, #62-#66 and #70 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
+2026-10-18, PRs #57-#60, #62-#66, #70 and #72 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
 issues #54-#56 and #61, plus the grok runner Dongjin added on 2026-10-19). Linux is the supported platform. The Windows target
 still compiles and passes clippy, but the live workspace switch returns 501 on
 Windows (see ROADMAP "Later").
