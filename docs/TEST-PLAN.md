@@ -328,6 +328,42 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-sidebar-resize | FR-971,FR-972,FR-974 | TC-972 | `sidebar_resize_clamps_and_narrow_layout` (ignored) | e2e | ✅ | v0.2.2 |
 | M8,M2 | SPEC-graph-swimlane | FR-880..885,UX-880,UX-881 | TC-882 | `graph_swimlane_renders_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.2 |
 | M8 | SPEC-graph-swimlane | FR-883 | TC-883 | `hub_clears_stale_finish_when_node_runs_again` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-890,FR-891 | TC-890 | `builtin_grok_preset_registration` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-890,FR-899 | TC-891 | `fresh_install_lists_grok` | integration | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-892,FR-894,NFR-890 | TC-892 | `grok_preset_argv_is_headless_and_not_a_shell` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-893,FR-894 | TC-893 | `grok_streaming_json_extracts_text_and_session` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-893,FR-894,FR-895 | TC-894 | `grok_mock_turn_returns_text_and_reports_errors` | integration | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-895 | TC-895 | `grok_models_parse_default_filter_and_fast` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-896,NFR-890 | TC-896 | `grok_auth_is_models_stdout_only` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-896 | TC-897 | `grok_unauthenticated_send_explains_login` | integration | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-897 | TC-898 | `grok_cancel_kills_the_process_group` | integration | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-898 | TC-899 | `grok_preset_color_is_distinct` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-898 | TC-900 | `grok_chat_and_dashboard_use_preset_color` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-899 | TC-901 | `builtin_grok_is_not_graph_routed_unless_listed` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-899 | TC-902 | `grok_effective_model_skips_composer_default` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-899 | TC-903 | `graph_status_names_builtin_grok_exception` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-896 | TC-904 | `selecting_grok_requests_a_model_probe` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-900 | TC-905 | `readme_and_changelog_mention_builtin_grok` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-900 | TC-906 | `starter_config_mentions_builtin_grok` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-892,FR-893 | TC-907 | `grok_live_smoke_headless_turn` (ignored) | live | ✅ | v0.2.2 |
+| M8 | SPEC-grok-runner | FR-913,FR-914,FR-916 | TC-913 | `grok_preset_avoids_stranded_auto_wake` | unit | ✅ | v0.2.2 (#72) |
+| M8 | SPEC-grok-runner | FR-914 | TC-914 | `grok_end_line_finishes_turn_and_reaps_group` | integration | ✅ | v0.2.2 (#72) |
+| M8 | SPEC-grok-runner | FR-914 | TC-915 | `grok_orphan_holding_stdout_does_not_block_turn` | integration | ✅ | v0.2.2 (#72) |
+| M8 | SPEC-grok-runner | FR-915 | TC-916 | `grok_turn_without_end_line_completes_at_exit` | integration | ✅ | v0.2.2 (#72) |
+| M8 | SPEC-grok-runner | FR-916 | TC-917 | `append_reply_text_breaks_paragraphs_once` | unit | ✅ | v0.2.2 (#72) |
+| M8 | SPEC-grok-runner | FR-916 | TC-918 | `grok_text_after_tool_call_starts_new_paragraph` | integration | ✅ | v0.2.2 (#72) |
+| M8 | SPEC-grok-runner | FR-980 | TC-980 | `grok_tool_lines_map_to_activity_items` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-grok-runner | FR-980 | TC-981 | `grok_tool_calls_emit_activity_events` | integration | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-running-indicators | FR-981 | TC-982 | `dashboard_agent_activity_matches_tui_status` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-running-indicators | FR-981 | TC-983 | `dashboard_shows_agent_activity_detail` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-running-indicators | FR-982 | TC-984 | `cancel_appends_one_cancelled_notice_for_every_runner` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-running-indicators | FR-982 | TC-985 | `dashboard_cancel_shows_cancelled_notice` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-first-run | FR-983 | TC-816 | `welcome_lists_registered_runners` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-web-dashboard | FR-984 | TC-986 | `dashboard_snapshot_never_contains_startup_token` | unit | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-web-dashboard | FR-984 | TC-987 | `api_snapshots_do_not_echo_token` | integration | ✅ | v0.2.2 (#74) |
+| M8 | SPEC-model-policy | FR-910 | TC-910 | `fast_models_are_rejected_for_every_runner` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-model-policy | FR-911 | TC-911 | `grok_models_are_allowed_only_for_the_grok_runner` | unit | ✅ | v0.2.2 |
+| M8 | SPEC-model-policy | FR-912 | TC-912 | `dmuxai_graph_yaml_keeps_grok_disallow_and_explains_why` | integration | ✅ | v0.2.2 |
 | M8 | SPEC-graph-swimlane | FR-881,FR-884 | TC-884 | `graph_swimlane_one_head_per_target_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.2 |
 | M8 | SPEC-graph-swimlane | FR-884 | TC-885 | `graph_swimlane_direct_arrow_avoids_cards_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.2 |
 
