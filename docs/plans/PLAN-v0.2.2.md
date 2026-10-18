@@ -34,3 +34,7 @@ The order is 1 → 2 → 3. Items 1 and 2 share the layout, so the left sidebar 
    - re-exec via `std::os::unix::process::CommandExt::exec`, behind a trait so tests can use a double;
    - a header button and dialog in a new `workspace.js`;
    - a runner cwd test across custom agents and graph nodes.
+4. **Graph swimlane (SPEC-graph-swimlane, #61)**, added 2026-10-18 after Dongjin picked mockup B:
+   - replace the subway SVG renderer in `app.js` with lanes per runner, a time axis, a now line, cards sized by duration, browser-side estimates for pending nodes, and arrows routed without loop-back;
+   - turn the detail panel into an overlay drawer, add a Fit text floor of 11px, and fix light-theme pending contrast;
+   - add asset, math/contrast and e2e tests, with light and dark screenshots.

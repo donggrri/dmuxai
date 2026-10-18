@@ -11,8 +11,9 @@ Source: Dongjin, 2026-10-18 09:42 KST.
 | 1 | Prompt box stays centered with sidebars open | UX | [SPEC-centered-prompt](specs/SPEC-centered-prompt.md) (FR-850..852, UX-850) | [#54](https://github.com/donggrri/dmuxai/issues/54) | planned |
 | 2 | Left sidebar of sessions/conversations (ChatGPT-style), TUI picker parity | UX | [SPEC-session-sidebar](specs/SPEC-session-sidebar.md) (FR-860..864, UX-860) | [#55](https://github.com/donggrri/dmuxai/issues/55) | planned |
 | 3 | Set the project working directory (CLI, config, dashboard) | feature | [SPEC-workspace-dir](specs/SPEC-workspace-dir.md) (FR-870..875, NFR-870) | [#56](https://github.com/donggrri/dmuxai/issues/56) | planned |
+| 4 | Graph view: horizontal swimlane timeline (replaces the subway map) | UX | [SPEC-graph-swimlane](specs/SPEC-graph-swimlane.md) (FR-880..885, UX-880..881) | [#61](https://github.com/donggrri/dmuxai/issues/61) | planned |
 
-Order: 1 → 2 → 3 (1 and 2 share the layout; 2 and 3 both touch the header). No release in this round.
+Order: 1 → 2 → 3 → 4 (1 and 2 share the layout; 2 and 3 both touch the header). No release in this round.
 
 ## v0.2.1 (released 2026-10-18)
 

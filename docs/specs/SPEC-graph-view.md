@@ -8,6 +8,8 @@ Related: SPEC-web-dashboard (FR-525, FR-529), SPEC-theme-colors (UX-600)
 
 ## 1. Decision summary
 
+> v0.2.2: the subway-map drawing (UX-700) is replaced by the horizontal swimlane timeline in [SPEC-graph-swimlane](SPEC-graph-swimlane.md) (#61). Layout data (FR-700, FR-701), details (FR-702) and the toggle, zoom and pan behaviour (UX-701..UX-703) still apply.
+
 Today the dashboard lists graph-run nodes in a linear list, which hides
 parallelism and dependencies. This feature adds a Graph view that draws the
 run's DAG as embedded SVG, with no external library and no CDN:
