@@ -73,3 +73,16 @@ Checked and left:
 - P10: TUI confirm probes at `app.rs:2345` through `request_builtin_grok_models` `:2265`. Dashboard `SessionCommand::SelectAgent` `:1682-1690` calls the same probe. Chip color is `AgentView.color` `#6366f1` (SPEC-grok-runner FR-896, FR-898; tests `grok_chat_and_dashboard_use_preset_color`, `selecting_grok_requests_a_model_probe`). Still full under `--web` only.
 - Fifteen other §3 cites that still match: `handle_key` 1996-2058, Enter 2043, Ctrl+C 1997 and `cancel_selected` 3168, Ctrl+O 2001 and `toggle_last_activity_details` 3746, F2 2041 and `open_model_picker` 2455, F3 2042, clipboard image 2030-2036 and 2704, paste 1977-1994, mouse 2144-2208, `open_file_link_at` 4487, M2 `:6607` (`file_link_click_target`), `render_activity_group` 5699-5778, `draw_status` 5847-5998, `App::run` 1187-1279 with command drain 1224, gate string 3989 and 4136, `app.js:1690-1700` (the TUI gate hint), chips `app.js:1739-1788`, session Esc 358/396/760/815, memory approve/reject `server.rs:1495-1502`, Shift+Enter row `parity.rs:26-30`, activity collapsed line `app.rs:1590-1592`.
 - §3.9 recounted from the row statuses in §3.1-3.6: 54 rows, 27 full, 13 partial, 6 missing, 8 n/a. The table already matched. No status changed (P10 stays full, P11 stays n/a).
+
+## Round 4 (free-model review of round 3)
+
+Reviewers of the round-3 doc diff. Docs only.
+
+- opencode nemotron-3-ultra-free: APPROVE, no items. Noted a ±1 drift on the §3.0 no-args hub cite.
+- opencode beam-free: APPROVE, one minor on the `cli.rs` range in R4.
+- deepseek-v4.1-flash-free and glm-5.3-flash-free: no answer (timeouts).
+
+Changed in `docs/specs/SPEC-dashboard-full-parity.md`:
+
+- §3.0 no-args hub: `:655-661` included the `} else {` line. The hub body (no server, event-log sink, `None`) is `main.rs:656-661`.
+- R4: `src/cli.rs:524-612` covered `run_and_report` (524-550) and stopped one line short of `run_headless`. The row means the headless runner, now `src/cli.rs:552-613` `run_headless`. That was the only `cli.rs` cite in the spec.
