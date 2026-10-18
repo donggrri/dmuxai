@@ -1023,7 +1023,8 @@ function graphArrowHead(t, className) {
 function graphFitText(text, maxPx, charPx) {
   var str = String(text || '');
   var max = Math.max(1, Math.floor(maxPx / charPx));
-  return str.length > max ? str.slice(0, Math.max(1, max - 1)) + '\u2026' : str;
+  if (str.length <= max) { return str; }
+  return max <= 1 ? '\u2026' : str.slice(0, max - 1) + '\u2026';
 }
 
 function graphCardTime(entry, nowMs) {
@@ -1349,6 +1350,7 @@ window.dmuxaiGraph = {
   arrowPath: graphArrowPath,
   tickStep: graphTickStep,
   headState: graphHeadState,
+  fitText: graphFitText,
   layout: buildSwimlaneGeometry,
   contrast: contrastRatio
 };

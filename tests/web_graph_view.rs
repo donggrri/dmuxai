@@ -998,7 +998,10 @@ fn graph_swimlane_one_head_per_target_in_headless_chrome() {
     mixed: G.headState(['completed', 'running', 'pending']),
     failed: G.headState(['running', 'failed']),
     done: G.headState(['completed', 'completed']),
-    waiting: G.headState(['completed', 'pending'])
+    waiting: G.headState(['completed', 'pending']),
+    fitOne: G.fitText('abcdef', 10, 8),
+    fitFour: G.fitText('abcdef', 32, 8),
+    fitAll: G.fitText('abc', 32, 8)
   });
 })()"#,
     );
@@ -1015,4 +1018,8 @@ fn graph_swimlane_one_head_per_target_in_headless_chrome() {
     assert_eq!(result["failed"], "failed");
     assert_eq!(result["done"], "completed");
     assert_eq!(result["waiting"], "pending");
+    // graphFitText never exceeds its width: one slot is just the ellipsis.
+    assert_eq!(result["fitOne"], "\u{2026}");
+    assert_eq!(result["fitFour"], "abc\u{2026}");
+    assert_eq!(result["fitAll"], "abc");
 }
