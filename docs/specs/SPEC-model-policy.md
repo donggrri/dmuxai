@@ -1,6 +1,6 @@
 # SPEC: Model policy (composer-2.5) and per-runner model selection
 
-Status: Implemented (PR #2, #4, #6); grok rows draft (SPEC-grok-runner)  
+Status: Implemented (PR #2, #4, #6); grok rows implemented (SPEC-grok-runner) 
 Owner: DmuxAI  
 Created: 2026-10-17  
 Baseline: `73e3f4d`  
@@ -66,7 +66,7 @@ Repository graph definitions, subagents and DmuxAI routing defaults use only `co
 ## 6. Data, integration, and safety contracts
 
 - Model ids are passed to CLIs as argv, never interpolated into a shell.
-- `docs/dmuxai-graph.yaml` node models stay `composer-2.5`. The grok amendment adds a comment on `disallow_patterns` and does not add a grok model (FR-912). The comment to place immediately above `disallow_patterns` is:
+- `docs/dmuxai-graph.yaml` node models stay `composer-2.5`. The grok amendment adds a comment on `disallow_patterns` and does not add a grok model (FR-912). The comment immediately above `disallow_patterns` is:
 
 ```yaml
   # This repo graph stays composer-2.5 on every node. Runtime policy allows
@@ -81,5 +81,5 @@ Shipped rows stay as they are. FR-910..FR-912 and TC-910..TC-912 are implemented
 ## 8. Review and test exit criteria
 
 - All non-proposed TCs pass. TC-315 stays proposed until an opencode override test is added.
-- TC-910, TC-911, and TC-912 pass before the grok runner is marked complete.
+- TC-910, TC-911, and TC-912 pass. The grok runner is implemented (SPEC-grok-runner).
 - `cargo test --test model_policy_repo` still passes after the yaml comment lands.

@@ -1,6 +1,6 @@
 # SPEC: Built-in grok runner
 
-Status: draft
+Status: Implemented
 Owner: DmuxAI
 Created: 2026-10-18
 Baseline: `787436b`
@@ -154,8 +154,8 @@ Phase 1 is this spec, the model-policy rows, [PLAN-grok-runner.md](../plans/PLAN
 
 ## 8. Review and test exit criteria
 
-- [ ] Every Must row maps to a passing TC in section 5.
-- [ ] `cargo test --test spec_index` passes (Status line and unique IDs).
-- [ ] Deterministic tests pass with the mock and without grok credentials.
-- [ ] `grok_live_smoke_headless_turn` stays `#[ignore]` and is reported separately.
-- [ ] `docs/reviews/REVIEW-grok-runner.md` records commands and residual risk after phase 2.
+- [x] Every Must row maps to a passing TC in section 5.
+- [x] `cargo test --test spec_index` passes (Status line and unique IDs).
+- [x] Deterministic tests pass with the mock and without grok credentials.
+- [x] `grok_live_smoke_headless_turn` stays `#[ignore]` and is reported separately.
+- [x] `docs/reviews/REVIEW-grok-runner.md` records commands and residual risk after phase 2.
