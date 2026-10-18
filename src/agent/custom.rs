@@ -8,9 +8,8 @@ use std::{
 };
 
 use dmuxai::custom_agent::{
-    BUILTIN_MODELS_TIMEOUT, CustomAgentOutput, CustomAgentSpec, PromptVia, SubstitutionContext,
-    build_argv, failure_reason, list_model_ids, parse_jsonl_line, policy_message, spec_at,
-    substitute,
+    BUILTIN_MODELS_TIMEOUT, CustomAgentOutput, CustomAgentSpec, SubstitutionContext, build_argv,
+    failure_reason, list_model_ids, parse_jsonl_line, policy_message, spec_at, substitute,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},

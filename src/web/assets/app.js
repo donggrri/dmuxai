@@ -2361,7 +2361,14 @@ function render(nowMs) {
   var snap = snapshot;
   if (!snap || typeof snap.revision !== 'number') { return; }
 
-  $('workspace').textContent = String(snap.workspace || '-');
+  var wsEl = $('workspace-button') || $('workspace');
+  if (wsEl) {
+    var rawWs = String(snap.workspace || '-');
+    wsEl.title = snap.workspace ? String(snap.workspace) : '';
+    wsEl.textContent = typeof window.dmuxaiFormatWorkspacePath === 'function'
+      ? window.dmuxaiFormatWorkspacePath(rawWs)
+      : rawWs;
+  }
   $('source').textContent = String(snap.source || '-');
   $('revision').textContent = String(snap.revision);
 

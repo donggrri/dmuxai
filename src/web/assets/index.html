@@ -32,7 +32,7 @@
   <button id="todos-toggle" type="button" class="btn sidebar-toggle" aria-controls="sidebar" aria-expanded="false" title="Toggle to-dos sidebar" aria-label="To-dos, 0 open">To-dos <span id="todos-count" class="todos-count" aria-hidden="true">0</span></button>
   <nav id="status" class="status" aria-label="dashboard status">
     <span id="run-status" class="run-status run-status-idle" role="status" aria-live="polite">Idle</span>
-    <span class="stat"><span class="stat-k">workspace</span><span id="workspace" class="stat-v">&ndash;</span></span>
+    <span class="stat"><span class="stat-k">workspace</span><button id="workspace-button" type="button" class="btn stat-v workspace-button" aria-haspopup="dialog" title="">&ndash;</button></span>
     <span class="stat"><span class="stat-k">source</span><span id="source" class="stat-v">&ndash;</span></span>
     <span class="stat"><span class="stat-k">rev</span><span id="revision" class="stat-v">&ndash;</span></span>
     <span id="conn" class="conn conn-connecting" aria-live="polite">connecting</span>
@@ -184,7 +184,44 @@
   </div>
 </aside>
 <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
+<div id="workspace-dialog" class="workspace-dialog-backdrop" role="dialog" aria-modal="true" aria-labelledby="workspace-dialog-title" hidden>
+  <div class="workspace-dialog-card">
+    <div class="workspace-dialog-header">
+      <h2 id="workspace-dialog-title" class="workspace-dialog-title">Workspace directory</h2>
+      <button id="workspace-close" type="button" class="btn sidebar-close" aria-label="Close workspace dialog">&times;</button>
+    </div>
+    <p id="workspace-view-only" class="hint workspace-hint" hidden>
+      View-only: start <code>dmuxai --web</code> to browse or switch workspaces.
+    </p>
+    <div class="workspace-current-row">
+      <span class="field-label">Current</span>
+      <code id="workspace-current" class="workspace-current">&ndash;</code>
+    </div>
+    <label class="todo-field workspace-field">
+      <span class="field-label">Path</span>
+      <input id="workspace-path" class="workspace-path" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/workspace">
+    </label>
+    <p id="workspace-reason" class="workspace-reason" role="status" aria-live="polite" hidden></p>
+    <div id="workspace-recent-section" class="workspace-section">
+      <span class="field-label">Recent</span>
+      <ul id="workspace-recent" class="workspace-recent"></ul>
+    </div>
+    <div id="workspace-browser-section" class="workspace-section">
+      <div class="workspace-browser-header">
+        <span class="field-label">Directories</span>
+        <code id="workspace-browser-cwd" class="workspace-browser-cwd"></code>
+        <button id="workspace-up" type="button" class="btn btn-small">Up</button>
+      </div>
+      <ul id="workspace-browser" class="workspace-browser"></ul>
+    </div>
+    <div class="workspace-dialog-actions">
+      <button id="workspace-cancel" type="button" class="btn">Cancel</button>
+      <button id="workspace-switch" type="button" class="btn btn-primary" disabled>Switch</button>
+    </div>
+  </div>
+</div>
 <script src="/assets/memory.js" defer></script>
 <script src="/assets/session.js" defer></script>
+<script src="/assets/workspace.js" defer></script>
 </body>
 </html>

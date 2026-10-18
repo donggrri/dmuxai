@@ -1700,3 +1700,151 @@ main {
   stroke-dasharray: none;
   opacity: 0.35;
 }
+
+/* ---------------------------------------------------------------------------
+ * Workspace button and switcher dialog (SPEC-workspace-dir FR-871, FR-872)
+ * ------------------------------------------------------------------------- */
+
+.workspace-button {
+  padding: 2px 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85em;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.workspace-dialog-backdrop[hidden],
+.workspace-dialog-backdrop [hidden] {
+  display: none !important;
+}
+
+.workspace-dialog-card {
+  background: var(--bg-panel, var(--bg));
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.4);
+  width: 100%;
+  max-width: 540px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  overflow: auto;
+}
+
+.workspace-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.workspace-dialog-title {
+  margin: 0;
+  font-size: 1.05em;
+}
+
+.workspace-current-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.workspace-current,
+.workspace-browser-cwd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85em;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.workspace-path {
+  background: var(--bg-chip);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  padding: 6px 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.workspace-reason {
+  margin: 0;
+  font-size: 0.85em;
+  color: var(--muted);
+}
+
+.workspace-reason-error {
+  color: var(--err);
+}
+
+.workspace-reason-info {
+  color: var(--accent);
+}
+
+.workspace-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.workspace-browser-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.workspace-recent,
+.workspace-browser {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-chip);
+  max-height: 160px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.workspace-recent-btn,
+.workspace-dir-btn {
+  width: 100%;
+  text-align: left;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85em;
+  padding: 4px 8px;
+}
+
+.workspace-browser-empty {
+  color: var(--muted);
+  font-size: 0.85em;
+  padding: 6px 8px;
+}
+
+.workspace-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+

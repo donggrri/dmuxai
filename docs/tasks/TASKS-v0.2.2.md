@@ -8,10 +8,10 @@
 | [x] | 3 | `SessionConversation` fields and running detection | FR-860 | AGY | opencode-haiku | TC-860, TC-861 |
 | [x] | 4 | Left sessions sidebar (list, filter, New, collapse, a11y) | FR-861..FR-863, UX-860 | AGY | opencode-haiku | TC-862, TC-863 |
 | [x] | 5 | TUI picker: agent, time and running mark | FR-864 | opencode-deepseek / maintainer | opencode-haiku | TC-864 |
-| [ ] | 6 | `-C`/`--workspace-dir`, user config, precedence and validation | FR-870, FR-873 | AGY | opencode-haiku | TC-870, TC-871 |
-| [ ] | 7 | Workspace API (`dirs`, `validate`, `switch`) with re-exec | FR-872..FR-874, NFR-870 | AGY | opencode-haiku | TC-873, TC-875, TC-876 |
-| [ ] | 8 | Header path button and workspace dialog | FR-871, FR-872 | AGY | opencode-haiku | TC-872, TC-874 |
-| [ ] | 9 | Runner cwd guard | FR-875 | opencode-glm / maintainer | opencode-haiku | TC-877 |
+| [x] | 6 | `-C`/`--workspace-dir`, user config, precedence and validation | FR-870, FR-873 | AGY | opencode-haiku | TC-870, TC-871 |
+| [x] | 7 | Workspace API (`dirs`, `validate`, `switch`) with re-exec | FR-872..FR-874, NFR-870 | AGY | opencode-haiku | TC-873, TC-875, TC-876 |
+| [x] | 8 | Header path button and workspace dialog | FR-871, FR-872 | AGY | opencode-haiku | TC-872, TC-874 |
+| [x] | 9 | Runner cwd guard | FR-875 | opencode-glm / maintainer | opencode-haiku | TC-877 |
 | [ ] | 10 | Before/after screenshots (demo data) per UI PR | UX items | maintainer | — | PR bodies |
 | [ ] | 11 | Swimlane renderer (lanes, axis, now line, cards, estimates, arrows without loop-back) | FR-880..FR-884 | AGY / maintainer | opencode-haiku | TC-880, TC-881 |
 | [ ] | 12 | Detail drawer overlay, Fit text floor, light contrast | FR-885, UX-880, UX-881 | AGY / maintainer | opencode-haiku | TC-881, TC-882 |

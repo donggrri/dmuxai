@@ -664,6 +664,7 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     let result = app.run(session.terminal_mut()).await;
     let switch_target = app.take_switch_ready();
     app.shutdown().await;
+    drop(app);
     drop(session);
     let mut bound_port = None;
     let mut dashboard_tok = None;

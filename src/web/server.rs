@@ -451,6 +451,22 @@ async fn get_session_js() -> impl IntoResponse {
     )
 }
 
+async fn get_workspace_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::WORKSPACE_JS,
+    )
+}
+
 async fn get_favicon_idle() -> impl IntoResponse {
     (
         [
@@ -1434,6 +1450,7 @@ pub fn build_router_with(
         .route("/assets/app.js", get(get_app_js))
         .route("/assets/memory.js", get(get_memory_js))
         .route("/assets/session.js", get(get_session_js))
+        .route("/assets/workspace.js", get(get_workspace_js))
         .route("/assets/session.css", get(get_session_css))
         .route("/assets/app.css", get(get_app_css))
         .route("/assets/favicon-idle.svg", get(get_favicon_idle))

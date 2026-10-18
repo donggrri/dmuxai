@@ -50,7 +50,8 @@
 
   function formatWorkspaceLabel(fullPath, homeDir) {
     if (!fullPath || fullPath === '-' || fullPath === '\u2013') { return '\u2013'; }
-    return middleEllipsis(abbreviateHome(fullPath, homeDir), ELLIPSIS_MAX);
+    var home = typeof homeDir === 'string' && homeDir ? homeDir : (state && state.homeDir ? state.homeDir : '');
+    return middleEllipsis(abbreviateHome(fullPath, home), ELLIPSIS_MAX);
   }
 
   window.dmuxaiMiddleEllipsis = middleEllipsis;

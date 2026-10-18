@@ -7,6 +7,22 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Added
 
+- **Workspace directory selection and live switch (SPEC-workspace-dir FR-870..FR-875, NFR-870, #56).**
+  A global `-C DIR` / `--workspace-dir DIR` flag and user-config `[workspace] dir`
+  set the active workspace for every mode (flag > `DMUXAI_WORKSPACE` > user
+  config `[workspace] dir` > current directory). Paths are canonicalized and
+  validated (must be a writable directory and not `/`, the DmuxAI state/config
+  dirs, or credential directories such as `~/.ssh`, `~/.aws`, `~/.gnupg`, or
+  runner credential folders); invalid paths exit with code 2. The web dashboard
+  header shows the `~`-abbreviated, middle-ellipsized workspace path as a button
+  that opens `#workspace-dialog` with live validation (`POST /api/workspace/validate`),
+  an MRU recent-paths list (`recent-workspaces.json`, max 10), and a directory-only
+  browser (`GET /api/workspace/dirs`) confined to `$HOME` and `[workspace] browse_roots`.
+  Confirming a switch (`POST /api/workspace/switch`) guards against busy turns,
+  performs a preflight check, cleanly shuts down warm processes and session
+  state, and on Unix `exec`s `dmuxai` into the new workspace on the same port,
+  bind address and token while the browser reconnects automatically.
+
 - **Left sessions sidebar and running conversation marks (SPEC-session-sidebar FR-860..FR-864, UX-860, #55).**
   The conversation list moves from the in-panel box into a collapsible 320px
   left sidebar (`#sessions-sidebar`, header toggle `Sessions`) with a filter
