@@ -2,6 +2,7 @@ name: Verify
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches:
       - main
@@ -9,26 +10,70 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same PR (or main) cancels the older run, so superseded
+# commits do not use Actions minutes.
+concurrency:
+  group: verify-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   spec:
     name: Spec traceability
-    runs-on: windows-latest
+    # ubuntu-latest: Linux minutes count 1x (windows-latest counts 2x on private repos).
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Validate baseline traceability
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/check-spec.ps1 -SpecPath docs/specs/DMUXAI-BASELINE.md
+      - name: Detect code changes
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          # Docs-only changes (Markdown and images under docs/, top-level *.md)
+          # skip the Rust job; anything else, or an unknown base, runs it.
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "$base" HEAD | grep -qvE '^(docs/.*|[^/]+\.md)$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
 
   rust:
     name: Rust quality gates
     needs: spec
-    runs-on: windows-latest
+    # Draft PRs (WIP pushes) skip the Rust job; marking the PR ready runs it.
+    if: needs.spec.outputs.code == 'true' && github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --check
-      - name: Run tests
-        run: cargo test --all-targets
       - name: Lint
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Run tests
+        run: cargo test --locked --all-targets --no-fail-fast
+      # Windows stays a compile target: clippy for x86_64-pc-windows-gnu on
+      # Linux (needs the MinGW C compiler for bundled C dependencies). The
+      # Windows release build in release.yml still runs on windows-latest, on tags only.
+      - name: Install MinGW for the Windows-target lint
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64
+      - name: Lint (Windows target)
+        run: cargo clippy --locked --all-targets --all-features --target x86_64-pc-windows-gnu -- -D warnings
