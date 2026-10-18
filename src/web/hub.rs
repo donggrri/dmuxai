@@ -117,8 +117,19 @@ impl DashboardHub {
                     {
                         timing.started_at_ms = Some(now_ms);
                     }
+                    let terminal = matches!(
+                        node.status,
+                        GraphNodeStatus::Completed
+                            | GraphNodeStatus::Failed
+                            | GraphNodeStatus::Skipped
+                    );
                     if let Some(finished) = node.finished_at_ms {
                         timing.finished_at_ms = Some(finished);
+                    } else if !terminal {
+                        // A node that left a terminal state without an attempt bump
+                        // (or whose Pending frame was coalesced) must not keep a stale
+                        // finish time from before.
+                        timing.finished_at_ms = None;
                     } else if matches!(
                         node.status,
                         GraphNodeStatus::Completed
@@ -435,6 +446,43 @@ mod tests {
         let node_retry1 = &snap_retry1.graph.as_ref().unwrap().nodes[0];
         assert_eq!(node_retry1.started_at_ms, Some(10000));
         assert_eq!(node_retry1.finished_at_ms, None);
+    }
+
+    // TC-883: a node that goes back to Running without an attempt bump drops the stale finish
+    #[test]
+    fn hub_clears_stale_finish_when_node_runs_again() {
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        hub.publish_at(
+            Vec::new(),
+            Some(make_test_graph("run-1", GraphNodeStatus::Running)),
+            1000,
+        );
+        hub.publish_at(
+            Vec::new(),
+            Some(make_test_graph("run-1", GraphNodeStatus::Completed)),
+            4000,
+        );
+        hub.publish_at(
+            Vec::new(),
+            Some(make_test_graph("run-1", GraphNodeStatus::Running)),
+            5000,
+        );
+        let snap = hub.snapshot();
+        let node = &snap.graph.as_ref().unwrap().nodes[0];
+        assert_eq!(node.finished_at_ms, None);
+        assert_eq!(node.elapsed_ms, None);
+        assert_eq!(node.started_at_ms, Some(1000));
+
+        // Executor-supplied timestamps win over the hub's own clock.
+        let mut g = make_test_graph("run-1", GraphNodeStatus::Completed);
+        g.nodes[0].started_at_ms = Some(1500);
+        g.nodes[0].finished_at_ms = Some(6500);
+        hub.publish_at(Vec::new(), Some(g), 7000);
+        let snap = hub.snapshot();
+        let node = &snap.graph.as_ref().unwrap().nodes[0];
+        assert_eq!(node.started_at_ms, Some(1500));
+        assert_eq!(node.finished_at_ms, Some(6500));
+        assert_eq!(node.elapsed_ms, Some(5000));
     }
 
     // TC-606 / FR-603: snapshot_exposes_ui_theme
