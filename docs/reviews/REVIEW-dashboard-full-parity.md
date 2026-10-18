@@ -54,3 +54,22 @@ Date: 2026-10-18/19 (KST). Scope: SPEC, PLAN and TASKS for dashboard full parity
 - Added rows P10 (grok runner, full under `--web`) and P11 (#70, n/a), and recorded #71 as a dashboard-only feature.
 - The new counts were checked with a script: 54 rows, 27 full, 13 partial, 6 missing, 8 n/a.
 - The delta review on deepseek-v4.1-flash-free and glm-5.3-flash-free gave no output in about 12 minutes. Both processes were killed when work stopped for the day. **This review is still to do.**
+
+## Round 3 (grok via dmuxai)
+
+Checked §3 against the workspace source, which is `origin/main` f1b36ae (#70 is in that tree). Docs only.
+
+Changed:
+
+- Baseline is `origin/main` f1b36ae. #70 is merged (f1b36ae) in the baseline, P11, §3.8, and `docs/ROADMAP.md`. #71 stays open. `draw_conversation_picker` is still `app.rs:6278`.
+- §3.0: the no-args hub is `main.rs:655-661` (654 is the `--web` call). `SnapshotSource::Files` is `:515`. `attach_web_dashboard` is `:730-829` (also R2). Browse/switch 403 is `server.rs:1228-1229` and `:1341-1342` (also C4).
+- R5: `server.rs:1199` is `can_switch` on a 200, not a 403. `GET /api/workspace` stays 200 under `serve`.
+- #70 added lines after the conversation picker, so three `app.rs` cites still had a4c50ae numbers: `summary_prompt` 7228→7252 (S9), mode picker 6366→6390 (P7), slash-preview draw 6439→6463 (K9).
+- P8: `push_startup_notice` is `app.rs:4430`; the welcome text is `:1000-1002`. Palette map is `session.js:647-697`. Filter and arrows are `:788-823`. Heartbeat `touch_session` is `:1203`.
+
+Checked and left:
+
+- §3.0 TTY exit `main.rs:607-612` (message and exit 1; stdin or stdout). `TerminalSession::start` and `App::run` `:663-664`. `run_serve` `:437-566` (URL at 543, `web.json` via `publish_discovery` at 545, read-only Docs `:467`, 500 ms poll `:552-559`, no App). Prompt 409 `:929-931`, command 409 `:970-972`, to-do Run 409 `:875-876`. `App::run_headless` `app.rs:4749` (called from `cli.rs` for `run` and `todo run`). Serve snapshot agents stay empty, so grok is absent there. Memory and MCP import do not need the command channel.
+- P10: TUI confirm probes at `app.rs:2345` through `request_builtin_grok_models` `:2265`. Dashboard `SessionCommand::SelectAgent` `:1682-1690` calls the same probe. Chip color is `AgentView.color` `#6366f1` (SPEC-grok-runner FR-896, FR-898; tests `grok_chat_and_dashboard_use_preset_color`, `selecting_grok_requests_a_model_probe`). Still full under `--web` only.
+- Fifteen other §3 cites that still match: `handle_key` 1996-2058, Enter 2043, Ctrl+C 1997 and `cancel_selected` 3168, Ctrl+O 2001 and `toggle_last_activity_details` 3746, F2 2041 and `open_model_picker` 2455, F3 2042, clipboard image 2030-2036 and 2704, paste 1977-1994, mouse 2144-2208, `open_file_link_at` 4487, M2 `:6607` (`file_link_click_target`), `render_activity_group` 5699-5778, `draw_status` 5847-5998, `App::run` 1187-1279 with command drain 1224, gate string 3989 and 4136, `app.js:1690-1700` (the TUI gate hint), chips `app.js:1739-1788`, session Esc 358/396/760/815, memory approve/reject `server.rs:1495-1502`, Shift+Enter row `parity.rs:26-30`, activity collapsed line `app.rs:1590-1592`.
+- §3.9 recounted from the row statuses in §3.1-3.6: 54 rows, 27 full, 13 partial, 6 missing, 8 n/a. The table already matched. No status changed (P10 stays full, P11 stays n/a).

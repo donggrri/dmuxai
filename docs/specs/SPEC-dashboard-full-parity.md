@@ -3,7 +3,7 @@
 Status: Draft (v0.2.4; gap list awaiting Dongjin's review, no implementation yet)
 Owner: DmuxAI
 Created: 2026-10-18
-Baseline: `origin/main` a4c50ae (v0.2.2 in progress: includes #65 swimlane and #66 grok runner; #70 TUI picker width and #71 resizable sidebars are open v0.2.2 PRs)
+Baseline: `origin/main` f1b36ae (v0.2.2 in progress: includes #65 swimlane and #66 grok runner; #70 TUI picker width is merged (f1b36ae); #71 resizable sidebars is an open v0.2.2 PR)
 Related: SPEC-dashboard-parity (v0.2.0 slice G2, FR-780..784; the slash-command matrix this spec extends), SPEC-web-dashboard (`serve`, FR-520..530), SPEC-agent-api (headless `run`, FR-760..773), SPEC-session-sidebar, SPEC-workspace-dir, SPEC-grok-runner (PR #66), SPEC-plan-gate (PR #67)
 
 > File name: `SPEC-dashboard-parity.md` already exists and is the implemented
@@ -69,7 +69,7 @@ v0.2.4 does three things, in order:
 | OQ-1003 | Keyboard shortcuts in the browser: F2/F3 are often taken by the browser/OS. Proposed: `Alt+M` model, `Alt+C` conversations, `Esc` twice or `Ctrl+.` cancel, `Ctrl+O` details; all shown in the palette hints. | Dongjin | UX-1000 |
 | OQ-1004 | Clicking a file link in the transcript: open it in the Docs preview (in-browser) rather than the OS app the TUI launches. Proposed: Docs preview, with "Open in OS app" only on a loopback bind. | Dongjin | FR-1012 |
 
-## 3. Gap audit (TUI vs dashboard), baseline a4c50ae
+## 3. Gap audit (TUI vs dashboard), baseline f1b36ae
 
 Status: **full** = the dashboard does the same thing today; **partial** = the
 dashboard can reach it but with less behavior; **missing** = no dashboard
@@ -80,9 +80,9 @@ equivalent, or a TUI-only concern that disappears with the TUI.
 
 | Mode | Runs without a terminal? | What works | What does not |
 | --- | --- | --- | --- |
-| `dmuxai` (no args) | No: exits 1 with `dmuxai needs an interactive terminal (TTY)` when stdin or stdout is not a TTY (`src/main.rs:607-612`) | TUI only; a hub feeds the event log, no HTTP server (`:654-660`) | no dashboard at all |
-| `dmuxai --web` | No: same TTY check, then `TerminalSession::start` and `App::run(terminal)` (`:663-664`); the dashboard server lives inside the TUI process (`attach_web_dashboard`, `:729-830`) | everything in §3.2-3.6 marked full: prompts (`POST /api/prompt` 202), session commands (`POST /api/command` 200), pickers, conversations, to-dos incl. Run, memory, writable Docs, workspace switch (Unix) | it cannot be started headless; quitting the TUI stops the dashboard |
-| `dmuxai serve` | Yes (`run_serve`, `:437-566`): `SnapshotSource::Files`, polls `.dmuxai` graph runs every 500 ms (`:552-559`), prints the URL, writes `web.json` | graph view of persisted runs, to-do create/edit/delete and MCP import, memory get/save/approve/reject, event log, **read-only** Docs preview (`:467`) | no App, no agents, no session: prompts and session commands 409 `requires dmuxai --web` (`src/web/server.rs:929-931`, `:970-972`), to-do Run 409 (`:875-876`), workspace browse/switch 403 (`:1228`, `:1341`), no webhook/command hooks, no custom agents (incl. grok) in the snapshot |
+| `dmuxai` (no args) | No: exits 1 with `dmuxai needs an interactive terminal (TTY)` when stdin or stdout is not a TTY (`src/main.rs:607-612`) | TUI only; a hub feeds the event log, no HTTP server (`:655-661`) | no dashboard at all |
+| `dmuxai --web` | No: same TTY check, then `TerminalSession::start` and `App::run(terminal)` (`:663-664`); the dashboard server lives inside the TUI process (`attach_web_dashboard`, `:730-829`) | everything in §3.2-3.6 marked full: prompts (`POST /api/prompt` 202), session commands (`POST /api/command` 200), pickers, conversations, to-dos incl. Run, memory, writable Docs, workspace switch (Unix) | it cannot be started headless; quitting the TUI stops the dashboard |
+| `dmuxai serve` | Yes (`run_serve`, `:437-566`): `SnapshotSource::Files` (`:515`), polls `.dmuxai` graph runs every 500 ms (`:552-559`), prints the URL, writes `web.json` | graph view of persisted runs, to-do create/edit/delete and MCP import, memory get/save/approve/reject, event log, **read-only** Docs preview (`:467`) | no App, no agents, no session: prompts and session commands 409 `requires dmuxai --web` (`src/web/server.rs:929-931`, `:970-972`), to-do Run 409 (`:875-876`), workspace browse/switch 403 (`:1228-1229`, `:1341-1342`), no webhook/command hooks, no custom agents (incl. grok) in the snapshot |
 | `dmuxai run` / `todo run` | Yes: `App::run_headless` in-process (`src/app.rs:4749`), one prompt or to-do, exit codes | full agent and graph execution for one job | no HTTP server, no dashboard |
 | `dmuxai status` / `events` / `todo add\|list` / `mcp` / `mcp-memory` / `init` | Yes | read state, MCP over stdio | no prompts from a browser |
 
@@ -93,15 +93,15 @@ So the only way to drive agents from the browser today is `dmuxai --web`, and th
 | # | TUI / CLI feature | TUI source | Dashboard today | Status | Gap → requirement |
 | --- | --- | --- | --- | --- | --- |
 | R1 | Interactive session without a terminal | `src/main.rs:606` `run_tui` always builds a ratatui `Terminal`; `src/app.rs:1187-1279` `App::run` mixes the core loop with `event::poll` and `terminal.draw` | `dmuxai serve` (`src/main.rs:437-566`) has **no session**: `SnapshotSource::Files`, `commands: None` (`:491`), Docs `read_only = true` (`:467`), no App and no agents (to-do CRUD/import and memory save/approve/reject do work, `:486-512`); `POST /api/prompt` and `/api/command` answer 409 "requires dmuxai --web" (`src/web/server.rs:929-931`, `:970-972`); to-do Run 409 (`:875-876`) | **missing** | headless interactive serve, FR-1000..1004 |
-| R2 | `dmuxai --web` (TUI + dashboard) | `src/main.rs:164-165` parse, `:354` dispatch, `:729-830` `attach_web_dashboard` | the only interactive dashboard mode; exits 1 without a TTY (`src/main.rs:607-612`) | partial | becomes `serve`, FR-1000, FR-1031 |
+| R2 | `dmuxai --web` (TUI + dashboard) | `src/main.rs:164-165` parse, `:354` dispatch, `:730-829` `attach_web_dashboard` | the only interactive dashboard mode; exits 1 without a TTY (`src/main.rs:607-612`) | partial | becomes `serve`, FR-1000, FR-1031 |
 | R3 | Dashboard command channel | `src/main.rs:738-747`: the `DashboardCommand` channel is created only when the to-do DB opens | if the to-do DB fails, prompts and pickers are 409 even under `--web` | partial (coupling bug) | FR-1003 |
 | R4 | Headless one-shot CLI: `run`, `todo add/list/run`, `status`, `events`, `mcp`, `mcp-memory`, `init` | `src/main.rs:349-356` dispatch, `src/cli.rs:524-612`, `src/app.rs:4749` `App::run_headless` | not a TUI feature; already terminal-free | full | keep; `run_headless` is the model for FR-1001 |
-| R5 | Workspace switch (dashboard dialog, re-exec) and directory browse | no TUI switcher (`-C` only, `src/main.rs:296-317`); re-exec `:678-724` | works only under `--web`; `serve` answers 403 (`server.rs:1199`, `:1228`, `:1341`) | partial | FR-1000 (switch re-execs `serve`) |
+| R5 | Workspace switch (dashboard dialog, re-exec) and directory browse | no TUI switcher (`-C` only, `src/main.rs:296-317`); re-exec `:678-724` | works only under `--web`; `serve` answers 403 on directory browse and switch (`server.rs:1228-1229`, `:1341-1342`). `GET /api/workspace` stays 200 with `can_switch` false (`:1199`) | partial | FR-1000 (switch re-execs `serve`) |
 
 ### 3.2 Slash commands (`SLASH_COMMANDS`, `src/app.rs:113-189`, plus `/graph` at `:2860`)
 
 All are mapped in `src/web/parity.rs:20-136` and reachable from the Ctrl+K
-palette (`src/web/assets/session.js:650-705`).
+palette (`src/web/assets/session.js:647-697`).
 
 | # | Command | TUI source | Dashboard | Status | Gap |
 | --- | --- | --- | --- | --- | --- |
@@ -113,7 +113,7 @@ palette (`src/web/assets/session.js:650-705`).
 | S6 | `/new` | `create_conversation` | New button `session.js:298`, sessions sidebar | full | — |
 | S7 | `/conversations` | `app.rs:2286` | sessions sidebar (SPEC-session-sidebar) | full | — |
 | S8 | `/resume <id>` | `select_conversation` | sidebar Load (`resume`) `session.js:592` | full | — |
-| S9 | `/summarize` | `app.rs:7228` `summary_prompt` | palette | full | — |
+| S9 | `/summarize` | `app.rs:7252` `summary_prompt` | palette | full | — |
 | S10 | `/compact [focus]` | alias of S9 | palette | full | — |
 | S11 | `/share` | `app.rs:3281` | Share menu `session.js:301` | full | — |
 | S12 | `/image <path>` | `app.rs:2661` `attach_image_path` | palette asks for a **workspace path** (`session.js:671`), which the core attaches like the TUI; no file picker, drop or paste upload | partial | browser upload / drop / paste, FR-1010 |
@@ -135,7 +135,7 @@ palette (`src/web/assets/session.js:650-705`).
 | K6 | F2 | model picker (`app.rs:2041`, `:2455`) | Model picker click only | partial | shortcut, UX-1000 |
 | K7 | F3 | conversation picker (`app.rs:2042`) | sessions sidebar click only | partial | shortcut, UX-1000 |
 | K8 | Ctrl+V / Alt+V | attach clipboard image (`app.rs:2030-2036`, `:2704`, `src/clipboard_image.rs`) | none | **missing** | FR-1010 |
-| K9 | `/` + Up/Down/Tab/Enter | slash preview (`app.rs:2060-2091`, draw `:6439`) | `/` in an empty box opens the palette (`session.js:336-341`), filter and arrows (`:797-823`); Tab does not run a row | full | — |
+| K9 | `/` + Up/Down/Tab/Enter | slash preview (`app.rs:2060-2091`, draw `:6463`) | `/` in an empty box opens the palette (`session.js:336-341`), filter and arrows (`:788-823`); Tab does not run a row | full | — |
 | K10 | Picker Up/Down/Enter/Esc; Tab in the Codex model picker jumps to effort (`app.rs:2517-2559`) | native `<select>` pickers; effort is its own picker | full | — |
 | K11 | Backspace, typing | edit the input | native textarea | n/a | — |
 
@@ -160,11 +160,11 @@ palette (`src/web/assets/session.js:650-705`).
 | P4 | Status bar: state badge with spinner and elapsed, model, mode, effort, **activity detail**, **other agents' activity**, **graph assignment line**, **notice slot** (`copy_notice`, also used for background-conversation notices such as a failed save, `app.rs:5340-5344`) | `draw_status` `app.rs:5847-5998` | agent chips with running/elapsed (`app.js:1739-1788`), pickers show model/mode/effort; no activity detail, no other-agents summary, no assignment line, background-conversation notices never reach the page | partial | FR-1013 |
 | P5 | Attachments chip line in the prompt title | `draw_input` `app.rs:5785-5793` | none (no `pending_images` in the snapshot) | **missing** | FR-1010 |
 | P6 | Model picker with catalog loading, policy filter, Codex effort | `app.rs:6000`, `:2455-2578` | Model picker + "Load models…" | full | — |
-| P7 | Effort / agent / mode / conversation pickers | `app.rs:6095`, `:6209`, `:6366`, `:6278` | pickers + sidebar with running mark | full | — |
-| P8 | Startup notices, welcome/help text, system messages | `push_startup_notice`, `app.rs:1002` | transcript `system` messages | full | help text names TUI keys, FR-1032 |
+| P7 | Effort / agent / mode / conversation pickers | `app.rs:6095`, `:6209`, `:6390`, `:6278` | pickers + sidebar with running mark | full | — |
+| P8 | Startup notices, welcome/help text, system messages | welcome text `app.rs:1000-1002`; `push_startup_notice` `:4430` | transcript `system` messages | full | help text names TUI keys, FR-1032 |
 | P9 | Sensitive-step gate prompt (`Gate: confirm … with /graph continue`) | `app.rs:3989`, `:4136` | system message + palette `/graph continue` | partial | FR-1014 |
 | P10 | Built-in grok runner (#66, merged): picker entry, preset color `#6366f1`, `grok models` probe and the `grok login` message | TUI `/agent` confirm probes (`app.rs:2345`, `:2265`), reply text in the preset color | dashboard agent control runs the same probe (`SessionCommand::SelectAgent`, `app.rs:1682-1690`); chip color via `AgentView.color` (SPEC-grok-runner FR-896, FR-898, tests `grok_chat_and_dashboard_use_preset_color`, `selecting_grok_requests_a_model_probe`) | full | under `--web` only; under `serve` grok is absent (R1) |
-| P11 | Conversation picker width scales with the terminal (#70, open, SPEC-session-sidebar FR-865) | `draw_conversation_picker` `app.rs:6278` | the sessions sidebar already lays out by CSS, and #71 (open, SPEC-sidebar-resize FR-970..974) makes it resizable | n/a | terminal layout fix; disappears with the TUI |
+| P11 | Conversation picker width scales with the terminal (#70, merged (f1b36ae), SPEC-session-sidebar FR-865) | `draw_conversation_picker` `app.rs:6278` | the sessions sidebar already lays out by CSS, and #71 (open, SPEC-sidebar-resize FR-970..974) makes it resizable | n/a | terminal layout fix; disappears with the TUI |
 
 ### 3.6 Settings (`src/settings.rs`)
 
@@ -173,11 +173,11 @@ palette (`src/web/assets/session.js:650-705`).
 | C1 | `[theme]` TUI colors, `force_color`, `DMUXAI_FORCE_COLOR`, `NO_COLOR` (`settings.rs:52-53`, `src/theme.rs`) | TUI rendering only; `[web] theme/accent` is the dashboard's | n/a | deprecate with the TUI, FR-1032 |
 | C2 | `[ui] show_tools`, `show_thinking` (`src/activity.rs:110-115`) | TUI activity rendering only (`app.rs:5714-5741`) | **missing** | FR-1011 |
 | C3 | `reduced_motion` | TUI spinner and dashboard (`hub.set_ui`, `main.rs:516-520`) | full | — |
-| C4 | `[cursor] prewarm*`, `[graph]`, `[routing]`, `[memory]`, `[notify]` delivery, `[[agents.custom]]`, `builtin_opencode`, `[mcp]`, `[todo]`, `[workspace]` | core (App) | full under `--web`; **not running** under `serve` (no App, no `EventSink`, so no webhook/command hooks and no custom agents; workspace browse/switch answer 403, `server.rs:1228`, `:1341`). The TUI never edited these either, so no settings editor is required | full | covered by R1 / FR-1001. Side finding: `[routing] cursor_models` is parsed but never read |
+| C4 | `[cursor] prewarm*`, `[graph]`, `[routing]`, `[memory]`, `[notify]` delivery, `[[agents.custom]]`, `builtin_opencode`, `[mcp]`, `[todo]`, `[workspace]` | core (App) | full under `--web`; **not running** under `serve` (no App, no `EventSink`, so no webhook/command hooks and no custom agents; workspace browse/switch answer 403, `server.rs:1228-1229`, `:1341-1342`). The TUI never edited these either, so no settings editor is required | full | covered by R1 / FR-1001. Side finding: `[routing] cursor_models` is parsed but never read |
 
 ### 3.7 Core work that only runs inside the TUI loop (`App::run`, `src/app.rs:1187-1279`)
 
-Session heartbeat (`engine.touch_session`, `:1202`), 1 s `tick`, dashboard
+Session heartbeat (`engine.touch_session`, `:1203`), 1 s `tick`, dashboard
 command drain (`:1224`), agent event drain, dashboard publish throttling
 (FR-530), Cursor pre-warm, to-do runs, graph executor ticks, workspace switch
 restart (`main.rs:678-720`), `shutdown` (`:1281`). None of it needs a terminal;
@@ -188,7 +188,7 @@ all of it moves to the session host (FR-1001).
 | PR | Feature | Dashboard requirement already in that spec | Check here |
 | --- | --- | --- | --- |
 | #66 grok runner (merged a4c50ae) | `grok` preset in pickers, color `#6366f1`, logged-out state, graph routing | SPEC-grok-runner FR-896, FR-898 (TUI and dashboard chip); verified on the dashboard under `--web` (P10) | FR-1021: must also appear under interactive `serve` (TC-1000) |
-| #70 TUI picker width (open, v0.2.2) | TUI-only layout fix | none needed | P11 n/a |
+| #70 TUI picker width (merged (f1b36ae), v0.2.2) | TUI-only layout fix | none needed | P11 n/a |
 | #71 resizable sidebars (open, v0.2.2) | dashboard-only; no TUI counterpart | SPEC-sidebar-resize | dashboard ahead of the TUI; keep when the TUI goes |
 | #67 plan gate | judge line, plan approval panel (approve / edit / reject), `/plan` and `/direct`, route selector | SPEC-plan-gate UX-930, UX-932, UX-933, FR-945 | FR-1021 |
 | v0.2.3 #2, #3 | diff review sidebar, world model (INTENT/MISSION) | specs not written yet; must be dashboard-first | FR-1021 |
