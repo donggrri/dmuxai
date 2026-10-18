@@ -385,33 +385,10 @@ async fn run_turn(
     }
 
     let argv = build_argv(spec, &ctx);
-    let (program, args) = argv
-        .split_first()
+    let program = argv
+        .first()
         .ok_or_else(|| format!("{}: empty command", spec.label()))?;
-    let mut command = tokio::process::Command::new(program);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .stdin(if spec.prompt_via == PromptVia::Stdin {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    if let Some(mcp_path) = &ctx.mcp_config {
-        command.env("DMUXAI_MCP_CONFIG", mcp_path);
-    }
-
-    for (key, value) in &spec.env {
-        if let Some(value) = substitute(value, &ctx) {
-            command.env(key, value);
-        }
-    }
-    #[cfg(unix)]
-    command.process_group(0);
+    let mut command = dmuxai::custom_agent::build_custom_command(spec, &ctx, cwd)?;
 
     let mut child = command
         .spawn()

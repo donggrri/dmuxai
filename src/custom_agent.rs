@@ -387,6 +387,45 @@ pub fn build_argv(spec: &CustomAgentSpec, ctx: &SubstitutionContext) -> Vec<Stri
     argv
 }
 
+/// Builds a headless `tokio::process::Command` for a custom agent turn with
+/// `.current_dir(workspace)` and substituted environment variables (FR-875).
+pub fn build_custom_command(
+    spec: &CustomAgentSpec,
+    ctx: &SubstitutionContext,
+    workspace: &Path,
+) -> Result<tokio::process::Command, String> {
+    let argv = build_argv(spec, ctx);
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| format!("{}: empty command", spec.label()))?;
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .current_dir(workspace)
+        .stdin(if spec.prompt_via == PromptVia::Stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    if let Some(mcp_path) = &ctx.mcp_config {
+        command.env("DMUXAI_MCP_CONFIG", mcp_path);
+    }
+
+    for (key, value) in &spec.env {
+        if let Some(value) = substitute(value, ctx) {
+            command.env(key, value);
+        }
+    }
+    #[cfg(unix)]
+    command.process_group(0);
+
+    Ok(command)
+}
+
 /// Result of parsing a single JSONL line emitted by a custom agent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedLine {
@@ -1157,5 +1196,46 @@ image_arg = []
         )
         .await;
         assert_eq!(ids, Ok(vec!["opencode/a-free".to_owned()]));
+    }
+
+    // TC-877 (FR-875)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_cwd_is_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(tmp.path()).unwrap();
+        let test_cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert_ne!(workspace, test_cwd);
+
+        let spec = CustomAgentSpec {
+            name: "probe".to_owned(),
+            command: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "pwd; printf '%s\\n' \"$1\"".to_owned(),
+                "--".to_owned(),
+                "{workspace}".to_owned(),
+            ],
+            models_command: vec!["sh".to_owned(), "-c".to_owned(), "pwd".to_owned()],
+            ..Default::default()
+        };
+        let ctx = SubstitutionContext::new(
+            "check cwd",
+            workspace.to_string_lossy().into_owned(),
+            "ask",
+            "deny",
+        );
+        let mut cmd = build_custom_command(&spec, &ctx, &workspace).unwrap();
+        let out = cmd.output().await.unwrap();
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+        let ws_str = workspace.to_string_lossy();
+        assert_eq!(lines, vec![ws_str.as_ref(), ws_str.as_ref()]);
+
+        let model_lines = list_model_ids(&spec, &workspace, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert_eq!(model_lines, vec![ws_str.into_owned()]);
     }
 }

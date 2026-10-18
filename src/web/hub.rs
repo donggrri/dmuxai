@@ -20,6 +20,7 @@ struct HubState {
     timings: HashMap<String, NodeTiming>,
     current_graph_id: Option<String>,
     snapshot: DashboardSnapshot,
+    switch_config: Option<crate::web::WorkspaceSwitchConfig>,
 }
 
 #[derive(Clone)]
@@ -58,10 +59,19 @@ impl DashboardHub {
                 timings: HashMap::new(),
                 current_graph_id: None,
                 snapshot: initial_snapshot,
+                switch_config: None,
             })),
             watch_tx: Arc::new(tx),
             events: None,
         }
+    }
+
+    pub fn set_switch_config(&self, config: crate::web::WorkspaceSwitchConfig) {
+        self.state.lock().unwrap().switch_config = Some(config);
+    }
+
+    pub fn switch_config(&self) -> Option<crate::web::WorkspaceSwitchConfig> {
+        self.state.lock().unwrap().switch_config.clone()
     }
 
     pub fn publish(&self, agents: Vec<AgentView>, graph: Option<GraphView>) {

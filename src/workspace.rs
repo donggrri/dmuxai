@@ -285,15 +285,15 @@ pub fn build_reexec_args(
         "-C".to_owned(),
         canonical_workspace.to_string_lossy().into_owned(),
     ];
+    let mut saw_port = false;
     let mut i = 0;
     while i < stripped.len() {
         if stripped[i] == "--port"
             && let Some(next) = stripped.get(i + 1)
         {
+            saw_port = true;
             out.push("--port".to_owned());
-            if next == "0"
-                && let Some(port) = bound_port
-            {
+            if let Some(port) = bound_port {
                 out.push(port.to_string());
             } else {
                 out.push(next.clone());
@@ -303,6 +303,12 @@ pub fn build_reexec_args(
         }
         out.push(stripped[i].clone());
         i += 1;
+    }
+    if !saw_port
+        && let Some(port) = bound_port
+    {
+        out.push("--port".to_owned());
+        out.push(port.to_string());
     }
     out
 }

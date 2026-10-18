@@ -494,7 +494,6 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 memory: memory.clone(),
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
-                switch_config: None,
             }
         }
         Err(error) => {
@@ -508,7 +507,6 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 // The event log is independent of the to-do database (FR-766).
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
-                switch_config: None,
             }
         }
     };
@@ -777,7 +775,6 @@ async fn attach_web_dashboard(
             .map(|config| dmuxai::memory::MemoryHandle::from_config(config, workspace_root)),
         events_path: Some(dmuxai::events::events_path(workspace_root)),
         docs,
-        switch_config: None,
     };
 
     let sink = cli::build_event_sink(workspace_root, settings);
