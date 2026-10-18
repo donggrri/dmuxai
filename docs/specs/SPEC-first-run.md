@@ -1,6 +1,6 @@
 # SPEC: first-run
 
-Status: Implemented (v0.2.1)
+Status: Implemented (v0.2.1; FR-983 in v0.2.2)
 Created: 2026-10-17
 Related: Dongjin dogfood 2026-10-17 23:43 (fresh install: no `~/.config/dmuxai/`, opencode 1.17.20 at `~/.opencode/bin/opencode`, cwd `~/tangled-paws`)
 

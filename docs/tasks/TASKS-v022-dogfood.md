@@ -1,6 +1,6 @@
 # TASKS: v0.2.2 dogfood fixes
 
-Status: in progress
+Status: done
 Plan: [PLAN-v022-dogfood](../plans/PLAN-v022-dogfood.md)
 
 - [x] T1 FR-980: `src/grok_activity.rs` tracker. Test: `cargo test --lib grok_tool_lines_map_to_activity_items` (TC-980)
@@ -9,4 +9,4 @@ Plan: [PLAN-v022-dogfood](../plans/PLAN-v022-dogfood.md)
 - [x] T4 FR-982: cancel notice. Tests: `cancel_appends_one_cancelled_notice_for_every_runner` (TC-984), `dashboard_cancel_shows_cancelled_notice` (TC-985)
 - [x] T5 FR-983: welcome from registry. Test: `welcome_lists_registered_runners` (TC-816)
 - [x] T6 FR-984: local-only token notice. Tests: `dashboard_snapshot_never_contains_startup_token` (TC-986), `api_snapshots_do_not_echo_token` (TC-987)
-- [ ] T7 CHANGELOG, review doc, gates, live grok-4.7 verification, screenshots
+- [x] T7 CHANGELOG, review doc, gates, live grok-4.7 verification, screenshots

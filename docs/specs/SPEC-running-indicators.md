@@ -1,6 +1,6 @@
 # SPEC: running-indicators
 
-Status: Implemented (v0.2.1)
+Status: Implemented (v0.2.1; FR-981, FR-982 in v0.2.2)
 Created: 2026-10-17
 Related: v0.2.2 dogfood 2026-10-19 (FR-981, FR-982; [PLAN-v022-dogfood](../plans/PLAN-v022-dogfood.md)); Dongjin dogfood 2026-10-17 23:38/23:41 (`dmuxai --web` on Linux: "running state is not clearly visible"; wants a spinner in both TUI and web)
 
