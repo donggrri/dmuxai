@@ -2,6 +2,7 @@ name: Verify
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches:
       - main
@@ -53,7 +54,8 @@ jobs:
   rust:
     name: Rust quality gates
     needs: spec
-    if: needs.spec.outputs.code == 'true'
+    # Draft PRs (WIP pushes) skip the Rust job; marking the PR ready runs it.
+    if: needs.spec.outputs.code == 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
