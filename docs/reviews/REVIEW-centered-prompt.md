@@ -13,4 +13,4 @@ Implementer: AGY (`dmuxai run --agent agy --mode implement`, about 10 min). Revi
 
 - TC-851 fails against the old CSS: the prompt was off-centre with the Files sidebar open. It passes with the new rules.
 
-## Round 2 — see PR
+## Round 2 — APPROVE
