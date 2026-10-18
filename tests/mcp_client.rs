@@ -341,6 +341,18 @@ async fn mcp_client_kills_stdio_process_group() {
     use std::os::unix::fs::PermissionsExt;
 
     fn is_pid_alive(pid: i32) -> bool {
+        // A killed grandchild is re-parented; until its new parent reaps it,
+        // it lingers as a zombie that `kill -0` still reports as alive (seen
+        // on GitHub's ubuntu runners). Treat zombies as dead.
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            let state = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next());
+            return !matches!(state, Some("Z") | Some("X"));
+        }
+        if std::path::Path::new("/proc/self/stat").exists() {
+            return false;
+        }
         std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
             .stdin(std::process::Stdio::null())
