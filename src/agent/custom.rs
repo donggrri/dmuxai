@@ -479,7 +479,7 @@ fn kill_group(pgid: u32) {
     #[cfg(unix)]
     if pgid > 0 {
         let _ = std::process::Command::new("kill")
-            .args(["-TERM", &format!("-{pgid}")])
+            .args(["-TERM", "--", &format!("-{pgid}")])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
