@@ -86,3 +86,31 @@ Changed in `docs/specs/SPEC-dashboard-full-parity.md`:
 
 - §3.0 no-args hub: `:655-661` included the `} else {` line. The hub body (no server, event-log sink, `None`) is `main.rs:656-661`.
 - R4: `src/cli.rs:524-612` covered `run_and_report` (524-550) and stopped one line short of `run_headless`. The row means the headless runner, now `src/cli.rs:552-613` `run_headless`. That was the only `cli.rs` cite in the spec.
+
+## Dogfooding notes (grok runner inside dmuxai, 2026-10-19 00:30-00:50 KST)
+
+Rounds 3 and 4 were written by Grok Build through dmuxai itself.
+
+**Setup**
+- Binary: `dmuxai --web` built from f1b36ae, running in tmux.
+- Config and state were isolated: `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `DMUXAI_STATE_DIR` pointed under `/workspace/dmux-wt/_parity/dogfood`. The config had `[graph] enabled = false` and `allowed_runners = ["grok"]`.
+- In the dashboard API: agent `grok`, model `grok-4.7` (selected explicitly), mode Implement.
+- The process argv was checked: `grok -p … -m grok-4.7 --cwd <worktree> --output-format streaming-json --always-approve`. The second turn added `-r <session>`.
+
+**Results**
+- Turn 1: done in 597 s.
+- Turn 2: resumed with `-r` and done in 46 s.
+- No hang. The process exited on its own both times.
+
+**Issues found.** Not fixed here: runner code is out of scope for this PR.
+
+1. **Missing separators between streamed text segments.** Consecutive `text` events are joined with nothing in between, so the transcript reads `…those claims point at.Section 3 is loaded.` and `…one per line.# DmuxAI`. Both the TUI and the dashboard show it (evidence: `/api/state` transcript, tmux capture). It follows SPEC-grok-runner FR-893 ("no added separator"), but the result is unreadable. Suggest a newline or a space between message segments.
+2. **No activity for grok tool calls.** Turn 1 made 83 tool calls (grok `events.jsonl`: `tool_started`/`tool_completed`). dmuxai showed no activity rows and no status detail. The dashboard went 3-4 minutes with no visible progress beyond "running".
+3. **No notice after a cancel.** Cancel works: the child had its own process group and exited 0.29 s after `POST /api/command cancel`, and the run state is `cancelled`. But the transcript keeps the partial agent message and adds no "cancelled" system line.
+4. **Welcome text is stale.** It still says "Codex, Cursor, and AGY use real structured headless protocols" and does not mention grok (or opencode).
+5. **Token in the transcript.** The startup notice with the full `?token=` URL is a system message in the transcript, and so in every SSE snapshot.
+
+**Grok usage** (`grok usage 01a14fa3-8d33-73d2-a66d-fc0910f50be0`, model `grok-4.7-build`)
+- Turn 1: 3,676,530 total tokens (3,624,712 input of which 3,448,064 cached; 51,818 output), 30 model calls.
+- Turn 2: 757,912 total tokens, 4 model calls.
+- Session: 4,434,442 total tokens, `costUsdTicks` 27,942,960,000.
