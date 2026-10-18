@@ -15058,6 +15058,7 @@ mod tests {
         assert_eq!(sanitize_picker_text("a\u{200B}b\u{202E}c"), "a b c");
         assert_eq!(sanitize_picker_text("a\u{061C}b"), "a b");
         assert_eq!(sanitize_picker_text("👨\u{200D}👩"), "👨\u{200D}👩");
+        assert_eq!(sanitize_picker_text("a\u{200C}b"), "a\u{200C}b");
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("conversations.sqlite3");
