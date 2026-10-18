@@ -301,8 +301,8 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-cursor-latency | FR-806,FR-807 | TC-806 | `prewarm_discarded_on_arg_change` | unit | ✅ | v0.2.1 |
 | M8,M2 | SPEC-cursor-latency | FR-807,NFR-805 | TC-807 | `prewarm_disabled_and_expiry` | unit | ✅ | v0.2.1 |
 | M8,M2 | SPEC-cursor-latency | FR-806 | TC-808 | `prewarm_exited_process_is_replaced` | unit | ✅ | v0.2.1 |
-| M8,M2 | SPEC-centered-prompt | FR-850,UX-850 | TC-850 | `prompt_centering_assets` | unit | ⏳ | v0.2.2 |
-| M8,M2 | SPEC-centered-prompt | FR-850..852,UX-850 | TC-851 | `prompt_stays_centered_in_headless_chrome` (ignored) | e2e | ⏳ | v0.2.2 |
+| M8,M2 | SPEC-centered-prompt | FR-850,UX-850 | TC-850 | `prompt_centering_assets` | unit | ✅ | v0.2.2 |
+| M8,M2 | SPEC-centered-prompt | FR-850..852,UX-850 | TC-851 | `prompt_stays_centered_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.2 |
 | M8,M2 | SPEC-session-sidebar | FR-860 | TC-860 | `session_conversation_fields_roundtrip` | unit | ⏳ | v0.2.2 |
 | M8,M2 | SPEC-session-sidebar | FR-860 | TC-861 | `session_conversations_report_running_and_agent` | unit | ⏳ | v0.2.2 |
 | M8,M2 | SPEC-session-sidebar | FR-861..863,UX-860 | TC-862 | `session_sidebar_assets` | unit | ⏳ | v0.2.2 |

@@ -1,6 +1,6 @@
 # SPEC: centered-prompt
 
-Status: Draft (v0.2.2)
+Status: Implemented (v0.2.2)
 Created: 2026-10-18
 Related: issue #54; Dongjin 2026-10-18 09:42 KST ("keep the prompt input box centered"); SPEC-docs-tree UX-830 (right sidebar), SPEC-session-sidebar (left sidebar)
 
@@ -22,6 +22,7 @@ Decision: the layout reserves space for each open docked sidebar. The chat colum
 ### Design notes
 
 - Layout: `body` classes (`left-sidebar-open`, `sidebar-open`) set the CSS custom properties `--left-dock` and `--right-dock` (0, or the docked sidebar width) above 900px. A content wrapper is padded by `--left-dock` and `--right-dock`, and `main` keeps `max-width: 880px; margin-inline: auto` inside it. Centering then comes from one rule instead of per-state margins.
+- The left dock rule (`body.left-sidebar-open`) is in place before the left sidebar exists; SPEC-session-sidebar (#55) adds the toggle. Until then TC-851 simulates the left dock with a probe element.
 - The prompt box keeps its place in the session panel; this SPEC does not make it sticky.
 
 ## 3. Tests
