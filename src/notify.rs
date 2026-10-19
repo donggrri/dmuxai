@@ -305,6 +305,7 @@ async fn deliver_command(
         return;
     };
     let mut cmd = tokio::process::Command::new(program);
+    crate::process::strip_dashboard_env(cmd.as_std_mut());
     cmd.args(&command[1..])
         .current_dir(workspace_root)
         .stdin(Stdio::piped())

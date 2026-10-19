@@ -3165,6 +3165,176 @@ mod tests {
         }
     }
 
+    struct TodoPlanGateDouble {
+        store: Arc<TodoStore>,
+        awaiting: Option<(String, u32, String)>,
+        agent_skipped_judge: bool,
+    }
+
+    fn spawn_todo_plan_gate_double(store: Arc<TodoStore>) -> mpsc::Sender<DashboardCommand> {
+        let state = Arc::new(std::sync::Mutex::new(TodoPlanGateDouble {
+            store,
+            awaiting: None,
+            agent_skipped_judge: false,
+        }));
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            let session = crate::web::SessionView {
+                conversation_id: "conv-todo".to_owned(),
+                selected_agent: "codex".to_owned(),
+                ..crate::web::SessionView::default()
+            };
+            while let Some(command) = rx.recv().await {
+                match command {
+                    DashboardCommand::RunTodo {
+                        todo_id,
+                        mode,
+                        reply,
+                    } => {
+                        let mut guard = state.lock().unwrap();
+                        let result = match mode {
+                            RunMode::Graph => {
+                                let plan_id = format!("plan-{}", todo_id);
+                                guard.awaiting = Some((plan_id.clone(), 1, todo_id.clone()));
+                                guard
+                                    .store
+                                    .mark_running(&todo_id, "graph", &plan_id)
+                                    .map_err(|_| RunTodoError::NotFound)
+                            }
+                            RunMode::Agent { agent } => {
+                                guard.agent_skipped_judge = true;
+                                guard
+                                    .store
+                                    .mark_running(&todo_id, "agent", &agent)
+                                    .map_err(|_| RunTodoError::NotFound)
+                            }
+                        };
+                        let _ = reply.send(result);
+                    }
+                    DashboardCommand::Session {
+                        command:
+                            SessionCommand::PlanDecision {
+                                plan_id,
+                                revision,
+                                decision,
+                                ..
+                            },
+                        reply,
+                    } => {
+                        let mut guard = state.lock().unwrap();
+                        let result = match &guard.awaiting {
+                            Some((expected_plan, expected_rev, todo_id))
+                                if *expected_plan == plan_id && *expected_rev == revision =>
+                            {
+                                if matches!(decision, PlanDecisionAction::Reject) {
+                                    let todo_id = todo_id.clone();
+                                    guard.awaiting = None;
+                                    match guard.store.finish_run(
+                                        &todo_id,
+                                        false,
+                                        Some("plan rejected".to_owned()),
+                                    ) {
+                                        Ok(_) => Ok(session.clone()),
+                                        Err(_) => Err(RunTodoError::NotFound),
+                                    }
+                                } else {
+                                    Err(RunTodoError::Busy("unexpected decision".to_owned()))
+                                }
+                            }
+                            _ => Err(RunTodoError::Busy("not awaiting approval".to_owned())),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        tx
+    }
+
+    // TC-954 / FR-947: graph to-do waits for plan approval; reject reopens the to-do.
+    #[tokio::test]
+    async fn todo_graph_run_waits_for_plan_approval() {
+        let token = "todo-plan-gate-token".to_string();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TodoStore::open(&temp_dir.path().join("todos.db")).unwrap());
+        let todo = store
+            .create(crate::todo::NewTodo {
+                title: "feature".to_owned(),
+                body: String::new(),
+                source: crate::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let commands = spawn_todo_plan_gate_double(store.clone());
+        let router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                todos: Some(store.clone()),
+                commands: Some(commands),
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        );
+
+        let run_resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/todos/{}/run", todo.id),
+                &token,
+                r#"{"mode":"graph"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(run_resp.status(), StatusCode::ACCEPTED);
+
+        let reject_body = serde_json::json!({
+            "command": "plan_decision",
+            "plan_id": format!("plan-{}", todo.id),
+            "revision": 1,
+            "decision": "reject"
+        });
+        let reject_resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &reject_body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reject_resp.status(), StatusCode::OK);
+
+        let reopened = store.get(&todo.id).unwrap();
+        assert_eq!(reopened.status, TodoStatus::Open);
+        assert_eq!(reopened.last_error.as_deref(), Some("plan rejected"));
+
+        let todo_agent = store
+            .create(crate::todo::NewTodo {
+                title: "direct".to_owned(),
+                body: String::new(),
+                source: crate::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let agent_resp = router
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/todos/{}/run", todo_agent.id),
+                &token,
+                r#"{"mode":"agent","agent":"codex"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(agent_resp.status(), StatusCode::ACCEPTED);
+        let running = store.get(&todo_agent.id).unwrap();
+        assert_eq!(running.run_kind.as_deref(), Some("agent"));
+    }
+
     // TC-766 / FR-765: prompt route contract
     #[tokio::test]
     async fn prompt_route_contract() {

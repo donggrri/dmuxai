@@ -565,6 +565,7 @@ mod tests {
             orchestrate_started_ms: None,
             plan_fixed_ms: None,
             pending_replan_plan: None,
+            todo_id: None,
         }
     }
 

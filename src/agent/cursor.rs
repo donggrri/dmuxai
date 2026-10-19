@@ -20,7 +20,7 @@ use super::{
     ModelInfo, OutputContext, SpawnedAdapter, implement_outcome::ImplementTurnTracker,
     prompt_with_image_tokens,
 };
-use crate::process::cursor_command;
+use dmuxai::process::cursor_command;
 use dmuxai::settings::DmuxSettings;
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;

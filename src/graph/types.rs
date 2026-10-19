@@ -212,6 +212,9 @@ pub struct GraphRun {
     /// FR-959: proposed plan while a sensitive replan waits for approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_replan_plan: Option<GraphPlan>,
+    /// FR-947: dashboard to-do id when this run was started from a to-do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_id: Option<String>,
 }
 
 /// FR-943: at most five plan revisions per run.

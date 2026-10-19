@@ -1161,6 +1161,10 @@ pub struct App {
     dashboard_commands: Option<mpsc::Receiver<DashboardCommand>>,
     todo_turns: HashMap<(Agent, StoredTurnId), String>,
     graph_todo: Option<(String, String)>,
+    /// FR-947: to-do id while judge/planning runs before `GraphRun` exists.
+    pending_todo_graph: Option<String>,
+    /// FR-947: preallocated run id for `mark_running` and judge triage.
+    pending_todo_run_id: Option<String>,
     pub(crate) color_enabled: bool,
     cached_agent_colors: HashMap<Agent, Color>,
     cached_theme: Option<Theme>,
@@ -1384,6 +1388,8 @@ impl App {
             dashboard_commands: None,
             todo_turns: HashMap::new(),
             graph_todo: None,
+            pending_todo_graph: None,
+            pending_todo_run_id: None,
             color_enabled,
             cached_agent_colors: HashMap::new(),
             cached_theme: None,
@@ -2214,7 +2220,13 @@ impl App {
                 let kind = match decision {
                     PlanDecisionAction::Approve => PlanDecisionKind::Approve,
                     PlanDecisionAction::Edit => {
-                        PlanDecisionKind::Edit(feedback.unwrap_or_default())
+                        let feedback = feedback.unwrap_or_default();
+                        if feedback.trim().is_empty() {
+                            return Err(RunTodoError::Invalid(
+                                PlanDecisionError::EmptyFeedback.user_message(),
+                            ));
+                        }
+                        PlanDecisionKind::Edit(feedback)
                     }
                     PlanDecisionAction::Reject => PlanDecisionKind::Reject,
                 };
@@ -3746,6 +3758,8 @@ impl App {
                     self.push_system(format!("Could not save the cancelled run: {error}"));
                 }
             }
+            // FR-947: a cancelled plan of a to-do run sends the to-do back to open.
+            self.finish_linked_graph_todo(false, Some("cancelled by user".to_owned()));
             self.push_system(format!("{plan_agent} turn cancelled."));
             return;
         }
@@ -3794,6 +3808,8 @@ impl App {
                 self.push_system(format!("Could not save the cancelled run: {error}"));
             }
             self.last_graph_run = Some(run);
+            // FR-947: a to-do whose judge turn is cancelled goes back to open.
+            self.finish_linked_graph_todo(false, Some("cancelled by user".to_owned()));
             self.push_system(format!("{agent} turn cancelled."));
             return;
         }
@@ -4265,7 +4281,10 @@ impl App {
             resume_session: None,
             image_paths: vec![],
         };
-        let run_id = Uuid::new_v4().to_string();
+        let run_id = self
+            .pending_todo_run_id
+            .take()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         match self.adapters[index].send(request) {
             Ok(()) => {
                 let now = Instant::now();
@@ -4642,6 +4661,10 @@ impl App {
         position: Option<u32>,
         note: Option<String>,
     ) -> Result<TaskEdit, RunTodoError> {
+        let task_id = task_id.trim();
+        if task_id.is_empty() {
+            return Err(RunTodoError::Invalid(Self::GRAPH_TASK_USAGE.to_owned()));
+        }
         match action.trim() {
             "rename" => {
                 let title = title
@@ -4783,6 +4806,9 @@ impl App {
         revision: u32,
         by: DecisionBy,
     ) -> Result<(), PlanDecisionError> {
+        if matches!(&decision, PlanDecisionKind::Edit(feedback) if feedback.trim().is_empty()) {
+            return Err(PlanDecisionError::EmptyFeedback);
+        }
         if self.pending_plan.is_some() {
             return Err(PlanDecisionError::AgentBusy);
         }
@@ -4819,9 +4845,6 @@ impl App {
                 }
                 if run.pending_replan_plan.is_some() {
                     return Err(PlanDecisionError::ReplanEditRefused);
-                }
-                if feedback.trim().is_empty() {
-                    return Err(PlanDecisionError::EmptyFeedback);
                 }
                 if approval.revisions.len() as u32 >= MAX_PLAN_REVISIONS {
                     return Err(PlanDecisionError::RevisionCap);
@@ -5261,6 +5284,7 @@ impl App {
         }
         self.graph_approval_stale = None;
         self.push_system("Plan rejected.".to_owned());
+        self.finish_linked_graph_todo(false, Some("plan rejected".to_owned()));
         Ok(())
     }
 
@@ -5719,6 +5743,8 @@ impl App {
             self.push_system(format!("Could not save the fallback plan: {error}"));
         }
         self.remember_judge_reason_triage(run.triage.as_ref());
+        let plan_id = run.plan.id.clone();
+        self.commit_pending_graph_todo(&plan_id, &mut run);
         self.last_graph_run = Some(run);
     }
 
@@ -6005,6 +6031,8 @@ impl App {
                 self.push_system(format!("Could not save the planning run: {error}"));
             }
             self.remember_judge_reason_triage(planning_run.triage.as_ref());
+            let plan_id = planning_run.plan.id.clone();
+            self.commit_pending_graph_todo(&plan_id, &mut planning_run);
             self.last_graph_run = Some(planning_run);
         }
         self.push_system(format!("Planning with {runner} {model}…"));
@@ -8202,6 +8230,13 @@ impl App {
         let turn_index = GraphStore::new(&self.workspace_root)
             .conversation_run_count(self.conversation_id.as_str()) as u32
             + 1;
+        // A to-do link: still pending (judge stage) or already bound to this plan id.
+        let todo_id = self.pending_todo_graph.clone().or_else(|| {
+            self.graph_todo
+                .as_ref()
+                .filter(|(plan_id, _)| plan_id == &plan.id)
+                .map(|(_, todo_id)| todo_id.clone())
+        });
         GraphRun {
             plan,
             conversation_id: self.conversation_id.as_str().to_owned(),
@@ -8221,6 +8256,47 @@ impl App {
             replan_chars_used: 0,
             pending_replan_plan: None,
             planner_io: Vec::new(),
+            todo_id,
+        }
+    }
+
+    fn commit_pending_graph_todo(&mut self, plan_id: &str, run: &mut GraphRun) {
+        // The pending link is consumed by the first run it reaches, so a later
+        // plain prompt never inherits a finished to-do.
+        let pending = self.pending_todo_graph.take();
+        self.pending_todo_run_id = None;
+        if run.todo_id.is_none() {
+            run.todo_id = pending;
+        }
+        if self.graph_todo.is_none()
+            && let Some(todo_id) = run.todo_id.clone()
+        {
+            self.graph_todo = Some((plan_id.to_owned(), todo_id));
+        }
+    }
+
+    fn finish_linked_graph_todo(&mut self, success: bool, error: Option<String>) {
+        let todo_id = self
+            .graph_todo
+            .as_ref()
+            .map(|(_, id)| id.clone())
+            .or_else(|| self.pending_todo_graph.clone())
+            .or_else(|| {
+                self.last_graph_run
+                    .as_ref()
+                    .and_then(|run| run.todo_id.clone())
+            });
+        let Some(todo_id) = todo_id else {
+            return;
+        };
+        self.graph_todo = None;
+        self.pending_todo_graph = None;
+        self.pending_todo_run_id = None;
+        if let Some(store) = self.todo_store.clone() {
+            if let Err(err) = store.finish_run(&todo_id, success, error) {
+                self.push_system(format!("Failed to finish to-do run: {err}"));
+            }
+            self.publish_todos();
         }
     }
 
@@ -8866,7 +8942,9 @@ impl App {
         }
     }
 
-    fn start_graph_run_record(&mut self, run: GraphRun) {
+    fn start_graph_run_record(&mut self, mut run: GraphRun) {
+        let plan_id = run.plan.id.clone();
+        self.commit_pending_graph_todo(&plan_id, &mut run);
         if self
             .tasks_file_last_snapshot
             .as_ref()
@@ -10394,33 +10472,19 @@ impl App {
                     )));
                 }
 
-                // B1: no plan turn yet, so a to-do graph run is a quiet 1-node
-                // run on the selected agent (FR-947 wiring lands later).
-                let run = self
-                    .build_one_node_run(
-                        &prompt,
-                        agent,
-                        Route::Simple,
-                        "to-do run".to_owned(),
-                        TriageSource::Override,
-                        None,
-                        Some(OverrideKind::Agent),
-                        Uuid::new_v4().to_string(),
-                        0,
-                        0,
-                    )
-                    .map_err(RunTodoError::Internal)?;
-                let plan_id = run.plan.id.clone();
-                self.graph_todo = Some((plan_id.clone(), todo_id.to_owned()));
+                let run_ref = Uuid::new_v4().to_string();
+                self.pending_todo_graph = Some(todo_id.to_owned());
+                self.pending_todo_run_id = Some(run_ref.clone());
                 let updated = store
-                    .mark_running(todo_id, "graph", &plan_id)
+                    .mark_running(todo_id, "graph", &run_ref)
                     .map_err(|err| {
-                        self.graph_todo = None;
+                        self.pending_todo_graph = None;
+                        self.pending_todo_run_id = None;
                         self.push_system(format!("Failed to mark to-do running: {err}"));
                         RunTodoError::Internal(err.to_string())
                     })?;
                 self.begin_user_prompt_turn();
-                self.start_graph_run_record(run);
+                self.start_judge_turn(agent, prompt);
                 self.publish_todos();
                 Ok(updated)
             }
@@ -14980,12 +15044,10 @@ mod tests {
         );
         assert!(matches!(unknown_res, Err(RunTodoError::UnknownAgent(_))));
 
-        // (e) graph mode with a prompt that plans a Graph (look at plan_request/infer_roles for keywords,
-        // e.g. "research, test, review and implement the change") starts a graph session
-        // and the to-do run_ref equals the plan id; dispatching GraphAction::Completed marks it done.
+        // (e) graph mode enters judge triage, then a simple verdict starts a 1-node run.
         let todo_graph = store
             .create(dmuxai::todo::NewTodo {
-                title: "research, test, review and implement the change".to_owned(),
+                title: "Fix the widget".to_owned(),
                 body: "all steps together".to_owned(),
                 source: dmuxai::todo::TodoSource::Manual,
                 source_ref: None,
@@ -14996,8 +15058,37 @@ mod tests {
             .expect("graph mode should succeed");
         assert_eq!(running_graph.status, TodoStatus::Running);
         assert_eq!(running_graph.run_kind.as_deref(), Some("graph"));
+        assert!(app.pending_triage.is_some());
+        assert!(app.graph_session.is_none());
+        let judge = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(_, request)| request.turn_id.as_str().starts_with("judge-"))
+            .map(|(_, request)| request.clone())
+            .expect("judge request");
+        assert!(judge.turn_id.as_str().starts_with("judge-"));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(ConversationId::new(judge.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(judge.turn_id.as_str())),
+            event: AgentEvent::TextDelta(
+                "{\"route\":\"simple\",\"reason\":\"one step\"}".to_owned(),
+            ),
+        }));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(ConversationId::new(judge.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(judge.turn_id.as_str())),
+            event: AgentEvent::Completed,
+        }));
         assert!(app.graph_session.is_some());
         let plan_id = app.graph_session.as_ref().unwrap().run().plan.id.clone();
+        assert_eq!(
+            app.graph_session.as_ref().unwrap().run().todo_id.as_deref(),
+            Some(todo_graph.id.as_str())
+        );
         assert_eq!(running_graph.run_ref.as_deref(), Some(plan_id.as_str()));
 
         // dispatching GraphAction::Completed marks it done
@@ -15013,9 +15104,179 @@ mod tests {
         assert_eq!(snap_graph.status, TodoStatus::Done);
     }
 
+    // TC-954 / FR-947: to-do graph runs use judge triage; complex plans wait at the gate.
+    #[test]
+    fn todo_graph_run_goes_through_judge() {
+        let workspace = std::env::temp_dir().join(format!("dmuxai-todo-graph-{}", Uuid::new_v4()));
+        let mut h = plan_gate_harness_in_workspace(workspace, &[]);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TodoStore::open(&temp_dir.path().join("todos.db")).unwrap());
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        h.app.attach_dashboard_services(store.clone(), cmd_rx);
+
+        let todo = store
+            .create(dmuxai::todo::NewTodo {
+                title: "ship feature".to_owned(),
+                body: String::new(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+
+        let running = h
+            .app
+            .run_todo(&todo.id, RunMode::Graph)
+            .expect("graph todo run");
+        assert_eq!(running.status, TodoStatus::Running);
+        assert!(h.app.pending_triage.is_some());
+
+        let judge = h.sent.lock().unwrap()[0].1.clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::TextDelta("{\"route\":\"simple\",\"reason\":\"tiny\"}".to_owned()),
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::Completed,
+        )));
+        let run = h.app.graph_session.as_ref().expect("1-node run").run();
+        assert_eq!(run.todo_id.as_deref(), Some(todo.id.as_str()));
+        assert_eq!(run.phase, GraphRunPhase::Active);
+        let node_req = graph_node_requests(&h.sent)
+            .last()
+            .cloned()
+            .expect("graph node turn");
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &node_req,
+            AgentEvent::Completed,
+        )));
+        h.app.dispatch_graph_actions(vec![GraphAction::Completed]);
+        assert!(h.app.graph_session.is_none());
+        assert_eq!(store.get(&todo.id).unwrap().status, TodoStatus::Done);
+        // The to-do link is consumed by its run: nothing leaks into later prompts.
+        assert!(h.app.pending_todo_graph.is_none());
+        assert!(h.app.pending_todo_run_id.is_none());
+
+        // Cancelling the judge turn of a to-do run sends the to-do back to open.
+        let todo_cancel = store
+            .create(dmuxai::todo::NewTodo {
+                title: "cancel me".to_owned(),
+                body: String::new(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let _ = h
+            .app
+            .run_todo(&todo_cancel.id, RunMode::Graph)
+            .expect("cancel graph todo");
+        assert!(h.app.pending_triage.is_some());
+        h.app.cancel_selected();
+        assert_eq!(store.get(&todo_cancel.id).unwrap().status, TodoStatus::Open);
+        assert!(h.app.pending_todo_graph.is_none());
+        assert_eq!(
+            store.get(&todo.id).unwrap().status,
+            TodoStatus::Done,
+            "the earlier to-do is untouched"
+        );
+
+        let todo_complex = store
+            .create(dmuxai::todo::NewTodo {
+                title: "multi".to_owned(),
+                body: String::new(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let _ = h
+            .app
+            .run_todo(&todo_complex.id, RunMode::Graph)
+            .expect("second graph todo");
+        let judge2 = h
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(_, request)| request.turn_id.as_str().starts_with("judge-"))
+            .map(|(_, request)| request.clone())
+            .expect("second judge");
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge2,
+            AgentEvent::TextDelta("{\"route\":\"complex\",\"reason\":\"needs plan\"}".to_owned(),),
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge2,
+            AgentEvent::Completed,
+        )));
+        let plan_req = h
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(_, request)| request.turn_id.as_str().starts_with("plan-"))
+            .map(|(_, request)| request.clone())
+            .expect("plan turn");
+        assert!(plan_req.turn_id.as_str().starts_with("plan-"));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::TextDelta(valid_codex_plan_json().to_owned()),
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::Completed,
+        )));
+        let awaiting = h.app.last_graph_run.as_ref().expect("awaiting run");
+        assert_eq!(awaiting.phase, GraphRunPhase::AwaitingApproval);
+        assert_eq!(awaiting.todo_id.as_deref(), Some(todo_complex.id.as_str()));
+
+        let plan_id = awaiting.plan.id.clone();
+        let revision = App::current_plan_revision_n(awaiting).unwrap();
+        h.app
+            .decide_plan(PlanDecisionKind::Reject, plan_id, revision, DecisionBy::Tui)
+            .expect("reject plan");
+        let reopened = store.get(&todo_complex.id).unwrap();
+        assert_eq!(reopened.status, TodoStatus::Open);
+        assert_eq!(reopened.last_error.as_deref(), Some("plan rejected"));
+
+        let todo_agent = store
+            .create(dmuxai::todo::NewTodo {
+                title: "direct".to_owned(),
+                body: String::new(),
+                source: dmuxai::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        h.app
+            .run_todo(
+                &todo_agent.id,
+                RunMode::Agent {
+                    agent: "codex".to_owned(),
+                },
+            )
+            .expect("agent todo");
+        assert!(
+            h.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .any(|(_, req)| !req.turn_id.as_str().starts_with("judge-"))
+        );
+        assert!(h.app.pending_triage.is_none());
+    }
+
     #[tokio::test]
     async fn dashboard_run_todo_review_round_1_edge_cases() {
-        let (mut app, _sent) = test_app();
+        let (mut app, sent) = test_app();
         let hub = dmuxai::web::DashboardHub::new(
             dmuxai::web::SnapshotSource::Tui,
             "/test-workspace".to_owned(),
@@ -15149,7 +15410,7 @@ mod tests {
             })
             .unwrap();
         let _ = app.run_todo(&todo_gfail.id, RunMode::Graph).unwrap();
-        assert!(app.graph_session.is_some());
+        finish_todo_graph_judge_simple(&mut app, &sent);
         app.dispatch_graph_actions(vec![GraphAction::Failed("pipeline exploded".to_owned())]);
         let failed_todo = store.get(&todo_gfail.id).unwrap();
         assert_eq!(failed_todo.status, TodoStatus::Open);
@@ -15166,7 +15427,7 @@ mod tests {
             })
             .unwrap();
         let _ = app.run_todo(&todo_gactive.id, RunMode::Graph).unwrap();
-        assert!(app.graph_session.is_some());
+        finish_todo_graph_judge_simple(&mut app, &sent);
         let todo_ablocked = store
             .create(dmuxai::todo::NewTodo {
                 title: "agent while graph active".to_owned(),
@@ -23596,6 +23857,24 @@ mod tests {
             {"id":"step-2","role":"implement","job":"deploy the service","runner":"codex","model":"composer-2.5","depends_on":["step-1"],"sensitive":false,"task":"task-1"},
             {"id":"step-3","role":"test","job":"run checks","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"}
         ]}"#
+    }
+
+    fn finish_todo_graph_judge_simple(app: &mut App, sent: &SentRequests) {
+        let judge = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(_, request)| request.turn_id.as_str().starts_with("judge-"))
+            .map(|(agent, request)| (*agent, request.clone()))
+            .expect("judge request for to-do graph run");
+        assert!(app.apply_agent_output(triage_output(
+            judge.0,
+            &judge.1,
+            AgentEvent::TextDelta("{\"route\":\"simple\",\"reason\":\"one step\"}".to_owned()),
+        )));
+        assert!(app.apply_agent_output(triage_output(judge.0, &judge.1, AgentEvent::Completed,)));
+        assert!(app.graph_session.is_some());
     }
 
     fn complete_complex_judge(h: &mut PlanGateHarness) -> AgentRequest {

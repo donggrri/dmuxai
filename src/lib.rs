@@ -18,6 +18,7 @@ pub mod memory;
 pub mod memory_mcp;
 pub mod model_policy;
 pub mod notify;
+pub mod process;
 pub mod settings;
 pub mod skills;
 pub mod state_path;

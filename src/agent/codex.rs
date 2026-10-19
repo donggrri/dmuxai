@@ -19,7 +19,7 @@ use super::{
     AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ConversationId,
     ExecutionMode, ModelInfo, OutputContext, SpawnedAdapter,
 };
-use crate::process::{headless_command, resolve_program};
+use dmuxai::process::{headless_command, resolve_program};
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const RAW_MESSAGE_CHANNEL_CAPACITY: usize = 64;

@@ -24,7 +24,7 @@ use super::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::process::{headless_command, resolve_program};
+use dmuxai::process::{headless_command, resolve_program};
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const STDERR_HISTORY_CAPACITY: usize = 8;
@@ -980,6 +980,29 @@ mod tests {
             Some(AgentEvent::Completed)
         ));
         assert_eq!(state.conversation_id.as_deref(), Some("conversation"));
+    }
+
+    // TC-1010 / FR-1010: the shared headless builder (used by every runner,
+    // judge and planner turn) removes the dashboard token without any extra call.
+    #[test]
+    fn agent_child_env_drops_web_token() {
+        fn token_removed(command: &tokio::process::Command) -> bool {
+            command
+                .as_std()
+                .get_envs()
+                .any(|(key, value)| key == "DMUXAI_WEB_TOKEN" && value.is_none())
+        }
+        let command = dmuxai::process::headless_command(std::path::PathBuf::from("agy"));
+        assert!(token_removed(&command), "headless_command");
+        match dmuxai::process::cursor_command() {
+            Ok(command) => assert!(token_removed(&command), "cursor_command"),
+            // Windows without LOCALAPPDATA cannot build the command at all.
+            Err(error) => {
+                if !cfg!(windows) {
+                    panic!("cursor_command failed: {error}");
+                }
+            }
+        }
     }
 
     #[test]

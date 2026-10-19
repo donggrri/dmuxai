@@ -98,7 +98,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   FR-967. TC-998.
   Files: `src/settings.rs`, `src/init.rs`, `src/graph/tasks.rs`, `src/app.rs`, `docs/API.md`.
   Done when: `tasks_file_setting_and_persistence` green.
-- [ ] P19 — To-do runs through triage; explicit agent = `/direct` (OQ-932, resolved yes).
+- [x] P19 — (#67 agent-planned graph c2208f02: 4 steps over 4 tasks, approved from the dashboard Approve button; composer-2.5; review claude-sonnet-5-5-high BLOCK (to-do link never consumed so later prompts inherited a finished to-do; judge/plan cancel left the to-do running) → fixed by hand → APPROVE; + FR-1010 from #67 dogfood: DMUXAI_WEB_TOKEN no longer inherited by agents, MCP servers, model listing, notify hooks) To-do runs through triage; explicit agent = `/direct` (OQ-932, resolved yes).
   FR-947. TC-954.
   Files: `src/web/server.rs`, `src/app.rs`.
   Done when: `todo_graph_run_waits_for_plan_approval` green.
