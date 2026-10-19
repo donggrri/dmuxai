@@ -1,29 +1,5 @@
-use crate::settings::DmuxSettings;
-
 use super::judge::Route;
-use super::policy::{assign_runner, model_for_role};
-use super::types::{ExecutionPlan, NodeRole, SinglePlan};
-
-/// FR-948: the keyword planner never builds a multi-node graph any more.
-/// `plan_request` stays only as a thin temporary wrapper that hands every
-/// caller the FR-950 1-node fallback plan until the judge/plan state machine
-/// owns routing (later steps remove its callers).
-pub fn plan_request(
-    prompt: &str,
-    workspace: &std::path::Path,
-    settings: &DmuxSettings,
-) -> ExecutionPlan {
-    let _ = workspace;
-    let runner = assign_runner(NodeRole::Implement, settings);
-    // Transitional: a single-agent send until the App triage state machine
-    // records every turn as a 1-node graph (FR-937, FR-954).
-    ExecutionPlan::Single(SinglePlan {
-        runner,
-        model_id: model_for_role(NodeRole::Implement).to_owned(),
-        role: NodeRole::Implement,
-        job: prompt.trim().to_owned(),
-    })
-}
+use super::types::NodeRole;
 
 /// FR-936: pure route heuristic with no I/O. Keeps the English keywords and
 /// adds the Korean equivalents. It only picks the route; it never builds a

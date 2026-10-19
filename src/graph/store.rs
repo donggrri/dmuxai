@@ -24,6 +24,35 @@ impl GraphStore {
         fs::write(&path, json)?;
         Ok(path)
     }
+
+    /// Every stored run record, skipping files that do not parse so one bad
+    /// file never hides the rest.
+    pub fn list_runs(&self) -> Vec<GraphRun> {
+        let Ok(read_dir) = fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        let mut runs = Vec::new();
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(contents) = fs::read_to_string(&path)
+                && let Ok(run) = serde_json::from_str::<GraphRun>(&contents)
+            {
+                runs.push(run);
+            }
+        }
+        runs
+    }
+
+    /// FR-954: how many runs are already stored for `conversation_id`.
+    pub fn conversation_run_count(&self, conversation_id: &str) -> usize {
+        self.list_runs()
+            .iter()
+            .filter(|run| run.conversation_id == conversation_id)
+            .count()
+    }
 }
 
 /// Replaces every failed-parse `raw` with its 4 KiB char-boundary cap so the

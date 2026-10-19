@@ -29,6 +29,7 @@ use tokio::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use uuid::Uuid;
 
 use dmuxai::{
     attachments::{
@@ -53,8 +54,10 @@ use dmuxai::{
     },
     events::EventDraft,
     graph::{
-        ExecutionPlan, GraphAction, GraphRun, GraphRunPhase, GraphRunSession, NodeAssignment,
-        NodeRole, plan_request, save_run,
+        Approval, ApprovalState, FallbackCause, GraphAction, GraphPlan, GraphRun, GraphRunPhase,
+        GraphRunSession, GraphStore, NodeAssignment, NodeRole, OverrideKind, PlanRevision,
+        PlanStep, PlannerCalls, Route, Triage, TriageSource, build_judge_prompt, fallback_plan,
+        heuristic_route, parse_verdict, save_run,
     },
     mcp::config::ResolvedMcpServer,
     mcp::registry::McpRegistry,
@@ -79,6 +82,11 @@ const RENDER_INTERVAL: Duration = Duration::from_millis(25);
 const EVENT_LOOP_PAUSE: Duration = Duration::from_millis(5);
 const DASHBOARD_PUBLISH_MIN_INTERVAL: Duration = Duration::from_millis(200);
 const DASHBOARD_BUSY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// OQ-931: the judge turn is abandoned 90 s after the last streamed event.
+const JUDGE_SILENCE_TIMEOUT: Duration = Duration::from_secs(90);
+/// OQ-931: hard cap on the whole judge turn.
+const JUDGE_HARD_CAP: Duration = Duration::from_secs(270);
 const DEFAULT_INPUT_HEIGHT: u16 = 3;
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MIN_MAIN_HEIGHT: u16 = 5;
@@ -101,6 +109,7 @@ enum SlashAction {
     Details,
     Remember,
     Memory,
+    Direct,
 }
 
 #[derive(Clone, Copy)]
@@ -110,7 +119,7 @@ struct SlashCommand {
     action: SlashAction,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 15] = [
+const SLASH_COMMANDS: [SlashCommand; 16] = [
     SlashCommand {
         name: "/agent",
         description: "Switch the active agent",
@@ -120,6 +129,11 @@ const SLASH_COMMANDS: [SlashCommand; 15] = [
         name: "/mode",
         description: "Choose Ask, Plan, or Implement",
         action: SlashAction::Mode,
+    },
+    SlashCommand {
+        name: "/direct",
+        description: "Run on the selected agent without planning",
+        action: SlashAction::Direct,
     },
     SlashCommand {
         name: "/effort",
@@ -592,6 +606,23 @@ struct PendingSummary {
     deferred: Option<DeferredTurn>,
 }
 
+/// FR-932: an internal read-only judge turn. Its streamed text is buffered and
+/// never shown; the agent is busy for its duration and its mode is restored on
+/// every ending.
+struct PendingTriage {
+    agent: Agent,
+    conversation_id: StoredConversationId,
+    turn_id: StoredTurnId,
+    buffer: String,
+    buffer_chars: usize,
+    started: Instant,
+    last_event: Instant,
+    prompt: String,
+    saved_mode: ExecutionMode,
+    run_id: String,
+    judge_calls: u32,
+}
+
 #[derive(Default)]
 struct SlashPreview {
     cursor: usize,
@@ -846,6 +877,7 @@ pub struct App {
     next_internal_turn_id: u64,
     active_turns: HashMap<Agent, ActiveTurn>,
     pending_summary: Option<PendingSummary>,
+    pending_triage: Option<PendingTriage>,
     deferred_turns: Vec<DeferredTurn>,
     restored_inputs: HashMap<StoredConversationId, String>,
     busy_agents: HashSet<Agent>,
@@ -876,6 +908,13 @@ pub struct App {
     graph_agent_nodes: HashMap<Agent, String>,
     graph_node_details: HashMap<String, NodeDetailTracker>,
     single_graph_plan: Option<(NodeRole, Agent, String)>,
+    /// FR-937: a 1-node run hides the graph progress lines so the transcript
+    /// looks like a direct send.
+    quiet_graph_run: bool,
+    /// Test-only escape hatch: legacy app tests assume a direct send, so they
+    /// skip the judge and start a quiet 1-node run with override kind `agent`.
+    #[cfg(test)]
+    skip_judge_for_tests: bool,
     last_group_expanded: bool,
     all_details_expanded: bool,
     dashboard: Option<dmuxai::web::DashboardHub>,
@@ -1036,6 +1075,7 @@ impl App {
             next_internal_turn_id: 1,
             active_turns: HashMap::new(),
             pending_summary: None,
+            pending_triage: None,
             deferred_turns: Vec::new(),
             restored_inputs: HashMap::new(),
             busy_agents: HashSet::new(),
@@ -1077,6 +1117,9 @@ impl App {
             graph_agent_nodes: HashMap::new(),
             graph_node_details: HashMap::new(),
             single_graph_plan: None,
+            quiet_graph_run: false,
+            #[cfg(test)]
+            skip_judge_for_tests: false,
             last_group_expanded: false,
             all_details_expanded: false,
             dashboard: None,
@@ -1206,6 +1249,7 @@ impl App {
         for adapter in &self.adapters {
             let _ = adapter.tick();
         }
+        self.check_triage_timeout(Instant::now());
         let busy = !self.busy_agents.is_empty();
         if busy {
             self.dirty = true;
@@ -1921,6 +1965,9 @@ impl App {
         if self.output_belongs_to_summary(&output) {
             return self.apply_summary_output(output);
         }
+        if self.output_belongs_to_triage(&output) {
+            return self.apply_triage_output(output);
+        }
 
         match (&output.conversation_id, &output.turn_id) {
             (Some(conversation_id), Some(turn_id)) => {
@@ -2170,6 +2217,7 @@ impl App {
                 "Usage: /remember [--human | --decision <name> | --gotcha <name>] <text>",
             ),
             SlashAction::Memory => self.memory_command(""),
+            SlashAction::Direct => self.push_system("Usage: /direct <prompt>"),
         }
     }
 
@@ -2889,6 +2937,20 @@ impl App {
                     self.memory_command(&rest);
                     return;
                 }
+                "/direct" => {
+                    let rest = prompt
+                        .strip_prefix("/direct")
+                        .unwrap_or("")
+                        .trim()
+                        .to_owned();
+                    if rest.is_empty() {
+                        self.push_system("Usage: /direct <prompt>");
+                    } else {
+                        let agent = self.adapters[self.selected].agent();
+                        self.submit_direct_run(rest, agent, OverrideKind::Direct);
+                    }
+                    return;
+                }
                 "/graph" => {
                     let rest = prompt.strip_prefix("/graph").unwrap().trim();
                     if rest.is_empty() {
@@ -2911,6 +2973,14 @@ impl App {
         }
 
         if !prompt.trim_start().starts_with('/') {
+            let agent = self.adapters[self.selected].agent();
+            if self.busy_agents.contains(&agent) {
+                self.input = prompt;
+                self.push_system(format!(
+                    "{agent} is busy; cancel the active turn before sending another prompt."
+                ));
+                return;
+            }
             if self
                 .settings
                 .graph_allowed_runners
@@ -2920,42 +2990,16 @@ impl App {
                 self.push_system(
                     "Graph disabled: allowed_runners list is empty. Falling back to single-agent mode.",
                 );
-                let agent = self.adapters[self.selected].agent();
-                self.submit_to_agent(agent, prompt, true);
+                self.submit_direct_run(prompt, agent, OverrideKind::NoAllowedRunners);
                 return;
             }
-            match plan_request(&prompt, &self.workspace_root, &self.settings) {
-                ExecutionPlan::Single(plan) => {
-                    let agent = self.adapters[self.selected].agent();
-                    let runner = runner_name(agent);
-                    if self
-                        .apply_runner_and_model(runner, &plan.model_id)
-                        .is_some()
-                    {
-                        let shown_model = self
-                            .effective_model_for(agent, &plan.model_id)
-                            .unwrap_or_else(|| "provider default".to_owned());
-                        self.graph_assignment_line =
-                            format!("single {} → {}", plan.role, shown_model);
-                        if !self.busy_agents.contains(&agent) {
-                            self.single_graph_plan =
-                                Some((plan.role, agent, plan.model_id.clone()));
-                        }
-                        self.submit_to_agent(agent, plan.job, true);
-                    }
-                    return;
-                }
-                ExecutionPlan::Graph(mut plan) => {
-                    plan.limits.max_parallel = self.settings.graph_max_parallel;
-                    plan.limits.max_retries = self.settings.graph_max_retries;
-                    plan.limits.max_replans = self.settings.graph_max_replans;
-                    plan.limits.replan_budget_chars =
-                        self.settings.graph_replan_budget_chars as usize;
-                    plan.limits.max_nodes = self.settings.graph_max_nodes as usize;
-                    self.start_graph_run(plan);
-                    return;
-                }
+            #[cfg(test)]
+            if self.skip_judge_for_tests {
+                self.submit_direct_run(prompt, agent, OverrideKind::Agent);
+                return;
             }
+            self.start_judge_turn(agent, prompt);
+            return;
         }
 
         let agent = self.adapters[self.selected].agent();
@@ -3203,8 +3247,10 @@ impl App {
 
     fn cancel_selected(&mut self) {
         let agent = self.adapters[self.selected].agent();
-        let was_tracking =
-            self.busy_agents.contains(&agent) || self.active_turns.contains_key(&agent);
+        let triage_agent = self.pending_triage.as_ref().map(|pending| pending.agent);
+        let was_tracking = self.busy_agents.contains(&agent)
+            || self.active_turns.contains_key(&agent)
+            || triage_agent == Some(agent);
 
         if let Err(error) = self.adapters[self.selected].cancel()
             && was_tracking
@@ -3213,6 +3259,51 @@ impl App {
                 Role::System,
                 format!("Could not cancel {agent}: {error}"),
             ));
+        }
+
+        // FR-935: a user cancel is not a fallback. The run becomes `cancelled`
+        // and the prompt is restored.
+        if triage_agent == Some(agent) {
+            let Some(pending) = self.pending_triage.take() else {
+                return;
+            };
+            self.busy_agents.remove(&agent);
+            self.activities.remove(&agent);
+            self.end_run_state(agent, false, true);
+            let _ = self.adapters[adapter_index(agent)].select_mode(pending.saved_mode);
+            self.input = pending.prompt.clone();
+            let runner = runner_name(agent).to_owned();
+            let plan = GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: pending.run_id.clone(),
+                orchestrator_model: runner.clone(),
+                user_prompt: pending.prompt.clone(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                limits: self.graph_limits(),
+            };
+            let run = self.build_graph_run(
+                plan,
+                GraphRunPhase::Cancelled,
+                Triage {
+                    route: heuristic_route(&pending.prompt),
+                    reason: "cancelled by user".to_owned(),
+                    source: TriageSource::Fallback,
+                    cause: None,
+                    override_kind: None,
+                    runner: runner.clone(),
+                    model: String::new(),
+                    elapsed_ms: pending.started.elapsed().as_millis() as u64,
+                },
+                None,
+                pending.judge_calls,
+            );
+            if let Err(error) = save_run(&self.workspace_root, &run) {
+                self.push_system(format!("Could not save the cancelled run: {error}"));
+            }
+            self.last_graph_run = Some(run);
+            self.push_system(format!("{agent} turn cancelled."));
+            return;
         }
 
         if was_tracking {
@@ -3580,6 +3671,578 @@ impl App {
             | AgentEvent::Activity(_)
             | AgentEvent::Status(_) => false,
         }
+    }
+
+    fn output_belongs_to_triage(&self, output: &AgentOutput) -> bool {
+        self.pending_triage.as_ref().is_some_and(|pending| {
+            pending.agent == output.agent
+                && output
+                    .conversation_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == pending.conversation_id.as_str())
+                && output
+                    .turn_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == pending.turn_id.as_str())
+        })
+    }
+
+    /// FR-932: the judge turn is an internal read-only turn. Its text is
+    /// buffered, never shown, and the user's mode is restored on every ending.
+    fn start_judge_turn(&mut self, agent: Agent, prompt: String) {
+        let index = adapter_index(agent);
+        let judge_mode = if self.adapters[index]
+            .validate_mode(ExecutionMode::Ask)
+            .is_ok()
+        {
+            Some(ExecutionMode::Ask)
+        } else if self.adapters[index]
+            .validate_mode(ExecutionMode::Plan)
+            .is_ok()
+        {
+            Some(ExecutionMode::Plan)
+        } else {
+            None
+        };
+        let saved_mode = self.modes.get(&agent).copied().unwrap_or_default();
+        let Some(judge_mode) = judge_mode else {
+            // FR-932: no read-only mode means no judge turn at all.
+            let run_id = Uuid::new_v4().to_string();
+            self.triage_fallback(
+                prompt,
+                agent,
+                saved_mode,
+                FallbackCause::NoReadOnlyMode,
+                run_id,
+                0,
+                0,
+            );
+            return;
+        };
+        if self.adapters[index].select_mode(judge_mode).is_err() {
+            let run_id = Uuid::new_v4().to_string();
+            self.triage_fallback(
+                prompt,
+                agent,
+                saved_mode,
+                FallbackCause::NoReadOnlyMode,
+                run_id,
+                0,
+                0,
+            );
+            return;
+        }
+        let nonce = Uuid::new_v4().simple().to_string();
+        let judge_prompt = match build_judge_prompt(&prompt, &nonce) {
+            Ok(judge_prompt) => judge_prompt,
+            Err(_) => {
+                let run_id = Uuid::new_v4().to_string();
+                self.triage_fallback(
+                    prompt,
+                    agent,
+                    saved_mode,
+                    FallbackCause::InvalidVerdict,
+                    run_id,
+                    0,
+                    0,
+                );
+                return;
+            }
+        };
+        let turn_id = TurnId::new(format!("judge-{}", self.next_internal_turn_id));
+        self.next_internal_turn_id += 1;
+        let request = AgentRequest {
+            conversation_id: ConversationId::new(self.conversation_id.as_str()),
+            turn_id: turn_id.clone(),
+            prompt: judge_prompt,
+            resume_session: None,
+            image_paths: vec![],
+        };
+        let run_id = Uuid::new_v4().to_string();
+        match self.adapters[index].send(request) {
+            Ok(()) => {
+                let now = Instant::now();
+                let started_at_ms = unix_ms_now();
+                self.busy_agents.insert(agent);
+                self.run_states.insert(
+                    agent,
+                    RunState::Running {
+                        started_at: now,
+                        started_at_ms,
+                        node: None,
+                    },
+                );
+                self.activities
+                    .insert(agent, AgentActivity::queued(ActivityKind::Summary, now));
+                self.pending_triage = Some(PendingTriage {
+                    agent,
+                    conversation_id: self.conversation_id.clone(),
+                    turn_id: StoredTurnId::new(turn_id.as_str()),
+                    buffer: String::new(),
+                    buffer_chars: 0,
+                    started: now,
+                    last_event: now,
+                    prompt,
+                    saved_mode,
+                    run_id,
+                    judge_calls: 1,
+                });
+            }
+            Err(error) => {
+                self.push_system(format!("Could not start judge turn with {agent}: {error}"));
+                self.triage_fallback(
+                    prompt,
+                    agent,
+                    saved_mode,
+                    FallbackCause::Error,
+                    run_id,
+                    0,
+                    0,
+                );
+            }
+        }
+    }
+
+    fn apply_triage_output(&mut self, output: AgentOutput) -> bool {
+        self.observe_activity(output.agent, &output.event, Instant::now());
+        if let Some(pending) = self.pending_triage.as_mut() {
+            pending.last_event = Instant::now();
+        }
+        match output.event {
+            AgentEvent::Started | AgentEvent::ProviderSessionBound(_) | AgentEvent::Notice(_) => {
+                true
+            }
+            AgentEvent::TextDelta(delta) => {
+                let delta_chars = delta.chars().count();
+                let exceeds_limit = self.pending_triage.as_ref().is_some_and(|pending| {
+                    pending.buffer_chars.saturating_add(delta_chars) > MAX_SUMMARY_BUFFER_CHARS
+                });
+                if exceeds_limit {
+                    let Some(pending) = self.pending_triage.take() else {
+                        return false;
+                    };
+                    self.busy_agents.remove(&pending.agent);
+                    self.activities.remove(&pending.agent);
+                    self.end_run_state(pending.agent, false, false);
+                    let elapsed_ms = pending.started.elapsed().as_millis() as u64;
+                    self.triage_fallback(
+                        pending.prompt,
+                        pending.agent,
+                        pending.saved_mode,
+                        FallbackCause::InvalidVerdict,
+                        pending.run_id,
+                        pending.judge_calls,
+                        elapsed_ms,
+                    );
+                } else if let Some(pending) = self.pending_triage.as_mut() {
+                    pending.buffer_chars += delta_chars;
+                    pending.buffer.push_str(&delta);
+                }
+                true
+            }
+            AgentEvent::Completed => {
+                let Some(pending) = self.pending_triage.take() else {
+                    return false;
+                };
+                self.busy_agents.remove(&pending.agent);
+                self.activities.remove(&pending.agent);
+                self.end_run_state(pending.agent, true, false);
+                let elapsed_ms = pending.started.elapsed().as_millis() as u64;
+                let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
+                match parse_verdict(&pending.buffer) {
+                    Ok(verdict) => match verdict.route {
+                        Route::Simple => self.start_one_node_run(
+                            pending.prompt,
+                            pending.agent,
+                            Route::Simple,
+                            verdict.reason,
+                            TriageSource::Judge,
+                            None,
+                            None,
+                            pending.run_id,
+                            pending.judge_calls,
+                            elapsed_ms,
+                        ),
+                        Route::Complex => self.begin_planning(
+                            pending.prompt,
+                            pending.agent,
+                            Route::Complex,
+                            verdict.reason,
+                            TriageSource::Judge,
+                            None,
+                            pending.run_id,
+                            pending.judge_calls,
+                            elapsed_ms,
+                        ),
+                    },
+                    Err(_) => self.triage_fallback(
+                        pending.prompt,
+                        pending.agent,
+                        pending.saved_mode,
+                        FallbackCause::InvalidVerdict,
+                        pending.run_id,
+                        pending.judge_calls,
+                        elapsed_ms,
+                    ),
+                }
+                true
+            }
+            AgentEvent::Cancelled | AgentEvent::Error(_) => {
+                let Some(pending) = self.pending_triage.take() else {
+                    return false;
+                };
+                self.busy_agents.remove(&pending.agent);
+                self.activities.remove(&pending.agent);
+                self.end_run_state(pending.agent, false, false);
+                let elapsed_ms = pending.started.elapsed().as_millis() as u64;
+                self.triage_fallback(
+                    pending.prompt,
+                    pending.agent,
+                    pending.saved_mode,
+                    FallbackCause::Error,
+                    pending.run_id,
+                    pending.judge_calls,
+                    elapsed_ms,
+                );
+                true
+            }
+            AgentEvent::ModelsListed { .. }
+            | AgentEvent::ModelSelected(_)
+            | AgentEvent::EffortSelected(_)
+            | AgentEvent::ModeSelected(_)
+            | AgentEvent::ToolProgress { .. }
+            | AgentEvent::Activity(_)
+            | AgentEvent::Status(_) => false,
+        }
+    }
+
+    /// FR-935: judge failure. Runs the deterministic heuristic and either
+    /// starts a 1-node run or parks the run at `awaiting_approval`.
+    #[allow(clippy::too_many_arguments)]
+    fn triage_fallback(
+        &mut self,
+        prompt: String,
+        agent: Agent,
+        saved_mode: ExecutionMode,
+        cause: FallbackCause,
+        run_id: String,
+        judge_calls: u32,
+        elapsed_ms: u64,
+    ) {
+        let _ = self.adapters[adapter_index(agent)].select_mode(saved_mode);
+        let reason = "heuristic fallback".to_owned();
+        match heuristic_route(&prompt) {
+            Route::Simple => self.start_one_node_run(
+                prompt,
+                agent,
+                Route::Simple,
+                reason,
+                TriageSource::Fallback,
+                Some(cause),
+                None,
+                run_id,
+                judge_calls,
+                elapsed_ms,
+            ),
+            Route::Complex => self.begin_planning(
+                prompt,
+                agent,
+                Route::Complex,
+                reason,
+                TriageSource::Fallback,
+                Some(cause),
+                run_id,
+                judge_calls,
+                elapsed_ms,
+            ),
+        }
+    }
+
+    /// `/direct`, an explicit agent, or empty `allowed_runners`: a 1-node run
+    /// with no judge turn (FR-930, FR-937).
+    fn submit_direct_run(&mut self, prompt: String, agent: Agent, override_kind: OverrideKind) {
+        if self.busy_agents.contains(&agent) {
+            self.input = prompt;
+            self.push_system(format!(
+                "{agent} is busy; cancel the active turn before sending another prompt."
+            ));
+            return;
+        }
+        let run_id = Uuid::new_v4().to_string();
+        self.start_one_node_run(
+            prompt,
+            agent,
+            Route::Simple,
+            "override".to_owned(),
+            TriageSource::Override,
+            None,
+            Some(override_kind),
+            run_id,
+            0,
+            0,
+        );
+    }
+
+    /// FR-937: the quiet 1-node run on the selected agent.
+    #[allow(clippy::too_many_arguments)]
+    fn start_one_node_run(
+        &mut self,
+        prompt: String,
+        agent: Agent,
+        route: Route,
+        reason: String,
+        source: TriageSource,
+        cause: Option<FallbackCause>,
+        override_kind: Option<OverrideKind>,
+        run_id: String,
+        judge_calls: u32,
+        elapsed_ms: u64,
+    ) {
+        let run = match self.build_one_node_run(
+            &prompt,
+            agent,
+            route,
+            reason,
+            source,
+            cause,
+            override_kind,
+            run_id,
+            judge_calls,
+            elapsed_ms,
+        ) {
+            Ok(run) => run,
+            Err(error) => {
+                self.input = prompt;
+                self.push_system(error);
+                return;
+            }
+        };
+        self.start_graph_run_record(run);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_one_node_run(
+        &self,
+        prompt: &str,
+        agent: Agent,
+        route: Route,
+        reason: String,
+        source: TriageSource,
+        cause: Option<FallbackCause>,
+        override_kind: Option<OverrideKind>,
+        run_id: String,
+        judge_calls: u32,
+        elapsed_ms: u64,
+    ) -> Result<GraphRun, String> {
+        let model = self.selected_run_model(agent).map_err(|error| {
+            format!(
+                "Model policy rejected the 1-node run on {}: {error}",
+                runner_name(agent)
+            )
+        })?;
+        let runner = runner_name(agent).to_owned();
+        let built = fallback_plan(prompt, &runner, Some(&model), "direct")?;
+        let mut plan = built.plan;
+        plan.id = run_id;
+        plan.orchestrator_model = model.clone();
+        plan.limits = self.graph_limits();
+        let triage = Triage {
+            route,
+            reason,
+            source,
+            cause,
+            override_kind,
+            runner,
+            model,
+            elapsed_ms,
+        };
+        let approval = Approval {
+            state: ApprovalState::NotRequired,
+            revisions: Vec::new(),
+            decided_by: None,
+            decided_at_ms: None,
+        };
+        Ok(self.build_graph_run(
+            plan,
+            GraphRunPhase::Active,
+            triage,
+            Some(approval),
+            judge_calls,
+        ))
+    }
+
+    /// B1 stub for the complex path: build the FR-950 fallback plan and park
+    /// the run at `awaiting_approval`. B2 replaces this with a real plan turn.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_planning(
+        &mut self,
+        prompt: String,
+        agent: Agent,
+        route: Route,
+        reason: String,
+        source: TriageSource,
+        cause: Option<FallbackCause>,
+        run_id: String,
+        judge_calls: u32,
+        elapsed_ms: u64,
+    ) {
+        let model = match self.selected_run_model(agent) {
+            Ok(model) => model,
+            Err(error) => {
+                self.input = prompt;
+                self.push_system(error);
+                return;
+            }
+        };
+        let runner = runner_name(agent).to_owned();
+        let cause_label = cause
+            .map(fallback_cause_label)
+            .unwrap_or("planning not wired yet");
+        let built = match fallback_plan(&prompt, &runner, Some(&model), cause_label) {
+            Ok(built) => built,
+            Err(error) => {
+                self.input = prompt;
+                self.push_system(error);
+                return;
+            }
+        };
+        let requires_gate = built
+            .plan
+            .nodes
+            .first()
+            .map(|node| node.requires_gate)
+            .unwrap_or(false);
+        let mut plan = built.plan;
+        plan.id = run_id;
+        plan.orchestrator_model = model.clone();
+        plan.limits = self.graph_limits();
+        let step = PlanStep {
+            id: "step-1".to_owned(),
+            role: "implement".to_owned(),
+            job: prompt.clone(),
+            runner: runner.clone(),
+            model: Some(model.clone()),
+            depends_on: Vec::new(),
+            sensitive: Some(requires_gate),
+            ..Default::default()
+        };
+        let approval = Approval {
+            state: ApprovalState::Pending,
+            revisions: vec![PlanRevision {
+                n: 1,
+                source: "fallback".to_owned(),
+                steps: vec![step],
+                feedback: None,
+                errors: Some(vec![built.note.clone()]),
+                raw: None,
+            }],
+            decided_by: None,
+            decided_at_ms: None,
+        };
+        let triage = Triage {
+            route,
+            reason,
+            source,
+            cause,
+            override_kind: None,
+            runner,
+            model,
+            elapsed_ms,
+        };
+        let run = self.build_graph_run(
+            plan,
+            GraphRunPhase::AwaitingApproval,
+            triage,
+            Some(approval),
+            judge_calls,
+        );
+        self.push_system(built.note);
+        if let Err(error) = save_run(&self.workspace_root, &run) {
+            self.push_system(format!("Could not save the fallback plan: {error}"));
+        }
+        self.last_graph_run = Some(run);
+    }
+
+    fn build_graph_run(
+        &self,
+        plan: GraphPlan,
+        phase: GraphRunPhase,
+        triage: Triage,
+        approval: Option<Approval>,
+        judge_calls: u32,
+    ) -> GraphRun {
+        let turn_index = GraphStore::new(&self.workspace_root)
+            .conversation_run_count(self.conversation_id.as_str()) as u32
+            + 1;
+        GraphRun {
+            plan,
+            conversation_id: self.conversation_id.as_str().to_owned(),
+            phase,
+            waiting_gate_node: None,
+            triage: Some(triage),
+            approval,
+            turn_index,
+            plan_history: Vec::new(),
+            planner_calls: PlannerCalls {
+                judge: judge_calls,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn graph_limits(&self) -> dmuxai::graph::GraphLimits {
+        dmuxai::graph::GraphLimits {
+            max_parallel: self.settings.graph_max_parallel,
+            max_retries: self.settings.graph_max_retries,
+            max_replans: self.settings.graph_max_replans,
+            replan_budget_chars: self.settings.graph_replan_budget_chars as usize,
+            max_nodes: self.settings.graph_max_nodes as usize,
+        }
+    }
+
+    /// The model the selected agent will actually run with, validated against
+    /// the model policy before any record is created (FR-937).
+    fn selected_run_model(&self, agent: Agent) -> Result<String, String> {
+        let runner = runner_name(agent);
+        let selected = self
+            .model_catalogs
+            .get(&agent)
+            .and_then(|catalog| catalog.selected.clone());
+        let model = match selected {
+            Some(model) => model,
+            None if agent == Agent::Cursor => dmuxai::model_policy::ALLOWED_MODEL.to_owned(),
+            None => dmuxai::model_policy::default_model().to_owned(),
+        };
+        dmuxai::model_policy::validate_model_for_runner(runner, &model).map(|()| model)
+    }
+
+    /// OQ-931: judge 90 s since the last streamed event, hard cap 270 s.
+    fn check_triage_timeout(&mut self, now: Instant) {
+        let Some(pending) = self.pending_triage.as_ref() else {
+            return;
+        };
+        let silent = now.saturating_duration_since(pending.last_event) >= JUDGE_SILENCE_TIMEOUT;
+        let hard = now.saturating_duration_since(pending.started) >= JUDGE_HARD_CAP;
+        if !silent && !hard {
+            return;
+        }
+        let Some(pending) = self.pending_triage.take() else {
+            return;
+        };
+        let _ = self.adapters[adapter_index(pending.agent)].cancel();
+        self.busy_agents.remove(&pending.agent);
+        self.activities.remove(&pending.agent);
+        self.end_run_state(pending.agent, false, false);
+        let elapsed_ms = pending.started.elapsed().as_millis() as u64;
+        self.triage_fallback(
+            pending.prompt,
+            pending.agent,
+            pending.saved_mode,
+            FallbackCause::Timeout,
+            pending.run_id,
+            pending.judge_calls,
+            elapsed_ms,
+        );
     }
 
     fn apply_agent_event(&mut self, agent: Agent, event: AgentEvent) {
@@ -4011,10 +4674,8 @@ impl App {
         Some(agent)
     }
 
+    #[cfg(test)]
     fn start_graph_run(&mut self, plan: dmuxai::graph::GraphPlan) {
-        self.single_graph_plan = None;
-        self.graph_node_details.clear();
-        self.graph_agent_nodes.clear();
         let run = GraphRun {
             plan,
             conversation_id: self.conversation_id.as_str().to_owned(),
@@ -4022,14 +4683,31 @@ impl App {
             waiting_gate_node: None,
             ..Default::default()
         };
+        self.start_graph_run_record(run);
+    }
+
+    fn start_graph_run_record(&mut self, run: GraphRun) {
+        self.single_graph_plan = None;
+        self.graph_node_details.clear();
+        self.graph_agent_nodes.clear();
+        // FR-937: a 1-node run is quiet; only the graph status line shows.
+        self.quiet_graph_run = run
+            .plan
+            .nodes
+            .iter()
+            .filter(|node| node.role != NodeRole::Orchestrate)
+            .count()
+            <= 1;
         let mut session = GraphRunSession::new(run);
         self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, &session);
-        self.push_system(format!(
-            "Graph {} (orchestrator {}): {}",
-            session.run().plan.id,
-            session.run().plan.orchestrator_model,
-            self.graph_assignment_line
-        ));
+        if !self.quiet_graph_run {
+            self.push_system(format!(
+                "Graph {} (orchestrator {}): {}",
+                session.run().plan.id,
+                session.run().plan.orchestrator_model,
+                self.graph_assignment_line
+            ));
+        }
         let actions = session.schedule();
         let _ = save_run(&self.workspace_root, session.run());
         self.graph_session = Some(session);
@@ -4052,7 +4730,10 @@ impl App {
                     ));
                 }
                 GraphAction::Completed => {
-                    self.push_system("Graph run completed.");
+                    if !self.quiet_graph_run {
+                        self.push_system("Graph run completed.");
+                    }
+                    self.quiet_graph_run = false;
                     self.graph_session = None;
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
@@ -4068,6 +4749,7 @@ impl App {
                 }
                 GraphAction::Failed(message) => {
                     self.push_system(format!("Graph failed: {message}"));
+                    self.quiet_graph_run = false;
                     for (agent, _node_id) in self.graph_agent_nodes.drain() {
                         let _ = self.adapters[adapter_index(agent)].cancel();
                         if let Some(active) = self.active_turns.remove(&agent) {
@@ -4143,13 +4825,15 @@ impl App {
                 }
             }
         }
-        let shown_model = self
-            .effective_model_for(agent, &assignment.model_id)
-            .unwrap_or_else(|| "provider default".to_owned());
-        self.push_system(format!(
-            "Graph node {} via {} model {}",
-            assignment.node_id, agent, shown_model
-        ));
+        if !self.quiet_graph_run {
+            let shown_model = self
+                .effective_model_for(agent, &assignment.model_id)
+                .unwrap_or_else(|| "provider default".to_owned());
+            self.push_system(format!(
+                "Graph node {} via {} model {}",
+                assignment.node_id, agent, shown_model
+            ));
+        }
         if let Err(err) = self.try_submit_to_agent(agent, prompt, false, false) {
             self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
                 "failed to start node {}: {err:?}",
@@ -5269,75 +5953,42 @@ impl App {
                     return Err(RunTodoError::Forbidden("no allowed runners".to_owned()));
                 }
 
-                match plan_request(&prompt, &self.workspace_root, &self.settings) {
-                    ExecutionPlan::Graph(mut plan) => {
-                        plan.limits.max_parallel = self.settings.graph_max_parallel;
-                        plan.limits.max_retries = self.settings.graph_max_retries;
-                        plan.limits.max_replans = self.settings.graph_max_replans;
-                        plan.limits.replan_budget_chars =
-                            self.settings.graph_replan_budget_chars as usize;
-                        plan.limits.max_nodes = self.settings.graph_max_nodes as usize;
-
-                        let candidate_run = GraphRun {
-                            plan: plan.clone(),
-                            conversation_id: self.conversation_id.as_str().to_owned(),
-                            phase: GraphRunPhase::Active,
-                            waiting_gate_node: None,
-                            ..Default::default()
-                        };
-                        let mut candidate_session = GraphRunSession::new(candidate_run);
-                        let initial_actions = candidate_session.schedule();
-                        for action in &initial_actions {
-                            let assignment = match action {
-                                GraphAction::StartNode(a) | GraphAction::PauseForGate(a) => a,
-                                _ => continue,
-                            };
-                            if let Some(allowed) = &self.settings.graph_allowed_runners {
-                                if allowed.is_empty() {
-                                    return Err(RunTodoError::Forbidden(
-                                        "no allowed runners".to_owned(),
-                                    ));
-                                }
-                                if !allowed.iter().any(|r| {
-                                    r.trim().eq_ignore_ascii_case(assignment.runner.trim())
-                                }) {
-                                    return Err(RunTodoError::Forbidden(format!(
-                                        "runner '{}' is not in allowed_runners",
-                                        assignment.runner
-                                    )));
-                                }
-                            }
-                            let Some(agent) = runner_from_str(&assignment.runner) else {
-                                return Err(RunTodoError::UnknownAgent(assignment.runner.clone()));
-                            };
-                            if self.busy_agents.contains(&agent) {
-                                return Err(RunTodoError::Busy(format!(
-                                    "runner '{}' is busy",
-                                    assignment.runner
-                                )));
-                            }
-                        }
-
-                        let plan_id = plan.id.clone();
-                        self.graph_todo = Some((plan_id.clone(), todo_id.to_owned()));
-                        let updated =
-                            store
-                                .mark_running(todo_id, "graph", &plan_id)
-                                .map_err(|err| {
-                                    self.graph_todo = None;
-                                    self.push_system(format!(
-                                        "Failed to mark to-do running: {err}"
-                                    ));
-                                    RunTodoError::Internal(err.to_string())
-                                })?;
-                        self.start_graph_run(plan);
-                        self.publish_todos();
-                        Ok(updated)
-                    }
-                    ExecutionPlan::Single(plan) => {
-                        self.run_todo_agent(&store, todo_id, &plan.runner, prompt)
-                    }
+                let agent = self.adapters[self.selected].agent();
+                if self.busy_agents.contains(&agent) {
+                    return Err(RunTodoError::Busy(format!(
+                        "runner '{}' is busy",
+                        runner_name(agent)
+                    )));
                 }
+
+                // B1: no plan turn yet, so a to-do graph run is a quiet 1-node
+                // run on the selected agent (FR-947 wiring lands later).
+                let run = self
+                    .build_one_node_run(
+                        &prompt,
+                        agent,
+                        Route::Simple,
+                        "to-do run".to_owned(),
+                        TriageSource::Override,
+                        None,
+                        Some(OverrideKind::Agent),
+                        Uuid::new_v4().to_string(),
+                        0,
+                        0,
+                    )
+                    .map_err(RunTodoError::Internal)?;
+                let plan_id = run.plan.id.clone();
+                self.graph_todo = Some((plan_id.clone(), todo_id.to_owned()));
+                let updated = store
+                    .mark_running(todo_id, "graph", &plan_id)
+                    .map_err(|err| {
+                        self.graph_todo = None;
+                        self.push_system(format!("Failed to mark to-do running: {err}"));
+                        RunTodoError::Internal(err.to_string())
+                    })?;
+                self.start_graph_run_record(run);
+                self.publish_todos();
+                Ok(updated)
             }
         }
     }
@@ -7033,6 +7684,16 @@ fn adapter_index(agent: Agent) -> usize {
         .expect("agent belongs to Agent::all()")
 }
 
+/// FR-950: the `cause` label stored in the fallback note and revision errors.
+fn fallback_cause_label(cause: FallbackCause) -> &'static str {
+    match cause {
+        FallbackCause::Timeout => "timeout",
+        FallbackCause::Error => "error",
+        FallbackCause::InvalidVerdict => "invalid_verdict",
+        FallbackCause::NoReadOnlyMode => "no_read_only_mode",
+    }
+}
+
 fn adapter_request(
     request: dmuxai::conversation::AgentRequest,
     image_paths: Vec<PathBuf>,
@@ -7755,8 +8416,9 @@ mod tests {
         agent: Agent,
         sent: SentRequests,
         cancelled: CancelRequests,
+        selected_modes: Arc<Mutex<Vec<(Agent, ExecutionMode)>>>,
         fail_send: bool,
-        unsupported_mode: Option<ExecutionMode>,
+        unsupported_modes: Vec<ExecutionMode>,
     }
 
     impl AgentAdapter for RecordingAdapter {
@@ -7790,7 +8452,7 @@ mod tests {
         }
 
         fn validate_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
-            if self.unsupported_mode == Some(mode) {
+            if self.unsupported_modes.contains(&mode) {
                 return Err(AdapterError::UnsupportedMode {
                     agent: self.agent,
                     mode,
@@ -7799,7 +8461,8 @@ mod tests {
             Ok(())
         }
 
-        fn select_mode(&self, _mode: ExecutionMode) -> Result<(), AdapterError> {
+        fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
+            self.selected_modes.lock().unwrap().push((self.agent, mode));
             Ok(())
         }
     }
@@ -7829,6 +8492,7 @@ mod tests {
     ) -> (App, SentRequests, CancelRequests) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let selected_modes = Arc::new(Mutex::new(Vec::new()));
         let adapters = Agent::all()
             .into_iter()
             .map(|agent| {
@@ -7836,8 +8500,9 @@ mod tests {
                     agent,
                     sent: Arc::clone(&sent),
                     cancelled: Arc::clone(&cancelled),
+                    selected_modes: Arc::clone(&selected_modes),
                     fail_send: failing_agent == Some(agent),
-                    unsupported_mode: None,
+                    unsupported_modes: Vec::new(),
                 }) as Box<dyn AgentAdapter>
             })
             .collect();
@@ -7858,6 +8523,7 @@ mod tests {
         // Most unit tests were authored with Codex as the implicit active runner.
         app.selected = adapter_index(Agent::Codex);
         app.color_enabled = true;
+        app.skip_judge_for_tests = true;
         (app, sent, cancelled)
     }
 
@@ -7867,6 +8533,7 @@ mod tests {
             ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let selected_modes = Arc::new(Mutex::new(Vec::new()));
         let adapters = Agent::all()
             .into_iter()
             .map(|agent| {
@@ -7874,8 +8541,9 @@ mod tests {
                     agent,
                     sent: Arc::clone(&sent),
                     cancelled: Arc::clone(&cancelled),
+                    selected_modes: Arc::clone(&selected_modes),
                     fail_send: false,
-                    unsupported_mode: None,
+                    unsupported_modes: Vec::new(),
                 }) as Box<dyn AgentAdapter>
             })
             .collect();
@@ -7894,6 +8562,7 @@ mod tests {
         .unwrap();
         app.selected = adapter_index(Agent::Codex);
         app.color_enabled = true;
+        app.skip_judge_for_tests = true;
         (app, sent, event_tx)
     }
 
@@ -7904,6 +8573,7 @@ mod tests {
     ) -> (App, SentRequests) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let selected_modes = Arc::new(Mutex::new(Vec::new()));
         let adapters = Agent::all()
             .into_iter()
             .map(|candidate| {
@@ -7911,8 +8581,13 @@ mod tests {
                     agent: candidate,
                     sent: Arc::clone(&sent),
                     cancelled: Arc::clone(&cancelled),
+                    selected_modes: Arc::clone(&selected_modes),
                     fail_send: false,
-                    unsupported_mode: (candidate == agent).then_some(mode),
+                    unsupported_modes: if candidate == agent {
+                        vec![mode]
+                    } else {
+                        Vec::new()
+                    },
                 }) as Box<dyn AgentAdapter>
             })
             .collect();
@@ -7931,7 +8606,70 @@ mod tests {
         )
         .unwrap();
         app.selected = adapter_index(Agent::Codex);
+        app.skip_judge_for_tests = true;
         (app, sent)
+    }
+
+    struct PlanGateHarness {
+        app: App,
+        sent: SentRequests,
+        cancelled: CancelRequests,
+        modes: Arc<Mutex<Vec<(Agent, ExecutionMode)>>>,
+    }
+
+    /// A recording-adapter app with the judge enabled (`skip_judge_for_tests`
+    /// stays false) on a throwaway workspace so run records do not touch the
+    /// repository's `.dmuxai/graphs`.
+    fn plan_gate_test_app() -> PlanGateHarness {
+        plan_gate_harness(&[])
+    }
+
+    /// Like [`plan_gate_test_app`] but some agents reject the listed modes.
+    fn plan_gate_harness(unsupported: &[(Agent, ExecutionMode)]) -> PlanGateHarness {
+        let workspace = std::env::temp_dir().join(format!("dmuxai-plan-gate-{}", Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&workspace);
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let modes = Arc::new(Mutex::new(Vec::new()));
+        let adapters = Agent::all()
+            .into_iter()
+            .map(|agent| {
+                Box::new(RecordingAdapter {
+                    agent,
+                    sent: Arc::clone(&sent),
+                    cancelled: Arc::clone(&cancelled),
+                    selected_modes: Arc::clone(&modes),
+                    fail_send: false,
+                    unsupported_modes: unsupported
+                        .iter()
+                        .filter(|(candidate, _)| *candidate == agent)
+                        .map(|(_, mode)| *mode)
+                        .collect(),
+                }) as Box<dyn AgentAdapter>
+            })
+            .collect();
+        let (event_tx, event_rx) = event_channel();
+        drop(event_tx);
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            workspace,
+            DmuxSettings::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        app.selected = adapter_index(Agent::Codex);
+        PlanGateHarness {
+            app,
+            sent,
+            cancelled,
+            modes,
+        }
     }
 
     fn find_cell_fg(app: &mut App, needle: &str) -> Option<Color> {
@@ -14286,8 +15024,9 @@ mod tests {
                 agent: Agent::Custom(0),
                 sent,
                 cancelled,
+                selected_modes: Arc::new(Mutex::new(Vec::new())),
                 fail_send: false,
-                unsupported_mode: None,
+                unsupported_modes: Vec::new(),
             }));
         }
         app.messages.clear();
@@ -14539,6 +15278,7 @@ mod tests {
     fn app_with_runner_agents(agents: Vec<Agent>, settings: DmuxSettings) -> App {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let selected_modes = Arc::new(Mutex::new(Vec::new()));
         let adapters = agents
             .into_iter()
             .map(|agent| {
@@ -14546,8 +15286,9 @@ mod tests {
                     agent,
                     sent: Arc::clone(&sent),
                     cancelled: Arc::clone(&cancelled),
+                    selected_modes: Arc::clone(&selected_modes),
                     fail_send: false,
-                    unsupported_mode: None,
+                    unsupported_modes: Vec::new(),
                 }) as Box<dyn AgentAdapter>
             })
             .collect();
@@ -14568,6 +15309,7 @@ mod tests {
         )
         .unwrap();
         app.selected = adapter_index(Agent::Codex);
+        app.skip_judge_for_tests = true;
         app
     }
 
@@ -15079,6 +15821,446 @@ mod tests {
         assert!(joined.contains("first line second"), "{rows:?}");
         assert!(joined.contains("a b c"), "{rows:?}");
         assert!(joined.contains("next"), "{rows:?}");
+    }
+
+    fn triage_output(agent: Agent, request: &AgentRequest, event: AgentEvent) -> AgentOutput {
+        AgentOutput {
+            agent,
+            conversation_id: Some(request.conversation_id.clone()),
+            turn_id: Some(request.turn_id.clone()),
+            event,
+        }
+    }
+
+    fn last_system(app: &App) -> String {
+        app.messages
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, Role::System))
+            .map(|message| message.content.clone())
+            .unwrap_or_default()
+    }
+
+    // TC-930 / FR-930: every non-slash prompt starts a judge turn.
+    #[test]
+    fn plan_gate_every_prompt_enters_triage() {
+        let mut harness = plan_gate_test_app();
+        harness.app.input = "hello".to_owned();
+        harness.app.submit_prompt();
+
+        let sent = harness.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let (agent, request) = sent[0].clone();
+        assert_eq!(agent, Agent::Codex);
+        assert!(request.turn_id.as_str().starts_with("judge-"));
+        assert!(request.resume_session.is_none());
+        assert!(request.prompt.contains("triage judge"));
+        drop(sent);
+
+        assert!(harness.app.pending_triage.is_some());
+        assert!(harness.app.graph_session.is_none());
+        assert!(harness.app.last_graph_run.is_none());
+        assert!(
+            !harness
+                .app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("triage judge"))
+        );
+    }
+
+    // TC-931 / FR-930: an empty allowed_runners list notices and sends directly.
+    #[test]
+    fn plan_gate_empty_allowed_runners_sends_direct() {
+        let mut harness = plan_gate_test_app();
+        harness.app.settings.graph_allowed_runners = Some(Vec::new());
+        harness.app.input = "hello".to_owned();
+        harness.app.submit_prompt();
+
+        assert!(
+            harness
+                .app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Graph disabled"))
+        );
+        let sent = harness.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(!sent[0].1.prompt.contains("triage judge"));
+        drop(sent);
+
+        let session = harness.app.graph_session.as_ref().expect("1-node run");
+        let triage = session.run().triage.as_ref().unwrap();
+        assert_eq!(triage.source, TriageSource::Override);
+        assert_eq!(triage.override_kind, Some(OverrideKind::NoAllowedRunners));
+        assert_eq!(session.run().plan.nodes.len(), 1);
+    }
+
+    // TC-933 / FR-932: the judge runs read-only on the selected agent's model.
+    #[test]
+    fn judge_turn_uses_selected_agent_read_only() {
+        let mut harness = plan_gate_test_app();
+        harness.app.selected = adapter_index(Agent::Agy);
+        harness
+            .app
+            .modes
+            .insert(Agent::Agy, ExecutionMode::Implement);
+        harness
+            .app
+            .model_catalogs
+            .get_mut(&Agent::Agy)
+            .unwrap()
+            .selected = Some("gemini-3.8-flash-medium".to_owned());
+        harness.app.input = "hello".to_owned();
+        harness.app.submit_prompt();
+
+        let judge = harness.sent.lock().unwrap()[0].1.clone();
+        assert_eq!(harness.sent.lock().unwrap()[0].0, Agent::Agy);
+        assert!(judge.turn_id.as_str().starts_with("judge-"));
+        assert!(judge.resume_session.is_none());
+        assert_eq!(
+            harness.modes.lock().unwrap().last().copied(),
+            Some((Agent::Agy, ExecutionMode::Ask))
+        );
+
+        let reply = "{\"route\":\"simple\",\"reason\":\"tiny\"}";
+        assert!(harness.app.apply_agent_output(triage_output(
+            Agent::Agy,
+            &judge,
+            AgentEvent::TextDelta(reply.to_owned())
+        )));
+        assert!(harness.app.apply_agent_output(triage_output(
+            Agent::Agy,
+            &judge,
+            AgentEvent::Completed
+        )));
+
+        let modes = harness.modes.lock().unwrap();
+        assert_eq!(
+            modes.first().copied(),
+            Some((Agent::Agy, ExecutionMode::Ask))
+        );
+        assert_eq!(
+            modes.last().copied(),
+            Some((Agent::Agy, ExecutionMode::Implement))
+        );
+        drop(modes);
+        assert!(
+            !harness
+                .app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("\"route\""))
+        );
+        let session = harness.app.graph_session.as_ref().expect("1-node run");
+        assert_eq!(session.run().plan.nodes[0].runner, "agy");
+        assert_eq!(
+            session.run().plan.nodes[0].model_id,
+            "gemini-3.8-flash-medium"
+        );
+        assert_eq!(
+            session.run().plan.orchestrator_model,
+            "gemini-3.8-flash-medium"
+        );
+
+        // No read-only mode: no judge turn, fallback with no_read_only_mode.
+        let mut no_mode = plan_gate_harness(&[
+            (Agent::Codex, ExecutionMode::Ask),
+            (Agent::Codex, ExecutionMode::Plan),
+        ]);
+        no_mode
+            .app
+            .modes
+            .insert(Agent::Codex, ExecutionMode::Implement);
+        no_mode.app.input = "hello".to_owned();
+        no_mode.app.submit_prompt();
+        let sent = no_mode.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "no judge turn, only the fallback node");
+        assert!(!sent[0].1.prompt.contains("triage judge"));
+        drop(sent);
+        assert!(no_mode.app.pending_triage.is_none());
+        let session = no_mode.app.graph_session.as_ref().expect("fallback run");
+        let triage = session.run().triage.as_ref().unwrap();
+        assert_eq!(triage.source, TriageSource::Fallback);
+        assert_eq!(triage.cause, Some(FallbackCause::NoReadOnlyMode));
+    }
+
+    // TC-934 / FR-932: a busy selected agent refuses the prompt before any judge.
+    #[test]
+    fn judge_refused_when_selected_agent_busy() {
+        let mut harness = plan_gate_test_app();
+        harness.app.busy_agents.insert(Agent::Codex);
+        harness.app.input = "hello".to_owned();
+        harness.app.submit_prompt();
+
+        assert_eq!(harness.app.input, "hello");
+        assert!(harness.sent.lock().unwrap().is_empty());
+        assert!(harness.app.pending_triage.is_none());
+        assert!(last_system(&harness.app).contains("busy"));
+    }
+
+    // TC-937 / FR-935: silence past 90 s falls back; recent events keep it alive.
+    #[test]
+    fn judge_timeout_falls_back_to_heuristic() {
+        let mut harness = plan_gate_test_app();
+        harness.app.input = "hello".to_owned();
+        harness.app.submit_prompt();
+
+        {
+            let now = Instant::now();
+            let pending = harness.app.pending_triage.as_mut().unwrap();
+            pending.started = now - Duration::from_secs(100);
+            pending.last_event = now - Duration::from_secs(10);
+        }
+        harness.app.tick();
+        assert!(harness.app.pending_triage.is_some(), "stream kept it alive");
+
+        harness.app.pending_triage.as_mut().unwrap().last_event =
+            Instant::now() - Duration::from_secs(91);
+        harness.app.tick();
+        assert!(harness.app.pending_triage.is_none());
+        assert_eq!(
+            harness.cancelled.lock().unwrap().as_slice(),
+            &[Agent::Codex]
+        );
+        let session = harness.app.graph_session.as_ref().expect("fallback run");
+        let triage = session.run().triage.as_ref().unwrap();
+        assert_eq!(triage.source, TriageSource::Fallback);
+        assert_eq!(triage.cause, Some(FallbackCause::Timeout));
+
+        // The hard cap trips even while events stream.
+        let mut capped = plan_gate_test_app();
+        capped.app.input = "hello".to_owned();
+        capped.app.submit_prompt();
+        {
+            let now = Instant::now();
+            let pending = capped.app.pending_triage.as_mut().unwrap();
+            pending.started = now - Duration::from_secs(271);
+            pending.last_event = now;
+        }
+        capped.app.tick();
+        assert!(capped.app.pending_triage.is_none());
+        assert_eq!(
+            capped
+                .app
+                .graph_session
+                .as_ref()
+                .unwrap()
+                .run()
+                .triage
+                .as_ref()
+                .unwrap()
+                .cause,
+            Some(FallbackCause::Timeout)
+        );
+    }
+
+    // TC-938 / FR-935: invalid verdict, error, and user cancel.
+    #[test]
+    fn judge_failure_modes() {
+        let mut h = plan_gate_test_app();
+        h.app.input = "research, plan, implement and test X".to_owned();
+        h.app.submit_prompt();
+        let judge = h.sent.lock().unwrap()[0].1.clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::TextDelta("not json".to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::Completed
+        )));
+        assert_eq!(h.sent.lock().unwrap().len(), 1, "no plan turn in B1");
+        let run = h.app.last_graph_run.as_ref().expect("fallback run");
+        assert_eq!(run.phase, GraphRunPhase::AwaitingApproval);
+        let triage = run.triage.as_ref().unwrap();
+        assert_eq!(triage.source, TriageSource::Fallback);
+        assert_eq!(triage.cause, Some(FallbackCause::InvalidVerdict));
+        let approval = run.approval.as_ref().unwrap();
+        assert_eq!(approval.state, ApprovalState::Pending);
+        assert_eq!(approval.revisions.len(), 1);
+        assert_eq!(approval.revisions[0].source, "fallback");
+
+        let mut e = plan_gate_test_app();
+        e.app.input = "hello".to_owned();
+        e.app.submit_prompt();
+        let judge = e.sent.lock().unwrap()[0].1.clone();
+        assert!(e.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::Error("boom".to_owned())
+        )));
+        let session = e.app.graph_session.as_ref().expect("fallback run");
+        assert_eq!(
+            session.run().triage.as_ref().unwrap().cause,
+            Some(FallbackCause::Error)
+        );
+
+        let mut c = plan_gate_test_app();
+        c.app.input = "hello".to_owned();
+        c.app.submit_prompt();
+        c.app.cancel_selected();
+        assert_eq!(c.app.input, "hello");
+        assert!(c.app.pending_triage.is_none());
+        let run = c.app.last_graph_run.as_ref().expect("cancelled run");
+        assert_eq!(run.phase, GraphRunPhase::Cancelled);
+    }
+
+    // TC-939 / FR-937: a simple verdict runs one node on the selected agent.
+    #[test]
+    fn simple_verdict_runs_one_node_graph() {
+        let mut h = plan_gate_test_app();
+        h.app.selected = adapter_index(Agent::Cursor);
+        h.app.settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
+        h.app
+            .model_catalogs
+            .get_mut(&Agent::Cursor)
+            .unwrap()
+            .selected = None;
+        h.app.input = "hello".to_owned();
+        h.app.submit_prompt();
+        let judge = h.sent.lock().unwrap()[0].1.clone();
+        let simple = "{\"route\":\"simple\",\"reason\":\"tiny\"}";
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Cursor,
+            &judge,
+            AgentEvent::TextDelta(simple.to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Cursor,
+            &judge,
+            AgentEvent::Completed
+        )));
+
+        let run = h.app.graph_session.as_ref().unwrap().run().clone();
+        assert_eq!(run.phase, GraphRunPhase::Active);
+        assert_eq!(run.triage.as_ref().unwrap().source, TriageSource::Judge);
+        let steps: Vec<_> = run
+            .plan
+            .nodes
+            .iter()
+            .filter(|node| node.role != NodeRole::Orchestrate)
+            .collect();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].id, "step-1");
+        assert_eq!(steps[0].runner, "cursor");
+        assert_eq!(steps[0].job, "hello");
+        assert_eq!(steps[0].model_id, "composer-2.5");
+
+        // The selected agent's own node runs even though it is not allowed.
+        let node = h.sent.lock().unwrap()[1].1.clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Cursor,
+            &node,
+            AgentEvent::Completed
+        )));
+        assert!(h.app.graph_session.is_none(), "run completed");
+        assert!(dmuxai::graph::load_run(&h.app.workspace_root, &run.plan.id).is_ok());
+
+        // A policy-rejected fast model creates no record.
+        let mut fast = plan_gate_test_app();
+        fast.app.selected = adapter_index(Agent::Cursor);
+        fast.app
+            .model_catalogs
+            .get_mut(&Agent::Cursor)
+            .unwrap()
+            .selected = Some("composer-2.5-fast".to_owned());
+        fast.app.input = "hello".to_owned();
+        fast.app.submit_prompt();
+        let judge = fast.sent.lock().unwrap()[0].1.clone();
+        assert!(fast.app.apply_agent_output(triage_output(
+            Agent::Cursor,
+            &judge,
+            AgentEvent::TextDelta(simple.to_owned())
+        )));
+        assert!(fast.app.apply_agent_output(triage_output(
+            Agent::Cursor,
+            &judge,
+            AgentEvent::Completed
+        )));
+        assert_eq!(fast.app.input, "hello");
+        assert!(fast.app.graph_session.is_none());
+        assert!(fast.app.last_graph_run.is_none());
+        assert!(last_system(&fast.app).contains("Model policy rejected"));
+    }
+
+    // TC-940 / FR-937, FR-945: /direct skips the judge.
+    #[test]
+    fn direct_override_skips_judge() {
+        let mut h = plan_gate_test_app();
+        h.app.input = "/direct fix it".to_owned();
+        h.app.submit_prompt();
+        let sent = h.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(!sent[0].1.prompt.contains("triage judge"));
+        drop(sent);
+        let session = h.app.graph_session.as_ref().expect("1-node run");
+        let triage = session.run().triage.as_ref().unwrap();
+        assert_eq!(triage.source, TriageSource::Override);
+        assert_eq!(triage.override_kind, Some(OverrideKind::Direct));
+        assert_eq!(session.run().plan.nodes[0].job, "fix it");
+
+        let mut usage = plan_gate_test_app();
+        usage.app.input = "/direct".to_owned();
+        usage.app.submit_prompt();
+        assert!(usage.sent.lock().unwrap().is_empty());
+        assert!(last_system(&usage.app).contains("Usage: /direct"));
+    }
+
+    // TC-964 / FR-948: an English keyword prompt never builds a keyword chain.
+    #[test]
+    fn keyword_prompt_never_builds_chain() {
+        let mut h = plan_gate_test_app();
+        h.app.input = "research, plan, review and implement X".to_owned();
+        h.app.submit_prompt();
+        let judge = h.sent.lock().unwrap()[0].1.clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::TextDelta("{\"route\":\"simple\",\"reason\":\"one turn\"}".to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::Completed
+        )));
+        let run = h.app.graph_session.as_ref().unwrap().run();
+        let executable = run
+            .plan
+            .nodes
+            .iter()
+            .filter(|node| node.role != NodeRole::Orchestrate)
+            .count();
+        assert_eq!(executable, 1);
+        assert!(run.plan.edges.is_empty());
+    }
+
+    // TC-968 / FR-951: the record keeps the triage agent and its effective model.
+    #[test]
+    fn orchestrate_node_records_triage_agent() {
+        let mut h = plan_gate_test_app();
+        h.app.selected = adapter_index(Agent::Agy);
+        h.app.model_catalogs.get_mut(&Agent::Agy).unwrap().selected =
+            Some("gemini-3.8-flash-medium".to_owned());
+        h.app.input = "research, plan, implement and test X".to_owned();
+        h.app.submit_prompt();
+        let judge = h.sent.lock().unwrap()[0].1.clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Agy,
+            &judge,
+            AgentEvent::TextDelta("{\"route\":\"complex\",\"reason\":\"multi-step\"}".to_owned())
+        )));
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(Agent::Agy, &judge, AgentEvent::Completed))
+        );
+        let run = h.app.last_graph_run.as_ref().expect("plan run");
+        assert_eq!(run.plan.orchestrator_model, "gemini-3.8-flash-medium");
+        let triage = run.triage.as_ref().unwrap();
+        assert_eq!(triage.runner, "agy");
+        assert_eq!(triage.model, "gemini-3.8-flash-medium");
     }
 }
 

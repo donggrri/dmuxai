@@ -1,58 +1,47 @@
 #![allow(clippy::field_reassign_with_default)]
 use dmuxai::graph::{
-    ExecutionPlan, GraphRun, GraphRunPhase, GraphRunSession, NodeRole, ORCHESTRATOR_MODEL,
-    plan_request, save_run, validate_model_id,
+    GraphEdge, GraphNode, GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, GraphRunSession,
+    NodeRole, ORCHESTRATOR_MODEL, save_run, validate_model_id,
 };
-use dmuxai::settings::DmuxSettings;
 use dmuxai::skills::discover_skills;
 use tempfile::tempdir;
 
-#[test]
-fn planner_sets_orchestrator_model() {
-    let dir = tempdir().unwrap();
-    let plan = plan_request(
-        "research the auth module, plan migration, implement fix, and review",
-        dir.path(),
-        &DmuxSettings::default(),
-    );
-    let graph = match plan {
-        ExecutionPlan::Graph(graph) => graph,
-        ExecutionPlan::Single(_) => panic!("expected multi-node graph"),
-    };
-    assert_eq!(graph.orchestrator_model, ORCHESTRATOR_MODEL);
-    assert!(
-        graph
-            .nodes
-            .iter()
-            .any(|node| node.role == NodeRole::Orchestrate)
-    );
-}
-
-#[test]
-fn simple_prompt_uses_single_agent() {
-    let dir = tempdir().unwrap();
-    let plan = plan_request("fix typo in README", dir.path(), &DmuxSettings::default());
-    assert!(matches!(plan, ExecutionPlan::Single(_)));
-}
-
-#[test]
-fn planner_creates_single_node_or_multi_node_graph_by_complexity() {
-    let dir = tempdir().unwrap();
-    let simple = plan_request("what is 2+2", dir.path(), &DmuxSettings::default());
-    assert!(matches!(simple, ExecutionPlan::Single(_)));
-
-    let complex = plan_request(
-        "research the auth module, plan migration, implement fix, and test",
-        dir.path(),
-        &DmuxSettings::default(),
-    );
-    match complex {
-        ExecutionPlan::Graph(graph) => {
-            assert!(graph.nodes.len() > 1);
-            assert_eq!(graph.orchestrator_model, ORCHESTRATOR_MODEL);
-        }
-        ExecutionPlan::Single(_) => panic!("expected multi-node graph"),
+fn node(id: &str, role: NodeRole, runner: &str, requires_gate: bool) -> GraphNode {
+    GraphNode {
+        id: id.to_owned(),
+        role,
+        job: format!("{role} the work"),
+        runner: runner.to_owned(),
+        model_id: "composer-2.5".to_owned(),
+        skill: None,
+        requires_gate,
+        status: GraphNodeStatus::Pending,
+        attempt: 0,
+        started_at_ms: None,
+        finished_at_ms: None,
     }
+}
+
+/// A minimal two-node plan where the first node is gated. Built directly so
+/// the orchestration tests do not depend on the removed keyword planner.
+fn gated_plan() -> GraphPlan {
+    let mut plan = GraphPlan {
+        schema: "dmuxai.graph.plan.v1".to_owned(),
+        id: "plan-gate-test".to_owned(),
+        orchestrator_model: ORCHESTRATOR_MODEL.to_owned(),
+        user_prompt: "research auth then implement".to_owned(),
+        nodes: vec![
+            node("step-1", NodeRole::Research, "cursor", true),
+            node("step-2", NodeRole::Implement, "codex", false),
+        ],
+        edges: vec![GraphEdge {
+            from: "step-1".to_owned(),
+            to: "step-2".to_owned(),
+        }],
+        ..Default::default()
+    };
+    plan.limits.max_parallel = 2;
+    plan
 }
 
 #[test]
@@ -69,17 +58,8 @@ fn validate_rejects_fast_and_non_composer_models() {
 #[test]
 fn store_round_trip() {
     let dir = tempdir().unwrap();
-    let plan = plan_request(
-        "explore codebase and implement feature with tests and review",
-        dir.path(),
-        &DmuxSettings::default(),
-    );
-    let graph = match plan {
-        ExecutionPlan::Graph(graph) => graph,
-        ExecutionPlan::Single(_) => panic!("expected graph"),
-    };
     let run = GraphRun {
-        plan: graph,
+        plan: gated_plan(),
         conversation_id: "conv-1".to_owned(),
         phase: GraphRunPhase::Active,
         waiting_gate_node: None,
@@ -94,17 +74,8 @@ fn store_round_trip() {
 #[test]
 fn gate_pauses_until_continue() {
     let dir = tempdir().unwrap();
-    let plan = plan_request(
-        "research auth, plan database migration, implement merge to main",
-        dir.path(),
-        &DmuxSettings::default(),
-    );
-    let graph = match plan {
-        ExecutionPlan::Graph(graph) => graph,
-        ExecutionPlan::Single(_) => panic!("expected graph"),
-    };
     let run = GraphRun {
-        plan: graph,
+        plan: gated_plan(),
         conversation_id: "conv".to_owned(),
         phase: GraphRunPhase::Active,
         waiting_gate_node: None,
@@ -115,18 +86,22 @@ fn gate_pauses_until_continue() {
     assert!(
         first
             .iter()
-            .any(|action| matches!(action, dmuxai::graph::GraphAction::PauseForGate(_)))
-            || first
-                .iter()
-                .any(|action| matches!(action, dmuxai::graph::GraphAction::StartNode(_)))
+            .any(|action| matches!(action, dmuxai::graph::GraphAction::PauseForGate(_))),
+        "a gated node must pause the run"
     );
-    if first
-        .iter()
-        .any(|a| matches!(a, dmuxai::graph::GraphAction::PauseForGate(_)))
-    {
-        let after = session.acknowledge_gate();
-        assert!(!after.is_empty() || session.run().phase == GraphRunPhase::WaitingGate);
-    }
+    assert_eq!(session.run().phase, GraphRunPhase::WaitingGate);
+    assert_eq!(session.run().waiting_gate_node.as_deref(), Some("step-1"));
+
+    let after = session.acknowledge_gate();
+    assert!(
+        after
+            .iter()
+            .any(|action| matches!(action, dmuxai::graph::GraphAction::StartNode(_))),
+        "continuing the gate starts the approved node"
+    );
+    assert_ne!(session.run().phase, GraphRunPhase::WaitingGate);
+
+    let _ = dir;
 }
 
 #[test]
@@ -138,83 +113,4 @@ fn discover_skills_finds_agent_graph_engineering() {
             .any(|skill| skill.id == "agent-graph-engineering"),
         "expected agent-graph-engineering skill in repo"
     );
-}
-
-#[test]
-fn allowed_list_excludes_cursor_every_node_runner_is_agy() {
-    // TC-430, FR-430, FR-431, FR-432
-    let dir = tempdir().unwrap();
-    let mut settings = DmuxSettings::default();
-    settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
-
-    let plan = plan_request(
-        "research auth, plan database migration, implement merge to main and test",
-        dir.path(),
-        &settings,
-    );
-    let graph = match plan {
-        ExecutionPlan::Graph(graph) => graph,
-        ExecutionPlan::Single(_) => panic!("expected multi-node graph"),
-    };
-    assert!(!graph.nodes.is_empty());
-    for node in &graph.nodes {
-        assert_eq!(
-            node.runner, "agy",
-            "node {} has runner {}, expected agy",
-            node.id, node.runner
-        );
-    }
-}
-
-#[test]
-fn routing_default_not_allowed_falls_back() {
-    // TC-431, FR-431
-    let dir = tempdir().unwrap();
-    let mut settings = DmuxSettings::default();
-    settings.routing_default_agent = Some("codex".to_owned());
-    settings.graph_allowed_runners = Some(vec!["cursor".to_owned(), "agy".to_owned()]);
-
-    let plan = plan_request(
-        "research auth, plan database migration, implement fix and test",
-        dir.path(),
-        &settings,
-    );
-    let graph = match plan {
-        ExecutionPlan::Graph(graph) => graph,
-        ExecutionPlan::Single(_) => panic!("expected multi-node graph"),
-    };
-    for node in &graph.nodes {
-        assert_eq!(node.runner, "cursor");
-    }
-
-    // When cursor is also excluded, falls back to first allowed runner
-    settings.routing_default_agent = Some("cursor".to_owned());
-    settings.graph_allowed_runners = Some(vec!["agy".to_owned(), "codex".to_owned()]);
-    let plan2 = plan_request(
-        "research auth, plan database migration, implement fix and test",
-        dir.path(),
-        &settings,
-    );
-    let graph2 = match plan2 {
-        ExecutionPlan::Graph(graph) => graph,
-        ExecutionPlan::Single(_) => panic!("expected multi-node graph"),
-    };
-    for node in &graph2.nodes {
-        assert_eq!(node.runner, "agy");
-    }
-}
-
-#[test]
-fn empty_allowed_runners_planner_falls_back_to_single() {
-    // TC-433, INT-430
-    let dir = tempdir().unwrap();
-    let mut settings = DmuxSettings::default();
-    settings.graph_allowed_runners = Some(Vec::new());
-
-    let plan = plan_request(
-        "research auth, plan database migration, implement fix and test",
-        dir.path(),
-        &settings,
-    );
-    assert!(matches!(plan, ExecutionPlan::Single(_)));
 }

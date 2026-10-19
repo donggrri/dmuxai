@@ -16,7 +16,7 @@ pub use plan_doc::{
     AllowedRunner, FallbackPlan, PLAN_PROMPT, PlanContext, PlanDoc, PlanError, PlanPromptMode,
     PlanPromptRequest, PlanStep, build_plan_prompt, fallback_plan, parse_plan, validate_plan,
 };
-pub use planner::{heuristic_route, plan_request};
+pub use planner::heuristic_route;
 pub use policy::{
     ORCHESTRATOR_MODEL, assign_runner, default_limits, is_runner_allowed, model_for_role,
     validate_model_id,
