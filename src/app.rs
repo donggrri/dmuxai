@@ -74,7 +74,9 @@ use dmuxai::{
     skills::{discover_skills, skill_prompt_prefix},
     theme::{Speaker, Theme},
     todo::{Todo, TodoError, TodoStatus, TodoStore},
-    web::commands::{DashboardCommand, PromptAccepted, RunMode, RunTodoError, SessionCommand},
+    web::commands::{
+        DashboardCommand, PlanDecisionAction, PromptAccepted, RunMode, RunTodoError, SessionCommand,
+    },
     web::{
         SessionAgent, SessionCommandInfo, SessionConversation, SessionMessage, SessionModel,
         SessionView, cap_session_transcript,
@@ -785,6 +787,45 @@ impl PlanDecisionError {
                 | Self::NotAwaitingApproval
                 | Self::StaleRecord
         )
+    }
+
+    /// User-visible refusal (TUI system line and dashboard HTTP body).
+    pub fn user_message(&self) -> String {
+        match self {
+            PlanDecisionError::NotAwaitingApproval => "No plan is waiting for approval.".to_owned(),
+            PlanDecisionError::WrongPlanId => "Plan id does not match the awaiting run.".to_owned(),
+            PlanDecisionError::StaleRevision => {
+                "That revision is no longer current; refresh the approval panel.".to_owned()
+            }
+            PlanDecisionError::StaleRecord => {
+                "Cannot approve a plan restored after restart; use /graph reject.".to_owned()
+            }
+            PlanDecisionError::AlreadyDecided => {
+                "A plan decision was already applied for this revision.".to_owned()
+            }
+            PlanDecisionError::EmptyFeedback => "Usage: /graph edit <feedback>".to_owned(),
+            PlanDecisionError::RevisionCap => {
+                format!("At most {MAX_PLAN_REVISIONS} plan revisions are allowed.")
+            }
+            PlanDecisionError::AgentBusy => {
+                "The planning agent is busy; wait for the current plan turn to finish.".to_owned()
+            }
+            PlanDecisionError::InvalidRevisionPlan(message) => {
+                format!("Approved plan steps are invalid: {message}")
+            }
+            PlanDecisionError::TaskEditRefused(reason) => {
+                format!("Task edit refused: {reason}")
+            }
+            PlanDecisionError::ReplanEditRefused => "edit is only for the initial plan".to_owned(),
+        }
+    }
+
+    pub fn into_run_todo_error(self) -> RunTodoError {
+        if matches!(self, PlanDecisionError::EmptyFeedback) {
+            RunTodoError::Invalid(self.user_message())
+        } else {
+            RunTodoError::Busy(self.user_message())
+        }
     }
 }
 
@@ -1623,9 +1664,10 @@ impl App {
                         text,
                         agent,
                         mode,
+                        route,
                         reply,
                     } => {
-                        let result = self.handle_dashboard_submit_prompt(text, agent, mode);
+                        let result = self.handle_dashboard_submit_prompt(text, agent, mode, route);
                         let _ = reply.send(result);
                         changed = true;
                     }
@@ -1691,12 +1733,14 @@ impl App {
         text: String,
         agent: Option<String>,
         mode: Option<String>,
+        route: Option<String>,
     ) -> Result<PromptAccepted, RunTodoError> {
         if self.switch_pending.is_some() {
             return Err(RunTodoError::Busy(
                 "workspace switch in progress".to_owned(),
             ));
         }
+        let text = Self::preprocess_dashboard_prompt_text(&text, route.as_deref())?;
         if self.plan_gate_blocks_send() && Self::prompt_blocked_by_plan_gate(&text) {
             return Err(RunTodoError::Busy(PLAN_AWAITING_APPROVAL_MSG.to_owned()));
         }
@@ -2158,6 +2202,39 @@ impl App {
             SessionCommand::Status => self.request_status(),
             SessionCommand::ToggleDetails => self.toggle_all_activity_details(),
             SessionCommand::Quit => self.exit = true,
+            SessionCommand::PlanDecision {
+                plan_id,
+                revision,
+                decision,
+                feedback,
+            } => {
+                let kind = match decision {
+                    PlanDecisionAction::Approve => PlanDecisionKind::Approve,
+                    PlanDecisionAction::Edit => {
+                        PlanDecisionKind::Edit(feedback.unwrap_or_default())
+                    }
+                    PlanDecisionAction::Reject => PlanDecisionKind::Reject,
+                };
+                self.decide_plan(kind, plan_id, revision, DecisionBy::Dashboard)
+                    .map_err(PlanDecisionError::into_run_todo_error)?;
+            }
+            SessionCommand::PlanReplan { note } => {
+                self.request_replan(note.as_deref().unwrap_or(""), DecisionBy::Dashboard)?;
+            }
+            SessionCommand::PlanTaskEdit {
+                action,
+                task_id,
+                title,
+                from,
+                position,
+                note,
+            } => {
+                let edit = Self::task_edit_from_dashboard_fields(
+                    &action, &task_id, title, from, position, note,
+                )?;
+                self.apply_graph_task_edit(edit, DecisionBy::Dashboard)
+                    .map_err(PlanDecisionError::into_run_todo_error)?;
+            }
         }
         self.dirty = true;
         Ok(self.session_view())
@@ -3302,9 +3379,9 @@ impl App {
                             self.push_system("No plan is waiting for approval.");
                         }
                     } else if rest == "replan" {
-                        self.request_replan("", DecisionBy::Tui);
+                        let _ = self.request_replan("", DecisionBy::Tui);
                     } else if let Some(note) = rest.strip_prefix("replan ") {
-                        self.request_replan(note.trim(), DecisionBy::Tui);
+                        let _ = self.request_replan(note.trim(), DecisionBy::Tui);
                     } else {
                         self.show_graph_status();
                     }
@@ -4518,36 +4595,117 @@ impl App {
     }
 
     fn plan_decision_notice(error: PlanDecisionError) -> String {
-        match error {
-            PlanDecisionError::NotAwaitingApproval => "No plan is waiting for approval.".to_owned(),
-            PlanDecisionError::WrongPlanId => "Plan id does not match the awaiting run.".to_owned(),
-            PlanDecisionError::StaleRevision => {
-                "That revision is no longer current; refresh the approval panel.".to_owned()
-            }
-            PlanDecisionError::StaleRecord => {
-                "Cannot approve a plan restored after restart; use /graph reject.".to_owned()
-            }
-            PlanDecisionError::AlreadyDecided => {
-                "A plan decision was already applied for this revision.".to_owned()
-            }
-            PlanDecisionError::EmptyFeedback => "Usage: /graph edit <feedback>".to_owned(),
-            PlanDecisionError::RevisionCap => {
-                format!("At most {MAX_PLAN_REVISIONS} plan revisions are allowed.")
-            }
-            PlanDecisionError::AgentBusy => {
-                "The planning agent is busy; wait for the current plan turn to finish.".to_owned()
-            }
-            PlanDecisionError::InvalidRevisionPlan(message) => {
-                format!("Approved plan steps are invalid: {message}")
-            }
-            PlanDecisionError::TaskEditRefused(reason) => {
-                format!("Task edit refused: {reason}")
-            }
-            PlanDecisionError::ReplanEditRefused => "edit is only for the initial plan".to_owned(),
-        }
+        error.user_message()
     }
 
     const GRAPH_TASK_USAGE: &'static str = "Usage: /graph task rename <id> <title> | delete <id> | merge <into> <from> | move <id> <position> | split <id> <note>";
+
+    fn preprocess_dashboard_prompt_text(
+        text: &str,
+        route: Option<&str>,
+    ) -> Result<String, RunTodoError> {
+        let slash_command = text.starts_with('/') && !text.starts_with("//");
+        if slash_command {
+            return Ok(text.to_owned());
+        }
+        let route = route
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("auto")
+            .to_ascii_lowercase();
+        match route.as_str() {
+            "auto" => Ok(text.to_owned()),
+            "plan" => {
+                if text.trim().is_empty() {
+                    return Err(RunTodoError::Invalid("text is required".to_owned()));
+                }
+                Ok(format!("/plan {}", text.trim()))
+            }
+            "direct" => {
+                if text.trim().is_empty() {
+                    return Err(RunTodoError::Invalid("text is required".to_owned()));
+                }
+                Ok(format!("/direct {}", text.trim()))
+            }
+            _ => Err(RunTodoError::Invalid("invalid route".to_owned())),
+        }
+    }
+
+    fn task_edit_from_dashboard_fields(
+        action: &str,
+        task_id: &str,
+        title: Option<String>,
+        from: Option<String>,
+        position: Option<u32>,
+        note: Option<String>,
+    ) -> Result<TaskEdit, RunTodoError> {
+        match action.trim() {
+            "rename" => {
+                let title = title
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| RunTodoError::Invalid(Self::GRAPH_TASK_USAGE.to_owned()))?;
+                Ok(TaskEdit::Rename {
+                    task_id: task_id.to_owned(),
+                    title: title.trim().to_owned(),
+                })
+            }
+            "delete" => Ok(TaskEdit::Delete {
+                task_id: task_id.to_owned(),
+            }),
+            "merge" => {
+                let from = from
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| RunTodoError::Invalid(Self::GRAPH_TASK_USAGE.to_owned()))?;
+                Ok(TaskEdit::Merge {
+                    into: task_id.to_owned(),
+                    from: from.trim().to_owned(),
+                })
+            }
+            "move" => {
+                let position = position
+                    .ok_or_else(|| RunTodoError::Invalid(Self::GRAPH_TASK_USAGE.to_owned()))?;
+                let position = usize::try_from(position)
+                    .map_err(|_| RunTodoError::Invalid(Self::GRAPH_TASK_USAGE.to_owned()))?;
+                if position == 0 {
+                    return Err(RunTodoError::Invalid(Self::GRAPH_TASK_USAGE.to_owned()));
+                }
+                Ok(TaskEdit::Move {
+                    task_id: task_id.to_owned(),
+                    position,
+                })
+            }
+            "split" => {
+                let note = note
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| RunTodoError::Invalid(Self::GRAPH_TASK_USAGE.to_owned()))?;
+                Ok(TaskEdit::Split {
+                    task_id: task_id.to_owned(),
+                    note: note.trim().to_owned(),
+                })
+            }
+            _ => Err(RunTodoError::Invalid(Self::GRAPH_TASK_USAGE.to_owned())),
+        }
+    }
+
+    fn apply_graph_task_edit(
+        &mut self,
+        edit: TaskEdit,
+        by: DecisionBy,
+    ) -> Result<(), PlanDecisionError> {
+        let plan_id = self
+            .last_graph_run
+            .as_ref()
+            .filter(|run| run.phase == GraphRunPhase::AwaitingApproval)
+            .map(|run| run.plan.id.clone());
+        let revision = self
+            .last_graph_run
+            .as_ref()
+            .and_then(Self::current_plan_revision_n);
+        match (plan_id, revision) {
+            (Some(plan_id), Some(revision)) => self.apply_task_edit(edit, plan_id, revision, by),
+            _ => Err(PlanDecisionError::NotAwaitingApproval),
+        }
+    }
 
     fn current_plan_revision_n(run: &GraphRun) -> Option<u32> {
         run.approval.as_ref().map(|approval| {
@@ -4912,22 +5070,11 @@ impl App {
     }
 
     fn graph_task_edit_from_tui(&mut self, args: &str) {
-        let plan_id = self
-            .last_graph_run
-            .as_ref()
-            .filter(|run| run.phase == GraphRunPhase::AwaitingApproval)
-            .map(|run| run.plan.id.clone());
-        let revision = self
-            .last_graph_run
-            .as_ref()
-            .and_then(Self::current_plan_revision_n);
         match Self::parse_graph_task_edit(args) {
             Err(message) => self.push_system(message),
             Ok(edit) => {
-                if let (Some(plan_id), Some(revision)) = (plan_id, revision) {
-                    let _ = self.apply_task_edit(edit, plan_id, revision, DecisionBy::Tui);
-                } else {
-                    self.push_system("No plan is waiting for approval.");
+                if let Err(error) = self.apply_graph_task_edit(edit, DecisionBy::Tui) {
+                    self.push_system(Self::plan_decision_notice(error));
                 }
             }
         }
@@ -6726,18 +6873,19 @@ impl App {
         trigger: ReplanTrigger,
         failure_node_id: Option<String>,
         from_flush: bool,
-    ) {
+    ) -> String {
         let message = if cause == "budget" {
             "replan skipped: budget".to_owned()
         } else {
             format!("replan skipped: {cause}")
         };
-        self.push_system(message);
+        self.push_system(message.clone());
         if failure_node_id.is_some() || trigger == ReplanTrigger::Failure {
             self.finish_held_graph_failure();
         } else if from_flush {
             self.resume_graph_after_replan();
         }
+        message
     }
 
     fn finish_held_graph_failure(&mut self) {
@@ -6753,17 +6901,28 @@ impl App {
     }
 
     /// FR-956: user or dashboard replan request.
-    pub fn request_replan(&mut self, note: &str, by: DecisionBy) {
+    pub fn request_replan(&mut self, note: &str, by: DecisionBy) -> Result<(), RunTodoError> {
         if !self.graph_session_is_multi_step() {
-            self.push_system("Replan needs a multi-step run".to_owned());
-            return;
+            let message = "Replan needs a multi-step run".to_owned();
+            self.push_system(message.clone());
+            return Err(RunTodoError::Busy(message));
+        }
+        if self.graph_session.is_none() {
+            let message = "no active graph session".to_owned();
+            self.push_system(message.clone());
+            return Err(RunTodoError::Busy(message));
         }
         let reason = if note.trim().is_empty() {
             "user request".to_owned()
         } else {
             note.trim().to_owned()
         };
-        self.enqueue_replan_trigger(ReplanTrigger::User, reason, None, false, Some(by));
+        if let Some(message) =
+            self.enqueue_replan_trigger(ReplanTrigger::User, reason, None, false, Some(by))
+        {
+            return Err(RunTodoError::Busy(message));
+        }
+        Ok(())
     }
 
     fn enqueue_replan_trigger(
@@ -6773,12 +6932,12 @@ impl App {
         failure_node_id: Option<String>,
         from_flush: bool,
         decided_by: Option<DecisionBy>,
-    ) {
+    ) -> Option<String> {
         if !self.graph_session_is_multi_step() {
             if failure_node_id.is_some() || trigger == ReplanTrigger::Failure {
                 self.finish_held_graph_failure();
             }
-            return;
+            return None;
         }
         if self.pending_replan.is_some() {
             self.store_queued_replan(QueuedReplan {
@@ -6787,7 +6946,7 @@ impl App {
                 failure_node_id,
                 decided_by,
             });
-            return;
+            return None;
         }
         if self.pending_plan.is_some() {
             self.store_queued_replan(QueuedReplan {
@@ -6796,18 +6955,18 @@ impl App {
                 failure_node_id,
                 decided_by,
             });
-            return;
+            return None;
         }
         let run = self
             .graph_session
             .as_ref()
             .map(|session| session.run().clone());
         let Some(run) = run else {
-            return;
+            return Self::replan_user_refusal(trigger, "no active graph session".to_owned());
         };
         if !replan_allowed(&run) {
-            self.push_replan_skipped("budget", trigger, failure_node_id, from_flush);
-            return;
+            let message = self.push_replan_skipped("budget", trigger, failure_node_id, from_flush);
+            return Self::replan_user_refusal(trigger, message);
         }
         let user_prompt = run.plan.user_prompt.clone();
         let summaries = self.replan_summaries.clone();
@@ -6829,17 +6988,23 @@ impl App {
         let prompt = match build_replan_prompt(&run, trigger, &reason, &summaries, &ctx, &nonce) {
             Ok(prompt) => prompt,
             Err(_) => {
-                self.push_replan_skipped("prompt blocked", trigger, failure_node_id, from_flush);
-                return;
+                let message = self.push_replan_skipped(
+                    "prompt blocked",
+                    trigger,
+                    failure_node_id,
+                    from_flush,
+                );
+                return Self::replan_user_refusal(trigger, message);
             }
         };
         if !budget_allows(&run, prompt.chars().count()) {
-            self.push_replan_skipped("budget", trigger, failure_node_id, from_flush);
-            return;
+            let message = self.push_replan_skipped("budget", trigger, failure_node_id, from_flush);
+            return Self::replan_user_refusal(trigger, message);
         }
         let Some(agent) = self.replan_planner_agent() else {
-            self.push_replan_skipped("no planner", trigger, failure_node_id, from_flush);
-            return;
+            let message =
+                self.push_replan_skipped("no planner", trigger, failure_node_id, from_flush);
+            return Self::replan_user_refusal(trigger, message);
         };
         if self.busy_agents.contains(&agent) {
             self.store_queued_replan(QueuedReplan {
@@ -6848,7 +7013,7 @@ impl App {
                 failure_node_id,
                 decided_by,
             });
-            return;
+            return None;
         }
         let rev = next_plan_change_rev(&run);
         self.start_replan_turn(
@@ -6863,6 +7028,15 @@ impl App {
             summaries,
             from_flush,
         );
+        None
+    }
+
+    fn replan_user_refusal(trigger: ReplanTrigger, message: String) -> Option<String> {
+        if trigger == ReplanTrigger::User {
+            Some(message)
+        } else {
+            None
+        }
     }
 
     fn try_flush_queued_replan(&mut self) {
@@ -7695,6 +7869,7 @@ impl App {
         if let Some(session) = self.graph_session.as_ref() {
             self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
         }
+        // An approved failure replan replaces the held failure (FR-956).
         self.graph_failure_replan = None;
         self.graph_approval_stale = None;
         self.resume_graph_after_replan();
@@ -13657,7 +13832,7 @@ mod tests {
             {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
             {"id":"step-4","role":"implement","job":"deploy to production","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"sensitive":true,"task":"task-1"}
         ]}"#;
-        h.app.request_replan("ship", DecisionBy::Tui);
+        let _ = h.app.request_replan("ship", DecisionBy::Tui);
         finish_replan_steps(&mut h, add_sensitive);
         let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
         let rev = App::current_plan_revision_n(h.app.last_graph_run.as_ref().unwrap()).unwrap();
@@ -13678,6 +13853,65 @@ mod tests {
         assert_eq!(step2_node.status, GraphNodeStatus::Completed);
     }
 
+    // UX-932 / P11: dashboard replan reject keeps the held failure path.
+    #[test]
+    fn failure_sensitive_replan_reject_dashboard_finishes_held_failure() {
+        let mut h = plan_gate_test_app();
+        start_approved_three_step_run(&mut h);
+        h.app.graph_failure_replan = Some("step-3".to_owned());
+        let add_sensitive = r#"{"reason":"deploy","steps":[
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
+            {"id":"step-4","role":"implement","job":"deploy to production","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"sensitive":true,"task":"task-1"}
+        ]}"#;
+        h.app.request_replan("ship", DecisionBy::Tui).unwrap();
+        finish_replan_steps(&mut h, add_sensitive);
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        let rev = App::current_plan_revision_n(h.app.last_graph_run.as_ref().unwrap()).unwrap();
+        h.app
+            .decide_plan(
+                PlanDecisionKind::Reject,
+                plan_id,
+                rev,
+                DecisionBy::Dashboard,
+            )
+            .unwrap();
+        assert!(h.app.graph_failure_replan.is_none());
+        assert!(
+            system_containing(&h.app, "graph node step-3 failed")
+                .contains("graph node step-3 failed")
+        );
+    }
+
+    // FR-956 / FR-959: approving a sensitive failure replan (dashboard) releases the held failure.
+    #[test]
+    fn failure_sensitive_replan_approve_dashboard_resumes() {
+        let mut h = plan_gate_test_app();
+        start_approved_three_step_run(&mut h);
+        h.app.graph_failure_replan = Some("step-3".to_owned());
+        let add_sensitive = r#"{"reason":"deploy","steps":[
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
+            {"id":"step-4","role":"implement","job":"deploy to production","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"sensitive":true,"task":"task-1"}
+        ]}"#;
+        h.app.request_replan("ship", DecisionBy::Tui).unwrap();
+        finish_replan_steps(&mut h, add_sensitive);
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        let rev = App::current_plan_revision_n(h.app.last_graph_run.as_ref().unwrap()).unwrap();
+        h.app
+            .decide_plan(
+                PlanDecisionKind::Approve,
+                plan_id,
+                rev,
+                DecisionBy::Dashboard,
+            )
+            .unwrap();
+        assert!(h.app.graph_failure_replan.is_none());
+        assert!(!h.app.replan_scheduling_blocked());
+        assert_eq!(
+            h.app.graph_session.as_ref().unwrap().run().phase,
+            GraphRunPhase::Active
+        );
+    }
+
     // FR-956 / FR-959: rejecting a sensitive failure replan still fails the held node.
     #[test]
     fn failure_sensitive_replan_reject_finishes_held_failure() {
@@ -13688,7 +13922,7 @@ mod tests {
             {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
             {"id":"step-4","role":"implement","job":"deploy to production","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"sensitive":true,"task":"task-1"}
         ]}"#;
-        h.app.request_replan("ship", DecisionBy::Tui);
+        let _ = h.app.request_replan("ship", DecisionBy::Tui);
         finish_replan_steps(&mut h, add_sensitive);
         assert_eq!(h.app.graph_failure_replan.as_deref(), Some("step-3"));
         assert_eq!(
@@ -19238,6 +19472,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dashboard_plan_decision_command_matches_tui_gate() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval_with_plan(&mut h, three_step_codex_plan_json());
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        let revision =
+            App::current_plan_revision_n(h.app.last_graph_run.as_ref().unwrap()).unwrap();
+        h.app
+            .handle_session_command(SessionCommand::PlanDecision {
+                plan_id: plan_id.clone(),
+                revision,
+                decision: PlanDecisionAction::Approve,
+                feedback: None,
+            })
+            .unwrap();
+        assert_eq!(
+            h.app.last_graph_run.as_ref().map(|run| run.phase),
+            Some(GraphRunPhase::Active)
+        );
+
+        let mut edit_h = plan_gate_test_app();
+        reach_awaiting_approval_with_plan(&mut edit_h, three_step_codex_plan_json());
+        let plan_id = edit_h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        let revision =
+            App::current_plan_revision_n(edit_h.app.last_graph_run.as_ref().unwrap()).unwrap();
+        let edit = edit_h
+            .app
+            .handle_session_command(SessionCommand::PlanDecision {
+                plan_id,
+                revision,
+                decision: PlanDecisionAction::Edit,
+                feedback: None,
+            });
+        assert!(matches!(
+            edit,
+            Err(RunTodoError::Invalid(message)) if message.contains("Usage: /graph edit")
+        ));
+    }
+
+    #[test]
+    fn dashboard_prompt_route_preprocesses_plan_and_direct() {
+        assert_eq!(
+            App::preprocess_dashboard_prompt_text("work", Some("plan")).unwrap(),
+            "/plan work"
+        );
+        assert_eq!(
+            App::preprocess_dashboard_prompt_text("/direct keep", Some("plan")).unwrap(),
+            "/direct keep"
+        );
+        assert!(App::preprocess_dashboard_prompt_text("   ", Some("direct")).is_err());
+        assert!(App::preprocess_dashboard_prompt_text("x", Some("nope")).is_err());
+    }
+
     // TC-766: dashboard submit prompt behaves like Enter
     #[tokio::test]
     async fn dashboard_submit_prompt_runs_like_enter() {
@@ -19250,6 +19537,7 @@ mod tests {
             text: "hello from dashboard".to_string(),
             agent: Some("codex".to_string()),
             mode: Some("ask".to_string()),
+            route: None,
             reply,
         })
         .await
@@ -19410,6 +19698,7 @@ mod tests {
             text: "line one\nline two".to_owned(),
             agent: Some("codex".to_owned()),
             mode: None,
+            route: None,
             reply,
         })
         .await
@@ -19809,6 +20098,7 @@ mod tests {
                 text: text.to_owned(),
                 agent: Some("codex".to_owned()),
                 mode: None,
+                route: None,
                 reply,
             })
             .await
@@ -19825,6 +20115,7 @@ mod tests {
             text: "plain text".to_owned(),
             agent: Some("codex".to_owned()),
             mode: None,
+            route: None,
             reply,
         })
         .await
@@ -22436,7 +22727,7 @@ mod tests {
         user.app
             .decide_plan(PlanDecisionKind::Approve, plan_id, 1, DecisionBy::Tui)
             .unwrap();
-        user.app.request_replan("add docs", DecisionBy::Tui);
+        let _ = user.app.request_replan("add docs", DecisionBy::Tui);
         let step1 = last_graph_node_request_index(&user.sent);
         complete_sent_graph_turn(&mut user.app, &user.sent, step1);
         let replans = replan_requests(&user.sent);
@@ -22553,7 +22844,7 @@ mod tests {
             step2,
             "done\n\nDMUXAI_REPLAN: need tests\n",
         );
-        h.app.request_replan("add docs", DecisionBy::Tui);
+        let _ = h.app.request_replan("add docs", DecisionBy::Tui);
         assert!(h.app.queued_replan.is_some());
         if let Some(session) = h.app.graph_session.as_mut() {
             session.run_mut().replan_chars_used = 50_000;
@@ -23237,7 +23528,7 @@ mod tests {
             {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
             {"id":"step-4","role":"review","job":"lint","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"task":"task-1"}
         ]}"#;
-        h.app.request_replan("lint", DecisionBy::Tui);
+        let _ = h.app.request_replan("lint", DecisionBy::Tui);
         finish_replan_steps(&mut h, replan_json);
         while h.app.graph_session.is_some() {
             drain_busy_for_queued_replan(&mut h);
@@ -23372,7 +23663,7 @@ mod tests {
         assert_eq!(triage.override_kind, Some(OverrideKind::Plan));
         assert_eq!(judge_line_text(&triage), "/plan");
         start_approved_three_step_run(&mut h);
-        h.app.request_replan("lint pass", DecisionBy::Tui);
+        let _ = h.app.request_replan("lint pass", DecisionBy::Tui);
         let notice = last_system(&h.app);
         assert!(
             notice.contains("Replan queued (runs after step-2)"),
@@ -23694,7 +23985,7 @@ mod tests {
             {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
             {"id":"step-4","role":"review","job":"lint","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"task":"task-1"}
         ]}"#;
-        h.app.request_replan("lint", DecisionBy::Tui);
+        let _ = h.app.request_replan("lint", DecisionBy::Tui);
         finish_replan_steps(&mut h, json);
         assert_eq!(
             h.app.graph_session.as_ref().unwrap().run().phase,
@@ -23712,7 +24003,7 @@ mod tests {
         let bad = r#"{"reason":"new task","steps":[
             {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-3b"}
         ]}"#;
-        h.app.request_replan("bad", DecisionBy::Tui);
+        let _ = h.app.request_replan("bad", DecisionBy::Tui);
         finish_replan_steps(&mut h, bad);
         let history = &h.app.graph_session.as_ref().unwrap().run().plan_history;
         let revs: Vec<u32> = history.iter().map(|change| change.rev).collect();
@@ -23740,7 +24031,7 @@ mod tests {
             {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
             {"id":"step-4","role":"implement","job":"deploy to production","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"sensitive":true,"task":"task-1"}
         ]}"#;
-        h.app.request_replan("ship", DecisionBy::Tui);
+        let _ = h.app.request_replan("ship", DecisionBy::Tui);
         finish_replan_steps(&mut h, add_sensitive);
         let run_phase = h.app.graph_session.as_ref().unwrap().run().phase;
         assert_eq!(
@@ -23823,7 +24114,7 @@ mod tests {
             {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
             {"id":"step-4","role":"implement","job":"deploy to production","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"sensitive":true,"task":"task-1"}
         ]}"#;
-        approve_h.app.request_replan("ship", DecisionBy::Tui);
+        let _ = approve_h.app.request_replan("ship", DecisionBy::Tui);
         finish_replan_steps(&mut approve_h, add_sensitive_three);
         let rev =
             App::current_plan_revision_n(approve_h.app.last_graph_run.as_ref().unwrap()).unwrap();
@@ -23960,7 +24251,7 @@ mod tests {
             {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
             {"id":"step-4","role":"review","job":"lint","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"task":"task-1"}
         ]}"#;
-        h.app.request_replan("lint", DecisionBy::Tui);
+        let _ = h.app.request_replan("lint", DecisionBy::Tui);
         finish_replan_steps(&mut h, json);
         let notice = system_containing(&h.app, "Plan rev 2 (replan after user)");
         assert!(notice.contains("+1 ~0 −"));
@@ -23985,7 +24276,7 @@ mod tests {
             {{"id":"step-4","role":"review","job":"lint","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"task":"task-1"}}
         ]}}"#
         );
-        h.app.request_replan("lint", DecisionBy::Tui);
+        let _ = h.app.request_replan("lint", DecisionBy::Tui);
         finish_replan_steps(&mut h, &json);
         let notice = system_containing(&h.app, "Plan rev 2");
         let width = h.app.terminal_area.width.max(40) as usize;
@@ -24007,7 +24298,7 @@ mod tests {
             {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
             {"id":"step-4","role":"review","job":"follow","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"task":"task-2"}
         ]}"#;
-        h.app.request_replan("tasks", DecisionBy::Tui);
+        let _ = h.app.request_replan("tasks", DecisionBy::Tui);
         finish_replan_steps(&mut h, json);
         let notice = system_containing(&h.app, "Plan rev 2 (replan after user)");
         assert!(notice.contains(" tasks +1 ~0 −0"), "notice: {notice}");

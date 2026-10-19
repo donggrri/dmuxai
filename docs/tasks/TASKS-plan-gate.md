@@ -82,7 +82,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   FR-955, FR-962, UX-936 (data). TC-957, TC-977 (snapshot), TC-990, TC-996 (snapshot).
   Files: `src/web/snapshot.rs`.
   Done when: `cargo test --locked --lib web::snapshot` green incl. `snapshot_carries_task_checklist`.
-- [ ] P15 — Dashboard commands: `plan_decision`, `plan_replan`, `plan_task_edit`, `POST /api/prompt` `route`.
+- [x] P15 — (#67 agent-planned graph 7f96ced1: 5 steps (plan needed 1 repair); composer-2.5; review claude-sonnet-5-5-high APPROVE; my check of its nit 1 found a real regression: the approve path no longer cleared the held failure, so scheduling stayed blocked after approving a failure replan → fixed by hand + `failure_sensitive_replan_approve_dashboard_resumes`; nits for P16/P19: blank task_id → 400, EmptyFeedback checked before state, app-level 409 tests for plan_replan/plan_task_edit) Dashboard commands: `plan_decision`, `plan_replan`, `plan_task_edit`, `POST /api/prompt` `route`.
   UX-932, UX-933 (server), FR-965 (dashboard). TC-959.
   Files: `src/web/commands.rs`, `src/web/server.rs`, `src/app.rs`.
   Done when: `plan_decision_command_contract` + route test green.

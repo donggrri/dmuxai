@@ -925,12 +925,39 @@ struct PromptBody {
     text: String,
     agent: Option<String>,
     mode: Option<String>,
+    route: Option<String>,
+}
+
+fn session_command_needs_web_write(command: &SessionCommand) -> bool {
+    matches!(
+        command,
+        SessionCommand::PlanDecision { .. }
+            | SessionCommand::PlanReplan { .. }
+            | SessionCommand::PlanTaskEdit { .. }
+    )
 }
 
 async fn post_prompt(
     State(state): State<AppState>,
     ApiJson(body): ApiJson<PromptBody>,
 ) -> Response {
+    let slash_wins = body.text.starts_with('/') && !body.text.starts_with("//");
+    if !slash_wins
+        && let Some(route) = body
+            .route
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        let route = route.to_ascii_lowercase();
+        if matches!(route.as_str(), "plan" | "direct") && body.text.trim().is_empty() {
+            return error_json(StatusCode::BAD_REQUEST, "text is required");
+        }
+        if !matches!(route.as_str(), "auto" | "plan" | "direct") {
+            return error_json(StatusCode::BAD_REQUEST, "invalid route");
+        }
+    }
+
     if body.text.trim().is_empty() {
         return error_json(StatusCode::BAD_REQUEST, "text is required");
     }
@@ -952,6 +979,7 @@ async fn post_prompt(
             text: body.text,
             agent: body.agent,
             mode: body.mode,
+            route: body.route,
             reply,
         })
         .await
@@ -983,6 +1011,9 @@ async fn post_command(
     State(state): State<AppState>,
     ApiJson(command): ApiJson<SessionCommand>,
 ) -> Response {
+    if !state.services.web_attached && session_command_needs_web_write(&command) {
+        return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
+    }
     let Some(sender) = state.services.commands.clone() else {
         return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
     };
@@ -1594,6 +1625,7 @@ pub async fn start_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web::commands::PlanDecisionAction;
     use http_body_util::BodyExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
@@ -2171,6 +2203,363 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    struct PlanApprovalDouble {
+        plan_id: String,
+        revision: u32,
+        decided: bool,
+    }
+
+    fn spawn_plan_decision_double(
+        plan_id: String,
+        revision: u32,
+    ) -> mpsc::Sender<DashboardCommand> {
+        let state = Arc::new(std::sync::Mutex::new(PlanApprovalDouble {
+            plan_id,
+            revision,
+            decided: false,
+        }));
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            let session = crate::web::SessionView {
+                conversation_id: "conv-plan".to_owned(),
+                selected_agent: "codex".to_owned(),
+                ..crate::web::SessionView::default()
+            };
+            while let Some(command) = rx.recv().await {
+                if let DashboardCommand::Session { command, reply } = command {
+                    let result = match command {
+                        SessionCommand::PlanDecision {
+                            plan_id,
+                            revision,
+                            decision,
+                            feedback,
+                        } => {
+                            let mut guard = state.lock().unwrap();
+                            if plan_id != guard.plan_id {
+                                Err(RunTodoError::Busy(
+                                    "Plan id does not match the awaiting run.".to_owned(),
+                                ))
+                            } else if revision != guard.revision {
+                                Err(RunTodoError::Busy(
+                                    "That revision is no longer current; refresh the approval panel."
+                                        .to_owned(),
+                                ))
+                            } else if matches!(decision, PlanDecisionAction::Edit)
+                                && feedback
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                                    .is_none()
+                            {
+                                Err(RunTodoError::Invalid(
+                                    "Usage: /graph edit <feedback>".to_owned(),
+                                ))
+                            } else if guard.decided {
+                                Err(RunTodoError::Busy(
+                                    "A plan decision was already applied for this revision."
+                                        .to_owned(),
+                                ))
+                            } else {
+                                guard.decided = true;
+                                Ok(session.clone())
+                            }
+                        }
+                        other => Err(RunTodoError::Invalid(format!(
+                            "unexpected session command: {other:?}"
+                        ))),
+                    };
+                    let _ = reply.send(result);
+                }
+            }
+        });
+        tx
+    }
+
+    // TC-959 (UX-932): `plan_decision` HTTP mapping with an awaiting-approval double.
+    #[tokio::test]
+    async fn plan_decision_command_contract() {
+        let token = "plan-decision-token".to_string();
+        let plan_id = "plan-abc".to_string();
+        let revision = 2_u32;
+        let router_with = |commands: mpsc::Sender<DashboardCommand>| {
+            build_router_with(
+                test_hub(),
+                token.clone(),
+                allowed_localhost(),
+                DashboardServices {
+                    commands: Some(commands),
+                    web_attached: true,
+                    ..DashboardServices::default()
+                },
+            )
+        };
+
+        let router = router_with(spawn_plan_decision_double(plan_id.clone(), revision));
+        let approve_body = serde_json::json!({
+            "command": "plan_decision",
+            "plan_id": plan_id,
+            "revision": revision,
+            "decision": "approve"
+        });
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &approve_body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(json["session"]["conversation_id"], "conv-plan");
+
+        let router = router_with(spawn_plan_decision_double(plan_id.clone(), revision));
+        let edit_body = serde_json::json!({
+            "command": "plan_decision",
+            "plan_id": plan_id,
+            "revision": revision,
+            "decision": "edit"
+        });
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &edit_body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(read_body(resp).await.contains("Usage: /graph edit"));
+
+        let tx = spawn_plan_decision_double(plan_id.clone(), revision);
+        let router = router_with(tx);
+        let reject_body = serde_json::json!({
+            "command": "plan_decision",
+            "plan_id": plan_id,
+            "revision": revision,
+            "decision": "reject"
+        });
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &reject_body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &reject_body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(read_body(resp).await.contains("already applied"));
+
+        let router = router_with(spawn_plan_decision_double(plan_id.clone(), revision));
+        let wrong_plan = serde_json::json!({
+            "command": "plan_decision",
+            "plan_id": "other-plan",
+            "revision": revision,
+            "decision": "approve"
+        });
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &wrong_plan.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(read_body(resp).await.contains("Plan id does not match"));
+
+        let router = router_with(spawn_plan_decision_double(plan_id.clone(), revision));
+        let stale_rev = serde_json::json!({
+            "command": "plan_decision",
+            "plan_id": plan_id,
+            "revision": revision - 1,
+            "decision": "approve"
+        });
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &stale_rev.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(read_body(resp).await.contains("no longer current"));
+
+        let view_router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                commands: Some(spawn_plan_decision_double(plan_id.clone(), revision)),
+                web_attached: false,
+                ..DashboardServices::default()
+            },
+        );
+        let resp = view_router
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &approve_body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(read_body(resp).await.contains("view-only"));
+    }
+
+    fn spawn_plan_gate_session_double() -> (
+        mpsc::Sender<DashboardCommand>,
+        Arc<std::sync::Mutex<Vec<SessionCommand>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_task = Arc::clone(&seen);
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            let session = crate::web::SessionView {
+                conversation_id: "conv-gate".to_owned(),
+                selected_agent: "codex".to_owned(),
+                ..crate::web::SessionView::default()
+            };
+            while let Some(command) = rx.recv().await {
+                if let DashboardCommand::Session { command, reply } = command {
+                    seen_task.lock().unwrap().push(command.clone());
+                    let result = match command {
+                        SessionCommand::PlanReplan { note } => {
+                            if note.as_deref() == Some("refuse") {
+                                Err(RunTodoError::Busy(
+                                    "Replan needs a multi-step run".to_owned(),
+                                ))
+                            } else {
+                                Ok(session.clone())
+                            }
+                        }
+                        SessionCommand::PlanTaskEdit { action, .. } => {
+                            if action == "rename" {
+                                Ok(session.clone())
+                            } else {
+                                Err(RunTodoError::Busy(
+                                    "Task edit refused: unknown task 'missing'".to_owned(),
+                                ))
+                            }
+                        }
+                        SessionCommand::PlanDecision {
+                            decision, feedback, ..
+                        } => {
+                            if matches!(decision, PlanDecisionAction::Edit)
+                                && feedback
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                                    .is_none()
+                            {
+                                Err(RunTodoError::Invalid(
+                                    "Usage: /graph edit <feedback>".to_owned(),
+                                ))
+                            } else {
+                                Ok(session.clone())
+                            }
+                        }
+                        other => Err(RunTodoError::Invalid(format!(
+                            "unexpected session command: {other:?}"
+                        ))),
+                    };
+                    let _ = reply.send(result);
+                }
+            }
+        });
+        (tx, seen)
+    }
+
+    #[tokio::test]
+    async fn plan_replan_and_task_edit_commands() {
+        let token = "plan-gate-cmd-token".to_string();
+        let (tx, seen) = spawn_plan_gate_session_double();
+        let router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                commands: Some(tx),
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        );
+
+        let replan_ok = r#"{"command":"plan_replan","note":"tighten deps"}"#;
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/command", &token, replan_ok))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let replan_fail = r#"{"command":"plan_replan","note":"refuse"}"#;
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/command", &token, replan_fail))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(read_body(resp).await.contains("multi-step"));
+
+        let task_ok =
+            r#"{"command":"plan_task_edit","action":"rename","task_id":"task-1","title":"New"}"#;
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/command", &token, task_ok))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let task_bad = r#"{"command":"plan_task_edit","action":"delete"}"#;
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/command", &token, task_bad))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let task_conflict =
+            r#"{"command":"plan_task_edit","action":"merge","task_id":"task-1","from":"task-2"}"#;
+        let resp = router
+            .oneshot(json_request("POST", "/api/command", &token, task_conflict))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(read_body(resp).await.contains("Task edit refused"));
+
+        let commands = seen.lock().unwrap();
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, SessionCommand::PlanReplan { .. }))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, SessionCommand::PlanTaskEdit { .. }))
+        );
     }
 
     // TC-541 / FR-541: CRUD routes and the snapshot reflect every mutation.
@@ -2887,6 +3276,131 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // UX-933: optional `route` (auto | plan | direct), slash wins, empty/unknown → 400
+        let (tx, seen) = spawn_prompt_route_capture();
+        let route_router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                commands: Some(tx),
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        );
+
+        let resp = route_router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"hello","route":"auto"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            ("hello".to_owned(), Some("auto".to_owned()))
+        );
+
+        let resp = route_router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"do work","route":"plan"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            seen.lock().unwrap().last().map(|row| row.0.as_str()),
+            Some("do work")
+        );
+
+        let resp = route_router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"skip triage","route":"direct"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            seen.lock().unwrap().last().map(|row| row.0.as_str()),
+            Some("skip triage")
+        );
+
+        let resp = route_router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"/direct inline","route":"plan"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            seen.lock().unwrap().last().map(|row| row.0.as_str()),
+            Some("/direct inline")
+        );
+
+        let resp = route_router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"   ","route":"plan"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = route_router
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"hello","route":"warp"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(read_body(resp).await.contains("invalid route"));
+    }
+
+    type CapturedPromptRoutes = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
+    fn spawn_prompt_route_capture() -> (mpsc::Sender<DashboardCommand>, CapturedPromptRoutes) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_task = Arc::clone(&seen);
+        let accepted = PromptAccepted {
+            conversation_id: "conv-route".to_string(),
+            agent: "codex".to_string(),
+        };
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                if let DashboardCommand::SubmitPrompt {
+                    text, route, reply, ..
+                } = command
+                {
+                    seen_task.lock().unwrap().push((text, route));
+                    let _ = reply.send(Ok(accepted.clone()));
+                }
+            }
+        });
+        (tx, seen)
     }
 
     // TC-767 / FR-766: REST catch-up and SSE `state-change` frames tail the log file.
