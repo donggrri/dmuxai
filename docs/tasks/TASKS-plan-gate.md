@@ -44,7 +44,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   FR-942, FR-945. TC-946, TC-947, TC-952 (app part).
   Files: `src/app.rs`, `src/web/parity.rs`.
   Done when: `awaiting_approval_blocks_new_prompts`, `stale_records_after_restart`, `slash_list_has_plan_and_direct` green.
-- [ ] P06 — `decide_plan` approve / edit / reject, `/graph approve|edit|reject`, first decision wins.
+- [x] P06 — (composer-2.5 two turns via dmuxai cursor runner; review claude-sonnet-5-5-high BLOCK → fixed → APPROVE, two nits fixed by hand: run-id guard and replan counter kept on edit; dashboard 409 wiring is P15) `decide_plan` approve / edit / reject, `/graph approve|edit|reject`, first decision wins.
   FR-943, FR-951 (complex). TC-948, TC-949, TC-950, TC-963, TC-964/TC-968 (complex parts).
   Files: `src/app.rs`.
   Done when: `approve_starts_graph`, `edit_replans_with_feedback`, `reject_stops_run`, `concurrent_plan_decisions_first_wins` green.

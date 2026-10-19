@@ -15,8 +15,8 @@ pub use judge::{
 };
 pub use plan_doc::{
     AllowedRunner, FallbackPlan, PLAN_PROMPT, PlanContext, PlanDoc, PlanError, PlanPromptMode,
-    PlanPromptRequest, PlanStep, build_plan_prompt, fallback_plan, one_node_plan_on, parse_plan,
-    validate_plan,
+    PlanPromptRequest, PlanStep, build_plan_prompt, fallback_plan, graph_plan_from_revision_steps,
+    one_node_plan_on, parse_plan, plan_json_for_edit, validate_plan,
 };
 pub use planner::heuristic_route;
 pub use policy::{
@@ -32,7 +32,7 @@ pub use store::{GraphStore, load_run, save_run};
 pub use tasks::{TaskState, task_counts, task_status};
 pub use types::{
     Approval, ApprovalState, DecisionBy, ExecutionPlan, GraphEdge, GraphLimits, GraphNode,
-    GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, NodeRole, PLAN_HISTORY_MAX, PlanChange,
-    PlanChangeKind, PlanChangeTrigger, PlanRevision, PlanTask, PlannerCalls, SinglePlan, TaskSize,
-    Triage, cap_revision_raw,
+    GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, MAX_PLAN_REVISIONS, NodeRole,
+    PLAN_HISTORY_MAX, PlanChange, PlanChangeKind, PlanChangeTrigger, PlanRevision, PlanTask,
+    PlannerCalls, SinglePlan, TaskSize, Triage, cap_revision_raw,
 };

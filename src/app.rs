@@ -54,12 +54,13 @@ use dmuxai::{
     },
     events::EventDraft,
     graph::{
-        AllowedRunner, Approval, ApprovalState, FallbackCause, GraphAction, GraphPlan, GraphRun,
-        GraphRunPhase, GraphRunSession, GraphStore, NodeAssignment, NodeRole, OverrideKind,
-        PlanContext, PlanDoc, PlanPromptMode, PlanPromptRequest, PlanRevision, PlanStep,
-        PlannerCalls, Route, Triage, TriageSource, build_judge_prompt, build_plan_prompt,
-        cap_revision_raw, fallback_plan, heuristic_route, parse_plan, parse_verdict, save_run,
-        validate_plan,
+        AllowedRunner, Approval, ApprovalState, DecisionBy, FallbackCause, GraphAction, GraphNode,
+        GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, GraphRunSession, GraphStore,
+        MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind, PlanContext, PlanDoc,
+        PlanPromptMode, PlanPromptRequest, PlanRevision, PlanStep, PlannerCalls, Route, Triage,
+        TriageSource, build_judge_prompt, build_plan_prompt, cap_revision_raw, fallback_plan,
+        graph_plan_from_revision_steps, heuristic_route, parse_plan, parse_verdict,
+        plan_json_for_edit, save_run, validate_plan,
     },
     mcp::config::ResolvedMcpServer,
     mcp::registry::McpRegistry,
@@ -681,6 +682,44 @@ struct PendingPlan {
     triage_elapsed_ms: u64,
     model: String,
     runner: String,
+    edit_previous_json: Option<String>,
+    edit_feedback: Option<String>,
+}
+
+/// FR-943: approve, edit with feedback, or reject at the plan gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanDecisionKind {
+    Approve,
+    Edit(String),
+    Reject,
+}
+
+/// FR-943: refusal reasons for plan decisions (dashboard maps conflicts to 409).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanDecisionError {
+    NotAwaitingApproval,
+    WrongPlanId,
+    StaleRevision,
+    StaleRecord,
+    AlreadyDecided,
+    EmptyFeedback,
+    RevisionCap,
+    AgentBusy,
+    InvalidRevisionPlan(String),
+}
+
+impl PlanDecisionError {
+    #[allow(dead_code)]
+    pub fn is_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::AlreadyDecided
+                | Self::StaleRevision
+                | Self::WrongPlanId
+                | Self::NotAwaitingApproval
+                | Self::StaleRecord
+        )
+    }
 }
 
 #[derive(Default)]
@@ -2917,6 +2956,11 @@ impl App {
         }
         self.slash_preview = None;
 
+        if self.plan_gate_blocks_send() && Self::prompt_blocked_by_plan_gate(&prompt) {
+            self.refuse_plan_gate_prompt(prompt);
+            return;
+        }
+
         if prompt_should_attach_only(&prompt) {
             self.attach_image_path(&prompt);
             return;
@@ -2924,6 +2968,10 @@ impl App {
 
         let is_escaped = prompt.starts_with("//");
         if is_escaped {
+            if self.plan_gate_blocks_send() {
+                self.refuse_plan_gate_prompt(prompt);
+                return;
+            }
             prompt = prompt[1..].to_owned();
         } else if prompt.starts_with('/') && !first_token_is_path(&prompt) {
             let cmd = prompt.split_whitespace().next().unwrap_or(&prompt);
@@ -3069,12 +3117,66 @@ impl App {
                     } else if let Some(args) = rest.strip_prefix("override ") {
                         self.override_graph_node(args.trim());
                     } else if rest == "approve" {
-                        if self.approval_is_stale() {
-                            self.push_system(
-                                "Cannot approve a plan restored after restart; use /graph reject.",
+                        let plan_id = self
+                            .last_graph_run
+                            .as_ref()
+                            .filter(|run| run.phase == GraphRunPhase::AwaitingApproval)
+                            .map(|run| run.plan.id.clone());
+                        let revision = self
+                            .last_graph_run
+                            .as_ref()
+                            .and_then(Self::current_plan_revision_n);
+                        if let (Some(plan_id), Some(revision)) = (plan_id, revision) {
+                            let _ = self.decide_plan(
+                                PlanDecisionKind::Approve,
+                                plan_id,
+                                revision,
+                                DecisionBy::Tui,
                             );
                         } else {
-                            self.show_graph_status();
+                            self.push_system("No plan is waiting for approval.");
+                        }
+                    } else if let Some(feedback) = rest.strip_prefix("edit ") {
+                        let plan_id = self
+                            .last_graph_run
+                            .as_ref()
+                            .filter(|run| run.phase == GraphRunPhase::AwaitingApproval)
+                            .map(|run| run.plan.id.clone());
+                        let revision = self
+                            .last_graph_run
+                            .as_ref()
+                            .and_then(Self::current_plan_revision_n);
+                        if let (Some(plan_id), Some(revision)) = (plan_id, revision) {
+                            let _ = self.decide_plan(
+                                PlanDecisionKind::Edit(feedback.trim().to_owned()),
+                                plan_id,
+                                revision,
+                                DecisionBy::Tui,
+                            );
+                        } else {
+                            self.push_system("No plan is waiting for approval.");
+                        }
+                    } else if rest == "edit" {
+                        self.push_system("Usage: /graph edit <feedback>");
+                    } else if rest == "reject" {
+                        let plan_id = self
+                            .last_graph_run
+                            .as_ref()
+                            .filter(|run| run.phase == GraphRunPhase::AwaitingApproval)
+                            .map(|run| run.plan.id.clone());
+                        let revision = self
+                            .last_graph_run
+                            .as_ref()
+                            .and_then(Self::current_plan_revision_n);
+                        if let (Some(plan_id), Some(revision)) = (plan_id, revision) {
+                            let _ = self.decide_plan(
+                                PlanDecisionKind::Reject,
+                                plan_id,
+                                revision,
+                                DecisionBy::Tui,
+                            );
+                        } else {
+                            self.push_system("No plan is waiting for approval.");
                         }
                     } else {
                         self.show_graph_status();
@@ -3367,6 +3469,19 @@ impl App {
 
     fn cancel_selected(&mut self) {
         let agent = self.adapters[self.selected].agent();
+        let selected_has_turn =
+            self.busy_agents.contains(&agent) || self.active_turns.contains_key(&agent);
+        if self.pending_plan.is_none()
+            && self.pending_triage.is_none()
+            && !selected_has_turn
+            && let Some(run) = self.last_graph_run.as_ref()
+            && run.phase == GraphRunPhase::AwaitingApproval
+            && let Some(revision) = Self::current_plan_revision_n(run)
+        {
+            let plan_id = run.plan.id.clone();
+            let _ = self.decide_plan(PlanDecisionKind::Reject, plan_id, revision, DecisionBy::Tui);
+            return;
+        }
         let triage_agent = self.pending_triage.as_ref().map(|pending| pending.agent);
         let plan_agent = self.pending_plan.as_ref().map(|pending| pending.agent);
         let was_tracking = self.busy_agents.contains(&agent)
@@ -3395,6 +3510,11 @@ impl App {
             self.activities.remove(&plan_agent);
             self.end_run_state(plan_agent, false, true);
             let _ = self.adapters[adapter_index(plan_agent)].select_mode(pending.saved_mode);
+            if pending.edit_previous_json.is_some() {
+                self.restore_awaiting_after_edit_failure(&pending, "cancelled by user");
+                self.push_system(format!("{plan_agent} turn cancelled."));
+                return;
+            }
             self.input = pending.prompt.clone();
             let runner = runner_name(plan_agent).to_owned();
             let plan = GraphPlan {
@@ -3550,6 +3670,7 @@ impl App {
         // Switching conversations clears the dashboard's retained graph so the
         // previous conversation's finished run is not shown (FR-525/FR-530).
         self.last_graph_run = None;
+        self.graph_approval_stale = None;
         self.graph_node_details.clear();
         self.graph_agent_nodes.clear();
         self.clear_graph_defer_state();
@@ -3596,6 +3717,7 @@ impl App {
             let deferred = self.deferred_turns.remove(index);
             self.submit_to_agent(deferred.agent, deferred.prompt, true);
         }
+        self.restore_graph_runs_on_startup();
         self.publish_dashboard();
     }
 
@@ -4157,6 +4279,7 @@ impl App {
     }
 
     fn prompt_blocked_by_plan_gate(text: &str) -> bool {
+        let text = text.trim_start();
         if text.starts_with("//") {
             return true;
         }
@@ -4183,6 +4306,7 @@ impl App {
         let conversation_id = self.conversation_id.as_str().to_owned();
         let store = GraphStore::new(&self.workspace_root);
         let mut awaiting: Option<GraphRun> = None;
+        let mut stale_awaiting = 0u32;
         for run in store.list_runs() {
             if run.conversation_id != conversation_id.as_str() {
                 continue;
@@ -4201,16 +4325,43 @@ impl App {
                         ));
                     }
                 }
-                GraphRunPhase::AwaitingApproval
-                    if awaiting.as_ref().is_none_or(|prev| {
+                GraphRunPhase::AwaitingApproval => {
+                    let keep = awaiting.as_ref().is_none_or(|prev| {
                         run.turn_index > prev.turn_index
                             || (run.turn_index == prev.turn_index && run.plan.id > prev.plan.id)
-                    }) =>
-                {
-                    awaiting = Some(run);
+                    });
+                    if keep {
+                        if let Some(prev) = awaiting {
+                            let mut cancelled = prev;
+                            let run_id = cancelled.plan.id.clone();
+                            cancelled.phase = GraphRunPhase::Cancelled;
+                            if let Err(error) = save_run(&self.workspace_root, &cancelled) {
+                                self.push_system(format!(
+                                    "Could not cancel stale awaiting run {run_id}: {error}"
+                                ));
+                            }
+                            stale_awaiting += 1;
+                        }
+                        awaiting = Some(run);
+                    } else {
+                        let mut cancelled = run;
+                        let run_id = cancelled.plan.id.clone();
+                        cancelled.phase = GraphRunPhase::Cancelled;
+                        if let Err(error) = save_run(&self.workspace_root, &cancelled) {
+                            self.push_system(format!(
+                                "Could not cancel stale awaiting run {run_id}: {error}"
+                            ));
+                        }
+                        stale_awaiting += 1;
+                    }
                 }
                 _ => {}
             }
+        }
+        if stale_awaiting > 0 {
+            self.push_system(format!(
+                "Cancelled {stale_awaiting} stale awaiting-approval run(s) from a previous session."
+            ));
         }
         if let Some(run) = awaiting {
             self.graph_approval_stale = Some(run.plan.id.clone());
@@ -4224,6 +4375,336 @@ impl App {
             (Some(id), Some(run)) => run.plan.id == *id,
             _ => false,
         }
+    }
+
+    fn plan_decision_notice(error: PlanDecisionError) -> String {
+        match error {
+            PlanDecisionError::NotAwaitingApproval => "No plan is waiting for approval.".to_owned(),
+            PlanDecisionError::WrongPlanId => "Plan id does not match the awaiting run.".to_owned(),
+            PlanDecisionError::StaleRevision => {
+                "That revision is no longer current; refresh the approval panel.".to_owned()
+            }
+            PlanDecisionError::StaleRecord => {
+                "Cannot approve a plan restored after restart; use /graph reject.".to_owned()
+            }
+            PlanDecisionError::AlreadyDecided => {
+                "A plan decision was already applied for this revision.".to_owned()
+            }
+            PlanDecisionError::EmptyFeedback => "Usage: /graph edit <feedback>".to_owned(),
+            PlanDecisionError::RevisionCap => {
+                format!("At most {MAX_PLAN_REVISIONS} plan revisions are allowed.")
+            }
+            PlanDecisionError::AgentBusy => {
+                "The planning agent is busy; wait for the current plan turn to finish.".to_owned()
+            }
+            PlanDecisionError::InvalidRevisionPlan(message) => {
+                format!("Approved plan steps are invalid: {message}")
+            }
+        }
+    }
+
+    fn current_plan_revision_n(run: &GraphRun) -> Option<u32> {
+        run.approval.as_ref().map(|approval| {
+            approval
+                .revisions
+                .last()
+                .map(|revision| revision.n)
+                .unwrap_or(0)
+        })
+    }
+
+    fn pending_plan_edit(pending: &PendingPlan) -> Option<(String, String)> {
+        match (&pending.edit_previous_json, &pending.edit_feedback) {
+            (Some(previous), Some(feedback)) => Some((previous.clone(), feedback.clone())),
+            _ => None,
+        }
+    }
+
+    fn planner_calls_for_pending(&self, pending: &PendingPlan) -> PlannerCalls {
+        let stored = self
+            .last_graph_run
+            .as_ref()
+            .filter(|run| run.plan.id == pending.run_id)
+            .map(|run| run.planner_calls);
+        PlannerCalls {
+            judge: pending.judge_calls,
+            plan: pending.plan_calls,
+            repair: pending.repair_calls,
+            edit: stored.map(|calls| calls.edit).unwrap_or(0),
+            replan: stored.map(|calls| calls.replan).unwrap_or(0),
+        }
+    }
+
+    fn restore_awaiting_after_edit_failure(&mut self, pending: &PendingPlan, cause: &str) {
+        if let Some(run) = self.last_graph_run.as_mut()
+            && run.plan.id == pending.run_id
+            && run.phase == GraphRunPhase::Planning
+        {
+            run.phase = GraphRunPhase::AwaitingApproval;
+            if let Err(error) = save_run(&self.workspace_root, run) {
+                self.push_system(format!(
+                    "Could not save the plan after edit failure: {error}"
+                ));
+            }
+        }
+        self.push_system(format!(
+            "Plan edit failed: {cause}; previous revision kept."
+        ));
+    }
+
+    /// FR-943: approve, edit, or reject the awaiting plan (serialized via the app loop).
+    pub fn decide_plan(
+        &mut self,
+        decision: PlanDecisionKind,
+        plan_id: String,
+        revision: u32,
+        by: DecisionBy,
+    ) -> Result<(), PlanDecisionError> {
+        match self.apply_plan_decision(decision, plan_id, revision, by) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.push_system(Self::plan_decision_notice(error.clone()));
+                Err(error)
+            }
+        }
+    }
+
+    fn apply_plan_decision(
+        &mut self,
+        decision: PlanDecisionKind,
+        plan_id: String,
+        revision: u32,
+        by: DecisionBy,
+    ) -> Result<(), PlanDecisionError> {
+        if self.pending_plan.is_some() {
+            return Err(PlanDecisionError::AgentBusy);
+        }
+        let approval_stale = self.approval_is_stale();
+        let run = self
+            .last_graph_run
+            .as_mut()
+            .filter(|run| run.phase == GraphRunPhase::AwaitingApproval)
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        if run.plan.id != plan_id {
+            return Err(PlanDecisionError::WrongPlanId);
+        }
+        let current = Self::current_plan_revision_n(run).unwrap_or(0);
+        if revision != current {
+            return Err(PlanDecisionError::StaleRevision);
+        }
+        let approval = run
+            .approval
+            .as_mut()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        if approval.state != ApprovalState::Pending {
+            return Err(PlanDecisionError::AlreadyDecided);
+        }
+        match decision {
+            PlanDecisionKind::Approve => {
+                if approval_stale {
+                    return Err(PlanDecisionError::StaleRecord);
+                }
+                self.approve_awaiting_plan(by)?;
+            }
+            PlanDecisionKind::Edit(feedback) => {
+                if approval_stale {
+                    return Err(PlanDecisionError::StaleRecord);
+                }
+                if feedback.trim().is_empty() {
+                    return Err(PlanDecisionError::EmptyFeedback);
+                }
+                if approval.revisions.len() as u32 >= MAX_PLAN_REVISIONS {
+                    return Err(PlanDecisionError::RevisionCap);
+                }
+                self.begin_plan_edit(feedback, by)?;
+            }
+            PlanDecisionKind::Reject => {
+                self.reject_awaiting_plan(by)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn approve_awaiting_plan(&mut self, by: DecisionBy) -> Result<(), PlanDecisionError> {
+        let (triage, steps, tasks, user_prompt, plan_id, orchestrate_started, plan_fixed) = {
+            let run = self
+                .last_graph_run
+                .as_ref()
+                .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+            let approval = run
+                .approval
+                .as_ref()
+                .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+            let revision = approval
+                .revisions
+                .last()
+                .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+            (
+                run.triage
+                    .clone()
+                    .ok_or(PlanDecisionError::NotAwaitingApproval)?,
+                revision.steps.clone(),
+                run.plan.tasks.clone(),
+                run.plan.user_prompt.clone(),
+                run.plan.id.clone(),
+                run.orchestrate_started_ms.unwrap_or_else(unix_ms_now),
+                run.plan_fixed_ms.unwrap_or_else(unix_ms_now),
+            )
+        };
+        let limits = self.graph_limits();
+        let available = self.registered_runner_names();
+        let ctx = PlanContext {
+            user_prompt: &user_prompt,
+            available_runners: &available,
+            runner_allowed: &|runner: &str| self.runner_is_allowed(runner),
+            effective_model: &|runner: &str| {
+                runner_from_str(runner).and_then(|agent| {
+                    self.effective_model_for(agent, "").filter(|model| {
+                        dmuxai::model_policy::validate_model_for_runner(runner, model).is_ok()
+                    })
+                })
+            },
+            validate_model: &dmuxai::model_policy::validate_model_for_runner,
+        };
+        let mut graph_plan = graph_plan_from_revision_steps(
+            &plan_id,
+            &user_prompt,
+            &triage.model,
+            &tasks,
+            &steps,
+            limits,
+            &ctx,
+        )
+        .map_err(|errors| {
+            PlanDecisionError::InvalidRevisionPlan(
+                errors
+                    .iter()
+                    .map(|err| err.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        })?;
+        Self::attach_orchestrate_node(&mut graph_plan, &triage, orchestrate_started, plan_fixed);
+        let decided_at = unix_ms_now();
+        let run = self
+            .last_graph_run
+            .as_mut()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        let approval = run
+            .approval
+            .as_mut()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        approval.state = ApprovalState::Approved;
+        approval.decided_by = Some(by);
+        approval.decided_at_ms = Some(decided_at);
+        run.phase = GraphRunPhase::Active;
+        run.plan = graph_plan;
+        if let Err(error) = save_run(&self.workspace_root, run) {
+            self.push_system(format!("Could not save the approved plan: {error}"));
+        }
+        let run = self.last_graph_run.clone().expect("approved run");
+        self.graph_approval_stale = None;
+        self.start_graph_run_record(run);
+        Ok(())
+    }
+
+    fn reject_awaiting_plan(&mut self, by: DecisionBy) -> Result<(), PlanDecisionError> {
+        let run = self
+            .last_graph_run
+            .as_mut()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        let approval = run
+            .approval
+            .as_mut()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        approval.state = ApprovalState::Rejected;
+        approval.decided_by = Some(by);
+        approval.decided_at_ms = Some(unix_ms_now());
+        run.phase = GraphRunPhase::Rejected;
+        if let Err(error) = save_run(&self.workspace_root, run) {
+            self.push_system(format!("Could not save the rejected plan: {error}"));
+        }
+        self.graph_approval_stale = None;
+        self.push_system("Plan rejected.".to_owned());
+        Ok(())
+    }
+
+    fn begin_plan_edit(
+        &mut self,
+        feedback: String,
+        _by: DecisionBy,
+    ) -> Result<(), PlanDecisionError> {
+        let run = self
+            .last_graph_run
+            .as_ref()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        let triage = run
+            .triage
+            .as_ref()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        let approval = run
+            .approval
+            .as_ref()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        let revision = approval
+            .revisions
+            .last()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        let agent =
+            runner_from_str(&triage.runner).ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        let previous_json = plan_json_for_edit(&revision.steps, &run.plan.tasks);
+        let prompt = run.plan.user_prompt.clone();
+        let run_id = run.plan.id.clone();
+        self.begin_plan_edit_turn(
+            prompt,
+            agent,
+            triage.route,
+            triage.reason.clone(),
+            triage.source,
+            triage.cause,
+            run_id,
+            run.planner_calls.judge,
+            triage.elapsed_ms,
+            triage.model.clone(),
+            triage.runner.clone(),
+            run.orchestrate_started_ms.unwrap_or_else(unix_ms_now),
+            previous_json,
+            feedback,
+            run.planner_calls,
+        )?;
+        Ok(())
+    }
+
+    fn attach_orchestrate_node(
+        plan: &mut GraphPlan,
+        triage: &Triage,
+        started_ms: u64,
+        finished_ms: u64,
+    ) {
+        let summary = triage.reason.trim();
+        let job = if summary.is_empty() {
+            "Judge and plan".to_owned()
+        } else {
+            format!("Judge and plan: {summary}")
+        };
+        plan.orchestrator_model = triage.model.clone();
+        plan.nodes.insert(
+            0,
+            GraphNode {
+                id: "orchestrate".to_owned(),
+                role: NodeRole::Orchestrate,
+                job,
+                runner: triage.runner.clone(),
+                model_id: triage.model.clone(),
+                skill: None,
+                requires_gate: false,
+                status: GraphNodeStatus::Completed,
+                attempt: 0,
+                task: None,
+                started_at_ms: Some(started_ms),
+                finished_at_ms: Some(finished_ms),
+            },
+        );
     }
 
     /// `/plan`: skip the judge and start a plan turn (FR-945).
@@ -4485,6 +4966,7 @@ impl App {
             },
             None,
             override_kind,
+            None,
         );
     }
 
@@ -4586,11 +5068,58 @@ impl App {
             judge_calls,
         );
         run.planner_calls = planner_calls;
+        run.orchestrate_started_ms = Some(unix_ms_now().saturating_sub(elapsed_ms));
+        run.plan_fixed_ms = Some(unix_ms_now());
         self.push_system(built.note);
         if let Err(error) = save_run(&self.workspace_root, &run) {
             self.push_system(format!("Could not save the fallback plan: {error}"));
         }
         self.last_graph_run = Some(run);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_plan_edit_turn(
+        &mut self,
+        prompt: String,
+        agent: Agent,
+        route: Route,
+        verdict_reason: String,
+        triage_source: TriageSource,
+        triage_cause: Option<FallbackCause>,
+        run_id: String,
+        judge_calls: u32,
+        triage_elapsed_ms: u64,
+        model: String,
+        runner: String,
+        orchestrate_started_ms: u64,
+        previous_json: String,
+        feedback: String,
+        planner_calls: PlannerCalls,
+    ) -> Result<(), PlanDecisionError> {
+        if self.busy_agents.contains(&agent) || self.pending_plan.is_some() {
+            return Err(PlanDecisionError::AgentBusy);
+        }
+        self.start_plan_turn(
+            prompt,
+            agent,
+            route,
+            verdict_reason,
+            triage_source,
+            triage_cause,
+            run_id,
+            judge_calls,
+            triage_elapsed_ms,
+            model,
+            runner,
+            orchestrate_started_ms,
+            0,
+            Vec::new(),
+            planner_calls,
+            None,
+            None,
+            Some((previous_json, feedback)),
+        );
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4613,6 +5142,7 @@ impl App {
         planner_calls: PlannerCalls,
         user_saved_mode: Option<ExecutionMode>,
         override_kind: Option<OverrideKind>,
+        edit: Option<(String, String)>,
     ) {
         if self.pending_plan.is_some() {
             self.park_fallback_plan(
@@ -4699,7 +5229,27 @@ impl App {
                 models,
             })
             .collect();
-        let plan_prompt = match if attempt == 0 {
+        let plan_prompt = match if attempt > 0 {
+            let errors: Vec<&str> = repair_errors.iter().map(String::as_str).collect();
+            build_plan_prompt(&PlanPromptRequest {
+                user_prompt: &prompt,
+                nonce: &nonce,
+                verdict_reason: &verdict_reason,
+                runners: &allowed_refs,
+                mode: PlanPromptMode::Repair { errors: &errors },
+            })
+        } else if let Some((previous, feedback)) = edit.as_ref() {
+            build_plan_prompt(&PlanPromptRequest {
+                user_prompt: &prompt,
+                nonce: &nonce,
+                verdict_reason: &verdict_reason,
+                runners: &allowed_refs,
+                mode: PlanPromptMode::Edit {
+                    previous_plan: previous,
+                    feedback,
+                },
+            })
+        } else if attempt == 0 {
             build_plan_prompt(&PlanPromptRequest {
                 user_prompt: &prompt,
                 nonce: &nonce,
@@ -4749,7 +5299,10 @@ impl App {
         };
         let mut plan_calls = planner_calls.plan;
         let mut repair_calls = planner_calls.repair;
-        if attempt == 0 {
+        let mut edit_calls = planner_calls.edit;
+        if edit.is_some() && attempt == 0 {
+            edit_calls += 1;
+        } else if attempt == 0 {
             plan_calls += 1;
         } else {
             repair_calls += 1;
@@ -4758,7 +5311,7 @@ impl App {
             judge: planner_calls.judge,
             plan: plan_calls,
             repair: repair_calls,
-            edit: planner_calls.edit,
+            edit: edit_calls,
             replan: planner_calls.replan,
         };
         let triage = Triage {
@@ -4771,28 +5324,43 @@ impl App {
             model: model.clone(),
             elapsed_ms: triage_elapsed_ms,
         };
-        let planning_plan = GraphPlan {
-            schema: "dmuxai.graph/v1".to_owned(),
-            id: run_id.clone(),
-            orchestrator_model: model.clone(),
-            user_prompt: prompt.clone(),
-            nodes: Vec::new(),
-            edges: Vec::new(),
-            limits: self.graph_limits(),
-            tasks: Vec::new(),
-        };
-        let mut planning_run = self.build_graph_run(
-            planning_plan,
-            GraphRunPhase::Planning,
-            triage,
-            None,
-            judge_calls,
-        );
-        planning_run.planner_calls = updated_calls;
-        if let Err(error) = save_run(&self.workspace_root, &planning_run) {
-            self.push_system(format!("Could not save the planning run: {error}"));
+        let editing_existing = self
+            .last_graph_run
+            .as_ref()
+            .is_some_and(|run| run.plan.id == run_id && (edit.is_some() || run.approval.is_some()));
+        if editing_existing {
+            let run = self.last_graph_run.as_mut().expect("edit run");
+            run.phase = GraphRunPhase::Planning;
+            run.planner_calls = updated_calls;
+            run.orchestrate_started_ms = Some(orchestrate_started_ms);
+            if let Err(error) = save_run(&self.workspace_root, run) {
+                self.push_system(format!("Could not save the planning run: {error}"));
+            }
+        } else {
+            let planning_plan = GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: run_id.clone(),
+                orchestrator_model: model.clone(),
+                user_prompt: prompt.clone(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                limits: self.graph_limits(),
+                tasks: Vec::new(),
+            };
+            let mut planning_run = self.build_graph_run(
+                planning_plan,
+                GraphRunPhase::Planning,
+                triage,
+                None,
+                judge_calls,
+            );
+            planning_run.planner_calls = updated_calls;
+            planning_run.orchestrate_started_ms = Some(orchestrate_started_ms);
+            if let Err(error) = save_run(&self.workspace_root, &planning_run) {
+                self.push_system(format!("Could not save the planning run: {error}"));
+            }
+            self.last_graph_run = Some(planning_run);
         }
-        self.last_graph_run = Some(planning_run);
         self.push_system(format!("Planning with {runner} {model}…"));
         match self.adapters[index].send(request) {
             Ok(()) => {
@@ -4832,26 +5400,58 @@ impl App {
                     triage_elapsed_ms,
                     model,
                     runner,
+                    edit_previous_json: edit.as_ref().map(|(previous, _)| previous.clone()),
+                    edit_feedback: edit.as_ref().map(|(_, feedback)| feedback.clone()),
                 });
             }
             Err(error) => {
                 let _ = self.adapters[index].select_mode(saved_mode);
                 self.push_system(format!("Could not start plan turn with {agent}: {error}"));
-                self.park_fallback_plan(
-                    prompt,
-                    agent,
-                    route,
-                    verdict_reason,
-                    triage_source,
-                    triage_cause,
-                    run_id,
-                    judge_calls,
-                    triage_elapsed_ms,
-                    updated_calls,
-                    "error",
-                    None,
-                    None,
-                );
+                if edit.is_some() {
+                    let pending = PendingPlan {
+                        agent,
+                        conversation_id: self.conversation_id.clone(),
+                        turn_id: StoredTurnId::new(turn_id.as_str()),
+                        buffer: String::new(),
+                        buffer_chars: 0,
+                        started: Instant::now(),
+                        last_event: Instant::now(),
+                        prompt,
+                        saved_mode,
+                        run_id,
+                        route,
+                        verdict_reason,
+                        triage_source,
+                        triage_cause,
+                        judge_calls,
+                        plan_calls,
+                        repair_calls,
+                        attempt,
+                        orchestrate_started_ms,
+                        triage_elapsed_ms,
+                        model,
+                        runner,
+                        edit_previous_json: edit.as_ref().map(|(previous, _)| previous.clone()),
+                        edit_feedback: edit.as_ref().map(|(_, feedback)| feedback.clone()),
+                    };
+                    self.restore_awaiting_after_edit_failure(&pending, "send error");
+                } else {
+                    self.park_fallback_plan(
+                        prompt,
+                        agent,
+                        route,
+                        verdict_reason,
+                        triage_source,
+                        triage_cause,
+                        run_id,
+                        judge_calls,
+                        triage_elapsed_ms,
+                        updated_calls,
+                        "error",
+                        None,
+                        None,
+                    );
+                }
             }
         }
     }
@@ -4959,10 +5559,60 @@ impl App {
             repair: pending.repair_calls,
             ..Default::default()
         };
+        run.orchestrate_started_ms = Some(pending.orchestrate_started_ms);
+        run.plan_fixed_ms = Some(unix_ms_now());
         if let Err(error) = save_run(&self.workspace_root, &run) {
             self.push_system(format!("Could not save the plan: {error}"));
         }
         self.last_graph_run = Some(run);
+    }
+
+    fn finish_validated_plan_edit(
+        &mut self,
+        pending: PendingPlan,
+        doc: &PlanDoc,
+        mut graph_plan: GraphPlan,
+    ) {
+        let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
+        graph_plan.id = pending.run_id.clone();
+        graph_plan.orchestrator_model = pending.model.clone();
+        graph_plan.limits = self.graph_limits();
+        let feedback = pending.edit_feedback.clone();
+        let steps = Self::revision_steps_from_doc(doc);
+        let Some(run) = self
+            .last_graph_run
+            .as_mut()
+            .filter(|run| run.plan.id == pending.run_id)
+        else {
+            return;
+        };
+        let edit_calls = run.planner_calls.edit;
+        let Some(approval) = run.approval.as_mut() else {
+            return;
+        };
+        let next_n = approval.revisions.last().map(|rev| rev.n + 1).unwrap_or(1);
+        approval.revisions.push(PlanRevision {
+            n: next_n,
+            source: "edit".to_owned(),
+            steps,
+            feedback,
+            errors: None,
+            raw: None,
+        });
+        approval.state = ApprovalState::Pending;
+        run.plan = graph_plan;
+        run.phase = GraphRunPhase::AwaitingApproval;
+        run.plan_fixed_ms = Some(unix_ms_now());
+        run.planner_calls = PlannerCalls {
+            judge: pending.judge_calls,
+            plan: pending.plan_calls,
+            repair: pending.repair_calls,
+            edit: edit_calls,
+            ..run.planner_calls
+        };
+        if let Err(error) = save_run(&self.workspace_root, run) {
+            self.push_system(format!("Could not save the edited plan: {error}"));
+        }
     }
 
     /// Retires the plan turn id and cancels the adapter turn (overflow and
@@ -5018,26 +5668,30 @@ impl App {
                     self.end_run_state(pending.agent, false, false);
                     let _ =
                         self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
-                    self.park_fallback_plan(
-                        pending.prompt,
-                        pending.agent,
-                        pending.route,
-                        pending.verdict_reason,
-                        pending.triage_source,
-                        pending.triage_cause,
-                        pending.run_id,
-                        pending.judge_calls,
-                        pending.triage_elapsed_ms,
-                        PlannerCalls {
-                            judge: pending.judge_calls,
-                            plan: pending.plan_calls,
-                            repair: pending.repair_calls,
-                            ..Default::default()
-                        },
-                        "error",
-                        None,
-                        None,
-                    );
+                    if pending.edit_previous_json.is_some() {
+                        self.restore_awaiting_after_edit_failure(&pending, "error");
+                    } else {
+                        self.park_fallback_plan(
+                            pending.prompt,
+                            pending.agent,
+                            pending.route,
+                            pending.verdict_reason,
+                            pending.triage_source,
+                            pending.triage_cause,
+                            pending.run_id,
+                            pending.judge_calls,
+                            pending.triage_elapsed_ms,
+                            PlannerCalls {
+                                judge: pending.judge_calls,
+                                plan: pending.plan_calls,
+                                repair: pending.repair_calls,
+                                ..Default::default()
+                            },
+                            "error",
+                            None,
+                            None,
+                        );
+                    }
                 } else if let Some(pending) = self.pending_plan.as_mut() {
                     pending.buffer_chars += delta_chars;
                     pending.buffer.push_str(&delta);
@@ -5073,7 +5727,11 @@ impl App {
                         };
                         match validate_plan(&doc, &ctx) {
                             Ok(graph_plan) => {
-                                self.finish_validated_plan(pending, &doc, graph_plan);
+                                if pending.edit_previous_json.is_some() {
+                                    self.finish_validated_plan_edit(pending, &doc, graph_plan);
+                                } else {
+                                    self.finish_validated_plan(pending, &doc, graph_plan);
+                                }
                             }
                             Err(errors) if pending.attempt == 0 => {
                                 let _ = self.adapters[adapter_index(pending.agent)]
@@ -5081,6 +5739,8 @@ impl App {
                                 let messages: Vec<String> =
                                     errors.iter().map(|err| err.to_string()).collect();
                                 let saved_mode = pending.saved_mode;
+                                let edit_ctx = Self::pending_plan_edit(&pending);
+                                let planner_calls = self.planner_calls_for_pending(&pending);
                                 self.start_plan_turn(
                                     pending.prompt,
                                     pending.agent,
@@ -5096,42 +5756,45 @@ impl App {
                                     pending.orchestrate_started_ms,
                                     1,
                                     messages,
-                                    PlannerCalls {
-                                        judge: pending.judge_calls,
-                                        plan: pending.plan_calls,
-                                        repair: pending.repair_calls,
-                                        ..Default::default()
-                                    },
+                                    planner_calls,
                                     Some(saved_mode),
                                     None,
+                                    edit_ctx,
                                 );
                             }
                             Err(errors) => {
                                 let _ = self.adapters[adapter_index(pending.agent)]
                                     .select_mode(pending.saved_mode);
-                                let raw = cap_revision_raw(&pending.buffer);
-                                let error_lines: Vec<String> =
-                                    errors.iter().map(|err| err.to_string()).collect();
-                                self.park_fallback_plan(
-                                    pending.prompt,
-                                    pending.agent,
-                                    pending.route,
-                                    pending.verdict_reason,
-                                    pending.triage_source,
-                                    pending.triage_cause,
-                                    pending.run_id,
-                                    pending.judge_calls,
-                                    pending.triage_elapsed_ms,
-                                    PlannerCalls {
-                                        judge: pending.judge_calls,
-                                        plan: pending.plan_calls,
-                                        repair: pending.repair_calls,
-                                        ..Default::default()
-                                    },
-                                    "plan invalid twice",
-                                    Some(error_lines),
-                                    Some(raw),
-                                );
+                                if pending.edit_previous_json.is_some() {
+                                    self.restore_awaiting_after_edit_failure(
+                                        &pending,
+                                        "plan invalid twice",
+                                    );
+                                } else {
+                                    let raw = cap_revision_raw(&pending.buffer);
+                                    let error_lines: Vec<String> =
+                                        errors.iter().map(|err| err.to_string()).collect();
+                                    self.park_fallback_plan(
+                                        pending.prompt,
+                                        pending.agent,
+                                        pending.route,
+                                        pending.verdict_reason,
+                                        pending.triage_source,
+                                        pending.triage_cause,
+                                        pending.run_id,
+                                        pending.judge_calls,
+                                        pending.triage_elapsed_ms,
+                                        PlannerCalls {
+                                            judge: pending.judge_calls,
+                                            plan: pending.plan_calls,
+                                            repair: pending.repair_calls,
+                                            ..Default::default()
+                                        },
+                                        "plan invalid twice",
+                                        Some(error_lines),
+                                        Some(raw),
+                                    );
+                                }
                             }
                         }
                     }
@@ -5141,6 +5804,8 @@ impl App {
                         let messages: Vec<String> =
                             errors.iter().map(|err| err.to_string()).collect();
                         let saved_mode = pending.saved_mode;
+                        let edit_ctx = Self::pending_plan_edit(&pending);
+                        let planner_calls = self.planner_calls_for_pending(&pending);
                         self.start_plan_turn(
                             pending.prompt,
                             pending.agent,
@@ -5156,42 +5821,45 @@ impl App {
                             pending.orchestrate_started_ms,
                             1,
                             messages,
-                            PlannerCalls {
-                                judge: pending.judge_calls,
-                                plan: pending.plan_calls,
-                                repair: pending.repair_calls,
-                                ..Default::default()
-                            },
+                            planner_calls,
                             Some(saved_mode),
                             None,
+                            edit_ctx,
                         );
                     }
                     Err(errors) => {
                         let _ = self.adapters[adapter_index(pending.agent)]
                             .select_mode(pending.saved_mode);
-                        let raw = cap_revision_raw(&pending.buffer);
-                        let error_lines: Vec<String> =
-                            errors.iter().map(|err| err.to_string()).collect();
-                        self.park_fallback_plan(
-                            pending.prompt,
-                            pending.agent,
-                            pending.route,
-                            pending.verdict_reason,
-                            pending.triage_source,
-                            pending.triage_cause,
-                            pending.run_id,
-                            pending.judge_calls,
-                            pending.triage_elapsed_ms,
-                            PlannerCalls {
-                                judge: pending.judge_calls,
-                                plan: pending.plan_calls,
-                                repair: pending.repair_calls,
-                                ..Default::default()
-                            },
-                            "plan invalid twice",
-                            Some(error_lines),
-                            Some(raw),
-                        );
+                        if pending.edit_previous_json.is_some() {
+                            self.restore_awaiting_after_edit_failure(
+                                &pending,
+                                "plan invalid twice",
+                            );
+                        } else {
+                            let raw = cap_revision_raw(&pending.buffer);
+                            let error_lines: Vec<String> =
+                                errors.iter().map(|err| err.to_string()).collect();
+                            self.park_fallback_plan(
+                                pending.prompt,
+                                pending.agent,
+                                pending.route,
+                                pending.verdict_reason,
+                                pending.triage_source,
+                                pending.triage_cause,
+                                pending.run_id,
+                                pending.judge_calls,
+                                pending.triage_elapsed_ms,
+                                PlannerCalls {
+                                    judge: pending.judge_calls,
+                                    plan: pending.plan_calls,
+                                    repair: pending.repair_calls,
+                                    ..Default::default()
+                                },
+                                "plan invalid twice",
+                                Some(error_lines),
+                                Some(raw),
+                            );
+                        }
                     }
                 }
                 true
@@ -5205,26 +5873,30 @@ impl App {
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, false, false);
                 let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
-                self.park_fallback_plan(
-                    pending.prompt,
-                    pending.agent,
-                    pending.route,
-                    pending.verdict_reason,
-                    pending.triage_source,
-                    pending.triage_cause,
-                    pending.run_id,
-                    pending.judge_calls,
-                    pending.triage_elapsed_ms,
-                    PlannerCalls {
-                        judge: pending.judge_calls,
-                        plan: pending.plan_calls,
-                        repair: pending.repair_calls,
-                        ..Default::default()
-                    },
-                    "error",
-                    None,
-                    None,
-                );
+                if pending.edit_previous_json.is_some() {
+                    self.restore_awaiting_after_edit_failure(&pending, "error");
+                } else {
+                    self.park_fallback_plan(
+                        pending.prompt,
+                        pending.agent,
+                        pending.route,
+                        pending.verdict_reason,
+                        pending.triage_source,
+                        pending.triage_cause,
+                        pending.run_id,
+                        pending.judge_calls,
+                        pending.triage_elapsed_ms,
+                        PlannerCalls {
+                            judge: pending.judge_calls,
+                            plan: pending.plan_calls,
+                            repair: pending.repair_calls,
+                            ..Default::default()
+                        },
+                        "error",
+                        None,
+                        None,
+                    );
+                }
                 true
             }
             AgentEvent::ModelsListed { .. }
@@ -5255,26 +5927,30 @@ impl App {
         self.activities.remove(&pending.agent);
         self.end_run_state(pending.agent, false, false);
         let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
-        self.park_fallback_plan(
-            pending.prompt,
-            pending.agent,
-            pending.route,
-            pending.verdict_reason,
-            pending.triage_source,
-            pending.triage_cause,
-            pending.run_id,
-            pending.judge_calls,
-            pending.triage_elapsed_ms,
-            PlannerCalls {
-                judge: pending.judge_calls,
-                plan: pending.plan_calls,
-                repair: pending.repair_calls,
-                ..Default::default()
-            },
-            "timeout",
-            None,
-            None,
-        );
+        if pending.edit_previous_json.is_some() {
+            self.restore_awaiting_after_edit_failure(&pending, "timeout");
+        } else {
+            self.park_fallback_plan(
+                pending.prompt,
+                pending.agent,
+                pending.route,
+                pending.verdict_reason,
+                pending.triage_source,
+                pending.triage_cause,
+                pending.run_id,
+                pending.judge_calls,
+                pending.triage_elapsed_ms,
+                PlannerCalls {
+                    judge: pending.judge_calls,
+                    plan: pending.plan_calls,
+                    repair: pending.repair_calls,
+                    ..Default::default()
+                },
+                "timeout",
+                None,
+                None,
+            );
+        }
     }
 
     fn build_graph_run(
@@ -5301,6 +5977,8 @@ impl App {
                 judge: judge_calls,
                 ..Default::default()
             },
+            orchestrate_started_ms: None,
+            plan_fixed_ms: None,
         }
     }
 
@@ -18037,6 +18715,11 @@ mod tests {
         h.app.submit_prompt();
         assert_eq!(h.sent.lock().unwrap().len(), sent_before);
         assert!(!last_system(&h.app).contains(PLAN_AWAITING_APPROVAL_MSG));
+
+        h.app.input = "  //not a comment".to_owned();
+        h.app.submit_prompt();
+        assert_eq!(h.app.input, "  //not a comment");
+        assert!(last_system(&h.app).contains(PLAN_AWAITING_APPROVAL_MSG));
     }
 
     // TC-947 / FR-942: restart keeps awaiting approval as stale; triage/planning cancel.
@@ -18062,7 +18745,14 @@ mod tests {
             waiting_gate_node: None,
             approval: Some(Approval {
                 state: ApprovalState::Pending,
-                revisions: Vec::new(),
+                revisions: vec![PlanRevision {
+                    n: 1,
+                    source: "agent".to_owned(),
+                    steps: Vec::new(),
+                    feedback: None,
+                    errors: None,
+                    raw: None,
+                }],
                 decided_by: None,
                 decided_at_ms: None,
             }),
@@ -18114,7 +18804,17 @@ mod tests {
         h.app.submit_prompt();
         assert!(last_system(&h.app).contains("Cannot approve"));
 
-        // P06: `/graph reject` on stale records and dashboard `plan_decision`.
+        h.app.input = "/graph edit tweak".to_owned();
+        h.app.submit_prompt();
+        assert!(last_system(&h.app).contains("Cannot approve"));
+
+        h.app.input = "/graph reject".to_owned();
+        h.app.submit_prompt();
+        assert_eq!(
+            h.app.last_graph_run.as_ref().map(|run| run.phase),
+            Some(GraphRunPhase::Rejected)
+        );
+        assert!(!h.app.approval_is_stale());
 
         let saved_planning =
             dmuxai::graph::load_run(&workspace, "run-planning").expect("planning record");
@@ -18151,6 +18851,49 @@ mod tests {
             .count();
         assert_eq!(executable, 1);
         assert!(run.plan.edges.is_empty());
+
+        let mut h2 = plan_gate_test_app();
+        h2.app.input = "research, plan, review and implement Y".to_owned();
+        h2.app.submit_prompt();
+        let judge2 = h2.sent.lock().unwrap()[0].1.clone();
+        assert!(h2.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge2,
+            AgentEvent::TextDelta("{\"route\":\"complex\",\"reason\":\"multi\"}".to_owned())
+        )));
+        assert!(h2.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge2,
+            AgentEvent::Completed
+        )));
+        let plan_req = h2.sent.lock().unwrap()[1].1.clone();
+        assert!(h2.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::TextDelta(two_step_codex_plan_json().to_owned())
+        )));
+        assert!(h2.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::Completed
+        )));
+        let awaiting = h2.app.last_graph_run.as_ref().expect("complex awaiting");
+        assert_eq!(awaiting.phase, GraphRunPhase::AwaitingApproval);
+        let plan_id = awaiting.plan.id.clone();
+        h2.app
+            .decide_plan(PlanDecisionKind::Approve, plan_id, 1, DecisionBy::Tui)
+            .unwrap();
+        let active = h2.app.graph_session.as_ref().expect("active graph").run();
+        let steps: Vec<_> = active
+            .plan
+            .nodes
+            .iter()
+            .filter(|node| node.role != NodeRole::Orchestrate)
+            .collect();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(active.plan.edges.len(), 1);
+        assert_eq!(active.plan.edges[0].from, "step-1");
+        assert_eq!(active.plan.edges[0].to, "step-2");
     }
 
     // TC-968 / FR-951: the record keeps the triage agent and its effective model.
@@ -18188,10 +18931,422 @@ mod tests {
         let triage = run.triage.as_ref().unwrap();
         assert_eq!(triage.runner, "agy");
         assert_eq!(triage.model, "gemini-3.8-flash-medium");
+        let plan_id = run.plan.id.clone();
+        h.app
+            .decide_plan(PlanDecisionKind::Approve, plan_id, 1, DecisionBy::Tui)
+            .unwrap();
+        let active = h.app.graph_session.as_ref().expect("active").run();
+        let orch = active
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.role == NodeRole::Orchestrate)
+            .expect("orchestrate node");
+        assert_eq!(orch.runner, "agy");
+        assert_eq!(orch.model_id, "gemini-3.8-flash-medium");
+        assert_eq!(orch.status, GraphNodeStatus::Completed);
+        assert!(orch.started_at_ms.is_some());
+        assert!(orch.finished_at_ms.is_some());
+        assert!(orch.job.contains("Judge and plan"));
+        assert_eq!(active.plan.orchestrator_model, "gemini-3.8-flash-medium");
+    }
+
+    // TC-948 / FR-943: approve starts scheduling from the validated plan.
+    #[test]
+    fn approve_starts_graph() {
+        let mut h = plan_gate_test_app();
+        h.app.settings.graph_max_parallel = 2;
+        let plan_req = complete_complex_judge(&mut h);
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::TextDelta(three_step_codex_plan_json().to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::Completed
+        )));
+        let run = h.app.last_graph_run.as_ref().unwrap();
+        let plan_id = run.plan.id.clone();
+        let approval = run.approval.as_ref().unwrap();
+        assert_eq!(approval.state, ApprovalState::Pending);
+        h.app.input = "/graph approve".to_owned();
+        h.app.submit_prompt();
+        let active = h.app.graph_session.as_ref().expect("graph started").run();
+        assert_eq!(active.phase, GraphRunPhase::Active);
+        assert_eq!(
+            active.approval.as_ref().unwrap().state,
+            ApprovalState::Approved
+        );
+        assert_eq!(
+            active.approval.as_ref().unwrap().decided_by,
+            Some(DecisionBy::Tui)
+        );
+        assert!(
+            h.app.graph_agent_nodes.contains_key(&Agent::Codex),
+            "first ready node started"
+        );
+        assert!(
+            active
+                .plan
+                .nodes
+                .iter()
+                .any(|node| node.role == NodeRole::Orchestrate)
+        );
+        assert_eq!(plan_id, active.plan.id);
+    }
+
+    // TC-949 / FR-943: edit feedback runs a new plan turn and caps revisions at five.
+    #[test]
+    fn edit_replans_with_feedback() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval(&mut h);
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        h.app.input = "/graph edit 테스트 단계 빼줘".to_owned();
+        h.app.submit_prompt();
+        let edit_req = h.sent.lock().unwrap().last().unwrap().1.clone();
+        assert!(edit_req.prompt.contains("테스트 단계 빼줘"));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &edit_req,
+            AgentEvent::TextDelta(valid_codex_plan_json().to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &edit_req,
+            AgentEvent::Completed
+        )));
+        let run = h.app.last_graph_run.as_ref().unwrap();
+        assert_eq!(run.approval.as_ref().unwrap().revisions.len(), 2);
+        assert_eq!(run.approval.as_ref().unwrap().revisions[1].source, "edit");
+        assert_eq!(run.approval.as_ref().unwrap().revisions[1].n, 2);
+
+        h.app.input = "/graph edit".to_owned();
+        h.app.submit_prompt();
+        assert!(last_system(&h.app).contains("Usage"));
+
+        for n in 3..=5 {
+            h.app.input = format!("/graph edit tweak {n}");
+            h.app.submit_prompt();
+            let req = h.sent.lock().unwrap().last().unwrap().1.clone();
+            assert!(h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &req,
+                AgentEvent::TextDelta(valid_codex_plan_json().to_owned())
+            )));
+            assert!(h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &req,
+                AgentEvent::Completed
+            )));
+            assert_eq!(
+                h.app
+                    .last_graph_run
+                    .as_ref()
+                    .unwrap()
+                    .approval
+                    .as_ref()
+                    .unwrap()
+                    .revisions
+                    .len(),
+                n as usize
+            );
+        }
+        let revision = h
+            .app
+            .last_graph_run
+            .as_ref()
+            .and_then(App::current_plan_revision_n)
+            .unwrap();
+        assert_eq!(revision, 5);
+        assert_eq!(
+            h.app.decide_plan(
+                PlanDecisionKind::Edit("one more".to_owned()),
+                plan_id.clone(),
+                revision,
+                DecisionBy::Tui,
+            ),
+            Err(PlanDecisionError::RevisionCap)
+        );
+    }
+
+    // TC-949 / FR-943: edit repair keeps revision numbering and counts repair (not edit).
+    #[test]
+    fn edit_repair_keeps_revision_numbering() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval(&mut h);
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        h.app.input = "/graph edit drop tests".to_owned();
+        h.app.submit_prompt();
+        let edit_req = h.sent.lock().unwrap().last().unwrap().1.clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &edit_req,
+            AgentEvent::TextDelta(r#"{"steps":[]}"#.to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &edit_req,
+            AgentEvent::Completed
+        )));
+        assert_eq!(
+            h.sent.lock().unwrap().len(),
+            4,
+            "judge + plan + edit + repair"
+        );
+        let repair_req = h.sent.lock().unwrap().last().unwrap().1.clone();
+        assert!(repair_req.prompt.contains("Validation errors"));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &repair_req,
+            AgentEvent::TextDelta(valid_codex_plan_json().to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &repair_req,
+            AgentEvent::Completed
+        )));
+        let run = h.app.last_graph_run.as_ref().unwrap();
+        assert_eq!(run.phase, GraphRunPhase::AwaitingApproval);
+        assert_eq!(run.approval.as_ref().unwrap().revisions.len(), 2);
+        assert_eq!(run.approval.as_ref().unwrap().revisions[1].n, 2);
+        assert_eq!(run.approval.as_ref().unwrap().revisions[1].source, "edit");
+        assert_eq!(run.planner_calls.edit, 1);
+        assert_eq!(run.planner_calls.repair, 1);
+        assert_eq!(run.planner_calls.plan, 1);
+        assert_eq!(run.plan.id, plan_id);
+    }
+
+    // TC-949 / FR-943: failed edit restores awaiting approval without a new revision.
+    #[test]
+    fn edit_failure_keeps_previous_revision() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval(&mut h);
+        let revisions_before = h
+            .app
+            .last_graph_run
+            .as_ref()
+            .unwrap()
+            .approval
+            .as_ref()
+            .unwrap()
+            .revisions
+            .len();
+        h.app.input = "/graph edit break".to_owned();
+        h.app.submit_prompt();
+        for _ in 0..2 {
+            let req = h.sent.lock().unwrap().last().unwrap().1.clone();
+            assert!(h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &req,
+                AgentEvent::TextDelta(r#"{"steps":[]}"#.to_owned())
+            )));
+            assert!(h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &req,
+                AgentEvent::Completed
+            )));
+        }
+        let run = h.app.last_graph_run.as_ref().unwrap();
+        assert_eq!(run.phase, GraphRunPhase::AwaitingApproval);
+        assert_eq!(
+            run.approval.as_ref().unwrap().revisions.len(),
+            revisions_before
+        );
+        assert!(last_system(&h.app).contains("Plan edit failed"));
+        assert!(last_system(&h.app).contains("previous revision kept"));
+    }
+
+    // TC-950 / FR-943: reject ends the run; later approve is refused; Ctrl+C rejects too.
+    #[test]
+    fn reject_stops_run() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval(&mut h);
+        let sent_before = h.sent.lock().unwrap().len();
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        let revision =
+            App::current_plan_revision_n(h.app.last_graph_run.as_ref().unwrap()).unwrap();
+        h.app.input = "/graph reject".to_owned();
+        h.app.submit_prompt();
+        let run = h.app.last_graph_run.as_ref().unwrap();
+        assert_eq!(run.phase, GraphRunPhase::Rejected);
+        assert_eq!(
+            run.approval.as_ref().unwrap().state,
+            ApprovalState::Rejected
+        );
+        assert!(h.app.graph_session.is_none());
+        assert_eq!(h.sent.lock().unwrap().len(), sent_before);
+        assert!(last_system(&h.app).contains("Plan rejected."));
+        assert!(
+            h.app
+                .decide_plan(
+                    PlanDecisionKind::Approve,
+                    plan_id,
+                    revision,
+                    DecisionBy::Tui,
+                )
+                .is_err()
+        );
+
+        let mut ctrl = plan_gate_test_app();
+        reach_awaiting_approval(&mut ctrl);
+        ctrl.app.cancel_selected();
+        assert_eq!(
+            ctrl.app.last_graph_run.as_ref().map(|run| run.phase),
+            Some(GraphRunPhase::Rejected)
+        );
+
+        let mut busy = plan_gate_test_app();
+        reach_awaiting_approval(&mut busy);
+        busy.app.busy_agents.insert(Agent::Codex);
+        busy.app.cancel_selected();
+        assert_eq!(
+            busy.app.last_graph_run.as_ref().map(|run| run.phase),
+            Some(GraphRunPhase::AwaitingApproval)
+        );
+    }
+
+    // TC-950 / FR-943: reject works when the approval record has no revisions.
+    #[test]
+    fn reject_awaiting_without_revisions() {
+        let mut h = plan_gate_test_app();
+        let run = GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: "run-empty-rev".to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: "ship".to_owned(),
+                limits: dmuxai::graph::GraphLimits::default(),
+                tasks: Vec::new(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            },
+            conversation_id: h.app.conversation_id.as_str().to_owned(),
+            phase: GraphRunPhase::AwaitingApproval,
+            approval: Some(Approval {
+                state: ApprovalState::Pending,
+                revisions: Vec::new(),
+                decided_by: None,
+                decided_at_ms: None,
+            }),
+            ..Default::default()
+        };
+        h.app.last_graph_run = Some(run);
+        h.app
+            .decide_plan(
+                PlanDecisionKind::Reject,
+                "run-empty-rev".to_owned(),
+                0,
+                DecisionBy::Tui,
+            )
+            .unwrap();
+        assert_eq!(
+            h.app.last_graph_run.as_ref().unwrap().phase,
+            GraphRunPhase::Rejected
+        );
+    }
+
+    // TC-963 / FR-943: plan decision refusals use specific error variants.
+    #[test]
+    fn plan_decision_error_variants() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval(&mut h);
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        let revision =
+            App::current_plan_revision_n(h.app.last_graph_run.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            h.app.decide_plan(
+                PlanDecisionKind::Approve,
+                "wrong-id".to_owned(),
+                revision,
+                DecisionBy::Tui,
+            ),
+            Err(PlanDecisionError::WrongPlanId)
+        );
+        assert_eq!(
+            h.app.decide_plan(
+                PlanDecisionKind::Approve,
+                plan_id.clone(),
+                revision + 1,
+                DecisionBy::Tui,
+            ),
+            Err(PlanDecisionError::StaleRevision)
+        );
+    }
+
+    // TC-963 / FR-943: only the first decision for the current revision applies.
+    #[test]
+    fn concurrent_plan_decisions_first_wins() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval(&mut h);
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        h.app.input = "/graph edit round two".to_owned();
+        h.app.submit_prompt();
+        let edit_req = h.sent.lock().unwrap().last().unwrap().1.clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &edit_req,
+            AgentEvent::TextDelta(valid_codex_plan_json().to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &edit_req,
+            AgentEvent::Completed
+        )));
+        let revision = 2u32;
+        assert!(
+            h.app
+                .decide_plan(
+                    PlanDecisionKind::Approve,
+                    plan_id.clone(),
+                    revision,
+                    DecisionBy::Dashboard,
+                )
+                .is_ok()
+        );
+        assert!(
+            h.app
+                .decide_plan(
+                    PlanDecisionKind::Reject,
+                    plan_id.clone(),
+                    revision,
+                    DecisionBy::Tui,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            h.app.last_graph_run.as_ref().unwrap().phase,
+            GraphRunPhase::Active
+        );
+        assert_eq!(
+            h.app.decide_plan(
+                PlanDecisionKind::Edit("stale".to_owned()),
+                plan_id,
+                1,
+                DecisionBy::Dashboard,
+            ),
+            Err(PlanDecisionError::NotAwaitingApproval)
+        );
     }
 
     fn valid_codex_plan_json() -> &'static str {
         r#"{"tasks":[{"id":"task-1","title":"work","done_check":"done","areas":[],"size":"small","depends_on":[]}],"steps":[{"id":"step-1","role":"implement","job":"ship","runner":"codex","model":"composer-2.5","depends_on":[],"task":"task-1"}]}"#
+    }
+
+    fn three_step_codex_plan_json() -> &'static str {
+        r#"{"tasks":[{"id":"task-1","title":"work","done_check":"done","areas":[],"size":"small","depends_on":[]}],"steps":[
+            {"id":"step-1","role":"research","job":"research","runner":"codex","model":"composer-2.5","depends_on":[],"task":"task-1"},
+            {"id":"step-2","role":"implement","job":"build","runner":"codex","model":"composer-2.5","depends_on":["step-1"],"task":"task-1"},
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"}
+        ]}"#
+    }
+
+    fn two_step_codex_plan_json() -> &'static str {
+        r#"{"tasks":[{"id":"task-1","title":"work","done_check":"done","areas":[],"size":"small","depends_on":[]}],"steps":[
+            {"id":"step-1","role":"research","job":"research","runner":"codex","model":"composer-2.5","depends_on":[],"task":"task-1"},
+            {"id":"step-2","role":"implement","job":"build","runner":"codex","model":"composer-2.5","depends_on":["step-1"],"task":"task-1"}
+        ]}"#
     }
 
     fn complete_complex_judge(h: &mut PlanGateHarness) -> AgentRequest {

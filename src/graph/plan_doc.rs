@@ -571,6 +571,41 @@ pub(crate) fn validate_plan_with_limit(
     })
 }
 
+/// JSON snapshot of the current revision for an edit turn (FR-943).
+pub fn plan_json_for_edit(steps: &[PlanStep], tasks: &[PlanTask]) -> String {
+    #[derive(Serialize)]
+    struct Out<'a> {
+        tasks: &'a [PlanTask],
+        steps: &'a [PlanStep],
+    }
+    serde_json::to_string(&Out { tasks, steps }).unwrap_or_else(|_| "{}".to_owned())
+}
+
+/// Builds an executable [`GraphPlan`] from persisted revision steps (FR-943).
+pub fn graph_plan_from_revision_steps(
+    plan_id: &str,
+    user_prompt: &str,
+    orchestrator_model: &str,
+    tasks: &[PlanTask],
+    steps: &[PlanStep],
+    limits: super::types::GraphLimits,
+    ctx: &PlanContext<'_>,
+) -> Result<GraphPlan, Vec<PlanError>> {
+    let doc = PlanDoc {
+        steps: steps.to_vec(),
+        tasks: tasks.to_vec(),
+        require_tasks: !tasks.is_empty(),
+        task_errors: Vec::new(),
+    };
+    let max_steps = limits.max_nodes.max(1);
+    let mut plan = validate_plan_with_limit(&doc, ctx, max_steps)?;
+    plan.id = plan_id.to_owned();
+    plan.orchestrator_model = orchestrator_model.to_owned();
+    plan.user_prompt = user_prompt.to_owned();
+    plan.limits = limits;
+    Ok(plan)
+}
+
 /// FR-963, FR-964: task schema, ids, order, dependencies and the task->step
 /// mapping. Task count is capped by `max_steps` and the global 12-task limit.
 fn validate_tasks(doc: &PlanDoc, max_steps: usize, errors: &mut Vec<PlanError>) {

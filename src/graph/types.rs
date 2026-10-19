@@ -188,7 +188,16 @@ pub struct GraphRun {
     /// FR-958: planner call counters.
     #[serde(default)]
     pub planner_calls: PlannerCalls,
+    /// FR-951: judge start (ms since epoch) for the orchestrate node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrate_started_ms: Option<u64>,
+    /// FR-951: when the plan (or 1-node plan) was fixed at the gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_fixed_ms: Option<u64>,
 }
+
+/// FR-943: at most five plan revisions per run.
+pub const MAX_PLAN_REVISIONS: u32 = 5;
 
 impl GraphRun {
     /// Keeps at most [`PLAN_HISTORY_MAX`] entries, dropping the oldest.
