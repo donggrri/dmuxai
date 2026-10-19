@@ -4867,9 +4867,6 @@ impl App {
         let mut limits = self.graph_limits();
         limits.max_retries = 0;
         plan.limits = limits;
-        for node in &mut plan.nodes {
-            node.requires_gate = false;
-        }
         let triage = Triage {
             route,
             reason,
@@ -13500,7 +13497,7 @@ mod tests {
     #[test]
     fn summarize_focus_is_included_in_prompt() {
         let (mut app, sent) = test_app();
-        app.input = "keep the sqlite migration decision".to_owned();
+        app.input = "keep the sqlite schema decision".to_owned();
         app.submit_prompt();
         let first = sent.lock().unwrap()[0].1.clone();
         assert!(app.apply_agent_output(AgentOutput {
@@ -15672,7 +15669,7 @@ mod tests {
         app.settings.graph_allowed_runners = Some(Vec::new());
 
         // Complex multi-step prompt that would normally trigger a graph plan
-        app.input = "research the auth module, plan migration, implement fix, and test".to_owned();
+        app.input = "research the module, plan changes, implement fix, and test".to_owned();
         app.submit_prompt();
 
         // FR-930: empty allowed_runners still runs a quiet 1-node graph record.
@@ -18530,6 +18527,148 @@ mod tests {
         assert_eq!(run.phase, GraphRunPhase::Cancelled);
     }
 
+    // TC-951 / FR-944: sensitive-step gates on approved plans and 1-node runs.
+    #[test]
+    fn sensitive_gate_kept_for_plans() {
+        let mut h = plan_gate_test_app();
+        h.app.input = "please deploy the release".to_owned();
+        h.app.submit_prompt();
+        let judge = h.sent.lock().unwrap()[0].1.clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::TextDelta(
+                "{\"route\":\"complex\",\"reason\":\"needs several steps\"}".to_owned(),
+            )
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::Completed
+        )));
+        let plan_req = h.sent.lock().unwrap()[1].1.clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::TextDelta(sensitive_gate_plan_json().to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::Completed
+        )));
+        let awaiting = h.app.last_graph_run.as_ref().expect("awaiting approval");
+        let plan_id = awaiting.plan.id.clone();
+        h.app
+            .decide_plan(PlanDecisionKind::Approve, plan_id, 1, DecisionBy::Tui)
+            .unwrap();
+        let run = h.app.graph_session.as_ref().expect("active graph").run();
+        assert_eq!(run.phase, GraphRunPhase::WaitingGate);
+        let node_gate = |id: &str| {
+            run.plan
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .map(|node| node.requires_gate)
+                .expect("node")
+        };
+        assert!(node_gate("step-1"), "sensitive true gates the step");
+        assert!(
+            node_gate("step-2"),
+            "sensitive false does not clear deploy in the job"
+        );
+        assert!(
+            node_gate("step-3"),
+            "the user prompt keyword gates every step"
+        );
+        assert!(
+            last_system(&h.app).contains("Gate: confirm sensitive step")
+                && last_system(&h.app).contains("/graph continue")
+        );
+        assert_eq!(
+            h.sent.lock().unwrap().len(),
+            2,
+            "judge and plan turns only; the first step waits on the gate"
+        );
+
+        for expected in ["step-1", "step-2", "step-3"] {
+            h.app.input = "/graph continue".to_owned();
+            h.app.submit_prompt();
+            let sent = h.sent.lock().unwrap();
+            let node_req = sent.last().expect("node turn started").1.clone();
+            drop(sent);
+            assert_eq!(
+                h.app
+                    .graph_session
+                    .as_ref()
+                    .and_then(|session| session.run().waiting_gate_node.as_deref()),
+                None,
+                "gate cleared for {expected}"
+            );
+            assert!(h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &node_req,
+                AgentEvent::Completed
+            )));
+        }
+        assert!(h.app.graph_session.is_none(), "multi-node run finished");
+
+        let mut simple = plan_gate_test_app();
+        simple.app.input = "deploy the app".to_owned();
+        simple.app.submit_prompt();
+        let judge = simple.sent.lock().unwrap()[0].1.clone();
+        assert!(simple.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::TextDelta("{\"route\":\"simple\",\"reason\":\"tiny\"}".to_owned())
+        )));
+        assert!(simple.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::Completed
+        )));
+        assert_eq!(
+            simple.app.graph_session.as_ref().unwrap().run().phase,
+            GraphRunPhase::WaitingGate
+        );
+        assert!(
+            last_system(&simple.app).contains("Gate: confirm sensitive step")
+                && last_system(&simple.app).contains("/graph continue")
+        );
+        assert_eq!(simple.sent.lock().unwrap().len(), 1);
+        simple.app.input = "/graph continue".to_owned();
+        simple.app.submit_prompt();
+        let node_req = simple.sent.lock().unwrap()[1].1.clone();
+        assert!(simple.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &node_req,
+            AgentEvent::Completed
+        )));
+        assert!(simple.app.graph_session.is_none());
+
+        let mut direct = plan_gate_test_app();
+        direct.app.input = "/direct deploy hotfix".to_owned();
+        direct.app.submit_prompt();
+        assert_eq!(direct.sent.lock().unwrap().len(), 0, "no judge on /direct");
+        assert_eq!(
+            direct.app.graph_session.as_ref().unwrap().run().phase,
+            GraphRunPhase::WaitingGate
+        );
+        assert!(
+            last_system(&direct.app).contains("Gate: confirm sensitive step")
+                && last_system(&direct.app).contains("/graph continue")
+        );
+        direct.app.input = "/graph continue".to_owned();
+        direct.app.submit_prompt();
+        let node_req = direct.sent.lock().unwrap()[0].1.clone();
+        assert!(direct.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &node_req,
+            AgentEvent::Completed
+        )));
+        assert!(direct.app.graph_session.is_none());
+    }
+
     // TC-939 / FR-937: a simple verdict runs one node on the selected agent.
     #[test]
     fn simple_verdict_runs_one_node_graph() {
@@ -19346,6 +19485,14 @@ mod tests {
         r#"{"tasks":[{"id":"task-1","title":"work","done_check":"done","areas":[],"size":"small","depends_on":[]}],"steps":[
             {"id":"step-1","role":"research","job":"research","runner":"codex","model":"composer-2.5","depends_on":[],"task":"task-1"},
             {"id":"step-2","role":"implement","job":"build","runner":"codex","model":"composer-2.5","depends_on":["step-1"],"task":"task-1"}
+        ]}"#
+    }
+
+    fn sensitive_gate_plan_json() -> &'static str {
+        r#"{"tasks":[{"id":"task-1","title":"work","done_check":"done","areas":[],"size":"small","depends_on":[]}],"steps":[
+            {"id":"step-1","role":"research","job":"read the spec","runner":"codex","model":"composer-2.5","depends_on":[],"sensitive":true,"task":"task-1"},
+            {"id":"step-2","role":"implement","job":"deploy the service","runner":"codex","model":"composer-2.5","depends_on":["step-1"],"sensitive":false,"task":"task-1"},
+            {"id":"step-3","role":"test","job":"run checks","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"}
         ]}"#
     }
 

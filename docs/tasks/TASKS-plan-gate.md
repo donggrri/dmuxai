@@ -48,7 +48,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   FR-943, FR-951 (complex). TC-948, TC-949, TC-950, TC-963, TC-964/TC-968 (complex parts).
   Files: `src/app.rs`.
   Done when: `approve_starts_graph`, `edit_replans_with_feedback`, `reject_stops_run`, `concurrent_plan_decisions_first_wins` green.
-- [ ] P07 — Sensitive gates on planned and 1-node runs.
+- [x] P07 — (first #67 agent-planned graph run 89caf6df: `/plan` → plan turn (1 call, 2 tasks, 2 steps) → `/graph approve` → implement → keyword gate → `/graph continue` → test; composer-2.5; review claude-sonnet-5-5-high APPROVE; open nits for later: explicit-agent and fallback gate cases, a negative no-gate case, assert a send per continue) Sensitive gates on planned and 1-node runs.
   FR-944. TC-951.
   Files: `src/app.rs`, `src/graph/plan_doc.rs`.
   Done when: `sensitive_gate_kept_for_plans` green.
