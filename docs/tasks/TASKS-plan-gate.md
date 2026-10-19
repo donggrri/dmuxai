@@ -35,7 +35,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   FR-976, FR-977, FR-949. TC-1001, TC-1002.
   Files: `src/app.rs`, `src/graph/executor.rs`, `src/web/snapshot.rs`.
   Done when: `next_node_waits_for_adapter_release`, `node_failure_marks_run_failed_everywhere` green.
-- [ ] P04 — Real plan turn: `begin_planning`, validate, one repair turn, fallback revision, `awaiting_approval`.
+- [x] P04 — (composer-2.5 single turns via dmuxai cursor runner; review claude-sonnet-5-5-high BLOCK ×2 → fixed (round-2 cancel-scope and retire fixes by hand) → APPROVE) Real plan turn: `begin_planning`, validate, one repair turn, fallback revision, `awaiting_approval`.
   FR-938, FR-939 (app), FR-940, FR-941, FR-950 (app). TC-941, TC-944, TC-945.
   Also (from P03b review): tests `defer_keeps_running_node_mapping` (two ready cursor nodes, `max_parallel` 2) and `defer_timeout_ignores_wait_behind_real_turn`.
   Files: `src/app.rs`.
