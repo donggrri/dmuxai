@@ -12,6 +12,13 @@ pub const SNAPSHOT_SCHEMA: &str = "dmuxai.dashboard/v1";
 /// FR-955: at most this many turn bands are sent in each snapshot.
 pub const CONVERSATION_TURN_BAND_LIMIT: usize = 20;
 
+const SNAPSHOT_USER_PROMPT_LIMIT: usize = 200;
+const SNAPSHOT_PLAN_HISTORY_REASON_LIMIT: usize = 300;
+const SNAPSHOT_APPROVAL_NOTE_LIMIT: usize = 300;
+const SNAPSHOT_STEP_JOB_LIMIT: usize = 2000;
+/// Live swimlane node job text stays short (unchanged contract).
+const SNAPSHOT_NODE_JOB_LIMIT: usize = 200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotSource {
@@ -256,6 +263,8 @@ pub struct TurnBandView {
 pub struct FollowUpEdgeView {
     pub from: String,
     pub to: String,
+    pub from_run: String,
+    pub to_run: String,
     pub kind: String,
 }
 
@@ -465,7 +474,7 @@ fn plan_change_view(change: &PlanChange) -> PlanChangeView {
         kind: change.kind,
         at_ms: change.at_ms,
         after_node: change.after_node.clone(),
-        reason: change.reason.clone(),
+        reason: truncate_with_ellipsis(&change.reason, SNAPSHOT_PLAN_HISTORY_REASON_LIMIT),
         trigger: change.trigger,
         prompt_chars: change.prompt_chars,
         response_chars: change.response_chars,
@@ -530,7 +539,7 @@ fn approval_step_view(revision: &PlanRevision, step: &PlanStep) -> ApprovalStepV
         role: step.role.clone(),
         runner: step.runner.clone(),
         model,
-        job: step.job.clone(),
+        job: truncate_with_ellipsis(&step.job, SNAPSHOT_STEP_JOB_LIMIT),
         depends_on: step.depends_on.clone(),
         task: step.task.clone(),
         rev_change: rev_change_for_step_id(revision, &step.id),
@@ -546,8 +555,9 @@ fn approval_view(run: &GraphRun) -> Option<ApprovalView> {
         .map(|errors| {
             errors
                 .iter()
-                .map(|note| note.trim().to_owned())
+                .map(|note| note.trim())
                 .filter(|note| !note.is_empty())
+                .map(|note| truncate_with_ellipsis(note, SNAPSHOT_APPROVAL_NOTE_LIMIT))
                 .collect()
         })
         .unwrap_or_default();
@@ -610,7 +620,7 @@ fn task_state_label(state: TaskState) -> String {
 }
 
 pub fn snapshot_from_run(run: &GraphRun) -> GraphView {
-    build_graph_view(run, &[])
+    build_graph_view(run, &[], None)
 }
 
 /// Like [`snapshot_from_run`] but fills FR-955 `turns` / `follow_up` from
@@ -618,11 +628,16 @@ pub fn snapshot_from_run(run: &GraphRun) -> GraphView {
 pub fn snapshot_from_run_with_conversation(
     run: &GraphRun,
     conversation_runs: &[GraphRun],
+    conversation_run_total: Option<usize>,
 ) -> GraphView {
-    build_graph_view(run, conversation_runs)
+    build_graph_view(run, conversation_runs, conversation_run_total)
 }
 
-fn build_graph_view(run: &GraphRun, conversation_runs: &[GraphRun]) -> GraphView {
+fn build_graph_view(
+    run: &GraphRun,
+    conversation_runs: &[GraphRun],
+    conversation_run_total: Option<usize>,
+) -> GraphView {
     let applied_revision = latest_applied_plan_change(run);
     let mut counts = GraphCounts {
         pending: 0,
@@ -709,7 +724,7 @@ fn build_graph_view(run: &GraphRun, conversation_runs: &[GraphRun]) -> GraphView
         nodes.push(NodeView {
             id: node.id.clone(),
             role: node.role,
-            job: truncate_with_ellipsis(&node.job, 200),
+            job: truncate_with_ellipsis(&node.job, SNAPSHOT_NODE_JOB_LIMIT),
             runner: node.runner.clone(),
             model_id: node.model_id.clone(),
             status: node.status,
@@ -734,13 +749,17 @@ fn build_graph_view(run: &GraphRun, conversation_runs: &[GraphRun]) -> GraphView
         .collect::<Vec<_>>();
     let tasks = task_checklist_views(run);
 
-    let turn_fields = conversation_turn_fields(&run.conversation_id, conversation_runs);
+    let turn_fields = conversation_turn_fields(
+        &run.conversation_id,
+        conversation_runs,
+        conversation_run_total,
+    );
 
     GraphView {
         id: run.plan.id.clone(),
         phase: run.phase,
         orchestrator_model: run.plan.orchestrator_model.clone(),
-        user_prompt: truncate_with_ellipsis(&run.plan.user_prompt, 200),
+        user_prompt: truncate_with_ellipsis(&run.plan.user_prompt, SNAPSHOT_USER_PROMPT_LIMIT),
         current_nodes,
         waiting_gate_node: run.waiting_gate_node.clone(),
         counts,
@@ -769,6 +788,7 @@ struct ConversationTurnFields {
 fn conversation_turn_fields(
     conversation_id: &str,
     conversation_runs: &[GraphRun],
+    conversation_run_total: Option<usize>,
 ) -> ConversationTurnFields {
     let mut runs: Vec<&GraphRun> = conversation_runs
         .iter()
@@ -783,7 +803,8 @@ fn conversation_turn_fields(
             .then_with(|| left.plan.id.cmp(&right.plan.id))
     });
 
-    let omitted = runs.len().saturating_sub(CONVERSATION_TURN_BAND_LIMIT);
+    let total = conversation_run_total.unwrap_or(runs.len());
+    let omitted = total.saturating_sub(CONVERSATION_TURN_BAND_LIMIT);
     let visible = runs[runs.len().saturating_sub(CONVERSATION_TURN_BAND_LIMIT)..].to_vec();
 
     let bands = visible
@@ -792,7 +813,7 @@ fn conversation_turn_fields(
             run_id: run.plan.id.clone(),
             turn_index: run.turn_index,
             phase: run.phase,
-            user_prompt: truncate_with_ellipsis(&run.plan.user_prompt, 200),
+            user_prompt: truncate_with_ellipsis(&run.plan.user_prompt, SNAPSHOT_USER_PROMPT_LIMIT),
             nodes: executable_node_ids(&run.plan),
         })
         .collect();
@@ -808,6 +829,8 @@ fn conversation_turn_fields(
                 follow_up.push(FollowUpEdgeView {
                     from: from.clone(),
                     to: to.clone(),
+                    from_run: from_run.plan.id.clone(),
+                    to_run: to_run.plan.id.clone(),
                     kind: "follow_up".to_owned(),
                 });
             }
@@ -1468,7 +1491,7 @@ mod tests {
         )];
         let all_runs: Vec<GraphRun> = runs_a.iter().chain(runs_b.iter()).cloned().collect();
 
-        let view = snapshot_from_run_with_conversation(&runs_a[2], &all_runs);
+        let view = snapshot_from_run_with_conversation(&runs_a[2], &all_runs, None);
         assert_eq!(view.turns.len(), 3);
         assert!(
             !view.turns.iter().any(|band| band.run_id == "run-b-1"),
@@ -1483,15 +1506,55 @@ mod tests {
                 FollowUpEdgeView {
                     from: "a1".to_string(),
                     to: "a2".to_string(),
+                    from_run: "run-a-1".to_string(),
+                    to_run: "run-a-2".to_string(),
                     kind: "follow_up".to_string(),
                 },
                 FollowUpEdgeView {
                     from: "a2".to_string(),
                     to: "a3".to_string(),
+                    from_run: "run-a-2".to_string(),
+                    to_run: "run-a-3".to_string(),
                     kind: "follow_up".to_string(),
                 },
             ]
         );
+
+        let dup_runs = [
+            turn_run(
+                "conv-dup",
+                1,
+                "run-dup-1",
+                "step-1",
+                GraphNodeStatus::Completed,
+            ),
+            turn_run(
+                "conv-dup",
+                2,
+                "run-dup-2",
+                "step-1",
+                GraphNodeStatus::Completed,
+            ),
+        ];
+        let dup_view = snapshot_from_run_with_conversation(&dup_runs[1], &dup_runs, None);
+        assert_eq!(dup_view.follow_up.len(), 1);
+        assert_eq!(dup_view.follow_up[0].from, "step-1");
+        assert_eq!(dup_view.follow_up[0].to, "step-1");
+        assert_eq!(dup_view.follow_up[0].from_run, "run-dup-1");
+        assert_eq!(dup_view.follow_up[0].to_run, "run-dup-2");
+
+        let long_korean = "가".repeat(250);
+        let mut korean_run = turn_run("conv-ko", 1, "run-ko", "k1", GraphNodeStatus::Completed);
+        korean_run.plan.user_prompt = long_korean.clone();
+        let ko_view = snapshot_from_run_with_conversation(
+            &korean_run,
+            std::slice::from_ref(&korean_run),
+            None,
+        );
+        let band_prompt = &ko_view.turns[0].user_prompt;
+        assert_eq!(band_prompt.chars().count(), SNAPSHOT_USER_PROMPT_LIMIT + 1);
+        assert!(band_prompt.ends_with('…'));
+        assert!(std::str::from_utf8(band_prompt.as_bytes()).is_ok());
         assert!(
             view.turns
                 .iter()
@@ -1512,11 +1575,17 @@ mod tests {
             })
             .collect();
         let tail = many.last().unwrap();
-        let packed = snapshot_from_run_with_conversation(tail, &many);
+        let packed = snapshot_from_run_with_conversation(tail, &many, None);
         assert_eq!(packed.turns.len(), 20);
         assert_eq!(packed.earlier_turns, 2);
         assert_eq!(packed.turns[0].turn_index, 3);
         assert_eq!(packed.turns[19].turn_index, 22);
+
+        let partial: Vec<GraphRun> = many[many.len().saturating_sub(21)..].to_vec();
+        let packed_partial = snapshot_from_run_with_conversation(tail, &partial, Some(many.len()));
+        assert_eq!(packed_partial.turns.len(), 20);
+        assert_eq!(packed_partial.earlier_turns, 2);
+        assert_eq!(packed_partial.turns[0].turn_index, 3);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
     time::SystemTime,
@@ -6,10 +7,17 @@ use std::{
 
 use super::types::GraphRun;
 
-/// Reuses [`GraphStore::list_runs`] when the graphs directory mtime is unchanged.
+#[derive(Debug, Clone)]
+struct CachedRunFile {
+    mtime: Option<SystemTime>,
+    len: u64,
+    run: GraphRun,
+}
+
+/// Reuses parsed runs per graph record file until that file's `(mtime, len)` changes.
 #[derive(Debug, Default)]
 pub struct GraphRunListCache {
-    dir_mtime: Option<SystemTime>,
+    by_file: HashMap<PathBuf, CachedRunFile>,
     runs: Vec<GraphRun>,
 }
 
@@ -54,15 +62,61 @@ impl GraphStore {
         runs
     }
 
-    /// Lists runs once per directory modification time (FR-955 snapshot builds).
+    /// Lists runs, reloading only graph JSON files whose `(mtime, len)` changed.
     pub fn list_runs_cached<'a>(&self, cache: &'a mut GraphRunListCache) -> &'a [GraphRun] {
-        let mtime = fs::metadata(&self.root)
-            .and_then(|meta| meta.modified())
-            .ok();
-        if cache.dir_mtime != mtime {
-            cache.runs = self.list_runs();
-            cache.dir_mtime = mtime;
+        let Ok(read_dir) = fs::read_dir(&self.root) else {
+            cache.by_file.clear();
+            cache.runs.clear();
+            return &cache.runs;
+        };
+
+        let mut seen = HashSet::new();
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            seen.insert(path.clone());
+
+            let (mtime, len) = fs::metadata(&path)
+                .map(|meta| (meta.modified().ok(), meta.len()))
+                .unwrap_or((None, 0));
+
+            let needs_reload = match cache.by_file.get(&path) {
+                None => true,
+                Some(cached) => {
+                    mtime.is_none()
+                        || cached.mtime.is_none()
+                        || cached.mtime != mtime
+                        || cached.len != len
+                }
+            };
+
+            if needs_reload {
+                match fs::read_to_string(&path) {
+                    Ok(contents) => match serde_json::from_str::<GraphRun>(&contents) {
+                        Ok(run) => {
+                            cache
+                                .by_file
+                                .insert(path, CachedRunFile { mtime, len, run });
+                        }
+                        Err(_) => {
+                            cache.by_file.remove(&path);
+                        }
+                    },
+                    Err(_) => {
+                        cache.by_file.remove(&path);
+                    }
+                }
+            }
         }
+
+        cache.by_file.retain(|path, _| seen.contains(path));
+        cache.runs = cache
+            .by_file
+            .values()
+            .map(|entry| entry.run.clone())
+            .collect();
         &cache.runs
     }
 
@@ -401,5 +455,27 @@ mod tests {
         let legacy = load_run(root, "legacy-no-tasks").unwrap();
         assert!(legacy.plan.tasks.is_empty());
         assert!(legacy.plan.nodes[0].task.is_none());
+    }
+
+    #[test]
+    fn run_cache_reloads_rewritten_record() {
+        let dir = tempdir().unwrap();
+        let store = GraphStore::new(dir.path());
+        let mut cache = GraphRunListCache::default();
+
+        let mut run = run("cached-run");
+        run.phase = GraphRunPhase::Active;
+        store.save(&run).unwrap();
+
+        let listed = store.list_runs_cached(&mut cache);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].phase, GraphRunPhase::Active);
+
+        run.phase = GraphRunPhase::Completed;
+        store.save(&run).unwrap();
+
+        let listed = store.list_runs_cached(&mut cache);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].phase, GraphRunPhase::Completed);
     }
 }

@@ -9607,7 +9607,7 @@ impl App {
     }
 
     /// FR-955: conversation runs for the dashboard swimlane (cached store listing).
-    fn conversation_runs_for_snapshot(&mut self) -> Vec<GraphRun> {
+    fn conversation_runs_for_snapshot(&mut self) -> (usize, Vec<GraphRun>) {
         let conversation_id = self.conversation_id.as_str();
         let store = GraphStore::new(&self.workspace_root);
         let mut runs: Vec<GraphRun> = store
@@ -9625,7 +9625,14 @@ impl App {
                 runs.push(live.clone());
             }
         }
-        runs
+        runs.sort_by(|left, right| {
+            left.turn_index
+                .cmp(&right.turn_index)
+                .then_with(|| left.plan.id.cmp(&right.plan.id))
+        });
+        let total = runs.len();
+        let start = runs.len().saturating_sub(21);
+        (total, runs[start..].to_vec())
     }
 
     /// Publishes agent and graph state to the attached dashboard, if any (FR-530).
@@ -9676,11 +9683,14 @@ impl App {
             self.last_graph_run = Some(run);
         }
 
-        let conversation_runs = self.conversation_runs_for_snapshot();
-        let mut graph = self
-            .last_graph_run
-            .as_ref()
-            .map(|run| dmuxai::web::snapshot_from_run_with_conversation(run, &conversation_runs));
+        let (conversation_run_total, conversation_runs) = self.conversation_runs_for_snapshot();
+        let mut graph = self.last_graph_run.as_ref().map(|run| {
+            dmuxai::web::snapshot_from_run_with_conversation(
+                run,
+                &conversation_runs,
+                Some(conversation_run_total),
+            )
+        });
 
         if let Some(graph) = graph.as_mut() {
             for node in &mut graph.nodes {
