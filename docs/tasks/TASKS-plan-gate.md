@@ -18,9 +18,9 @@ Plan: [PLAN-plan-gate](../plans/PLAN-plan-gate.md)
   Requirements: FR-948, FR-949, FR-950, FR-951, FR-952, FR-953. Verify:
   `cargo test --locked --lib graph::executor::tests::schedule_runs_independent_steps_in_parallel graph::executor::tests::same_runner_steps_wait_for_runner`,
   `cargo test --locked --lib graph::plan_doc`, `cargo test --locked --bin dmuxai keyword_prompt_never_builds_chain orchestrate_node_records_triage_agent`
-- [ ] T3c — Dynamic graph: every turn recorded with `turn_index`, conversation turn bands, replan turn after each node, `apply_replan` (pending-only, same validation, caps), sensitive-revision approval, `plan_history`, snapshot badges and history list, TUI revision line.
+- [ ] T3c — Dynamic graph: every turn recorded with `turn_index`, conversation turn bands, event-triggered replan turn (failure, marker, user) with compact payload and budget, `apply_replan` (pending-only, same validation, caps), sensitive-revision approval, `plan_history`, snapshot badges and history list, TUI revision line.
   Requirements: FR-954..FR-962, UX-934, UX-935. Verify:
-  `cargo test --locked --lib graph::replan`, `cargo test --locked --lib web::snapshot`, `cargo test --locked --bin dmuxai every_turn_is_recorded replan_turn_after sensitive_replan revision_notice`
+  `cargo test --locked --lib graph::replan`, `cargo test --locked --lib web::snapshot`, `cargo test --locked --bin dmuxai every_turn_is_recorded replan_only_on_trigger sensitive_replan revision_notice`
 - [ ] T4 — App triage state machine: judge turn, timeout/fallback, 1-node run, plan turn, repair, approval, edit, reject, `/plan`, `/direct`, `/graph approve|edit|reject`.
   Requirements: FR-932, FR-935, FR-937, FR-938, FR-940, FR-941, FR-942, FR-943, FR-944, FR-945. Verify:
   `cargo test --locked --bin dmuxai judge_ simple_verdict concurrent_plan_decisions direct_override complex_verdict invalid_plan plan_fallback awaiting_approval stale_awaiting approve_starts edit_replans reject_stops sensitive_gate_kept slash_list_has_plan`
