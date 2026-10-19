@@ -29,7 +29,10 @@ pub use replan::{
     strip_replan_marker,
 };
 pub use store::{GraphStore, load_run, save_run};
-pub use tasks::{TaskState, task_counts, task_status};
+pub use tasks::{
+    TaskEdit, TaskState, apply_task_delete, apply_task_merge, apply_task_move, apply_task_rename,
+    task_counts, task_status,
+};
 pub use types::{
     Approval, ApprovalState, DecisionBy, ExecutionPlan, GraphEdge, GraphLimits, GraphNode,
     GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, MAX_PLAN_REVISIONS, NodeRole,

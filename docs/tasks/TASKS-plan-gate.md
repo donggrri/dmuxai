@@ -53,7 +53,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   Files: `src/app.rs`, `src/graph/plan_doc.rs`.
   Done when: `sensitive_gate_kept_for_plans` green.
 - [x] P07b — (composer-2.5 via #67 `/direct` 1-node run; review claude-sonnet-5-5-high APPROVE) Stale graph panel after `Graph run completed.`: the Completed arm now stores and saves the final run so the record, snapshot and panel show completed together (FR-978; TC-1003 `completed_run_shows_final_state_everywhere`). Found in #67 dogfood run 89caf6df.
-- [ ] P08 — Task edits at the gate: rename, delete, merge, move (local revision), split (edit turn); `/graph task …`.
+- [x] P08 — (#67 agent-planned graph 71450cd7: 3 tasks/3 steps chain, two keyword gates passed with /graph continue; fix turn as #67 /direct run; composer-2.5; review claude-sonnet-5-5-high BLOCK (nondeterministic dep order) → fixed → APPROVE; open nits: task-cycle-by-merge test, no-op edits consume a revision, move out-of-range test, title length cap) Task edits at the gate: rename, delete, merge, move (local revision), split (edit turn); `/graph task …`.
   FR-965. TC-994.
   Files: `src/graph/tasks.rs`, `src/app.rs`.
   Done when: `task_edits_rebuild_plan`, `task_split_uses_edit_turn` green.

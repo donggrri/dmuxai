@@ -1,6 +1,273 @@
+use std::collections::{HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 
+use super::plan_doc::{PlanContext, PlanDoc, PlanError, PlanStep, validate_plan_with_limit};
 use super::types::{GraphNode, GraphNodeStatus, GraphPlan, GraphRun, PlanTask};
+
+/// Local task edit at the approval gate (FR-965).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskEdit {
+    Rename {
+        task_id: String,
+        title: String,
+    },
+    Delete {
+        task_id: String,
+    },
+    Merge {
+        into: String,
+        from: String,
+    },
+    /// `position` is 1-based in the task list.
+    Move {
+        task_id: String,
+        position: usize,
+    },
+    /// Model edit turn (FR-965); handled in the app, not [`TaskEdit::apply`].
+    Split {
+        task_id: String,
+        note: String,
+    },
+}
+
+impl TaskEdit {
+    pub fn apply(
+        self,
+        steps: &[PlanStep],
+        tasks: &[PlanTask],
+        ctx: &PlanContext<'_>,
+        max_steps: usize,
+    ) -> Result<(Vec<PlanStep>, Vec<PlanTask>), String> {
+        match self {
+            Self::Rename { task_id, title } => {
+                apply_task_rename(steps, tasks, &task_id, &title, ctx, max_steps)
+            }
+            Self::Delete { task_id } => apply_task_delete(steps, tasks, &task_id, ctx, max_steps),
+            Self::Merge { into, from } => {
+                apply_task_merge(steps, tasks, &into, &from, ctx, max_steps)
+            }
+            Self::Move { task_id, position } => {
+                apply_task_move(steps, tasks, &task_id, position, ctx, max_steps)
+            }
+            Self::Split { .. } => Err("split is not a local task edit".to_owned()),
+        }
+    }
+}
+
+fn first_validation_error(errors: Vec<PlanError>) -> String {
+    errors
+        .first()
+        .map(|err| err.to_string())
+        .unwrap_or_else(|| "plan validation failed".to_owned())
+}
+
+fn revalidate_revision(
+    steps: Vec<PlanStep>,
+    tasks: Vec<PlanTask>,
+    ctx: &PlanContext<'_>,
+    max_steps: usize,
+) -> Result<(Vec<PlanStep>, Vec<PlanTask>), String> {
+    if tasks.is_empty() {
+        return Err("zero tasks remaining".to_owned());
+    }
+    let doc = PlanDoc {
+        steps,
+        tasks,
+        require_tasks: true,
+        task_errors: Vec::new(),
+    };
+    validate_plan_with_limit(&doc, ctx, max_steps)
+        .map(|_| (doc.steps.clone(), doc.tasks.clone()))
+        .map_err(first_validation_error)
+}
+
+fn task_index(tasks: &[PlanTask], id: &str) -> Result<usize, String> {
+    tasks
+        .iter()
+        .position(|task| task.id == id)
+        .ok_or_else(|| format!("unknown task '{id}'"))
+}
+
+fn renumber_tasks_and_refs(
+    tasks: Vec<PlanTask>,
+    steps: Vec<PlanStep>,
+) -> (Vec<PlanTask>, Vec<PlanStep>) {
+    let id_map: HashMap<String, String> = tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| (task.id.clone(), format!("task-{}", index + 1)))
+        .collect();
+    let map_dep = |dep: &String| id_map.get(dep).cloned().unwrap_or_else(|| dep.clone());
+    let tasks = tasks
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut task)| {
+            task.id = format!("task-{}", index + 1);
+            let mut seen_deps = HashSet::new();
+            task.depends_on = task
+                .depends_on
+                .iter()
+                .map(map_dep)
+                .filter(|dep| dep != &task.id)
+                .filter(|dep| seen_deps.insert(dep.clone()))
+                .collect();
+            task
+        })
+        .collect();
+    let steps = steps
+        .into_iter()
+        .map(|mut step| {
+            if let Some(task) = step.task.clone() {
+                step.task = Some(map_dep(&task));
+            }
+            step
+        })
+        .collect();
+    (tasks, steps)
+}
+
+pub fn apply_task_rename(
+    steps: &[PlanStep],
+    tasks: &[PlanTask],
+    task_id: &str,
+    title: &str,
+    ctx: &PlanContext<'_>,
+    max_steps: usize,
+) -> Result<(Vec<PlanStep>, Vec<PlanTask>), String> {
+    let index = task_index(tasks, task_id)?;
+    let mut tasks = tasks.to_vec();
+    tasks[index].title = title.to_owned();
+    revalidate_revision(steps.to_vec(), tasks, ctx, max_steps)
+}
+
+pub fn apply_task_delete(
+    steps: &[PlanStep],
+    tasks: &[PlanTask],
+    task_id: &str,
+    ctx: &PlanContext<'_>,
+    max_steps: usize,
+) -> Result<(Vec<PlanStep>, Vec<PlanTask>), String> {
+    task_index(tasks, task_id)?;
+    let removed_step_ids: HashSet<String> = steps
+        .iter()
+        .filter(|step| step.task.as_deref() == Some(task_id))
+        .map(|step| step.id.clone())
+        .collect();
+    let tasks: Vec<PlanTask> = tasks
+        .iter()
+        .filter(|task| task.id != task_id)
+        .map(|task| {
+            let mut task = task.clone();
+            task.depends_on.retain(|dep| dep != task_id);
+            task
+        })
+        .collect();
+    if tasks.is_empty() {
+        return Err("zero tasks remaining".to_owned());
+    }
+    let steps: Vec<PlanStep> = steps
+        .iter()
+        .filter(|step| step.task.as_deref() != Some(task_id))
+        .map(|step| {
+            let mut step = step.clone();
+            step.depends_on
+                .retain(|dep| !removed_step_ids.contains(dep));
+            step
+        })
+        .collect();
+    let (tasks, steps) = renumber_tasks_and_refs(tasks, steps);
+    revalidate_revision(steps, tasks, ctx, max_steps)
+}
+
+pub fn apply_task_merge(
+    steps: &[PlanStep],
+    tasks: &[PlanTask],
+    into: &str,
+    from: &str,
+    ctx: &PlanContext<'_>,
+    max_steps: usize,
+) -> Result<(Vec<PlanStep>, Vec<PlanTask>), String> {
+    if into == from {
+        return Err("cannot merge a task into itself".to_owned());
+    }
+    let into_index = task_index(tasks, into)?;
+    let from_index = task_index(tasks, from)?;
+    let into_task = &tasks[into_index];
+    let from_task = &tasks[from_index];
+    let mut merged_deps = Vec::new();
+    let mut seen_deps = HashSet::new();
+    for dep in into_task
+        .depends_on
+        .iter()
+        .chain(from_task.depends_on.iter())
+    {
+        if dep == into || dep == from {
+            continue;
+        }
+        if seen_deps.insert(dep.clone()) {
+            merged_deps.push(dep.clone());
+        }
+    }
+    let tasks: Vec<PlanTask> = tasks
+        .iter()
+        .filter(|task| task.id != from)
+        .map(|task| {
+            let mut task = task.clone();
+            if task.id == into {
+                task.depends_on = merged_deps.clone();
+            } else {
+                let mut deps = Vec::new();
+                let mut seen = HashSet::new();
+                for dep in &task.depends_on {
+                    let mapped = if dep == from {
+                        into.to_owned()
+                    } else {
+                        dep.clone()
+                    };
+                    if mapped == from || !seen.insert(mapped.clone()) {
+                        continue;
+                    }
+                    deps.push(mapped);
+                }
+                task.depends_on = deps;
+            }
+            task
+        })
+        .collect();
+    let steps: Vec<PlanStep> = steps
+        .iter()
+        .map(|step| {
+            let mut step = step.clone();
+            if step.task.as_deref() == Some(from) {
+                step.task = Some(into.to_owned());
+            }
+            step
+        })
+        .collect();
+    let (tasks, steps) = renumber_tasks_and_refs(tasks, steps);
+    revalidate_revision(steps, tasks, ctx, max_steps)
+}
+
+pub fn apply_task_move(
+    steps: &[PlanStep],
+    tasks: &[PlanTask],
+    task_id: &str,
+    position: usize,
+    ctx: &PlanContext<'_>,
+    max_steps: usize,
+) -> Result<(Vec<PlanStep>, Vec<PlanTask>), String> {
+    let from_index = task_index(tasks, task_id)?;
+    if position == 0 || position > tasks.len() {
+        return Err(format!("position must be 1 to {}", tasks.len()));
+    }
+    let to_index = position - 1;
+    let mut tasks = tasks.to_vec();
+    let moved = tasks.remove(from_index);
+    tasks.insert(to_index, moved);
+    let (tasks, steps) = renumber_tasks_and_refs(tasks, steps.to_vec());
+    revalidate_revision(steps, tasks, ctx, max_steps)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -210,5 +477,215 @@ mod tests {
             vec![task("task-1")],
         );
         assert_eq!(state_for(&failed_wins, "task-1"), TaskState::Failed);
+    }
+
+    type RunnerAllowed = Box<dyn Fn(&str) -> bool>;
+    type EffectiveModel = Box<dyn Fn(&str) -> Option<String>>;
+
+    struct PlanCtx {
+        available: Vec<String>,
+        runner_allowed: RunnerAllowed,
+        effective_model: EffectiveModel,
+    }
+
+    impl PlanCtx {
+        fn new(available: &[&str]) -> Self {
+            PlanCtx {
+                available: available.iter().map(|name| (*name).to_owned()).collect(),
+                runner_allowed: Box::new(|_| true),
+                effective_model: Box::new(|_| Some("composer-2.5".to_owned())),
+            }
+        }
+
+        fn context<'a>(&'a self, user_prompt: &'a str) -> PlanContext<'a> {
+            PlanContext {
+                user_prompt,
+                available_runners: &self.available,
+                runner_allowed: self.runner_allowed.as_ref(),
+                effective_model: self.effective_model.as_ref(),
+                validate_model: &crate::model_policy::validate_model_for_runner,
+            }
+        }
+    }
+
+    fn plan_task(id: &str, title: &str, depends_on: &[&str]) -> PlanTask {
+        PlanTask {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            done_check: "done".to_owned(),
+            areas: Vec::new(),
+            size: TaskSize::Small,
+            depends_on: depends_on.iter().map(|dep| (*dep).to_owned()).collect(),
+            implicit: false,
+        }
+    }
+
+    fn plan_step(id: &str, task: &str, depends_on: &[&str]) -> PlanStep {
+        PlanStep {
+            id: id.to_owned(),
+            role: "implement".to_owned(),
+            job: id.to_owned(),
+            runner: "cursor".to_owned(),
+            model: None,
+            depends_on: depends_on.iter().map(|dep| (*dep).to_owned()).collect(),
+            sensitive: None,
+            task: Some(task.to_owned()),
+            sensitive_invalid: false,
+            depends_on_invalid: false,
+            model_invalid: false,
+            id_invalid: false,
+            not_object: false,
+        }
+    }
+
+    fn sample_revision() -> (Vec<PlanStep>, Vec<PlanTask>) {
+        let tasks = vec![
+            plan_task("task-1", "One", &[]),
+            plan_task("task-2", "Two", &[]),
+            plan_task("task-3", "Three", &["task-1", "task-2"]),
+        ];
+        let steps = vec![
+            plan_step("impl-1", "task-1", &[]),
+            plan_step("impl-2", "task-2", &[]),
+            plan_step("impl-3", "task-3", &["impl-1", "impl-2"]),
+        ];
+        (steps, tasks)
+    }
+
+    // TC-994 / FR-965: rename, delete, merge, move renumber refs; refuse unknown id and delete-all.
+    #[test]
+    fn task_edits_rebuild_plan() {
+        let ctx = PlanCtx::new(&["cursor"]);
+        let plan_ctx = ctx.context("build it");
+        let max_steps = 8;
+        let (steps, tasks) = sample_revision();
+        let (steps, tasks) =
+            apply_task_move(&steps, &tasks, "task-3", 1, &plan_ctx, max_steps).expect("move");
+        assert_eq!(tasks[0].id, "task-1");
+        assert_eq!(tasks[0].title, "Three");
+        assert_eq!(tasks[1].id, "task-2");
+        assert_eq!(tasks[2].id, "task-3");
+        assert_eq!(
+            tasks[0].depends_on,
+            vec!["task-2".to_owned(), "task-3".to_owned()]
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .find(|step| step.id == "impl-1")
+                .and_then(|step| step.task.as_deref()),
+            Some("task-2")
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .find(|step| step.id == "impl-2")
+                .and_then(|step| step.task.as_deref()),
+            Some("task-3")
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .find(|step| step.id == "impl-3")
+                .and_then(|step| step.task.as_deref()),
+            Some("task-1")
+        );
+
+        let (steps, tasks) = sample_revision();
+        let (_steps, tasks) =
+            apply_task_merge(&steps, &tasks, "task-1", "task-2", &plan_ctx, max_steps)
+                .expect("merge deps collapse");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].id, "task-2");
+        assert_eq!(tasks[1].depends_on, vec!["task-1".to_owned()]);
+
+        let tasks = vec![
+            plan_task("task-1", "One", &[]),
+            plan_task("task-2", "Two", &["task-1"]),
+            plan_task("task-3", "Three", &["task-2"]),
+        ];
+        let steps = vec![
+            plan_step("impl-1", "task-1", &[]),
+            plan_step("impl-2", "task-2", &["impl-1"]),
+            plan_step("impl-3", "task-3", &["impl-2"]),
+        ];
+        let (_steps, tasks) =
+            apply_task_merge(&steps, &tasks, "task-2", "task-1", &plan_ctx, max_steps)
+                .expect("merge into depends on from");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "task-1");
+        assert_eq!(tasks[0].depends_on, Vec::<String>::new());
+        assert_eq!(tasks[1].depends_on, vec!["task-1".to_owned()]);
+
+        let (steps, tasks) = sample_revision();
+        assert_eq!(
+            apply_task_merge(&steps, &tasks, "task-1", "task-1", &plan_ctx, max_steps),
+            Err("cannot merge a task into itself".to_owned())
+        );
+
+        let (steps, tasks) = sample_revision();
+
+        let (steps, tasks) = apply_task_rename(
+            &steps,
+            &tasks,
+            "task-2",
+            "Two renamed",
+            &plan_ctx,
+            max_steps,
+        )
+        .expect("rename");
+        assert_eq!(tasks[1].title, "Two renamed");
+
+        let (steps, tasks) =
+            apply_task_delete(&steps, &tasks, "task-1", &plan_ctx, max_steps).expect("delete");
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|task| task.title != "One"));
+        assert!(steps.iter().all(|step| step.id != "impl-1"));
+        assert_eq!(tasks[0].id, "task-1");
+        assert_eq!(tasks[1].id, "task-2");
+        assert_eq!(tasks[1].depends_on, vec!["task-1".to_owned()]);
+        assert_eq!(
+            steps
+                .iter()
+                .find(|step| step.id == "impl-3")
+                .map(|step| step.depends_on.clone()),
+            Some(vec!["impl-2".to_owned()])
+        );
+
+        let (steps, tasks) =
+            apply_task_merge(&steps, &tasks, "task-1", "task-2", &plan_ctx, max_steps)
+                .expect("merge");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "task-1");
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.task.as_deref() == Some("task-1"))
+        );
+
+        let (steps, tasks) =
+            apply_task_move(&steps, &tasks, "task-1", 1, &plan_ctx, max_steps).expect("move");
+        assert_eq!(tasks[0].id, "task-1");
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.task.as_deref() == Some("task-1"))
+        );
+
+        let (steps, tasks) = sample_revision();
+        assert_eq!(
+            apply_task_rename(&steps, &tasks, "task-9", "nope", &plan_ctx, max_steps),
+            Err("unknown task 'task-9'".to_owned())
+        );
+
+        let (steps, tasks) = sample_revision();
+        let (steps, tasks) =
+            apply_task_delete(&steps, &tasks, "task-1", &plan_ctx, max_steps).unwrap();
+        let (steps, tasks) =
+            apply_task_delete(&steps, &tasks, "task-2", &plan_ctx, max_steps).unwrap();
+        assert_eq!(
+            apply_task_delete(&steps, &tasks, "task-1", &plan_ctx, max_steps),
+            Err("zero tasks remaining".to_owned())
+        );
     }
 }

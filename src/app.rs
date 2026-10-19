@@ -57,9 +57,9 @@ use dmuxai::{
         AllowedRunner, Approval, ApprovalState, DecisionBy, FallbackCause, GraphAction, GraphNode,
         GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, GraphRunSession, GraphStore,
         MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind, PlanContext, PlanDoc,
-        PlanPromptMode, PlanPromptRequest, PlanRevision, PlanStep, PlannerCalls, Route, Triage,
-        TriageSource, build_judge_prompt, build_plan_prompt, cap_revision_raw, fallback_plan,
-        graph_plan_from_revision_steps, heuristic_route, parse_plan, parse_verdict,
+        PlanPromptMode, PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls, Route,
+        TaskEdit, Triage, TriageSource, build_judge_prompt, build_plan_prompt, cap_revision_raw,
+        fallback_plan, graph_plan_from_revision_steps, heuristic_route, parse_plan, parse_verdict,
         plan_json_for_edit, save_run, validate_plan,
     },
     mcp::config::ResolvedMcpServer,
@@ -706,6 +706,7 @@ pub enum PlanDecisionError {
     RevisionCap,
     AgentBusy,
     InvalidRevisionPlan(String),
+    TaskEditRefused(String),
 }
 
 impl PlanDecisionError {
@@ -3158,6 +3159,10 @@ impl App {
                         }
                     } else if rest == "edit" {
                         self.push_system("Usage: /graph edit <feedback>");
+                    } else if rest == "task" {
+                        self.push_system(Self::GRAPH_TASK_USAGE);
+                    } else if let Some(args) = rest.strip_prefix("task ") {
+                        self.graph_task_edit_from_tui(args);
                     } else if rest == "reject" {
                         let plan_id = self
                             .last_graph_run
@@ -4400,8 +4405,13 @@ impl App {
             PlanDecisionError::InvalidRevisionPlan(message) => {
                 format!("Approved plan steps are invalid: {message}")
             }
+            PlanDecisionError::TaskEditRefused(reason) => {
+                format!("Task edit refused: {reason}")
+            }
         }
     }
+
+    const GRAPH_TASK_USAGE: &'static str = "Usage: /graph task rename <id> <title> | delete <id> | merge <into> <from> | move <id> <position> | split <id> <note>";
 
     fn current_plan_revision_n(run: &GraphRun) -> Option<u32> {
         run.approval.as_ref().map(|approval| {
@@ -4523,6 +4533,232 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// FR-965: local task edits or a split edit turn at the plan gate.
+    pub fn apply_task_edit(
+        &mut self,
+        edit: TaskEdit,
+        plan_id: String,
+        revision: u32,
+        by: DecisionBy,
+    ) -> Result<(), PlanDecisionError> {
+        match self.try_apply_task_edit(edit, plan_id, revision, by) {
+            Ok(()) => Ok(()),
+            Err(PlanDecisionError::TaskEditRefused(reason)) => {
+                self.push_system(format!("Task edit refused: {reason}"));
+                Err(PlanDecisionError::TaskEditRefused(reason))
+            }
+            Err(error) => {
+                self.push_system(Self::plan_decision_notice(error.clone()));
+                Err(error)
+            }
+        }
+    }
+
+    fn try_apply_task_edit(
+        &mut self,
+        edit: TaskEdit,
+        plan_id: String,
+        revision: u32,
+        by: DecisionBy,
+    ) -> Result<(), PlanDecisionError> {
+        if self.pending_plan.is_some() {
+            return Err(PlanDecisionError::AgentBusy);
+        }
+        let approval_stale = self.approval_is_stale();
+        let run = self
+            .last_graph_run
+            .as_mut()
+            .filter(|run| run.phase == GraphRunPhase::AwaitingApproval)
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        if run.plan.id != plan_id {
+            return Err(PlanDecisionError::WrongPlanId);
+        }
+        let current = Self::current_plan_revision_n(run).unwrap_or(0);
+        if revision != current {
+            return Err(PlanDecisionError::StaleRevision);
+        }
+        let approval = run
+            .approval
+            .as_mut()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        if approval.state != ApprovalState::Pending {
+            return Err(PlanDecisionError::AlreadyDecided);
+        }
+        if approval_stale {
+            return Err(PlanDecisionError::StaleRecord);
+        }
+        if approval.revisions.len() as u32 >= MAX_PLAN_REVISIONS {
+            return Err(PlanDecisionError::RevisionCap);
+        }
+
+        // `by` is recorded only for model-driven edits (split → begin_plan_edit).
+        match edit {
+            TaskEdit::Split { task_id, note } => {
+                if !run.plan.tasks.iter().any(|task| task.id == task_id) {
+                    return Err(PlanDecisionError::TaskEditRefused(format!(
+                        "unknown task '{task_id}'"
+                    )));
+                }
+                if note.trim().is_empty() {
+                    return Err(PlanDecisionError::TaskEditRefused(
+                        "split note must not be empty".to_owned(),
+                    ));
+                }
+                let feedback = format!("split {task_id}: {}", note.trim());
+                self.begin_plan_edit(feedback, by)?;
+            }
+            local => {
+                let revision_steps = approval
+                    .revisions
+                    .iter()
+                    .rev()
+                    .find(|rev| rev.errors.is_none())
+                    .map(|rev| rev.steps.clone())
+                    .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+                let tasks = run.plan.tasks.clone();
+                let user_prompt = run.plan.user_prompt.clone();
+                let available = self.registered_runner_names();
+                let ctx = PlanContext {
+                    user_prompt: &user_prompt,
+                    available_runners: &available,
+                    runner_allowed: &|runner: &str| self.runner_is_allowed(runner),
+                    effective_model: &|runner: &str| {
+                        runner_from_str(runner).and_then(|agent| {
+                            self.effective_model_for(agent, "").filter(|model| {
+                                dmuxai::model_policy::validate_model_for_runner(runner, model)
+                                    .is_ok()
+                            })
+                        })
+                    },
+                    validate_model: &dmuxai::model_policy::validate_model_for_runner,
+                };
+                let max_steps = self.graph_limits().max_nodes.max(1);
+                let (steps, tasks) = local
+                    .apply(&revision_steps, &tasks, &ctx, max_steps)
+                    .map_err(PlanDecisionError::TaskEditRefused)?;
+                self.push_local_task_revision(steps, tasks)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn push_local_task_revision(
+        &mut self,
+        steps: Vec<PlanStep>,
+        tasks: Vec<PlanTask>,
+    ) -> Result<(), PlanDecisionError> {
+        let run = self
+            .last_graph_run
+            .as_mut()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        let approval = run
+            .approval
+            .as_mut()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        let next_n = approval.revisions.last().map(|rev| rev.n + 1).unwrap_or(1);
+        approval.revisions.push(PlanRevision {
+            n: next_n,
+            source: "user".to_owned(),
+            steps,
+            feedback: None,
+            errors: None,
+            raw: None,
+        });
+        run.plan.tasks = tasks;
+        run.plan_fixed_ms = Some(unix_ms_now());
+        if let Err(error) = save_run(&self.workspace_root, run) {
+            self.push_system(format!("Could not save the task edit: {error}"));
+        }
+        Ok(())
+    }
+
+    fn parse_graph_task_edit(args: &str) -> Result<TaskEdit, String> {
+        let (verb, rest) = match args.split_once(char::is_whitespace) {
+            Some((verb, rest)) => (verb, rest.trim()),
+            None => (args.trim(), ""),
+        };
+        match verb {
+            "rename" => {
+                let (task_id, title) = rest
+                    .split_once(char::is_whitespace)
+                    .ok_or(Self::GRAPH_TASK_USAGE)?;
+                if title.trim().is_empty() {
+                    return Err(Self::GRAPH_TASK_USAGE.to_owned());
+                }
+                Ok(TaskEdit::Rename {
+                    task_id: task_id.to_owned(),
+                    title: title.trim().to_owned(),
+                })
+            }
+            "delete" => {
+                if rest.is_empty() || rest.contains(char::is_whitespace) {
+                    return Err(Self::GRAPH_TASK_USAGE.to_owned());
+                }
+                Ok(TaskEdit::Delete {
+                    task_id: rest.to_owned(),
+                })
+            }
+            "merge" => {
+                let parts = rest.split_whitespace().collect::<Vec<_>>();
+                if parts.len() != 2 {
+                    return Err(Self::GRAPH_TASK_USAGE.to_owned());
+                }
+                Ok(TaskEdit::Merge {
+                    into: parts[0].to_owned(),
+                    from: parts[1].to_owned(),
+                })
+            }
+            "move" => {
+                let parts = rest.split_whitespace().collect::<Vec<_>>();
+                if parts.len() != 2 {
+                    return Err(Self::GRAPH_TASK_USAGE.to_owned());
+                }
+                let position = parts[1]
+                    .parse::<usize>()
+                    .map_err(|_| Self::GRAPH_TASK_USAGE.to_owned())?;
+                Ok(TaskEdit::Move {
+                    task_id: parts[0].to_owned(),
+                    position,
+                })
+            }
+            "split" => {
+                let (task_id, note) = rest
+                    .split_once(char::is_whitespace)
+                    .ok_or(Self::GRAPH_TASK_USAGE)?;
+                if note.trim().is_empty() {
+                    return Err(Self::GRAPH_TASK_USAGE.to_owned());
+                }
+                Ok(TaskEdit::Split {
+                    task_id: task_id.to_owned(),
+                    note: note.trim().to_owned(),
+                })
+            }
+            _ => Err(Self::GRAPH_TASK_USAGE.to_owned()),
+        }
+    }
+
+    fn graph_task_edit_from_tui(&mut self, args: &str) {
+        let plan_id = self
+            .last_graph_run
+            .as_ref()
+            .filter(|run| run.phase == GraphRunPhase::AwaitingApproval)
+            .map(|run| run.plan.id.clone());
+        let revision = self
+            .last_graph_run
+            .as_ref()
+            .and_then(Self::current_plan_revision_n);
+        match Self::parse_graph_task_edit(args) {
+            Err(message) => self.push_system(message),
+            Ok(edit) => {
+                if let (Some(plan_id), Some(revision)) = (plan_id, revision) {
+                    let _ = self.apply_task_edit(edit, plan_id, revision, DecisionBy::Tui);
+                } else {
+                    self.push_system("No plan is waiting for approval.");
+                }
+            }
+        }
     }
 
     fn approve_awaiting_plan(&mut self, by: DecisionBy) -> Result<(), PlanDecisionError> {
@@ -6867,6 +7103,9 @@ impl App {
         self.push_system(format!("Allowed runners: {allowed_str}"));
         self.push_system(
             "Plan gate: /graph approve · /graph edit <feedback> · /graph reject · /graph replan [note]",
+        );
+        self.push_system(
+            "Task gate: /graph task rename <id> <title> · delete <id> · merge <into> <from> · move <id> <position> · split <id> <note>",
         );
         if self
             .graph_session
@@ -19560,6 +19799,166 @@ mod tests {
 
     fn valid_codex_plan_json() -> &'static str {
         r#"{"tasks":[{"id":"task-1","title":"work","done_check":"done","areas":[],"size":"small","depends_on":[]}],"steps":[{"id":"step-1","role":"implement","job":"ship","runner":"codex","model":"composer-2.5","depends_on":[],"task":"task-1"}]}"#
+    }
+
+    fn three_task_codex_plan_json() -> &'static str {
+        r#"{"tasks":[
+            {"id":"task-1","title":"one","done_check":"done","areas":[],"size":"small","depends_on":[]},
+            {"id":"task-2","title":"two","done_check":"done","areas":[],"size":"small","depends_on":[]},
+            {"id":"task-3","title":"three","done_check":"done","areas":[],"size":"medium","depends_on":["task-1","task-2"]}
+        ],"steps":[
+            {"id":"impl-1","role":"implement","job":"a","runner":"codex","model":"composer-2.5","depends_on":[],"task":"task-1"},
+            {"id":"impl-2","role":"implement","job":"b","runner":"codex","model":"composer-2.5","depends_on":[],"task":"task-2"},
+            {"id":"impl-3","role":"implement","job":"c","runner":"codex","model":"composer-2.5","depends_on":["impl-1","impl-2"],"task":"task-3"}
+        ]}"#
+    }
+
+    fn reach_awaiting_approval_with_plan(h: &mut PlanGateHarness, plan_json: &str) {
+        let plan_req = complete_complex_judge(h);
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::TextDelta(plan_json.to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::Completed
+        )));
+        assert_eq!(
+            h.app.last_graph_run.as_ref().map(|run| run.phase).unwrap(),
+            GraphRunPhase::AwaitingApproval
+        );
+    }
+
+    // TC-994 / FR-965: local edits cap at five revisions; stale restored runs refuse rename.
+    #[test]
+    fn task_local_edit_revision_cap_and_stale_rename() {
+        use dmuxai::graph::TaskEdit;
+
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval_with_plan(&mut h, three_task_codex_plan_json());
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        for n in 0..4 {
+            let revision =
+                App::current_plan_revision_n(h.app.last_graph_run.as_ref().unwrap()).unwrap();
+            h.app
+                .apply_task_edit(
+                    TaskEdit::Rename {
+                        task_id: format!("task-{}", (n % 3) + 1),
+                        title: format!("title {n}"),
+                    },
+                    plan_id.clone(),
+                    revision,
+                    DecisionBy::Tui,
+                )
+                .expect("local rename");
+        }
+        let revision =
+            App::current_plan_revision_n(h.app.last_graph_run.as_ref().unwrap()).unwrap();
+        assert_eq!(revision, 5);
+        assert_eq!(
+            h.app.apply_task_edit(
+                TaskEdit::Rename {
+                    task_id: "task-1".to_owned(),
+                    title: "one more".to_owned(),
+                },
+                plan_id.clone(),
+                revision,
+                DecisionBy::Tui,
+            ),
+            Err(PlanDecisionError::RevisionCap)
+        );
+
+        h.app.last_graph_run = None;
+        h.app.graph_approval_stale = None;
+        h.app.restore_graph_runs_on_startup();
+        assert!(h.app.approval_is_stale());
+        let revision =
+            App::current_plan_revision_n(h.app.last_graph_run.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            h.app.apply_task_edit(
+                TaskEdit::Rename {
+                    task_id: "task-1".to_owned(),
+                    title: "after restart".to_owned(),
+                },
+                plan_id.clone(),
+                revision,
+                DecisionBy::Tui,
+            ),
+            Err(PlanDecisionError::StaleRecord)
+        );
+    }
+
+    // TC-994 / FR-965: local task edits bump revision with source user; split uses one edit turn.
+    #[test]
+    fn task_split_uses_edit_turn() {
+        use dmuxai::graph::TaskEdit;
+
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval_with_plan(&mut h, three_task_codex_plan_json());
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        let revision =
+            App::current_plan_revision_n(h.app.last_graph_run.as_ref().unwrap()).unwrap();
+        let sent_before = h.sent.lock().unwrap().len();
+
+        h.app
+            .apply_task_edit(
+                TaskEdit::Rename {
+                    task_id: "task-2".to_owned(),
+                    title: "two renamed".to_owned(),
+                },
+                plan_id.clone(),
+                revision,
+                DecisionBy::Tui,
+            )
+            .expect("rename");
+        assert_eq!(h.sent.lock().unwrap().len(), sent_before);
+        let run = h.app.last_graph_run.as_ref().unwrap();
+        assert_eq!(run.approval.as_ref().unwrap().revisions.len(), 2);
+        assert_eq!(run.approval.as_ref().unwrap().revisions[1].source, "user");
+        assert_eq!(run.plan.tasks[1].title, "two renamed");
+
+        let revision = App::current_plan_revision_n(run).unwrap();
+        h.app
+            .apply_task_edit(
+                TaskEdit::Rename {
+                    task_id: "task-9".to_owned(),
+                    title: "nope".to_owned(),
+                },
+                plan_id.clone(),
+                revision,
+                DecisionBy::Tui,
+            )
+            .expect_err("unknown task");
+        assert!(last_system(&h.app).contains("Task edit refused: unknown task 'task-9'"));
+        assert_eq!(
+            h.app
+                .last_graph_run
+                .as_ref()
+                .unwrap()
+                .approval
+                .as_ref()
+                .unwrap()
+                .revisions
+                .len(),
+            2
+        );
+
+        h.app.input = "/graph task split task-2 split note".to_owned();
+        h.app.submit_prompt();
+        assert_eq!(h.sent.lock().unwrap().len(), sent_before + 1);
+        let edit_req = h.sent.lock().unwrap().last().unwrap().1.clone();
+        assert!(edit_req.prompt.contains("split task-2: split note"));
+        assert_eq!(
+            h.app
+                .pending_plan
+                .as_ref()
+                .unwrap()
+                .edit_feedback
+                .as_deref(),
+            Some("split task-2: split note")
+        );
     }
 
     fn three_step_codex_plan_json() -> &'static str {
