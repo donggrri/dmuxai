@@ -875,6 +875,8 @@ pub struct App {
     conversation_id: StoredConversationId,
     conversation_title: String,
     next_internal_turn_id: u64,
+    /// Internal judge (and similar) turn ids whose adapter output must be dropped.
+    retired_internal_turns: HashSet<String>,
     active_turns: HashMap<Agent, ActiveTurn>,
     pending_summary: Option<PendingSummary>,
     pending_triage: Option<PendingTriage>,
@@ -1073,6 +1075,7 @@ impl App {
             conversation_id: snapshot.id.clone(),
             conversation_title: snapshot.title.clone(),
             next_internal_turn_id: 1,
+            retired_internal_turns: HashSet::new(),
             active_turns: HashMap::new(),
             pending_summary: None,
             pending_triage: None,
@@ -1962,6 +1965,13 @@ impl App {
     }
 
     fn apply_agent_output(&mut self, output: AgentOutput) -> bool {
+        if output
+            .turn_id
+            .as_ref()
+            .is_some_and(|turn_id| self.retired_internal_turns.contains(turn_id.as_str()))
+        {
+            return false;
+        }
         if self.output_belongs_to_summary(&output) {
             return self.apply_summary_output(output);
         }
@@ -3673,6 +3683,12 @@ impl App {
         }
     }
 
+    fn retire_internal_judge_turn(&mut self, pending: &PendingTriage) {
+        self.retired_internal_turns
+            .insert(pending.turn_id.as_str().to_owned());
+        let _ = self.adapters[adapter_index(pending.agent)].cancel();
+    }
+
     fn output_belongs_to_triage(&self, output: &AgentOutput) -> bool {
         self.pending_triage.as_ref().is_some_and(|pending| {
             pending.agent == output.agent
@@ -3796,7 +3812,7 @@ impl App {
                     saved_mode,
                     FallbackCause::Error,
                     run_id,
-                    0,
+                    1,
                     0,
                 );
             }
@@ -3821,6 +3837,7 @@ impl App {
                     let Some(pending) = self.pending_triage.take() else {
                         return false;
                     };
+                    self.retire_internal_judge_turn(&pending);
                     self.busy_agents.remove(&pending.agent);
                     self.activities.remove(&pending.agent);
                     self.end_run_state(pending.agent, false, false);
@@ -3961,6 +3978,15 @@ impl App {
     /// `/direct`, an explicit agent, or empty `allowed_runners`: a 1-node run
     /// with no judge turn (FR-930, FR-937).
     fn submit_direct_run(&mut self, prompt: String, agent: Agent, override_kind: OverrideKind) {
+        if self
+            .pending_summary
+            .as_ref()
+            .is_some_and(|pending| pending.conversation_id == self.conversation_id)
+        {
+            self.input = prompt;
+            self.push_system("Another conversation summary is already running.");
+            return;
+        }
         if self.busy_agents.contains(&agent) {
             self.input = prompt;
             self.push_system(format!(
@@ -4034,18 +4060,45 @@ impl App {
         judge_calls: u32,
         elapsed_ms: u64,
     ) -> Result<GraphRun, String> {
-        let model = self.selected_run_model(agent).map_err(|error| {
-            format!(
-                "Model policy rejected the 1-node run on {}: {error}",
-                runner_name(agent)
-            )
-        })?;
         let runner = runner_name(agent).to_owned();
-        let built = fallback_plan(prompt, &runner, Some(&model), "direct")?;
+        if let Some(selected) = self
+            .model_catalogs
+            .get(&agent)
+            .and_then(|catalog| catalog.selected.clone())
+            && let Err(error) = dmuxai::model_policy::validate_model_for_runner(&runner, &selected)
+        {
+            return Err(format!(
+                "Model policy rejected the 1-node run on {}: {error}",
+                runner
+            ));
+        }
+        let model_hint = self.selected_run_model(agent).ok();
+        // FR-937: an agent without an explicit model runs on its provider
+        // default, exactly like the old direct send.
+        let built = match fallback_plan(prompt, &runner, model_hint.as_deref(), "direct") {
+            Ok(built) => built,
+            Err(_) if model_hint.is_none() => {
+                dmuxai::graph::one_node_plan_on(prompt, &runner, "provider default", "direct")
+            }
+            Err(error) => return Err(error),
+        };
+        let model = built
+            .plan
+            .nodes
+            .first()
+            .map(|node| node.model_id.clone())
+            .unwrap_or_else(|| {
+                model_hint.unwrap_or_else(|| dmuxai::model_policy::default_model().to_owned())
+            });
         let mut plan = built.plan;
         plan.id = run_id;
         plan.orchestrator_model = model.clone();
-        plan.limits = self.graph_limits();
+        let mut limits = self.graph_limits();
+        limits.max_retries = 0;
+        plan.limits = limits;
+        for node in &mut plan.nodes {
+            node.requires_gate = false;
+        }
         let triage = Triage {
             route,
             reason,
@@ -4229,7 +4282,7 @@ impl App {
         let Some(pending) = self.pending_triage.take() else {
             return;
         };
-        let _ = self.adapters[adapter_index(pending.agent)].cancel();
+        self.retire_internal_judge_turn(&pending);
         self.busy_agents.remove(&pending.agent);
         self.activities.remove(&pending.agent);
         self.end_run_state(pending.agent, false, false);
@@ -4690,14 +4743,20 @@ impl App {
         self.single_graph_plan = None;
         self.graph_node_details.clear();
         self.graph_agent_nodes.clear();
-        // FR-937: a 1-node run is quiet; only the graph status line shows.
+        // FR-937: triage/direct 1-node runs are quiet; multi-step plans with an
+        // orchestrate node keep the normal graph banners.
         self.quiet_graph_run = run
             .plan
             .nodes
             .iter()
-            .filter(|node| node.role != NodeRole::Orchestrate)
-            .count()
-            <= 1;
+            .all(|node| node.role != NodeRole::Orchestrate)
+            && run
+                .plan
+                .nodes
+                .iter()
+                .filter(|node| node.role != NodeRole::Orchestrate)
+                .count()
+                <= 1;
         let mut session = GraphRunSession::new(run);
         self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, &session);
         if !self.quiet_graph_run {
@@ -4734,6 +4793,27 @@ impl App {
                         self.push_system("Graph run completed.");
                     }
                     self.quiet_graph_run = false;
+                    let agents: Vec<Agent> = self
+                        .graph_agent_nodes
+                        .drain()
+                        .map(|(agent, _node_id)| agent)
+                        .collect();
+                    for agent in agents {
+                        if let Some(active) = self.active_turns.remove(&agent) {
+                            let stored_output = TurnOutput {
+                                conversation_id: active.conversation_id,
+                                turn_id: active.turn_id,
+                                agent: agent_key(agent),
+                                event: TurnEvent::Cancelled,
+                            };
+                            let _ = self.engine.record_turn_outputs(&[stored_output]);
+                        }
+                        self.busy_agents.remove(&agent);
+                        self.streaming_messages.remove(&agent);
+                        self.activities.remove(&agent);
+                        self.tool_messages.remove(&agent);
+                        self.end_run_state(agent, true, false);
+                    }
                     self.graph_session = None;
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
@@ -4834,7 +4914,40 @@ impl App {
                 assignment.node_id, agent, shown_model
             ));
         }
-        if let Err(err) = self.try_submit_to_agent(agent, prompt, false, false) {
+        let restore_input = self.quiet_graph_run;
+        let allow_defer = self.quiet_graph_run;
+        if let Err(err) =
+            self.try_submit_to_agent(agent, prompt.clone(), restore_input, allow_defer)
+        {
+            if self.quiet_graph_run && Self::is_quiet_graph_agent_busy(&err) {
+                if self.input.is_empty() {
+                    self.input = prompt;
+                }
+                self.push_system(format!(
+                    "{agent} is busy; cancel the active turn before sending another prompt."
+                ));
+                if let Some(session) = self.graph_session.as_mut() {
+                    session.run_mut().phase = GraphRunPhase::Failed;
+                    let run = session.run().clone();
+                    let _ = save_run(&self.workspace_root, &run);
+                    self.last_graph_run = Some(run);
+                }
+                self.graph_agent_nodes.remove(&agent);
+                self.graph_session = None;
+                self.graph_assignment_line.clear();
+                self.quiet_graph_run = false;
+                return Err(format!(
+                    "failed to start node {}: {err:?}",
+                    assignment.node_id
+                ));
+            }
+            if matches!(
+                &err,
+                RunTodoError::Busy(msg) if msg.contains("requires conversation summary")
+            ) {
+                self.graph_agent_nodes.remove(&agent);
+                return Ok(());
+            }
             self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
                 "failed to start node {}: {err:?}",
                 assignment.node_id
@@ -5639,9 +5752,15 @@ impl App {
                     todo: None,
                 };
             }
-        } else {
+        } else if req.prompt.trim_start().starts_with('/')
+            && !req.prompt.trim_start().starts_with("//")
+            && !first_token_is_path(req.prompt.trim_start())
+        {
             self.input = req.prompt.clone();
             self.submit_prompt();
+        } else {
+            let agent = self.adapters[self.selected].agent();
+            self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::Agent);
         }
 
         let is_sync_slash = req.todo_id.is_none()
@@ -6058,6 +6177,10 @@ impl App {
             })?;
         self.publish_todos();
         Ok(updated)
+    }
+
+    fn is_quiet_graph_agent_busy(err: &RunTodoError) -> bool {
+        matches!(err, RunTodoError::Busy(msg) if msg.contains(" is busy"))
     }
 
     fn restore_deferred_input(&mut self, deferred: DeferredTurn) {
@@ -13348,8 +13471,8 @@ mod tests {
         app.input = "research the auth module, plan migration, implement fix, and test".to_owned();
         app.submit_prompt();
 
-        // No graph session should be started
-        assert!(app.graph_session.is_none());
+        // FR-930: empty allowed_runners still runs a quiet 1-node graph record.
+        assert!(app.graph_session.is_some());
         assert!(app.messages.iter().any(|m| m.content.contains(
             "Graph disabled: allowed_runners list is empty. Falling back to single-agent mode."
         )));
@@ -15997,6 +16120,100 @@ mod tests {
         assert!(harness.sent.lock().unwrap().is_empty());
         assert!(harness.app.pending_triage.is_none());
         assert!(last_system(&harness.app).contains("busy"));
+    }
+
+    // TC-934 / FR-937: quiet 1-node run busy teardown restores the prompt.
+    #[test]
+    fn quiet_run_busy_restores_prompt() {
+        let mut harness = plan_gate_test_app();
+        harness.app.busy_agents.insert(Agent::Codex);
+        harness.app.quiet_graph_run = true;
+        harness.app.input.clear();
+        let run = harness
+            .app
+            .build_one_node_run(
+                "hello",
+                Agent::Codex,
+                Route::Simple,
+                "tiny".to_owned(),
+                TriageSource::Judge,
+                None,
+                None,
+                Uuid::new_v4().to_string(),
+                1,
+                0,
+            )
+            .unwrap();
+        harness
+            .app
+            .graph_session
+            .replace(GraphRunSession::new(run.clone()));
+        harness.app.last_graph_run = Some(run);
+        let node = harness
+            .app
+            .graph_session
+            .as_ref()
+            .unwrap()
+            .run()
+            .plan
+            .nodes
+            .first()
+            .unwrap();
+        let assignment = NodeAssignment {
+            node_id: node.id.clone(),
+            runner: node.runner.clone(),
+            model_id: node.model_id.clone(),
+            prompt: "hello".to_owned(),
+            role: node.role,
+        };
+        assert!(harness.app.start_graph_node(assignment).is_err());
+        assert_eq!(harness.app.input, "hello");
+        assert!(last_system(&harness.app).contains("busy"));
+        assert!(harness.app.graph_session.is_none());
+        assert_eq!(
+            harness.app.last_graph_run.as_ref().unwrap().phase,
+            GraphRunPhase::Failed
+        );
+    }
+
+    // TC-938 / FR-932: judge buffer overflow cancels and hides stray judge text.
+    #[test]
+    fn judge_overflow_cancels_and_hides_judge_text() {
+        let mut harness = plan_gate_test_app();
+        harness.app.input = "hello".to_owned();
+        harness.app.submit_prompt();
+        let judge = harness.sent.lock().unwrap()[0].1.clone();
+        harness.app.pending_triage.as_mut().unwrap().buffer_chars = MAX_SUMMARY_BUFFER_CHARS;
+        assert!(harness.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::TextDelta("overflow".to_owned())
+        )));
+        assert_eq!(&*harness.cancelled.lock().unwrap(), &[Agent::Codex]);
+        assert!(
+            !harness
+                .app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("overflow"))
+        );
+        assert!(!harness.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::TextDelta("leaked judge text".to_owned())
+        )));
+        assert!(
+            !harness
+                .app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("leaked judge text"))
+        );
+        assert!(!harness.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::Cancelled
+        )));
     }
 
     // TC-937 / FR-935: silence past 90 s falls back; recent events keep it alive.

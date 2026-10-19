@@ -492,7 +492,17 @@ pub fn fallback_plan(
             default.to_owned()
         }
     };
-    Ok(FallbackPlan {
+    Ok(one_node_plan_on(prompt, &runner, &model, cause))
+}
+
+/// Builds the 1-node plan on `runner` with `model` as given (no policy
+/// lookup). Used by [`fallback_plan`] after it resolved the model, and by the
+/// direct 1-node run when the selected agent has no explicit model and runs on
+/// its provider default (FR-937).
+pub fn one_node_plan_on(prompt: &str, runner: &str, model: &str, cause: &str) -> FallbackPlan {
+    let runner = runner.trim().to_ascii_lowercase();
+    let model = model.to_owned();
+    FallbackPlan {
         plan: GraphPlan {
             schema: SCHEMA.to_owned(),
             id: Uuid::new_v4().to_string(),
@@ -517,7 +527,7 @@ pub fn fallback_plan(
         note: format!(
             "Plan fallback ({cause}): one step on {runner} {model}. Edit to ask for a real plan."
         ),
-    })
+    }
 }
 
 fn valid_step_id(id: &str) -> bool {

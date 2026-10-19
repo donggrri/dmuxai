@@ -60,6 +60,7 @@ impl GraphRunSession {
         if let Some(node_id) = self.run.waiting_gate_node.clone() {
             if let Some(node) = self.run.plan.nodes.iter_mut().find(|n| n.id == node_id) {
                 node.status = GraphNodeStatus::Ready;
+                node.requires_gate = false;
             }
             self.run.waiting_gate_node = None;
             self.run.phase = GraphRunPhase::Active;

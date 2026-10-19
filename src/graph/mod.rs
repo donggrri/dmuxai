@@ -14,7 +14,8 @@ pub use judge::{
 };
 pub use plan_doc::{
     AllowedRunner, FallbackPlan, PLAN_PROMPT, PlanContext, PlanDoc, PlanError, PlanPromptMode,
-    PlanPromptRequest, PlanStep, build_plan_prompt, fallback_plan, parse_plan, validate_plan,
+    PlanPromptRequest, PlanStep, build_plan_prompt, fallback_plan, one_node_plan_on, parse_plan,
+    validate_plan,
 };
 pub use planner::heuristic_route;
 pub use policy::{
