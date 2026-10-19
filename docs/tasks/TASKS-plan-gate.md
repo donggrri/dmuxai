@@ -66,7 +66,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   FR-956, FR-957. TC-973.
   Files: `src/app.rs`.
   Done when: `replan_only_on_trigger` green.
-- [ ] P11 — Replan send/apply: budget check, hold scheduling, apply or reject, sensitive revision approval, `plan_history` + event log, TUI notice; every turn recorded.
+- [x] P11 — (#67 agent-planned graph 4b1d8cab: 6 steps; 2 fix turns as #67 /direct runs + a hand fix; composer-2.5; review claude-sonnet-5-5-high BLOCK ×3 rounds (held failure lost on sensitive reject; unbounded/unscoped busy wait; stale approve snapshot; cancel left deferred turn) → fixed → APPROVE; dogfood bug from run 4b1d8cab fixed as FR-979/TC-1004 (internal turns wait for adapter release, bounded 120 s); nits for P15: dashboard 409 mapping, merge_live_graph_progress on rewritten failed nodes, second defer dropped, approval phase overwritten by a node failure) Replan send/apply: budget check, hold scheduling, apply or reject, sensitive revision approval, `plan_history` + event log, TUI notice; every turn recorded.
   FR-954, FR-959, FR-960, UX-935. TC-976, TC-979 (TUI), TC-989.
   Files: `src/app.rs`.
   Done when: `sensitive_replan_needs_approval`, `revision_notice_renders`, `every_turn_is_recorded_as_graph_run` green.

@@ -293,6 +293,29 @@ pub fn task_status(plan: &GraphPlan) -> Vec<(PlanTask, TaskState)> {
         .collect()
 }
 
+/// Task list deltas for a local approval-gate edit (FR-965).
+pub fn diff_plan_tasks(previous: &[PlanTask], next: &[PlanTask]) -> (usize, usize, usize) {
+    let previous_ids: HashMap<&str, &PlanTask> = previous
+        .iter()
+        .map(|task| (task.id.as_str(), task))
+        .collect();
+    let next_ids: HashSet<&str> = next.iter().map(|task| task.id.as_str()).collect();
+    let mut added = 0usize;
+    let mut changed = 0usize;
+    for task in next.iter() {
+        match previous_ids.get(task.id.as_str()) {
+            None => added += 1,
+            Some(old) if **old != *task => changed += 1,
+            _ => {}
+        }
+    }
+    let removed = previous
+        .iter()
+        .filter(|task| !next_ids.contains(task.id.as_str()))
+        .count();
+    (added, changed, removed)
+}
+
 pub fn task_counts(plan: &GraphPlan) -> (usize, usize) {
     let statuses = task_status(plan);
     let total = statuses.len();

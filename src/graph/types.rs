@@ -206,6 +206,9 @@ pub struct GraphRun {
     /// FR-951: when the plan (or 1-node plan) was fixed at the gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_fixed_ms: Option<u64>,
+    /// FR-959: proposed plan while a sensitive replan waits for approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_replan_plan: Option<GraphPlan>,
 }
 
 /// FR-943: at most five plan revisions per run.
@@ -263,6 +266,12 @@ pub struct PlanRevision {
     pub n: u32,
     pub source: String,
     pub steps: Vec<PlanStep>,
+    /// FR-959: step ids added in a replan revision awaiting approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added: Vec<String>,
+    /// FR-959: step ids changed in a replan revision awaiting approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

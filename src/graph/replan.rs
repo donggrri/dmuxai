@@ -751,6 +751,15 @@ fn dependencies(plan: &GraphPlan, id: &str) -> Vec<String> {
         .collect()
 }
 
+/// Pending/ready steps from a proposed replan plan (FR-959 approval panel).
+pub fn replan_revision_steps(plan: &GraphPlan) -> Vec<PlanStep> {
+    plan.nodes
+        .iter()
+        .filter(|node| node.role != NodeRole::Orchestrate && is_pending(node.status))
+        .map(|node| step_from_node(plan, node))
+        .collect()
+}
+
 fn step_from_node(plan: &GraphPlan, node: &GraphNode) -> PlanStep {
     PlanStep {
         id: node.id.clone(),

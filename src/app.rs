@@ -28,7 +28,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 use dmuxai::{
@@ -60,10 +60,11 @@ use dmuxai::{
         PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode, PlanPromptRequest, PlanRevision,
         PlanStep, PlanTask, PlannerCalls, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage,
         TriageSource, apply_replan, budget_allows, build_judge_prompt, build_plan_prompt,
-        build_replan_prompt, cap_replan_step_summary, cap_revision_raw, fallback_plan,
-        graph_plan_from_revision_steps, heuristic_route, parse_plan, parse_replan,
-        parse_replan_marker, parse_verdict, plan_json_for_edit, replan_allowed,
-        revision_needs_approval, save_run, strip_replan_marker, validate_plan,
+        build_replan_prompt, cap_replan_step_summary, cap_revision_raw, diff_plan_steps,
+        diff_plan_tasks, fallback_plan, graph_plan_from_revision_steps, heuristic_route,
+        parse_plan, parse_replan, parse_replan_marker, parse_verdict, plan_json_for_edit,
+        replan_allowed, replan_revision_steps, revision_needs_approval, save_run,
+        strip_replan_marker, validate_plan,
     },
     mcp::config::ResolvedMcpServer,
     mcp::registry::McpRegistry,
@@ -116,6 +117,8 @@ const PLAN_SILENCE_TIMEOUT: Duration = Duration::from_secs(240);
 const PLAN_HARD_CAP: Duration = Duration::from_secs(720);
 /// OQ-936: hard cap on a replan turn (plan silence timeout still applies).
 const REPLAN_HARD_CAP: Duration = Duration::from_secs(120);
+/// FR-979: cap waiting for an adapter busy refusal on internal judge/plan/replan turns.
+const INTERNAL_DEFER_MAX_WAIT: Duration = Duration::from_secs(120);
 const DEFAULT_INPUT_HEIGHT: u16 = 3;
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MIN_MAIN_HEIGHT: u16 = 5;
@@ -650,8 +653,11 @@ struct PendingSummary {
 /// every ending.
 struct PendingTriage {
     agent: Agent,
+    /// FR-979: first busy-defer time, kept across resends so the wait stays bounded.
+    defer_origin: Option<Instant>,
     conversation_id: StoredConversationId,
     turn_id: StoredTurnId,
+    adapter_prompt: String,
     buffer: String,
     buffer_chars: usize,
     started: Instant,
@@ -666,8 +672,11 @@ struct PendingTriage {
 /// shown, and the pinned agent keeps the turn even if the user switches tabs.
 struct PendingPlan {
     agent: Agent,
+    /// FR-979: first busy-defer time, kept across resends so the wait stays bounded.
+    defer_origin: Option<Instant>,
     conversation_id: StoredConversationId,
     turn_id: StoredTurnId,
+    adapter_prompt: String,
     buffer: String,
     buffer_chars: usize,
     started: Instant,
@@ -694,6 +703,8 @@ struct PendingPlan {
 /// FR-956: internal read-only replan turn (buffer hidden like [`PendingPlan`]).
 struct PendingReplan {
     agent: Agent,
+    /// FR-979: first busy-defer time, kept across resends so the wait stays bounded.
+    defer_origin: Option<Instant>,
     conversation_id: StoredConversationId,
     turn_id: StoredTurnId,
     buffer: String,
@@ -711,6 +722,18 @@ struct PendingReplan {
     decided_by: Option<DecisionBy>,
     #[allow(dead_code)]
     summaries: Vec<(String, String)>,
+}
+
+enum DeferredInternalTurn {
+    Triage(PendingTriage),
+    Plan(PendingPlan),
+    Replan(PendingReplan),
+}
+
+struct DeferredInternalTurnWait {
+    deferred_since: Instant,
+    retry_after: Instant,
+    turn: DeferredInternalTurn,
 }
 
 /// FR-956: wait until the planning agent finishes its graph step.
@@ -742,6 +765,7 @@ pub enum PlanDecisionError {
     AgentBusy,
     InvalidRevisionPlan(String),
     TaskEditRefused(String),
+    ReplanEditRefused,
 }
 
 impl PlanDecisionError {
@@ -1022,6 +1046,7 @@ pub struct App {
     replan_summaries: Vec<(String, String)>,
     /// Node id whose terminal failure is held until replan finishes (FR-956).
     graph_failure_replan: Option<String>,
+    deferred_internal_turn: Option<DeferredInternalTurnWait>,
     deferred_turns: Vec<DeferredTurn>,
     restored_inputs: HashMap<StoredConversationId, String>,
     busy_agents: HashSet<Agent>,
@@ -1233,6 +1258,7 @@ impl App {
             queued_replan: None,
             replan_summaries: Vec::new(),
             graph_failure_replan: None,
+            deferred_internal_turn: None,
             deferred_turns: Vec::new(),
             restored_inputs: HashMap::new(),
             busy_agents: HashSet::new(),
@@ -1414,12 +1440,13 @@ impl App {
         self.check_triage_timeout(Instant::now());
         self.check_plan_timeout(Instant::now());
         self.check_replan_timeout(Instant::now());
+        let flushed_internal = self.flush_deferred_internal_turns();
         let flushed = self.flush_deferred_graph_starts();
         let busy = !self.busy_agents.is_empty();
-        if busy || flushed {
+        if busy || flushed || flushed_internal {
             self.dirty = true;
         }
-        busy || flushed
+        busy || flushed || flushed_internal
     }
 
     pub async fn run<B>(&mut self, terminal: &mut Terminal<B>) -> Result<(), B::Error>
@@ -3527,6 +3554,13 @@ impl App {
 
     fn cancel_selected(&mut self) {
         let agent = self.adapters[self.selected].agent();
+        // FR-979: a judge/plan/replan turn waiting for the adapter is cancelled
+        // like a running one (the adapter itself has nothing to cancel).
+        let from_deferred = self.take_deferred_turn_for_cancel(agent);
+        if from_deferred == Some(false) {
+            return;
+        }
+        let from_deferred = from_deferred.is_some();
         let selected_has_turn =
             self.busy_agents.contains(&agent) || self.active_turns.contains_key(&agent);
         if self.pending_plan.is_none()
@@ -3547,7 +3581,8 @@ impl App {
             || triage_agent == Some(agent)
             || plan_agent == Some(agent);
 
-        if let Err(error) = self.adapters[self.selected].cancel()
+        if !from_deferred
+            && let Err(error) = self.adapters[self.selected].cancel()
             && was_tracking
         {
             self.messages.push(Message::new(
@@ -4112,6 +4147,7 @@ impl App {
         };
         let turn_id = TurnId::new(format!("judge-{}", self.next_internal_turn_id));
         self.next_internal_turn_id += 1;
+        let adapter_prompt = judge_prompt.clone();
         let request = AgentRequest {
             conversation_id: ConversationId::new(self.conversation_id.as_str()),
             turn_id: turn_id.clone(),
@@ -4136,9 +4172,11 @@ impl App {
                 self.activities
                     .insert(agent, AgentActivity::queued(ActivityKind::Summary, now));
                 self.pending_triage = Some(PendingTriage {
+                    defer_origin: None,
                     agent,
                     conversation_id: self.conversation_id.clone(),
                     turn_id: StoredTurnId::new(turn_id.as_str()),
+                    adapter_prompt,
                     buffer: String::new(),
                     buffer_chars: 0,
                     started: now,
@@ -4254,6 +4292,15 @@ impl App {
                 let Some(pending) = self.pending_triage.take() else {
                     return false;
                 };
+                if Self::internal_turn_busy_error(&output.event).is_some() {
+                    self.busy_agents.remove(&pending.agent);
+                    self.activities.remove(&pending.agent);
+                    self.end_run_state(pending.agent, false, false);
+                    let _ =
+                        self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
+                    self.defer_internal_turn(DeferredInternalTurn::Triage(pending));
+                    return true;
+                }
                 self.busy_agents.remove(&pending.agent);
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, false, false);
@@ -4461,6 +4508,7 @@ impl App {
             PlanDecisionError::TaskEditRefused(reason) => {
                 format!("Task edit refused: {reason}")
             }
+            PlanDecisionError::ReplanEditRefused => "edit is only for the initial plan".to_owned(),
         }
     }
 
@@ -4573,6 +4621,9 @@ impl App {
                 if approval_stale {
                     return Err(PlanDecisionError::StaleRecord);
                 }
+                if run.pending_replan_plan.is_some() {
+                    return Err(PlanDecisionError::ReplanEditRefused);
+                }
                 if feedback.trim().is_empty() {
                     return Err(PlanDecisionError::EmptyFeedback);
                 }
@@ -4642,6 +4693,9 @@ impl App {
         if approval_stale {
             return Err(PlanDecisionError::StaleRecord);
         }
+        if run.pending_replan_plan.is_some() {
+            return Err(PlanDecisionError::ReplanEditRefused);
+        }
         if approval.revisions.len() as u32 >= MAX_PLAN_REVISIONS {
             return Err(PlanDecisionError::RevisionCap);
         }
@@ -4702,28 +4756,57 @@ impl App {
         steps: Vec<PlanStep>,
         tasks: Vec<PlanTask>,
     ) -> Result<(), PlanDecisionError> {
-        let run = self
-            .last_graph_run
-            .as_mut()
-            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
-        let approval = run
-            .approval
-            .as_mut()
-            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
-        let next_n = approval.revisions.last().map(|rev| rev.n + 1).unwrap_or(1);
-        approval.revisions.push(PlanRevision {
-            n: next_n,
-            source: "user".to_owned(),
-            steps,
-            feedback: None,
-            errors: None,
-            raw: None,
-        });
-        run.plan.tasks = tasks;
-        run.plan_fixed_ms = Some(unix_ms_now());
-        if let Err(error) = save_run(&self.workspace_root, run) {
-            self.push_system(format!("Could not save the task edit: {error}"));
-        }
+        let change = {
+            let run = self
+                .last_graph_run
+                .as_mut()
+                .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+            let approval = run
+                .approval
+                .as_mut()
+                .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+            let prev_steps = approval
+                .revisions
+                .last()
+                .map(|rev| rev.steps.clone())
+                .unwrap_or_default();
+            let prev_tasks = run.plan.tasks.clone();
+            let next_n = approval.revisions.last().map(|rev| rev.n + 1).unwrap_or(1);
+            let (added, changed, removed) = diff_plan_steps(&prev_steps, &steps);
+            let (tasks_added, tasks_changed, tasks_removed) = diff_plan_tasks(&prev_tasks, &tasks);
+            approval.revisions.push(PlanRevision {
+                n: next_n,
+                source: "user".to_owned(),
+                steps,
+                added: Vec::new(),
+                changed: Vec::new(),
+                feedback: None,
+                errors: None,
+                raw: None,
+            });
+            run.plan.tasks = tasks;
+            run.plan_fixed_ms = Some(unix_ms_now());
+            PlanChange {
+                rev: next_n,
+                kind: PlanChangeKind::Edit,
+                at_ms: unix_ms_now(),
+                after_node: None,
+                reason: "user task edit".to_owned(),
+                trigger: None,
+                prompt_chars: None,
+                response_chars: None,
+                added,
+                changed,
+                removed,
+                tasks_added,
+                tasks_changed,
+                tasks_removed,
+                applied: true,
+                error: None,
+                decided_by: None,
+            }
+        };
+        self.record_plan_change(change);
         Ok(())
     }
 
@@ -4815,6 +4898,13 @@ impl App {
     }
 
     fn approve_awaiting_plan(&mut self, by: DecisionBy) -> Result<(), PlanDecisionError> {
+        if self
+            .last_graph_run
+            .as_ref()
+            .is_some_and(|run| run.pending_replan_plan.is_some())
+        {
+            return self.approve_replan_awaiting(by);
+        }
         let (triage, steps, tasks, user_prompt, plan_id, orchestrate_started, plan_fixed) = {
             let run = self
                 .last_graph_run
@@ -4875,22 +4965,58 @@ impl App {
         })?;
         Self::attach_orchestrate_node(&mut graph_plan, &triage, orchestrate_started, plan_fixed);
         let decided_at = unix_ms_now();
-        let run = self
-            .last_graph_run
-            .as_mut()
-            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
-        let approval = run
-            .approval
-            .as_mut()
-            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
-        approval.state = ApprovalState::Approved;
-        approval.decided_by = Some(by);
-        approval.decided_at_ms = Some(decided_at);
-        run.phase = GraphRunPhase::Active;
-        run.plan = graph_plan;
-        if let Err(error) = save_run(&self.workspace_root, run) {
+        let (plan_id, rev, save_error) = {
+            let run = self
+                .last_graph_run
+                .as_mut()
+                .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+            let approval = run
+                .approval
+                .as_mut()
+                .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+            let revision_steps = approval
+                .revisions
+                .last()
+                .map(|rev| rev.steps.clone())
+                .unwrap_or_default();
+            let rev = approval.revisions.last().map(|rev| rev.n).unwrap_or(1);
+            approval.state = ApprovalState::Approved;
+            approval.decided_by = Some(by);
+            approval.decided_at_ms = Some(decided_at);
+            run.phase = GraphRunPhase::Active;
+            run.plan = graph_plan;
+            let (added, changed, removed) = if run.plan_history.is_empty() {
+                diff_plan_steps(&[], &revision_steps)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
+            run.push_plan_change(PlanChange {
+                rev,
+                kind: PlanChangeKind::Initial,
+                at_ms: decided_at,
+                after_node: None,
+                reason: "approved".to_owned(),
+                trigger: None,
+                prompt_chars: None,
+                response_chars: None,
+                added,
+                changed,
+                removed,
+                tasks_added: 0,
+                tasks_changed: 0,
+                tasks_removed: 0,
+                applied: true,
+                error: None,
+                decided_by: Some(by),
+            });
+            let plan_id = run.plan.id.clone();
+            let save_error = save_run(&self.workspace_root, run).err();
+            (plan_id, rev, save_error)
+        };
+        if let Some(error) = save_error {
             self.push_system(format!("Could not save the approved plan: {error}"));
         }
+        self.emit_plan_revised_event(&plan_id, rev);
         let run = self.last_graph_run.clone().expect("approved run");
         self.graph_approval_stale = None;
         self.start_graph_run_record(run);
@@ -4898,19 +5024,50 @@ impl App {
     }
 
     fn reject_awaiting_plan(&mut self, by: DecisionBy) -> Result<(), PlanDecisionError> {
-        let run = self
+        if self
             .last_graph_run
-            .as_mut()
-            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
-        let approval = run
-            .approval
-            .as_mut()
-            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
-        approval.state = ApprovalState::Rejected;
-        approval.decided_by = Some(by);
-        approval.decided_at_ms = Some(unix_ms_now());
-        run.phase = GraphRunPhase::Rejected;
-        if let Err(error) = save_run(&self.workspace_root, run) {
+            .as_ref()
+            .is_some_and(|run| run.pending_replan_plan.is_some())
+        {
+            return self.reject_replan_awaiting(by);
+        }
+        let save_error = {
+            let run = self
+                .last_graph_run
+                .as_mut()
+                .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+            let approval = run
+                .approval
+                .as_mut()
+                .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+            let decided_at = unix_ms_now();
+            let rev = approval.revisions.last().map(|rev| rev.n).unwrap_or(1);
+            approval.state = ApprovalState::Rejected;
+            approval.decided_by = Some(by);
+            approval.decided_at_ms = Some(decided_at);
+            run.phase = GraphRunPhase::Rejected;
+            run.push_plan_change(PlanChange {
+                rev,
+                kind: PlanChangeKind::Initial,
+                at_ms: decided_at,
+                after_node: None,
+                reason: "rejected".to_owned(),
+                trigger: None,
+                prompt_chars: None,
+                response_chars: None,
+                added: Vec::new(),
+                changed: Vec::new(),
+                removed: Vec::new(),
+                tasks_added: 0,
+                tasks_changed: 0,
+                tasks_removed: 0,
+                applied: false,
+                error: None,
+                decided_by: Some(by),
+            });
+            save_run(&self.workspace_root, run).err()
+        };
+        if let Some(error) = save_error {
             self.push_system(format!("Could not save the rejected plan: {error}"));
         }
         self.graph_approval_stale = None;
@@ -5329,6 +5486,8 @@ impl App {
                 n: 1,
                 source: "fallback".to_owned(),
                 steps: vec![step],
+                added: Vec::new(),
+                changed: Vec::new(),
                 feedback: None,
                 errors: Some(revision_error_lines),
                 raw: revision_raw,
@@ -5576,6 +5735,7 @@ impl App {
         };
         let turn_id = TurnId::new(format!("plan-{}", self.next_internal_turn_id));
         self.next_internal_turn_id += 1;
+        let adapter_prompt = plan_prompt.clone();
         let request = AgentRequest {
             conversation_id: ConversationId::new(self.conversation_id.as_str()),
             turn_id: turn_id.clone(),
@@ -5664,9 +5824,11 @@ impl App {
                 self.activities
                     .insert(agent, AgentActivity::queued(ActivityKind::Summary, now));
                 self.pending_plan = Some(PendingPlan {
+                    defer_origin: None,
                     agent,
                     conversation_id: self.conversation_id.clone(),
                     turn_id: StoredTurnId::new(turn_id.as_str()),
+                    adapter_prompt,
                     buffer: String::new(),
                     buffer_chars: 0,
                     started: now,
@@ -5695,9 +5857,11 @@ impl App {
                 self.push_system(format!("Could not start plan turn with {agent}: {error}"));
                 if edit.is_some() {
                     let pending = PendingPlan {
+                        defer_origin: None,
                         agent,
                         conversation_id: self.conversation_id.clone(),
                         turn_id: StoredTurnId::new(turn_id.as_str()),
+                        adapter_prompt: adapter_prompt.clone(),
                         buffer: String::new(),
                         buffer_chars: 0,
                         started: Instant::now(),
@@ -5815,6 +5979,8 @@ impl App {
                 n: 1,
                 source: "agent".to_owned(),
                 steps: Self::revision_steps_from_doc(doc),
+                added: Vec::new(),
+                changed: Vec::new(),
                 feedback: None,
                 errors: None,
                 raw: None,
@@ -5876,29 +6042,61 @@ impl App {
         let Some(approval) = run.approval.as_mut() else {
             return;
         };
-        let next_n = approval.revisions.last().map(|rev| rev.n + 1).unwrap_or(1);
-        approval.revisions.push(PlanRevision {
-            n: next_n,
-            source: "edit".to_owned(),
-            steps,
-            feedback,
-            errors: None,
-            raw: None,
-        });
-        approval.state = ApprovalState::Pending;
-        run.plan = graph_plan;
-        run.phase = GraphRunPhase::AwaitingApproval;
-        run.plan_fixed_ms = Some(unix_ms_now());
-        run.planner_calls = PlannerCalls {
-            judge: pending.judge_calls,
-            plan: pending.plan_calls,
-            repair: pending.repair_calls,
-            edit: edit_calls,
-            ..run.planner_calls
+        let reason = feedback
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| text.trim().to_owned())
+            .unwrap_or_else(|| "edit".to_owned());
+        let change = {
+            let prev_steps = approval
+                .revisions
+                .last()
+                .map(|rev| rev.steps.clone())
+                .unwrap_or_default();
+            let next_n = approval.revisions.last().map(|rev| rev.n + 1).unwrap_or(1);
+            let (added, changed, removed) = diff_plan_steps(&prev_steps, &steps);
+            approval.revisions.push(PlanRevision {
+                n: next_n,
+                source: "edit".to_owned(),
+                steps,
+                added: Vec::new(),
+                changed: Vec::new(),
+                feedback,
+                errors: None,
+                raw: None,
+            });
+            approval.state = ApprovalState::Pending;
+            run.plan = graph_plan;
+            run.phase = GraphRunPhase::AwaitingApproval;
+            run.plan_fixed_ms = Some(unix_ms_now());
+            run.planner_calls = PlannerCalls {
+                judge: pending.judge_calls,
+                plan: pending.plan_calls,
+                repair: pending.repair_calls,
+                edit: edit_calls,
+                ..run.planner_calls
+            };
+            PlanChange {
+                rev: next_n,
+                kind: PlanChangeKind::Edit,
+                at_ms: unix_ms_now(),
+                after_node: None,
+                reason,
+                trigger: None,
+                prompt_chars: None,
+                response_chars: None,
+                added,
+                changed,
+                removed,
+                tasks_added: 0,
+                tasks_changed: 0,
+                tasks_removed: 0,
+                applied: true,
+                error: None,
+                decided_by: None,
+            }
         };
-        if let Err(error) = save_run(&self.workspace_root, run) {
-            self.push_system(format!("Could not save the edited plan: {error}"));
-        }
+        self.record_plan_change(change);
     }
 
     /// Retires the plan turn id and cancels the adapter turn (overflow and
@@ -6154,13 +6352,26 @@ impl App {
                 let Some(pending) = self.pending_plan.take() else {
                     return false;
                 };
+                if Self::internal_turn_busy_error(&output.event).is_some() {
+                    self.busy_agents.remove(&pending.agent);
+                    self.activities.remove(&pending.agent);
+                    self.end_run_state(pending.agent, false, false);
+                    let _ =
+                        self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
+                    self.defer_internal_turn(DeferredInternalTurn::Plan(pending));
+                    return true;
+                }
                 self.retire_plan_turn_id(&pending);
                 self.busy_agents.remove(&pending.agent);
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, false, false);
                 let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
+                let detail = match output.event {
+                    AgentEvent::Error(message) => message,
+                    _ => "cancelled".to_owned(),
+                };
                 if pending.edit_previous_json.is_some() {
-                    self.restore_awaiting_after_edit_failure(&pending, "error");
+                    self.restore_awaiting_after_edit_failure(&pending, &detail);
                 } else {
                     self.park_fallback_plan(
                         pending.prompt,
@@ -6178,7 +6389,7 @@ impl App {
                             repair: pending.repair_calls,
                             ..Default::default()
                         },
-                        "error",
+                        &detail,
                         None,
                         None,
                     );
@@ -6264,6 +6475,22 @@ impl App {
         self.pending_replan.is_some()
             || self.queued_replan.is_some()
             || self.graph_failure_replan.is_some()
+            || self.deferred_internal_turn.is_some()
+            || self.replan_approval_blocks_starts()
+    }
+
+    fn replan_approval_blocks_starts(&self) -> bool {
+        self.graph_session
+            .as_ref()
+            .is_some_and(|session| Self::run_blocks_replan_starts(session.run()))
+            || self
+                .last_graph_run
+                .as_ref()
+                .is_some_and(Self::run_blocks_replan_starts)
+    }
+
+    fn run_blocks_replan_starts(run: &GraphRun) -> bool {
+        run.phase == GraphRunPhase::AwaitingApproval && run.pending_replan_plan.is_some()
     }
 
     fn filter_graph_actions_for_replan(&mut self, actions: Vec<GraphAction>) -> Vec<GraphAction> {
@@ -6328,7 +6555,12 @@ impl App {
                         }
                     }
                 } else if Self::queued_replan_is_failure(&incoming) {
-                    incoming
+                    QueuedReplan {
+                        trigger: incoming.trigger,
+                        reason: Self::merge_replan_reasons(&existing.reason, &incoming.reason),
+                        failure_node_id: incoming.failure_node_id.or(existing.failure_node_id),
+                        decided_by: incoming.decided_by.or(existing.decided_by),
+                    }
                 } else {
                     QueuedReplan {
                         trigger: incoming.trigger,
@@ -6397,6 +6629,9 @@ impl App {
         decided_by: Option<DecisionBy>,
     ) {
         if !self.graph_session_is_multi_step() {
+            if failure_node_id.is_some() || trigger == ReplanTrigger::Failure {
+                self.finish_held_graph_failure();
+            }
             return;
         }
         if self.pending_replan.is_some() {
@@ -6568,6 +6803,7 @@ impl App {
                 self.activities
                     .insert(agent, AgentActivity::queued(ActivityKind::Summary, now));
                 self.pending_replan = Some(PendingReplan {
+                    defer_origin: None,
                     agent,
                     conversation_id: self.conversation_id.clone(),
                     turn_id: StoredTurnId::new(turn_id.as_str()),
@@ -6629,19 +6865,486 @@ impl App {
             .insert(pending.turn_id.as_str().to_owned());
     }
 
+    fn finalize_pending_replan_change(
+        pending: &PendingReplan,
+        mut change: PlanChange,
+    ) -> PlanChange {
+        change.rev = pending.rev;
+        change.trigger = Some(Self::plan_change_trigger(pending.trigger));
+        change.prompt_chars = Some(pending.prompt.chars().count());
+        change.response_chars = Some(pending.buffer.chars().count());
+        change.after_node = pending.failure_node_id.clone();
+        if change.decided_by.is_none() {
+            change.decided_by = pending.decided_by;
+        }
+        change
+    }
+
+    fn plan_change_should_emit_revised(change: &PlanChange) -> bool {
+        if change.kind == PlanChangeKind::Initial && !change.applied {
+            return false;
+        }
+        if change.error.is_some() {
+            return false;
+        }
+        change.applied
+            || !change.added.is_empty()
+            || !change.changed.is_empty()
+            || !change.removed.is_empty()
+            || change.tasks_added > 0
+            || change.tasks_changed > 0
+            || change.tasks_removed > 0
+    }
+
+    fn defer_internal_turn(&mut self, turn: DeferredInternalTurn) {
+        if self.deferred_internal_turn.is_some() {
+            self.push_system(
+                "Internal turn still waiting for the adapter; ignoring another defer.".to_owned(),
+            );
+            return;
+        }
+        let now = Instant::now();
+        let origin = match &turn {
+            DeferredInternalTurn::Triage(pending) => pending.defer_origin,
+            DeferredInternalTurn::Plan(pending) => pending.defer_origin,
+            DeferredInternalTurn::Replan(pending) => pending.defer_origin,
+        };
+        self.deferred_internal_turn = Some(DeferredInternalTurnWait {
+            deferred_since: origin.unwrap_or(now),
+            retry_after: now + GRAPH_DEFER_RETRY_INTERVAL,
+            turn,
+        });
+    }
+
+    fn finish_deferred_internal_turn_expired(&mut self, turn: DeferredInternalTurn) {
+        const MESSAGE: &str = "adapter stayed busy";
+        match turn {
+            DeferredInternalTurn::Triage(pending) => {
+                let elapsed_ms = pending.started.elapsed().as_millis() as u64;
+                self.triage_fallback(
+                    pending.prompt,
+                    pending.agent,
+                    pending.saved_mode,
+                    FallbackCause::Error,
+                    pending.run_id,
+                    pending.judge_calls,
+                    elapsed_ms,
+                );
+                self.push_system(format!("Judge turn failed: {MESSAGE}"));
+            }
+            DeferredInternalTurn::Plan(pending) => {
+                self.restore_or_fallback_after_plan_error(&pending, MESSAGE);
+            }
+            DeferredInternalTurn::Replan(pending) => {
+                self.finish_replan_rejected(pending, MESSAGE.to_owned(), true);
+            }
+        }
+    }
+
+    /// FR-979: on a user cancel, move a deferred judge/plan turn of `agent` back
+    /// into its pending slot (`Some(true)`, the normal cancel path finishes it)
+    /// or end a deferred replan here (`Some(false)`). `None`: nothing deferred.
+    fn take_deferred_turn_for_cancel(&mut self, agent: Agent) -> Option<bool> {
+        let deferred_agent = match &self.deferred_internal_turn.as_ref()?.turn {
+            DeferredInternalTurn::Triage(pending) => pending.agent,
+            DeferredInternalTurn::Plan(pending) => pending.agent,
+            DeferredInternalTurn::Replan(pending) => pending.agent,
+        };
+        if deferred_agent != agent {
+            return None;
+        }
+        let waiting = self.deferred_internal_turn.take()?;
+        match waiting.turn {
+            DeferredInternalTurn::Triage(pending) => {
+                self.pending_triage = Some(pending);
+                Some(true)
+            }
+            DeferredInternalTurn::Plan(pending) => {
+                self.pending_plan = Some(pending);
+                Some(true)
+            }
+            DeferredInternalTurn::Replan(pending) => {
+                self.finish_replan_rejected(pending, "cancelled by user".to_owned(), true);
+                Some(false)
+            }
+        }
+    }
+
+    fn flush_deferred_internal_turns(&mut self) -> bool {
+        let Some(waiting) = self.deferred_internal_turn.take() else {
+            return false;
+        };
+        let now = Instant::now();
+        if now.saturating_duration_since(waiting.deferred_since) >= INTERNAL_DEFER_MAX_WAIT {
+            self.finish_deferred_internal_turn_expired(waiting.turn);
+            return true;
+        }
+        let agent = match &waiting.turn {
+            DeferredInternalTurn::Triage(pending) => pending.agent,
+            DeferredInternalTurn::Plan(pending) => pending.agent,
+            DeferredInternalTurn::Replan(pending) => pending.agent,
+        };
+        if self.busy_agents.contains(&agent) || now < waiting.retry_after {
+            self.deferred_internal_turn = Some(waiting);
+            return false;
+        }
+        let origin = Some(waiting.deferred_since);
+        match waiting.turn {
+            DeferredInternalTurn::Triage(mut pending) => {
+                pending.defer_origin = origin;
+                self.resend_internal_triage(pending)
+            }
+            DeferredInternalTurn::Plan(mut pending) => {
+                pending.defer_origin = origin;
+                self.resend_internal_plan(pending)
+            }
+            DeferredInternalTurn::Replan(mut pending) => {
+                pending.defer_origin = origin;
+                self.resend_internal_replan(pending)
+            }
+        }
+        true
+    }
+
+    fn merge_live_graph_progress(live: &GraphPlan, proposed: &mut GraphPlan) {
+        for node in &mut proposed.nodes {
+            let Some(live_node) = live.nodes.iter().find(|entry| entry.id == node.id) else {
+                continue;
+            };
+            if matches!(
+                live_node.status,
+                GraphNodeStatus::Running
+                    | GraphNodeStatus::WaitingGate
+                    | GraphNodeStatus::Completed
+                    | GraphNodeStatus::Failed
+                    | GraphNodeStatus::Skipped
+            ) {
+                node.status = live_node.status;
+                node.attempt = live_node.attempt;
+                node.started_at_ms = live_node.started_at_ms;
+                node.finished_at_ms = live_node.finished_at_ms;
+            }
+        }
+    }
+
+    fn resend_internal_triage(&mut self, mut pending: PendingTriage) {
+        let index = adapter_index(pending.agent);
+        let judge_mode = if self.adapters[index]
+            .validate_mode(ExecutionMode::Ask)
+            .is_ok()
+        {
+            ExecutionMode::Ask
+        } else {
+            ExecutionMode::Plan
+        };
+        if self.adapters[index].select_mode(judge_mode).is_err() {
+            self.triage_fallback(
+                pending.prompt,
+                pending.agent,
+                pending.saved_mode,
+                FallbackCause::Error,
+                pending.run_id,
+                pending.judge_calls,
+                0,
+            );
+            return;
+        }
+        let request = AgentRequest {
+            conversation_id: ConversationId::new(pending.conversation_id.as_str()),
+            turn_id: TurnId::new(pending.turn_id.as_str()),
+            prompt: pending.adapter_prompt.clone(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        let now = Instant::now();
+        pending.started = now;
+        pending.last_event = now;
+        match self.adapters[index].send(request) {
+            Ok(()) => {
+                self.busy_agents.insert(pending.agent);
+                self.run_states.insert(
+                    pending.agent,
+                    RunState::Running {
+                        started_at: now,
+                        started_at_ms: unix_ms_now(),
+                        node: None,
+                    },
+                );
+                self.activities.insert(
+                    pending.agent,
+                    AgentActivity::queued(ActivityKind::Summary, now),
+                );
+                self.pending_triage = Some(pending);
+            }
+            Err(_) => {
+                let _ = self.adapters[index].select_mode(pending.saved_mode);
+                self.triage_fallback(
+                    pending.prompt,
+                    pending.agent,
+                    pending.saved_mode,
+                    FallbackCause::Error,
+                    pending.run_id,
+                    pending.judge_calls,
+                    0,
+                );
+            }
+        }
+    }
+
+    fn resend_internal_plan(&mut self, mut pending: PendingPlan) {
+        let index = adapter_index(pending.agent);
+        let plan_mode = if self.adapters[index]
+            .validate_mode(ExecutionMode::Ask)
+            .is_ok()
+        {
+            ExecutionMode::Ask
+        } else {
+            ExecutionMode::Plan
+        };
+        if self.adapters[index].select_mode(plan_mode).is_err() {
+            self.restore_or_fallback_after_plan_error(&pending, "mode select failed");
+            return;
+        }
+        let request = AgentRequest {
+            conversation_id: ConversationId::new(pending.conversation_id.as_str()),
+            turn_id: TurnId::new(pending.turn_id.as_str()),
+            prompt: pending.adapter_prompt.clone(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        let now = Instant::now();
+        pending.started = now;
+        pending.last_event = now;
+        match self.adapters[index].send(request) {
+            Ok(()) => {
+                self.busy_agents.insert(pending.agent);
+                self.run_states.insert(
+                    pending.agent,
+                    RunState::Running {
+                        started_at: now,
+                        started_at_ms: unix_ms_now(),
+                        node: None,
+                    },
+                );
+                self.activities.insert(
+                    pending.agent,
+                    AgentActivity::queued(ActivityKind::Summary, now),
+                );
+                self.pending_plan = Some(pending);
+            }
+            Err(_) => {
+                let _ = self.adapters[index].select_mode(pending.saved_mode);
+                self.restore_or_fallback_after_plan_error(&pending, "send error");
+            }
+        }
+    }
+
+    fn resend_internal_replan(&mut self, mut pending: PendingReplan) {
+        let index = adapter_index(pending.agent);
+        let plan_mode = if self.adapters[index]
+            .validate_mode(ExecutionMode::Ask)
+            .is_ok()
+        {
+            ExecutionMode::Ask
+        } else {
+            ExecutionMode::Plan
+        };
+        if self.adapters[index].select_mode(plan_mode).is_err() {
+            self.finish_replan_rejected(pending, "mode select failed".to_owned(), true);
+            return;
+        }
+        let request = AgentRequest {
+            conversation_id: ConversationId::new(pending.conversation_id.as_str()),
+            turn_id: TurnId::new(pending.turn_id.as_str()),
+            prompt: pending.prompt.clone(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        let now = Instant::now();
+        pending.started = now;
+        pending.last_event = now;
+        match self.adapters[index].send(request) {
+            Ok(()) => {
+                self.busy_agents.insert(pending.agent);
+                self.run_states.insert(
+                    pending.agent,
+                    RunState::Running {
+                        started_at: now,
+                        started_at_ms: unix_ms_now(),
+                        node: None,
+                    },
+                );
+                self.activities.insert(
+                    pending.agent,
+                    AgentActivity::queued(ActivityKind::Summary, now),
+                );
+                self.pending_replan = Some(pending);
+            }
+            Err(_) => {
+                let _ = self.adapters[index].select_mode(pending.saved_mode);
+                self.finish_replan_rejected(pending, "send error".to_owned(), true);
+            }
+        }
+    }
+
+    fn restore_or_fallback_after_plan_error(&mut self, pending: &PendingPlan, detail: &str) {
+        if pending.edit_previous_json.is_some() {
+            self.restore_awaiting_after_edit_failure(pending, detail);
+        } else {
+            self.park_fallback_plan(
+                pending.prompt.clone(),
+                pending.agent,
+                pending.route,
+                pending.verdict_reason.clone(),
+                pending.triage_source,
+                pending.triage_cause,
+                pending.run_id.clone(),
+                pending.judge_calls,
+                pending.triage_elapsed_ms,
+                PlannerCalls {
+                    judge: pending.judge_calls,
+                    plan: pending.plan_calls,
+                    repair: pending.repair_calls,
+                    ..Default::default()
+                },
+                detail,
+                None,
+                None,
+            );
+        }
+    }
+
+    fn internal_turn_busy_error(event: &AgentEvent) -> Option<&str> {
+        match event {
+            AgentEvent::Error(message) if is_adapter_turn_busy_rejection(message) => {
+                Some(message.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    fn cut_system_line(&self, line: &str) -> String {
+        let width = self.terminal_area.width.max(40) as usize;
+        if line.width() <= width {
+            return line.to_owned();
+        }
+        let mut out = String::new();
+        let mut used = 0usize;
+        for ch in line.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + ch_width > width.saturating_sub(1) {
+                out.push('…');
+                break;
+            }
+            out.push(ch);
+            used += ch_width;
+        }
+        out
+    }
+
+    fn replan_notice_task_suffix(change: &PlanChange) -> String {
+        if change.tasks_added == 0 && change.tasks_changed == 0 && change.tasks_removed == 0 {
+            return String::new();
+        }
+        format!(
+            " tasks +{} ~{} −{}",
+            change.tasks_added, change.tasks_changed, change.tasks_removed
+        )
+    }
+
+    fn push_replan_applied_notice(&mut self, change: &PlanChange) {
+        let after = change.after_node.as_deref().unwrap_or("user");
+        let line = format!(
+            "Plan rev {} (replan after {}): +{} ~{} −{} — {}{}",
+            change.rev,
+            after,
+            change.added.len(),
+            change.changed.len(),
+            change.removed.len(),
+            change.reason,
+            Self::replan_notice_task_suffix(change)
+        );
+        self.push_system(self.cut_system_line(&line));
+    }
+
+    fn push_replan_rejected_notice(&mut self, rev: u32, message: &str) {
+        let line = if message == "rejected" {
+            format!("Replan rev {rev} rejected by user")
+        } else {
+            format!("Replan rev {rev} rejected: {message}")
+        };
+        self.push_system(self.cut_system_line(&line));
+    }
+
+    fn push_replan_needs_approval_notice(&mut self, rev: u32) {
+        let line = format!("Plan rev {rev} needs approval (sensitive step)");
+        self.push_system(self.cut_system_line(&line));
+    }
+
+    fn emit_plan_revised_event(&mut self, plan_id: &str, rev: u32) {
+        if let Some(hub) = &self.dashboard {
+            hub.emit_event(EventDraft {
+                kind: "graph".to_owned(),
+                task: Some(plan_id.to_owned()),
+                to_state: "revised".to_owned(),
+                message: Some(rev.to_string()),
+                ..EventDraft::default()
+            });
+        }
+    }
+
+    fn record_plan_change(&mut self, change: PlanChange) {
+        let rev = change.rev;
+        let emit = Self::plan_change_should_emit_revised(&change);
+        let gate_only = self.last_graph_run.as_ref().is_some_and(|run| {
+            run.phase == GraphRunPhase::AwaitingApproval && self.graph_session.is_none()
+        });
+        let (plan_id, save_error) = if gate_only {
+            let run = self.last_graph_run.as_mut().expect("gate awaiting run");
+            run.push_plan_change(change);
+            let plan_id = run.plan.id.clone();
+            (plan_id, save_run(&self.workspace_root, run).err())
+        } else if let Some(session) = self.graph_session.as_mut() {
+            let run = session.run_mut();
+            run.push_plan_change(change);
+            let plan_id = run.plan.id.clone();
+            let save_error = save_run(&self.workspace_root, run).err();
+            if self
+                .last_graph_run
+                .as_ref()
+                .is_some_and(|stored| stored.plan.id == plan_id)
+            {
+                self.last_graph_run = Some(run.clone());
+            }
+            (plan_id, save_error)
+        } else if let Some(run) = self.last_graph_run.as_mut() {
+            run.push_plan_change(change);
+            let plan_id = run.plan.id.clone();
+            (plan_id, save_run(&self.workspace_root, run).err())
+        } else {
+            return;
+        };
+        if let Some(error) = save_error {
+            self.push_system(format!("Could not save plan change: {error}"));
+        }
+        if emit {
+            self.emit_plan_revised_event(&plan_id, rev);
+        }
+    }
+
     fn finish_replan_rejected(&mut self, pending: PendingReplan, message: String, resume: bool) {
         let rev = pending.rev;
-        if let Some(session) = self.graph_session.as_mut() {
-            let run = session.run_mut();
-            let change = PlanChange {
+        let change = Self::finalize_pending_replan_change(
+            &pending,
+            PlanChange {
                 rev,
                 kind: PlanChangeKind::Replan,
                 at_ms: unix_ms_now(),
                 after_node: pending.failure_node_id.clone(),
                 reason: pending.trigger_reason.clone(),
-                trigger: Some(Self::plan_change_trigger(pending.trigger)),
-                prompt_chars: Some(pending.prompt.chars().count()),
-                response_chars: Some(pending.buffer.chars().count()),
+                trigger: None,
+                prompt_chars: None,
+                response_chars: None,
                 added: Vec::new(),
                 changed: Vec::new(),
                 removed: Vec::new(),
@@ -6650,13 +7353,11 @@ impl App {
                 tasks_removed: 0,
                 applied: false,
                 error: Some(message.clone()),
-                decided_by: pending.decided_by,
-            };
-            run.push_plan_change(change);
-            let _ = save_run(&self.workspace_root, run);
-            self.last_graph_run = Some(run.clone());
-        }
-        self.push_system(format!("Replan rev {rev} rejected: {message}"));
+                decided_by: None,
+            },
+        );
+        self.record_plan_change(change);
+        self.push_replan_rejected_notice(rev, &message);
         if pending.trigger == ReplanTrigger::Failure || pending.failure_node_id.is_some() {
             self.finish_held_graph_failure();
         } else if resume {
@@ -6666,7 +7367,7 @@ impl App {
 
     fn finish_replan_kept(&mut self, pending: PendingReplan, reason: String) {
         let rev = pending.rev;
-        if let Some(session) = self.graph_session.as_mut() {
+        let saved = if let Some(session) = self.graph_session.as_mut() {
             let run = session.run_mut();
             let change = PlanChange {
                 rev,
@@ -6687,9 +7388,14 @@ impl App {
                 error: None,
                 decided_by: pending.decided_by,
             };
-            run.push_plan_change(change);
+            run.push_plan_change(change.clone());
             let _ = save_run(&self.workspace_root, run);
-            self.last_graph_run = Some(run.clone());
+            Some(run.clone())
+        } else {
+            None
+        };
+        if let Some(saved) = saved {
+            self.last_graph_run = Some(saved);
         }
         self.push_system(format!("Replan kept the plan: {reason}"));
         if pending.trigger == ReplanTrigger::Failure || pending.failure_node_id.is_some() {
@@ -6699,35 +7405,193 @@ impl App {
         }
     }
 
+    fn finish_replan_needs_approval(
+        &mut self,
+        pending: PendingReplan,
+        proposed: GraphPlan,
+        change: PlanChange,
+    ) {
+        let mut change = Self::finalize_pending_replan_change(&pending, change);
+        change.applied = false;
+        change.error = None;
+        let steps = replan_revision_steps(&proposed);
+        let added = change.added.clone();
+        let changed = change.changed.clone();
+        let saved = if let Some(session) = self.graph_session.as_mut() {
+            let run = session.run_mut();
+            run.pending_replan_plan = Some(proposed);
+            if let Some(approval) = run.approval.as_mut() {
+                approval.state = ApprovalState::Pending;
+                approval.revisions.push(PlanRevision {
+                    n: pending.rev,
+                    source: "replan".to_owned(),
+                    steps,
+                    added,
+                    changed,
+                    feedback: None,
+                    errors: None,
+                    raw: None,
+                });
+            } else {
+                run.approval = Some(Approval {
+                    state: ApprovalState::Pending,
+                    revisions: vec![PlanRevision {
+                        n: pending.rev,
+                        source: "replan".to_owned(),
+                        steps,
+                        added,
+                        changed,
+                        feedback: None,
+                        errors: None,
+                        raw: None,
+                    }],
+                    decided_by: None,
+                    decided_at_ms: None,
+                });
+            }
+            run.phase = GraphRunPhase::AwaitingApproval;
+            run.push_plan_change(change);
+            let _ = save_run(&self.workspace_root, run);
+            run.clone()
+        } else {
+            return;
+        };
+        self.last_graph_run = Some(saved);
+        self.push_replan_needs_approval_notice(pending.rev);
+        self.resume_graph_after_replan();
+    }
+
     fn finish_replan_applied(
         &mut self,
         pending: PendingReplan,
         plan: GraphPlan,
         change: PlanChange,
     ) {
-        let rev = pending.rev;
-        let mut change = change;
-        change.rev = rev;
-        change.trigger = Some(Self::plan_change_trigger(pending.trigger));
-        change.prompt_chars = Some(pending.prompt.chars().count());
-        change.response_chars = Some(pending.buffer.chars().count());
-        change.after_node = pending.failure_node_id.clone();
-        change.decided_by = pending.decided_by;
-        if let Some(session) = self.graph_session.as_mut() {
+        let mut change = Self::finalize_pending_replan_change(&pending, change);
+        change.applied = true;
+        change.error = None;
+        let (plan_id, rev, saved) = if let Some(session) = self.graph_session.as_mut() {
             session.run_mut().plan = plan;
             let run = session.run_mut();
-            run.push_plan_change(change);
+            run.push_plan_change(change.clone());
+            let plan_id = run.plan.id.clone();
+            let rev = change.rev;
             let _ = save_run(&self.workspace_root, run);
-            self.last_graph_run = Some(run.clone());
+            (plan_id, rev, run.clone())
+        } else {
+            return;
+        };
+        self.last_graph_run = Some(saved);
+        if let Some(session) = self.graph_session.as_ref() {
             self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
         }
-        // P11: sensitive replan revisions pause for approval (FR-959).
+        if Self::plan_change_should_emit_revised(&change) {
+            self.emit_plan_revised_event(&plan_id, rev);
+        }
+        self.push_replan_applied_notice(&change);
         if pending.trigger == ReplanTrigger::Failure || pending.failure_node_id.is_some() {
             self.graph_failure_replan = None;
-            self.resume_graph_after_replan();
+        }
+        self.resume_graph_after_replan();
+    }
+
+    fn approve_replan_awaiting(&mut self, by: DecisionBy) -> Result<(), PlanDecisionError> {
+        if self.graph_session.is_none() {
+            return Err(PlanDecisionError::NotAwaitingApproval);
+        }
+        let proposed = self
+            .last_graph_run
+            .as_mut()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?
+            .pending_replan_plan
+            .take()
+            .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+        let decided_at = unix_ms_now();
+        let (saved, emit_rev) = if let Some(session) = self.graph_session.as_mut() {
+            let run = session.run_mut();
+            let live = run.plan.clone();
+            let mut merged = proposed;
+            Self::merge_live_graph_progress(&live, &mut merged);
+            run.plan = merged;
+            run.pending_replan_plan = None;
+            run.phase = GraphRunPhase::Active;
+            if let Some(approval) = run.approval.as_mut() {
+                approval.state = ApprovalState::Approved;
+                approval.decided_by = Some(by);
+                approval.decided_at_ms = Some(decided_at);
+            }
+            let emit_rev = run
+                .plan_history
+                .iter_mut()
+                .rev()
+                .find(|entry| entry.kind == PlanChangeKind::Replan && !entry.applied)
+                .map(|change| {
+                    change.applied = true;
+                    change.decided_by = Some(by);
+                    change.rev
+                });
+            let _ = save_run(&self.workspace_root, run);
+            (run.clone(), emit_rev)
+        } else {
+            return Err(PlanDecisionError::NotAwaitingApproval);
+        };
+        let plan_id = saved.plan.id.clone();
+        self.last_graph_run = Some(saved);
+        if let Some(rev) = emit_rev {
+            self.emit_plan_revised_event(&plan_id, rev);
+        }
+        if let Some(session) = self.graph_session.as_ref() {
+            self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
+        }
+        self.graph_failure_replan = None;
+        self.graph_approval_stale = None;
+        self.resume_graph_after_replan();
+        Ok(())
+    }
+
+    fn reject_replan_awaiting(&mut self, by: DecisionBy) -> Result<(), PlanDecisionError> {
+        if self.graph_session.is_none() {
+            if let Some(run) = self.last_graph_run.as_mut() {
+                run.pending_replan_plan = None;
+            }
+            return Err(PlanDecisionError::NotAwaitingApproval);
+        }
+        let held_failure = self.graph_failure_replan.is_some();
+        let rejected_rev = if let Some(session) = self.graph_session.as_mut() {
+            let run = session.run_mut();
+            run.pending_replan_plan = None;
+            run.phase = GraphRunPhase::Active;
+            if let Some(approval) = run.approval.as_mut() {
+                approval.state = ApprovalState::Approved;
+            }
+            let rejected_rev = run
+                .plan_history
+                .iter_mut()
+                .rev()
+                .find(|entry| entry.kind == PlanChangeKind::Replan && !entry.applied)
+                .map(|change| {
+                    change.decided_by = Some(by);
+                    change.error = Some("rejected".to_owned());
+                    change.rev
+                });
+            let _ = save_run(&self.workspace_root, run);
+            self.last_graph_run = Some(run.clone());
+            rejected_rev
+        } else {
+            None
+        };
+        self.graph_approval_stale = None;
+        if let Some(rev) = rejected_rev {
+            self.push_replan_rejected_notice(rev, "rejected");
+        } else {
+            self.push_system("Replan revision rejected; previous plan continues.".to_owned());
+        }
+        if held_failure {
+            self.finish_held_graph_failure();
         } else {
             self.resume_graph_after_replan();
         }
+        Ok(())
     }
 
     fn resume_graph_after_replan(&mut self) {
@@ -6821,11 +7685,7 @@ impl App {
                             Ok((plan, change)) => {
                                 let old = run.plan;
                                 if revision_needs_approval(&old, &plan, &change) {
-                                    self.finish_replan_rejected(
-                                        pending,
-                                        "sensitive revision needs approval".to_owned(),
-                                        true,
-                                    );
+                                    self.finish_replan_needs_approval(pending, plan, change);
                                 } else {
                                     self.finish_replan_applied(pending, plan, change);
                                 }
@@ -6853,12 +7713,25 @@ impl App {
                 let Some(pending) = self.pending_replan.take() else {
                     return false;
                 };
+                if Self::internal_turn_busy_error(&output.event).is_some() {
+                    self.busy_agents.remove(&pending.agent);
+                    self.activities.remove(&pending.agent);
+                    self.end_run_state(pending.agent, false, false);
+                    let _ =
+                        self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
+                    self.defer_internal_turn(DeferredInternalTurn::Replan(pending));
+                    return true;
+                }
                 self.retire_replan_turn_id(&pending);
                 self.busy_agents.remove(&pending.agent);
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, false, false);
                 let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
-                self.finish_replan_rejected(pending, "error".to_owned(), true);
+                let message = match output.event {
+                    AgentEvent::Error(message) => message,
+                    _ => "cancelled".to_owned(),
+                };
+                self.finish_replan_rejected(pending, message, true);
                 true
             }
             AgentEvent::ModelsListed { .. }
@@ -6924,9 +7797,11 @@ impl App {
     ) {
         let mut display_text = output_text.to_owned();
         let mut marker_reason = None;
-        if success && let Some(reason) = parse_replan_marker(output_text) {
+        if let Some(reason) = parse_replan_marker(output_text) {
             display_text = strip_replan_marker(output_text);
-            self.rewrite_last_agent_message(agent, display_text.clone());
+            if success {
+                self.rewrite_last_agent_message(agent, display_text.clone());
+            }
             marker_reason = Some(reason);
         }
         if success {
@@ -6955,17 +7830,20 @@ impl App {
             if let Some(session) = self.graph_session.as_mut() {
                 session.run_mut().phase = GraphRunPhase::Active;
             }
-            self.graph_failure_replan = Some(node_id.clone());
+            if self.graph_failure_replan.is_none() {
+                self.graph_failure_replan = Some(node_id.clone());
+            }
+            let replan_reason = match marker_reason {
+                Some(marker) => Self::merge_replan_reasons(&message, &marker),
+                None => message,
+            };
             self.enqueue_replan_trigger(
                 ReplanTrigger::Failure,
-                message,
+                replan_reason,
                 Some(node_id.clone()),
                 false,
                 None,
             );
-            if let Some(reason) = marker_reason {
-                self.enqueue_replan_trigger(ReplanTrigger::Marker, reason, None, false, None);
-            }
             return;
         }
         let run_completes = actions
@@ -7007,6 +7885,7 @@ impl App {
             plan_fixed_ms: None,
             replans_used: 0,
             replan_chars_used: 0,
+            pending_replan_plan: None,
         }
     }
 
@@ -7512,7 +8391,19 @@ impl App {
         self.start_graph_run_record(run);
     }
 
+    fn cancel_active_replan_turn(&mut self) {
+        if let Some(pending) = self.pending_replan.take() {
+            self.retire_internal_replan_turn(&pending);
+            self.busy_agents.remove(&pending.agent);
+            self.activities.remove(&pending.agent);
+            self.end_run_state(pending.agent, false, false);
+            let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
+        }
+        self.deferred_internal_turn = None;
+    }
+
     fn start_graph_run_record(&mut self, run: GraphRun) {
+        self.cancel_active_replan_turn();
         self.single_graph_plan = None;
         self.graph_node_details.clear();
         self.graph_agent_nodes.clear();
@@ -11833,6 +12724,20 @@ mod tests {
             .collect()
     }
 
+    fn graph_node_requests(sent: &SentRequests) -> Vec<AgentRequest> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, request)| {
+                let turn = request.turn_id.as_str();
+                !turn.starts_with("replan-")
+                    && !turn.starts_with("judge-")
+                    && !turn.starts_with("plan-")
+            })
+            .map(|(_, request)| request.clone())
+            .collect()
+    }
+
     fn complete_replan_keep(h: &mut PlanGateHarness) {
         let req = h.sent.lock().unwrap().last().unwrap().1.clone();
         assert!(
@@ -11921,6 +12826,230 @@ mod tests {
             },
             tasks: Vec::new(),
         }
+    }
+
+    // TC-1004 / FR-979: adapter busy on an internal replan turn waits and retries once.
+    #[test]
+    fn internal_turn_waits_for_adapter_release() {
+        let mut h = plan_gate_test_app();
+        start_approved_three_step_run(&mut h);
+        let step2 = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn_with_text(
+            &mut h.app,
+            &h.sent,
+            step2,
+            "done\n\nDMUXAI_REPLAN: need tests\n",
+        );
+        let replan_req = last_replan_request(&h.sent);
+        assert_eq!(replan_req.turn_id.as_str(), "replan-1");
+        let replans_before = h.app.last_graph_run.as_ref().unwrap().planner_calls.replan;
+        assert_eq!(replans_before, 1);
+        assert!(
+            h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &replan_req,
+                AgentEvent::Error(
+                    "Codex is already running a turn; cancel it before sending another prompt"
+                        .to_owned(),
+                ),
+            ))
+        );
+        assert!(h.app.deferred_internal_turn.is_some());
+        assert_eq!(replan_requests(&h.sent).len(), 1);
+        let graph_nodes_before = graph_node_requests(&h.sent).len();
+        assert!(h.app.tick());
+        assert_eq!(graph_node_requests(&h.sent).len(), graph_nodes_before);
+        assert_eq!(replan_requests(&h.sent).len(), 2);
+        assert_eq!(
+            h.app.last_graph_run.as_ref().unwrap().planner_calls.replan,
+            1
+        );
+        let retry = last_replan_request(&h.sent);
+        assert_eq!(retry.turn_id.as_str(), "replan-1");
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &retry,
+            AgentEvent::Error("boom".to_owned()),
+        )));
+        assert!(
+            system_containing(&h.app, "Replan rev 1 rejected: boom")
+                .contains("Replan rev 1 rejected: boom")
+        );
+    }
+
+    fn defer_replan_once(h: &mut PlanGateHarness) {
+        let step2 = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn_with_text(
+            &mut h.app,
+            &h.sent,
+            step2,
+            "done\n\nDMUXAI_REPLAN: need tests\n",
+        );
+        refuse_last_replan_busy(h);
+    }
+
+    fn refuse_last_replan_busy(h: &mut PlanGateHarness) {
+        let replan_req = last_replan_request(&h.sent);
+        assert!(
+            h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &replan_req,
+                AgentEvent::Error(
+                    "Codex is already running a turn; cancel it before sending another prompt"
+                        .to_owned(),
+                ),
+            ))
+        );
+        assert!(h.app.deferred_internal_turn.is_some());
+    }
+
+    // FR-979: a second busy refusal keeps the first defer time, so the bound holds.
+    #[test]
+    fn internal_turn_redefer_keeps_first_defer_time() {
+        let mut h = plan_gate_test_app();
+        start_approved_three_step_run(&mut h);
+        defer_replan_once(&mut h);
+        let first = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+        h.app
+            .deferred_internal_turn
+            .as_mut()
+            .expect("deferred replan")
+            .deferred_since = first;
+        assert!(h.app.tick());
+        assert_eq!(replan_requests(&h.sent).len(), 2);
+        refuse_last_replan_busy(&mut h);
+        assert_eq!(
+            h.app
+                .deferred_internal_turn
+                .as_ref()
+                .expect("deferred again")
+                .deferred_since,
+            first
+        );
+    }
+
+    // FR-979: Ctrl+C on the agent cancels a deferred replan; nothing is resent.
+    #[test]
+    fn cancel_clears_deferred_internal_turn() {
+        let mut h = plan_gate_test_app();
+        start_approved_three_step_run(&mut h);
+        defer_replan_once(&mut h);
+        h.app.selected = adapter_index(Agent::Codex);
+        h.app.cancel_selected();
+        assert!(h.app.deferred_internal_turn.is_none());
+        assert!(!h.app.replan_scheduling_blocked());
+        let sent = replan_requests(&h.sent).len();
+        h.app.tick();
+        assert_eq!(replan_requests(&h.sent).len(), sent);
+        assert!(!system_containing(&h.app, "cancelled by user").is_empty());
+    }
+
+    // FR-979: internal defer expires instead of waiting forever.
+    #[test]
+    fn internal_turn_busy_wait_is_bounded() {
+        let mut h = plan_gate_test_app();
+        start_approved_three_step_run(&mut h);
+        let step2 = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn_with_text(
+            &mut h.app,
+            &h.sent,
+            step2,
+            "done\n\nDMUXAI_REPLAN: need tests\n",
+        );
+        let replan_req = last_replan_request(&h.sent);
+        assert!(
+            h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &replan_req,
+                AgentEvent::Error(
+                    "Codex is already running a turn; cancel it before sending another prompt"
+                        .to_owned(),
+                ),
+            ))
+        );
+        let old = Instant::now()
+            .checked_sub(Duration::from_secs(200))
+            .unwrap_or_else(Instant::now);
+        h.app
+            .deferred_internal_turn
+            .as_mut()
+            .expect("deferred replan")
+            .deferred_since = old;
+        assert!(h.app.tick());
+        assert!(h.app.deferred_internal_turn.is_none());
+        let run = h.app.last_graph_run.as_ref().expect("run saved");
+        assert!(
+            run.plan_history
+                .iter()
+                .any(|entry| { entry.error.as_deref() == Some("adapter stayed busy") })
+        );
+        assert_eq!(replan_requests(&h.sent).len(), 1);
+    }
+
+    // FR-959: approving a replan keeps nodes that finished while awaiting approval.
+    #[test]
+    fn approve_replan_keeps_nodes_finished_while_waiting() {
+        let mut h = plan_gate_test_app();
+        start_approved_three_step_run(&mut h);
+        let add_sensitive = r#"{"reason":"deploy","steps":[
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
+            {"id":"step-4","role":"implement","job":"deploy to production","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"sensitive":true,"task":"task-1"}
+        ]}"#;
+        h.app.request_replan("ship", DecisionBy::Tui);
+        finish_replan_steps(&mut h, add_sensitive);
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        let rev = App::current_plan_revision_n(h.app.last_graph_run.as_ref().unwrap()).unwrap();
+        h.app
+            .decide_plan(PlanDecisionKind::Approve, plan_id, rev, DecisionBy::Tui)
+            .unwrap();
+        let step2_node = h
+            .app
+            .graph_session
+            .as_ref()
+            .unwrap()
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.id == "step-2")
+            .expect("step-2");
+        assert_eq!(step2_node.status, GraphNodeStatus::Completed);
+    }
+
+    // FR-956 / FR-959: rejecting a sensitive failure replan still fails the held node.
+    #[test]
+    fn failure_sensitive_replan_reject_finishes_held_failure() {
+        let mut h = plan_gate_test_app();
+        start_approved_three_step_run(&mut h);
+        h.app.graph_failure_replan = Some("step-3".to_owned());
+        let add_sensitive = r#"{"reason":"deploy","steps":[
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
+            {"id":"step-4","role":"implement","job":"deploy to production","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"sensitive":true,"task":"task-1"}
+        ]}"#;
+        h.app.request_replan("ship", DecisionBy::Tui);
+        finish_replan_steps(&mut h, add_sensitive);
+        assert_eq!(h.app.graph_failure_replan.as_deref(), Some("step-3"));
+        assert_eq!(
+            h.app.graph_session.as_ref().unwrap().run().phase,
+            GraphRunPhase::AwaitingApproval
+        );
+        h.app.input = "/graph reject".to_owned();
+        h.app.submit_prompt();
+        let phase = h
+            .app
+            .graph_session
+            .as_ref()
+            .map(|session| session.run().phase)
+            .or_else(|| h.app.last_graph_run.as_ref().map(|run| run.phase))
+            .expect("run record");
+        assert_eq!(phase, GraphRunPhase::Failed);
+        assert!(h.app.graph_failure_replan.is_none());
+        assert!(
+            system_containing(&h.app, "graph node step-3 failed")
+                .contains("graph node step-3 failed")
+        );
     }
 
     // TC-1001 / FR-976: adapter "already running" defers the next node without
@@ -19357,6 +20486,17 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn system_containing(app: &App, needle: &str) -> String {
+        app.messages
+            .iter()
+            .rev()
+            .find(|message| {
+                matches!(message.role, Role::System) && message.content.contains(needle)
+            })
+            .map(|message| message.content.clone())
+            .unwrap_or_default()
+    }
+
     // TC-930 / FR-930: every non-slash prompt starts a judge turn.
     #[test]
     fn plan_gate_every_prompt_enters_triage() {
@@ -20079,6 +21219,8 @@ mod tests {
                     n: 1,
                     source: "agent".to_owned(),
                     steps: Vec::new(),
+                    added: Vec::new(),
+                    changed: Vec::new(),
                     feedback: None,
                     errors: None,
                     raw: None,
@@ -20451,6 +21593,36 @@ mod tests {
             last_system(&budget.app)
         );
         assert_eq!(replan_requests(&budget.sent).len(), 0);
+    }
+
+    // P11: failure replan merges a queued user trigger instead of replacing it.
+    #[test]
+    fn queued_user_replan_merges_when_failure_arrives() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval_with_plan(&mut h, three_step_codex_plan_json());
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        h.app
+            .decide_plan(PlanDecisionKind::Approve, plan_id, 1, DecisionBy::Tui)
+            .unwrap();
+        h.app.queued_replan = Some(QueuedReplan {
+            trigger: ReplanTrigger::User,
+            reason: "add docs".to_owned(),
+            failure_node_id: None,
+            decided_by: Some(DecisionBy::Tui),
+        });
+        h.app.enqueue_replan_trigger(
+            ReplanTrigger::Failure,
+            "graph node step-2 failed".to_owned(),
+            Some("step-2".to_owned()),
+            false,
+            None,
+        );
+        let queued = h.app.queued_replan.as_ref().unwrap();
+        assert_eq!(queued.trigger, ReplanTrigger::Failure);
+        assert!(queued.reason.contains("add docs"));
+        assert!(queued.reason.contains("graph node step-2 failed"));
+        assert_eq!(queued.failure_node_id.as_deref(), Some("step-2"));
+        assert_eq!(queued.decided_by, Some(DecisionBy::Tui));
     }
 
     // FR-956: queued failure replan is not dropped when a marker trigger follows.
@@ -21332,6 +22504,362 @@ mod tests {
         assert_eq!(no_model.app.input, "fix");
         assert!(last_system(&no_model.app).contains("fast models"));
         assert!(no_model.app.last_graph_run.is_none());
+    }
+
+    fn start_approved_three_step_run(h: &mut PlanGateHarness) -> String {
+        reach_awaiting_approval_with_plan(h, three_step_codex_plan_json());
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        h.app
+            .decide_plan(
+                PlanDecisionKind::Approve,
+                plan_id.clone(),
+                1,
+                DecisionBy::Tui,
+            )
+            .unwrap();
+        let step1 = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn(&mut h.app, &h.sent, step1);
+        plan_id
+    }
+
+    fn drain_busy_for_queued_replan(h: &mut PlanGateHarness) {
+        if h.app.queued_replan.is_none() {
+            return;
+        }
+        if h.app.busy_agents.contains(&Agent::Codex) {
+            let idx = last_graph_node_request_index(&h.sent);
+            let turn_id = h.sent.lock().unwrap()[idx].1.turn_id.as_str().to_owned();
+            if !turn_id.starts_with("replan-") {
+                complete_sent_graph_turn(&mut h.app, &h.sent, idx);
+            }
+        }
+        h.app.try_flush_queued_replan();
+        h.app.tick();
+    }
+
+    fn finish_replan_steps(h: &mut PlanGateHarness, json: &str) {
+        drain_busy_for_queued_replan(h);
+        assert!(
+            h.app.pending_replan.is_some()
+                || h.sent
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|(_, req)| req.turn_id.as_str().starts_with("replan-")),
+            "replan turn did not start"
+        );
+        let req = h.sent.lock().unwrap().last().unwrap().1.clone();
+        assert!(
+            req.turn_id.as_str().starts_with("replan-"),
+            "expected replan turn, got {}",
+            req.turn_id.as_str()
+        );
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &req,
+            AgentEvent::TextDelta(json.to_owned())
+        )));
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(Agent::Codex, &req, AgentEvent::Completed))
+        );
+    }
+
+    fn last_replan_request(sent: &SentRequests) -> AgentRequest {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(_, req)| req.turn_id.as_str().starts_with("replan-"))
+            .map(|(_, req)| req.clone())
+            .expect("replan request")
+    }
+
+    fn assert_replan_plan_history(h: &PlanGateHarness, json: &str, rev: u32, applied: bool) {
+        let req = last_replan_request(&h.sent);
+        let expected_prompt = req.prompt.chars().count();
+        let expected_response = json.chars().count();
+        let entry = h
+            .app
+            .last_graph_run
+            .as_ref()
+            .unwrap()
+            .plan_history
+            .iter()
+            .find(|entry| {
+                entry.kind == PlanChangeKind::Replan && entry.rev == rev && entry.applied == applied
+            })
+            .unwrap_or_else(|| panic!("replan rev {rev} applied={applied} plan_history entry"));
+        assert_eq!(entry.prompt_chars, Some(expected_prompt));
+        assert_eq!(entry.response_chars, Some(expected_response));
+    }
+
+    // TC-976 / FR-959: non-sensitive replan revisions apply immediately.
+    #[test]
+    fn non_sensitive_replan_applies_immediately() {
+        let mut h = plan_gate_test_app();
+        h.app.terminal_area = Rect::new(0, 0, 120, 30);
+        start_approved_three_step_run(&mut h);
+        let json = r#"{"reason":"add lint pass","steps":[
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
+            {"id":"step-4","role":"review","job":"lint","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"task":"task-1"}
+        ]}"#;
+        h.app.request_replan("lint", DecisionBy::Tui);
+        finish_replan_steps(&mut h, json);
+        assert_eq!(
+            h.app.graph_session.as_ref().unwrap().run().phase,
+            GraphRunPhase::Active
+        );
+        assert_replan_plan_history(&h, json, 1, true);
+    }
+
+    // TC-976 / FR-959: sensitive replan revisions pause for approval.
+    #[test]
+    fn sensitive_replan_needs_approval() {
+        let mut h = plan_gate_test_app();
+        h.app.terminal_area = Rect::new(0, 0, 120, 30);
+        start_approved_three_step_run(&mut h);
+
+        let add_sensitive = r#"{"reason":"deploy","steps":[
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
+            {"id":"step-4","role":"implement","job":"deploy to production","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"sensitive":true,"task":"task-1"}
+        ]}"#;
+        h.app.request_replan("ship", DecisionBy::Tui);
+        finish_replan_steps(&mut h, add_sensitive);
+        let run_phase = h.app.graph_session.as_ref().unwrap().run().phase;
+        assert_eq!(
+            run_phase,
+            GraphRunPhase::AwaitingApproval,
+            "replan notice: {}",
+            system_containing(&h.app, "Plan rev 1")
+        );
+        let approval = h
+            .app
+            .last_graph_run
+            .as_ref()
+            .unwrap()
+            .approval
+            .as_ref()
+            .unwrap();
+        let replan_revision = approval
+            .revisions
+            .iter()
+            .find(|revision| revision.source == "replan")
+            .expect("replan revision");
+        assert_eq!(replan_revision.added, vec!["step-4".to_owned()]);
+        assert!(
+            system_containing(&h.app, "needs approval (sensitive step)").contains("Plan rev 1")
+        );
+        assert_replan_plan_history(&h, add_sensitive, 1, false);
+        let sent_before = h.sent.lock().unwrap().len();
+        h.app.flush_deferred_graph_starts();
+        assert_eq!(h.sent.lock().unwrap().len(), sent_before);
+        h.app.input = "/graph edit tweak".to_owned();
+        h.app.submit_prompt();
+        assert!(
+            system_containing(&h.app, "edit is only for the initial plan")
+                .contains("edit is only for the initial plan")
+        );
+        h.app.input = "/graph reject".to_owned();
+        h.app.submit_prompt();
+        assert!(
+            system_containing(&h.app, "Replan rev 1 rejected by user").contains("rejected by user")
+        );
+        assert_eq!(
+            h.app.graph_session.as_ref().unwrap().run().phase,
+            GraphRunPhase::Active
+        );
+        assert!(
+            !h.app
+                .graph_session
+                .as_ref()
+                .unwrap()
+                .run()
+                .plan
+                .nodes
+                .iter()
+                .any(|node| node.id == "step-4")
+        );
+
+        let mut approve_h = plan_gate_test_app();
+        approve_h.app.terminal_area = Rect::new(0, 0, 120, 30);
+        reach_awaiting_approval_with_plan(&mut approve_h, three_step_codex_plan_json());
+        let approve_plan = approve_h
+            .app
+            .last_graph_run
+            .as_ref()
+            .unwrap()
+            .plan
+            .id
+            .clone();
+        approve_h
+            .app
+            .decide_plan(
+                PlanDecisionKind::Approve,
+                approve_plan.clone(),
+                1,
+                DecisionBy::Tui,
+            )
+            .unwrap();
+        let step1 = last_graph_node_request_index(&approve_h.sent);
+        complete_sent_graph_turn(&mut approve_h.app, &approve_h.sent, step1);
+        let add_sensitive_three = r#"{"reason":"deploy","steps":[
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
+            {"id":"step-4","role":"implement","job":"deploy to production","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"sensitive":true,"task":"task-1"}
+        ]}"#;
+        approve_h.app.request_replan("ship", DecisionBy::Tui);
+        finish_replan_steps(&mut approve_h, add_sensitive_three);
+        let rev =
+            App::current_plan_revision_n(approve_h.app.last_graph_run.as_ref().unwrap()).unwrap();
+        approve_h
+            .app
+            .decide_plan(
+                PlanDecisionKind::Approve,
+                approve_plan,
+                rev,
+                DecisionBy::Tui,
+            )
+            .unwrap();
+        let step4 = approve_h
+            .app
+            .graph_session
+            .as_ref()
+            .unwrap()
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.id == "step-4")
+            .expect("step-4 added after approve");
+        assert_eq!(step4.status, GraphNodeStatus::Pending);
+        assert!(step4.requires_gate);
+        assert_replan_plan_history(&approve_h, add_sensitive_three, 1, true);
+    }
+
+    // TC-979 / UX-935: revision notice text in the TUI transcript.
+    #[test]
+    fn revision_notice_renders() {
+        let mut h = plan_gate_test_app();
+        h.app.terminal_area = Rect::new(0, 0, 100, 30);
+        start_approved_three_step_run(&mut h);
+        let json = r#"{"reason":"add lint pass","steps":[
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
+            {"id":"step-4","role":"review","job":"lint","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"task":"task-1"}
+        ]}"#;
+        h.app.request_replan("lint", DecisionBy::Tui);
+        finish_replan_steps(&mut h, json);
+        let notice = system_containing(&h.app, "Plan rev 1 (replan after user)");
+        assert!(notice.contains("+1 ~0 −"));
+        assert!(notice.contains("add lint pass"));
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| h.app.draw(frame))
+            .expect("draw revision notice");
+    }
+
+    // TC-979 / UX-935: char-safe width clipping for revision notices.
+    #[test]
+    fn revision_notice_truncates_char_safe() {
+        let mut h = plan_gate_test_app();
+        h.app.terminal_area = Rect::new(0, 0, 40, 30);
+        start_approved_three_step_run(&mut h);
+        let reason = "가".repeat(40);
+        let json = format!(
+            r#"{{"reason":"{reason}","steps":[
+            {{"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"}},
+            {{"id":"step-4","role":"review","job":"lint","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"task":"task-1"}}
+        ]}}"#
+        );
+        h.app.request_replan("lint", DecisionBy::Tui);
+        finish_replan_steps(&mut h, &json);
+        let notice = system_containing(&h.app, "Plan rev 1");
+        let width = h.app.terminal_area.width.max(40) as usize;
+        assert!(notice.chars().count() <= width);
+        assert!(notice.ends_with('…'));
+        assert!(std::str::from_utf8(notice.as_bytes()).is_ok());
+    }
+
+    // TC-979 / FR-968: task change counts appear on the replan notice suffix.
+    #[test]
+    fn revision_notice_includes_task_counts() {
+        let mut h = plan_gate_test_app();
+        h.app.terminal_area = Rect::new(0, 0, 120, 30);
+        start_approved_three_step_run(&mut h);
+        let json = r#"{"reason":"add follow-up task","tasks":[
+            {"id":"task-1","title":"work","done_check":"done","areas":[],"size":"small","depends_on":[]},
+            {"id":"task-2","title":"follow-up","done_check":"done","areas":[],"size":"small","depends_on":["task-1"]}
+        ],"steps":[
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
+            {"id":"step-4","role":"review","job":"follow","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"task":"task-2"}
+        ]}"#;
+        h.app.request_replan("tasks", DecisionBy::Tui);
+        finish_replan_steps(&mut h, json);
+        let notice = system_containing(&h.app, "Plan rev 1 (replan after user)");
+        assert!(notice.contains(" tasks +1 ~0 −0"), "notice: {notice}");
+        assert!(notice.contains("add follow-up task"));
+    }
+
+    // TC-989 / FR-954: every user turn gets a graph run record before its first node.
+    #[test]
+    fn every_turn_is_recorded_as_graph_run() {
+        let mut h = plan_gate_test_app();
+        let conversation_id = h.app.conversation_id.as_str().to_owned();
+        let store = dmuxai::graph::GraphStore::new(&h.app.workspace_root);
+
+        h.app.input = "simple turn".to_owned();
+        h.app.submit_prompt();
+        let judge = h.sent.lock().unwrap()[0].1.clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::TextDelta("{\"route\":\"simple\",\"reason\":\"one step\"}".to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::Completed
+        )));
+        let runs = store
+            .list_runs()
+            .into_iter()
+            .filter(|run| run.conversation_id == conversation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].turn_index, 1);
+        let first_node = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn(&mut h.app, &h.sent, first_node);
+
+        h.app.input = "/direct second turn".to_owned();
+        h.app.submit_prompt();
+        let runs = store
+            .list_runs()
+            .into_iter()
+            .filter(|run| run.conversation_id == conversation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs.iter().map(|run| run.turn_index).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let second_node = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn(&mut h.app, &h.sent, second_node);
+
+        h.app.input = "/plan third turn".to_owned();
+        h.app.submit_prompt();
+        let runs = store
+            .list_runs()
+            .into_iter()
+            .filter(|run| run.conversation_id == conversation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(
+            runs.iter().map(|run| run.turn_index).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let planned = runs.iter().find(|run| run.turn_index == 3).unwrap();
+        assert_eq!(planned.phase, GraphRunPhase::Planning);
+        assert!(h.app.pending_plan.is_some());
     }
 
     // TC-1001 / FR-976: deferred start keeps the running node's agent mapping.

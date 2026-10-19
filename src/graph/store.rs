@@ -165,6 +165,8 @@ mod tests {
                 n: 1,
                 source: "fallback".to_owned(),
                 steps: vec![Default::default()],
+                added: Vec::new(),
+                changed: Vec::new(),
                 feedback: None,
                 errors: Some(vec!["not json".to_owned()]),
                 raw: Some(long_text.clone()),

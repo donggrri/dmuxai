@@ -4,7 +4,7 @@
 //! `validate_model` callback, which production code sets to
 //! `model_policy::validate_model_for_runner`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -588,6 +588,48 @@ pub(crate) fn validate_plan_with_limit(
         limits: default_limits(),
         tasks: doc.tasks.clone(),
     })
+}
+
+/// Step id lists for a plan revision diff (FR-960).
+pub fn diff_plan_steps(
+    previous: &[PlanStep],
+    next: &[PlanStep],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let previous_ids: HashMap<&str, &PlanStep> = previous
+        .iter()
+        .map(|step| (step.id.as_str(), step))
+        .collect();
+    let next_ids: HashMap<&str, &PlanStep> =
+        next.iter().map(|step| (step.id.as_str(), step)).collect();
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+    let mut removed = Vec::new();
+    for step in next {
+        match previous_ids.get(step.id.as_str()) {
+            None => added.push(step.id.clone()),
+            Some(old) if !plan_step_same(old, step) => changed.push(step.id.clone()),
+            _ => {}
+        }
+    }
+    for step in previous {
+        if !next_ids.contains_key(step.id.as_str()) {
+            removed.push(step.id.clone());
+        }
+    }
+    added.sort();
+    changed.sort();
+    removed.sort();
+    (added, changed, removed)
+}
+
+fn plan_step_same(left: &PlanStep, right: &PlanStep) -> bool {
+    left.role == right.role
+        && left.job == right.job
+        && left.runner == right.runner
+        && left.model == right.model
+        && left.depends_on == right.depends_on
+        && left.sensitive == right.sensitive
+        && left.task == right.task
 }
 
 /// JSON snapshot of the current revision for an edit turn (FR-943).

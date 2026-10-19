@@ -15,8 +15,9 @@ pub use judge::{
 };
 pub use plan_doc::{
     AllowedRunner, FallbackPlan, PLAN_PROMPT, PlanContext, PlanDoc, PlanError, PlanPromptMode,
-    PlanPromptRequest, PlanStep, build_plan_prompt, fallback_plan, graph_plan_from_revision_steps,
-    one_node_plan_on, parse_plan, plan_json_for_edit, validate_plan,
+    PlanPromptRequest, PlanStep, build_plan_prompt, diff_plan_steps, fallback_plan,
+    graph_plan_from_revision_steps, one_node_plan_on, parse_plan, plan_json_for_edit,
+    validate_plan,
 };
 pub use planner::heuristic_route;
 pub use policy::{
@@ -26,13 +27,13 @@ pub use policy::{
 pub use replan::{
     NODE_REPLAN_HINT, REPLAN_PROMPT, ReplanDoc, ReplanTrigger, apply_replan, budget_allows,
     build_replan_prompt, cap_replan_step_summary, node_send_prompt, parse_replan,
-    parse_replan_marker, replan_allowed, replans_left, revision_needs_approval,
-    strip_replan_marker,
+    parse_replan_marker, replan_allowed, replan_revision_steps, replans_left,
+    revision_needs_approval, strip_replan_marker,
 };
 pub use store::{GraphStore, load_run, save_run};
 pub use tasks::{
     TaskEdit, TaskState, apply_task_delete, apply_task_merge, apply_task_move, apply_task_rename,
-    task_counts, task_status,
+    diff_plan_tasks, task_counts, task_status,
 };
 pub use types::{
     Approval, ApprovalState, DecisionBy, ExecutionPlan, GraphEdge, GraphLimits, GraphNode,
