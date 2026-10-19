@@ -1280,4 +1280,147 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(bytes.as_ref(), SIDEBAR_RESIZE_JS.as_bytes());
     }
+
+    fn js_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+        let from = src
+            .find(start)
+            .unwrap_or_else(|| panic!("missing JS marker {:?}", start));
+        let tail = &src[from..];
+        let to = tail
+            .find(end)
+            .unwrap_or_else(|| panic!("missing JS marker {:?} after {:?}", end, start));
+        &tail[..to]
+    }
+
+    // TC-952 (FR-945, UX-933): route selector beside send; POST /api/prompt `route`.
+    #[test]
+    fn prompt_route_selector_present() {
+        assert!(SESSION_JS.contains("var PROMPT_ROUTES = ["));
+        for label in ["Auto", "Plan", "Direct"] {
+            assert!(
+                SESSION_JS.contains(&format!("label: '{label}'")),
+                "missing route label {label}"
+            );
+        }
+        for value in ["auto", "plan", "direct"] {
+            assert!(
+                SESSION_JS.contains(&format!("value: '{value}'")),
+                "missing route value {value}"
+            );
+        }
+        assert!(SESSION_JS.contains("picker('Route', 'route'"));
+        assert!(SESSION_JS.contains("data-parity"));
+        assert!(SESSION_JS.contains("body.route = ui.route.value"));
+        assert!(SESSION_JS.contains("ui.route.value !== 'auto'"));
+        assert!(SESSION_JS.contains("/api/prompt"));
+        assert!(SESSION_CSS.contains(".session-send-col"));
+    }
+
+    // TC-957 (UX-930): `#graph-judge-line` from `graph.triage.line`, text nodes only.
+    #[test]
+    fn judge_line_asset() {
+        assert!(INDEX_HTML.contains("id=\"graph-judge-line\""));
+        assert!(APP_JS.contains("function renderGraphJudgeLine"));
+        assert!(APP_JS.contains("function fillJudgeLineContent"));
+        assert!(APP_JS.contains("graph.triage"));
+        assert!(APP_JS.contains("triage.line"));
+        assert!(APP_JS.contains("judge-fallback-word"));
+        assert!(APP_JS.contains("replaceChildren"));
+        assert!(APP_JS.contains("createTextNode"));
+        assert!(APP_CSS.contains(".graph-judge-line"));
+        assert!(APP_CSS.contains(".judge-fallback-word"));
+
+        let judge_js = js_between(
+            APP_JS,
+            "function fillJudgeLineContent",
+            "function renderGraphJudgeLine",
+        );
+        assert!(
+            !judge_js.contains("innerHTML"),
+            "judge line must not use innerHTML"
+        );
+        let render_js = js_between(
+            APP_JS,
+            "function renderGraphJudgeLine",
+            "// UX-932 / FR-965",
+        );
+        assert!(
+            !render_js.contains("innerHTML"),
+            "renderGraphJudgeLine must not use innerHTML"
+        );
+    }
+
+    // TC-960 (UX-932, UX-933, INT-930): approval panel, plan commands, parity ids.
+    #[test]
+    fn approval_panel_asset() {
+        assert!(INDEX_HTML.contains("id=\"graph-approval\""));
+        for id in ["plan-approve", "plan-edit", "plan-reject", "plan-replan"] {
+            assert!(
+                SESSION_JS.contains(&format!("'{id}'")),
+                "session.js must declare parity control {id}"
+            );
+        }
+        assert!(SESSION_JS.contains("window.dmuxaiPlanGate"));
+        assert!(APP_JS.contains("function renderApprovalPanel"));
+        assert!(APP_JS.contains("command: 'plan_decision'"));
+        assert!(APP_JS.contains("command: 'plan_task_edit'"));
+        assert!(APP_JS.contains("graph.phase !== 'awaiting_approval'"));
+        assert!(APP_JS.contains("graph-approval-header"));
+        assert!(APP_JS.contains("graph-approval-error"));
+        assert!(APP_JS.contains("action: 'rename'"));
+        assert!(APP_JS.contains("action: 'split'"));
+        assert!(APP_JS.contains("action: 'merge'"));
+        assert!(APP_JS.contains("action: 'delete'"));
+        assert!(APP_JS.contains("action: 'move'"));
+        assert!(APP_CSS.contains(".graph-approval"));
+
+        let plan_gate_js = js_between(APP_JS, "// UX-932 / FR-965", "var lastRenderedAgentsKey");
+        assert!(
+            !plan_gate_js.contains("innerHTML"),
+            "plan approval and task-edit paths must not use innerHTML"
+        );
+        assert!(
+            plan_gate_js.contains("textContent") || plan_gate_js.contains("createTextNode"),
+            "plan gate UI must render via text nodes"
+        );
+    }
+
+    // TC-979 (UX-934, UX-935): revision badges on nodes and plan-history list.
+    #[test]
+    fn revision_badges_and_history_asset() {
+        assert!(APP_JS.contains("node.rev_change"));
+        assert!(APP_JS.contains("'card-rev-badge card-rev-badge-' + revChange"));
+        assert!(APP_JS.contains("revChange === 'added'"));
+        assert!(APP_JS.contains("revChange === 'changed'"));
+        assert!(APP_JS.contains("function graphNodesRevKey"));
+        assert!(INDEX_HTML.contains("id=\"graph-replan\""));
+        assert!(INDEX_HTML.contains("data-parity=\"plan-replan\""));
+        assert!(INDEX_HTML.contains("id=\"plan-history\""));
+        assert!(INDEX_HTML.contains("data-parity=\"plan-history\""));
+        assert!(INDEX_HTML.contains("id=\"graph-plan-history\""));
+        assert!(APP_JS.contains("function renderPlanHistoryPanel"));
+        assert!(APP_JS.contains("graph.plan_history"));
+        assert!(APP_JS.contains("command: 'plan_replan'"));
+        assert!(APP_JS.contains("panel.scrollTop = scrollTop"));
+        for theme in ["dark", "light"] {
+            assert!(
+                APP_CSS.contains(&format!(":root[data-theme=\"{theme}\"]")),
+                "missing {theme} palette for rev badges"
+            );
+        }
+        assert!(APP_CSS.contains(".card-rev-badge-added"));
+        assert!(APP_CSS.contains(".card-rev-badge-changed"));
+        assert!(APP_CSS.contains(".graph-plan-history-list"));
+
+        let history_js = js_between(
+            APP_JS,
+            "function renderPlanHistoryPanel",
+            "function renderGraphHeaderActions",
+        );
+        assert!(
+            !history_js.contains("innerHTML"),
+            "plan history panel must not use innerHTML"
+        );
+        assert!(history_js.contains("createTextNode"));
+    }
 }

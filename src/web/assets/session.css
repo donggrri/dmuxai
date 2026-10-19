@@ -27,6 +27,8 @@
 .session-notice { margin: .4rem 0 0; font-size: .85rem; color: var(--muted); }
 .session-notice-error { color: var(--error-text); }
 .session-prompt { display: flex; gap: .5rem; align-items: flex-end; margin-top: .5rem; }
+.session-send-col { display: flex; flex-direction: column; gap: .35rem; flex-shrink: 0; }
+.session-plan-gate { display: none; }
 .session-input { flex: 1; resize: vertical; min-height: 3.5rem; background: var(--bg-chip); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: .5rem; font: inherit; }
 .session-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 .session-disabled .session-bar, .session-disabled .session-prompt { opacity: .6; }

@@ -115,13 +115,33 @@ pub const PARITY: &[ParityEntry] = &[
     },
     ParityEntry {
         tui: "/plan",
-        control: "plan",
+        control: "route",
         action: "prompt",
     },
     ParityEntry {
         tui: "/direct",
-        control: "direct",
+        control: "route",
         action: "prompt",
+    },
+    ParityEntry {
+        tui: "/graph approve",
+        control: "plan-approve",
+        action: "plan_decision",
+    },
+    ParityEntry {
+        tui: "/graph edit",
+        control: "plan-edit",
+        action: "plan_decision",
+    },
+    ParityEntry {
+        tui: "/graph reject",
+        control: "plan-reject",
+        action: "plan_decision",
+    },
+    ParityEntry {
+        tui: "/graph replan",
+        control: "plan-replan",
+        action: "plan_replan",
     },
     ParityEntry {
         tui: "/remember",

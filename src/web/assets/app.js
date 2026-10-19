@@ -543,6 +543,7 @@ var graphUserInteracted = false;
 var lastGraphGeometryKey = null;
 var lastGraphCanvasRevision = null;
 var lastGraphCanvasGeometryKey = null;
+var lastGraphCanvasNodesKey = null;
 var graphGeometry = null;
 var graphLastBuildAt = 0;
 
@@ -1119,7 +1120,17 @@ function graphCard(entry, geometry, nowMs) {
   group.appendChild(svgRect('card-chip', chipX, 9, chipW, 17, 4));
   group.appendChild(svgText(chipX + chipW / 2, 21.5, chipText, 'card-chip-text', 'middle'));
 
-  var idText = svgText(26, 22, graphFitText(entry.id, chipX - 32, CARD_ID_CHAR), 'card-id');
+  var revChange = node.rev_change;
+  var revBadgeW = 0;
+  if (revChange === 'added' || revChange === 'changed') {
+    var revLabel = revChange;
+    revBadgeW = revLabel.length * 5.5 + 10;
+    group.appendChild(svgRect('card-rev-badge card-rev-badge-' + revChange, 8, 4, revBadgeW, 14, 3));
+    group.appendChild(svgText(8 + revBadgeW / 2, 14.5, revLabel, 'card-rev-badge-text card-rev-badge-text-' + revChange, 'middle'));
+  }
+
+  var idPad = 26 + (revBadgeW > 0 ? revBadgeW + 6 : 0);
+  var idText = svgText(idPad, 22, graphFitText(entry.id, chipX - idPad - 6, CARD_ID_CHAR), 'card-id');
   group.appendChild(idText);
   var timeText = graphCardTime(entry, nowMs);
   var timeW = timeText.length * CARD_TIME_CHAR;
@@ -1164,6 +1175,17 @@ function graphGeometryKey(geometry) {
   for (var i = 0; i < geometry.entries.length; i++) {
     var entry = geometry.entries[i];
     parts.push(entry.id + '@' + entry.lane + ',' + entry.subrow);
+  }
+  return parts.join('|');
+}
+
+// UX-934: rebuild swimlane cards when revision marks change but layout ids stay put.
+function graphNodesRevKey(graph) {
+  var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+  var parts = [];
+  for (var i = 0; i < nodes.length; i++) {
+    var node = nodes[i];
+    parts.push(String(node.id) + ':' + String(node.rev_change || ''));
   }
   return parts.join('|');
 }
@@ -1356,13 +1378,16 @@ function syncGraphCanvas(graph, nowMs, revision) {
   if (!graph) { return; }
   var geometry = buildSwimlaneGeometry(graph, graphServerNow(snapshot, nowMs), graphTimelineWidth());
   var key = graphGeometryKey(geometry);
+  var nodesKey = graphNodesRevKey(graph);
   var needsBuild = lastGraphCanvasRevision !== revision ||
     lastGraphCanvasGeometryKey !== key ||
+    lastGraphCanvasNodesKey !== nodesKey ||
     !document.querySelector('.graph-svg');
   if (needsBuild) {
     renderGraphCanvas(graph, nowMs, geometry, key);
     lastGraphCanvasRevision = revision;
     lastGraphCanvasGeometryKey = key;
+    lastGraphCanvasNodesKey = nodesKey;
     updateGraphNodeSelection();
     return;
   }
@@ -1659,6 +1684,28 @@ function bindGraphControls() {
   var fit = $('graph-fit');
   if (listBtn) { listBtn.addEventListener('click', function () { setGraphViewChoice('list'); }); }
   if (graphBtn) { graphBtn.addEventListener('click', function () { setGraphViewChoice('graph'); }); }
+  var replanBtn = $('graph-replan');
+  if (replanBtn) {
+    replanBtn.addEventListener('click', function () { submitPlanReplan(); });
+  }
+  var historyBtn = $('plan-history');
+  if (historyBtn) {
+    historyBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (planGateDisabled()) { return; }
+      planHistoryUi.open = !planHistoryUi.open;
+      var graph = snapshot && snapshot.graph;
+      if (graph) { renderPlanHistoryPanel(graph); }
+    });
+  }
+  document.addEventListener('click', function (e) {
+    if (!planHistoryUi.open) { return; }
+    var wrap = document.querySelector('.graph-history-wrap');
+    if (wrap && e.target instanceof Node && wrap.contains(e.target)) { return; }
+    planHistoryUi.open = false;
+    var graph = snapshot && snapshot.graph;
+    if (graph) { renderPlanHistoryPanel(graph); }
+  });
   if (fit) {
     fit.addEventListener('click', function () {
       // Re-enable auto-fit and frame the whole map again.
@@ -1699,6 +1746,510 @@ function renderGateHint(graph) {
     'Waiting for gate at "' + graph.waiting_gate_node +
     '". Type /graph continue in the TUI to proceed.';
 }
+
+// UX-930 / TC-957: plain-text judge line from snapshot `graph.triage.line`.
+function fillJudgeLineContent(container, text, highlightFallback) {
+  container.replaceChildren();
+  if (!text) { return; }
+  if (!highlightFallback || text.indexOf('fallback') < 0) {
+    container.appendChild(document.createTextNode(text));
+    return;
+  }
+  var token = 'fallback';
+  var rest = text;
+  while (rest.length > 0) {
+    var index = rest.indexOf(token);
+    if (index < 0) {
+      container.appendChild(document.createTextNode(rest));
+      break;
+    }
+    if (index > 0) {
+      container.appendChild(document.createTextNode(rest.slice(0, index)));
+    }
+    container.appendChild(el('span', 'judge-fallback-word', token));
+    rest = rest.slice(index + token.length);
+  }
+}
+
+function renderGraphJudgeLine(graph) {
+  var lineEl = $('graph-judge-line');
+  if (!lineEl) { return; }
+  var triage = graph && graph.triage;
+  var text = triage && typeof triage.line === 'string' ? triage.line : '';
+  if (!text) {
+    lineEl.hidden = true;
+    lineEl.replaceChildren();
+    lineEl.removeAttribute('title');
+    return;
+  }
+  lineEl.hidden = false;
+  lineEl.title = text;
+  var highlightFallback = triage && triage.source === 'fallback';
+  fillJudgeLineContent(lineEl, text, highlightFallback);
+}
+
+// UX-932 / FR-965: plan approval panel and task edits at the gate.
+var PLAN_REV_MAX = 5;
+var planGateUi = {
+  busy: false,
+  editOpen: false,
+  editDraft: '',
+  error: ''
+};
+
+function isDashboardViewOnly() {
+  var snap = snapshot;
+  return !!(snap && String(snap.source || '') === 'files');
+}
+
+function planGateDisabled() {
+  return isDashboardViewOnly() || planGateUi.busy;
+}
+
+function syncSessionPlanGateButtons() {
+  var disabled = planGateDisabled();
+  ['plan-approve', 'plan-edit', 'plan-reject', 'plan-replan'].forEach(function (id) {
+    var btn = document.getElementById(id);
+    if (btn) { btn.disabled = disabled; }
+  });
+  var graph = snapshot && snapshot.graph;
+  var replanBtn = $('graph-replan');
+  if (replanBtn) {
+    replanBtn.disabled = disabled || !graphReplanAllowed(graph);
+  }
+  var historyBtn = $('plan-history');
+  if (historyBtn) {
+    historyBtn.disabled = disabled;
+  }
+}
+
+function currentPlanGateContext() {
+  var graph = snapshot && snapshot.graph;
+  if (!graph || graph.phase !== 'awaiting_approval' || !graph.approval) { return null; }
+  return { graph: graph, approval: graph.approval };
+}
+
+function runPlanCommand(body) {
+  if (isDashboardViewOnly()) { return Promise.resolve(null); }
+  planGateUi.busy = true;
+  planGateUi.error = '';
+  syncSessionPlanGateButtons();
+  var ctx = currentPlanGateContext();
+  if (ctx) { renderApprovalPanel(ctx.graph); }
+  return todoApi('POST', '/api/command', body).then(function (data) {
+    planGateUi.busy = false;
+    planGateUi.editOpen = false;
+    planGateUi.editDraft = '';
+    syncSessionPlanGateButtons();
+    poll();
+    return data;
+  }).catch(function (err) {
+    planGateUi.busy = false;
+    planGateUi.error = err && err.message ? err.message : 'Request failed';
+    syncSessionPlanGateButtons();
+    var graph = snapshot && snapshot.graph;
+    if (graph) { renderApprovalPanel(graph); }
+    return null;
+  });
+}
+
+function submitPlanDecision(decision, feedback) {
+  var ctx = currentPlanGateContext();
+  if (!ctx || planGateDisabled()) { return; }
+  var body = {
+    command: 'plan_decision',
+    plan_id: String(ctx.graph.id || ''),
+    revision: ctx.approval.rev,
+    decision: decision
+  };
+  if (feedback !== undefined && feedback !== null && String(feedback).trim()) {
+    body.feedback = String(feedback);
+  }
+  runPlanCommand(body);
+}
+
+function submitPlanTaskEdit(payload) {
+  if (planGateDisabled()) { return; }
+  var body = { command: 'plan_task_edit' };
+  Object.keys(payload).forEach(function (key) { body[key] = payload[key]; });
+  runPlanCommand(body);
+}
+
+function approvalStepMarker(revChange) {
+  if (revChange === 'added') { return '+'; }
+  if (revChange === 'changed') { return '~'; }
+  return '';
+}
+
+function approvalDepsSuffix(dependsOn) {
+  if (!dependsOn || !dependsOn.length) { return ''; }
+  return ' \u2190 ' + dependsOn.join(', ');
+}
+
+function approvalStepsForTask(steps, taskId) {
+  var out = [];
+  for (var i = 0; i < steps.length; i++) {
+    if (steps[i].task === taskId) { out.push(steps[i]); }
+  }
+  return out;
+}
+
+function approvalUnassignedSteps(steps, tasks) {
+  var known = {};
+  for (var t = 0; t < tasks.length; t++) { known[tasks[t].id] = true; }
+  var out = [];
+  for (var i = 0; i < steps.length; i++) {
+    var task = steps[i].task;
+    if (!task || !known[task]) { out.push(steps[i]); }
+  }
+  return out;
+}
+
+function appendApprovalStep(panel, step) {
+  var stepRow = el('div', 'graph-approval-step');
+  var mark = approvalStepMarker(step.rev_change);
+  if (mark) {
+    stepRow.appendChild(el('span', 'graph-approval-step-mark graph-approval-step-mark-' + step.rev_change, mark));
+    stepRow.appendChild(document.createTextNode(' '));
+  }
+  var model = step.model ? String(step.model) : '';
+  stepRow.appendChild(document.createTextNode(
+    String(step.id || '') + ' ' +
+    String(step.role || '') + ' ' +
+    String(step.runner || '') + ':' + model +
+    approvalDepsSuffix(step.depends_on)
+  ));
+  panel.appendChild(stepRow);
+  var job = step.job ? String(step.job) : '';
+  if (job) {
+    panel.appendChild(el('div', 'graph-approval-job', job));
+  }
+}
+
+function planGateActionButton(label, extraClass, onClick) {
+  var btn = el('button', 'btn' + (extraClass ? ' ' + extraClass : ''), label);
+  btn.type = 'button';
+  btn.disabled = planGateDisabled();
+  btn.addEventListener('click', onClick);
+  return btn;
+}
+
+function appendTaskActions(panel, task, tasks) {
+  var taskId = String(task.id || '');
+  var row = el('div', 'graph-approval-task-actions');
+  var idx = -1;
+  for (var i = 0; i < tasks.length; i++) {
+    if (tasks[i].id === taskId) { idx = i; break; }
+  }
+  row.appendChild(planGateActionButton('Rename', '', function () {
+    var title = window.prompt('Rename task ' + taskId + ':', String(task.title || ''));
+    if (title === null) { return; }
+    var trimmed = String(title).trim();
+    if (!trimmed) { return; }
+    submitPlanTaskEdit({ action: 'rename', task_id: taskId, title: trimmed });
+  }));
+  row.appendChild(planGateActionButton('Split', '', function () {
+    var note = window.prompt('Split ' + taskId + ' — note for the planner:');
+    if (note === null) { return; }
+    var trimmed = String(note).trim();
+    if (!trimmed) { return; }
+    submitPlanTaskEdit({ action: 'split', task_id: taskId, note: trimmed });
+  }));
+  row.appendChild(planGateActionButton('Merge', '', function () {
+    var from = window.prompt('Merge into ' + taskId + ' — source task id:');
+    if (from === null) { return; }
+    var trimmed = String(from).trim();
+    if (!trimmed) { return; }
+    submitPlanTaskEdit({ action: 'merge', task_id: taskId, from: trimmed });
+  }));
+  row.appendChild(planGateActionButton('Delete', 'btn-danger', function () {
+    if (!window.confirm('Delete task ' + taskId + '?')) { return; }
+    submitPlanTaskEdit({ action: 'delete', task_id: taskId });
+  }));
+  if (idx > 0) {
+    row.appendChild(planGateActionButton('Move up', '', function () {
+      submitPlanTaskEdit({ action: 'move', task_id: taskId, position: idx });
+    }));
+  }
+  if (idx >= 0 && idx < tasks.length - 1) {
+    row.appendChild(planGateActionButton('Move down', '', function () {
+      submitPlanTaskEdit({ action: 'move', task_id: taskId, position: idx + 2 });
+    }));
+  }
+  panel.appendChild(row);
+}
+
+function renderApprovalPanel(graph) {
+  var panel = $('graph-approval');
+  if (!panel) { return; }
+  var draft = planGateUi.editDraft;
+  var editOpen = planGateUi.editOpen;
+  var active = document.activeElement;
+  var focusFeedback = active && active.classList && active.classList.contains('graph-approval-feedback');
+
+  if (!graph || graph.phase !== 'awaiting_approval' || !graph.approval) {
+    panel.hidden = true;
+    panel.replaceChildren();
+    syncSessionPlanGateButtons();
+    return;
+  }
+  var approval = graph.approval;
+  var steps = Array.isArray(approval.steps) ? approval.steps : [];
+  var tasks = Array.isArray(graph.tasks) ? graph.tasks : [];
+
+  panel.hidden = false;
+  panel.replaceChildren();
+
+  if (planGateUi.error) {
+    var errEl = el('p', 'graph-approval-error', planGateUi.error);
+    errEl.setAttribute('role', 'alert');
+    panel.appendChild(errEl);
+  }
+
+  panel.appendChild(el(
+    'p',
+    'graph-approval-header',
+    'Plan rev ' + String(approval.rev) + '/' + PLAN_REV_MAX + ' \u00b7 ' + String(approval.source || '')
+  ));
+
+  if (approval.fallback) {
+    panel.appendChild(el('p', 'graph-approval-warning', String(approval.fallback)));
+  }
+
+  if (!tasks.length) {
+    for (var s = 0; s < steps.length; s++) {
+      appendApprovalStep(panel, steps[s]);
+    }
+  } else {
+    for (var t = 0; t < tasks.length; t++) {
+      var task = tasks[t];
+      var taskRow = el('p', 'graph-approval-task', String(task.id || '') + ' ' + String(task.title || ''));
+      if (task.nodes && task.nodes.length) {
+        taskRow.title = 'nodes: ' + task.nodes.join(', ');
+      }
+      panel.appendChild(taskRow);
+      var taskSteps = approvalStepsForTask(steps, task.id);
+      for (var ts = 0; ts < taskSteps.length; ts++) {
+        appendApprovalStep(panel, taskSteps[ts]);
+      }
+      appendTaskActions(panel, task, tasks);
+    }
+    var loose = approvalUnassignedSteps(steps, tasks);
+    for (var u = 0; u < loose.length; u++) {
+      appendApprovalStep(panel, loose[u]);
+    }
+  }
+
+  var notes = Array.isArray(approval.notes) ? approval.notes : [];
+  for (var n = 0; n < notes.length; n++) {
+    panel.appendChild(el('p', 'graph-approval-note', String(notes[n])));
+  }
+
+  var actions = el('div', 'graph-approval-actions');
+  actions.appendChild(planGateActionButton('Approve', 'btn-primary', function () {
+    submitPlanDecision('approve');
+  }));
+  actions.appendChild(planGateActionButton('Edit', '', function () {
+    planGateUi.editOpen = !planGateUi.editOpen;
+    renderApprovalPanel(graph);
+  }));
+  actions.appendChild(planGateActionButton('Reject', 'btn-danger', function () {
+    if (!window.confirm('Reject this plan revision?')) { return; }
+    submitPlanDecision('reject');
+  }));
+
+  if (editOpen) {
+    var editWrap = el('div', 'graph-approval-edit');
+    var textarea = document.createElement('textarea');
+    textarea.className = 'graph-approval-feedback';
+    textarea.setAttribute('aria-label', 'Plan edit feedback');
+    textarea.value = draft;
+    textarea.disabled = planGateDisabled();
+    textarea.addEventListener('input', function () {
+      planGateUi.editDraft = textarea.value;
+    });
+    editWrap.appendChild(textarea);
+    editWrap.appendChild(planGateActionButton('Send feedback', 'btn-primary', function () {
+      var text = textarea.value;
+      if (!String(text).trim()) { return; }
+      submitPlanDecision('edit', text);
+    }));
+    actions.appendChild(editWrap);
+  }
+
+  panel.appendChild(actions);
+  syncSessionPlanGateButtons();
+
+  if (focusFeedback || editOpen) {
+    var ta = panel.querySelector('.graph-approval-feedback');
+    if (ta) { ta.focus(); }
+  }
+}
+
+// UX-934: replan + revision history in the graph header.
+var planHistoryUi = { open: false };
+
+function graphReplanAllowed(graph) {
+  if (!graph) { return false; }
+  var nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+  if (nodes.length <= 1) { return false; }
+  var phase = String(graph.phase || '');
+  return phase === 'active' || phase === 'waiting_gate';
+}
+
+function runPlanReplanCommand(note) {
+  if (isDashboardViewOnly()) { return Promise.resolve(null); }
+  planGateUi.busy = true;
+  planGateUi.error = '';
+  syncSessionPlanGateButtons();
+  var graph = snapshot && snapshot.graph;
+  if (graph) {
+    renderApprovalPanel(graph);
+    renderGraphHeaderActions(graph);
+  }
+  var body = { command: 'plan_replan' };
+  if (note !== undefined && note !== null && String(note).trim()) {
+    body.note = String(note).trim();
+  }
+  return todoApi('POST', '/api/command', body).then(function (data) {
+    planGateUi.busy = false;
+    syncSessionPlanGateButtons();
+    poll();
+    return data;
+  }).catch(function (err) {
+    planGateUi.busy = false;
+    planGateUi.error = err && err.message ? err.message : 'Request failed';
+    syncSessionPlanGateButtons();
+    graph = snapshot && snapshot.graph;
+    if (graph) {
+      renderApprovalPanel(graph);
+      renderGraphHeaderActions(graph);
+    }
+    return null;
+  });
+}
+
+function submitPlanReplan() {
+  if (planGateDisabled()) { return; }
+  var graph = snapshot && snapshot.graph;
+  if (!graphReplanAllowed(graph)) { return; }
+  var note = window.prompt('Replan note (optional):');
+  if (note === null) { return; }
+  runPlanReplanCommand(note);
+}
+
+function formatPlanHistoryTime(atMs) {
+  if (typeof atMs !== 'number' || !isFinite(atMs) || atMs <= 0) { return ''; }
+  try {
+    return new Date(atMs).toLocaleString();
+  } catch (err) {
+    return String(atMs);
+  }
+}
+
+function planHistoryDelta(change) {
+  var parts = [];
+  if (change.added && change.added.length) {
+    parts.push('+' + change.added.join(','));
+  }
+  if (change.changed && change.changed.length) {
+    parts.push('~' + change.changed.join(','));
+  }
+  if (change.removed && change.removed.length) {
+    parts.push('\u2212' + change.removed.join(','));
+  }
+  return parts.length ? parts.join(' ') : '\u2014';
+}
+
+function renderPlanHistoryPanel(graph) {
+  var panel = $('graph-plan-history');
+  var toggle = $('plan-history');
+  if (!panel || !toggle) { return; }
+  var scrollTop = panel.scrollTop;
+  panel.replaceChildren();
+  if (!planHistoryUi.open) {
+    panel.hidden = true;
+    toggle.setAttribute('aria-expanded', 'false');
+    return;
+  }
+  toggle.setAttribute('aria-expanded', 'true');
+  panel.hidden = false;
+  var history = graph && Array.isArray(graph.plan_history) ? graph.plan_history : [];
+  if (!history.length) {
+    panel.appendChild(el('p', 'graph-plan-history-empty', 'No revisions yet.'));
+    panel.scrollTop = scrollTop;
+    return;
+  }
+  var start = Math.max(0, history.length - 10);
+  var recent = history.slice(start).reverse();
+  var list = el('ul', 'graph-plan-history-list');
+  for (var i = 0; i < recent.length; i++) {
+    var change = recent[i];
+    var item = el('li', 'graph-plan-history-item');
+    if (!change.applied) {
+      item.classList.add('graph-plan-history-rejected');
+    }
+    var head = el('div', 'graph-plan-history-head');
+    head.appendChild(document.createTextNode(
+      'rev ' + String(change.rev) + ' ' + String(change.kind || '') +
+      (change.applied ? '' : ' rejected')
+    ));
+    var time = formatPlanHistoryTime(change.at_ms);
+    if (time) {
+      head.appendChild(document.createTextNode(' \u00b7 ' + time));
+    }
+    item.appendChild(head);
+    item.appendChild(el('div', 'graph-plan-history-delta', planHistoryDelta(change)));
+    var reason = change.reason ? String(change.reason) : '';
+    if (!change.applied && change.error) {
+      reason = reason ? reason + ' \u2014 ' + String(change.error) : String(change.error);
+    }
+    if (reason) {
+      item.appendChild(el('div', 'graph-plan-history-reason', reason));
+    }
+    list.appendChild(item);
+  }
+  panel.appendChild(list);
+  panel.scrollTop = scrollTop;
+}
+
+function renderGraphHeaderActions(graph) {
+  var replanBtn = $('graph-replan');
+  var historyBtn = $('plan-history');
+  if (!replanBtn || !historyBtn) { return; }
+  if (!graph) {
+    replanBtn.hidden = true;
+    historyBtn.hidden = true;
+    planHistoryUi.open = false;
+    renderPlanHistoryPanel(null);
+    return;
+  }
+  var showReplan = graphReplanAllowed(graph);
+  replanBtn.hidden = !showReplan;
+  var hasHistory = Array.isArray(graph.plan_history) && graph.plan_history.length > 0;
+  historyBtn.hidden = !hasHistory;
+  if (!hasHistory) {
+    planHistoryUi.open = false;
+  }
+  syncSessionPlanGateButtons();
+  renderPlanHistoryPanel(graph);
+}
+
+window.dmuxaiPlanGate = {
+  approve: function () { submitPlanDecision('approve'); },
+  reject: function () {
+    if (!window.confirm('Reject this plan revision?')) { return; }
+    submitPlanDecision('reject');
+  },
+  toggleEdit: function () {
+    var graph = snapshot && snapshot.graph;
+    if (!graph) { return; }
+    planGateUi.editOpen = !planGateUi.editOpen;
+    renderApprovalPanel(graph);
+  },
+  replan: function () { submitPlanReplan(); },
+  isBusy: function () { return planGateUi.busy; }
+};
 
 var lastRenderedAgentsKey = null;
 
@@ -2862,7 +3413,11 @@ function render(nowMs) {
     graphZoomGroup = null;
     lastGraphCanvasRevision = null;
     lastGraphCanvasGeometryKey = null;
+    lastGraphCanvasNodesKey = null;
     renderGateHint(null);
+    renderGraphHeaderActions(null);
+    renderGraphJudgeLine(null);
+    renderApprovalPanel(null);
     renderCounts(null);
     renderBar(null);
     if ($('graph-percent')) { $('graph-percent').textContent = '0%'; }
@@ -2877,6 +3432,9 @@ function render(nowMs) {
     );
     $('graph-prompt').textContent = String(graph.user_prompt || '');
     $('graph-prompt').title = String(graph.user_prompt || '');
+    renderGraphJudgeLine(graph);
+    renderGraphHeaderActions(graph);
+    renderApprovalPanel(graph);
     renderGraphSummary(graph);
     renderNodes(graph, nowMs);
     applyGraphViewMode();
