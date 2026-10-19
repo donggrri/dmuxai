@@ -52,6 +52,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   FR-944. TC-951.
   Files: `src/app.rs`, `src/graph/plan_doc.rs`.
   Done when: `sensitive_gate_kept_for_plans` green.
+- [x] P07b — (composer-2.5 via #67 `/direct` 1-node run; review claude-sonnet-5-5-high APPROVE) Stale graph panel after `Graph run completed.`: the Completed arm now stores and saves the final run so the record, snapshot and panel show completed together (FR-978; TC-1003 `completed_run_shows_final_state_everywhere`). Found in #67 dogfood run 89caf6df.
 - [ ] P08 — Task edits at the gate: rename, delete, merge, move (local revision), split (edit turn); `/graph task …`.
   FR-965. TC-994.
   Files: `src/graph/tasks.rs`, `src/app.rs`.

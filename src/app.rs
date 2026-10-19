@@ -6540,6 +6540,13 @@ impl App {
                         self.push_system("Graph run completed.");
                     }
                     self.quiet_graph_run = false;
+                    if let Some(session) = self.graph_session.as_mut() {
+                        let run = session.run().clone();
+                        let _ = save_run(&self.workspace_root, &run);
+                        self.last_graph_run = Some(run);
+                        self.graph_assignment_line =
+                            resolved_assignment_line(&self.model_catalogs, session);
+                    }
                     let agents: Vec<Agent> = self
                         .graph_agent_nodes
                         .drain()
@@ -8116,7 +8123,7 @@ impl App {
         }
         if let Some(run) = &self.last_graph_run
             && run.conversation_id == self.conversation_id.as_str()
-            && run.phase == GraphRunPhase::Failed
+            && matches!(run.phase, GraphRunPhase::Failed | GraphRunPhase::Completed)
         {
             let session = GraphRunSession::new(run.clone());
             return session.status_line_with(resolve);
@@ -11021,6 +11028,88 @@ mod tests {
         let rendered = render_text_at(&mut app, 120, 30);
         assert!(rendered.contains("step-1 research · cursor"));
         assert!(rendered.contains("· failed"));
+    }
+
+    // TC-1003 / FR-978: terminal completion updates the record, snapshot, and
+    // graph status line together (multi-node and quiet 1-node runs).
+    #[test]
+    fn completed_run_shows_final_state_everywhere() {
+        fn assert_completed_everywhere(
+            app: &mut App,
+            hub: &dmuxai::web::DashboardHub,
+            run_id: &str,
+            check_panel: bool,
+        ) {
+            let run = app.last_graph_run.as_ref().expect("retained run");
+            assert_eq!(run.phase, GraphRunPhase::Completed);
+            let stored =
+                dmuxai::graph::load_run(&app.workspace_root, run_id).expect("saved run record");
+            assert_eq!(stored.phase, GraphRunPhase::Completed);
+            assert!(stored.plan.nodes.iter().all(|node| {
+                !matches!(
+                    node.status,
+                    dmuxai::graph::GraphNodeStatus::Running
+                        | dmuxai::graph::GraphNodeStatus::Pending
+                )
+            }));
+
+            app.publish_dashboard();
+            let graph = hub.snapshot().graph.expect("snapshot graph");
+            assert_eq!(graph.phase, GraphRunPhase::Completed);
+            assert!(graph.nodes.iter().all(|node| {
+                !matches!(
+                    node.status,
+                    dmuxai::graph::GraphNodeStatus::Running
+                        | dmuxai::graph::GraphNodeStatus::Pending
+                )
+            }));
+
+            if check_panel {
+                app.terminal_area = Rect::new(0, 0, 120, 30);
+                let rendered = render_text_at(app, 120, 30);
+                assert!(rendered.contains("· done"));
+            }
+        }
+
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/test-workspace".to_owned(),
+        );
+
+        let (mut app, sent) = test_app();
+        app.selected = adapter_index(Agent::Cursor);
+        app.quiet_graph_run = false;
+        app.attach_dashboard(hub.clone());
+        app.start_graph_run(two_step_cursor_chain_plan("tc-1003-two", 1));
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        complete_sent_graph_turn(&mut app, &sent, 0);
+        assert_eq!(sent.lock().unwrap().len(), 2);
+        complete_sent_graph_turn(&mut app, &sent, 1);
+        assert!(app.graph_session.is_none());
+        assert_completed_everywhere(&mut app, &hub, "tc-1003-two", true);
+
+        let mut h = plan_gate_test_app();
+        h.app.attach_dashboard(hub.clone());
+        h.app.input = "/direct quiet one-node".to_owned();
+        h.app.submit_prompt();
+        assert_eq!(h.sent.lock().unwrap().len(), 1);
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        assert!(h.app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(request.turn_id.as_str())),
+            event: AgentEvent::Completed,
+        }));
+        assert!(h.app.graph_session.is_none());
+        let run_id = h
+            .app
+            .last_graph_run
+            .as_ref()
+            .expect("retained run")
+            .plan
+            .id
+            .clone();
+        assert_completed_everywhere(&mut h.app, &hub, &run_id, false);
     }
 
     fn start_multi_node_graph(app: &mut App, extra_nodes: Vec<dmuxai::graph::GraphNode>) {
