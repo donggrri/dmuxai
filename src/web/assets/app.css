@@ -1611,7 +1611,7 @@ main {
 
 .graph-stage[hidden] { display: none; }
 
-/* UX-936: task checklist beside swimlane; stacks below on narrow viewports. */
+/* UX-936: task checklist below the swimlane (full width). */
 .graph-stage-layout {
   display: flex;
   flex-direction: column;
@@ -1621,17 +1621,11 @@ main {
   min-width: 0;
 }
 
-@media (min-width: 640px) {
-  .graph-stage-layout {
-    flex-direction: row;
-    align-items: stretch;
-  }
-}
-
 .task-checklist {
   flex: 0 0 auto;
   width: 100%;
-  max-height: 38vh;
+  max-width: none;
+  max-height: 32vh;
   overflow: auto;
   margin: 0;
   padding: 8px 10px;
@@ -1640,15 +1634,6 @@ main {
   background: var(--bg-panel);
   font-size: 0.85em;
   box-sizing: border-box;
-}
-
-@media (min-width: 640px) {
-  .task-checklist {
-    flex: 0 0 auto;
-    width: 100%;
-    max-width: 280px;
-    max-height: 70vh;
-  }
 }
 
 .task-checklist[hidden] { display: none; }
@@ -1663,6 +1648,10 @@ main {
 }
 
 .task-checklist-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr));
+  align-items: start;
+  gap: 4px 8px;
   list-style: none;
   margin: 0;
   padding: 0;
@@ -1713,9 +1702,8 @@ main {
 
 .task-checklist-label {
   color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .task-checklist-meta {
@@ -1750,6 +1738,7 @@ main {
 .graph-canvas {
   position: relative;
   flex: 1 1 auto;
+  width: 100%;
   min-width: 0;
   min-height: 180px;
   max-height: 70vh;

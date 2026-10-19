@@ -538,7 +538,6 @@ var graphSelectedId = null;
 // UX-936: selected checklist task highlights swimlane nodes (survives snapshot re-render).
 var taskChecklistSelectedId = null;
 var taskChecklistHighlight = {};
-var taskChecklistEverVisible = false;
 var graphPan = null;
 var graphPointerDown = false;
 var graphZoomGroup = null;
@@ -2196,7 +2195,7 @@ function renderApprovalPanel(graph) {
   approvalPanelFocusFeedback = false;
 }
 
-// UX-936: task checklist beside the swimlane (`graph.tasks` from pushed snapshots).
+// UX-936: task checklist below the swimlane (`graph.tasks` from pushed snapshots).
 function taskChecklistStatusClass(status) {
   var label = String(status || 'pending');
   if (label === 'running' || label === 'done' || label === 'failed') { return label; }
@@ -2325,15 +2324,6 @@ function createTaskChecklistRow(task) {
   return row;
 }
 
-function autoFitGraphAfterTaskChecklistLayout() {
-  if (!graphGeometry) { return; }
-  window.requestAnimationFrame(function () {
-    if (!graphGeometry) { return; }
-    autoFitGraph(graphGeometry);
-    applyGraphTransform();
-  });
-}
-
 function renderTaskChecklist(graph) {
   var panel = $('task-checklist');
   if (!panel) { return; }
@@ -2347,7 +2337,6 @@ function renderTaskChecklist(graph) {
     panel.replaceChildren();
     taskChecklistSelectedId = null;
     taskChecklistHighlight = {};
-    taskChecklistEverVisible = false;
     updateGraphNodeSelection();
     return;
   }
@@ -2392,10 +2381,6 @@ function renderTaskChecklist(graph) {
   if (focusTaskId) {
     var focused = list.querySelector('[data-task-id="' + focusTaskId + '"]');
     if (focused) { focused.focus(); }
-  }
-  if (!taskChecklistEverVisible) {
-    taskChecklistEverVisible = true;
-    autoFitGraphAfterTaskChecklistLayout();
   }
 }
 

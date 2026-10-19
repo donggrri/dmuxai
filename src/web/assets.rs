@@ -1375,7 +1375,7 @@ mod tests {
         let approval_render_js = js_between(
             APP_JS,
             "function renderApprovalPanel",
-            "// UX-936: task checklist beside the swimlane",
+            "// UX-936: task checklist below the swimlane",
         );
         assert!(
             !approval_render_js.contains("|| editOpen"),
@@ -1406,12 +1406,22 @@ mod tests {
         );
     }
 
-    // TC-996 (UX-936): task checklist panel beside the swimlane.
+    // TC-996 (UX-936): task checklist panel below the swimlane.
     #[test]
     fn task_checklist_asset() {
         assert!(INDEX_HTML.contains("id=\"task-checklist\""));
         assert!(INDEX_HTML.contains("data-parity=\"task-checklist\""));
         assert!(INDEX_HTML.contains("graph-stage-layout"));
+        let canvas_pos = INDEX_HTML
+            .find("id=\"graph-canvas\"")
+            .expect("graph-canvas in index");
+        let checklist_pos = INDEX_HTML
+            .find("id=\"task-checklist\"")
+            .expect("task-checklist in index");
+        assert!(
+            canvas_pos < checklist_pos,
+            "task checklist must follow graph canvas in index.html"
+        );
         assert!(APP_JS.contains("function renderTaskChecklist"));
         assert!(APP_JS.contains("function taskChecklistStatusIcon"));
         assert!(APP_JS.contains("graph.tasks"));
@@ -1423,8 +1433,19 @@ mod tests {
         assert!(APP_JS.contains("data-task-id"));
         assert!(APP_JS.contains("function tasksForChecklist"));
         assert!(APP_JS.contains("list.insertBefore(rowNode"));
-        assert!(APP_JS.contains("taskChecklistEverVisible"));
-        assert!(APP_CSS.contains("max-width: 280px"));
+        assert!(!APP_JS.contains("taskChecklistEverVisible"));
+        assert!(!APP_CSS.contains("max-width: 280px"));
+        assert!(APP_CSS.contains("flex-direction: column"));
+        assert!(
+            !APP_CSS.contains(".graph-stage-layout {\n    flex-direction: row"),
+            "graph-stage-layout must not switch to row at wide widths"
+        );
+        assert!(
+            APP_CSS.contains(
+                "grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr))"
+            )
+        );
+        assert!(!APP_JS.contains("autoFitGraphAfterTaskChecklistLayout"));
         for status in ["pending", "running", "done", "failed"] {
             assert!(
                 APP_CSS.contains(&format!(".task-checklist-status-{status}")),
@@ -1443,7 +1464,7 @@ mod tests {
 
         let checklist_js = js_between(
             APP_JS,
-            "// UX-936: task checklist beside the swimlane",
+            "// UX-936: task checklist below the swimlane",
             "// UX-934: replan + revision history in the graph header.",
         );
         assert!(
