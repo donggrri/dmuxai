@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io, mem,
     ops::Range,
     path::{Path, PathBuf},
@@ -74,9 +74,26 @@ use dmuxai::{
 
 use crate::agent::{
     Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ConversationId,
-    CursorAdapterConfig, ExecutionMode, ModelInfo, TurnId, event_channel, spawn_agy_adapter,
-    spawn_codex_adapter, spawn_cursor_adapter, spawn_custom_adapter,
+    CursorAdapterConfig, ExecutionMode, ModelInfo, TurnId, event_channel,
+    is_adapter_turn_busy_rejection, spawn_agy_adapter, spawn_codex_adapter, spawn_cursor_adapter,
+    spawn_custom_adapter,
 };
+
+/// Minimum wait between graph defer retries (FR-976); zero in unit tests.
+const GRAPH_DEFER_RETRY_INTERVAL: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(1)
+};
+
+/// FR-976: if the adapter never frees, fail like a stuck node (same cap as judge hard stop).
+const GRAPH_DEFER_MAX_WAIT: Duration = Duration::from_secs(270);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphNodeDispatch {
+    Started,
+    Deferred,
+}
 
 const RENDER_INTERVAL: Duration = Duration::from_millis(25);
 const EVENT_LOOP_PAUSE: Duration = Duration::from_millis(5);
@@ -908,6 +925,10 @@ pub struct App {
     graph_assignment_line: String,
     /// Graph node id currently driven by each agent turn (parallel-safe, FR-702).
     graph_agent_nodes: HashMap<Agent, String>,
+    /// Ready nodes waiting for a runner whose adapter is still busy (FR-976).
+    graph_deferred_starts: HashMap<Agent, VecDeque<NodeAssignment>>,
+    graph_defer_retry_after: HashMap<String, Instant>,
+    graph_defer_since: HashMap<String, Instant>,
     graph_node_details: HashMap<String, NodeDetailTracker>,
     single_graph_plan: Option<(NodeRole, Agent, String)>,
     /// FR-937: a 1-node run hides the graph progress lines so the transcript
@@ -1118,6 +1139,9 @@ impl App {
             graph_session: None,
             graph_assignment_line: String::new(),
             graph_agent_nodes: HashMap::new(),
+            graph_deferred_starts: HashMap::new(),
+            graph_defer_retry_after: HashMap::new(),
+            graph_defer_since: HashMap::new(),
             graph_node_details: HashMap::new(),
             single_graph_plan: None,
             quiet_graph_run: false,
@@ -1253,11 +1277,12 @@ impl App {
             let _ = adapter.tick();
         }
         self.check_triage_timeout(Instant::now());
+        let flushed = self.flush_deferred_graph_starts();
         let busy = !self.busy_agents.is_empty();
-        if busy {
+        if busy || flushed {
             self.dirty = true;
         }
-        busy
+        busy || flushed
     }
 
     pub async fn run<B>(&mut self, terminal: &mut Terminal<B>) -> Result<(), B::Error>
@@ -3392,6 +3417,7 @@ impl App {
         self.last_graph_run = None;
         self.graph_node_details.clear();
         self.graph_agent_nodes.clear();
+        self.clear_graph_defer_state();
         self.messages.clear();
         self.streaming_messages.clear();
         self.last_group_expanded = false;
@@ -4638,19 +4664,29 @@ impl App {
             && let Some(todo_id) = self.todo_turns.remove(&(agent, active.turn_id))
             && let Some(store) = self.todo_store.clone()
         {
-            if let Err(err) = store.finish_run(&todo_id, success, error) {
+            if let Err(err) = store.finish_run(&todo_id, success, error.clone()) {
                 self.push_system(format!("Failed to finish to-do run: {err}"));
             }
             self.publish_todos();
         }
-        if let Some(node_id) = self.graph_agent_nodes.remove(&agent)
-            && let Some(session) = self.graph_session.as_mut()
-        {
-            let actions = session.on_node_finished(&node_id, success);
-            self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
-            let _ = save_run(&self.workspace_root, session.run());
-            self.dispatch_graph_actions(actions);
+        if let Some(node_id) = self.graph_agent_nodes.remove(&agent) {
+            if !success
+                && error.as_deref().is_some_and(is_adapter_turn_busy_rejection)
+                && let Some(session) = self.graph_session.as_mut()
+                && let Some(assignment) = session.assignment_for_node(&node_id)
+            {
+                self.defer_graph_node_start(agent, assignment);
+                return;
+            }
+            if let Some(session) = self.graph_session.as_mut() {
+                let actions = session.on_node_finished(&node_id, success);
+                self.graph_assignment_line =
+                    resolved_assignment_line(&self.model_catalogs, session);
+                let _ = save_run(&self.workspace_root, session.run());
+                self.dispatch_graph_actions(actions);
+            }
         }
+        self.flush_deferred_graph_starts();
     }
 
     /// The model a planned step should actually use on `agent`.
@@ -4744,6 +4780,7 @@ impl App {
         self.single_graph_plan = None;
         self.graph_node_details.clear();
         self.graph_agent_nodes.clear();
+        self.clear_graph_defer_state();
         // FR-937: triage/direct 1-node runs are quiet; multi-step plans with an
         // orchestrate node keep the normal graph banners.
         self.quiet_graph_run = run
@@ -4831,6 +4868,15 @@ impl App {
                 GraphAction::Failed(message) => {
                     self.push_system(format!("Graph failed: {message}"));
                     self.quiet_graph_run = false;
+                    if let Some(session) = self.graph_session.as_mut() {
+                        session.finalize_failure();
+                        let run = session.run().clone();
+                        let _ = save_run(&self.workspace_root, &run);
+                        self.last_graph_run = Some(run);
+                        self.graph_assignment_line =
+                            resolved_assignment_line(&self.model_catalogs, session);
+                    }
+                    self.clear_graph_defer_state();
                     for (agent, _node_id) in self.graph_agent_nodes.drain() {
                         let _ = self.adapters[adapter_index(agent)].cancel();
                         if let Some(active) = self.active_turns.remove(&agent) {
@@ -4868,16 +4914,116 @@ impl App {
         if let Some(session) = self.graph_session.as_ref() {
             let _ = save_run(&self.workspace_root, session.run());
         }
+        self.flush_deferred_graph_starts();
     }
 
     fn active_graph_node_for_agent(&self, agent: Agent) -> Option<String> {
         self.graph_agent_nodes.get(&agent).cloned()
     }
 
-    fn start_graph_node(&mut self, assignment: NodeAssignment) -> Result<(), String> {
+    fn clear_graph_defer_state(&mut self) {
+        self.graph_deferred_starts.clear();
+        self.graph_defer_retry_after.clear();
+        self.graph_defer_since.clear();
+    }
+
+    fn remove_deferred_assignment_for_node(&mut self, node_id: &str) {
+        for queue in self.graph_deferred_starts.values_mut() {
+            queue.retain(|assignment| assignment.node_id != node_id);
+        }
+        if let Some(session) = self.graph_session.as_mut() {
+            session.clear_node_deferred(node_id);
+        }
+    }
+
+    fn defer_graph_node_start(&mut self, agent: Agent, assignment: NodeAssignment) {
+        let node_id = assignment.node_id.clone();
+        self.graph_defer_since
+            .entry(node_id.clone())
+            .or_insert_with(Instant::now);
+        self.graph_defer_retry_after
+            .insert(node_id.clone(), Instant::now() + GRAPH_DEFER_RETRY_INTERVAL);
+        if let Some(session) = self.graph_session.as_mut() {
+            session.revert_node_start(&node_id);
+            let _ = save_run(&self.workspace_root, session.run());
+            self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
+        }
+        // Only drop the mapping when it points at the node being deferred; a
+        // different node may still be running on this runner (FR-949).
+        if self.graph_agent_nodes.get(&agent) == Some(&node_id) {
+            self.graph_agent_nodes.remove(&agent);
+        }
+        let queue = self.graph_deferred_starts.entry(agent).or_default();
+        if !queue.iter().any(|pending| pending.node_id == node_id) {
+            queue.push_back(assignment);
+        }
+    }
+
+    fn flush_deferred_graph_starts(&mut self) -> bool {
+        if self.graph_session.is_none() || self.graph_deferred_starts.is_empty() {
+            return false;
+        }
+        let agents: Vec<Agent> = self.graph_deferred_starts.keys().copied().collect();
+        let mut dispatched = false;
+        let now = Instant::now();
+        for agent in agents {
+            if self.busy_agents.contains(&agent) {
+                // FR-976: waiting behind a real turn is not a rejection; the
+                // timeout only counts adapter refusals after the runner frees.
+                if let Some(queue) = self.graph_deferred_starts.get(&agent) {
+                    for pending in queue {
+                        self.graph_defer_since.insert(pending.node_id.clone(), now);
+                    }
+                }
+                continue;
+            }
+            let Some(queue) = self.graph_deferred_starts.get_mut(&agent) else {
+                continue;
+            };
+            let Some(assignment) = queue.front().cloned() else {
+                continue;
+            };
+            if self
+                .graph_defer_retry_after
+                .get(&assignment.node_id)
+                .is_some_and(|retry_after| now < *retry_after)
+            {
+                continue;
+            }
+            if self
+                .graph_defer_since
+                .get(&assignment.node_id)
+                .is_some_and(|since| now.saturating_duration_since(*since) >= GRAPH_DEFER_MAX_WAIT)
+            {
+                queue.pop_front();
+                self.graph_defer_since.remove(&assignment.node_id);
+                self.graph_defer_retry_after.remove(&assignment.node_id);
+                self.remove_deferred_assignment_for_node(&assignment.node_id);
+                self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
+                    "graph node {} timed out waiting for runner {}",
+                    assignment.node_id, agent
+                ))]);
+                continue;
+            }
+            queue.pop_front();
+            if matches!(
+                self.start_graph_node(assignment),
+                Ok(GraphNodeDispatch::Started)
+            ) {
+                dispatched = true;
+            }
+        }
+        dispatched
+    }
+
+    fn start_graph_node(
+        &mut self,
+        assignment: NodeAssignment,
+    ) -> Result<GraphNodeDispatch, String> {
         if self.graph_session.is_none() {
             return Err("no active graph session".to_owned());
         }
+        self.remove_deferred_assignment_for_node(&assignment.node_id);
         let Some(agent) = self.apply_runner_and_model(&assignment.runner, &assignment.model_id)
         else {
             self.push_system(format!("Unknown graph runner: {}", assignment.runner));
@@ -4887,6 +5033,14 @@ impl App {
             ))]);
             return Err(format!("unknown graph runner: {}", assignment.runner));
         };
+        let deferred_assignment = assignment.clone();
+        if self.busy_agents.contains(&agent) && !self.quiet_graph_run {
+            self.defer_graph_node_start(agent, deferred_assignment);
+            return Ok(GraphNodeDispatch::Deferred);
+        }
+        if let Some(session) = self.graph_session.as_mut() {
+            session.ensure_node_running(&assignment.node_id);
+        }
         self.graph_node_details.remove(&assignment.node_id);
         self.graph_agent_nodes
             .insert(agent, assignment.node_id.clone());
@@ -4897,7 +5051,7 @@ impl App {
                 .plan
                 .nodes
                 .iter()
-                .find(|node| node.id == assignment.node_id)
+                .find(|node| node.id == deferred_assignment.node_id)
                 .and_then(|node| node.skill.clone());
             if let Some(skill_id) = skill_id {
                 let skills = discover_skills(&self.workspace_root);
@@ -4917,9 +5071,15 @@ impl App {
         }
         let restore_input = self.quiet_graph_run;
         let allow_defer = self.quiet_graph_run;
+
         if let Err(err) =
             self.try_submit_to_agent(agent, prompt.clone(), restore_input, allow_defer)
         {
+            if !self.quiet_graph_run && matches!(&err, RunTodoError::Busy(_)) {
+                self.graph_agent_nodes.remove(&agent);
+                self.defer_graph_node_start(agent, deferred_assignment);
+                return Ok(GraphNodeDispatch::Deferred);
+            }
             if self.quiet_graph_run && Self::is_quiet_graph_agent_busy(&err) {
                 if self.input.is_empty() {
                     self.input = prompt;
@@ -4947,7 +5107,7 @@ impl App {
                 RunTodoError::Busy(msg) if msg.contains("requires conversation summary")
             ) {
                 self.graph_agent_nodes.remove(&agent);
-                return Ok(());
+                return Ok(GraphNodeDispatch::Deferred);
             }
             self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
                 "failed to start node {}: {err:?}",
@@ -4958,7 +5118,9 @@ impl App {
                 assignment.node_id
             ));
         }
-        Ok(())
+        self.graph_defer_since.remove(&assignment.node_id);
+        self.graph_defer_retry_after.remove(&assignment.node_id);
+        Ok(GraphNodeDispatch::Started)
     }
 
     fn show_graph_status(&mut self) {
@@ -6227,17 +6389,25 @@ impl App {
     }
 
     fn current_graph_status_line(&self) -> Option<String> {
+        let resolve = |runner: &str, planned: &str| {
+            if let Some(agent) = runner_from_str(runner) {
+                self.effective_model_for(agent, planned)
+                    .unwrap_or_else(|| "provider default".to_owned())
+            } else {
+                planned.to_owned()
+            }
+        };
         if let Some(session) = &self.graph_session
             && session.run().phase != GraphRunPhase::Completed
         {
-            return session.status_line_with(|runner, planned| {
-                if let Some(agent) = runner_from_str(runner) {
-                    self.effective_model_for(agent, planned)
-                        .unwrap_or_else(|| "provider default".to_owned())
-                } else {
-                    planned.to_owned()
-                }
-            });
+            return session.status_line_with(resolve);
+        }
+        if let Some(run) = &self.last_graph_run
+            && run.conversation_id == self.conversation_id.as_str()
+            && run.phase == GraphRunPhase::Failed
+        {
+            let session = GraphRunSession::new(run.clone());
+            return session.status_line_with(resolve);
         }
         if let Some((role, agent, planned_model)) = &self.single_graph_plan {
             let runner = runner_name(*agent);
@@ -8846,6 +9016,274 @@ mod tests {
                 .as_deref(),
             Some("composer-2.5")
         );
+    }
+
+    fn complete_sent_graph_turn(app: &mut App, sent: &SentRequests, index: usize) {
+        let (agent, request) = sent.lock().unwrap()[index].clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(request.turn_id.as_str())),
+            event: AgentEvent::Completed,
+        }));
+    }
+
+    fn two_step_cursor_chain_plan(id: &str, max_retries: u32) -> dmuxai::graph::GraphPlan {
+        dmuxai::graph::GraphPlan {
+            schema: "dmuxai.graph/v1".to_owned(),
+            id: id.to_owned(),
+            orchestrator_model: "composer-2.5".to_owned(),
+            user_prompt: "chain".to_owned(),
+            nodes: vec![
+                dmuxai::graph::GraphNode {
+                    id: "step-1".to_owned(),
+                    role: NodeRole::Research,
+                    job: "first".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Pending,
+                    attempt: 0,
+                    task: None,
+                    started_at_ms: None,
+                    finished_at_ms: None,
+                },
+                dmuxai::graph::GraphNode {
+                    id: "step-2".to_owned(),
+                    role: NodeRole::Test,
+                    job: "second".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Pending,
+                    attempt: 0,
+                    task: None,
+                    started_at_ms: None,
+                    finished_at_ms: None,
+                },
+            ],
+            edges: vec![dmuxai::graph::GraphEdge {
+                from: "step-1".to_owned(),
+                to: "step-2".to_owned(),
+            }],
+            limits: dmuxai::graph::GraphLimits {
+                max_parallel: 1,
+                max_retries,
+                ..dmuxai::graph::GraphLimits::default()
+            },
+            tasks: Vec::new(),
+        }
+    }
+
+    // TC-1001 / FR-976: adapter "already running" defers the next node without
+    // counting an attempt; it starts once the runner is free.
+    #[test]
+    fn next_node_waits_for_adapter_release() {
+        let (mut app, sent, _tx) = test_app_with_event_sender();
+        app.selected = adapter_index(Agent::Cursor);
+        app.quiet_graph_run = false;
+        app.start_graph_run(two_step_cursor_chain_plan("tc-1001", 2));
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        complete_sent_graph_turn(&mut app, &sent, 0);
+        assert_eq!(sent.lock().unwrap().len(), 2);
+
+        let (agent, request) = sent.lock().unwrap()[1].clone();
+        assert_eq!(agent, Agent::Cursor);
+        assert!(
+            app.apply_agent_output(AgentOutput {
+                agent,
+                conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+                turn_id: Some(TurnId::new(request.turn_id.as_str())),
+                event: AgentEvent::Error(
+                    "Cursor is already running a turn; cancel it before sending another prompt"
+                        .to_owned(),
+                ),
+            })
+        );
+
+        let session = app.graph_session.as_ref().expect("run still active");
+        let step_2 = session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.id == "step-2")
+            .expect("step-2");
+        assert_eq!(step_2.status, dmuxai::graph::GraphNodeStatus::Ready);
+        assert_eq!(step_2.attempt, 0);
+        assert_eq!(
+            app.graph_deferred_starts
+                .get(&Agent::Cursor)
+                .map(|queue| queue.len())
+                .unwrap_or(0),
+            1
+        );
+        // TC-1001: defer must not schedule a duplicate StartNode for step-2.
+        assert_eq!(sent.lock().unwrap().len(), 2);
+
+        assert!(app.tick());
+        assert_eq!(sent.lock().unwrap().len(), 3);
+        complete_sent_graph_turn(&mut app, &sent, 2);
+        assert!(app.graph_session.is_none());
+        let stored =
+            dmuxai::graph::load_run(&app.workspace_root, "tc-1001").expect("saved run record");
+        assert_eq!(stored.phase, GraphRunPhase::Completed);
+    }
+
+    // TC-1001 / FR-976: per-runner FIFO for deferred starts (no overwrite).
+    #[test]
+    fn deferred_starts_queue_per_runner() {
+        let (mut app, sent, _tx) = test_app_with_event_sender();
+        app.selected = adapter_index(Agent::Cursor);
+        app.quiet_graph_run = false;
+        let plan = dmuxai::graph::GraphPlan {
+            schema: "dmuxai.graph/v1".to_owned(),
+            id: "tc-1001-queue".to_owned(),
+            orchestrator_model: "composer-2.5".to_owned(),
+            user_prompt: "parallel".to_owned(),
+            nodes: vec![
+                dmuxai::graph::GraphNode {
+                    id: "step-a".to_owned(),
+                    role: NodeRole::Research,
+                    job: "a".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Ready,
+                    attempt: 0,
+                    task: None,
+                    started_at_ms: None,
+                    finished_at_ms: None,
+                },
+                dmuxai::graph::GraphNode {
+                    id: "step-b".to_owned(),
+                    role: NodeRole::Test,
+                    job: "b".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Ready,
+                    attempt: 0,
+                    task: None,
+                    started_at_ms: None,
+                    finished_at_ms: None,
+                },
+            ],
+            edges: Vec::new(),
+            limits: dmuxai::graph::GraphLimits {
+                max_parallel: 2,
+                max_retries: 2,
+                ..dmuxai::graph::GraphLimits::default()
+            },
+            tasks: Vec::new(),
+        };
+        app.graph_session = Some(GraphRunSession::new(GraphRun {
+            plan,
+            conversation_id: "conv-queue".to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+            ..Default::default()
+        }));
+
+        let first = NodeAssignment {
+            node_id: "step-a".to_owned(),
+            runner: "cursor".to_owned(),
+            model_id: "composer-2.5".to_owned(),
+            prompt: "a".to_owned(),
+            role: NodeRole::Research,
+        };
+        let second = NodeAssignment {
+            node_id: "step-b".to_owned(),
+            runner: "cursor".to_owned(),
+            model_id: "composer-2.5".to_owned(),
+            prompt: "b".to_owned(),
+            role: NodeRole::Test,
+        };
+        app.defer_graph_node_start(Agent::Cursor, first.clone());
+        app.defer_graph_node_start(Agent::Cursor, second);
+
+        let queue = app
+            .graph_deferred_starts
+            .get(&Agent::Cursor)
+            .expect("cursor queue");
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].node_id, "step-a");
+        assert_eq!(queue[1].node_id, "step-b");
+
+        assert!(app.flush_deferred_graph_starts());
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert_eq!(
+            app.graph_agent_nodes
+                .get(&Agent::Cursor)
+                .map(String::as_str),
+            Some("step-a")
+        );
+
+        complete_sent_graph_turn(&mut app, &sent, 0);
+        assert_eq!(sent.lock().unwrap().len(), 2);
+        assert_eq!(
+            app.graph_agent_nodes
+                .get(&Agent::Cursor)
+                .map(String::as_str),
+            Some("step-b")
+        );
+    }
+
+    // TC-1002 / FR-977: terminal node failure updates the record, snapshot, and
+    // graph status line together.
+    #[test]
+    fn node_failure_marks_run_failed_everywhere() {
+        let (mut app, sent) = test_app();
+        app.selected = adapter_index(Agent::Cursor);
+        app.quiet_graph_run = false;
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            "/test-workspace".to_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+        app.start_graph_run(two_step_cursor_chain_plan("tc-1002", 1));
+        assert_eq!(sent.lock().unwrap().len(), 1);
+
+        let (agent, request) = sent.lock().unwrap()[0].clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(request.turn_id.as_str())),
+            event: AgentEvent::Error("step-1 provider failure".to_owned()),
+        }));
+
+        assert!(app.graph_session.is_none());
+        let run = app.last_graph_run.as_ref().expect("retained run");
+        assert_eq!(run.phase, GraphRunPhase::Failed);
+        let stored =
+            dmuxai::graph::load_run(&app.workspace_root, "tc-1002").expect("saved run record");
+        assert_eq!(stored.phase, GraphRunPhase::Failed);
+        assert!(
+            stored
+                .plan
+                .nodes
+                .iter()
+                .all(|node| node.status != dmuxai::graph::GraphNodeStatus::Running)
+        );
+
+        app.publish_dashboard();
+        let graph = hub.snapshot().graph.expect("snapshot graph");
+        assert_eq!(graph.phase, GraphRunPhase::Failed);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| node.status != dmuxai::graph::GraphNodeStatus::Running)
+        );
+
+        app.terminal_area = Rect::new(0, 0, 120, 30);
+        let rendered = render_text_at(&mut app, 120, 30);
+        assert!(rendered.contains("step-1 research · cursor"));
+        assert!(rendered.contains("· failed"));
     }
 
     fn start_multi_node_graph(app: &mut App, extra_nodes: Vec<dmuxai::graph::GraphNode>) {

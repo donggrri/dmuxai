@@ -23,6 +23,8 @@ pub struct GraphRunSession {
     run: GraphRun,
     active: HashSet<String>,
     node_turns: HashMap<String, String>,
+    /// Ready nodes waiting on adapter availability (FR-976); skip in [`schedule`].
+    deferred_ready: HashSet<String>,
 }
 
 pub type GraphSession = GraphRunSession;
@@ -33,7 +35,16 @@ impl GraphRunSession {
             run,
             active: HashSet::new(),
             node_turns: HashMap::new(),
+            deferred_ready: HashSet::new(),
         }
+    }
+
+    pub fn mark_node_deferred(&mut self, node_id: &str) {
+        self.deferred_ready.insert(node_id.to_owned());
+    }
+
+    pub fn clear_node_deferred(&mut self, node_id: &str) {
+        self.deferred_ready.remove(node_id);
     }
 
     pub fn run(&self) -> &GraphRun {
@@ -66,6 +77,74 @@ impl GraphRunSession {
             self.run.phase = GraphRunPhase::Active;
         }
         self.schedule()
+    }
+
+    pub fn assignment_for_node(&self, node_id: &str) -> Option<NodeAssignment> {
+        let node = self.run.plan.nodes.iter().find(|node| node.id == node_id)?;
+        if node.role == NodeRole::Orchestrate {
+            return None;
+        }
+        Some(NodeAssignment {
+            node_id: node.id.clone(),
+            runner: node.runner.clone(),
+            model_id: node.model_id.clone(),
+            prompt: node.job.clone(),
+            role: node.role,
+        })
+    }
+
+    /// Undo a scheduled [`GraphAction::StartNode`] when the adapter refuses to
+    /// start (FR-976) so the node stays ready without counting an attempt.
+    pub fn revert_node_start(&mut self, node_id: &str) {
+        self.deferred_ready.insert(node_id.to_owned());
+        self.active.remove(node_id);
+        if let Some(node) = self
+            .run
+            .plan
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        {
+            if node.status == GraphNodeStatus::Running {
+                node.status = GraphNodeStatus::Ready;
+            }
+            if node.attempt == 0 {
+                node.started_at_ms = None;
+            }
+        }
+    }
+
+    /// Mark a ready node running again after a deferred start (FR-976).
+    pub fn ensure_node_running(&mut self, node_id: &str) {
+        if self.active.contains(node_id) {
+            return;
+        }
+        if let Some(node) = self.run.plan.nodes.iter_mut().find(|node| {
+            node.id == node_id
+                && (node.status == GraphNodeStatus::Ready
+                    || node.status == GraphNodeStatus::Pending)
+        }) {
+            node.status = GraphNodeStatus::Running;
+            if node.started_at_ms.is_none() {
+                node.started_at_ms = Some(unix_now_ms());
+            }
+            node.finished_at_ms = None;
+            self.active.insert(node_id.to_owned());
+            self.deferred_ready.remove(node_id);
+        }
+    }
+
+    /// Terminal failure: no node stays running in the persisted run (FR-977).
+    pub fn finalize_failure(&mut self) {
+        if self.run.phase != GraphRunPhase::Failed {
+            self.run.phase = GraphRunPhase::Failed;
+        }
+        self.active.clear();
+        for node in &mut self.run.plan.nodes {
+            if node.status == GraphNodeStatus::Running {
+                node.status = GraphNodeStatus::Skipped;
+            }
+        }
     }
 
     pub fn on_node_finished(&mut self, node_id: &str, success: bool) -> Vec<GraphAction> {
@@ -130,6 +209,10 @@ impl GraphRunSession {
             let status = self.run.plan.nodes[index].status;
             let requires_gate = self.run.plan.nodes[index].requires_gate;
             if status != GraphNodeStatus::Pending && status != GraphNodeStatus::Ready {
+                index += 1;
+                continue;
+            }
+            if self.deferred_ready.contains(&node_id) {
                 index += 1;
                 continue;
             }

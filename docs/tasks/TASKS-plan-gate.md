@@ -31,12 +31,13 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   Files: new `src/graph/tasks.rs`, `src/graph/store.rs`, `src/app.rs` (1-node builder only).
   Done when: `task_status_follows_nodes`, `one_node_run_has_implicit_task` green.
 - [x] P03 — (composer-2.5 in v0.2.2 graph run e3a7ceb5; review claude-sonnet-5-5-high APPROVE) see below.
-- [ ] P03b — Graph robustness from the v0.2.2 dogfood run e3a7ceb5: a node is never sent to a runner whose adapter is still busy (start refusal keeps it ready, FR-976), and a node failure marks the run failed in the record, snapshot and graph panel (FR-977).
+- [x] P03b — (composer-2.5 single turns; review claude-sonnet-5-5-high BLOCK ×2 → fixed, last two fixes by hand: keep a running node's runner mapping, timeout counts only adapter refusals; follow-up tests for those two still to add in P04) Graph robustness from the v0.2.2 dogfood run e3a7ceb5: a node is never sent to a runner whose adapter is still busy (start refusal keeps it ready, FR-976), and a node failure marks the run failed in the record, snapshot and graph panel (FR-977).
   FR-976, FR-977, FR-949. TC-1001, TC-1002.
   Files: `src/app.rs`, `src/graph/executor.rs`, `src/web/snapshot.rs`.
   Done when: `next_node_waits_for_adapter_release`, `node_failure_marks_run_failed_everywhere` green.
 - [ ] P04 — Real plan turn: `begin_planning`, validate, one repair turn, fallback revision, `awaiting_approval`.
   FR-938, FR-939 (app), FR-940, FR-941, FR-950 (app). TC-941, TC-944, TC-945.
+  Also (from P03b review): tests `defer_keeps_running_node_mapping` (two ready cursor nodes, `max_parallel` 2) and `defer_timeout_ignores_wait_behind_real_turn`.
   Files: `src/app.rs`.
   Done when: `complex_verdict_starts_plan_turn`, `invalid_plan_gets_one_repair`, `plan_fallback_requires_approval` green.
 - [ ] P05 — `/plan` override, awaiting-approval blocks new prompts, stale records after restart.

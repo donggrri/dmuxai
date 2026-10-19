@@ -11,6 +11,7 @@ Tasks: [TASKS-plan-gate](../tasks/TASKS-plan-gate.md)
 | P01 | opencode deepseek-v4.1-flash-free (WIP) + composer-2.5 | glm-5.3-flash-free: BLOCK (judge overflow leak, busy teardown); claude-sonnet-5-5-high re-review | APPROVE after fixes |
 | P02 | opencode deepseek-v4.1-flash-free + composer-2.5 fix | claude-sonnet-5-5-high | BLOCK (replan lost tasks) → fixed; follow-up moved to P09 |
 | P03 | composer-2.5 (v0.2.2 graph run) | claude-sonnet-5-5-high | APPROVE |
+| P03b | composer-2.5 (+2 hand fixes) | claude-sonnet-5-5-high | BLOCK (deferred slot overwrite, lost mapping, text-matched unbounded retries, duplicate dispatch) → fixed; 2nd BLOCK (mapping removal, timeout behind real turn) → fixed by hand, tests pending in P04 |
 
 ## Dogfood findings (v0.2.2 binary driving #67)
 
