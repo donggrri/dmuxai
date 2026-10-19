@@ -188,9 +188,6 @@ pub struct GraphRun {
     /// FR-958: planner call counters.
     #[serde(default)]
     pub planner_calls: PlannerCalls,
-    /// FR-963: task list; empty for old records.
-    #[serde(default)]
-    pub tasks: Vec<PlanTask>,
 }
 
 impl GraphRun {
@@ -430,6 +427,5 @@ mod tests {
         let run_json = format!(r#"{{"plan":{plan_json},"conversation_id":"c1","phase":"active"}}"#);
         let run: GraphRun = serde_json::from_str(&run_json).expect("run");
         assert!(run.plan.tasks.is_empty());
-        assert!(run.tasks.is_empty());
     }
 }

@@ -5,6 +5,7 @@ mod planner;
 mod policy;
 mod replan;
 mod store;
+mod tasks;
 mod types;
 
 pub use executor::{GraphAction, GraphRunSession, GraphSession, NodeAssignment};
@@ -28,6 +29,7 @@ pub use replan::{
     strip_replan_marker,
 };
 pub use store::{GraphStore, load_run, save_run};
+pub use tasks::{TaskState, task_counts, task_status};
 pub use types::{
     Approval, ApprovalState, DecisionBy, ExecutionPlan, GraphEdge, GraphLimits, GraphNode,
     GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, NodeRole, PLAN_HISTORY_MAX, PlanChange,

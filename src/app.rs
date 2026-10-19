@@ -4241,7 +4241,6 @@ impl App {
                 judge: judge_calls,
                 ..Default::default()
             },
-            tasks: Vec::new(),
         }
     }
 
@@ -16429,6 +16428,35 @@ mod tests {
         assert!(fast.app.graph_session.is_none());
         assert!(fast.app.last_graph_run.is_none());
         assert!(last_system(&fast.app).contains("Model policy rejected"));
+    }
+
+    // TC-995 / FR-969: a 1-node run carries one implicit task (no model call).
+    #[test]
+    fn one_node_run_has_implicit_task() {
+        let line = "가".repeat(90);
+        let prompt = format!("/direct {line}");
+        let mut h = plan_gate_test_app();
+        h.app.input = prompt;
+        h.app.submit_prompt();
+
+        let sent = h.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "only the agent turn, no plan model call");
+        drop(sent);
+
+        let session = h.app.graph_session.as_ref().expect("1-node run");
+        let run = session.run();
+        assert_eq!(run.plan.tasks.len(), 1);
+        let task = &run.plan.tasks[0];
+        assert_eq!(task.id, "task-1");
+        assert!(task.implicit);
+        assert_eq!(task.done_check, "the agent turn completes");
+        assert_eq!(task.size, dmuxai::graph::TaskSize::Small);
+        assert_eq!(task.title.chars().count(), 80);
+        assert!(task.title.ends_with('…'));
+        assert_eq!(run.plan.nodes[0].task.as_deref(), Some("task-1"));
+
+        let saved = dmuxai::graph::load_run(&h.app.workspace_root, &run.plan.id).unwrap();
+        assert_eq!(saved.plan.tasks, run.plan.tasks);
     }
 
     // TC-940 / FR-937, FR-945: /direct skips the judge.

@@ -303,4 +303,65 @@ mod tests {
         assert_eq!(reloaded.plan_history.len(), 50);
         assert_eq!(reloaded.plan_history[0].rev, extra.plan_history[0].rev);
     }
+
+    // TC-998 / FR-967: plan tasks round-trip; legacy records without task fields load.
+    #[test]
+    fn run_with_tasks_round_trips() {
+        use super::super::types::{PlanTask, TaskSize};
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut run = run("tasks-run");
+        run.plan.tasks = vec![
+            PlanTask {
+                id: "task-1".to_owned(),
+                title: "first".to_owned(),
+                done_check: "d1".to_owned(),
+                areas: Vec::new(),
+                size: TaskSize::Small,
+                depends_on: Vec::new(),
+                implicit: false,
+            },
+            PlanTask {
+                id: "task-2".to_owned(),
+                title: "second".to_owned(),
+                done_check: "d2".to_owned(),
+                areas: Vec::new(),
+                size: TaskSize::Medium,
+                depends_on: vec!["task-1".to_owned()],
+                implicit: false,
+            },
+        ];
+        save_run(root, &run).unwrap();
+        let loaded = load_run(root, "tasks-run").unwrap();
+        assert_eq!(loaded.plan.tasks, run.plan.tasks);
+
+        let legacy_json = r#"{
+            "plan": {
+                "schema": "dmuxai.graph/v1",
+                "id": "legacy-no-tasks",
+                "orchestrator_model": "m",
+                "user_prompt": "p",
+                "nodes": [{
+                    "id": "step-1",
+                    "role": "implement",
+                    "job": "work",
+                    "runner": "cursor",
+                    "model_id": "composer-2.5",
+                    "requires_gate": false,
+                    "status": "pending",
+                    "attempt": 0
+                }],
+                "edges": [],
+                "limits": { "max_parallel": 2, "max_retries": 2 }
+            },
+            "conversation_id": "conv",
+            "phase": "active"
+        }"#;
+        let dir_path = root.join(".dmuxai").join("graphs");
+        fs::write(dir_path.join("legacy-no-tasks.json"), legacy_json).unwrap();
+        let legacy = load_run(root, "legacy-no-tasks").unwrap();
+        assert!(legacy.plan.tasks.is_empty());
+        assert!(legacy.plan.nodes[0].task.is_none());
+    }
 }
