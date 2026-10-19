@@ -18,11 +18,11 @@ Shared gate for every task (in addition to its own check): no test hangs — run
 
 ## Remaining (execution order)
 
-- [ ] P01 — Finish the triage state machine (judge turn, timeouts, `/direct`, quiet 1-node runs; WIP commit 1375768): make all app tests pass, fix the `headless_run_reports_agent_error` hang, `/direct` parity row.
+- [x] P01 — (7e547c2; composer-2.5 on opencode deepseek WIP; review glm BLOCK → 2 blockers fixed, re-review pending) Finish the triage state machine (judge turn, timeouts, `/direct`, quiet 1-node runs; WIP commit 1375768): make all app tests pass, fix the `headless_run_reports_agent_error` hang, `/direct` parity row.
   FR-930, FR-932, FR-935, FR-937, FR-948, FR-951, FR-954. TC-930, TC-931, TC-933, TC-934, TC-937..TC-940, TC-964 (simple), TC-968 (simple).
   Files: `src/app.rs`, `src/web/parity.rs`, `tests/graph_orchestration.rs`.
   Done when: `timeout 300 cargo test --locked --bin dmuxai` 0 failed, `cargo test --locked --test graph_orchestration` green.
-- [ ] P02 — Plan `tasks` schema in the plan JSON, validation, task→step mapping, `PLAN_PROMPT` split rule (pure).
+- [ ] P02 — (in progress: opencode deepseek-v4.1-flash-free) Plan `tasks` schema in the plan JSON, validation, task→step mapping, `PLAN_PROMPT` split rule (pure).
   FR-963, FR-964, FR-975. TC-991, TC-992, TC-993.
   Files: `src/graph/plan_doc.rs`, `src/graph/types.rs` (`PlanTask`, `GraphNode.task`, `GraphRun.tasks` serde default).
   Done when: `cargo test --locked --lib graph::plan_doc` green incl. `plan_tasks_parse_and_validate`, `plan_tasks_invalid_cases`, `tasks_build_dag_with_parallel_branches`.
