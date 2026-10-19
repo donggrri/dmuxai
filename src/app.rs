@@ -2910,7 +2910,7 @@ impl App {
             }
         }
 
-        if self.settings.graph_enabled && !prompt.trim_start().starts_with('/') {
+        if !prompt.trim_start().starts_with('/') {
             if self
                 .settings
                 .graph_allowed_runners
@@ -4904,13 +4904,6 @@ impl App {
                 error: Some(msg),
                 todo: None,
             };
-        }
-
-        if req.graph {
-            self.settings.graph_enabled = true;
-        }
-        if req.agent.is_some() {
-            self.settings.graph_enabled = false;
         }
 
         let headless_title = {
@@ -7998,7 +7991,6 @@ mod tests {
             finished_at_ms: None,
         }];
         nodes.extend(extra_nodes);
-        app.settings.graph_enabled = true;
         app.start_graph_run(dmuxai::graph::GraphPlan {
             schema: "cursor-agent-graph/v1".to_owned(),
             id: "test-run".to_owned(),
@@ -9339,26 +9331,6 @@ mod tests {
         app.finish_turn(Agent::Cursor);
         let areas = app.ui_areas(app.terminal_area);
         assert!(areas.graph_status.is_none());
-    }
-
-    #[test]
-    fn disabled_graph_bypasses_planner_and_renders_no_status_line() {
-        let (mut app, sent) = test_app();
-        app.settings.graph_enabled = false;
-        app.selected = adapter_index(Agent::Cursor);
-        app.input = "research auth and implement fix".to_owned();
-
-        app.submit_prompt();
-
-        assert!(app.graph_session.is_none());
-        assert!(app.single_graph_plan.is_none());
-        let areas = app.ui_areas(Rect::new(0, 0, 100, 30));
-        assert!(areas.graph_status.is_none());
-        let rendered = render_text_at(&mut app, 100, 30);
-        assert!(!rendered.contains("Graph "));
-        let requests = sent.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].0, Agent::Cursor);
     }
 
     #[test]
@@ -10887,7 +10859,8 @@ mod tests {
     #[test]
     fn already_running_adapter_error_clears_busy_state() {
         let (mut app, sent) = test_app();
-        app.settings.graph_enabled = false;
+        // FR-930: no graph toggle; empty allowed_runners keeps the direct-send path.
+        app.settings.graph_allowed_runners = Some(Vec::new());
 
         // Turn A is submitted and the adapter starts the turn.
         app.input = "first".to_owned();
@@ -14656,7 +14629,8 @@ mod tests {
         let snapshot = serde_json::to_string(&hub.snapshot()).unwrap();
         assert!(snapshot.contains("ordinary startup notice"), "{snapshot}");
 
-        app.settings.graph_enabled = false;
+        // FR-930: the empty allowed_runners override keeps the direct-send path.
+        app.settings.graph_allowed_runners = Some(Vec::new());
         app.input = "hello from the turn".to_owned();
         app.submit_prompt();
         app.append_delta(Agent::Codex, "partial reply".to_owned());
@@ -15016,7 +14990,8 @@ mod tests {
             command: vec!["grok".to_owned()],
             ..Default::default()
         }];
-        app.settings.graph_enabled = false;
+        // FR-930: the empty allowed_runners override keeps the direct-send path.
+        app.settings.graph_allowed_runners = Some(Vec::new());
         app.selected = adapter_index(Agent::Custom(0));
         app.create_conversation(Some("Ship the conversation picker overflow fix".to_owned()));
         app.input = "still working".to_owned();

@@ -24,8 +24,7 @@ const STARTER_CONFIG: &str = r##"# DmuxAI configuration (dmuxai.toml). Everythin
 # default_agent = "cursor"
 
 # [graph]
-# Graph orchestration splits multi-step prompts across runners (on by default).
-# enabled = true
+# Graph orchestration splits multi-step prompts across runners (always on).
 # max_parallel = 2
 # max_retries = 2
 # Unset: every runner may take graph nodes, except built-in presets (opencode

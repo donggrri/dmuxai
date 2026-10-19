@@ -45,9 +45,14 @@ pub struct DmuxSettings {
     pub cursor_prewarm_idle_secs: u64,
     pub routing_default_agent: Option<String>,
     pub routing_cursor_models: Vec<String>,
-    pub graph_enabled: bool,
     pub graph_max_parallel: usize,
     pub graph_max_retries: u32,
+    /// `[graph] max_replans` (FR-958), clamped to 0..=10; 0 disables replanning.
+    pub graph_max_replans: u32,
+    /// `[graph] replan_budget_chars` (FR-958), clamped to 2 000..=200 000.
+    pub graph_replan_budget_chars: u32,
+    /// `[graph] max_nodes` (FR-958), clamped to 1..=16.
+    pub graph_max_nodes: u32,
     pub graph_allowed_runners: Option<Vec<String>>,
     pub theme: Theme,
     pub theme_force_color: Option<bool>,
@@ -178,7 +183,37 @@ struct GraphToml {
     enabled: Option<bool>,
     max_parallel: Option<usize>,
     max_retries: Option<u32>,
+    max_replans: Option<u32>,
+    replan_budget_chars: Option<u32>,
+    max_nodes: Option<u32>,
     allowed_runners: Option<Vec<String>>,
+}
+
+/// Warning emitted once per settings load when `[graph] enabled` is present (FR-931).
+const GRAPH_ENABLED_DEPRECATED: &str =
+    "[graph] enabled is deprecated: graph engineering is always on; remove the key";
+
+/// Defaults for the FR-958 replan caps.
+const DEFAULT_GRAPH_MAX_REPLANS: u32 = 3;
+const DEFAULT_GRAPH_REPLAN_BUDGET_CHARS: u32 = 24_000;
+const DEFAULT_GRAPH_MAX_NODES: u32 = 12;
+
+/// Validates a `[graph]` replan cap (FR-958): a value inside `range` is used;
+/// an out-of-range value falls back to `default` with a config warning.
+fn clamp_replan_limit(
+    value: u32,
+    range: std::ops::RangeInclusive<u32>,
+    default: u32,
+    key: &str,
+) -> Result<u32, String> {
+    if range.contains(&value) {
+        return Ok(value);
+    }
+    Err(format!(
+        "[graph] {key} = {value} is out of range {}..={}; using {default}",
+        range.start(),
+        range.end()
+    ))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -513,14 +548,43 @@ impl DmuxSettings {
             }
         }
         if let Some(graph) = parsed.graph {
-            if let Some(enabled) = graph.enabled {
-                self.graph_enabled = enabled;
+            if graph.enabled.is_some() {
+                self.config_warnings
+                    .push(GRAPH_ENABLED_DEPRECATED.to_owned());
             }
             if let Some(max_parallel) = graph.max_parallel {
                 self.graph_max_parallel = max_parallel;
             }
             if let Some(max_retries) = graph.max_retries {
                 self.graph_max_retries = max_retries;
+            }
+            if let Some(max_replans) = graph.max_replans {
+                match clamp_replan_limit(
+                    max_replans,
+                    0..=10,
+                    DEFAULT_GRAPH_MAX_REPLANS,
+                    "max_replans",
+                ) {
+                    Ok(value) => self.graph_max_replans = value,
+                    Err(warning) => self.config_warnings.push(warning),
+                }
+            }
+            if let Some(budget) = graph.replan_budget_chars {
+                match clamp_replan_limit(
+                    budget,
+                    2_000..=200_000,
+                    DEFAULT_GRAPH_REPLAN_BUDGET_CHARS,
+                    "replan_budget_chars",
+                ) {
+                    Ok(value) => self.graph_replan_budget_chars = value,
+                    Err(warning) => self.config_warnings.push(warning),
+                }
+            }
+            if let Some(max_nodes) = graph.max_nodes {
+                match clamp_replan_limit(max_nodes, 1..=16, DEFAULT_GRAPH_MAX_NODES, "max_nodes") {
+                    Ok(value) => self.graph_max_nodes = value,
+                    Err(warning) => self.config_warnings.push(warning),
+                }
             }
             if let Some(runners) = graph.allowed_runners {
                 let mut valid = Vec::new();
@@ -640,9 +704,11 @@ impl Default for DmuxSettings {
             cursor_prewarm_idle_secs: 300,
             routing_default_agent: None,
             routing_cursor_models: Vec::new(),
-            graph_enabled: true,
             graph_max_parallel: 2,
             graph_max_retries: 2,
+            graph_max_replans: DEFAULT_GRAPH_MAX_REPLANS,
+            graph_replan_budget_chars: DEFAULT_GRAPH_REPLAN_BUDGET_CHARS,
+            graph_max_nodes: DEFAULT_GRAPH_MAX_NODES,
             graph_allowed_runners: None,
             theme: Theme::default(),
             theme_force_color: None,
@@ -1077,17 +1143,81 @@ command = ["workspace-only"]
         std::fs::remove_dir_all(&temp_base).ok();
     }
 
+    // TC-932 (FR-931): `[graph] enabled` is deprecated and ignored; other keys apply.
     #[test]
-    fn graph_enabled_by_default_and_can_be_disabled() {
+    fn graph_enabled_key_is_deprecated_and_ignored() {
         let dir =
             std::env::temp_dir().join(format!("dmuxai-graph-settings-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let default_settings = DmuxSettings::load(&dir);
-        assert!(default_settings.graph_enabled);
+        std::fs::write(
+            dir.join("dmuxai.toml"),
+            "[graph]\nenabled = false\nmax_parallel = 3\n",
+        )
+        .unwrap();
 
-        std::fs::write(dir.join("dmuxai.toml"), "[graph]\nenabled = false\n").unwrap();
-        let disabled_settings = DmuxSettings::load(&dir);
-        assert!(!disabled_settings.graph_enabled);
+        for _ in 0..2 {
+            let settings = DmuxSettings::load_with_user_config(&dir, None);
+            assert_eq!(settings.graph_max_parallel, 3);
+            let warnings = settings
+                .config_warnings
+                .iter()
+                .filter(|w| {
+                    *w == "[graph] enabled is deprecated: graph engineering is always on; remove the key"
+                })
+                .count();
+            assert_eq!(warnings, 1, "warnings: {:?}", settings.config_warnings);
+        }
+
+        assert!(
+            !crate::init::starter_config(false, false).contains("enabled"),
+            "init template must not write [graph] enabled"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // TC-975 (FR-958): replan caps default, clamp out-of-range values and warn.
+    #[test]
+    fn graph_replan_limits_clamped() {
+        let dir = std::env::temp_dir().join(format!("dmuxai-graph-limits-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let defaults = DmuxSettings::load_with_user_config(&dir, None);
+        assert_eq!(defaults.graph_max_replans, 3);
+        assert_eq!(defaults.graph_replan_budget_chars, 24_000);
+        assert_eq!(defaults.graph_max_nodes, 12);
+        assert!(defaults.config_warnings.is_empty());
+
+        std::fs::write(
+            dir.join("dmuxai.toml"),
+            "[graph]\nmax_replans = 99\nreplan_budget_chars = 10\nmax_nodes = 0\n",
+        )
+        .unwrap();
+        let clamped = DmuxSettings::load_with_user_config(&dir, None);
+        assert_eq!(clamped.graph_max_replans, 3);
+        assert_eq!(clamped.graph_replan_budget_chars, 24_000);
+        assert_eq!(clamped.graph_max_nodes, 12);
+        for key in ["max_replans", "replan_budget_chars", "max_nodes"] {
+            assert!(
+                clamped
+                    .config_warnings
+                    .iter()
+                    .any(|w| w.contains(&format!("[graph] {key} ="))),
+                "{key}: {:?}",
+                clamped.config_warnings
+            );
+        }
+
+        std::fs::write(
+            dir.join("dmuxai.toml"),
+            "[graph]\nmax_replans = 0\nreplan_budget_chars = 2000\nmax_nodes = 16\n",
+        )
+        .unwrap();
+        let in_range = DmuxSettings::load_with_user_config(&dir, None);
+        assert_eq!(in_range.graph_max_replans, 0);
+        assert_eq!(in_range.graph_replan_budget_chars, 2_000);
+        assert_eq!(in_range.graph_max_nodes, 16);
+        assert!(in_range.config_warnings.is_empty());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

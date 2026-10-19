@@ -7,6 +7,8 @@ Baseline: `73e3f4d`
 Related: SPEC-agent-graph-orchestration, SPEC-model-policy, docs/TEST-PLAN.md
 Superseded in part: the `[graph] enabled` toggle (FR-370) and the keyword split of FR-371 are replaced by [SPEC-plan-gate](SPEC-plan-gate.md) FR-930, FR-931 and FR-937 once that spec is implemented.
 
+FR-370 is superseded by SPEC-plan-gate FR-930/FR-931; the replacing test is `src/settings.rs` `graph_enabled_key_is_deprecated_and_ignored` (TC-932).
+
 ## 1. Decision summary
 
 DmuxAI enables graph engineering by default for every user prompt, automatically synthesizing execution plans through the planner while treating trivial prompts as single-node graphs. Users can opt out globally by configuring `[graph] enabled = false` in `dmuxai.toml`. When a graph run is in progress, DmuxAI displays a compact live status line above the prompt input showing current node id, runner, model, execution state (`pending`, `running`, `done`, `failed`), and overall progress `n/m` (e.g. `"Graph 2/4 · step-2 implement · agy gemini-3.8-flash-medium · running"`). When no graph is active, this line is hidden. Model resolution guarantees that an F2-selected model for a runner always wins, while the default `composer-2.5` model applies strictly to the Cursor runner.
