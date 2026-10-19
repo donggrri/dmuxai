@@ -1,6 +1,6 @@
 # SPEC: plan-gate (always-on graph, judge, plan approval)
 
-Status: Draft (v0.2.3 feature 1; reviewed by deepseek-v4.1-flash-free and glm-5.3-flash-free 2026-10-18; agent-planned DAG scope added 2026-10-19)
+Status: Implemented in tree (v0.2.3; #67 dogfood P04–P20; draft PR, not released). Prior review: deepseek-v4.1-flash-free and glm-5.3-flash-free 2026-10-18; agent-planned DAG scope added 2026-10-19.
 Owner: donggrri
 Created: 2026-10-18
 Baseline: `787436b` (origin/main)
@@ -282,9 +282,16 @@ See [../plans/PLAN-plan-gate.md](../plans/PLAN-plan-gate.md) and [../tasks/TASKS
 
 ## 8. Review and test exit criteria
 
-- [ ] All Must requirements map to passing evidence.
-- [ ] The diff has been reviewed against scope and non-goals (no judge-model setting, no policy rule changes).
-- [ ] `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (Linux and `x86_64-pc-windows-gnu`), `cargo test --all-targets` pass.
-- [ ] TC-960 (e2e) and TC-962 (live) are marked run, skipped, or blocked with a reason.
-- [ ] `../reviews/REVIEW-plan-gate.md` records commands, results, residual risk and rollback notes.
-- [ ] Light-theme screenshots (`/workspace/shots/v023-plangate-*.png`): judge line, dashboard approval panel with an agent-planned DAG that has a parallel branch, the swimlane of that run, a run where a replan visibly added a node (`v023-plangate-replan*.png`), TUI approval panel. Plus the task checklist next to the swimlane (`v023-plangate-tasks.png`, UX-936).
+- [x] All Must requirements map to passing evidence (#67 dogfood P04–P20; unit/integration tests in tree). Task-level review table and compliance matrix: [REVIEW-plan-gate](../reviews/REVIEW-plan-gate.md).
+- [x] The diff has been reviewed against scope and non-goals (no judge-model setting, no policy rule changes).
+- [x] Local Rust gates pass with isolated `CARGO_TARGET_DIR` (GitHub Actions unavailable for this repo): `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` (Linux), `cargo test --locked` for `--test cli`, `--lib`, `--bin dmuxai`, and `--test spec_index`; `check-spec` on this spec and the baseline. Recorded commands and results are in REVIEW “Local gates”.
+- [ ] Release gates (P22): Windows `cargo clippy` (`x86_64-pc-windows-gnu`), full `cargo test --locked --all-targets`, and draft-PR CI when available.
+- [x] External and manual test evidence (skipped automated paths are not reported as passing):
+  - [x] **TC-960** (dashboard e2e): **skipped** — manual browser dogfood on the #67 binary (Approve click → `decided_by: dashboard`; Edit + Send feedback → rev 2; Replan button queued). Automated headless e2e not added (reason: manual dogfood covers it).
+  - [ ] **TC-962** (live smoke): **partial** — the plan, repair, edit and replan turns ran live on the Cursor runner in every #67 task P04–P20, but all of them used `/plan`, so the live judge verdict (Korean simple and complex prompt) was not exercised; no ignored live test exists in the tree yet.
+  - [x] **TC-979** (replan badges/history): unit/asset tests plus manual #67 replans (e.g. P13 applied +1 node, P12/P18 rejections).
+  - [x] **TC-996** (task checklist): unit/asset tests plus manual #67 screenshots of the checklist and approval task actions.
+- [x] Measured planner/replan volume (#67 P11–P20; planned tasks used `/plan`, fix-ups `/direct`, so judge calls = 0 in these records): **14 calls**, **42,495** prompt chars, **34,479** response chars. Plan input is the fixed **1963**-char `PLAN_PROMPT` + user prompt; replan prompts stay ~4.1–4.6k chars. P04–P13 plan/repair sizes predate `planner_io` recording (replan sizes only for P11–P13). Per-run table in REVIEW; ~4 chars/token is only a rough token estimate.
+- [x] [REVIEW-plan-gate](../reviews/REVIEW-plan-gate.md) records commands, dogfood findings, measured planner table, screenshots, local gates, residual risk, rollback notes, and open nits / follow-ups.
+- [ ] TUI screenshots (judge line, TUI approval panel): not taken as light-theme PNGs; the TUI was driven in tmux only.
+- [x] Light-theme dashboard screenshots (not in the repo; #67 dogfood): `v023-plangate-approval-dashboard.png`, `v023-plangate-approval-panel.png`, `v023-plangate-approval-edit-feedback.png`, `v023-plangate-approval-rev2-dashboard.png`, `v023-plangate-approval-P13.png`, `v023-plangate-approval-P19.png`, `v023-plangate-approval-P20.png` (DAG with a parallel branch), `v023-plangate-tasks.png`, `v023-plangate-tasks-highlight.png`, `v023-plangate-replan-applied-P13.png` (replan that added a node), `v023-plangate-replan-031955.png`, `v023-plangate-replan-050318.png`, `v023-plangate-replan-P12-rejected.png`, `v023-plangate-replan-dashboard.png`, `v023-run-P03.png` .. `v023-run-P20.png`.

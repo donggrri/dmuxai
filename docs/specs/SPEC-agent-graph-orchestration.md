@@ -5,6 +5,8 @@ Baseline: image-attachment PR
 Related: MISSION.md, agent-graph-engineering skill  
 Superseded in part: keyword role inference (`infer_roles`) becomes the fallback only; the selected agent judges and plans per [SPEC-plan-gate](SPEC-plan-gate.md).
 
+**Status (v0.2.3):** [SPEC-plan-gate](SPEC-plan-gate.md) implements default orchestration in place of this doc’s keyword routing and fixed `composer-2.5` on every node: the selected agent judges and plans; `infer_roles` runs only when the judge fails; per-step runner and model come from the plan JSON and model policy. Sensitive-step gates and `.dmuxai/graphs/` persistence remain as described here.
+
 ## Decision summary
 
 DmuxAI plans multi-step work using the agent-graph-engineering shape by default. The orchestrator step emits a graph.yaml-style plan with per-node runner assignments; **every node model is `composer-2.5`**. Trivial prompts skip the graph and run one agent. The UI shows the plan and accepts overrides. Sensitive steps pause for confirmation. Graph runs persist under `.dmuxai/graphs/` for resume.
