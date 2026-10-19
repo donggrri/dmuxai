@@ -535,6 +535,9 @@ var graphViewPref = null;
 var graphViewMode = 'graph';
 var graphTransform = { scale: 1, x: 0, y: 0 };
 var graphSelectedId = null;
+// UX-936: selected checklist task highlights swimlane nodes (survives snapshot re-render).
+var taskChecklistSelectedId = null;
+var taskChecklistHighlight = {};
 var graphPan = null;
 var graphPointerDown = false;
 var graphZoomGroup = null;
@@ -1083,6 +1086,7 @@ function graphCard(entry, geometry, nowMs) {
   var classes = 'node card state-' + status;
   if (entry.est.blocked) { classes += ' card-blocked'; }
   if (graphSelectedId === entry.id) { classes += ' node-selected'; }
+  if (taskChecklistHighlight[entry.id]) { classes += ' node-task-highlight'; }
   group.setAttribute('class', classes);
   group.setAttribute('data-id', entry.id);
   group.setAttribute('data-lane', String(entry.lane));
@@ -1349,6 +1353,7 @@ function updateGraphNodeSelection() {
   for (var i = 0; i < groups.length; i++) {
     var id = groups[i].getAttribute('data-id');
     groups[i].classList.toggle('node-selected', id === graphSelectedId);
+    groups[i].classList.toggle('node-task-highlight', !!taskChecklistHighlight[id]);
   }
 }
 
@@ -2084,6 +2089,113 @@ function renderApprovalPanel(graph) {
     var ta = panel.querySelector('.graph-approval-feedback');
     if (ta) { ta.focus(); }
   }
+}
+
+// UX-936: task checklist beside the swimlane (`graph.tasks` from pushed snapshots).
+function taskChecklistStatusIcon(status) {
+  var label = String(status || 'pending');
+  if (label === 'running') { return '\u25D0'; }
+  if (label === 'done') { return '\u2713'; }
+  if (label === 'failed') { return '\u2717'; }
+  return '\u25CB';
+}
+
+function taskChecklistNodeIdsText(nodes) {
+  if (!nodes || !nodes.length) { return ''; }
+  return nodes.map(function (id) { return String(id); }).join(', ');
+}
+
+function rebuildTaskChecklistHighlight(graph) {
+  taskChecklistHighlight = {};
+  if (!taskChecklistSelectedId || !graph) { return; }
+  var tasks = Array.isArray(graph.tasks) ? graph.tasks : [];
+  for (var i = 0; i < tasks.length; i++) {
+    var task = tasks[i];
+    if (String(task.id) !== taskChecklistSelectedId) { continue; }
+    var nodes = Array.isArray(task.nodes) ? task.nodes : [];
+    for (var n = 0; n < nodes.length; n++) {
+      taskChecklistHighlight[String(nodes[n])] = true;
+    }
+    return;
+  }
+  taskChecklistSelectedId = null;
+}
+
+function selectTaskChecklistTask(taskId) {
+  var id = String(taskId || '');
+  if (!id) { return; }
+  if (taskChecklistSelectedId === id) {
+    taskChecklistSelectedId = null;
+  } else {
+    taskChecklistSelectedId = id;
+  }
+  var graph = snapshot && snapshot.graph ? snapshot.graph : null;
+  rebuildTaskChecklistHighlight(graph);
+  renderTaskChecklist(graph);
+  updateGraphNodeSelection();
+}
+
+function appendTaskChecklistRow(list, task) {
+  var taskId = String(task.id || '');
+  var status = String(task.status || 'pending');
+  var row = el('div', 'task-checklist-row');
+  if (taskId === taskChecklistSelectedId) {
+    row.classList.add('task-checklist-row-selected');
+  }
+  row.setAttribute('role', 'button');
+  row.setAttribute('tabindex', '0');
+  row.setAttribute('data-task-id', taskId);
+  row.appendChild(el(
+    'span',
+    'task-checklist-status task-checklist-status-' + status,
+    taskChecklistStatusIcon(status)
+  ));
+  var head = el('div');
+  head.appendChild(el('span', 'task-checklist-id', taskId));
+  head.appendChild(document.createTextNode(' '));
+  head.appendChild(el('span', 'task-checklist-label', String(task.title || '')));
+  row.appendChild(head);
+  var meta = el('div', 'task-checklist-meta');
+  meta.appendChild(el('p', 'task-checklist-done', 'done: ' + String(task.done_check || '')));
+  var nodesText = taskChecklistNodeIdsText(task.nodes);
+  if (nodesText) {
+    meta.appendChild(el('p', 'task-checklist-nodes', nodesText));
+  }
+  row.appendChild(meta);
+  row.addEventListener('click', function () { selectTaskChecklistTask(taskId); });
+  row.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+      e.preventDefault();
+      selectTaskChecklistTask(taskId);
+    }
+  });
+  list.appendChild(row);
+}
+
+function renderTaskChecklist(graph) {
+  var panel = $('task-checklist');
+  if (!panel) { return; }
+  var scrollTop = panel.scrollTop;
+  var tasks = graph && Array.isArray(graph.tasks) ? graph.tasks : [];
+  if (!graph || !tasks.length) {
+    panel.hidden = true;
+    panel.replaceChildren();
+    taskChecklistSelectedId = null;
+    taskChecklistHighlight = {};
+    updateGraphNodeSelection();
+    return;
+  }
+  rebuildTaskChecklistHighlight(graph);
+  panel.hidden = false;
+  panel.replaceChildren();
+  panel.appendChild(el('p', 'task-checklist-title-bar', 'Tasks'));
+  var list = el('div', 'task-checklist-list');
+  for (var i = 0; i < tasks.length; i++) {
+    appendTaskChecklistRow(list, tasks[i]);
+  }
+  panel.appendChild(list);
+  panel.scrollTop = scrollTop;
+  updateGraphNodeSelection();
 }
 
 // UX-934: replan + revision history in the graph header.
@@ -3418,6 +3530,7 @@ function render(nowMs) {
     renderGraphHeaderActions(null);
     renderGraphJudgeLine(null);
     renderApprovalPanel(null);
+    renderTaskChecklist(null);
     renderCounts(null);
     renderBar(null);
     if ($('graph-percent')) { $('graph-percent').textContent = '0%'; }
@@ -3435,6 +3548,7 @@ function render(nowMs) {
     renderGraphJudgeLine(graph);
     renderGraphHeaderActions(graph);
     renderApprovalPanel(graph);
+    renderTaskChecklist(graph);
     renderGraphSummary(graph);
     renderNodes(graph, nowMs);
     applyGraphViewMode();

@@ -1611,6 +1611,138 @@ main {
 
 .graph-stage[hidden] { display: none; }
 
+/* UX-936: task checklist beside swimlane; stacks below on narrow viewports. */
+.graph-stage-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+@media (min-width: 640px) {
+  .graph-stage-layout {
+    flex-direction: row;
+    align-items: stretch;
+  }
+}
+
+.task-checklist {
+  flex: 0 0 auto;
+  width: 100%;
+  max-height: 38vh;
+  overflow: auto;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  font-size: 0.85em;
+  box-sizing: border-box;
+}
+
+@media (min-width: 640px) {
+  .task-checklist {
+    width: min(17rem, 34vw);
+    max-height: 70vh;
+  }
+}
+
+.task-checklist[hidden] { display: none; }
+
+.task-checklist-title-bar {
+  margin: 0 0 6px;
+  font-size: 0.75em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.task-checklist-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.task-checklist-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  align-items: baseline;
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.task-checklist-row:last-child { margin-bottom: 0; }
+
+.task-checklist-row:hover,
+.task-checklist-row:focus-visible,
+.task-checklist-row.task-checklist-row-selected {
+  background: var(--current-bg);
+  border-color: var(--line);
+}
+
+.task-checklist-row.task-checklist-row-selected {
+  outline: 1px solid var(--accent);
+}
+
+.task-checklist-status {
+  font-size: 1.05em;
+  line-height: 1;
+  width: 1.25em;
+  text-align: center;
+}
+
+.task-checklist-status-pending { color: var(--muted); }
+.task-checklist-status-running { color: var(--accent); }
+.task-checklist-status-done { color: var(--ok); }
+.task-checklist-status-failed { color: var(--err); }
+
+.task-checklist-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82em;
+  color: var(--faint);
+}
+
+.task-checklist-label {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-checklist-meta {
+  grid-column: 1 / -1;
+  display: none;
+  margin: 2px 0 0;
+  padding-left: calc(1.25em + 8px);
+  font-size: 0.88em;
+  color: var(--muted);
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.task-checklist-row:hover .task-checklist-meta,
+.task-checklist-row:focus-within .task-checklist-meta,
+.task-checklist-row.task-checklist-row-expanded .task-checklist-meta {
+  display: block;
+}
+
+.task-checklist-done {
+  margin: 0 0 4px;
+  color: var(--faint);
+}
+
+.task-checklist-nodes {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  color: var(--muted);
+}
+
 .graph-canvas {
   position: relative;
   flex: 1 1 auto;
@@ -1742,6 +1874,14 @@ main {
 .graph-svg .node:focus .card-box,
 .graph-svg .node:hover .card-box { stroke-width: 2.5; }
 .graph-svg .node.node-selected .card-box { stroke: var(--warn); stroke-width: 2.5; stroke-dasharray: none; }
+
+.graph-svg .node.node-task-highlight .card-box {
+  stroke: var(--gate);
+  stroke-width: 2.5;
+  stroke-dasharray: none;
+}
+
+.graph-svg .node.node-task-highlight .card-accent { fill: var(--gate); }
 
 .graph-svg .edge {
   fill: none;

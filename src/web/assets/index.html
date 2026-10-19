@@ -90,7 +90,10 @@
         <span class="graph-hint">wheel to zoom &middot; drag to pan &middot; click a step for details</span>
       </div>
       <div id="graph-stage" class="graph-stage">
-        <div id="graph-canvas" class="graph-canvas"></div>
+        <div class="graph-stage-layout">
+          <div id="graph-canvas" class="graph-canvas"></div>
+          <aside id="task-checklist" class="task-checklist" data-parity="task-checklist" hidden aria-label="Task checklist"></aside>
+        </div>
         <aside id="graph-detail" class="graph-detail" hidden aria-label="Node details"></aside>
       </div>
       <div class="graph-legend">

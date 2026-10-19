@@ -1385,6 +1385,49 @@ mod tests {
         );
     }
 
+    // TC-996 (UX-936): task checklist panel beside the swimlane.
+    #[test]
+    fn task_checklist_asset() {
+        assert!(INDEX_HTML.contains("id=\"task-checklist\""));
+        assert!(INDEX_HTML.contains("data-parity=\"task-checklist\""));
+        assert!(INDEX_HTML.contains("graph-stage-layout"));
+        assert!(APP_JS.contains("function renderTaskChecklist"));
+        assert!(APP_JS.contains("function taskChecklistStatusIcon"));
+        assert!(APP_JS.contains("graph.tasks"));
+        assert!(APP_JS.contains("node-task-highlight"));
+        assert!(APP_JS.contains("task.done_check"));
+        assert!(APP_JS.contains("task-checklist-status-' + status"));
+        for status in ["pending", "running", "done", "failed"] {
+            assert!(
+                APP_CSS.contains(&format!(".task-checklist-status-{status}")),
+                "missing status style for {status}"
+            );
+        }
+        for icon in ["\\u25CB", "\\u25D0", "\\u2713", "\\u2717"] {
+            assert!(
+                APP_JS.contains(icon),
+                "taskChecklistStatusIcon must define icon {icon}"
+            );
+        }
+        assert!(APP_CSS.contains(".task-checklist"));
+        assert!(APP_CSS.contains(".graph-stage-layout"));
+        assert!(APP_CSS.contains(".node-task-highlight"));
+
+        let checklist_js = js_between(
+            APP_JS,
+            "// UX-936: task checklist beside the swimlane",
+            "// UX-934: replan + revision history in the graph header.",
+        );
+        assert!(
+            !checklist_js.contains("innerHTML"),
+            "task checklist must not use innerHTML"
+        );
+        assert!(
+            checklist_js.contains("task-checklist-label") && checklist_js.contains("done_check"),
+            "task title and done_check must render via DOM helpers"
+        );
+    }
+
     // TC-979 (UX-934, UX-935): revision badges on nodes and plan-history list.
     #[test]
     fn revision_badges_and_history_asset() {
