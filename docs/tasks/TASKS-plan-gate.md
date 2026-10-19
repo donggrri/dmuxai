@@ -86,15 +86,15 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   UX-932, UX-933 (server), FR-965 (dashboard). TC-959.
   Files: `src/web/commands.rs`, `src/web/server.rs`, `src/app.rs`.
   Done when: `plan_decision_command_contract` + route test green.
-- [ ] P16 — Dashboard assets: route selector, judge line, approval panel (tasks + nodes, task actions), revisions list, `added`/`changed` badges, parity rows.
+- [x] P16 — (#67 agent-planned graph c4ab8ea0: 6 steps; fix turns P16b /direct b28ed165 + P16c; composer-2.5; review claude-sonnet-5-5-high BLOCK (focus stealing / full rebuild; then row order, view-only key, button classes) → fixed; dogfood: approve/edit decided from the real dashboard buttons; visible panel controls lacked data-parity (only hidden copies) → fixed) Dashboard assets: route selector, judge line, approval panel (tasks + nodes, task actions), revisions list, `added`/`changed` badges, parity rows.
   UX-932..UX-934, INT-930. TC-952 (asset), TC-957 (asset), TC-960 (asset), TC-979 (asset).
   Files: `src/web/assets/app.js`, `src/web/assets/session.js`, CSS, `src/web/assets.rs`, `src/web/parity.rs`.
   Done when: `cargo test --locked --lib web::` green, `node --check` on both JS files.
-- [ ] P17 — Dashboard task checklist next to the swimlane (live status, click highlights nodes).
+- [x] P17 — (#67 agent-planned graph f0a750c9, approved from the dashboard Approve button; composer-2.5; review claude-sonnet-5-5-high BLOCK (expand class, focus on re-render, stage layout) → fixed in P16b; screenshots v023-plangate-tasks.png, v023-plangate-tasks-highlight.png) Dashboard task checklist next to the swimlane (live status, click highlights nodes).
   UX-936. TC-996 (asset).
   Files: `src/web/assets/app.js`, CSS, `src/web/assets.rs`.
   Done when: `task_checklist_asset` green, `node --check`.
-- [ ] P18 — `[graph] tasks_file` setting and markdown writer, documented path.
+- [x] P18 — (#67 agent-planned graph bfa6a6ba: planner first planned the wrong scope (parity/web), fixed by a dashboard Edit + Send feedback → rev 2; dashboard Replan request rejected correctly (task already done, FR-968); composer-2.5; review claude-sonnet-5-5-high BLOCK (dedupe by status only, renames never rewrote the file) → fixed by hand: content-keyed dedupe, note once on write errors, one-line titles) `[graph] tasks_file` setting and markdown writer, documented path.
   FR-967. TC-998.
   Files: `src/settings.rs`, `src/init.rs`, `src/graph/tasks.rs`, `src/app.rs`, `docs/API.md`.
   Done when: `tasks_file_setting_and_persistence` green.

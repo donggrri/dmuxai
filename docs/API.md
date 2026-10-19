@@ -348,3 +348,20 @@ events = ["completed", "failed", "stalled"]
 stall_after_secs = 600
 command = ["tee", "-a", "events.log"]
 ```
+
+## 6. Configuration (`dmuxai.toml`)
+
+User config (`$XDG_CONFIG_HOME/dmuxai/dmuxai.toml` or `~/.config/dmuxai/dmuxai.toml`)
+loads first; workspace `dmuxai.toml` overrides per key. See `dmuxai init` for a
+commented starter file.
+
+### `[graph]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `tasks_file` | `false` | When `true`, DmuxAI writes `<workspace>/.dmuxai/tasks/TASKS-<run id>.md` (UTF-8 markdown checklist) at plan approval and after each task status change. Write failures become a system note and never fail the run. |
+
+```toml
+[graph]
+tasks_file = true
+```

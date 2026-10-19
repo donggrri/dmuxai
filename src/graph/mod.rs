@@ -34,7 +34,8 @@ pub use replan::{
 pub use store::{GraphRunListCache, GraphStore, load_run, save_run};
 pub use tasks::{
     TaskEdit, TaskState, apply_task_delete, apply_task_merge, apply_task_move, apply_task_rename,
-    diff_plan_tasks, task_counts, task_status,
+    diff_plan_tasks, render_tasks_markdown, should_write_tasks_file, task_counts, task_status,
+    tasks_file_path, write_tasks_file, write_tasks_file_if_enabled,
 };
 pub use triage_view::{
     PanelLine, PanelLineKind, approval_panel_lines, ellipsize_to_width, judge_line_text,

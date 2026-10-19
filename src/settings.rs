@@ -53,6 +53,9 @@ pub struct DmuxSettings {
     pub graph_replan_budget_chars: u32,
     /// `[graph] max_nodes` (FR-958), clamped to 1..=16.
     pub graph_max_nodes: u32,
+    /// `[graph] tasks_file` (FR-967). When true, writes
+    /// `<workspace>/.dmuxai/tasks/TASKS-<run id>.md` on approval and task status changes.
+    pub graph_tasks_file: bool,
     pub graph_allowed_runners: Option<Vec<String>>,
     pub theme: Theme,
     pub theme_force_color: Option<bool>,
@@ -186,6 +189,7 @@ struct GraphToml {
     max_replans: Option<u32>,
     replan_budget_chars: Option<u32>,
     max_nodes: Option<u32>,
+    tasks_file: Option<bool>,
     allowed_runners: Option<Vec<String>>,
 }
 
@@ -586,6 +590,9 @@ impl DmuxSettings {
                     Err(warning) => self.config_warnings.push(warning),
                 }
             }
+            if let Some(tasks_file) = graph.tasks_file {
+                self.graph_tasks_file = tasks_file;
+            }
             if let Some(runners) = graph.allowed_runners {
                 let mut valid = Vec::new();
                 for runner in runners {
@@ -709,6 +716,7 @@ impl Default for DmuxSettings {
             graph_max_replans: DEFAULT_GRAPH_MAX_REPLANS,
             graph_replan_budget_chars: DEFAULT_GRAPH_REPLAN_BUDGET_CHARS,
             graph_max_nodes: DEFAULT_GRAPH_MAX_NODES,
+            graph_tasks_file: false,
             graph_allowed_runners: None,
             theme: Theme::default(),
             theme_force_color: None,
@@ -1217,6 +1225,24 @@ command = ["workspace-only"]
         assert_eq!(in_range.graph_replan_budget_chars, 2_000);
         assert_eq!(in_range.graph_max_nodes, 16);
         assert!(in_range.config_warnings.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // TC-998 / FR-967: `[graph] tasks_file` parses and defaults off.
+    #[test]
+    fn graph_tasks_file_parses() {
+        let dir =
+            std::env::temp_dir().join(format!("dmuxai-graph-tasks-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let defaults = DmuxSettings::load_with_user_config(&dir, None);
+        assert!(!defaults.graph_tasks_file);
+
+        std::fs::write(dir.join("dmuxai.toml"), "[graph]\ntasks_file = true\n").unwrap();
+        let enabled = DmuxSettings::load_with_user_config(&dir, None);
+        assert!(enabled.graph_tasks_file);
+        assert!(enabled.config_warnings.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }

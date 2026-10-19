@@ -27,6 +27,10 @@ const STARTER_CONFIG: &str = r##"# DmuxAI configuration (dmuxai.toml). Everythin
 # Graph orchestration splits multi-step prompts across runners (always on).
 # max_parallel = 2
 # max_retries = 2
+# When true, write a markdown task checklist at
+# <workspace>/.dmuxai/tasks/TASKS-<run id>.md on plan approval and when a
+# task status changes (default false).
+# tasks_file = false
 # Unset: every runner may take graph nodes, except built-in presets (opencode
 # and grok). A built-in preset is never graph-routed unless it is listed here.
 # allowed_runners = ["cursor", "agy", "codex"]

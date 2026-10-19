@@ -1,4 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -363,10 +366,103 @@ impl GraphRun {
     }
 }
 
+/// Path for FR-967 tasks markdown: `<workspace>/.dmuxai/tasks/TASKS-<run id>.md`.
+pub fn tasks_file_path(workspace: &Path, run: &GraphRun) -> PathBuf {
+    workspace
+        .join(".dmuxai")
+        .join("tasks")
+        .join(format!("TASKS-{}.md", run.plan.id))
+}
+
+/// FR-969: 1-node implicit-only runs do not get a tasks file.
+pub fn should_write_tasks_file(run: &GraphRun) -> bool {
+    run.plan.tasks.iter().any(|task| !task.implicit)
+}
+
+fn task_state_label(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Pending => "pending",
+        TaskState::Running => "running",
+        TaskState::Done => "done",
+        TaskState::Failed => "failed",
+    }
+}
+
+/// UTF-8 checklist markdown for a run (FR-967); never includes prompt or node output.
+/// Collapses whitespace and line breaks so each task stays one markdown line.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub fn render_tasks_markdown(run: &GraphRun) -> String {
+    let mut out = format!("# Tasks {}\n", run.plan.id);
+    for (task, state) in run.task_status() {
+        if task.implicit {
+            continue;
+        }
+        let checkbox = if state == TaskState::Done {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        out.push_str(&format!(
+            "- {} {} {} — done: {} ({})\n",
+            checkbox,
+            task.id,
+            one_line(&task.title),
+            one_line(&task.done_check),
+            task_state_label(state)
+        ));
+    }
+    out
+}
+
+/// When `enabled` is false or the run has only implicit tasks, does nothing.
+pub fn write_tasks_file_if_enabled(
+    workspace: &Path,
+    enabled: bool,
+    run: &GraphRun,
+) -> io::Result<Option<PathBuf>> {
+    if !enabled || !should_write_tasks_file(run) {
+        return Ok(None);
+    }
+    write_tasks_file(workspace, run).map(Some)
+}
+
+/// Creates `.dmuxai/tasks` and atomically writes `TASKS-<run id>.md`.
+pub fn write_tasks_file(workspace: &Path, run: &GraphRun) -> io::Result<PathBuf> {
+    if !should_write_tasks_file(run) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no exportable tasks",
+        ));
+    }
+    let dir = workspace.join(".dmuxai").join("tasks");
+    fs::create_dir_all(&dir)?;
+    let path = tasks_file_path(workspace, run);
+    let body = render_tasks_markdown(run);
+    let temp_path = dir.join(format!(
+        ".TASKS-{}.md.tmp.{}",
+        run.plan.id,
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&temp_path);
+    {
+        let mut temp = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        temp.write_all(body.as_bytes())?;
+        temp.flush()?;
+    }
+    fs::rename(&temp_path, &path)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::types::{GraphLimits, NodeRole, TaskSize};
+    use crate::graph::types::{GraphLimits, GraphRun, GraphRunPhase, NodeRole, PlanTask, TaskSize};
 
     fn node(id: &str, task: &str, status: GraphNodeStatus) -> GraphNode {
         GraphNode {
@@ -710,5 +806,136 @@ mod tests {
             apply_task_delete(&steps, &tasks, "task-1", &plan_ctx, max_steps),
             Err("zero tasks remaining".to_owned())
         );
+    }
+
+    // TC-998 / FR-967: tasks file path, markdown shape, setting gate, persistence.
+    #[test]
+    fn tasks_file_setting_and_persistence() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+
+        fn sample_run() -> GraphRun {
+            let tasks = vec![
+                PlanTask {
+                    id: "task-1".to_owned(),
+                    title: "First".to_owned(),
+                    done_check: "tests pass".to_owned(),
+                    areas: Vec::new(),
+                    size: TaskSize::Small,
+                    depends_on: Vec::new(),
+                    implicit: false,
+                },
+                PlanTask {
+                    id: "task-2".to_owned(),
+                    title: "Second".to_owned(),
+                    done_check: "docs updated".to_owned(),
+                    areas: Vec::new(),
+                    size: TaskSize::Small,
+                    depends_on: Vec::new(),
+                    implicit: false,
+                },
+            ];
+            let nodes = vec![
+                node("n1", "task-1", GraphNodeStatus::Pending),
+                node("n2", "task-2", GraphNodeStatus::Pending),
+            ];
+            GraphRun {
+                plan: plan(nodes, tasks),
+                conversation_id: "c".to_owned(),
+                phase: GraphRunPhase::Active,
+                waiting_gate_node: None,
+                ..Default::default()
+            }
+        }
+
+        let mut run = sample_run();
+        run.plan.id = "run-a1b2".to_owned();
+        run.plan.user_prompt = "SECRET_USER_PROMPT_DO_NOT_LEAK".to_owned();
+
+        let path = tasks_file_path(workspace, &run);
+        assert_eq!(
+            path,
+            workspace
+                .join(".dmuxai")
+                .join("tasks")
+                .join("TASKS-run-a1b2.md")
+        );
+
+        assert!(
+            write_tasks_file_if_enabled(workspace, false, &run)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!path.exists());
+
+        let written = write_tasks_file_if_enabled(workspace, true, &run)
+            .unwrap()
+            .expect("written");
+        assert_eq!(written, path);
+        let approved = fs::read_to_string(&path).unwrap();
+        assert!(approved.contains("# Tasks run-a1b2"));
+        assert!(approved.contains("- [ ] task-1 First — done: tests pass (pending)"));
+        assert!(approved.contains("- [ ] task-2 Second — done: docs updated (pending)"));
+        assert!(!approved.contains("SECRET_USER_PROMPT"));
+        assert!(!approved.contains("user_prompt"));
+
+        run.plan.nodes[0].status = GraphNodeStatus::Completed;
+        write_tasks_file(workspace, &run).unwrap();
+        let after_done = fs::read_to_string(&path).unwrap();
+        assert!(after_done.contains("- [x] task-1 First — done: tests pass (done)"));
+        assert!(after_done.contains("- [ ] task-2 Second — done: docs updated (pending)"));
+
+        let implicit_only = {
+            let mut r = sample_run();
+            r.plan.id = "implicit-run".to_owned();
+            r.plan.tasks = vec![PlanTask {
+                id: "task-1".to_owned(),
+                title: "implicit".to_owned(),
+                done_check: "the agent turn completes".to_owned(),
+                areas: Vec::new(),
+                size: TaskSize::Small,
+                depends_on: Vec::new(),
+                implicit: true,
+            }];
+            r.plan.nodes = vec![node("n1", "task-1", GraphNodeStatus::Pending)];
+            r
+        };
+        assert!(!should_write_tasks_file(&implicit_only));
+        assert!(
+            write_tasks_file_if_enabled(workspace, true, &implicit_only)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!tasks_file_path(workspace, &implicit_only).exists());
+
+        let err_dir = tempfile::tempdir().unwrap();
+        let err_ws = err_dir.path();
+        fs::create_dir_all(err_ws.join(".dmuxai")).unwrap();
+        fs::write(err_ws.join(".dmuxai").join("tasks"), "blocked").unwrap();
+        let err = write_tasks_file(err_ws, &run).unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let json = serde_json::to_string(&run).unwrap();
+        let loaded: GraphRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.plan.tasks, run.plan.tasks);
+
+        let legacy_json = r#"{
+            "plan": {
+                "schema": "dmuxai.graph/v1",
+                "id": "legacy",
+                "orchestrator_model": "m",
+                "user_prompt": "p",
+                "nodes": [],
+                "edges": [],
+                "limits": { "max_parallel": 2, "max_retries": 2 }
+            },
+            "conversation_id": "conv",
+            "phase": "active",
+            "waiting_gate_node": null
+        }"#;
+        let legacy: GraphRun = serde_json::from_str(legacy_json).unwrap();
+        assert!(legacy.plan.tasks.is_empty());
     }
 }

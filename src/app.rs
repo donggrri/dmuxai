@@ -59,14 +59,14 @@ use dmuxai::{
         GraphStore, MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind, PanelLineKind,
         PlanChange, PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode,
         PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls, PlannerIo,
-        PlannerIoKind, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage, TriageSource,
+        PlannerIoKind, ReplanDoc, ReplanTrigger, Route, TaskEdit, TaskState, Triage, TriageSource,
         apply_replan, approval_panel_lines, budget_allows, build_judge_prompt, build_plan_prompt,
         build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary, cap_revision_raw,
         diff_plan_steps, diff_plan_tasks, fallback_plan, graph_plan_from_revision_steps,
         heuristic_route, judge_line_text, judging_line_text, next_plan_change_rev, parse_plan,
         parse_replan, parse_replan_marker, parse_verdict, plan_json_for_edit, replan_allowed,
         replan_revision_steps, revision_needs_approval, save_run, strip_replan_marker,
-        task_counter_text, validate_plan,
+        task_counter_text, validate_plan, write_tasks_file_if_enabled,
     },
     mcp::config::ResolvedMcpServer,
     mcp::registry::McpRegistry,
@@ -1144,6 +1144,8 @@ pub struct App {
     all_details_expanded: bool,
     dashboard: Option<dmuxai::web::DashboardHub>,
     last_graph_run: Option<dmuxai::graph::GraphRun>,
+    /// Last written task-status snapshot per run id (FR-967 dedupe).
+    tasks_file_last_snapshot: Option<(String, String)>,
     graph_run_list_cache: GraphRunListCache,
     /// UX-930: monotonic id for the current user turn; judge line triage is
     /// shown only while its stored seq matches.
@@ -1371,6 +1373,7 @@ impl App {
             all_details_expanded: false,
             dashboard: None,
             last_graph_run: None,
+            tasks_file_last_snapshot: None,
             graph_run_list_cache: GraphRunListCache::default(),
             user_turn_seq: 0,
             judge_reason_capture_turn: None,
@@ -5202,6 +5205,7 @@ impl App {
         }
         self.emit_plan_revised_event(&plan_id, rev);
         let run = self.last_graph_run.clone().expect("approved run");
+        self.sync_tasks_file_for_run(&run);
         self.graph_approval_stale = None;
         self.start_graph_run_record(run);
         Ok(())
@@ -7862,7 +7866,8 @@ impl App {
             return Err(PlanDecisionError::NotAwaitingApproval);
         };
         let plan_id = saved.plan.id.clone();
-        self.last_graph_run = Some(saved);
+        self.last_graph_run = Some(saved.clone());
+        self.sync_tasks_file_for_run(&saved);
         if let Some(rev) = emit_rev {
             self.emit_plan_revised_event(&plan_id, rev);
         }
@@ -8134,13 +8139,14 @@ impl App {
         if success {
             self.note_replan_summary(&node_id, &display_text);
         }
-        let (actions, failed_message) = {
+        let (actions, failed_message, run_snapshot) = {
             let Some(session) = self.graph_session.as_mut() else {
                 return;
             };
             let actions = session.on_node_finished(&node_id, success);
             self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
             let _ = save_run(&self.workspace_root, session.run());
+            let run_snapshot = session.run().clone();
             let failed_message = if !success {
                 actions.iter().find_map(|action| match action {
                     GraphAction::Failed(message) => Some(message.clone()),
@@ -8149,8 +8155,9 @@ impl App {
             } else {
                 None
             };
-            (actions, failed_message)
+            (actions, failed_message, run_snapshot)
         };
+        self.sync_tasks_file_for_run(&run_snapshot);
         if let Some(message) = failed_message
             && self.graph_session_is_multi_step()
         {
@@ -8828,7 +8835,45 @@ impl App {
         self.deferred_internal_turn = None;
     }
 
+    /// FR-967: the rendered file is the dedupe key, so title or done-check edits
+    /// rewrite it too; a failed write is remembered so the note appears once.
+    fn tasks_file_snapshot(run: &GraphRun) -> String {
+        dmuxai::graph::render_tasks_markdown(run)
+    }
+
+    /// FR-967: write `.dmuxai/tasks/TASKS-<run id>.md` when enabled and its content changed.
+    fn sync_tasks_file_for_run(&mut self, run: &GraphRun) {
+        if !self.settings.graph_tasks_file {
+            return;
+        }
+        let snapshot = Self::tasks_file_snapshot(run);
+        if self
+            .tasks_file_last_snapshot
+            .as_ref()
+            .is_some_and(|(id, prev)| id == &run.plan.id && prev == &snapshot)
+        {
+            return;
+        }
+        match write_tasks_file_if_enabled(&self.workspace_root, true, run) {
+            Ok(Some(_path)) => {
+                self.tasks_file_last_snapshot = Some((run.plan.id.clone(), snapshot));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.tasks_file_last_snapshot = Some((run.plan.id.clone(), snapshot));
+                self.push_system(format!("tasks file not written: {error}"));
+            }
+        }
+    }
+
     fn start_graph_run_record(&mut self, run: GraphRun) {
+        if self
+            .tasks_file_last_snapshot
+            .as_ref()
+            .is_none_or(|(id, _)| id != &run.plan.id)
+        {
+            self.tasks_file_last_snapshot = None;
+        }
         self.cancel_active_replan_turn();
         self.single_graph_plan = None;
         self.graph_node_details.clear();
@@ -8978,6 +9023,8 @@ impl App {
         }
         if let Some(session) = self.graph_session.as_ref() {
             let _ = save_run(&self.workspace_root, session.run());
+            let run = session.run().clone();
+            self.sync_tasks_file_for_run(&run);
         }
         self.flush_deferred_graph_starts();
     }
@@ -22275,6 +22322,73 @@ mod tests {
 
         let saved = dmuxai::graph::load_run(&h.app.workspace_root, &run.plan.id).unwrap();
         assert_eq!(saved.plan.tasks, run.plan.tasks);
+    }
+
+    // TC-998 / FR-967: tasks markdown file on approve and after a task finishes.
+    #[test]
+    fn tasks_file_written_on_status_change() {
+        use dmuxai::graph::tasks_file_path;
+
+        let mut h = plan_gate_test_app();
+        h.app.settings.graph_tasks_file = true;
+        reach_awaiting_approval_with_plan(&mut h, three_task_codex_plan_json());
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        let user_prompt = h
+            .app
+            .last_graph_run
+            .as_ref()
+            .unwrap()
+            .plan
+            .user_prompt
+            .clone();
+        let path = tasks_file_path(
+            &h.app.workspace_root,
+            h.app.last_graph_run.as_ref().unwrap(),
+        );
+        assert!(!path.exists());
+
+        // A rename at the gate (same ids and states) still reaches the file.
+        h.app.input = "/graph task rename task-2 renamed two".to_owned();
+        h.app.submit_prompt();
+        h.app.input = "/graph approve".to_owned();
+        h.app.submit_prompt();
+
+        let approved = std::fs::read_to_string(&path).unwrap();
+        assert!(approved.contains("- [ ] task-2 renamed two"), "{approved}");
+        assert!(approved.contains(&format!("# Tasks {}", plan_id)));
+        assert!(approved.contains("- [ ] task-1 one"));
+        assert!(!approved.contains(&user_prompt));
+
+        for _ in 0..6 {
+            if std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("- [x] task-1 one")
+            {
+                break;
+            }
+            let step = last_graph_node_request_index(&h.sent);
+            complete_sent_graph_turn(&mut h.app, &h.sent, step);
+        }
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("- [x] task-1 one"));
+        assert!(after.contains("- [ ] task-2 renamed two"));
+    }
+
+    #[test]
+    fn tasks_file_write_error_becomes_system_note() {
+        let workspace =
+            std::env::temp_dir().join(format!("dmuxai-tasks-file-err-{}", uuid::Uuid::new_v4()));
+        let mut h = plan_gate_harness_in_workspace(workspace.clone(), &[]);
+        h.app.settings.graph_tasks_file = true;
+        std::fs::create_dir_all(workspace.join(".dmuxai")).unwrap();
+        std::fs::write(workspace.join(".dmuxai").join("tasks"), "blocked").unwrap();
+
+        reach_awaiting_approval_with_plan(&mut h, three_task_codex_plan_json());
+        h.app.input = "/graph approve".to_owned();
+        h.app.submit_prompt();
+
+        assert!(last_system(&h.app).contains("tasks file not written:"));
     }
 
     // TC-940 / FR-937, FR-945: /direct skips the judge.
