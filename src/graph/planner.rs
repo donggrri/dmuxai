@@ -15,17 +15,14 @@ pub fn plan_request(
 ) -> ExecutionPlan {
     let _ = workspace;
     let runner = assign_runner(NodeRole::Implement, settings);
-    match super::plan_doc::fallback_plan(prompt, &runner, None, "keyword planner removed") {
-        Ok(fallback) => ExecutionPlan::Graph(fallback.plan),
-        // No allowed model here: return today's single-agent plan shape; the
-        // App's model application rejects the policy-violating model.
-        Err(_) => ExecutionPlan::Single(SinglePlan {
-            runner,
-            model_id: model_for_role(NodeRole::Implement).to_owned(),
-            role: NodeRole::Implement,
-            job: prompt.trim().to_owned(),
-        }),
-    }
+    // Transitional: a single-agent send until the App triage state machine
+    // records every turn as a 1-node graph (FR-937, FR-954).
+    ExecutionPlan::Single(SinglePlan {
+        runner,
+        model_id: model_for_role(NodeRole::Implement).to_owned(),
+        role: NodeRole::Implement,
+        job: prompt.trim().to_owned(),
+    })
 }
 
 /// FR-936: pure route heuristic with no I/O. Keeps the English keywords and
