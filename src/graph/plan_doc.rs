@@ -75,7 +75,7 @@ pub struct PlanError {
 }
 
 impl PlanError {
-    fn new(step_id: impl Into<String>, rule: impl Into<String>) -> Self {
+    pub(crate) fn new(step_id: impl Into<String>, rule: impl Into<String>) -> Self {
         Self {
             step_id: step_id.into(),
             rule: rule.into(),
@@ -193,7 +193,7 @@ pub fn build_plan_prompt(request: &PlanPromptRequest<'_>) -> Result<String, Prom
     Ok(out)
 }
 
-fn push_block(out: &mut String, nonce: &str, body: &str) {
+pub(crate) fn push_block(out: &mut String, nonce: &str, body: &str) {
     out.push_str("<<<DATA-");
     out.push_str(nonce);
     out.push('\n');
@@ -225,7 +225,7 @@ pub fn parse_plan(text: &str) -> Result<PlanDoc, Vec<PlanError>> {
     Ok(PlanDoc { steps })
 }
 
-fn step_from_value(value: &Value, index: usize) -> PlanStep {
+pub(crate) fn step_from_value(value: &Value, index: usize) -> PlanStep {
     let mut step = PlanStep {
         id: format!("#{index}"),
         ..PlanStep::default()
@@ -276,12 +276,22 @@ fn step_from_value(value: &Value, index: usize) -> PlanStep {
 /// An omitted model uses the runner's effective model. Both are passed to
 /// `validate_model`. `sensitive: false` does not clear a keyword gate.
 pub fn validate_plan(doc: &PlanDoc, ctx: &PlanContext<'_>) -> Result<GraphPlan, Vec<PlanError>> {
+    validate_plan_with_limit(doc, ctx, 8)
+}
+
+/// Same rules as [`validate_plan`] but with an explicit executable-step cap.
+/// Replan revisions use the run's `max_nodes` instead of the initial 8.
+pub(crate) fn validate_plan_with_limit(
+    doc: &PlanDoc,
+    ctx: &PlanContext<'_>,
+    max_steps: usize,
+) -> Result<GraphPlan, Vec<PlanError>> {
     let mut errors = Vec::new();
     let count = doc.steps.len();
-    if !(1..=8).contains(&count) {
+    if !(1..=max_steps).contains(&count) {
         errors.push(PlanError::new(
             "plan",
-            format!("step count must be 1 to 8 (found {count})"),
+            format!("step count must be 1 to {max_steps} (found {count})"),
         ));
     }
 

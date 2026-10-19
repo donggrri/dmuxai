@@ -3,6 +3,7 @@ mod judge;
 mod plan_doc;
 mod planner;
 mod policy;
+mod replan;
 mod store;
 mod types;
 
@@ -19,6 +20,11 @@ pub use planner::{heuristic_route, plan_request};
 pub use policy::{
     ORCHESTRATOR_MODEL, assign_runner, default_limits, is_runner_allowed, model_for_role,
     validate_model_id,
+};
+pub use replan::{
+    NODE_REPLAN_HINT, REPLAN_PROMPT, ReplanDoc, ReplanTrigger, apply_replan, budget_allows,
+    build_replan_prompt, parse_replan, parse_replan_marker, replans_left, revision_needs_approval,
+    strip_replan_marker,
 };
 pub use store::{GraphStore, load_run, save_run};
 pub use types::{
