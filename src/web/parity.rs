@@ -188,6 +188,20 @@ pub fn page_has_control(session_js: &str, control: &str) -> bool {
     .any(|pattern| session_js.contains(pattern.as_str()))
 }
 
+/// Plan-gate and graph-header controls may be rendered in `app.js` or `index.html`
+/// (via `dmuxaiSession.parityButton`) instead of hidden session stubs.
+pub fn dashboard_has_control(
+    session_js: &str,
+    app_js: &str,
+    index_html: &str,
+    control: &str,
+) -> bool {
+    page_has_control(session_js, control)
+        || app_js.contains(&format!("data-parity=\"{control}\""))
+        || index_html.contains(&format!("data-parity=\"{control}\""))
+        || (app_js.contains(&format!("'{control}'")) && app_js.contains("parityButton"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,10 +210,12 @@ mod tests {
     #[test]
     fn parity_matrix_controls_exist_in_session_js() {
         let js = crate::web::assets::SESSION_JS;
+        let app_js = crate::web::assets::APP_JS;
+        let index_html = crate::web::assets::INDEX_HTML;
         assert!(js.contains("data-parity"));
         for (index, entry) in PARITY.iter().enumerate() {
             assert!(
-                page_has_control(js, entry.control),
+                dashboard_has_control(js, app_js, index_html, entry.control),
                 "{} maps to missing control {}",
                 entry.tui,
                 entry.control

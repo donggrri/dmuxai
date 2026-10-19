@@ -1801,6 +1801,9 @@ var planGateUi = {
   editDraft: '',
   error: ''
 };
+var planGateContextKey = '';
+var approvalPanelLastKey = null;
+var approvalPanelFocusFeedback = false;
 
 function isDashboardViewOnly() {
   var snap = snapshot;
@@ -1823,8 +1826,50 @@ function syncSessionPlanGateButtons() {
     replanBtn.disabled = disabled || !graphReplanAllowed(graph);
   }
   var historyBtn = $('plan-history');
-  if (historyBtn) {
-    historyBtn.disabled = disabled;
+  if (historyBtn && !historyBtn.hidden) {
+    historyBtn.disabled = false;
+  }
+}
+
+function resetPlanGateUiIfContextChanged(graph) {
+  var rev = graph && graph.approval ? String(graph.approval.rev) : '';
+  var next = graph ? String(graph.id || '') + ':' + rev : '';
+  if (next === planGateContextKey) { return; }
+  planGateContextKey = next;
+  planGateUi.error = '';
+  planGateUi.editOpen = false;
+  planGateUi.editDraft = '';
+  approvalPanelLastKey = null;
+}
+
+function approvalPanelRenderKey(graph, approval) {
+  return JSON.stringify({
+    rev: approval.rev,
+    source: approval.source,
+    fallback: approval.fallback,
+    steps: approval.steps,
+    notes: approval.notes,
+    tasks: graph.tasks,
+    error: planGateUi.error,
+    busy: planGateUi.busy,
+    editOpen: planGateUi.editOpen
+  });
+}
+
+function syncApprovalPanelButtonStates() {
+  var disabled = planGateDisabled();
+  ['plan-approve', 'plan-edit', 'plan-reject', 'plan-replan'].forEach(function (id) {
+    var btn = document.getElementById(id);
+    if (btn) { btn.disabled = disabled; }
+  });
+  var graph = snapshot && snapshot.graph;
+  var replanBtn = $('graph-replan');
+  if (replanBtn) {
+    replanBtn.disabled = disabled || !graphReplanAllowed(graph);
+  }
+  var historyBtn = $('plan-history');
+  if (historyBtn && !historyBtn.hidden) {
+    historyBtn.disabled = false;
   }
 }
 
@@ -1939,6 +1984,22 @@ function planGateActionButton(label, extraClass, onClick) {
   return btn;
 }
 
+function planGateParityButton(label, parity, extraClass, onClick) {
+  var make = window.dmuxaiSession && window.dmuxaiSession.parityButton;
+  var btn;
+  if (make) {
+    btn = make(label, parity, onClick, extraClass);
+  } else {
+    btn = el('button', 'btn' + (extraClass ? ' ' + extraClass : ''), label);
+    btn.type = 'button';
+    if (parity) { btn.setAttribute('data-parity', parity); }
+    btn.addEventListener('click', onClick);
+  }
+  if (parity) { btn.id = parity; }
+  btn.disabled = planGateDisabled();
+  return btn;
+}
+
 function appendTaskActions(panel, task, tasks) {
   var taskId = String(task.id || '');
   var row = el('div', 'graph-approval-task-actions');
@@ -1973,6 +2034,7 @@ function appendTaskActions(panel, task, tasks) {
   }));
   if (idx > 0) {
     row.appendChild(planGateActionButton('Move up', '', function () {
+      // Server `parse_graph_task_edit` move uses 1-based target slot (see apply_task_move).
       submitPlanTaskEdit({ action: 'move', task_id: taskId, position: idx });
     }));
   }
@@ -1987,18 +2049,32 @@ function appendTaskActions(panel, task, tasks) {
 function renderApprovalPanel(graph) {
   var panel = $('graph-approval');
   if (!panel) { return; }
-  var draft = planGateUi.editDraft;
-  var editOpen = planGateUi.editOpen;
-  var active = document.activeElement;
-  var focusFeedback = active && active.classList && active.classList.contains('graph-approval-feedback');
+  resetPlanGateUiIfContextChanged(graph);
 
   if (!graph || graph.phase !== 'awaiting_approval' || !graph.approval) {
     panel.hidden = true;
     panel.replaceChildren();
+    approvalPanelLastKey = null;
     syncSessionPlanGateButtons();
     return;
   }
   var approval = graph.approval;
+  var renderKey = approvalPanelRenderKey(graph, approval);
+  if (renderKey === approvalPanelLastKey) {
+    syncApprovalPanelButtonStates();
+    syncSessionPlanGateButtons();
+    return;
+  }
+  approvalPanelLastKey = renderKey;
+
+  var draft = planGateUi.editDraft;
+  var editOpen = planGateUi.editOpen;
+  var active = document.activeElement;
+  var savedCaret = null;
+  if (editOpen && active && active.classList && active.classList.contains('graph-approval-feedback')) {
+    savedCaret = { start: active.selectionStart, end: active.selectionEnd };
+  }
+
   var steps = Array.isArray(approval.steps) ? approval.steps : [];
   var tasks = Array.isArray(graph.tasks) ? graph.tasks : [];
 
@@ -2051,14 +2127,18 @@ function renderApprovalPanel(graph) {
   }
 
   var actions = el('div', 'graph-approval-actions');
-  actions.appendChild(planGateActionButton('Approve', 'btn-primary', function () {
+  actions.appendChild(planGateParityButton('Approve', 'plan-approve', 'btn-primary', function () {
     submitPlanDecision('approve');
   }));
-  actions.appendChild(planGateActionButton('Edit', '', function () {
-    planGateUi.editOpen = !planGateUi.editOpen;
-    renderApprovalPanel(graph);
+  actions.appendChild(planGateParityButton('Edit', 'plan-edit', '', function () {
+    var g = snapshot && snapshot.graph;
+    if (!g) { return; }
+    var opening = !planGateUi.editOpen;
+    planGateUi.editOpen = opening;
+    if (opening) { approvalPanelFocusFeedback = true; }
+    renderApprovalPanel(g);
   }));
-  actions.appendChild(planGateActionButton('Reject', 'btn-danger', function () {
+  actions.appendChild(planGateParityButton('Reject', 'plan-reject', 'btn-danger', function () {
     if (!window.confirm('Reject this plan revision?')) { return; }
     submitPlanDecision('reject');
   }));
@@ -2085,19 +2165,49 @@ function renderApprovalPanel(graph) {
   panel.appendChild(actions);
   syncSessionPlanGateButtons();
 
-  if (focusFeedback || editOpen) {
-    var ta = panel.querySelector('.graph-approval-feedback');
-    if (ta) { ta.focus(); }
+  var ta = panel.querySelector('.graph-approval-feedback');
+  if (ta && savedCaret) {
+    ta.focus();
+    try {
+      ta.setSelectionRange(savedCaret.start, savedCaret.end);
+    } catch (ignore) { /* ignore */ }
+  } else if (ta && approvalPanelFocusFeedback) {
+    ta.focus();
   }
+  approvalPanelFocusFeedback = false;
 }
 
 // UX-936: task checklist beside the swimlane (`graph.tasks` from pushed snapshots).
-function taskChecklistStatusIcon(status) {
+function taskChecklistStatusClass(status) {
   var label = String(status || 'pending');
+  if (label === 'running' || label === 'done' || label === 'failed') { return label; }
+  return 'pending';
+}
+
+function taskChecklistStatusIcon(status) {
+  var label = taskChecklistStatusClass(status);
   if (label === 'running') { return '\u25D0'; }
   if (label === 'done') { return '\u2713'; }
   if (label === 'failed') { return '\u2717'; }
   return '\u25CB';
+}
+
+function tasksForChecklist(graph) {
+  if (!graph) { return []; }
+  var tasks = Array.isArray(graph.tasks) ? graph.tasks : [];
+  if (tasks.length) { return tasks; }
+  var nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+  if (nodes.length !== 1) { return []; }
+  var node = nodes[0];
+  var job = String(node.job || '');
+  if (job.length > 80) { job = job.slice(0, 79) + '\u2026'; }
+  return [{
+    id: 'task-1',
+    title: job,
+    done_check: '',
+    status: 'pending',
+    nodes: [String(node.id || '')]
+  }];
 }
 
 function taskChecklistNodeIdsText(nodes) {
@@ -2108,7 +2218,7 @@ function taskChecklistNodeIdsText(nodes) {
 function rebuildTaskChecklistHighlight(graph) {
   taskChecklistHighlight = {};
   if (!taskChecklistSelectedId || !graph) { return; }
-  var tasks = Array.isArray(graph.tasks) ? graph.tasks : [];
+  var tasks = tasksForChecklist(graph);
   for (var i = 0; i < tasks.length; i++) {
     var task = tasks[i];
     if (String(task.id) !== taskChecklistSelectedId) { continue; }
@@ -2135,33 +2245,56 @@ function selectTaskChecklistTask(taskId) {
   updateGraphNodeSelection();
 }
 
-function appendTaskChecklistRow(list, task) {
+function updateTaskChecklistRow(row, task) {
   var taskId = String(task.id || '');
-  var status = String(task.status || 'pending');
-  var row = el('div', 'task-checklist-row');
+  var statusClass = taskChecklistStatusClass(task.status);
+  row.className = 'task-checklist-row';
   if (taskId === taskChecklistSelectedId) {
     row.classList.add('task-checklist-row-selected');
+    row.classList.add('task-checklist-row-expanded');
   }
+  var statusEl = row.querySelector('.task-checklist-status');
+  if (!statusEl) {
+    statusEl = el('span', 'task-checklist-status');
+    row.insertBefore(statusEl, row.firstChild);
+  }
+  statusEl.className = 'task-checklist-status task-checklist-status-' + statusClass;
+  statusEl.textContent = taskChecklistStatusIcon(task.status);
+  var idEl = row.querySelector('.task-checklist-id');
+  if (!idEl) {
+    var head = el('div');
+    idEl = el('span', 'task-checklist-id');
+    head.appendChild(idEl);
+    head.appendChild(document.createTextNode(' '));
+    head.appendChild(el('span', 'task-checklist-label'));
+    row.appendChild(head);
+  }
+  idEl.textContent = taskId;
+  var labelEl = row.querySelector('.task-checklist-label');
+  if (labelEl) { labelEl.textContent = String(task.title || ''); }
+  var meta = row.querySelector('.task-checklist-meta');
+  if (!meta) {
+    meta = el('div', 'task-checklist-meta');
+    meta.appendChild(el('p', 'task-checklist-done'));
+    meta.appendChild(el('p', 'task-checklist-nodes'));
+    row.appendChild(meta);
+  }
+  var doneEl = meta.querySelector('.task-checklist-done');
+  if (doneEl) { doneEl.textContent = 'done: ' + String(task.done_check || ''); }
+  var nodesText = taskChecklistNodeIdsText(task.nodes);
+  var nodesEl = meta.querySelector('.task-checklist-nodes');
+  if (nodesEl) {
+    nodesEl.textContent = nodesText;
+    nodesEl.hidden = !nodesText;
+  }
+}
+
+function createTaskChecklistRow(task) {
+  var taskId = String(task.id || '');
+  var row = el('div', 'task-checklist-row');
   row.setAttribute('role', 'button');
   row.setAttribute('tabindex', '0');
   row.setAttribute('data-task-id', taskId);
-  row.appendChild(el(
-    'span',
-    'task-checklist-status task-checklist-status-' + status,
-    taskChecklistStatusIcon(status)
-  ));
-  var head = el('div');
-  head.appendChild(el('span', 'task-checklist-id', taskId));
-  head.appendChild(document.createTextNode(' '));
-  head.appendChild(el('span', 'task-checklist-label', String(task.title || '')));
-  row.appendChild(head);
-  var meta = el('div', 'task-checklist-meta');
-  meta.appendChild(el('p', 'task-checklist-done', 'done: ' + String(task.done_check || '')));
-  var nodesText = taskChecklistNodeIdsText(task.nodes);
-  if (nodesText) {
-    meta.appendChild(el('p', 'task-checklist-nodes', nodesText));
-  }
-  row.appendChild(meta);
   row.addEventListener('click', function () { selectTaskChecklistTask(taskId); });
   row.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
@@ -2169,14 +2302,18 @@ function appendTaskChecklistRow(list, task) {
       selectTaskChecklistTask(taskId);
     }
   });
-  list.appendChild(row);
+  updateTaskChecklistRow(row, task);
+  return row;
 }
 
 function renderTaskChecklist(graph) {
   var panel = $('task-checklist');
   if (!panel) { return; }
   var scrollTop = panel.scrollTop;
-  var tasks = graph && Array.isArray(graph.tasks) ? graph.tasks : [];
+  var active = document.activeElement;
+  var focusTaskId = active && active.classList && active.classList.contains('task-checklist-row')
+    ? active.getAttribute('data-task-id') : null;
+  var tasks = graph ? tasksForChecklist(graph) : [];
   if (!graph || !tasks.length) {
     panel.hidden = true;
     panel.replaceChildren();
@@ -2187,15 +2324,43 @@ function renderTaskChecklist(graph) {
   }
   rebuildTaskChecklistHighlight(graph);
   panel.hidden = false;
-  panel.replaceChildren();
-  panel.appendChild(el('p', 'task-checklist-title-bar', 'Tasks'));
-  var list = el('div', 'task-checklist-list');
-  for (var i = 0; i < tasks.length; i++) {
-    appendTaskChecklistRow(list, tasks[i]);
+  var titleBar = panel.querySelector('.task-checklist-title-bar');
+  if (!titleBar) {
+    panel.replaceChildren();
+    panel.appendChild(el('p', 'task-checklist-title-bar', 'Tasks'));
   }
-  panel.appendChild(list);
+  var list = panel.querySelector('.task-checklist-list');
+  if (!list) {
+    list = el('div', 'task-checklist-list');
+    panel.appendChild(list);
+  }
+  var existing = {};
+  var rows = list.querySelectorAll('.task-checklist-row');
+  for (var r = 0; r < rows.length; r++) {
+    var row = rows[r];
+    existing[row.getAttribute('data-task-id')] = row;
+  }
+  var seen = {};
+  for (var i = 0; i < tasks.length; i++) {
+    var task = tasks[i];
+    var taskId = String(task.id || '');
+    seen[taskId] = true;
+    var rowNode = existing[taskId];
+    if (rowNode) {
+      updateTaskChecklistRow(rowNode, task);
+    } else {
+      list.appendChild(createTaskChecklistRow(task));
+    }
+  }
+  for (var id in existing) {
+    if (!seen[id]) { existing[id].remove(); }
+  }
   panel.scrollTop = scrollTop;
   updateGraphNodeSelection();
+  if (focusTaskId) {
+    var focused = list.querySelector('[data-task-id="' + focusTaskId + '"]');
+    if (focused) { focused.focus(); }
+  }
 }
 
 // UX-934: replan + revision history in the graph header.
@@ -2205,8 +2370,7 @@ function graphReplanAllowed(graph) {
   if (!graph) { return false; }
   var nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
   if (nodes.length <= 1) { return false; }
-  var phase = String(graph.phase || '');
-  return phase === 'active' || phase === 'waiting_gate';
+  return String(graph.phase || '') === 'active';
 }
 
 function runPlanReplanCommand(note) {
@@ -2356,7 +2520,9 @@ window.dmuxaiPlanGate = {
   toggleEdit: function () {
     var graph = snapshot && snapshot.graph;
     if (!graph) { return; }
-    planGateUi.editOpen = !planGateUi.editOpen;
+    var opening = !planGateUi.editOpen;
+    planGateUi.editOpen = opening;
+    if (opening) { approvalPanelFocusFeedback = true; }
     renderApprovalPanel(graph);
   },
   replan: function () { submitPlanReplan(); },

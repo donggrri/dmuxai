@@ -356,27 +356,6 @@
     sendCol.appendChild(ui.send);
     form.appendChild(sendCol);
 
-    // Plan-gate approval controls (rendered in app.js; ids must live here for parity).
-    var planGate = el('div', 'session-plan-gate');
-    planGate.hidden = true;
-    planGate.setAttribute('aria-hidden', 'true');
-    ui.planApprove = button('Approve', 'plan-approve', function () {
-      if (window.dmuxaiPlanGate && window.dmuxaiPlanGate.approve) { window.dmuxaiPlanGate.approve(); }
-    });
-    ui.planEdit = button('Edit', 'plan-edit', function () {
-      if (window.dmuxaiPlanGate && window.dmuxaiPlanGate.toggleEdit) { window.dmuxaiPlanGate.toggleEdit(); }
-    });
-    ui.planReject = button('Reject', 'plan-reject', function () {
-      if (window.dmuxaiPlanGate && window.dmuxaiPlanGate.reject) { window.dmuxaiPlanGate.reject(); }
-    });
-    ui.planReplan = button('Replan', 'plan-replan', function () {
-      if (window.dmuxaiPlanGate && window.dmuxaiPlanGate.replan) { window.dmuxaiPlanGate.replan(); }
-    });
-    [ui.planApprove, ui.planEdit, ui.planReject, ui.planReplan].forEach(function (b) {
-      planGate.appendChild(b);
-    });
-    root.appendChild(planGate);
-
     root.appendChild(form);
 
     document.addEventListener('keydown', function (e) {
@@ -511,11 +490,6 @@
     });
     if (ui.route) { ui.route.disabled = viewOnly; }
     ui.input.disabled = viewOnly;
-    var planBusy = window.dmuxaiPlanGate && window.dmuxaiPlanGate.isBusy && window.dmuxaiPlanGate.isBusy();
-    [ui.planApprove, ui.planEdit, ui.planReject, ui.planReplan].forEach(function (b) {
-      if (b) { b.disabled = viewOnly || planBusy; }
-    });
-
     renderTranscript();
     renderConversations();
   }
@@ -918,4 +892,7 @@
     root.hidden = true;
     if (pending) { applySnapshot(pending); pending = null; }
   });
+
+  // Plan-gate approval buttons are rendered in app.js via parityButton (parity ids).
+  window.dmuxaiSession = { parityButton: button };
 })();

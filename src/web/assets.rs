@@ -1354,14 +1354,28 @@ mod tests {
     #[test]
     fn approval_panel_asset() {
         assert!(INDEX_HTML.contains("id=\"graph-approval\""));
-        for id in ["plan-approve", "plan-edit", "plan-reject", "plan-replan"] {
+        assert!(SESSION_JS.contains("parityButton"));
+        for id in ["plan-approve", "plan-edit", "plan-reject"] {
             assert!(
-                SESSION_JS.contains(&format!("'{id}'")),
-                "session.js must declare parity control {id}"
+                APP_JS.contains(&format!("'{id}'")) && APP_JS.contains("planGateParityButton"),
+                "visible approval panel must declare parity control {id}"
             );
         }
-        assert!(SESSION_JS.contains("window.dmuxaiPlanGate"));
+        assert!(INDEX_HTML.contains("data-parity=\"plan-replan\""));
+        assert!(APP_JS.contains("window.dmuxaiPlanGate"));
         assert!(APP_JS.contains("function renderApprovalPanel"));
+        assert!(APP_JS.contains("approvalPanelRenderKey"));
+        assert!(APP_JS.contains("approvalPanelLastKey"));
+        assert!(APP_JS.contains("approvalPanelFocusFeedback"));
+        let approval_render_js = js_between(
+            APP_JS,
+            "function renderApprovalPanel",
+            "// UX-936: task checklist beside the swimlane",
+        );
+        assert!(
+            !approval_render_js.contains("|| editOpen"),
+            "do not refocus feedback textarea on every render when editOpen"
+        );
         assert!(APP_JS.contains("command: 'plan_decision'"));
         assert!(APP_JS.contains("command: 'plan_task_edit'"));
         assert!(APP_JS.contains("graph.phase !== 'awaiting_approval'"));
@@ -1372,6 +1386,8 @@ mod tests {
         assert!(APP_JS.contains("action: 'merge'"));
         assert!(APP_JS.contains("action: 'delete'"));
         assert!(APP_JS.contains("action: 'move'"));
+        assert!(APP_JS.contains("position: idx + 2"));
+        assert!(APP_JS.contains("parse_graph_task_edit"));
         assert!(APP_CSS.contains(".graph-approval"));
 
         let plan_gate_js = js_between(APP_JS, "// UX-932 / FR-965", "var lastRenderedAgentsKey");
@@ -1396,7 +1412,11 @@ mod tests {
         assert!(APP_JS.contains("graph.tasks"));
         assert!(APP_JS.contains("node-task-highlight"));
         assert!(APP_JS.contains("task.done_check"));
-        assert!(APP_JS.contains("task-checklist-status-' + status"));
+        assert!(APP_JS.contains("function taskChecklistStatusClass"));
+        assert!(APP_JS.contains("task-checklist-row-expanded"));
+        assert!(APP_JS.contains("tasksForChecklist"));
+        assert!(APP_JS.contains("data-task-id"));
+        assert!(APP_JS.contains("function tasksForChecklist"));
         for status in ["pending", "running", "done", "failed"] {
             assert!(
                 APP_CSS.contains(&format!(".task-checklist-status-{status}")),

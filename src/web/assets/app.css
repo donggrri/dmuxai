@@ -606,9 +606,9 @@ main {
 .graph-approval {
   margin: 0 0 12px;
   padding: 10px 12px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--bg-badge);
+  background: var(--bg-panel);
   font-size: 0.88em;
 }
 
@@ -1616,6 +1616,8 @@ main {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  flex: 1 1 auto;
+  width: 100%;
   min-width: 0;
 }
 
