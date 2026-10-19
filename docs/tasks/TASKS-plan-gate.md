@@ -102,7 +102,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   FR-947. TC-954.
   Files: `src/web/server.rs`, `src/app.rs`.
   Done when: `todo_graph_run_waits_for_plan_approval` green.
-- [ ] P20 — Headless `dmuxai run`: `--approve-plan`, exit 7, `--graph` no-op, `triage.source` in JSON, sensitive gate exit 7; fake-agent `judge`/`plan` behaviours; docs/API.md.
+- [x] P20 — (#67 agent-planned graph 3a9ebe75: 5 steps with a parallel branch, approved from the dashboard Approve button; an agent emitted DMUXAI_REPLAN mid-run → replan rev 2 rejected (step size large); composer-2.5; review claude-sonnet-5-5-high APPROVE; my fix of its nit: an approved plan that comes back to awaiting approval exits 7, never 0) Headless `dmuxai run`: `--approve-plan`, exit 7, `--graph` no-op, `triage.source` in JSON, sensitive gate exit 7; fake-agent `judge`/`plan` behaviours; docs/API.md.
   FR-947, FR-944 (headless). TC-955.
   Files: `src/cli.rs`, `src/app.rs`, `tests/cli.rs`, `tests/fixtures/fake-agent.sh`, `docs/API.md`.
   Done when: `cargo test --locked --test cli` green incl. `run_complex_needs_approve_plan`.

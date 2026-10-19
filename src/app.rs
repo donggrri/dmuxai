@@ -153,6 +153,9 @@ enum SlashAction {
 const PLAN_AWAITING_APPROVAL_MSG: &str =
     "A plan is awaiting approval: approve, edit or reject it first";
 
+const HEADLESS_APPROVAL_NOTE: &str = "approval required (headless)";
+const HEADLESS_GATE_NOTE: &str = "sensitive step needs /graph continue (headless)";
+
 #[derive(Clone, Copy)]
 struct SlashCommand {
     name: &'static str,
@@ -850,7 +853,14 @@ pub struct HeadlessRequest {
     pub agent: Option<String>,
     pub mode: Option<ExecutionMode>,
     pub graph: bool,
+    pub approve_plan: bool,
     pub todo_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeadlessPlan {
+    pub steps: Vec<PlanStep>,
+    pub tasks: Vec<PlanTask>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -871,6 +881,16 @@ pub struct HeadlessOutcome {
     pub messages: Vec<HeadlessMessage>,
     pub error: Option<String>,
     pub todo: Option<Todo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage: Option<Triage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<HeadlessPlan>,
+}
+
+enum HeadlessIdleAction {
+    Done,
+    ContinueAfterApprove,
+    Exit(Box<HeadlessOutcome>),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -8848,6 +8868,13 @@ impl App {
             }
             return Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
         }
+        if let Agent::Custom(index) = agent
+            && let Some(spec) = dmuxai::custom_agent::spec_at(index)
+            && let Some(default) = &spec.default_model
+            && dmuxai::model_policy::validate_model_for_runner(&spec.name, default).is_ok()
+        {
+            return Some(default.clone());
+        }
         None
     }
 
@@ -8987,6 +9014,7 @@ impl App {
         }
         let actions = session.schedule();
         let _ = save_run(&self.workspace_root, session.run());
+        self.last_graph_run = Some(session.run().clone());
         self.graph_session = Some(session);
         self.dispatch_graph_actions(actions);
     }
@@ -10014,6 +10042,256 @@ impl App {
         self.todo_store = Some(store);
     }
 
+    fn headless_plan_snapshot(&self) -> (Option<Triage>, Option<HeadlessPlan>) {
+        let run = self.last_graph_run.as_ref();
+        let Some(run) = run else {
+            return (None, None);
+        };
+        let triage = run.triage.clone();
+        let plan = run.approval.as_ref().and_then(|approval| {
+            approval.revisions.last().map(|revision| HeadlessPlan {
+                steps: revision.steps.clone(),
+                tasks: run.plan.tasks.clone(),
+            })
+        });
+        (triage, plan)
+    }
+
+    fn headless_plan_text(plan: &HeadlessPlan) -> String {
+        plan.steps
+            .iter()
+            .map(|step| step.job.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn headless_cancel_awaiting_plan(&mut self, note: &str) {
+        let save_error = {
+            let run = self
+                .last_graph_run
+                .as_mut()
+                .filter(|run| run.phase == GraphRunPhase::AwaitingApproval);
+            let Some(run) = run else {
+                return;
+            };
+            let rev = run
+                .approval
+                .as_ref()
+                .and_then(|approval| approval.revisions.last())
+                .map(|revision| revision.n)
+                .unwrap_or(1);
+            run.phase = GraphRunPhase::Cancelled;
+            run.push_plan_change(PlanChange {
+                rev,
+                kind: PlanChangeKind::Initial,
+                at_ms: unix_ms_now(),
+                after_node: None,
+                reason: note.to_owned(),
+                trigger: None,
+                prompt_chars: None,
+                response_chars: None,
+                added: Vec::new(),
+                changed: Vec::new(),
+                removed: Vec::new(),
+                tasks_added: 0,
+                tasks_changed: 0,
+                tasks_removed: 0,
+                applied: false,
+                error: None,
+                response_excerpt: None,
+                decided_by: None,
+            });
+            save_run(&self.workspace_root, run).err()
+        };
+        if let Some(error) = save_error {
+            self.push_system(format!("Could not save the cancelled plan: {error}"));
+        }
+        self.graph_approval_stale = None;
+        self.finish_linked_graph_todo(false, Some(note.to_owned()));
+    }
+
+    fn headless_active_run_phase(&self) -> GraphRunPhase {
+        self.graph_session
+            .as_ref()
+            .map(|session| session.run().phase)
+            .or_else(|| self.last_graph_run.as_ref().map(|run| run.phase))
+            .unwrap_or(GraphRunPhase::Active)
+    }
+
+    fn headless_record_waiting_gate_note(&mut self, note: &str) {
+        let change = |run: &mut GraphRun| {
+            let rev = next_plan_change_rev(run);
+            let after_node = run.waiting_gate_node.clone();
+            run.push_plan_change(PlanChange {
+                rev,
+                kind: PlanChangeKind::Initial,
+                at_ms: unix_ms_now(),
+                after_node,
+                reason: note.to_owned(),
+                trigger: None,
+                prompt_chars: None,
+                response_chars: None,
+                added: Vec::new(),
+                changed: Vec::new(),
+                removed: Vec::new(),
+                tasks_added: 0,
+                tasks_changed: 0,
+                tasks_removed: 0,
+                applied: false,
+                error: None,
+                response_excerpt: None,
+                decided_by: None,
+            });
+        };
+        let save_error = if let Some(session) = self
+            .graph_session
+            .as_mut()
+            .filter(|session| session.run().phase == GraphRunPhase::WaitingGate)
+        {
+            change(session.run_mut());
+            let run = session.run().clone();
+            let err = save_run(&self.workspace_root, &run).err();
+            self.last_graph_run = Some(run);
+            err
+        } else if let Some(run) = self
+            .last_graph_run
+            .as_mut()
+            .filter(|run| run.phase == GraphRunPhase::WaitingGate)
+        {
+            change(run);
+            save_run(&self.workspace_root, run).err()
+        } else {
+            return;
+        };
+        if let Some(error) = save_error {
+            self.push_system(format!("Could not save the gated run: {error}"));
+        }
+    }
+
+    fn headless_outcome_exit_7(
+        &self,
+        conversation_id: &str,
+        agent: Option<String>,
+        note: &str,
+        text: String,
+    ) -> HeadlessOutcome {
+        let graph_id = self
+            .graph_session
+            .as_ref()
+            .map(|session| session.run().plan.id.clone())
+            .or_else(|| self.last_graph_run.as_ref().map(|run| run.plan.id.clone()));
+        let (triage, plan) = self.headless_plan_snapshot();
+        HeadlessOutcome {
+            ok: false,
+            exit_code: dmuxai::agent_api::exit::APPROVAL_REQUIRED,
+            conversation_id: conversation_id.to_owned(),
+            agent,
+            graph_id,
+            text,
+            messages: Vec::new(),
+            error: Some(note.to_owned()),
+            todo: None,
+            triage,
+            plan,
+        }
+    }
+
+    fn headless_submit_prompt(&mut self, req: &HeadlessRequest) {
+        if req.prompt.trim_start().starts_with('/')
+            && !req.prompt.trim_start().starts_with("//")
+            && !first_token_is_path(req.prompt.trim_start())
+        {
+            self.input = req.prompt.clone();
+            self.submit_prompt();
+            return;
+        }
+        if req.agent.is_some() {
+            let agent = self.adapters[self.selected].agent();
+            self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::Agent);
+            return;
+        }
+        let agent = self.adapters[self.selected].agent();
+        if self.refuse_plan_gate_prompt(req.prompt.clone()) {
+            return;
+        }
+        self.begin_user_prompt_turn();
+        if self
+            .settings
+            .graph_allowed_runners
+            .as_ref()
+            .is_some_and(|runners| runners.is_empty())
+        {
+            self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::NoAllowedRunners);
+            return;
+        }
+        self.start_judge_turn(agent, req.prompt.clone());
+    }
+
+    fn headless_idle_action(
+        &mut self,
+        req: &HeadlessRequest,
+        conversation_id: &str,
+        agent_label: Option<String>,
+        approved_plan: bool,
+    ) -> HeadlessIdleAction {
+        let phase = self.headless_active_run_phase();
+        if phase == GraphRunPhase::WaitingGate {
+            self.headless_record_waiting_gate_note(HEADLESS_GATE_NOTE);
+            let text = self
+                .messages
+                .iter()
+                .rev()
+                .find(|message| matches!(message.role, Role::System) && !message.local_only)
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            return HeadlessIdleAction::Exit(Box::new(self.headless_outcome_exit_7(
+                conversation_id,
+                agent_label,
+                HEADLESS_GATE_NOTE,
+                text,
+            )));
+        }
+        if phase == GraphRunPhase::AwaitingApproval {
+            if req.approve_plan && !approved_plan {
+                if let Err(error) = self.approve_awaiting_plan(DecisionBy::Cli) {
+                    let message = Self::plan_decision_notice(error);
+                    return HeadlessIdleAction::Exit(Box::new(HeadlessOutcome {
+                        ok: false,
+                        exit_code: 1,
+                        conversation_id: conversation_id.to_owned(),
+                        agent: agent_label,
+                        graph_id: self.last_graph_run.as_ref().map(|run| run.plan.id.clone()),
+                        text: String::new(),
+                        messages: Vec::new(),
+                        error: Some(message),
+                        todo: None,
+                        triage: None,
+                        plan: None,
+                    }));
+                }
+                return HeadlessIdleAction::ContinueAfterApprove;
+            }
+            // Without --approve-plan, or a second gate after the approved plan
+            // (a sensitive replan revision): stop with exit 7, never exit 0.
+            if !req.approve_plan || approved_plan {
+                let (_, plan) = self.headless_plan_snapshot();
+                let text = plan
+                    .as_ref()
+                    .map(Self::headless_plan_text)
+                    .unwrap_or_default();
+                self.headless_cancel_awaiting_plan(HEADLESS_APPROVAL_NOTE);
+                return HeadlessIdleAction::Exit(Box::new(self.headless_outcome_exit_7(
+                    conversation_id,
+                    agent_label,
+                    HEADLESS_APPROVAL_NOTE,
+                    text,
+                )));
+            }
+        }
+        HeadlessIdleAction::Done
+    }
+
     /// Runs a prompt or to-do headlessly without terminal I/O (SPEC-agent-api FR-761, FR-762).
     pub async fn run_headless(
         &mut self,
@@ -10037,6 +10315,8 @@ impl App {
                     messages: Vec::new(),
                     error: Some(format!("unknown agent '{agent_str}'")),
                     todo: None,
+                    triage: None,
+                    plan: None,
                 };
             };
             let target_agent = adapter.agent();
@@ -10057,10 +10337,18 @@ impl App {
                     messages: Vec::new(),
                     error: Some(format!("runner '{runner_id}' is not in allowed_runners")),
                     todo: None,
+                    triage: None,
+                    plan: None,
                 };
             }
             self.selected = adapter_index(target_agent);
-        } else if !req.graph {
+        } else if let Some(default) = self.settings.routing_default_agent.as_deref()
+            && let Some(agent) = runner_from_str(default)
+        {
+            self.selected = adapter_index(agent);
+        }
+
+        if req.agent.is_none() {
             let target_agent = self.adapters[self.selected].agent();
             let runner_id = runner_name(target_agent);
             if let Some(allowed) = &self.settings.graph_allowed_runners
@@ -10079,6 +10367,8 @@ impl App {
                     messages: Vec::new(),
                     error: Some(format!("runner '{runner_id}' is not in allowed_runners")),
                     todo: None,
+                    triage: None,
+                    plan: None,
                 };
             }
         }
@@ -10097,6 +10387,8 @@ impl App {
                 messages: Vec::new(),
                 error: Some(msg),
                 todo: None,
+                triage: None,
+                plan: None,
             };
         }
 
@@ -10113,60 +10405,8 @@ impl App {
 
         let start_msg_count = self.messages.len();
 
-        if let Some(ref todo_id) = req.todo_id {
-            let mode = if req.graph {
-                RunMode::Graph
-            } else {
-                RunMode::Agent {
-                    agent: runner_name(self.adapters[self.selected].agent()).to_owned(),
-                }
-            };
-            if let Err(err) = self.run_todo(todo_id, mode) {
-                let (exit_code, msg) = match err {
-                    RunTodoError::NotFound => (3, "to-do not found".to_owned()),
-                    RunTodoError::UnknownAgent(agent) => (3, format!("unknown agent '{agent}'")),
-                    RunTodoError::AlreadyRunning => (4, "to-do is already running".to_owned()),
-                    RunTodoError::Busy(msg) => (4, msg),
-                    RunTodoError::Forbidden(msg) => (5, msg),
-                    RunTodoError::Missing(msg) => (3, msg),
-                    RunTodoError::Invalid(msg) => (2, msg),
-                    RunTodoError::Internal(msg) => (6, msg),
-                };
-                return HeadlessOutcome {
-                    ok: false,
-                    exit_code,
-                    conversation_id: self.conversation_id.as_str().to_owned(),
-                    agent: Some(runner_name(self.adapters[self.selected].agent()).to_owned()),
-                    graph_id: None,
-                    text: String::new(),
-                    messages: Vec::new(),
-                    error: Some(msg),
-                    todo: None,
-                };
-            }
-        } else if req.prompt.trim_start().starts_with('/')
-            && !req.prompt.trim_start().starts_with("//")
-            && !first_token_is_path(req.prompt.trim_start())
-        {
-            self.input = req.prompt.clone();
-            self.submit_prompt();
-        } else {
-            let agent = self.adapters[self.selected].agent();
-            self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::Agent);
-        }
-
-        let is_sync_slash = req.todo_id.is_none()
-            && req.prompt.trim_start().starts_with('/')
-            && !req.prompt.trim_start().starts_with("//")
-            && !first_token_is_path(req.prompt.trim_start());
-
-        let mut turn_started = req.todo_id.is_some()
-            || is_sync_slash
-            || !self.busy_agents.is_empty()
-            || self.graph_session.is_some()
-            || self.pending_summary.is_some()
-            || !self.deferred_turns.is_empty();
-
+        let mut approved_plan = false;
+        let mut prompt_submitted = false;
         let mut last_session_heartbeat = Instant::now();
         let mut last_busy_tick = Instant::now();
         let mut last_publish = Instant::now();
@@ -10174,95 +10414,188 @@ impl App {
         let mut dirty = false;
         let mut had_agent_error = false;
         let mut last_graph_id: Option<String> = None;
-        let mut cancelled = false;
+        let mut cancelled;
 
         loop {
-            if cancel.load(Ordering::Relaxed) {
-                cancelled = true;
-                for &agent in &self.busy_agents {
-                    let idx = adapter_index(agent);
-                    if idx < self.adapters.len() {
-                        let _ = self.adapters[idx].cancel();
+            if !prompt_submitted {
+                if let Some(ref todo_id) = req.todo_id {
+                    let mode = if req.graph {
+                        RunMode::Graph
+                    } else {
+                        RunMode::Agent {
+                            agent: runner_name(self.adapters[self.selected].agent()).to_owned(),
+                        }
+                    };
+                    if let Err(err) = self.run_todo(todo_id, mode) {
+                        let (exit_code, msg) = match err {
+                            RunTodoError::NotFound => (3, "to-do not found".to_owned()),
+                            RunTodoError::UnknownAgent(agent) => {
+                                (3, format!("unknown agent '{agent}'"))
+                            }
+                            RunTodoError::AlreadyRunning => {
+                                (4, "to-do is already running".to_owned())
+                            }
+                            RunTodoError::Busy(msg) => (4, msg),
+                            RunTodoError::Forbidden(msg) => (5, msg),
+                            RunTodoError::Missing(msg) => (3, msg),
+                            RunTodoError::Invalid(msg) => (2, msg),
+                            RunTodoError::Internal(msg) => (6, msg),
+                        };
+                        return HeadlessOutcome {
+                            ok: false,
+                            exit_code,
+                            conversation_id: self.conversation_id.as_str().to_owned(),
+                            agent: Some(
+                                runner_name(self.adapters[self.selected].agent()).to_owned(),
+                            ),
+                            graph_id: None,
+                            text: String::new(),
+                            messages: Vec::new(),
+                            error: Some(msg),
+                            todo: None,
+                            triage: None,
+                            plan: None,
+                        };
                     }
+                } else {
+                    self.headless_submit_prompt(&req);
                 }
-                let drain_start = Instant::now();
-                while (!self.busy_agents.is_empty()
-                    || self.graph_session.is_some()
-                    || self.pending_summary.is_some()
-                    || !self.deferred_turns.is_empty())
-                    && drain_start.elapsed() < Duration::from_secs(5)
-                {
-                    self.drain_dashboard_commands();
-                    let drain = self.drain_agent_events();
-                    if drain.errored {
-                        had_agent_error = true;
-                    }
-                    self.tick();
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                break;
+                prompt_submitted = true;
             }
 
-            if last_session_heartbeat.elapsed() >= Duration::from_secs(5) {
-                if let Err(error) = self.engine.touch_session() {
-                    self.push_system(format!(
-                        "Could not refresh the DmuxAI runtime session: {error}"
-                    ));
-                }
-                last_session_heartbeat = Instant::now();
-                dirty = true;
-            }
+            let is_sync_slash = req.todo_id.is_none()
+                && req.prompt.trim_start().starts_with('/')
+                && !req.prompt.trim_start().starts_with("//")
+                && !first_token_is_path(req.prompt.trim_start());
 
-            if last_busy_tick.elapsed() >= Duration::from_secs(1) {
-                if self.tick() {
-                    dirty = true;
-                }
-                last_busy_tick = Instant::now();
-            }
-
-            let cmd_changed = self.drain_dashboard_commands();
-            let drain = self.drain_agent_events();
-            if drain.errored {
-                had_agent_error = true;
-            }
-            dirty |= cmd_changed || drain.changed || self.dirty;
-            self.dirty = false;
-
-            dashboard_dirty |= drain.changed || dirty;
-            let busy = !self.busy_agents.is_empty();
-            if drain.completed
-                || (dashboard_dirty && last_publish.elapsed() >= DASHBOARD_PUBLISH_MIN_INTERVAL)
-                || (busy && last_publish.elapsed() >= DASHBOARD_BUSY_INTERVAL)
-            {
-                self.publish_dashboard();
-                last_publish = Instant::now();
-                dashboard_dirty = false;
-            }
-
-            if let Some(session) = &self.graph_session {
-                last_graph_id = Some(session.run().plan.id.clone());
-            }
-
-            if !self.busy_agents.is_empty()
+            let mut turn_started = req.todo_id.is_some()
+                || is_sync_slash
+                || approved_plan
+                || !self.busy_agents.is_empty()
                 || self.graph_session.is_some()
                 || self.pending_summary.is_some()
-                || !self.deferred_turns.is_empty()
-            {
-                turn_started = true;
+                || !self.deferred_turns.is_empty();
+
+            cancelled = false;
+
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    cancelled = true;
+                    for &agent in &self.busy_agents {
+                        let idx = adapter_index(agent);
+                        if idx < self.adapters.len() {
+                            let _ = self.adapters[idx].cancel();
+                        }
+                    }
+                    let drain_start = Instant::now();
+                    while (!self.busy_agents.is_empty()
+                        || self.graph_session.is_some()
+                        || self.pending_summary.is_some()
+                        || !self.deferred_turns.is_empty())
+                        && drain_start.elapsed() < Duration::from_secs(5)
+                    {
+                        self.drain_dashboard_commands();
+                        let drain = self.drain_agent_events();
+                        if drain.errored {
+                            had_agent_error = true;
+                        }
+                        self.tick();
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    break;
+                }
+
+                if last_session_heartbeat.elapsed() >= Duration::from_secs(5) {
+                    if let Err(error) = self.engine.touch_session() {
+                        self.push_system(format!(
+                            "Could not refresh the DmuxAI runtime session: {error}"
+                        ));
+                    }
+                    last_session_heartbeat = Instant::now();
+                    dirty = true;
+                }
+
+                if last_busy_tick.elapsed() >= Duration::from_secs(1) {
+                    if self.tick() {
+                        dirty = true;
+                    }
+                    last_busy_tick = Instant::now();
+                }
+
+                let cmd_changed = self.drain_dashboard_commands();
+                let drain = self.drain_agent_events();
+                if drain.errored {
+                    had_agent_error = true;
+                }
+                dirty |= cmd_changed || drain.changed || self.dirty;
+                self.dirty = false;
+
+                dashboard_dirty |= drain.changed || dirty;
+                let busy = !self.busy_agents.is_empty();
+                if drain.completed
+                    || (dashboard_dirty && last_publish.elapsed() >= DASHBOARD_PUBLISH_MIN_INTERVAL)
+                    || (busy && last_publish.elapsed() >= DASHBOARD_BUSY_INTERVAL)
+                {
+                    self.publish_dashboard();
+                    last_publish = Instant::now();
+                    dashboard_dirty = false;
+                }
+
+                if let Some(session) = &self.graph_session {
+                    last_graph_id = Some(session.run().plan.id.clone());
+                }
+
+                if !self.busy_agents.is_empty()
+                    || self.graph_session.is_some()
+                    || self.pending_summary.is_some()
+                    || !self.deferred_turns.is_empty()
+                {
+                    turn_started = true;
+                }
+
+                let any_busy = !self.busy_agents.is_empty();
+                let has_graph = self.graph_session.is_some();
+                let has_summary = self.pending_summary.is_some();
+                let has_deferred = !self.deferred_turns.is_empty();
+                let headless_pause = self
+                    .graph_session
+                    .as_ref()
+                    .map(|session| session.run().phase)
+                    .or_else(|| self.last_graph_run.as_ref().map(|run| run.phase))
+                    .is_some_and(|phase| {
+                        matches!(
+                            phase,
+                            GraphRunPhase::WaitingGate | GraphRunPhase::AwaitingApproval
+                        )
+                    });
+
+                if (headless_pause || (!any_busy && !has_graph && !has_summary && !has_deferred))
+                    && (turn_started || self.messages.len() > start_msg_count)
+                {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
 
-            let any_busy = !self.busy_agents.is_empty();
-            let has_graph = self.graph_session.is_some();
-            let has_summary = self.pending_summary.is_some();
-            let has_deferred = !self.deferred_turns.is_empty();
-
-            if (!any_busy && !has_graph && !has_summary && !has_deferred)
-                && (turn_started || self.messages.len() > start_msg_count)
-            {
+            if cancelled {
                 break;
             }
 
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let agent_label = Some(runner_name(self.adapters[self.selected].agent()).to_owned());
+            match self.headless_idle_action(
+                &req,
+                &headless_conversation_id,
+                agent_label,
+                approved_plan,
+            ) {
+                HeadlessIdleAction::Exit(outcome) => return *outcome,
+                HeadlessIdleAction::ContinueAfterApprove => {
+                    approved_plan = true;
+                    continue;
+                }
+                HeadlessIdleAction::Done => break,
+            }
         }
 
         let mut mapped_messages = Vec::new();
@@ -10341,6 +10674,7 @@ impl App {
             (true, 0, None)
         };
 
+        let (triage, plan) = self.headless_plan_snapshot();
         HeadlessOutcome {
             ok,
             exit_code,
@@ -10351,6 +10685,8 @@ impl App {
             messages: mapped_messages,
             error,
             todo,
+            triage,
+            plan,
         }
     }
 
@@ -19522,6 +19858,7 @@ mod tests {
             agent: Some("codex".to_owned()),
             mode: Some(ExecutionMode::Ask),
             graph: false,
+            approve_plan: false,
             todo_id: None,
         };
         let outcome = app.run_headless(req, cancel).await;
@@ -19550,6 +19887,7 @@ mod tests {
             agent: Some("nonexistent_agent".to_owned()),
             mode: None,
             graph: false,
+            approve_plan: false,
             todo_id: None,
         };
         let outcome = app.run_headless(req, Arc::clone(&cancel)).await;
@@ -19564,6 +19902,7 @@ mod tests {
             agent: Some("codex".to_owned()),
             mode: None,
             graph: false,
+            approve_plan: false,
             todo_id: None,
         };
         let outcome = app.run_headless(req, cancel).await;
@@ -19613,6 +19952,7 @@ mod tests {
             agent: Some("codex".to_owned()),
             mode: None,
             graph: false,
+            approve_plan: false,
             todo_id: None,
         };
         let outcome = app.run_headless(req, cancel).await;
@@ -19648,6 +19988,7 @@ mod tests {
             agent: Some("codex".to_owned()),
             mode: Some(ExecutionMode::Ask),
             graph: false,
+            approve_plan: false,
             todo_id: None,
         };
         let outcome = tokio::time::timeout(Duration::from_secs(20), app.run_headless(req, cancel))
@@ -20984,6 +21325,7 @@ mod tests {
             agent: Some("cursor".to_owned()),
             mode: Some(ExecutionMode::Ask),
             graph: false,
+            approve_plan: false,
             todo_id: None,
         };
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

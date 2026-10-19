@@ -21,7 +21,7 @@ print usage to stderr and exit `2`.
 
 | Command | Flags | stdout |
 | --- | --- | --- |
-| `dmuxai run <prompt\|->` | `--agent ID`, `--mode ask\|plan\|implement`, `--graph`, `--json` | Final agent text, or one JSON object with `--json` |
+| `dmuxai run <prompt\|->` | `--agent ID`, `--mode ask\|plan\|implement`, `--approve-plan`, `--graph` (no-op), `--json` | Final agent text, or one JSON object with `--json` |
 | `dmuxai todo add <title>` | `--body TEXT`, `--json` | The created to-do (TSV or JSON) |
 | `dmuxai todo list` | `--status open\|running\|done`, `--json` | To-dos (TSV lines or a JSON array) |
 | `dmuxai todo run <id>` | `--agent ID \| --graph`, `--mode M`, `--json` | Same as `run`; the to-do is marked running then done/open |
@@ -31,8 +31,12 @@ print usage to stderr and exit `2`.
 
 Notes:
 
-- `run` accepts either `--agent` or `--graph`, not both. `--` ends flag parsing
+- `run` accepts either `--agent` or `--graph`, not both. `--graph` is accepted as a
+  no-op (legacy scripts); it does not change judge routing. `--` ends flag parsing
   (`dmuxai run -- --literal prompt`).
+- Without `--agent`, headless `run` uses the same judge → plan path as the TUI.
+  Exit `7` means plan approval (`--approve-plan`) or a sensitive gate (not bypassable
+  by `--approve-plan`). JSON includes `triage` and, when applicable, `plan`.
 - `dmuxai run -` reads the prompt from stdin:
   `echo "summarize the repo" | dmuxai run - --agent agy --json`.
 - With `--json`, stdout carries only the JSON document(s); warnings/diagnostics go
@@ -53,6 +57,8 @@ Notes:
   ],
   "error": null,
   "todo": null,
+  "triage": { "route": "simple", "source": "judge", "reason": "…", "runner": "agy", "model": "…", "elapsed_ms": 42 },
+  "plan": null,
   "events": { "first_seq": 12, "last_seq": 14 }
 }
 ```
@@ -68,6 +74,8 @@ Notes:
 | `messages` | array | `{ role, agent, content }` per message |
 | `error` | string\|null | Failure detail when `ok` is false |
 | `todo` | object\|null | To-do after a `todo run` |
+| `triage` | object\|null | Judge/fallback/override verdict (`source`: `judge`, `fallback`, or `override`) when a graph run started |
+| `plan` | object\|null | `{steps, tasks}` when a plan was produced (including exit 7 awaiting approval) |
 | `events` | object | `first_seq`/`last_seq` written for this run; both `null` when the run wrote no events |
 
 Failures with `--json` print `{ "ok": false, "exit_code": <n>, "error": "<message>" }`.
@@ -83,6 +91,7 @@ Failures with `--json` print `{ "ok": false, "exit_code": <n>, "error": "<messag
 | 4 | Busy / conflict (already running) |
 | 5 | Runner not in `[graph] allowed_runners` |
 | 6 | Internal error |
+| 7 | Plan approval or sensitive gate required (headless); use `--approve-plan` for plans only |
 | 130 | Cancelled (Ctrl+C) |
 
 ### Examples
@@ -90,6 +99,8 @@ Failures with `--json` print `{ "ok": false, "exit_code": <n>, "error": "<messag
 ```bash
 dmuxai status --json
 dmuxai run "summarize this repo" --agent agy --json
+dmuxai run "ship the feature" --json
+dmuxai run "ship the feature" --json --approve-plan
 dmuxai run "plan the migration" --graph --json
 dmuxai todo add "Write docs" --body "API.md first" --json
 dmuxai todo list --status open --json

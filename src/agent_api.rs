@@ -17,6 +17,8 @@ pub mod exit {
     pub const CONFLICT: i32 = 4;
     pub const FORBIDDEN: i32 = 5;
     pub const INTERNAL: i32 = 6;
+    /// Plan approval or sensitive gate required in headless mode (FR-947, FR-944).
+    pub const APPROVAL_REQUIRED: i32 = 7;
     pub const CANCELLED: i32 = 130;
 }
 

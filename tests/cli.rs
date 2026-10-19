@@ -185,3 +185,175 @@ fn workspace_dir_flag_sets_workspace() {
     );
     assert_eq!(lines[0], format!("error: -C {missing_str}: does not exist"));
 }
+
+/// Headless plan gate helpers (TC-955 / FR-947, FR-944). Unix only (fake-agent.sh).
+#[cfg(unix)]
+mod plan_gate {
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output, Stdio};
+
+    use serde_json::Value;
+
+    pub struct Sandbox {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        workspace: PathBuf,
+    }
+
+    impl Sandbox {
+        pub fn new(config: &str) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path().to_path_buf();
+            let workspace = root.join("ws");
+            for sub in ["ws", "state", "cfg", "home"] {
+                std::fs::create_dir_all(root.join(sub)).unwrap();
+            }
+            std::fs::write(workspace.join("dmuxai.toml"), config).unwrap();
+            Self {
+                _dir: dir,
+                root,
+                workspace,
+            }
+        }
+
+        pub fn workspace(&self) -> &std::path::Path {
+            &self.workspace
+        }
+
+        pub fn run(&self, args: &[&str]) -> Output {
+            Command::new(env!("CARGO_BIN_EXE_dmuxai"))
+                .args(args)
+                .current_dir(&self.workspace)
+                .env("DMUXAI_WORKSPACE", &self.workspace)
+                .env("DMUXAI_STATE_DIR", self.root.join("state"))
+                .env("XDG_CONFIG_HOME", self.root.join("cfg"))
+                .env("APPDATA", self.root.join("cfg"))
+                .env("HOME", self.root.join("home"))
+                .env_remove("DMUXAI_WEB_TOKEN")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("execute dmuxai")
+        }
+    }
+
+    pub fn stdout_json(output: &Output) -> Value {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "stdout is not one JSON document ({e}): {stdout}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    }
+
+    pub fn plan_gate_config(behavior: &str) -> String {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("fake-agent.sh");
+        format!(
+            r#"[routing]
+default_agent = "fake"
+
+[graph]
+allowed_runners = ["fake"]
+
+[[agents.custom]]
+name = "fake"
+command = ["sh", "{fixture}", "{behavior}", "{{prompt}}"]
+prompt_via = "arg"
+output = "text"
+default_model = "composer-2.5"
+timeout_secs = 60
+"#,
+            fixture = fixture.display().to_string().replace('\\', "/"),
+            behavior = behavior,
+        )
+    }
+}
+
+/// TC-955: complex plan needs `--approve-plan`; `--agent` sets triage override.
+#[cfg(unix)]
+#[test]
+fn run_complex_needs_approve_plan() {
+    use dmuxai::graph::{GraphRunPhase, load_run};
+    use plan_gate::{Sandbox, plan_gate_config, stdout_json};
+
+    let sandbox = Sandbox::new(&plan_gate_config("plan"));
+    let first = sandbox.run(&["run", "ship the feature", "--json"]);
+    let json = stdout_json(&first);
+    assert_eq!(first.status.code(), Some(7), "{json}");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["exit_code"], 7);
+    assert_eq!(json["error"].as_str(), Some("approval required (headless)"));
+    assert_eq!(json["triage"]["source"].as_str(), Some("judge"));
+    assert_eq!(json["triage"]["route"].as_str(), Some("complex"));
+    assert!(
+        json["plan"]["steps"]
+            .as_array()
+            .is_some_and(|s| s.len() >= 2)
+    );
+    let graph_id = json["graph_id"].as_str().expect("graph_id");
+    let run = load_run(sandbox.workspace(), graph_id).expect("saved run");
+    assert_eq!(run.phase, GraphRunPhase::Cancelled);
+    assert!(
+        run.plan_history
+            .iter()
+            .any(|change| change.reason == "approval required (headless)")
+    );
+
+    let approved = sandbox.run(&["run", "ship the feature", "--json", "--approve-plan"]);
+    let approved_json = stdout_json(&approved);
+    assert_eq!(approved.status.code(), Some(0), "{approved_json}");
+    assert_eq!(approved_json["ok"], true);
+    let graph_id = approved_json["graph_id"].as_str().expect("graph_id");
+    let run = load_run(sandbox.workspace(), graph_id).expect("approved run");
+    assert_eq!(
+        run.approval
+            .as_ref()
+            .and_then(|approval| approval.decided_by),
+        Some(dmuxai::graph::DecisionBy::Cli)
+    );
+
+    let direct = sandbox.run(&["run", "ship the feature", "--json", "--agent", "fake"]);
+    let direct_json = stdout_json(&direct);
+    assert_eq!(direct_json["triage"]["source"].as_str(), Some("override"));
+}
+
+/// FR-944: sensitive keyword in headless simple run exits 7 at the gate.
+#[cfg(unix)]
+#[test]
+fn run_sensitive_gate_exits_7_headless() {
+    use dmuxai::graph::{GraphRunPhase, load_run};
+    use plan_gate::{Sandbox, plan_gate_config, stdout_json};
+
+    let sandbox = Sandbox::new(&plan_gate_config("judge-simple"));
+    let output = sandbox.run(&["run", "deploy the app", "--json"]);
+    let json = stdout_json(&output);
+    assert_eq!(output.status.code(), Some(7), "{json}");
+    assert_eq!(
+        json["error"].as_str(),
+        Some("sensitive step needs /graph continue (headless)")
+    );
+    let graph_id = json["graph_id"].as_str().expect("graph_id");
+    let run = load_run(sandbox.workspace(), graph_id).expect("gated run");
+    assert_eq!(run.phase, GraphRunPhase::WaitingGate);
+    assert!(
+        run.plan_history
+            .iter()
+            .any(|change| change.reason == "sensitive step needs /graph continue (headless)")
+    );
+
+    let with_approve = sandbox.run(&["run", "deploy the app", "--json", "--approve-plan"]);
+    let approve_json = stdout_json(&with_approve);
+    assert_eq!(with_approve.status.code(), Some(7), "{approve_json}");
+    assert_eq!(
+        approve_json["error"].as_str(),
+        Some("sensitive step needs /graph continue (headless)")
+    );
+    let graph_id = approve_json["graph_id"].as_str().expect("graph_id");
+    let gated = load_run(sandbox.workspace(), graph_id).expect("gated run");
+    assert_eq!(gated.phase, GraphRunPhase::WaitingGate);
+}
