@@ -77,6 +77,11 @@ pub struct ThemeToml {
 }
 
 impl Theme {
+    /// Warning/highlight color for fallback labels and badges (accent, else yellow).
+    pub fn warning_color(&self) -> Color {
+        self.accent.unwrap_or(Color::Yellow)
+    }
+
     /// Apply serialized TOML colors onto this theme, keeping current colors for any
     /// missing or invalid color name.
     pub fn apply_toml(&mut self, t: &ThemeToml) {

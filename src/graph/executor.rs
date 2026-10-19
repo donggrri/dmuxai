@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use super::replan::node_send_prompt;
 use super::types::{GraphNode, GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, NodeRole};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,8 @@ pub struct GraphRunSession {
     run: GraphRun,
     active: HashSet<String>,
     node_turns: HashMap<String, String>,
+    /// Ready nodes waiting on adapter availability (FR-976); skip in [`schedule`].
+    deferred_ready: HashSet<String>,
 }
 
 pub type GraphSession = GraphRunSession;
@@ -33,7 +36,16 @@ impl GraphRunSession {
             run,
             active: HashSet::new(),
             node_turns: HashMap::new(),
+            deferred_ready: HashSet::new(),
         }
+    }
+
+    pub fn mark_node_deferred(&mut self, node_id: &str) {
+        self.deferred_ready.insert(node_id.to_owned());
+    }
+
+    pub fn clear_node_deferred(&mut self, node_id: &str) {
+        self.deferred_ready.remove(node_id);
     }
 
     pub fn run(&self) -> &GraphRun {
@@ -60,11 +72,98 @@ impl GraphRunSession {
         if let Some(node_id) = self.run.waiting_gate_node.clone() {
             if let Some(node) = self.run.plan.nodes.iter_mut().find(|n| n.id == node_id) {
                 node.status = GraphNodeStatus::Ready;
+                node.requires_gate = false;
             }
             self.run.waiting_gate_node = None;
             self.run.phase = GraphRunPhase::Active;
         }
         self.schedule()
+    }
+
+    pub fn assignment_for_node(&self, node_id: &str) -> Option<NodeAssignment> {
+        let node = self.run.plan.nodes.iter().find(|node| node.id == node_id)?;
+        if node.role == NodeRole::Orchestrate {
+            return None;
+        }
+        Some(NodeAssignment {
+            node_id: node.id.clone(),
+            runner: node.runner.clone(),
+            model_id: node.model_id.clone(),
+            prompt: node_send_prompt(&node.job, &self.run.plan),
+            role: node.role,
+        })
+    }
+
+    /// Undo a [`GraphAction::StartNode`] held for a pending replan turn (FR-956).
+    /// Unlike [`revert_node_start`], the node stays eligible on the next [`schedule`].
+    pub fn undo_replan_held_start(&mut self, node_id: &str) {
+        self.active.remove(node_id);
+        if let Some(node) = self
+            .run
+            .plan
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        {
+            if node.status == GraphNodeStatus::Running {
+                node.status = GraphNodeStatus::Ready;
+            }
+            if node.attempt == 0 {
+                node.started_at_ms = None;
+            }
+        }
+    }
+
+    pub fn revert_node_start(&mut self, node_id: &str) {
+        self.deferred_ready.insert(node_id.to_owned());
+        self.active.remove(node_id);
+        if let Some(node) = self
+            .run
+            .plan
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        {
+            if node.status == GraphNodeStatus::Running {
+                node.status = GraphNodeStatus::Ready;
+            }
+            if node.attempt == 0 {
+                node.started_at_ms = None;
+            }
+        }
+    }
+
+    /// Mark a ready node running again after a deferred start (FR-976).
+    pub fn ensure_node_running(&mut self, node_id: &str) {
+        if self.active.contains(node_id) {
+            return;
+        }
+        if let Some(node) = self.run.plan.nodes.iter_mut().find(|node| {
+            node.id == node_id
+                && (node.status == GraphNodeStatus::Ready
+                    || node.status == GraphNodeStatus::Pending)
+        }) {
+            node.status = GraphNodeStatus::Running;
+            if node.started_at_ms.is_none() {
+                node.started_at_ms = Some(unix_now_ms());
+            }
+            node.finished_at_ms = None;
+            self.active.insert(node_id.to_owned());
+            self.deferred_ready.remove(node_id);
+        }
+    }
+
+    /// Terminal failure: no node stays running in the persisted run (FR-977).
+    pub fn finalize_failure(&mut self) {
+        if self.run.phase != GraphRunPhase::Failed {
+            self.run.phase = GraphRunPhase::Failed;
+        }
+        self.active.clear();
+        for node in &mut self.run.plan.nodes {
+            if node.status == GraphNodeStatus::Running {
+                node.status = GraphNodeStatus::Skipped;
+            }
+        }
     }
 
     pub fn on_node_finished(&mut self, node_id: &str, success: bool) -> Vec<GraphAction> {
@@ -113,6 +212,14 @@ impl GraphRunSession {
             .filter(|node| node.status == GraphNodeStatus::Completed)
             .map(|node| node.id.clone())
             .collect();
+        // FR-949 / OQ-934: one turn per runner, so a ready step waits while
+        // another step of this run is running on the same runner.
+        let mut active_runners: HashSet<String> = plan
+            .nodes
+            .iter()
+            .filter(|node| self.active.contains(&node.id))
+            .map(|node| node.runner.clone())
+            .collect();
 
         let mut index = 0usize;
         while index < self.run.plan.nodes.len() {
@@ -124,6 +231,10 @@ impl GraphRunSession {
                 index += 1;
                 continue;
             }
+            if self.deferred_ready.contains(&node_id) {
+                index += 1;
+                continue;
+            }
             if role == NodeRole::Orchestrate {
                 index += 1;
                 continue;
@@ -132,15 +243,20 @@ impl GraphRunSession {
                 index += 1;
                 continue;
             }
-            if self.active.len() + actions.len() >= max_parallel {
+            if active_runners.contains(&self.run.plan.nodes[index].runner) {
+                index += 1;
+                continue;
+            }
+            if running + actions.len() >= max_parallel {
                 break;
             }
 
+            let job = self.run.plan.nodes[index].job.clone();
             let assignment = NodeAssignment {
                 node_id: node_id.clone(),
                 runner: self.run.plan.nodes[index].runner.clone(),
                 model_id: self.run.plan.nodes[index].model_id.clone(),
-                prompt: self.run.plan.nodes[index].job.clone(),
+                prompt: node_send_prompt(&job, &self.run.plan),
                 role,
             };
 
@@ -159,6 +275,7 @@ impl GraphRunSession {
             }
             self.run.plan.nodes[index].finished_at_ms = None;
             self.active.insert(node_id);
+            active_runners.insert(self.run.plan.nodes[index].runner.clone());
             actions.push(GraphAction::StartNode(assignment));
             index += 1;
         }
@@ -355,6 +472,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Completed,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -368,6 +486,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -381,6 +500,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -394,6 +514,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -407,6 +528,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -428,7 +550,9 @@ mod tests {
             limits: GraphLimits {
                 max_parallel: 1,
                 max_retries: 1,
+                ..GraphLimits::default()
             },
+            tasks: Vec::new(),
         };
 
         let run = GraphRun {
@@ -436,6 +560,7 @@ mod tests {
             conversation_id: "conv-1".to_owned(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         };
         let mut session = GraphRunSession::new(run);
 
@@ -511,6 +636,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Completed,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -524,6 +650,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -537,6 +664,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -545,7 +673,9 @@ mod tests {
             limits: GraphLimits {
                 max_parallel: 1,
                 max_retries: 1,
+                ..GraphLimits::default()
             },
+            tasks: Vec::new(),
         };
 
         let run = GraphRun {
@@ -553,6 +683,7 @@ mod tests {
             conversation_id: "conv-1".to_owned(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         };
         let session = GraphRunSession::new(run);
 
@@ -576,6 +707,144 @@ mod tests {
         assert_eq!(
             session.assignment_line(),
             "impl-1:impl→cursor:composer-2.5 | research-1:research→agy:composer-2.5"
+        );
+    }
+
+    struct PlanCtx {
+        available: Vec<String>,
+    }
+
+    impl PlanCtx {
+        fn new(runners: &[&str]) -> Self {
+            Self {
+                available: runners.iter().map(|name| (*name).to_owned()).collect(),
+            }
+        }
+
+        fn context<'a>(&'a self, prompt: &'a str) -> crate::graph::PlanContext<'a> {
+            crate::graph::PlanContext {
+                user_prompt: prompt,
+                available_runners: &self.available,
+                runner_allowed: &|_runner| true,
+                effective_model: &|runner: &str| match runner {
+                    "grok" => Some("grok-4.7".to_owned()),
+                    "opencode" => Some("opencode/glm-5.3-flash-free".to_owned()),
+                    _ => Some(crate::model_policy::default_model().to_owned()),
+                },
+                validate_model: &crate::model_policy::validate_model_for_runner,
+            }
+        }
+    }
+
+    fn plan_from_json(json: &str, max_parallel: usize) -> GraphPlan {
+        let doc = crate::graph::parse_plan(json).unwrap();
+        let ctx = PlanCtx::new(&["grok", "opencode"]);
+        let mut plan = crate::graph::validate_plan(&doc, &ctx.context("parallel work")).unwrap();
+        plan.limits.max_parallel = max_parallel;
+        plan
+    }
+
+    fn session_for(plan: GraphPlan) -> GraphRunSession {
+        GraphRunSession::new(GraphRun {
+            plan,
+            conversation_id: "conv-1".to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+            ..Default::default()
+        })
+    }
+
+    fn started_ids(actions: &[GraphAction]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                GraphAction::StartNode(assignment) => Some(assignment.node_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn node_status(session: &GraphRunSession, id: &str) -> GraphNodeStatus {
+        session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .unwrap()
+            .status
+    }
+
+    // TC-965 / FR-949: independent roots start together up to max_parallel,
+    // and a join step starts only after all its parents complete.
+    #[test]
+    fn schedule_runs_independent_steps_in_parallel() {
+        let json = r#"{"tasks":[
+            {"id":"task-1","title":"a","done_check":"d","size":"small"},
+            {"id":"task-2","title":"b","done_check":"d","size":"small"},
+            {"id":"task-3","title":"c","done_check":"d","size":"small","depends_on":["task-1","task-2"]}
+        ],"steps":[
+            {"id":"a","role":"research","job":"root a","runner":"grok","model":"grok-4.7","depends_on":[],"task":"task-1"},
+            {"id":"b","role":"research","job":"root b","runner":"opencode","model":"opencode/glm-5.3-flash-free","depends_on":[],"task":"task-2"},
+            {"id":"c","role":"test","job":"join c","runner":"grok","model":"grok-4.7","depends_on":["a","b"],"task":"task-3"}
+        ]}"#;
+
+        let mut session = session_for(plan_from_json(json, 2));
+        assert_eq!(
+            session.run().plan.edges,
+            vec![
+                GraphEdge {
+                    from: "a".to_owned(),
+                    to: "c".to_owned(),
+                },
+                GraphEdge {
+                    from: "b".to_owned(),
+                    to: "c".to_owned(),
+                },
+            ]
+        );
+
+        let actions = session.schedule();
+        assert_eq!(started_ids(&actions), vec!["a", "b"]);
+        assert_eq!(node_status(&session, "c"), GraphNodeStatus::Pending);
+
+        let actions = session.on_node_finished("a", true);
+        assert!(started_ids(&actions).is_empty(), "c waits for b");
+        assert_eq!(node_status(&session, "c"), GraphNodeStatus::Pending);
+
+        let actions = session.on_node_finished("b", true);
+        assert_eq!(started_ids(&actions), vec!["c"]);
+
+        // max_parallel = 1 runs the same DAG one step at a time.
+        let mut serial = session_for(plan_from_json(json, 1));
+        assert_eq!(started_ids(&serial.schedule()), vec!["a"]);
+        assert_eq!(started_ids(&serial.on_node_finished("a", true)), vec!["b"]);
+        assert_eq!(started_ids(&serial.on_node_finished("b", true)), vec!["c"]);
+    }
+
+    // TC-966 / FR-949 / OQ-934: one turn per runner, so a ready step on a busy
+    // runner waits instead of failing.
+    #[test]
+    fn same_runner_steps_wait_for_runner() {
+        let json = r#"{"tasks":[
+            {"id":"task-1","title":"a","done_check":"d","size":"small"},
+            {"id":"task-2","title":"b","done_check":"d","size":"small"}
+        ],"steps":[
+            {"id":"a","role":"research","job":"first","runner":"grok","model":"grok-4.7","depends_on":[],"task":"task-1"},
+            {"id":"b","role":"research","job":"second","runner":"grok","model":"grok-4.7","depends_on":[],"task":"task-2"}
+        ]}"#;
+
+        let mut session = session_for(plan_from_json(json, 2));
+        assert_eq!(started_ids(&session.schedule()), vec!["a"]);
+        assert_eq!(node_status(&session, "b"), GraphNodeStatus::Pending);
+
+        let actions = session.on_node_finished("a", true);
+        assert_eq!(started_ids(&actions), vec!["b"]);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, GraphAction::Failed(_))),
+            "waiting is not a failure"
         );
     }
 }

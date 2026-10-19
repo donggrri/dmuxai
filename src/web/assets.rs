@@ -1280,4 +1280,239 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(bytes.as_ref(), SIDEBAR_RESIZE_JS.as_bytes());
     }
+
+    fn js_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+        let from = src
+            .find(start)
+            .unwrap_or_else(|| panic!("missing JS marker {:?}", start));
+        let tail = &src[from..];
+        let to = tail
+            .find(end)
+            .unwrap_or_else(|| panic!("missing JS marker {:?} after {:?}", end, start));
+        &tail[..to]
+    }
+
+    // TC-952 (FR-945, UX-933): route selector beside send; POST /api/prompt `route`.
+    #[test]
+    fn prompt_route_selector_present() {
+        assert!(SESSION_JS.contains("var PROMPT_ROUTES = ["));
+        for label in ["Auto", "Plan", "Direct"] {
+            assert!(
+                SESSION_JS.contains(&format!("label: '{label}'")),
+                "missing route label {label}"
+            );
+        }
+        for value in ["auto", "plan", "direct"] {
+            assert!(
+                SESSION_JS.contains(&format!("value: '{value}'")),
+                "missing route value {value}"
+            );
+        }
+        assert!(SESSION_JS.contains("picker('Route', 'route'"));
+        assert!(SESSION_JS.contains("data-parity"));
+        assert!(SESSION_JS.contains("body.route = ui.route.value"));
+        assert!(SESSION_JS.contains("ui.route.value !== 'auto'"));
+        assert!(SESSION_JS.contains("/api/prompt"));
+        assert!(SESSION_CSS.contains(".session-send-col"));
+    }
+
+    // TC-957 (UX-930): `#graph-judge-line` from `graph.triage.line`, text nodes only.
+    #[test]
+    fn judge_line_asset() {
+        assert!(INDEX_HTML.contains("id=\"graph-judge-line\""));
+        assert!(APP_JS.contains("function renderGraphJudgeLine"));
+        assert!(APP_JS.contains("function fillJudgeLineContent"));
+        assert!(APP_JS.contains("graph.triage"));
+        assert!(APP_JS.contains("triage.line"));
+        assert!(APP_JS.contains("judge-fallback-word"));
+        assert!(APP_JS.contains("replaceChildren"));
+        assert!(APP_JS.contains("createTextNode"));
+        assert!(APP_CSS.contains(".graph-judge-line"));
+        assert!(APP_CSS.contains(".judge-fallback-word"));
+
+        let judge_js = js_between(
+            APP_JS,
+            "function fillJudgeLineContent",
+            "function renderGraphJudgeLine",
+        );
+        assert!(
+            !judge_js.contains("innerHTML"),
+            "judge line must not use innerHTML"
+        );
+        let render_js = js_between(
+            APP_JS,
+            "function renderGraphJudgeLine",
+            "// UX-932 / FR-965",
+        );
+        assert!(
+            !render_js.contains("innerHTML"),
+            "renderGraphJudgeLine must not use innerHTML"
+        );
+    }
+
+    // TC-960 (UX-932, UX-933, INT-930): approval panel, plan commands, parity ids.
+    #[test]
+    fn approval_panel_asset() {
+        assert!(INDEX_HTML.contains("id=\"graph-approval\""));
+        assert!(SESSION_JS.contains("parityButton"));
+        assert!(SESSION_JS.contains("classList.add"));
+        assert!(APP_JS.contains("planGateParityButton('Approve', 'plan-approve', 'btn-primary'"));
+        assert!(APP_JS.contains("planGateParityButton('Edit', 'plan-edit', ''"));
+        assert!(APP_JS.contains("planGateParityButton('Reject', 'plan-reject', 'btn-danger'"));
+        assert!(APP_JS.contains("viewOnly: isDashboardViewOnly()"));
+        assert!(APP_JS.contains("syncApprovalPanelButtonStates"));
+        assert!(APP_JS.contains("panel.querySelectorAll('button[data-plan-gate]')"));
+        assert!(APP_JS.contains("position: idx"));
+        assert!(APP_JS.contains("if (idx > 0) {"));
+        assert!(INDEX_HTML.contains("data-parity=\"plan-history\""));
+        assert!(APP_JS.contains("historyBtn.disabled = false"));
+        assert!(INDEX_HTML.contains("data-parity=\"plan-replan\""));
+        assert!(APP_JS.contains("window.dmuxaiPlanGate"));
+        assert!(APP_JS.contains("function renderApprovalPanel"));
+        assert!(APP_JS.contains("approvalPanelRenderKey"));
+        assert!(APP_JS.contains("approvalPanelLastKey"));
+        assert!(APP_JS.contains("approvalPanelFocusFeedback"));
+        let approval_render_js = js_between(
+            APP_JS,
+            "function renderApprovalPanel",
+            "// UX-936: task checklist below the swimlane",
+        );
+        assert!(
+            !approval_render_js.contains("|| editOpen"),
+            "do not refocus feedback textarea on every render when editOpen"
+        );
+        assert!(APP_JS.contains("command: 'plan_decision'"));
+        assert!(APP_JS.contains("command: 'plan_task_edit'"));
+        assert!(APP_JS.contains("graph.phase !== 'awaiting_approval'"));
+        assert!(APP_JS.contains("graph-approval-header"));
+        assert!(APP_JS.contains("graph-approval-error"));
+        assert!(APP_JS.contains("action: 'rename'"));
+        assert!(APP_JS.contains("action: 'split'"));
+        assert!(APP_JS.contains("action: 'merge'"));
+        assert!(APP_JS.contains("action: 'delete'"));
+        assert!(APP_JS.contains("action: 'move'"));
+        assert!(APP_JS.contains("position: idx + 2"));
+        assert!(APP_JS.contains("parse_graph_task_edit"));
+        assert!(APP_CSS.contains(".graph-approval"));
+
+        let plan_gate_js = js_between(APP_JS, "// UX-932 / FR-965", "var lastRenderedAgentsKey");
+        assert!(
+            !plan_gate_js.contains("innerHTML"),
+            "plan approval and task-edit paths must not use innerHTML"
+        );
+        assert!(
+            plan_gate_js.contains("textContent") || plan_gate_js.contains("createTextNode"),
+            "plan gate UI must render via text nodes"
+        );
+    }
+
+    // TC-996 (UX-936): task checklist panel below the swimlane.
+    #[test]
+    fn task_checklist_asset() {
+        assert!(INDEX_HTML.contains("id=\"task-checklist\""));
+        assert!(INDEX_HTML.contains("data-parity=\"task-checklist\""));
+        assert!(INDEX_HTML.contains("graph-stage-layout"));
+        let canvas_pos = INDEX_HTML
+            .find("id=\"graph-canvas\"")
+            .expect("graph-canvas in index");
+        let checklist_pos = INDEX_HTML
+            .find("id=\"task-checklist\"")
+            .expect("task-checklist in index");
+        assert!(
+            canvas_pos < checklist_pos,
+            "task checklist must follow graph canvas in index.html"
+        );
+        assert!(APP_JS.contains("function renderTaskChecklist"));
+        assert!(APP_JS.contains("function taskChecklistStatusIcon"));
+        assert!(APP_JS.contains("graph.tasks"));
+        assert!(APP_JS.contains("node-task-highlight"));
+        assert!(APP_JS.contains("task.done_check"));
+        assert!(APP_JS.contains("function taskChecklistStatusClass"));
+        assert!(APP_JS.contains("task-checklist-row-expanded"));
+        assert!(APP_JS.contains("tasksForChecklist"));
+        assert!(APP_JS.contains("data-task-id"));
+        assert!(APP_JS.contains("function tasksForChecklist"));
+        assert!(APP_JS.contains("list.insertBefore(rowNode"));
+        assert!(!APP_JS.contains("taskChecklistEverVisible"));
+        assert!(!APP_CSS.contains("max-width: 280px"));
+        assert!(APP_CSS.contains("flex-direction: column"));
+        assert!(
+            !APP_CSS.contains(".graph-stage-layout {\n    flex-direction: row"),
+            "graph-stage-layout must not switch to row at wide widths"
+        );
+        assert!(
+            APP_CSS.contains(
+                "grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr))"
+            )
+        );
+        assert!(!APP_JS.contains("autoFitGraphAfterTaskChecklistLayout"));
+        for status in ["pending", "running", "done", "failed"] {
+            assert!(
+                APP_CSS.contains(&format!(".task-checklist-status-{status}")),
+                "missing status style for {status}"
+            );
+        }
+        for icon in ["\\u25CB", "\\u25D0", "\\u2713", "\\u2717"] {
+            assert!(
+                APP_JS.contains(icon),
+                "taskChecklistStatusIcon must define icon {icon}"
+            );
+        }
+        assert!(APP_CSS.contains(".task-checklist"));
+        assert!(APP_CSS.contains(".graph-stage-layout"));
+        assert!(APP_CSS.contains(".node-task-highlight"));
+
+        let checklist_js = js_between(
+            APP_JS,
+            "// UX-936: task checklist below the swimlane",
+            "// UX-934: replan + revision history in the graph header.",
+        );
+        assert!(
+            !checklist_js.contains("innerHTML"),
+            "task checklist must not use innerHTML"
+        );
+        assert!(
+            checklist_js.contains("task-checklist-label") && checklist_js.contains("done_check"),
+            "task title and done_check must render via DOM helpers"
+        );
+    }
+
+    // TC-979 (UX-934, UX-935): revision badges on nodes and plan-history list.
+    #[test]
+    fn revision_badges_and_history_asset() {
+        assert!(APP_JS.contains("node.rev_change"));
+        assert!(APP_JS.contains("'card-rev-badge card-rev-badge-' + revChange"));
+        assert!(APP_JS.contains("revChange === 'added'"));
+        assert!(APP_JS.contains("revChange === 'changed'"));
+        assert!(APP_JS.contains("function graphNodesRevKey"));
+        assert!(INDEX_HTML.contains("id=\"graph-replan\""));
+        assert!(INDEX_HTML.contains("data-parity=\"plan-replan\""));
+        assert!(INDEX_HTML.contains("id=\"plan-history\""));
+        assert!(INDEX_HTML.contains("data-parity=\"plan-history\""));
+        assert!(INDEX_HTML.contains("id=\"graph-plan-history\""));
+        assert!(APP_JS.contains("function renderPlanHistoryPanel"));
+        assert!(APP_JS.contains("graph.plan_history"));
+        assert!(APP_JS.contains("command: 'plan_replan'"));
+        assert!(APP_JS.contains("panel.scrollTop = scrollTop"));
+        for theme in ["dark", "light"] {
+            assert!(
+                APP_CSS.contains(&format!(":root[data-theme=\"{theme}\"]")),
+                "missing {theme} palette for rev badges"
+            );
+        }
+        assert!(APP_CSS.contains(".card-rev-badge-added"));
+        assert!(APP_CSS.contains(".card-rev-badge-changed"));
+        assert!(APP_CSS.contains(".graph-plan-history-list"));
+
+        let history_js = js_between(
+            APP_JS,
+            "function renderPlanHistoryPanel",
+            "function renderGraphHeaderActions",
+        );
+        assert!(
+            !history_js.contains("innerHTML"),
+            "plan history panel must not use innerHTML"
+        );
+        assert!(history_js.contains("createTextNode"));
+    }
 }

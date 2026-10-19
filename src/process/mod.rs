@@ -2,6 +2,11 @@ use std::{ffi::OsString, io, path::PathBuf};
 
 use tokio::process::Command;
 
+/// FR-1010: child agent/runner processes must not inherit the dashboard token.
+pub fn strip_dashboard_env(cmd: &mut std::process::Command) {
+    cmd.env_remove("DMUXAI_WEB_TOKEN");
+}
+
 /// Resolves a provider executable without invoking a shell.
 ///
 /// The environment override is shared across platforms. Only the fallback
@@ -44,12 +49,15 @@ pub fn headless_command(program: PathBuf) -> Command {
         // a console-subsystem provider executable on Windows.
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+        strip_dashboard_env(command.as_std_mut());
         command
     }
 
     #[cfg(not(windows))]
     {
-        Command::new(program)
+        let mut command = Command::new(program);
+        strip_dashboard_env(command.as_std_mut());
+        command
     }
 }
 

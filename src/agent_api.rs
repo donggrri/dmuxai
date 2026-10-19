@@ -17,6 +17,8 @@ pub mod exit {
     pub const CONFLICT: i32 = 4;
     pub const FORBIDDEN: i32 = 5;
     pub const INTERNAL: i32 = 6;
+    /// Plan approval or sensitive gate required in headless mode (FR-947, FR-944).
+    pub const APPROVAL_REQUIRED: i32 = 7;
     pub const CANCELLED: i32 = 130;
 }
 
@@ -246,7 +248,8 @@ pub fn status_json(workspace_root: &Path) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "agents": agents,
         "allowed_runners": settings.graph_allowed_runners,
-        "graph_enabled": settings.graph_enabled,
+        // FR-930: graph engineering is always on; the deprecated setting no longer exists.
+        "graph_enabled": true,
         "todos": todos,
         "last_graph": last_graph,
         "events": { "path": events_path.display().to_string(), "last_seq": last_seq },

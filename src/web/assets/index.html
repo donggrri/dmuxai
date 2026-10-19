@@ -68,8 +68,17 @@
           <button id="view-list" type="button" class="toggle-btn" aria-pressed="false">List</button>
           <button id="view-graph" type="button" class="toggle-btn on" aria-pressed="true">Graph</button>
         </div>
+        <div id="graph-header-actions" class="graph-header-actions">
+          <button id="graph-replan" type="button" class="btn btn-small" data-parity="plan-replan" hidden>Replan</button>
+          <div class="graph-history-wrap">
+            <button id="plan-history" type="button" class="btn btn-small" data-parity="plan-history" aria-expanded="false" hidden>Revisions</button>
+            <div id="graph-plan-history" class="graph-plan-history" hidden role="region" aria-label="Plan revisions"></div>
+          </div>
+        </div>
       </div>
+      <p id="graph-judge-line" class="graph-judge-line" hidden></p>
       <p id="graph-prompt" class="graph-prompt"></p>
+      <div id="graph-approval" class="graph-approval" hidden aria-label="Plan approval"></div>
       <div class="graph-summary">
         <div id="graph-bar" class="bar" title="graph progress by node status"></div>
         <span id="graph-percent" class="graph-percent">0%</span>
@@ -81,7 +90,10 @@
         <span class="graph-hint">wheel to zoom &middot; drag to pan &middot; click a step for details</span>
       </div>
       <div id="graph-stage" class="graph-stage">
-        <div id="graph-canvas" class="graph-canvas"></div>
+        <div class="graph-stage-layout">
+          <div id="graph-canvas" class="graph-canvas"></div>
+          <aside id="task-checklist" class="task-checklist" data-parity="task-checklist" hidden aria-label="Task checklist"></aside>
+        </div>
         <aside id="graph-detail" class="graph-detail" hidden aria-label="Node details"></aside>
       </div>
       <div class="graph-legend">

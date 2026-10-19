@@ -563,6 +563,8 @@ pub fn build_custom_command(
     #[cfg(unix)]
     command.process_group(0);
 
+    crate::process::strip_dashboard_env(command.as_std_mut());
+
     Ok(command)
 }
 
@@ -822,6 +824,7 @@ async fn run_models_output(
         .current_dir(cwd)
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    crate::process::strip_dashboard_env(command.as_std_mut());
     // Test fixtures set GROK_FAKE_* on the preset. Production grok env is empty.
     // Opencode keeps its models command free of OPENCODE_CONFIG substitution.
     if is_builtin_grok(spec) {
