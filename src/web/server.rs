@@ -1598,7 +1598,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
-    use crate::graph::{GraphEdge, GraphNodeStatus, GraphRunPhase, NodeRole};
+    use crate::graph::{GraphEdge, GraphNodeStatus, GraphRunPhase, NodeRole, PlannerCalls};
     use crate::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
     use crate::todo::{Todo, TodoStore};
     use crate::web::auth::generate_token;
@@ -1874,11 +1874,22 @@ mod tests {
                 deps: Vec::new(),
                 layout: None,
                 detail: NodeDetail::default(),
+                rev_change: None,
+                task: None,
             }],
             edges: vec![GraphEdge {
                 from: "a".to_string(),
                 to: "b".to_string(),
             }],
+            triage: None,
+            approval: None,
+            plan_history: Vec::new(),
+            tasks: Vec::new(),
+            planner_calls: PlannerCalls::default(),
+            planner_io: Vec::new(),
+            turns: Vec::new(),
+            earlier_turns: 0,
+            follow_up: Vec::new(),
         };
         hub.publish(Vec::new(), Some(test_graph));
 

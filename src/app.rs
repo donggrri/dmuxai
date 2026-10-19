@@ -55,16 +55,16 @@ use dmuxai::{
     events::EventDraft,
     graph::{
         AllowedRunner, Approval, ApprovalState, DecisionBy, FallbackCause, GraphAction, GraphNode,
-        GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, GraphRunSession, GraphStore,
-        MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind, PanelLineKind, PlanChange,
-        PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode, PlanPromptRequest,
-        PlanRevision, PlanStep, PlanTask, PlannerCalls, PlannerIo, PlannerIoKind, ReplanDoc,
-        ReplanTrigger, Route, TaskEdit, Triage, TriageSource, apply_replan, approval_panel_lines,
-        budget_allows, build_judge_prompt, build_plan_prompt, build_replan_prompt,
-        cap_plan_response_excerpt, cap_replan_step_summary, cap_revision_raw, diff_plan_steps,
-        diff_plan_tasks, fallback_plan, graph_plan_from_revision_steps, heuristic_route,
-        judge_line_text, judging_line_text, next_plan_change_rev, parse_plan, parse_replan,
-        parse_replan_marker, parse_verdict, plan_json_for_edit, replan_allowed,
+        GraphNodeStatus, GraphPlan, GraphRun, GraphRunListCache, GraphRunPhase, GraphRunSession,
+        GraphStore, MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind, PanelLineKind,
+        PlanChange, PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode,
+        PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls, PlannerIo,
+        PlannerIoKind, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage, TriageSource,
+        apply_replan, approval_panel_lines, budget_allows, build_judge_prompt, build_plan_prompt,
+        build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary, cap_revision_raw,
+        diff_plan_steps, diff_plan_tasks, fallback_plan, graph_plan_from_revision_steps,
+        heuristic_route, judge_line_text, judging_line_text, next_plan_change_rev, parse_plan,
+        parse_replan, parse_replan_marker, parse_verdict, plan_json_for_edit, replan_allowed,
         replan_revision_steps, revision_needs_approval, save_run, strip_replan_marker,
         task_counter_text, validate_plan,
     },
@@ -1103,6 +1103,7 @@ pub struct App {
     all_details_expanded: bool,
     dashboard: Option<dmuxai::web::DashboardHub>,
     last_graph_run: Option<dmuxai::graph::GraphRun>,
+    graph_run_list_cache: GraphRunListCache,
     /// UX-930: monotonic id for the current user turn; judge line triage is
     /// shown only while its stored seq matches.
     user_turn_seq: u32,
@@ -1329,6 +1330,7 @@ impl App {
             all_details_expanded: false,
             dashboard: None,
             last_graph_run: None,
+            graph_run_list_cache: GraphRunListCache::default(),
             user_turn_seq: 0,
             judge_reason_capture_turn: None,
             judge_reason_line: None,
@@ -9604,6 +9606,28 @@ impl App {
         }
     }
 
+    /// FR-955: conversation runs for the dashboard swimlane (cached store listing).
+    fn conversation_runs_for_snapshot(&mut self) -> Vec<GraphRun> {
+        let conversation_id = self.conversation_id.as_str();
+        let store = GraphStore::new(&self.workspace_root);
+        let mut runs: Vec<GraphRun> = store
+            .list_runs_cached(&mut self.graph_run_list_cache)
+            .iter()
+            .filter(|run| run.conversation_id == conversation_id)
+            .cloned()
+            .collect();
+        if let Some(live) = self.last_graph_run.as_ref()
+            && live.conversation_id == conversation_id
+        {
+            if let Some(index) = runs.iter().position(|run| run.plan.id == live.plan.id) {
+                runs[index] = live.clone();
+            } else {
+                runs.push(live.clone());
+            }
+        }
+        runs
+    }
+
     /// Publishes agent and graph state to the attached dashboard, if any (FR-530).
     ///
     /// The latest graph run is remembered so the dashboard keeps showing the
@@ -9652,10 +9676,11 @@ impl App {
             self.last_graph_run = Some(run);
         }
 
+        let conversation_runs = self.conversation_runs_for_snapshot();
         let mut graph = self
             .last_graph_run
             .as_ref()
-            .map(dmuxai::web::snapshot_from_run);
+            .map(|run| dmuxai::web::snapshot_from_run_with_conversation(run, &conversation_runs));
 
         if let Some(graph) = graph.as_mut() {
             for node in &mut graph.nodes {

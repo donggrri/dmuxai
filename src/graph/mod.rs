@@ -31,7 +31,7 @@ pub use replan::{
     parse_replan_marker, replan_allowed, replan_revision_steps, replans_left,
     revision_needs_approval, strip_replan_marker,
 };
-pub use store::{GraphStore, load_run, save_run};
+pub use store::{GraphRunListCache, GraphStore, load_run, save_run};
 pub use tasks::{
     TaskEdit, TaskState, apply_task_delete, apply_task_merge, apply_task_move, apply_task_rename,
     diff_plan_tasks, task_counts, task_status,

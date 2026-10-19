@@ -29,7 +29,8 @@ pub use snapshot::{
     SESSION_MESSAGE_MAX_BYTES, SESSION_TRANSCRIPT_MAX_BYTES, SESSION_TRANSCRIPT_MAX_MESSAGES,
     SESSION_TRUNCATED_MARKER, SNAPSHOT_SCHEMA, SessionAgent, SessionCommandInfo,
     SessionConversation, SessionMessage, SessionModel, SessionView, SnapshotSource, UiTheme,
-    cap_session_message, cap_session_transcript, snapshot_from_run, truncate_with_ellipsis,
+    cap_session_message, cap_session_transcript, snapshot_from_run,
+    snapshot_from_run_with_conversation, truncate_with_ellipsis,
 };
 
 /// Default dashboard port (OQ-520). If it is taken, an ephemeral port is used.

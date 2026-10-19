@@ -1,9 +1,17 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use super::types::GraphRun;
+
+/// Reuses [`GraphStore::list_runs`] when the graphs directory mtime is unchanged.
+#[derive(Debug, Default)]
+pub struct GraphRunListCache {
+    dir_mtime: Option<SystemTime>,
+    runs: Vec<GraphRun>,
+}
 
 pub struct GraphStore {
     root: PathBuf,
@@ -44,6 +52,18 @@ impl GraphStore {
             }
         }
         runs
+    }
+
+    /// Lists runs once per directory modification time (FR-955 snapshot builds).
+    pub fn list_runs_cached<'a>(&self, cache: &'a mut GraphRunListCache) -> &'a [GraphRun] {
+        let mtime = fs::metadata(&self.root)
+            .and_then(|meta| meta.modified())
+            .ok();
+        if cache.dir_mtime != mtime {
+            cache.runs = self.list_runs();
+            cache.dir_mtime = mtime;
+        }
+        &cache.runs
     }
 
     /// FR-954: how many runs are already stored for `conversation_id`.

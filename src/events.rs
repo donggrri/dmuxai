@@ -892,9 +892,20 @@ mod tests {
                 deps: Vec::new(),
                 layout: None,
                 detail: crate::web::NodeDetail::default(),
+                rev_change: None,
+                task: None,
             }],
             edges: Vec::new(),
             layers: 0,
+            triage: None,
+            approval: None,
+            plan_history: Vec::new(),
+            tasks: Vec::new(),
+            planner_calls: crate::graph::PlannerCalls::default(),
+            planner_io: Vec::new(),
+            turns: Vec::new(),
+            earlier_turns: 0,
+            follow_up: Vec::new(),
         }
     }
 

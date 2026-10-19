@@ -78,7 +78,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   UX-931, UX-937, FR-975. TC-958, TC-997.
   Files: `src/graph/triage_view.rs`, `src/app.rs`.
   Done when: `plan_approval_panel_renders`, `task_counter_and_grouped_panel_render` green.
-- [ ] P14 — Snapshot: `triage`, `approval`, `plan_history`, `rev_change`, `turns` + `follow_up`, `tasks` with derived status.
+- [x] P14 — (#67 agent-planned graph 42781e37: 5 steps; composer-2.5; review claude-sonnet-5-5-high APPROVE; nits fixed in P14b: run-cache invalidation by file mtime/len, follow_up edges carry run ids, snapshot clones only the last 21 runs) Snapshot: `triage`, `approval`, `plan_history`, `rev_change`, `turns` + `follow_up`, `tasks` with derived status.
   FR-955, FR-962, UX-936 (data). TC-957, TC-977 (snapshot), TC-990, TC-996 (snapshot).
   Files: `src/web/snapshot.rs`.
   Done when: `cargo test --locked --lib web::snapshot` green incl. `snapshot_carries_task_checklist`.
