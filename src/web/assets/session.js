@@ -667,6 +667,7 @@
     },
     '/summarize': function () { askText('Focus (optional)', function (t) { sendPrompt(t ? '/summarize ' + t : '/summarize'); }); },
     '/compact': function () { askText('Focus (optional)', function (t) { sendPrompt(t ? '/compact ' + t : '/compact'); }); },
+    '/plan': function () { askText('Prompt (plan first, then approve)', function (t) { if (t) { sendPrompt('/plan ' + t); } }, true); },
     '/direct': function () { askText('Prompt (runs without planning)', function (t) { if (t) { sendPrompt('/direct ' + t); } }, true); },
     '/share': function () { openShare(); },
     '/image': function () { askText('Image path in the workspace', function (t) { if (t) { sendPrompt('/image ' + t); } }, true); },
@@ -700,7 +701,7 @@
   var PARITY_IDS = {
     '/agent': 'agent', '/mode': 'mode', '/effort': 'effort', '/status': 'status', '/quit': 'quit',
     '/new': 'new', '/conversations': 'conversations', '/resume': 'resume', '/summarize': 'summarize',
-    '/compact': 'compact', '/direct': 'direct', '/share': 'share', '/image': 'image', '/details': 'details', '/graph': 'graph',
+    '/compact': 'compact', '/plan': 'plan', '/direct': 'direct', '/share': 'share', '/image': 'image', '/details': 'details', '/graph': 'graph',
     '/remember': 'remember', '/memory': 'memory'
   };
 

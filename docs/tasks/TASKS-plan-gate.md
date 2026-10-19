@@ -40,7 +40,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   Also (from P03b review): tests `defer_keeps_running_node_mapping` (two ready cursor nodes, `max_parallel` 2) and `defer_timeout_ignores_wait_behind_real_turn`.
   Files: `src/app.rs`.
   Done when: `complex_verdict_starts_plan_turn`, `invalid_plan_gets_one_repair`, `plan_fallback_requires_approval` green.
-- [ ] P05 — `/plan` override, awaiting-approval blocks new prompts, stale records after restart.
+- [x] P05 — (composer-2.5 single turn via dmuxai cursor runner; review claude-sonnet-5-5-high APPROVE, nit fixed by hand: stale flag scoped to the restored plan id; open nits for P06: reject on stale run, trim before slash check, `//` escape guard, multiple stale awaiting records, startup stale notice) `/plan` override, awaiting-approval blocks new prompts, stale records after restart.
   FR-942, FR-945. TC-946, TC-947, TC-952 (app part).
   Files: `src/app.rs`, `src/web/parity.rs`.
   Done when: `awaiting_approval_blocks_new_prompts`, `stale_records_after_restart`, `slash_list_has_plan_and_direct` green.

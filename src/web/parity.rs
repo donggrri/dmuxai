@@ -114,6 +114,11 @@ pub const PARITY: &[ParityEntry] = &[
         action: "prompt",
     },
     ParityEntry {
+        tui: "/plan",
+        control: "plan",
+        action: "prompt",
+    },
+    ParityEntry {
         tui: "/direct",
         control: "direct",
         action: "prompt",

@@ -133,7 +133,12 @@ enum SlashAction {
     Remember,
     Memory,
     Direct,
+    Plan,
 }
+
+/// FR-942: refusal when a plan waits for approval before new sends.
+const PLAN_AWAITING_APPROVAL_MSG: &str =
+    "A plan is awaiting approval: approve, edit or reject it first";
 
 #[derive(Clone, Copy)]
 struct SlashCommand {
@@ -142,7 +147,7 @@ struct SlashCommand {
     action: SlashAction,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 16] = [
+const SLASH_COMMANDS: [SlashCommand; 17] = [
     SlashCommand {
         name: "/agent",
         description: "Switch the active agent",
@@ -152,6 +157,11 @@ const SLASH_COMMANDS: [SlashCommand; 16] = [
         name: "/mode",
         description: "Choose Ask, Plan, or Implement",
         action: SlashAction::Mode,
+    },
+    SlashCommand {
+        name: "/plan",
+        description: "Plan first, then ask for approval",
+        action: SlashAction::Plan,
     },
     SlashCommand {
         name: "/direct",
@@ -976,6 +986,9 @@ pub struct App {
     all_details_expanded: bool,
     dashboard: Option<dmuxai::web::DashboardHub>,
     last_graph_run: Option<dmuxai::graph::GraphRun>,
+    /// FR-942: plan id of a run restored at `awaiting_approval` after a
+    /// restart (no live agent turn behind it); approve is refused for it.
+    graph_approval_stale: Option<String>,
     pub(crate) dirty: bool,
     todo_store: Option<Arc<TodoStore>>,
     dashboard_commands: Option<mpsc::Receiver<DashboardCommand>>,
@@ -1186,6 +1199,7 @@ impl App {
             all_details_expanded: false,
             dashboard: None,
             last_graph_run: None,
+            graph_approval_stale: None,
             dirty: false,
             todo_store: None,
             dashboard_commands: None,
@@ -1214,6 +1228,7 @@ impl App {
         app.messages
             .push(Message::new(Role::System, welcome_message(&runners)));
         app.restore_snapshot(snapshot);
+        app.restore_graph_runs_on_startup();
         Ok(app)
     }
 
@@ -1545,6 +1560,9 @@ impl App {
                 "workspace switch in progress".to_owned(),
             ));
         }
+        if self.plan_gate_blocks_send() && Self::prompt_blocked_by_plan_gate(&text) {
+            return Err(RunTodoError::Busy(PLAN_AWAITING_APPROVAL_MSG.to_owned()));
+        }
         let target_agent = if let Some(ref agent_str) = agent {
             let runner_clean = agent_str.trim().to_ascii_lowercase();
             let adapter = self
@@ -1796,7 +1814,9 @@ impl App {
             .collect();
         commands.push(SessionCommandInfo {
             name: "/graph".to_owned(),
-            description: "Graph status, continue, or override with text".to_owned(),
+            description:
+                "Graph status, continue, approve, edit, reject, replan, or override with text"
+                    .to_owned(),
         });
 
         SessionView {
@@ -2292,6 +2312,7 @@ impl App {
             ),
             SlashAction::Memory => self.memory_command(""),
             SlashAction::Direct => self.push_system("Usage: /direct <prompt>"),
+            SlashAction::Plan => self.push_system("Usage: /plan <prompt>"),
         }
     }
 
@@ -3011,6 +3032,18 @@ impl App {
                     self.memory_command(&rest);
                     return;
                 }
+                "/plan" => {
+                    let rest = prompt.strip_prefix("/plan").unwrap_or("").trim().to_owned();
+                    if rest.is_empty() {
+                        self.push_system("Usage: /plan <prompt>");
+                    } else if self.refuse_plan_gate_prompt(prompt) {
+                        return;
+                    } else {
+                        let agent = self.adapters[self.selected].agent();
+                        self.submit_plan_run(rest, agent);
+                    }
+                    return;
+                }
                 "/direct" => {
                     let rest = prompt
                         .strip_prefix("/direct")
@@ -3019,6 +3052,8 @@ impl App {
                         .to_owned();
                     if rest.is_empty() {
                         self.push_system("Usage: /direct <prompt>");
+                    } else if self.refuse_plan_gate_prompt(prompt) {
+                        return;
                     } else {
                         let agent = self.adapters[self.selected].agent();
                         self.submit_direct_run(rest, agent, OverrideKind::Direct);
@@ -3033,6 +3068,14 @@ impl App {
                         self.continue_graph_gate();
                     } else if let Some(args) = rest.strip_prefix("override ") {
                         self.override_graph_node(args.trim());
+                    } else if rest == "approve" {
+                        if self.approval_is_stale() {
+                            self.push_system(
+                                "Cannot approve a plan restored after restart; use /graph reject.",
+                            );
+                        } else {
+                            self.show_graph_status();
+                        }
                     } else {
                         self.show_graph_status();
                     }
@@ -3047,6 +3090,9 @@ impl App {
         }
 
         if !prompt.trim_start().starts_with('/') {
+            if self.refuse_plan_gate_prompt(prompt.clone()) {
+                return;
+            }
             let agent = self.adapters[self.selected].agent();
             if self.busy_agents.contains(&agent) {
                 self.input = prompt;
@@ -3822,6 +3868,9 @@ impl App {
     /// FR-932: the judge turn is an internal read-only turn. Its text is
     /// buffered, never shown, and the user's mode is restored on every ending.
     fn start_judge_turn(&mut self, agent: Agent, prompt: String) {
+        if self.refuse_plan_gate_prompt(prompt.clone()) {
+            return;
+        }
         let index = adapter_index(agent);
         let judge_mode = if self.adapters[index]
             .validate_mode(ExecutionMode::Ask)
@@ -4006,6 +4055,7 @@ impl App {
                             pending.run_id,
                             pending.judge_calls,
                             elapsed_ms,
+                            None,
                         ),
                     },
                     Err(_) => self.triage_fallback(
@@ -4098,9 +4148,126 @@ impl App {
         }
     }
 
+    fn plan_gate_blocks_send(&self) -> bool {
+        self.pending_plan.is_some()
+            || self
+                .last_graph_run
+                .as_ref()
+                .is_some_and(|run| run.phase == GraphRunPhase::AwaitingApproval)
+    }
+
+    fn prompt_blocked_by_plan_gate(text: &str) -> bool {
+        if text.starts_with("//") {
+            return true;
+        }
+        if text.starts_with('/') {
+            let cmd = text.split_whitespace().next().unwrap_or(text);
+            matches!(cmd, "/plan" | "/direct")
+        } else {
+            true
+        }
+    }
+
+    /// FR-942: restore the prompt and show the refusal notice.
+    fn refuse_plan_gate_prompt(&mut self, prompt: String) -> bool {
+        if !self.plan_gate_blocks_send() {
+            return false;
+        }
+        self.input = prompt;
+        self.push_system(PLAN_AWAITING_APPROVAL_MSG.to_owned());
+        true
+    }
+
+    /// FR-942: reload interrupted graph runs and surface stale approval state.
+    fn restore_graph_runs_on_startup(&mut self) {
+        let conversation_id = self.conversation_id.as_str().to_owned();
+        let store = GraphStore::new(&self.workspace_root);
+        let mut awaiting: Option<GraphRun> = None;
+        for run in store.list_runs() {
+            if run.conversation_id != conversation_id.as_str() {
+                continue;
+            }
+            match run.phase {
+                GraphRunPhase::Triage | GraphRunPhase::Planning => {
+                    let mut cancelled = run;
+                    let run_id = cancelled.plan.id.clone();
+                    cancelled.phase = GraphRunPhase::Cancelled;
+                    if let Some(triage) = &mut cancelled.triage {
+                        triage.reason = "interrupted by restart".to_owned();
+                    }
+                    if let Err(error) = save_run(&self.workspace_root, &cancelled) {
+                        self.push_system(format!(
+                            "Could not save interrupted graph run {run_id}: {error}"
+                        ));
+                    }
+                }
+                GraphRunPhase::AwaitingApproval
+                    if awaiting.as_ref().is_none_or(|prev| {
+                        run.turn_index > prev.turn_index
+                            || (run.turn_index == prev.turn_index && run.plan.id > prev.plan.id)
+                    }) =>
+                {
+                    awaiting = Some(run);
+                }
+                _ => {}
+            }
+        }
+        if let Some(run) = awaiting {
+            self.graph_approval_stale = Some(run.plan.id.clone());
+            self.last_graph_run = Some(run);
+        }
+    }
+
+    /// FR-942: the current awaiting run is the one restored after restart.
+    fn approval_is_stale(&self) -> bool {
+        match (&self.graph_approval_stale, &self.last_graph_run) {
+            (Some(id), Some(run)) => run.plan.id == *id,
+            _ => false,
+        }
+    }
+
+    /// `/plan`: skip the judge and start a plan turn (FR-945).
+    fn submit_plan_run(&mut self, prompt: String, agent: Agent) {
+        if self.refuse_plan_gate_prompt(prompt.clone()) {
+            return;
+        }
+        if self
+            .pending_summary
+            .as_ref()
+            .is_some_and(|pending| pending.conversation_id == self.conversation_id)
+        {
+            self.input = prompt;
+            self.push_system("Another conversation summary is already running.");
+            return;
+        }
+        if self.busy_agents.contains(&agent) {
+            self.input = prompt;
+            self.push_system(format!(
+                "{agent} is busy; cancel the active turn before sending another prompt."
+            ));
+            return;
+        }
+        let run_id = Uuid::new_v4().to_string();
+        self.begin_planning(
+            prompt,
+            agent,
+            Route::Complex,
+            "override".to_owned(),
+            TriageSource::Override,
+            None,
+            run_id,
+            0,
+            0,
+            Some(OverrideKind::Plan),
+        );
+    }
+
     /// `/direct`, an explicit agent, or empty `allowed_runners`: a 1-node run
     /// with no judge turn (FR-930, FR-937).
     fn submit_direct_run(&mut self, prompt: String, agent: Agent, override_kind: OverrideKind) {
+        if self.refuse_plan_gate_prompt(prompt.clone()) {
+            return;
+        }
         if self
             .pending_summary
             .as_ref()
@@ -4261,7 +4428,11 @@ impl App {
         run_id: String,
         judge_calls: u32,
         elapsed_ms: u64,
+        override_kind: Option<OverrideKind>,
     ) {
+        if self.refuse_plan_gate_prompt(prompt.clone()) {
+            return;
+        }
         let model = match self.selected_run_model(agent) {
             Ok(model) => model,
             Err(error) => {
@@ -4313,6 +4484,7 @@ impl App {
                 ..Default::default()
             },
             None,
+            override_kind,
         );
     }
 
@@ -4440,6 +4612,7 @@ impl App {
         repair_errors: Vec<String>,
         planner_calls: PlannerCalls,
         user_saved_mode: Option<ExecutionMode>,
+        override_kind: Option<OverrideKind>,
     ) {
         if self.pending_plan.is_some() {
             self.park_fallback_plan(
@@ -4593,7 +4766,7 @@ impl App {
             reason: verdict_reason.clone(),
             source: triage_source,
             cause: triage_cause,
-            override_kind: None,
+            override_kind,
             runner: runner.clone(),
             model: model.clone(),
             elapsed_ms: triage_elapsed_ms,
@@ -4930,6 +5103,7 @@ impl App {
                                         ..Default::default()
                                     },
                                     Some(saved_mode),
+                                    None,
                                 );
                             }
                             Err(errors) => {
@@ -4989,6 +5163,7 @@ impl App {
                                 ..Default::default()
                             },
                             Some(saved_mode),
+                            None,
                         );
                     }
                     Err(errors) => {
@@ -6008,6 +6183,9 @@ impl App {
         }
         self.push_system(format!("Graph assignment: {}", self.graph_assignment_line));
         self.push_system(format!("Allowed runners: {allowed_str}"));
+        self.push_system(
+            "Plan gate: /graph approve · /graph edit <feedback> · /graph reject · /graph replan [note]",
+        );
         if self
             .graph_session
             .as_ref()
@@ -9778,8 +9956,10 @@ mod tests {
     }
 
     /// Like [`plan_gate_test_app`] but some agents reject the listed modes.
-    fn plan_gate_harness(unsupported: &[(Agent, ExecutionMode)]) -> PlanGateHarness {
-        let workspace = std::env::temp_dir().join(format!("dmuxai-plan-gate-{}", Uuid::new_v4()));
+    fn plan_gate_harness_in_workspace(
+        workspace: std::path::PathBuf,
+        unsupported: &[(Agent, ExecutionMode)],
+    ) -> PlanGateHarness {
         let _ = std::fs::create_dir_all(&workspace);
         let engine =
             ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
@@ -9823,6 +10003,29 @@ mod tests {
             cancelled,
             modes,
         }
+    }
+
+    fn plan_gate_harness(unsupported: &[(Agent, ExecutionMode)]) -> PlanGateHarness {
+        let workspace = std::env::temp_dir().join(format!("dmuxai-plan-gate-{}", Uuid::new_v4()));
+        plan_gate_harness_in_workspace(workspace, unsupported)
+    }
+
+    fn reach_awaiting_approval(h: &mut PlanGateHarness) {
+        let plan_req = complete_complex_judge(h);
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::TextDelta(valid_codex_plan_json().to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::Completed
+        )));
+        assert_eq!(
+            h.app.last_graph_run.as_ref().map(|run| run.phase).unwrap(),
+            GraphRunPhase::AwaitingApproval
+        );
     }
 
     fn find_cell_fg(app: &mut App, needle: &str) -> Option<Color> {
@@ -17779,6 +17982,149 @@ mod tests {
         assert!(last_system(&usage.app).contains("Usage: /direct"));
     }
 
+    // TC-952 / FR-945: `/plan` and `/direct` are listed for the TUI and session.
+    #[test]
+    fn slash_list_has_plan_and_direct() {
+        let plan = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/plan")
+            .expect("/plan in slash list");
+        assert_eq!(plan.description, "Plan first, then ask for approval");
+        let direct = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/direct")
+            .expect("/direct in slash list");
+        assert_eq!(
+            direct.description,
+            "Run on the selected agent without planning"
+        );
+
+        let (mut app, _) = test_app();
+        let session = app.session_view();
+        let names: Vec<&str> = session
+            .commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert!(names.contains(&"/plan"));
+        assert!(names.contains(&"/direct"));
+    }
+
+    // TC-946 / FR-942: awaiting approval blocks new sends, not other slash commands.
+    #[test]
+    fn awaiting_approval_blocks_new_prompts() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval(&mut h);
+        let sent_before = h.sent.lock().unwrap().len();
+
+        h.app.input = "another prompt".to_owned();
+        h.app.submit_prompt();
+        assert_eq!(h.app.input, "another prompt");
+        assert_eq!(h.sent.lock().unwrap().len(), sent_before);
+        assert!(last_system(&h.app).contains(PLAN_AWAITING_APPROVAL_MSG));
+
+        h.app.input = "/plan do more".to_owned();
+        h.app.submit_prompt();
+        assert_eq!(h.app.input, "/plan do more");
+        assert_eq!(h.sent.lock().unwrap().len(), sent_before);
+
+        h.app.input = "/direct fix".to_owned();
+        h.app.submit_prompt();
+        assert_eq!(h.app.input, "/direct fix");
+        assert_eq!(h.sent.lock().unwrap().len(), sent_before);
+
+        h.app.input = "/status".to_owned();
+        h.app.submit_prompt();
+        assert_eq!(h.sent.lock().unwrap().len(), sent_before);
+        assert!(!last_system(&h.app).contains(PLAN_AWAITING_APPROVAL_MSG));
+    }
+
+    // TC-947 / FR-942: restart keeps awaiting approval as stale; triage/planning cancel.
+    #[test]
+    fn stale_records_after_restart() {
+        let workspace = std::env::temp_dir().join(format!("dmuxai-plan-gate-{}", Uuid::new_v4()));
+        let mut h = plan_gate_harness_in_workspace(workspace.clone(), &[]);
+        let conversation_id = h.app.conversation_id.as_str().to_owned();
+
+        let awaiting = GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: "run-await".to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: "ship".to_owned(),
+                limits: dmuxai::graph::GraphLimits::default(),
+                tasks: Vec::new(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            },
+            conversation_id: conversation_id.clone(),
+            phase: GraphRunPhase::AwaitingApproval,
+            waiting_gate_node: None,
+            approval: Some(Approval {
+                state: ApprovalState::Pending,
+                revisions: Vec::new(),
+                decided_by: None,
+                decided_at_ms: None,
+            }),
+            ..Default::default()
+        };
+        dmuxai::graph::save_run(&workspace, &awaiting).expect("save awaiting");
+
+        let planning = GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: "run-planning".to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: "planning".to_owned(),
+                limits: dmuxai::graph::GraphLimits::default(),
+                tasks: Vec::new(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            },
+            conversation_id: conversation_id.clone(),
+            phase: GraphRunPhase::Planning,
+            waiting_gate_node: None,
+            triage: Some(Triage {
+                route: Route::Complex,
+                reason: "judge".to_owned(),
+                source: TriageSource::Judge,
+                cause: None,
+                override_kind: None,
+                runner: "codex".to_owned(),
+                model: "composer-2.5".to_owned(),
+                elapsed_ms: 0,
+            }),
+            ..Default::default()
+        };
+        dmuxai::graph::save_run(&workspace, &planning).expect("save planning");
+
+        h.app.last_graph_run = None;
+        h.app.graph_approval_stale = None;
+        h.app.restore_graph_runs_on_startup();
+        assert!(h.app.approval_is_stale());
+        let run = h
+            .app
+            .last_graph_run
+            .as_ref()
+            .expect("awaiting run retained");
+        assert_eq!(run.phase, GraphRunPhase::AwaitingApproval);
+        assert_eq!(run.plan.id, "run-await");
+
+        h.app.input = "/graph approve".to_owned();
+        h.app.submit_prompt();
+        assert!(last_system(&h.app).contains("Cannot approve"));
+
+        // P06: `/graph reject` on stale records and dashboard `plan_decision`.
+
+        let saved_planning =
+            dmuxai::graph::load_run(&workspace, "run-planning").expect("planning record");
+        assert_eq!(saved_planning.phase, GraphRunPhase::Cancelled);
+        assert_eq!(
+            saved_planning.triage.as_ref().unwrap().reason,
+            "interrupted by restart"
+        );
+    }
+
     // TC-964 / FR-948: an English keyword prompt never builds a keyword chain.
     #[test]
     fn keyword_prompt_never_builds_chain() {
@@ -18047,6 +18393,7 @@ mod tests {
             Uuid::new_v4().to_string(),
             1,
             0,
+            None,
         );
         let run = busy.app.last_graph_run.as_ref().unwrap();
         assert_eq!(
@@ -18105,6 +18452,7 @@ mod tests {
             Uuid::new_v4().to_string(),
             1,
             0,
+            None,
         );
         assert_eq!(no_model.app.input, "fix");
         assert!(last_system(&no_model.app).contains("fast models"));
