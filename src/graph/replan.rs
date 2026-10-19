@@ -42,6 +42,16 @@ Mark a step with \"sensitive\": true when it deploys, migrates, or touches auth,
 /// (FR-956).
 pub const NODE_REPLAN_HINT: &str = "If the remaining plan no longer fits what you found, end your reply with a line `DMUXAI_REPLAN: <reason>`";
 
+/// Agent-facing node prompt: job text plus [`NODE_REPLAN_HINT`] on multi-step runs
+/// (more than one executable step); 1-node runs omit the hint (FR-956).
+pub fn node_send_prompt(job: &str, plan: &GraphPlan) -> String {
+    if executable_count(plan) > 1 {
+        format!("{job}\n{NODE_REPLAN_HINT}")
+    } else {
+        job.to_owned()
+    }
+}
+
 /// Why the replan turn runs (FR-956).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplanTrigger {
@@ -780,6 +790,11 @@ fn cut_with_ellipsis(text: &str, max: usize) -> String {
     out
 }
 
+/// Caps a finished-step summary stored for the next replan payload (FR-956).
+pub fn cap_replan_step_summary(text: &str) -> String {
+    cut_with_ellipsis(text.trim(), SUMMARY_MAX_CHARS)
+}
+
 fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1491,6 +1506,21 @@ mod tests {
         assert!(!prompt.contains(&"b".repeat(500)));
         assert!(prompt.contains(&"r".repeat(300)));
         assert!(!prompt.contains(&"r".repeat(301)));
+    }
+
+    // FR-956: replan marker hint only on multi-step runs.
+    #[test]
+    fn node_send_prompt_appends_hint_only_for_multi_step() {
+        let one = plan_with_nodes(vec![step_node("step-1", "do work", false)]);
+        assert_eq!(node_send_prompt("do work", &one), "do work");
+
+        let multi = plan_with_nodes(vec![
+            step_node("step-1", "research", false),
+            step_node("step-2", "build", false),
+        ]);
+        let prompt = node_send_prompt("build", &multi);
+        assert!(prompt.ends_with(NODE_REPLAN_HINT));
+        assert!(prompt.contains("build\n"));
     }
 
     // TC-973 (marker part) / FR-956.

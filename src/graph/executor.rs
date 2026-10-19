@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use super::replan::node_send_prompt;
 use super::types::{GraphNode, GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, NodeRole};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,13 +89,31 @@ impl GraphRunSession {
             node_id: node.id.clone(),
             runner: node.runner.clone(),
             model_id: node.model_id.clone(),
-            prompt: node.job.clone(),
+            prompt: node_send_prompt(&node.job, &self.run.plan),
             role: node.role,
         })
     }
 
-    /// Undo a scheduled [`GraphAction::StartNode`] when the adapter refuses to
-    /// start (FR-976) so the node stays ready without counting an attempt.
+    /// Undo a [`GraphAction::StartNode`] held for a pending replan turn (FR-956).
+    /// Unlike [`revert_node_start`], the node stays eligible on the next [`schedule`].
+    pub fn undo_replan_held_start(&mut self, node_id: &str) {
+        self.active.remove(node_id);
+        if let Some(node) = self
+            .run
+            .plan
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+        {
+            if node.status == GraphNodeStatus::Running {
+                node.status = GraphNodeStatus::Ready;
+            }
+            if node.attempt == 0 {
+                node.started_at_ms = None;
+            }
+        }
+    }
+
     pub fn revert_node_start(&mut self, node_id: &str) {
         self.deferred_ready.insert(node_id.to_owned());
         self.active.remove(node_id);
@@ -232,11 +251,12 @@ impl GraphRunSession {
                 break;
             }
 
+            let job = self.run.plan.nodes[index].job.clone();
             let assignment = NodeAssignment {
                 node_id: node_id.clone(),
                 runner: self.run.plan.nodes[index].runner.clone(),
                 model_id: self.run.plan.nodes[index].model_id.clone(),
-                prompt: self.run.plan.nodes[index].job.clone(),
+                prompt: node_send_prompt(&job, &self.run.plan),
                 role,
             };
 

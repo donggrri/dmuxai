@@ -25,8 +25,9 @@ pub use policy::{
 };
 pub use replan::{
     NODE_REPLAN_HINT, REPLAN_PROMPT, ReplanDoc, ReplanTrigger, apply_replan, budget_allows,
-    build_replan_prompt, parse_replan, parse_replan_marker, replan_allowed, replans_left,
-    revision_needs_approval, strip_replan_marker,
+    build_replan_prompt, cap_replan_step_summary, node_send_prompt, parse_replan,
+    parse_replan_marker, replan_allowed, replans_left, revision_needs_approval,
+    strip_replan_marker,
 };
 pub use store::{GraphStore, load_run, save_run};
 pub use tasks::{

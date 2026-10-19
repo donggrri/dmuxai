@@ -62,7 +62,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   Also: `REPLAN_PROMPT` asks for `task` on every new/changed step and a replan step without `task` inherits the task of the existing node with the same id (from P02 review); cut every model-provided id in PlanError text.
   Files: `src/graph/replan.rs`, `src/graph/types.rs`.
   Done when: `cargo test --locked --lib graph::replan` green incl. `replan_revises_only_pending_tasks`.
-- [ ] P10 — Replan triggers: `NODE_REPLAN_HINT` on multi-node prompts, marker strip, failure hold, `/graph replan [note]`.
+- [x] P10 — (#67 agent-planned graph 0606ec52: 4-step chain; fix turn as #67 /direct run; composer-2.5; review claude-sonnet-5-5-high BLOCK ×3 findings (queued failure trigger overwritten, skipped queued trigger never resumed, marker on final node) → fixed → APPROVE; nits moved to P11) Replan triggers: `NODE_REPLAN_HINT` on multi-node prompts, marker strip, failure hold, `/graph replan [note]`.
   FR-956, FR-957. TC-973.
   Files: `src/app.rs`.
   Done when: `replan_only_on_trigger` green.

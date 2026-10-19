@@ -56,11 +56,14 @@ use dmuxai::{
     graph::{
         AllowedRunner, Approval, ApprovalState, DecisionBy, FallbackCause, GraphAction, GraphNode,
         GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, GraphRunSession, GraphStore,
-        MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind, PlanContext, PlanDoc,
-        PlanPromptMode, PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls, Route,
-        TaskEdit, Triage, TriageSource, build_judge_prompt, build_plan_prompt, cap_revision_raw,
-        fallback_plan, graph_plan_from_revision_steps, heuristic_route, parse_plan, parse_verdict,
-        plan_json_for_edit, save_run, validate_plan,
+        MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind, PlanChange, PlanChangeKind,
+        PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode, PlanPromptRequest, PlanRevision,
+        PlanStep, PlanTask, PlannerCalls, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage,
+        TriageSource, apply_replan, budget_allows, build_judge_prompt, build_plan_prompt,
+        build_replan_prompt, cap_replan_step_summary, cap_revision_raw, fallback_plan,
+        graph_plan_from_revision_steps, heuristic_route, parse_plan, parse_replan,
+        parse_replan_marker, parse_verdict, plan_json_for_edit, replan_allowed,
+        revision_needs_approval, save_run, strip_replan_marker, validate_plan,
     },
     mcp::config::ResolvedMcpServer,
     mcp::registry::McpRegistry,
@@ -111,6 +114,8 @@ const JUDGE_HARD_CAP: Duration = Duration::from_secs(270);
 const PLAN_SILENCE_TIMEOUT: Duration = Duration::from_secs(240);
 /// OQ-931: hard cap on a plan or repair turn.
 const PLAN_HARD_CAP: Duration = Duration::from_secs(720);
+/// OQ-936: hard cap on a replan turn (plan silence timeout still applies).
+const REPLAN_HARD_CAP: Duration = Duration::from_secs(120);
 const DEFAULT_INPUT_HEIGHT: u16 = 3;
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MIN_MAIN_HEIGHT: u16 = 5;
@@ -686,6 +691,36 @@ struct PendingPlan {
     edit_feedback: Option<String>,
 }
 
+/// FR-956: internal read-only replan turn (buffer hidden like [`PendingPlan`]).
+struct PendingReplan {
+    agent: Agent,
+    conversation_id: StoredConversationId,
+    turn_id: StoredTurnId,
+    buffer: String,
+    buffer_chars: usize,
+    started: Instant,
+    last_event: Instant,
+    prompt: String,
+    saved_mode: ExecutionMode,
+    #[allow(dead_code)]
+    run_id: String,
+    rev: u32,
+    trigger: ReplanTrigger,
+    trigger_reason: String,
+    failure_node_id: Option<String>,
+    decided_by: Option<DecisionBy>,
+    #[allow(dead_code)]
+    summaries: Vec<(String, String)>,
+}
+
+/// FR-956: wait until the planning agent finishes its graph step.
+struct QueuedReplan {
+    trigger: ReplanTrigger,
+    reason: String,
+    failure_node_id: Option<String>,
+    decided_by: Option<DecisionBy>,
+}
+
 /// FR-943: approve, edit with feedback, or reject at the plan gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanDecisionKind {
@@ -981,6 +1016,12 @@ pub struct App {
     pending_summary: Option<PendingSummary>,
     pending_triage: Option<PendingTriage>,
     pending_plan: Option<PendingPlan>,
+    pending_replan: Option<PendingReplan>,
+    queued_replan: Option<QueuedReplan>,
+    /// Step result summaries since the last replan turn (FR-956).
+    replan_summaries: Vec<(String, String)>,
+    /// Node id whose terminal failure is held until replan finishes (FR-956).
+    graph_failure_replan: Option<String>,
     deferred_turns: Vec<DeferredTurn>,
     restored_inputs: HashMap<StoredConversationId, String>,
     busy_agents: HashSet<Agent>,
@@ -1188,6 +1229,10 @@ impl App {
             pending_summary: None,
             pending_triage: None,
             pending_plan: None,
+            pending_replan: None,
+            queued_replan: None,
+            replan_summaries: Vec::new(),
+            graph_failure_replan: None,
             deferred_turns: Vec::new(),
             restored_inputs: HashMap::new(),
             busy_agents: HashSet::new(),
@@ -1368,6 +1413,7 @@ impl App {
         }
         self.check_triage_timeout(Instant::now());
         self.check_plan_timeout(Instant::now());
+        self.check_replan_timeout(Instant::now());
         let flushed = self.flush_deferred_graph_starts();
         let busy = !self.busy_agents.is_empty();
         if busy || flushed {
@@ -2101,6 +2147,9 @@ impl App {
         }
         if self.output_belongs_to_plan(&output) {
             return self.apply_plan_output(output);
+        }
+        if self.output_belongs_to_replan(&output) {
+            return self.apply_replan_output(output);
         }
 
         match (&output.conversation_id, &output.turn_id) {
@@ -3183,6 +3232,10 @@ impl App {
                         } else {
                             self.push_system("No plan is waiting for approval.");
                         }
+                    } else if rest == "replan" {
+                        self.request_replan("", DecisionBy::Tui);
+                    } else if let Some(note) = rest.strip_prefix("replan ") {
+                        self.request_replan(note.trim(), DecisionBy::Tui);
                     } else {
                         self.show_graph_status();
                     }
@@ -6186,6 +6239,746 @@ impl App {
         }
     }
 
+    fn graph_executable_step_count(plan: &GraphPlan) -> usize {
+        plan.nodes
+            .iter()
+            .filter(|node| node.role != NodeRole::Orchestrate)
+            .count()
+    }
+
+    fn graph_session_is_multi_step(&self) -> bool {
+        self.graph_session
+            .as_ref()
+            .is_some_and(|session| Self::graph_executable_step_count(&session.run().plan) > 1)
+    }
+
+    fn replan_planner_agent(&self) -> Option<Agent> {
+        let triage = self
+            .graph_session
+            .as_ref()
+            .and_then(|session| session.run().triage.as_ref())?;
+        runner_from_str(&triage.runner)
+    }
+
+    fn replan_scheduling_blocked(&self) -> bool {
+        self.pending_replan.is_some()
+            || self.queued_replan.is_some()
+            || self.graph_failure_replan.is_some()
+    }
+
+    fn filter_graph_actions_for_replan(&mut self, actions: Vec<GraphAction>) -> Vec<GraphAction> {
+        if !self.replan_scheduling_blocked() {
+            return actions;
+        }
+        let mut kept = Vec::new();
+        for action in actions {
+            match action {
+                GraphAction::StartNode(assignment) | GraphAction::PauseForGate(assignment) => {
+                    if let Some(session) = self.graph_session.as_mut() {
+                        session.undo_replan_held_start(&assignment.node_id);
+                        let _ = save_run(&self.workspace_root, session.run());
+                    }
+                }
+                other => kept.push(other),
+            }
+        }
+        kept
+    }
+
+    fn plan_change_trigger(trigger: ReplanTrigger) -> PlanChangeTrigger {
+        match trigger {
+            ReplanTrigger::Failure => PlanChangeTrigger::Failure,
+            ReplanTrigger::Marker => PlanChangeTrigger::Marker,
+            ReplanTrigger::User => PlanChangeTrigger::User,
+        }
+    }
+
+    fn merge_replan_reasons(existing: &str, incoming: &str) -> String {
+        if incoming.trim().is_empty() {
+            return existing.to_owned();
+        }
+        if existing.trim().is_empty() {
+            return incoming.to_owned();
+        }
+        format!("{existing}; {incoming}")
+    }
+
+    fn queued_replan_is_failure(queued: &QueuedReplan) -> bool {
+        queued.failure_node_id.is_some() || queued.trigger == ReplanTrigger::Failure
+    }
+
+    fn store_queued_replan(&mut self, incoming: QueuedReplan) {
+        let merged = match self.queued_replan.take() {
+            None => incoming,
+            Some(existing) => {
+                if Self::queued_replan_is_failure(&existing) {
+                    if Self::queued_replan_is_failure(&incoming) {
+                        QueuedReplan {
+                            trigger: ReplanTrigger::Failure,
+                            reason: Self::merge_replan_reasons(&existing.reason, &incoming.reason),
+                            failure_node_id: existing.failure_node_id.or(incoming.failure_node_id),
+                            decided_by: incoming.decided_by.or(existing.decided_by),
+                        }
+                    } else {
+                        QueuedReplan {
+                            trigger: existing.trigger,
+                            reason: Self::merge_replan_reasons(&existing.reason, &incoming.reason),
+                            failure_node_id: existing.failure_node_id,
+                            decided_by: incoming.decided_by.or(existing.decided_by),
+                        }
+                    }
+                } else if Self::queued_replan_is_failure(&incoming) {
+                    incoming
+                } else {
+                    QueuedReplan {
+                        trigger: incoming.trigger,
+                        reason: Self::merge_replan_reasons(&existing.reason, &incoming.reason),
+                        failure_node_id: None,
+                        decided_by: incoming.decided_by.or(existing.decided_by),
+                    }
+                }
+            }
+        };
+        self.queued_replan = Some(merged);
+    }
+
+    fn push_replan_skipped(
+        &mut self,
+        cause: &str,
+        trigger: ReplanTrigger,
+        failure_node_id: Option<String>,
+        from_flush: bool,
+    ) {
+        let message = if cause == "budget" {
+            "replan skipped: budget".to_owned()
+        } else {
+            format!("replan skipped: {cause}")
+        };
+        self.push_system(message);
+        if failure_node_id.is_some() || trigger == ReplanTrigger::Failure {
+            self.finish_held_graph_failure();
+        } else if from_flush {
+            self.resume_graph_after_replan();
+        }
+    }
+
+    fn finish_held_graph_failure(&mut self) {
+        let Some(node_id) = self.graph_failure_replan.take() else {
+            return;
+        };
+        if let Some(session) = self.graph_session.as_mut() {
+            session.run_mut().phase = GraphRunPhase::Failed;
+        }
+        self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
+            "graph node {node_id} failed"
+        ))]);
+    }
+
+    /// FR-956: user or dashboard replan request.
+    pub fn request_replan(&mut self, note: &str, by: DecisionBy) {
+        if !self.graph_session_is_multi_step() {
+            self.push_system("Replan needs a multi-step run".to_owned());
+            return;
+        }
+        let reason = if note.trim().is_empty() {
+            "user request".to_owned()
+        } else {
+            note.trim().to_owned()
+        };
+        self.enqueue_replan_trigger(ReplanTrigger::User, reason, None, false, Some(by));
+    }
+
+    fn enqueue_replan_trigger(
+        &mut self,
+        trigger: ReplanTrigger,
+        reason: String,
+        failure_node_id: Option<String>,
+        from_flush: bool,
+        decided_by: Option<DecisionBy>,
+    ) {
+        if !self.graph_session_is_multi_step() {
+            return;
+        }
+        if self.pending_replan.is_some() {
+            self.store_queued_replan(QueuedReplan {
+                trigger,
+                reason,
+                failure_node_id,
+                decided_by,
+            });
+            return;
+        }
+        if self.pending_plan.is_some() {
+            self.store_queued_replan(QueuedReplan {
+                trigger,
+                reason,
+                failure_node_id,
+                decided_by,
+            });
+            return;
+        }
+        let run = self
+            .graph_session
+            .as_ref()
+            .map(|session| session.run().clone());
+        let Some(run) = run else {
+            return;
+        };
+        if !replan_allowed(&run) {
+            self.push_replan_skipped("budget", trigger, failure_node_id, from_flush);
+            return;
+        }
+        let user_prompt = run.plan.user_prompt.clone();
+        let summaries = self.replan_summaries.clone();
+        let available = self.registered_runner_names();
+        let ctx = PlanContext {
+            user_prompt: &user_prompt,
+            available_runners: &available,
+            runner_allowed: &|runner: &str| self.runner_is_allowed(runner),
+            effective_model: &|runner: &str| {
+                runner_from_str(runner).and_then(|agent| {
+                    self.effective_model_for(agent, "").filter(|model| {
+                        dmuxai::model_policy::validate_model_for_runner(runner, model).is_ok()
+                    })
+                })
+            },
+            validate_model: &dmuxai::model_policy::validate_model_for_runner,
+        };
+        let nonce = Uuid::new_v4().simple().to_string();
+        let prompt = match build_replan_prompt(&run, trigger, &reason, &summaries, &ctx, &nonce) {
+            Ok(prompt) => prompt,
+            Err(_) => {
+                self.push_replan_skipped("prompt blocked", trigger, failure_node_id, from_flush);
+                return;
+            }
+        };
+        if !budget_allows(&run, prompt.chars().count()) {
+            self.push_replan_skipped("budget", trigger, failure_node_id, from_flush);
+            return;
+        }
+        let Some(agent) = self.replan_planner_agent() else {
+            self.push_replan_skipped("no planner", trigger, failure_node_id, from_flush);
+            return;
+        };
+        if self.busy_agents.contains(&agent) {
+            self.store_queued_replan(QueuedReplan {
+                trigger,
+                reason,
+                failure_node_id,
+                decided_by,
+            });
+            return;
+        }
+        let rev = run.replans_used + 1;
+        self.start_replan_turn(
+            agent,
+            run.plan.id.clone(),
+            rev,
+            prompt,
+            trigger,
+            reason,
+            failure_node_id,
+            decided_by,
+            summaries,
+            from_flush,
+        );
+    }
+
+    fn try_flush_queued_replan(&mut self) {
+        if self.pending_replan.is_some() || self.pending_plan.is_some() {
+            return;
+        }
+        let Some(queued) = self.queued_replan.take() else {
+            return;
+        };
+        self.enqueue_replan_trigger(
+            queued.trigger,
+            queued.reason,
+            queued.failure_node_id,
+            true,
+            queued.decided_by,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_replan_turn(
+        &mut self,
+        agent: Agent,
+        run_id: String,
+        rev: u32,
+        replan_prompt: String,
+        trigger: ReplanTrigger,
+        trigger_reason: String,
+        failure_node_id: Option<String>,
+        decided_by: Option<DecisionBy>,
+        summaries: Vec<(String, String)>,
+        from_flush: bool,
+    ) {
+        let index = adapter_index(agent);
+        let plan_mode = if self.adapters[index]
+            .validate_mode(ExecutionMode::Ask)
+            .is_ok()
+        {
+            Some(ExecutionMode::Ask)
+        } else if self.adapters[index]
+            .validate_mode(ExecutionMode::Plan)
+            .is_ok()
+        {
+            Some(ExecutionMode::Plan)
+        } else {
+            None
+        };
+        let saved_mode = self.modes.get(&agent).copied().unwrap_or_default();
+        let Some(plan_mode) = plan_mode else {
+            self.push_replan_skipped("unsupported mode", trigger, failure_node_id, from_flush);
+            return;
+        };
+        if self.adapters[index].select_mode(plan_mode).is_err() {
+            self.push_replan_skipped("mode select failed", trigger, failure_node_id, from_flush);
+            return;
+        }
+        let turn_id = TurnId::new(format!("replan-{rev}"));
+        let request = AgentRequest {
+            conversation_id: ConversationId::new(self.conversation_id.as_str()),
+            turn_id: turn_id.clone(),
+            prompt: replan_prompt.clone(),
+            resume_session: None,
+            image_paths: vec![],
+        };
+        if let Some(session) = self.graph_session.as_mut() {
+            let run = session.run_mut();
+            run.replans_used += 1;
+            run.replan_chars_used += replan_prompt.chars().count();
+            run.planner_calls.replan += 1;
+            let _ = save_run(&self.workspace_root, run);
+            self.last_graph_run = Some(run.clone());
+        }
+        match self.adapters[index].send(request) {
+            Ok(()) => {
+                let now = Instant::now();
+                self.busy_agents.insert(agent);
+                self.run_states.insert(
+                    agent,
+                    RunState::Running {
+                        started_at: now,
+                        started_at_ms: unix_ms_now(),
+                        node: None,
+                    },
+                );
+                self.activities
+                    .insert(agent, AgentActivity::queued(ActivityKind::Summary, now));
+                self.pending_replan = Some(PendingReplan {
+                    agent,
+                    conversation_id: self.conversation_id.clone(),
+                    turn_id: StoredTurnId::new(turn_id.as_str()),
+                    buffer: String::new(),
+                    buffer_chars: 0,
+                    started: now,
+                    last_event: now,
+                    prompt: replan_prompt,
+                    saved_mode,
+                    run_id,
+                    rev,
+                    trigger,
+                    trigger_reason,
+                    failure_node_id,
+                    decided_by,
+                    summaries,
+                });
+                self.replan_summaries.clear();
+            }
+            Err(error) => {
+                let _ = self.adapters[index].select_mode(saved_mode);
+                self.push_system(format!("Could not start replan turn with {agent}: {error}"));
+                if let Some(session) = self.graph_session.as_mut() {
+                    let run = session.run_mut();
+                    run.replans_used = run.replans_used.saturating_sub(1);
+                    run.replan_chars_used = run
+                        .replan_chars_used
+                        .saturating_sub(replan_prompt.chars().count());
+                    run.planner_calls.replan = run.planner_calls.replan.saturating_sub(1);
+                    let _ = save_run(&self.workspace_root, run);
+                }
+                self.push_replan_skipped("send error", trigger, failure_node_id, from_flush);
+            }
+        }
+    }
+
+    fn output_belongs_to_replan(&self, output: &AgentOutput) -> bool {
+        self.pending_replan.as_ref().is_some_and(|pending| {
+            pending.agent == output.agent
+                && output
+                    .conversation_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == pending.conversation_id.as_str())
+                && output
+                    .turn_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == pending.turn_id.as_str())
+        })
+    }
+
+    fn retire_internal_replan_turn(&mut self, pending: &PendingReplan) {
+        self.retired_internal_turns
+            .insert(pending.turn_id.as_str().to_owned());
+        let _ = self.adapters[adapter_index(pending.agent)].cancel();
+    }
+
+    fn retire_replan_turn_id(&mut self, pending: &PendingReplan) {
+        self.retired_internal_turns
+            .insert(pending.turn_id.as_str().to_owned());
+    }
+
+    fn finish_replan_rejected(&mut self, pending: PendingReplan, message: String, resume: bool) {
+        let rev = pending.rev;
+        if let Some(session) = self.graph_session.as_mut() {
+            let run = session.run_mut();
+            let change = PlanChange {
+                rev,
+                kind: PlanChangeKind::Replan,
+                at_ms: unix_ms_now(),
+                after_node: pending.failure_node_id.clone(),
+                reason: pending.trigger_reason.clone(),
+                trigger: Some(Self::plan_change_trigger(pending.trigger)),
+                prompt_chars: Some(pending.prompt.chars().count()),
+                response_chars: Some(pending.buffer.chars().count()),
+                added: Vec::new(),
+                changed: Vec::new(),
+                removed: Vec::new(),
+                tasks_added: 0,
+                tasks_changed: 0,
+                tasks_removed: 0,
+                applied: false,
+                error: Some(message.clone()),
+                decided_by: pending.decided_by,
+            };
+            run.push_plan_change(change);
+            let _ = save_run(&self.workspace_root, run);
+            self.last_graph_run = Some(run.clone());
+        }
+        self.push_system(format!("Replan rev {rev} rejected: {message}"));
+        if pending.trigger == ReplanTrigger::Failure || pending.failure_node_id.is_some() {
+            self.finish_held_graph_failure();
+        } else if resume {
+            self.resume_graph_after_replan();
+        }
+    }
+
+    fn finish_replan_kept(&mut self, pending: PendingReplan, reason: String) {
+        let rev = pending.rev;
+        if let Some(session) = self.graph_session.as_mut() {
+            let run = session.run_mut();
+            let change = PlanChange {
+                rev,
+                kind: PlanChangeKind::Replan,
+                at_ms: unix_ms_now(),
+                after_node: pending.failure_node_id.clone(),
+                reason: reason.clone(),
+                trigger: Some(Self::plan_change_trigger(pending.trigger)),
+                prompt_chars: Some(pending.prompt.chars().count()),
+                response_chars: Some(pending.buffer.chars().count()),
+                added: Vec::new(),
+                changed: Vec::new(),
+                removed: Vec::new(),
+                tasks_added: 0,
+                tasks_changed: 0,
+                tasks_removed: 0,
+                applied: true,
+                error: None,
+                decided_by: pending.decided_by,
+            };
+            run.push_plan_change(change);
+            let _ = save_run(&self.workspace_root, run);
+            self.last_graph_run = Some(run.clone());
+        }
+        self.push_system(format!("Replan kept the plan: {reason}"));
+        if pending.trigger == ReplanTrigger::Failure || pending.failure_node_id.is_some() {
+            self.finish_held_graph_failure();
+        } else {
+            self.resume_graph_after_replan();
+        }
+    }
+
+    fn finish_replan_applied(
+        &mut self,
+        pending: PendingReplan,
+        plan: GraphPlan,
+        change: PlanChange,
+    ) {
+        let rev = pending.rev;
+        let mut change = change;
+        change.rev = rev;
+        change.trigger = Some(Self::plan_change_trigger(pending.trigger));
+        change.prompt_chars = Some(pending.prompt.chars().count());
+        change.response_chars = Some(pending.buffer.chars().count());
+        change.after_node = pending.failure_node_id.clone();
+        change.decided_by = pending.decided_by;
+        if let Some(session) = self.graph_session.as_mut() {
+            session.run_mut().plan = plan;
+            let run = session.run_mut();
+            run.push_plan_change(change);
+            let _ = save_run(&self.workspace_root, run);
+            self.last_graph_run = Some(run.clone());
+            self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
+        }
+        // P11: sensitive replan revisions pause for approval (FR-959).
+        if pending.trigger == ReplanTrigger::Failure || pending.failure_node_id.is_some() {
+            self.graph_failure_replan = None;
+            self.resume_graph_after_replan();
+        } else {
+            self.resume_graph_after_replan();
+        }
+    }
+
+    fn resume_graph_after_replan(&mut self) {
+        if let Some(session) = self.graph_session.as_mut() {
+            if session.run().phase == GraphRunPhase::Failed && self.graph_failure_replan.is_none() {
+                session.run_mut().phase = GraphRunPhase::Active;
+            }
+            let actions = session.schedule();
+            let actions = self.filter_graph_actions_for_replan(actions);
+            self.dispatch_graph_actions(actions);
+        }
+        self.try_flush_queued_replan();
+    }
+
+    fn apply_replan_output(&mut self, output: AgentOutput) -> bool {
+        self.observe_activity(output.agent, &output.event, Instant::now());
+        if let Some(pending) = self.pending_replan.as_mut() {
+            pending.last_event = Instant::now();
+        }
+        match output.event {
+            AgentEvent::Started | AgentEvent::ProviderSessionBound(_) | AgentEvent::Notice(_) => {
+                true
+            }
+            AgentEvent::TextDelta(delta) => {
+                let delta_chars = delta.chars().count();
+                let exceeds_limit = self.pending_replan.as_ref().is_some_and(|pending| {
+                    pending.buffer_chars.saturating_add(delta_chars) > MAX_SUMMARY_BUFFER_CHARS
+                });
+                if exceeds_limit {
+                    let Some(pending) = self.pending_replan.take() else {
+                        return false;
+                    };
+                    self.retire_internal_replan_turn(&pending);
+                    self.busy_agents.remove(&pending.agent);
+                    self.activities.remove(&pending.agent);
+                    self.end_run_state(pending.agent, false, false);
+                    let _ =
+                        self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
+                    self.finish_replan_rejected(pending, "buffer overflow".to_owned(), true);
+                } else if let Some(pending) = self.pending_replan.as_mut() {
+                    pending.buffer_chars += delta_chars;
+                    pending.buffer.push_str(&delta);
+                }
+                true
+            }
+            AgentEvent::Completed => {
+                let Some(pending) = self.pending_replan.take() else {
+                    return false;
+                };
+                self.retire_replan_turn_id(&pending);
+                self.busy_agents.remove(&pending.agent);
+                self.activities.remove(&pending.agent);
+                self.end_run_state(pending.agent, true, false);
+                let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
+                match parse_replan(&pending.buffer) {
+                    Ok(ReplanDoc::Keep { reason }) => {
+                        self.finish_replan_kept(pending, reason);
+                    }
+                    Ok(doc @ ReplanDoc::Steps { .. }) => {
+                        let run = self
+                            .graph_session
+                            .as_ref()
+                            .map(|session| session.run().clone());
+                        let Some(run) = run else {
+                            self.finish_replan_rejected(
+                                pending,
+                                "no active graph".to_owned(),
+                                true,
+                            );
+                            return true;
+                        };
+                        let user_prompt = run.plan.user_prompt.clone();
+                        let available = self.registered_runner_names();
+                        let ctx = PlanContext {
+                            user_prompt: &user_prompt,
+                            available_runners: &available,
+                            runner_allowed: &|runner: &str| self.runner_is_allowed(runner),
+                            effective_model: &|runner: &str| {
+                                runner_from_str(runner).and_then(|agent| {
+                                    self.effective_model_for(agent, "").filter(|model| {
+                                        dmuxai::model_policy::validate_model_for_runner(
+                                            runner, model,
+                                        )
+                                        .is_ok()
+                                    })
+                                })
+                            },
+                            validate_model: &dmuxai::model_policy::validate_model_for_runner,
+                        };
+                        match apply_replan(&run, &doc, &ctx) {
+                            Ok((plan, change)) => {
+                                let old = run.plan;
+                                if revision_needs_approval(&old, &plan, &change) {
+                                    self.finish_replan_rejected(
+                                        pending,
+                                        "sensitive revision needs approval".to_owned(),
+                                        true,
+                                    );
+                                } else {
+                                    self.finish_replan_applied(pending, plan, change);
+                                }
+                            }
+                            Err(errors) => {
+                                let message = errors
+                                    .first()
+                                    .map(|err| err.to_string())
+                                    .unwrap_or_else(|| "invalid replan".to_owned());
+                                self.finish_replan_rejected(pending, message, true);
+                            }
+                        }
+                    }
+                    Err(errors) => {
+                        let message = errors
+                            .first()
+                            .map(|err| err.to_string())
+                            .unwrap_or_else(|| "invalid replan".to_owned());
+                        self.finish_replan_rejected(pending, message, true);
+                    }
+                }
+                true
+            }
+            AgentEvent::Cancelled | AgentEvent::Error(_) => {
+                let Some(pending) = self.pending_replan.take() else {
+                    return false;
+                };
+                self.retire_replan_turn_id(&pending);
+                self.busy_agents.remove(&pending.agent);
+                self.activities.remove(&pending.agent);
+                self.end_run_state(pending.agent, false, false);
+                let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
+                self.finish_replan_rejected(pending, "error".to_owned(), true);
+                true
+            }
+            AgentEvent::ModelsListed { .. }
+            | AgentEvent::ModelSelected(_)
+            | AgentEvent::EffortSelected(_)
+            | AgentEvent::ModeSelected(_)
+            | AgentEvent::ToolProgress { .. }
+            | AgentEvent::Activity(_)
+            | AgentEvent::Status(_) => false,
+        }
+    }
+
+    /// OQ-936: replan uses plan silence timeout with a 120 s hard cap.
+    fn check_replan_timeout(&mut self, now: Instant) {
+        let Some(pending) = self.pending_replan.as_ref() else {
+            return;
+        };
+        let silent = now.saturating_duration_since(pending.last_event) >= PLAN_SILENCE_TIMEOUT;
+        let hard = now.saturating_duration_since(pending.started) >= REPLAN_HARD_CAP;
+        if !silent && !hard {
+            return;
+        }
+        let Some(pending) = self.pending_replan.take() else {
+            return;
+        };
+        self.retire_internal_replan_turn(&pending);
+        self.busy_agents.remove(&pending.agent);
+        self.activities.remove(&pending.agent);
+        self.end_run_state(pending.agent, false, false);
+        let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
+        self.finish_replan_rejected(pending, "timeout".to_owned(), true);
+    }
+
+    fn rewrite_last_agent_message(&mut self, agent: Agent, content: String) {
+        if let Some(index) = self.streaming_messages.get(&agent).copied()
+            && let Some(message) = self.messages.get_mut(index)
+        {
+            message.content = content;
+            return;
+        }
+        for message in self.messages.iter_mut().rev() {
+            if message.role == Role::Agent(agent) {
+                message.content = content;
+                return;
+            }
+        }
+    }
+
+    fn note_replan_summary(&mut self, node_id: &str, text: &str) {
+        let capped = cap_replan_step_summary(text);
+        if capped.is_empty() {
+            return;
+        }
+        self.replan_summaries.push((node_id.to_owned(), capped));
+    }
+
+    fn intercept_graph_node_finished(
+        &mut self,
+        agent: Agent,
+        node_id: String,
+        success: bool,
+        output_text: &str,
+    ) {
+        let mut display_text = output_text.to_owned();
+        let mut marker_reason = None;
+        if success && let Some(reason) = parse_replan_marker(output_text) {
+            display_text = strip_replan_marker(output_text);
+            self.rewrite_last_agent_message(agent, display_text.clone());
+            marker_reason = Some(reason);
+        }
+        if success {
+            self.note_replan_summary(&node_id, &display_text);
+        }
+        let (actions, failed_message) = {
+            let Some(session) = self.graph_session.as_mut() else {
+                return;
+            };
+            let actions = session.on_node_finished(&node_id, success);
+            self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
+            let _ = save_run(&self.workspace_root, session.run());
+            let failed_message = if !success {
+                actions.iter().find_map(|action| match action {
+                    GraphAction::Failed(message) => Some(message.clone()),
+                    _ => None,
+                })
+            } else {
+                None
+            };
+            (actions, failed_message)
+        };
+        if let Some(message) = failed_message
+            && self.graph_session_is_multi_step()
+        {
+            if let Some(session) = self.graph_session.as_mut() {
+                session.run_mut().phase = GraphRunPhase::Active;
+            }
+            self.graph_failure_replan = Some(node_id.clone());
+            self.enqueue_replan_trigger(
+                ReplanTrigger::Failure,
+                message,
+                Some(node_id.clone()),
+                false,
+                None,
+            );
+            if let Some(reason) = marker_reason {
+                self.enqueue_replan_trigger(ReplanTrigger::Marker, reason, None, false, None);
+            }
+            return;
+        }
+        let run_completes = actions
+            .iter()
+            .any(|action| matches!(action, GraphAction::Completed));
+        if let Some(reason) = marker_reason
+            && !run_completes
+        {
+            self.enqueue_replan_trigger(ReplanTrigger::Marker, reason, None, false, None);
+        }
+        self.dispatch_graph_actions(actions);
+    }
+
     fn build_graph_run(
         &self,
         plan: GraphPlan,
@@ -6588,6 +7381,7 @@ impl App {
             let turn_id = active.turn_id.as_str().to_owned();
             let started_ms = active.started_ms;
             let workspace_scan = active.workspace_scan.clone();
+            let output_for_docs = output_text.clone();
             std::thread::spawn(move || {
                 record_turn_doc_changes(
                     log,
@@ -6598,7 +7392,7 @@ impl App {
                     started_ms,
                     workspace_scan,
                     &workspace_root,
-                    output_text,
+                    output_for_docs,
                 );
             });
         }
@@ -6625,15 +7419,10 @@ impl App {
                 self.defer_graph_node_start(agent, assignment);
                 return;
             }
-            if let Some(session) = self.graph_session.as_mut() {
-                let actions = session.on_node_finished(&node_id, success);
-                self.graph_assignment_line =
-                    resolved_assignment_line(&self.model_catalogs, session);
-                let _ = save_run(&self.workspace_root, session.run());
-                self.dispatch_graph_actions(actions);
-            }
+            self.intercept_graph_node_finished(agent, node_id, success, &output_text);
         }
         self.flush_deferred_graph_starts();
+        self.try_flush_queued_replan();
     }
 
     /// The model a planned step should actually use on `agent`.
@@ -6728,6 +7517,10 @@ impl App {
         self.graph_node_details.clear();
         self.graph_agent_nodes.clear();
         self.clear_graph_defer_state();
+        self.pending_replan = None;
+        self.queued_replan = None;
+        self.replan_summaries.clear();
+        self.graph_failure_replan = None;
         // FR-937: triage/direct 1-node runs are quiet; multi-step plans with an
         // orchestrate node keep the normal graph banners.
         self.quiet_graph_run = run
@@ -6759,6 +7552,7 @@ impl App {
     }
 
     fn dispatch_graph_actions(&mut self, actions: Vec<GraphAction>) {
+        let actions = self.filter_graph_actions_for_replan(actions);
         for action in actions {
             if self.graph_session.is_none() {
                 break;
@@ -11004,13 +11798,80 @@ mod tests {
     }
 
     fn complete_sent_graph_turn(app: &mut App, sent: &SentRequests, index: usize) {
+        complete_sent_graph_turn_with_text(app, sent, index, "");
+    }
+
+    fn complete_sent_graph_turn_with_text(
+        app: &mut App,
+        sent: &SentRequests,
+        index: usize,
+        text: &str,
+    ) {
         let (agent, request) = sent.lock().unwrap()[index].clone();
+        if !text.is_empty() {
+            assert!(app.apply_agent_output(AgentOutput {
+                agent,
+                conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+                turn_id: Some(TurnId::new(request.turn_id.as_str())),
+                event: AgentEvent::TextDelta(text.to_owned()),
+            }));
+        }
         assert!(app.apply_agent_output(AgentOutput {
             agent,
             conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
             turn_id: Some(TurnId::new(request.turn_id.as_str())),
             event: AgentEvent::Completed,
         }));
+    }
+
+    fn replan_requests(sent: &SentRequests) -> Vec<AgentRequest> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, request)| request.turn_id.as_str().starts_with("replan-"))
+            .map(|(_, request)| request.clone())
+            .collect()
+    }
+
+    fn complete_replan_keep(h: &mut PlanGateHarness) {
+        let req = h.sent.lock().unwrap().last().unwrap().1.clone();
+        assert!(
+            req.turn_id.as_str().starts_with("replan-"),
+            "expected replan turn, got {}",
+            req.turn_id.as_str()
+        );
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &req,
+            AgentEvent::TextDelta(r#"{"keep":true,"reason":"ok"}"#.to_owned())
+        )));
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(Agent::Codex, &req, AgentEvent::Completed))
+        );
+    }
+
+    fn last_agent_content(app: &App, agent: Agent) -> String {
+        app.messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::Agent(agent))
+            .map(|message| message.content.clone())
+            .unwrap_or_default()
+    }
+
+    fn last_graph_node_request_index(sent: &SentRequests) -> usize {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, (_, request))| {
+                let id = request.turn_id.as_str();
+                !id.starts_with("plan-") && !id.starts_with("judge-") && !id.starts_with("replan-")
+            })
+            .map(|(index, _)| index)
+            .expect("graph node request")
     }
 
     fn two_step_cursor_chain_plan(id: &str, max_retries: u32) -> dmuxai::graph::GraphPlan {
@@ -19464,6 +20325,228 @@ mod tests {
                 .any(|node| node.role == NodeRole::Orchestrate)
         );
         assert_eq!(plan_id, active.plan.id);
+    }
+
+    // TC-973 / FR-956: replan turns only on failure, marker, or user request.
+    #[test]
+    fn replan_only_on_trigger() {
+        let mut h = plan_gate_test_app();
+        h.app.settings.graph_max_retries = 1;
+        reach_awaiting_approval_with_plan(&mut h, three_step_codex_plan_json());
+        let goal = h
+            .app
+            .last_graph_run
+            .as_ref()
+            .unwrap()
+            .plan
+            .user_prompt
+            .clone();
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        h.app
+            .decide_plan(PlanDecisionKind::Approve, plan_id, 1, DecisionBy::Tui)
+            .unwrap();
+
+        let step1_secret = format!("{}step1 done", "X".repeat(600));
+        let step1 = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn_with_text(&mut h.app, &h.sent, step1, &step1_secret);
+        assert_eq!(replan_requests(&h.sent).len(), 0);
+
+        let step2 = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn_with_text(
+            &mut h.app,
+            &h.sent,
+            step2,
+            "built\n\nDMUXAI_REPLAN: need tests\n",
+        );
+        assert!(!last_agent_content(&h.app, Agent::Codex).contains("DMUXAI_REPLAN"));
+        let replans = replan_requests(&h.sent);
+        assert_eq!(replans.len(), 1);
+        assert_eq!(replans[0].turn_id.as_str(), "replan-1");
+        let prompt = &replans[0].prompt;
+        assert!(prompt.contains(&goal));
+        assert!(prompt.contains("step-3"));
+        assert!(prompt.contains("Pending steps (JSON)"));
+        assert!(prompt.contains("step-1:"));
+        assert!(prompt.contains(&step1_secret.chars().take(400).collect::<String>()));
+        assert!(!prompt.contains(&step1_secret));
+        assert!(!prompt.contains("needs several steps"));
+        complete_replan_keep(&mut h);
+
+        h.app.flush_deferred_graph_starts();
+        let step3 = last_graph_node_request_index(&h.sent);
+        assert_eq!(
+            h.app
+                .graph_agent_nodes
+                .get(&Agent::Codex)
+                .map(String::as_str),
+            Some("step-3")
+        );
+        let (agent, request) = h.sent.lock().unwrap()[step3].clone();
+        assert!(h.app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(request.turn_id.as_str())),
+            event: AgentEvent::Error("step failed".to_owned()),
+        }));
+        assert!(h.app.graph_session.is_some());
+        assert_ne!(
+            h.app.graph_session.as_ref().unwrap().run().phase,
+            GraphRunPhase::Failed
+        );
+        let replans = replan_requests(&h.sent);
+        assert_eq!(replans.len(), 2);
+        assert_eq!(replans[1].turn_id.as_str(), "replan-2");
+        complete_replan_keep(&mut h);
+        assert_eq!(
+            h.app
+                .graph_session
+                .as_ref()
+                .map(|session| session.run().phase),
+            None
+        );
+        assert_eq!(
+            h.app.last_graph_run.as_ref().map(|run| run.phase),
+            Some(GraphRunPhase::Failed)
+        );
+
+        let mut user = plan_gate_test_app();
+        reach_awaiting_approval_with_plan(&mut user, three_step_codex_plan_json());
+        let plan_id = user.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        user.app
+            .decide_plan(PlanDecisionKind::Approve, plan_id, 1, DecisionBy::Tui)
+            .unwrap();
+        user.app.request_replan("add docs", DecisionBy::Tui);
+        let step1 = last_graph_node_request_index(&user.sent);
+        complete_sent_graph_turn(&mut user.app, &user.sent, step1);
+        let replans = replan_requests(&user.sent);
+        assert_eq!(replans.len(), 1);
+        assert!(replans[0].prompt.contains("add docs"));
+
+        let mut one = plan_gate_test_app();
+        one.app.input = "/direct solo".to_owned();
+        one.app.submit_prompt();
+        one.app.input = "/graph replan note".to_owned();
+        one.app.submit_prompt();
+        assert!(last_system(&one.app).contains("Replan needs a multi-step run"));
+
+        let mut budget = plan_gate_test_app();
+        budget.app.settings.graph_replan_budget_chars = 1_000;
+        reach_awaiting_approval_with_plan(&mut budget, three_step_codex_plan_json());
+        let plan_id = budget.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        budget
+            .app
+            .decide_plan(PlanDecisionKind::Approve, plan_id, 1, DecisionBy::Tui)
+            .unwrap();
+        if let Some(session) = budget.app.graph_session.as_mut() {
+            session.run_mut().replan_chars_used = 1_000;
+        }
+        budget.app.input = "/graph replan broke budget".to_owned();
+        budget.app.submit_prompt();
+        assert!(
+            budget.app.messages.iter().any(|message| {
+                matches!(message.role, Role::System)
+                    && message.content.contains("replan skipped: budget")
+            }),
+            "last system: {}",
+            last_system(&budget.app)
+        );
+        assert_eq!(replan_requests(&budget.sent).len(), 0);
+    }
+
+    // FR-956: queued failure replan is not dropped when a marker trigger follows.
+    #[test]
+    fn queued_failure_replan_merges_marker_reason() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval_with_plan(&mut h, three_step_codex_plan_json());
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        h.app
+            .decide_plan(PlanDecisionKind::Approve, plan_id, 1, DecisionBy::Tui)
+            .unwrap();
+        h.app.graph_failure_replan = Some("step-3".to_owned());
+        h.app.queued_replan = Some(QueuedReplan {
+            trigger: ReplanTrigger::Failure,
+            reason: "graph node step-3 failed".to_owned(),
+            failure_node_id: Some("step-3".to_owned()),
+            decided_by: None,
+        });
+        h.app.enqueue_replan_trigger(
+            ReplanTrigger::Marker,
+            "need tests".to_owned(),
+            None,
+            false,
+            None,
+        );
+        let queued = h.app.queued_replan.as_ref().unwrap();
+        assert_eq!(queued.trigger, ReplanTrigger::Failure);
+        assert!(queued.reason.contains("graph node step-3 failed"));
+        assert!(queued.reason.contains("need tests"));
+        assert_eq!(h.app.graph_failure_replan.as_deref(), Some("step-3"));
+    }
+
+    // FR-956: a skipped queued user replan at flush resumes graph scheduling.
+    #[test]
+    fn queued_user_replan_skipped_at_flush_resumes_graph() {
+        let mut h = plan_gate_test_app();
+        h.app.settings.graph_replan_budget_chars = 50_000;
+        reach_awaiting_approval_with_plan(&mut h, three_step_codex_plan_json());
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        h.app
+            .decide_plan(PlanDecisionKind::Approve, plan_id, 1, DecisionBy::Tui)
+            .unwrap();
+        let step1 = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn(&mut h.app, &h.sent, step1);
+        let step2 = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn_with_text(
+            &mut h.app,
+            &h.sent,
+            step2,
+            "done\n\nDMUXAI_REPLAN: need tests\n",
+        );
+        h.app.request_replan("add docs", DecisionBy::Tui);
+        assert!(h.app.queued_replan.is_some());
+        if let Some(session) = h.app.graph_session.as_mut() {
+            session.run_mut().replan_chars_used = 50_000;
+        }
+        complete_replan_keep(&mut h);
+        assert!(h.app.messages.iter().any(|message| {
+            matches!(message.role, Role::System)
+                && message.content.contains("replan skipped: budget")
+        }));
+        assert_eq!(
+            h.app
+                .graph_agent_nodes
+                .get(&Agent::Codex)
+                .map(String::as_str),
+            Some("step-3")
+        );
+        assert_eq!(replan_requests(&h.sent).len(), 1);
+    }
+
+    // FR-956: marker on the final step is ignored when the run completes.
+    #[test]
+    fn replan_marker_ignored_when_run_completes() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval_with_plan(&mut h, three_step_codex_plan_json());
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        h.app
+            .decide_plan(PlanDecisionKind::Approve, plan_id, 1, DecisionBy::Tui)
+            .unwrap();
+        let step1 = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn(&mut h.app, &h.sent, step1);
+        let step2 = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn(&mut h.app, &h.sent, step2);
+        let before = replan_requests(&h.sent).len();
+        let step3 = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn_with_text(
+            &mut h.app,
+            &h.sent,
+            step3,
+            "all done\n\nDMUXAI_REPLAN: too late\n",
+        );
+        assert_eq!(replan_requests(&h.sent).len(), before);
+        let run = h.app.last_graph_run.as_ref().expect("run saved");
+        assert_eq!(run.phase, GraphRunPhase::Completed);
+        assert_eq!(run.replans_used, 0);
     }
 
     // TC-949 / FR-943: edit feedback runs a new plan turn and caps revisions at five.
