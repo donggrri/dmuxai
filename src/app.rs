@@ -22373,6 +22373,14 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("- [x] task-1 one"));
         assert!(after.contains("- [ ] task-2 renamed two"));
+
+        // After the first write, a title-only change (same ids and states)
+        // must still rewrite the file.
+        let mut run = h.app.last_graph_run.clone().unwrap();
+        run.plan.tasks[1].title = "retitled two".to_owned();
+        h.app.sync_tasks_file_for_run(&run);
+        let retitled = std::fs::read_to_string(&path).unwrap();
+        assert!(retitled.contains("task-2 retitled two"), "{retitled}");
     }
 
     #[test]
@@ -23428,6 +23436,51 @@ mod tests {
                 DecisionBy::Tui,
             ),
             Err(PlanDecisionError::StaleRecord)
+        );
+    }
+
+    // TC-994 / FR-965: `/graph task move` uses 1-based slots (dashboard Move up/down).
+    #[test]
+    fn graph_task_move_command_puts_task_first() {
+        use dmuxai::graph::TaskEdit;
+
+        let edit = App::parse_graph_task_edit("move task-2 1").expect("parse move");
+        assert_eq!(
+            edit,
+            TaskEdit::Move {
+                task_id: "task-2".to_owned(),
+                position: 1,
+            }
+        );
+
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval_with_plan(&mut h, three_task_codex_plan_json());
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        let revision =
+            App::current_plan_revision_n(h.app.last_graph_run.as_ref().unwrap()).unwrap();
+        h.app
+            .apply_task_edit(edit, plan_id, revision, DecisionBy::Tui)
+            .expect("move task-2 to slot 1");
+        // Task ids are renumbered by position after an edit, so the moved
+        // task ("two") is now task-1.
+        let tasks = &h.app.last_graph_run.as_ref().unwrap().plan.tasks;
+        assert_eq!(tasks[0].title, "two");
+        assert_eq!(tasks[0].id, "task-1");
+        assert_eq!(tasks[1].title, "one");
+        assert_eq!(tasks[2].title, "three");
+
+        // Slot 0 is not a valid 1-based position.
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        let revision =
+            App::current_plan_revision_n(h.app.last_graph_run.as_ref().unwrap()).unwrap();
+        let zero = TaskEdit::Move {
+            task_id: "task-1".to_owned(),
+            position: 0,
+        };
+        assert!(
+            h.app
+                .apply_task_edit(zero, plan_id, revision, DecisionBy::Tui)
+                .is_err()
         );
     }
 

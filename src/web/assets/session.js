@@ -134,9 +134,14 @@
     return node;
   }
 
-  function button(label, parity, onClick, className) {
-    var b = el('button', 'btn' + (className ? ' ' + className : ''), label);
+  function button(label, parity, onClick, extraClass) {
+    var b = el('button', 'btn', label);
     b.type = 'button';
+    if (extraClass) {
+      extraClass.split(/\s+/).forEach(function (cls) {
+        if (cls) { b.classList.add(cls); }
+      });
+    }
     if (parity) { b.setAttribute('data-parity', parity); }
     b.addEventListener('click', onClick);
     return b;

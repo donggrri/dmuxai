@@ -1355,12 +1355,17 @@ mod tests {
     fn approval_panel_asset() {
         assert!(INDEX_HTML.contains("id=\"graph-approval\""));
         assert!(SESSION_JS.contains("parityButton"));
-        for id in ["plan-approve", "plan-edit", "plan-reject"] {
-            assert!(
-                APP_JS.contains(&format!("'{id}'")) && APP_JS.contains("planGateParityButton"),
-                "visible approval panel must declare parity control {id}"
-            );
-        }
+        assert!(SESSION_JS.contains("classList.add"));
+        assert!(APP_JS.contains("planGateParityButton('Approve', 'plan-approve', 'btn-primary'"));
+        assert!(APP_JS.contains("planGateParityButton('Edit', 'plan-edit', ''"));
+        assert!(APP_JS.contains("planGateParityButton('Reject', 'plan-reject', 'btn-danger'"));
+        assert!(APP_JS.contains("viewOnly: isDashboardViewOnly()"));
+        assert!(APP_JS.contains("syncApprovalPanelButtonStates"));
+        assert!(APP_JS.contains("panel.querySelectorAll('button[data-plan-gate]')"));
+        assert!(APP_JS.contains("position: idx"));
+        assert!(APP_JS.contains("if (idx > 0) {"));
+        assert!(INDEX_HTML.contains("data-parity=\"plan-history\""));
+        assert!(APP_JS.contains("historyBtn.disabled = false"));
         assert!(INDEX_HTML.contains("data-parity=\"plan-replan\""));
         assert!(APP_JS.contains("window.dmuxaiPlanGate"));
         assert!(APP_JS.contains("function renderApprovalPanel"));
@@ -1417,6 +1422,9 @@ mod tests {
         assert!(APP_JS.contains("tasksForChecklist"));
         assert!(APP_JS.contains("data-task-id"));
         assert!(APP_JS.contains("function tasksForChecklist"));
+        assert!(APP_JS.contains("list.insertBefore(rowNode"));
+        assert!(APP_JS.contains("taskChecklistEverVisible"));
+        assert!(APP_CSS.contains("max-width: 280px"));
         for status in ["pending", "running", "done", "failed"] {
             assert!(
                 APP_CSS.contains(&format!(".task-checklist-status-{status}")),

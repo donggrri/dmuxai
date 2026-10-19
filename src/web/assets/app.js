@@ -538,6 +538,7 @@ var graphSelectedId = null;
 // UX-936: selected checklist task highlights swimlane nodes (survives snapshot re-render).
 var taskChecklistSelectedId = null;
 var taskChecklistHighlight = {};
+var taskChecklistEverVisible = false;
 var graphPan = null;
 var graphPointerDown = false;
 var graphZoomGroup = null;
@@ -1852,12 +1853,23 @@ function approvalPanelRenderKey(graph, approval) {
     tasks: graph.tasks,
     error: planGateUi.error,
     busy: planGateUi.busy,
+    viewOnly: isDashboardViewOnly(),
     editOpen: planGateUi.editOpen
   });
 }
 
 function syncApprovalPanelButtonStates() {
   var disabled = planGateDisabled();
+  var panel = $('graph-approval');
+  if (panel && !panel.hidden) {
+    // Only plan-gate controls: buttons with their own rules (move ends, history) are left alone.
+    var buttons = panel.querySelectorAll('button[data-plan-gate]');
+    for (var b = 0; b < buttons.length; b++) {
+      buttons[b].disabled = disabled;
+    }
+    var feedback = panel.querySelector('.graph-approval-feedback');
+    if (feedback) { feedback.disabled = disabled; }
+  }
   ['plan-approve', 'plan-edit', 'plan-reject', 'plan-replan'].forEach(function (id) {
     var btn = document.getElementById(id);
     if (btn) { btn.disabled = disabled; }
@@ -1979,6 +1991,7 @@ function appendApprovalStep(panel, step) {
 function planGateActionButton(label, extraClass, onClick) {
   var btn = el('button', 'btn' + (extraClass ? ' ' + extraClass : ''), label);
   btn.type = 'button';
+  btn.setAttribute('data-plan-gate', '1');
   btn.disabled = planGateDisabled();
   btn.addEventListener('click', onClick);
   return btn;
@@ -1990,12 +2003,18 @@ function planGateParityButton(label, parity, extraClass, onClick) {
   if (make) {
     btn = make(label, parity, onClick, extraClass);
   } else {
-    btn = el('button', 'btn' + (extraClass ? ' ' + extraClass : ''), label);
+    btn = el('button', 'btn', label);
     btn.type = 'button';
     if (parity) { btn.setAttribute('data-parity', parity); }
     btn.addEventListener('click', onClick);
   }
+  if (extraClass) {
+    extraClass.split(/\s+/).forEach(function (cls) {
+      if (cls) { btn.classList.add(cls); }
+    });
+  }
   if (parity) { btn.id = parity; }
+  if (parity !== 'plan-history') { btn.setAttribute('data-plan-gate', '1'); }
   btn.disabled = planGateDisabled();
   return btn;
 }
@@ -2306,6 +2325,15 @@ function createTaskChecklistRow(task) {
   return row;
 }
 
+function autoFitGraphAfterTaskChecklistLayout() {
+  if (!graphGeometry) { return; }
+  window.requestAnimationFrame(function () {
+    if (!graphGeometry) { return; }
+    autoFitGraph(graphGeometry);
+    applyGraphTransform();
+  });
+}
+
 function renderTaskChecklist(graph) {
   var panel = $('task-checklist');
   if (!panel) { return; }
@@ -2319,6 +2347,7 @@ function renderTaskChecklist(graph) {
     panel.replaceChildren();
     taskChecklistSelectedId = null;
     taskChecklistHighlight = {};
+    taskChecklistEverVisible = false;
     updateGraphNodeSelection();
     return;
   }
@@ -2349,7 +2378,10 @@ function renderTaskChecklist(graph) {
     if (rowNode) {
       updateTaskChecklistRow(rowNode, task);
     } else {
-      list.appendChild(createTaskChecklistRow(task));
+      rowNode = createTaskChecklistRow(task);
+    }
+    if (list.children[i] !== rowNode) {
+      list.insertBefore(rowNode, list.children[i] || null);
     }
   }
   for (var id in existing) {
@@ -2360,6 +2392,10 @@ function renderTaskChecklist(graph) {
   if (focusTaskId) {
     var focused = list.querySelector('[data-task-id="' + focusTaskId + '"]');
     if (focused) { focused.focus(); }
+  }
+  if (!taskChecklistEverVisible) {
+    taskChecklistEverVisible = true;
+    autoFitGraphAfterTaskChecklistLayout();
   }
 }
 

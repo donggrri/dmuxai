@@ -455,7 +455,10 @@ pub fn write_tasks_file(workspace: &Path, run: &GraphRun) -> io::Result<PathBuf>
         temp.write_all(body.as_bytes())?;
         temp.flush()?;
     }
-    fs::rename(&temp_path, &path)?;
+    if let Err(error) = fs::rename(&temp_path, &path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
     Ok(path)
 }
 
