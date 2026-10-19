@@ -2094,6 +2094,9 @@ mod builtin_opencode_tests {
     // defaults, with or without the opencode example, and names every section.
     #[test]
     fn starter_config_parses() {
+        let _guard = REDUCED_MOTION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dmuxai.toml");
         for opencode in [false, true] {

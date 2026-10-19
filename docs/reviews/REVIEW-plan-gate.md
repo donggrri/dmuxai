@@ -1,6 +1,6 @@
 # REVIEW: plan-gate
 
-Status: Implemented (draft PR, not released; release gates in P22)
+Status: Done (draft PR, not released)
 Spec: [SPEC-plan-gate](../specs/SPEC-plan-gate.md)
 Tasks: [TASKS-plan-gate](../tasks/TASKS-plan-gate.md)
 
@@ -15,7 +15,7 @@ Tasks: [TASKS-plan-gate](../tasks/TASKS-plan-gate.md)
 | To-do and headless (FR-947, FR-1010) | Met | P19–P20, `tests/cli.rs` TC-955 |
 | Non-goals (no judge-model setting, no policy edits) | Met | Spec §2; no `[graph] judge` in tree |
 
-Residual risk: `settings::builtin_opencode_tests::starter_config_parses` and `agent::cursor` `prewarm_exited_process_is_replaced` fail intermittently under load (fix tracked in P22). Automated TC-960 headless Chrome e2e not added; manual #67 browser dogfood covers Approve / Edit / Replan. The live judge path (TC-962) was not exercised because every #67 run used `/plan`. Rollback: the feature lives on the `feat/plan-gate` draft branch only; nothing is released, so rollback is not merging (or reverting the merge); old run records stay readable (new fields are serde-default).
+Residual risk: the two formerly flaky tests (`starter_config_parses`, `prewarm_exited_process_is_replaced`) were fixed in P22 and passed 8/8 repeated runs; not proven under every load. Automated TC-960 headless Chrome e2e not added; manual #67 browser dogfood covers Approve / Edit / Replan. The live judge path (TC-962) was not exercised because every #67 run used `/plan`. Rollback: the feature lives on the `feat/plan-gate` draft branch only; nothing is released, so rollback is not merging (or reverting the merge); old run records stay readable (new fields are serde-default).
 
 ## Task reviews (diff-only, reviewer differs from the author)
 
@@ -46,8 +46,8 @@ Residual risk: `settings::builtin_opencode_tests::starter_config_parses` and `ag
 | P18 | composer-2.5 (#67 graph bfa6a6ba, rev 2) | claude-sonnet-5-5-high | BLOCK → hand fix → APPROVE (tasks_file dedupe); clippy follow-up b60323f |
 | P19 | composer-2.5 (#67 graph c2208f02) | claude-sonnet-5-5-high | BLOCK → hand fix → APPROVE (todo_id leak on plain prompt; judge/plan cancel reopen to-do; FR-1010) |
 | P20 | composer-2.5 (#67 graph 3a9ebe75) | claude-sonnet-5-5-high | APPROVE (hand fix: sensitive replan back to awaiting_approval exits 7) |
-| P21 | composer-2.5 | — | Docs only (README, SPEC status notes, this REVIEW); no implementation diff |
-| P22 | — | — | Pending (`TASKS-plan-gate`: final fmt/clippy Windows, full `--all-targets`, CI on draft PR) |
+| P21 | composer-2.5 (#67 graph 16076f4a + hand corrections) | claude-sonnet-5-5-high | APPROVE (docs; nits applied) |
+| P22 | composer-2.5 (/direct) | claude-sonnet-5-5-high | APPROVE (flaky tests fixed; initial plan no longer badges every node `added`) |
 
 Implement steps P04–P20: cursor **composer-2.5**. Reviews: cursor-agent **claude-sonnet-5-5-high** on the diff only.
 
@@ -116,11 +116,21 @@ Latest recorded pass on the P20 tree (`CARGO_TARGET_DIR` isolated target dir):
 | `cargo test --locked --test spec_index` | pass (3/3) |
 | `check-spec` BASELINE + SPEC-plan-gate | pass |
 
-P22 still requires Windows clippy (`x86_64-pc-windows-gnu`) and full `cargo test --locked --all-targets` before release.
+GitHub Actions is billing-blocked for this repository, so these local gates replace "CI green on the draft PR".
+
+Final P22 run (head after P22):
+
+| Gate | Result |
+| --- | --- |
+| `cargo fmt --check` | pass |
+| `cargo clippy --locked --all-targets -- -D warnings` (Linux) | pass |
+| `cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings` | pass (mingw-w64 installed on the dogfood box) |
+| `cargo test --locked --all-targets` | pass (lib 354, bin 325, integration 70 incl. cli 7 and spec_index 3; 0 failed) |
+| `check-spec` BASELINE + SPEC-plan-gate | pass |
+| repeated `settings::` suite (16 threads) and `prewarm_exited_process_is_replaced` | 8/8 each |
 
 ## Open nits / follow-ups
 
-- Initial plan marks every node `added` in the swimlane (rev 1 counts as the latest applied change) — fixed in P22.
 - TUI screenshots (judge line, TUI approval panel) not taken as PNGs.
 - Checklist titles are cut at 280 px (no wrap/ellipsis tooltip) — dogfood P19 screenshot.
 - Temp tasks file is left behind when write/flush (not rename) fails.

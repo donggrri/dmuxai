@@ -445,7 +445,10 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 fn latest_applied_plan_change(run: &GraphRun) -> Option<&PlanChange> {
-    run.plan_history.iter().rev().find(|change| change.applied)
+    run.plan_history
+        .iter()
+        .rev()
+        .find(|change| change.applied && change.kind != PlanChangeKind::Initial)
 }
 
 fn rev_change_for_step_id(revision: &PlanRevision, step_id: &str) -> Option<RevChangeMark> {
@@ -1214,6 +1217,97 @@ mod tests {
         assert!(json.contains("\"line\":"));
         assert!(json.contains("\"planner_calls\""));
         assert!(json.contains("\"planner_io\""));
+    }
+
+    // TC-977 snapshot part (FR-960): the initial approval revision is not a replan
+    // badge source; only later applied edit/replan revisions mark nodes.
+    #[test]
+    fn initial_plan_has_no_rev_change_badges() {
+        let make_node = |id: &str| GraphNode {
+            id: id.to_string(),
+            role: NodeRole::Implement,
+            job: id.to_string(),
+            runner: "cursor".to_string(),
+            model_id: "m".to_string(),
+            skill: None,
+            requires_gate: false,
+            status: GraphNodeStatus::Pending,
+            attempt: 0,
+            task: None,
+            started_at_ms: None,
+            finished_at_ms: None,
+        };
+        let initial = PlanChange {
+            rev: 1,
+            kind: PlanChangeKind::Initial,
+            at_ms: 1,
+            after_node: None,
+            reason: "approved".to_owned(),
+            trigger: None,
+            prompt_chars: None,
+            response_chars: None,
+            added: vec!["node-a".to_owned(), "node-b".to_owned()],
+            changed: vec![],
+            removed: vec![],
+            tasks_added: 0,
+            tasks_changed: 0,
+            tasks_removed: 0,
+            applied: true,
+            error: None,
+            response_excerpt: None,
+            decided_by: Some(DecisionBy::Tui),
+        };
+        let fresh = GraphRun {
+            plan: GraphPlan {
+                schema: "dmuxai.graph/v1".to_string(),
+                id: "run-initial".to_string(),
+                orchestrator_model: "m".to_string(),
+                user_prompt: "p".to_string(),
+                limits: GraphLimits::default(),
+                tasks: Vec::new(),
+                nodes: vec![make_node("node-a"), make_node("node-b")],
+                edges: Vec::new(),
+            },
+            conversation_id: "conv".to_string(),
+            phase: GraphRunPhase::Active,
+            plan_history: vec![initial],
+            ..Default::default()
+        };
+        let fresh_view = snapshot_from_run(&fresh);
+        for node in &fresh_view.nodes {
+            assert_eq!(node.rev_change, None, "node {}", node.id);
+        }
+
+        let replan = PlanChange {
+            rev: 2,
+            kind: PlanChangeKind::Replan,
+            at_ms: 2,
+            after_node: Some("node-a".to_owned()),
+            reason: "failure".to_owned(),
+            trigger: Some(PlanChangeTrigger::Failure),
+            prompt_chars: None,
+            response_chars: None,
+            added: vec!["node-c".to_owned()],
+            changed: vec!["node-a".to_owned()],
+            removed: vec![],
+            tasks_added: 0,
+            tasks_changed: 0,
+            tasks_removed: 0,
+            applied: true,
+            error: None,
+            response_excerpt: None,
+            decided_by: None,
+        };
+        let mut after_replan = fresh;
+        after_replan.plan.nodes.push(make_node("node-c"));
+        after_replan.plan_history.push(replan);
+        let replan_view = snapshot_from_run(&after_replan);
+        let node_a = replan_view.nodes.iter().find(|n| n.id == "node-a").unwrap();
+        let node_b = replan_view.nodes.iter().find(|n| n.id == "node-b").unwrap();
+        let node_c = replan_view.nodes.iter().find(|n| n.id == "node-c").unwrap();
+        assert_eq!(node_a.rev_change, Some(RevChangeMark::Changed));
+        assert_eq!(node_b.rev_change, None);
+        assert_eq!(node_c.rev_change, Some(RevChangeMark::Added));
     }
 
     // TC-977 snapshot part (FR-960, FR-962): applied replan sets node `rev_change`;
