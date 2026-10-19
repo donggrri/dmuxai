@@ -56,16 +56,17 @@ use dmuxai::{
     graph::{
         AllowedRunner, Approval, ApprovalState, DecisionBy, FallbackCause, GraphAction, GraphNode,
         GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, GraphRunSession, GraphStore,
-        MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind, PlanChange, PlanChangeKind,
-        PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode, PlanPromptRequest, PlanRevision,
-        PlanStep, PlanTask, PlannerCalls, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage,
-        TriageSource, apply_replan, budget_allows, build_judge_prompt, build_plan_prompt,
-        build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary, cap_revision_raw,
-        diff_plan_steps, diff_plan_tasks, fallback_plan, graph_plan_from_revision_steps,
-        heuristic_route, judge_line_text, judging_line_text, next_plan_change_rev, parse_plan,
-        parse_replan, parse_replan_marker, parse_verdict, plan_json_for_edit, replan_allowed,
+        MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind, PanelLineKind, PlanChange,
+        PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode, PlanPromptRequest,
+        PlanRevision, PlanStep, PlanTask, PlannerCalls, PlannerIo, PlannerIoKind, ReplanDoc,
+        ReplanTrigger, Route, TaskEdit, Triage, TriageSource, apply_replan, approval_panel_lines,
+        budget_allows, build_judge_prompt, build_plan_prompt, build_replan_prompt,
+        cap_plan_response_excerpt, cap_replan_step_summary, cap_revision_raw, diff_plan_steps,
+        diff_plan_tasks, fallback_plan, graph_plan_from_revision_steps, heuristic_route,
+        judge_line_text, judging_line_text, next_plan_change_rev, parse_plan, parse_replan,
+        parse_replan_marker, parse_verdict, plan_json_for_edit, replan_allowed,
         replan_revision_steps, revision_needs_approval, save_run, strip_replan_marker,
-        validate_plan,
+        task_counter_text, validate_plan,
     },
     mcp::config::ResolvedMcpServer,
     mcp::registry::McpRegistry,
@@ -699,6 +700,9 @@ struct PendingPlan {
     runner: String,
     edit_previous_json: Option<String>,
     edit_feedback: Option<String>,
+    override_kind: Option<OverrideKind>,
+    /// True once the adapter accepted the plan/repair/edit turn.
+    adapter_sent: bool,
 }
 
 /// FR-956: internal read-only replan turn (buffer hidden like [`PendingPlan`]).
@@ -723,6 +727,7 @@ struct PendingReplan {
     decided_by: Option<DecisionBy>,
     #[allow(dead_code)]
     summaries: Vec<(String, String)>,
+    adapter_sent: bool,
 }
 
 enum DeferredInternalTurn {
@@ -793,6 +798,7 @@ struct UiAreas {
     chat: Rect,
     graph_status: Option<Rect>,
     judge_line: Option<Rect>,
+    approval_panel: Option<Rect>,
     input: Rect,
     status: Rect,
 }
@@ -1049,6 +1055,8 @@ pub struct App {
     /// Node id whose terminal failure is held until replan finishes (FR-956).
     graph_failure_replan: Option<String>,
     deferred_internal_turn: Option<DeferredInternalTurnWait>,
+    /// FR-1008: planner_io recorded before the run row exists (e.g. judge).
+    deferred_planner_io: HashMap<String, Vec<PlannerIo>>,
     deferred_turns: Vec<DeferredTurn>,
     restored_inputs: HashMap<StoredConversationId, String>,
     busy_agents: HashSet<Agent>,
@@ -1064,6 +1072,7 @@ pub struct App {
     modes: HashMap<Agent, ExecutionMode>,
     tool_messages: HashMap<Agent, HashMap<String, usize>>,
     chat_scroll: usize,
+    approval_panel_scroll: usize,
     chat_selection: Option<ChatSelection>,
     selecting_chat: bool,
     selection_dragged: bool,
@@ -1267,6 +1276,7 @@ impl App {
             replan_summaries: Vec::new(),
             graph_failure_replan: None,
             deferred_internal_turn: None,
+            deferred_planner_io: HashMap::new(),
             deferred_turns: Vec::new(),
             restored_inputs: HashMap::new(),
             busy_agents: HashSet::new(),
@@ -1294,6 +1304,7 @@ impl App {
                 .collect(),
             tool_messages: HashMap::new(),
             chat_scroll: 0,
+            approval_panel_scroll: 0,
             chat_selection: None,
             selecting_chat: false,
             selection_dragged: false,
@@ -2338,6 +2349,24 @@ impl App {
 
         match key.code {
             KeyCode::Esc => {}
+            KeyCode::PageUp => {
+                if self.ui_areas(self.terminal_area).approval_panel.is_some() {
+                    let page = self.approval_panel_page_lines();
+                    let max_scroll = self.approval_panel_max_scroll();
+                    self.approval_panel_scroll = self
+                        .approval_panel_scroll
+                        .saturating_sub(page)
+                        .min(max_scroll);
+                }
+            }
+            KeyCode::PageDown => {
+                if self.ui_areas(self.terminal_area).approval_panel.is_some() {
+                    let page = self.approval_panel_page_lines();
+                    let max_scroll = self.approval_panel_max_scroll();
+                    self.approval_panel_scroll =
+                        (self.approval_panel_scroll + page).min(max_scroll);
+                }
+            }
             KeyCode::F(2) => self.open_model_picker(),
             KeyCode::F(3) => self.open_conversation_picker(),
             KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => self.submit_prompt(),
@@ -3617,42 +3646,24 @@ impl App {
             self.end_run_state(plan_agent, false, true);
             let _ = self.adapters[adapter_index(plan_agent)].select_mode(pending.saved_mode);
             if pending.edit_previous_json.is_some() {
+                self.record_pending_plan_io(&pending, false);
                 self.restore_awaiting_after_edit_failure(&pending, "cancelled by user");
                 self.push_system(format!("{plan_agent} turn cancelled."));
                 return;
             }
+            self.record_pending_plan_io(&pending, false);
             self.input = pending.prompt.clone();
-            let runner = runner_name(plan_agent).to_owned();
-            let plan = GraphPlan {
-                schema: "dmuxai.graph/v1".to_owned(),
-                id: pending.run_id.clone(),
-                orchestrator_model: pending.model.clone(),
-                user_prompt: pending.prompt.clone(),
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                limits: self.graph_limits(),
-                tasks: Vec::new(),
-            };
-            let run = self.build_graph_run(
-                plan,
-                GraphRunPhase::Cancelled,
-                Triage {
-                    route: pending.route,
-                    reason: "cancelled by user".to_owned(),
-                    source: pending.triage_source,
-                    cause: pending.triage_cause,
-                    override_kind: None,
-                    runner,
-                    model: pending.model,
-                    elapsed_ms: pending.triage_elapsed_ms,
-                },
-                None,
-                pending.judge_calls,
-            );
-            if let Err(error) = save_run(&self.workspace_root, &run) {
-                self.push_system(format!("Could not save the cancelled run: {error}"));
+            if let Some(run) = self.last_graph_run.as_mut()
+                && run.plan.id == pending.run_id
+            {
+                run.phase = GraphRunPhase::Cancelled;
+                if let Some(triage) = run.triage.as_mut() {
+                    triage.reason = "cancelled by user".to_owned();
+                }
+                if let Err(error) = save_run(&self.workspace_root, run) {
+                    self.push_system(format!("Could not save the cancelled run: {error}"));
+                }
             }
-            self.last_graph_run = Some(run);
             self.push_system(format!("{plan_agent} turn cancelled."));
             return;
         }
@@ -3667,6 +3678,7 @@ impl App {
             self.activities.remove(&agent);
             self.end_run_state(agent, false, true);
             let _ = self.adapters[adapter_index(agent)].select_mode(pending.saved_mode);
+            self.record_pending_triage_io(&pending, false);
             self.input = pending.prompt.clone();
             let runner = runner_name(agent).to_owned();
             let plan = GraphPlan {
@@ -3679,7 +3691,7 @@ impl App {
                 limits: self.graph_limits(),
                 tasks: Vec::new(),
             };
-            let run = self.build_graph_run(
+            let mut run = self.build_graph_run(
                 plan,
                 GraphRunPhase::Cancelled,
                 Triage {
@@ -3695,6 +3707,7 @@ impl App {
                 None,
                 pending.judge_calls,
             );
+            self.apply_stored_planner_io(&pending.run_id, &mut run);
             if let Err(error) = save_run(&self.workspace_root, &run) {
                 self.push_system(format!("Could not save the cancelled run: {error}"));
             }
@@ -4210,7 +4223,7 @@ impl App {
                     saved_mode,
                     FallbackCause::Error,
                     run_id,
-                    1,
+                    0,
                     0,
                 );
             }
@@ -4240,6 +4253,7 @@ impl App {
                     self.activities.remove(&pending.agent);
                     self.end_run_state(pending.agent, false, false);
                     let elapsed_ms = pending.started.elapsed().as_millis() as u64;
+                    self.record_pending_triage_io(&pending, false);
                     self.triage_fallback(
                         pending.prompt,
                         pending.agent,
@@ -4264,7 +4278,9 @@ impl App {
                 self.end_run_state(pending.agent, true, false);
                 let elapsed_ms = pending.started.elapsed().as_millis() as u64;
                 let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
-                match parse_verdict(&pending.buffer) {
+                let verdict_result = parse_verdict(&pending.buffer);
+                self.record_pending_triage_io(&pending, verdict_result.is_ok());
+                match verdict_result {
                     Ok(verdict) => match verdict.route {
                         Route::Simple => self.start_one_node_run(
                             pending.prompt,
@@ -4320,6 +4336,7 @@ impl App {
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, false, false);
                 let elapsed_ms = pending.started.elapsed().as_millis() as u64;
+                self.record_pending_triage_io(&pending, false);
                 self.triage_fallback(
                     pending.prompt,
                     pending.agent,
@@ -4379,6 +4396,7 @@ impl App {
                 run_id,
                 judge_calls,
                 elapsed_ms,
+                None,
                 PlannerCalls {
                     judge: judge_calls,
                     ..Default::default()
@@ -5261,7 +5279,7 @@ impl App {
         judge_calls: u32,
         elapsed_ms: u64,
     ) {
-        let run = match self.build_one_node_run(
+        let mut run = match self.build_one_node_run(
             &prompt,
             agent,
             route,
@@ -5280,6 +5298,8 @@ impl App {
                 return;
             }
         };
+        let run_id = run.plan.id.clone();
+        self.apply_stored_planner_io(&run_id, &mut run);
         // UX-930: simple verdicts and overrides keep their judge line too.
         self.remember_judge_reason_triage(run.triage.as_ref());
         self.start_graph_run_record(run);
@@ -5399,6 +5419,7 @@ impl App {
                 run_id,
                 judge_calls,
                 elapsed_ms,
+                override_kind,
                 PlannerCalls {
                     judge: judge_calls,
                     ..Default::default()
@@ -5448,6 +5469,7 @@ impl App {
         run_id: String,
         judge_calls: u32,
         elapsed_ms: u64,
+        override_kind: Option<OverrideKind>,
         planner_calls: PlannerCalls,
         fallback_cause: &str,
         revision_errors: Option<Vec<String>>,
@@ -5487,6 +5509,7 @@ impl App {
             .first()
             .map(|node| node.model_id.clone())
             .unwrap_or_else(|| model_hint.unwrap_or_default());
+        let run_id_for_io = run_id.clone();
         let mut plan = built.plan;
         plan.id = run_id;
         plan.orchestrator_model = model.clone();
@@ -5522,7 +5545,7 @@ impl App {
             reason,
             source,
             cause,
-            override_kind: None,
+            override_kind,
             runner,
             model,
             elapsed_ms,
@@ -5537,6 +5560,7 @@ impl App {
         run.planner_calls = planner_calls;
         run.orchestrate_started_ms = Some(unix_ms_now().saturating_sub(elapsed_ms));
         run.plan_fixed_ms = Some(unix_ms_now());
+        self.apply_stored_planner_io(&run_id_for_io, &mut run);
         self.push_system(built.note);
         if let Err(error) = save_run(&self.workspace_root, &run) {
             self.push_system(format!("Could not save the fallback plan: {error}"));
@@ -5623,6 +5647,7 @@ impl App {
                 run_id,
                 judge_calls,
                 triage_elapsed_ms,
+                override_kind,
                 planner_calls,
                 "agent busy",
                 None,
@@ -5658,6 +5683,7 @@ impl App {
                 run_id,
                 judge_calls,
                 triage_elapsed_ms,
+                override_kind,
                 planner_calls,
                 "no_read_only_mode",
                 None,
@@ -5676,6 +5702,7 @@ impl App {
                 run_id,
                 judge_calls,
                 triage_elapsed_ms,
+                override_kind,
                 planner_calls,
                 "no_read_only_mode",
                 None,
@@ -5748,6 +5775,7 @@ impl App {
                     run_id,
                     judge_calls,
                     triage_elapsed_ms,
+                    override_kind,
                     planner_calls,
                     "error",
                     None,
@@ -5766,23 +5794,6 @@ impl App {
             resume_session: None,
             image_paths: vec![],
         };
-        let mut plan_calls = planner_calls.plan;
-        let mut repair_calls = planner_calls.repair;
-        let mut edit_calls = planner_calls.edit;
-        if edit.is_some() && attempt == 0 {
-            edit_calls += 1;
-        } else if attempt == 0 {
-            plan_calls += 1;
-        } else {
-            repair_calls += 1;
-        }
-        let updated_calls = PlannerCalls {
-            judge: planner_calls.judge,
-            plan: plan_calls,
-            repair: repair_calls,
-            edit: edit_calls,
-            replan: planner_calls.replan,
-        };
         let triage = Triage {
             route,
             reason: verdict_reason.clone(),
@@ -5798,10 +5809,21 @@ impl App {
             .as_ref()
             .is_some_and(|run| run.plan.id == run_id && (edit.is_some() || run.approval.is_some()));
         if editing_existing {
+            let run_id_for_io = self
+                .last_graph_run
+                .as_ref()
+                .expect("edit run")
+                .plan
+                .id
+                .clone();
+            let stored_io = self.take_planner_io_for_run(&run_id_for_io);
             let run = self.last_graph_run.as_mut().expect("edit run");
             run.phase = GraphRunPhase::Planning;
-            run.planner_calls = updated_calls;
+            run.planner_calls = planner_calls;
             run.orchestrate_started_ms = Some(orchestrate_started_ms);
+            if !stored_io.is_empty() {
+                run.planner_io = stored_io;
+            }
             if let Err(error) = save_run(&self.workspace_root, run) {
                 self.push_system(format!("Could not save the planning run: {error}"));
             }
@@ -5823,8 +5845,9 @@ impl App {
                 None,
                 judge_calls,
             );
-            planning_run.planner_calls = updated_calls;
+            planning_run.planner_calls = planner_calls;
             planning_run.orchestrate_started_ms = Some(orchestrate_started_ms);
+            self.apply_stored_planner_io(&run_id, &mut planning_run);
             if let Err(error) = save_run(&self.workspace_root, &planning_run) {
                 self.push_system(format!("Could not save the planning run: {error}"));
             }
@@ -5834,6 +5857,37 @@ impl App {
         self.push_system(format!("Planning with {runner} {model}…"));
         match self.adapters[index].send(request) {
             Ok(()) => {
+                let mut plan_calls = planner_calls.plan;
+                let mut repair_calls = planner_calls.repair;
+                let mut edit_calls = planner_calls.edit;
+                if edit.is_some() && attempt == 0 {
+                    edit_calls += 1;
+                } else if attempt == 0 {
+                    plan_calls += 1;
+                } else {
+                    repair_calls += 1;
+                }
+                let updated_calls = PlannerCalls {
+                    judge: planner_calls.judge,
+                    plan: plan_calls,
+                    repair: repair_calls,
+                    edit: edit_calls,
+                    replan: planner_calls.replan,
+                };
+                if editing_existing {
+                    let run = self.last_graph_run.as_mut().expect("edit run");
+                    run.planner_calls = updated_calls;
+                    if let Err(error) = save_run(&self.workspace_root, run) {
+                        self.push_system(format!("Could not save the planning run: {error}"));
+                    }
+                } else if let Some(run) = self.last_graph_run.as_mut()
+                    && run.plan.id == run_id
+                {
+                    run.planner_calls = updated_calls;
+                    if let Err(error) = save_run(&self.workspace_root, run) {
+                        self.push_system(format!("Could not save the planning run: {error}"));
+                    }
+                }
                 let now = Instant::now();
                 let started_at_ms = unix_ms_now();
                 self.busy_agents.insert(agent);
@@ -5874,6 +5928,8 @@ impl App {
                     runner,
                     edit_previous_json: edit.as_ref().map(|(previous, _)| previous.clone()),
                     edit_feedback: edit.as_ref().map(|(_, feedback)| feedback.clone()),
+                    override_kind,
+                    adapter_sent: true,
                 });
             }
             Err(error) => {
@@ -5898,8 +5954,8 @@ impl App {
                         triage_source,
                         triage_cause,
                         judge_calls,
-                        plan_calls,
-                        repair_calls,
+                        plan_calls: planner_calls.plan,
+                        repair_calls: planner_calls.repair,
                         attempt,
                         orchestrate_started_ms,
                         triage_elapsed_ms,
@@ -5907,6 +5963,8 @@ impl App {
                         runner,
                         edit_previous_json: edit.as_ref().map(|(previous, _)| previous.clone()),
                         edit_feedback: edit.as_ref().map(|(_, feedback)| feedback.clone()),
+                        override_kind,
+                        adapter_sent: false,
                     };
                     self.restore_awaiting_after_edit_failure(&pending, "send error");
                 } else {
@@ -5920,7 +5978,8 @@ impl App {
                         run_id,
                         judge_calls,
                         triage_elapsed_ms,
-                        updated_calls,
+                        override_kind,
+                        planner_calls,
                         "error",
                         None,
                         None,
@@ -6017,7 +6076,7 @@ impl App {
             reason: pending.verdict_reason,
             source: pending.triage_source,
             cause: pending.triage_cause,
-            override_kind: None,
+            override_kind: pending.override_kind,
             runner: pending.runner.clone(),
             model: pending.model.clone(),
             elapsed_ms: pending.triage_elapsed_ms,
@@ -6037,6 +6096,7 @@ impl App {
         };
         run.orchestrate_started_ms = Some(pending.orchestrate_started_ms);
         run.plan_fixed_ms = Some(unix_ms_now());
+        self.apply_stored_planner_io(&pending.run_id, &mut run);
         if let Err(error) = save_run(&self.workspace_root, &run) {
             self.push_system(format!("Could not save the plan: {error}"));
         }
@@ -6178,6 +6238,7 @@ impl App {
                     self.end_run_state(pending.agent, false, false);
                     let _ =
                         self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
+                    self.record_pending_plan_io(&pending, false);
                     if pending.edit_previous_json.is_some() {
                         self.restore_awaiting_after_edit_failure(&pending, "error");
                     } else {
@@ -6191,6 +6252,7 @@ impl App {
                             pending.run_id,
                             pending.judge_calls,
                             pending.triage_elapsed_ms,
+                            pending.override_kind,
                             PlannerCalls {
                                 judge: pending.judge_calls,
                                 plan: pending.plan_calls,
@@ -6237,6 +6299,7 @@ impl App {
                         };
                         match validate_plan(&doc, &ctx) {
                             Ok(graph_plan) => {
+                                self.record_pending_plan_io(&pending, true);
                                 if pending.edit_previous_json.is_some() {
                                     self.finish_validated_plan_edit(pending, &doc, graph_plan);
                                 } else {
@@ -6246,6 +6309,7 @@ impl App {
                             Err(errors) if pending.attempt == 0 => {
                                 let _ = self.adapters[adapter_index(pending.agent)]
                                     .select_mode(pending.saved_mode);
+                                self.record_pending_plan_io(&pending, false);
                                 let messages: Vec<String> =
                                     errors.iter().map(|err| err.to_string()).collect();
                                 let saved_mode = pending.saved_mode;
@@ -6268,13 +6332,14 @@ impl App {
                                     messages,
                                     planner_calls,
                                     Some(saved_mode),
-                                    None,
+                                    pending.override_kind,
                                     edit_ctx,
                                 );
                             }
                             Err(errors) => {
                                 let _ = self.adapters[adapter_index(pending.agent)]
                                     .select_mode(pending.saved_mode);
+                                self.record_pending_plan_io(&pending, false);
                                 if pending.edit_previous_json.is_some() {
                                     self.restore_awaiting_after_edit_failure(
                                         &pending,
@@ -6294,6 +6359,7 @@ impl App {
                                         pending.run_id,
                                         pending.judge_calls,
                                         pending.triage_elapsed_ms,
+                                        pending.override_kind,
                                         PlannerCalls {
                                             judge: pending.judge_calls,
                                             plan: pending.plan_calls,
@@ -6311,6 +6377,7 @@ impl App {
                     Err(errors) if pending.attempt == 0 => {
                         let _ = self.adapters[adapter_index(pending.agent)]
                             .select_mode(pending.saved_mode);
+                        self.record_pending_plan_io(&pending, false);
                         let messages: Vec<String> =
                             errors.iter().map(|err| err.to_string()).collect();
                         let saved_mode = pending.saved_mode;
@@ -6333,13 +6400,14 @@ impl App {
                             messages,
                             planner_calls,
                             Some(saved_mode),
-                            None,
+                            pending.override_kind,
                             edit_ctx,
                         );
                     }
                     Err(errors) => {
                         let _ = self.adapters[adapter_index(pending.agent)]
                             .select_mode(pending.saved_mode);
+                        self.record_pending_plan_io(&pending, false);
                         if pending.edit_previous_json.is_some() {
                             self.restore_awaiting_after_edit_failure(
                                 &pending,
@@ -6359,6 +6427,7 @@ impl App {
                                 pending.run_id,
                                 pending.judge_calls,
                                 pending.triage_elapsed_ms,
+                                pending.override_kind,
                                 PlannerCalls {
                                     judge: pending.judge_calls,
                                     plan: pending.plan_calls,
@@ -6396,6 +6465,7 @@ impl App {
                     AgentEvent::Error(message) => message,
                     _ => "cancelled".to_owned(),
                 };
+                self.record_pending_plan_io(&pending, false);
                 if pending.edit_previous_json.is_some() {
                     self.restore_awaiting_after_edit_failure(&pending, &detail);
                 } else {
@@ -6409,6 +6479,7 @@ impl App {
                         pending.run_id,
                         pending.judge_calls,
                         pending.triage_elapsed_ms,
+                        pending.override_kind,
                         PlannerCalls {
                             judge: pending.judge_calls,
                             plan: pending.plan_calls,
@@ -6450,6 +6521,7 @@ impl App {
         self.activities.remove(&pending.agent);
         self.end_run_state(pending.agent, false, false);
         let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
+        self.record_pending_plan_io(&pending, false);
         if pending.edit_previous_json.is_some() {
             self.restore_awaiting_after_edit_failure(&pending, "timeout");
         } else {
@@ -6463,6 +6535,7 @@ impl App {
                 pending.run_id,
                 pending.judge_calls,
                 pending.triage_elapsed_ms,
+                pending.override_kind,
                 PlannerCalls {
                     judge: pending.judge_calls,
                     plan: pending.plan_calls,
@@ -6597,7 +6670,52 @@ impl App {
                 }
             }
         };
+        let reason = merged.reason.clone();
         self.queued_replan = Some(merged);
+        self.push_replan_queued_notice(&reason);
+    }
+
+    fn cut_replan_note(note: &str) -> String {
+        let note = note.trim();
+        if note.chars().count() <= 80 {
+            return note.to_owned();
+        }
+        let mut out = note.chars().take(79).collect::<String>();
+        out.push('…');
+        out
+    }
+
+    fn replan_queue_wait_node(&self) -> String {
+        if let Some(session) = &self.graph_session {
+            return session
+                .run()
+                .plan
+                .nodes
+                .iter()
+                .filter(|node| node.role != NodeRole::Orchestrate)
+                .find(|node| node.status == GraphNodeStatus::Running)
+                .map(|node| node.id.clone())
+                .or_else(|| {
+                    session
+                        .run()
+                        .plan
+                        .nodes
+                        .iter()
+                        .filter(|node| node.role != NodeRole::Orchestrate)
+                        .find(|node| node.status == GraphNodeStatus::Ready)
+                        .map(|node| node.id.clone())
+                })
+                .unwrap_or_else(|| "node".to_owned());
+        }
+        "node".to_owned()
+    }
+
+    fn push_replan_queued_notice(&mut self, note: &str) {
+        let node = self.replan_queue_wait_node();
+        self.push_system(format!(
+            "Replan queued (runs after {node}): {}",
+            Self::cut_replan_note(note)
+        ));
     }
 
     fn push_replan_skipped(
@@ -6806,16 +6924,20 @@ impl App {
             resume_session: None,
             image_paths: vec![],
         };
-        if let Some(session) = self.graph_session.as_mut() {
-            let run = session.run_mut();
-            run.replans_used += 1;
-            run.replan_chars_used += replan_prompt.chars().count();
-            run.planner_calls.replan += 1;
-            let _ = save_run(&self.workspace_root, run);
-            self.last_graph_run = Some(run.clone());
-        }
         match self.adapters[index].send(request) {
             Ok(()) => {
+                if let Some(session) = self.graph_session.as_mut() {
+                    let run = session.run_mut();
+                    run.replans_used += 1;
+                    run.replan_chars_used += replan_prompt.chars().count();
+                    run.planner_calls.replan += 1;
+                    let _ = save_run(&self.workspace_root, run);
+                    self.last_graph_run = Some(run.clone());
+                }
+                self.push_system(format!(
+                    "Replan requested: {}",
+                    Self::cut_replan_note(&trigger_reason)
+                ));
                 let now = Instant::now();
                 self.busy_agents.insert(agent);
                 self.run_states.insert(
@@ -6846,21 +6968,13 @@ impl App {
                     failure_node_id,
                     decided_by,
                     summaries,
+                    adapter_sent: true,
                 });
                 self.replan_summaries.clear();
             }
             Err(error) => {
                 let _ = self.adapters[index].select_mode(saved_mode);
                 self.push_system(format!("Could not start replan turn with {agent}: {error}"));
-                if let Some(session) = self.graph_session.as_mut() {
-                    let run = session.run_mut();
-                    run.replans_used = run.replans_used.saturating_sub(1);
-                    run.replan_chars_used = run
-                        .replan_chars_used
-                        .saturating_sub(replan_prompt.chars().count());
-                    run.planner_calls.replan = run.planner_calls.replan.saturating_sub(1);
-                    let _ = save_run(&self.workspace_root, run);
-                }
                 self.push_replan_skipped("send error", trigger, failure_node_id, from_flush);
             }
         }
@@ -6947,6 +7061,7 @@ impl App {
         match turn {
             DeferredInternalTurn::Triage(pending) => {
                 let elapsed_ms = pending.started.elapsed().as_millis() as u64;
+                self.record_pending_triage_io(&pending, false);
                 self.triage_fallback(
                     pending.prompt,
                     pending.agent,
@@ -7214,6 +7329,7 @@ impl App {
     }
 
     fn restore_or_fallback_after_plan_error(&mut self, pending: &PendingPlan, detail: &str) {
+        self.record_pending_plan_io(pending, false);
         if pending.edit_previous_json.is_some() {
             self.restore_awaiting_after_edit_failure(pending, detail);
         } else {
@@ -7227,6 +7343,7 @@ impl App {
                 pending.run_id.clone(),
                 pending.judge_calls,
                 pending.triage_elapsed_ms,
+                pending.override_kind,
                 PlannerCalls {
                     judge: pending.judge_calls,
                     plan: pending.plan_calls,
@@ -7359,6 +7476,7 @@ impl App {
     }
 
     fn finish_replan_rejected(&mut self, pending: PendingReplan, message: String, resume: bool) {
+        self.record_pending_replan_io(&pending, false);
         let rev = pending.rev;
         let excerpt = cap_plan_response_excerpt(&pending.buffer);
         let change = Self::finalize_pending_replan_change(
@@ -7394,6 +7512,7 @@ impl App {
     }
 
     fn finish_replan_kept(&mut self, pending: PendingReplan, reason: String) {
+        self.record_pending_replan_io(&pending, true);
         let rev = pending.rev;
         let saved = if let Some(session) = self.graph_session.as_mut() {
             let run = session.run_mut();
@@ -7440,6 +7559,7 @@ impl App {
         proposed: GraphPlan,
         change: PlanChange,
     ) {
+        self.record_pending_replan_io(&pending, true);
         let mut change = Self::finalize_pending_replan_change(&pending, change);
         change.applied = false;
         change.error = None;
@@ -7496,6 +7616,7 @@ impl App {
         plan: GraphPlan,
         change: PlanChange,
     ) {
+        self.record_pending_replan_io(&pending, true);
         let mut change = Self::finalize_pending_replan_change(&pending, change);
         change.applied = true;
         change.error = None;
@@ -7915,7 +8036,105 @@ impl App {
             replans_used: 0,
             replan_chars_used: 0,
             pending_replan_plan: None,
+            planner_io: Vec::new(),
         }
+    }
+
+    fn make_planner_io(
+        kind: PlannerIoKind,
+        adapter_prompt: &str,
+        response: &str,
+        ok: bool,
+    ) -> PlannerIo {
+        PlannerIo {
+            kind,
+            prompt_chars: adapter_prompt.chars().count(),
+            response_chars: response.chars().count(),
+            at_ms: unix_ms_now(),
+            ok,
+        }
+    }
+
+    fn pending_plan_io_kind(pending: &PendingPlan) -> PlannerIoKind {
+        if pending.edit_previous_json.is_some() && pending.attempt == 0 {
+            PlannerIoKind::Edit
+        } else if pending.attempt > 0 {
+            PlannerIoKind::Repair
+        } else {
+            PlannerIoKind::Plan
+        }
+    }
+
+    fn take_planner_io_for_run(&mut self, run_id: &str) -> Vec<PlannerIo> {
+        let mut io = self.deferred_planner_io.remove(run_id).unwrap_or_default();
+        if let Some(session) = self.graph_session.as_ref()
+            && session.run().plan.id == run_id
+            && !session.run().planner_io.is_empty()
+        {
+            io = session.run().planner_io.clone();
+        }
+        if let Some(run) = self.last_graph_run.as_ref()
+            && run.plan.id == run_id
+            && run.planner_io.len() > io.len()
+        {
+            io = run.planner_io.clone();
+        }
+        io
+    }
+
+    fn apply_stored_planner_io(&mut self, run_id: &str, run: &mut GraphRun) {
+        let stored = self.take_planner_io_for_run(run_id);
+        if !stored.is_empty() {
+            run.planner_io = stored;
+        }
+    }
+
+    fn push_planner_io(&mut self, run_id: &str, entry: PlannerIo) {
+        if let Some(session) = self.graph_session.as_mut()
+            && session.run().plan.id == run_id
+        {
+            session.run_mut().planner_io.push(entry);
+            self.last_graph_run = Some(session.run().clone());
+            return;
+        }
+        if let Some(run) = self.last_graph_run.as_mut()
+            && run.plan.id == run_id
+        {
+            run.planner_io.push(entry);
+            return;
+        }
+        self.deferred_planner_io
+            .entry(run_id.to_owned())
+            .or_default()
+            .push(entry);
+    }
+
+    fn record_pending_triage_io(&mut self, pending: &PendingTriage, ok: bool) {
+        let entry = Self::make_planner_io(
+            PlannerIoKind::Judge,
+            &pending.adapter_prompt,
+            &pending.buffer,
+            ok,
+        );
+        self.push_planner_io(&pending.run_id, entry);
+    }
+
+    fn record_pending_plan_io(&mut self, pending: &PendingPlan, ok: bool) {
+        if !pending.adapter_sent {
+            return;
+        }
+        let kind = Self::pending_plan_io_kind(pending);
+        let entry = Self::make_planner_io(kind, &pending.adapter_prompt, &pending.buffer, ok);
+        self.push_planner_io(&pending.run_id, entry);
+    }
+
+    fn record_pending_replan_io(&mut self, pending: &PendingReplan, ok: bool) {
+        if !pending.adapter_sent {
+            return;
+        }
+        let entry =
+            Self::make_planner_io(PlannerIoKind::Replan, &pending.prompt, &pending.buffer, ok);
+        self.push_planner_io(&pending.run_id, entry);
     }
 
     fn graph_limits(&self) -> dmuxai::graph::GraphLimits {
@@ -7962,6 +8181,7 @@ impl App {
         self.activities.remove(&pending.agent);
         self.end_run_state(pending.agent, false, false);
         let elapsed_ms = pending.started.elapsed().as_millis() as u64;
+        self.record_pending_triage_io(&pending, false);
         self.triage_fallback(
             pending.prompt,
             pending.agent,
@@ -10115,6 +10335,11 @@ impl App {
         if let Some(judge_line_area) = areas.judge_line {
             self.draw_judge_reason_line(frame, judge_line_area);
         }
+        if let Some(approval_panel_area) = areas.approval_panel {
+            self.draw_approval_panel(frame, approval_panel_area);
+        } else {
+            self.approval_panel_scroll = 0;
+        }
         self.draw_input(frame, areas.input);
         self.draw_status(frame, areas.status);
         if let Some(picker) = &self.model_picker {
@@ -10132,7 +10357,99 @@ impl App {
         }
     }
 
+    fn awaiting_approval_run(&self) -> Option<&GraphRun> {
+        let conversation_id = self.conversation_id.as_str();
+        if let Some(session) = &self.graph_session {
+            let run = session.run();
+            if run.phase == GraphRunPhase::AwaitingApproval
+                && run.conversation_id == conversation_id
+            {
+                return Some(run);
+            }
+        }
+        if let Some(run) = &self.last_graph_run
+            && run.phase == GraphRunPhase::AwaitingApproval
+            && run.conversation_id == conversation_id
+        {
+            return Some(run);
+        }
+        None
+    }
+
+    fn wants_approval_panel(&self) -> bool {
+        self.awaiting_approval_run().is_some()
+    }
+
+    fn graph_run_for_task_counter(&self) -> Option<&GraphRun> {
+        let conversation_id = self.conversation_id.as_str();
+        if let Some(session) = &self.graph_session
+            && session.run().conversation_id == conversation_id
+            && session.run().phase != GraphRunPhase::Completed
+        {
+            return Some(session.run());
+        }
+        if self.single_graph_plan.is_some() {
+            return self
+                .last_graph_run
+                .as_ref()
+                .filter(|run| run.conversation_id == conversation_id);
+        }
+        if let Some(run) = &self.last_graph_run
+            && run.conversation_id == conversation_id
+        {
+            return Some(run);
+        }
+        None
+    }
+
+    fn append_task_counter(line: String, run: Option<&GraphRun>) -> String {
+        if let Some(run) = run
+            && let Some(counter) = task_counter_text(run)
+        {
+            return format!("{line} · {counter}");
+        }
+        line
+    }
+
+    fn approval_panel_height_for(&self, room: u16, terminal_height: u16, width: u16) -> u16 {
+        if room == 0 {
+            return 0;
+        }
+        let run = self.awaiting_approval_run().expect("approval panel wanted");
+        let line_count = approval_panel_lines(run, width.max(1) as usize).len();
+        if line_count == 0 {
+            return 0;
+        }
+        let max_height = (terminal_height / 2).max(1);
+        line_count
+            .min(max_height as usize)
+            .min(room as usize)
+            .max(1) as u16
+    }
+
+    fn approval_panel_page_lines(&self) -> usize {
+        self.ui_areas(self.terminal_area)
+            .approval_panel
+            .map(|area| area.height.max(1) as usize)
+            .unwrap_or(1)
+    }
+
+    fn approval_panel_max_scroll(&self) -> usize {
+        let Some(run) = self.awaiting_approval_run() else {
+            return 0;
+        };
+        let width = self
+            .ui_areas(self.terminal_area)
+            .approval_panel
+            .map(|area| area.width.max(1) as usize)
+            .unwrap_or(1);
+        let line_count = approval_panel_lines(run, width).len();
+        let visible = self.approval_panel_page_lines();
+        line_count.saturating_sub(visible)
+    }
+
     fn current_graph_status_line(&self) -> Option<String> {
+        let run_for_counter = self.graph_run_for_task_counter();
         let resolve = |runner: &str, planned: &str| {
             if let Some(agent) = runner_from_str(runner) {
                 self.effective_model_for(agent, planned)
@@ -10144,23 +10461,33 @@ impl App {
         if let Some(session) = &self.graph_session
             && session.run().phase != GraphRunPhase::Completed
         {
-            return session.status_line_with(resolve);
+            return session
+                .status_line_with(resolve)
+                .map(|line| Self::append_task_counter(line, run_for_counter));
         }
         if let Some(run) = &self.last_graph_run
             && run.conversation_id == self.conversation_id.as_str()
             && matches!(run.phase, GraphRunPhase::Failed | GraphRunPhase::Completed)
         {
             let session = GraphRunSession::new(run.clone());
-            return session.status_line_with(resolve);
+            return session
+                .status_line_with(resolve)
+                .map(|line| Self::append_task_counter(line, run_for_counter));
         }
         if let Some((role, agent, planned_model)) = &self.single_graph_plan {
             let runner = runner_name(*agent);
             let model = self
                 .effective_model_for(*agent, planned_model)
                 .unwrap_or_else(|| "provider default".to_owned());
-            return Some(format!(
-                "Graph 1/1 · single {role} · {runner} {model} · running"
+            return Some(Self::append_task_counter(
+                format!("Graph 1/1 · single {role} · {runner} {model} · running"),
+                run_for_counter,
             ));
+        }
+        if let Some(run) = self.awaiting_approval_run()
+            && let Some(counter) = task_counter_text(run)
+        {
+            return Some(counter);
         }
         None
     }
@@ -10177,7 +10504,11 @@ impl App {
         {
             return true;
         }
-        self.single_graph_plan.is_some()
+        if self.single_graph_plan.is_some() {
+            return true;
+        }
+        self.awaiting_approval_run()
+            .is_some_and(|run| task_counter_text(run).is_some())
     }
 
     fn wants_judge_reason_line(&self) -> bool {
@@ -10189,16 +10520,26 @@ impl App {
         let input_height = clamp_input_height(self.input_height, area.height);
         let want_graph_status = self.wants_graph_status_line();
         let want_judge_line = self.wants_judge_reason_line();
+        let want_approval_panel = self.wants_approval_panel();
         let room_for_banners = area
             .height
             .saturating_sub(input_height + STATUS_HEIGHT + MIN_MAIN_HEIGHT);
         let show_graph_status = want_graph_status && room_for_banners >= 1;
         let show_judge_line =
             want_judge_line && room_for_banners >= if show_graph_status { 2 } else { 1 };
-        let banner_rows = (show_graph_status as u16) + (show_judge_line as u16);
+        let room_for_panel =
+            room_for_banners.saturating_sub((show_graph_status as u16) + (show_judge_line as u16));
+        let approval_panel_height = if want_approval_panel {
+            self.approval_panel_height_for(room_for_panel, area.height, area.width)
+        } else {
+            0
+        };
+        let show_approval_panel = approval_panel_height > 0;
+        let banner_rows =
+            (show_graph_status as u16) + (show_judge_line as u16) + approval_panel_height;
 
-        if show_graph_status || show_judge_line {
-            let mut constraints = Vec::with_capacity(4 + banner_rows as usize);
+        if show_graph_status || show_judge_line || show_approval_panel {
+            let mut constraints = Vec::with_capacity(5 + banner_rows as usize);
             let main_height = area.height.saturating_sub(
                 input_height
                     .saturating_add(STATUS_HEIGHT)
@@ -10210,6 +10551,9 @@ impl App {
             }
             if show_judge_line {
                 constraints.push(Constraint::Length(1));
+            }
+            if show_approval_panel {
+                constraints.push(Constraint::Length(approval_panel_height));
             }
             constraints.push(Constraint::Length(input_height));
             constraints.push(Constraint::Length(STATUS_HEIGHT));
@@ -10232,10 +10576,18 @@ impl App {
             } else {
                 None
             };
+            let approval_panel = if show_approval_panel {
+                let area = vertical[index];
+                index += 1;
+                Some(area)
+            } else {
+                None
+            };
             UiAreas {
                 chat: vertical[0],
                 graph_status,
                 judge_line,
+                approval_panel,
                 input: vertical[index],
                 status: vertical[index + 1],
             }
@@ -10255,6 +10607,7 @@ impl App {
                 chat: vertical[0],
                 graph_status: None,
                 judge_line: None,
+                approval_panel: None,
                 input: vertical[1],
                 status: vertical[2],
             }
@@ -10560,6 +10913,62 @@ impl App {
             spans.push(Span::styled(rest.to_owned(), muted));
         }
         Line::from(spans)
+    }
+
+    fn draw_approval_panel(&mut self, frame: &mut Frame, area: Rect) {
+        let run = self.awaiting_approval_run().expect("approval panel area");
+        let width = area.width.max(1) as usize;
+        let panel_lines = approval_panel_lines(run, width);
+        if panel_lines.is_empty() {
+            return;
+        }
+        let visible_height = area.height.max(1) as usize;
+        let max_scroll = panel_lines.len().saturating_sub(visible_height);
+        let scroll = self
+            .approval_panel_scroll
+            .min(max_scroll)
+            .min(u16::MAX as usize) as u16;
+        let colors = self.colors_enabled();
+        let muted = if colors {
+            Style::default()
+                .fg(self.settings.theme.color_for(Speaker::System))
+                .add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
+        let normal = if colors {
+            let fg = self
+                .settings
+                .theme
+                .foreground
+                .unwrap_or_else(|| self.settings.theme.color_for(Speaker::System));
+            Style::default().fg(fg)
+        } else {
+            Style::default()
+        };
+        let warning = if colors {
+            Style::default().fg(self.settings.theme.warning_color())
+        } else {
+            Style::default()
+        };
+        let lines: Vec<Line> = panel_lines
+            .iter()
+            .skip(scroll as usize)
+            .take(visible_height)
+            .map(|line| {
+                let style = match line.kind {
+                    PanelLineKind::Warning => warning,
+                    PanelLineKind::Hint | PanelLineKind::Note | PanelLineKind::Job => muted,
+                    PanelLineKind::Header | PanelLineKind::Task | PanelLineKind::Step => normal,
+                };
+                Line::from(Span::styled(line.text.clone(), style))
+            })
+            .collect();
+        let mut paragraph = Paragraph::new(lines);
+        if colors && let Some(bg) = self.settings.theme.background {
+            paragraph = paragraph.style(Style::default().bg(bg));
+        }
+        frame.render_widget(paragraph, area);
     }
 
     fn render_activity_group(
@@ -22661,6 +23070,26 @@ mod tests {
         ]}"#
     }
 
+    fn korean_three_task_codex_plan_json() -> &'static str {
+        r#"{"tasks":[
+            {"id":"task-1","title":"설계 문서를 읽고 요약하기","done_check":"done","areas":[],"size":"small","depends_on":[]},
+            {"id":"task-2","title":"테스트 작성","done_check":"done","areas":[],"size":"small","depends_on":[]},
+            {"id":"task-3","title":"배포 준비","done_check":"done","areas":[],"size":"medium","depends_on":["task-1","task-2"]}
+        ],"steps":[
+            {"id":"impl-1","role":"implement","job":"a","runner":"codex","model":"composer-2.5","depends_on":[],"task":"task-1"},
+            {"id":"impl-2","role":"implement","job":"b","runner":"codex","model":"composer-2.5","depends_on":[],"task":"task-2"},
+            {"id":"impl-3","role":"implement","job":"c","runner":"codex","model":"composer-2.5","depends_on":["impl-1","impl-2"],"task":"task-3"}
+        ]}"#
+    }
+
+    fn mark_task_done_in_plan(run: &mut GraphRun, task_id: &str) {
+        for node in &mut run.plan.nodes {
+            if node.task.as_deref() == Some(task_id) {
+                node.status = GraphNodeStatus::Completed;
+            }
+        }
+    }
+
     fn two_step_codex_plan_json() -> &'static str {
         r#"{"tasks":[{"id":"task-1","title":"work","done_check":"done","areas":[],"size":"small","depends_on":[]}],"steps":[
             {"id":"step-1","role":"research","job":"research","runner":"codex","model":"composer-2.5","depends_on":[],"task":"task-1"},
@@ -22725,6 +23154,196 @@ mod tests {
         let run = h.app.last_graph_run.as_ref().expect("approved plan");
         assert_eq!(run.phase, GraphRunPhase::AwaitingApproval);
         assert_eq!(run.approval.as_ref().unwrap().revisions[0].source, "agent");
+    }
+
+    // TC-1008 / FR-1008: planner_io records prompt/response sizes per internal call.
+    #[test]
+    fn planner_io_records_sizes() {
+        let mut h = plan_gate_test_app();
+        h.app.terminal_area = Rect::new(0, 0, 120, 30);
+        h.app.input = "/plan needs several steps".to_owned();
+        h.app.submit_prompt();
+        let plan_req = h.sent.lock().unwrap().last().unwrap().1.clone();
+        let bad_plan = r#"{"steps":[]}"#;
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::TextDelta(bad_plan.to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::Completed
+        )));
+        let repair_req = h.sent.lock().unwrap().last().unwrap().1.clone();
+        let good_plan = three_step_codex_plan_json();
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &repair_req,
+            AgentEvent::TextDelta(good_plan.to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &repair_req,
+            AgentEvent::Completed
+        )));
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        h.app
+            .decide_plan(
+                PlanDecisionKind::Approve,
+                plan_id.clone(),
+                1,
+                DecisionBy::Tui,
+            )
+            .unwrap();
+        let idx = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn(&mut h.app, &h.sent, idx);
+        let replan_json = r#"{"reason":"add lint pass","steps":[
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
+            {"id":"step-4","role":"review","job":"lint","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"task":"task-1"}
+        ]}"#;
+        h.app.request_replan("lint", DecisionBy::Tui);
+        finish_replan_steps(&mut h, replan_json);
+        while h.app.graph_session.is_some() {
+            drain_busy_for_queued_replan(&mut h);
+            if h.app.busy_agents.contains(&Agent::Codex) {
+                let idx = last_graph_node_request_index(&h.sent);
+                complete_sent_graph_turn(&mut h.app, &h.sent, idx);
+            } else if let Some(session) = h.app.graph_session.as_ref() {
+                if session.run().phase == GraphRunPhase::Completed {
+                    break;
+                }
+                h.app.tick();
+            } else {
+                break;
+            }
+        }
+        assert_eq!(
+            h.app.last_graph_run.as_ref().unwrap().phase,
+            GraphRunPhase::Completed
+        );
+        let run = h.app.last_graph_run.as_ref().unwrap();
+        let kinds: Vec<PlannerIoKind> = run.planner_io.iter().map(|entry| entry.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                PlannerIoKind::Plan,
+                PlannerIoKind::Repair,
+                PlannerIoKind::Replan,
+            ]
+        );
+        assert_eq!(
+            run.planner_io[0].prompt_chars,
+            plan_req.prompt.chars().count()
+        );
+        assert_eq!(run.planner_io[0].response_chars, bad_plan.chars().count());
+        assert!(!run.planner_io[0].ok);
+        assert_eq!(
+            run.planner_io[1].prompt_chars,
+            repair_req.prompt.chars().count()
+        );
+        assert_eq!(run.planner_io[1].response_chars, good_plan.chars().count());
+        assert!(run.planner_io[1].ok);
+        let replan_req = last_replan_request(&h.sent);
+        assert_eq!(
+            run.planner_io[2].prompt_chars,
+            replan_req.prompt.chars().count()
+        );
+        assert_eq!(
+            run.planner_io[2].response_chars,
+            replan_json.chars().count()
+        );
+        assert!(run.planner_io[2].ok);
+
+        let legacy_json = r#"{"plan":{"schema":"dmuxai.graph/v1","id":"legacy","orchestrator_model":"m","user_prompt":"u","nodes":[],"edges":[],"limits":{"max_parallel":2,"max_retries":2,"max_replans":3,"replan_budget_chars":24000,"max_nodes":12},"tasks":[]},"conversation_id":"c1","phase":"completed"}"#;
+        let legacy: GraphRun = serde_json::from_str(legacy_json).expect("legacy run");
+        assert!(legacy.planner_io.is_empty());
+        let calls = &run.planner_calls;
+        let total = calls.judge + calls.plan + calls.repair + calls.edit + calls.replan;
+        assert_eq!(total as usize, run.planner_io.len());
+    }
+
+    // TC-1008 / FR-1008: judge, edit, failed call, busy defer does not add io.
+    #[test]
+    fn planner_io_covers_judge_edit_and_failure() {
+        let mut h = plan_gate_test_app();
+        let plan_req = complete_complex_judge(&mut h);
+        let judge_req = h.sent.lock().unwrap()[0].1.clone();
+        let partial = r#"{"steps":[{"id":"step-1"#;
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::TextDelta(partial.to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::Error("boom".to_owned())
+        )));
+        let run = h.app.last_graph_run.as_ref().unwrap();
+        assert_eq!(run.planner_io.len(), 2);
+        assert_eq!(run.planner_io[0].kind, PlannerIoKind::Judge);
+        assert_eq!(
+            run.planner_io[0].prompt_chars,
+            judge_req.prompt.chars().count()
+        );
+        assert_eq!(run.planner_io[1].kind, PlannerIoKind::Plan);
+        assert!(!run.planner_io[1].ok);
+        assert_eq!(run.planner_io[1].response_chars, partial.chars().count());
+        let plan_id = run.plan.id.clone();
+        h.app
+            .decide_plan(
+                PlanDecisionKind::Edit("tighter deps".to_owned()),
+                plan_id,
+                1,
+                DecisionBy::Tui,
+            )
+            .unwrap();
+        let edit_req = h.sent.lock().unwrap().last().unwrap().1.clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &edit_req,
+            AgentEvent::TextDelta(three_step_codex_plan_json().to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &edit_req,
+            AgentEvent::Completed
+        )));
+        let run = h.app.last_graph_run.as_ref().unwrap();
+        assert!(
+            run.planner_io
+                .iter()
+                .any(|entry| entry.kind == PlannerIoKind::Edit && entry.ok)
+        );
+        let calls = &run.planner_calls;
+        let total = calls.judge + calls.plan + calls.repair + calls.edit + calls.replan;
+        assert_eq!(total as usize, run.planner_io.len());
+    }
+
+    // TC-1009 / FR-1009: `/plan` override line and queued replan feedback.
+    #[test]
+    fn plan_override_and_replan_queue_feedback() {
+        let mut h = plan_gate_test_app();
+        h.app.terminal_area = Rect::new(0, 0, 100, 30);
+        h.app.input = "/plan needs several steps".to_owned();
+        h.app.submit_prompt();
+        let triage = h
+            .app
+            .last_graph_run
+            .as_ref()
+            .and_then(|run| run.triage.clone())
+            .expect("plan run triage");
+        assert_eq!(triage.override_kind, Some(OverrideKind::Plan));
+        assert_eq!(judge_line_text(&triage), "/plan");
+        start_approved_three_step_run(&mut h);
+        h.app.request_replan("lint pass", DecisionBy::Tui);
+        let notice = last_system(&h.app);
+        assert!(
+            notice.contains("Replan queued (runs after step-2)"),
+            "{notice}"
+        );
+        assert!(notice.contains("lint pass"));
     }
 
     // TC-944 / FR-940: one repair turn after an invalid first plan.
@@ -22906,6 +23525,7 @@ mod tests {
             Uuid::new_v4().to_string(),
             1,
             0,
+            None,
             PlannerCalls::default(),
             "plan invalid twice",
             None,
@@ -23195,6 +23815,104 @@ mod tests {
         assert_eq!(step4.status, GraphNodeStatus::Pending);
         assert!(step4.requires_gate);
         assert_replan_plan_history(&approve_h, add_sensitive_three, 2, true);
+    }
+
+    // TC-958 / UX-931: approval panel rows, deps, fallback notes, hint; gone after approve.
+    #[test]
+    fn plan_approval_panel_renders() {
+        let mut h = plan_gate_test_app();
+        h.app.terminal_area = Rect::new(0, 0, 100, 30);
+        h.app.color_enabled = true;
+        reach_awaiting_approval_with_plan(&mut h, three_step_codex_plan_json());
+        let note = "fallback validation note";
+        {
+            let run = h.app.last_graph_run.as_mut().unwrap();
+            run.triage.as_mut().unwrap().cause = Some(FallbackCause::Error);
+            let revision = run.approval.as_mut().unwrap().revisions.last_mut().unwrap();
+            revision.source = "fallback".to_owned();
+            revision.errors = Some(vec![note.to_owned()]);
+        }
+        let areas = h.app.ui_areas(h.app.terminal_area);
+        assert!(areas.approval_panel.is_some());
+
+        let rendered = render_text_at(&mut h.app, 100, 30);
+        assert!(rendered.contains("Plan rev 1/5 · fallback"));
+        assert!(
+            rendered.contains("step-2 implement codex:composer-2.5 ← step-1"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(note));
+        assert!(rendered.contains("/graph approve · /graph edit <feedback> · /graph reject"));
+        let warning = h.app.settings.theme.warning_color();
+        assert_eq!(
+            find_cell_fg(&mut h.app, "Fallback plan (heuristic"),
+            Some(warning)
+        );
+
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        h.app
+            .decide_plan(PlanDecisionKind::Approve, plan_id, 1, DecisionBy::Tui)
+            .unwrap();
+        let after = h.app.ui_areas(h.app.terminal_area);
+        assert!(after.approval_panel.is_none());
+        let rendered_after = render_text_at(&mut h.app, 100, 30);
+        assert!(
+            !rendered_after.contains("/graph approve · /graph edit <feedback> · /graph reject")
+        );
+    }
+
+    // TC-997 / UX-937, FR-975: task counter, grouped steps, char-safe cuts at 40 columns.
+    #[test]
+    fn task_counter_and_grouped_panel_render() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval_with_plan(&mut h, korean_three_task_codex_plan_json());
+        {
+            let run = h.app.last_graph_run.as_mut().unwrap();
+            mark_task_done_in_plan(run, "task-1");
+        }
+
+        for (width, height) in [(100u16, 30u16), (40, 20)] {
+            h.app.terminal_area = Rect::new(0, 0, width, height);
+            let areas = h.app.ui_areas(h.app.terminal_area);
+            assert!(areas.approval_panel.is_some(), "panel at {width}x{height}");
+            assert!(areas.graph_status.is_some());
+
+            let run = h.app.last_graph_run.as_ref().unwrap();
+            let panel_texts: Vec<String> = approval_panel_lines(run, width as usize)
+                .into_iter()
+                .map(|line| line.text)
+                .collect();
+            let task_one = panel_texts
+                .iter()
+                .position(|line| line.starts_with("task-1 "))
+                .expect("task-1 header in panel model");
+            let step_one = panel_texts
+                .iter()
+                .position(|line| line.starts_with("impl-1 "))
+                .expect("impl-1 step in panel model");
+            let task_three = panel_texts
+                .iter()
+                .position(|line| line.starts_with("task-3 "))
+                .expect("task-3 header in panel model");
+            assert!(task_one < step_one && step_one < task_three);
+
+            if width == 40 {
+                use unicode_width::UnicodeWidthStr;
+                for line in &panel_texts {
+                    assert!(
+                        UnicodeWidthStr::width(line.as_str()) <= 40,
+                        "panel line too wide: {line:?}"
+                    );
+                }
+            }
+
+            let rendered = render_text_at(&mut h.app, width, height);
+            assert!(
+                rendered.contains("tasks 1/3"),
+                "status at {width}x{height}: {rendered}"
+            );
+            assert!(std::str::from_utf8(rendered.as_bytes()).is_ok());
+        }
     }
 
     // TC-979 / UX-935: revision notice text in the TUI transcript.

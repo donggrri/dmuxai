@@ -74,7 +74,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   UX-930. TC-956.
   Files: new `src/graph/triage_view.rs`, `src/app.rs` (render).
   Done when: `judge_reason_line_renders` green.
-- [ ] P13 — TUI approval panel with steps grouped by task, `tasks d/t` counter.
+- [x] P13 — (#67 agent-planned graph e0ae8527: 5 steps + 1 step added by an applied user replan (rev 2: +planner-io-review ~verify-p13-gates); fix turn as #67 /direct run e093b4f0 + hand fix; composer-2.5; review claude-sonnet-5-5-high BLOCK ×2 (PgUp/PgDn scope; expired judge io, kept on purpose: 1:1 with planner_calls) → fixed → APPROVE; folded in owner request FR-1008 `planner_io` sizes per planner call; dogfood findings from e0ae8527 fixed as FR-1009/TC-1009: /plan judge line read `/direct`, queued `/graph replan` had no feedback; nits for P15/P16: cut_replan_note by width, newline in panel notes, deferred_planner_io cleanup on run-build errors, hint pinned on short panels) TUI approval panel with steps grouped by task, `tasks d/t` counter.
   UX-931, UX-937, FR-975. TC-958, TC-997.
   Files: `src/graph/triage_view.rs`, `src/app.rs`.
   Done when: `plan_approval_panel_renders`, `task_counter_and_grouped_panel_render` green.

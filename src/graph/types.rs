@@ -192,6 +192,9 @@ pub struct GraphRun {
     /// FR-958: planner call counters.
     #[serde(default)]
     pub planner_calls: PlannerCalls,
+    /// FR-1008: one entry per counted internal planner adapter call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planner_io: Vec<PlannerIo>,
     /// FR-958: applied or rejected replan turns sent for this run.
     /// Incremented by the App when a replan turn is sent (P11).
     #[serde(default)]
@@ -411,6 +414,27 @@ pub struct Approval {
     pub decided_at_ms: Option<u64>,
 }
 
+/// Kind of internal planner adapter call (FR-1008).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannerIoKind {
+    Judge,
+    Plan,
+    Repair,
+    Edit,
+    Replan,
+}
+
+/// Size record for one internal planner adapter call (FR-1008).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannerIo {
+    pub kind: PlannerIoKind,
+    pub prompt_chars: usize,
+    pub response_chars: usize,
+    pub at_ms: u64,
+    pub ok: bool,
+}
+
 /// Planner call counters (FR-958).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannerCalls {
@@ -496,5 +520,6 @@ mod tests {
         let run_json = format!(r#"{{"plan":{plan_json},"conversation_id":"c1","phase":"active"}}"#);
         let run: GraphRun = serde_json::from_str(&run_json).expect("run");
         assert!(run.plan.tasks.is_empty());
+        assert!(run.planner_io.is_empty());
     }
 }
