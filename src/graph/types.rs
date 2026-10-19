@@ -82,6 +82,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphNodeStatus {
@@ -188,6 +192,14 @@ pub struct GraphRun {
     /// FR-958: planner call counters.
     #[serde(default)]
     pub planner_calls: PlannerCalls,
+    /// FR-958: applied or rejected replan turns sent for this run.
+    /// Incremented by the App when a replan turn is sent (P11).
+    #[serde(default)]
+    pub replans_used: u32,
+    /// FR-958: summed replan prompt lengths sent for this run.
+    /// Incremented by the App when a replan turn is sent (P11).
+    #[serde(default)]
+    pub replan_chars_used: usize,
     /// FR-951: judge start (ms since epoch) for the orchestrate node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrate_started_ms: Option<u64>,
@@ -317,6 +329,15 @@ pub struct PlanChange {
     pub changed: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed: Vec<String>,
+    /// FR-968: new tasks in a replan revision (count only).
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub tasks_added: usize,
+    /// FR-968: pending tasks revised in a replan revision (count only).
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub tasks_changed: usize,
+    /// FR-968: pending tasks dropped in a replan revision (count only).
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub tasks_removed: usize,
     pub applied: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

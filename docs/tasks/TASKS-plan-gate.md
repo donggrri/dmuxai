@@ -57,7 +57,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   FR-965. TC-994.
   Files: `src/graph/tasks.rs`, `src/app.rs`.
   Done when: `task_edits_rebuild_plan`, `task_split_uses_edit_turn` green.
-- [ ] P09 — Replan review fixes: `replans_used`/`replan_chars_used` counters, reject deps on failed/skipped nodes, `revision_needs_approval_cases`, drop non-executable deps; replans revise only pending tasks.
+- [x] P09 — (#67 agent-planned graph 3db42ed5: 7 tasks/7 steps with 3 independent roots, serialized on the single cursor runner; fix turn as #67 /direct run; composer-2.5; review claude-sonnet-5-5-high BLOCK (task removal never counted) → fixed → APPROVE; nit for P11: pending steps of a partly-done task) Replan review fixes: `replans_used`/`replan_chars_used` counters, reject deps on failed/skipped nodes, `revision_needs_approval_cases`, drop non-executable deps; replans revise only pending tasks.
   FR-957, FR-958, FR-968. TC-974, TC-975, TC-999.
   Also: `REPLAN_PROMPT` asks for `task` on every new/changed step and a replan step without `task` inherits the task of the existing node with the same id (from P02 review); cut every model-provided id in PlanError text.
   Files: `src/graph/replan.rs`, `src/graph/types.rs`.

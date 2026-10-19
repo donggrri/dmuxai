@@ -269,6 +269,25 @@ pub fn parse_plan(text: &str) -> Result<PlanDoc, Vec<PlanError>> {
     })
 }
 
+/// Optional `tasks` array from a replan JSON object (FR-968).
+pub(crate) fn optional_tasks_from_value(
+    value: Option<&Value>,
+    errors: &mut Vec<PlanError>,
+) -> Vec<PlanTask> {
+    match value {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(index, value)| task_from_value(value, index, errors))
+            .collect(),
+        Some(_) => {
+            errors.push(PlanError::new("plan", "tasks must be an array"));
+            Vec::new()
+        }
+    }
+}
+
 fn task_from_value(value: &Value, index: usize, errors: &mut Vec<PlanError>) -> PlanTask {
     let fallback_id = format!("task-{}", index + 1);
     let mut task = PlanTask {

@@ -6212,6 +6212,8 @@ impl App {
             },
             orchestrate_started_ms: None,
             plan_fixed_ms: None,
+            replans_used: 0,
+            replan_chars_used: 0,
         }
     }
 
