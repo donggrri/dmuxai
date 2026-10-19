@@ -103,6 +103,7 @@ mod tests {
             conversation_id: "conv-1".to_string(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         };
         serde_json::to_string(&run).unwrap()
     }

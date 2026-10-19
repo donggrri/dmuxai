@@ -362,6 +362,11 @@ fn phase_str(phase: GraphRunPhase) -> &'static str {
         GraphRunPhase::WaitingGate => "waiting_gate",
         GraphRunPhase::Completed => "completed",
         GraphRunPhase::Failed => "failed",
+        GraphRunPhase::Triage => "triage",
+        GraphRunPhase::Planning => "planning",
+        GraphRunPhase::AwaitingApproval => "awaiting_approval",
+        GraphRunPhase::Rejected => "rejected",
+        GraphRunPhase::Cancelled => "cancelled",
     }
 }
 

@@ -456,6 +456,7 @@ mod tests {
             conversation_id: "conv-1".to_string(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         };
 
         let view = snapshot_from_run(&run);
@@ -560,6 +561,7 @@ mod tests {
             conversation_id: "conv-1".to_string(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         };
 
         let view = snapshot_from_run(&run);

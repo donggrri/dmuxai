@@ -22,6 +22,8 @@ pub use policy::{
 };
 pub use store::{GraphStore, load_run, save_run};
 pub use types::{
-    ExecutionPlan, GraphEdge, GraphLimits, GraphNode, GraphNodeStatus, GraphPlan, GraphRun,
-    GraphRunPhase, NodeRole, SinglePlan,
+    Approval, ApprovalState, DecisionBy, ExecutionPlan, GraphEdge, GraphLimits, GraphNode,
+    GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, NodeRole, PLAN_HISTORY_MAX, PlanChange,
+    PlanChangeKind, PlanChangeTrigger, PlanRevision, PlannerCalls, SinglePlan, Triage,
+    cap_revision_raw,
 };

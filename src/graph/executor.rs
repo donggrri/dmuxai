@@ -428,6 +428,7 @@ mod tests {
             limits: GraphLimits {
                 max_parallel: 1,
                 max_retries: 1,
+                ..GraphLimits::default()
             },
         };
 
@@ -436,6 +437,7 @@ mod tests {
             conversation_id: "conv-1".to_owned(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         };
         let mut session = GraphRunSession::new(run);
 
@@ -545,6 +547,7 @@ mod tests {
             limits: GraphLimits {
                 max_parallel: 1,
                 max_retries: 1,
+                ..GraphLimits::default()
             },
         };
 
@@ -553,6 +556,7 @@ mod tests {
             conversation_id: "conv-1".to_owned(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         };
         let session = GraphRunSession::new(run);
 

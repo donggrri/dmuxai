@@ -2948,6 +2948,10 @@ impl App {
                 ExecutionPlan::Graph(mut plan) => {
                     plan.limits.max_parallel = self.settings.graph_max_parallel;
                     plan.limits.max_retries = self.settings.graph_max_retries;
+                    plan.limits.max_replans = self.settings.graph_max_replans;
+                    plan.limits.replan_budget_chars =
+                        self.settings.graph_replan_budget_chars as usize;
+                    plan.limits.max_nodes = self.settings.graph_max_nodes as usize;
                     self.start_graph_run(plan);
                     return;
                 }
@@ -4016,6 +4020,7 @@ impl App {
             conversation_id: self.conversation_id.as_str().to_owned(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         };
         let mut session = GraphRunSession::new(run);
         self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, &session);
@@ -5268,12 +5273,17 @@ impl App {
                     ExecutionPlan::Graph(mut plan) => {
                         plan.limits.max_parallel = self.settings.graph_max_parallel;
                         plan.limits.max_retries = self.settings.graph_max_retries;
+                        plan.limits.max_replans = self.settings.graph_max_replans;
+                        plan.limits.replan_budget_chars =
+                            self.settings.graph_replan_budget_chars as usize;
+                        plan.limits.max_nodes = self.settings.graph_max_nodes as usize;
 
                         let candidate_run = GraphRun {
                             plan: plan.clone(),
                             conversation_id: self.conversation_id.as_str().to_owned(),
                             phase: GraphRunPhase::Active,
                             waiting_gate_node: None,
+                            ..Default::default()
                         };
                         let mut candidate_session = GraphRunSession::new(candidate_run);
                         let initial_actions = candidate_session.schedule();
@@ -8001,6 +8011,7 @@ mod tests {
             limits: dmuxai::graph::GraphLimits {
                 max_parallel: 1,
                 max_retries: 2,
+                ..dmuxai::graph::GraphLimits::default()
             },
         });
     }
@@ -8118,6 +8129,7 @@ mod tests {
             conversation_id: app.conversation_id.as_str().to_owned(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         }));
         app.busy_agents.insert(Agent::Agy);
         app.publish_dashboard();
@@ -8175,6 +8187,7 @@ mod tests {
             conversation_id: app.conversation_id.as_str().to_owned(),
             phase: GraphRunPhase::Completed,
             waiting_gate_node: None,
+            ..Default::default()
         };
         app.graph_session = Some(GraphRunSession::new(stale_run.clone()));
         app.last_graph_run = Some(stale_run);
@@ -8226,6 +8239,7 @@ mod tests {
             conversation_id: app.conversation_id.as_str().to_owned(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         }));
         app.busy_agents.insert(Agent::Agy);
         app.graph_agent_nodes
@@ -8363,6 +8377,7 @@ mod tests {
                 limits: dmuxai::graph::GraphLimits {
                     max_parallel: 2,
                     max_retries: 2,
+                    ..dmuxai::graph::GraphLimits::default()
                 },
                 nodes: vec![
                     dmuxai::graph::GraphNode {
@@ -8397,6 +8412,7 @@ mod tests {
             conversation_id: app.conversation_id.as_str().to_owned(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         }));
         app.graph_agent_nodes
             .insert(Agent::Codex, "node-a".to_owned());
@@ -8480,6 +8496,7 @@ mod tests {
             conversation_id: app.conversation_id.as_str().to_owned(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         }));
         app.graph_agent_nodes
             .insert(Agent::Agy, "step-1".to_owned());
@@ -9047,6 +9064,7 @@ mod tests {
             limits: dmuxai::graph::GraphLimits {
                 max_parallel: 1,
                 max_retries: 2,
+                ..dmuxai::graph::GraphLimits::default()
             },
         };
 
@@ -9055,6 +9073,7 @@ mod tests {
             conversation_id: app.conversation_id.as_str().to_owned(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         }));
 
         // Batch: [StartNode(a), Failed, StartNode(b)]
@@ -9291,6 +9310,7 @@ mod tests {
             conversation_id: "c1".to_owned(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         };
         let session = GraphRunSession::new(run);
         app.graph_session = Some(session);
@@ -12660,11 +12680,13 @@ mod tests {
                 limits: dmuxai::graph::GraphLimits {
                     max_parallel: 1,
                     max_retries: 0,
+                    ..dmuxai::graph::GraphLimits::default()
                 },
             },
             conversation_id: conv_before.clone(),
             phase: GraphRunPhase::Failed,
             waiting_gate_node: None,
+            ..Default::default()
         });
         let cancel = Arc::new(AtomicBool::new(false));
 

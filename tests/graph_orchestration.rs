@@ -83,6 +83,7 @@ fn store_round_trip() {
         conversation_id: "conv-1".to_owned(),
         phase: GraphRunPhase::Active,
         waiting_gate_node: None,
+        ..Default::default()
     };
     let path = save_run(dir.path(), &run).unwrap();
     assert!(path.exists());
@@ -107,6 +108,7 @@ fn gate_pauses_until_continue() {
         conversation_id: "conv".to_owned(),
         phase: GraphRunPhase::Active,
         waiting_gate_node: None,
+        ..Default::default()
     };
     let mut session = GraphRunSession::new(run);
     let first = session.schedule();
