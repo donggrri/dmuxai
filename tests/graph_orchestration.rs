@@ -17,6 +17,7 @@ fn node(id: &str, role: NodeRole, runner: &str, requires_gate: bool) -> GraphNod
         requires_gate,
         status: GraphNodeStatus::Pending,
         attempt: 0,
+        task: None,
         started_at_ms: None,
         finished_at_ms: None,
     }

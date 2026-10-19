@@ -311,6 +311,7 @@ pub fn apply_replan(
                 merged.steps.push(step_from_node(&run.plan, node));
             }
             merged.steps.extend(steps.iter().cloned());
+            merged.tasks = run.plan.tasks.clone();
 
             let validated = validate_plan_with_limit(&merged, ctx, run.plan.limits.max_nodes)?;
 
@@ -481,6 +482,7 @@ fn step_from_node(plan: &GraphPlan, node: &GraphNode) -> PlanStep {
         model: Some(node.model_id.clone()),
         depends_on: dependencies(plan, &node.id),
         sensitive: Some(node.requires_gate),
+        task: node.task.clone(),
         ..PlanStep::default()
     }
 }
@@ -520,7 +522,7 @@ fn unix_now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::types::{GraphEdge, GraphLimits};
+    use crate::graph::types::{GraphEdge, GraphLimits, PlanTask, TaskSize};
 
     type RunnerAllowed = Box<dyn Fn(&str) -> bool>;
     type EffectiveModel = Box<dyn Fn(&str) -> Option<String>>;
@@ -568,6 +570,7 @@ mod tests {
             requires_gate: false,
             status,
             attempt: 0,
+            task: None,
             started_at_ms: None,
             finished_at_ms: None,
         }
@@ -583,6 +586,7 @@ mod tests {
                 nodes,
                 edges,
                 limits: GraphLimits::default(),
+                tasks: Vec::new(),
             },
             ..Default::default()
         }
@@ -607,6 +611,87 @@ mod tests {
     ) -> Result<(GraphPlan, PlanChange), Vec<PlanError>> {
         let doc = parse_replan(json)?;
         apply_replan(run, &doc, &ctx.context(&run.plan.user_prompt))
+    }
+
+    // TC-993 / FR-964, FR-968: replan merge keeps tasks when steps carry `task`.
+    #[test]
+    fn replan_keeps_tasks_of_planned_run() {
+        let tasks = vec![
+            PlanTask {
+                id: "task-1".to_owned(),
+                title: "done work".to_owned(),
+                done_check: "d".to_owned(),
+                areas: Vec::new(),
+                size: TaskSize::Small,
+                depends_on: Vec::new(),
+                implicit: false,
+            },
+            PlanTask {
+                id: "task-2".to_owned(),
+                title: "pending work".to_owned(),
+                done_check: "d".to_owned(),
+                areas: Vec::new(),
+                size: TaskSize::Small,
+                depends_on: vec!["task-1".to_owned()],
+                implicit: false,
+            },
+        ];
+        let mut run = run_with(
+            vec![
+                GraphNode {
+                    id: "a".to_owned(),
+                    role: NodeRole::Implement,
+                    job: "job a".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: GraphNodeStatus::Completed,
+                    attempt: 1,
+                    task: Some("task-1".to_owned()),
+                    started_at_ms: None,
+                    finished_at_ms: None,
+                },
+                GraphNode {
+                    id: "c".to_owned(),
+                    role: NodeRole::Test,
+                    job: "job c".to_owned(),
+                    runner: "cursor".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: GraphNodeStatus::Pending,
+                    attempt: 0,
+                    task: Some("task-2".to_owned()),
+                    started_at_ms: None,
+                    finished_at_ms: None,
+                },
+            ],
+            vec![GraphEdge {
+                from: "a".to_owned(),
+                to: "c".to_owned(),
+            }],
+        );
+        run.plan.tasks = tasks.clone();
+        let ctx = PlanCtx::new(&["cursor"]);
+        let (plan, _) = apply(
+            &run,
+            &ctx,
+            r#"{"reason":"adjust c","steps":[
+                {"id":"c","role":"test","job":"updated","runner":"cursor","depends_on":["a"],"task":"task-2"}
+            ]}"#,
+        )
+        .expect("replan with tasks");
+        assert_eq!(plan.tasks, tasks);
+        assert_eq!(
+            plan.nodes
+                .iter()
+                .find(|n| n.id == "c")
+                .unwrap()
+                .task
+                .as_deref(),
+            Some("task-2")
+        );
     }
 
     // TC-974 / FR-957: only pending steps change; immutable nodes are copied

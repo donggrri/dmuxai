@@ -97,6 +97,7 @@ mod tests {
                 orchestrator_model: "gpt-4o".to_string(),
                 user_prompt: "prompt".to_string(),
                 limits: GraphLimits::default(),
+                tasks: Vec::new(),
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },

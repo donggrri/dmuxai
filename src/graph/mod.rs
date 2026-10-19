@@ -31,6 +31,6 @@ pub use store::{GraphStore, load_run, save_run};
 pub use types::{
     Approval, ApprovalState, DecisionBy, ExecutionPlan, GraphEdge, GraphLimits, GraphNode,
     GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, NodeRole, PLAN_HISTORY_MAX, PlanChange,
-    PlanChangeKind, PlanChangeTrigger, PlanRevision, PlannerCalls, SinglePlan, Triage,
-    cap_revision_raw,
+    PlanChangeKind, PlanChangeTrigger, PlanRevision, PlanTask, PlannerCalls, SinglePlan, TaskSize,
+    Triage, cap_revision_raw,
 };

@@ -3291,6 +3291,7 @@ impl App {
                 nodes: Vec::new(),
                 edges: Vec::new(),
                 limits: self.graph_limits(),
+                tasks: Vec::new(),
             };
             let run = self.build_graph_run(
                 plan,
@@ -4240,6 +4241,7 @@ impl App {
                 judge: judge_calls,
                 ..Default::default()
             },
+            tasks: Vec::new(),
         }
     }
 
@@ -8858,6 +8860,7 @@ mod tests {
             requires_gate: false,
             status: dmuxai::graph::GraphNodeStatus::Completed,
             attempt: 0,
+            task: None,
             started_at_ms: None,
             finished_at_ms: None,
         }];
@@ -8874,6 +8877,7 @@ mod tests {
                 max_retries: 2,
                 ..dmuxai::graph::GraphLimits::default()
             },
+            tasks: Vec::new(),
         });
     }
 
@@ -8896,6 +8900,7 @@ mod tests {
                 requires_gate: false,
                 status: dmuxai::graph::GraphNodeStatus::Pending,
                 attempt: 0,
+                task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
             }],
@@ -8936,6 +8941,7 @@ mod tests {
                 requires_gate: false,
                 status: dmuxai::graph::GraphNodeStatus::Pending,
                 attempt: 0,
+                task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
             }],
@@ -8972,6 +8978,7 @@ mod tests {
                 orchestrator_model: "composer-2.5".to_owned(),
                 user_prompt: "build the dashboard".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
+                tasks: Vec::new(),
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -8982,6 +8989,7 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Running,
                     attempt: 1,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 }],
@@ -9042,6 +9050,7 @@ mod tests {
                 orchestrator_model: "composer-2.5".to_owned(),
                 user_prompt: "old conversation".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
+                tasks: Vec::new(),
                 nodes: vec![],
                 edges: vec![],
             },
@@ -9082,6 +9091,7 @@ mod tests {
                 orchestrator_model: "composer-2.5".to_owned(),
                 user_prompt: "track details".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
+                tasks: Vec::new(),
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -9092,6 +9102,7 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Running,
                     attempt: 1,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 }],
@@ -9240,6 +9251,7 @@ mod tests {
                     max_retries: 2,
                     ..dmuxai::graph::GraphLimits::default()
                 },
+                tasks: Vec::new(),
                 nodes: vec![
                     dmuxai::graph::GraphNode {
                         id: "node-a".to_owned(),
@@ -9251,6 +9263,7 @@ mod tests {
                         requires_gate: false,
                         status: dmuxai::graph::GraphNodeStatus::Running,
                         attempt: 1,
+                        task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
                     },
@@ -9264,6 +9277,7 @@ mod tests {
                         requires_gate: false,
                         status: dmuxai::graph::GraphNodeStatus::Running,
                         attempt: 1,
+                        task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
                     },
@@ -9339,6 +9353,7 @@ mod tests {
                 orchestrator_model: "composer-2.5".to_owned(),
                 user_prompt: "retry".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
+                tasks: Vec::new(),
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -9349,6 +9364,7 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Running,
                     attempt: 2,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 }],
@@ -9904,6 +9920,7 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -9917,6 +9934,7 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -9927,6 +9945,7 @@ mod tests {
                 max_retries: 2,
                 ..dmuxai::graph::GraphLimits::default()
             },
+            tasks: Vec::new(),
         };
 
         app.graph_session = Some(GraphRunSession::new(GraphRun {
@@ -10107,6 +10126,7 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Completed,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -10120,6 +10140,7 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Completed,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -10133,6 +10154,7 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Running,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -10146,6 +10168,7 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -10159,12 +10182,14 @@ mod tests {
                     requires_gate: false,
                     status: dmuxai::graph::GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
             ],
             edges: vec![],
             limits: dmuxai::graph::GraphLimits::default(),
+            tasks: Vec::new(),
         };
         let run = GraphRun {
             plan,
@@ -13429,11 +13454,13 @@ mod tests {
                 requires_gate: false,
                 status: dmuxai::graph::GraphNodeStatus::Pending,
                 attempt: 0,
+                task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
             }],
             edges: Vec::new(),
             limits: dmuxai::graph::default_limits(),
+            tasks: Vec::new(),
         };
         app.start_graph_run(plan);
 
@@ -13543,6 +13570,7 @@ mod tests {
                     max_retries: 0,
                     ..dmuxai::graph::GraphLimits::default()
                 },
+                tasks: Vec::new(),
             },
             conversation_id: conv_before.clone(),
             phase: GraphRunPhase::Failed,

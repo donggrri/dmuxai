@@ -104,6 +104,7 @@ mod tests {
                 nodes: Vec::new(),
                 edges: Vec::new(),
                 limits: Default::default(),
+                tasks: Vec::new(),
             },
             conversation_id: "conv".to_owned(),
             phase: GraphRunPhase::Active,

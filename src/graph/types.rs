@@ -47,10 +47,39 @@ pub struct GraphNode {
     pub requires_gate: bool,
     pub status: GraphNodeStatus,
     pub attempt: u32,
+    /// FR-964: the task this step belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at_ms: Option<u64>,
+}
+
+/// FR-963: one planned task (one runner turn or less).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanTask {
+    pub id: String,
+    pub title: String,
+    pub done_check: String,
+    #[serde(default)]
+    pub areas: Vec<String>,
+    pub size: TaskSize,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub implicit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskSize {
+    Small,
+    Medium,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +148,9 @@ pub struct GraphPlan {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
     pub limits: GraphLimits,
+    /// FR-963: task list for this plan; empty for old records.
+    #[serde(default)]
+    pub tasks: Vec<PlanTask>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +188,9 @@ pub struct GraphRun {
     /// FR-958: planner call counters.
     #[serde(default)]
     pub planner_calls: PlannerCalls,
+    /// FR-963: task list; empty for old records.
+    #[serde(default)]
+    pub tasks: Vec<PlanTask>,
 }
 
 impl GraphRun {
@@ -360,5 +395,41 @@ mod tests {
         assert!(json.contains("\"finished_at_ms\":1700000120000"));
         let roundtrip: GraphNode = serde_json::from_str(&json).expect("roundtrip timed");
         assert_eq!(roundtrip, timed);
+    }
+
+    #[test]
+    fn graph_plan_and_run_without_tasks_field_load() {
+        let plan_json = r#"{
+            "schema": "cursor-agent-graph/v1",
+            "id": "p1",
+            "orchestrator_model": "composer-2.5",
+            "user_prompt": "go",
+            "nodes": [{
+                "id": "a",
+                "role": "implement",
+                "job": "work",
+                "runner": "cursor",
+                "model_id": "composer-2.5",
+                "requires_gate": false,
+                "status": "pending",
+                "attempt": 0
+            }],
+            "edges": [],
+            "limits": {
+                "max_parallel": 2,
+                "max_retries": 2,
+                "max_replans": 3,
+                "replan_budget_chars": 24000,
+                "max_nodes": 12
+            }
+        }"#;
+        let plan: GraphPlan = serde_json::from_str(plan_json).expect("plan");
+        assert!(plan.tasks.is_empty());
+        assert!(plan.nodes[0].task.is_none());
+
+        let run_json = format!(r#"{{"plan":{plan_json},"conversation_id":"c1","phase":"active"}}"#);
+        let run: GraphRun = serde_json::from_str(&run_json).expect("run");
+        assert!(run.plan.tasks.is_empty());
+        assert!(run.tasks.is_empty());
     }
 }

@@ -369,6 +369,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Completed,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -382,6 +383,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -395,6 +397,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -408,6 +411,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -421,6 +425,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -444,6 +449,7 @@ mod tests {
                 max_retries: 1,
                 ..GraphLimits::default()
             },
+            tasks: Vec::new(),
         };
 
         let run = GraphRun {
@@ -527,6 +533,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Completed,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -540,6 +547,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -553,6 +561,7 @@ mod tests {
                     requires_gate: false,
                     status: GraphNodeStatus::Pending,
                     attempt: 0,
+                    task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
                 },
@@ -563,6 +572,7 @@ mod tests {
                 max_retries: 1,
                 ..GraphLimits::default()
             },
+            tasks: Vec::new(),
         };
 
         let run = GraphRun {
@@ -666,10 +676,14 @@ mod tests {
     // and a join step starts only after all its parents complete.
     #[test]
     fn schedule_runs_independent_steps_in_parallel() {
-        let json = r#"{"steps":[
-            {"id":"a","role":"research","job":"root a","runner":"grok","model":"grok-4.7","depends_on":[]},
-            {"id":"b","role":"research","job":"root b","runner":"opencode","model":"opencode/glm-5.3-flash-free","depends_on":[]},
-            {"id":"c","role":"test","job":"join c","runner":"grok","model":"grok-4.7","depends_on":["a","b"]}
+        let json = r#"{"tasks":[
+            {"id":"task-1","title":"a","done_check":"d","size":"small"},
+            {"id":"task-2","title":"b","done_check":"d","size":"small"},
+            {"id":"task-3","title":"c","done_check":"d","size":"small","depends_on":["task-1","task-2"]}
+        ],"steps":[
+            {"id":"a","role":"research","job":"root a","runner":"grok","model":"grok-4.7","depends_on":[],"task":"task-1"},
+            {"id":"b","role":"research","job":"root b","runner":"opencode","model":"opencode/glm-5.3-flash-free","depends_on":[],"task":"task-2"},
+            {"id":"c","role":"test","job":"join c","runner":"grok","model":"grok-4.7","depends_on":["a","b"],"task":"task-3"}
         ]}"#;
 
         let mut session = session_for(plan_from_json(json, 2));
@@ -709,9 +723,12 @@ mod tests {
     // runner waits instead of failing.
     #[test]
     fn same_runner_steps_wait_for_runner() {
-        let json = r#"{"steps":[
-            {"id":"a","role":"research","job":"first","runner":"grok","model":"grok-4.7","depends_on":[]},
-            {"id":"b","role":"research","job":"second","runner":"grok","model":"grok-4.7","depends_on":[]}
+        let json = r#"{"tasks":[
+            {"id":"task-1","title":"a","done_check":"d","size":"small"},
+            {"id":"task-2","title":"b","done_check":"d","size":"small"}
+        ],"steps":[
+            {"id":"a","role":"research","job":"first","runner":"grok","model":"grok-4.7","depends_on":[],"task":"task-1"},
+            {"id":"b","role":"research","job":"second","runner":"grok","model":"grok-4.7","depends_on":[],"task":"task-2"}
         ]}"#;
 
         let mut session = session_for(plan_from_json(json, 2));

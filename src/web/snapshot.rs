@@ -407,6 +407,7 @@ mod tests {
                 orchestrator_model: "gpt-4o".to_string(),
                 user_prompt: "Build dashboard".to_string(),
                 limits: GraphLimits::default(),
+                tasks: Vec::new(),
                 nodes: vec![
                     GraphNode {
                         id: "step-1".to_string(),
@@ -418,6 +419,7 @@ mod tests {
                         requires_gate: false,
                         status: GraphNodeStatus::Completed,
                         attempt: 1,
+                        task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
                     },
@@ -431,6 +433,7 @@ mod tests {
                         requires_gate: false,
                         status: GraphNodeStatus::Running,
                         attempt: 1,
+                        task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
                     },
@@ -444,6 +447,7 @@ mod tests {
                         requires_gate: false,
                         status: GraphNodeStatus::Pending,
                         attempt: 0,
+                        task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
                     },
@@ -527,6 +531,7 @@ mod tests {
             requires_gate: false,
             status: GraphNodeStatus::Pending,
             attempt: 0,
+            task: None,
             started_at_ms: None,
             finished_at_ms: None,
         };
@@ -537,6 +542,7 @@ mod tests {
                 orchestrator_model: "gpt-4o".to_string(),
                 user_prompt: "prompt".to_string(),
                 limits: GraphLimits::default(),
+                tasks: Vec::new(),
                 nodes: vec![
                     make_node("a", "root"),
                     make_node("b", "left"),

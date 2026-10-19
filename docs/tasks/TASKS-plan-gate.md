@@ -18,11 +18,11 @@ Shared gate for every task (in addition to its own check): no test hangs — run
 
 ## Remaining (execution order)
 
-- [x] P01 — (7e547c2; composer-2.5 on opencode deepseek WIP; review glm BLOCK → 2 blockers fixed, re-review pending) Finish the triage state machine (judge turn, timeouts, `/direct`, quiet 1-node runs; WIP commit 1375768): make all app tests pass, fix the `headless_run_reports_agent_error` hang, `/direct` parity row.
+- [x] P01 — (7e547c2; composer-2.5 on opencode deepseek WIP; review glm BLOCK → fixed; sonnet-5.5-high re-review APPROVE) Finish the triage state machine (judge turn, timeouts, `/direct`, quiet 1-node runs; WIP commit 1375768): make all app tests pass, fix the `headless_run_reports_agent_error` hang, `/direct` parity row.
   FR-930, FR-932, FR-935, FR-937, FR-948, FR-951, FR-954. TC-930, TC-931, TC-933, TC-934, TC-937..TC-940, TC-964 (simple), TC-968 (simple).
   Files: `src/app.rs`, `src/web/parity.rs`, `tests/graph_orchestration.rs`.
   Done when: `timeout 300 cargo test --locked --bin dmuxai` 0 failed, `cargo test --locked --test graph_orchestration` green.
-- [ ] P02 — (in progress: opencode deepseek-v4.1-flash-free) Plan `tasks` schema in the plan JSON, validation, task→step mapping, `PLAN_PROMPT` split rule (pure).
+- [x] P02 — (opencode deepseek-v4.1-flash-free + composer-2.5 fix; review sonnet-5.5-high BLOCK → fixed; 2nd-round finding "replan steps need `task` in the replan prompt" moved to P09) Plan `tasks` schema in the plan JSON, validation, task→step mapping, `PLAN_PROMPT` split rule (pure).
   FR-963, FR-964, FR-975. TC-991, TC-992, TC-993.
   Files: `src/graph/plan_doc.rs`, `src/graph/types.rs` (`PlanTask`, `GraphNode.task`, `GraphRun.tasks` serde default).
   Done when: `cargo test --locked --lib graph::plan_doc` green incl. `plan_tasks_parse_and_validate`, `plan_tasks_invalid_cases`, `tasks_build_dag_with_parallel_branches`.
@@ -52,6 +52,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   Done when: `task_edits_rebuild_plan`, `task_split_uses_edit_turn` green.
 - [ ] P09 — Replan review fixes: `replans_used`/`replan_chars_used` counters, reject deps on failed/skipped nodes, `revision_needs_approval_cases`, drop non-executable deps; replans revise only pending tasks.
   FR-957, FR-958, FR-968. TC-974, TC-975, TC-999.
+  Also: `REPLAN_PROMPT` asks for `task` on every new/changed step and a replan step without `task` inherits the task of the existing node with the same id (from P02 review); cut every model-provided id in PlanError text.
   Files: `src/graph/replan.rs`, `src/graph/types.rs`.
   Done when: `cargo test --locked --lib graph::replan` green incl. `replan_revises_only_pending_tasks`.
 - [ ] P10 — Replan triggers: `NODE_REPLAN_HINT` on multi-node prompts, marker strip, failure hold, `/graph replan [note]`.
