@@ -6,6 +6,7 @@ mod policy;
 mod replan;
 mod store;
 mod tasks;
+mod triage_view;
 mod types;
 
 pub use executor::{GraphAction, GraphRunSession, GraphSession, NodeAssignment};
@@ -35,9 +36,11 @@ pub use tasks::{
     TaskEdit, TaskState, apply_task_delete, apply_task_merge, apply_task_move, apply_task_rename,
     diff_plan_tasks, task_counts, task_status,
 };
+pub use triage_view::{ellipsize_to_width, judge_line_text, judging_line_text};
 pub use types::{
     Approval, ApprovalState, DecisionBy, ExecutionPlan, GraphEdge, GraphLimits, GraphNode,
     GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, MAX_PLAN_REVISIONS, NodeRole,
     PLAN_HISTORY_MAX, PlanChange, PlanChangeKind, PlanChangeTrigger, PlanRevision, PlanTask,
-    PlannerCalls, SinglePlan, TaskSize, Triage, cap_revision_raw,
+    PlannerCalls, SinglePlan, TaskSize, Triage, cap_plan_response_excerpt, cap_revision_raw,
+    next_plan_change_rev,
 };

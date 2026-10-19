@@ -70,7 +70,7 @@ Shared gate for every task (in addition to its own check): no test hangs — run
   FR-954, FR-959, FR-960, UX-935. TC-976, TC-979 (TUI), TC-989.
   Files: `src/app.rs`.
   Done when: `sensitive_replan_needs_approval`, `revision_notice_renders`, `every_turn_is_recorded_as_graph_run` green.
-- [ ] P12 — TUI judge line (shared text helpers).
+- [x] P12 — (#67 agent-planned graph a5247340: 5 steps; fix turn as #67 /direct run 73f2797e + hand fixes; composer-2.5; review claude-sonnet-5-5-high BLOCK ×2 (graph status regression/stale triage; simple verdicts never kept the judge line) → fixed → APPROVE; dogfood findings from a5247340 fixed as FR-1007/TC-1007: replan revs collided with the initial rev, rejected replan response not kept (now `response_excerpt`), `**DMUXAI_REPLAN:**` marker ignored; nits for P14/P15: Cf/bidi chars in reasons, empty runner/model text, late judge from another conversation, `wants_graph_status_line` duplication) TUI judge line (shared text helpers).
   UX-930. TC-956.
   Files: new `src/graph/triage_view.rs`, `src/app.rs` (render).
   Done when: `judge_reason_line_renders` green.

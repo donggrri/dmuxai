@@ -239,6 +239,7 @@ mod tests {
             tasks_removed: 0,
             applied: true,
             error: None,
+            response_excerpt: None,
             decided_by: None,
         };
         let rejected = PlanChange {
@@ -258,6 +259,7 @@ mod tests {
             tasks_removed: 0,
             applied: false,
             error: Some("duplicate step id node-b".to_owned()),
+            response_excerpt: Some("invalid json body".to_owned()),
             decided_by: Some(DecisionBy::Tui),
         };
         run.push_plan_change(applied.clone());
@@ -283,6 +285,7 @@ mod tests {
             tasks_removed: 0,
             applied: true,
             error: None,
+            response_excerpt: None,
             decided_by: Some(DecisionBy::Cli),
         });
         let mut extra = run.clone();
@@ -304,6 +307,7 @@ mod tests {
                 tasks_removed: 0,
                 applied: true,
                 error: None,
+                response_excerpt: None,
                 decided_by: None,
             });
         }

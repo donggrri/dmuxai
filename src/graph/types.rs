@@ -350,8 +350,38 @@ pub struct PlanChange {
     pub applied: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// FR-1007: rejected/invalid replan adapter text (≤2000 chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_excerpt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided_by: Option<DecisionBy>,
+}
+
+/// Next revision number shared by `plan_history` and approval revisions (FR-1007).
+pub fn next_plan_change_rev(run: &GraphRun) -> u32 {
+    let from_history = run
+        .plan_history
+        .last()
+        .map(|change| change.rev.saturating_add(1))
+        .unwrap_or(1);
+    let from_approval = run
+        .approval
+        .as_ref()
+        .and_then(|approval| approval.revisions.last().map(|rev| rev.n.saturating_add(1)))
+        .unwrap_or(1);
+    from_history.max(from_approval)
+}
+
+/// Caps replan rejection excerpts on a char boundary (FR-1007).
+pub fn cap_plan_response_excerpt(raw: &str) -> String {
+    const MAX: usize = 2000;
+    if raw.chars().count() <= MAX {
+        return raw.to_owned();
+    }
+    raw.char_indices()
+        .nth(MAX)
+        .map(|(index, _)| raw[..index].to_owned())
+        .unwrap_or_else(|| raw.to_owned())
 }
 
 /// Triage verdict persisted on the run (FR-946).

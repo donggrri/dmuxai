@@ -60,11 +60,12 @@ use dmuxai::{
         PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode, PlanPromptRequest, PlanRevision,
         PlanStep, PlanTask, PlannerCalls, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage,
         TriageSource, apply_replan, budget_allows, build_judge_prompt, build_plan_prompt,
-        build_replan_prompt, cap_replan_step_summary, cap_revision_raw, diff_plan_steps,
-        diff_plan_tasks, fallback_plan, graph_plan_from_revision_steps, heuristic_route,
-        parse_plan, parse_replan, parse_replan_marker, parse_verdict, plan_json_for_edit,
-        replan_allowed, replan_revision_steps, revision_needs_approval, save_run,
-        strip_replan_marker, validate_plan,
+        build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary, cap_revision_raw,
+        diff_plan_steps, diff_plan_tasks, fallback_plan, graph_plan_from_revision_steps,
+        heuristic_route, judge_line_text, judging_line_text, next_plan_change_rev, parse_plan,
+        parse_replan, parse_replan_marker, parse_verdict, plan_json_for_edit, replan_allowed,
+        replan_revision_steps, revision_needs_approval, save_run, strip_replan_marker,
+        validate_plan,
     },
     mcp::config::ResolvedMcpServer,
     mcp::registry::McpRegistry,
@@ -791,6 +792,7 @@ struct SlashPreview {
 struct UiAreas {
     chat: Rect,
     graph_status: Option<Rect>,
+    judge_line: Option<Rect>,
     input: Rect,
     status: Rect,
 }
@@ -1092,6 +1094,12 @@ pub struct App {
     all_details_expanded: bool,
     dashboard: Option<dmuxai::web::DashboardHub>,
     last_graph_run: Option<dmuxai::graph::GraphRun>,
+    /// UX-930: monotonic id for the current user turn; judge line triage is
+    /// shown only while its stored seq matches.
+    user_turn_seq: u32,
+    /// Set when the user starts a turn that may show a judge line (UX-930).
+    judge_reason_capture_turn: Option<u32>,
+    judge_reason_line: Option<(u32, String, Triage)>,
     /// FR-942: plan id of a run restored at `awaiting_approval` after a
     /// restart (no live agent turn behind it); approve is refused for it.
     graph_approval_stale: Option<String>,
@@ -1310,6 +1318,9 @@ impl App {
             all_details_expanded: false,
             dashboard: None,
             last_graph_run: None,
+            user_turn_seq: 0,
+            judge_reason_capture_turn: None,
+            judge_reason_line: None,
             graph_approval_stale: None,
             dirty: false,
             todo_store: None,
@@ -3288,6 +3299,7 @@ impl App {
                 ));
                 return;
             }
+            self.begin_user_prompt_turn();
             if self
                 .settings
                 .graph_allowed_runners
@@ -3310,6 +3322,7 @@ impl App {
         }
 
         let agent = self.adapters[self.selected].agent();
+        self.begin_user_prompt_turn();
         self.submit_to_agent(agent, prompt, true);
     }
 
@@ -3800,6 +3813,8 @@ impl App {
         self.chat_scroll = 0;
         self.message_link_cache.clear();
         self.clear_chat_selection();
+        self.judge_reason_line = None;
+        self.judge_reason_capture_turn = None;
         if let Some(prompt) = self.restored_inputs.remove(&self.conversation_id) {
             self.input = prompt;
         } else if let Some(index) = self
@@ -4761,6 +4776,7 @@ impl App {
                 .last_graph_run
                 .as_mut()
                 .ok_or(PlanDecisionError::NotAwaitingApproval)?;
+            let next_n = next_plan_change_rev(run);
             let approval = run
                 .approval
                 .as_mut()
@@ -4771,7 +4787,6 @@ impl App {
                 .map(|rev| rev.steps.clone())
                 .unwrap_or_default();
             let prev_tasks = run.plan.tasks.clone();
-            let next_n = approval.revisions.last().map(|rev| rev.n + 1).unwrap_or(1);
             let (added, changed, removed) = diff_plan_steps(&prev_steps, &steps);
             let (tasks_added, tasks_changed, tasks_removed) = diff_plan_tasks(&prev_tasks, &tasks);
             approval.revisions.push(PlanRevision {
@@ -4803,6 +4818,7 @@ impl App {
                 tasks_removed,
                 applied: true,
                 error: None,
+                response_excerpt: None,
                 decided_by: None,
             }
         };
@@ -5007,6 +5023,7 @@ impl App {
                 tasks_removed: 0,
                 applied: true,
                 error: None,
+                response_excerpt: None,
                 decided_by: Some(by),
             });
             let plan_id = run.plan.id.clone();
@@ -5063,6 +5080,7 @@ impl App {
                 tasks_removed: 0,
                 applied: false,
                 error: None,
+                response_excerpt: None,
                 decided_by: Some(by),
             });
             save_run(&self.workspace_root, run).err()
@@ -5174,6 +5192,7 @@ impl App {
             ));
             return;
         }
+        self.begin_user_prompt_turn();
         let run_id = Uuid::new_v4().to_string();
         self.begin_planning(
             prompt,
@@ -5211,6 +5230,7 @@ impl App {
             ));
             return;
         }
+        self.begin_user_prompt_turn();
         let run_id = Uuid::new_v4().to_string();
         self.start_one_node_run(
             prompt,
@@ -5260,6 +5280,8 @@ impl App {
                 return;
             }
         };
+        // UX-930: simple verdicts and overrides keep their judge line too.
+        self.remember_judge_reason_triage(run.triage.as_ref());
         self.start_graph_run_record(run);
     }
 
@@ -5519,6 +5541,7 @@ impl App {
         if let Err(error) = save_run(&self.workspace_root, &run) {
             self.push_system(format!("Could not save the fallback plan: {error}"));
         }
+        self.remember_judge_reason_triage(run.triage.as_ref());
         self.last_graph_run = Some(run);
     }
 
@@ -5805,6 +5828,7 @@ impl App {
             if let Err(error) = save_run(&self.workspace_root, &planning_run) {
                 self.push_system(format!("Could not save the planning run: {error}"));
             }
+            self.remember_judge_reason_triage(planning_run.triage.as_ref());
             self.last_graph_run = Some(planning_run);
         }
         self.push_system(format!("Planning with {runner} {model}…"));
@@ -6016,6 +6040,7 @@ impl App {
         if let Err(error) = save_run(&self.workspace_root, &run) {
             self.push_system(format!("Could not save the plan: {error}"));
         }
+        self.remember_judge_reason_triage(run.triage.as_ref());
         self.last_graph_run = Some(run);
     }
 
@@ -6039,6 +6064,7 @@ impl App {
             return;
         };
         let edit_calls = run.planner_calls.edit;
+        let next_n = next_plan_change_rev(run);
         let Some(approval) = run.approval.as_mut() else {
             return;
         };
@@ -6053,7 +6079,6 @@ impl App {
                 .last()
                 .map(|rev| rev.steps.clone())
                 .unwrap_or_default();
-            let next_n = approval.revisions.last().map(|rev| rev.n + 1).unwrap_or(1);
             let (added, changed, removed) = diff_plan_steps(&prev_steps, &steps);
             approval.revisions.push(PlanRevision {
                 n: next_n,
@@ -6093,6 +6118,7 @@ impl App {
                 tasks_removed: 0,
                 applied: true,
                 error: None,
+                response_excerpt: None,
                 decided_by: None,
             }
         };
@@ -6704,7 +6730,7 @@ impl App {
             });
             return;
         }
-        let rev = run.replans_used + 1;
+        let rev = next_plan_change_rev(&run);
         self.start_replan_turn(
             agent,
             run.plan.id.clone(),
@@ -7334,6 +7360,7 @@ impl App {
 
     fn finish_replan_rejected(&mut self, pending: PendingReplan, message: String, resume: bool) {
         let rev = pending.rev;
+        let excerpt = cap_plan_response_excerpt(&pending.buffer);
         let change = Self::finalize_pending_replan_change(
             &pending,
             PlanChange {
@@ -7353,6 +7380,7 @@ impl App {
                 tasks_removed: 0,
                 applied: false,
                 error: Some(message.clone()),
+                response_excerpt: (!excerpt.is_empty()).then_some(excerpt),
                 decided_by: None,
             },
         );
@@ -7386,6 +7414,7 @@ impl App {
                 tasks_removed: 0,
                 applied: true,
                 error: None,
+                response_excerpt: None,
                 decided_by: pending.decided_by,
             };
             run.push_plan_change(change.clone());
@@ -9913,6 +9942,7 @@ impl App {
                         self.push_system(format!("Failed to mark to-do running: {err}"));
                         RunTodoError::Internal(err.to_string())
                     })?;
+                self.begin_user_prompt_turn();
                 self.start_graph_run_record(run);
                 self.publish_todos();
                 Ok(updated)
@@ -9974,6 +10004,7 @@ impl App {
             ));
         }
 
+        self.begin_user_prompt_turn();
         let turn_id = self.try_submit_to_agent(target_agent, prompt, false, false)?;
         self.todo_turns
             .insert((target_agent, turn_id), todo_id.to_owned());
@@ -10008,6 +10039,71 @@ impl App {
         }
     }
 
+    fn begin_user_turn_for_judge_line(&mut self) {
+        self.user_turn_seq = self.user_turn_seq.wrapping_add(1);
+    }
+
+    fn begin_user_prompt_turn(&mut self) {
+        self.begin_user_turn_for_judge_line();
+        self.judge_reason_capture_turn = Some(self.user_turn_seq);
+    }
+
+    fn remember_judge_reason_triage(&mut self, triage: Option<&Triage>) {
+        if self.judge_reason_capture_turn != Some(self.user_turn_seq) {
+            return;
+        }
+        if let Some(triage) = triage {
+            self.judge_reason_line = Some((
+                self.user_turn_seq,
+                self.conversation_id.as_str().to_owned(),
+                triage.clone(),
+            ));
+        }
+    }
+
+    fn pending_triage_for_judge_line(&self) -> Option<&PendingTriage> {
+        self.pending_triage
+            .as_ref()
+            .filter(|pending| pending.conversation_id.as_str() == self.conversation_id.as_str())
+    }
+
+    fn finished_judge_line_triage(&self) -> Option<&Triage> {
+        self.judge_reason_line
+            .as_ref()
+            .filter(|(seq, conversation_id, _)| {
+                *seq == self.user_turn_seq && conversation_id == self.conversation_id.as_str()
+            })
+            .map(|(_, _, triage)| triage)
+    }
+
+    fn judge_line_model_for_agent(&self, agent: Agent) -> String {
+        self.selected_run_model(agent)
+            .unwrap_or_else(|_| "provider default".to_owned())
+    }
+
+    fn judging_reason_line_text(&self, pending: &PendingTriage) -> String {
+        let runner = runner_name(pending.agent);
+        let model = self.judge_line_model_for_agent(pending.agent);
+        let now = self.injected_now.unwrap_or_else(Instant::now);
+        let elapsed = now.saturating_duration_since(pending.started);
+        let frame = spinner_frame(elapsed, self.reduced_motion());
+        format!("{} {}", frame, judging_line_text(runner, &model))
+    }
+
+    fn current_judge_reason_line_raw(&self) -> Option<String> {
+        if let Some(pending) = self.pending_triage_for_judge_line() {
+            return Some(self.judging_reason_line_text(pending));
+        }
+        self.finished_judge_line_triage().map(judge_line_text)
+    }
+
+    fn judge_reason_line_highlight_fallback(&self) -> bool {
+        self.pending_triage_for_judge_line().is_none()
+            && self
+                .finished_judge_line_triage()
+                .is_some_and(|triage| triage.source == TriageSource::Fallback)
+    }
+
     fn draw(&mut self, frame: &mut Frame) {
         self.terminal_area = frame.area();
         let areas = self.ui_areas(self.terminal_area);
@@ -10015,6 +10111,9 @@ impl App {
         self.draw_chat(frame, areas.chat);
         if let Some(graph_status_area) = areas.graph_status {
             self.draw_graph_status(frame, graph_status_area);
+        }
+        if let Some(judge_line_area) = areas.judge_line {
+            self.draw_judge_reason_line(frame, judge_line_area);
         }
         self.draw_input(frame, areas.input);
         self.draw_status(frame, areas.status);
@@ -10066,32 +10165,79 @@ impl App {
         None
     }
 
+    fn wants_graph_status_line(&self) -> bool {
+        if let Some(session) = &self.graph_session
+            && session.run().phase != GraphRunPhase::Completed
+        {
+            return true;
+        }
+        if let Some(run) = &self.last_graph_run
+            && run.conversation_id == self.conversation_id.as_str()
+            && matches!(run.phase, GraphRunPhase::Failed | GraphRunPhase::Completed)
+        {
+            return true;
+        }
+        self.single_graph_plan.is_some()
+    }
+
+    fn wants_judge_reason_line(&self) -> bool {
+        self.pending_triage_for_judge_line().is_some()
+            || self.finished_judge_line_triage().is_some()
+    }
+
     fn ui_areas(&self, area: Rect) -> UiAreas {
         let input_height = clamp_input_height(self.input_height, area.height);
-        let show_graph_status = self.current_graph_status_line().is_some()
-            && area.height >= MIN_MAIN_HEIGHT + 1 + input_height + STATUS_HEIGHT;
+        let want_graph_status = self.wants_graph_status_line();
+        let want_judge_line = self.wants_judge_reason_line();
+        let room_for_banners = area
+            .height
+            .saturating_sub(input_height + STATUS_HEIGHT + MIN_MAIN_HEIGHT);
+        let show_graph_status = want_graph_status && room_for_banners >= 1;
+        let show_judge_line =
+            want_judge_line && room_for_banners >= if show_graph_status { 2 } else { 1 };
+        let banner_rows = (show_graph_status as u16) + (show_judge_line as u16);
 
-        if show_graph_status {
-            let graph_status_height = 1u16;
+        if show_graph_status || show_judge_line {
+            let mut constraints = Vec::with_capacity(4 + banner_rows as usize);
             let main_height = area.height.saturating_sub(
                 input_height
                     .saturating_add(STATUS_HEIGHT)
-                    .saturating_add(graph_status_height),
+                    .saturating_add(banner_rows),
             );
+            constraints.push(Constraint::Length(main_height));
+            if show_graph_status {
+                constraints.push(Constraint::Length(1));
+            }
+            if show_judge_line {
+                constraints.push(Constraint::Length(1));
+            }
+            constraints.push(Constraint::Length(input_height));
+            constraints.push(Constraint::Length(STATUS_HEIGHT));
             let vertical = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(main_height),
-                    Constraint::Length(graph_status_height),
-                    Constraint::Length(input_height),
-                    Constraint::Length(STATUS_HEIGHT),
-                ])
+                .constraints(constraints)
                 .split(area);
+            let mut index = 1usize;
+            let graph_status = if show_graph_status {
+                let area = vertical[index];
+                index += 1;
+                Some(area)
+            } else {
+                None
+            };
+            let judge_line = if show_judge_line {
+                let area = vertical[index];
+                index += 1;
+                Some(area)
+            } else {
+                None
+            };
             UiAreas {
                 chat: vertical[0],
-                graph_status: Some(vertical[1]),
-                input: vertical[2],
-                status: vertical[3],
+                graph_status,
+                judge_line,
+                input: vertical[index],
+                status: vertical[index + 1],
             }
         } else {
             let main_height = area
@@ -10108,6 +10254,7 @@ impl App {
             UiAreas {
                 chat: vertical[0],
                 graph_status: None,
+                judge_line: None,
                 input: vertical[1],
                 status: vertical[2],
             }
@@ -10365,6 +10512,54 @@ impl App {
             let paragraph = Paragraph::new(status).style(style);
             frame.render_widget(paragraph, area);
         }
+    }
+
+    fn draw_judge_reason_line(&self, frame: &mut Frame, area: Rect) {
+        let Some(raw) = self.current_judge_reason_line_raw() else {
+            return;
+        };
+        let width = area.width as usize;
+        let text = ellipsize_to_width(&raw, width);
+        let highlight_fallback = self.judge_reason_line_highlight_fallback();
+        let line = self.judge_reason_line_to_spans(&text, highlight_fallback);
+        let colors = self.colors_enabled();
+        let mut paragraph = Paragraph::new(line);
+        if colors && let Some(bg) = self.settings.theme.background {
+            paragraph = paragraph.style(Style::default().bg(bg));
+        }
+        frame.render_widget(paragraph, area);
+    }
+
+    fn judge_reason_line_to_spans(&self, text: &str, highlight_fallback: bool) -> Line<'static> {
+        let colors = self.colors_enabled();
+        let muted = if colors {
+            Style::default()
+                .fg(self.settings.theme.color_for(Speaker::System))
+                .add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
+        let warning = if colors {
+            Style::default().fg(self.settings.theme.warning_color())
+        } else {
+            Style::default()
+        };
+        if !highlight_fallback || !text.contains("fallback") {
+            return Line::from(Span::styled(text.to_owned(), muted));
+        }
+        let mut spans = Vec::new();
+        let mut rest = text;
+        while let Some(index) = rest.find("fallback") {
+            if index > 0 {
+                spans.push(Span::styled(rest[..index].to_owned(), muted));
+            }
+            spans.push(Span::styled("fallback".to_owned(), warning));
+            rest = &rest[index + "fallback".len()..];
+        }
+        if !rest.is_empty() {
+            spans.push(Span::styled(rest.to_owned(), muted));
+        }
+        Line::from(spans)
     }
 
     fn render_activity_group(
@@ -12637,6 +12832,14 @@ mod tests {
     }
 
     fn find_cell_fg(app: &mut App, needle: &str) -> Option<Color> {
+        find_cell_at(app, needle).map(|cell| cell.fg)
+    }
+
+    fn find_cell_modifier(app: &mut App, needle: &str) -> Option<Modifier> {
+        find_cell_at(app, needle).map(|cell| cell.modifier)
+    }
+
+    fn find_cell_at(app: &mut App, needle: &str) -> Option<ratatui::buffer::Cell> {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
@@ -12647,7 +12850,7 @@ mod tests {
                 .collect();
             if let Some(byte_idx) = row.find(needle) {
                 let col = row[..byte_idx].chars().count() as u16;
-                return Some(buffer[(col, y)].fg);
+                return Some(buffer[(col, y)].clone());
             }
         }
         None
@@ -12841,7 +13044,7 @@ mod tests {
             "done\n\nDMUXAI_REPLAN: need tests\n",
         );
         let replan_req = last_replan_request(&h.sent);
-        assert_eq!(replan_req.turn_id.as_str(), "replan-1");
+        assert_eq!(replan_req.turn_id.as_str(), "replan-2");
         let replans_before = h.app.last_graph_run.as_ref().unwrap().planner_calls.replan;
         assert_eq!(replans_before, 1);
         assert!(
@@ -12865,15 +13068,28 @@ mod tests {
             1
         );
         let retry = last_replan_request(&h.sent);
-        assert_eq!(retry.turn_id.as_str(), "replan-1");
+        assert_eq!(retry.turn_id.as_str(), "replan-2");
         assert!(h.app.apply_agent_output(triage_output(
             Agent::Codex,
             &retry,
             AgentEvent::Error("boom".to_owned()),
         )));
         assert!(
-            system_containing(&h.app, "Replan rev 1 rejected: boom")
-                .contains("Replan rev 1 rejected: boom")
+            system_containing(&h.app, "Replan rev 2 rejected: boom")
+                .contains("Replan rev 2 rejected: boom")
+        );
+        assert!(
+            h.app
+                .last_graph_run
+                .as_ref()
+                .unwrap()
+                .plan_history
+                .iter()
+                .any(|c| c.kind == PlanChangeKind::Replan && c.rev == 2 && !c.applied)
+        );
+        assert_eq!(
+            parse_replan_marker("**DMUXAI_REPLAN:** x").as_deref(),
+            Some("x")
         );
     }
 
@@ -14731,6 +14947,216 @@ mod tests {
         app.finish_turn(Agent::Cursor);
         let areas = app.ui_areas(app.terminal_area);
         assert!(areas.graph_status.is_none());
+    }
+
+    #[test]
+    // TC-956 / UX-930: judge line text, styles, and ellipsize above the prompt.
+    fn judge_reason_line_renders() {
+        let (mut app, _sent) = test_app();
+        app.terminal_area = Rect::new(0, 0, 100, 30);
+        let theme = app.settings.theme.clone();
+        let system = theme.color_for(Speaker::System);
+        let warning = theme.warning_color();
+
+        assert!(app.ui_areas(app.terminal_area).judge_line.is_none());
+
+        let conversation_id = app.conversation_id.clone();
+        app.user_turn_seq = 1;
+
+        let simple = Triage {
+            route: Route::Simple,
+            reason: "quick fix".to_owned(),
+            source: TriageSource::Judge,
+            cause: None,
+            override_kind: None,
+            runner: "cursor".to_owned(),
+            model: "composer-2.5".to_owned(),
+            elapsed_ms: 12,
+        };
+        app.judge_reason_line = Some((1, conversation_id.as_str().to_owned(), simple.clone()));
+        let areas = app.ui_areas(app.terminal_area);
+        assert!(areas.judge_line.is_some());
+        assert_eq!(areas.judge_line.unwrap().bottom(), areas.input.y);
+        let rendered = render_text_at(&mut app, 100, 30);
+        assert!(rendered.contains("Judge (cursor composer-2.5): simple — quick fix"));
+        assert_eq!(find_cell_fg(&mut app, "Judge (cursor"), Some(system));
+        assert!(
+            find_cell_modifier(&mut app, "Judge (cursor")
+                .is_some_and(|m| m.contains(Modifier::DIM))
+        );
+
+        let complex = Triage {
+            route: Route::Complex,
+            reason: "needs plan".to_owned(),
+            source: TriageSource::Judge,
+            cause: None,
+            override_kind: None,
+            runner: "cursor".to_owned(),
+            model: "composer-2.5".to_owned(),
+            elapsed_ms: 12,
+        };
+        app.judge_reason_line = Some((1, conversation_id.as_str().to_owned(), complex));
+        assert!(
+            render_text_at(&mut app, 100, 30)
+                .contains("Judge (cursor composer-2.5): complex — needs plan")
+        );
+
+        let fallback = Triage {
+            route: Route::Simple,
+            reason: "ignored".to_owned(),
+            source: TriageSource::Fallback,
+            cause: Some(FallbackCause::Timeout),
+            override_kind: None,
+            runner: "cursor".to_owned(),
+            model: "composer-2.5".to_owned(),
+            elapsed_ms: 12,
+        };
+        app.judge_reason_line = Some((1, conversation_id.as_str().to_owned(), fallback));
+        let rendered = render_text_at(&mut app, 100, 30);
+        assert!(rendered.contains("Judge fallback: timeout (heuristic) — simple"));
+        assert_eq!(find_cell_fg(&mut app, "fallback"), Some(warning));
+        assert_eq!(find_cell_fg(&mut app, "timeout"), Some(system));
+
+        let plan_override = Triage {
+            route: Route::Complex,
+            reason: "override".to_owned(),
+            source: TriageSource::Override,
+            cause: None,
+            override_kind: Some(OverrideKind::Plan),
+            runner: "cursor".to_owned(),
+            model: "composer-2.5".to_owned(),
+            elapsed_ms: 0,
+        };
+        app.judge_reason_line = Some((1, conversation_id.as_str().to_owned(), plan_override));
+        assert!(render_text_at(&mut app, 100, 30).contains("/plan"));
+
+        let direct_override = Triage {
+            route: Route::Simple,
+            reason: String::new(),
+            source: TriageSource::Override,
+            cause: None,
+            override_kind: Some(OverrideKind::Direct),
+            runner: "cursor".to_owned(),
+            model: "composer-2.5".to_owned(),
+            elapsed_ms: 0,
+        };
+        app.judge_reason_line = Some((1, conversation_id.as_str().to_owned(), direct_override));
+        assert!(render_text_at(&mut app, 100, 30).contains("/direct"));
+
+        let agent_override = Triage {
+            route: Route::Complex,
+            reason: String::new(),
+            source: TriageSource::Override,
+            cause: None,
+            override_kind: Some(OverrideKind::Agent),
+            runner: "grok".to_owned(),
+            model: "grok-4.7".to_owned(),
+            elapsed_ms: 0,
+        };
+        app.judge_reason_line = Some((1, conversation_id.as_str().to_owned(), agent_override));
+        assert!(render_text_at(&mut app, 100, 30).contains("agent grok"));
+
+        let no_runners = Triage {
+            route: Route::Simple,
+            reason: String::new(),
+            source: TriageSource::Override,
+            cause: None,
+            override_kind: Some(OverrideKind::NoAllowedRunners),
+            runner: String::new(),
+            model: String::new(),
+            elapsed_ms: 0,
+        };
+        app.judge_reason_line = Some((1, conversation_id.as_str().to_owned(), no_runners));
+        assert!(render_text_at(&mut app, 100, 30).contains("no allowed runners"));
+
+        let long_reason = "가".repeat(120);
+        let long = Triage {
+            route: Route::Simple,
+            reason: long_reason,
+            source: TriageSource::Judge,
+            cause: None,
+            override_kind: None,
+            runner: "cursor".to_owned(),
+            model: "composer-2.5".to_owned(),
+            elapsed_ms: 1,
+        };
+        let full_len = judge_line_text(&long).len();
+        app.judge_reason_line = Some((1, conversation_id.as_str().to_owned(), long));
+        let rendered = render_text_at(&mut app, 100, 30);
+        let line = rendered
+            .lines()
+            .find(|line| line.contains("Judge (cursor"))
+            .expect("judge line");
+        assert!(line.contains('…'));
+        assert!(!line.contains(&"가".repeat(80)));
+        assert!(line.len() < full_len);
+
+        app.judge_reason_line = None;
+        let start = Instant::now();
+        app.injected_now = Some(start);
+        app.pending_triage = Some(PendingTriage {
+            defer_origin: None,
+            agent: Agent::Cursor,
+            conversation_id: conversation_id.clone(),
+            turn_id: StoredTurnId::new("judge-1"),
+            adapter_prompt: String::new(),
+            buffer: String::new(),
+            buffer_chars: 0,
+            started: start,
+            last_event: start,
+            prompt: "hello".to_owned(),
+            saved_mode: ExecutionMode::Implement,
+            run_id: "run-judge".to_owned(),
+            judge_calls: 1,
+        });
+        let frame = spinner_frame(Duration::ZERO, app.reduced_motion());
+        let rendered = render_text_at(&mut app, 100, 30);
+        assert!(rendered.contains(&format!("{frame} Judging with cursor composer-2.5…")));
+        assert_eq!(find_cell_fg(&mut app, "Judging with"), Some(system));
+        assert!(
+            find_cell_modifier(&mut app, "Judging with").is_some_and(|m| m.contains(Modifier::DIM))
+        );
+
+        app.user_turn_seq = 2;
+        app.pending_triage = None;
+        app.judge_reason_line = Some((
+            1,
+            conversation_id.as_str().to_owned(),
+            Triage {
+                route: Route::Simple,
+                reason: "quick fix".to_owned(),
+                source: TriageSource::Judge,
+                cause: None,
+                override_kind: None,
+                runner: "cursor".to_owned(),
+                model: "composer-2.5".to_owned(),
+                elapsed_ms: 12,
+            },
+        ));
+        assert!(app.ui_areas(app.terminal_area).judge_line.is_none());
+
+        app.terminal_area = Rect::new(0, 0, 100, 10);
+        app.user_turn_seq = 1;
+        app.single_graph_plan =
+            Some((NodeRole::Research, Agent::Cursor, "composer-2.5".to_owned()));
+        app.judge_reason_line = Some((1, conversation_id.as_str().to_owned(), simple.clone()));
+        let areas = app.ui_areas(app.terminal_area);
+        assert!(areas.graph_status.is_some());
+        assert!(areas.judge_line.is_none());
+
+        app.single_graph_plan = None;
+        app.pending_triage = None;
+        app.judge_reason_line = Some((
+            1,
+            StoredConversationId::new("other-conversation")
+                .as_str()
+                .to_owned(),
+            simple,
+        ));
+        assert!(!app.wants_judge_reason_line());
+
+        assert_eq!(ellipsize_to_width("hello", 1), "…");
+        assert_eq!(ellipsize_to_width("abc", 2), "a…");
     }
 
     #[test]
@@ -20590,6 +21016,15 @@ mod tests {
             &judge,
             AgentEvent::Completed
         )));
+        // UX-930: a real simple verdict keeps its finished judge line.
+        assert!(
+            harness
+                .app
+                .current_judge_reason_line_raw()
+                .is_some_and(|line| line.contains("simple") && line.contains("tiny")),
+            "{:?}",
+            harness.app.current_judge_reason_line_raw()
+        );
 
         let modes = harness.modes.lock().unwrap();
         assert_eq!(
@@ -21503,7 +21938,7 @@ mod tests {
         assert!(!last_agent_content(&h.app, Agent::Codex).contains("DMUXAI_REPLAN"));
         let replans = replan_requests(&h.sent);
         assert_eq!(replans.len(), 1);
-        assert_eq!(replans[0].turn_id.as_str(), "replan-1");
+        assert_eq!(replans[0].turn_id.as_str(), "replan-2");
         let prompt = &replans[0].prompt;
         assert!(prompt.contains(&goal));
         assert!(prompt.contains("step-3"));
@@ -21537,7 +21972,7 @@ mod tests {
         );
         let replans = replan_requests(&h.sent);
         assert_eq!(replans.len(), 2);
-        assert_eq!(replans[1].turn_id.as_str(), "replan-2");
+        assert_eq!(replans[1].turn_id.as_str(), "replan-3");
         complete_replan_keep(&mut h);
         assert_eq!(
             h.app
@@ -22610,7 +23045,33 @@ mod tests {
             h.app.graph_session.as_ref().unwrap().run().phase,
             GraphRunPhase::Active
         );
-        assert_replan_plan_history(&h, json, 1, true);
+        assert_replan_plan_history(&h, json, 2, true);
+    }
+
+    // TC-1007 / FR-1007: one revision counter per run; a rejected replan keeps its excerpt.
+    #[test]
+    fn replan_revisions_share_counter() {
+        let mut h = plan_gate_test_app();
+        h.app.terminal_area = Rect::new(0, 0, 120, 30);
+        start_approved_three_step_run(&mut h);
+        let bad = r#"{"reason":"new task","steps":[
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-3b"}
+        ]}"#;
+        h.app.request_replan("bad", DecisionBy::Tui);
+        finish_replan_steps(&mut h, bad);
+        let history = &h.app.graph_session.as_ref().unwrap().run().plan_history;
+        let revs: Vec<u32> = history.iter().map(|change| change.rev).collect();
+        assert_eq!(revs, vec![1, 2], "history: {history:?}");
+        assert!(!history[1].applied);
+        assert!(
+            history[1]
+                .response_excerpt
+                .as_deref()
+                .is_some_and(|text| text.contains("task-3b"))
+        );
+        assert!(
+            system_containing(&h.app, "Replan rev 2 rejected").contains("unknown task 'task-3b'")
+        );
     }
 
     // TC-976 / FR-959: sensitive replan revisions pause for approval.
@@ -22631,7 +23092,7 @@ mod tests {
             run_phase,
             GraphRunPhase::AwaitingApproval,
             "replan notice: {}",
-            system_containing(&h.app, "Plan rev 1")
+            system_containing(&h.app, "Plan rev 2")
         );
         let approval = h
             .app
@@ -22648,9 +23109,9 @@ mod tests {
             .expect("replan revision");
         assert_eq!(replan_revision.added, vec!["step-4".to_owned()]);
         assert!(
-            system_containing(&h.app, "needs approval (sensitive step)").contains("Plan rev 1")
+            system_containing(&h.app, "needs approval (sensitive step)").contains("Plan rev 2")
         );
-        assert_replan_plan_history(&h, add_sensitive, 1, false);
+        assert_replan_plan_history(&h, add_sensitive, 2, false);
         let sent_before = h.sent.lock().unwrap().len();
         h.app.flush_deferred_graph_starts();
         assert_eq!(h.sent.lock().unwrap().len(), sent_before);
@@ -22663,7 +23124,7 @@ mod tests {
         h.app.input = "/graph reject".to_owned();
         h.app.submit_prompt();
         assert!(
-            system_containing(&h.app, "Replan rev 1 rejected by user").contains("rejected by user")
+            system_containing(&h.app, "Replan rev 2 rejected by user").contains("rejected by user")
         );
         assert_eq!(
             h.app.graph_session.as_ref().unwrap().run().phase,
@@ -22733,7 +23194,7 @@ mod tests {
             .expect("step-4 added after approve");
         assert_eq!(step4.status, GraphNodeStatus::Pending);
         assert!(step4.requires_gate);
-        assert_replan_plan_history(&approve_h, add_sensitive_three, 1, true);
+        assert_replan_plan_history(&approve_h, add_sensitive_three, 2, true);
     }
 
     // TC-979 / UX-935: revision notice text in the TUI transcript.
@@ -22748,7 +23209,7 @@ mod tests {
         ]}"#;
         h.app.request_replan("lint", DecisionBy::Tui);
         finish_replan_steps(&mut h, json);
-        let notice = system_containing(&h.app, "Plan rev 1 (replan after user)");
+        let notice = system_containing(&h.app, "Plan rev 2 (replan after user)");
         assert!(notice.contains("+1 ~0 −"));
         assert!(notice.contains("add lint pass"));
         let backend = TestBackend::new(100, 30);
@@ -22773,7 +23234,7 @@ mod tests {
         );
         h.app.request_replan("lint", DecisionBy::Tui);
         finish_replan_steps(&mut h, &json);
-        let notice = system_containing(&h.app, "Plan rev 1");
+        let notice = system_containing(&h.app, "Plan rev 2");
         let width = h.app.terminal_area.width.max(40) as usize;
         assert!(notice.chars().count() <= width);
         assert!(notice.ends_with('…'));
@@ -22795,7 +23256,7 @@ mod tests {
         ]}"#;
         h.app.request_replan("tasks", DecisionBy::Tui);
         finish_replan_steps(&mut h, json);
-        let notice = system_containing(&h.app, "Plan rev 1 (replan after user)");
+        let notice = system_containing(&h.app, "Plan rev 2 (replan after user)");
         assert!(notice.contains(" tasks +1 ~0 −0"), "notice: {notice}");
         assert!(notice.contains("add follow-up task"));
     }

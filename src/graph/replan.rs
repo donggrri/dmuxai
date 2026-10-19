@@ -163,17 +163,63 @@ pub fn build_replan_prompt(
     Ok(out)
 }
 
-/// Returns the reason of the last non-empty line when it is
-/// `DMUXAI_REPLAN: <reason>`.
-pub fn parse_replan_marker(text: &str) -> Option<String> {
-    let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
-    let reason = line.trim_start().strip_prefix("DMUXAI_REPLAN:")?;
-    let reason = reason.trim();
-    if reason.is_empty() {
+fn strip_leading_marker_decoration(line: &str) -> &str {
+    let mut rest = line.trim_start();
+    while !rest.is_empty() {
+        if let Some(next) = rest.strip_prefix("**") {
+            rest = next;
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix("__") {
+            rest = next;
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix('`') {
+            rest = next;
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix('*') {
+            rest = next;
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix('_') {
+            rest = next;
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix("- ") {
+            rest = next;
+            continue;
+        }
+        break;
+    }
+    rest
+}
+
+fn parse_replan_marker_line(line: &str) -> Option<String> {
+    let stripped = strip_leading_marker_decoration(line);
+    let after = stripped.strip_prefix("DMUXAI_REPLAN:").or_else(|| {
+        ["**", "__", "`", "*", "_"].iter().find_map(|close| {
+            stripped
+                .strip_prefix("DMUXAI_REPLAN")
+                .and_then(|rest| rest.strip_prefix(close))
+                .and_then(|rest| rest.strip_prefix(':'))
+        })
+    })?;
+    let after = after.trim_start_matches(['*', '_', '`']).trim();
+    let reason = after.trim_end_matches(['*', '_', '`']).trim();
+    // A quoted instruction (`DMUXAI_REPLAN: <reason>`) is not a marker.
+    if reason.is_empty() || reason == "<reason>" {
         None
     } else {
         Some(reason.to_owned())
     }
+}
+
+/// Returns the reason of the last non-empty line when it is
+/// `DMUXAI_REPLAN: <reason>` (optional markdown emphasis, FR-1007).
+pub fn parse_replan_marker(text: &str) -> Option<String> {
+    let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
+    parse_replan_marker_line(line)
 }
 
 /// Removes the trailing `DMUXAI_REPLAN: <reason>` line from the shown text.
@@ -182,7 +228,7 @@ pub fn strip_replan_marker(text: &str) -> String {
     let Some(index) = lines.iter().rposition(|line| !line.trim().is_empty()) else {
         return text.to_owned();
     };
-    if parse_replan_marker(&lines[index..].join("\n")).is_none() {
+    if parse_replan_marker_line(lines[index]).is_none() {
         return text.to_owned();
     }
     lines
@@ -267,12 +313,7 @@ pub fn apply_replan(
     doc: &ReplanDoc,
     ctx: &PlanContext<'_>,
 ) -> Result<(GraphPlan, PlanChange), Vec<PlanError>> {
-    let rev = run
-        .plan_history
-        .last()
-        .map(|change| change.rev)
-        .unwrap_or(0)
-        + 1;
+    let rev = super::types::next_plan_change_rev(run);
     match doc {
         ReplanDoc::Keep { reason } => Ok((
             run.plan.clone(),
@@ -293,6 +334,7 @@ pub fn apply_replan(
                 tasks_removed: 0,
                 applied: true,
                 error: None,
+                response_excerpt: None,
                 decided_by: None,
             },
         )),
@@ -432,6 +474,7 @@ pub fn apply_replan(
                 tasks_removed: task_counts.removed,
                 applied: true,
                 error: None,
+                response_excerpt: None,
                 decided_by: None,
             };
             Ok((plan, change))
@@ -1459,6 +1502,7 @@ mod tests {
                 tasks_removed: 0,
                 applied: true,
                 error: None,
+                response_excerpt: None,
                 decided_by: None,
             });
             run.replans_used += 1;
@@ -1547,6 +1591,29 @@ mod tests {
         assert_eq!(strip_replan_marker("no marker"), "no marker");
     }
 
+    // TC-1007 / FR-1007: markdown-wrapped replan markers from node output.
+    #[test]
+    fn marker_accepts_markdown_emphasis() {
+        let text = "done\n\n**DMUXAI_REPLAN:** need tests\n";
+        assert_eq!(parse_replan_marker(text).as_deref(), Some("need tests"));
+        assert_eq!(strip_replan_marker(text), "done");
+        assert_eq!(
+            parse_replan_marker("**DMUXAI_REPLAN:** x").as_deref(),
+            Some("x")
+        );
+        for line in [
+            "**DMUXAI_REPLAN: x**",
+            "`DMUXAI_REPLAN: x`",
+            "**DMUXAI_REPLAN**: x",
+            "- DMUXAI_REPLAN: x",
+        ] {
+            assert_eq!(parse_replan_marker(line).as_deref(), Some("x"), "{line}");
+        }
+        assert_eq!(parse_replan_marker("> DMUXAI_REPLAN: <reason>"), None);
+        assert_eq!(parse_replan_marker("**DMUXAI_REPLAN:**"), None);
+        assert_eq!(parse_replan_marker("`DMUXAI_REPLAN: <reason>`"), None);
+    }
+
     fn plan_with_nodes(nodes: Vec<GraphNode>) -> GraphPlan {
         GraphPlan {
             schema: "cursor-agent-graph/v1".to_owned(),
@@ -1597,6 +1664,7 @@ mod tests {
             tasks_removed: 0,
             applied: true,
             error: None,
+            response_excerpt: None,
             decided_by: None,
         };
         let old = plan_with_nodes(vec![step_node("a", "edit readme", false)]);
@@ -1630,6 +1698,7 @@ mod tests {
                     tasks_removed: 0,
                     applied: true,
                     error: None,
+                    response_excerpt: None,
                     decided_by: None,
                 },
                 true,
@@ -1655,6 +1724,7 @@ mod tests {
                     tasks_removed: 0,
                     applied: true,
                     error: None,
+                    response_excerpt: None,
                     decided_by: None,
                 },
                 true,
@@ -1683,6 +1753,7 @@ mod tests {
                     tasks_removed: 0,
                     applied: true,
                     error: None,
+                    response_excerpt: None,
                     decided_by: None,
                 },
                 false,
@@ -1708,6 +1779,7 @@ mod tests {
                     tasks_removed: 0,
                     applied: true,
                     error: None,
+                    response_excerpt: None,
                     decided_by: None,
                 },
                 false,
@@ -1736,6 +1808,7 @@ mod tests {
                     tasks_removed: 0,
                     applied: true,
                     error: None,
+                    response_excerpt: None,
                     decided_by: None,
                 },
                 true,
@@ -1761,6 +1834,7 @@ mod tests {
                     tasks_removed: 0,
                     applied: true,
                     error: None,
+                    response_excerpt: None,
                     decided_by: None,
                 },
                 false,
