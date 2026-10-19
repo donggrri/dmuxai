@@ -113,6 +113,14 @@ impl GraphRunSession {
             .filter(|node| node.status == GraphNodeStatus::Completed)
             .map(|node| node.id.clone())
             .collect();
+        // FR-949 / OQ-934: one turn per runner, so a ready step waits while
+        // another step of this run is running on the same runner.
+        let mut active_runners: HashSet<String> = plan
+            .nodes
+            .iter()
+            .filter(|node| self.active.contains(&node.id))
+            .map(|node| node.runner.clone())
+            .collect();
 
         let mut index = 0usize;
         while index < self.run.plan.nodes.len() {
@@ -132,7 +140,11 @@ impl GraphRunSession {
                 index += 1;
                 continue;
             }
-            if self.active.len() + actions.len() >= max_parallel {
+            if active_runners.contains(&self.run.plan.nodes[index].runner) {
+                index += 1;
+                continue;
+            }
+            if running + actions.len() >= max_parallel {
                 break;
             }
 
@@ -159,6 +171,7 @@ impl GraphRunSession {
             }
             self.run.plan.nodes[index].finished_at_ms = None;
             self.active.insert(node_id);
+            active_runners.insert(self.run.plan.nodes[index].runner.clone());
             actions.push(GraphAction::StartNode(assignment));
             index += 1;
         }
@@ -580,6 +593,137 @@ mod tests {
         assert_eq!(
             session.assignment_line(),
             "impl-1:impl→cursor:composer-2.5 | research-1:research→agy:composer-2.5"
+        );
+    }
+
+    struct PlanCtx {
+        available: Vec<String>,
+    }
+
+    impl PlanCtx {
+        fn new(runners: &[&str]) -> Self {
+            Self {
+                available: runners.iter().map(|name| (*name).to_owned()).collect(),
+            }
+        }
+
+        fn context<'a>(&'a self, prompt: &'a str) -> crate::graph::PlanContext<'a> {
+            crate::graph::PlanContext {
+                user_prompt: prompt,
+                available_runners: &self.available,
+                runner_allowed: &|_runner| true,
+                effective_model: &|runner: &str| match runner {
+                    "grok" => Some("grok-4.7".to_owned()),
+                    "opencode" => Some("opencode/glm-5.3-flash-free".to_owned()),
+                    _ => Some(crate::model_policy::default_model().to_owned()),
+                },
+                validate_model: &crate::model_policy::validate_model_for_runner,
+            }
+        }
+    }
+
+    fn plan_from_json(json: &str, max_parallel: usize) -> GraphPlan {
+        let doc = crate::graph::parse_plan(json).unwrap();
+        let ctx = PlanCtx::new(&["grok", "opencode"]);
+        let mut plan = crate::graph::validate_plan(&doc, &ctx.context("parallel work")).unwrap();
+        plan.limits.max_parallel = max_parallel;
+        plan
+    }
+
+    fn session_for(plan: GraphPlan) -> GraphRunSession {
+        GraphRunSession::new(GraphRun {
+            plan,
+            conversation_id: "conv-1".to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+            ..Default::default()
+        })
+    }
+
+    fn started_ids(actions: &[GraphAction]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                GraphAction::StartNode(assignment) => Some(assignment.node_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn node_status(session: &GraphRunSession, id: &str) -> GraphNodeStatus {
+        session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .unwrap()
+            .status
+    }
+
+    // TC-965 / FR-949: independent roots start together up to max_parallel,
+    // and a join step starts only after all its parents complete.
+    #[test]
+    fn schedule_runs_independent_steps_in_parallel() {
+        let json = r#"{"steps":[
+            {"id":"a","role":"research","job":"root a","runner":"grok","model":"grok-4.7","depends_on":[]},
+            {"id":"b","role":"research","job":"root b","runner":"opencode","model":"opencode/glm-5.3-flash-free","depends_on":[]},
+            {"id":"c","role":"test","job":"join c","runner":"grok","model":"grok-4.7","depends_on":["a","b"]}
+        ]}"#;
+
+        let mut session = session_for(plan_from_json(json, 2));
+        assert_eq!(
+            session.run().plan.edges,
+            vec![
+                GraphEdge {
+                    from: "a".to_owned(),
+                    to: "c".to_owned(),
+                },
+                GraphEdge {
+                    from: "b".to_owned(),
+                    to: "c".to_owned(),
+                },
+            ]
+        );
+
+        let actions = session.schedule();
+        assert_eq!(started_ids(&actions), vec!["a", "b"]);
+        assert_eq!(node_status(&session, "c"), GraphNodeStatus::Pending);
+
+        let actions = session.on_node_finished("a", true);
+        assert!(started_ids(&actions).is_empty(), "c waits for b");
+        assert_eq!(node_status(&session, "c"), GraphNodeStatus::Pending);
+
+        let actions = session.on_node_finished("b", true);
+        assert_eq!(started_ids(&actions), vec!["c"]);
+
+        // max_parallel = 1 runs the same DAG one step at a time.
+        let mut serial = session_for(plan_from_json(json, 1));
+        assert_eq!(started_ids(&serial.schedule()), vec!["a"]);
+        assert_eq!(started_ids(&serial.on_node_finished("a", true)), vec!["b"]);
+        assert_eq!(started_ids(&serial.on_node_finished("b", true)), vec!["c"]);
+    }
+
+    // TC-966 / FR-949 / OQ-934: one turn per runner, so a ready step on a busy
+    // runner waits instead of failing.
+    #[test]
+    fn same_runner_steps_wait_for_runner() {
+        let json = r#"{"steps":[
+            {"id":"a","role":"research","job":"first","runner":"grok","model":"grok-4.7","depends_on":[]},
+            {"id":"b","role":"research","job":"second","runner":"grok","model":"grok-4.7","depends_on":[]}
+        ]}"#;
+
+        let mut session = session_for(plan_from_json(json, 2));
+        assert_eq!(started_ids(&session.schedule()), vec!["a"]);
+        assert_eq!(node_status(&session, "b"), GraphNodeStatus::Pending);
+
+        let actions = session.on_node_finished("a", true);
+        assert_eq!(started_ids(&actions), vec!["b"]);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, GraphAction::Failed(_))),
+            "waiting is not a failure"
         );
     }
 }
