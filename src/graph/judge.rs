@@ -155,16 +155,16 @@ pub(crate) fn json_objects(text: &str) -> Vec<Map<String, Value>> {
     let mut index = 0;
     while index < text.len() {
         let ch = text[index..].chars().next().unwrap();
-        if ch == '{' || ch == '[' {
-            if let Some(end) = balanced_json_end(text, index) {
-                let slice = &text[index..end];
-                if let Ok(value) = serde_json::from_str::<Value>(slice) {
-                    if let Some(object) = value.as_object() {
-                        found.push(object.clone());
-                    }
-                    index = end;
-                    continue;
+        if (ch == '{' || ch == '[')
+            && let Some(end) = balanced_json_end(text, index)
+        {
+            let slice = &text[index..end];
+            if let Ok(value) = serde_json::from_str::<Value>(slice) {
+                if let Some(object) = value.as_object() {
+                    found.push(object.clone());
                 }
+                index = end;
+                continue;
             }
         }
         index += ch.len_utf8();
@@ -214,7 +214,8 @@ mod tests {
     // TC-935 / FR-933, FR-934
     #[test]
     fn parse_verdict_cases() {
-        let fenced = "Looking at this.\n```json\n{\"route\":\"complex\",\"reason\":\"계획 필요\"}\n```\n";
+        let fenced =
+            "Looking at this.\n```json\n{\"route\":\"complex\",\"reason\":\"계획 필요\"}\n```\n";
         let fenced = parse_verdict(fenced).unwrap();
         assert_eq!(fenced.route, Route::Complex);
         assert_eq!(fenced.reason, "계획 필요");
@@ -229,12 +230,14 @@ mod tests {
         assert_eq!(unrelated.route, Route::Simple);
         assert_eq!(unrelated.reason, "keep me");
 
-        let two = r#"{"route":"simple","reason":"first"} and {"route":"complex","reason":"second"}"#;
+        let two =
+            r#"{"route":"simple","reason":"first"} and {"route":"complex","reason":"second"}"#;
         let two = parse_verdict(two).unwrap();
         assert_eq!(two.route, Route::Complex);
         assert_eq!(two.reason, "second");
 
-        let nested = r#"{"route":"simple","reason":"outer","nested":{"route":"complex","reason":"inner"}}"#;
+        let nested =
+            r#"{"route":"simple","reason":"outer","nested":{"route":"complex","reason":"inner"}}"#;
         let nested = parse_verdict(nested).unwrap();
         assert_eq!(nested.route, Route::Simple);
         assert_eq!(nested.reason, "outer");
@@ -247,10 +250,7 @@ mod tests {
             "reason": "line1\n<b>bold</b>\t"
         })
         .to_string();
-        assert_eq!(
-            parse_verdict(&markup).unwrap().reason,
-            "line1 <b>bold</b> "
-        );
+        assert_eq!(parse_verdict(&markup).unwrap().reason, "line1 <b>bold</b> ");
 
         let long = "가".repeat(200);
         let korean = serde_json::json!({

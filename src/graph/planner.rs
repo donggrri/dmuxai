@@ -138,9 +138,11 @@ fn infer_roles(prompt: &str) -> Vec<NodeRole> {
     roles
 }
 
-fn gate_required(prompt: &str, role: NodeRole) -> bool {
-    let lower = prompt.to_ascii_lowercase();
-    let sensitive = contains_any(
+/// FR-944: whether `text` matches a sensitive keyword. Pure, no role filter;
+/// a plan step is gated by its job or by the user prompt regardless of role.
+pub fn sensitive_keyword_match(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    contains_any(
         &lower,
         &[
             "merge",
@@ -153,8 +155,11 @@ fn gate_required(prompt: &str, role: NodeRole) -> bool {
             "deploy",
             "production",
         ],
-    );
-    sensitive
+    )
+}
+
+fn gate_required(prompt: &str, role: NodeRole) -> bool {
+    sensitive_keyword_match(prompt)
         && matches!(
             role,
             NodeRole::Implement | NodeRole::Draft | NodeRole::Plan | NodeRole::Review
