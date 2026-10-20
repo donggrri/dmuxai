@@ -54,18 +54,24 @@ No Must requirement depends on an unanswered question for CI; live smoke is manu
 
 | ID | Priority | Preconditions / trigger | Required observable result | Failure / boundary | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| FR-1300 | Must | `[cursor] protocol` unset or `acp`, Cursor binary resolvable. | Turns spawn `cursor-agent acp` (or `DMUXAI_CURSOR_BIN` + `acp`). Prompt via `session/prompt`. Session id persisted for resume. | `protocol = "legacy"` uses existing stream-json path. Child reaped on end/cancel/error. | TC-1300, TC-1305 |
-| FR-1301 | Must | Built-in grok registered, `grok_protocol` unset or `acp`. | Turns spawn `grok agent stdio` with `-m <model>` and implement-equivalent approval flags; no streaming-json argv. | `protocol = "legacy"` uses SPEC-grok-runner argv. | TC-1301, TC-1305 |
+| FR-1300 | Must | `[cursor] protocol = "acp"`, Cursor binary resolvable. | Turns spawn `cursor-agent acp` (or `DMUXAI_CURSOR_BIN` + `acp`). Each turn runs `initialize`, then `session/load` or `session/resume` when capabilities allow, else `session/new`. Prompt via `session/prompt`. Session id persisted. | Default `protocol` is `legacy` (FR-1313). Child reaped on end/cancel/error; `session/cancel` on user cancel. | TC-1300, TC-1305, TC-1316 |
+| FR-1301 | Must | Built-in grok registered, `grok_protocol` unset or `acp`. | Turns spawn `grok agent -m <model> [--reasoning-effort …] stdio` (flags before `stdio`). dmuxai answers `session/request_permission`; no `--always-approve`. | `protocol = "legacy"` uses SPEC-grok-runner argv. | TC-1301, TC-1305, TC-1316 |
 | FR-1302 | Must | ACP turn in progress. | `session/update` maps to `TextDelta`, `Activity`, plan/tool events consistent with existing UI. Debug logs name ACP methods/stop reasons, never prompt bodies or secrets. | Malformed lines logged and skipped where safe. | TC-1302 |
 | FR-1303 | Must | User cancels or child crashes. | `session/cancel` sent when possible; no orphan agent process after turn end. | Crash → `Error` event and non-zero handling. | TC-1303, TC-1304 |
 | FR-1304 | Must | Agent sends `session/request_permission`. | Allow workspace read/write and normal tools; deny paths outside workspace; defer to existing sensitive-step gates when applicable; otherwise allow selected option. | Cancelled permission → turn ends cleanly. | TC-1306, TC-1307 |
-| FR-1305 | Must | `protocol = "legacy"` for Cursor or grok. | Behavior matches pre-ACP release for that runner (no ACP spawn). | Default remains `acp` when key omitted. | TC-1308 |
+| FR-1305 | Must | `protocol = "legacy"` for Cursor or grok. | Behavior matches pre-ACP release for that runner (no ACP spawn). | Cursor default `legacy`; grok default `acp`. | TC-1308, TC-1305 |
 | FR-1306 | Must | User sends prompt (any runner). | No `/mode` command; no mode picker; adapters run agent-mode CLI (or ACP) without Ask/Plan. | — | TC-1309 |
 | FR-1307 | Must | Internal judge/plan/replan turn (FR-932). | `TurnPolicy::ReadOnly` on the request; adapter uses read-only CLI/ACP behavior; user agent policy unchanged after turn. | No read-only support → existing fallback paths. | TC-1310 |
 | FR-1308 | Must | Config/API sends `mode` (`ask`/`plan`/`implement`), `[agents.custom.modes]`, or dashboard `set_mode`. | One startup or first-use warning per process; value ignored; no crash. | — | TC-1311 |
 | FR-1309 | Must | Docs updated. | README and CHANGELOG describe ACP default, legacy switch, single agent mode, Linux-only support for this feature set. Older mode specs carry a superseded note. | — | TC-1312 |
 | NFR-1300 | Must | ACP or legacy turn. | MCP merge behavior unchanged from baseline. | — | TC-1300 |
 | NFR-1301 | Must | This spec’s ACP and agent-mode contracts. | Documented supported platform is Linux; no new Windows/WSL documentation for these features. | — | Review |
+| FR-1313 | Must | Cursor `protocol = "acp"`. | After `session/new`/`load`, if effective model is a fast variant and cannot be switched off, refuse turn with clear error; emit `ModelSelected` with agent-reported model, not requested id. | Default Cursor protocol is `legacy`. | TC-1318 |
+| FR-1314 | Must | ACP `session/request_permission` paths. | Only structured path fields are checked; normalized component-wise workspace prefix ( `/proj-evil` ∉ `/proj` ). | Session ids/titles are not paths. | TC-1313, TC-1314 |
+| FR-1315 | Must | ACP debug / stderr. | Trace via `DMUXAI_ACP_LOG` file only (not stderr). Child stderr drained; tail included in errors. | — | Review |
+| FR-1316 | Must | User cancel during ACP turn. | `session/cancel`, brief grace, then process-group kill. | No orphan `cursor-agent acp`. | TC-1317 |
+| FR-1317 | Must | `TurnPolicy::ReadOnly` internal turns. | ACP `session/set_mode` ask/plan (or equivalent) before prompt. | — | TC-1310 |
+| FR-1318 | Must | CLI `dmuxai run` / `todo run`. | `--mode` is rejected with error (not silently ignored). | — | `src/cli.rs` |
 
 ## 5. Acceptance scenarios
 
@@ -76,7 +82,7 @@ No Must requirement depends on an unanswered question for CI; live smoke is manu
 | TC-1302 | FR-1302 | unit | Fixture NDJSON | Parse updates | Expected `AgentEvent` sequence | `src/acp/` |
 | TC-1303 | FR-1303 | integration | Fake agent | Cancel mid-turn | `Cancelled`, child gone | `src/agent/acp.rs` |
 | TC-1304 | FR-1304 | integration | Fake agent exits 1 | Prompt | `Error` surfaced | `src/agent/acp.rs` |
-| TC-1305 | FR-1300, FR-1301 | unit | Settings parse | Load toml | Defaults `acp` | `src/settings.rs` |
+| TC-1305 | FR-1300, FR-1301 | unit | Settings parse | Load toml | Cursor `legacy`, grok `acp` | `src/settings.rs` |
 | TC-1306 | FR-1304 | unit | Permission payload outside workspace | Policy | Deny | `src/acp/permissions.rs` |
 | TC-1307 | FR-1304 | unit | Permission with sensitive gate active | Policy | Gate path | `src/acp/permissions.rs` |
 | TC-1308 | FR-1305 | integration | `protocol=legacy` + fake legacy cursor | Prompt | No `acp` in argv | `src/agent/cursor.rs` |
@@ -84,6 +90,12 @@ No Must requirement depends on an unanswered question for CI; live smoke is manu
 | TC-1310 | FR-1307 | integration | Judge turn | Start judge | Read-only argv/policy | `src/app.rs` |
 | TC-1311 | FR-1308 | unit | TOML with `[modes]` | Load settings | Warning + implement args | `src/settings.rs` |
 | TC-1312 | FR-1309 | manual | Read docs | — | Linux-only stated | `docs/specs/SPEC-acp-runners.md` |
+| TC-1313 | FR-1314 | unit | Permission JSON with sessionId | Policy | Allow in-workspace shell | `src/agent/acp/permissions.rs` |
+| TC-1314 | FR-1314 | unit | `/proj` vs `/proj-evil` | Prefix check | Deny outside | `src/agent/acp/permissions.rs` |
+| TC-1315 | FR-1302 | unit | `tool_call_update` payload | Map update | Title/kind/status | `src/agent/acp/updates.rs` |
+| TC-1316 | FR-1301 | unit | `grok_acp_argv` | Build argv | `-m` before `stdio` | `src/agent/acp_runner.rs` |
+| TC-1317 | FR-1316 | integration | Fake agent + cancel | Cancel turn | `session/cancel` observed | `tests/fixtures/fake_acp_agent.rs` |
+| TC-1318 | FR-1313 | unit | Fast model payload | `cursor_acp_model_check` | Error | `src/agent/acp/session.rs` |
 
 ### Live smoke (manual, Linux only)
 

@@ -732,7 +732,7 @@ impl Default for DmuxSettings {
             cursor_windows_unsandboxed: false,
             cursor_prewarm: true,
             cursor_prewarm_idle_secs: 300,
-            cursor_protocol: RunnerProtocol::Acp,
+            cursor_protocol: RunnerProtocol::Legacy,
             grok_protocol: RunnerProtocol::Acp,
             routing_default_agent: None,
             routing_cursor_models: Vec::new(),
@@ -1968,7 +1968,7 @@ mod builtin_memory_mcp_tests {
     #[test]
     fn tc_1305_runner_protocol_defaults_and_parse() {
         let defaults = DmuxSettings::default();
-        assert_eq!(defaults.cursor_protocol, RunnerProtocol::Acp);
+        assert_eq!(defaults.cursor_protocol, RunnerProtocol::Legacy);
         assert_eq!(defaults.grok_protocol, RunnerProtocol::Acp);
 
         let ws = tempfile::tempdir().unwrap();

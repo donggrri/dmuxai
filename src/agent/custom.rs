@@ -81,6 +81,7 @@ struct ActiveTurn {
     handle: JoinHandle<()>,
     context: OutputContext,
     pgid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 async fn runtime_loop(
@@ -282,8 +283,13 @@ fn spawn_turn(
 ) -> ActiveTurn {
     let context = OutputContext::from(&request);
     let pgid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let settings = dmuxai::settings::DmuxSettings::load(&cwd);
+    let uses_acp = is_builtin_grok(spec)
+        && settings.grok_protocol == dmuxai::runner_protocol::RunnerProtocol::Acp;
+    let acp_cancel = uses_acp.then(super::acp::new_cancel_flag);
     let turn_context = context.clone();
     let turn_pgid = pgid.clone();
+    let cancel_for_turn = acp_cancel.clone();
     let handle = tokio::spawn(async move {
         send(&event_tx, agent, Some(&turn_context), AgentEvent::Started).await;
         let event = match run_turn(
@@ -297,6 +303,7 @@ fn spawn_turn(
             &turn_pgid,
             &mcp_servers,
             &mcp_notice_shown,
+            cancel_for_turn,
         )
         .await
         {
@@ -309,6 +316,7 @@ fn spawn_turn(
         handle,
         context,
         pgid,
+        acp_cancel,
     }
 }
 
@@ -363,22 +371,28 @@ async fn run_turn(
     pgid: &std::sync::atomic::AtomicU32,
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     mcp_notice_shown: &AtomicBool,
+    acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), String> {
     let settings = dmuxai::settings::DmuxSettings::load(cwd);
     if is_builtin_grok(spec)
-        && settings.grok_protocol == super::acp::RunnerProtocol::Acp
-        && request.policy == TurnPolicy::Agent
+        && settings.grok_protocol == dmuxai::runner_protocol::RunnerProtocol::Acp
     {
         let model_id = model.as_deref().ok_or_else(grok_no_allowed_model_message)?;
         let program = spec
             .command
             .first()
             .ok_or_else(|| format!("{}: empty command", spec.label()))?;
-        let args = super::acp_runner::grok_acp_argv(model_id);
+        let effort = spec
+            .env
+            .get("GROK_REASONING_EFFORT")
+            .cloned()
+            .or_else(|| std::env::var("GROK_REASONING_EFFORT").ok());
+        let args = super::acp_runner::grok_acp_argv(model_id, effort.as_deref());
         let permission_ctx = super::acp::PermissionContext {
             workspace: cwd.to_string_lossy().into_owned(),
             sensitive_gate_active: false,
         };
+        let cancel = acp_cancel.unwrap_or_else(super::acp::new_cancel_flag);
         super::acp_runner::run_agent_acp_turn(
             Path::new(program),
             &args,
@@ -387,9 +401,14 @@ async fn run_turn(
             agent,
             event_tx,
             permission_ctx,
+            super::acp::AcpRunnerKind::Grok,
+            super::acp::AcpLifecycle::Delegate,
+            cancel,
+            Some(model_id.to_owned()),
+            None,
+            None,
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
         return Ok(());
     }
 
@@ -640,9 +659,14 @@ fn kill_group_with(pgid: u32, signal: &str) {
 
 async fn stop_turn(agent: Agent, turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
     if let Some(turn) = turn {
-        kill_group(turn.pgid.load(std::sync::atomic::Ordering::SeqCst));
-        turn.handle.abort();
-        let _ = turn.handle.await;
+        if let Some(cancel) = &turn.acp_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(1600), turn.handle).await;
+        } else {
+            kill_group(turn.pgid.load(std::sync::atomic::Ordering::SeqCst));
+            turn.handle.abort();
+            let _ = turn.handle.await;
+        }
         send(event_tx, agent, Some(&turn.context), AgentEvent::Cancelled).await;
     }
 }
@@ -718,6 +742,7 @@ mod tests {
             &pgid,
             mcp_servers,
             &notice_shown,
+            None,
         )
         .await;
         drop(tx);
@@ -908,6 +933,7 @@ env = { FAKE_CFG = "{temp_config}" }
             &pgid,
             mcp_servers,
             notice_shown,
+            None,
         )
         .await;
         drop(tx);

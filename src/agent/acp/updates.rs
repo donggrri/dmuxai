@@ -3,6 +3,7 @@
 use serde_json::Value;
 
 use crate::agent::AgentEvent;
+use dmuxai::activity::{ActivityItem, ToolStatus};
 
 pub fn map_session_update(update: &Value) -> Vec<AgentEvent> {
     let mut events = Vec::new();
@@ -18,25 +19,31 @@ pub fn map_session_update(update: &Value) -> Vec<AgentEvent> {
                 events.push(AgentEvent::TextDelta(text));
             }
         }
+        "tool_call" => {
+            if let Some(item) = map_tool_call(update) {
+                events.push(AgentEvent::Activity(item));
+            }
+        }
         "tool_call_update" => {
-            let summary = update
-                .pointer("/toolCall/title")
-                .or_else(|| update.pointer("/toolCall/summary"))
-                .and_then(Value::as_str)
-                .unwrap_or("tool");
+            if let Some(item) = map_tool_call_update(update) {
+                events.push(AgentEvent::Activity(item));
+            }
+            let summary = tool_summary(update);
             let state = update
-                .pointer("/toolCall/status")
+                .get("status")
+                .or_else(|| update.pointer("/toolCall/status"))
                 .and_then(Value::as_str)
                 .unwrap_or("in_progress");
             let item_id = update
-                .pointer("/toolCall/toolCallId")
+                .get("toolCallId")
+                .or_else(|| update.pointer("/toolCall/toolCallId"))
                 .or_else(|| update.pointer("/toolCall/id"))
                 .and_then(Value::as_str)
                 .unwrap_or("tool")
                 .to_owned();
             events.push(AgentEvent::ToolProgress {
                 item_id,
-                summary: summary.to_owned(),
+                summary,
                 state: state.to_owned(),
             });
         }
@@ -56,6 +63,87 @@ pub fn map_session_update(update: &Value) -> Vec<AgentEvent> {
         _ => {}
     }
     events
+}
+
+fn tool_summary(update: &Value) -> String {
+    update
+        .get("title")
+        .or_else(|| update.pointer("/toolCall/title"))
+        .or_else(|| update.get("kind"))
+        .or_else(|| update.pointer("/toolCall/kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool")
+        .to_owned()
+}
+
+fn map_tool_call(update: &Value) -> Option<ActivityItem> {
+    let title = tool_summary(update);
+    let kind = update
+        .get("kind")
+        .or_else(|| update.pointer("/toolCall/kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+    let status = tool_status_from_str(
+        update
+            .get("status")
+            .or_else(|| update.pointer("/toolCall/status"))
+            .and_then(Value::as_str)
+            .unwrap_or("running"),
+    );
+    let location = update
+        .pointer("/locations/0/path")
+        .or_else(|| update.pointer("/toolCall/locations/0/path"))
+        .or_else(|| update.get("path"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Some(ActivityItem::Tool {
+        name: kind.to_owned(),
+        target: location.unwrap_or_else(|| title.clone()),
+        status,
+        duration_ms: None,
+        detail: title,
+    })
+}
+
+fn map_tool_call_update(update: &Value) -> Option<ActivityItem> {
+    let title = tool_summary(update);
+    let status = tool_status_from_str(
+        update
+            .get("status")
+            .or_else(|| update.pointer("/toolCall/status"))
+            .and_then(Value::as_str)
+            .unwrap_or("running"),
+    );
+    let location = update
+        .pointer("/locations/0/path")
+        .or_else(|| update.pointer("/toolCall/locations/0/path"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let diff = update
+        .pointer("/diff")
+        .or_else(|| update.pointer("/toolCall/diff"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let kind = update
+        .get("kind")
+        .or_else(|| update.pointer("/toolCall/kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+    Some(ActivityItem::Tool {
+        name: kind.to_owned(),
+        target: location.unwrap_or_else(|| title.clone()),
+        status,
+        duration_ms: None,
+        detail: diff.unwrap_or(title),
+    })
+}
+
+fn tool_status_from_str(raw: &str) -> ToolStatus {
+    match raw.to_ascii_lowercase().as_str() {
+        "completed" | "complete" | "done" | "success" => ToolStatus::Ok,
+        "failed" | "error" => ToolStatus::Failed,
+        _ => ToolStatus::Running,
+    }
 }
 
 fn extract_text(update: &Value) -> Option<String> {
@@ -96,5 +184,23 @@ mod tests {
         let events = map_session_update(&update);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], AgentEvent::TextDelta("hello".to_owned()));
+    }
+
+    // TC-1315 / FR-1302: tool_call_update reads top-level fields.
+    #[test]
+    fn maps_tool_call_update_fields() {
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-1",
+            "title": "Read file",
+            "kind": "read",
+            "status": "completed",
+            "locations": [{"path": "src/main.rs"}]
+        });
+        let events = map_session_update(&update);
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::ToolProgress { summary, .. } if summary == "Read file")
+        ));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Activity(_))));
     }
 }

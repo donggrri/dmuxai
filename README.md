@@ -641,10 +641,13 @@ Agent turns may modify project files inside the provider workspace/sandbox.
 DmuxAI never enables Codex danger-full-access, Cursor's unsandboxed mode, or
 AGY's `--dangerously-skip-permissions` for read-only turns.
 
-On **Linux**, Cursor and grok default to **ACP** (`[cursor] protocol = "acp"`,
-`[agents] grok_protocol = "acp"`). Set `protocol = "legacy"` in config to keep
-the previous stream-json / grok argv paths. **ACP is supported on Linux only** in
-this release; Windows continues to use legacy Cursor stream-json where available.
+On **Linux**, **grok** defaults to **ACP** (`[agents] grok_protocol = "acp"`).
+**Cursor** defaults to **legacy** stream-json (`[cursor] protocol = "legacy"`)
+because Cursor ACP currently exposes fast-only composer models; set
+`protocol = "acp"` for `cursor-agent acp` (DmuxAI refuses stuck fast models).
+Set `grok_protocol = "legacy"` to keep grok streaming-json argv. **ACP is
+supported on Linux only** in this release; Windows continues to use legacy
+Cursor stream-json where available.
 
 Cursor agent turns that write files are unavailable on Windows when the Cursor
 sandbox is unavailable; DmuxAI surfaces `CursorWritesUnavailable` before starting

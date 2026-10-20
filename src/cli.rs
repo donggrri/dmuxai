@@ -71,13 +71,6 @@ fn value<'a>(args: &'a [String], index: &mut usize, flag: &str) -> Result<&'a st
         .ok_or_else(|| format!("{flag} needs a value"))
 }
 
-fn parse_mode(raw: &str) -> Result<String, String> {
-    match raw.to_ascii_lowercase().as_str() {
-        m @ ("ask" | "plan" | "implement") => Ok(m.to_owned()),
-        _ => Err("--mode must be ask, plan or implement".to_owned()),
-    }
-}
-
 /// Parses run-style flags; positional words become the prompt.
 fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, String> {
     let mut options = RunOptions::default();
@@ -92,7 +85,13 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
             match arg {
                 "--" => rest_is_prompt = true,
                 "--agent" => options.agent = Some(value(args, &mut index, "--agent")?.to_owned()),
-                "--mode" => options.mode = Some(parse_mode(value(args, &mut index, "--mode")?)?),
+                "--mode" => {
+                    let _ = value(args, &mut index, "--mode")?;
+                    return Err(
+                        "--mode was removed; DmuxAI runs a single agent mode (write-capable). Omit --mode."
+                            .to_owned(),
+                    );
+                }
                 "--graph" => options.graph = true,
                 "--approve-plan" => options.approve_plan = true,
                 "--json" => options.json = true,
@@ -555,9 +554,6 @@ async fn run_headless(
     for warning in &settings.config_warnings {
         eprintln!("warning: {warning}");
     }
-    if options.mode.is_some() {
-        eprintln!("warning: --mode is ignored; DmuxAI uses a single agent mode (former implement)");
-    }
     let (db_path, notice) =
         dmuxai::state_path::prepare_repo_db(workspace_root).map_err(|e| internal(&e))?;
     if let Some(notice) = notice {
@@ -756,17 +752,18 @@ mod tests {
     fn parse_cli_agent_api_subcommands() {
         assert_eq!(
             parse(&args(&[
-                "run", "fix", "the", "bug", "--agent", "agy", "--mode", "Plan", "--json"
+                "run", "fix", "the", "bug", "--agent", "agy", "--json"
             ])),
             Ok(AgentCommand::Run(RunOptions {
                 prompt: "fix the bug".into(),
                 agent: Some("agy".into()),
-                mode: Some("plan".into()),
+                mode: None,
                 graph: false,
                 approve_plan: false,
                 json: true,
             }))
         );
+        assert!(parse(&args(&["run", "x", "--mode", "ask"])).is_err());
         assert_eq!(
             parse(&args(&["run", "--graph", "--", "--literal prompt"])),
             Ok(AgentCommand::Run(RunOptions {

@@ -7,10 +7,17 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Changed
 
-- **ACP runners for Cursor and grok (SPEC-acp-runners).** `[cursor] protocol` and
-  `[agents] grok_protocol` default to `acp` (Linux). Set `legacy` to keep
-  stream-json / grok streaming-json argv. Cursor prewarm applies only to legacy
-  stream-json.
+- **ACP runners for Cursor and grok (SPEC-acp-runners).** `[agents] grok_protocol`
+  defaults to `acp` on Linux (`grok agent -m <model> stdio`; dmuxai handles
+  permissions, no `--always-approve`). `[cursor] protocol` defaults to **`legacy`**
+  because Cursor ACP currently exposes only fast composer models; set
+  `protocol = "acp"` explicitly to use `cursor-agent acp` (fast-model guard
+  applies). ACP turns always `initialize`, then `session/load` / `session/resume`
+  or `session/new`; cancel sends `session/cancel` before killing the child.
+  Cursor prewarm applies only to legacy stream-json.
+- **CLI:** `dmuxai run` / `todo run` reject `--mode` with an error instead of
+  running write-capable turns silently.
+- **AGY:** normal agent turns no longer require observed file writes to succeed.
 - **Single agent turn mode.** Removed `/mode`, the mode picker, and per-agent
   mode state. Every user turn runs in agent mode; judge/plan/replan use
   read-only adapter flags internally. CLI `--mode` and dashboard `set_mode` are

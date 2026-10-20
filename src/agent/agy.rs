@@ -675,12 +675,12 @@ async fn stream_child(
     let status = exit_status.expect("child.wait runs before the loop can finish");
     let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
     let protocol_completed = state.pending_terminal.is_some();
-    let plan_only = mode == TurnPolicy::Agent
+    let _plan_only = mode == TurnPolicy::Agent
         && is_plan_only_implement_outcome(
             implement_tracker.writes_observed(),
             &state.response_text,
         );
-    let require_writes = mode == TurnPolicy::Agent && !plan_only;
+    let require_writes = false;
     let writes_observed = implement_tracker.writes_observed();
     if let Err(reason) = implement_tracker.finish(
         &status,

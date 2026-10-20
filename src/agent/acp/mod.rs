@@ -1,10 +1,8 @@
-//! Agent Client Protocol (ACP) JSON-RPC client over stdio (SPEC-acp-runners FR-1300..FR-1304).
-
 mod client;
+mod debug;
 mod permissions;
+mod session;
 mod updates;
 
-pub use client::run_acp_turn;
+pub use client::{AcpLifecycle, AcpRunnerKind, AcpTurnConfig, new_cancel_flag, run_acp_turn};
 pub use permissions::PermissionContext;
-
-pub use dmuxai::runner_protocol::RunnerProtocol;

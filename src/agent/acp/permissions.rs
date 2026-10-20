@@ -1,5 +1,7 @@
 //! ACP `session/request_permission` policy (SPEC-acp-runners FR-1304).
 
+use std::path::{Component, Path, PathBuf};
+
 use serde_json::Value;
 
 /// Inputs for permission decisions (sensitive gates are enforced by the App before
@@ -33,49 +35,79 @@ pub fn choose_permission_option(params: &Value, ctx: &PermissionContext) -> Opti
 }
 
 fn path_outside_workspace(params: &Value, workspace: &str) -> bool {
-    let paths = collect_paths(params);
+    let paths = collect_path_fields(params);
     if paths.is_empty() {
         return false;
     }
-    let workspace = workspace.trim_end_matches('/');
+    let workspace = normalize_path(Path::new(workspace.trim()));
     paths.iter().any(|path| {
         let path = path.trim();
         if path.is_empty() {
             return false;
         }
-        if path.starts_with("file://") {
-            let path = path.strip_prefix("file://").unwrap_or(path);
-            return !path.starts_with(workspace);
-        }
-        !path.starts_with(workspace) && !path.starts_with("./")
+        let path = path.strip_prefix("file://").unwrap_or(path);
+        !path_within_workspace(&workspace, Path::new(path))
     })
 }
 
-fn collect_paths(value: &Value) -> Vec<String> {
+fn is_path_field_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k == "path"
+        || k == "uri"
+        || k == "filepath"
+        || k == "file"
+        || k.ends_with("path")
+        || k.ends_with("uri")
+}
+
+fn collect_path_fields(value: &Value) -> Vec<String> {
     let mut out = Vec::new();
+    collect_path_fields_inner(value, &mut out);
+    out
+}
+
+fn collect_path_fields_inner(value: &Value, out: &mut Vec<String>) {
     match value {
-        Value::String(s) => out.push(s.clone()),
         Value::Array(items) => {
             for item in items {
-                out.extend(collect_paths(item));
+                collect_path_fields_inner(item, out);
             }
         }
         Value::Object(map) => {
             for (key, val) in map {
-                if key.eq_ignore_ascii_case("path")
-                    || key.eq_ignore_ascii_case("uri")
-                    || key.ends_with("Path")
-                {
+                if is_path_field_key(key) {
                     if let Some(s) = val.as_str() {
+                        out.push(s.to_owned());
+                    } else if let Some(s) = val.get("path").and_then(Value::as_str) {
                         out.push(s.to_owned());
                     }
                 }
-                out.extend(collect_paths(val));
+                collect_path_fields_inner(val, out);
             }
         }
         _ => {}
     }
+}
+
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
     out
+}
+
+pub(crate) fn path_within_workspace(workspace: &Path, candidate: &Path) -> bool {
+    let workspace = normalize_path(workspace);
+    let candidate = normalize_path(candidate);
+    candidate == workspace || candidate.starts_with(&workspace)
 }
 
 fn allow_workspace_option(options: &[Value]) -> Option<String> {
@@ -140,6 +172,44 @@ mod tests {
             choose_permission_option(&params, &ctx).as_deref(),
             Some("deny")
         );
+    }
+
+    // TC-1313 / FR-1313: session ids and titles must not be treated as paths.
+    #[test]
+    fn tc_1313_ignores_session_id_strings_for_workspace_check() {
+        let params = json!({
+            "options": [
+                {"optionId": "allow", "kind": "allow"},
+                {"optionId": "deny", "kind": "deny"}
+            ],
+            "sessionId": "11111111-1111-1111-1111-111111111111",
+            "title": "/tmp/not-a-real-path"
+        });
+        let ctx = PermissionContext {
+            workspace: "/home/user/proj".to_owned(),
+            sensitive_gate_active: false,
+        };
+        assert_eq!(
+            choose_permission_option(&params, &ctx).as_deref(),
+            Some("allow")
+        );
+    }
+
+    // TC-1314 / FR-1304: component-wise prefix — /proj-evil is not inside /proj.
+    #[test]
+    fn tc_1314_path_prefix_is_component_wise() {
+        assert!(!path_within_workspace(
+            Path::new("/home/user/proj"),
+            Path::new("/home/user/proj-evil/secret")
+        ));
+        assert!(path_within_workspace(
+            Path::new("/home/user/proj"),
+            Path::new("/home/user/proj/src/main.rs")
+        ));
+        assert!(!path_within_workspace(
+            Path::new("/home/user/proj"),
+            Path::new("/home/user/proj/../proj-evil")
+        ));
     }
 
     // TC-1307

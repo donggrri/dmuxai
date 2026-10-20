@@ -657,8 +657,10 @@ fn spawn_turn(
     reset_epoch: u64,
 ) -> ActiveTurn {
     let warm_pgid = warm_child.as_ref().and_then(|c| c.id());
+    let acp_cancel = (protocol == RunnerProtocol::Acp).then(acp_runner::acp_cancel_for_turn);
     let context = OutputContext::from(&request);
     let error_context = context.clone();
+    let cancel_for_turn = acp_cancel.clone();
     let handle = tokio::spawn(async move {
         match run_turn_with_child(
             &request,
@@ -670,6 +672,7 @@ fn spawn_turn(
             protocol,
             &mcp_servers,
             &cursor_notice_emitted,
+            cancel_for_turn,
         )
         .await
         {
@@ -691,6 +694,7 @@ fn spawn_turn(
         is_graph,
         reset_epoch,
         warm_pgid,
+        acp_cancel,
     }
 }
 
@@ -702,16 +706,22 @@ struct ActiveTurn {
     // Only used for group kills on Unix (Windows support is postponed).
     #[cfg_attr(not(unix), allow(dead_code))]
     warm_pgid: Option<u32>,
+    acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
     if let Some(turn) = turn {
-        #[cfg(unix)]
-        if let Some(pgid) = turn.warm_pgid {
-            terminate_group(pgid).await;
+        if let Some(cancel) = &turn.acp_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(1600), turn.handle).await;
+        } else {
+            #[cfg(unix)]
+            if let Some(pgid) = turn.warm_pgid {
+                terminate_group(pgid).await;
+            }
+            turn.handle.abort();
+            let _ = turn.handle.await;
         }
-        turn.handle.abort();
-        let _ = turn.handle.await;
         send_event(event_tx, Some(&turn.context), AgentEvent::Cancelled).await;
     }
 }
@@ -738,6 +748,7 @@ pub(crate) async fn run_turn(
         protocol,
         mcp_servers,
         cursor_notice_emitted,
+        None,
     )
     .await
 }
@@ -753,6 +764,7 @@ async fn run_turn_with_child(
     protocol: RunnerProtocol,
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     cursor_notice_emitted: &std::sync::atomic::AtomicBool,
+    acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> io::Result<Option<String>> {
     let policy = request.policy;
     validate_cursor_policy(policy, windows_unsandboxed)
@@ -800,6 +812,9 @@ async fn run_turn_with_child(
             workspace: cwd.to_string_lossy().into_owned(),
             sensitive_gate_active: false,
         };
+        let cancel = acp_cancel
+            .clone()
+            .unwrap_or_else(acp_runner::acp_cancel_for_turn);
         return acp_runner::run_agent_acp_turn(
             &program,
             &args,
@@ -808,6 +823,12 @@ async fn run_turn_with_child(
             Agent::Cursor,
             event_tx,
             permission_ctx,
+            super::acp::AcpRunnerKind::Cursor,
+            super::acp::AcpLifecycle::Managed,
+            cancel,
+            selected_model.clone(),
+            None,
+            None,
         )
         .await
         .map_err(io::Error::other);
