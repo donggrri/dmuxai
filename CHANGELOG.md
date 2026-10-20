@@ -5,6 +5,14 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Fixed
+
+- **Approving a fallback plan works again (FR-941, FR-950, TC-1011).** The
+  1-node fallback revision (heuristic complex route, invalid plan twice, plan
+  turn error/timeout, busy agent) stored its step without the implicit
+  `task-1` reference, so `/graph approve` and the dashboard Approve were
+  refused with "Approved plan steps are invalid: step must reference a task".
+
 ## [0.2.2] - 2026-10-19
 
 Dashboard layout, workspace and graph view changes requested by Dongjin on
