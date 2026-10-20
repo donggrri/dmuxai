@@ -9,11 +9,11 @@ use tokio::sync::mpsc;
 use super::acp::{
     AcpLifecycle, AcpRunnerKind, AcpTurnConfig, PermissionContext, new_cancel_flag, run_acp_turn,
 };
+use super::{Agent, AgentRequest, OutputContext, prompt_with_image_tokens};
 
 pub fn acp_cancel_for_turn() -> Arc<AtomicBool> {
     new_cancel_flag()
 }
-use super::{Agent, AgentRequest, OutputContext, prompt_with_image_tokens};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_agent_acp_turn(
@@ -86,6 +86,16 @@ pub fn grok_acp_argv(model: &str, reasoning_effort: Option<&str>) -> Vec<String>
     args
 }
 
+/// argv for `opencode acp` (SPEC-acp-runners FR-1320). Model is set via ACP
+/// `session/set_config_option`, not CLI flags.
+pub fn opencode_acp_argv(cwd: &Path) -> Vec<String> {
+    vec![
+        "acp".to_owned(),
+        "--cwd".to_owned(),
+        cwd.to_string_lossy().into_owned(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +116,15 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|a| a == "--always-approve"));
+    }
+
+    // TC-1320 / FR-1320: opencode ACP argv shape.
+    #[test]
+    fn opencode_acp_argv_includes_acp_and_cwd() {
+        let cwd = std::path::Path::new("/tmp/proj");
+        let args = opencode_acp_argv(cwd);
+        assert_eq!(args[0], "acp");
+        assert_eq!(args[1], "--cwd");
+        assert_eq!(args[2], "/tmp/proj");
     }
 }

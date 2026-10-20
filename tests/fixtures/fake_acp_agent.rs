@@ -158,6 +158,17 @@ fn main() {
                     respond(&mut stdout, id, serde_json::json!({}));
                 }
             }
+            "session/set_config_option" => {
+                if let Some(path) = std::env::var_os("FAKE_ACP_MODEL_CAPTURE") {
+                    let value = value
+                        .get("params")
+                        .and_then(|p| p.get("value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let _ = std::fs::write(path, value);
+                }
+                respond(&mut stdout, id, serde_json::json!({}));
+            }
             "session/prompt" => {
                 if std::env::var("FAKE_ACP_PERMISSION_OUTSIDE").is_ok() {
                     let perm = serde_json::json!({

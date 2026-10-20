@@ -13,6 +13,7 @@ All notable changes to dmuxai are listed here. Versions follow
   because Cursor ACP currently exposes only fast composer models; set
   `protocol = "acp"` explicitly to use `cursor-agent acp` (fast-model guard
   applies). ACP turns always `initialize`, then `session/load` / `session/resume`
+<<<<<<< HEAD
   (with `cwd` and `mcpServers: []`) or `session/new`; resume failures surface a
   notice. Cursor reads `models.currentModelId`, attempts non-fast model selection,
   and refuses fast-only sessions. Read-only turns use `session/set_mode` with
@@ -29,6 +30,12 @@ All notable changes to dmuxai are listed here. Versions follow
   exists. Opencode model listing checks the binary path before invoking `models`.
   Unit tests pin `XDG_STATE_HOME` / `DMUXAI_STATE_DIR` to a temp directory.
   Cursor prewarm applies only to legacy stream-json.
+=======
+  or `session/new`; cancel sends `session/cancel` before killing the child.
+  Cursor prewarm applies only to legacy stream-json. Built-in **opencode** uses
+  `opencode acp --cwd <workspace>` when `[agents] opencode_protocol = "acp"`
+  (default); model via ACP `session/set_config_option`.
+>>>>>>> 64d4b1a (feat(opencode): ACP runner with model session config)
 - **CLI:** `dmuxai run` / `todo run` reject `--mode` with an error instead of
   running write-capable turns silently.
 - **AGY:** normal agent turns no longer require observed file writes to succeed.

@@ -48,6 +48,8 @@ pub struct DmuxSettings {
     pub cursor_protocol: RunnerProtocol,
     /// `[agents] grok_protocol` (default ACP).
     pub grok_protocol: RunnerProtocol,
+    /// `[agents] opencode_protocol` (default ACP).
+    pub opencode_protocol: RunnerProtocol,
     pub routing_default_agent: Option<String>,
     pub routing_cursor_models: Vec<String>,
     pub graph_max_parallel: usize,
@@ -179,6 +181,7 @@ struct AgentsToml {
     builtin_opencode: Option<bool>,
     builtin_grok: Option<bool>,
     grok_protocol: Option<String>,
+    opencode_protocol: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -529,6 +532,14 @@ impl DmuxSettings {
                     )),
                 }
             }
+            if let Some(protocol) = agents.opencode_protocol {
+                match RunnerProtocol::parse_config(&protocol) {
+                    Some(value) => self.opencode_protocol = value,
+                    None => self.config_warnings.push(format!(
+                        "[agents] opencode_protocol ignored: expected acp or legacy, got {protocol:?}"
+                    )),
+                }
+            }
         }
         if let Some(mcp) = parsed.mcp {
             self.merge_mcp_servers(mcp.servers);
@@ -740,6 +751,7 @@ impl Default for DmuxSettings {
             cursor_prewarm_idle_secs: 300,
             cursor_protocol: RunnerProtocol::Legacy,
             grok_protocol: RunnerProtocol::Acp,
+            opencode_protocol: RunnerProtocol::Acp,
             routing_default_agent: None,
             routing_cursor_models: Vec::new(),
             graph_max_parallel: 2,
@@ -858,13 +870,28 @@ fn normalize_jira_base_url(value: &str) -> Result<String, String> {
 /// is authoritative when set: it must name an existing file. Otherwise the first
 /// `opencode` file on `PATH` is used.
 pub fn find_opencode_bin() -> Option<PathBuf> {
-    match std::env::var_os("DMUXAI_OPENCODE_BIN").filter(|value| !value.is_empty()) {
-        Some(raw) => {
-            let path = PathBuf::from(raw);
-            path.is_file().then_some(path)
-        }
-        None => find_on_path("opencode"),
+    find_opencode_bin_from(
+        std::env::var_os("DMUXAI_OPENCODE_BIN").filter(|value| !value.is_empty()),
+        std::env::var_os("PATH"),
+        home_dir(),
+    )
+}
+
+/// Lookup used by [`find_opencode_bin`]. `explicit` is authoritative when set.
+fn find_opencode_bin_from(
+    explicit: Option<std::ffi::OsString>,
+    path_var: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(raw) = explicit {
+        let path = PathBuf::from(raw);
+        return path.is_file().then_some(path);
     }
+    if let Some(found) = find_on_path_in("opencode", path_var.as_deref()) {
+        return Some(found);
+    }
+    home.map(|h| h.join(".opencode").join("bin").join("opencode"))
+        .filter(|p| p.is_file())
 }
 
 /// When `DMUXAI_OPENCODE_BIN` is set but not a file, returns a user-facing error.
@@ -1989,16 +2016,37 @@ mod builtin_memory_mcp_tests {
         let defaults = DmuxSettings::default();
         assert_eq!(defaults.cursor_protocol, RunnerProtocol::Legacy);
         assert_eq!(defaults.grok_protocol, RunnerProtocol::Acp);
+        assert_eq!(defaults.opencode_protocol, RunnerProtocol::Acp);
 
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(
             ws.path().join("dmuxai.toml"),
-            "[cursor]\nprotocol = \"legacy\"\n[agents]\ngrok_protocol = \"legacy\"\n",
+            "[cursor]\nprotocol = \"legacy\"\n[agents]\ngrok_protocol = \"legacy\"\nopencode_protocol = \"legacy\"\n",
         )
         .unwrap();
         let settings = DmuxSettings::load(ws.path());
         assert_eq!(settings.cursor_protocol, RunnerProtocol::Legacy);
         assert_eq!(settings.grok_protocol, RunnerProtocol::Legacy);
+        assert_eq!(settings.opencode_protocol, RunnerProtocol::Legacy);
+    }
+
+    // TC-1322 / FR-1321: opencode binary resolution includes ~/.opencode/bin/opencode.
+    #[test]
+    fn tc_1322_find_opencode_bin_home_install() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".opencode").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("opencode");
+        std::fs::write(&exe, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(
+            find_opencode_bin_from(None, None, Some(home.path().to_path_buf())),
+            Some(exe)
+        );
     }
 }
 

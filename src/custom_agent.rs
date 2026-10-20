@@ -221,6 +221,11 @@ pub fn is_builtin_grok(spec: &CustomAgentSpec) -> bool {
     spec.builtin && spec.name.eq_ignore_ascii_case("grok")
 }
 
+/// Built-in `opencode` preset (SPEC-first-run FR-810, SPEC-acp-runners FR-1320).
+pub fn is_builtin_opencode(spec: &CustomAgentSpec) -> bool {
+    spec.builtin && spec.name.eq_ignore_ascii_case("opencode")
+}
+
 /// `(?i)^grok-[a-z0-9][a-z0-9._-]*$` on the trimmed id. Does not apply the `fast` rule.
 pub fn is_grok_model_id(model_id: &str) -> bool {
     static PATTERN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
