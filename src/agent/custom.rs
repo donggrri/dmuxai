@@ -391,6 +391,7 @@ async fn run_turn(
         let permission_ctx = super::acp::PermissionContext {
             workspace: cwd.to_string_lossy().into_owned(),
             sensitive_gate_active: false,
+            read_only_fail_closed: false,
         };
         let cancel = acp_cancel.unwrap_or_else(super::acp::new_cancel_flag);
         super::acp_runner::run_agent_acp_turn(

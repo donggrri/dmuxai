@@ -11,6 +11,8 @@ pub struct PermissionContext {
     pub workspace: String,
     /// When true, prefer deny/cancel for write/exec style options (graph gate).
     pub sensitive_gate_active: bool,
+    /// Read-only turn but `session/set_mode` failed: deny write/exec permissions (FR-1317).
+    pub read_only_fail_closed: bool,
 }
 
 /// Pick an option id to approve, or `None` to cancel/deny.
@@ -24,6 +26,9 @@ pub fn choose_permission_option(params: &Value, ctx: &PermissionContext) -> Opti
 
     if ctx.sensitive_gate_active {
         return None;
+    }
+    if ctx.read_only_fail_closed {
+        return deny_option(options).or_else(|| deny_write_options(options));
     }
 
     let workspace = ctx.workspace.as_str();
@@ -111,20 +116,53 @@ pub(crate) fn path_within_workspace(workspace: &Path, candidate: &Path) -> bool 
 }
 
 fn allow_workspace_option(options: &[Value]) -> Option<String> {
+    prefer_allow_once(options).or_else(|| prefer_non_always_allow(options))
+}
+
+fn prefer_allow_once(options: &[Value]) -> Option<String> {
     for opt in options {
-        let id = option_id(opt)?;
-        let kind = opt
-            .get("kind")
-            .or_else(|| opt.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        let kind = option_kind(opt);
+        if kind.contains("allow_once") || kind == "allow-once" {
+            return option_id(opt);
+        }
+    }
+    None
+}
+
+fn prefer_non_always_allow(options: &[Value]) -> Option<String> {
+    for opt in options {
+        let kind = option_kind(opt);
         if kind.contains("deny") || kind.contains("cancel") || kind.contains("reject") {
             continue;
         }
-        return Some(id);
+        if kind.contains("always") {
+            continue;
+        }
+        return option_id(opt);
     }
-    options.first().and_then(option_id)
+    None
+}
+
+fn deny_write_options(options: &[Value]) -> Option<String> {
+    for opt in options {
+        let kind = option_kind(opt);
+        if kind.contains("deny")
+            || kind.contains("cancel")
+            || kind.contains("reject")
+            || kind.contains("refuse")
+        {
+            return option_id(opt);
+        }
+    }
+    None
+}
+
+fn option_kind(opt: &Value) -> String {
+    opt.get("kind")
+        .or_else(|| opt.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase()
 }
 
 fn deny_option(options: &[Value]) -> Option<String> {
@@ -167,10 +205,31 @@ mod tests {
         let ctx = PermissionContext {
             workspace: "/home/user/proj".to_owned(),
             sensitive_gate_active: false,
+            read_only_fail_closed: false,
         };
         assert_eq!(
             choose_permission_option(&params, &ctx).as_deref(),
             Some("deny")
+        );
+    }
+
+    // TC-1325 / FR-1304: prefer allow_once over always-allow (Grok).
+    #[test]
+    fn prefers_allow_once_over_always_allow() {
+        let params = json!({
+            "options": [
+                {"optionId": "always", "kind": "allow_always"},
+                {"optionId": "once", "kind": "allow_once"}
+            ]
+        });
+        let ctx = PermissionContext {
+            workspace: "/home/user/proj".to_owned(),
+            sensitive_gate_active: false,
+            read_only_fail_closed: false,
+        };
+        assert_eq!(
+            choose_permission_option(&params, &ctx).as_deref(),
+            Some("once")
         );
     }
 
@@ -188,6 +247,7 @@ mod tests {
         let ctx = PermissionContext {
             workspace: "/home/user/proj".to_owned(),
             sensitive_gate_active: false,
+            read_only_fail_closed: false,
         };
         assert_eq!(
             choose_permission_option(&params, &ctx).as_deref(),
@@ -221,6 +281,7 @@ mod tests {
         let ctx = PermissionContext {
             workspace: "/home/user/proj".to_owned(),
             sensitive_gate_active: true,
+            read_only_fail_closed: false,
         };
         assert!(choose_permission_option(&params, &ctx).is_none());
     }

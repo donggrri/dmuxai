@@ -38,6 +38,7 @@ DmuxAI removes user-facing **ExecutionMode** (Ask / Plan / Implement): every use
 | --- | --- | --- | --- |
 | OQ-1300 | Cursor and grok ACP servers speak ACP v1 with blocking `session/prompt` completion (stop reason on response or terminal `session/update`). | DmuxAI | Live smoke on Linux |
 | OQ-1301 | `grok agent stdio` accepts `-m`, optional `--reasoning-effort`, and `--always-approve` for agent-mode turns. | DmuxAI | Live smoke on Linux |
+| OQ-1326 | Native sandbox for ACP stdio agents (`cursor-agent acp --sandbox enabled` is best-effort; grok/opencode ACP sandbox flags unknown). | DmuxAI | Live smoke on Linux |
 
 No Must requirement depends on an unanswered question for CI; live smoke is manual on Linux.
 
@@ -72,6 +73,13 @@ No Must requirement depends on an unanswered question for CI; live smoke is manu
 | FR-1316 | Must | User cancel during ACP turn. | `session/cancel`, brief grace, then process-group kill. | No orphan `cursor-agent acp`. | TC-1317 |
 | FR-1317 | Must | `TurnPolicy::ReadOnly` internal turns. | ACP `session/set_mode` ask/plan (or equivalent) before prompt. | — | TC-1310 |
 | FR-1318 | Must | CLI `dmuxai run` / `todo run`. | `--mode` is rejected with error (not silently ignored). | — | `src/cli.rs` |
+| FR-1319 | Must | Cursor ACP `session/new`/`load` result. | Read `models.currentModelId` (and `availableModels`); if fast, call `session/set_model` or `session/set_config_option` when advertised; refuse if still fast; `ModelSelected` uses agent-reported id. | — | TC-1318, TC-1319 |
+| FR-1320 | Must | `session/load` / `session/resume`. | Params include `cwd` and `mcpServers: []`; load/resume failure surfaces a user-visible notice before `session/new`. | — | TC-1323 |
+| FR-1321 | Must | `session/set_mode` for read-only turns. | JSON uses `modeId` (not `mode`); if set_mode fails or is unsupported, deny write/exec permissions for that turn (fail closed). | — | TC-1324 |
+| FR-1322 | Must | Permission options from agent. | Prefer `allow_once`; never auto-select `allow_always`. | — | TC-1325 |
+| FR-1323 | Must | User cancel during prompt or blocking RPC. | Cancel is polled independently of agent output; `session/cancel` is sent before kill. | — | TC-1317 |
+| FR-1324 | Must | Permission denied with no assistant text. | Turn ends with `Error` (not `Completed` / `ok: true`). | — | Review |
+| FR-1325 | Must | ACP tool UI noise. | Suppress generic `tool` / `Tool [completed]: tool` rows; keep meaningful tool activity (edit, execute with command). | — | TC-1315 |
 
 ## 5. Acceptance scenarios
 
@@ -96,6 +104,12 @@ No Must requirement depends on an unanswered question for CI; live smoke is manu
 | TC-1316 | FR-1301 | unit | `grok_acp_argv` | Build argv | `-m` before `stdio` | `src/agent/acp_runner.rs` |
 | TC-1317 | FR-1316 | integration | Fake agent + cancel | Cancel turn | `session/cancel` observed | `tests/fixtures/fake_acp_agent.rs` |
 | TC-1318 | FR-1313 | unit | Fast model payload | `cursor_acp_model_check` | Error | `src/agent/acp/session.rs` |
+| TC-1319 | FR-1319 | unit | `currentModelId` fast vs requested | `cursor_acp_model_check` | Uses reported id | `src/agent/acp/session.rs` |
+| TC-1323 | FR-1320 | unit | `session_load_params` | Inspect JSON | `cwd`, `mcpServers` | `src/agent/acp/session.rs` |
+| TC-1324 | FR-1321 | unit | `session_set_mode_params` | Inspect JSON | `modeId` present | `src/agent/acp/session.rs` |
+| TC-1325 | FR-1322 | unit | Grok-style options | `choose_permission_option` | `allow_once` wins | `src/agent/acp/permissions.rs` |
+
+Deterministic ACP integration tests require `cargo test --features test-fixtures` (builds `fake-acp-agent`); plain `cargo test` must pass without the fixture binary.
 
 ### Live smoke (manual, Linux only)
 
@@ -108,7 +122,7 @@ No Must requirement depends on an unanswered question for CI; live smoke is manu
 | Area | Contract |
 | --- | --- |
 | Persistence | No schema change; legacy mode fields in JSON ignored. |
-| Security | ACP permissions: allow in-workspace; deny outside; sensitive gates unchanged. |
+| Security | ACP permissions: allow in-workspace; deny outside; sensitive gates unchanged. Cursor ACP passes `--sandbox enabled` when supported (OQ-1326 for grok/opencode). Shell redirection outside the workspace is not parsed heuristically. |
 | Platform | **Linux only** for FR-1300..FR-1309 and NFR-1301; do not extend Windows handling in this change. |
 
 ## 7. Implementation plan

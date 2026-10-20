@@ -13,7 +13,13 @@ All notable changes to dmuxai are listed here. Versions follow
   because Cursor ACP currently exposes only fast composer models; set
   `protocol = "acp"` explicitly to use `cursor-agent acp` (fast-model guard
   applies). ACP turns always `initialize`, then `session/load` / `session/resume`
-  or `session/new`; cancel sends `session/cancel` before killing the child.
+  (with `cwd` and `mcpServers: []`) or `session/new`; resume failures surface a
+  notice. Cursor reads `models.currentModelId`, attempts non-fast model selection,
+  and refuses fast-only sessions. Read-only turns use `session/set_mode` with
+  `modeId` or fail closed on permissions. Permission prompts prefer `allow_once`.
+  Cancel is polled independently and sends `session/cancel` before kill. Generic
+  `tool` activity rows are suppressed. Fake ACP tests use `--features test-fixtures`.
+  Cursor ACP argv includes `--sandbox enabled` when supported (OQ-1326).
   Cursor prewarm applies only to legacy stream-json.
 - **CLI:** `dmuxai run` / `todo run` reject `--mode` with an error instead of
   running write-capable turns silently.

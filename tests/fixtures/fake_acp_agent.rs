@@ -1,4 +1,5 @@
 //! Minimal ACP v1 agent for tests (SPEC-acp-runners TC-1300..TC-1304, TC-1317).
+//! Validates request params strictly (mirrors Cursor/grok/opencode expectations).
 
 use std::io::{BufRead, Write};
 
@@ -15,6 +16,10 @@ fn main() {
             serde_json::from_str(&line).unwrap_or(serde_json::Value::Null);
         let method = value.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = value.get("id").cloned();
+        let params = value
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
 
         match method {
             "initialize" => {
@@ -25,30 +30,98 @@ fn main() {
                         serde_json::json!({
                             "protocolVersion": 1,
                             "agentInfo": { "name": "fake-acp", "version": "0" },
-                            "agentCapabilities": { "loadSession": true, "resume": true }
+                            "agentCapabilities": {
+                                "loadSession": true,
+                                "resume": true,
+                                "set_mode": true,
+                                "set_model": true,
+                                "set_config_option": true
+                            }
                         }),
                     );
                 }
             }
             "session/new" => {
                 if let Some(id) = id {
+                    if let Err(msg) = require_session_new_params(&params) {
+                        error(&mut stdout, id, -32602, &msg);
+                        continue;
+                    }
                     session = "fake-session-1".to_owned();
-                    respond(&mut stdout, id, serde_json::json!({ "sessionId": session }));
+                    respond(
+                        &mut stdout,
+                        id,
+                        serde_json::json!({
+                            "sessionId": session,
+                            "models": {
+                                "currentModelId": "composer-2.5",
+                                "availableModels": ["composer-2.5", "composer-2.5[fast=true]"]
+                            }
+                        }),
+                    );
                 }
             }
-            "session/load" | "session/resume" => {
+            "session/load" => {
                 if let Some(id) = id {
-                    let sid = value
-                        .pointer("/params/sessionId")
+                    if let Err(msg) = require_resume_params(&params) {
+                        error(&mut stdout, id, -32602, &msg);
+                        continue;
+                    }
+                    let sid = params
+                        .get("sessionId")
                         .and_then(|v| v.as_str())
                         .unwrap_or(&session);
                     session = sid.to_owned();
                     respond(&mut stdout, id, serde_json::json!({ "sessionId": session }));
                 }
             }
-            "session/set_config_option" | "session/set_mode" => {
+            "session/resume" => {
                 if let Some(id) = id {
-                    respond(&mut stdout, id, serde_json::json!({}));
+                    if let Err(msg) = require_resume_params(&params) {
+                        error(&mut stdout, id, -32602, &msg);
+                        continue;
+                    }
+                    let sid = params
+                        .get("sessionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&session);
+                    session = sid.to_owned();
+                    respond(&mut stdout, id, serde_json::json!({ "sessionId": session }));
+                }
+            }
+            "session/set_config_option" | "session/set_mode" | "session/set_model" => {
+                if method == "session/set_mode" {
+                    if let Err(msg) = require_set_mode_params(&params) {
+                        if let Some(req_id) = id.clone() {
+                            error(&mut stdout, req_id, -32602, &msg);
+                            continue;
+                        }
+                    }
+                }
+                if method == "session/set_config_option"
+                    && let Some(path) = std::env::var_os("FAKE_ACP_MODEL_CAPTURE")
+                {
+                    let model = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                    let _ = std::fs::write(path, model);
+                }
+                if method == "session/set_model" {
+                    let model = params
+                        .get("modelId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("composer-2.5");
+                    if let Some(path) = std::env::var_os("FAKE_ACP_MODEL_CAPTURE") {
+                        let _ = std::fs::write(path, model);
+                    }
+                }
+                if let Some(id) = id {
+                    let result = if method == "session/set_model" {
+                        serde_json::json!({
+                            "models": { "currentModelId": params.get("modelId").cloned().unwrap_or(serde_json::json!("composer-2.5")) }
+                        })
+                    } else {
+                        serde_json::json!({})
+                    };
+                    respond(&mut stdout, id, result);
                 }
             }
             "session/cancel" => {
@@ -99,6 +172,63 @@ fn main() {
             }
         }
     }
+}
+
+fn require_session_new_params(params: &serde_json::Value) -> Result<(), String> {
+    if params
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .is_none_or(|s| s.is_empty())
+    {
+        return Err("session/new missing cwd".to_owned());
+    }
+    if !params
+        .get("mcpServers")
+        .map(|v| v.is_array())
+        .unwrap_or(false)
+    {
+        return Err("session/new missing mcpServers array".to_owned());
+    }
+    Ok(())
+}
+
+fn require_resume_params(params: &serde_json::Value) -> Result<(), String> {
+    if params
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .is_none_or(|s| s.is_empty())
+    {
+        return Err("missing sessionId".to_owned());
+    }
+    if params
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .is_none_or(|s| s.is_empty())
+    {
+        return Err("missing cwd".to_owned());
+    }
+    if !params
+        .get("mcpServers")
+        .map(|v| v.is_array())
+        .unwrap_or(false)
+    {
+        return Err("missing mcpServers array".to_owned());
+    }
+    Ok(())
+}
+
+fn require_set_mode_params(params: &serde_json::Value) -> Result<(), String> {
+    if params
+        .get("modeId")
+        .and_then(|v| v.as_str())
+        .is_none_or(|s| s.is_empty())
+    {
+        return Err("session/set_mode requires modeId".to_owned());
+    }
+    if params.get("mode").is_some() {
+        return Err("session/set_mode must not use legacy mode field".to_owned());
+    }
+    Ok(())
 }
 
 fn respond(stdout: &mut std::io::Stdout, id: serde_json::Value, result: serde_json::Value) {

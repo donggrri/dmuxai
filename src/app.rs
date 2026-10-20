@@ -12911,7 +12911,14 @@ fn stored_event(event: &AgentEvent) -> Option<TurnEvent> {
         AgentEvent::TextDelta(delta) => Some(TurnEvent::TextDelta(delta.clone())),
         AgentEvent::Notice(notice) => Some(TurnEvent::Notice(notice.clone())),
         AgentEvent::ToolProgress { summary, state, .. } => {
-            Some(TurnEvent::Notice(format!("Tool [{state}]: {summary}")))
+            if summary.eq_ignore_ascii_case("tool")
+                || format!("Tool [{state}]: {summary}")
+                    .eq_ignore_ascii_case("Tool [completed]: tool")
+            {
+                None
+            } else {
+                Some(TurnEvent::Notice(format!("Tool [{state}]: {summary}")))
+            }
         }
         AgentEvent::Activity(_) => None,
         AgentEvent::Completed => Some(TurnEvent::Completed),

@@ -27,25 +27,26 @@ pub fn map_session_update(update: &Value) -> Vec<AgentEvent> {
         "tool_call_update" => {
             if let Some(item) = map_tool_call_update(update) {
                 events.push(AgentEvent::Activity(item));
+            } else if should_emit_tool_progress(update) {
+                let summary = tool_summary(update);
+                let state = update
+                    .get("status")
+                    .or_else(|| update.pointer("/toolCall/status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("in_progress");
+                let item_id = update
+                    .get("toolCallId")
+                    .or_else(|| update.pointer("/toolCall/toolCallId"))
+                    .or_else(|| update.pointer("/toolCall/id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_owned();
+                events.push(AgentEvent::ToolProgress {
+                    item_id,
+                    summary,
+                    state: state.to_owned(),
+                });
             }
-            let summary = tool_summary(update);
-            let state = update
-                .get("status")
-                .or_else(|| update.pointer("/toolCall/status"))
-                .and_then(Value::as_str)
-                .unwrap_or("in_progress");
-            let item_id = update
-                .get("toolCallId")
-                .or_else(|| update.pointer("/toolCall/toolCallId"))
-                .or_else(|| update.pointer("/toolCall/id"))
-                .and_then(Value::as_str)
-                .unwrap_or("tool")
-                .to_owned();
-            events.push(AgentEvent::ToolProgress {
-                item_id,
-                summary,
-                state: state.to_owned(),
-            });
         }
         "plan_update" => {
             let text = update
@@ -76,8 +77,24 @@ fn tool_summary(update: &Value) -> String {
         .to_owned()
 }
 
+fn should_emit_tool_progress(update: &Value) -> bool {
+    let summary = tool_summary(update);
+    let kind = update
+        .get("kind")
+        .or_else(|| update.pointer("/toolCall/kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+    !summary.eq_ignore_ascii_case("tool")
+        || !kind.eq_ignore_ascii_case("tool")
+        || update.pointer("/locations/0/path").is_some()
+        || update.pointer("/toolCall/locations/0/path").is_some()
+}
+
 fn map_tool_call(update: &Value) -> Option<ActivityItem> {
     let title = tool_summary(update);
+    if title.eq_ignore_ascii_case("tool") {
+        return None;
+    }
     let kind = update
         .get("kind")
         .or_else(|| update.pointer("/toolCall/kind"))
@@ -107,6 +124,9 @@ fn map_tool_call(update: &Value) -> Option<ActivityItem> {
 
 fn map_tool_call_update(update: &Value) -> Option<ActivityItem> {
     let title = tool_summary(update);
+    if title.eq_ignore_ascii_case("tool") {
+        return None;
+    }
     let status = tool_status_from_str(
         update
             .get("status")
@@ -198,9 +218,12 @@ mod tests {
             "locations": [{"path": "src/main.rs"}]
         });
         let events = map_session_update(&update);
-        assert!(events.iter().any(
-            |e| matches!(e, AgentEvent::ToolProgress { summary, .. } if summary == "Read file")
-        ));
+        assert!(
+            !events.iter().any(
+                |e| matches!(e, AgentEvent::ToolProgress { summary, .. } if summary == "tool")
+            ),
+            "generic tool progress should be suppressed"
+        );
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Activity(_))));
     }
 }

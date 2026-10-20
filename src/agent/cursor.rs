@@ -811,6 +811,7 @@ async fn run_turn_with_child(
         let permission_ctx = PermissionContext {
             workspace: cwd.to_string_lossy().into_owned(),
             sensitive_gate_active: false,
+            read_only_fail_closed: false,
         };
         let cancel = acp_cancel
             .clone()
@@ -2560,6 +2561,7 @@ pub(crate) mod tests {
     }
 
     // TC-1300 / FR-1300: Cursor ACP protocol drives a fake ACP agent binary.
+    #[cfg(feature = "test-fixtures")]
     #[tokio::test]
     async fn cursor_acp_turn_with_fake_agent() {
         let fake = fake_acp_agent_bin();

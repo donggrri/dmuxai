@@ -61,12 +61,15 @@ pub async fn run_agent_acp_turn(
 
 pub fn cursor_acp_argv(model: Option<&str>, cwd: &Path) -> Vec<String> {
     let mut args = vec!["acp".to_owned()];
-    if let Some(model) = model {
-        if dmuxai::model_policy::validate_model_for_runner("cursor", model).is_ok() {
-            args.push("--model".to_owned());
-            args.push(model.to_owned());
-        }
+    if let Some(model) = model
+        && dmuxai::model_policy::validate_model_for_runner("cursor", model).is_ok()
+    {
+        args.push("--model".to_owned());
+        args.push(model.to_owned());
     }
+    // Best-effort: match legacy stream-json sandbox when the ACP CLI supports it (OQ-1326).
+    args.push("--sandbox".to_owned());
+    args.push("enabled".to_owned());
     args.push("--workspace".to_owned());
     args.push(cwd.to_string_lossy().into_owned());
     args
