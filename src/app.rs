@@ -1775,6 +1775,12 @@ impl App {
                 .iter()
                 .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean);
             let Some(adapter) = adapter else {
+                if runner_clean == "opencode"
+                    && let Some(message) =
+                        dmuxai::settings::opencode_bin_explicit_missing_message()
+                {
+                    return Err(RunTodoError::Missing(message));
+                }
                 return Err(RunTodoError::UnknownAgent(agent_str.clone()));
             };
             adapter.agent()
