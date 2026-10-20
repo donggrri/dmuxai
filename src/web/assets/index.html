@@ -30,6 +30,8 @@
   <button id="sessions-toggle" type="button" class="btn sidebar-toggle" aria-controls="sessions-sidebar" aria-expanded="false" title="Toggle sessions sidebar">Sessions</button>
   <button id="sidebar-toggle-files" type="button" class="btn sidebar-toggle" aria-controls="sidebar" aria-expanded="false" title="Toggle files sidebar">Files</button>
   <button id="todos-toggle" type="button" class="btn sidebar-toggle" aria-controls="sidebar" aria-expanded="false" title="Toggle to-dos sidebar" aria-label="To-dos, 0 open">To-dos <span id="todos-count" class="todos-count" aria-hidden="true">0</span></button>
+  <button id="diff-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="diff" aria-controls="docs" aria-expanded="false" title="Show files changed by agents (Esc closes)" aria-label="Diff">Diff <span id="diff-count" class="todos-count" aria-hidden="true" hidden>0</span></button>
+  <button id="graph-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="graph" aria-controls="graph" aria-expanded="false" title="Show the graph run and plan (Esc closes)" aria-label="Graph">Graph <span id="graph-indicator" class="view-indicator" aria-hidden="true" hidden></span></button>
   <nav id="status" class="status" aria-label="dashboard status">
     <span id="run-status" class="run-status run-status-idle" role="status" aria-live="polite">Idle</span>
     <span class="stat"><span class="stat-k">workspace</span><button id="workspace-button" type="button" class="btn stat-v workspace-button" aria-haspopup="dialog" title="">&ndash;</button></span>
@@ -50,11 +52,15 @@
   </section>
 
 
-  <section id="docs" class="panel panel-collapsible" data-collapsed="true">
+  <section id="docs" class="panel panel-collapsible center-view" data-collapsed="true" aria-label="Diff" hidden>
+    <div class="center-view-head">
+      <span class="center-view-title">Diff</span>
+      <button type="button" class="btn sidebar-close center-view-close" data-view="diff" aria-label="Close Diff">&times;</button>
+    </div>
     <h2 class="panel-title panel-title-toggle">
       <button id="docs-toggle" type="button" class="panel-toggle" aria-expanded="false" aria-controls="docs-body">
         <span class="panel-caret" aria-hidden="true"></span>
-        <span class="panel-toggle-label">Documents</span>
+        <span class="panel-toggle-label">Changed files</span>
         <span id="docs-count" class="panel-count" hidden></span>
       </button>
     </h2>
@@ -64,8 +70,11 @@
     </div>
   </section>
 
-  <section id="graph" class="panel">
-    <h2 class="panel-title">Graph</h2>
+  <section id="graph" class="panel center-view" aria-label="Graph" hidden>
+    <div class="center-view-head">
+      <h2 class="panel-title center-view-title">Graph</h2>
+      <button type="button" class="btn sidebar-close center-view-close" data-view="graph" aria-label="Close Graph">&times;</button>
+    </div>
     <p id="graph-empty" class="empty">No graph run yet</p>
     <div id="graph-body" hidden>
       <div class="graph-meta">

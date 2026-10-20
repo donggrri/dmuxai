@@ -1,4 +1,4 @@
-//! TC-1204 (SPEC-dashboard-fullwidth FR-1200, FR-1202, FR-1203, FR-1205,
+//! TC-1204, TC-1207, TC-1208 (SPEC-dashboard-fullwidth FR-1200, FR-1202, FR-1203, FR-1205,
 //! FR-1209, FR-1210): in headless Chrome, the center column fills the content
 //! area, the Documents panel starts collapsed and toggles from the keyboard,
 //! and an agent turn's text is rendered once: in the chat, with a compact
@@ -9,7 +9,7 @@
 //! `cargo test --test web_dashboard_fullwidth -- --ignored`.
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -50,13 +50,11 @@ fn find_chrome() -> Option<PathBuf> {
     None
 }
 
-// TC-1204: document_text_rendered_once_in_headless_chrome
-#[test]
-#[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn document_text_rendered_once_in_headless_chrome() {
+/// Chrome and python Playwright, or `None` (the test prints SKIP).
+fn prepare() -> Option<(PathBuf, &'static str)> {
     let Some(chrome) = find_chrome() else {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
-        return;
+        return None;
     };
     let python = if cfg!(windows) { "python" } else { "python3" };
     let probe = Command::new(python)
@@ -66,17 +64,17 @@ fn document_text_rendered_once_in_headless_chrome() {
         .status();
     if !probe.map(|status| status.success()).unwrap_or(false) {
         println!("SKIP: python playwright not installed");
-        return;
+        return None;
     }
+    Some((chrome, python))
+}
 
-    let workspace = tempfile::tempdir().expect("temp workspace");
-    let home = tempfile::tempdir().expect("temp home");
-    std::fs::write(workspace.path().join("README.md"), "# Full width\n").expect("write doc");
-
+/// `dmuxai serve --port 0` in `workspace`; returns the guard and the URL.
+fn start_serve(workspace: &Path, home: &Path) -> (ChildGuard, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
         .args(["serve", "--port", "0"])
-        .current_dir(workspace.path())
-        .env("HOME", home.path())
+        .current_dir(workspace)
+        .env("HOME", home)
         .env_remove("DMUXAI_WORKSPACE")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -84,7 +82,7 @@ fn document_text_rendered_once_in_headless_chrome() {
         .spawn()
         .expect("spawn dmuxai serve");
     let stdout = child.stdout.take().expect("stdout is piped");
-    let _guard = ChildGuard(Some(child));
+    let guard = ChildGuard(Some(child));
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
@@ -99,6 +97,59 @@ fn document_text_rendered_once_in_headless_chrome() {
         .strip_prefix("dmuxai dashboard: ")
         .unwrap_or_else(|| panic!("unexpected first stdout line: {line:?}"))
         .to_owned();
+    (guard, url)
+}
+
+/// Runs a Playwright script with `argv = [chrome, url]`; returns the last
+/// JSON line it prints.
+fn run_probe(python: &str, chrome: &Path, url: &str, script: &str) -> serde_json::Value {
+    let mut py_child = Command::new(python)
+        .args(["-c", script])
+        .arg(chrome)
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn playwright");
+    let (tx_out, rx_out) = mpsc::channel();
+    let mut py_stdout = py_child.stdout.take().expect("py stdout");
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut out = Vec::new();
+        let _ = py_stdout.read_to_end(&mut out);
+        let _ = tx_out.send(out);
+    });
+    let out_bytes = match rx_out.recv_timeout(Duration::from_secs(90)) {
+        Ok(b) => {
+            let _ = py_child.wait();
+            b
+        }
+        Err(_) => {
+            let _ = py_child.kill();
+            let _ = py_child.wait();
+            panic!("playwright execution timed out after 90s");
+        }
+    };
+    let text = String::from_utf8_lossy(&out_bytes);
+    let json_line = text
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or_else(|| panic!("no JSON result from playwright:\n{text}"));
+    serde_json::from_str(json_line).expect("json result")
+}
+
+// TC-1204: document_text_rendered_once_in_headless_chrome
+#[test]
+#[ignore = "needs Chrome/Chromium; run with --ignored"]
+fn document_text_rendered_once_in_headless_chrome() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let home = tempfile::tempdir().expect("temp home");
+    std::fs::write(workspace.path().join("README.md"), "# Full width\n").expect("write doc");
+    let (_guard, url) = start_serve(workspace.path(), home.path());
 
     let script = r##"
 import sys, json, time
@@ -171,40 +222,7 @@ with sync_playwright() as p:
     b.close()
 "##;
 
-    let mut py_child = Command::new(python)
-        .args(["-c", script])
-        .arg(&chrome)
-        .arg(&url)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn playwright");
-    let (tx_out, rx_out) = mpsc::channel();
-    let mut py_stdout = py_child.stdout.take().expect("py stdout");
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut out = Vec::new();
-        let _ = py_stdout.read_to_end(&mut out);
-        let _ = tx_out.send(out);
-    });
-    let out_bytes = match rx_out.recv_timeout(Duration::from_secs(90)) {
-        Ok(b) => {
-            let _ = py_child.wait();
-            b
-        }
-        Err(_) => {
-            let _ = py_child.kill();
-            let _ = py_child.wait();
-            panic!("playwright execution timed out after 90s");
-        }
-    };
-    let text = String::from_utf8_lossy(&out_bytes);
-    let json_line = text
-        .lines()
-        .rev()
-        .find(|l| l.trim_start().starts_with('{'))
-        .unwrap_or_else(|| panic!("no JSON result from playwright:\n{text}"));
-    let v: serde_json::Value = serde_json::from_str(json_line).expect("json result");
+    let v = run_probe(python, &chrome, &url, script);
 
     // FR-1202: collapsed by default.
     assert_eq!(v["initial"]["expanded"], "false", "{v}");
@@ -253,4 +271,405 @@ with sync_playwright() as p:
     // FR-1203: Enter on the focused toggle collapses again.
     assert_eq!(v["after_enter"]["expanded"], "false", "{v}");
     assert_eq!(v["after_enter"]["hidden"], true, "{v}");
+}
+
+/// A completed two-node run, for the Graph view toggle checks.
+const DONE_RUN: &str = r#"{"plan":{"schema":"dmuxai.graph/v1","id":"run-done","orchestrator_model":"composer-2.5",
+ "user_prompt":"Add CSV export","limits":{"max_parallel":2,"max_retries":1},
+ "nodes":[{"id":"a","role":"plan","job":"plan","runner":"cursor","model_id":"composer-2.5","skill":null,"requires_gate":false,"status":"completed","attempt":1,"started_at_ms":1000,"finished_at_ms":61000},
+          {"id":"b","role":"implement","job":"build","runner":"cursor","model_id":"composer-2.5","skill":null,"requires_gate":false,"status":"completed","attempt":1,"started_at_ms":61000,"finished_at_ms":121000}],
+ "edges":[{"from":"a","to":"b"}]},"conversation_id":"c","phase":"completed","waiting_gate_node":null}"#;
+
+/// A plan waiting for approval (#67 plan gate).
+const APPROVAL_RUN: &str = r#"{"plan":{"schema":"dmuxai.graph/v1","id":"plan-wait","orchestrator_model":"composer-2.5",
+ "user_prompt":"Add CSV export","limits":{"max_parallel":2,"max_retries":1},"nodes":[],"edges":[]},
+ "conversation_id":"c","phase":"awaiting_approval","waiting_gate_node":null,
+ "approval":{"state":"pending","revisions":[{"n":1,"source":"planner","steps":[
+   {"id":"explore","role":"explore","job":"Read the reports page","runner":"cursor","model":"composer-2.5","depends_on":[]},
+   {"id":"implement","role":"implement","job":"Add the CSV writer","runner":"cursor","model":"composer-2.5","depends_on":["explore"]}]}]}}"#;
+
+fn workspace_with_run(json: &str) -> tempfile::TempDir {
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let graphs = workspace.path().join(".dmuxai").join("graphs");
+    std::fs::create_dir_all(&graphs).expect("graphs dir");
+    std::fs::write(graphs.join("run.json"), json).expect("write run");
+    workspace
+}
+
+// TC-1207: center_views_toggle_in_headless_chrome (FR-1211, FR-1212,
+// FR-1213, FR-1214, FR-1216)
+#[test]
+#[ignore = "needs Chrome/Chromium; run with --ignored"]
+fn center_views_toggle_in_headless_chrome() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let workspace = workspace_with_run(DONE_RUN);
+    let home = tempfile::tempdir().expect("temp home");
+    let (_guard, url) = start_serve(workspace.path(), home.path());
+    let script = r##"
+import sys, json
+from playwright.sync_api import sync_playwright
+
+STATE = """() => {
+  const r = q => { const e = document.querySelector(q); const b = e.getBoundingClientRect(); return {left: b.left, width: b.width}; };
+  const cs = getComputedStyle(document.body);
+  return {
+    graph_hidden: document.querySelector('#graph').hidden,
+    docs_hidden: document.querySelector('#docs').hidden,
+    graph_exp: document.querySelector('#graph-toggle').getAttribute('aria-expanded'),
+    diff_exp: document.querySelector('#diff-toggle').getAttribute('aria-expanded'),
+    chat_visible: !document.querySelector('#session').hidden,
+    graph_rect: r('#graph'), canvas_w: document.querySelector('#graph-canvas').clientWidth,
+    vw: innerWidth, dock_l: parseFloat(cs.paddingLeft), dock_r: parseFloat(cs.paddingRight),
+    nodes: document.querySelectorAll('.graph-svg g.node').length,
+    focus: document.activeElement ? (document.activeElement.id || document.activeElement.className) : null,
+    stored: sessionStorage.getItem('dmuxai.centerView')
+  };
+}"""
+
+out = {}
+with sync_playwright() as p:
+    b = p.chromium.launch(executable_path=sys.argv[1], args=["--no-sandbox"])
+    pg = b.new_page(viewport={"width": 1440, "height": 900}, bypass_csp=True)
+    pg.on("pageerror", lambda e: print("PAGEERROR", e, file=sys.stderr))
+    pg.goto(sys.argv[2])
+    pg.wait_for_selector("#graph-toggle", timeout=15000)
+    pg.wait_for_function("() => document.querySelector('#graph-id').textContent.length > 0", timeout=15000)
+    out["initial"] = pg.evaluate(STATE)
+    pg.click("#graph-toggle")
+    pg.wait_for_function("() => document.querySelectorAll('.graph-svg g.node').length === 2", timeout=15000)
+    pg.wait_for_timeout(400)
+    out["graph_open"] = pg.evaluate(STATE)
+    pg.click("#graph-toggle")
+    out["graph_closed_click"] = pg.evaluate(STATE)
+    pg.focus("#diff-toggle")
+    pg.keyboard.press("Enter")
+    out["diff_open"] = pg.evaluate(STATE)
+    pg.click("#graph-toggle")
+    out["switch_to_graph"] = pg.evaluate(STATE)
+    pg.reload()
+    pg.wait_for_selector("#graph-toggle", timeout=15000)
+    pg.wait_for_timeout(500)
+    out["after_reload"] = pg.evaluate(STATE)
+    pg.keyboard.press("Escape")
+    out["after_esc"] = pg.evaluate(STATE)
+    print(json.dumps(out))
+    b.close()
+"##;
+    let v = run_probe(python, &chrome, &url, script);
+
+    // FR-1211: hidden by default, chat stays the center view.
+    let init = &v["initial"];
+    assert_eq!(init["graph_hidden"], true, "{v}");
+    assert_eq!(init["docs_hidden"], true, "{v}");
+    assert_eq!(init["graph_exp"], "false", "{v}");
+    assert_eq!(init["diff_exp"], "false", "{v}");
+    assert_eq!(init["chat_visible"], true, "{v}");
+    // FR-1213: the open Graph view covers the center area.
+    let open = &v["graph_open"];
+    assert_eq!(open["graph_hidden"], false, "{v}");
+    assert_eq!(open["graph_exp"], "true", "{v}");
+    assert_eq!(open["nodes"], 2, "{v}");
+    let content = open["vw"].as_f64().unwrap()
+        - open["dock_l"].as_f64().unwrap()
+        - open["dock_r"].as_f64().unwrap();
+    let gw = open["graph_rect"]["width"].as_f64().unwrap();
+    assert!(
+        (gw - (content - 28.0)).abs() <= 2.0,
+        "graph view {gw} vs content {content}: {v}"
+    );
+    let gl = open["graph_rect"]["left"].as_f64().unwrap();
+    assert!(
+        (gl - (open["dock_l"].as_f64().unwrap() + 14.0)).abs() <= 2.0,
+        "{v}"
+    );
+    assert!(open["canvas_w"].as_f64().unwrap() >= content - 80.0, "{v}");
+    assert_eq!(open["focus"], "btn sidebar-close center-view-close", "{v}");
+    // FR-1212: clicking again hides it.
+    assert_eq!(v["graph_closed_click"]["graph_hidden"], true, "{v}");
+    assert_eq!(v["graph_closed_click"]["graph_exp"], "false", "{v}");
+    // Keyboard opens Diff; one view at a time.
+    assert_eq!(v["diff_open"]["docs_hidden"], false, "{v}");
+    assert_eq!(v["diff_open"]["diff_exp"], "true", "{v}");
+    let sw = &v["switch_to_graph"];
+    assert_eq!(sw["docs_hidden"], true, "{v}");
+    assert_eq!(sw["graph_hidden"], false, "{v}");
+    // FR-1216: the open view survives a reload in the same tab.
+    assert_eq!(v["after_reload"]["graph_hidden"], false, "{v}");
+    assert_eq!(v["after_reload"]["stored"], "graph", "{v}");
+    // FR-1212: Esc hides it.
+    assert_eq!(v["after_esc"]["graph_hidden"], true, "{v}");
+    assert_eq!(v["after_esc"]["stored"], "", "{v}");
+}
+
+// TC-1208: approval_opens_graph_in_headless_chrome (FR-1214, FR-1215)
+#[test]
+#[ignore = "needs Chrome/Chromium; run with --ignored"]
+fn approval_opens_graph_in_headless_chrome() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let workspace = workspace_with_run(APPROVAL_RUN);
+    let home = tempfile::tempdir().expect("temp home");
+    let (_guard, url) = start_serve(workspace.path(), home.path());
+    let script = r##"
+import sys, json
+from playwright.sync_api import sync_playwright
+
+STATE = """() => ({
+  graph_hidden: document.querySelector('#graph').hidden,
+  approval_visible: !document.querySelector('#graph-approval').hidden && document.querySelector('#graph-approval').getClientRects().length > 0,
+  label: document.querySelector('#graph-toggle').getAttribute('aria-label'),
+  indicator: document.querySelector('#graph-indicator').hidden ? null : document.querySelector('#graph-indicator').textContent,
+  card: (() => {
+    const c = document.querySelector('#session .session-transcript > li.chat-aux-approval');
+    if (!c) { return null; }
+    const btn = k => { const b = c.querySelector('.chat-aux-approval-' + k); return b ? {disabled: b.disabled} : null; };
+    return {text: c.innerText, approve: btn('approve'), edit: btn('edit'), reject: btn('reject'), open: btn('open'),
+            visible: c.getClientRects().length > 0};
+  })()
+})"""
+
+out = {}
+with sync_playwright() as p:
+    b = p.chromium.launch(executable_path=sys.argv[1], args=["--no-sandbox"])
+    pg = b.new_page(viewport={"width": 1440, "height": 900}, bypass_csp=True)
+    pg.on("pageerror", lambda e: print("PAGEERROR", e, file=sys.stderr))
+    pg.goto(sys.argv[2])
+    pg.wait_for_function("() => document.querySelector('#graph-phase').textContent === 'awaiting_approval'", timeout=15000)
+    pg.wait_for_timeout(300)
+    out["initial"] = pg.evaluate(STATE)
+    pg.keyboard.press("Escape")
+    pg.wait_for_timeout(1500)
+    out["closed"] = pg.evaluate(STATE)
+    pg.click("li.chat-aux-approval .chat-aux-approval-open")
+    out["reopened"] = pg.evaluate(STATE)
+    print(json.dumps(out))
+    b.close()
+"##;
+    let v = run_probe(python, &chrome, &url, script);
+
+    // FR-1214: a pending plan opens the Graph view with the approval panel.
+    let init = &v["initial"];
+    assert_eq!(init["graph_hidden"], false, "{v}");
+    assert_eq!(init["approval_visible"], true, "{v}");
+    assert_eq!(init["indicator"], "!", "{v}");
+    assert_eq!(init["label"], "Graph, plan awaiting approval", "{v}");
+    // FR-1215 / FR-1221: the chat carries the approval card the whole time.
+    assert!(init["card"].is_object(), "{v}");
+    // Closed while pending -> it stays closed (no re-open on the next
+    // snapshot) and the inline card is visible in the chat.
+    let closed = &v["closed"];
+    assert_eq!(closed["graph_hidden"], true, "{v}");
+    let card = &closed["card"];
+    assert_eq!(card["visible"], true, "{v}");
+    let text = card["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("Plan rev 1 is waiting for your approval"),
+        "{v}"
+    );
+    assert!(text.contains("2 steps"), "{v}");
+    // `dmuxai serve` is view-only: the decisions are shown but disabled;
+    // "Open graph" still works.
+    for k in ["approve", "edit", "reject"] {
+        assert_eq!(card[k]["disabled"], true, "{k}: {v}");
+    }
+    assert_eq!(card["open"]["disabled"], false, "{v}");
+    assert!(
+        text.contains("view-only") || text.contains("View-only"),
+        "{v}"
+    );
+    assert_eq!(v["reopened"]["graph_hidden"], false, "{v}");
+    assert_eq!(v["reopened"]["approval_visible"], true, "{v}");
+}
+
+// TC-1211: inline_activity_rows_in_headless_chrome (FR-1217, FR-1218,
+// FR-1219, FR-1220)
+#[test]
+#[ignore = "needs Chrome/Chromium; run with --ignored"]
+fn inline_activity_rows_in_headless_chrome() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let workspace = workspace_with_run(DONE_RUN);
+    let home = tempfile::tempdir().expect("temp home");
+    let (_guard, url) = start_serve(workspace.path(), home.path());
+    let script = r##"
+import sys, json, copy
+from playwright.sync_api import sync_playwright
+
+TURNS = {"turns": [
+    {"id": "t1", "agent": "demo", "graph_id": "run-done", "node_id": "b", "started_ms": 1, "finished_ms": 2,
+     "files": [{"path": "src/export.rs", "change": "created"}, {"path": "docs/plan.md", "change": "modified"}],
+     "truncated": False, "output_tail": ["Added the export."], "links": [], "message_id": "c1:4"},
+]}
+NODES = [
+    {"id": "a", "role": "plan", "job": "plan", "runner": "cursor", "model_id": "m", "status": "completed", "attempt": 1,
+     "started_at_ms": 1000, "finished_at_ms": 61000, "elapsed_ms": 60000, "deps": []},
+    {"id": "b", "role": "implement", "job": "build", "runner": "cursor", "model_id": "m", "status": "completed", "attempt": 1,
+     "started_at_ms": 61000, "finished_at_ms": 121000, "elapsed_ms": 60000, "deps": ["a"]},
+]
+SNAP = {"source": "tui", "workspace": "/tmp/x", "agents": [],
+    "graph": {"id": "run-done", "phase": "completed", "user_prompt": "Add CSV export", "nodes": NODES},
+    "session": {
+    "conversation_id": "c1", "conversation_title": "t", "selected_agent": "demo", "details_expanded": False,
+    "agents": [{"id": "demo", "label": "demo", "allowed": True, "busy": False, "modes": ["ask"], "mode": "ask",
+                "models": [], "model": None, "effort": None, "models_loading": False}],
+    "conversations": [], "transcript_omitted": 0,
+    "transcript": [
+        {"id": "c1:0", "role": "user", "agent": None, "content": "Add CSV export", "streaming": False},
+        {"id": "c1:1", "role": "activity", "agent": "demo", "content": "\u25b8 read src/reports.rs \u2713 1.0s", "streaming": False},
+        {"id": "c1:2", "role": "activity", "agent": "demo", "content": "\u25b8 edit src/export.rs \u2713 0.4s", "streaming": False},
+        {"id": "c1:3", "role": "activity", "agent": "demo", "content": "\u25b8 run cargo test export \u2713 6.0s", "streaming": False},
+        {"id": "c1:4", "role": "agent", "agent": "demo", "content": "Added the export.", "streaming": False},
+    ]}}
+
+ROWS = """() => {
+  const t = document.querySelector('.session-transcript');
+  const run = t.querySelector(':scope > li.chat-aux-run');
+  const acts = t.querySelector(':scope > li.chat-aux-acts');
+  const head = li => li ? li.querySelector('.chat-aux-head') : null;
+  const kids = [...t.children].map(li => li.getAttribute('data-msg-id') || (li.classList.contains('chat-aux') ? li.getAttribute('data-aux-key') : li.className));
+  return {
+    order: kids,
+    run_text: run ? head(run).innerText : null,
+    run_expanded: run ? head(run).getAttribute('aria-expanded') : null,
+    run_live: run ? run.classList.contains('chat-aux-live') : null,
+    steps_hidden: run && run.querySelector('.chat-aux-steps') ? run.querySelector('.chat-aux-steps').hidden : null,
+    steps: run ? [...run.querySelectorAll('.chat-aux-step-btn')].filter(b => b.getClientRects().length).map(b => b.innerText) : [],
+    acts_text: acts ? head(acts).innerText : null,
+    acts_expanded: acts ? head(acts).getAttribute('aria-expanded') : null,
+    acts_visible: [...t.querySelectorAll(':scope > li.msg-activity')].filter(li => li.getClientRects().length).length,
+    working: !!t.querySelector(':scope > li.msg-working'),
+    files: [...document.querySelectorAll('.msg-doc-card-file-btn')].map(b => b.innerText),
+    graph_hidden: document.querySelector('#graph').hidden,
+    docs_hidden: document.querySelector('#docs').hidden,
+    detail_visible: !document.querySelector('#graph-detail').hidden,
+    detail_text: document.querySelector('#graph-detail').innerText,
+    active: document.activeElement ? (document.activeElement.innerText || '') : ''
+  };
+}"""
+
+out = {}
+with sync_playwright() as p:
+    b = p.chromium.launch(executable_path=sys.argv[1], args=["--no-sandbox"])
+    pg = b.new_page(viewport={"width": 1440, "height": 900}, bypass_csp=True)
+    pg.on("pageerror", lambda e: print("PAGEERROR", e, file=sys.stderr))
+    pg.route("**/api/docs/changes*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=json.dumps(TURNS)))
+    pg.goto(sys.argv[2])
+    pg.wait_for_function("() => document.querySelector('#graph-phase').textContent === 'completed'", timeout=15000)
+    send = lambda snap: pg.evaluate("snap => document.dispatchEvent(new CustomEvent('dmuxai:snapshot', {detail: snap}))", snap)
+    send(SNAP)
+    pg.wait_for_selector("li.chat-aux-run", timeout=15000)
+    pg.wait_for_selector(".msg-doc-card-file-btn", timeout=15000)
+    out["initial"] = pg.evaluate(ROWS)
+    pg.click("li.chat-aux-acts .chat-aux-head")
+    pg.click("li.chat-aux-run .chat-aux-head")
+    out["expanded"] = pg.evaluate(ROWS)
+    # A step opens the Graph view focused on that node.
+    pg.click("li.chat-aux-run .chat-aux-step-btn >> nth=1")
+    pg.wait_for_timeout(900)
+    out["step"] = pg.evaluate(ROWS)
+    pg.keyboard.press("Escape")
+    pg.keyboard.press("Escape")
+    pg.wait_for_timeout(300)
+    # A file row opens Diff at that file.
+    pg.click(".msg-doc-card-file-btn >> nth=1")
+    pg.wait_for_timeout(900)
+    out["file"] = pg.evaluate(ROWS)
+    pg.keyboard.press("Escape")
+    # Live: a running graph and, separately, a single running agent.
+    live = copy.deepcopy(SNAP)
+    live["graph"]["phase"] = "running"
+    live["graph"]["nodes"][1].update({"status": "running", "finished_at_ms": None, "elapsed_ms": None})
+    live["session"]["agents"][0]["run"] = {"state": "running", "started_at_ms": 61000}
+    live["session"]["transcript"] = live["session"]["transcript"][:4]
+    send(live)
+    pg.wait_for_selector("li.chat-aux-run.chat-aux-live", timeout=5000)
+    out["live_graph"] = pg.evaluate(ROWS)
+    solo = copy.deepcopy(live)
+    solo["graph"] = None
+    solo["agents"] = [{"id": "demo", "label": "demo", "activity": "\u25b8 run cargo test export",
+                       "run": {"state": "running", "started_at_ms": 61000}}]
+    send(solo)
+    pg.wait_for_timeout(300)
+    out["live_agent"] = pg.evaluate(ROWS)
+    print(json.dumps(out))
+    b.close()
+"##;
+    let v = run_probe(python, &chrome, &url, script);
+
+    // FR-1217: one muted run row after the exchange, collapsed by default.
+    let init = &v["initial"];
+    let run = init["run_text"].as_str().expect("graph run row");
+    assert!(run.contains("Ran"), "{v}");
+    assert!(run.contains("2/2 steps"), "{v}");
+    assert!(run.contains("2m"), "{v}");
+    assert_eq!(init["run_expanded"], "false", "{v}");
+    assert_eq!(init["steps_hidden"], true, "{v}");
+    assert_eq!(init["run_live"], false, "{v}");
+    let order: Vec<String> = init["order"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap_or_default().to_string())
+        .collect();
+    let reply = order.iter().position(|k| k == "c1:4").expect("reply");
+    assert_eq!(
+        order.get(reply + 1).map(String::as_str),
+        Some("graph:run-done"),
+        "{v}"
+    );
+    // FR-1219: consecutive activity lines fold into one collapsed row.
+    let acts = init["acts_text"].as_str().expect("actions row");
+    assert!(acts.contains("3 actions"), "{v}");
+    assert!(acts.contains("run cargo test export"), "{v}");
+    assert_eq!(init["acts_expanded"], "false", "{v}");
+    assert_eq!(init["acts_visible"], 0, "{v}");
+    // FR-1220: the doc card lists each file with its change.
+    let files = init["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "{v}");
+    assert!(files[0].as_str().unwrap().contains("Created"), "{v}");
+    assert!(files[0].as_str().unwrap().contains("src/export.rs"), "{v}");
+    assert!(files[1].as_str().unwrap().contains("Edited"), "{v}");
+    // Expanding shows the steps with status icons and the activity lines.
+    let exp = &v["expanded"];
+    assert_eq!(exp["run_expanded"], "true", "{v}");
+    assert_eq!(exp["acts_expanded"], "true", "{v}");
+    assert_eq!(exp["acts_visible"], 3, "{v}");
+    let steps = exp["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 2, "{v}");
+    assert!(steps[1].as_str().unwrap().contains('\u{2713}'), "{v}");
+    assert!(steps[1].as_str().unwrap().contains("implement"), "{v}");
+    // FR-1218: a step opens Graph with that node's detail.
+    let step = &v["step"];
+    assert_eq!(step["graph_hidden"], false, "{v}");
+    assert_eq!(step["detail_visible"], true, "{v}");
+    assert!(
+        step["detail_text"].as_str().unwrap().contains("build"),
+        "{v}"
+    );
+    // FR-1220: a file row opens Diff and focuses that file.
+    let file = &v["file"];
+    assert_eq!(file["docs_hidden"], false, "{v}");
+    assert!(
+        file["active"].as_str().unwrap().contains("docs/plan.md"),
+        "{v}"
+    );
+    // Live graph row: spinner line with the running step and its runner.
+    let lg = &v["live_graph"];
+    assert_eq!(lg["run_live"], true, "{v}");
+    let text = lg["run_text"].as_str().unwrap();
+    assert!(text.contains("Running b on cursor"), "{v}");
+    assert!(text.contains("1/2 steps"), "{v}");
+    assert_eq!(lg["working"], false, "{v}");
+    // Single-agent run: the agent's live activity line.
+    let la = &v["live_agent"];
+    let text = la["run_text"].as_str().expect("agent run row");
+    assert!(text.contains("demo"), "{v}");
+    assert!(text.contains("run cargo test export"), "{v}");
+    assert_eq!(la["run_live"], true, "{v}");
+    assert_eq!(la["working"], false, "{v}");
 }

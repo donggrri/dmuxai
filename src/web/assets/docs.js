@@ -98,7 +98,9 @@
   function initDocsToggle() {
     var toggle = $('docs-toggle');
     if (!toggle) { return; }
-    setDocsExpanded(readDocsExpanded());
+    var panel = $('docs');
+    // An open Diff view (restored by app.js) always shows the list.
+    setDocsExpanded(readDocsExpanded() || !!(panel && !panel.hidden));
     // A native <button> already handles Enter and Space.
     toggle.addEventListener('click', function () {
       var expanded = toggle.getAttribute('aria-expanded') !== 'true';
@@ -108,6 +110,16 @@
   }
 
   function setDocsCount(n) {
+    // FR-1212: the header Diff button carries the same count.
+    var diffCount = $('diff-count');
+    if (diffCount) {
+      diffCount.textContent = String(n || 0);
+      diffCount.hidden = !(typeof n === 'number' && n > 0);
+      var diffToggle = $('diff-toggle');
+      if (diffToggle) {
+        diffToggle.setAttribute('aria-label', n > 0 ? 'Diff, ' + n + ' changed' : 'Diff');
+      }
+    }
     var count = $('docs-count');
     if (!count) { return; }
     if (typeof n === 'number' && n > 0) {
@@ -1187,6 +1199,7 @@
 
   // FR-1210: expand the Documents panel and bring one turn into view.
   function revealTurn(turnId) {
+    if (typeof window.dmuxaiSetCenterView === 'function') { window.dmuxaiSetCenterView('diff'); }
     setDocsExpanded(true);
     writeDocsExpanded(true);
     var row = document.getElementById(docTurnDomId(turnId));
@@ -1195,7 +1208,27 @@
     flash(row);
   }
 
+  // FR-1220: open the Diff view at one file of one turn.
+  function revealFile(turnId, path) {
+    revealTurn(turnId);
+    var row = document.getElementById(docTurnDomId(turnId));
+    if (!row) { return; }
+    var links = row.querySelectorAll('.doc-file');
+    for (var i = 0; i < links.length; i++) {
+      var a = links[i].querySelector('.doc-link');
+      if (a && a.textContent === path) {
+        links[i].scrollIntoView({ block: 'center' });
+        flash(links[i]);
+        var focusable = links[i].querySelector('a');
+        if (focusable) { focusable.focus(); }
+        return;
+      }
+    }
+  }
+
   function revealMessage(messageId) {
+    // The chat sits under the Diff view; close the view first.
+    if (typeof window.dmuxaiSetCenterView === 'function') { window.dmuxaiSetCenterView(null); }
     var node = chatMessageNode(messageId);
     if (!node) { return; }
     node.scrollIntoView({ block: 'center', behavior: 'smooth' });
@@ -1249,13 +1282,30 @@
       files.length > 1 ? name + ' +' + (files.length - 1) + ' more' : name));
     head.appendChild(kindBadge(entryKind(path)));
     card.appendChild(head);
-    var preview = files.map(function (f) {
-      return String(f.change || 'modified') + ' ' + String(f.path || '');
-    }).join(' \u00b7 ');
-    card.appendChild(el('div', 'msg-doc-card-preview', truncate(preview, 160)));
-    var open = el('button', 'btn btn-small msg-doc-card-open', 'Open in Documents');
+    // FR-1220: one muted row per changed file; a row opens the Diff view at
+    // that file. The change log has no line counts, so no +N/-M is shown.
+    var list = el('ul', 'msg-doc-card-files');
+    var VERBS = { created: 'Created', modified: 'Edited', deleted: 'Deleted' };
+    files.slice(0, 5).forEach(function (f) {
+      var fpath = String(f.path || '');
+      var change = String(f.change || 'modified');
+      var li = el('li', 'msg-doc-card-file');
+      var b = el('button', 'msg-doc-card-file-btn');
+      b.type = 'button';
+      b.title = 'Show ' + fpath + ' in the Diff view';
+      b.appendChild(el('span', 'msg-doc-card-verb doc-chg-' + change, VERBS[change] || 'Edited'));
+      b.appendChild(el('span', 'msg-doc-card-path', fpath));
+      b.addEventListener('click', function () { revealFile(turn.id, fpath); });
+      li.appendChild(b);
+      list.appendChild(li);
+    });
+    if (files.length > 5) {
+      list.appendChild(el('li', 'msg-doc-card-more', '+' + (files.length - 5) + ' more files'));
+    }
+    card.appendChild(list);
+    var open = el('button', 'btn btn-small msg-doc-card-open', 'Open in Diff');
     open.type = 'button';
-    open.setAttribute('aria-controls', 'docs-body');
+    open.setAttribute('aria-controls', 'docs');
     open.addEventListener('click', function () { revealTurn(turn.id); });
     card.appendChild(open);
     return card;

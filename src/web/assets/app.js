@@ -1683,6 +1683,196 @@ function onGraphKeydown(e) {
   if (e.key === 'Escape' && graphSelectedId) { closeGraphDetail(); }
 }
 
+// ---------------------------------------------------------------------------
+// SPEC-dashboard-fullwidth FR-1211..FR-1216: Diff and Graph are center views
+// opened from header buttons. Chat stays the main center content; at most one
+// view is open, it covers the center area between the docked sidebars, and
+// the choice is kept per tab in sessionStorage.
+// ---------------------------------------------------------------------------
+
+var CENTER_VIEW_KEY = 'dmuxai.centerView';
+var CENTER_VIEWS = { diff: { panel: 'docs', toggle: 'diff-toggle' }, graph: { panel: 'graph', toggle: 'graph-toggle' } };
+var centerView = null;
+var centerViewReturnFocus = null;
+// Approval keys (graph id + plan rev) that already auto-opened the Graph view,
+// so closing it while the plan waits does not re-open it on every snapshot.
+var approvalAutoOpened = {};
+
+function readCenterView() {
+  var v = null;
+  try { v = window.sessionStorage.getItem(CENTER_VIEW_KEY); } catch (err) { v = null; }
+  return CENTER_VIEWS[v] ? v : null;
+}
+
+function writeCenterView(v) {
+  try { window.sessionStorage.setItem(CENTER_VIEW_KEY, v || ''); } catch (err) { /* ignore */ }
+}
+
+function setCenterView(next, opts) {
+  opts = opts || {};
+  if (next && !CENTER_VIEWS[next]) { next = null; }
+  var prev = centerView;
+  centerView = next;
+  Object.keys(CENTER_VIEWS).forEach(function (name) {
+    var cfg = CENTER_VIEWS[name];
+    var panel = $(cfg.panel);
+    var toggle = $(cfg.toggle);
+    var open = name === next;
+    if (panel) {
+      panel.hidden = !open;
+      panel.classList.toggle('open', open);
+    }
+    if (toggle) {
+      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      toggle.classList.toggle('active', open);
+    }
+  });
+  document.body.classList.toggle('center-view-open', !!next);
+  if (opts.persist !== false) { writeCenterView(next); }
+  if (next === 'diff') {
+    // The Diff view is the change list; show it expanded.
+    var docsToggle = $('docs-toggle');
+    if (docsToggle && docsToggle.getAttribute('aria-expanded') !== 'true') { docsToggle.click(); }
+  }
+  if (next === 'graph') {
+    // The canvas had no width while hidden; lay it out for the open view.
+    onGraphResize();
+  }
+  if (next && next !== prev && opts.focus !== false) {
+    centerViewReturnFocus = document.activeElement;
+    var close = document.querySelector('#' + CENTER_VIEWS[next].panel + ' .center-view-close');
+    if (close) { close.focus(); }
+  } else if (!next && prev && opts.focus !== false) {
+    var back = $(CENTER_VIEWS[prev].toggle);
+    if (back) { back.focus(); }
+  }
+}
+
+// docs.js opens the Diff view from chat document cards and closes it for
+// "Show in chat".
+window.dmuxaiSetCenterView = function (name) { setCenterView(name || null); };
+
+function toggleCenterView(name) {
+  setCenterView(centerView === name ? null : name);
+}
+
+function graphAwaitingApproval(graph) {
+  return !!(graph && graph.phase === 'awaiting_approval' && graph.approval);
+}
+
+// Graph button indicator: "!" while a plan waits for approval, a pulsing dot
+// while the run is active.
+function updateGraphIndicator(snap) {
+  var ind = $('graph-indicator');
+  var toggle = $('graph-toggle');
+  if (!ind || !toggle) { return; }
+  var graph = snap ? snap.graph : null;
+  var label = 'Graph';
+  ind.className = 'view-indicator';
+  if (graphAwaitingApproval(graph)) {
+    ind.hidden = false;
+    ind.textContent = '!';
+    ind.classList.add('view-indicator-approval');
+    label = 'Graph, plan awaiting approval';
+  } else if (graph && isSomethingRunning(snap) && graph.phase !== 'completed' && graph.phase !== 'failed') {
+    ind.hidden = false;
+    ind.textContent = '';
+    ind.classList.add('view-indicator-running');
+    label = 'Graph, run active';
+  } else {
+    ind.hidden = true;
+    ind.textContent = '';
+  }
+  toggle.setAttribute('aria-label', label);
+}
+
+// FR-1214, FR-1221: approval is never hidden. A new pending plan opens the
+// Graph view once; the chat always shows an inline approval card (session.js)
+// with Approve / Edit / Reject while the plan waits.
+function syncCenterViewsWithSnapshot(snap) {
+  var graph = snap ? snap.graph : null;
+  updateGraphIndicator(snap);
+  if (graphAwaitingApproval(graph)) {
+    var key = String(graph.id || '') + ':' + String(graph.approval.rev);
+    if (!approvalAutoOpened[key]) {
+      approvalAutoOpened[key] = true;
+      if (centerView !== 'graph') { setCenterView('graph', { focus: false }); }
+    }
+  }
+}
+
+// Hooks for the inline chat rows (session.js, FR-1217..FR-1221).
+window.dmuxaiServerNow = function () { return graphServerNow(snapshot, Date.now()); };
+
+window.dmuxaiFocusGraphNode = function (id) {
+  setCenterView('graph', { focus: false });
+  if (graphViewMode !== 'graph') { setGraphViewChoice('graph'); }
+  // The canvas is laid out after the view opens; select once it is drawn.
+  window.setTimeout(function () {
+    selectGraphNode(id);
+    var detail = $('graph-detail');
+    if (detail && !detail.hidden) {
+      detail.setAttribute('tabindex', '-1');
+      detail.focus();
+    }
+  }, 250);
+};
+
+// Chat approval card hooks (FR-1221); kept apart from window.dmuxaiPlanGate.
+window.dmuxaiChatPlanGate = {
+  disabled: function () { return planGateDisabled() || !currentPlanGateContext(); },
+  action: function (kind) {
+    var g = snapshot && snapshot.graph;
+    if (kind === 'open') {
+      setCenterView('graph');
+      var panel = $('graph-approval');
+      if (panel && panel.scrollIntoView) { panel.scrollIntoView({ block: 'nearest' }); }
+      return;
+    }
+    if (planGateDisabled() || !g) { return; }
+    if (kind === 'approve') { submitPlanDecision('approve'); return; }
+    if (kind === 'reject') {
+      if (!window.confirm('Reject this plan revision?')) { return; }
+      submitPlanDecision('reject');
+      return;
+    }
+    if (kind === 'edit') {
+      // Edit needs the feedback box, which lives in the Graph view.
+      setCenterView('graph', { focus: false });
+      planGateUi.editOpen = true;
+      approvalPanelFocusFeedback = true;
+      renderApprovalPanel(g);
+    }
+  }
+};
+
+function bindCenterViews() {
+  Object.keys(CENTER_VIEWS).forEach(function (name) {
+    var toggle = $(CENTER_VIEWS[name].toggle);
+    if (toggle) { toggle.addEventListener('click', function () { toggleCenterView(name); }); }
+  });
+  var closes = document.querySelectorAll('.center-view-close');
+  for (var i = 0; i < closes.length; i++) {
+    closes[i].addEventListener('click', function () { setCenterView(null); });
+  }
+  // Capture phase: runs before the inner layers' own Esc handlers, so it
+  // sees their state before they close.
+  window.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' || !centerView || e.defaultPrevented) { return; }
+    // Inner layers close first: the document preview, node details, the
+    // command palette and the plan edit box keep their own Esc.
+    var preview = document.querySelector('.doc-overlay');
+    if (preview && !preview.hidden) { return; }
+    if (centerView === 'graph' && graphSelectedId) { return; }
+    if (document.querySelector('.session-overlay')) { return; }
+    var t = e.target;
+    if (t && t.classList && t.classList.contains('graph-approval-feedback')) { return; }
+    if (t && t.closest && t.closest('.sidebar, .sessions-sidebar, .workspace-dialog-backdrop')) { return; }
+    setCenterView(null);
+  }, true);
+  setCenterView(readCenterView(), { persist: false, focus: false });
+}
+
 function bindGraphControls() {
   var listBtn = $('view-list');
   var graphBtn = $('view-graph');
@@ -3820,6 +4010,7 @@ function applySnapshot(snap) {
   lastRendered = Date.now();
   applySnapshotUi(snap);
   render(lastRendered);
+  syncCenterViewsWithSnapshot(snap);
   renderTodos(snap);
   if (isSomethingRunning(snap)) {
     scheduleTick();
@@ -3980,6 +4171,7 @@ function init() {
 
   // Graph controls (toggle, pan/zoom, details) work without a token too.
   bindGraphControls();
+  bindCenterViews();
 
   if (!token) {
     showMsg(

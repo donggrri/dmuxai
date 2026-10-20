@@ -49,6 +49,10 @@
   var conversationShown = null;
   var messageNodes = {};
   var stickToBottom = true;
+  // Last full dashboard snapshot (graph, agents) for the inline activity rows.
+  var lastSnap = null;
+  // Expanded state of inline rows, keyed by data-aux-key (default collapsed).
+  var auxExpanded = {};
   var palette = null;
   var workspaceKey = '';
   var workspaceInitialized = null;
@@ -364,6 +368,7 @@
 
     root.appendChild(form);
     trackHeaderHeight();
+    window.setInterval(tickLiveRows, 1000);
 
     document.addEventListener('keydown', function (e) {
       if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
@@ -383,6 +388,289 @@
         }
       }
     });
+  }
+
+  // ---- Inline activity rows (SPEC-dashboard-fullwidth FR-1217..FR-1221) ----
+  // Grok-app style: the agent's processing shows in the chat stream as muted,
+  // one-line, collapsible rows. They are rebuilt from the current snapshot on
+  // every render and live in <li class="chat-aux"> elements between messages.
+
+  var STEP_ICONS = { completed: '\u2713', running: '\u25CF', failed: '\u2717', skipped: '\u2013',
+    waiting_gate: '\u23F8', ready: '\u25CB', pending: '\u25CB' };
+
+  function fmtElapsed(ms) {
+    var total = Math.max(0, Math.floor(ms / 1000));
+    var h = Math.floor(total / 3600);
+    var m = Math.floor((total % 3600) / 60);
+    var sec = total % 60;
+    if (h > 0) { return h + 'h' + (m ? ' ' + m + 'm' : ''); }
+    if (m > 0) { return m + 'm' + (sec ? ' ' + sec + 's' : ''); }
+    return sec + 's';
+  }
+
+  function serverNow() {
+    return typeof window.dmuxaiServerNow === 'function' ? window.dmuxaiServerNow() : Date.now();
+  }
+
+  // A collapsible row: a one-line header button and an optional detail list.
+  function auxRow(key, cls, headParts, detail) {
+    var li = el('li', 'chat-aux ' + cls);
+    li.setAttribute('data-aux-key', key);
+    var head = el(detail ? 'button' : 'div', 'chat-aux-head');
+    if (detail) {
+      head.type = 'button';
+      head.setAttribute('data-aux-key', key);
+      var open = !!auxExpanded[key];
+      head.setAttribute('aria-expanded', open ? 'true' : 'false');
+      head.appendChild(el('span', 'chat-aux-caret'));
+      head.lastChild.setAttribute('aria-hidden', 'true');
+      head.addEventListener('click', function () {
+        auxExpanded[key] = !auxExpanded[key];
+        head.setAttribute('aria-expanded', auxExpanded[key] ? 'true' : 'false');
+        detail.hidden = !auxExpanded[key];
+      });
+      detail.hidden = !open;
+    }
+    headParts.forEach(function (part) { if (part) { head.appendChild(part); } });
+    li.appendChild(head);
+    if (detail) { li.appendChild(detail); }
+    return li;
+  }
+
+  // Live rows keep their elapsed time current between snapshots.
+  function liveText(lineFn, live) {
+    var span = el('span', 'chat-aux-text', lineFn());
+    if (live) { span.dmuxLine = lineFn; }
+    return span;
+  }
+
+  function tickLiveRows() {
+    if (!ui.transcript) { return; }
+    ui.transcript.querySelectorAll('li.chat-aux-live .chat-aux-text').forEach(function (span) {
+      if (typeof span.dmuxLine === 'function') { span.textContent = span.dmuxLine(); }
+    });
+  }
+
+  function graphElapsed(graph, now) {
+    var start = null;
+    var end = 0;
+    (graph.nodes || []).forEach(function (n) {
+      if (typeof n.started_at_ms === 'number' && (start === null || n.started_at_ms < start)) { start = n.started_at_ms; }
+      if (typeof n.finished_at_ms === 'number' && n.finished_at_ms > end) { end = n.finished_at_ms; }
+    });
+    if (start === null) { return null; }
+    var finished = graph.phase === 'completed' || graph.phase === 'failed';
+    return (finished && end ? end : now) - start;
+  }
+
+  // FR-1217, FR-1218: the graph run as one status row with an expandable step
+  // list; a step opens the Graph view focused on that node.
+  function graphRunRow(graph) {
+    var nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+    if (!nodes.length || graph.phase === 'awaiting_approval') { return null; }
+    var done = 0;
+    var running = [];
+    nodes.forEach(function (n) {
+      var st = String(n.status || 'pending');
+      if (st === 'completed' || st === 'skipped') { done++; }
+      if (st === 'running') { running.push(String(n.id) + (n.runner ? ' on ' + n.runner : '')); }
+    });
+    var active = graph.phase !== 'completed' && graph.phase !== 'failed';
+    var verb;
+    if (graph.phase === 'failed') { verb = 'Run failed'; }
+    else if (!active) { verb = 'Ran'; }
+    else if (running.length) { verb = 'Running ' + running.join(', '); }
+    else { verb = 'Waiting'; }
+    var parts = [];
+    if (active) { parts.push(el('span', 'spinner')); }
+    else { parts.push(el('span', 'chat-aux-icon chat-aux-' + (graph.phase === 'failed' ? 'failed' : 'ok'), graph.phase === 'failed' ? '\u2717' : '\u2713')); }
+    var lineFn = function () {
+      var line = verb + ' \u00b7 ' + done + '/' + nodes.length + ' steps';
+      var ms = graphElapsed(graph, serverNow());
+      if (ms !== null) { line += ' \u00b7 ' + fmtElapsed(ms); }
+      return line;
+    };
+    parts.push(liveText(lineFn, active));
+    var list = el('ul', 'chat-aux-steps');
+    nodes.forEach(function (n) {
+      var st = String(n.status || 'pending');
+      var item = el('li', 'chat-aux-step chat-aux-step-' + st);
+      var b = el('button', 'chat-aux-step-btn');
+      b.type = 'button';
+      b.title = 'Show ' + n.id + ' in the Graph view';
+      b.appendChild(el('span', 'chat-aux-icon', STEP_ICONS[st] || '\u25CB'));
+      b.lastChild.setAttribute('aria-hidden', 'true');
+      b.appendChild(el('span', 'chat-aux-step-id', String(n.id)));
+      b.appendChild(el('span', 'chat-aux-step-meta',
+        [n.role, n.runner].filter(Boolean).join(' \u00b7 ') + ' \u00b7 ' + st.replace('_', ' ') +
+        (typeof n.elapsed_ms === 'number' ? ' \u00b7 ' + fmtElapsed(n.elapsed_ms) : '')));
+      b.addEventListener('click', function () {
+        if (typeof window.dmuxaiFocusGraphNode === 'function') { window.dmuxaiFocusGraphNode(String(n.id)); }
+      });
+      item.appendChild(b);
+      list.appendChild(item);
+    });
+    return auxRow('graph:' + graph.id, 'chat-aux-run' + (active ? ' chat-aux-live' : ''), parts, list);
+  }
+
+  // Single-agent turn in progress: the live activity line from the snapshot.
+  function agentRunRow(agent) {
+    if (!agent || !agent.run || agent.run.state !== 'running') { return null; }
+    var parts = [el('span', 'spinner')];
+    var lineFn = function () {
+      var line = String(agent.label || agent.id || 'agent');
+      var act = agent.activity ? String(agent.activity) : 'working';
+      line += ' \u00b7 ' + act.replace(/^\u25B8\s*/, '');
+      if (typeof agent.run.started_at_ms === 'number') {
+        line += ' \u00b7 ' + fmtElapsed(serverNow() - agent.run.started_at_ms);
+      }
+      return line;
+    };
+    parts.push(liveText(lineFn, true));
+    return auxRow('agent:' + agent.id, 'chat-aux-run chat-aux-live', parts, null);
+  }
+
+  // FR-1221: a pending plan is an inline card with Approve / Edit / Reject.
+  function approvalRow(graph) {
+    if (!graph || graph.phase !== 'awaiting_approval' || !graph.approval) { return null; }
+    var gate = window.dmuxaiChatPlanGate || null;
+    var approval = graph.approval;
+    var steps = Array.isArray(approval.steps) ? approval.steps.length : 0;
+    var li = el('li', 'chat-aux chat-aux-approval');
+    li.setAttribute('data-aux-key', 'approval:' + graph.id + ':' + approval.rev);
+    li.setAttribute('role', 'group');
+    li.setAttribute('aria-label', 'Plan approval');
+    var head = el('div', 'chat-aux-head');
+    head.appendChild(el('span', 'chat-aux-icon chat-aux-warn', '!'));
+    head.lastChild.setAttribute('aria-hidden', 'true');
+    head.appendChild(el('span', 'chat-aux-text',
+      'Plan rev ' + approval.rev + ' is waiting for your approval \u00b7 ' + steps + (steps === 1 ? ' step' : ' steps')));
+    li.appendChild(head);
+    var actions = el('div', 'chat-aux-actions');
+    var disabled = !gate || gate.disabled();
+    [['Approve', 'approve', 'btn-primary'], ['Edit', 'edit', ''], ['Reject', 'reject', 'btn-danger'],
+      ['Open graph', 'open', '']].forEach(function (spec) {
+      var b = el('button', 'btn btn-small chat-aux-approval-' + spec[1] + (spec[2] ? ' ' + spec[2] : ''), spec[0]);
+      b.type = 'button';
+      b.disabled = spec[1] !== 'open' && disabled;
+      b.addEventListener('click', function () { if (gate) { gate.action(spec[1]); } });
+      actions.appendChild(b);
+    });
+    li.appendChild(actions);
+    if (disabled && viewOnly) {
+      li.appendChild(el('div', 'chat-aux-note', 'View-only: start dmuxai --web to decide from the browser.'));
+    }
+    return li;
+  }
+
+  // FR-1219: consecutive activity messages (tool calls, commands, thinking)
+  // fold into one row: "N actions · <latest>"; expanding shows each line.
+  function groupActivities() {
+    var t = ui.transcript;
+    var child = t.firstChild;
+    while (child) {
+      if (child.classList && child.classList.contains('msg-activity')) {
+        var members = [];
+        var cur = child;
+        while (cur && cur.classList && cur.classList.contains('msg-activity')) {
+          members.push(cur);
+          cur = cur.nextSibling;
+        }
+        var key = 'acts:' + members[0].getAttribute('data-msg-id');
+        var last = members[members.length - 1].dmuxText ? members[members.length - 1].dmuxText.textContent : '';
+        var running = members.some(function (m) {
+          var txt = m.dmuxText ? m.dmuxText.textContent : '';
+          return txt.indexOf('\u2713') < 0 && txt.indexOf('\u2717') < 0 && /^\u25B8/.test(txt);
+        });
+        var parts = [];
+        parts.push(running ? el('span', 'spinner') : el('span', 'chat-aux-icon', '\u2699'));
+        if (!running) { parts[0].setAttribute('aria-hidden', 'true'); }
+        parts.push(el('span', 'chat-aux-text',
+          members.length + (members.length === 1 ? ' action' : ' actions') + ' \u00b7 ' + last.replace(/^\u25B8\s*/, '')));
+        var detail = el('div', 'chat-aux-detail-marker');
+        var row = auxRow(key, 'chat-aux-acts', parts, detail);
+        // The members stay in place; the row only shows or hides them.
+        detail.hidden = true;
+        row.removeChild(detail);
+        var open = !!auxExpanded[key];
+        members.forEach(function (m) { m.hidden = !open; m.classList.add('msg-activity-grouped'); });
+        var head = row.querySelector('.chat-aux-head');
+        head.addEventListener('click', function () {
+          members.forEach(function (m) { m.hidden = !auxExpanded[key]; });
+        });
+        t.insertBefore(row, members[0]);
+        child = cur;
+      } else {
+        child = child.nextSibling;
+      }
+    }
+  }
+
+  // Index of the chat <li> after which the graph rows go: the last message of
+  // the exchange whose user prompt started this graph, else the end.
+  function graphAnchor(graph) {
+    var t = ui.transcript;
+    var prompt = String(graph.user_prompt || '').trim();
+    var users = t.querySelectorAll(':scope > li.msg-user');
+    var start = null;
+    for (var i = users.length - 1; i >= 0 && prompt; i--) {
+      if ((users[i].dmuxText ? users[i].dmuxText.textContent : '').trim() === prompt) { start = users[i]; break; }
+    }
+    if (!start) { return null; }
+    var anchor = start;
+    var next = start.nextSibling;
+    while (next && !(next.classList && next.classList.contains('msg-user'))) {
+      if (next.classList && next.classList.contains('msg')) { anchor = next; }
+      next = next.nextSibling;
+    }
+    return anchor;
+  }
+
+  function insertAfter(node, anchor) {
+    var t = ui.transcript;
+    if (anchor && anchor.parentNode === t) { t.insertBefore(node, anchor.nextSibling); }
+    else { t.appendChild(node); }
+  }
+
+  function renderChatAux() {
+    if (!ui.transcript) { return; }
+    var t = ui.transcript;
+    var active = document.activeElement;
+    var focusKey = active && active.closest && t.contains(active) && active.getAttribute('data-aux-key');
+    Array.prototype.slice.call(t.querySelectorAll(':scope > li.chat-aux')).forEach(function (n) { t.removeChild(n); });
+    Array.prototype.slice.call(t.querySelectorAll(':scope > li.msg-activity-grouped')).forEach(function (n) {
+      n.hidden = false;
+      n.classList.remove('msg-activity-grouped');
+    });
+    groupActivities();
+    var snap = lastSnap || {};
+    var graph = snap.graph || null;
+    if (graph) {
+      var anchor = graphAnchor(graph);
+      var runRow = graphRunRow(graph);
+      var appr = approvalRow(graph);
+      if (appr) { insertAfter(appr, anchor); }
+      if (runRow) { insertAfter(runRow, anchor); }
+    }
+    var graphLive = graph && graph.phase !== 'completed' && graph.phase !== 'failed';
+    if (graphLive && t.querySelector(':scope > li.chat-aux-run.chat-aux-live')) {
+      var busy = t.querySelector(':scope > li.msg-working');
+      if (busy) { busy.parentNode.removeChild(busy); }
+    }
+    if (!graphLive) {
+      (snap.agents || []).forEach(function (a) {
+        var row = agentRunRow(a);
+        if (row) {
+          var working = t.querySelector(':scope > li.msg-working');
+          if (working) { working.parentNode.removeChild(working); }
+          t.appendChild(row);
+        }
+      });
+    }
+    if (focusKey) {
+      var again = t.querySelector('button[data-aux-key="' + String(focusKey).replace(/["\\]/g, '\\$&') + '"]');
+      if (again) { again.focus(); }
+    }
   }
 
   // ---- ChatGPT-style layout (SPEC-dashboard-fullwidth FR-1205..FR-1208) ----
@@ -645,6 +933,7 @@
     } else if (workingNode) {
       workingNode.parentNode.removeChild(workingNode);
     }
+    renderChatAux();
     // docs.js links agent turns that changed files to their chat message
     // (SPEC-dashboard-fullwidth FR-1209, FR-1210).
     window.dispatchEvent(new window.CustomEvent('dmuxai:transcript-rendered'));
@@ -943,6 +1232,7 @@
 
   function applySnapshot(snap) {
     if (!snap) { return; }
+    lastSnap = snap;
     if (snap.workspace) {
       initSessionsSidebarForWorkspace(snap.workspace);
     }
@@ -962,6 +1252,7 @@
       session = null;
       [ui.agent, ui.mode, ui.model, ui.effort, ui.input, ui.send].forEach(function (c) { c.disabled = true; });
       renderConversations();
+      renderChatAux();
     }
   }
 

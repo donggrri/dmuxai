@@ -1128,3 +1128,117 @@ body.sidebar-resizing .sidebar-resize-handle.is-dragging::after {
 @media (prefers-reduced-motion: reduce) {
   .doc-turn.flash, .session-transcript li.flash { animation: none; }
 }
+
+/* ---------------------------------------------------------------------------
+ * SPEC-dashboard-fullwidth FR-1211..FR-1216: Diff and Graph center views.
+ * Hidden by default; an open view covers the center area between the docked
+ * sidebars and below the sticky header, so the graph gets the full width.
+ * ------------------------------------------------------------------------- */
+
+.center-view[hidden] {
+  display: none !important;
+}
+
+.center-view.open {
+  position: fixed;
+  top: calc(var(--top-h, 56px) + 10px);
+  left: calc(var(--left-dock, 0px) + 14px);
+  right: calc(var(--right-dock, 0px) + 14px);
+  bottom: 14px;
+  z-index: 9;
+  margin: 0;
+  overflow: auto;
+  box-sizing: border-box;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
+  transition: left 0.2s ease-in-out, right 0.2s ease-in-out;
+}
+
+.center-view-head {
+  display: none;
+}
+
+.center-view.open .center-view-head {
+  position: sticky;
+  top: -12px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: -12px -14px 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-panel);
+}
+
+.center-view-title {
+  margin: 0;
+  font-size: 0.8em;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* In the Diff view the change list uses the whole view height. */
+.center-view.open .docs-changes {
+  max-height: none;
+}
+
+.view-indicator {
+  display: inline-block;
+  min-width: 0.6em;
+  height: 0.6em;
+  margin-left: 4px;
+  border-radius: 999px;
+  vertical-align: 0.05em;
+}
+
+.view-indicator[hidden] {
+  display: none;
+}
+
+.view-indicator-running {
+  width: 0.6em;
+  background: var(--accent);
+  animation: view-pulse 1.4s ease-in-out infinite;
+}
+
+.view-indicator-approval {
+  min-width: 1.4em;
+  height: auto;
+  padding: 0 5px;
+  background: var(--warn);
+  color: var(--bg-panel);
+  font-size: 0.8em;
+  font-weight: 700;
+  line-height: 1.5;
+  text-align: center;
+  vertical-align: baseline;
+}
+
+@keyframes view-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .view-indicator-running { animation: none; }
+  .center-view.open { transition: none; }
+}
+
+.reduced-motion .view-indicator-running { animation: none; }
+.reduced-motion .center-view.open { transition: none; }
+
+
+@media (max-width: 900px) {
+  .center-view.open {
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+  }
+}
+
+.todos-count[hidden] {
+  display: none;
+}

@@ -310,7 +310,10 @@ mod tests {
         // the docs panel section.
         assert!(INDEX_HTML.contains(r#"<link rel="stylesheet" href="/assets/docs.css">"#));
         assert!(INDEX_HTML.contains(r#"<script src="/assets/docs.js" defer></script>"#));
-        assert!(INDEX_HTML.contains(r#"<section id="docs" class="panel panel-collapsible""#));
+        assert!(
+            INDEX_HTML
+                .contains(r#"<section id="docs" class="panel panel-collapsible center-view""#)
+        );
 
         // FR-746: the HTML preview iframe is set with an empty sandbox
         // attribute (setAttribute('sandbox', '')) and never grants scripts or
@@ -1615,7 +1618,108 @@ mod tests {
         let card_js = js_between(DOCS_JS, "function docCard", "function syncChatLinks");
         assert!(!card_js.contains("output_tail"));
         assert!(!card_js.contains("turnTailText"));
-        assert!(card_js.contains("'Open in Documents'"));
+        assert!(card_js.contains("'Open in Diff'"));
         assert!(DOCS_JS.contains("'Show in chat'"));
+    }
+
+    // TC-1209 (SPEC-dashboard-fullwidth FR-1211, FR-1212, FR-1213, FR-1214, FR-1215, FR-1216): Diff and Graph are
+    // header-button center views, hidden in the served HTML.
+    #[test]
+    fn diff_and_graph_center_view_assets() {
+        for (id, panel, view) in [
+            ("diff-toggle", "docs", "diff"),
+            ("graph-toggle", "graph", "graph"),
+        ] {
+            let start = INDEX_HTML
+                .find(&format!("<button id=\"{id}\""))
+                .unwrap_or_else(|| panic!("missing {id}"));
+            let tag = &INDEX_HTML[start..INDEX_HTML[start..].find('>').unwrap() + start];
+            assert!(
+                tag.contains("class=\"btn sidebar-toggle view-toggle\""),
+                "{tag}"
+            );
+            assert!(tag.contains(&format!("aria-controls=\"{panel}\"")), "{tag}");
+            assert!(tag.contains("aria-expanded=\"false\""), "{tag}");
+            assert!(tag.contains(&format!("data-view=\"{view}\"")), "{tag}");
+            let section = format!("<section id=\"{panel}\" class=\"panel");
+            let at = INDEX_HTML.find(&section).expect("view section");
+            let open_tag = &INDEX_HTML[at..INDEX_HTML[at..].find('>').unwrap() + at];
+            assert!(open_tag.contains("center-view"), "{open_tag}");
+            assert!(open_tag.ends_with(" hidden"), "{open_tag}");
+        }
+        // The buttons sit right after To-dos in the header.
+        let todos = INDEX_HTML.find("id=\"todos-toggle\"").unwrap();
+        let diff = INDEX_HTML.find("id=\"diff-toggle\"").unwrap();
+        let graph = INDEX_HTML.find("id=\"graph-toggle\"").unwrap();
+        let status = INDEX_HTML.find("<nav id=\"status\"").unwrap();
+        assert!(todos < diff && diff < graph && graph < status);
+        assert!(INDEX_HTML.contains("id=\"graph-indicator\""));
+        // FR-1215: the chat reminder is the inline approval card (FR-1221),
+        // not a separate callout.
+        assert!(!INDEX_HTML.contains("approval-callout"));
+
+        let views_js = js_between(APP_JS, "var CENTER_VIEW_KEY", "function bindGraphControls");
+        assert!(views_js.contains("'dmuxai.centerView'"));
+        assert!(views_js.contains("window.sessionStorage"));
+        assert!(!views_js.contains("localStorage"));
+        assert!(views_js.contains("toggle.setAttribute('aria-expanded'"));
+        assert!(views_js.contains("e.key !== 'Escape'"));
+        assert!(views_js.contains("graph.phase === 'awaiting_approval'"));
+        assert!(views_js.contains("approvalAutoOpened[key]"));
+        assert!(!views_js.contains("innerHTML"));
+        assert!(APP_JS.contains("bindCenterViews();"));
+        assert!(APP_JS.contains("syncCenterViewsWithSnapshot(snap);"));
+        assert!(DOCS_CSS.contains(".center-view[hidden]"));
+        assert!(DOCS_CSS.contains("left: calc(var(--left-dock, 0px) + 14px);"));
+        assert!(DOCS_CSS.contains("right: calc(var(--right-dock, 0px) + 14px);"));
+        assert!(DOCS_CSS.contains(".view-indicator-approval"));
+        assert!(DOCS_CSS.contains(".todos-count[hidden]"));
+        assert!(DOCS_JS.contains("window.dmuxaiSetCenterView('diff')"));
+        assert!(DOCS_JS.contains("$('diff-count')"));
+    }
+
+    // TC-1212 (SPEC-dashboard-fullwidth FR-1217, FR-1218, FR-1219, FR-1220,
+    // FR-1221, UX-1202): inline agent-processing rows in the chat.
+    #[test]
+    fn chat_inline_activity_assets() {
+        let aux = js_between(
+            SESSION_JS,
+            "function fmtElapsed",
+            "// ---- ChatGPT-style layout",
+        );
+        // Rows are built with DOM APIs and stay collapsed until clicked.
+        assert!(!aux.contains("innerHTML"));
+        assert!(aux.contains("head.setAttribute('aria-expanded', open ? 'true' : 'false')"));
+        assert!(aux.contains("detail.hidden = !open;"));
+        // FR-1217: "Running X · done/total steps · elapsed", live-updated.
+        assert!(aux.contains("verb = 'Running ' + running.join(', ')"));
+        assert!(aux.contains("' steps'"));
+        assert!(SESSION_JS.contains("window.setInterval(tickLiveRows, 1000)"));
+        // FR-1218: a step opens Graph focused on that node.
+        assert!(aux.contains("window.dmuxaiFocusGraphNode(String(n.id))"));
+        assert!(APP_JS.contains("window.dmuxaiFocusGraphNode = function (id)"));
+        // FR-1219: consecutive activity lines fold into one actions row.
+        assert!(aux.contains("' action' : ' actions'"));
+        assert!(aux.contains("msg-activity-grouped"));
+        // FR-1221: inline approval card with Approve / Edit / Reject.
+        for label in [
+            "'Approve', 'approve'",
+            "'Edit', 'edit'",
+            "'Reject', 'reject'",
+        ] {
+            assert!(aux.contains(label), "{label}");
+        }
+        assert!(aux.contains("window.dmuxaiChatPlanGate"));
+        assert!(APP_JS.contains("window.dmuxaiChatPlanGate = {"));
+        // The plan-gate API used elsewhere is still defined once.
+        assert_eq!(APP_JS.matches("window.dmuxaiPlanGate = {").count(), 1);
+        // FR-1220: doc card file rows open Diff at that file.
+        assert!(DOCS_JS.contains("msg-doc-card-file-btn"));
+        assert!(DOCS_JS.contains("function revealFile(turnId, path)"));
+        // UX-1202: muted one-line rows in both themes, reduced motion honoured.
+        assert!(SESSION_CSS.contains(".session-transcript > li.chat-aux {"));
+        assert!(SESSION_CSS.contains(".chat-aux-approval"));
+        assert!(SESSION_CSS.contains("li.chat-aux { margin-bottom: .5rem; color: var(--muted)"));
+        assert!(SESSION_CSS.contains("@media (prefers-reduced-motion: reduce) { .chat-aux-caret"));
     }
 }

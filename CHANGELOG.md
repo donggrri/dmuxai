@@ -16,12 +16,28 @@ All notable changes to dmuxai are listed here. Versions follow
   the bottom (Send inside), right-aligned user bubbles, plain agent text with
   styled code blocks, and a centered ~860px reading column.
 
+- **Diff and Graph open from header buttons (FR-1211..FR-1216).** The change
+  list (Diff) and the graph run (swimlane, plan approval, task checklist) are no
+  longer inline in the center. `Diff` and `Graph` buttons next to To-dos open
+  them over the center area (Esc or a second click closes; kept per tab). The
+  Graph button shows `!` while a plan waits for approval and a dot while a run
+  is active; a pending plan opens the Graph view once, and the chat always
+  shows an inline approval card.
+
+- **Agent processing inline in the chat (FR-1217..FR-1221).** Compact, muted,
+  collapsible one-line rows: a live "Running <step> on <runner> · 2/8 steps ·
+  29s" row whose steps open the Graph view at that node; "N actions" rows that
+  fold the turn's tool activity; per-file rows on the document card that open
+  Diff at that file; and an inline plan approval card with Approve / Edit /
+  Reject. Line counts (+N/−M) are not shown because change records do not
+  carry them.
+
 ### Fixed
 
 - **Agent replies no longer show twice (FR-1209, FR-1210).** The Documents
   panel printed each turn's output tail, which is the same text as the chat
   reply. Change records now carry the chat `message_id`; the reply stays in the
-  chat with a compact document card ("Open in Documents"), and the Documents row
+  chat with a compact document card ("Open in Diff"), and the Documents row
   keeps the changed files plus a one-line "Show in chat" reference.
 
 ## [0.2.2] - 2026-10-19
