@@ -29,6 +29,11 @@ ammonia = "4"
 linkify = "0.10"
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "html", "regex-fancy", "parsing"] }
 
+[[bin]]
+name = "fake-acp-agent"
+path = "tests/fixtures/fake_acp_agent.rs"
+test = false
+
 [dev-dependencies]
 filetime = "0.2.27"
 tempfile = "3.27.0"

@@ -16,12 +16,16 @@ use tokio::{
 };
 
 use super::{
-    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ExecutionMode,
-    ModelInfo, OutputContext, SpawnedAdapter, implement_outcome::ImplementTurnTracker,
+    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ModelInfo,
+    OutputContext, SpawnedAdapter, TurnPolicy, implement_outcome::ImplementTurnTracker,
     prompt_with_image_tokens,
 };
 use dmuxai::process::cursor_command;
+use dmuxai::runner_protocol::RunnerProtocol;
 use dmuxai::settings::DmuxSettings;
+
+use super::acp::PermissionContext;
+use super::acp_runner;
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const STDERR_HISTORY_CAPACITY: usize = 8;
@@ -34,7 +38,6 @@ enum CursorCommand {
     Cancel,
     ListModels,
     SelectModel(String),
-    SelectMode(ExecutionMode),
     Prewarm,
     Reset,
     Tick,
@@ -45,6 +48,7 @@ pub struct CursorAdapterConfig {
     pub windows_unsandboxed: bool,
     pub prewarm: bool,
     pub prewarm_idle_secs: u64,
+    pub protocol: RunnerProtocol,
 }
 
 impl Default for CursorAdapterConfig {
@@ -53,6 +57,7 @@ impl Default for CursorAdapterConfig {
             windows_unsandboxed: false,
             prewarm: false,
             prewarm_idle_secs: 300,
+            protocol: RunnerProtocol::Acp,
         }
     }
 }
@@ -63,6 +68,7 @@ impl From<DmuxSettings> for CursorAdapterConfig {
             windows_unsandboxed: settings.cursor_windows_unsandboxed,
             prewarm: settings.cursor_prewarm,
             prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
+            protocol: settings.cursor_protocol,
         }
     }
 }
@@ -73,6 +79,7 @@ impl From<&DmuxSettings> for CursorAdapterConfig {
             windows_unsandboxed: settings.cursor_windows_unsandboxed,
             prewarm: settings.cursor_prewarm,
             prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
+            protocol: settings.cursor_protocol,
         }
     }
 }
@@ -83,12 +90,14 @@ impl CursorAdapterConfig {
             windows_unsandboxed: settings.cursor_windows_unsandboxed,
             prewarm: prewarm && settings.cursor_prewarm,
             prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
+            protocol: settings.cursor_protocol,
         }
     }
 }
 
 pub struct CursorAdapter {
     command_tx: mpsc::Sender<CursorCommand>,
+    #[allow(dead_code)]
     windows_unsandboxed: bool,
     /// Bumped synchronously by `reset()`. The runtime applies a pending reset
     /// before handling any later command, so a reset is never lost or
@@ -134,17 +143,6 @@ impl AgentAdapter for CursorAdapter {
     fn select_model(&self, model: String) -> Result<(), AdapterError> {
         self.command_tx
             .try_send(CursorCommand::SelectModel(model))
-            .map_err(map_send_error)
-    }
-
-    fn validate_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
-        validate_cursor_mode(mode, self.windows_unsandboxed)
-    }
-
-    fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
-        validate_cursor_mode(mode, self.windows_unsandboxed)?;
-        self.command_tx
-            .try_send(CursorCommand::SelectMode(mode))
             .map_err(map_send_error)
     }
 
@@ -281,7 +279,7 @@ async fn reap_warm_process(mut warm: WarmProcess) {
 fn spawn_warm_process(
     resume_session: Option<&str>,
     selected_model: Option<&str>,
-    mode: ExecutionMode,
+    mode: TurnPolicy,
     cwd: &Path,
     windows_unsandboxed: bool,
 ) -> io::Result<WarmProcess> {
@@ -329,16 +327,16 @@ async fn runtime_loop(
     reset_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let windows_unsandboxed = config.windows_unsandboxed;
+    let protocol = config.protocol;
     let idle_limit = std::time::Duration::from_secs(config.prewarm_idle_secs);
     let applicable: Vec<dmuxai::mcp::ResolvedMcpServer> = mcp_servers
         .into_iter()
         .filter(|s| s.applies_to("cursor"))
         .collect();
-    let can_prewarm = config.prewarm && applicable.is_empty();
+    let can_prewarm = config.prewarm && applicable.is_empty() && protocol == RunnerProtocol::Legacy;
     let cursor_notice_emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut active: Option<ActiveTurn> = None;
     let mut selected_model: Option<String> = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
-    let mut selected_mode = ExecutionMode::default();
     let mut latest_session_id: Option<String> = None;
     let mut reset_epoch: u64 = 0;
     let mut warm_process: Option<WarmProcess> = None;
@@ -396,7 +394,8 @@ async fn runtime_loop(
 
             match command {
                 CursorCommand::Send { request, is_graph } => {
-                    if let Err(error) = validate_cursor_mode(selected_mode, windows_unsandboxed) {
+                    if let Err(error) = validate_cursor_policy(request.policy, windows_unsandboxed)
+                    {
                         let context = OutputContext::from(&request);
                         send_event(
                             &event_tx,
@@ -412,10 +411,10 @@ async fn runtime_loop(
                             request,
                             None,
                             selected_model.clone(),
-                            selected_mode,
                             cwd.clone(),
                             event_tx.clone(),
                             windows_unsandboxed,
+                            protocol,
                             applicable.clone(),
                             cursor_notice_emitted.clone(),
                             true,
@@ -428,7 +427,7 @@ async fn runtime_loop(
                                 cmd,
                                 request.resume_session.as_deref(),
                                 selected_model.as_deref(),
-                                selected_mode,
+                                request.policy,
                                 &cwd,
                                 windows_unsandboxed,
                             );
@@ -482,10 +481,10 @@ async fn runtime_loop(
                             request,
                             warm_child,
                             selected_model.clone(),
-                            selected_mode,
                             cwd.clone(),
                             event_tx.clone(),
                             windows_unsandboxed,
+                            protocol,
                             applicable.clone(),
                             cursor_notice_emitted.clone(),
                             false,
@@ -531,7 +530,7 @@ async fn runtime_loop(
                             warm_process = spawn_warm_process(
                                 latest_session_id.as_deref(),
                                 selected_model.as_deref(),
-                                selected_mode,
+                                TurnPolicy::Agent,
                                 &cwd,
                                 windows_unsandboxed,
                             )
@@ -540,30 +539,12 @@ async fn runtime_loop(
                     }
                     send_event(&event_tx, None, AgentEvent::ModelSelected(model)).await;
                 }
-                CursorCommand::SelectMode(mode) => {
-                    let changed = selected_mode != mode;
-                    selected_mode = mode;
-                    if changed && let Some(warm) = warm_process.take() {
-                        reap_warm_process(warm).await;
-                        if can_prewarm {
-                            warm_process = spawn_warm_process(
-                                latest_session_id.as_deref(),
-                                selected_model.as_deref(),
-                                selected_mode,
-                                &cwd,
-                                windows_unsandboxed,
-                            )
-                            .ok();
-                        }
-                    }
-                    send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
-                }
                 CursorCommand::Prewarm => {
                     if warm_process.is_none() && can_prewarm {
                         warm_process = spawn_warm_process(
                             latest_session_id.as_deref(),
                             selected_model.as_deref(),
-                            selected_mode,
+                            TurnPolicy::Agent,
                             &cwd,
                             windows_unsandboxed,
                         )
@@ -591,7 +572,7 @@ async fn runtime_loop(
                     warm_process = spawn_warm_process(
                         latest_session_id.as_deref(),
                         selected_model.as_deref(),
-                        selected_mode,
+                        TurnPolicy::Agent,
                         &cwd,
                         windows_unsandboxed,
                     )
@@ -609,7 +590,7 @@ async fn runtime_loop(
                             warm_process = spawn_warm_process(
                                 latest_session_id.as_deref(),
                                 selected_model.as_deref(),
-                                selected_mode,
+                                TurnPolicy::Agent,
                                 &cwd,
                                 windows_unsandboxed,
                             )
@@ -645,17 +626,6 @@ async fn runtime_loop(
                             ),
                         ).await;
                     }
-                    Some(CursorCommand::SelectMode(mode)) => {
-                        selected_mode = mode;
-                        send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
-                        send_event(
-                            &event_tx,
-                            None,
-                            AgentEvent::Notice(
-                                "Cursor mode changed; it will apply to the next turn".to_owned(),
-                            ),
-                        ).await;
-                    }
                     Some(CursorCommand::Prewarm | CursorCommand::Tick) => {}
                     // Wake-up only; handled by apply_pending_reset! above.
                     Some(CursorCommand::Reset) => {}
@@ -677,10 +647,10 @@ fn spawn_turn(
     request: AgentRequest,
     warm_child: Option<tokio::process::Child>,
     selected_model: Option<String>,
-    mode: ExecutionMode,
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
     windows_unsandboxed: bool,
+    protocol: RunnerProtocol,
     mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
     cursor_notice_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     is_graph: bool,
@@ -694,10 +664,10 @@ fn spawn_turn(
             &request,
             warm_child,
             selected_model,
-            mode,
             &cwd,
             &event_tx,
             windows_unsandboxed,
+            protocol,
             &mcp_servers,
             &cursor_notice_emitted,
         )
@@ -751,10 +721,10 @@ async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput
 pub(crate) async fn run_turn(
     request: &AgentRequest,
     selected_model: Option<String>,
-    mode: ExecutionMode,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     windows_unsandboxed: bool,
+    protocol: RunnerProtocol,
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     cursor_notice_emitted: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Option<String>> {
@@ -762,10 +732,10 @@ pub(crate) async fn run_turn(
         request,
         None,
         selected_model,
-        mode,
         cwd,
         event_tx,
         windows_unsandboxed,
+        protocol,
         mcp_servers,
         cursor_notice_emitted,
     )
@@ -777,14 +747,15 @@ async fn run_turn_with_child(
     request: &AgentRequest,
     warm_child: Option<tokio::process::Child>,
     selected_model: Option<String>,
-    mode: ExecutionMode,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     windows_unsandboxed: bool,
+    protocol: RunnerProtocol,
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     cursor_notice_emitted: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Option<String>> {
-    validate_cursor_mode(mode, windows_unsandboxed)
+    let policy = request.policy;
+    validate_cursor_policy(policy, windows_unsandboxed)
         .map_err(|error| io::Error::other(error.to_string()))?;
 
     let context = OutputContext::from(request);
@@ -818,6 +789,30 @@ async fn run_turn_with_child(
         None
     };
 
+    if protocol == RunnerProtocol::Acp {
+        if let Some(mut child) = warm_child {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        let program = PathBuf::from(cursor_command()?.as_std().get_program().to_os_string());
+        let args = acp_runner::cursor_acp_argv(selected_model.as_deref(), cwd);
+        let permission_ctx = PermissionContext {
+            workspace: cwd.to_string_lossy().into_owned(),
+            sensitive_gate_active: false,
+        };
+        return acp_runner::run_agent_acp_turn(
+            &program,
+            &args,
+            cwd,
+            request,
+            Agent::Cursor,
+            event_tx,
+            permission_ctx,
+        )
+        .await
+        .map_err(io::Error::other);
+    }
+
     let mut child = match warm_child {
         Some(child) => child,
         None => {
@@ -826,7 +821,7 @@ async fn run_turn_with_child(
                 &mut command,
                 request.resume_session.as_deref(),
                 selected_model.as_deref(),
-                mode,
+                policy,
                 cwd,
                 windows_unsandboxed,
             );
@@ -854,7 +849,7 @@ async fn run_turn_with_child(
         .ok_or_else(|| io::Error::other("Cursor stderr was not piped"))?;
 
     let context = OutputContext::from(request);
-    if mode == ExecutionMode::Implement && cfg!(windows) && windows_unsandboxed {
+    if policy == TurnPolicy::Agent && cfg!(windows) && windows_unsandboxed {
         send_event(
             event_tx,
             Some(&context),
@@ -871,29 +866,26 @@ async fn run_turn_with_child(
     stdin.shutdown().await?;
     drop(stdin);
 
-    stream_child(&mut child, stdout, stderr, event_tx, &context, mode).await
+    stream_child(&mut child, stdout, stderr, event_tx, &context, policy).await
 }
 
 fn configure_command(
     command: &mut tokio::process::Command,
     resume_session: Option<&str>,
     selected_model: Option<&str>,
-    mode: ExecutionMode,
+    mode: TurnPolicy,
     cwd: &Path,
     windows_unsandboxed: bool,
 ) {
     command.arg("--print");
     match mode {
-        ExecutionMode::Ask => {
+        TurnPolicy::ReadOnly => {
             command.args(["--mode", "ask"]);
         }
-        ExecutionMode::Plan => {
-            command.args(["--mode", "plan"]);
-        }
-        ExecutionMode::Implement if cfg!(windows) && windows_unsandboxed => {
+        TurnPolicy::Agent if cfg!(windows) && windows_unsandboxed => {
             command.arg("--force");
         }
-        ExecutionMode::Implement => {
+        TurnPolicy::Agent => {
             command.args(["--force", "--sandbox", "enabled"]);
         }
     }
@@ -924,7 +916,7 @@ async fn stream_child(
     stderr: ChildStderr,
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
-    mode: ExecutionMode,
+    mode: TurnPolicy,
 ) -> io::Result<Option<String>> {
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
@@ -965,13 +957,9 @@ async fn stream_child(
 
     let status = exit_status.expect("child.wait runs before the loop can finish");
     let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
-    if let Err(reason) = implement_tracker.finish(
-        &status,
-        &diagnostic,
-        state.terminal,
-        mode == ExecutionMode::Implement,
-        false,
-    ) {
+    if let Err(reason) =
+        implement_tracker.finish(&status, &diagnostic, state.terminal, false, false)
+    {
         return Err(io::Error::other(reason));
     }
     if !state.terminal {
@@ -984,15 +972,12 @@ async fn stream_child(
     Ok(state.session_id)
 }
 
-fn validate_cursor_mode(
-    mode: ExecutionMode,
+fn validate_cursor_policy(
+    policy: TurnPolicy,
     windows_unsandboxed: bool,
 ) -> Result<(), AdapterError> {
-    if mode == ExecutionMode::Implement && cfg!(windows) && !windows_unsandboxed {
-        return Err(AdapterError::UnsupportedMode {
-            agent: Agent::Cursor,
-            mode,
-        });
+    if policy == TurnPolicy::Agent && cfg!(windows) && !windows_unsandboxed {
+        return Err(AdapterError::CursorWritesUnavailable);
     }
     Ok(())
 }
@@ -1191,13 +1176,13 @@ pub(crate) mod tests {
     #[test]
     // TC-480, TC-483 / INT-480, INT-481: only Windows Cursor Implement is blocked.
     fn cursor_mode_validation_matches_platform() {
-        assert_eq!(validate_cursor_mode(ExecutionMode::Ask, false), Ok(()));
-        assert_eq!(validate_cursor_mode(ExecutionMode::Plan, false), Ok(()));
+        assert_eq!(validate_cursor_policy(TurnPolicy::ReadOnly, false), Ok(()));
+        assert_eq!(validate_cursor_policy(TurnPolicy::ReadOnly, false), Ok(()));
         assert_eq!(
-            validate_cursor_mode(ExecutionMode::Implement, false).is_ok(),
+            validate_cursor_policy(TurnPolicy::Agent, false).is_ok(),
             !cfg!(windows)
         );
-        assert_eq!(validate_cursor_mode(ExecutionMode::Implement, true), Ok(()));
+        assert_eq!(validate_cursor_policy(TurnPolicy::Agent, true), Ok(()));
     }
 
     #[test]
@@ -1444,6 +1429,7 @@ pub(crate) mod tests {
             prompt: "hello".to_owned(),
             resume_session: Some("cursor-session".to_owned()),
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         let mut command = tokio::process::Command::new("cursor-agent");
 
@@ -1451,7 +1437,7 @@ pub(crate) mod tests {
             &mut command,
             request.resume_session.as_deref(),
             Some("composer-2.5"),
-            ExecutionMode::Ask,
+            TurnPolicy::ReadOnly,
             cwd,
             false,
         );
@@ -1481,13 +1467,14 @@ pub(crate) mod tests {
             prompt: "hello".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         let mut command = tokio::process::Command::new("cursor-agent");
         configure_command(
             &mut command,
             request.resume_session.as_deref(),
             None,
-            ExecutionMode::Ask,
+            TurnPolicy::ReadOnly,
             cwd,
             false,
         );
@@ -1514,6 +1501,7 @@ pub(crate) mod tests {
             prompt: "hello".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
 
         for disallowed in ["composer-2.5-fast", "claude-3-5-sonnet-fast", "gpt-5", ""] {
@@ -1522,7 +1510,7 @@ pub(crate) mod tests {
                 &mut command,
                 request.resume_session.as_deref(),
                 Some(disallowed),
-                ExecutionMode::Ask,
+                TurnPolicy::ReadOnly,
                 cwd,
                 false,
             );
@@ -1560,13 +1548,14 @@ pub(crate) mod tests {
                 PathBuf::from("/tmp/shot.png"),
                 PathBuf::from("/tmp/other.png"),
             ],
+            policy: TurnPolicy::Agent,
         };
         let mut command = tokio::process::Command::new("cursor-agent");
         configure_command(
             &mut command,
             request.resume_session.as_deref(),
             None,
-            ExecutionMode::Ask,
+            TurnPolicy::ReadOnly,
             cwd,
             false,
         );
@@ -1590,6 +1579,7 @@ pub(crate) mod tests {
             prompt: "hello".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         let cwd = Path::new("workspace");
 
@@ -1610,11 +1600,9 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let ask = args_for(ExecutionMode::Ask);
-        assert!(ask.windows(2).any(|args| args == ["--mode", "ask"]));
-        let plan = args_for(ExecutionMode::Plan);
-        assert!(plan.windows(2).any(|args| args == ["--mode", "plan"]));
-        let implement = args_for(ExecutionMode::Implement);
+        let read_only = args_for(TurnPolicy::ReadOnly);
+        assert!(read_only.windows(2).any(|args| args == ["--mode", "ask"]));
+        let implement = args_for(TurnPolicy::Agent);
         assert!(implement.iter().any(|arg| arg == "--force"));
         assert!(
             implement
@@ -1630,7 +1618,7 @@ pub(crate) mod tests {
         // disable pre-start explicitly: the default config now enables it.
         #[cfg(unix)]
         let _guard = TEST_CURSOR_MUTEX.lock().await;
-        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let (event_tx, event_rx) = mpsc::channel(8);
         let (adapter, worker) = spawn_cursor_adapter(
             event_tx,
             PathBuf::from("workspace"),
@@ -1638,15 +1626,9 @@ pub(crate) mod tests {
             Vec::new(),
         );
 
-        adapter.select_mode(ExecutionMode::Plan).unwrap();
-
-        let output = timeout(Duration::from_secs(1), event_rx.recv())
-            .await
-            .expect("mode selection should be acknowledged")
-            .expect("runtime should remain connected");
-        assert_eq!(output.event, AgentEvent::ModeSelected(ExecutionMode::Plan));
         drop(adapter);
         worker.await.unwrap();
+        let _ = event_rx;
     }
 
     #[cfg(windows)]
@@ -1660,16 +1642,18 @@ pub(crate) mod tests {
             dmuxai::settings::DmuxSettings::default(),
             Vec::new(),
         );
-        let expected = AdapterError::UnsupportedMode {
-            agent: Agent::Cursor,
-            mode: ExecutionMode::Implement,
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conversation"),
+            turn_id: super::super::TurnId::new("turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
-
         assert_eq!(
-            adapter.validate_mode(ExecutionMode::Implement),
-            Err(expected)
+            adapter.send(request),
+            Err(AdapterError::CursorWritesUnavailable)
         );
-        assert_eq!(adapter.select_mode(ExecutionMode::Implement), Err(expected));
         assert!(
             timeout(Duration::from_millis(100), event_rx.recv())
                 .await
@@ -1691,15 +1675,16 @@ pub(crate) mod tests {
             prompt: "hello".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
 
         let error = run_turn(
             &request,
             None,
-            ExecutionMode::Implement,
             Path::new("missing-workspace"),
             &event_tx,
             false,
+            RunnerProtocol::Legacy,
             &[],
             &std::sync::atomic::AtomicBool::new(false),
         )
@@ -1708,11 +1693,7 @@ pub(crate) mod tests {
 
         assert_eq!(
             error.to_string(),
-            AdapterError::UnsupportedMode {
-                agent: Agent::Cursor,
-                mode: ExecutionMode::Implement,
-            }
-            .to_string()
+            AdapterError::CursorWritesUnavailable.to_string()
         );
         assert!(event_rx.try_recv().is_err());
     }
@@ -1728,15 +1709,16 @@ pub(crate) mod tests {
             prompt: "Reply with exactly CURSOR_OK. Do not use tools or modify files.".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         let turn = tokio::spawn(async move {
             run_turn(
                 &request,
                 Some("composer-2.5".to_owned()),
-                ExecutionMode::Ask,
                 &cwd,
                 &event_tx,
                 false,
+                RunnerProtocol::Legacy,
                 &[],
                 &std::sync::atomic::AtomicBool::new(false),
             )
@@ -1756,7 +1738,6 @@ pub(crate) mod tests {
                     | AgentEvent::ModelsListed { .. }
                     | AgentEvent::ModelSelected(_)
                     | AgentEvent::EffortSelected(_)
-                    | AgentEvent::ModeSelected(_)
                     | AgentEvent::ToolProgress { .. }
                     | AgentEvent::Activity(_)
                     | AgentEvent::Status(_)
@@ -1818,6 +1799,7 @@ pub(crate) mod tests {
             prompt: "prompt 1".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
 
         // Override cursor binary so the test does not spawn a live external cursor-agent CLI
@@ -1829,10 +1811,10 @@ pub(crate) mod tests {
         let _ = run_turn(
             &req1,
             None,
-            ExecutionMode::Plan,
             temp.path(),
             &event_tx,
             false,
+            RunnerProtocol::Legacy,
             std::slice::from_ref(&server),
             &notice_shown,
         )
@@ -1858,16 +1840,17 @@ pub(crate) mod tests {
             prompt: "prompt 2".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
 
         // Turn 2
         let _ = run_turn(
             &req2,
             None,
-            ExecutionMode::Plan,
             temp.path(),
             &event_tx,
             false,
+            RunnerProtocol::Legacy,
             std::slice::from_ref(&server),
             &notice_shown,
         )
@@ -2088,6 +2071,7 @@ pub(crate) mod tests {
         let fixture = FakeCursorFixture::new().await;
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
+            protocol: RunnerProtocol::Legacy,
             windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 300,
@@ -2103,6 +2087,7 @@ pub(crate) mod tests {
             prompt: "prompt 1".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         adapter.send(req1).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -2150,6 +2135,7 @@ pub(crate) mod tests {
             prompt: "prompt 2".to_owned(),
             resume_session: Some("sess-1".to_owned()),
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         adapter.send(req2).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -2185,6 +2171,7 @@ pub(crate) mod tests {
         let fixture = FakeCursorFixture::new().await;
         let (event_tx, _) = mpsc::channel(64);
         let config = CursorAdapterConfig {
+            protocol: RunnerProtocol::Legacy,
             windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 300,
@@ -2231,6 +2218,7 @@ pub(crate) mod tests {
         let fixture = FakeCursorFixture::new().await;
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
+            protocol: RunnerProtocol::Legacy,
             windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 300,
@@ -2246,24 +2234,7 @@ pub(crate) mod tests {
         let pid1 = spawns[0].pid;
         assert!(fixture.is_pid_alive(pid1));
 
-        // 2. Change mode: Plan
-        adapter.select_mode(ExecutionMode::Plan).unwrap();
-        let event = event_rx.recv().await.unwrap();
-        assert_eq!(event.event, AgentEvent::ModeSelected(ExecutionMode::Plan));
-
-        assert!(
-            fixture
-                .wait_for_pid_gone(pid1, Duration::from_secs(3))
-                .await,
-            "pid1 should be dead after mode change"
-        );
-        let spawns = fixture.wait_for_spawns(2, Duration::from_secs(3)).await;
-        assert_eq!(spawns.len(), 2);
-        let pid2 = spawns[1].pid;
-        assert!(fixture.is_pid_alive(pid2));
-        assert!(spawns[1].argv.windows(2).any(|w| w == ["--mode", "plan"]));
-
-        // 3. Change model
+        // 2. Change model (mode selection removed; model change still reaps warm process)
         adapter.select_model("custom-model".to_owned()).unwrap();
         let event = event_rx.recv().await.unwrap();
         assert_eq!(
@@ -2273,31 +2244,31 @@ pub(crate) mod tests {
 
         assert!(
             fixture
+                .wait_for_pid_gone(pid1, Duration::from_secs(3))
+                .await,
+            "pid1 should be dead after model change"
+        );
+        let spawns = fixture.wait_for_spawns(2, Duration::from_secs(3)).await;
+        assert_eq!(spawns.len(), 2);
+        let pid2 = spawns[1].pid;
+        assert!(fixture.is_pid_alive(pid2));
+
+        // 3. /new (reset)
+        adapter.reset().unwrap();
+        assert!(
+            fixture
                 .wait_for_pid_gone(pid2, Duration::from_secs(3))
                 .await,
-            "pid2 should be dead after model change"
+            "pid2 should be dead after /new reset"
         );
+        // Reset never spawns; the next selection trigger does.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fixture.read_spawns().len(), 2, "reset must not spawn");
+        adapter.prewarm().unwrap();
         let spawns = fixture.wait_for_spawns(3, Duration::from_secs(3)).await;
         assert_eq!(spawns.len(), 3);
         let pid3 = spawns[2].pid;
         assert!(fixture.is_pid_alive(pid3));
-
-        // 4. /new (reset)
-        adapter.reset().unwrap();
-        assert!(
-            fixture
-                .wait_for_pid_gone(pid3, Duration::from_secs(3))
-                .await,
-            "pid3 should be dead after /new reset"
-        );
-        // Reset never spawns; the next selection trigger does.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(fixture.read_spawns().len(), 3, "reset must not spawn");
-        adapter.prewarm().unwrap();
-        let spawns = fixture.wait_for_spawns(4, Duration::from_secs(3)).await;
-        assert_eq!(spawns.len(), 4);
-        let pid4 = spawns[3].pid;
-        assert!(fixture.is_pid_alive(pid4));
 
         // 5. Next prompt runs using the warm process
         let req = AgentRequest {
@@ -2306,6 +2277,7 @@ pub(crate) mod tests {
             prompt: "hello".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         adapter.send(req).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -2313,7 +2285,7 @@ pub(crate) mod tests {
         let prompts = fixture.prompts_received();
         assert_eq!(prompts.len(), 1);
         assert_eq!(
-            prompts[0].0, pid4,
+            prompts[0].0, pid3,
             "prompt should run in the warm process spawned after reset"
         );
 
@@ -2343,7 +2315,7 @@ pub(crate) mod tests {
         // SAFETY: the fixture holds TEST_CURSOR_MUTEX for the whole test.
         unsafe { std::env::set_var("DMUXAI_CURSOR_BIN", &script) };
 
-        let warm = spawn_warm_process(None, None, ExecutionMode::Ask, dir.path(), false).unwrap();
+        let warm = spawn_warm_process(None, None, TurnPolicy::ReadOnly, dir.path(), false).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let grandchild = loop {
             if let Ok(text) = std::fs::read_to_string(&pid_file)
@@ -2381,6 +2353,7 @@ pub(crate) mod tests {
 
         // 2. Disabled config: no warm spawn
         let disabled_config = CursorAdapterConfig {
+            protocol: RunnerProtocol::Legacy,
             windows_unsandboxed: false,
             prewarm: false,
             prewarm_idle_secs: 300,
@@ -2405,6 +2378,7 @@ pub(crate) mod tests {
             prompt: "run disabled".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         disabled_adapter.send(req).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -2419,6 +2393,7 @@ pub(crate) mod tests {
 
         // 3. Graph nodes never prewarm
         let enabled_config = CursorAdapterConfig {
+            protocol: RunnerProtocol::Legacy,
             windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 1, // short idle expiry for step 4
@@ -2440,6 +2415,7 @@ pub(crate) mod tests {
             prompt: "graph node prompt".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         enabled_adapter.send_graph_node(graph_req).unwrap();
         assert!(
@@ -2497,6 +2473,7 @@ pub(crate) mod tests {
         let fixture = FakeCursorFixture::new().await;
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
+            protocol: RunnerProtocol::Legacy,
             windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 300,
@@ -2526,6 +2503,7 @@ pub(crate) mod tests {
             prompt: "fresh prompt".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         adapter.send(req).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -2548,5 +2526,67 @@ pub(crate) mod tests {
 
         drop(adapter);
         let _ = worker.await;
+    }
+
+    fn fake_acp_agent_bin() -> PathBuf {
+        let mut path = std::env::current_exe().expect("test exe");
+        path.pop();
+        if path.ends_with("deps") {
+            path.pop();
+        }
+        path.push("fake-acp-agent");
+        path
+    }
+
+    // TC-1300 / FR-1300: Cursor ACP protocol drives a fake ACP agent binary.
+    #[tokio::test]
+    async fn cursor_acp_turn_with_fake_agent() {
+        let fake = fake_acp_agent_bin();
+        assert!(
+            fake.is_file(),
+            "build fake-acp-agent first (expected at {})",
+            fake.display()
+        );
+        unsafe {
+            std::env::set_var("DMUXAI_CURSOR_BIN", &fake);
+        }
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let workspace = tempfile::tempdir().unwrap();
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conv-acp"),
+            turn_id: super::super::TurnId::new("turn-acp"),
+            prompt: "hello acp".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+        };
+        let notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        run_turn(
+            &request,
+            None,
+            workspace.path(),
+            &event_tx,
+            false,
+            RunnerProtocol::Acp,
+            &[],
+            &notice,
+        )
+        .await
+        .expect("acp turn");
+        let mut text = String::new();
+        let mut completed = false;
+        while let Some(output) = event_rx.recv().await {
+            match output.event {
+                AgentEvent::TextDelta(delta) => text.push_str(&delta),
+                AgentEvent::Completed => {
+                    completed = true;
+                    break;
+                }
+                AgentEvent::Error(err) => panic!("acp error: {err}"),
+                _ => {}
+            }
+        }
+        assert!(completed);
+        assert!(text.contains("ACP_OK"), "{text}");
     }
 }

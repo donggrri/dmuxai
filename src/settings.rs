@@ -7,6 +7,7 @@ use crate::activity::UiSettings;
 use crate::mcp::config::ToolNames;
 use crate::mcp::{McpServerSpec, ServerKind};
 use crate::notify::NotifySettings;
+use crate::runner_protocol::RunnerProtocol;
 use crate::theme::{Theme, ThemeToml};
 
 /// Web dashboard theme settings loaded from `[web]`.
@@ -43,6 +44,10 @@ pub struct DmuxSettings {
     pub cursor_windows_unsandboxed: bool,
     pub cursor_prewarm: bool,
     pub cursor_prewarm_idle_secs: u64,
+    /// `[cursor] protocol` (default ACP on Linux-supported builds).
+    pub cursor_protocol: RunnerProtocol,
+    /// `[agents] grok_protocol` (default ACP).
+    pub grok_protocol: RunnerProtocol,
     pub routing_default_agent: Option<String>,
     pub routing_cursor_models: Vec<String>,
     pub graph_max_parallel: usize,
@@ -173,6 +178,7 @@ struct AgentsToml {
     custom: Option<Vec<crate::custom_agent::CustomAgentSpec>>,
     builtin_opencode: Option<bool>,
     builtin_grok: Option<bool>,
+    grok_protocol: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -225,6 +231,7 @@ struct CursorToml {
     windows_unsandboxed: Option<bool>,
     prewarm: Option<bool>,
     prewarm_idle_secs: Option<u64>,
+    protocol: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -501,13 +508,21 @@ impl DmuxSettings {
                 self.memory_raw.inject = memory.inject;
             }
         }
-        if let Some(agents) = parsed.agents
-            && let Some(custom) = agents.custom
-        {
-            for spec in &custom {
-                known_custom.push(spec.name.clone());
+        if let Some(agents) = parsed.agents {
+            if let Some(custom) = agents.custom {
+                for spec in &custom {
+                    known_custom.push(spec.name.clone());
+                }
+                self.custom_agents = custom;
             }
-            self.custom_agents = custom;
+            if let Some(protocol) = agents.grok_protocol {
+                match RunnerProtocol::parse_config(&protocol) {
+                    Some(value) => self.grok_protocol = value,
+                    None => self.config_warnings.push(format!(
+                        "[agents] grok_protocol ignored: expected acp or legacy, got {protocol:?}"
+                    )),
+                }
+            }
         }
         if let Some(mcp) = parsed.mcp {
             self.merge_mcp_servers(mcp.servers);
@@ -531,6 +546,14 @@ impl DmuxSettings {
             }
             if let Some(idle) = cursor.prewarm_idle_secs {
                 self.cursor_prewarm_idle_secs = idle;
+            }
+            if let Some(protocol) = cursor.protocol {
+                match RunnerProtocol::parse_config(&protocol) {
+                    Some(value) => self.cursor_protocol = value,
+                    None => self.config_warnings.push(format!(
+                        "[cursor] protocol ignored: expected acp or legacy, got {protocol:?}"
+                    )),
+                }
             }
         }
         if let Some(routing) = parsed.routing {
@@ -709,6 +732,8 @@ impl Default for DmuxSettings {
             cursor_windows_unsandboxed: false,
             cursor_prewarm: true,
             cursor_prewarm_idle_secs: 300,
+            cursor_protocol: RunnerProtocol::Acp,
+            grok_protocol: RunnerProtocol::Acp,
             routing_default_agent: None,
             routing_cursor_models: Vec::new(),
             graph_max_parallel: 2,
@@ -1937,6 +1962,24 @@ mod builtin_memory_mcp_tests {
         let settings = DmuxSettings::load(ws.path());
         assert!(!settings.cursor_prewarm);
         assert_eq!(settings.cursor_prewarm_idle_secs, 120);
+    }
+
+    // TC-1305 / FR-1300, FR-1301: runner protocol defaults and TOML parsing.
+    #[test]
+    fn tc_1305_runner_protocol_defaults_and_parse() {
+        let defaults = DmuxSettings::default();
+        assert_eq!(defaults.cursor_protocol, RunnerProtocol::Acp);
+        assert_eq!(defaults.grok_protocol, RunnerProtocol::Acp);
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            "[cursor]\nprotocol = \"legacy\"\n[agents]\ngrok_protocol = \"legacy\"\n",
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(ws.path());
+        assert_eq!(settings.cursor_protocol, RunnerProtocol::Legacy);
+        assert_eq!(settings.grok_protocol, RunnerProtocol::Legacy);
     }
 }
 

@@ -18,8 +18,8 @@ use tokio::{
 };
 
 use super::{
-    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ExecutionMode,
-    ModelInfo, OutputContext, SpawnedAdapter,
+    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ModelInfo,
+    OutputContext, SpawnedAdapter, TurnPolicy,
 };
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
@@ -30,7 +30,6 @@ enum CustomCommand {
     Cancel,
     ListModels,
     SelectModel(String),
-    SelectMode(ExecutionMode),
 }
 
 pub struct CustomAdapter {
@@ -64,9 +63,6 @@ impl AgentAdapter for CustomAdapter {
     }
     fn select_model(&self, model: String) -> Result<(), AdapterError> {
         self.push(CustomCommand::SelectModel(model))
-    }
-    fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
-        self.push(CustomCommand::SelectMode(mode))
     }
 }
 
@@ -122,7 +118,6 @@ async fn runtime_loop_with_spec(
         .collect();
     let mut active: Option<ActiveTurn> = None;
     let mut selected_model = spec.default_model.clone();
-    let mut selected_mode = ExecutionMode::default();
     let mcp_notice_shown = Arc::new(AtomicBool::new(false));
 
     loop {
@@ -168,7 +163,6 @@ async fn runtime_loop_with_spec(
                     spec,
                     request,
                     selected_model.clone(),
-                    selected_mode,
                     cwd.clone(),
                     event_tx.clone(),
                     applicable.clone(),
@@ -208,10 +202,6 @@ async fn runtime_loop_with_spec(
                 }
                 selected_model = Some(model.clone());
                 send(&event_tx, agent, None, AgentEvent::ModelSelected(model)).await;
-            }
-            CustomCommand::SelectMode(mode) => {
-                selected_mode = mode;
-                send(&event_tx, agent, None, AgentEvent::ModeSelected(mode)).await;
             }
         }
     }
@@ -272,11 +262,10 @@ async fn ensure_grok_model(
     }
 }
 
-fn mode_names(mode: ExecutionMode) -> (&'static str, &'static str) {
-    match mode {
-        ExecutionMode::Ask => ("ask", "deny"),
-        ExecutionMode::Plan => ("plan", "deny"),
-        ExecutionMode::Implement => ("implement", "allow"),
+fn mode_names(policy: TurnPolicy) -> (&'static str, &'static str) {
+    match policy {
+        TurnPolicy::ReadOnly => ("ask", "deny"),
+        TurnPolicy::Agent => ("implement", "allow"),
     }
 }
 
@@ -286,7 +275,6 @@ fn spawn_turn(
     spec: &'static CustomAgentSpec,
     request: AgentRequest,
     model: Option<String>,
-    mode: ExecutionMode,
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
     mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
@@ -303,7 +291,6 @@ fn spawn_turn(
             spec,
             &request,
             model,
-            mode,
             &cwd,
             &event_tx,
             &turn_context,
@@ -370,7 +357,6 @@ async fn run_turn(
     spec: &CustomAgentSpec,
     request: &AgentRequest,
     model: Option<String>,
-    mode: ExecutionMode,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
@@ -378,7 +364,36 @@ async fn run_turn(
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     mcp_notice_shown: &AtomicBool,
 ) -> Result<(), String> {
-    let (mode_name, edit) = mode_names(mode);
+    let settings = dmuxai::settings::DmuxSettings::load(cwd);
+    if is_builtin_grok(spec)
+        && settings.grok_protocol == super::acp::RunnerProtocol::Acp
+        && request.policy == TurnPolicy::Agent
+    {
+        let model_id = model.as_deref().ok_or_else(grok_no_allowed_model_message)?;
+        let program = spec
+            .command
+            .first()
+            .ok_or_else(|| format!("{}: empty command", spec.label()))?;
+        let args = super::acp_runner::grok_acp_argv(model_id);
+        let permission_ctx = super::acp::PermissionContext {
+            workspace: cwd.to_string_lossy().into_owned(),
+            sensitive_gate_active: false,
+        };
+        super::acp_runner::run_agent_acp_turn(
+            Path::new(program),
+            &args,
+            cwd,
+            request,
+            agent,
+            event_tx,
+            permission_ctx,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    let (mode_name, edit) = mode_names(request.policy);
     let mut ctx = SubstitutionContext::new(
         request.prompt.clone(),
         cwd.display().to_string(),
@@ -686,6 +701,7 @@ mod tests {
             prompt: "hi --model x".to_owned(),
             resume_session: None,
             image_paths: Vec::new(),
+            policy: TurnPolicy::Agent,
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
@@ -696,7 +712,6 @@ mod tests {
             spec,
             &request,
             model.map(str::to_owned),
-            ExecutionMode::Implement,
             &cwd,
             &tx,
             &context,
@@ -877,6 +892,7 @@ env = { FAKE_CFG = "{temp_config}" }
             prompt: "hi --model x".to_owned(),
             resume_session: None,
             image_paths: Vec::new(),
+            policy: TurnPolicy::Agent,
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
@@ -886,7 +902,6 @@ env = { FAKE_CFG = "{temp_config}" }
             spec,
             &request,
             None,
-            ExecutionMode::Implement,
             &cwd,
             &tx,
             &context,
@@ -993,6 +1008,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
             prompt: prompt.to_owned(),
             resume_session: resume.map(str::to_owned),
             image_paths: Vec::new(),
+            policy: TurnPolicy::Agent,
         }
     }
 
@@ -1003,6 +1019,12 @@ temp_config_template = '{"mcp": "not-an-object"}'
         mpsc::Receiver<AgentOutput>,
         JoinHandle<()>,
     ) {
+        let workspace = tempfile::tempdir().expect("grok test workspace");
+        std::fs::write(
+            workspace.path().join("dmuxai.toml"),
+            "[agents]\ngrok_protocol = \"legacy\"\n",
+        )
+        .expect("grok legacy settings");
         let (event_tx, event_rx) = mpsc::channel(64);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let worker = tokio::spawn(runtime_loop_with_spec(
@@ -1010,9 +1032,10 @@ temp_config_template = '{"mcp": "not-an-object"}'
             spec,
             command_rx,
             event_tx,
-            std::env::temp_dir(),
+            workspace.path().to_path_buf(),
             Vec::new(),
         ));
+        std::mem::forget(workspace);
         (command_tx, event_rx, worker)
     }
 
