@@ -571,7 +571,6 @@ Controls:
 - `Enter`: send to the selected agent
 - Type `/`: preview matching slash commands; use `Up` / `Down` and `Enter` or `Tab`
 - `/agent`: open the active-agent picker, then use `Up` / `Down` and `Enter`
-- `/mode`: choose `Ask`, `Plan`, or `Implement` for the active agent; Cursor Implement is unavailable on Windows
 - `/effort`: choose a supported Codex reasoning effort for later turns
 - `/status`: show Codex model/effort plus available token activity and rate limits
 - `/new [title]`: create and switch to a durable conversation
