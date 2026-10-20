@@ -894,9 +894,18 @@ fn find_opencode_bin_from(
         .filter(|p| p.is_file())
 }
 
-/// When `DMUXAI_OPENCODE_BIN` is set but not a file, returns a user-facing error.
+/// When `DMUXAI_OPENCODE_BIN` is set but does not name an existing file, returns
+/// a user-facing message (SPEC-acp-runners FR-1326).
 pub fn opencode_bin_explicit_missing_message() -> Option<String> {
-    let raw = std::env::var_os("DMUXAI_OPENCODE_BIN").filter(|value| !value.is_empty())?;
+    opencode_bin_explicit_missing_message_from(
+        std::env::var_os("DMUXAI_OPENCODE_BIN").filter(|value| !value.is_empty()),
+    )
+}
+
+fn opencode_bin_explicit_missing_message_from(
+    explicit: Option<std::ffi::OsString>,
+) -> Option<String> {
+    let raw = explicit?;
     let path = PathBuf::from(raw);
     if path.is_file() {
         return None;
@@ -2047,6 +2056,18 @@ mod builtin_memory_mcp_tests {
             find_opencode_bin_from(None, None, Some(home.path().to_path_buf())),
             Some(exe)
         );
+    }
+
+    // FR-1326: explicit DMUXAI_OPENCODE_BIN missing file → clear message.
+    #[test]
+    fn opencode_explicit_bin_missing_message() {
+        let msg = opencode_bin_explicit_missing_message_from(Some(std::ffi::OsString::from(
+            "/nonexistent/opencode",
+        )))
+        .expect("message");
+        assert!(msg.contains("opencode binary not found"));
+        assert!(msg.contains("/nonexistent/opencode"));
+        assert!(msg.contains("DMUXAI_OPENCODE_BIN"));
     }
 }
 

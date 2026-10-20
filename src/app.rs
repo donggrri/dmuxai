@@ -1854,7 +1854,14 @@ impl App {
             .iter()
             .map(|adapter| adapter.agent())
             .find(|candidate| self.agent_runner_name(*candidate).eq_ignore_ascii_case(raw))
-            .ok_or_else(|| RunTodoError::UnknownAgent(format!("unknown agent '{raw}'")))
+            .ok_or_else(|| {
+                if raw.eq_ignore_ascii_case("opencode")
+                    && let Some(message) = dmuxai::settings::opencode_bin_explicit_missing_message()
+                {
+                    return RunTodoError::Missing(message);
+                }
+                RunTodoError::UnknownAgent(format!("unknown agent '{raw}'"))
+            })
     }
 
     fn agent_key_display_name(&self, key: AgentKey) -> String {

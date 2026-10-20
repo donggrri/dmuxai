@@ -23,21 +23,13 @@ All notable changes to dmuxai are listed here. Versions follow
   ACP turns always terminate the child process group on error/cancel/success.
   Read-only internal turns pick `modeId` from `modes.availableModes` and refuse
   when unsettable. Permission-denied turns report failure. Composer fast-model
-<<<<<<< HEAD
-  guard only switches within the requested model family.   `DMUXAI_ACP_LOG` logs compact mode/model summaries (not truncated raw JSON).
-  Reject/deny permission options fail the turn. Tool dashboard rows merge by
-  `toolCallId`. Agent text after tools only inserts `\n\n` when prior agent text
-  exists. Opencode model listing checks the binary path before invoking `models`.
-  Unit tests pin `XDG_STATE_HOME` / `DMUXAI_STATE_DIR` to a temp directory.
-  Cursor prewarm applies only to legacy stream-json.
-=======
-  or `session/new`; cancel sends `session/cancel` before killing the child.
-=======
-  guard only switches within the requested model family. `DMUXAI_ACP_LOG` traces
-  session/new/set_mode/set_model responses (truncated). Unit tests pin
-  `XDG_STATE_HOME` / `DMUXAI_STATE_DIR` to a temp directory.
->>>>>>> 130c619 (fix(test): fake ACP agent model capture; spec 1320 rows)
-  Cursor prewarm applies only to legacy stream-json. Built-in **opencode** uses
+  guard only switches within the requested model family. `DMUXAI_ACP_LOG` logs
+  compact mode/model summaries (not truncated raw JSON). Reject/deny permission
+  options fail the turn. Tool dashboard rows merge by `toolCallId`. Agent text
+  after tools only inserts `\n\n` when prior agent text exists. Opencode model
+  listing checks `DMUXAI_OPENCODE_BIN` before invoking `models`. Unit tests pin
+  `XDG_STATE_HOME` / `DMUXAI_STATE_DIR` to a temp directory. Cursor prewarm
+  applies only to legacy stream-json. Built-in **opencode** uses
   `opencode acp --cwd <workspace>` when `[agents] opencode_protocol = "acp"`
   (default); model via ACP `session/set_config_option` with verified free-model
   policy (turn aborts if config fails or a paid default would be used).

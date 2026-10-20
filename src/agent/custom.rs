@@ -1618,44 +1618,44 @@ temp_config_template = '{"mcp": "not-an-object"}'
         // TC-1327 / FR-1326: opencode ACP turn sets model via session config.
         #[tokio::test]
         async fn opencode_acp_turn_with_fake_agent() {
-        let fake = fake_acp_agent_bin();
-        assert!(
-            fake.is_file(),
-            "build fake-acp-agent first (expected at {})",
-            fake.display()
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let model_capture = dir.path().join("model.txt");
-        unsafe {
-            std::env::set_var(
-                "FAKE_ACP_MODEL_CAPTURE",
-                model_capture.to_str().expect("utf8"),
+            let fake = fake_acp_agent_bin();
+            assert!(
+                fake.is_file(),
+                "build fake-acp-agent first (expected at {})",
+                fake.display()
             );
-        }
-        let spec = opencode_acp_spec(&fake.to_string_lossy());
-        assert!(spec.builtin && spec.name == "opencode");
-        let (tx, mut rx, worker) = drive_opencode_acp(spec).await;
-        tx.send(CustomCommand::Send(request("hello acp", None)))
-            .await
-            .unwrap();
-        let events = until_terminal(&mut rx).await;
-        let text: String = events
-            .iter()
-            .filter_map(|event| match event {
-                AgentEvent::TextDelta(delta) => Some(delta.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(text, "ACP_OK");
-        assert!(
-            events
+            let dir = tempfile::tempdir().unwrap();
+            let model_capture = dir.path().join("model.txt");
+            unsafe {
+                std::env::set_var(
+                    "FAKE_ACP_MODEL_CAPTURE",
+                    model_capture.to_str().expect("utf8"),
+                );
+            }
+            let spec = opencode_acp_spec(&fake.to_string_lossy());
+            assert!(spec.builtin && spec.name == "opencode");
+            let (tx, mut rx, worker) = drive_opencode_acp(spec).await;
+            tx.send(CustomCommand::Send(request("hello acp", None)))
+                .await
+                .unwrap();
+            let events = until_terminal(&mut rx).await;
+            let text: String = events
                 .iter()
-                .any(|event| matches!(event, AgentEvent::Completed))
-        );
-        let captured = std::fs::read_to_string(&model_capture).unwrap_or_default();
-        assert_eq!(captured, "opencode/glm-5.3-flash-free");
-        drop(tx);
-        worker.await.unwrap();
+                .filter_map(|event| match event {
+                    AgentEvent::TextDelta(delta) => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, "ACP_OK");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::Completed))
+            );
+            let captured = std::fs::read_to_string(&model_capture).unwrap_or_default();
+            assert_eq!(captured, "opencode/glm-5.3-flash-free");
+            drop(tx);
+            worker.await.unwrap();
         }
     }
 }

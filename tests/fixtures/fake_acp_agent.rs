@@ -144,6 +144,10 @@ fn main() {
                         serde_json::json!({
                             "models": { "currentModelId": params.get("modelId").cloned().unwrap_or(serde_json::json!("composer-2.5")) }
                         })
+                    } else if method == "session/set_config_option" {
+                        serde_json::json!({
+                            "value": params.get("value").cloned().unwrap_or(serde_json::json!(""))
+                        })
                     } else {
                         serde_json::json!({})
                     };
