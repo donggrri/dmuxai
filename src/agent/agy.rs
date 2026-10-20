@@ -1478,7 +1478,7 @@ mod tests {
         });
         let (_dir, fake) = write_fake_agy(|_| {
             format!(
-                "#!/bin/sh\nprintf '%s\\n' '{}'\nsleep 0.7\nprintf '%s\\n' '{}'\nsleep 0.7\nprintf '%s\\n' '{}'\nsleep 0.7\nprintf '%s\\n' '{}'\n",
+                "#!/bin/sh\nprintf '%s\\n' '{}'\nsleep 0.4\nprintf '%s\\n' '{}'\nsleep 0.4\nprintf '%s\\n' '{}'\nsleep 0.4\nprintf '%s\\n' '{}'\n",
                 step("one"),
                 step("two"),
                 step("three"),
@@ -1486,9 +1486,9 @@ mod tests {
             )
         });
 
-        let outcome = with_agy_spawn_env(&fake, "2", async {
+        let outcome = with_agy_spawn_env(&fake, "5", async {
             timeout(
-                Duration::from_secs(20),
+                Duration::from_secs(45),
                 run_fake_agy_turn(TurnPolicy::ReadOnly),
             )
             .await

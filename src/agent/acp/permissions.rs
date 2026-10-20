@@ -187,6 +187,32 @@ fn option_id(opt: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn permission_options(params: &Value) -> Option<&Vec<Value>> {
+    params.get("options").and_then(Value::as_array).or_else(|| {
+        params
+            .pointer("/toolCall/options")
+            .and_then(Value::as_array)
+    })
+}
+
+/// True when the selected option is an explicit reject/deny (not cancelled).
+pub fn permission_option_denies(params: &Value, chosen_id: &str) -> bool {
+    let Some(options) = permission_options(params) else {
+        return false;
+    };
+    let opt = options
+        .iter()
+        .find(|opt| option_id(opt).as_deref() == Some(chosen_id));
+    let Some(opt) = opt else {
+        return false;
+    };
+    let kind = option_kind(opt);
+    kind.contains("deny")
+        || kind.contains("reject")
+        || kind.contains("refuse")
+        || kind.contains("cancel")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +296,25 @@ mod tests {
             Path::new("/home/user/proj"),
             Path::new("/home/user/proj/../proj-evil")
         ));
+    }
+
+    // TC-1331 / FR-1329: active reject-once counts as permission denied.
+    #[test]
+    fn reject_once_option_counts_as_denied() {
+        let params = json!({
+            "options": [
+                {"optionId": "allow", "kind": "allow_once"},
+                {"optionId": "reject", "kind": "reject-once"}
+            ],
+            "path": "/etc/passwd"
+        });
+        let ctx = PermissionContext {
+            workspace: "/home/user/proj".to_owned(),
+            sensitive_gate_active: false,
+            read_only_fail_closed: false,
+        };
+        let chosen = choose_permission_option(&params, &ctx).expect("reject option");
+        assert!(permission_option_denies(&params, &chosen));
     }
 
     // TC-1307

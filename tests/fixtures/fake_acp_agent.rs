@@ -7,9 +7,18 @@ fn main() {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut session = String::from("fake-session-1");
+    let mut reader = std::io::BufReader::new(stdin.lock());
+    let mut line_buf = String::new();
 
-    for line in stdin.lock().lines().map_while(Result::ok) {
-        if line.trim().is_empty() {
+    while reader
+        .read_line(&mut line_buf)
+        .ok()
+        .filter(|n| *n > 0)
+        .is_some()
+    {
+        let line = line_buf.trim_end_matches(['\r', '\n']).to_owned();
+        line_buf.clear();
+        if line.is_empty() {
             continue;
         }
         let value: serde_json::Value =
@@ -108,13 +117,12 @@ fn main() {
                 }
             }
             "session/set_config_option" | "session/set_mode" | "session/set_model" => {
-                if method == "session/set_mode" {
-                    if let Err(msg) = require_set_mode_params(&params) {
-                        if let Some(req_id) = id.clone() {
-                            error(&mut stdout, req_id, -32602, &msg);
-                            continue;
-                        }
-                    }
+                if method == "session/set_mode"
+                    && let Err(msg) = require_set_mode_params(&params)
+                    && let Some(req_id) = id.clone()
+                {
+                    error(&mut stdout, req_id, -32602, &msg);
+                    continue;
                 }
                 if method == "session/set_config_option"
                     && let Some(path) = std::env::var_os("FAKE_ACP_MODEL_CAPTURE")
@@ -151,6 +159,25 @@ fn main() {
                 }
             }
             "session/prompt" => {
+                if std::env::var("FAKE_ACP_PERMISSION_OUTSIDE").is_ok() {
+                    let perm = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/request_permission",
+                        "id": 99,
+                        "params": {
+                            "options": [
+                                {"optionId": "allow", "kind": "allow_once"},
+                                {"optionId": "reject", "kind": "reject-once"}
+                            ],
+                            "path": "/etc/passwd"
+                        }
+                    });
+                    writeln!(stdout, "{perm}").unwrap();
+                    stdout.flush().unwrap();
+                    line_buf.clear();
+                    let _ = reader.read_line(&mut line_buf);
+                    line_buf.clear();
+                }
                 if std::env::var("FAKE_ACP_SLEEP_MS").is_ok() {
                     let ms = std::env::var("FAKE_ACP_SLEEP_MS")
                         .ok()

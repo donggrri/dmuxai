@@ -914,6 +914,12 @@ pub async fn list_model_ids(
     cwd: &Path,
     timeout: Option<Duration>,
 ) -> Result<Vec<String>, String> {
+    if spec.builtin
+        && spec.name.eq_ignore_ascii_case("opencode")
+        && let Some(message) = crate::settings::opencode_bin_explicit_missing_message()
+    {
+        return Err(message);
+    }
     if is_builtin_grok(spec) {
         return list_grok_model_ids(spec, cwd, timeout).await;
     }

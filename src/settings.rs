@@ -867,6 +867,19 @@ pub fn find_opencode_bin() -> Option<PathBuf> {
     }
 }
 
+/// When `DMUXAI_OPENCODE_BIN` is set but not a file, returns a user-facing error.
+pub fn opencode_bin_explicit_missing_message() -> Option<String> {
+    let raw = std::env::var_os("DMUXAI_OPENCODE_BIN").filter(|value| !value.is_empty())?;
+    let path = PathBuf::from(raw);
+    if path.is_file() {
+        return None;
+    }
+    Some(format!(
+        "opencode binary not found at {} (set by DMUXAI_OPENCODE_BIN)",
+        path.display()
+    ))
+}
+
 /// Finds the grok executable (SPEC-grok-runner FR-890). A non-empty
 /// `DMUXAI_GROK_BIN` is authoritative and does not fall through. Otherwise the
 /// first `grok` on `PATH`, then `~/.grok/bin/grok` (`grok.exe` on Windows) when

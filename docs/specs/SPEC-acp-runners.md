@@ -114,6 +114,8 @@ No Must requirement depends on an unanswered question for CI; live smoke is manu
 | TC-1325 | FR-1322 | unit | Grok-style options | `choose_permission_option` | `allow_once` wins | `src/agent/acp/permissions.rs` |
 | TC-1328 | FR-1330 | unit | Mixed model list | `pick_non_fast_model` | Stays on composer family | `src/agent/acp/session.rs` |
 | TC-1329 | FR-1327 | integration | Fake agent fast-only | ACP turn | Child reaped | `src/agent/cursor.rs` |
+| TC-1331 | FR-1329 | integration | Fake agent permission outside | ACP turn | `Error`, not `Completed` | `src/agent/cursor.rs` |
+| TC-1332 | FR-1302 | unit | Duplicate `tool_call_update` ids | Map updates | Single activity row | `src/agent/acp/updates.rs` |
 
 Deterministic ACP integration tests require `cargo test --features test-fixtures` (builds `fake-acp-agent`); plain `cargo test` must pass without the fixture binary.
 

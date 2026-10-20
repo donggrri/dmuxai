@@ -23,9 +23,11 @@ All notable changes to dmuxai are listed here. Versions follow
   ACP turns always terminate the child process group on error/cancel/success.
   Read-only internal turns pick `modeId` from `modes.availableModes` and refuse
   when unsettable. Permission-denied turns report failure. Composer fast-model
-  guard only switches within the requested model family. `DMUXAI_ACP_LOG` traces
-  session/new/set_mode/set_model responses (truncated). Unit tests pin
-  `XDG_STATE_HOME` / `DMUXAI_STATE_DIR` to a temp directory.
+  guard only switches within the requested model family.   `DMUXAI_ACP_LOG` logs compact mode/model summaries (not truncated raw JSON).
+  Reject/deny permission options fail the turn. Tool dashboard rows merge by
+  `toolCallId`. Agent text after tools only inserts `\n\n` when prior agent text
+  exists. Opencode model listing checks the binary path before invoking `models`.
+  Unit tests pin `XDG_STATE_HOME` / `DMUXAI_STATE_DIR` to a temp directory.
   Cursor prewarm applies only to legacy stream-json.
 - **CLI:** `dmuxai run` / `todo run` reject `--mode` with an error instead of
   running write-capable turns silently.

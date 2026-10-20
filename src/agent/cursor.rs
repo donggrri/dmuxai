@@ -2569,6 +2569,33 @@ pub(crate) mod tests {
             path
         }
 
+        fn live_fake_acp_agent_count() -> usize {
+            let output = std::process::Command::new("pgrep")
+                .args(["-x", "fake-acp-agent"])
+                .output()
+                .ok();
+            let Some(output) = output else {
+                return 0;
+            };
+            output
+                .stdout
+                .split(|b| *b == b'\n')
+                .filter(|line| !line.is_empty())
+                .filter(|line| {
+                    let pid = std::str::from_utf8(line).ok().and_then(|s| s.parse::<u32>().ok());
+                    pid.is_some_and(|pid| {
+                        let stat = std::process::Command::new("ps")
+                            .args(["-o", "stat=", "-p", &pid.to_string()])
+                            .output()
+                            .ok()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                            .unwrap_or_default();
+                        !stat.starts_with('Z')
+                    })
+                })
+                .count()
+        }
+
         #[tokio::test]
         async fn cursor_acp_turn_with_fake_agent() {
             {
@@ -2666,20 +2693,77 @@ pub(crate) mod tests {
                 "expected fast-model refusal, got {err}"
             );
             while event_rx.try_recv().is_ok() {}
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let alive = std::process::Command::new("pgrep")
-                .arg("-f")
-                .arg("fake-acp-agent")
-                .output()
-                .map(|o| !o.stdout.is_empty())
-                .unwrap_or(false);
+            let mut alive = live_fake_acp_agent_count();
+            for _ in 0..30 {
+                if alive == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                alive = live_fake_acp_agent_count();
+            }
             {
                 let _guard = FAKE_ACP_ENV.lock().unwrap();
                 unsafe {
                     std::env::remove_var("FAKE_ACP_FAST_ONLY");
                 }
             }
-            assert!(!alive, "fake-acp-agent process should not outlive turn");
+            assert_eq!(alive, 0, "fake-acp-agent process should not outlive turn");
+        }
+
+        // TC-1331 / FR-1329: active reject-once for out-of-workspace write fails the turn.
+        #[tokio::test]
+        async fn cursor_acp_permission_reject_outside_workspace() {
+            let fake = fake_acp_agent_bin();
+            assert!(fake.is_file(), "build fake-acp-agent first");
+            {
+                let _guard = FAKE_ACP_ENV.lock().unwrap();
+                unsafe {
+                    std::env::set_var("DMUXAI_CURSOR_BIN", &fake);
+                    std::env::set_var("FAKE_ACP_PERMISSION_OUTSIDE", "1");
+                }
+            }
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let workspace = tempfile::tempdir().unwrap();
+            let request = AgentRequest {
+                conversation_id: ConversationId::new("conv-acp-perm"),
+                turn_id: TurnId::new("turn-acp-perm"),
+                prompt: "write outside".to_owned(),
+                resume_session: None,
+                image_paths: vec![],
+                policy: TurnPolicy::Agent,
+            };
+            let notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let err = run_turn(
+                &request,
+                None,
+                workspace.path(),
+                &event_tx,
+                false,
+                RunnerProtocol::Acp,
+                &[],
+                &notice,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .to_ascii_lowercase()
+                    .contains("permission denied"),
+                "expected permission failure, got {err}"
+            );
+            let mut saw_error = false;
+            while let Ok(output) = event_rx.try_recv() {
+                if matches!(output.event, AgentEvent::Error(_)) {
+                    saw_error = true;
+                }
+            }
+            assert!(saw_error, "expected AgentEvent::Error before turn end");
+            {
+                let _guard = FAKE_ACP_ENV.lock().unwrap();
+                unsafe {
+                    std::env::remove_var("FAKE_ACP_PERMISSION_OUTSIDE");
+                }
+            }
         }
     }
 }

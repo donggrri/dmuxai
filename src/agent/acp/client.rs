@@ -18,14 +18,14 @@ use crate::agent::{Agent, AgentEvent, AgentOutput, OutputContext, TurnPolicy};
 use dmuxai::process::strip_dashboard_env;
 
 use super::debug::acp_trace;
-use super::permissions::{PermissionContext, choose_permission_option};
+use super::permissions::{PermissionContext, choose_permission_option, permission_option_denies};
 use super::session::{
     AgentCapabilities, SessionOpenNote, available_model_ids, cursor_acp_model_check,
     extract_reported_model, is_fast_model_label, parse_agent_capabilities, pick_non_fast_model,
     pick_read_only_mode_id, read_only_turn_refusal, session_load_params, session_resume_params,
     session_set_mode_params, session_set_model_params,
 };
-use super::updates::map_session_update;
+use super::updates::{ToolCallCache, map_session_update};
 
 const CLIENT_NAME: &str = "dmuxai";
 const CLIENT_VERSION: &str = "0.2.2";
@@ -75,6 +75,7 @@ struct SharedState {
     saw_agent_text: AtomicBool,
     cancel_sent: AtomicBool,
     text_break_before_next_delta: AtomicBool,
+    tool_calls: Mutex<ToolCallCache>,
 }
 
 impl SharedState {
@@ -136,6 +137,7 @@ pub async fn run_acp_turn(
         saw_agent_text: AtomicBool::new(false),
         cancel_sent: AtomicBool::new(false),
         text_break_before_next_delta: AtomicBool::new(false),
+        tool_calls: Mutex::new(ToolCallCache::default()),
     });
 
     let (line_tx, mut line_rx) = mpsc::channel::<String>(64);
@@ -581,13 +583,13 @@ async fn apply_read_only_mode(
             if result.get("error").is_some() {
                 acp_trace(format!(
                     "session/set_mode modeId={mode_id} rejected: {}",
-                    trace_payload(&result)
+                    compact_json(&result)
                 ));
                 Ok(false)
             } else {
                 acp_trace(format!(
                     "session/set_mode modeId={mode_id} ok: {}",
-                    trace_payload(&result)
+                    compact_json(&result)
                 ));
                 Ok(true)
             }
@@ -707,12 +709,18 @@ async fn dispatch_inbound(
                     .or_else(|| update.get("type"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if kind == "tool_call" || kind == "tool_call_update" {
+                if (kind == "tool_call" || kind == "tool_call_update")
+                    && state.saw_agent_text.load(Ordering::SeqCst)
+                {
                     state
                         .text_break_before_next_delta
                         .store(true, Ordering::SeqCst);
                 }
-                for event in map_session_update(&update) {
+                let events = {
+                    let mut tool_cache = state.tool_calls.lock().unwrap();
+                    map_session_update(&update, &mut tool_cache)
+                };
+                for event in events {
                     let event = match event {
                         AgentEvent::TextDelta(delta) => {
                             state.saw_agent_text.store(true, Ordering::SeqCst);
@@ -735,7 +743,11 @@ async fn dispatch_inbound(
                 let params = value.get("params").cloned().unwrap_or(Value::Null);
                 let req_id = value.get("id").cloned().unwrap_or(Value::Null);
                 let option = choose_permission_option(&params, permission_ctx);
-                if option.is_none() {
+                let denied = option.is_none()
+                    || option
+                        .as_ref()
+                        .is_some_and(|id| permission_option_denies(&params, id));
+                if denied {
                     state.permission_denied.store(true, Ordering::SeqCst);
                 }
                 let result = if let Some(option_id) = option {
@@ -823,8 +835,8 @@ async fn request(
             let result = value.get("result").cloned().unwrap_or(Value::Null);
             if should_trace_response(method) {
                 acp_trace(format!(
-                    "response method={method} id={id} result={}",
-                    trace_payload(&result)
+                    "response method={method} id={id} {}",
+                    acp_result_trace_summary(method, &result)
                 ));
             }
             return Ok(result);
@@ -985,10 +997,36 @@ fn should_trace_response(method: &str) -> bool {
     )
 }
 
-fn trace_payload(value: &Value) -> String {
+fn acp_result_trace_summary(method: &str, result: &Value) -> String {
+    if !matches!(
+        method,
+        "session/new"
+            | "session/load"
+            | "session/resume"
+            | "session/set_mode"
+            | "session/set_model"
+            | "session/set_config_option"
+    ) {
+        return format!("result={}", compact_json(result));
+    }
+    let mode_ids = super::session::available_mode_ids(result);
+    let model_ids = super::session::available_model_ids(result);
+    let current_mode = result
+        .pointer("/modes/currentModeId")
+        .and_then(Value::as_str);
+    let current_model = super::session::extract_reported_model(result);
+    let config_model = opencode_config_model_value(result);
+    format!(
+        "modes.currentModeId={current_mode:?} modes.availableModes={mode_ids:?} \
+models.currentModelId={current_model:?} models.availableModels={model_ids:?} \
+configOptions.model.currentValue={config_model:?}"
+    )
+}
+
+fn compact_json(value: &Value) -> String {
     let raw = value.to_string();
-    if raw.len() > 512 {
-        format!("{}…", &raw[..512])
+    if raw.len() > 256 {
+        format!("{}…", &raw[..256])
     } else {
         raw
     }
