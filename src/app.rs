@@ -5983,6 +5983,9 @@ impl App {
             model: Some(model.clone()),
             depends_on: Vec::new(),
             sensitive: Some(requires_gate),
+            // The revision is re-validated against `plan.tasks` on approve
+            // (FR-963), so the step must keep the implicit task reference.
+            task: plan.nodes.first().and_then(|node| node.task.clone()),
             ..Default::default()
         };
         let revision_error_lines = revision_errors.unwrap_or_else(|| vec![built.note.clone()]);
@@ -25416,6 +25419,69 @@ mod tests {
             h.app
                 .retired_internal_turns
                 .contains(plan_req.turn_id.as_str())
+        );
+    }
+
+    fn park_invalid_twice_fallback(h: &mut PlanGateHarness) {
+        complete_complex_judge(h);
+        for _ in 0..2 {
+            let req = h.sent.lock().unwrap().last().unwrap().1.clone();
+            assert!(h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &req,
+                AgentEvent::TextDelta(r#"{"steps":[]}"#.to_owned())
+            )));
+            assert!(h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &req,
+                AgentEvent::Completed
+            )));
+        }
+        let run = h.app.last_graph_run.as_ref().expect("fallback run");
+        assert_eq!(run.phase, GraphRunPhase::AwaitingApproval);
+        let revision = &run.approval.as_ref().unwrap().revisions[0];
+        assert_eq!(revision.source, "fallback");
+        // The revision step keeps the implicit task the plan node uses.
+        assert_eq!(revision.steps[0].task.as_deref(), Some("task-1"));
+        assert_eq!(run.plan.nodes[0].task.as_deref(), Some("task-1"));
+    }
+
+    // TC-1011 / FR-941, FR-950: approving a fallback plan starts the run, from
+    // the TUI and from the dashboard.
+    #[test]
+    fn plan_fallback_approve_starts_run() {
+        let mut tui = plan_gate_test_app();
+        park_invalid_twice_fallback(&mut tui);
+        tui.app.input = "/graph approve".to_owned();
+        tui.app.submit_prompt();
+        assert!(
+            !tui.app
+                .messages
+                .iter()
+                .any(|m| m.content.contains("Approved plan steps are invalid")),
+            "fallback approve refused"
+        );
+        assert_eq!(
+            tui.app.last_graph_run.as_ref().map(|run| run.phase),
+            Some(GraphRunPhase::Active)
+        );
+
+        let mut dash = plan_gate_test_app();
+        park_invalid_twice_fallback(&mut dash);
+        let run = dash.app.last_graph_run.as_ref().unwrap();
+        let plan_id = run.plan.id.clone();
+        let revision = App::current_plan_revision_n(run).unwrap();
+        dash.app
+            .handle_session_command(SessionCommand::PlanDecision {
+                plan_id,
+                revision,
+                decision: PlanDecisionAction::Approve,
+                feedback: None,
+            })
+            .expect("dashboard approve");
+        assert_eq!(
+            dash.app.last_graph_run.as_ref().map(|run| run.phase),
+            Some(GraphRunPhase::Active)
         );
     }
 
