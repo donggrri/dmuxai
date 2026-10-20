@@ -310,7 +310,7 @@ mod tests {
         // the docs panel section.
         assert!(INDEX_HTML.contains(r#"<link rel="stylesheet" href="/assets/docs.css">"#));
         assert!(INDEX_HTML.contains(r#"<script src="/assets/docs.js" defer></script>"#));
-        assert!(INDEX_HTML.contains(r#"<section id="docs" class="panel">"#));
+        assert!(INDEX_HTML.contains(r#"<section id="docs" class="panel panel-collapsible""#));
 
         // FR-746: the HTML preview iframe is set with an empty sandbox
         // attribute (setAttribute('sandbox', '')) and never grants scripts or
@@ -1021,7 +1021,8 @@ mod tests {
         assert!(DOCS_CSS.contains("padding-left: var(--left-dock);"));
         assert!(DOCS_CSS.contains("padding-right: var(--right-dock);"));
         assert!(DOCS_CSS.contains("margin-inline: auto;"));
-        assert!(APP_CSS.contains("max-width: 880px;"));
+        // SPEC-dashboard-fullwidth FR-1200 replaced the 880px column.
+        assert!(!APP_CSS.contains("max-width: 880px;"));
 
         // The old per-state margin rule is gone.
         assert!(!DOCS_CSS.contains("margin-right: 320px"));
@@ -1514,5 +1515,107 @@ mod tests {
             "plan history panel must not use innerHTML"
         );
         assert!(history_js.contains("createTextNode"));
+    }
+
+    /// The declarations of the first top-level `selector {` rule in `css`.
+    fn css_rule<'a>(css: &'a str, selector: &str) -> &'a str {
+        let open = format!("\n{selector} {{\n");
+        let start = css
+            .find(&open)
+            .unwrap_or_else(|| panic!("missing CSS rule {selector}"))
+            + open.len();
+        let end = css[start..].find("\n}").expect("rule closes") + start;
+        &css[start..end]
+    }
+
+    // TC-1200 (SPEC-dashboard-fullwidth FR-1200, FR-1201): the center column
+    // has no width cap and no centered fixed container; the graph re-lays out
+    // when the column width changes without a window resize.
+    #[test]
+    fn center_column_uses_full_width() {
+        let main_rule = css_rule(APP_CSS, "main");
+        assert!(main_rule.contains("max-width: none;"), "{main_rule}");
+        assert!(main_rule.contains("margin: 0;"), "{main_rule}");
+        assert!(!main_rule.contains("margin: 0 auto"), "{main_rule}");
+        for css in [APP_CSS, DOCS_CSS, SESSION_CSS] {
+            assert!(!css.contains("max-width: 880px"));
+        }
+        // Narrow windows keep the existing small-screen padding.
+        assert!(APP_CSS.contains("main { padding: 0 10px 28px; }"));
+        // Docked sidebars still reserve their width (SPEC-centered-prompt).
+        assert!(DOCS_CSS.contains("padding-left: var(--left-dock);"));
+        assert!(DOCS_CSS.contains("padding-right: var(--right-dock);"));
+        // The chat transcript grows with the viewport instead of a fixed 26rem.
+        assert!(SESSION_CSS.contains("height: clamp(26rem, 55vh, 48rem);"));
+        assert!(APP_JS.contains("new window.ResizeObserver("));
+    }
+
+    // TC-1201 (SPEC-dashboard-fullwidth FR-1202, FR-1203, UX-1200): the center
+    // Documents panel is collapsed in the served HTML, with an accessible
+    // toggle button.
+    #[test]
+    fn documents_panel_is_collapsed_by_default() {
+        let start = INDEX_HTML.find("<section id=\"docs\"").expect("docs panel");
+        let end = INDEX_HTML[start..].find("</section>").expect("closes") + start;
+        let panel = &INDEX_HTML[start..end];
+        assert!(panel.contains("data-collapsed=\"true\""), "{panel}");
+        assert!(panel.contains("<button id=\"docs-toggle\" type=\"button\""));
+        assert!(panel.contains("aria-expanded=\"false\""));
+        assert!(panel.contains("aria-controls=\"docs-body\""));
+        assert!(panel.contains("<div id=\"docs-body\" class=\"panel-body\" hidden>"));
+        // The change list lives inside the collapsed body.
+        let body = panel.find("id=\"docs-body\"").unwrap();
+        assert!(panel.find("id=\"docs-changes\"").unwrap() > body);
+        assert!(APP_CSS.contains(".panel-body[hidden]"));
+        assert!(APP_CSS.contains(".panel-toggle:focus-visible"));
+        assert!(APP_CSS.contains(".panel-toggle[aria-expanded=\"true\"] .panel-caret"));
+    }
+
+    // TC-1202 (SPEC-dashboard-fullwidth FR-1203, FR-1204): the toggle flips
+    // aria-expanded and hidden together, defaults to collapsed, keeps the state
+    // in sessionStorage only, and the header shows the change count.
+    #[test]
+    fn documents_toggle_script() {
+        let toggle_js = js_between(DOCS_JS, "var DOCS_EXPANDED_KEY", "function docBadge");
+        assert!(toggle_js.contains("'dmuxai.docsExpanded'"));
+        assert!(toggle_js.contains("window.sessionStorage.getItem(DOCS_EXPANDED_KEY) === '1'"));
+        assert!(toggle_js.contains("return false;"));
+        assert!(!toggle_js.contains("localStorage"));
+        assert!(toggle_js.contains("toggle.setAttribute('aria-expanded'"));
+        assert!(toggle_js.contains("body.hidden = !expanded;"));
+        assert!(!toggle_js.contains("innerHTML"));
+        assert!(DOCS_JS.contains("initDocsToggle();"));
+        assert!(DOCS_JS.contains("setDocsCount(shown);"));
+    }
+
+    // TC-1206 (SPEC-dashboard-fullwidth FR-1206..FR-1210): ChatGPT-style chat
+    // and the single place an agent turn's text is rendered.
+    #[test]
+    fn chatgpt_style_chat_assets() {
+        let text_js = js_between(SESSION_JS, "function renderMessageText", "function picker(");
+        assert!(!text_js.contains("innerHTML"));
+        assert!(text_js.contains("el('pre', 'msg-code')"));
+        assert!(text_js.contains("'msg-inline-code'"));
+        assert!(text_js.contains("document.createTextNode"));
+        assert!(SESSION_JS.contains("e.key === 'Enter' && !e.shiftKey"));
+        assert!(SESSION_JS.contains("node.setAttribute('data-msg-id', m.id);"));
+        assert!(SESSION_JS.contains("'dmuxai:transcript-rendered'"));
+        assert!(SESSION_CSS.contains("--chat-col: 860px;"));
+        assert!(SESSION_CSS.contains(".session-transcript .msg-user { align-items: flex-end; }"));
+        assert!(SESSION_CSS.contains("border-radius: 1.5rem;"));
+        assert!(SESSION_CSS.contains("height: calc(100dvh - var(--top-h, 56px) - 32px);"));
+        assert!(SESSION_CSS.contains(".msg-doc-card {"));
+
+        let docs_js = js_between(DOCS_JS, "function fillTurnOutput", "function syncChatLinks");
+        assert!(!docs_js.contains("innerHTML"));
+        // The tail <pre> is only built after the in-chat branch returned.
+        let in_chat = docs_js.find("if (inChat) {").expect("in-chat branch");
+        let tail = docs_js.find("el('pre', 'doc-tail'").expect("tail pre");
+        assert!(in_chat < tail);
+        let card_js = js_between(DOCS_JS, "function docCard", "function syncChatLinks");
+        assert!(!card_js.contains("output_tail"));
+        assert!(!card_js.contains("turnTailText"));
+        assert!(card_js.contains("'Open in Documents'"));
+        assert!(DOCS_JS.contains("'Show in chat'"));
     }
 }

@@ -1461,6 +1461,7 @@ mod tests {
                 truncated: false,
                 output_tail: vec![],
                 links: vec![],
+                message_id: None,
             });
         }
 

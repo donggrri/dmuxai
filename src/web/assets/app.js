@@ -1732,6 +1732,20 @@ function bindGraphControls() {
     canvas.addEventListener('mouseleave', onGraphDragEnd);
   }
   window.addEventListener('resize', onGraphResize);
+  // SPEC-dashboard-fullwidth FR-1201: the center column now follows the
+  // docked sidebars, so a sidebar toggle or drag changes the canvas width
+  // without a window resize. Re-lay the timeline on width changes only (the
+  // render itself sets the canvas height).
+  if (canvas && typeof window.ResizeObserver === 'function') {
+    var lastCanvasWidth = canvas.clientWidth;
+    new window.ResizeObserver(function () {
+      var w = canvas.clientWidth;
+      if (w && w !== lastCanvasWidth) {
+        lastCanvasWidth = w;
+        onGraphResize();
+      }
+    }).observe(canvas);
+  }
   document.addEventListener('keydown', onGraphKeydown);
 
   var stored = null;

@@ -5,6 +5,25 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Changed
+
+- **Dashboard center column uses the full width (SPEC-dashboard-fullwidth FR-1200..FR-1204).**
+  The chat, graph and task checklist now fill the whole area between the
+  sidebars instead of an 880px column, and the Documents panel is collapsible
+  and collapsed by default.
+- **ChatGPT-style dashboard chat (FR-1205..FR-1208).** The chat fills the
+  window height with its own scrolling transcript, a rounded composer pinned at
+  the bottom (Send inside), right-aligned user bubbles, plain agent text with
+  styled code blocks, and a centered ~860px reading column.
+
+### Fixed
+
+- **Agent replies no longer show twice (FR-1209, FR-1210).** The Documents
+  panel printed each turn's output tail, which is the same text as the chat
+  reply. Change records now carry the chat `message_id`; the reply stays in the
+  chat with a compact document card ("Open in Documents"), and the Documents row
+  keeps the changed files plus a one-line "Show in chat" reference.
+
 ## [0.2.2] - 2026-10-19
 
 Dashboard layout, workspace and graph view changes requested by Dongjin on

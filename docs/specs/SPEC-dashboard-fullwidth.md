@@ -1,0 +1,60 @@
+# SPEC: dashboard-fullwidth
+
+Status: Implemented (v0.2.3)
+
+Created: 2026-10-20
+
+Related: Dongjin 2026-10-20 13:52 KST ("중앙 CHAT 부분 화면이 작다 … 사이드바 제외한 영역을 전부 사용", "DOCUMENT는 펼치기/접기, 기본으로는 접혀있도록"), follow-ups the same day (chat like ChatGPT; Documents content duplicated in the chat); SPEC-centered-prompt FR-850..FR-852; SPEC-docs-preview FR-748, UX-753; SPEC-graph-swimlane FR-880
+
+## 1. Decision summary
+
+The dashboard center column (`main`) was a fixed `max-width: 880px` column centered with `margin: 0 auto`. On a wide screen the chat, the graph swimlane and the task checklist used less than half the window. The Documents panel ("Changed by agents") was always open and pushed the graph down.
+
+Decision: `main` fills the whole content area between the docked sidebars (no width cap). The docked-sidebar padding from SPEC-centered-prompt stays, so a docked sidebar still never covers the column, and the prompt box, which now spans the column, stays centered in the content area. The chat transcript grows with the viewport height. The Documents panel gets a header button that expands and collapses it; it is collapsed on every new page load unless the user expanded it earlier in the same browser session.
+
+The chat panel is laid out like ChatGPT: it fills the viewport height below the header, the transcript scrolls on its own, the composer is a rounded box pinned at the bottom with Send inside it, user turns are right-aligned bubbles, agent turns are plain left-aligned text with styled code blocks, and messages plus composer share one centered column of about 860px while the panel background spans the full width.
+
+Duplication found: every agent turn's change record (`TurnChanges.output_tail`, FR-748) is the last 40 lines of the same chat message the transcript shows (`last_agent_output_text`), and the Documents panel printed it as `pre.doc-tail`. So each reply appeared twice, once in the chat and once in Documents. The record now carries `message_id`, the `SessionMessage.id` of that chat message. When that message is in the chat, the reply is rendered there only: Documents keeps the files plus a one-line reference with "Show in chat", and the chat message gets a compact document card (file name, kind, one-line change summary, "Open in Documents"). Turns whose message is not in the chat (graph nodes, other conversations, capped transcript) still show their tail in Documents.
+
+## 2. Scope
+
+In scope: `src/web/assets/index.html`, `app.css`, `session.css`, `session.js`, `docs.css`, `docs.js`, `app.js` (graph re-layout on column width changes), and `TurnChanges.message_id` (`src/docs/changes.rs`, `src/app.rs`). Out of scope: the TUI, the Files tree in the right sidebar, the document preview overlay, and the other center panels (Agents, Graph, Memory), which stay always open.
+
+## 3. Terms
+
+- Content area: the viewport minus each open docked sidebar (above 900px). At 900px and below the sidebars are overlay drawers and the content area is the viewport.
+- Documents panel: `<section id="docs">`, the center panel titled "Documents" that lists the files each agent turn changed (SPEC-docs-preview FR-748).
+
+## 4. Requirements
+
+| ID | Priority | Requirement | Tests |
+| --- | --- | --- | --- |
+| FR-1200 | Must | `main` has no maximum width and no auto-centered fixed column: its border box spans the content area minus nothing but its own 14px side padding (10px at 560px and below). The chat panel, the graph panel (canvas and task checklist) and the other center panels stretch to that width. | TC-1200, TC-1203 |
+| FR-1201 | Must | When the column width changes without a window resize (a sidebar is opened, closed or dragged), the graph swimlane is laid out again for the new canvas width. Only width changes trigger it, so the render setting the canvas height does not loop. | TC-1200, TC-1203 |
+| FR-1202 | Must | The Documents panel header is a native `<button id="docs-toggle">` inside the panel `<h2>`, with `aria-controls="docs-body"` and `aria-expanded`. The served HTML has `aria-expanded="false"`, `data-collapsed="true"` on the panel and `hidden` on `#docs-body`, so the panel is collapsed by default, also before JavaScript runs. | TC-1201, TC-1203 |
+| FR-1203 | Must | Clicking the button, or pressing Enter or Space while it has focus, toggles `aria-expanded`, the `hidden` attribute of `#docs-body` and `data-collapsed` together. The change list keeps polling while collapsed, so expanding shows current data. | TC-1201, TC-1202, TC-1203 |
+| FR-1204 | Should | The expanded state is kept in `sessionStorage` (`dmuxai.docsExpanded`, `1` or `0`), so a reload in the same tab keeps it and a new session starts collapsed. Storage errors fall back to collapsed. | TC-1202 |
+| UX-1200 | Should | The header shows a caret that rotates when expanded and, when agents changed files, a count badge with the number of listed turns, so a collapsed panel still tells the user there is something to see. The button has a visible focus ring; the caret animation is off under reduced motion. | TC-1201, TC-1203 |
+| UX-1201 | Should | The chat transcript grows to fill the chat panel (flex basis `clamp(26rem, 55vh, 48rem)` instead of a fixed 26rem), so the chat uses the window height. | TC-1200, TC-1203 |
+| FR-1205 | Must | The chat panel (`#session`) spans the content area width and the viewport height below the sticky header (`100dvh - --top-h - 32px`, at least 30rem; `--top-h` is measured from the header because it wraps). The transcript scrolls on its own; the composer (`.session-prompt`) stays at the bottom of the panel. | TC-1204, TC-1203 |
+| FR-1206 | Must | User messages are right-aligned rounded bubbles (max 80% of the column); agent messages are left-aligned plain text without a box, labeled with the agent name and its color dot. | TC-1204, TC-1206 |
+| FR-1207 | Must | Fenced code blocks (three backticks, optional language) render as `pre.msg-code > code`, and single-backtick spans as `code.msg-inline-code`. All text is set through text nodes, never `innerHTML`. An unclosed fence while streaming renders as code. | TC-1204, TC-1206 |
+| FR-1208 | Must | Messages and the composer share one column, max 860px, centered in the content area; the composer is a rounded box with a multi-line auto-growing textarea (max 12rem) and Send inside it. Enter sends, Shift+Enter adds a line (unchanged), and sending scrolls to the latest message; new output auto-scrolls while the user is at the bottom. | TC-1204, TC-1206 |
+| FR-1209 | Must | `TurnChanges` has `message_id` (omitted when unknown) set to the `SessionMessage.id` whose text is `output_tail`. When that message is in the chat, the Documents row renders no `pre.doc-tail`, only a one-line reference and a "Show in chat" button; a row with no files and no links is hidden. Otherwise the row shows the tail as before (FR-748, FR-749). The reply body therefore appears once on the page. | TC-1204, TC-1205, TC-1206 |
+| FR-1210 | Must | An agent message whose turn changed files gets one compact document card: icon, first file name (`+N more`), kind badge, a one-line change summary, and "Open in Documents", which expands the Documents panel (and stores the state), scrolls the turn into view and highlights it. The card never contains the reply text. | TC-1204, TC-1206 |
+
+## 5. Acceptance scenarios and test design
+
+| ID | Requirement | Level | Oracle | Test |
+| --- | --- | --- | --- | --- |
+| TC-1200 | FR-1200, FR-1201, UX-1201 | unit (asset) | The `main` rule has `max-width: none` and `margin: 0`; no stylesheet keeps `max-width: 880px`; the small-screen padding and dock padding rules remain; the transcript uses the clamp height; the graph binds a `ResizeObserver` | `src/web/assets.rs` `center_column_uses_full_width` |
+| TC-1201 | FR-1202, FR-1203, UX-1200 | unit (asset) | The served `#docs` section is collapsed (`data-collapsed="true"`, `aria-expanded="false"`, `hidden` body that contains `#docs-changes`); the toggle CSS has a focus ring and the expanded caret rule | `src/web/assets.rs` `documents_panel_is_collapsed_by_default` |
+| TC-1202 | FR-1203, FR-1204 | unit (asset) | The toggle script defaults to collapsed, flips `aria-expanded` and `hidden` together, stores only in `sessionStorage`, uses no `innerHTML`, and the change renderer updates the count | `src/web/assets.rs` `documents_toggle_script` |
+| TC-1203 | FR-1200..FR-1203, FR-1205, UX-1200, UX-1201 | manual (headless Chromium, light theme, demo agent) | At 1440px and 900px wide: `main` spans the content area, the ChatGPT-style chat and the graph fill it, Documents is collapsed on load and expands from the chat card; screenshots described in the PR | PR screenshots `dash-fullwidth-*.png` |
+| TC-1204 | FR-1200, FR-1202, FR-1203, FR-1205, FR-1206, FR-1207, FR-1208, FR-1209, FR-1210 | e2e (ignored, headless Chrome) | `dmuxai serve`, mocked `/api/docs/changes` with a turn linked to a chat message and one that is not, plus an injected session snapshot | Documents starts collapsed; the card opens it; the reply's second line occurs once in `body.innerText`; the linked row has no tail and one reference; the unlinked row keeps its tail; code block and right-aligned bubble render; `main` equals the content area; the composer is centered and capped; Enter on the toggle collapses | `tests/web_dashboard_fullwidth.rs` `document_text_rendered_once_in_headless_chrome` |
+| TC-1205 | FR-1209 | unit (app) | in-memory conversation, one agent turn that creates a file | The change record's `message_id` equals the dashboard transcript id of that reply and is serialized | `src/app.rs` `doc_change_record_links_chat_message` |
+| TC-1206 | FR-1206, FR-1207, FR-1208, FR-1209, FR-1210 | unit (asset) | JS and CSS assets | Message text uses text nodes and code elements, no `innerHTML`; bubble, composer and column rules exist; the Documents tail is only built when the message is not in the chat; the card has no tail text | `src/web/assets.rs` `chatgpt_style_chat_assets` |
+
+## 6. Exit criteria
+
+TC-1200..TC-1202, TC-1205 and TC-1206 pass in the local gates (fmt, clippy, tests); TC-1204, TC-851 and the sidebar-resize e2e tests pass with `--ignored`; the TC-1203 screenshots are reviewed by Dongjin before the release.

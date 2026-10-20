@@ -1100,3 +1100,31 @@ body.sidebar-resizing .sidebar-resize-handle.is-dragging::after {
   line-height: 1.5;
   text-align: center;
 }
+
+/* SPEC-dashboard-fullwidth FR-1209, FR-1210: a turn whose text is in the chat
+   keeps a one-line reference here instead of the full output tail. */
+.doc-turn[hidden] { display: none; }
+.doc-turn-ref {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  min-width: 0;
+}
+.doc-turn-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 0.85em;
+}
+.doc-turn.flash { animation: doc-flash 1.6s ease-out; }
+@keyframes doc-flash {
+  from { box-shadow: 0 0 0 2px var(--accent); }
+  to { box-shadow: 0 0 0 2px transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .doc-turn.flash, .session-transcript li.flash { animation: none; }
+}

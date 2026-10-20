@@ -50,10 +50,18 @@
   </section>
 
 
-  <section id="docs" class="panel">
-    <h2 class="panel-title">Documents</h2>
-    <h3 class="docs-sub">Changed by agents</h3>
-    <div id="docs-changes" class="docs-changes"></div>
+  <section id="docs" class="panel panel-collapsible" data-collapsed="true">
+    <h2 class="panel-title panel-title-toggle">
+      <button id="docs-toggle" type="button" class="panel-toggle" aria-expanded="false" aria-controls="docs-body">
+        <span class="panel-caret" aria-hidden="true"></span>
+        <span class="panel-toggle-label">Documents</span>
+        <span id="docs-count" class="panel-count" hidden></span>
+      </button>
+    </h2>
+    <div id="docs-body" class="panel-body" hidden>
+      <h3 class="docs-sub">Changed by agents</h3>
+      <div id="docs-changes" class="docs-changes"></div>
+    </div>
   </section>
 
   <section id="graph" class="panel">

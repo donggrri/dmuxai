@@ -341,7 +341,7 @@
 
     var form = el('div', 'session-prompt');
     ui.input = el('textarea', 'session-input');
-    ui.input.rows = 3;
+    ui.input.rows = 1;
     ui.input.placeholder = 'Message the selected agent. Enter sends, Shift+Enter adds a line, / opens commands.';
     ui.input.setAttribute('data-parity', 'prompt-newline');
     ui.input.setAttribute('aria-label', 'Prompt');
@@ -351,6 +351,7 @@
         ui.input.value = '';
         openPalette('', true);
       }
+      autoGrowInput();
     });
     form.appendChild(ui.input);
     var sendCol = el('div', 'session-send-col');
@@ -362,6 +363,7 @@
     form.appendChild(sendCol);
 
     root.appendChild(form);
+    trackHeaderHeight();
 
     document.addEventListener('keydown', function (e) {
       if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
@@ -381,6 +383,74 @@
         }
       }
     });
+  }
+
+  // ---- ChatGPT-style layout (SPEC-dashboard-fullwidth FR-1205..FR-1208) ----
+
+  // The chat panel fills the viewport below the sticky header; the header
+  // wraps on narrow windows, so its height is measured, not assumed.
+  function trackHeaderHeight() {
+    var header = document.querySelector('header.top');
+    if (!header) { return; }
+    var sync = function () {
+      document.documentElement.style.setProperty('--top-h', header.offsetHeight + 'px');
+    };
+    sync();
+    if (typeof window.ResizeObserver === 'function') {
+      new window.ResizeObserver(sync).observe(header);
+    } else {
+      window.addEventListener('resize', sync);
+    }
+  }
+
+  // The composer grows with its text up to the CSS max-height, then scrolls.
+  function autoGrowInput() {
+    var input = ui.input;
+    if (!input) { return; }
+    input.style.height = 'auto';
+    input.style.height = input.scrollHeight + 'px';
+  }
+
+  function scrollTranscriptToEnd() {
+    if (ui.transcript) { ui.transcript.scrollTop = ui.transcript.scrollHeight; }
+  }
+
+  // FR-1207: fenced ``` blocks become <pre><code>, `inline` spans become
+  // <code>; everything is a text node (no HTML parsing), so agent output can
+  // not inject markup. An unclosed fence (still streaming) renders as code.
+  function renderMessageText(target, content) {
+    if (target.dmuxContent === content) { return; }
+    target.dmuxContent = content;
+    target.textContent = '';
+    var text = String(content || '');
+    var fence = /```([^\n`]*)\n?([\s\S]*?)(?:```|$)/g;
+    var last = 0;
+    var match;
+    while ((match = fence.exec(text)) !== null) {
+      // The line breaks around a fence belong to the block, not the prose.
+      if (match.index > last) { appendInline(target, text.slice(last, match.index).replace(/\n+$/, '')); }
+      var pre = el('pre', 'msg-code');
+      var lang = match[1].trim();
+      if (lang) { pre.setAttribute('data-lang', lang); }
+      pre.appendChild(el('code', null, match[2].replace(/\n$/, '')));
+      target.appendChild(pre);
+      last = fence.lastIndex;
+      if (match[0].length === 0) { fence.lastIndex++; }
+      if (text.charAt(last) === '\n') { last++; }
+    }
+    if (last < text.length) { appendInline(target, text.slice(last).replace(/^\n+/, '')); }
+  }
+
+  function appendInline(target, text) {
+    var parts = text.split(/`([^`\n]+)`/);
+    for (var i = 0; i < parts.length; i++) {
+      if (!parts[i]) { continue; }
+      if (i % 2 === 1) {
+        target.appendChild(el('code', 'msg-inline-code', parts[i]));
+      } else {
+        target.appendChild(document.createTextNode(parts[i]));
+      }
+    }
   }
 
   function picker(label, parity, onChange) {
@@ -423,7 +493,13 @@
     ui.send.disabled = true;
     sendPrompt(text).then(function (ok) {
       ui.send.disabled = viewOnly;
-      if (ok) { ui.input.value = ''; }
+      if (ok) {
+        ui.input.value = '';
+        autoGrowInput();
+        // UX-1203: your own message always brings the view to the latest turn.
+        stickToBottom = true;
+        scrollTranscriptToEnd();
+      }
       ui.input.focus();
     });
   }
@@ -513,8 +589,11 @@
       var node = messageNodes[m.id];
       if (!node) {
         node = el('li', 'msg msg-' + m.role);
-        node.appendChild(el('span', 'msg-who'));
-        node.appendChild(el('div', 'msg-text'));
+        node.setAttribute('data-msg-id', m.id);
+        node.dmuxWho = el('span', 'msg-who');
+        node.dmuxText = el('div', 'msg-text');
+        node.appendChild(node.dmuxWho);
+        node.appendChild(node.dmuxText);
         messageNodes[m.id] = node;
         if (previous && previous.nextSibling) {
           ui.transcript.insertBefore(node, previous.nextSibling);
@@ -525,12 +604,12 @@
         }
       }
       var who = m.role === 'agent' ? (m.agent || 'agent') : m.role;
-      if (node.firstChild.textContent !== who) { node.firstChild.textContent = who; }
+      if (node.dmuxWho.textContent !== who) { node.dmuxWho.textContent = who; }
       // The agent color marks the message edge; the label keeps the theme's
       // text color so it stays readable for any configured agent color.
       var color = m.agent ? agentColor(m.agent) : null;
-      node.style.borderLeftColor = color || '';
-      if (node.lastChild.textContent !== m.content) { node.lastChild.textContent = m.content; }
+      if (color) { node.style.setProperty('--agent-color', color); } else { node.style.removeProperty('--agent-color'); }
+      renderMessageText(node.dmuxText, m.content);
       node.classList.toggle('msg-streaming', !!m.streaming);
       previous = node;
     });
@@ -566,7 +645,10 @@
     } else if (workingNode) {
       workingNode.parentNode.removeChild(workingNode);
     }
-    if (stickToBottom) { ui.transcript.scrollTop = ui.transcript.scrollHeight; }
+    // docs.js links agent turns that changed files to their chat message
+    // (SPEC-dashboard-fullwidth FR-1209, FR-1210).
+    window.dispatchEvent(new window.CustomEvent('dmuxai:transcript-rendered'));
+    if (stickToBottom) { scrollTranscriptToEnd(); }
   }
 
   function openSessionsAndFocusFilter() {

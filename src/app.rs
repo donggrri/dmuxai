@@ -8772,6 +8772,11 @@ impl App {
         self.activities.remove(&agent);
         self.end_run_state(agent, success, error.as_deref() == Some("cancelled"));
         let output_text = self.last_agent_output_text(agent);
+        // FR-1209: the chat message that holds this output, so the dashboard
+        // links the change record to it instead of rendering the text twice.
+        let output_message_id = self
+            .last_agent_output_index(agent)
+            .map(|index| format!("{}:{index}", self.conversation_id.as_str()));
         let active_turn = self.active_turns.remove(&agent);
         self.streaming_messages.remove(&agent);
         self.tool_messages.remove(&agent);
@@ -8801,6 +8806,7 @@ impl App {
                     workspace_scan,
                     &workspace_root,
                     output_for_docs,
+                    output_message_id,
                 );
             });
         }
@@ -9720,6 +9726,19 @@ impl App {
 
     fn dashboard_base_url(&self) -> Option<&str> {
         self.dashboard_doc_base.as_deref()
+    }
+
+    /// Index in `self.messages` of the message `last_agent_output_text`
+    /// reads, when that message is shown in the dashboard chat.
+    fn last_agent_output_index(&self, agent: Agent) -> Option<usize> {
+        let index = match self.streaming_messages.get(&agent) {
+            Some(index) if self.messages.get(*index).is_some() => *index,
+            _ => self
+                .messages
+                .iter()
+                .rposition(|message| message.role == Role::Agent(agent))?,
+        };
+        (!self.messages[index].local_only).then_some(index)
     }
 
     fn last_agent_output_text(&self, agent: Agent) -> String {
@@ -12491,6 +12510,7 @@ fn record_turn_doc_changes(
     workspace_scan: Arc<Mutex<Option<WorkspaceScan>>>,
     workspace_root: &Path,
     output_text: String,
+    message_id: Option<String>,
 ) {
     let Some(before) = wait_for_workspace_scan(&workspace_scan) else {
         return;
@@ -12513,6 +12533,7 @@ fn record_turn_doc_changes(
         truncated,
         output_tail: output_tail(&output_text),
         links,
+        message_id,
     });
 }
 
@@ -21004,6 +21025,62 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         assert!(recorded, "expected created.md in change log for the turn");
+    }
+
+    // TC-1205 (SPEC-dashboard-fullwidth FR-1209): the change record names the
+    // dashboard chat message that holds the same text, so the dashboard
+    // renders the reply once.
+    #[test]
+    fn doc_change_record_links_chat_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), dir.path()).unwrap();
+        let (mut app, sent) = test_app_with_engine(engine);
+        app.workspace_root = dir.path().to_path_buf();
+        let log = ChangeLog::default();
+        app.attach_doc_changes(log.clone());
+
+        app.input = "write a doc".to_owned();
+        app.submit_prompt();
+        let request = sent.lock().unwrap()[0].1.clone();
+        let agent = app.adapters[app.selected].agent();
+        let scan_slot = app
+            .active_turns
+            .get(&agent)
+            .expect("active turn")
+            .workspace_scan
+            .clone();
+        assert!(wait_for_workspace_scan(&scan_slot).is_some());
+        std::fs::write(dir.path().join("plan.md"), "plan").unwrap();
+        app.messages
+            .push(Message::new(Role::Agent(agent), "wrote plan.md".to_owned()));
+        app.finish_turn_outcome_with_error(agent, true, None);
+
+        let view = app.session_view();
+        let chat = view
+            .transcript
+            .iter()
+            .find(|m| m.role == "agent" && m.content == "wrote plan.md")
+            .expect("agent reply in the dashboard transcript");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut linked = None;
+        while Instant::now() < deadline {
+            if let Some(turn) = log
+                .list(None)
+                .into_iter()
+                .find(|turn| turn.id == request.turn_id.as_str())
+            {
+                linked = Some(turn);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let turn = linked.expect("turn recorded");
+        assert_eq!(turn.message_id.as_deref(), Some(chat.id.as_str()));
+        assert_eq!(turn.output_tail, vec!["wrote plan.md".to_owned()]);
+        let json = serde_json::to_value(&turn).unwrap();
+        assert_eq!(json["message_id"], chat.id.as_str());
     }
 
     #[test]

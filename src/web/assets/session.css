@@ -9,29 +9,65 @@
 .session-select:disabled { opacity: .55; }
 .session-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-left: auto; }
 .session-actions .btn-on { border-color: var(--accent); color: var(--accent); }
-.session-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: .75rem; }
-.session-transcript { list-style: none; margin: 0; padding: .5rem; height: 26rem; overflow-y: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; }
-.session-transcript .msg { padding: .35rem .5rem; border-radius: 6px; margin-bottom: .35rem; border-left: 3px solid transparent; }
-.session-transcript .msg-who { display: block; font-size: .75rem; font-weight: 600; color: var(--muted); text-transform: lowercase; }
-.session-transcript .msg-text { white-space: pre-wrap; word-break: break-word; }
-.session-transcript .msg-user { background: var(--bg-chip); }
-.session-transcript .msg-agent { background: var(--bg-panel); border-left-color: var(--accent); }
+/* SPEC-dashboard-fullwidth FR-1205..FR-1208, UX-1201..UX-1203: ChatGPT-style chat.
+   The panel spans the whole center area and the viewport height below the
+   sticky header; the transcript scrolls on its own and the composer stays at
+   the bottom. Messages and the composer share one readable column. */
+.session { --chat-col: 860px; display: flex; flex-direction: column; height: calc(100vh - var(--top-h, 56px) - 32px); height: calc(100dvh - var(--top-h, 56px) - 32px); min-height: 30rem; box-sizing: border-box; }
+.session[hidden] { display: none; }
+.session-head, .session-bar, .session-view-only { flex: none; }
+.session-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.session-transcript { flex: 1 1 auto; min-height: 0; height: clamp(26rem, 55vh, 48rem); list-style: none; margin: 0; padding: .75rem 0 1rem; overflow-y: auto; background: transparent; border: 0; border-top: 1px solid var(--line); scroll-behavior: auto; }
+.session-transcript > li { box-sizing: border-box; width: 100%; max-width: var(--chat-col); margin: 0 auto 1rem; padding: 0 1rem; }
+.session-transcript .msg { display: flex; flex-direction: column; align-items: flex-start; gap: .2rem; }
+.session-transcript .msg-who { display: inline-flex; align-items: center; gap: .4rem; font-size: .75rem; font-weight: 600; color: var(--muted); text-transform: lowercase; }
+.session-transcript .msg-agent .msg-who::before { content: ""; width: .55rem; height: .55rem; border-radius: 50%; background: var(--agent-color, var(--accent)); }
+.session-transcript .msg-text { white-space: pre-wrap; word-break: break-word; line-height: 1.55; max-width: 100%; }
+/* User turns: right-aligned rounded bubble. */
+.session-transcript .msg-user { align-items: flex-end; }
+.session-transcript .msg-user .msg-who { display: none; }
+.session-transcript .msg-user .msg-text { background: var(--bg-chip); border: 1px solid var(--line); border-radius: 1.25rem; padding: .6rem 1rem; max-width: min(80%, 40rem); }
+/* Agent turns: plain left-aligned text, no box. */
+.session-transcript .msg-agent .msg-text { padding: 0; background: none; }
 .session-transcript .msg-system .msg-text,
 .session-transcript .msg-activity .msg-text { color: var(--muted); font-size: .85rem; }
+.session-transcript .msg-activity { gap: 0; margin-bottom: .4rem; }
+.session-transcript .msg-activity .msg-who { display: none; }
+.session-transcript .msg-code { white-space: pre; overflow-x: auto; margin: .5rem 0; padding: .75rem 1rem; background: var(--bg); border: 1px solid var(--line); border-radius: .6rem; font: .85rem/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.session-transcript .msg-code[data-lang]::before { content: attr(data-lang); display: block; margin-bottom: .35rem; color: var(--muted); font-size: .75rem; font-family: inherit; }
+.session-transcript .msg-inline-code { padding: .05rem .3rem; background: var(--bg-chip); border: 1px solid var(--line); border-radius: .3rem; font: .88em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .session-transcript .msg-streaming .msg-text::after { content: "▍"; color: var(--accent); animation: session-blink 1s steps(2, start) infinite; }
 @keyframes session-blink { to { visibility: hidden; } }
 @media (prefers-reduced-motion: reduce) { .session-transcript .msg-streaming .msg-text::after { animation: none; } }
-.session-empty { color: var(--faint); padding: .5rem; list-style: none; }
+.session-transcript li.flash { animation: session-flash 1.6s ease-out; }
+@keyframes session-flash { from { background: var(--current-bg, var(--bg-chip)); } to { background: transparent; } }
+.session-empty { color: var(--faint); padding: .5rem; list-style: none; text-align: center; }
+/* FR-1210: compact document card under an agent turn that changed files. */
+.msg-doc-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .2rem .75rem; align-items: center; width: min(100%, 32rem); margin-top: .35rem; padding: .55rem .75rem; border: 1px solid var(--line); border-radius: .75rem; background: var(--bg-panel); }
+.msg-doc-card-head { display: flex; align-items: center; gap: .45rem; min-width: 0; font-weight: 600; }
+.msg-doc-card-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.msg-doc-card-preview { grid-column: 1; color: var(--muted); font-size: .8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg-doc-card-open { grid-column: 2; grid-row: 1 / span 2; }
 .session-subtitle { font-size: .85rem; margin: 0 0 .4rem; color: var(--muted); }
 .session .btn-small { padding: .1rem .45rem; font-size: .75rem; }
-.session-notice { margin: .4rem 0 0; font-size: .85rem; color: var(--muted); }
+.session-notice { flex: none; box-sizing: border-box; width: 100%; max-width: var(--chat-col); margin: .4rem auto 0; padding: 0 1rem; font-size: .85rem; color: var(--muted); }
 .session-notice-error { color: var(--error-text); }
-.session-prompt { display: flex; gap: .5rem; align-items: flex-end; margin-top: .5rem; }
-.session-send-col { display: flex; flex-direction: column; gap: .35rem; flex-shrink: 0; }
+/* Composer: a rounded box pinned under the transcript; Send sits inside it. */
+.session-prompt { flex: none; box-sizing: border-box; display: flex; flex-direction: column; gap: .35rem; width: calc(100% - 2rem); max-width: calc(var(--chat-col) - 2rem); margin: .5rem auto 0; padding: .6rem .75rem .5rem; background: var(--bg-chip); border: 1px solid var(--line); border-radius: 1.5rem; box-shadow: 0 2px 10px rgba(0, 0, 0, .06); }
+.session-prompt:focus-within { border-color: var(--accent); }
+.session-send-col { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: .5rem; flex-shrink: 0; }
+.session-send-col .session-picker { flex-direction: row; align-items: center; gap: .35rem; min-width: 0; }
+.session-send-col .btn-primary { border-radius: 999px; padding: .3rem .9rem; }
 .session-plan-gate { display: none; }
-.session-input { flex: 1; resize: vertical; min-height: 3.5rem; background: var(--bg-chip); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: .5rem; font: inherit; }
-.session-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.session-input { width: 100%; box-sizing: border-box; resize: none; min-height: 1.6rem; max-height: 12rem; overflow-y: auto; background: transparent; color: var(--text); border: 0; padding: .25rem .25rem; font: inherit; line-height: 1.5; }
+.session-input:focus { outline: none; }
 .session-disabled .session-bar, .session-disabled .session-prompt { opacity: .6; }
+@media (max-width: 560px) {
+  .session { height: calc(100dvh - var(--top-h, 56px) - 24px); min-height: 26rem; }
+  .session-transcript > li { padding: 0 .25rem; }
+  .session-prompt { width: 100%; max-width: none; border-radius: 1rem; }
+  .session-transcript .msg-user .msg-text { max-width: 90%; }
+}
 .session-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, .45); display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; z-index: 50; }
 .session-dialog { background: var(--bg-panel); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: .75rem; width: min(32rem, 92vw); max-height: 70vh; overflow-y: auto; box-shadow: 0 10px 40px rgba(0, 0, 0, .4); }
 .session-filter { width: 100%; box-sizing: border-box; margin-bottom: .5rem; background: var(--bg-chip); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: .4rem; }
