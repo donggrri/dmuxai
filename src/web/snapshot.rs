@@ -75,6 +75,33 @@ pub struct SessionView {
     pub transcript_omitted: usize,
     pub conversations: Vec<SessionConversation>,
     pub commands: Vec<SessionCommandInfo>,
+    /// SPEC-dashboard-fullwidth FR-1225: workspace folder groups for the
+    /// Sessions sidebar. The current workspace's group comes first, has
+    /// `current: true` and no `conversations` of its own (they are the
+    /// `conversations` above); the others follow by most recent activity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<SessionWorkspaceGroup>,
+}
+
+/// One workspace folder in the Sessions sidebar (FR-1225).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionWorkspaceGroup {
+    /// Normalized workspace key (`normalize_workspace_path`), the full path.
+    pub path: String,
+    /// Folder basename.
+    pub name: String,
+    /// Muted secondary label: the WSL distro when known, else the parent path.
+    pub label: String,
+    #[serde(default)]
+    pub current: bool,
+    /// The folder still exists, so the dashboard can switch to it.
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub updated_at_ms: u64,
+    #[serde(default)]
+    pub conversations: Vec<SessionConversation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

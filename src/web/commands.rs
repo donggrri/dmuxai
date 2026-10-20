@@ -99,6 +99,12 @@ pub enum SessionCommand {
     ShowGraphRun {
         run_id: String,
     },
+    /// SPEC-dashboard-fullwidth FR-1227: remember a conversation of another
+    /// workspace to open after the next workspace switch to that workspace.
+    PrepareOpenConversation {
+        workspace: String,
+        id: String,
+    },
     PlanTaskEdit {
         action: String,
         task_id: String,

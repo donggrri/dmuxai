@@ -1129,3 +1129,76 @@ fn runtime_session_schema_extension_preserves_existing_data() {
     assert_eq!(session_table, 1);
     assert_eq!(owner_column, 1);
 }
+
+// TC-1221 / SPEC-dashboard-fullwidth FR-1225: other workspaces' sessions are
+// read from their own per-workspace databases, read-only, without the copies
+// the legacy migration left in other databases.
+#[test]
+fn state_dir_listing_reads_other_workspaces() {
+    let temp = tempfile::tempdir().unwrap();
+    let repos = temp.path().join("repos");
+    let open = |name: &str| {
+        let ws = temp.path().join(name);
+        std::fs::create_dir_all(&ws).unwrap();
+        let key = dmuxai::workspace::normalize_workspace_path(&ws).unwrap();
+        let db = repos
+            .join(dmuxai::state_path::repo_key_for_canonical(&key))
+            .join("conversations.sqlite3");
+        (ConversationEngine::open(&db, &ws).unwrap(), key, db)
+    };
+    let (mut current, current_key, current_db) = open("current");
+    let (mut other, other_key, other_db) = open("other");
+    current
+        .select(ConversationSelection::New {
+            title: Some("mine".to_owned()),
+        })
+        .unwrap();
+    let first = other
+        .select(ConversationSelection::New {
+            title: Some("older".to_owned()),
+        })
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let second = other
+        .select(ConversationSelection::New {
+            title: Some("newer".to_owned()),
+        })
+        .unwrap();
+    drop(other);
+    // A legacy copy of the other workspace's row inside the current database.
+    let copy = Connection::open(&current_db).unwrap();
+    copy.execute(
+        "INSERT INTO conversations (id, workspace_root, title, created_at_ms, updated_at_ms)
+         VALUES ('legacy-copy', ?1, 'stale copy', 1, 1)",
+        [&other_key],
+    )
+    .unwrap();
+    drop(copy);
+    let before = std::fs::read(&other_db).unwrap();
+
+    let rows = dmuxai::conversation::list_state_dir_conversations(&repos, &current_key, 50);
+    let titles: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|(ws, card)| (ws.as_str(), card.title.as_str()))
+        .collect();
+    assert_eq!(
+        titles,
+        [(other_key.as_str(), "newer"), (other_key.as_str(), "older")]
+    );
+    assert_eq!(rows[0].1.id, second.id);
+    assert_eq!(rows[1].1.id, first.id);
+    assert_eq!(
+        dmuxai::conversation::list_state_dir_conversations(&repos, &current_key, 1).len(),
+        1
+    );
+    assert!(
+        dmuxai::conversation::list_state_dir_conversations(
+            &temp.path().join("none"),
+            &current_key,
+            5
+        )
+        .is_empty()
+    );
+    assert_eq!(std::fs::read(&other_db).unwrap(), before);
+    drop(current);
+}

@@ -166,6 +166,12 @@ def wait_for_server():
         time.sleep(0.1)
     raise RuntimeError("timed out waiting for dmuxai --web server; pty=" + "".join(pty_chunks))
 
+# SPEC-dashboard-fullwidth FR-1226: a group shows 3 rows plus "More"
+# (whose title says how many are hidden), so count both.
+TOTAL_ROWS = ("(document.querySelectorAll('#sessions-list .sessions-row').length + "
+              "[...document.querySelectorAll('#sessions-list .sessions-more-btn')]"
+              ".reduce((n, b) => n + (parseInt(b.title, 10) || 0), 0))")
+
 def rows_snapshot(pg):
     return pg.eval_on_selector_all(
         "#sessions-list .sessions-row",
@@ -202,8 +208,10 @@ try:
         try:
             pg.wait_for_function(
                 """expectedId => {
-                    const first = document.querySelector('#sessions-list .sessions-row');
-                    return first && first.getAttribute('data-id') === expectedId && first.getAttribute('aria-current') === 'true';
+                    // SPEC-dashboard-fullwidth FR-1226: rows are newest first,
+                    // so the opened row is found by id, not position.
+                    const row = document.querySelector(`#sessions-list .sessions-row[data-id="${expectedId}"]`);
+                    return row && row.getAttribute('aria-current') === 'true';
                 }""",
                 arg=second_id,
                 timeout=15000,
@@ -217,9 +225,12 @@ try:
         prev_count = len(out["after_switch_rows"])
         pg.click("#sessions-new")
         pg.wait_for_function(
-            f"document.querySelectorAll('#sessions-list .sessions-row').length === {prev_count + 1}",
+            f"{TOTAL_ROWS} === {prev_count + 1}",
             timeout=15000,
         )
+        more_btn = pg.query_selector("#sessions-list .sessions-more-btn[aria-expanded='false']")
+        if more_btn:
+            more_btn.click()
         out["after_new_rows"] = rows_snapshot(pg)
 
         pg.screenshot(path=screenshot_path)
@@ -233,7 +244,7 @@ try:
 
         pg.reload()
         pg.wait_for_function(
-            f"document.querySelectorAll('#sessions-list .sessions-row').length >= {prev_count + 1}",
+            f"{TOTAL_ROWS} >= {prev_count + 1}",
             timeout=15000,
         )
         out["open_after_reload"] = pg.eval_on_selector("#sessions-sidebar", "e => e.classList.contains('open')")
@@ -307,8 +318,16 @@ print(json.dumps(out))
         .collect();
     assert_eq!(seeded_rows.len(), 2, "{v}");
     for row in initial_rows {
+        // SPEC-dashboard-fullwidth FR-1226: compact relative time ("2m").
         let time_str = row["time"].as_str().unwrap_or("");
-        assert!(time_str.contains("ago"), "expected relative time in {row}");
+        assert!(
+            time_str.len() >= 2
+                && time_str[..time_str.len() - 1]
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+                && time_str.ends_with(['s', 'm', 'h', 'd', 'w', 'y']),
+            "expected compact relative time in {row}"
+        );
         let time_title = row["timeTitle"].as_str().unwrap_or("");
         assert!(
             time_title.contains('T'),
@@ -320,9 +339,13 @@ print(json.dumps(out))
     let after_switch = v["after_switch_rows"]
         .as_array()
         .expect("after_switch_rows array");
-    assert_eq!(after_switch[0]["id"], second_id, "{v}");
-    assert_eq!(after_switch[0]["ariaCurrent"], "true", "{v}");
-    assert!(after_switch[1]["ariaCurrent"].is_null(), "{v}");
+    // Rows stay newest first (FR-1226); the opened one is the only active row.
+    let active: Vec<_> = after_switch
+        .iter()
+        .filter(|row| row["ariaCurrent"] == "true")
+        .collect();
+    assert_eq!(active.len(), 1, "{v}");
+    assert_eq!(active[0]["id"], second_id, "{v}");
 
     let after_new = v["after_new_rows"]
         .as_array()

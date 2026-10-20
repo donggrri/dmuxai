@@ -1746,4 +1746,29 @@ mod tests {
         assert!(APP_JS.contains("applyPendingRunFocus(snap);"));
         assert!(SESSION_CSS.contains(".chat-aux-open-run {"));
     }
+
+    // TC-1225 / SPEC-dashboard-fullwidth FR-1225..FR-1227
+    #[test]
+    fn sessions_grouped_by_workspace_assets() {
+        let list = js_between(
+            SESSION_JS,
+            "var SESSIONS_GROUP_VISIBLE = 3;",
+            "// ---- palette",
+        );
+        assert!(list.contains("SESSIONS_COLLAPSED_KEY = 'dmuxai.sessions.collapsed'"));
+        assert!(list.contains("window.sessionStorage.setItem(SESSIONS_COLLAPSED_KEY"));
+        assert!(list.contains("function compactTime(ms)"));
+        assert!(list.contains("expanded ? 'Less' : 'More'"));
+        assert!(list.contains("head.title = path;"));
+        assert!(
+            list.contains("command: 'prepare_open_conversation', workspace: group.path, id: c.id")
+        );
+        assert!(list.contains("'This workspace folder no longer exists'"));
+        assert!(list.contains("if (!list.length && (q || !group.current)) { return; }"));
+        assert!(!list.contains("innerHTML"));
+        assert!(WORKSPACE_JS.contains("window.dmuxaiSwitchWorkspace = function (path)"));
+        assert!(WORKSPACE_JS.contains("apiPost('/api/workspace/switch', { path: path })"));
+        assert!(DOCS_CSS.contains(".sessions-group-name {"));
+        assert!(DOCS_CSS.contains(".sessions-group-label {"));
+    }
 }

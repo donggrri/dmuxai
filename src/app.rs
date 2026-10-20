@@ -1203,6 +1203,15 @@ pub struct App {
     /// Recent conversations for the dashboard session, refreshed at most every
     /// few seconds or when the active conversation changes (FR-780).
     session_conversations: Option<(Instant, String, Vec<SessionConversation>)>,
+    /// Other workspaces' groups for the Sessions sidebar (FR-1225), refreshed
+    /// with `session_conversations`.
+    session_workspaces: Vec<dmuxai::web::SessionWorkspaceGroup>,
+    /// (workspace key, conversation id) to open after the pending workspace
+    /// switch to that workspace (FR-1227).
+    switch_open_conversation: Option<(String, String)>,
+    /// `<state>/repos`, scanned read-only for other workspaces' sessions
+    /// (FR-1225). `None` (tests) lists only the current workspace.
+    state_repos_dir: Option<PathBuf>,
     doc_changes: Option<ChangeLog>,
     dashboard_doc_base: Option<String>,
     doc_open_tickets: Option<Arc<Mutex<dmuxai::web::OpenTickets>>>,
@@ -1423,6 +1432,9 @@ impl App {
             agy_mcp_notice_shown: false,
             agent_lifecycle: HashMap::new(),
             session_conversations: None,
+            session_workspaces: Vec::new(),
+            switch_open_conversation: None,
+            state_repos_dir: None,
             doc_changes: None,
             dashboard_doc_base: None,
             doc_open_tickets: None,
@@ -1757,6 +1769,7 @@ impl App {
 
     pub fn cancel_workspace_switch(&mut self, notice: String) {
         self.switch_pending = None;
+        self.switch_open_conversation = None;
         self.switch_ready = None;
         self.push_system(notice);
         self.publish_dashboard();
@@ -1932,6 +1945,7 @@ impl App {
                 })
                 .unwrap_or_default();
             self.session_conversations = Some((Instant::now(), conversation_id.clone(), list));
+            self.session_workspaces = self.other_workspace_groups();
         }
         let conversations = self
             .session_conversations
@@ -2042,8 +2056,145 @@ impl App {
             agents,
             transcript,
             transcript_omitted: start + omitted,
+            workspaces: {
+                let mut groups = Vec::with_capacity(self.session_workspaces.len() + 1);
+                let key = self.engine.workspace_key().to_owned();
+                let mut current = workspace_group_meta(
+                    &key,
+                    std::env::var("HOME").ok().as_deref(),
+                    std::env::var("WSL_DISTRO_NAME").ok().as_deref(),
+                );
+                current.current = true;
+                current.available = true;
+                current.updated_at_ms = conversations
+                    .iter()
+                    .map(|c| c.updated_at_ms)
+                    .max()
+                    .unwrap_or(0);
+                groups.push(current);
+                groups.extend(self.session_workspaces.iter().cloned());
+                groups
+            },
             conversations,
             commands,
+        }
+    }
+
+    /// Read-only listing of the other workspaces' conversations from the
+    /// shared state database, grouped by workspace (FR-1225).
+    fn other_workspace_groups(&self) -> Vec<dmuxai::web::SessionWorkspaceGroup> {
+        const OTHER_ROWS_MAX: usize = 300;
+        let Some(repos_dir) = self.state_repos_dir.as_deref() else {
+            return Vec::new();
+        };
+        let rows = dmuxai::conversation::list_state_dir_conversations(
+            repos_dir,
+            self.engine.workspace_key(),
+            OTHER_ROWS_MAX,
+        );
+        let rows = rows
+            .into_iter()
+            .map(|(workspace, card)| {
+                (
+                    workspace,
+                    SessionConversation {
+                        id: card.id.as_str().to_owned(),
+                        title: card.title,
+                        updated_at_ms: card.updated_at_ms.max(0) as u64,
+                        last_agent: card
+                            .last_agent
+                            .map(|agent| self.agent_key_display_name(agent)),
+                        turn_count: card.turn_count,
+                        running: card.running,
+                    },
+                )
+            })
+            .collect();
+        group_other_workspaces(
+            rows,
+            std::env::var("HOME").ok().as_deref(),
+            std::env::var("WSL_DISTRO_NAME").ok().as_deref(),
+            |path| std::path::Path::new(path).is_dir(),
+        )
+    }
+
+    /// FR-1227: validate and remember a conversation of another workspace so
+    /// the re-exec after `POST /api/workspace/switch` opens it.
+    fn prepare_open_conversation(&mut self, workspace: &str, id: &str) -> Result<(), RunTodoError> {
+        let id = id.trim();
+        if id.is_empty()
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(RunTodoError::Invalid("invalid conversation id".to_owned()));
+        }
+        if self.switch_pending.is_some() {
+            return Err(RunTodoError::Busy(
+                "workspace switch in progress".to_owned(),
+            ));
+        }
+        if workspace == self.engine.workspace_key() {
+            return Err(RunTodoError::Invalid(
+                "conversation is in the current workspace".to_owned(),
+            ));
+        }
+        let rows = self
+            .state_repos_dir
+            .as_deref()
+            .map(|dir| {
+                dmuxai::conversation::list_state_dir_conversations(
+                    dir,
+                    self.engine.workspace_key(),
+                    usize::MAX,
+                )
+            })
+            .unwrap_or_default();
+        if !rows
+            .iter()
+            .any(|(root, card)| root == workspace && card.id.as_str() == id)
+        {
+            return Err(RunTodoError::Missing(format!(
+                "no conversation {id} in that workspace"
+            )));
+        }
+        if !std::path::Path::new(workspace).is_dir() {
+            return Err(RunTodoError::Missing(
+                "that workspace folder no longer exists".to_owned(),
+            ));
+        }
+        self.switch_open_conversation = Some((workspace.to_owned(), id.to_owned()));
+        Ok(())
+    }
+
+    pub fn set_state_repos_dir(&mut self, dir: Option<PathBuf>) {
+        self.state_repos_dir = dir;
+        self.session_conversations = None;
+    }
+
+    /// The conversation to open in the switched-to workspace, if it was
+    /// prepared for that same workspace (FR-1227).
+    pub fn take_switch_open_conversation(&mut self, target: &std::path::Path) -> Option<String> {
+        let (workspace, id) = self.switch_open_conversation.take()?;
+        let key = dmuxai::workspace::normalize_workspace_path(target)
+            .unwrap_or_else(|_| target.display().to_string());
+        (key == workspace).then_some(id)
+    }
+
+    /// Startup half of FR-1227: open the conversation the previous process
+    /// asked for, if it belongs to this workspace.
+    pub fn open_conversation_on_startup(&mut self, id: &str) {
+        let id = id.trim();
+        if id.is_empty() || id == self.conversation_id.as_str() {
+            return;
+        }
+        match self.engine.list() {
+            Ok(cards) => {
+                if let Some(card) = cards.into_iter().find(|card| card.id.as_str() == id) {
+                    self.select_conversation(card.id);
+                }
+            }
+            Err(error) => self.push_system(format!("Could not open conversation: {error}")),
         }
     }
 
@@ -2262,6 +2413,9 @@ impl App {
                 self.request_replan(note.as_deref().unwrap_or(""), DecisionBy::Dashboard)?;
             }
             SessionCommand::ShowGraphRun { run_id } => self.show_graph_run(&run_id)?,
+            SessionCommand::PrepareOpenConversation { workspace, id } => {
+                self.prepare_open_conversation(&workspace, &id)?
+            }
             SessionCommand::PlanTaskEdit {
                 action,
                 task_id,
@@ -13740,6 +13894,76 @@ fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
     )
 }
 
+/// Folder basename and muted label for a Sessions sidebar group (FR-1225):
+/// the WSL distro when known, else the parent path with `~` for home.
+fn workspace_group_meta(
+    path: &str,
+    home: Option<&str>,
+    wsl_distro: Option<&str>,
+) -> dmuxai::web::SessionWorkspaceGroup {
+    let trimmed = path.trim_end_matches('/');
+    let (parent, name) = match trimmed.rfind('/') {
+        Some(0) => ("/", &trimmed[1..]),
+        Some(index) => (&trimmed[..index], &trimmed[index + 1..]),
+        None => ("", trimmed),
+    };
+    let name = if name.is_empty() { path } else { name };
+    let label = match wsl_distro.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(distro) => format!("WSL: {distro}"),
+        None => match home
+            .map(|h| h.trim_end_matches('/'))
+            .filter(|h| !h.is_empty())
+        {
+            Some(home) if parent == home => "~".to_owned(),
+            Some(home) if parent.starts_with(&format!("{home}/")) => {
+                format!("~{}", &parent[home.len()..])
+            }
+            _ => parent.to_owned(),
+        },
+    };
+    dmuxai::web::SessionWorkspaceGroup {
+        path: path.to_owned(),
+        name: name.to_owned(),
+        label,
+        ..Default::default()
+    }
+}
+
+/// Groups other workspaces' conversations (already newest first) by
+/// workspace key, ordered by most recent activity (FR-1225).
+fn group_other_workspaces(
+    rows: Vec<(String, SessionConversation)>,
+    home: Option<&str>,
+    wsl_distro: Option<&str>,
+    exists: impl Fn(&str) -> bool,
+) -> Vec<dmuxai::web::SessionWorkspaceGroup> {
+    const GROUP_CONVERSATIONS_MAX: usize = 50;
+    let mut groups: Vec<dmuxai::web::SessionWorkspaceGroup> = Vec::new();
+    for (workspace, conversation) in rows {
+        let index = match groups.iter().position(|g| g.path == workspace) {
+            Some(index) => index,
+            None => {
+                let mut group = workspace_group_meta(&workspace, home, wsl_distro);
+                group.available = exists(&workspace);
+                groups.push(group);
+                groups.len() - 1
+            }
+        };
+        let group = &mut groups[index];
+        group.updated_at_ms = group.updated_at_ms.max(conversation.updated_at_ms);
+        if group.conversations.len() < GROUP_CONVERSATIONS_MAX {
+            group.conversations.push(conversation);
+        }
+    }
+    groups.sort_by_key(|group| std::cmp::Reverse(group.updated_at_ms));
+    for group in &mut groups {
+        group
+            .conversations
+            .sort_by_key(|conversation| std::cmp::Reverse(conversation.updated_at_ms));
+    }
+    groups
+}
+
 /// SPEC-dashboard-fullwidth FR-1223: links each turn band to the transcript
 /// id (`<conversation>:<index>`) of the user message that started its run.
 /// Runs and user messages are matched in order on the prompt text (a leading
@@ -15311,6 +15535,165 @@ mod tests {
         });
         assert!(matches!(busy, Err(RunTodoError::Busy(_))), "{busy:?}");
         assert_eq!(h.app.last_graph_run.as_ref().unwrap().plan.id, "run-wait");
+    }
+
+    fn other_workspace_conversation(
+        repos: &std::path::Path,
+        title: &str,
+    ) -> (tempfile::TempDir, String, String) {
+        let other = tempfile::tempdir().unwrap();
+        let key = dmuxai::workspace::normalize_workspace_path(other.path()).unwrap();
+        let db = repos
+            .join(dmuxai::state_path::repo_key_for_canonical(&key))
+            .join("conversations.sqlite3");
+        let mut engine = ConversationEngine::open(&db, other.path()).unwrap();
+        let snapshot = engine
+            .select(ConversationSelection::New {
+                title: Some(title.to_owned()),
+            })
+            .unwrap();
+        let id = snapshot.id.as_str().to_owned();
+        drop(engine);
+        (other, key, id)
+    }
+
+    // TC-1221 / SPEC-dashboard-fullwidth FR-1225: the session view groups
+    // other workspaces' sessions (read from the state dir) after the current
+    // workspace's group.
+    #[test]
+    fn session_view_groups_other_workspaces() {
+        let (mut h, _hub) = history_app();
+        let state = tempfile::tempdir().unwrap();
+        let repos = state.path().join("repos");
+        let (_other, key, id) = other_workspace_conversation(&repos, "Other chat");
+        assert!(h.app.session_view().workspaces.len() <= 1);
+        h.app.set_state_repos_dir(Some(repos));
+        let view = h.app.session_view();
+        assert_eq!(view.workspaces.len(), 2, "{:?}", view.workspaces);
+        let current = &view.workspaces[0];
+        assert!(current.current && current.available);
+        assert_eq!(current.path, h.app.engine.workspace_key());
+        assert!(current.conversations.is_empty());
+        let other = &view.workspaces[1];
+        assert!(!other.current && other.available);
+        assert_eq!(other.path, key);
+        assert_eq!(
+            other.name,
+            std::path::Path::new(&key)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert_eq!(other.conversations.len(), 1);
+        assert_eq!(other.conversations[0].id, id);
+        assert_eq!(other.conversations[0].title, "Other chat");
+        assert!(view.conversations.iter().all(|c| c.id != id));
+    }
+
+    // TC-1222 / FR-1225: group labels and ordering.
+    #[test]
+    fn workspace_group_labels_and_order() {
+        let meta = workspace_group_meta("/home/u/src/dmux", Some("/home/u"), None);
+        assert_eq!((meta.name.as_str(), meta.label.as_str()), ("dmux", "~/src"));
+        let meta = workspace_group_meta("/home/u/dmux", Some("/home/u/"), None);
+        assert_eq!(meta.label, "~");
+        let meta = workspace_group_meta("/srv/app", Some("/home/u"), None);
+        assert_eq!((meta.name.as_str(), meta.label.as_str()), ("app", "/srv"));
+        let meta = workspace_group_meta("/home/u/src/dmux", Some("/home/u"), Some("Ubuntu"));
+        assert_eq!(meta.label, "WSL: Ubuntu");
+        let conv = |id: &str, at: u64| SessionConversation {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            updated_at_ms: at,
+            ..Default::default()
+        };
+        let groups = group_other_workspaces(
+            vec![
+                ("/w/b".to_owned(), conv("b2", 90)),
+                ("/w/a".to_owned(), conv("a1", 50)),
+                ("/w/b".to_owned(), conv("b1", 10)),
+                ("/w/gone".to_owned(), conv("g1", 5)),
+            ],
+            None,
+            None,
+            |path| path != "/w/gone",
+        );
+        let paths: Vec<&str> = groups.iter().map(|g| g.path.as_str()).collect();
+        assert_eq!(paths, ["/w/b", "/w/a", "/w/gone"]);
+        assert_eq!(groups[0].updated_at_ms, 90);
+        let ids: Vec<&str> = groups[0]
+            .conversations
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(ids, ["b2", "b1"]);
+        assert!(groups[0].available && !groups[2].available);
+    }
+
+    // TC-1223 / FR-1227: opening another workspace's session is prepared,
+    // validated and handed to the re-exec only for that workspace.
+    #[test]
+    fn prepare_open_conversation_is_scoped() {
+        let (mut h, _hub) = history_app();
+        let state = tempfile::tempdir().unwrap();
+        let repos = state.path().join("repos");
+        let (other, key, id) = other_workspace_conversation(&repos, "Other chat");
+        h.app.set_state_repos_dir(Some(repos));
+        let parsed: SessionCommand = serde_json::from_value(serde_json::json!({
+            "command": "prepare_open_conversation",
+            "workspace": key,
+            "id": id,
+        }))
+        .unwrap();
+        h.app.handle_session_command(parsed).unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        assert_eq!(h.app.take_switch_open_conversation(unrelated.path()), None);
+        h.app
+            .handle_session_command(SessionCommand::PrepareOpenConversation {
+                workspace: key.clone(),
+                id: id.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            h.app.take_switch_open_conversation(other.path()),
+            Some(id.clone())
+        );
+        assert_eq!(h.app.take_switch_open_conversation(other.path()), None);
+        // A cancelled switch forgets it.
+        h.app.prepare_open_conversation(&key, &id).unwrap();
+        h.app.cancel_workspace_switch("cancelled".to_owned());
+        assert_eq!(h.app.take_switch_open_conversation(other.path()), None);
+        // Unknown ids, ids of the current workspace and bad ids are refused.
+        let missing = h.app.prepare_open_conversation(&key, "nope");
+        assert!(
+            matches!(missing, Err(RunTodoError::Missing(_))),
+            "{missing:?}"
+        );
+        let current = h.app.engine.workspace_key().to_owned();
+        let own = h.app.conversation_id.as_str().to_owned();
+        let same = h.app.prepare_open_conversation(&current, &own);
+        assert!(matches!(same, Err(RunTodoError::Invalid(_))), "{same:?}");
+        let bad = h.app.prepare_open_conversation(&key, "../x");
+        assert!(matches!(bad, Err(RunTodoError::Invalid(_))), "{bad:?}");
+        // While a switch is pending nothing new is prepared.
+        h.app.switch_pending = Some(other.path().to_path_buf());
+        let busy = h.app.prepare_open_conversation(&key, &id);
+        assert!(matches!(busy, Err(RunTodoError::Busy(_))), "{busy:?}");
+    }
+
+    // TC-1223 / FR-1227: the re-exec'd process opens the requested
+    // conversation of its own workspace and ignores anything else.
+    #[test]
+    fn open_conversation_on_startup_selects_it() {
+        let (mut h, _hub) = history_app();
+        let first = h.app.conversation_id.clone();
+        h.app.create_conversation(Some("second".to_owned()));
+        let second = h.app.conversation_id.clone();
+        assert_ne!(first, second);
+        h.app.open_conversation_on_startup("not-a-conversation");
+        assert_eq!(h.app.conversation_id, second);
+        h.app.open_conversation_on_startup(first.as_str());
+        assert_eq!(h.app.conversation_id, first);
     }
 
     // TC-1217 / FR-1223: bands link to their own user message, in order, even

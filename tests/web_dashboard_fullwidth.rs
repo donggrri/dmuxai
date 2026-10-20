@@ -862,3 +862,219 @@ with sync_playwright() as p:
         "{v}"
     );
 }
+
+// TC-1224: sessions_grouped_by_workspace_in_headless_chrome
+#[test]
+#[ignore = "needs Chrome/Chromium; run with --ignored"]
+fn sessions_grouped_by_workspace_in_headless_chrome() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let workspace = workspace_with_run(DONE_RUN);
+    let home = tempfile::tempdir().expect("temp home");
+    let (_guard, url) = start_serve(workspace.path(), home.path());
+    let script = r##"
+import sys, json, copy, time
+from playwright.sync_api import sync_playwright
+
+GROUPS = """() => [...document.querySelectorAll('#sessions-list > li.sessions-group')].map(g => ({
+  ws: g.getAttribute('data-workspace'),
+  current: g.classList.contains('sessions-group-current'),
+  collapsed: g.classList.contains('sessions-group-collapsed'),
+  icon: !!g.querySelector('.sessions-group-head svg.sessions-group-icon'),
+  name: (g.querySelector('.sessions-group-name') || {}).textContent || '',
+  name_weight: getComputedStyle(g.querySelector('.sessions-group-name')).fontWeight,
+  label: (g.querySelector('.sessions-group-label') || {}).textContent || '',
+  tip: g.querySelector('.sessions-group-head').title,
+  more: (g.querySelector('.sessions-more-btn') || {}).textContent || null,
+  rows: [...g.querySelectorAll('.sessions-row')].map(r => ({
+    id: r.getAttribute('data-id'),
+    title: r.querySelector('.sessions-row-title').textContent,
+    time: r.querySelector('.sessions-row-time').textContent,
+    active: r.getAttribute('aria-current') === 'true',
+    disabled: r.getAttribute('aria-disabled') === 'true',
+    tip: r.title,
+    ellipsis: getComputedStyle(r.querySelector('.sessions-row-title')).textOverflow,
+    time_right: r.querySelector('.sessions-row-time').getBoundingClientRect().right > r.querySelector('.sessions-row-title').getBoundingClientRect().right
+  }))
+}))"""
+
+now = int(time.time() * 1000)
+M = 60000; H = 60 * M; D = 24 * H
+def conv(cid, title, age):
+    return {"id": cid, "title": title, "updated_at_ms": now - age, "last_agent": "demo", "turn_count": 1, "running": False}
+
+out = {"commands": [], "switch": []}
+with sync_playwright() as p:
+    b = p.chromium.launch(executable_path=sys.argv[1], args=["--no-sandbox"])
+    probe = b.new_page()
+    probe.goto(sys.argv[2])
+    probe.wait_for_function("() => document.querySelector('#graph-phase').textContent === 'completed'", timeout=15000)
+    from urllib.parse import urlparse, parse_qs
+    tok = parse_qs(urlparse(sys.argv[2]).query)["token"][0]
+    real = probe.evaluate("""async (t) => {
+        const r = await fetch('/api/state', {headers: {Authorization: 'Bearer ' + t}});
+        return await r.json(); }""", tok)
+    probe.close()
+
+    snap = copy.deepcopy(real)
+    snap["source"] = "tui"
+    snap["graph"] = None
+    snap["session"] = {"conversation_id": "cur-2", "conversation_title": "Current two", "selected_agent": "demo",
+        "details_expanded": False, "agents": [], "transcript": [], "transcript_omitted": 0, "commands": [],
+        "conversations": [conv("cur-2", "Current two", 2 * M), conv("cur-1", "Current one with a very long title that must be ellipsized in the sidebar", 3 * D)],
+        "workspaces": [
+            {"path": "/home/u/src/dmux", "name": "dmux", "label": "~/src", "current": True, "available": True, "updated_at_ms": now - 2 * M, "conversations": []},
+            {"path": "/home/u/old/gone", "name": "gone", "label": "~/old", "current": False, "available": False, "updated_at_ms": now - 9 * D,
+             "conversations": [conv("gone-1", "Gone folder chat", 9 * D)]},
+            {"path": "/home/u/src/api", "name": "api", "label": "~/src", "current": False, "available": True, "updated_at_ms": now - 5 * H,
+             "conversations": [conv("api-%d" % i, "Api chat %d" % i, age) for i, age in enumerate([5 * H, 6 * H, 2 * D, 4 * D, 8 * D])]},
+        ]}
+    state = {"snap": snap, "rev": 100, "current": "/home/u/src/dmux"}
+
+    def fulfill_state(route):
+        state["rev"] += 1
+        s = copy.deepcopy(state["snap"])
+        s["revision"] = state["rev"]
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(s))
+
+    def fulfill_command(route):
+        body = json.loads(route.request.post_data or "{}")
+        out["commands"].append(body)
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({"session": state["snap"]["session"]}))
+
+    def fulfill_workspace(route):
+        req = route.request
+        if req.method == "POST" and req.url.split("?")[0].endswith("/api/workspace/switch"):
+            body = json.loads(req.post_data or "{}")
+            out["switch"].append(body)
+            state["current"] = body.get("path")
+            route.fulfill(status=202, content_type="application/json", body=json.dumps({"path": body.get("path")}))
+            return
+        if req.url.split("?")[0].endswith("/api/workspace"):
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(
+                {"current": state["current"], "recent": [], "browse_roots": ["/home/u"], "can_switch": True}))
+            return
+        route.continue_()
+
+    ctx = b.new_context(viewport={"width": 1440, "height": 900}, bypass_csp=True)
+    ctx.add_init_script("delete window.EventSource;")
+    pg = ctx.new_page()
+    pg.on("pageerror", lambda e: print("PAGEERROR", e, file=sys.stderr))
+    pg.route("**/api/state*", fulfill_state)
+    pg.route("**/api/command*", fulfill_command)
+    pg.route("**/api/workspace*", fulfill_workspace)
+    pg.route("**/api/workspace/**", fulfill_workspace)
+    pg.goto(sys.argv[2])
+    pg.wait_for_selector("#sessions-list li.sessions-group", timeout=15000)
+    if not pg.evaluate("() => document.querySelector('#sessions-sidebar').classList.contains('open')"):
+        pg.click("#sessions-toggle")
+    pg.wait_for_function("() => [...document.querySelectorAll('#sessions-list .sessions-row')].some(r => r.getAttribute('aria-disabled') !== 'true' && r.getAttribute('data-id') === 'api-0' && !r.title.includes('not available'))", timeout=15000)
+    out["initial"] = pg.evaluate(GROUPS)
+    pg.click("li.sessions-group[data-workspace='/home/u/src/api'] .sessions-more-btn")
+    out["more"] = pg.evaluate(GROUPS)
+    pg.click("li.sessions-group[data-workspace='/home/u/src/api'] .sessions-more-btn")
+    out["less"] = pg.evaluate(GROUPS)
+    pg.fill("#sessions-filter", "api chat 4")
+    pg.wait_for_timeout(200)
+    out["filtered"] = pg.evaluate(GROUPS)
+    pg.fill("#sessions-filter", "nothing matches this")
+    pg.wait_for_timeout(200)
+    out["no_match"] = pg.evaluate("() => document.querySelector('#sessions-list').innerText")
+    pg.fill("#sessions-filter", "")
+    pg.wait_for_timeout(200)
+    pg.click("li.sessions-group[data-workspace='/home/u/src/api'] .sessions-group-head")
+    pg.reload()
+    pg.wait_for_selector("#sessions-list li.sessions-group", timeout=15000)
+    pg.wait_for_timeout(500)
+    out["after_reload"] = pg.evaluate(GROUPS)
+    pg.click("li.sessions-group[data-workspace='/home/u/src/api'] .sessions-group-head")
+    pg.wait_for_function("() => [...document.querySelectorAll('#sessions-list .sessions-row')].some(r => r.getAttribute('data-id') === 'api-0' && r.getAttribute('aria-disabled') !== 'true')", timeout=15000)
+    # Disabled row (folder gone) does nothing; another workspace's row switches.
+    pg.click("li.sessions-row[data-id='gone-1']")
+    pg.click("li.sessions-row[data-id='api-1']")
+    pg.wait_for_function("() => true", timeout=1000)
+    deadline = time.time() + 10
+    while time.time() < deadline and not out["switch"]:
+        pg.wait_for_timeout(100)
+    print(json.dumps(out))
+    b.close()
+"##;
+    let v = run_probe(python, &chrome, &url, script);
+
+    let initial = v["initial"].as_array().unwrap();
+    // FR-1225: current workspace first and highlighted, then by activity.
+    let order: Vec<&str> = initial.iter().map(|g| g["ws"].as_str().unwrap()).collect();
+    assert_eq!(
+        order,
+        ["/home/u/src/dmux", "/home/u/src/api", "/home/u/old/gone"],
+        "{v}"
+    );
+    assert_eq!(initial[0]["current"], true, "{v}");
+    for g in initial {
+        assert_eq!(g["icon"], true, "{v}");
+        assert!(
+            g["name_weight"].as_str().unwrap().parse::<u32>().unwrap() >= 600,
+            "{v}"
+        );
+        assert_eq!(g["tip"], g["ws"], "{v}");
+    }
+    assert_eq!(initial[1]["name"], "api", "{v}");
+    assert_eq!(initial[1]["label"], "~/src", "{v}");
+    // FR-1226: newest first, compact time on the right, ellipsized titles,
+    // the active session highlighted, 3 rows + More.
+    let cur = initial[0]["rows"].as_array().unwrap();
+    assert_eq!(cur[0]["id"], "cur-2", "{v}");
+    assert_eq!(cur[0]["active"], true, "{v}");
+    assert_eq!(cur[0]["time"], "2m", "{v}");
+    assert_eq!(cur[1]["time"], "3d", "{v}");
+    assert_eq!(cur[1]["ellipsis"], "ellipsis", "{v}");
+    assert_eq!(cur[1]["time_right"], true, "{v}");
+    let api = initial[1]["rows"].as_array().unwrap();
+    let ids: Vec<&str> = api.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["api-0", "api-1", "api-2"], "{v}");
+    assert_eq!(api[0]["time"], "5h", "{v}");
+    assert_eq!(initial[1]["more"], "More", "{v}");
+    assert_eq!(v["more"][1]["rows"].as_array().unwrap().len(), 5, "{v}");
+    assert_eq!(v["more"][1]["more"], "Less", "{v}");
+    assert_eq!(v["less"][1]["rows"].as_array().unwrap().len(), 3, "{v}");
+    // FR-1227: a missing folder's row is disabled with a tooltip.
+    let gone = &initial[2]["rows"][0];
+    assert_eq!(gone["disabled"], true, "{v}");
+    assert!(
+        gone["tip"].as_str().unwrap().contains("no longer exists"),
+        "{v}"
+    );
+    // Filter across groups hides empty groups.
+    let filtered = v["filtered"].as_array().unwrap();
+    assert_eq!(filtered.len(), 1, "{v}");
+    assert_eq!(filtered[0]["ws"], "/home/u/src/api", "{v}");
+    assert_eq!(filtered[0]["rows"][0]["id"], "api-4", "{v}");
+    assert!(
+        v["no_match"]
+            .as_str()
+            .unwrap()
+            .contains("No matching sessions."),
+        "{v}"
+    );
+    // Collapse state survives a reload in the same tab.
+    let api_after = v["after_reload"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["ws"] == "/home/u/src/api")
+        .unwrap()
+        .clone();
+    assert_eq!(api_after["collapsed"], true, "{v}");
+    // Opening another workspace's session prepares it, then switches.
+    let cmds = v["commands"].as_array().unwrap();
+    assert!(
+        cmds.iter()
+            .any(|c| c["command"] == "prepare_open_conversation"
+                && c["workspace"] == "/home/u/src/api"
+                && c["id"] == "api-1"),
+        "{v}"
+    );
+    assert!(!cmds.iter().any(|c| c["id"] == "gone-1"), "{v}");
+    assert_eq!(v["switch"][0]["path"], "/home/u/src/api", "{v}");
+}

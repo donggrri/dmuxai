@@ -253,6 +253,7 @@
         command({ command: 'new_conversation' });
       });
     }
+    window.addEventListener('dmuxai:workspace-info', function () { renderConversations(); });
     if (ui.sessionsFilter) {
       ui.sessionsFilter.addEventListener('input', function () {
         sessionsFilter = ui.sessionsFilter.value || '';
@@ -1065,6 +1066,164 @@
     if (ui.sessionsFilter) { ui.sessionsFilter.focus(); }
   }
 
+  // SPEC-dashboard-fullwidth FR-1225..FR-1227: the Sessions list is grouped
+  // by workspace folder (current workspace first), 3 rows per group with
+  // More/Less, compact relative times, and per-tab collapse state.
+  var SESSIONS_GROUP_VISIBLE = 3;
+  var SESSIONS_COLLAPSED_KEY = 'dmuxai.sessions.collapsed';
+  var sessionsMore = {};
+
+  function sessionsCollapsed() {
+    try {
+      var raw = window.sessionStorage.getItem(SESSIONS_COLLAPSED_KEY);
+      var parsed = raw ? JSON.parse(raw) : {};
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (err) { return {}; }
+  }
+
+  function setSessionsCollapsed(path, collapsed) {
+    var map = sessionsCollapsed();
+    if (collapsed) { map[path] = true; } else { delete map[path]; }
+    try { window.sessionStorage.setItem(SESSIONS_COLLAPSED_KEY, JSON.stringify(map)); } catch (err) { /* ignore */ }
+  }
+
+  function compactTime(ms) {
+    var ts = Number(ms) || 0;
+    if (!ts) { return ''; }
+    var sec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+    if (sec < 60) { return sec + 's'; }
+    var min = Math.floor(sec / 60);
+    if (min < 60) { return min + 'm'; }
+    var hr = Math.floor(min / 60);
+    if (hr < 24) { return hr + 'h'; }
+    var day = Math.floor(hr / 24);
+    if (day < 7) { return day + 'd'; }
+    if (day < 365) { return Math.floor(day / 7) + 'w'; }
+    return Math.floor(day / 365) + 'y';
+  }
+
+  function folderIcon() {
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('class', 'sessions-group-icon');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('aria-hidden', 'true');
+    var path = document.createElementNS(ns, 'path');
+    path.setAttribute('d', 'M1.5 3.5h4.2l1.5 1.5h7.3v7.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1z');
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', 'currentColor');
+    path.setAttribute('stroke-width', '1.3');
+    path.setAttribute('stroke-linejoin', 'round');
+    svg.appendChild(path);
+    return svg;
+  }
+
+  function sessionGroups() {
+    var groups = Array.isArray(session.workspaces) ? session.workspaces.slice() : [];
+    var current = null;
+    groups = groups.filter(function (g) {
+      if (g && g.current) { current = g; return false; }
+      return !!g;
+    });
+    if (!current) {
+      current = { path: '', name: 'This workspace', label: '', current: true, available: true };
+    }
+    var currentGroup = {
+      path: current.path, name: current.name, label: current.label,
+      current: true, available: true, conversations: session.conversations || []
+    };
+    groups.sort(function (a, b) { return (Number(b.updated_at_ms) || 0) - (Number(a.updated_at_ms) || 0); });
+    return [currentGroup].concat(groups);
+  }
+
+  function focusSessionRow(from, delta) {
+    var rows = Array.prototype.slice.call(ui.sessionsList.querySelectorAll('.sessions-row'));
+    var index = rows.indexOf(from);
+    var next = rows[index + delta];
+    if (next) { next.focus(); }
+  }
+
+  function openOtherWorkspaceConversation(group, c) {
+    var switcher = window.dmuxaiSwitchWorkspace;
+    if (typeof switcher !== 'function') {
+      notify('Switching workspace is not available in this dashboard.', true);
+      return;
+    }
+    command({ command: 'prepare_open_conversation', workspace: group.path, id: c.id }).then(function (data) {
+      if (!data) { return; }
+      notify('Switching to ' + (group.name || group.path) + '\u2026');
+      switcher(group.path).then(function (res) {
+        if (!res || !res.ok) { notify((res && res.error) || 'Workspace switch failed.', true); }
+      });
+    });
+  }
+
+  function sessionRow(group, c, canSwitch) {
+    var isActive = group.current && c.id === session.conversation_id;
+    var reason = '';
+    if (viewOnly) {
+      reason = 'View-only dashboard';
+    } else if (!group.current && !group.available) {
+      reason = 'This workspace folder no longer exists';
+    } else if (!group.current && !canSwitch) {
+      reason = 'Switching workspace is not available in this dashboard';
+    }
+    var disabled = !!reason;
+    var li = el('li', 'sessions-row' + (isActive ? ' sessions-row-active' : '') + (disabled ? ' sessions-row-disabled' : ''));
+    li.tabIndex = 0;
+    li.setAttribute('data-id', c.id);
+    li.setAttribute('data-parity', 'resume');
+    li.setAttribute('data-agent', c.last_agent || '');
+    if (disabled) { li.setAttribute('aria-disabled', 'true'); }
+    if (isActive) { li.setAttribute('aria-current', 'true'); }
+
+    var titleText = c.title || c.id.slice(0, 8);
+    var tip = titleText + (c.last_agent ? ' \u00b7 ' + c.last_agent : '');
+    if (!group.current && !disabled) { tip += ' \u00b7 opens in ' + (group.name || group.path); }
+    if (reason) { tip += ' \u2014 ' + reason; }
+    li.title = tip;
+
+    var top = el('div', 'sessions-row-head');
+    if (c.running) {
+      var spin = el('span', 'spinner');
+      spin.setAttribute('role', 'img');
+      spin.setAttribute('aria-label', 'running');
+      top.appendChild(spin);
+    }
+    top.appendChild(el('span', 'sessions-row-title', titleText));
+    top.appendChild(el('span', 'sessions-row-agent sr-only', c.last_agent || 'none'));
+    var timeEl = el('span', 'sessions-row-time', compactTime(c.updated_at_ms));
+    if (c.updated_at_ms) {
+      try { timeEl.title = new Date(c.updated_at_ms).toISOString(); } catch (err) { /* ignore */ }
+    }
+    top.appendChild(timeEl);
+    li.appendChild(top);
+
+    function activateRow() {
+      if (disabled || isActive) { return; }
+      if (group.current) {
+        command({ command: 'load_conversation', id: c.id });
+      } else {
+        openOtherWorkspaceConversation(group, c);
+      }
+    }
+    li.addEventListener('click', activateRow);
+    li.addEventListener('keydown', function (e) {
+      if (e.isComposing || e.keyCode === 229) { return; }
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        activateRow();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        focusSessionRow(li, 1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        focusSessionRow(li, -1);
+      }
+    });
+    return li;
+  }
+
   function renderConversations() {
     if (!ui.sessionsList) { return; }
     if (ui.sessionsNew) { ui.sessionsNew.disabled = viewOnly || !session; }
@@ -1076,80 +1235,79 @@
       return;
     }
     var q = (sessionsFilter || '').trim().toLowerCase();
-    var key = JSON.stringify(session.conversations) + '|' + session.conversation_id + '|' + q + '|' + (viewOnly ? '1' : '0');
+    var canSwitch = typeof window.dmuxaiWorkspaceCanSwitch === 'function' && window.dmuxaiWorkspaceCanSwitch();
+    var collapsed = sessionsCollapsed();
+    var key = JSON.stringify([session.conversations, session.workspaces || [], session.conversation_id, q,
+      viewOnly, canSwitch, collapsed, sessionsMore, Math.floor(Date.now() / 60000)]);
     if (ui.sessionsList.getAttribute('data-key') === key) { return; }
     ui.sessionsList.setAttribute('data-key', key);
     ui.sessionsList.textContent = '';
 
-    var filtered = session.conversations.filter(function (c) {
+    function matches(c) {
       if (!q) { return true; }
       var title = (c.title || '').toLowerCase();
       var id = (c.id || '').toLowerCase();
       var agent = (c.last_agent || '').toLowerCase();
       return title.indexOf(q) >= 0 || id.indexOf(q) >= 0 || agent.indexOf(q) >= 0;
-    });
-
-    if (!filtered.length) {
-      ui.sessionsList.appendChild(el('li', 'sessions-empty', q ? 'No matching sessions.' : 'No conversations yet.'));
-      return;
     }
 
-    filtered.forEach(function (c) {
-      var isActive = c.id === session.conversation_id;
-      var li = el('li', 'sessions-row' + (isActive ? ' sessions-row-active' : '') + (viewOnly ? ' sessions-row-disabled' : ''));
-      li.tabIndex = 0;
-      li.setAttribute('data-id', c.id);
-      li.setAttribute('data-parity', 'resume');
-      if (isActive) {
-        li.setAttribute('aria-current', 'true');
-      }
-
-      var top = el('div', 'sessions-row-head');
-      if (c.running) {
-        var spin = el('span', 'spinner');
-        spin.setAttribute('role', 'img');
-        spin.setAttribute('aria-label', 'running');
-        top.appendChild(spin);
-      }
-      var titleText = c.title || c.id.slice(0, 8);
-      var titleEl = el('span', 'sessions-row-title', titleText);
-      titleEl.title = titleText;
-      top.appendChild(titleEl);
-      li.appendChild(top);
-
-      var meta = el('div', 'sessions-row-meta');
-      meta.appendChild(el('span', 'sessions-row-agent', c.last_agent || 'none'));
-      var timeEl = el('span', 'sessions-row-time', relativeTime(c.updated_at_ms));
-      if (c.updated_at_ms) {
-        try { timeEl.title = new Date(c.updated_at_ms).toISOString(); } catch (err) { /* ignore */ }
-      }
-      meta.appendChild(timeEl);
-      li.appendChild(meta);
-
-      function activateRow() {
-        if (viewOnly || isActive) { return; }
-        command({ command: 'load_conversation', id: c.id });
-      }
-
-      li.addEventListener('click', activateRow);
-      li.addEventListener('keydown', function (e) {
-        if (e.isComposing || e.keyCode === 229) { return; }
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          activateRow();
-        } else if (e.key === 'ArrowDown') {
-          e.preventDefault();
-          var next = li.nextElementSibling;
-          if (next && next.classList.contains('sessions-row')) { next.focus(); }
-        } else if (e.key === 'ArrowUp') {
-          e.preventDefault();
-          var prev = li.previousElementSibling;
-          if (prev && prev.classList.contains('sessions-row')) { prev.focus(); }
-        }
+    var shown = 0;
+    sessionGroups().forEach(function (group) {
+      var list = (group.conversations || []).filter(matches).slice().sort(function (a, b) {
+        return (Number(b.updated_at_ms) || 0) - (Number(a.updated_at_ms) || 0);
       });
+      if (!list.length && (q || !group.current)) { return; }
+      var path = group.path || '';
+      var isCollapsed = !q && !!collapsed[path];
+      var gli = el('li', 'sessions-group' + (group.current ? ' sessions-group-current' : '') + (isCollapsed ? ' sessions-group-collapsed' : ''));
+      gli.setAttribute('data-workspace', path);
+      var head = el('button', 'sessions-group-head');
+      head.type = 'button';
+      head.title = path;
+      head.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
+      head.appendChild(folderIcon());
+      head.appendChild(el('span', 'sessions-group-name', group.name || path || 'Workspace'));
+      if (group.label) { head.appendChild(el('span', 'sessions-group-label', group.label)); }
+      head.addEventListener('click', function () {
+        setSessionsCollapsed(path, !isCollapsed);
+        renderConversations();
+      });
+      gli.appendChild(head);
 
-      ui.sessionsList.appendChild(li);
+      var ul = el('ul', 'sessions-group-list');
+      ul.hidden = isCollapsed;
+      var expanded = !!q || !!sessionsMore[path];
+      var visible = expanded ? list : list.slice(0, SESSIONS_GROUP_VISIBLE);
+      if (!expanded && group.current) {
+        var active = list.filter(function (c) { return c.id === session.conversation_id; })[0];
+        if (active && visible.indexOf(active) < 0) { visible = visible.concat([active]); }
+      }
+      visible.forEach(function (c) { ul.appendChild(sessionRow(group, c, canSwitch)); });
+      if (!list.length) {
+        ul.appendChild(el('li', 'sessions-empty', 'No conversations yet.'));
+      }
+      if (!q && list.length > SESSIONS_GROUP_VISIBLE) {
+        var moreLi = el('li', 'sessions-more');
+        var more = el('button', 'sessions-more-btn', expanded ? 'Less' : 'More');
+        more.type = 'button';
+        more.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+        if (!expanded) { more.title = (list.length - visible.length) + ' more'; }
+        more.addEventListener('click', function () {
+          if (expanded) { delete sessionsMore[path]; } else { sessionsMore[path] = true; }
+          renderConversations();
+        });
+        moreLi.appendChild(more);
+        ul.appendChild(moreLi);
+      }
+      gli.appendChild(ul);
+      ui.sessionsList.appendChild(gli);
+      shown += list.length;
     });
+
+    if (!shown && q) {
+      ui.sessionsList.textContent = '';
+      ui.sessionsList.appendChild(el('li', 'sessions-empty', 'No matching sessions.'));
+    }
   }
 
   // ---- palette ----------------------------------------------------------

@@ -39,6 +39,15 @@ All notable changes to dmuxai are listed here. Versions follow
   its own collapsed run row, and "Open in Graph" on an earlier run loads that
   run into the Graph view (`show_graph_run` command).
 
+- **Sessions grouped by workspace folder (FR-1225..FR-1227).** The Sessions
+  sidebar lists every workspace's sessions from the state dir (read-only),
+  one group per folder: folder icon, bold name, muted parent path (or WSL
+  distro), full path on hover. Rows are newest first with a compact time
+  ("5h"); 3 per group with More/Less; the current workspace and the active
+  session are highlighted; the filter spans all groups; collapsed groups are
+  remembered per tab. Opening another workspace's session switches workspace
+  and opens it there.
+
 ### Fixed
 
 - **Agent replies no longer show twice (FR-1209, FR-1210).** The Documents

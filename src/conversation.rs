@@ -903,6 +903,11 @@ impl ConversationEngine {
             .map_err(ConversationError::from)
     }
 
+    /// The normalized workspace key this engine lists and writes under.
+    pub fn workspace_key(&self) -> &str {
+        &self.workspace_root
+    }
+
     pub fn select(
         &mut self,
         selection: ConversationSelection,
@@ -1865,6 +1870,100 @@ fn now_ms() -> Result<i64, ConversationError> {
         .map_err(|_| ConversationError::ClockBeforeUnixEpoch)?
         .as_millis();
     i64::try_from(millis).map_err(|_| ConversationError::ClockBeforeUnixEpoch)
+}
+
+/// SPEC-dashboard-fullwidth FR-1225: read-only listing of the conversations
+/// of *other* workspaces, scanned from the per-workspace databases under the
+/// state dir's `repos/` (FR-450). Each database is opened read-only; only rows
+/// whose workspace hashes to that database's directory are taken, so copies
+/// left by the legacy-database migration (FR-452) are not listed twice.
+/// Unreadable or newer-schema databases are skipped. Newest first.
+pub fn list_state_dir_conversations(
+    repos_dir: &Path,
+    exclude_workspace: &str,
+    limit: usize,
+) -> Vec<(String, ConversationCard)> {
+    let Ok(entries) = fs::read_dir(repos_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
+        let db_path = entry.path().join("conversations.sqlite3");
+        if !db_path.is_file() {
+            continue;
+        }
+        let Ok(rows) = read_conversation_cards(&db_path, exclude_workspace, limit) else {
+            continue;
+        };
+        out.extend(rows.into_iter().filter(|(workspace, _)| {
+            crate::state_path::repo_key_for_canonical(workspace) == dir_name
+        }));
+    }
+    out.sort_by(|a, b| {
+        b.1.updated_at_ms
+            .cmp(&a.1.updated_at_ms)
+            .then_with(|| b.1.id.as_str().cmp(a.1.id.as_str()))
+    });
+    out.truncate(limit);
+    out
+}
+
+fn read_conversation_cards(
+    db_path: &Path,
+    exclude_workspace: &str,
+    limit: usize,
+) -> Result<Vec<(String, ConversationCard)>, ConversationError> {
+    let connection = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(std::time::Duration::from_millis(250))?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !(1..=SCHEMA_VERSION).contains(&version) {
+        return Ok(Vec::new());
+    }
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare(
+        "SELECT c.id, c.title, c.updated_at_ms,
+                COUNT(t.id),
+                (SELECT requested_agent
+                   FROM turns latest
+                  WHERE latest.conversation_id = c.id
+                  ORDER BY latest.seq DESC
+                  LIMIT 1),
+                EXISTS(
+                    SELECT 1
+                      FROM turns active
+                     WHERE active.conversation_id = c.id
+                       AND active.status IN ('queued', 'running')
+                ),
+                c.workspace_root
+           FROM conversations c
+           LEFT JOIN turns t ON t.conversation_id = c.id
+          WHERE c.workspace_root != ?1 AND c.archived_at_ms IS NULL
+          GROUP BY c.id
+          ORDER BY c.updated_at_ms DESC, c.id DESC
+          LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![exclude_workspace, limit], |row| {
+        let last_agent: Option<String> = row.get(4)?;
+        Ok((
+            row.get::<_, String>(6)?,
+            ConversationCard {
+                id: ConversationId::new(row.get::<_, String>(0)?),
+                title: row.get(1)?,
+                updated_at_ms: row.get(2)?,
+                turn_count: row.get::<_, i64>(3)?.try_into().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(error))
+                })?,
+                last_agent: last_agent.as_deref().map(AgentKey::from_db).transpose()?,
+                running: row.get(5)?,
+            },
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(ConversationError::from)
 }
 
 #[cfg(test)]
