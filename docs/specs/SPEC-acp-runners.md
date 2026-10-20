@@ -84,6 +84,7 @@ No Must requirement depends on an unanswered question for CI; live smoke is manu
 | FR-1328 | Must | Internal read-only turns. | Select `modeId` from `modes.availableModes`; apply `session/set_mode`; refuse the turn if no read-only mode applies (do not run writable agent mode). | — | TC-1324 |
 | FR-1329 | Must | Permission denied. | Any turn with a denied permission ends in `Error`, not `Completed` / `ok: true`. | — | Review |
 | FR-1330 | Must | Cursor fast-model selection. | Non-fast switch only within the requested model family (e.g. `composer-2.5`), never unrelated models. | — | TC-1328 |
+| FR-1326 | Must | Built-in opencode, `opencode_protocol = acp`. | `opencode acp --cwd <workspace>`; model via `session/set_config_option` with verified `configOptions` result (abort turn on mismatch or paid default). `DMUXAI_OPENCODE_BIN` missing → register runner and surface not-found on use. | `legacy` uses jsonl `run`. | TC-1326, TC-1327 |
 
 ## 5. Acceptance scenarios
 
@@ -116,6 +117,8 @@ No Must requirement depends on an unanswered question for CI; live smoke is manu
 | TC-1329 | FR-1327 | integration | Fake agent fast-only | ACP turn | Child reaped | `src/agent/cursor.rs` |
 | TC-1331 | FR-1329 | integration | Fake agent permission outside | ACP turn | `Error`, not `Completed` | `src/agent/cursor.rs` |
 | TC-1332 | FR-1302 | unit | Duplicate `tool_call_update` ids | Map updates | Single activity row | `src/agent/acp/updates.rs` |
+| TC-1326 | FR-1326 | unit | `opencode_acp_argv` | argv | `acp --cwd` | `src/agent/acp_runner.rs` |
+| TC-1327 | FR-1326 | integration | Fake ACP as opencode | Prompt | Model capture | `src/agent/custom.rs` |
 
 Deterministic ACP integration tests require `cargo test --features test-fixtures` (builds `fake-acp-agent`); plain `cargo test` must pass without the fixture binary.
 

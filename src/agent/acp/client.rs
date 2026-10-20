@@ -37,7 +37,6 @@ const CANCEL_GRACE_MS: u64 = 1500;
 pub enum AcpRunnerKind {
     Cursor,
     Grok,
-    #[allow(dead_code)]
     Opencode,
 }
 

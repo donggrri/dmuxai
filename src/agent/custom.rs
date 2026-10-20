@@ -425,10 +425,21 @@ async fn run_turn(
             .command
             .first()
             .ok_or_else(|| format!("{}: empty command", spec.label()))?;
+        let program_path = Path::new(program);
+        if !program_path.is_file() {
+            if let Some(message) = dmuxai::settings::opencode_bin_explicit_missing_message() {
+                return Err(message);
+            }
+            return Err(format!(
+                "opencode binary not found at {}",
+                program_path.display()
+            ));
+        }
         let args = super::acp_runner::opencode_acp_argv(cwd);
         let permission_ctx = super::acp::PermissionContext {
             workspace: cwd.to_string_lossy().into_owned(),
             sensitive_gate_active: false,
+            read_only_fail_closed: false,
         };
         let cancel = acp_cancel.unwrap_or_else(super::acp::new_cancel_flag);
         super::acp_runner::run_agent_acp_turn(
@@ -1557,52 +1568,56 @@ temp_config_template = '{"mcp": "not-an-object"}'
         worker.await.unwrap();
     }
 
-    fn fake_acp_agent_bin() -> std::path::PathBuf {
-        let mut path = std::env::current_exe().expect("test exe");
-        path.pop();
-        if path.ends_with("deps") {
+    #[cfg(feature = "test-fixtures")]
+    mod opencode_acp_fake_tests {
+        use super::*;
+
+        fn fake_acp_agent_bin() -> std::path::PathBuf {
+            let mut path = std::env::current_exe().expect("test exe");
             path.pop();
+            if path.ends_with("deps") {
+                path.pop();
+            }
+            path.push("fake-acp-agent");
+            path
         }
-        path.push("fake-acp-agent");
-        path
-    }
 
-    fn opencode_acp_spec(program: &str) -> &'static CustomAgentSpec {
-        let mut spec = dmuxai::custom_agent::opencode_preset(program);
-        spec.default_model = Some("opencode/glm-5.3-flash-free".to_owned());
-        Box::leak(Box::new(spec))
-    }
+        fn opencode_acp_spec(program: &str) -> &'static CustomAgentSpec {
+            let mut spec = dmuxai::custom_agent::opencode_preset(program);
+            spec.default_model = Some("opencode/glm-5.3-flash-free".to_owned());
+            Box::leak(Box::new(spec))
+        }
 
-    async fn drive_opencode_acp(
-        spec: &'static CustomAgentSpec,
-    ) -> (
-        mpsc::Sender<CustomCommand>,
-        mpsc::Receiver<AgentOutput>,
-        JoinHandle<()>,
-    ) {
-        let workspace = tempfile::tempdir().expect("opencode test workspace");
-        std::fs::write(
-            workspace.path().join("dmuxai.toml"),
-            "[agents]\nopencode_protocol = \"acp\"\n",
-        )
-        .expect("opencode acp settings");
-        let (event_tx, event_rx) = mpsc::channel(64);
-        let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-        let worker = tokio::spawn(runtime_loop_with_spec(
-            Agent::Custom(0),
-            spec,
-            command_rx,
-            event_tx,
-            workspace.path().to_path_buf(),
-            Vec::new(),
-        ));
-        std::mem::forget(workspace);
-        (command_tx, event_rx, worker)
-    }
+        async fn drive_opencode_acp(
+            spec: &'static CustomAgentSpec,
+        ) -> (
+            mpsc::Sender<CustomCommand>,
+            mpsc::Receiver<AgentOutput>,
+            JoinHandle<()>,
+        ) {
+            let workspace = tempfile::tempdir().expect("opencode test workspace");
+            std::fs::write(
+                workspace.path().join("dmuxai.toml"),
+                "[agents]\nopencode_protocol = \"acp\"\n",
+            )
+            .expect("opencode acp settings");
+            let (event_tx, event_rx) = mpsc::channel(64);
+            let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+            let worker = tokio::spawn(runtime_loop_with_spec(
+                Agent::Custom(0),
+                spec,
+                command_rx,
+                event_tx,
+                workspace.path().to_path_buf(),
+                Vec::new(),
+            ));
+            std::mem::forget(workspace);
+            (command_tx, event_rx, worker)
+        }
 
-    // TC-1321 / FR-1320, FR-1322: opencode ACP turn sets model via session config.
-    #[tokio::test]
-    async fn opencode_acp_turn_with_fake_agent() {
+        // TC-1327 / FR-1326: opencode ACP turn sets model via session config.
+        #[tokio::test]
+        async fn opencode_acp_turn_with_fake_agent() {
         let fake = fake_acp_agent_bin();
         assert!(
             fake.is_file(),
@@ -1641,5 +1656,6 @@ temp_config_template = '{"mcp": "not-an-object"}'
         assert_eq!(captured, "opencode/glm-5.3-flash-free");
         drop(tx);
         worker.await.unwrap();
+        }
     }
 }
