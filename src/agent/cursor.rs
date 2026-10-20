@@ -2582,7 +2582,9 @@ pub(crate) mod tests {
                 .split(|b| *b == b'\n')
                 .filter(|line| !line.is_empty())
                 .filter(|line| {
-                    let pid = std::str::from_utf8(line).ok().and_then(|s| s.parse::<u32>().ok());
+                    let pid = std::str::from_utf8(line)
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok());
                     pid.is_some_and(|pid| {
                         let stat = std::process::Command::new("ps")
                             .args(["-o", "stat=", "-p", &pid.to_string()])
