@@ -80,6 +80,10 @@ No Must requirement depends on an unanswered question for CI; live smoke is manu
 | FR-1323 | Must | User cancel during prompt or blocking RPC. | Cancel is polled independently of agent output; `session/cancel` is sent before kill. | — | TC-1317 |
 | FR-1324 | Must | Permission denied with no assistant text. | Turn ends with `Error` (not `Completed` / `ok: true`). | — | Review |
 | FR-1325 | Must | ACP tool UI noise. | Suppress generic `tool` / `Tool [completed]: tool` rows; keep meaningful tool activity (edit, execute with command). | — | TC-1315 |
+| FR-1327 | Must | ACP child lifecycle. | Every exit path (success, error, cancel) terminates the agent process group; no orphans after session-open failures. | — | TC-1329 |
+| FR-1328 | Must | Internal read-only turns. | Select `modeId` from `modes.availableModes`; apply `session/set_mode`; refuse the turn if no read-only mode applies (do not run writable agent mode). | — | TC-1324 |
+| FR-1329 | Must | Permission denied. | Any turn with a denied permission ends in `Error`, not `Completed` / `ok: true`. | — | Review |
+| FR-1330 | Must | Cursor fast-model selection. | Non-fast switch only within the requested model family (e.g. `composer-2.5`), never unrelated models. | — | TC-1328 |
 
 ## 5. Acceptance scenarios
 
@@ -108,6 +112,8 @@ No Must requirement depends on an unanswered question for CI; live smoke is manu
 | TC-1323 | FR-1320 | unit | `session_load_params` | Inspect JSON | `cwd`, `mcpServers` | `src/agent/acp/session.rs` |
 | TC-1324 | FR-1321 | unit | `session_set_mode_params` | Inspect JSON | `modeId` present | `src/agent/acp/session.rs` |
 | TC-1325 | FR-1322 | unit | Grok-style options | `choose_permission_option` | `allow_once` wins | `src/agent/acp/permissions.rs` |
+| TC-1328 | FR-1330 | unit | Mixed model list | `pick_non_fast_model` | Stays on composer family | `src/agent/acp/session.rs` |
+| TC-1329 | FR-1327 | integration | Fake agent fast-only | ACP turn | Child reaped | `src/agent/cursor.rs` |
 
 Deterministic ACP integration tests require `cargo test --features test-fixtures` (builds `fake-acp-agent`); plain `cargo test` must pass without the fixture binary.
 

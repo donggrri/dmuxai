@@ -47,15 +47,33 @@ fn main() {
                         error(&mut stdout, id, -32602, &msg);
                         continue;
                     }
+                    if std::env::var("FAKE_ACP_SESSION_NEW_ERROR").is_ok() {
+                        error(&mut stdout, id, -32603, "session/new refused for test");
+                        continue;
+                    }
                     session = "fake-session-1".to_owned();
+                    let fast_only = std::env::var("FAKE_ACP_FAST_ONLY").is_ok();
+                    let current = if fast_only {
+                        "composer-2.5[fast=true]"
+                    } else {
+                        "composer-2.5"
+                    };
+                    let available = if fast_only {
+                        serde_json::json!(["composer-2.5[fast=true]"])
+                    } else {
+                        serde_json::json!(["composer-2.5", "composer-2.5[fast=true]"])
+                    };
                     respond(
                         &mut stdout,
                         id,
                         serde_json::json!({
                             "sessionId": session,
                             "models": {
-                                "currentModelId": "composer-2.5",
-                                "availableModels": ["composer-2.5", "composer-2.5[fast=true]"]
+                                "currentModelId": current,
+                                "availableModels": available
+                            },
+                            "modes": {
+                                "availableModes": ["agent", "ask"]
                             }
                         }),
                     );

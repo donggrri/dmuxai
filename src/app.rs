@@ -13569,7 +13569,24 @@ mod tests {
         }
     }
 
+    static TEST_STATE_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+
+    fn pin_test_state_dir() {
+        TEST_STATE_DIR.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("test state tempdir");
+            let state = dir.path().join("dmuxai");
+            std::fs::create_dir_all(&state).expect("dmuxai state dir");
+            // SAFETY: tests should not share the developer's real state directory.
+            unsafe {
+                std::env::set_var("XDG_STATE_HOME", dir.path());
+                std::env::set_var("DMUXAI_STATE_DIR", state);
+            }
+            dir
+        });
+    }
+
     fn test_app() -> (App, SentRequests) {
+        pin_test_state_dir();
         let workspace = std::env::current_dir().unwrap();
         let engine =
             ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();

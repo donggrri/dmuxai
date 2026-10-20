@@ -4,8 +4,6 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::agent::TurnPolicy;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionOpenNote {
     New,
@@ -18,7 +16,6 @@ pub enum SessionOpenNote {
 pub struct AgentCapabilities {
     pub load_session: bool,
     pub resume_session: bool,
-    pub set_mode: bool,
     pub set_model: bool,
     pub set_config_option: bool,
 }
@@ -28,7 +25,6 @@ pub fn parse_agent_capabilities(init_result: &Value) -> AgentCapabilities {
     AgentCapabilities {
         load_session: blob.contains("loadsession") || blob.contains("session/load"),
         resume_session: blob.contains("resume") || blob.contains("session/resume"),
-        set_mode: blob.contains("set_mode") || blob.contains("session/set_mode"),
         set_model: blob.contains("set_model") || blob.contains("session/set_model"),
         set_config_option: blob.contains("set_config_option")
             || blob.contains("session/set_config_option"),
@@ -52,6 +48,14 @@ pub fn is_fast_model_label(model: &str) -> bool {
     lower.contains("fast") || lower.contains("[fast=true]")
 }
 
+pub fn model_family_base(model: &str) -> String {
+    let stem = model.split('[').next().unwrap_or(model).trim();
+    stem.strip_suffix("-fast")
+        .unwrap_or(stem)
+        .trim_end_matches("[fast=true]")
+        .to_owned()
+}
+
 pub fn extract_reported_model(session_result: &Value) -> Option<String> {
     session_result
         .pointer("/models/currentModelId")
@@ -71,26 +75,76 @@ pub fn available_model_ids(session_result: &Value) -> Vec<String> {
         session_result.get("availableModels"),
     ];
     for arr in arrays.into_iter().flatten() {
-        if let Some(items) = arr.as_array() {
-            for item in items {
-                if let Some(s) = item.as_str() {
-                    out.push(s.to_owned());
-                } else if let Some(id) = item.get("id").and_then(Value::as_str) {
-                    out.push(id.to_owned());
-                } else if let Some(id) = item.get("modelId").and_then(Value::as_str) {
-                    out.push(id.to_owned());
-                }
-            }
-        }
+        collect_id_list(arr, &mut out);
     }
     out
 }
 
-pub fn pick_non_fast_model(candidates: &[String]) -> Option<String> {
+pub fn available_mode_ids(session_result: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let arrays = [
+        session_result.pointer("/modes/availableModes"),
+        session_result.pointer("/modes/available_modes"),
+        session_result.get("availableModes"),
+    ];
+    for arr in arrays.into_iter().flatten() {
+        collect_id_list(arr, &mut out);
+    }
+    out
+}
+
+fn collect_id_list(arr: &Value, out: &mut Vec<String>) {
+    if let Some(items) = arr.as_array() {
+        for item in items {
+            if let Some(s) = item.as_str() {
+                out.push(s.to_owned());
+            } else if let Some(id) = item.get("id").and_then(Value::as_str) {
+                out.push(id.to_owned());
+            } else if let Some(id) = item.get("modeId").and_then(Value::as_str) {
+                out.push(id.to_owned());
+            } else if let Some(id) = item.get("modelId").and_then(Value::as_str) {
+                out.push(id.to_owned());
+            }
+        }
+    }
+}
+
+/// Pick a non-fast model id in the same family as `requested` (e.g. composer-2.5 only).
+pub fn pick_non_fast_model(candidates: &[String], requested: Option<&str>) -> Option<String> {
+    let base = requested.map(model_family_base)?;
     candidates
         .iter()
-        .find(|id| !is_fast_model_label(id))
+        .find(|id| !is_fast_model_label(id) && model_family_base(id) == base)
         .cloned()
+}
+
+const READ_ONLY_MODE_PREFERENCES: &[&str] = &[
+    "ask",
+    "plan",
+    "read-only",
+    "readonly",
+    "read_only",
+    "review",
+];
+
+/// Choose a read-only `modeId` from session payload (`modes.availableModes`).
+pub fn pick_read_only_mode_id(session_result: &Value) -> Option<String> {
+    let modes = available_mode_ids(session_result);
+    if modes.is_empty() {
+        return None;
+    }
+    for preferred in READ_ONLY_MODE_PREFERENCES {
+        if let Some(found) = modes.iter().find(|id| id.eq_ignore_ascii_case(preferred)) {
+            return Some(found.clone());
+        }
+    }
+    None
+}
+
+pub fn read_only_turn_refusal(agent: &str) -> String {
+    format!(
+        "ACP runner `{agent}` has no read-only mode available for this internal turn; refusing to run writable agent mode."
+    )
 }
 
 /// Inspect session payload; does not call ACP (used after open when no model switch is needed).
@@ -113,13 +167,6 @@ pub fn fast_model_refusal(effective: &str) -> String {
         "Cursor ACP session is using fast model `{effective}` and no non-fast composer model could be selected. \
 Set `[cursor] protocol = \"legacy\"` in dmuxai.toml or choose a non-fast model in Cursor."
     )
-}
-
-pub fn read_only_mode_id(policy: TurnPolicy) -> Option<&'static str> {
-    match policy {
-        TurnPolicy::ReadOnly => Some("ask"),
-        TurnPolicy::Agent => None,
-    }
 }
 
 pub fn session_set_mode_params(session_id: &str, mode_id: &str) -> Value {
@@ -165,6 +212,21 @@ mod tests {
         );
     }
 
+    // TC-1328 / FR-1313: do not switch to unrelated non-fast models.
+    #[test]
+    fn pick_non_fast_model_stays_in_requested_family() {
+        let candidates = vec![
+            "auto-smart".to_owned(),
+            "claude-opus-5-5".to_owned(),
+            "composer-2.5".to_owned(),
+        ];
+        assert_eq!(
+            pick_non_fast_model(&candidates, Some("composer-2.5[fast=true]")).as_deref(),
+            Some("composer-2.5")
+        );
+        assert!(pick_non_fast_model(&candidates, Some("grok-4.7")).is_none());
+    }
+
     // TC-1323 / FR-1316: session/load params include cwd and mcpServers.
     #[test]
     fn session_load_params_schema() {
@@ -180,5 +242,13 @@ mod tests {
         let params = session_set_mode_params("sid", "ask");
         assert_eq!(params["modeId"], "ask");
         assert!(params.get("mode").is_none());
+    }
+
+    #[test]
+    fn pick_read_only_mode_from_available_modes() {
+        let payload = json!({
+            "modes": { "availableModes": ["agent", "plan", "debug"] }
+        });
+        assert_eq!(pick_read_only_mode_id(&payload).as_deref(), Some("plan"));
     }
 }

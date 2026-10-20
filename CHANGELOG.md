@@ -20,6 +20,12 @@ All notable changes to dmuxai are listed here. Versions follow
   Cancel is polled independently and sends `session/cancel` before kill. Generic
   `tool` activity rows are suppressed. Fake ACP tests use `--features test-fixtures`.
   Cursor ACP argv includes `--sandbox enabled` when supported (OQ-1326).
+  ACP turns always terminate the child process group on error/cancel/success.
+  Read-only internal turns pick `modeId` from `modes.availableModes` and refuse
+  when unsettable. Permission-denied turns report failure. Composer fast-model
+  guard only switches within the requested model family. `DMUXAI_ACP_LOG` traces
+  session/new/set_mode/set_model responses (truncated). Unit tests pin
+  `XDG_STATE_HOME` / `DMUXAI_STATE_DIR` to a temp directory.
   Cursor prewarm applies only to legacy stream-json.
 - **CLI:** `dmuxai run` / `todo run` reject `--mode` with an error instead of
   running write-capable turns silently.

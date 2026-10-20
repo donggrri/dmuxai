@@ -2550,66 +2550,136 @@ pub(crate) mod tests {
         let _ = worker.await;
     }
 
-    fn fake_acp_agent_bin() -> PathBuf {
-        let mut path = std::env::current_exe().expect("test exe");
-        path.pop();
-        if path.ends_with("deps") {
-            path.pop();
-        }
-        path.push("fake-acp-agent");
-        path
-    }
-
     // TC-1300 / FR-1300: Cursor ACP protocol drives a fake ACP agent binary.
     #[cfg(feature = "test-fixtures")]
-    #[tokio::test]
-    async fn cursor_acp_turn_with_fake_agent() {
-        let fake = fake_acp_agent_bin();
-        assert!(
-            fake.is_file(),
-            "build fake-acp-agent first (expected at {})",
-            fake.display()
-        );
-        unsafe {
-            std::env::set_var("DMUXAI_CURSOR_BIN", &fake);
-        }
-        let (event_tx, mut event_rx) = mpsc::channel(64);
-        let workspace = tempfile::tempdir().unwrap();
-        let request = AgentRequest {
-            conversation_id: super::super::ConversationId::new("conv-acp"),
-            turn_id: super::super::TurnId::new("turn-acp"),
-            prompt: "hello acp".to_owned(),
-            resume_session: None,
-            image_paths: vec![],
-            policy: TurnPolicy::Agent,
-        };
-        let notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        run_turn(
-            &request,
-            None,
-            workspace.path(),
-            &event_tx,
-            false,
-            RunnerProtocol::Acp,
-            &[],
-            &notice,
-        )
-        .await
-        .expect("acp turn");
-        let mut text = String::new();
-        let mut completed = false;
-        while let Some(output) = event_rx.recv().await {
-            match output.event {
-                AgentEvent::TextDelta(delta) => text.push_str(&delta),
-                AgentEvent::Completed => {
-                    completed = true;
-                    break;
-                }
-                AgentEvent::Error(err) => panic!("acp error: {err}"),
-                _ => {}
+    mod fake_acp_agent_tests {
+        use super::*;
+        use crate::agent::{ConversationId, TurnId};
+        use std::sync::Mutex;
+
+        static FAKE_ACP_ENV: Mutex<()> = Mutex::new(());
+
+        fn fake_acp_agent_bin() -> PathBuf {
+            let mut path = std::env::current_exe().expect("test exe");
+            path.pop();
+            if path.ends_with("deps") {
+                path.pop();
             }
+            path.push("fake-acp-agent");
+            path
         }
-        assert!(completed);
-        assert!(text.contains("ACP_OK"), "{text}");
+
+        #[tokio::test]
+        async fn cursor_acp_turn_with_fake_agent() {
+            {
+                let _guard = FAKE_ACP_ENV.lock().unwrap();
+                unsafe {
+                    std::env::remove_var("FAKE_ACP_FAST_ONLY");
+                }
+            }
+            let fake = fake_acp_agent_bin();
+            assert!(
+                fake.is_file(),
+                "build fake-acp-agent first (expected at {})",
+                fake.display()
+            );
+            unsafe {
+                std::env::set_var("DMUXAI_CURSOR_BIN", &fake);
+            }
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let workspace = tempfile::tempdir().unwrap();
+            let request = AgentRequest {
+                conversation_id: ConversationId::new("conv-acp"),
+                turn_id: TurnId::new("turn-acp"),
+                prompt: "hello acp".to_owned(),
+                resume_session: None,
+                image_paths: vec![],
+                policy: TurnPolicy::Agent,
+            };
+            let notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            run_turn(
+                &request,
+                None,
+                workspace.path(),
+                &event_tx,
+                false,
+                RunnerProtocol::Acp,
+                &[],
+                &notice,
+            )
+            .await
+            .expect("acp turn");
+            let mut text = String::new();
+            let mut completed = false;
+            while let Some(output) = event_rx.recv().await {
+                match output.event {
+                    AgentEvent::TextDelta(delta) => text.push_str(&delta),
+                    AgentEvent::Completed => {
+                        completed = true;
+                        break;
+                    }
+                    AgentEvent::Error(err) => panic!("acp error: {err}"),
+                    _ => {}
+                }
+            }
+            assert!(completed);
+            assert!(text.contains("ACP_OK"), "{text}");
+        }
+
+        // TC-1329 / FR-1323: child process group is reaped after session open errors.
+        #[tokio::test]
+        async fn acp_child_reaped_after_fast_model_refusal() {
+            let fake = fake_acp_agent_bin();
+            assert!(fake.is_file(), "build fake-acp-agent first");
+            {
+                let _guard = FAKE_ACP_ENV.lock().unwrap();
+                unsafe {
+                    std::env::set_var("DMUXAI_CURSOR_BIN", &fake);
+                    std::env::set_var("FAKE_ACP_FAST_ONLY", "1");
+                }
+            }
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let workspace = tempfile::tempdir().unwrap();
+            let request = AgentRequest {
+                conversation_id: ConversationId::new("conv-acp-fail"),
+                turn_id: TurnId::new("turn-acp-fail"),
+                prompt: "hello".to_owned(),
+                resume_session: None,
+                image_paths: vec![],
+                policy: TurnPolicy::Agent,
+            };
+            let notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let err = run_turn(
+                &request,
+                Some("composer-2.5".to_owned()),
+                workspace.path(),
+                &event_tx,
+                false,
+                RunnerProtocol::Acp,
+                &[],
+                &notice,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("fast"),
+                "expected fast-model refusal, got {err}"
+            );
+            while event_rx.try_recv().is_ok() {}
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let alive = std::process::Command::new("pgrep")
+                .arg("-f")
+                .arg("fake-acp-agent")
+                .output()
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(false);
+            {
+                let _guard = FAKE_ACP_ENV.lock().unwrap();
+                unsafe {
+                    std::env::remove_var("FAKE_ACP_FAST_ONLY");
+                }
+            }
+            assert!(!alive, "fake-acp-agent process should not outlive turn");
+        }
     }
 }

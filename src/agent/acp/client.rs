@@ -22,8 +22,8 @@ use super::permissions::{PermissionContext, choose_permission_option};
 use super::session::{
     AgentCapabilities, SessionOpenNote, available_model_ids, cursor_acp_model_check,
     extract_reported_model, is_fast_model_label, parse_agent_capabilities, pick_non_fast_model,
-    read_only_mode_id, session_load_params, session_resume_params, session_set_mode_params,
-    session_set_model_params,
+    pick_read_only_mode_id, read_only_turn_refusal, session_load_params, session_resume_params,
+    session_set_mode_params, session_set_model_params,
 };
 use super::updates::map_session_update;
 
@@ -73,6 +73,8 @@ struct SharedState {
     session_id: Mutex<Option<String>>,
     permission_denied: AtomicBool,
     saw_agent_text: AtomicBool,
+    cancel_sent: AtomicBool,
+    text_break_before_next_delta: AtomicBool,
 }
 
 impl SharedState {
@@ -132,9 +134,9 @@ pub async fn run_acp_turn(
         session_id: Mutex::new(None),
         permission_denied: AtomicBool::new(false),
         saw_agent_text: AtomicBool::new(false),
+        cancel_sent: AtomicBool::new(false),
+        text_break_before_next_delta: AtomicBool::new(false),
     });
-
-    let mut permission_ctx = permission_ctx;
 
     let (line_tx, mut line_rx) = mpsc::channel::<String>(64);
     let reader = tokio::spawn(async move {
@@ -164,120 +166,127 @@ pub async fn run_acp_turn(
         send_event(event_tx, agent, context, AgentEvent::Started).await;
     }
 
-    let open = open_session(
-        // FR-1316 session resume/load
-        &mut stdin,
-        &mut line_rx,
-        &state,
-        cwd,
-        resume_session,
-        &config,
-        event_tx,
-        agent,
-        context,
-    )
-    .await
-    .map_err(io::Error::other)?;
+    let runner_label = match config.runner {
+        AcpRunnerKind::Cursor => "cursor",
+        AcpRunnerKind::Grok => "grok",
+        AcpRunnerKind::Opencode => "opencode",
+    };
 
-    let session_id = open.session_id;
-    *state.session_id.lock().unwrap() = Some(session_id.clone());
+    let turn_result: Result<AcpRunOutcome, String> = async {
+        let open = open_session(
+            &mut stdin,
+            &mut line_rx,
+            &state,
+            cwd,
+            resume_session,
+            &config,
+            event_tx,
+            agent,
+            context,
+        )
+        .await?;
 
-    if let Some(model) = &open.effective_model {
+        let session_id = open.session_id;
+        *state.session_id.lock().unwrap() = Some(session_id.clone());
+
+        if let Some(model) = &open.effective_model {
+            send_event(
+                event_tx,
+                agent,
+                context,
+                AgentEvent::ModelSelected(model.clone()),
+            )
+            .await;
+        }
+        if let Some(note) = open.notice {
+            send_event(event_tx, agent, context, AgentEvent::Notice(note)).await;
+        }
+
         send_event(
             event_tx,
             agent,
             context,
-            AgentEvent::ModelSelected(model.clone()),
+            AgentEvent::ProviderSessionBound(session_id.clone()),
         )
         .await;
-    }
-    if let Some(note) = open.notice {
-        send_event(event_tx, agent, context, AgentEvent::Notice(note)).await;
-    }
 
-    send_event(
-        event_tx,
-        agent,
-        context,
-        AgentEvent::ProviderSessionBound(session_id.clone()),
-    )
-    .await;
+        if config.policy == TurnPolicy::ReadOnly {
+            let mode_id = pick_read_only_mode_id(&open.session_payload)
+                .ok_or_else(|| read_only_turn_refusal(runner_label))?;
+            if !apply_read_only_mode(
+                &mut stdin,
+                &mut line_rx,
+                &state,
+                &session_id,
+                &mode_id,
+                &config.cancel,
+            )
+            .await?
+            {
+                return Err(read_only_turn_refusal(runner_label));
+            }
+        }
 
-    let mode_applied = if config.policy == TurnPolicy::ReadOnly && !open.set_mode_capable {
-        false
-    } else {
-        apply_read_only_mode(
+        if let Some(model) = config
+            .session_config_model
+            .as_deref()
+            .filter(|m| !m.is_empty())
+        {
+            match request(
+                &mut stdin,
+                &mut line_rx,
+                &state,
+                "session/set_config_option",
+                json!({
+                    "sessionId": session_id,
+                    "configId": "model",
+                    "value": model
+                }),
+                &config.cancel,
+            )
+            .await
+            {
+                Ok(result) => {
+                    if config.runner == AcpRunnerKind::Opencode {
+                        ensure_opencode_model_config(&result, model)?;
+                    }
+                    acp_trace(format!("session/set_config_option model={model} ok"));
+                }
+                Err(error) => {
+                    if config.runner == AcpRunnerKind::Opencode {
+                        return Err(format!(
+                            "opencode ACP model config failed for `{model}`: {error}"
+                        ));
+                    }
+                    acp_trace(format!("session/set_config_option failed: {error}"));
+                }
+            }
+        }
+
+        run_prompt(
             &mut stdin,
             &mut line_rx,
             &state,
             &session_id,
-            config.policy,
+            prompt,
+            &permission_ctx,
+            event_tx,
+            agent,
+            context,
             &config.cancel,
         )
         .await
-        .map_err(io::Error::other)?
-    };
-    if config.policy == TurnPolicy::ReadOnly && !mode_applied {
-        permission_ctx.read_only_fail_closed = true;
+        .map(|outcome| AcpRunOutcome {
+            session_id: outcome.session_id,
+            stop_reason: outcome.stop_reason,
+            effective_model: open.effective_model.clone(),
+        })
     }
-
-    if let Some(model) = config
-        .session_config_model
-        .as_deref()
-        .filter(|m| !m.is_empty())
-    {
-        match request(
-            &mut stdin,
-            &mut line_rx,
-            &state,
-            "session/set_config_option",
-            json!({
-                "sessionId": session_id,
-                "configId": "model",
-                "value": model
-            }),
-            &config.cancel,
-        )
-        .await
-        {
-            Ok(result) => {
-                if config.runner == AcpRunnerKind::Opencode {
-                    ensure_opencode_model_config(&result, model).map_err(io::Error::other)?;
-                }
-                acp_trace(format!("session/set_config_option model={model} ok"));
-            }
-            Err(error) => {
-                if config.runner == AcpRunnerKind::Opencode {
-                    return Err(io::Error::other(format!(
-                        "opencode ACP model config failed for `{model}`: {error}"
-                    )));
-                }
-                acp_trace(format!("session/set_config_option failed: {error}"));
-            }
-        }
-    }
-
-    let prompt_result = run_prompt(
-        &mut stdin,
-        &mut line_rx,
-        &state,
-        &session_id,
-        prompt,
-        &permission_ctx,
-        event_tx,
-        agent,
-        context,
-        &config.cancel,
-    )
     .await;
 
+    let session_id_for_cancel = state.session_id.lock().unwrap().clone();
     if config.cancel.load(Ordering::SeqCst) {
-        let _ = write_notification(
-            &mut stdin,
-            "session/cancel",
-            json!({ "sessionId": session_id }),
-        )
-        .await;
+        send_session_cancel_once(&state, &mut stdin, session_id_for_cancel.as_deref()).await;
         let _ = timeout(
             Duration::from_millis(CANCEL_GRACE_MS),
             wait_child(&mut child, child_pid),
@@ -285,14 +294,10 @@ pub async fn run_acp_turn(
         .await;
     }
 
-    let _ = child.start_kill();
-    #[cfg(unix)]
-    if let Some(pid) = child_pid {
-        terminate_group(pid).await;
-    }
-    let status = child.wait().await?;
+    shutdown_acp_child(&mut child, child_pid).await;
     reader.abort();
     stderr_reader.abort();
+    let status = child.wait().await?;
     let diagnostic = stderr_tail
         .lock()
         .unwrap()
@@ -300,6 +305,8 @@ pub async fn run_acp_turn(
         .cloned()
         .collect::<Vec<_>>()
         .join(" | ");
+
+    let prompt_result = turn_result;
 
     match prompt_result {
         Ok(outcome) => {
@@ -313,11 +320,7 @@ pub async fn run_acp_turn(
                 if config.lifecycle == AcpLifecycle::Managed {
                     send_event(event_tx, agent, context, AgentEvent::Completed).await;
                 }
-                Ok(AcpRunOutcome {
-                    session_id: outcome.session_id,
-                    stop_reason: outcome.stop_reason,
-                    effective_model: open.effective_model.clone(),
-                })
+                Ok(outcome)
             } else {
                 let msg = format_acp_exit(status, &diagnostic);
                 if config.lifecycle == AcpLifecycle::Managed {
@@ -327,7 +330,7 @@ pub async fn run_acp_turn(
             }
         }
         Err(error) => {
-            let msg = if diagnostic.is_empty() {
+            let msg = if diagnostic.is_empty() || diagnostic.contains(&error) {
                 error
             } else {
                 format!("{error} ({diagnostic})")
@@ -344,7 +347,29 @@ struct OpenSessionOutcome {
     session_id: String,
     effective_model: Option<String>,
     notice: Option<String>,
-    set_mode_capable: bool,
+    session_payload: Value,
+}
+
+async fn shutdown_acp_child(child: &mut tokio::process::Child, child_pid: Option<u32>) {
+    let _ = child.start_kill();
+    #[cfg(unix)]
+    if let Some(pid) = child_pid {
+        terminate_group(pid).await;
+    }
+}
+
+async fn send_session_cancel_once(
+    state: &Arc<SharedState>,
+    stdin: &mut ChildStdin,
+    session_id: Option<&str>,
+) {
+    if state.cancel_sent.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(session_id) = session_id {
+        let _ =
+            write_notification(stdin, "session/cancel", json!({ "sessionId": session_id })).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -530,7 +555,7 @@ async fn finish_open(
         session_id,
         effective_model,
         notice,
-        set_mode_capable: caps.set_mode,
+        session_payload,
     })
 }
 
@@ -539,12 +564,9 @@ async fn apply_read_only_mode(
     line_rx: &mut mpsc::Receiver<String>,
     state: &Arc<SharedState>,
     session_id: &str,
-    policy: TurnPolicy,
+    mode_id: &str,
     cancel: &Arc<AtomicBool>,
 ) -> Result<bool, String> {
-    let Some(mode_id) = read_only_mode_id(policy) else {
-        return Ok(true);
-    };
     match request(
         stdin,
         line_rx,
@@ -555,7 +577,21 @@ async fn apply_read_only_mode(
     )
     .await
     {
-        Ok(_) => Ok(true),
+        Ok(result) => {
+            if result.get("error").is_some() {
+                acp_trace(format!(
+                    "session/set_mode modeId={mode_id} rejected: {}",
+                    trace_payload(&result)
+                ));
+                Ok(false)
+            } else {
+                acp_trace(format!(
+                    "session/set_mode modeId={mode_id} ok: {}",
+                    trace_payload(&result)
+                ));
+                Ok(true)
+            }
+        }
         Err(error) => {
             acp_trace(format!("session/set_mode failed: {error}"));
             Ok(false)
@@ -596,12 +632,7 @@ async fn run_prompt(
     loop {
         let raw = tokio::select! {
             _ = wait_for_cancel(cancel.clone()) => {
-                let _ = write_notification(
-                    stdin,
-                    "session/cancel",
-                    json!({ "sessionId": session_id }),
-                )
-                .await;
+                send_session_cancel_once(state, stdin, Some(session_id)).await;
                 return Err("cancelled".to_owned());
             }
             line = line_rx.recv() => line,
@@ -642,10 +673,8 @@ async fn run_prompt(
         .await?;
     }
 
-    if state.permission_denied.load(Ordering::SeqCst)
-        && !state.saw_agent_text.load(Ordering::SeqCst)
-    {
-        return Err("ACP permission denied; no assistant reply".to_owned());
+    if state.permission_denied.load(Ordering::SeqCst) {
+        return Err("ACP permission denied".to_owned());
     }
 
     Ok(AcpRunOutcome {
@@ -673,10 +702,32 @@ async fn dispatch_inbound(
                     .or_else(|| value.pointer("/params"))
                     .cloned()
                     .unwrap_or(Value::Null);
+                let kind = update
+                    .get("sessionUpdate")
+                    .or_else(|| update.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if kind == "tool_call" || kind == "tool_call_update" {
+                    state
+                        .text_break_before_next_delta
+                        .store(true, Ordering::SeqCst);
+                }
                 for event in map_session_update(&update) {
-                    if matches!(&event, AgentEvent::TextDelta(_)) {
-                        state.saw_agent_text.store(true, Ordering::SeqCst);
-                    }
+                    let event = match event {
+                        AgentEvent::TextDelta(delta) => {
+                            state.saw_agent_text.store(true, Ordering::SeqCst);
+                            let delta = if state
+                                .text_break_before_next_delta
+                                .swap(false, Ordering::SeqCst)
+                            {
+                                format!("\n\n{delta}")
+                            } else {
+                                delta
+                            };
+                            AgentEvent::TextDelta(delta)
+                        }
+                        other => other,
+                    };
                     send_event(event_tx, agent, context, event).await;
                 }
             }
@@ -750,14 +801,7 @@ async fn request(
         let raw = tokio::select! {
             _ = wait_for_cancel(cancel.clone()) => {
                 let sid = state.session_id.lock().unwrap().clone();
-                if let Some(sid) = sid {
-                    let _ = write_notification(
-                        stdin,
-                        "session/cancel",
-                        json!({ "sessionId": sid }),
-                    )
-                    .await;
-                }
+                send_session_cancel_once(state, stdin, sid.as_deref()).await;
                 return Err("cancelled".to_owned());
             }
             line = line_rx.recv() => line,
@@ -776,7 +820,14 @@ async fn request(
             if let Some(err) = value.get("error") {
                 return Err(err.to_string());
             }
-            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+            let result = value.get("result").cloned().unwrap_or(Value::Null);
+            if should_trace_response(method) {
+                acp_trace(format!(
+                    "response method={method} id={id} result={}",
+                    trace_payload(&result)
+                ));
+            }
+            return Ok(result);
         }
         if value.get("method").is_some() {
             // Handled opportunistically during handshake; permission/update not expected here.
@@ -880,14 +931,10 @@ async fn ensure_cursor_session_model(
         return Ok(id.to_owned());
     }
     let candidates = available_model_ids(payload);
-    let target = pick_non_fast_model(&candidates).or_else(|| {
-        requested
-            .filter(|m| !is_fast_model_label(m))
-            .map(str::to_owned)
-    });
+    let target = pick_non_fast_model(&candidates, requested);
     if let Some(model_id) = target {
-        if caps.set_model {
-            if let Ok(updated) = request(
+        if caps.set_model
+            && let Ok(updated) = request(
                 stdin,
                 line_rx,
                 state,
@@ -896,16 +943,14 @@ async fn ensure_cursor_session_model(
                 cancel,
             )
             .await
-            {
-                let effective =
-                    extract_reported_model(&updated).unwrap_or_else(|| model_id.clone());
-                if !is_fast_model_label(&effective) {
-                    return Ok(effective);
-                }
+        {
+            let effective = extract_reported_model(&updated).unwrap_or_else(|| model_id.clone());
+            if !is_fast_model_label(&effective) {
+                return Ok(effective);
             }
         }
-        if caps.set_config_option {
-            if let Ok(updated) = request(
+        if caps.set_config_option
+            && let Ok(updated) = request(
                 stdin,
                 line_rx,
                 state,
@@ -918,27 +963,42 @@ async fn ensure_cursor_session_model(
                 cancel,
             )
             .await
-            {
-                let effective =
-                    extract_reported_model(&updated).unwrap_or_else(|| model_id.clone());
-                if !is_fast_model_label(&effective) {
-                    return Ok(effective);
-                }
+        {
+            let effective = extract_reported_model(&updated).unwrap_or_else(|| model_id.clone());
+            if !is_fast_model_label(&effective) {
+                return Ok(effective);
             }
         }
     }
     cursor_acp_model_check(payload, requested)
 }
 
+fn should_trace_response(method: &str) -> bool {
+    matches!(
+        method,
+        "session/new"
+            | "session/load"
+            | "session/resume"
+            | "session/set_mode"
+            | "session/set_model"
+            | "session/set_config_option"
+    )
+}
+
+fn trace_payload(value: &Value) -> String {
+    let raw = value.to_string();
+    if raw.len() > 512 {
+        format!("{}…", &raw[..512])
+    } else {
+        raw
+    }
+}
+
 fn ensure_opencode_model_config(result: &Value, requested: &str) -> Result<(), String> {
     if result.get("error").is_some() {
         return Err(format!("opencode rejected model `{requested}`"));
     }
-    let applied = result
-        .get("value")
-        .or_else(|| result.get("model"))
-        .and_then(Value::as_str)
-        .unwrap_or(requested);
+    let applied = opencode_config_model_value(result).unwrap_or_else(|| requested.to_owned());
     if applied != requested {
         return Err(format!(
             "opencode ACP applied model `{applied}` but dmuxai requested `{requested}`"
@@ -950,4 +1010,30 @@ fn ensure_opencode_model_config(result: &Value, requested: &str) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+fn opencode_config_model_value(result: &Value) -> Option<String> {
+    if let Some(value) = result.get("value").and_then(Value::as_str) {
+        return Some(value.to_owned());
+    }
+    if let Some(options) = result.get("configOptions").and_then(Value::as_array) {
+        for option in options {
+            let id = option
+                .get("configId")
+                .or_else(|| option.get("id"))
+                .and_then(Value::as_str);
+            if id == Some("model")
+                && let Some(current) = option
+                    .get("currentValue")
+                    .or_else(|| option.get("value"))
+                    .and_then(Value::as_str)
+            {
+                return Some(current.to_owned());
+            }
+        }
+    }
+    result
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }

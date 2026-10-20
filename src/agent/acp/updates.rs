@@ -19,11 +19,7 @@ pub fn map_session_update(update: &Value) -> Vec<AgentEvent> {
                 events.push(AgentEvent::TextDelta(text));
             }
         }
-        "tool_call" => {
-            if let Some(item) = map_tool_call(update) {
-                events.push(AgentEvent::Activity(item));
-            }
-        }
+        "tool_call" => {}
         "tool_call_update" => {
             if let Some(item) = map_tool_call_update(update) {
                 events.push(AgentEvent::Activity(item));
@@ -88,38 +84,6 @@ fn should_emit_tool_progress(update: &Value) -> bool {
         || !kind.eq_ignore_ascii_case("tool")
         || update.pointer("/locations/0/path").is_some()
         || update.pointer("/toolCall/locations/0/path").is_some()
-}
-
-fn map_tool_call(update: &Value) -> Option<ActivityItem> {
-    let title = tool_summary(update);
-    if title.eq_ignore_ascii_case("tool") {
-        return None;
-    }
-    let kind = update
-        .get("kind")
-        .or_else(|| update.pointer("/toolCall/kind"))
-        .and_then(Value::as_str)
-        .unwrap_or("tool");
-    let status = tool_status_from_str(
-        update
-            .get("status")
-            .or_else(|| update.pointer("/toolCall/status"))
-            .and_then(Value::as_str)
-            .unwrap_or("running"),
-    );
-    let location = update
-        .pointer("/locations/0/path")
-        .or_else(|| update.pointer("/toolCall/locations/0/path"))
-        .or_else(|| update.get("path"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    Some(ActivityItem::Tool {
-        name: kind.to_owned(),
-        target: location.unwrap_or_else(|| title.clone()),
-        status,
-        duration_ms: None,
-        detail: title,
-    })
 }
 
 fn map_tool_call_update(update: &Value) -> Option<ActivityItem> {

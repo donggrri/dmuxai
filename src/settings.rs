@@ -348,8 +348,14 @@ impl DmuxSettings {
         let names_grok = agents()
             .flat_map(|agents| agents.custom.iter().flatten())
             .any(|spec| spec.name.eq_ignore_ascii_case("grok"));
-        let opencode_preset_bin =
-            opencode_bin.filter(|_| settings.builtin_opencode && !names_opencode);
+        let explicit_opencode = std::env::var_os("DMUXAI_OPENCODE_BIN")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let opencode_preset_bin = if settings.builtin_opencode && !names_opencode {
+            opencode_bin.or(explicit_opencode)
+        } else {
+            None
+        };
         let grok_preset_bin = grok_bin.filter(|_| settings.builtin_grok && !names_grok);
 
         // Custom agent names seen in *either* config, so an id defined only in
