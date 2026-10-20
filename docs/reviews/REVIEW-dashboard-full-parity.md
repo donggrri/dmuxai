@@ -26,7 +26,7 @@ Date: 2026-10-18/19 (KST). Scope: SPEC, PLAN and TASKS for dashboard full parity
   - Added the `check-spec.ps1` gate to TASKS.
 - **glm-5.3-flash-free** (second opinion): failed 3 times with `Upstream request failed: Endpoint is unavailable`. One run hung for over 20 minutes and was killed. A fourth run is noted below.
 - **nemotron-3-ultra-free** (allowed fallback second opinion): REQUEST_CHANGES with 30 items. Applied:
-  - OQ-1000 wording ("view-only").
+  - OQ-1100 wording ("view-only").
   - Clearer S12 text.
   - Workspace-switch re-exec added to slice 1.
   - Separate JS modules per slice.

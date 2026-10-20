@@ -8,7 +8,7 @@ Source: Dongjin, 2026-10-18 23:3x KST: "모든 TUI 기능이 대시보드에서 
 
 | # | Item | Kind | SPEC (IDs) | Issue | Status |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Dashboard full parity and TUI retirement: headless interactive `dmuxai serve`, every TUI-only feature on the dashboard with logic in the shared Rust core, then remove the TUI | feature | [SPEC-dashboard-full-parity](specs/SPEC-dashboard-full-parity.md) (FR-1000..) | — | spec draft; gap list awaiting Dongjin's review |
+| 1 | Dashboard full parity and TUI retirement: headless interactive `dmuxai serve`, every TUI-only feature on the dashboard with logic in the shared Rust core, then remove the TUI | feature | [SPEC-dashboard-full-parity](specs/SPEC-dashboard-full-parity.md) (FR-1100..) | — | spec draft; gap list awaiting Dongjin's review |
 
 The grok runner ([#66](https://github.com/donggrri/dmuxai/pull/66), merged for v0.2.2) is already on the dashboard under `--web`; it must also work under the new interactive `serve`. The plan gate ([#67](https://github.com/donggrri/dmuxai/pull/67)) and the rest of v0.2.3 must be reachable from the dashboard before the TUI is removed. #70 (TUI picker width, merged (f1b36ae)) is TUI-only and #71 (resizable sidebars) is dashboard-only; neither adds a parity gap.
 
