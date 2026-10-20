@@ -113,7 +113,6 @@ calls still compile.
 | `test_app_with_engine(engine)` | `(App, SentRequests)` | You need a specific [`ConversationEngine`](src/conversation.rs) (e.g. on-disk temp DB). |
 | `test_app_with_engine_and_failure(engine, agent)` | `(App, SentRequests)` | Simulate `AdapterError::CommandQueueFull` on send for one agent. |
 | `test_app_runtime(engine, failing_agent)` | `(App, SentRequests, CancelRequests)` | Assert cancel paths as well as sent requests. |
-| `test_app_with_unsupported_mode(engine, agent, mode)` | `(App, SentRequests)` | One agent returns `AdapterError::UnsupportedMode` for a mode. |
 
 Typical flow:
 

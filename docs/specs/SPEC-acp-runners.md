@@ -1,6 +1,6 @@
 # SPEC: ACP runners and single agent mode
 
-Status: draft
+Status: Implemented (PR #78)
 Owner: DmuxAI
 Created: 2026-10-20
 Baseline: `a1538e3`

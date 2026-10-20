@@ -1804,18 +1804,11 @@ impl App {
             return Err(RunTodoError::Busy(format!("agent '{runner_id}' is busy")));
         }
 
-        if let Some(ref mode_str) = mode {
-            let exec_mode = match mode_str.trim().to_ascii_lowercase().as_str() {
-                "ask" => Some(TurnPolicy::ReadOnly),
-                "plan" => Some(TurnPolicy::ReadOnly),
-                "implement" => Some(TurnPolicy::Agent),
-                _ => None,
-            };
-            if let Some(m) = exec_mode
-                && let Err(err) = self.set_agent_mode(target_agent, m)
-            {
-                return Err(RunTodoError::Internal(err));
-            }
+        if let Some(mode_str) = mode.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let _ = mode_str;
+            self.push_system(
+                "Mode selection was removed; every turn runs in agent mode.".to_owned(),
+            );
         }
 
         self.selected = adapter_index(target_agent);
@@ -2900,18 +2893,6 @@ impl App {
         }
     }
 
-    fn open_mode_picker(&mut self) {
-        self.push_system("Mode selection was removed; every turn runs in agent mode.".to_owned());
-    }
-
-    fn set_agent_mode(&mut self, _agent: Agent, _mode: TurnPolicy) -> Result<bool, String> {
-        Ok(false)
-    }
-
-    fn select_active_agent_mode(&mut self, _mode: TurnPolicy) {
-        self.open_mode_picker();
-    }
-
     fn open_model_picker(&mut self) {
         let agent = self.adapters[self.selected].agent();
         if self.busy_agents.contains(&agent) {
@@ -3241,17 +3222,7 @@ impl App {
                     return;
                 }
                 "/mode" => {
-                    let arg = prompt.strip_prefix("/mode").unwrap().trim();
-                    if arg.is_empty() {
-                        self.execute_slash_action(SlashAction::Mode);
-                    } else {
-                        match arg.to_ascii_lowercase().as_str() {
-                            "ask" => self.select_active_agent_mode(TurnPolicy::ReadOnly),
-                            "plan" => self.select_active_agent_mode(TurnPolicy::ReadOnly),
-                            "implement" => self.select_active_agent_mode(TurnPolicy::Agent),
-                            _ => self.push_system("Usage: /mode <ask|plan|implement>"),
-                        }
-                    }
+                    self.execute_slash_action(SlashAction::Mode);
                     return;
                 }
                 "/summarize" | "/compact" => {
@@ -11738,7 +11709,6 @@ impl App {
                 })
                 .unwrap_or("provider default")
         };
-        let mode_name = "agent".to_owned();
         let effort_name = self
             .model_catalogs
             .get(&selected)
@@ -11777,7 +11747,6 @@ impl App {
             state,
             badge: Some(&badge_content),
             model,
-            mode: &mode_name,
             effort: effort_name,
             activity: &activity,
             other_activity: &other_activity,
@@ -12805,7 +12774,6 @@ pub(crate) struct StatusSegments<'a> {
     pub state: &'a str,
     pub badge: Option<&'a str>,
     pub model: &'a str,
-    pub mode: &'a str,
     pub effort: &'a str,
     pub activity: &'a str,
     pub other_activity: &'a str,
@@ -12841,8 +12809,8 @@ pub(crate) fn fit_status_segments(segments: &StatusSegments<'_>, width: usize) -
 
     // Candidate 1: Full status with all slash commands and all key hints
     let full = format!(
-        "{agent_state}  {}{other}  Model: {}  Effort: {}  Mode: {}{graph}{notice}  /effort  /status  /mode  /agent  /graph  /quit exit  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close",
-        segments.activity, segments.model, segments.effort, segments.mode
+        "{agent_state}  {}{other}  Model: {}  Effort: {}{graph}{notice}  /effort  /status  /agent  /graph  /quit exit  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close",
+        segments.activity, segments.model, segments.effort
     );
     if full.chars().count() <= width {
         return full;
@@ -12850,8 +12818,8 @@ pub(crate) fn fit_status_segments(segments: &StatusSegments<'_>, width: usize) -
 
     // Candidate 2: Drop low-priority slash commands
     let no_slash = format!(
-        "{agent_state}  {}{other}  Model: {}  Effort: {}  Mode: {}{graph}{notice}  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close",
-        segments.activity, segments.model, segments.effort, segments.mode
+        "{agent_state}  {}{other}  Model: {}  Effort: {}{graph}{notice}  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close",
+        segments.activity, segments.model, segments.effort
     );
     if no_slash.chars().count() <= width {
         return no_slash;
@@ -12859,8 +12827,8 @@ pub(crate) fn fit_status_segments(segments: &StatusSegments<'_>, width: usize) -
 
     // Candidate 3: Drop secondary navigation keys (F2, F3)
     let core_hints = format!(
-        "{agent_state}  {}{other}  Model: {}  Effort: {}  Mode: {}{graph}{notice}  Enter send  Ctrl+C cancel  Esc close",
-        segments.activity, segments.model, segments.effort, segments.mode
+        "{agent_state}  {}{other}  Model: {}  Effort: {}{graph}{notice}  Enter send  Ctrl+C cancel  Esc close",
+        segments.activity, segments.model, segments.effort
     );
     if core_hints.chars().count() <= width {
         return core_hints;
@@ -12873,8 +12841,8 @@ pub(crate) fn fit_status_segments(segments: &StatusSegments<'_>, width: usize) -
         segments.effort
     };
     let abbr_hints = format!(
-        "{agent_state}{other}  Model: {}  Effort: {effort_display}  Mode: {}  Enter  Ctrl+C  Esc",
-        segments.model, segments.mode
+        "{agent_state}{other}  Model: {}  Effort: {effort_display}  Enter  Ctrl+C  Esc",
+        segments.model
     );
     if abbr_hints.chars().count() <= width {
         return abbr_hints;
@@ -12882,24 +12850,21 @@ pub(crate) fn fit_status_segments(segments: &StatusSegments<'_>, width: usize) -
 
     // Candidate 5: Abbreviated keys without effort
     let no_effort_hints = format!(
-        "{agent_state}{other}  Model: {}  Mode: {}  Enter  Ctrl+C  Esc",
-        segments.model, segments.mode
+        "{agent_state}{other}  Model: {}  Enter  Ctrl+C  Esc",
+        segments.model
     );
     if no_effort_hints.chars().count() <= width {
         return no_effort_hints;
     }
 
     // Candidate 6: Drop all hints, keep essential (agent+state, model, mode)
-    let essential = format!(
-        "{agent_state}  Model: {}  Mode: {}",
-        segments.model, segments.mode
-    );
+    let essential = format!("{agent_state}  Model: {}", segments.model);
     if essential.chars().count() <= width {
         return essential;
     }
 
     // Candidate 7: Tight format for narrow width (<= 40)
-    let tight = format!("{agent_state}  {}  {}", segments.model, segments.mode);
+    let tight = format!("{agent_state}  {}", segments.model);
     if tight.chars().count() <= width {
         return tight;
     }
@@ -19176,7 +19141,6 @@ mod tests {
             state: "IDLE",
             badge: None,
             model: "composer-2.5",
-            mode: "ask",
             effort: "provider default",
             activity: "IDLE",
             other_activity: "",
@@ -19188,7 +19152,8 @@ mod tests {
         let at_200 = fit_status_segments(&segments, 200);
         assert!(at_200.chars().count() <= 200);
         assert!(at_200.contains("Model: composer-2.5"));
-        assert!(at_200.contains("Mode: ask"));
+        assert!(!at_200.contains("Mode:"));
+        assert!(!at_200.contains("/mode"));
         assert!(at_200.contains("/effort"));
         assert!(at_200.contains("/status"));
         assert!(at_200.contains("F2 model"));
@@ -19199,7 +19164,7 @@ mod tests {
         assert!(at_80.chars().count() <= 80);
         assert!(!at_80.contains("/effort"));
         assert!(at_80.contains("Model: composer-2.5"));
-        assert!(at_80.contains("Mode: ask"));
+        assert!(!at_80.contains("Mode:"));
         assert!(at_80.contains("Esc"));
 
         // Width 40: essential info fits within 40
@@ -19207,7 +19172,7 @@ mod tests {
         assert!(at_40.chars().count() <= 40);
         assert!(at_40.contains("Cursor"));
         assert!(at_40.contains("IDLE"));
-        assert!(at_40.contains("ask"));
+        assert!(at_40.contains("composer"));
     }
 
     #[test]
@@ -24757,9 +24722,6 @@ mod tests {
     #[test]
     fn invalid_plan_gets_one_repair() {
         let mut h = plan_gate_test_app();
-        h.app
-            .set_agent_mode(Agent::Codex, TurnPolicy::Agent)
-            .unwrap();
         let plan_req = complete_complex_judge(&mut h);
         assert!(h.app.apply_agent_output(triage_output(
             Agent::Codex,
@@ -24814,9 +24776,6 @@ mod tests {
     #[test]
     fn plan_turn_cancel_restores_prompt_and_mode() {
         let mut h = plan_gate_test_app();
-        h.app
-            .set_agent_mode(Agent::Codex, TurnPolicy::Agent)
-            .unwrap();
         let plan_req = complete_complex_judge(&mut h);
         // Ctrl+C on another tab cancels only that tab: the plan keeps running
         // and that tab's draft is untouched.
