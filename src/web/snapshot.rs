@@ -256,6 +256,27 @@ pub struct TurnBandView {
     pub phase: GraphRunPhase,
     pub user_prompt: String,
     pub nodes: Vec<String>,
+    /// Dashboard transcript id of the user message that started this run
+    /// (SPEC-dashboard-fullwidth FR-1223); set by `dmuxai --web`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// Per-step summary for the chat run row (FR-1223).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<TurnStepView>,
+}
+
+/// One executable step of a turn band (SPEC-dashboard-fullwidth FR-1223).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TurnStepView {
+    pub id: String,
+    pub role: NodeRole,
+    pub runner: String,
+    pub status: GraphNodeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -818,6 +839,21 @@ fn conversation_turn_fields(
             phase: run.phase,
             user_prompt: truncate_with_ellipsis(&run.plan.user_prompt, SNAPSHOT_USER_PROMPT_LIMIT),
             nodes: executable_node_ids(&run.plan),
+            message_id: None,
+            steps: run
+                .plan
+                .nodes
+                .iter()
+                .filter(|node| is_executable_node(node.role))
+                .map(|node| TurnStepView {
+                    id: node.id.clone(),
+                    role: node.role,
+                    runner: node.runner.clone(),
+                    status: node.status,
+                    started_at_ms: node.started_at_ms,
+                    finished_at_ms: node.finished_at_ms,
+                })
+                .collect(),
         })
         .collect();
 

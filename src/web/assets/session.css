@@ -116,5 +116,13 @@ button.chat-aux-head:focus-visible, .chat-aux-step-btn:focus-visible { outline: 
 .chat-aux-approval > .chat-aux-head { padding: .5rem .75rem 0; border: 1px solid var(--warn); border-bottom: 0; border-radius: .75rem .75rem 0 0; background: var(--bg-panel); color: var(--text); }
 .chat-aux-approval > .chat-aux-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: -.4rem; padding: .45rem .75rem .55rem; border: 1px solid var(--warn); border-top: 0; border-radius: 0 0 .75rem .75rem; background: var(--bg-panel); }
 .chat-aux-note { color: var(--faint); font-size: .75rem; }
+.chat-aux-neutral { color: var(--faint); }
+/* FR-1223, FR-1224: run rows carry a small "Open in Graph" link. */
+.session-transcript > li.chat-aux-run { display: flex; flex-wrap: wrap; align-items: center; column-gap: .6rem; }
+.session-transcript > li.chat-aux-run > .chat-aux-steps { flex-basis: 100%; }
+.chat-aux-open-run { padding: 0; border: 0; background: none; color: var(--accent); font: inherit; font-size: .75rem; cursor: pointer; }
+.chat-aux-open-run:hover { text-decoration: underline; }
+.chat-aux-open-run:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 4px; }
+.chat-aux-open-run:disabled, .chat-aux-step-btn:disabled { color: var(--faint); cursor: not-allowed; text-decoration: none; }
 @media (prefers-reduced-motion: reduce) { .chat-aux-caret { transition: none; } }
 

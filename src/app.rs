@@ -1176,6 +1176,10 @@ pub struct App {
     /// FR-942: plan id of a run restored at `awaiting_approval` after a
     /// restart (no live agent turn behind it); approve is refused for it.
     graph_approval_stale: Option<String>,
+    /// SPEC-dashboard-fullwidth FR-1222, FR-1224: plan id of a stored run
+    /// shown as read-only history in `last_graph_run`. Live node details are
+    /// keyed by node id only, so they are not applied to it.
+    graph_history_run_id: Option<String>,
     pub(crate) dirty: bool,
     todo_store: Option<Arc<TodoStore>>,
     dashboard_commands: Option<mpsc::Receiver<DashboardCommand>>,
@@ -1403,6 +1407,7 @@ impl App {
             judge_reason_capture_turn: None,
             judge_reason_line: None,
             graph_approval_stale: None,
+            graph_history_run_id: None,
             dirty: false,
             todo_store: None,
             dashboard_commands: None,
@@ -2256,6 +2261,7 @@ impl App {
             SessionCommand::PlanReplan { note } => {
                 self.request_replan(note.as_deref().unwrap_or(""), DecisionBy::Dashboard)?;
             }
+            SessionCommand::ShowGraphRun { run_id } => self.show_graph_run(&run_id)?,
             SessionCommand::PlanTaskEdit {
                 action,
                 task_id,
@@ -4626,6 +4632,110 @@ impl App {
             self.graph_approval_stale = Some(run.plan.id.clone());
             self.last_graph_run = Some(run);
         }
+        self.restore_conversation_graph_history();
+    }
+
+    /// SPEC-dashboard-fullwidth FR-1222: an opened conversation shows its
+    /// latest stored run again. Only runs with this `conversation_id` are
+    /// considered; a live run of this conversation (in `graph_session`) or a
+    /// restored awaiting run (above) wins.
+    fn restore_conversation_graph_history(&mut self) {
+        self.graph_history_run_id = None;
+        let conversation_id = self.conversation_id.as_str().to_owned();
+        if self
+            .last_graph_run
+            .as_ref()
+            .is_some_and(|run| run.conversation_id == conversation_id)
+        {
+            return;
+        }
+        if self
+            .graph_session
+            .as_ref()
+            .is_some_and(|session| session.run().conversation_id == conversation_id)
+        {
+            return;
+        }
+        let latest = GraphStore::new(&self.workspace_root)
+            .list_runs()
+            .into_iter()
+            .filter(|run| run.conversation_id == conversation_id)
+            .max_by(|left, right| {
+                left.turn_index
+                    .cmp(&right.turn_index)
+                    .then_with(|| left.plan.id.cmp(&right.plan.id))
+            });
+        if let Some(run) = latest {
+            self.graph_history_run_id = Some(run.plan.id.clone());
+            self.last_graph_run = Some(Self::graph_history_display(run));
+        }
+    }
+
+    /// FR-1222: a stored run is history, never resumed. One left mid-run (no
+    /// live `graph_session` owns it any more) is shown as cancelled; the file
+    /// on disk is not changed.
+    fn graph_history_display(mut run: GraphRun) -> GraphRun {
+        if matches!(
+            run.phase,
+            GraphRunPhase::Active
+                | GraphRunPhase::WaitingGate
+                | GraphRunPhase::Triage
+                | GraphRunPhase::Planning
+        ) {
+            run.phase = GraphRunPhase::Cancelled;
+        }
+        run
+    }
+
+    /// SPEC-dashboard-fullwidth FR-1224: show one stored run of the current
+    /// conversation in the Graph view. Refused while this conversation has a
+    /// live run or a plan waiting for approval, so neither is hidden.
+    fn show_graph_run(&mut self, run_id: &str) -> Result<(), RunTodoError> {
+        let run_id = run_id.trim();
+        if run_id.is_empty()
+            || !run_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(RunTodoError::Invalid("invalid graph run id".to_owned()));
+        }
+        let conversation_id = self.conversation_id.as_str().to_owned();
+        if let Some(session) = self
+            .graph_session
+            .as_ref()
+            .filter(|session| session.run().conversation_id == conversation_id)
+        {
+            if session.run().plan.id == run_id {
+                return Ok(());
+            }
+            return Err(RunTodoError::Busy(
+                "A graph run is in progress in this conversation; the Graph view keeps showing it."
+                    .to_owned(),
+            ));
+        }
+        if let Some(current) = self.last_graph_run.as_ref() {
+            if current.plan.id == run_id && current.conversation_id == conversation_id {
+                return Ok(());
+            }
+            if current.conversation_id == conversation_id
+                && current.phase == GraphRunPhase::AwaitingApproval
+            {
+                return Err(RunTodoError::Busy(
+                    "A plan is waiting for approval; approve, edit or reject it first.".to_owned(),
+                ));
+            }
+        }
+        let missing = || RunTodoError::Missing(format!("graph run {run_id} not found"));
+        let run = dmuxai::graph::load_run(&self.workspace_root, run_id).map_err(|_| missing())?;
+        if run.conversation_id != conversation_id {
+            return Err(missing());
+        }
+        if run.phase == GraphRunPhase::AwaitingApproval {
+            self.graph_approval_stale = Some(run.plan.id.clone());
+        }
+        self.graph_history_run_id = Some(run.plan.id.clone());
+        self.last_graph_run = Some(Self::graph_history_display(run));
+        Ok(())
     }
 
     /// FR-942: the current awaiting run is the one restored after restart.
@@ -10040,10 +10150,29 @@ impl App {
         });
 
         if let Some(graph) = graph.as_mut() {
+            let history = self.graph_history_run_id.as_deref() == Some(graph.id.as_str());
             for node in &mut graph.nodes {
+                if history {
+                    break;
+                }
                 if let Some(tracker) = self.graph_node_details.get(&node.id) {
                     node.detail = tracker.snapshot();
                 }
+            }
+            if self.dashboard_commands.is_some() {
+                let users: Vec<(usize, &str)> = self
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, message)| message.role == Role::User && !message.local_only)
+                    .map(|(index, message)| (index, message.content.as_str()))
+                    .collect();
+                link_turn_bands_to_messages(
+                    &mut graph.turns,
+                    &conversation_runs,
+                    &users,
+                    self.conversation_id.as_str(),
+                );
             }
         }
 
@@ -13611,6 +13740,47 @@ fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
     )
 }
 
+/// SPEC-dashboard-fullwidth FR-1223: links each turn band to the transcript
+/// id (`<conversation>:<index>`) of the user message that started its run.
+/// Runs and user messages are matched in order on the prompt text (a leading
+/// `/plan` or `/direct` is ignored), so repeated prompts map to their own
+/// messages; a run without a matching message keeps `message_id: None`.
+fn link_turn_bands_to_messages(
+    bands: &mut [dmuxai::web::TurnBandView],
+    runs: &[GraphRun],
+    users: &[(usize, &str)],
+    conversation_id: &str,
+) {
+    fn strip_route(text: &str) -> &str {
+        let text = text.trim();
+        for prefix in ["/plan ", "/direct "] {
+            if let Some(rest) = text.strip_prefix(prefix) {
+                return rest.trim();
+            }
+        }
+        text
+    }
+    let mut cursor = 0usize;
+    for band in bands.iter_mut() {
+        band.message_id = None;
+        let Some(run) = runs.iter().find(|run| run.plan.id == band.run_id) else {
+            continue;
+        };
+        let prompt = run.plan.user_prompt.trim();
+        if prompt.is_empty() {
+            continue;
+        }
+        if let Some(offset) = users[cursor.min(users.len())..]
+            .iter()
+            .position(|(_, text)| strip_route(text) == prompt)
+        {
+            let (index, _) = users[cursor + offset];
+            band.message_id = Some(format!("{conversation_id}:{index}"));
+            cursor += offset + 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Integration helpers for `App` unit tests (see `AGENTS.md` § Agent test helpers).
@@ -14927,6 +15097,248 @@ mod tests {
             hub.snapshot().graph.is_none(),
             "the previous conversation's graph must not leak into a new one"
         );
+    }
+
+    fn history_run(
+        id: &str,
+        conversation_id: &str,
+        turn_index: u32,
+        prompt: &str,
+        phase: GraphRunPhase,
+    ) -> GraphRun {
+        let status = match phase {
+            GraphRunPhase::Completed => dmuxai::graph::GraphNodeStatus::Completed,
+            GraphRunPhase::Active => dmuxai::graph::GraphNodeStatus::Running,
+            _ => dmuxai::graph::GraphNodeStatus::Pending,
+        };
+        GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: id.to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: prompt.to_owned(),
+                limits: dmuxai::graph::GraphLimits::default(),
+                tasks: Vec::new(),
+                nodes: vec![dmuxai::graph::GraphNode {
+                    id: "step-1".to_owned(),
+                    role: dmuxai::graph::NodeRole::Implement,
+                    job: prompt.to_owned(),
+                    runner: "codex".to_owned(),
+                    model_id: "composer-2.5".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status,
+                    attempt: 1,
+                    task: None,
+                    started_at_ms: Some(1_000),
+                    finished_at_ms: (phase == GraphRunPhase::Completed).then_some(61_000),
+                }],
+                edges: Vec::new(),
+            },
+            conversation_id: conversation_id.to_owned(),
+            phase,
+            waiting_gate_node: None,
+            turn_index,
+            ..Default::default()
+        }
+    }
+
+    fn history_app() -> (PlanGateHarness, dmuxai::web::DashboardHub) {
+        let h = plan_gate_test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            h.app.workspace_root.to_string_lossy().into_owned(),
+        );
+        let mut h = h;
+        h.app.attach_dashboard(hub.clone());
+        (h, hub)
+    }
+
+    // TC-1214 / SPEC-dashboard-fullwidth FR-1222: A -> B -> A restores each
+    // conversation's own latest run; B never shows A's.
+    #[test]
+    fn conversation_switch_restores_own_graph_run() {
+        let (mut h, hub) = history_app();
+        let a = h.app.conversation_id.clone();
+        h.app.input = "/direct first".to_owned();
+        h.app.submit_prompt();
+        h.app.graph_session = None;
+        let ws = h.app.workspace_root.clone();
+        for run in [
+            history_run("run-a1", a.as_str(), 1, "first", GraphRunPhase::Completed),
+            history_run("run-a2", a.as_str(), 2, "second", GraphRunPhase::Completed),
+        ] {
+            dmuxai::graph::save_run(&ws, &run).expect("save a");
+        }
+
+        h.app.create_conversation(Some("B".to_owned()));
+        let b = h.app.conversation_id.clone();
+        assert_ne!(a, b);
+        assert!(h.app.last_graph_run.is_none(), "B has no runs yet");
+        assert!(hub.snapshot().graph.is_none(), "B must not show A's run");
+        dmuxai::graph::save_run(
+            &ws,
+            &history_run("run-b1", b.as_str(), 1, "bee", GraphRunPhase::Completed),
+        )
+        .expect("save b");
+
+        h.app.select_conversation(a.clone());
+        let graph = hub.snapshot().graph.expect("A's graph restored");
+        assert_eq!(graph.id, "run-a2");
+        let bands: Vec<&str> = graph.turns.iter().map(|t| t.run_id.as_str()).collect();
+        assert!(
+            bands.contains(&"run-a1") && bands.contains(&"run-a2"),
+            "{bands:?}"
+        );
+        assert!(!bands.contains(&"run-b1"), "{bands:?}");
+        assert_eq!(graph.turns[0].steps.len(), 1);
+
+        h.app.select_conversation(b.clone());
+        let graph = hub.snapshot().graph.expect("B's graph restored");
+        assert_eq!(graph.id, "run-b1");
+        assert!(graph.turns.iter().all(|t| t.run_id == "run-b1"));
+
+        h.app.select_conversation(a);
+        assert_eq!(hub.snapshot().graph.unwrap().id, "run-a2");
+    }
+
+    // TC-1215 / FR-1222: a run left mid-run is shown cancelled (file kept);
+    // a live run of the conversation wins; a stored awaiting run is stale.
+    #[test]
+    fn restored_graph_history_is_safe() {
+        let (mut h, hub) = history_app();
+        let a = h.app.conversation_id.clone();
+        h.app.input = "/direct first".to_owned();
+        h.app.submit_prompt();
+        h.app.graph_session = None;
+        let ws = h.app.workspace_root.clone();
+        let mid = history_run("run-mid", a.as_str(), 5, "mid", GraphRunPhase::Active);
+        dmuxai::graph::save_run(&ws, &mid).expect("save mid");
+        h.app.create_conversation(None);
+        h.app.select_conversation(a.clone());
+        let run = h.app.last_graph_run.as_ref().expect("history");
+        assert_eq!(run.plan.id, "run-mid");
+        assert_eq!(run.phase, GraphRunPhase::Cancelled);
+        assert!(h.app.graph_session.is_none(), "history never resumes");
+        assert_eq!(
+            dmuxai::graph::load_run(&ws, "run-mid").unwrap().phase,
+            GraphRunPhase::Active,
+            "the stored record is not rewritten"
+        );
+        assert_eq!(
+            hub.snapshot().graph.unwrap().phase,
+            GraphRunPhase::Cancelled
+        );
+
+        // A live run of the active conversation takes precedence.
+        let live = history_run("run-live", a.as_str(), 6, "live", GraphRunPhase::Active);
+        h.app.create_conversation(None);
+        h.app.graph_session = Some(GraphRunSession::new(live));
+        h.app.select_conversation(a.clone());
+        h.app.publish_dashboard();
+        let graph = hub.snapshot().graph.unwrap();
+        assert_eq!(graph.id, "run-live");
+        assert_eq!(graph.phase, GraphRunPhase::Active);
+        h.app.graph_session = None;
+    }
+
+    // TC-1216 / FR-1224: the dashboard can show an older run of this
+    // conversation, never another conversation's, and not over a pending plan.
+    #[test]
+    fn show_graph_run_command_is_scoped() {
+        let (mut h, hub) = history_app();
+        let a = h.app.conversation_id.clone();
+        h.app.input = "/direct first".to_owned();
+        h.app.submit_prompt();
+        h.app.graph_session = None;
+        let ws = h.app.workspace_root.clone();
+        dmuxai::graph::save_run(
+            &ws,
+            &history_run("run-a1", a.as_str(), 1, "first", GraphRunPhase::Completed),
+        )
+        .unwrap();
+        dmuxai::graph::save_run(
+            &ws,
+            &history_run("run-a2", a.as_str(), 2, "second", GraphRunPhase::Completed),
+        )
+        .unwrap();
+        dmuxai::graph::save_run(
+            &ws,
+            &history_run(
+                "run-other",
+                "other-conversation",
+                1,
+                "x",
+                GraphRunPhase::Completed,
+            ),
+        )
+        .unwrap();
+        h.app.create_conversation(None);
+        h.app.select_conversation(a.clone());
+        assert_eq!(h.app.last_graph_run.as_ref().unwrap().plan.id, "run-a2");
+
+        let parsed: SessionCommand =
+            serde_json::from_str(r#"{"command":"show_graph_run","run_id":"run-a1"}"#)
+                .expect("dashboard JSON parses");
+        h.app
+            .handle_session_command(parsed)
+            .expect("show older run");
+        h.app.publish_dashboard();
+        assert_eq!(hub.snapshot().graph.unwrap().id, "run-a1");
+
+        let other = h.app.handle_session_command(SessionCommand::ShowGraphRun {
+            run_id: "run-other".to_owned(),
+        });
+        assert!(matches!(other, Err(RunTodoError::Missing(_))), "{other:?}");
+        let bad = h.app.handle_session_command(SessionCommand::ShowGraphRun {
+            run_id: "../run-a1".to_owned(),
+        });
+        assert!(matches!(bad, Err(RunTodoError::Invalid(_))), "{bad:?}");
+        assert_eq!(h.app.last_graph_run.as_ref().unwrap().plan.id, "run-a1");
+
+        // A plan waiting for approval is never replaced.
+        let mut pending = history_run(
+            "run-wait",
+            a.as_str(),
+            3,
+            "wait",
+            GraphRunPhase::AwaitingApproval,
+        );
+        pending.plan.nodes.clear();
+        h.app.last_graph_run = Some(pending);
+        let busy = h.app.handle_session_command(SessionCommand::ShowGraphRun {
+            run_id: "run-a2".to_owned(),
+        });
+        assert!(matches!(busy, Err(RunTodoError::Busy(_))), "{busy:?}");
+        assert_eq!(h.app.last_graph_run.as_ref().unwrap().plan.id, "run-wait");
+    }
+
+    // TC-1217 / FR-1223: bands link to their own user message, in order, even
+    // when a prompt repeats or carries a route prefix.
+    #[test]
+    fn turn_bands_link_to_user_messages() {
+        let runs = vec![
+            history_run("r1", "c", 1, "fix it", GraphRunPhase::Completed),
+            history_run("r2", "c", 2, "add docs", GraphRunPhase::Completed),
+            history_run("r3", "c", 3, "fix it", GraphRunPhase::Completed),
+            history_run("r4", "c", 4, "never sent", GraphRunPhase::Completed),
+        ];
+        let mut bands: Vec<dmuxai::web::TurnBandView> = runs
+            .iter()
+            .map(|run| dmuxai::web::TurnBandView {
+                run_id: run.plan.id.clone(),
+                turn_index: run.turn_index,
+                phase: run.phase,
+                user_prompt: run.plan.user_prompt.clone(),
+                nodes: vec!["step-1".to_owned()],
+                message_id: Some("stale".to_owned()),
+                steps: Vec::new(),
+            })
+            .collect();
+        let users = [(1, "fix it"), (4, "/plan add docs"), (7, "fix it")];
+        link_turn_bands_to_messages(&mut bands, &runs, &users, "c");
+        let ids: Vec<Option<&str>> = bands.iter().map(|b| b.message_id.as_deref()).collect();
+        assert_eq!(ids, vec![Some("c:1"), Some("c:4"), Some("c:7"), None]);
     }
 
     // TC-703 / FR-702: running graph nodes carry log_tail (last 20 lines, truncated to 300 chars)

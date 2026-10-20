@@ -475,15 +475,9 @@
       if (st === 'completed' || st === 'skipped') { done++; }
       if (st === 'running') { running.push(String(n.id) + (n.runner ? ' on ' + n.runner : '')); }
     });
-    var active = graph.phase !== 'completed' && graph.phase !== 'failed';
-    var verb;
-    if (graph.phase === 'failed') { verb = 'Run failed'; }
-    else if (!active) { verb = 'Ran'; }
-    else if (running.length) { verb = 'Running ' + running.join(', '); }
-    else { verb = 'Waiting'; }
-    var parts = [];
-    if (active) { parts.push(el('span', 'spinner')); }
-    else { parts.push(el('span', 'chat-aux-icon chat-aux-' + (graph.phase === 'failed' ? 'failed' : 'ok'), graph.phase === 'failed' ? '\u2717' : '\u2713')); }
+    var active = LIVE_PHASES.indexOf(String(graph.phase)) >= 0;
+    var verb = active ? (running.length ? 'Running ' + running.join(', ') : 'Waiting') : finishedVerb(graph.phase);
+    var parts = [active ? el('span', 'spinner') : phaseIcon(graph.phase)];
     var lineFn = function () {
       var line = verb + ' \u00b7 ' + done + '/' + nodes.length + ' steps';
       var ms = graphElapsed(graph, serverNow());
@@ -510,7 +504,106 @@
       item.appendChild(b);
       list.appendChild(item);
     });
-    return auxRow('graph:' + graph.id, 'chat-aux-run' + (active ? ' chat-aux-live' : ''), parts, list);
+    return withOpenButton(auxRow('graph:' + graph.id, 'chat-aux-run' + (active ? ' chat-aux-live' : ''), parts, list),
+      graph.id, null);
+  }
+
+  // SPEC-dashboard-fullwidth FR-1223: phases where the run is still moving.
+  var LIVE_PHASES = ['active', 'waiting_gate', 'triage', 'planning'];
+
+  function finishedVerb(phase) {
+    switch (String(phase)) {
+      case 'failed': return 'Run failed';
+      case 'cancelled': return 'Run stopped';
+      case 'rejected': return 'Plan rejected';
+      case 'awaiting_approval': return 'Plan waiting for approval';
+      default: return 'Ran';
+    }
+  }
+
+  function phaseIcon(phase) {
+    var p = String(phase);
+    var bad = p === 'failed';
+    var neutral = p === 'cancelled' || p === 'rejected' || p === 'awaiting_approval';
+    var icon = el('span', 'chat-aux-icon chat-aux-' + (bad ? 'failed' : neutral ? 'neutral' : 'ok'),
+      bad ? '\u2717' : neutral ? '\u2013' : '\u2713');
+    icon.setAttribute('aria-hidden', 'true');
+    return icon;
+  }
+
+  // FR-1224: open the Graph view on a run of this conversation (an older run
+  // is fetched by `show_graph_run`), optionally focused on one step.
+  function showRun(runId, nodeId) {
+    if (typeof window.dmuxaiShowGraphRun !== 'function') { return; }
+    window.dmuxaiShowGraphRun(runId, nodeId).then(function (res) {
+      if (res && res.error) { notify(res.error, true); }
+    });
+  }
+
+  function withOpenButton(li, runId, band) {
+    var b = el('button', 'chat-aux-open-run', 'Open in Graph');
+    b.type = 'button';
+    b.setAttribute('data-run-id', runId);
+    var older = !!band;
+    if (older && viewOnly) {
+      b.disabled = true;
+      b.title = 'The read-only view (dmuxai serve) shows the latest run only';
+    } else {
+      b.title = 'Show this run in the Graph view';
+    }
+    b.addEventListener('click', function () { showRun(runId, null); });
+    var head = li.querySelector(':scope > .chat-aux-head');
+    if (head && head.nextSibling) { li.insertBefore(b, head.nextSibling); } else { li.appendChild(b); }
+    return li;
+  }
+
+  // FR-1223: a collapsed run row for an earlier run of this conversation,
+  // built from its turn band (`graph.turns[]`).
+  function bandRunRow(band) {
+    var steps = Array.isArray(band.steps) ? band.steps : [];
+    if (!steps.length) { return null; }
+    var done = 0;
+    var start = null;
+    var end = null;
+    var allEnded = true;
+    steps.forEach(function (st) {
+      var status = String(st.status || 'pending');
+      if (status === 'completed' || status === 'skipped') { done++; }
+      if (typeof st.started_at_ms === 'number' && (start === null || st.started_at_ms < start)) { start = st.started_at_ms; }
+      if (typeof st.finished_at_ms === 'number') { end = end === null ? st.finished_at_ms : Math.max(end, st.finished_at_ms); }
+      else { allEnded = false; }
+    });
+    var line = finishedVerb(LIVE_PHASES.indexOf(String(band.phase)) >= 0 ? 'cancelled' : band.phase) +
+      ' \u00b7 ' + done + '/' + steps.length + ' steps';
+    if (start !== null && end !== null && allEnded) { line += ' \u00b7 ' + fmtElapsed(end - start); }
+    var parts = [phaseIcon(LIVE_PHASES.indexOf(String(band.phase)) >= 0 ? 'cancelled' : band.phase),
+      el('span', 'chat-aux-text', line)];
+    var list = el('ul', 'chat-aux-steps');
+    steps.forEach(function (st) {
+      var status = String(st.status || 'pending');
+      var item = el('li', 'chat-aux-step chat-aux-step-' + status);
+      var b = el('button', 'chat-aux-step-btn');
+      b.type = 'button';
+      b.title = 'Show ' + st.id + ' of this run in the Graph view';
+      if (viewOnly) {
+        b.disabled = true;
+        b.title = 'The read-only view (dmuxai serve) shows the latest run only';
+      }
+      b.appendChild(el('span', 'chat-aux-icon', STEP_ICONS[status] || '\u25CB'));
+      b.lastChild.setAttribute('aria-hidden', 'true');
+      b.appendChild(el('span', 'chat-aux-step-id', String(st.id)));
+      var ms = typeof st.started_at_ms === 'number' && typeof st.finished_at_ms === 'number'
+        ? st.finished_at_ms - st.started_at_ms : null;
+      b.appendChild(el('span', 'chat-aux-step-meta',
+        [st.role, st.runner].filter(Boolean).join(' \u00b7 ') + ' \u00b7 ' + status.replace('_', ' ') +
+        (ms !== null ? ' \u00b7 ' + fmtElapsed(ms) : '')));
+      b.addEventListener('click', function () { showRun(String(band.run_id), String(st.id)); });
+      item.appendChild(b);
+      list.appendChild(item);
+    });
+    var li = auxRow('graph:' + band.run_id, 'chat-aux-run chat-aux-run-earlier', parts, list);
+    li.setAttribute('data-run-id', String(band.run_id));
+    return withOpenButton(li, String(band.run_id), band);
   }
 
   // Single-agent turn in progress: the live activity line from the snapshot.
@@ -616,7 +709,11 @@
     for (var i = users.length - 1; i >= 0 && prompt; i--) {
       if ((users[i].dmuxText ? users[i].dmuxText.textContent : '').trim() === prompt) { start = users[i]; break; }
     }
-    if (!start) { return null; }
+    return start ? exchangeEnd(start) : null;
+  }
+
+  // The last chat message of the exchange that starts at user message `start`.
+  function exchangeEnd(start) {
     var anchor = start;
     var next = start.nextSibling;
     while (next && !(next.classList && next.classList.contains('msg-user'))) {
@@ -646,11 +743,34 @@
     var snap = lastSnap || {};
     var graph = snap.graph || null;
     if (graph) {
-      var anchor = graphAnchor(graph);
-      var runRow = graphRunRow(graph);
-      var appr = approvalRow(graph);
-      if (appr) { insertAfter(appr, anchor); }
-      if (runRow) { insertAfter(runRow, anchor); }
+      // FR-1223: one row per exchange that had a run, from the turn bands.
+      var placed = false;
+      (Array.isArray(graph.turns) ? graph.turns : []).forEach(function (band) {
+        if (!band || !band.message_id) { return; }
+        var user = null;
+        t.querySelectorAll(':scope > li.msg-user').forEach(function (li) {
+          if (li.getAttribute('data-msg-id') === String(band.message_id)) { user = li; }
+        });
+        if (!user) { return; }
+        var end = exchangeEnd(user);
+        if (band.run_id === graph.id) {
+          placed = true;
+          var apprHere = approvalRow(graph);
+          if (apprHere) { insertAfter(apprHere, end); }
+          var cur = graphRunRow(graph);
+          if (cur) { cur.setAttribute('data-run-id', String(graph.id)); insertAfter(cur, end); }
+        } else {
+          var row = bandRunRow(band);
+          if (row) { insertAfter(row, end); }
+        }
+      });
+      if (!placed) {
+        var anchor = graphAnchor(graph);
+        var runRow = graphRunRow(graph);
+        var appr = approvalRow(graph);
+        if (appr) { insertAfter(appr, anchor); }
+        if (runRow) { runRow.setAttribute('data-run-id', String(graph.id)); insertAfter(runRow, anchor); }
+      }
     }
     var graphLive = graph && graph.phase !== 'completed' && graph.phase !== 'failed';
     if (graphLive && t.querySelector(':scope > li.chat-aux-run.chat-aux-live')) {

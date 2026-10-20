@@ -28,8 +28,8 @@ pub use snapshot::{
     AgentView, DashboardSnapshot, GraphCounts, GraphView, NodeDetail, NodeView, RunStateView,
     SESSION_MESSAGE_MAX_BYTES, SESSION_TRANSCRIPT_MAX_BYTES, SESSION_TRANSCRIPT_MAX_MESSAGES,
     SESSION_TRUNCATED_MARKER, SNAPSHOT_SCHEMA, SessionAgent, SessionCommandInfo,
-    SessionConversation, SessionMessage, SessionModel, SessionView, SnapshotSource, UiTheme,
-    cap_session_message, cap_session_transcript, snapshot_from_run,
+    SessionConversation, SessionMessage, SessionModel, SessionView, SnapshotSource, TurnBandView,
+    TurnStepView, UiTheme, cap_session_message, cap_session_transcript, snapshot_from_run,
     snapshot_from_run_with_conversation, truncate_with_ellipsis,
 };
 

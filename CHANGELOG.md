@@ -32,6 +32,13 @@ All notable changes to dmuxai are listed here. Versions follow
   Reject. Line counts (+N/−M) are not shown because change records do not
   carry them.
 
+- **Graphs follow the conversation (FR-1222..FR-1224).** Opening or switching
+  to a conversation shows its latest stored graph run again (read-only; never
+  another conversation's; a live run still wins; a run left mid-run shows as
+  cancelled and is not resumed). Every chat exchange that started a run gets
+  its own collapsed run row, and "Open in Graph" on an earlier run loads that
+  run into the Graph view (`show_graph_run` command).
+
 ### Fixed
 
 - **Agent replies no longer show twice (FR-1209, FR-1210).** The Documents

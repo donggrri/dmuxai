@@ -1818,6 +1818,41 @@ window.dmuxaiFocusGraphNode = function (id) {
   }, 250);
 };
 
+// SPEC-dashboard-fullwidth FR-1224: open the Graph view on a run of the
+// current conversation. An older run is loaded by the `show_graph_run`
+// command; the node is focused once its snapshot arrives. Resolves to
+// {ok, error}.
+var pendingRunFocus = null;
+
+window.dmuxaiShowGraphRun = function (runId, nodeId) {
+  var graph = snapshot && snapshot.graph;
+  if (graph && graph.id === runId) {
+    if (nodeId) { window.dmuxaiFocusGraphNode(nodeId); } else { setCenterView('graph'); }
+    return Promise.resolve({ ok: true });
+  }
+  if (isDashboardViewOnly()) {
+    return Promise.resolve({ ok: false, error: 'The read-only view shows the latest run only.' });
+  }
+  pendingRunFocus = { runId: runId, nodeId: nodeId || null, until: Date.now() + 10000 };
+  return todoApi('POST', '/api/command', { command: 'show_graph_run', run_id: runId }).then(function () {
+    poll();
+    return { ok: true };
+  }).catch(function (err) {
+    pendingRunFocus = null;
+    return { ok: false, error: err && err.message ? err.message : 'Could not open that run.' };
+  });
+};
+
+function applyPendingRunFocus(snap) {
+  if (!pendingRunFocus) { return; }
+  if (Date.now() > pendingRunFocus.until) { pendingRunFocus = null; return; }
+  var graph = snap && snap.graph;
+  if (!graph || graph.id !== pendingRunFocus.runId) { return; }
+  var nodeId = pendingRunFocus.nodeId;
+  pendingRunFocus = null;
+  if (nodeId) { window.dmuxaiFocusGraphNode(nodeId); } else { setCenterView('graph'); }
+}
+
 // Chat approval card hooks (FR-1221); kept apart from window.dmuxaiPlanGate.
 window.dmuxaiChatPlanGate = {
   disabled: function () { return planGateDisabled() || !currentPlanGateContext(); },
@@ -3913,6 +3948,8 @@ function render(nowMs) {
   if (!graph) {
     $('graph-empty').hidden = false;
     $('graph-body').hidden = true;
+    // FR-1222: no text of another conversation's run stays in the hidden body.
+    if ($('graph-id')) { $('graph-id').textContent = ''; }
     graphZoomGroup = null;
     lastGraphCanvasRevision = null;
     lastGraphCanvasGeometryKey = null;
@@ -4011,6 +4048,7 @@ function applySnapshot(snap) {
   applySnapshotUi(snap);
   render(lastRendered);
   syncCenterViewsWithSnapshot(snap);
+  applyPendingRunFocus(snap);
   renderTodos(snap);
   if (isSomethingRunning(snap)) {
     scheduleTick();

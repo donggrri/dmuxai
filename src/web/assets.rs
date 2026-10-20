@@ -1692,7 +1692,7 @@ mod tests {
         assert!(aux.contains("head.setAttribute('aria-expanded', open ? 'true' : 'false')"));
         assert!(aux.contains("detail.hidden = !open;"));
         // FR-1217: "Running X · done/total steps · elapsed", live-updated.
-        assert!(aux.contains("verb = 'Running ' + running.join(', ')"));
+        assert!(aux.contains("'Running ' + running.join(', ')"));
         assert!(aux.contains("' steps'"));
         assert!(SESSION_JS.contains("window.setInterval(tickLiveRows, 1000)"));
         // FR-1218: a step opens Graph focused on that node.
@@ -1721,5 +1721,29 @@ mod tests {
         assert!(SESSION_CSS.contains(".chat-aux-approval"));
         assert!(SESSION_CSS.contains("li.chat-aux { margin-bottom: .5rem; color: var(--muted)"));
         assert!(SESSION_CSS.contains("@media (prefers-reduced-motion: reduce) { .chat-aux-caret"));
+    }
+
+    // TC-1219 (SPEC-dashboard-fullwidth FR-1223, FR-1224): one run row per
+    // exchange from the turn bands; older runs open through `show_graph_run`.
+    #[test]
+    fn per_turn_run_row_assets() {
+        let aux = js_between(
+            SESSION_JS,
+            "function fmtElapsed",
+            "// ---- ChatGPT-style layout",
+        );
+        assert!(aux.contains("Array.isArray(graph.turns) ? graph.turns : []"));
+        assert!(aux.contains("li.getAttribute('data-msg-id') === String(band.message_id)"));
+        assert!(aux.contains("function bandRunRow(band)"));
+        assert!(aux.contains("'Open in Graph'"));
+        assert!(aux.contains("window.dmuxaiShowGraphRun(runId, nodeId)"));
+        // Cancelled, rejected and stored mid-run phases never show a spinner.
+        assert!(
+            aux.contains("var LIVE_PHASES = ['active', 'waiting_gate', 'triage', 'planning'];")
+        );
+        assert!(!aux.contains("innerHTML"));
+        assert!(APP_JS.contains("command: 'show_graph_run', run_id: runId"));
+        assert!(APP_JS.contains("applyPendingRunFocus(snap);"));
+        assert!(SESSION_CSS.contains(".chat-aux-open-run {"));
     }
 }

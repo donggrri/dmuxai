@@ -582,7 +582,7 @@ with sync_playwright() as p:
     pg.keyboard.press("Escape")
     # Live: a running graph and, separately, a single running agent.
     live = copy.deepcopy(SNAP)
-    live["graph"]["phase"] = "running"
+    live["graph"]["phase"] = "active"
     live["graph"]["nodes"][1].update({"status": "running", "finished_at_ms": None, "elapsed_ms": None})
     live["session"]["agents"][0]["run"] = {"state": "running", "started_at_ms": 61000}
     live["session"]["transcript"] = live["session"]["transcript"][:4]
@@ -672,4 +672,193 @@ with sync_playwright() as p:
     assert!(text.contains("run cargo test export"), "{v}");
     assert_eq!(la["run_live"], true, "{v}");
     assert_eq!(la["working"], false, "{v}");
+}
+
+// TC-1218: per_turn_run_rows_and_session_graphs_in_headless_chrome (FR-1222,
+// FR-1223, FR-1224). The page polls a mocked `/api/state` built from the
+// served snapshot: conversation A has two runs, B has none.
+#[test]
+#[ignore = "needs Chrome/Chromium; run with --ignored"]
+fn per_turn_run_rows_and_session_graphs_in_headless_chrome() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let workspace = workspace_with_run(DONE_RUN);
+    let home = tempfile::tempdir().expect("temp home");
+    let (_guard, url) = start_serve(workspace.path(), home.path());
+    let script = r##"
+import sys, json, copy
+from playwright.sync_api import sync_playwright
+
+ROWS = """() => {
+  const t = document.querySelector('.session-transcript');
+  const kids = [...t.children].map(li => li.getAttribute('data-msg-id') || (li.classList.contains('chat-aux') ? 'row:' + (li.getAttribute('data-run-id') || li.getAttribute('data-aux-key')) : li.className));
+  const rows = [...t.querySelectorAll(':scope > li.chat-aux-run')].map(li => ({
+    run: li.getAttribute('data-run-id'),
+    text: li.querySelector('.chat-aux-head').innerText,
+    expanded: li.querySelector('.chat-aux-head').getAttribute('aria-expanded'),
+    open_btn: !!li.querySelector('.chat-aux-open-run')
+  }));
+  return {order: kids, rows: rows,
+    graph_hidden: document.querySelector('#graph').hidden,
+    graph_id: document.querySelector('#graph-id') ? document.querySelector('#graph-id').textContent : null,
+    graph_text: document.querySelector('#graph').innerText,
+    detail_visible: !document.querySelector('#graph-detail').hidden,
+    detail_text: document.querySelector('#graph-detail').innerText};
+}"""
+
+def session(cid, transcript):
+    return {"conversation_id": cid, "conversation_title": cid, "selected_agent": "demo", "details_expanded": False,
+        "agents": [{"id": "demo", "label": "demo", "allowed": True, "busy": False, "modes": ["ask"], "mode": "ask",
+                    "models": [], "model": None, "effort": None, "models_loading": False}],
+        "conversations": [], "transcript_omitted": 0, "transcript": transcript}
+
+def band(run_id, turn, prompt, msg, steps):
+    return {"run_id": run_id, "turn_index": turn, "phase": "completed", "user_prompt": prompt,
+            "nodes": [s["id"] for s in steps], "message_id": msg, "steps": steps}
+
+out = {"commands": []}
+with sync_playwright() as p:
+    b = p.chromium.launch(executable_path=sys.argv[1], args=["--no-sandbox"])
+    probe = b.new_page()
+    probe.goto(sys.argv[2])
+    probe.wait_for_function("() => document.querySelector('#graph-phase').textContent === 'completed'", timeout=15000)
+    from urllib.parse import urlparse, parse_qs
+    tok = parse_qs(urlparse(sys.argv[2]).query)["token"][0]
+    real = probe.evaluate("""async (t) => {
+        const r = await fetch('/api/state', {headers: {Authorization: 'Bearer ' + t}});
+        return await r.json(); }""", tok)
+    probe.close()
+
+    OLD_STEPS = [{"id": "a", "role": "plan", "runner": "cursor", "status": "completed", "started_at_ms": 1000, "finished_at_ms": 31000}]
+    NEW_STEPS = [{"id": "a", "role": "plan", "runner": "cursor", "status": "completed", "started_at_ms": 1000, "finished_at_ms": 61000},
+                 {"id": "b", "role": "implement", "runner": "cursor", "status": "completed", "started_at_ms": 61000, "finished_at_ms": 121000}]
+    A_TRANSCRIPT = [
+        {"id": "c1:0", "role": "user", "agent": None, "content": "Add CSV export", "streaming": False},
+        {"id": "c1:1", "role": "agent", "agent": "demo", "content": "Planned the export.", "streaming": False},
+        {"id": "c1:2", "role": "user", "agent": None, "content": "Now write it", "streaming": False},
+        {"id": "c1:3", "role": "agent", "agent": "demo", "content": "Wrote the export.", "streaming": False},
+    ]
+    a_snap = copy.deepcopy(real)
+    a_snap["source"] = "tui"
+    a_snap["session"] = session("c1", A_TRANSCRIPT)
+    a_snap["graph"]["user_prompt"] = "Now write it"
+    a_snap["graph"]["turns"] = [band("run-old", 1, "Add CSV export", "c1:0", OLD_STEPS),
+                                band("run-done", 2, "Now write it", "c1:2", NEW_STEPS)]
+    old_snap = copy.deepcopy(a_snap)
+    old_snap["graph"]["id"] = "run-old"
+    old_snap["graph"]["user_prompt"] = "Add CSV export"
+    old_snap["graph"]["nodes"][0]["detail"] = {}
+    b_snap = copy.deepcopy(real)
+    b_snap["source"] = "tui"
+    b_snap["graph"] = None
+    b_snap["session"] = session("c2", [
+        {"id": "c2:0", "role": "user", "agent": None, "content": "Unrelated question", "streaming": False},
+        {"id": "c2:1", "role": "agent", "agent": "demo", "content": "An answer.", "streaming": False}])
+    state = {"snap": a_snap, "rev": 100}
+
+    def fulfill_state(route):
+        state["rev"] += 1
+        snap = copy.deepcopy(state["snap"])
+        snap["revision"] = state["rev"]
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(snap))
+
+    def fulfill_command(route):
+        body = json.loads(route.request.post_data or "{}")
+        out["commands"].append(body)
+        if body.get("command") == "show_graph_run" and body.get("run_id") == "run-old":
+            state["snap"] = old_snap
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({"session": state["snap"]["session"]}))
+
+    ctx = b.new_context(viewport={"width": 1440, "height": 900}, bypass_csp=True)
+    ctx.add_init_script("delete window.EventSource;")
+    pg = ctx.new_page()
+    pg.on("pageerror", lambda e: print("PAGEERROR", e, file=sys.stderr))
+    pg.route("**/api/state*", fulfill_state)
+    pg.route("**/api/command*", fulfill_command)
+    pg.goto(sys.argv[2])
+    pg.wait_for_selector("li.chat-aux-run[data-run-id='run-old']", timeout=15000)
+    pg.wait_for_selector("li.chat-aux-run[data-run-id='run-done']", timeout=15000)
+    out["a"] = pg.evaluate(ROWS)
+    # Conversation B: no graph and no rows from A.
+    state["snap"] = b_snap
+    pg.wait_for_function("() => !document.querySelector('li.chat-aux-run') && document.querySelector('li.msg[data-msg-id=\"c2:0\"]')", timeout=15000)
+    pg.click("#graph-toggle")
+    pg.wait_for_timeout(300)
+    out["b"] = pg.evaluate(ROWS)
+    pg.keyboard.press("Escape")
+    # Back to A: the graph and both rows are back.
+    state["snap"] = a_snap
+    pg.wait_for_selector("li.chat-aux-run[data-run-id='run-old']", timeout=15000)
+    out["a_again"] = pg.evaluate(ROWS)
+    # The older run's step loads that run into the Graph view.
+    pg.click("li.chat-aux-run[data-run-id='run-old'] .chat-aux-head")
+    pg.click("li.chat-aux-run[data-run-id='run-old'] .chat-aux-step-btn")
+    pg.wait_for_function("() => !document.querySelector('#graph').hidden && !document.querySelector('#graph-detail').hidden", timeout=15000)
+    out["old_open"] = pg.evaluate(ROWS)
+    print(json.dumps(out))
+    b.close()
+"##;
+    let v = run_probe(python, &chrome, &url, script);
+
+    // FR-1223: each exchange with a run gets its own collapsed row, right
+    // after that exchange's reply.
+    let a = &v["a"];
+    let order: Vec<String> = a["order"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap_or_default().to_string())
+        .collect();
+    let at = |k: &str| {
+        order
+            .iter()
+            .position(|x| x == k)
+            .unwrap_or_else(|| panic!("{k}: {v}"))
+    };
+    assert_eq!(at("row:run-old"), at("c1:1") + 1, "{v}");
+    assert_eq!(at("row:run-done"), at("c1:3") + 1, "{v}");
+    let rows = a["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{v}");
+    for row in rows {
+        assert_eq!(row["expanded"], "false", "{v}");
+        assert_eq!(row["open_btn"], true, "{v}");
+    }
+    let old = rows.iter().find(|r| r["run"] == "run-old").unwrap();
+    assert!(
+        old["text"]
+            .as_str()
+            .unwrap()
+            .contains("Ran \u{b7} 1/1 steps \u{b7} 30s"),
+        "{v}"
+    );
+    let new = rows.iter().find(|r| r["run"] == "run-done").unwrap();
+    assert!(new["text"].as_str().unwrap().contains("2/2 steps"), "{v}");
+    // FR-1222 (client side): B shows no run rows and no graph of A.
+    let b = &v["b"];
+    assert_eq!(b["rows"].as_array().unwrap().len(), 0, "{v}");
+    assert!(
+        !b["graph_text"].as_str().unwrap().contains("run-done"),
+        "{v}"
+    );
+    assert!(
+        !b["order"].as_array().unwrap().iter().any(|x| x == "c1:0"),
+        "{v}"
+    );
+    // Back on A both rows return.
+    assert_eq!(v["a_again"]["rows"].as_array().unwrap().len(), 2, "{v}");
+    // FR-1224: the older step sent show_graph_run and focused that run's node.
+    let cmds = v["commands"].as_array().unwrap();
+    assert!(
+        cmds.iter()
+            .any(|c| c["command"] == "show_graph_run" && c["run_id"] == "run-old"),
+        "{v}"
+    );
+    let open = &v["old_open"];
+    assert_eq!(open["graph_hidden"], false, "{v}");
+    assert_eq!(open["detail_visible"], true, "{v}");
+    assert!(
+        open["graph_text"].as_str().unwrap().contains("run-old"),
+        "{v}"
+    );
 }
