@@ -5,6 +5,11 @@ Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `73e3f4d`
 Related: SPEC-agent-graph-orchestration, SPEC-model-policy, docs/TEST-PLAN.md
+Superseded in part: the `[graph] enabled` toggle (FR-370) and the keyword split of FR-371 are replaced by [SPEC-plan-gate](SPEC-plan-gate.md) FR-930, FR-931 and FR-937 once that spec is implemented.
+
+**Status (v0.2.3):** [SPEC-plan-gate](SPEC-plan-gate.md) now owns default graph behavior: engineering is always on; `[graph] enabled` is ignored with a deprecation warning (FR-931); simple vs complex triage uses the selected agent’s judge, with keyword heuristics as fallback only (FR-933..936). Live graph status line and 1-node runs match FR-937 and this spec’s UX goals.
+
+FR-370 is superseded by SPEC-plan-gate FR-930/FR-931; the replacing test is `src/settings.rs` `graph_enabled_key_is_deprecated_and_ignored` (TC-932).
 
 ## 1. Decision summary
 

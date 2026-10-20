@@ -24,10 +24,13 @@ const STARTER_CONFIG: &str = r##"# DmuxAI configuration (dmuxai.toml). Everythin
 # default_agent = "cursor"
 
 # [graph]
-# Graph orchestration splits multi-step prompts across runners (on by default).
-# enabled = true
+# Graph orchestration splits multi-step prompts across runners (always on).
 # max_parallel = 2
 # max_retries = 2
+# When true, write a markdown task checklist at
+# <workspace>/.dmuxai/tasks/TASKS-<run id>.md on plan approval and when a
+# task status changes (default false).
+# tasks_file = false
 # Unset: every runner may take graph nodes, except built-in presets (opencode
 # and grok). A built-in preset is never graph-routed unless it is listed here.
 # allowed_runners = ["cursor", "agy", "codex"]
@@ -91,7 +94,7 @@ const GROK_EXAMPLE: &str = r##"# Built-in grok runner, as an editable [[agents.c
 # name = "grok"
 # label = "grok"
 # color = "#6366f1"
-# command = ["grok", "-p", "{prompt}", "-m", "{model}", "--cwd", "{workspace}", "--output-format", "streaming-json"]
+# command = ["grok", "-p", "{prompt}", "-m", "{model}", "--cwd", "{workspace}", "--output-format", "streaming-json", "--no-wait-for-background"]
 # prompt_via = "arg"
 # models_command = ["grok", "models"]
 # allowed_models = "(?i)^grok-[a-z0-9][a-z0-9._-]*$"
@@ -101,6 +104,10 @@ const GROK_EXAMPLE: &str = r##"# Built-in grok runner, as an editable [[agents.c
 # session_id_path = "/sessionId"
 # resume_arg = ["-r", "{session_id}"]
 # timeout_secs = 900
+# done_when = { path = "/type", equals = "end" }
+# text_break_when = { path = "/type", equals = "tool_call" }
+# [agents.custom.env]
+# GROK_AUTO_WAKE = "0"
 # [agents.custom.modes]
 # ask = ["--permission-mode", "plan"]
 # plan = ["--permission-mode", "plan"]

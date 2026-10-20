@@ -379,6 +379,16 @@ h1.brand {
 .run-status-failed { color: var(--err); border-color: var(--err); }
 .run-status-cancelled { color: var(--muted); border-color: var(--line); }
 
+/* FR-981: activity suffix on the running pill. Color is inherited, so the
+   same ellipsis works in the light and dark palettes. */
+.run-status-activity {
+  max-width: 28ch;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @keyframes spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
@@ -508,6 +518,183 @@ main {
 .graph-id { color: var(--accent); font-weight: 600; }
 .graph-phase { color: var(--muted); }
 .graph-model { color: var(--faint); font-size: 0.85em; }
+
+.graph-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.graph-history-wrap {
+  position: relative;
+}
+
+.graph-plan-history {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  right: 0;
+  width: min(420px, 92vw);
+  max-height: 280px;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--text) 12%, transparent);
+  font-size: 0.82em;
+}
+
+.graph-plan-history-empty {
+  margin: 0;
+  color: var(--muted);
+}
+
+.graph-plan-history-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.graph-plan-history-item {
+  margin: 0 0 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.graph-plan-history-item:last-child {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.graph-plan-history-rejected .graph-plan-history-head {
+  color: var(--err);
+}
+
+.graph-plan-history-head {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.graph-plan-history-delta {
+  margin-top: 2px;
+  font-family: var(--mono, ui-monospace, monospace);
+  color: var(--accent);
+}
+
+.graph-plan-history-reason {
+  margin-top: 4px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.graph-judge-line {
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: 0.85em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.graph-judge-line .judge-fallback-word { color: var(--warn); }
+
+.graph-approval {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  font-size: 0.88em;
+}
+
+.graph-approval-error {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  color: var(--err);
+  background: color-mix(in srgb, var(--err) 12%, transparent);
+}
+
+.graph-approval-header {
+  margin: 0 0 6px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.graph-approval-warning {
+  margin: 0 0 8px;
+  color: var(--warn);
+}
+
+.graph-approval-task {
+  margin: 8px 0 4px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.graph-approval-step {
+  margin: 2px 0;
+  color: var(--muted);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.92em;
+}
+
+.graph-approval-step-mark {
+  color: var(--warn);
+  font-weight: 700;
+}
+
+.graph-approval-step-mark-added { color: var(--accent); }
+
+.graph-approval-job {
+  margin: 0 0 4px 1.25em;
+  color: var(--faint);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.graph-approval-note {
+  margin: 4px 0;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.graph-approval-task-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 4px 0 8px;
+}
+
+.graph-approval-task-actions .btn {
+  font-size: 0.78em;
+  padding: 2px 6px;
+}
+
+.graph-approval-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  align-items: flex-start;
+}
+
+.graph-approval-edit {
+  flex: 1 1 100%;
+  margin-top: 4px;
+}
+
+.graph-approval-edit textarea {
+  width: 100%;
+  min-height: 4em;
+  resize: vertical;
+  box-sizing: border-box;
+}
 
 .graph-prompt {
   margin: 0 0 10px;
@@ -1424,9 +1611,134 @@ main {
 
 .graph-stage[hidden] { display: none; }
 
+/* UX-936: task checklist below the swimlane (full width). */
+.graph-stage-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+}
+
+.task-checklist {
+  flex: 0 0 auto;
+  width: 100%;
+  max-width: none;
+  max-height: 32vh;
+  overflow: auto;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  font-size: 0.85em;
+  box-sizing: border-box;
+}
+
+.task-checklist[hidden] { display: none; }
+
+.task-checklist-title-bar {
+  margin: 0 0 6px;
+  font-size: 0.75em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.task-checklist-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr));
+  align-items: start;
+  gap: 4px 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.task-checklist-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  align-items: baseline;
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.task-checklist-row:last-child { margin-bottom: 0; }
+
+.task-checklist-row:hover,
+.task-checklist-row:focus-visible,
+.task-checklist-row.task-checklist-row-selected {
+  background: var(--current-bg);
+  border-color: var(--line);
+}
+
+.task-checklist-row.task-checklist-row-selected {
+  outline: 1px solid var(--accent);
+}
+
+.task-checklist-status {
+  font-size: 1.05em;
+  line-height: 1;
+  width: 1.25em;
+  text-align: center;
+}
+
+.task-checklist-status-pending { color: var(--muted); }
+.task-checklist-status-running { color: var(--accent); }
+.task-checklist-status-done { color: var(--ok); }
+.task-checklist-status-failed { color: var(--err); }
+
+.task-checklist-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82em;
+  color: var(--faint);
+}
+
+.task-checklist-label {
+  color: var(--text);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.task-checklist-meta {
+  grid-column: 1 / -1;
+  display: none;
+  margin: 2px 0 0;
+  padding-left: calc(1.25em + 8px);
+  font-size: 0.88em;
+  color: var(--muted);
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.task-checklist-row:hover .task-checklist-meta,
+.task-checklist-row:focus-within .task-checklist-meta,
+.task-checklist-row.task-checklist-row-expanded .task-checklist-meta {
+  display: block;
+}
+
+.task-checklist-done {
+  margin: 0 0 4px;
+  color: var(--faint);
+}
+
+.task-checklist-nodes {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  color: var(--muted);
+}
+
 .graph-canvas {
   position: relative;
   flex: 1 1 auto;
+  width: 100%;
   min-width: 0;
   min-height: 180px;
   max-height: 70vh;
@@ -1494,6 +1806,28 @@ main {
   letter-spacing: 0.04em;
 }
 
+.graph-svg .card-rev-badge-added {
+  fill: color-mix(in srgb, var(--accent) 22%, var(--graph-node-fill));
+  stroke: var(--accent);
+  stroke-width: 1;
+}
+
+.graph-svg .card-rev-badge-changed {
+  fill: color-mix(in srgb, var(--warn) 22%, var(--graph-node-fill));
+  stroke: var(--warn);
+  stroke-width: 1;
+}
+
+.graph-svg .card-rev-badge-text {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+}
+
+.graph-svg .card-rev-badge-text-added { fill: var(--accent); }
+.graph-svg .card-rev-badge-text-changed { fill: var(--warn); }
+
 .graph-svg .node.state-completed .card-box { stroke: var(--badge-completed-line); }
 .graph-svg .node.state-completed .card-accent,
 .graph-svg .node.state-completed .card-icon { fill: var(--ok); }
@@ -1533,6 +1867,14 @@ main {
 .graph-svg .node:focus .card-box,
 .graph-svg .node:hover .card-box { stroke-width: 2.5; }
 .graph-svg .node.node-selected .card-box { stroke: var(--warn); stroke-width: 2.5; stroke-dasharray: none; }
+
+.graph-svg .node.node-task-highlight .card-box {
+  stroke: var(--gate);
+  stroke-width: 2.5;
+  stroke-dasharray: none;
+}
+
+.graph-svg .node.node-task-highlight .card-accent { fill: var(--gate); }
 
 .graph-svg .edge {
   fill: none;

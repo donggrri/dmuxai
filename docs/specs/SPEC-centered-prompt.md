@@ -15,7 +15,7 @@ Decision: the layout reserves space for each open docked sidebar. The chat colum
 | ID | Priority | Requirement | Tests |
 | --- | --- | --- | --- |
 | FR-850 | Must | On viewports wider than 900px, the prompt box (`.session-prompt`) is horizontally centered in the content area: the viewport minus each open docked sidebar (left sessions, right Files/To-dos). Its center is within 2px of the content area's center, and no docked sidebar overlaps it. This holds for the four states: none, left only, right only, both | TC-850, TC-851 |
-| FR-851 | Must | Both docked sidebars are 320px wide. With no sidebar, or with both sidebars open, the prompt box center is within 2px of the viewport center at widths 1280, 1440 and 1920 | TC-851 |
+| FR-851 | Must | Both docked sidebars default to 320px wide (resizable per SPEC-sidebar-resize). With no sidebar, or with both sidebars open, the prompt box center is within 2px of the viewport center at widths 1280, 1440 and 1920 | TC-851 |
 | FR-852 | Must | At 900px and below, sidebars are overlay drawers. The prompt box stays centered in the viewport (within 2px) and keeps a width of at least min(100% - 20px, 320px) | TC-851 |
 | UX-850 | Should | Opening or closing a sidebar moves the column with the existing 0.2s transition (none under `prefers-reduced-motion`). The prompt keeps focus and its text | TC-850, TC-851 |
 

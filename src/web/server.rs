@@ -467,6 +467,22 @@ async fn get_workspace_js() -> impl IntoResponse {
     )
 }
 
+async fn get_sidebar_resize_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::SIDEBAR_RESIZE_JS,
+    )
+}
+
 async fn get_favicon_idle() -> impl IntoResponse {
     (
         [
@@ -909,12 +925,39 @@ struct PromptBody {
     text: String,
     agent: Option<String>,
     mode: Option<String>,
+    route: Option<String>,
+}
+
+fn session_command_needs_web_write(command: &SessionCommand) -> bool {
+    matches!(
+        command,
+        SessionCommand::PlanDecision { .. }
+            | SessionCommand::PlanReplan { .. }
+            | SessionCommand::PlanTaskEdit { .. }
+    )
 }
 
 async fn post_prompt(
     State(state): State<AppState>,
     ApiJson(body): ApiJson<PromptBody>,
 ) -> Response {
+    let slash_wins = body.text.starts_with('/') && !body.text.starts_with("//");
+    if !slash_wins
+        && let Some(route) = body
+            .route
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        let route = route.to_ascii_lowercase();
+        if matches!(route.as_str(), "plan" | "direct") && body.text.trim().is_empty() {
+            return error_json(StatusCode::BAD_REQUEST, "text is required");
+        }
+        if !matches!(route.as_str(), "auto" | "plan" | "direct") {
+            return error_json(StatusCode::BAD_REQUEST, "invalid route");
+        }
+    }
+
     if body.text.trim().is_empty() {
         return error_json(StatusCode::BAD_REQUEST, "text is required");
     }
@@ -936,6 +979,7 @@ async fn post_prompt(
             text: body.text,
             agent: body.agent,
             mode: body.mode,
+            route: body.route,
             reply,
         })
         .await
@@ -967,6 +1011,9 @@ async fn post_command(
     State(state): State<AppState>,
     ApiJson(command): ApiJson<SessionCommand>,
 ) -> Response {
+    if !state.services.web_attached && session_command_needs_web_write(&command) {
+        return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
+    }
     let Some(sender) = state.services.commands.clone() else {
         return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
     };
@@ -1479,6 +1526,7 @@ pub fn build_router_with(
         .route("/assets/memory.js", get(get_memory_js))
         .route("/assets/session.js", get(get_session_js))
         .route("/assets/workspace.js", get(get_workspace_js))
+        .route("/assets/sidebar-resize.js", get(get_sidebar_resize_js))
         .route("/assets/session.css", get(get_session_css))
         .route("/assets/app.css", get(get_app_css))
         .route("/assets/favicon-idle.svg", get(get_favicon_idle))
@@ -1577,11 +1625,12 @@ pub async fn start_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web::commands::PlanDecisionAction;
     use http_body_util::BodyExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
-    use crate::graph::{GraphEdge, GraphNodeStatus, GraphRunPhase, NodeRole};
+    use crate::graph::{GraphEdge, GraphNodeStatus, GraphRunPhase, NodeRole, PlannerCalls};
     use crate::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
     use crate::todo::{Todo, TodoStore};
     use crate::web::auth::generate_token;
@@ -1857,11 +1906,22 @@ mod tests {
                 deps: Vec::new(),
                 layout: None,
                 detail: NodeDetail::default(),
+                rev_change: None,
+                task: None,
             }],
             edges: vec![GraphEdge {
                 from: "a".to_string(),
                 to: "b".to_string(),
             }],
+            triage: None,
+            approval: None,
+            plan_history: Vec::new(),
+            tasks: Vec::new(),
+            planner_calls: PlannerCalls::default(),
+            planner_io: Vec::new(),
+            turns: Vec::new(),
+            earlier_turns: 0,
+            follow_up: Vec::new(),
         };
         hub.publish(Vec::new(), Some(test_graph));
 
@@ -2143,6 +2203,363 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    struct PlanApprovalDouble {
+        plan_id: String,
+        revision: u32,
+        decided: bool,
+    }
+
+    fn spawn_plan_decision_double(
+        plan_id: String,
+        revision: u32,
+    ) -> mpsc::Sender<DashboardCommand> {
+        let state = Arc::new(std::sync::Mutex::new(PlanApprovalDouble {
+            plan_id,
+            revision,
+            decided: false,
+        }));
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            let session = crate::web::SessionView {
+                conversation_id: "conv-plan".to_owned(),
+                selected_agent: "codex".to_owned(),
+                ..crate::web::SessionView::default()
+            };
+            while let Some(command) = rx.recv().await {
+                if let DashboardCommand::Session { command, reply } = command {
+                    let result = match command {
+                        SessionCommand::PlanDecision {
+                            plan_id,
+                            revision,
+                            decision,
+                            feedback,
+                        } => {
+                            let mut guard = state.lock().unwrap();
+                            if plan_id != guard.plan_id {
+                                Err(RunTodoError::Busy(
+                                    "Plan id does not match the awaiting run.".to_owned(),
+                                ))
+                            } else if revision != guard.revision {
+                                Err(RunTodoError::Busy(
+                                    "That revision is no longer current; refresh the approval panel."
+                                        .to_owned(),
+                                ))
+                            } else if matches!(decision, PlanDecisionAction::Edit)
+                                && feedback
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                                    .is_none()
+                            {
+                                Err(RunTodoError::Invalid(
+                                    "Usage: /graph edit <feedback>".to_owned(),
+                                ))
+                            } else if guard.decided {
+                                Err(RunTodoError::Busy(
+                                    "A plan decision was already applied for this revision."
+                                        .to_owned(),
+                                ))
+                            } else {
+                                guard.decided = true;
+                                Ok(session.clone())
+                            }
+                        }
+                        other => Err(RunTodoError::Invalid(format!(
+                            "unexpected session command: {other:?}"
+                        ))),
+                    };
+                    let _ = reply.send(result);
+                }
+            }
+        });
+        tx
+    }
+
+    // TC-959 (UX-932): `plan_decision` HTTP mapping with an awaiting-approval double.
+    #[tokio::test]
+    async fn plan_decision_command_contract() {
+        let token = "plan-decision-token".to_string();
+        let plan_id = "plan-abc".to_string();
+        let revision = 2_u32;
+        let router_with = |commands: mpsc::Sender<DashboardCommand>| {
+            build_router_with(
+                test_hub(),
+                token.clone(),
+                allowed_localhost(),
+                DashboardServices {
+                    commands: Some(commands),
+                    web_attached: true,
+                    ..DashboardServices::default()
+                },
+            )
+        };
+
+        let router = router_with(spawn_plan_decision_double(plan_id.clone(), revision));
+        let approve_body = serde_json::json!({
+            "command": "plan_decision",
+            "plan_id": plan_id,
+            "revision": revision,
+            "decision": "approve"
+        });
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &approve_body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(json["session"]["conversation_id"], "conv-plan");
+
+        let router = router_with(spawn_plan_decision_double(plan_id.clone(), revision));
+        let edit_body = serde_json::json!({
+            "command": "plan_decision",
+            "plan_id": plan_id,
+            "revision": revision,
+            "decision": "edit"
+        });
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &edit_body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(read_body(resp).await.contains("Usage: /graph edit"));
+
+        let tx = spawn_plan_decision_double(plan_id.clone(), revision);
+        let router = router_with(tx);
+        let reject_body = serde_json::json!({
+            "command": "plan_decision",
+            "plan_id": plan_id,
+            "revision": revision,
+            "decision": "reject"
+        });
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &reject_body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &reject_body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(read_body(resp).await.contains("already applied"));
+
+        let router = router_with(spawn_plan_decision_double(plan_id.clone(), revision));
+        let wrong_plan = serde_json::json!({
+            "command": "plan_decision",
+            "plan_id": "other-plan",
+            "revision": revision,
+            "decision": "approve"
+        });
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &wrong_plan.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(read_body(resp).await.contains("Plan id does not match"));
+
+        let router = router_with(spawn_plan_decision_double(plan_id.clone(), revision));
+        let stale_rev = serde_json::json!({
+            "command": "plan_decision",
+            "plan_id": plan_id,
+            "revision": revision - 1,
+            "decision": "approve"
+        });
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &stale_rev.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(read_body(resp).await.contains("no longer current"));
+
+        let view_router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                commands: Some(spawn_plan_decision_double(plan_id.clone(), revision)),
+                web_attached: false,
+                ..DashboardServices::default()
+            },
+        );
+        let resp = view_router
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &approve_body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(read_body(resp).await.contains("view-only"));
+    }
+
+    fn spawn_plan_gate_session_double() -> (
+        mpsc::Sender<DashboardCommand>,
+        Arc<std::sync::Mutex<Vec<SessionCommand>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_task = Arc::clone(&seen);
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            let session = crate::web::SessionView {
+                conversation_id: "conv-gate".to_owned(),
+                selected_agent: "codex".to_owned(),
+                ..crate::web::SessionView::default()
+            };
+            while let Some(command) = rx.recv().await {
+                if let DashboardCommand::Session { command, reply } = command {
+                    seen_task.lock().unwrap().push(command.clone());
+                    let result = match command {
+                        SessionCommand::PlanReplan { note } => {
+                            if note.as_deref() == Some("refuse") {
+                                Err(RunTodoError::Busy(
+                                    "Replan needs a multi-step run".to_owned(),
+                                ))
+                            } else {
+                                Ok(session.clone())
+                            }
+                        }
+                        SessionCommand::PlanTaskEdit { action, .. } => {
+                            if action == "rename" {
+                                Ok(session.clone())
+                            } else {
+                                Err(RunTodoError::Busy(
+                                    "Task edit refused: unknown task 'missing'".to_owned(),
+                                ))
+                            }
+                        }
+                        SessionCommand::PlanDecision {
+                            decision, feedback, ..
+                        } => {
+                            if matches!(decision, PlanDecisionAction::Edit)
+                                && feedback
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                                    .is_none()
+                            {
+                                Err(RunTodoError::Invalid(
+                                    "Usage: /graph edit <feedback>".to_owned(),
+                                ))
+                            } else {
+                                Ok(session.clone())
+                            }
+                        }
+                        other => Err(RunTodoError::Invalid(format!(
+                            "unexpected session command: {other:?}"
+                        ))),
+                    };
+                    let _ = reply.send(result);
+                }
+            }
+        });
+        (tx, seen)
+    }
+
+    #[tokio::test]
+    async fn plan_replan_and_task_edit_commands() {
+        let token = "plan-gate-cmd-token".to_string();
+        let (tx, seen) = spawn_plan_gate_session_double();
+        let router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                commands: Some(tx),
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        );
+
+        let replan_ok = r#"{"command":"plan_replan","note":"tighten deps"}"#;
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/command", &token, replan_ok))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let replan_fail = r#"{"command":"plan_replan","note":"refuse"}"#;
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/command", &token, replan_fail))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(read_body(resp).await.contains("multi-step"));
+
+        let task_ok =
+            r#"{"command":"plan_task_edit","action":"rename","task_id":"task-1","title":"New"}"#;
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/command", &token, task_ok))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let task_bad = r#"{"command":"plan_task_edit","action":"delete"}"#;
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/command", &token, task_bad))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let task_conflict =
+            r#"{"command":"plan_task_edit","action":"merge","task_id":"task-1","from":"task-2"}"#;
+        let resp = router
+            .oneshot(json_request("POST", "/api/command", &token, task_conflict))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(read_body(resp).await.contains("Task edit refused"));
+
+        let commands = seen.lock().unwrap();
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, SessionCommand::PlanReplan { .. }))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, SessionCommand::PlanTaskEdit { .. }))
+        );
     }
 
     // TC-541 / FR-541: CRUD routes and the snapshot reflect every mutation.
@@ -2748,6 +3165,176 @@ mod tests {
         }
     }
 
+    struct TodoPlanGateDouble {
+        store: Arc<TodoStore>,
+        awaiting: Option<(String, u32, String)>,
+        agent_skipped_judge: bool,
+    }
+
+    fn spawn_todo_plan_gate_double(store: Arc<TodoStore>) -> mpsc::Sender<DashboardCommand> {
+        let state = Arc::new(std::sync::Mutex::new(TodoPlanGateDouble {
+            store,
+            awaiting: None,
+            agent_skipped_judge: false,
+        }));
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            let session = crate::web::SessionView {
+                conversation_id: "conv-todo".to_owned(),
+                selected_agent: "codex".to_owned(),
+                ..crate::web::SessionView::default()
+            };
+            while let Some(command) = rx.recv().await {
+                match command {
+                    DashboardCommand::RunTodo {
+                        todo_id,
+                        mode,
+                        reply,
+                    } => {
+                        let mut guard = state.lock().unwrap();
+                        let result = match mode {
+                            RunMode::Graph => {
+                                let plan_id = format!("plan-{}", todo_id);
+                                guard.awaiting = Some((plan_id.clone(), 1, todo_id.clone()));
+                                guard
+                                    .store
+                                    .mark_running(&todo_id, "graph", &plan_id)
+                                    .map_err(|_| RunTodoError::NotFound)
+                            }
+                            RunMode::Agent { agent } => {
+                                guard.agent_skipped_judge = true;
+                                guard
+                                    .store
+                                    .mark_running(&todo_id, "agent", &agent)
+                                    .map_err(|_| RunTodoError::NotFound)
+                            }
+                        };
+                        let _ = reply.send(result);
+                    }
+                    DashboardCommand::Session {
+                        command:
+                            SessionCommand::PlanDecision {
+                                plan_id,
+                                revision,
+                                decision,
+                                ..
+                            },
+                        reply,
+                    } => {
+                        let mut guard = state.lock().unwrap();
+                        let result = match &guard.awaiting {
+                            Some((expected_plan, expected_rev, todo_id))
+                                if *expected_plan == plan_id && *expected_rev == revision =>
+                            {
+                                if matches!(decision, PlanDecisionAction::Reject) {
+                                    let todo_id = todo_id.clone();
+                                    guard.awaiting = None;
+                                    match guard.store.finish_run(
+                                        &todo_id,
+                                        false,
+                                        Some("plan rejected".to_owned()),
+                                    ) {
+                                        Ok(_) => Ok(session.clone()),
+                                        Err(_) => Err(RunTodoError::NotFound),
+                                    }
+                                } else {
+                                    Err(RunTodoError::Busy("unexpected decision".to_owned()))
+                                }
+                            }
+                            _ => Err(RunTodoError::Busy("not awaiting approval".to_owned())),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        tx
+    }
+
+    // TC-954 / FR-947: graph to-do waits for plan approval; reject reopens the to-do.
+    #[tokio::test]
+    async fn todo_graph_run_waits_for_plan_approval() {
+        let token = "todo-plan-gate-token".to_string();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TodoStore::open(&temp_dir.path().join("todos.db")).unwrap());
+        let todo = store
+            .create(crate::todo::NewTodo {
+                title: "feature".to_owned(),
+                body: String::new(),
+                source: crate::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let commands = spawn_todo_plan_gate_double(store.clone());
+        let router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                todos: Some(store.clone()),
+                commands: Some(commands),
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        );
+
+        let run_resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/todos/{}/run", todo.id),
+                &token,
+                r#"{"mode":"graph"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(run_resp.status(), StatusCode::ACCEPTED);
+
+        let reject_body = serde_json::json!({
+            "command": "plan_decision",
+            "plan_id": format!("plan-{}", todo.id),
+            "revision": 1,
+            "decision": "reject"
+        });
+        let reject_resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &reject_body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reject_resp.status(), StatusCode::OK);
+
+        let reopened = store.get(&todo.id).unwrap();
+        assert_eq!(reopened.status, TodoStatus::Open);
+        assert_eq!(reopened.last_error.as_deref(), Some("plan rejected"));
+
+        let todo_agent = store
+            .create(crate::todo::NewTodo {
+                title: "direct".to_owned(),
+                body: String::new(),
+                source: crate::todo::TodoSource::Manual,
+                source_ref: None,
+            })
+            .unwrap();
+        let agent_resp = router
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/todos/{}/run", todo_agent.id),
+                &token,
+                r#"{"mode":"agent","agent":"codex"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(agent_resp.status(), StatusCode::ACCEPTED);
+        let running = store.get(&todo_agent.id).unwrap();
+        assert_eq!(running.run_kind.as_deref(), Some("agent"));
+    }
+
     // TC-766 / FR-765: prompt route contract
     #[tokio::test]
     async fn prompt_route_contract() {
@@ -2859,6 +3446,131 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // UX-933: optional `route` (auto | plan | direct), slash wins, empty/unknown → 400
+        let (tx, seen) = spawn_prompt_route_capture();
+        let route_router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                commands: Some(tx),
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        );
+
+        let resp = route_router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"hello","route":"auto"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            ("hello".to_owned(), Some("auto".to_owned()))
+        );
+
+        let resp = route_router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"do work","route":"plan"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            seen.lock().unwrap().last().map(|row| row.0.as_str()),
+            Some("do work")
+        );
+
+        let resp = route_router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"skip triage","route":"direct"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            seen.lock().unwrap().last().map(|row| row.0.as_str()),
+            Some("skip triage")
+        );
+
+        let resp = route_router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"/direct inline","route":"plan"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            seen.lock().unwrap().last().map(|row| row.0.as_str()),
+            Some("/direct inline")
+        );
+
+        let resp = route_router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"   ","route":"plan"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = route_router
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"hello","route":"warp"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(read_body(resp).await.contains("invalid route"));
+    }
+
+    type CapturedPromptRoutes = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
+    fn spawn_prompt_route_capture() -> (mpsc::Sender<DashboardCommand>, CapturedPromptRoutes) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_task = Arc::clone(&seen);
+        let accepted = PromptAccepted {
+            conversation_id: "conv-route".to_string(),
+            agent: "codex".to_string(),
+        };
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                if let DashboardCommand::SubmitPrompt {
+                    text, route, reply, ..
+                } = command
+                {
+                    seen_task.lock().unwrap().push((text, route));
+                    let _ = reply.send(Ok(accepted.clone()));
+                }
+            }
+        });
+        (tx, seen)
     }
 
     // TC-767 / FR-766: REST catch-up and SSE `state-change` frames tail the log file.

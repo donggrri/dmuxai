@@ -1,6 +1,6 @@
 # SPEC: Local web dashboard (live graph, to-do board, MCP import)
 
-Status: Implemented in v0.2.0 (slices A, B and C)
+Status: Implemented in v0.2.0 (slices A, B and C); FR-984 in v0.2.2
 Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `5ff8c93`
@@ -75,6 +75,7 @@ client and Jira/Confluence import, mock-tested only).
 | FR-520 | Must | Given the CLI, when the user runs `dmuxai serve [--port N] [--bind ADDR] [--allow-remote]` or `dmuxai --web [--port N] [--bind ADDR] [--allow-remote]` | `serve` starts the dashboard without requiring a TTY; `--web` starts the TUI plus the dashboard; `--help` documents both | Unknown flags or a missing/invalid flag value exit 2 with usage; `--help`/`--version` keep current behavior | TC-520, TC-531 |
 | FR-521 | Must | Given a server start | A fresh random access token of at least 32 lowercase hex characters is generated and the URL `http://<host>:<port>/?token=<token>` is printed (stdout for `serve`; a TUI startup notice for `--web`) | Two starts never reuse a token | TC-521, TC-531 |
 | FR-522 | Must | Given a request to any `/api/*` path | It succeeds only with `Authorization: Bearer <token>` or `?token=<token>` (constant-time compare) | Missing or wrong token returns 401 with no state in the body | TC-522 |
+| FR-984 | Must | Given `dmuxai --web` started the dashboard and the TUI shows the startup notice with the full `?token=` URL (FR-521) | The TUI still shows the full URL, but the notice is local-only: it is not in any `DashboardSnapshot` / `SessionView` transcript, `/api/state`, `/api/session` or SSE payload, and it is not stored in the conversation database, shared with agents, or sent in agent context. Other startup notices are unchanged | A snapshot that would contain the token string is a bug; the dashboard shows the URL without the token at most | TC-986, TC-987 |
 | FR-523 | Must | Given a request with an `Origin` header, or a `Host` header | For loopback binds the Host must be `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>`; for opt-in remote binds any Host is accepted (the token is the guard). In both cases a present Origin must equal `http://<Host>` | Mismatch, a missing Host, or `Origin: null` returns 403 before auth; protects against cross-site and DNS-rebinding access | TC-523 |
 | FR-524 | Must | Given `--bind ADDR` | Loopback addresses bind normally; a non-loopback address binds only with `--allow-remote` and prints a warning that anyone who can reach the port and has the token can control agents | Non-loopback without `--allow-remote` refuses to start (exit 2) | TC-524 |
 | FR-525 | Must | Given a graph run is active or the latest persisted run exists | `GET /api/state` returns snapshot `dmuxai.dashboard/v1` with `revision`, `generated_at_ms` (last change), `sent_at_ms` (server clock at send time, used for live elapsed), `source`, `agents[]` (`id`, `label`, `busy`, `phase`, `model`), and `graph` (`id`, `phase`, `orchestrator_model`, `current_nodes[]`, `waiting_gate_node`, `counts`, `nodes[]` with `id`, `role`, `job`, `runner`, `model_id`, `status`, `attempt`, `started_at_ms`, `finished_at_ms`, `elapsed_ms`, and `edges[]`) | No graph gives `graph: null`; long `job`/prompt text is truncated to 200 chars | TC-525 |
@@ -156,6 +157,8 @@ MCP servers are defined once and used by every runner and by the dashboard.
 | TC-577 | NFR-561, INT-561 | unit | servers with secret env (stdio) and secret headers (http) | build Codex spawn argv and env | no secret value in argv; the values are in the child env; config uses env-var-name keys | `src/agent/codex.rs` `codex_mcp_secrets_not_in_argv` |
 | TC-578 | INT-561 | unit | Cursor runner with an existing user `.cursor/mcp.json`; two turns | run turns | the "not propagated" notice is emitted once per session; the user file is untouched | `src/agent/cursor.rs` `cursor_mcp_notice_once_per_session` |
 | TC-579 | FR-564, UX-561 | integration | `dmuxai serve` with `[todo] jira_base_url` | first GET `/api/state` before any mutation | snapshot has `jira_base_url` | `tests/web_mcp_import.rs` `serve_snapshot_has_jira_base_url_at_startup` |
+| TC-986 | FR-984 | unit | App with the dashboard hub; `push_startup_notice` with a URL containing a fixed token, then a turn | The TUI message list (rendered buffer) contains the token; the JSON of `dashboard_snapshot()` / session view never contains the token, before and after the turn and after switching conversations | `src/app.rs` `dashboard_snapshot_never_contains_startup_token` |
+| TC-987 | FR-984 | integration | `dmuxai --web`-style startup path that registers the token notice; router | `GET /api/state` and the session endpoint with the token as Bearer | Response bodies do not contain the token string | `src/app.rs` `api_snapshots_do_not_echo_token` |
 
 ## 6. Data, integration, and safety contracts
 

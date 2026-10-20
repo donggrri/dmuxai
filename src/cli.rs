@@ -57,6 +57,7 @@ pub struct RunOptions {
     pub agent: Option<String>,
     pub mode: Option<String>,
     pub graph: bool,
+    pub approve_plan: bool,
     pub json: bool,
 }
 
@@ -94,6 +95,7 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
                 "--agent" => options.agent = Some(value(args, &mut index, "--agent")?.to_owned()),
                 "--mode" => options.mode = Some(parse_mode(value(args, &mut index, "--mode")?)?),
                 "--graph" => options.graph = true,
+                "--approve-plan" => options.approve_plan = true,
                 "--json" => options.json = true,
                 flag if flag.starts_with("--") => {
                     return Err(format!("unexpected argument '{flag}'"));
@@ -512,6 +514,8 @@ fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Val
         "messages": outcome.messages,
         "error": outcome.error,
         "todo": outcome.todo,
+        "triage": outcome.triage,
+        "plan": outcome.plan,
         // Both `null` when the run wrote no events (e.g. rejected before start).
         "events": if last_seq >= first_seq {
             json!({ "first_seq": first_seq, "last_seq": last_seq })
@@ -603,6 +607,7 @@ async fn run_headless(
         agent: options.agent.clone(),
         mode,
         graph: options.graph,
+        approve_plan: options.approve_plan,
         todo_id,
     };
     let outcome = app.run_headless(request, cancel).await;
@@ -770,6 +775,7 @@ mod tests {
                 agent: Some("agy".into()),
                 mode: Some("plan".into()),
                 graph: false,
+                approve_plan: false,
                 json: true,
             }))
         );

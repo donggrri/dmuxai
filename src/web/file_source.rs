@@ -97,12 +97,14 @@ mod tests {
                 orchestrator_model: "gpt-4o".to_string(),
                 user_prompt: "prompt".to_string(),
                 limits: GraphLimits::default(),
+                tasks: Vec::new(),
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
             conversation_id: "conv-1".to_string(),
             phase: GraphRunPhase::Active,
             waiting_gate_node: None,
+            ..Default::default()
         };
         serde_json::to_string(&run).unwrap()
     }

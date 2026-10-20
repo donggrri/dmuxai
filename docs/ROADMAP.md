@@ -1,6 +1,6 @@
 # dmuxai roadmap
 
-Release history is in [CHANGELOG.md](../CHANGELOG.md). Each item links its SPEC (the contract) and its GitHub issue (status). GitHub milestones: [v0.2.1](https://github.com/donggrri/dmuxai/milestone/1) (released), [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2).
+Release history is in [CHANGELOG.md](../CHANGELOG.md). Each item links its SPEC (the contract) and its GitHub issue (status). GitHub milestones: [v0.2.1](https://github.com/donggrri/dmuxai/milestone/1) (released), [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2) (released).
 
 ## v0.2.4 (planned, after v0.2.3)
 
@@ -12,18 +12,20 @@ Source: Dongjin, 2026-10-18 23:3x KST: "모든 TUI 기능이 대시보드에서 
 
 The grok runner ([#66](https://github.com/donggrri/dmuxai/pull/66), merged for v0.2.2) is already on the dashboard under `--web`; it must also work under the new interactive `serve`. The plan gate ([#67](https://github.com/donggrri/dmuxai/pull/67)) and the rest of v0.2.3 must be reachable from the dashboard before the TUI is removed. #70 (TUI picker width, merged (f1b36ae)) is TUI-only and #71 (resizable sidebars) is dashboard-only; neither adds a parity gap.
 
-## v0.2.2 (in progress)
+## v0.2.2 (released 2026-10-19)
 
-Source: Dongjin, 2026-10-18 09:42 KST.
+Source: Dongjin, 2026-10-18 09:42 KST; item 5 added by Dongjin 2026-10-19 00:00 KST.
 
 | # | Item | Kind | SPEC (IDs) | Issue | Status |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Prompt box stays centered with sidebars open | UX | [SPEC-centered-prompt](specs/SPEC-centered-prompt.md) (FR-850..852, UX-850) | [#54](https://github.com/donggrri/dmuxai/issues/54) | planned |
-| 2 | Left sidebar of sessions/conversations (ChatGPT-style), TUI picker parity | UX | [SPEC-session-sidebar](specs/SPEC-session-sidebar.md) (FR-860..864, UX-860) | [#55](https://github.com/donggrri/dmuxai/issues/55) | planned |
-| 3 | Set the project working directory (CLI, config, dashboard) | feature | [SPEC-workspace-dir](specs/SPEC-workspace-dir.md) (FR-870..875, NFR-870) | [#56](https://github.com/donggrri/dmuxai/issues/56) | planned |
-| 4 | Graph view: horizontal swimlane timeline (replaces the subway map) | UX | [SPEC-graph-swimlane](specs/SPEC-graph-swimlane.md) (FR-880..885, UX-880..881) | [#61](https://github.com/donggrri/dmuxai/issues/61) | merged ([#65](https://github.com/donggrri/dmuxai/pull/65)) |
+| 1 | Prompt box stays centered with sidebars open | UX | [SPEC-centered-prompt](specs/SPEC-centered-prompt.md) (FR-850..852, UX-850) | [#54](https://github.com/donggrri/dmuxai/issues/54) | merged #58 (b224c50) |
+| 2 | Left sidebar of sessions/conversations (ChatGPT-style), TUI picker parity | UX | [SPEC-session-sidebar](specs/SPEC-session-sidebar.md) (FR-860..864, UX-860) | [#55](https://github.com/donggrri/dmuxai/issues/55) | merged #59 (6147561) |
+| 3 | Set the project working directory (CLI, config, dashboard) | feature | [SPEC-workspace-dir](specs/SPEC-workspace-dir.md) (FR-870..875, NFR-870) | [#56](https://github.com/donggrri/dmuxai/issues/56) | merged #60 (e0c988f) |
+| 4 | Graph view: horizontal swimlane timeline (replaces the subway map) | UX | [SPEC-graph-swimlane](specs/SPEC-graph-swimlane.md) (FR-880..885, UX-880..881) | [#61](https://github.com/donggrri/dmuxai/issues/61) | merged #65 (8c6b999) |
+| 5 | Built-in grok (Grok Build) runner: headless `grok -p`, grok-4.7 default, no fast models, login check, cancel, graph opt-in | feature | [SPEC-grok-runner](specs/SPEC-grok-runner.md) (FR-890..900, NFR-890); [SPEC-model-policy](specs/SPEC-model-policy.md) (FR-910..912) | — | merged #66 (a4c50ae) |
+| 6 | Release v0.2.2: CHANGELOG, version bump, release audit, tag, verify the Linux asset | release | — | — | release PR #69 (screens OK by Dongjin 2026-10-19); tag `v0.2.2` on its merge commit |
 
-Order: 1 → 2 → 3 → 4 (1 and 2 share the layout; 2 and 3 both touch the header). No release in this round.
+Order: 1 → 2 → 3 → 4 (1 and 2 share the layout; 2 and 3 both touch the header); 5 ran in parallel. The release waits for all of 1–5 and for Dongjin's OK on the screens.
 
 ## v0.2.1 (released 2026-10-18)
 

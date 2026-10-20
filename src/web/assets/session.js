@@ -7,6 +7,11 @@
 (function () {
   var TOKEN_KEY = 'dmuxai.token';
   var MODES = ['ask', 'plan', 'implement'];
+  var PROMPT_ROUTES = [
+    { value: 'auto', label: 'Auto' },
+    { value: 'plan', label: 'Plan' },
+    { value: 'direct', label: 'Direct' }
+  ];
   var SHARE_TARGETS = ['codex', 'cursor', 'agy'];
 
   var SESSIONS_OPEN_PREFIX = 'dmuxai.sessions.open.';
@@ -129,9 +134,14 @@
     return node;
   }
 
-  function button(label, parity, onClick, className) {
-    var b = el('button', 'btn' + (className ? ' ' + className : ''), label);
+  function button(label, parity, onClick, extraClass) {
+    var b = el('button', 'btn', label);
     b.type = 'button';
+    if (extraClass) {
+      extraClass.split(/\s+/).forEach(function (cls) {
+        if (cls) { b.classList.add(cls); }
+      });
+    }
     if (parity) { b.setAttribute('data-parity', parity); }
     b.addEventListener('click', onClick);
     return b;
@@ -182,6 +192,9 @@
     notify('');
     var body = { text: text };
     if (session && session.selected_agent) { body.agent = session.selected_agent; }
+    if (ui.route && ui.route.value && ui.route.value !== 'auto') {
+      body.route = ui.route.value;
+    }
     return api('/api/prompt', body).then(function () {
       stickToBottom = true;
       return true;
@@ -340,8 +353,14 @@
       }
     });
     form.appendChild(ui.input);
+    var sendCol = el('div', 'session-send-col');
+    ui.route = picker('Route', 'route', function () { /* value read on send */ });
+    setOptions(ui.route, PROMPT_ROUTES, 'auto');
+    sendCol.appendChild(ui.route.parentNode);
     ui.send = button('Send', 'prompt-send', submitPrompt, 'btn-primary');
-    form.appendChild(ui.send);
+    sendCol.appendChild(ui.send);
+    form.appendChild(sendCol);
+
     root.appendChild(form);
 
     document.addEventListener('keydown', function (e) {
@@ -474,8 +493,8 @@
     [ui.newConv, ui.status, ui.details, ui.share, ui.palette, ui.quit, ui.send].forEach(function (b) {
       b.disabled = viewOnly;
     });
+    if (ui.route) { ui.route.disabled = viewOnly; }
     ui.input.disabled = viewOnly;
-
     renderTranscript();
     renderConversations();
   }
@@ -667,6 +686,8 @@
     },
     '/summarize': function () { askText('Focus (optional)', function (t) { sendPrompt(t ? '/summarize ' + t : '/summarize'); }); },
     '/compact': function () { askText('Focus (optional)', function (t) { sendPrompt(t ? '/compact ' + t : '/compact'); }); },
+    '/plan': function () { askText('Prompt (plan first, then approve)', function (t) { if (t) { sendPrompt('/plan ' + t); } }, true); },
+    '/direct': function () { askText('Prompt (runs without planning)', function (t) { if (t) { sendPrompt('/direct ' + t); } }, true); },
     '/share': function () { openShare(); },
     '/image': function () { askText('Image path in the workspace', function (t) { if (t) { sendPrompt('/image ' + t); } }, true); },
     '/details': function () { command({ command: 'toggle_details' }); },
@@ -699,7 +720,7 @@
   var PARITY_IDS = {
     '/agent': 'agent', '/mode': 'mode', '/effort': 'effort', '/status': 'status', '/quit': 'quit',
     '/new': 'new', '/conversations': 'conversations', '/resume': 'resume', '/summarize': 'summarize',
-    '/compact': 'compact', '/share': 'share', '/image': 'image', '/details': 'details', '/graph': 'graph',
+    '/compact': 'compact', '/plan': 'route', '/direct': 'route', '/share': 'share', '/image': 'image', '/details': 'details', '/graph': 'graph',
     '/remember': 'remember', '/memory': 'memory'
   };
 
@@ -876,4 +897,7 @@
     root.hidden = true;
     if (pending) { applySnapshot(pending); pending = null; }
   });
+
+  // Plan-gate approval buttons are rendered in app.js via parityButton (parity ids).
+  window.dmuxaiSession = { parityButton: button };
 })();

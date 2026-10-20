@@ -92,6 +92,15 @@ pub struct CustomAgentSpec {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub modes: CustomAgentModes,
+    /// JSONL line that marks the end of the turn (SPEC-grok-runner FR-914).
+    /// When it matches, DmuxAI stops reading, gives the process a short grace
+    /// period to exit, then stops its process group.
+    #[serde(default)]
+    pub done_when: Option<TextWhen>,
+    /// JSONL line after which the next reply text starts a new paragraph
+    /// (SPEC-grok-runner FR-916), e.g. a tool call between two text segments.
+    #[serde(default)]
+    pub text_break_when: Option<TextWhen>,
     /// True for a built-in preset (opencode, grok). Not configurable.
     #[serde(skip)]
     pub builtin: bool,
@@ -168,6 +177,7 @@ pub fn grok_preset(program: &str) -> CustomAgentSpec {
             "{workspace}",
             "--output-format",
             "streaming-json",
+            "--no-wait-for-background",
         ]
         .map(str::to_owned)
         .to_vec(),
@@ -184,6 +194,18 @@ pub fn grok_preset(program: &str) -> CustomAgentSpec {
         session_id_path: Some("/sessionId".to_owned()),
         resume_arg: words(&["-r", "{session_id}"]),
         timeout_secs: Some(900),
+        // FR-913: a background task that finishes during the turn queues an
+        // auto-wake prompt that grok 1.0.62 never runs in headless mode, so the
+        // process idles forever after its reply. Auto-wake off avoids it.
+        env: BTreeMap::from([("GROK_AUTO_WAKE".to_owned(), "0".to_owned())]),
+        done_when: Some(TextWhen {
+            path: "/type".to_owned(),
+            equals: "end".to_owned(),
+        }),
+        text_break_when: Some(TextWhen {
+            path: "/type".to_owned(),
+            equals: "tool_call".to_owned(),
+        }),
         modes: CustomAgentModes {
             ask: words(&["--permission-mode", "plan"]),
             plan: words(&["--permission-mode", "plan"]),
@@ -541,6 +563,8 @@ pub fn build_custom_command(
     #[cfg(unix)]
     command.process_group(0);
 
+    crate::process::strip_dashboard_env(command.as_std_mut());
+
     Ok(command)
 }
 
@@ -550,6 +574,19 @@ pub struct ParsedLine {
     pub text: Option<String>,
     pub error: Option<String>,
     pub session_id: Option<String>,
+    /// The line matches `done_when` (FR-914).
+    pub done: bool,
+    /// The line matches `text_break_when` (FR-916).
+    pub text_break: bool,
+}
+
+/// True when `val` has `when.equals` at `when.path` (string or JSON value).
+fn json_matches(val: &serde_json::Value, when: &TextWhen) -> bool {
+    match val.pointer(&when.path) {
+        Some(serde_json::Value::String(s)) => s == &when.equals,
+        Some(v) => *v == when.equals,
+        None => false,
+    }
 }
 
 /// Parses a line of JSONL output according to the agent's pointer configuration.
@@ -562,11 +599,7 @@ pub fn parse_jsonl_line(spec: &CustomAgentSpec, line: &str) -> ParsedLine {
     let text = if let Some(text_path) = &spec.text_path {
         let condition_met = match &spec.text_when {
             None => true,
-            Some(when) => match val.pointer(&when.path) {
-                Some(serde_json::Value::String(s)) => s == &when.equals,
-                Some(v) => *v == when.equals,
-                None => false,
-            },
+            Some(when) => json_matches(&val, when),
         };
 
         if condition_met {
@@ -603,7 +636,32 @@ pub fn parse_jsonl_line(spec: &CustomAgentSpec, line: &str) -> ParsedLine {
         text,
         error,
         session_id,
+        done: spec
+            .done_when
+            .as_ref()
+            .is_some_and(|when| json_matches(&val, when)),
+        text_break: spec
+            .text_break_when
+            .as_ref()
+            .is_some_and(|when| json_matches(&val, when)),
     }
+}
+
+/// Appends `text` to `reply`, starting a new paragraph when a break is pending
+/// and the reply does not already end in whitespace (FR-916). Returns the text
+/// actually appended, so the streamed delta matches the stored reply.
+pub fn append_reply_text(reply: &mut String, text: &str, break_pending: &mut bool) -> String {
+    let mut chunk = String::new();
+    if std::mem::take(break_pending)
+        && !reply.is_empty()
+        && !reply.ends_with(char::is_whitespace)
+        && !text.starts_with(char::is_whitespace)
+    {
+        chunk.push_str("\n\n");
+    }
+    chunk.push_str(text);
+    reply.push_str(&chunk);
+    chunk
 }
 
 /// Determines whether a turn failed and returns an error reason if so.
@@ -766,6 +824,7 @@ async fn run_models_output(
         .current_dir(cwd)
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    crate::process::strip_dashboard_env(command.as_std_mut());
     // Test fixtures set GROK_FAKE_* on the preset. Production grok env is empty.
     // Opencode keeps its models command free of OPENCODE_CONFIG substitution.
     if is_builtin_grok(spec) {
@@ -1429,6 +1488,7 @@ image_arg = []
             "/ws",
             "--output-format",
             "streaming-json",
+            "--no-wait-for-background",
         ];
         for (mode, edit, extra) in [
             ("ask", "deny", &["--permission-mode", "plan"][..]),
@@ -1578,5 +1638,63 @@ image_arg = []
             assert_ne!(parsed, other_color, "{other}");
             assert_ne!(color.as_str(), other);
         }
+    }
+
+    // TC-913 / FR-913: the grok preset turns auto-wake off and does not wait
+    // for background work, and marks the end and tool-call lines.
+    #[test]
+    fn grok_preset_avoids_stranded_auto_wake() {
+        let spec = grok_preset("grok");
+        assert_eq!(
+            spec.env.get("GROK_AUTO_WAKE").map(String::as_str),
+            Some("0")
+        );
+        assert!(
+            spec.command
+                .iter()
+                .any(|arg| arg == "--no-wait-for-background")
+        );
+        let when = |path: &str, equals: &str| TextWhen {
+            path: path.to_owned(),
+            equals: equals.to_owned(),
+        };
+        assert_eq!(spec.done_when, Some(when("/type", "end")));
+        assert_eq!(spec.text_break_when, Some(when("/type", "tool_call")));
+        let line = |text: &str| parse_jsonl_line(&spec, text);
+        assert!(line(r#"{"type":"end","sessionId":"s"}"#).done);
+        assert!(!line(r#"{"type":"text","data":"x"}"#).done);
+        assert!(line(r#"{"type":"tool_call","toolCallId":"t"}"#).text_break);
+        assert!(!line(r#"{"type":"tool_call_update"}"#).text_break);
+    }
+
+    // TC-917 / FR-916: a pending break adds one blank line only between two
+    // words, never at the start or after existing whitespace.
+    #[test]
+    fn append_reply_text_breaks_paragraphs_once() {
+        let mut reply = String::new();
+        let mut pending = true;
+        assert_eq!(
+            append_reply_text(&mut reply, "Checking", &mut pending),
+            "Checking"
+        );
+        pending = true;
+        assert_eq!(
+            append_reply_text(&mut reply, "Done.", &mut pending),
+            "\n\nDone."
+        );
+        assert!(!pending);
+        assert_eq!(
+            append_reply_text(&mut reply, " More", &mut pending),
+            " More"
+        );
+        pending = true;
+        reply.push('\n');
+        assert_eq!(append_reply_text(&mut reply, "Next", &mut pending), "Next");
+        pending = true;
+        assert_eq!(
+            append_reply_text(&mut reply, " tail", &mut pending),
+            " tail"
+        );
+        assert_eq!(reply, "Checking\n\nDone. More\nNext tail");
     }
 }

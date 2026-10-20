@@ -309,6 +309,7 @@ async fn running_indicator_renders_in_headless_chrome() {
                 duration_ms: None,
                 node: None,
             }),
+            activity: None,
         }],
         None,
     );

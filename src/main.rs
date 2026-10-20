@@ -1,7 +1,6 @@
 mod agent;
 mod app;
 mod cli;
-mod process;
 
 use std::{
     error::Error,
@@ -82,7 +81,7 @@ Usage:
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
-  dmuxai run <prompt|-> [--agent ID] [--mode ask|plan|implement] [--graph] [--json]
+  dmuxai run <prompt|-> [--agent ID] [--mode ask|plan|implement] [--approve-plan] [--graph] [--json]
   dmuxai todo add <title> [--body TEXT] [--json]
   dmuxai todo list [--status open|running|done] [--json]
   dmuxai todo run <id> [--agent ID | --graph] [--mode M] [--json]
@@ -107,7 +106,7 @@ Options:
   --project NAME   Project name for mcp-memory
   run              Run one prompt headless and exit (exit codes: 0 ok, 1 failed,
                    2 usage, 3 not found, 4 busy, 5 runner not allowed, 6 internal,
-                   130 cancelled)
+                   7 approval or sensitive gate, 130 cancelled)
   todo             Add, list or run to-dos without the TUI
   status           Print workspace status (agents, to-dos, last graph, events)
   events           Print state-change events from .dmuxai/events.jsonl
@@ -811,7 +810,7 @@ async fn attach_web_dashboard(
             if let (Some((store, _)), Some(receiver)) = (todos, receiver) {
                 app.attach_dashboard_services(store.clone(), receiver);
             }
-            app.push_startup_notice(format!("dmuxai dashboard: {}", server.url));
+            app.push_local_notice(format!("dmuxai dashboard: {}", server.url));
             if let Some(warning) = server.warning.clone() {
                 app.push_startup_notice(warning);
             }

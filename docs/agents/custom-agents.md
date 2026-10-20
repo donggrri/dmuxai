@@ -21,6 +21,9 @@ text_path = "/part/text"          # jsonl: JSON pointer of a text chunk
 text_when = { path = "/type", equals = "text" }   # optional: only lines matching this
 error_path = "/error/message"     # jsonl: JSON pointer of an error message
 session_id_path = "/sessionID"    # jsonl: JSON pointer of the provider session id
+done_when = { path = "/type", equals = "end" }        # optional: this line ends the turn;
+                                  # DmuxAI stops reading, waits 3 s, then stops the process group
+text_break_when = { path = "/type", equals = "tool_call" }   # optional: next text starts a new paragraph
 resume_arg = ["--session", "{session_id}"]   # appended when resuming
 timeout_secs = 900
 failure_stderr = "(?i)permission denied|rejected permission"

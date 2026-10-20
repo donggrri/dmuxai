@@ -256,6 +256,17 @@ impl fmt::Display for AdapterError {
 
 impl Error for AdapterError {}
 
+const ADAPTER_BUSY_TURN_SUFFIX: &str =
+    " is already running a turn; cancel it before sending another prompt";
+
+/// Typed adapter refusal when a second prompt is sent before the prior turn ends.
+pub fn is_adapter_turn_busy_rejection(message: &str) -> bool {
+    match message.strip_suffix(ADAPTER_BUSY_TURN_SUFFIX) {
+        Some(prefix) => !prefix.is_empty() && !prefix.contains('\n'),
+        None => false,
+    }
+}
+
 /// The synchronous UI-facing handle for an asynchronous agent runtime.
 ///
 /// Commands are deliberately non-blocking: the UI either enqueues one or gets

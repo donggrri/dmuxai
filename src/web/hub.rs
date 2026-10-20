@@ -311,7 +311,7 @@ impl DashboardHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{GraphEdge, GraphNodeStatus, GraphRunPhase, NodeRole};
+    use crate::graph::{GraphEdge, GraphNodeStatus, GraphRunPhase, NodeRole, PlannerCalls};
     use crate::web::snapshot::{GraphCounts, NodeDetail, NodeView};
 
     fn make_test_graph(id: &str, status: GraphNodeStatus) -> GraphView {
@@ -366,11 +366,22 @@ mod tests {
                 deps: Vec::new(),
                 layout: None,
                 detail: NodeDetail::default(),
+                rev_change: None,
+                task: None,
             }],
             edges: vec![GraphEdge {
                 from: "a".to_string(),
                 to: "b".to_string(),
             }],
+            triage: None,
+            approval: None,
+            plan_history: Vec::new(),
+            tasks: Vec::new(),
+            planner_calls: PlannerCalls::default(),
+            planner_io: Vec::new(),
+            turns: Vec::new(),
+            earlier_turns: 0,
+            follow_up: Vec::new(),
         }
     }
 
@@ -509,6 +520,7 @@ mod tests {
                     model: None,
                     color: Some("#123456".to_string()),
                     run: None,
+                    activity: None,
                 },
                 AgentView {
                     id: "cursor".to_string(),
@@ -518,6 +530,7 @@ mod tests {
                     model: None,
                     color: Some("#000080".to_string()),
                     run: None,
+                    activity: None,
                 },
             ],
             None,

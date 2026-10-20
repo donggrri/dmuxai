@@ -1,9 +1,18 @@
+# GitHub Actions is currently billing-blocked for this repository, so this
+# workflow no longer runs on tag push. Releases are created by hand in the
+# GitHub web UI, with binaries built locally and attached to the release.
+# When Actions is available again, run this workflow manually (Actions tab ->
+# "Release binaries" -> "Run workflow") with the tag of an existing release to
+# build the Windows and Linux assets and attach them to that release.
 name: Release binaries
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build and attach assets for (e.g. v0.2.3)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,6 +23,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -52,6 +63,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -114,6 +127,7 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag }}
           generate_release_notes: true
           files: |
             dist/dmuxai-windows-x86_64.zip

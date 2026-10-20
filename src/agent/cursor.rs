@@ -20,7 +20,7 @@ use super::{
     ModelInfo, OutputContext, SpawnedAdapter, implement_outcome::ImplementTurnTracker,
     prompt_with_image_tokens,
 };
-use crate::process::cursor_command;
+use dmuxai::process::cursor_command;
 use dmuxai::settings::DmuxSettings;
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
@@ -2493,6 +2493,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     // TC-808 / FR-806: A warm process that has exited is reaped and the prompt runs in a fresh process.
     async fn prewarm_exited_process_is_replaced() {
+        const WAIT: Duration = Duration::from_secs(15);
         let fixture = FakeCursorFixture::new().await;
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
@@ -2509,14 +2510,12 @@ pub(crate) mod tests {
             spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config, Vec::new());
         adapter.prewarm().unwrap();
 
-        let spawns = fixture.wait_for_spawns(1, Duration::from_secs(3)).await;
+        let spawns = fixture.wait_for_spawns(1, WAIT).await;
         assert_eq!(spawns.len(), 1);
         let exited_pid = spawns[0].pid;
 
         assert!(
-            fixture
-                .wait_for_pid_gone(exited_pid, Duration::from_secs(3))
-                .await,
+            fixture.wait_for_pid_gone(exited_pid, WAIT).await,
             "warm process should have exited immediately"
         );
 

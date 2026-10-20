@@ -82,11 +82,16 @@ fn readme_and_changelog_mention_builtin_grok() {
         );
     }
     let changelog = read("CHANGELOG.md");
-    let unreleased = changelog
+    // Unreleased plus the newest release section (the runner ships in v0.2.2).
+    let after = changelog
         .split("## Unreleased")
         .nth(1)
-        .and_then(|rest| rest.split("\n## ").next())
         .expect("Unreleased section");
+    let unreleased = after
+        .split("\n## [")
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("\n## [");
     assert!(
         unreleased.contains("grok"),
         "CHANGELOG must state the new runner"

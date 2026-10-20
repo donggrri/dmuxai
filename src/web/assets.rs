@@ -3,6 +3,7 @@ pub const APP_JS: &str = include_str!("assets/app.js");
 pub const MEMORY_JS: &str = include_str!("assets/memory.js");
 pub const SESSION_JS: &str = include_str!("assets/session.js");
 pub const WORKSPACE_JS: &str = include_str!("assets/workspace.js");
+pub const SIDEBAR_RESIZE_JS: &str = include_str!("assets/sidebar-resize.js");
 pub const SESSION_CSS: &str = include_str!("assets/session.css");
 pub const APP_CSS: &str = include_str!("assets/app.css");
 pub const DOCS_JS: &str = include_str!("assets/docs.js");
@@ -962,17 +963,59 @@ mod tests {
         assert!(APP_JS.contains("cancelled"));
     }
 
+    #[test]
+    // TC-983 / FR-981: dashboard_shows_agent_activity_detail
+    fn dashboard_shows_agent_activity_detail() {
+        let key_at = APP_JS
+            .find("function computeAgentsKey")
+            .expect("computeAgentsKey");
+        let render_at = APP_JS.find("function renderAgents").expect("renderAgents");
+        let status_at = APP_JS
+            .find("function updateRunStatus")
+            .expect("updateRunStatus");
+        let tab_at = APP_JS
+            .find("function updateTabTitle")
+            .expect("updateTabTitle");
+        assert!(key_at < render_at && render_at < status_at && status_at < tab_at);
+
+        let key_body = &APP_JS[key_at..render_at];
+        assert!(
+            key_body.contains("a.activity"),
+            "computeAgentsKey must include a.activity"
+        );
+
+        let chip_body = &APP_JS[render_at..status_at];
+        assert!(
+            chip_body.contains("agent.activity"),
+            "agent chip must render agent.activity"
+        );
+
+        let pill_body = &APP_JS[status_at..tab_at];
+        assert!(
+            pill_body.contains("agent.activity"),
+            "run-status pill must render agent.activity"
+        );
+        assert!(pill_body.contains("run-status-activity"));
+        assert!(pill_body.contains("textContent"));
+        assert!(!pill_body.contains("innerHTML"));
+        assert!(APP_CSS.contains(".run-status-activity"));
+    }
+
     // TC-850: prompt_centering_assets (SPEC-centered-prompt FR-850, UX-850)
     #[test]
     fn prompt_centering_assets() {
-        // Dock custom properties default to 0px and expand to 320px above 900px.
+        // Dock custom properties default to 0px. Above 900px an open sidebar
+        // reserves its width. The default width is still 320px (FR-851); the
+        // dock follows --left/right-sidebar-width so a resize stays centered.
         assert!(DOCS_CSS.contains("--left-dock: 0px;"));
         assert!(DOCS_CSS.contains("--right-dock: 0px;"));
+        assert!(DOCS_CSS.contains("--left-sidebar-width: 320px;"));
+        assert!(DOCS_CSS.contains("--right-sidebar-width: 320px;"));
         assert!(DOCS_CSS.contains("@media (min-width: 901px)"));
         assert!(DOCS_CSS.contains("body.left-sidebar-open"));
-        assert!(DOCS_CSS.contains("--left-dock: 320px;"));
+        assert!(DOCS_CSS.contains("--left-dock: var(--left-sidebar-width);"));
         assert!(DOCS_CSS.contains("body.sidebar-open"));
-        assert!(DOCS_CSS.contains("--right-dock: 320px;"));
+        assert!(DOCS_CSS.contains("--right-dock: var(--right-sidebar-width);"));
 
         // Dock space is reserved on body and main stays centered via margin-inline: auto.
         assert!(DOCS_CSS.contains("padding-left: var(--left-dock);"));
@@ -1076,5 +1119,400 @@ mod tests {
         assert_eq!(headers["x-content-type-options"], "nosniff");
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(bytes.as_ref(), WORKSPACE_JS.as_bytes());
+    }
+
+    // TC-970: sidebar_resize_assets (FR-970, FR-971, FR-973, FR-974, UX-970, UX-971)
+    #[tokio::test]
+    async fn sidebar_resize_assets() {
+        assert!(INDEX_HTML.contains("id=\"sessions-resize\""));
+        assert!(INDEX_HTML.contains("id=\"sidebar-resize\""));
+        assert!(INDEX_HTML.contains("class=\"sidebar-resize-handle\""));
+        assert!(INDEX_HTML.contains("role=\"separator\""));
+        assert!(INDEX_HTML.contains("aria-orientation=\"vertical\""));
+        assert!(INDEX_HTML.contains("tabindex=\"0\""));
+        assert!(INDEX_HTML.contains("aria-controls=\"sessions-sidebar\""));
+        assert!(INDEX_HTML.contains("aria-controls=\"sidebar\""));
+        assert!(INDEX_HTML.contains("aria-label=\"Resize sessions sidebar\""));
+        assert!(INDEX_HTML.contains("aria-label=\"Resize files sidebar\""));
+        assert!(INDEX_HTML.contains("aria-valuenow=\"320\""));
+        assert!(INDEX_HTML.contains("aria-valuemin=\"180\""));
+        // aria-valuemax in the HTML is a static placeholder; the script overwrites it.
+        assert!(INDEX_HTML.contains("<script src=\"/assets/sidebar-resize.js\" defer></script>"));
+        let workspace_js = INDEX_HTML
+            .find("/assets/workspace.js")
+            .expect("workspace.js script");
+        let resize_js = INDEX_HTML
+            .find("/assets/sidebar-resize.js")
+            .expect("sidebar-resize.js script");
+        assert!(
+            workspace_js < resize_js,
+            "sidebar-resize.js must be linked after workspace.js"
+        );
+
+        let sessions_at = INDEX_HTML
+            .find("id=\"sessions-sidebar\"")
+            .expect("sessions sidebar");
+        let sessions_end = INDEX_HTML
+            .find("id=\"sessions-backdrop\"")
+            .expect("sessions backdrop");
+        let sessions_handle = INDEX_HTML
+            .find("id=\"sessions-resize\"")
+            .expect("sessions handle");
+        assert!(
+            sessions_at < sessions_handle && sessions_handle < sessions_end,
+            "#sessions-resize must sit inside #sessions-sidebar"
+        );
+        let files_at = INDEX_HTML.find("id=\"sidebar\"").expect("files sidebar");
+        let files_end = INDEX_HTML
+            .find("id=\"sidebar-backdrop\"")
+            .expect("files backdrop");
+        let files_handle = INDEX_HTML
+            .find("id=\"sidebar-resize\"")
+            .expect("files handle");
+        assert!(
+            files_at < files_handle && files_handle < files_end,
+            "#sidebar-resize must sit inside #sidebar"
+        );
+
+        assert!(DOCS_CSS.contains("--left-sidebar-width: 320px;"));
+        assert!(DOCS_CSS.contains("--right-sidebar-width: 320px;"));
+        assert!(DOCS_CSS.contains("width: var(--left-sidebar-width);"));
+        assert!(DOCS_CSS.contains("width: var(--right-sidebar-width);"));
+        assert!(DOCS_CSS.contains("--left-dock: var(--left-sidebar-width);"));
+        assert!(DOCS_CSS.contains("--right-dock: var(--right-sidebar-width);"));
+        assert!(DOCS_CSS.contains("cursor: col-resize;"));
+        assert!(DOCS_CSS.contains(":focus-visible"));
+        let resizing_at = DOCS_CSS
+            .find("body.sidebar-resizing")
+            .expect("body.sidebar-resizing rule");
+        let resizing_end = resizing_at
+            + DOCS_CSS[resizing_at..]
+                .find('}')
+                .expect("end of sidebar-resizing block");
+        let resizing_css = &DOCS_CSS[resizing_at..=resizing_end];
+        assert!(
+            resizing_css.contains("transition: none;"),
+            "sidebar-resizing block disables transition: {resizing_css}"
+        );
+        assert!(
+            resizing_css.contains("user-select: none;"),
+            "sidebar-resizing block suppresses selection: {resizing_css}"
+        );
+        let instant_at = DOCS_CSS
+            .find("body.sidebar-resize-instant")
+            .expect("sidebar-resize-instant rule");
+        let instant_end = instant_at
+            + DOCS_CSS[instant_at..]
+                .find('}')
+                .expect("end of sidebar-resize-instant block");
+        let instant_css = &DOCS_CSS[instant_at..=instant_end];
+        assert!(
+            instant_css.contains("transition: none;"),
+            "sidebar-resize-instant block disables transition: {instant_css}"
+        );
+        let narrow = DOCS_CSS
+            .find("@media (max-width: 900px)")
+            .expect("narrow media");
+        let narrow_end = DOCS_CSS[narrow..]
+            .find("\nbody {")
+            .expect("body rule follows the narrow media query")
+            + narrow;
+        let narrow_css = &DOCS_CSS[narrow..narrow_end];
+        assert!(
+            narrow_css.contains("width: min(320px, 85vw);"),
+            "narrow drawers keep min(320px, 85vw): {narrow_css}"
+        );
+        let handle_at = narrow_css
+            .find(".sidebar-resize-handle")
+            .expect("narrow layout must mention the handle");
+        let handle_end = handle_at
+            + narrow_css[handle_at..]
+                .find('}')
+                .expect("end of narrow handle rule");
+        let handle_css = &narrow_css[handle_at..=handle_end];
+        assert!(
+            handle_css.contains("display: none;"),
+            "@media (max-width: 900px) must hide .sidebar-resize-handle: {handle_css}"
+        );
+
+        assert!(SIDEBAR_RESIZE_JS.contains("dmuxai.sidebar.width.left"));
+        assert!(SIDEBAR_RESIZE_JS.contains("dmuxai.sidebar.width.right"));
+        assert!(SIDEBAR_RESIZE_JS.contains("var MIN_WIDTH = 180"));
+        assert!(SIDEBAR_RESIZE_JS.contains("Math.floor(vw * 0.5)"));
+        assert!(SIDEBAR_RESIZE_JS.contains("var SHIFT_STEP = 64"));
+        assert!(SIDEBAR_RESIZE_JS.contains("key === 'Home'"));
+        assert!(SIDEBAR_RESIZE_JS.contains("key === 'End'"));
+        assert!(SIDEBAR_RESIZE_JS.contains("key === 'Enter'"));
+        assert!(SIDEBAR_RESIZE_JS.contains("dblclick"));
+        assert!(SIDEBAR_RESIZE_JS.contains("addEventListener('pointercancel'"));
+        assert!(SIDEBAR_RESIZE_JS.contains("addEventListener('lostpointercapture'"));
+        assert!(SIDEBAR_RESIZE_JS.contains("document.documentElement.clientWidth"));
+        assert!(SIDEBAR_RESIZE_JS.contains("removeItem"));
+        assert!(SIDEBAR_RESIZE_JS.contains("ArrowRight"));
+        assert!(SIDEBAR_RESIZE_JS.contains("ArrowLeft"));
+        assert!(SIDEBAR_RESIZE_JS.contains("setPointerCapture"));
+        assert!(SIDEBAR_RESIZE_JS.contains("sidebar-resizing"));
+        assert!(SIDEBAR_RESIZE_JS.contains("MutationObserver"));
+        assert!(SIDEBAR_RESIZE_JS.contains("shiftKey"));
+        assert!(!SIDEBAR_RESIZE_JS.contains("innerHTML"));
+        assert!(!SIDEBAR_RESIZE_JS.contains("onclick"));
+
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        let router = build_router(hub, "testtoken123".to_string(), None);
+        let req = axum::http::Request::builder()
+            .uri("/assets/sidebar-resize.js")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let headers = resp.headers().clone();
+        assert!(
+            headers["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/javascript")
+        );
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(headers["content-security-policy"], "default-src 'self'");
+        assert_eq!(headers["referrer-policy"], "no-referrer");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), SIDEBAR_RESIZE_JS.as_bytes());
+    }
+
+    fn js_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+        let from = src
+            .find(start)
+            .unwrap_or_else(|| panic!("missing JS marker {:?}", start));
+        let tail = &src[from..];
+        let to = tail
+            .find(end)
+            .unwrap_or_else(|| panic!("missing JS marker {:?} after {:?}", end, start));
+        &tail[..to]
+    }
+
+    // TC-952 (FR-945, UX-933): route selector beside send; POST /api/prompt `route`.
+    #[test]
+    fn prompt_route_selector_present() {
+        assert!(SESSION_JS.contains("var PROMPT_ROUTES = ["));
+        for label in ["Auto", "Plan", "Direct"] {
+            assert!(
+                SESSION_JS.contains(&format!("label: '{label}'")),
+                "missing route label {label}"
+            );
+        }
+        for value in ["auto", "plan", "direct"] {
+            assert!(
+                SESSION_JS.contains(&format!("value: '{value}'")),
+                "missing route value {value}"
+            );
+        }
+        assert!(SESSION_JS.contains("picker('Route', 'route'"));
+        assert!(SESSION_JS.contains("data-parity"));
+        assert!(SESSION_JS.contains("body.route = ui.route.value"));
+        assert!(SESSION_JS.contains("ui.route.value !== 'auto'"));
+        assert!(SESSION_JS.contains("/api/prompt"));
+        assert!(SESSION_CSS.contains(".session-send-col"));
+    }
+
+    // TC-957 (UX-930): `#graph-judge-line` from `graph.triage.line`, text nodes only.
+    #[test]
+    fn judge_line_asset() {
+        assert!(INDEX_HTML.contains("id=\"graph-judge-line\""));
+        assert!(APP_JS.contains("function renderGraphJudgeLine"));
+        assert!(APP_JS.contains("function fillJudgeLineContent"));
+        assert!(APP_JS.contains("graph.triage"));
+        assert!(APP_JS.contains("triage.line"));
+        assert!(APP_JS.contains("judge-fallback-word"));
+        assert!(APP_JS.contains("replaceChildren"));
+        assert!(APP_JS.contains("createTextNode"));
+        assert!(APP_CSS.contains(".graph-judge-line"));
+        assert!(APP_CSS.contains(".judge-fallback-word"));
+
+        let judge_js = js_between(
+            APP_JS,
+            "function fillJudgeLineContent",
+            "function renderGraphJudgeLine",
+        );
+        assert!(
+            !judge_js.contains("innerHTML"),
+            "judge line must not use innerHTML"
+        );
+        let render_js = js_between(
+            APP_JS,
+            "function renderGraphJudgeLine",
+            "// UX-932 / FR-965",
+        );
+        assert!(
+            !render_js.contains("innerHTML"),
+            "renderGraphJudgeLine must not use innerHTML"
+        );
+    }
+
+    // TC-960 (UX-932, UX-933, INT-930): approval panel, plan commands, parity ids.
+    #[test]
+    fn approval_panel_asset() {
+        assert!(INDEX_HTML.contains("id=\"graph-approval\""));
+        assert!(SESSION_JS.contains("parityButton"));
+        assert!(SESSION_JS.contains("classList.add"));
+        assert!(APP_JS.contains("planGateParityButton('Approve', 'plan-approve', 'btn-primary'"));
+        assert!(APP_JS.contains("planGateParityButton('Edit', 'plan-edit', ''"));
+        assert!(APP_JS.contains("planGateParityButton('Reject', 'plan-reject', 'btn-danger'"));
+        assert!(APP_JS.contains("viewOnly: isDashboardViewOnly()"));
+        assert!(APP_JS.contains("syncApprovalPanelButtonStates"));
+        assert!(APP_JS.contains("panel.querySelectorAll('button[data-plan-gate]')"));
+        assert!(APP_JS.contains("position: idx"));
+        assert!(APP_JS.contains("if (idx > 0) {"));
+        assert!(INDEX_HTML.contains("data-parity=\"plan-history\""));
+        assert!(APP_JS.contains("historyBtn.disabled = false"));
+        assert!(INDEX_HTML.contains("data-parity=\"plan-replan\""));
+        assert!(APP_JS.contains("window.dmuxaiPlanGate"));
+        assert!(APP_JS.contains("function renderApprovalPanel"));
+        assert!(APP_JS.contains("approvalPanelRenderKey"));
+        assert!(APP_JS.contains("approvalPanelLastKey"));
+        assert!(APP_JS.contains("approvalPanelFocusFeedback"));
+        let approval_render_js = js_between(
+            APP_JS,
+            "function renderApprovalPanel",
+            "// UX-936: task checklist below the swimlane",
+        );
+        assert!(
+            !approval_render_js.contains("|| editOpen"),
+            "do not refocus feedback textarea on every render when editOpen"
+        );
+        assert!(APP_JS.contains("command: 'plan_decision'"));
+        assert!(APP_JS.contains("command: 'plan_task_edit'"));
+        assert!(APP_JS.contains("graph.phase !== 'awaiting_approval'"));
+        assert!(APP_JS.contains("graph-approval-header"));
+        assert!(APP_JS.contains("graph-approval-error"));
+        assert!(APP_JS.contains("action: 'rename'"));
+        assert!(APP_JS.contains("action: 'split'"));
+        assert!(APP_JS.contains("action: 'merge'"));
+        assert!(APP_JS.contains("action: 'delete'"));
+        assert!(APP_JS.contains("action: 'move'"));
+        assert!(APP_JS.contains("position: idx + 2"));
+        assert!(APP_JS.contains("parse_graph_task_edit"));
+        assert!(APP_CSS.contains(".graph-approval"));
+
+        let plan_gate_js = js_between(APP_JS, "// UX-932 / FR-965", "var lastRenderedAgentsKey");
+        assert!(
+            !plan_gate_js.contains("innerHTML"),
+            "plan approval and task-edit paths must not use innerHTML"
+        );
+        assert!(
+            plan_gate_js.contains("textContent") || plan_gate_js.contains("createTextNode"),
+            "plan gate UI must render via text nodes"
+        );
+    }
+
+    // TC-996 (UX-936): task checklist panel below the swimlane.
+    #[test]
+    fn task_checklist_asset() {
+        assert!(INDEX_HTML.contains("id=\"task-checklist\""));
+        assert!(INDEX_HTML.contains("data-parity=\"task-checklist\""));
+        assert!(INDEX_HTML.contains("graph-stage-layout"));
+        let canvas_pos = INDEX_HTML
+            .find("id=\"graph-canvas\"")
+            .expect("graph-canvas in index");
+        let checklist_pos = INDEX_HTML
+            .find("id=\"task-checklist\"")
+            .expect("task-checklist in index");
+        assert!(
+            canvas_pos < checklist_pos,
+            "task checklist must follow graph canvas in index.html"
+        );
+        assert!(APP_JS.contains("function renderTaskChecklist"));
+        assert!(APP_JS.contains("function taskChecklistStatusIcon"));
+        assert!(APP_JS.contains("graph.tasks"));
+        assert!(APP_JS.contains("node-task-highlight"));
+        assert!(APP_JS.contains("task.done_check"));
+        assert!(APP_JS.contains("function taskChecklistStatusClass"));
+        assert!(APP_JS.contains("task-checklist-row-expanded"));
+        assert!(APP_JS.contains("tasksForChecklist"));
+        assert!(APP_JS.contains("data-task-id"));
+        assert!(APP_JS.contains("function tasksForChecklist"));
+        assert!(APP_JS.contains("list.insertBefore(rowNode"));
+        assert!(!APP_JS.contains("taskChecklistEverVisible"));
+        assert!(!APP_CSS.contains("max-width: 280px"));
+        assert!(APP_CSS.contains("flex-direction: column"));
+        assert!(
+            !APP_CSS.contains(".graph-stage-layout {\n    flex-direction: row"),
+            "graph-stage-layout must not switch to row at wide widths"
+        );
+        assert!(
+            APP_CSS.contains(
+                "grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr))"
+            )
+        );
+        assert!(!APP_JS.contains("autoFitGraphAfterTaskChecklistLayout"));
+        for status in ["pending", "running", "done", "failed"] {
+            assert!(
+                APP_CSS.contains(&format!(".task-checklist-status-{status}")),
+                "missing status style for {status}"
+            );
+        }
+        for icon in ["\\u25CB", "\\u25D0", "\\u2713", "\\u2717"] {
+            assert!(
+                APP_JS.contains(icon),
+                "taskChecklistStatusIcon must define icon {icon}"
+            );
+        }
+        assert!(APP_CSS.contains(".task-checklist"));
+        assert!(APP_CSS.contains(".graph-stage-layout"));
+        assert!(APP_CSS.contains(".node-task-highlight"));
+
+        let checklist_js = js_between(
+            APP_JS,
+            "// UX-936: task checklist below the swimlane",
+            "// UX-934: replan + revision history in the graph header.",
+        );
+        assert!(
+            !checklist_js.contains("innerHTML"),
+            "task checklist must not use innerHTML"
+        );
+        assert!(
+            checklist_js.contains("task-checklist-label") && checklist_js.contains("done_check"),
+            "task title and done_check must render via DOM helpers"
+        );
+    }
+
+    // TC-979 (UX-934, UX-935): revision badges on nodes and plan-history list.
+    #[test]
+    fn revision_badges_and_history_asset() {
+        assert!(APP_JS.contains("node.rev_change"));
+        assert!(APP_JS.contains("'card-rev-badge card-rev-badge-' + revChange"));
+        assert!(APP_JS.contains("revChange === 'added'"));
+        assert!(APP_JS.contains("revChange === 'changed'"));
+        assert!(APP_JS.contains("function graphNodesRevKey"));
+        assert!(INDEX_HTML.contains("id=\"graph-replan\""));
+        assert!(INDEX_HTML.contains("data-parity=\"plan-replan\""));
+        assert!(INDEX_HTML.contains("id=\"plan-history\""));
+        assert!(INDEX_HTML.contains("data-parity=\"plan-history\""));
+        assert!(INDEX_HTML.contains("id=\"graph-plan-history\""));
+        assert!(APP_JS.contains("function renderPlanHistoryPanel"));
+        assert!(APP_JS.contains("graph.plan_history"));
+        assert!(APP_JS.contains("command: 'plan_replan'"));
+        assert!(APP_JS.contains("panel.scrollTop = scrollTop"));
+        for theme in ["dark", "light"] {
+            assert!(
+                APP_CSS.contains(&format!(":root[data-theme=\"{theme}\"]")),
+                "missing {theme} palette for rev badges"
+            );
+        }
+        assert!(APP_CSS.contains(".card-rev-badge-added"));
+        assert!(APP_CSS.contains(".card-rev-badge-changed"));
+        assert!(APP_CSS.contains(".graph-plan-history-list"));
+
+        let history_js = js_between(
+            APP_JS,
+            "function renderPlanHistoryPanel",
+            "function renderGraphHeaderActions",
+        );
+        assert!(
+            !history_js.contains("innerHTML"),
+            "plan history panel must not use innerHTML"
+        );
+        assert!(history_js.contains("createTextNode"));
     }
 }

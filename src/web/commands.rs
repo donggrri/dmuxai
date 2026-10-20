@@ -83,6 +83,37 @@ pub enum SessionCommand {
     Status,
     ToggleDetails,
     Quit,
+    PlanDecision {
+        plan_id: String,
+        revision: u32,
+        decision: PlanDecisionAction,
+        #[serde(default)]
+        feedback: Option<String>,
+    },
+    PlanReplan {
+        #[serde(default)]
+        note: Option<String>,
+    },
+    PlanTaskEdit {
+        action: String,
+        task_id: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        from: Option<String>,
+        #[serde(default)]
+        position: Option<u32>,
+        #[serde(default)]
+        note: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanDecisionAction {
+    Approve,
+    Edit,
+    Reject,
 }
 
 #[derive(Debug)]
@@ -96,6 +127,7 @@ pub enum DashboardCommand {
         text: String,
         agent: Option<String>,
         mode: Option<String>,
+        route: Option<String>,
         reply: oneshot::Sender<Result<PromptAccepted, RunTodoError>>,
     },
     Session {

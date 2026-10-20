@@ -501,7 +501,7 @@ It prints the path it wrote and the runners it found on `PATH`.
 
 ## Linux / WSL release binary
 
-Each tagged release also has a prebuilt, statically linked (musl)
+Each release also has a prebuilt, statically linked (musl)
 `dmuxai-linux-x86_64.tar.gz` that runs on any x86_64 Linux distro, including
 WSL. Download it and check the checksum:
 
@@ -679,25 +679,37 @@ prewarm_idle_secs = 300     # idle timeout in seconds before unprompted warm pro
 
 ## Agent graph orchestration (default)
 
-Multi-step prompts are planned as an agent-graph-engineering DAG before any CLI
-turn runs. **Every graph node uses `composer-2.5` only** (repository model policy).
-Model ids containing `fast`, or any non–composer-2.5 id, are rejected. Short 1–2
-step prompts skip the graph and run on the **currently selected** agent with
-`composer-2.5` applied.
+Graph engineering is always on. See [docs/specs/SPEC-plan-gate.md](docs/specs/SPEC-plan-gate.md)
+and [docs/API.md](docs/API.md). For each normal prompt the **selected agent** judges
+(simple → one implement node and run; complex → strict JSON plan, then
+`awaiting_approval`).
 
-- Status bar shows the active graph assignment.
-- `/graph` — show the current plan
-- `/graph continue` — approve a merge/DB/auth gate
-- `/graph override <node> <cursor\|agy\|codex> <model-id>` — override runner/model
+- `/plan <prompt>` — plan first (skips judge), same approval gate as complex.
+- `/direct <prompt>` — selected agent only, no judge (`triage.source: override`).
+- `/graph continue` — resume after a sensitive step gate (merge/DB/auth-class jobs).
+- `/graph override <node> <runner> <model-id>` — change a pending node's runner/model.
+- `/graph approve`, `/graph edit <feedback>`, `/graph reject`, `/graph replan [note]` —
+  plan decisions (TUI; dashboard has Approve, Edit with feedback, Reject, **Replan**).
 
-Graph state is stored under `.dmuxai/graphs/` for resume. Skills are loaded from
-`.agents/skills/*/SKILL.md` and prefixed to node prompts when bound.
+While a plan waits: edit tasks (rename, split, merge, delete, move up/down). The
+dashboard shows a task checklist next to the swimlane; the TUI graph line shows
+`tasks <done>/<total>`. Replans may change **pending** tasks only, triggered by node
+failure after retries, a final line `DMUXAI_REPLAN: <reason>`, `/graph replan`, or
+dashboard Replan.
 
-Disable auto-planning in `dmuxai.toml`:
+Runs persist under `.dmuxai/graphs/`. Optional `[graph] tasks_file = true` writes
+`.dmuxai/tasks/TASKS-<run id>.md`. The `[graph] enabled` key is deprecated and
+ignored (warning once per settings load).
+
+**Headless `dmuxai run`:** same judge/plan path unless `--agent` is set. Without
+`--approve-plan`, a complex plan is printed (JSON or one line per step), the record
+is saved `cancelled` with `approval required (headless)`, exit **7**. With
+`--approve-plan`, approve with `decided_by: cli` and run through. Sensitive gates
+save `waiting_gate` and exit **7**; `--approve-plan` does not bypass them. `--graph`
+is a no-op. JSON output includes `triage` and `plan`.
 
 ```toml
 [graph]
-enabled = false
 max_parallel = 2
 max_retries = 2
 ```

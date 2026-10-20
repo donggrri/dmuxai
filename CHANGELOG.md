@@ -5,9 +5,17 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+## [0.2.2] - 2026-10-19
+
+Dashboard layout, workspace and graph view changes requested by Dongjin on
+2026-10-18, PRs #57-#60, #62-#66 and #70-#74 (milestone [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2),
+issues #54-#56 and #61, plus the grok runner Dongjin added on 2026-10-19). Linux is the supported platform. The Windows target
+still compiles and passes clippy, but the live workspace switch returns 501 on
+Windows (see ROADMAP "Later").
+
 ### Added
 
-- **Built-in grok runner (SPEC-grok-runner FR-890..FR-900).** When `grok` is on
+- **Built-in grok runner (SPEC-grok-runner FR-890..FR-900, SPEC-model-policy FR-910..FR-912, #66).** When `grok` is on
   `PATH`, `DMUXAI_GROK_BIN` names it, or `~/.grok/bin/grok` is executable, DmuxAI
   adds a headless `grok` chat runner (`grok -p` with streaming-json). Models are
   `grok-*` without `fast` and default to `grok-4.7`. A logged-out CLI still lists
@@ -15,7 +23,9 @@ All notable changes to dmuxai are listed here. Versions follow
   and an `[[agents.custom]]` entry named `grok` replaces it. With
   `allowed_runners` unset, this built-in preset takes no graph nodes until
   `grok` is listed. A machine that has grok installed gains the chat runner and
-  does not gain grok graph nodes until that list includes it.
+  does not gain grok graph nodes until that list includes it. Model policy:
+  any id containing `fast` is rejected for every runner, `grok-*` ids only on
+  the grok runner, and Cursor stays `composer-2.5` only.
 
 - **Horizontal swimlane graph view (SPEC-graph-swimlane FR-880..FR-885, UX-880, UX-881, #61).**
   The Graph view's subway map is replaced by a timeline: one lane per runner
@@ -59,6 +69,17 @@ All notable changes to dmuxai are listed here. Versions follow
   conversation picker (`F3` / `/conversations`) shows a `● running` mark on
   in-flight conversations.
 
+- **Resizable dashboard sidebars (SPEC-sidebar-resize FR-970..FR-974, UX-970..UX-971, #71).**
+  On viewports wider than 900px, the left sessions sidebar and the right
+  Files/To-dos sidebar each get a drag handle on their inner edge (pointer,
+  pen or touch). Widths are clamped to 180px..min(50% of the viewport, the
+  space left after the other sidebar and a 360px content area), re-clamped on
+  window resize, and stored in `localStorage` (`dmuxai.sidebar.width.left` /
+  `.right`). The prompt box stays centered between the open sidebars at any
+  width. Handles are keyboard accessible (`role="separator"`, arrows 16px,
+  Shift 64px, Home/End, Enter or double-click resets to 320px). At 900px and
+  below the handles are hidden and the overlay drawers are unchanged.
+
 ### Changed
 
 - **Centered prompt box across sidebar states (SPEC-centered-prompt FR-850..FR-852, UX-850, #54).**
@@ -68,6 +89,66 @@ All notable changes to dmuxai are listed here. Versions follow
   the remaining content area instead of shifting off-centre with a fixed right
   margin. At 900px and below, sidebars stay overlay drawers and the prompt box
   remains centered in the viewport.
+
+### Fixed
+
+- **TUI conversation picker width (SPEC-session-sidebar FR-865, #70).** The F3
+  picker was a fixed 76 columns, so the agent and time were cut off in wide
+  terminals. It now takes about 90% of the terminal width (60 to 160 columns,
+  never wider than the terminal or the rows need) and shortens long titles
+  with `…`, so the running mark, id, turn count, agent and time stay visible
+  at 80, 120 and 200 columns.
+
+- **TUI picker rows never overflow (SPEC-session-sidebar FR-865, #73).** With a
+  long custom agent label or a terminal under 60 columns, the agent and time
+  were still clipped. Fields now give way in a fixed order (title, then the
+  agent label with `…`, then the id, the turn count, the title, the agent, and
+  `● running` becomes `●`), so the time and the running mark always fit.
+  Control, zero-width and bidi characters in titles become spaces, so each
+  conversation stays on one row.
+
+- **Process-group kill on Unix (#63 for the MCP server, #64 for the rest).** `kill` now receives `--` before
+  the negative process-group id when DmuxAI stops a custom agent, a Cursor
+  warm process, the MCP server's children, or an Office conversion. Without
+  it, some `kill` builds read `-<pgid>` as an option and left the group running.
+
+- **grok turns no longer hang after the final reply (SPEC-grok-runner FR-913..FR-917, #72).**
+  In grok 1.0.62, a background command that finished during a turn queued an
+  auto-wake prompt that headless `grok -p` never ran, so the process idled
+  forever after its `end` line. The grok preset now sets `GROK_AUTO_WAKE=0` and
+  passes `--no-wait-for-background`. Custom agents gain `done_when`: the grok
+  `end` line now ends the turn, and DmuxAI then stops the process group, so a
+  child left holding stdout cannot keep the turn open. The 900 s timeout
+  remains only as a last resort. Text before and after a tool call is now
+  separated by a blank line instead of running together (`text_break_when`).
+  [docs/agents/grok-build-delegation.md](docs/agents/grok-build-delegation.md)
+  explains how to delegate work to Grok Build with fewer tokens.
+
+- **grok tool calls show as activity (SPEC-grok-runner FR-980, #74).** grok's
+  streaming-json `tool_call` / `tool_call_update` lines now become activity
+  rows (`▸ read src/app.rs`, `▸ run cargo test ✓ 4.2s`) and the TUI status
+  detail, the same way agy and cursor tools do. A long grok turn no longer
+  shows only "running".
+- **Dashboard shows the live activity (SPEC-running-indicators FR-981, #74).**
+  `agents[].activity` carries the TUI status detail; the agent chip and the
+  `Running` pill show it while the turn runs.
+- **Cancelled turns are marked (SPEC-running-indicators FR-982, #74).** After a
+  cancel (Ctrl+C, dashboard Cancel, `/api/command cancel`) the transcript gets
+  one `<agent> turn cancelled.` line after the partial reply, for every runner,
+  and the stored turn is `cancelled`. Before, the adapter's late `Cancelled`
+  event was dropped and no line appeared.
+- **Welcome text lists the registered runners (SPEC-first-run FR-983, #74)**, for
+  example `Runners: cursor, agy, codex, grok.`, instead of a hardcoded
+  "Codex, Cursor, and AGY".
+- **The dashboard token stays in the TUI (SPEC-web-dashboard FR-984, #74).** The
+  `dmuxai dashboard: http://…/?token=…` notice is TUI-only; it is no longer in
+  dashboard snapshots, `/api/state`, SSE, headless output or agent context.
+
+### CI
+
+- Verify runs on `ubuntu-latest`, cancels superseded runs, and skips the Rust
+  job for docs-only changes and for draft PRs (it runs when a PR is marked
+  ready) (#63).
 
 ## [0.2.1] - 2026-10-18
 
@@ -275,5 +356,6 @@ Changes since v0.1.1 (2026-08-24), PRs #1-#38.
   - the non-Windows `dmuxai-launcher` stub (#17)
   - bash-only spec-index tests are gated on Windows (#24)
 
+[0.2.2]: https://github.com/donggrri/dmuxai/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/donggrri/dmuxai/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/donggrri/dmuxai/compare/v0.1.1...v0.2.0
