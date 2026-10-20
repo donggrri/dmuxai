@@ -501,7 +501,7 @@ It prints the path it wrote and the runners it found on `PATH`.
 
 ## Linux / WSL release binary
 
-Each tagged release also has a prebuilt, statically linked (musl)
+Each release also has a prebuilt, statically linked (musl)
 `dmuxai-linux-x86_64.tar.gz` that runs on any x86_64 Linux distro, including
 WSL. Download it and check the checksum:
 
