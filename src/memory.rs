@@ -1017,8 +1017,7 @@ mod tests {
         let mut lines = String::new();
         for i in 1..=40 {
             lines.push_str(&format!(
-                "- [2026-10-17] entry number {:02} with some descriptive padding text\n",
-                i
+                "- [2026-10-17] entry number {i:02} with some descriptive padding text\n"
             ));
         }
         std::fs::write(dir.path().join("human.md"), lines).unwrap();
@@ -1040,8 +1039,7 @@ mod tests {
         let mut human_lines = String::new();
         for i in 1..=20 {
             human_lines.push_str(&format!(
-                "- [2026-10-17] 한국어 사용자 설정 기록 번호 {:02} 가나다라마바사아자차카타파하\n",
-                i
+                "- [2026-10-17] 한국어 사용자 설정 기록 번호 {i:02} 가나다라마바사아자차카타파하\n"
             ));
         }
         std::fs::write(dir.path().join("human.md"), human_lines).unwrap();
@@ -1050,8 +1048,7 @@ mod tests {
         let mut proj_lines = String::new();
         for i in 1..=20 {
             proj_lines.push_str(&format!(
-                "- [2026-10-17] 한국어 프로젝트 기록 번호 {:02} 가나다라마바사아자차카타파하\n",
-                i
+                "- [2026-10-17] 한국어 프로젝트 기록 번호 {i:02} 가나다라마바사아자차카타파하\n"
             ));
         }
         std::fs::write(dir.path().join("projects").join("dmuxai.md"), proj_lines).unwrap();
@@ -1062,8 +1059,7 @@ mod tests {
         let mut decision_lines = String::new();
         for i in 1..=20 {
             decision_lines.push_str(&format!(
-                "- [2026-10-17] 한국어 결정 사항 기록 번호 {:02} 가나다라마바사아자차카타파하\n",
-                i
+                "- [2026-10-17] 한국어 결정 사항 기록 번호 {i:02} 가나다라마바사아자차카타파하\n"
             ));
         }
         std::fs::write(
@@ -1075,8 +1071,7 @@ mod tests {
         let mut gotcha_lines = String::new();
         for i in 1..=20 {
             gotcha_lines.push_str(&format!(
-                "- [2026-10-17] 한국어 함정 및 주의사항 번호 {:02} 다람쥐 헌 쳇바퀴에 타고파\n",
-                i
+                "- [2026-10-17] 한국어 함정 및 주의사항 번호 {i:02} 다람쥐 헌 쳇바퀴에 타고파\n"
             ));
         }
         std::fs::write(

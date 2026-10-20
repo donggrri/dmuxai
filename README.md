@@ -629,26 +629,27 @@ are scoped by the canonical current workspace path.
 
 ## Safety and platform behavior
 
-Every agent starts in `Ask`. Modes are kept separately per agent and apply to
-subsequent turns:
+Every user turn runs in **agent mode** (former Implement-equivalent CLI flags).
+Internal judge, plan, and replan turns use read-only provider flags only; they
+are not selectable from the UI.
 
-| Mode | Codex | Cursor | AGY |
-| --- | --- | --- | --- |
-| `Ask` | read-only sandbox | `--mode ask` | plan+sandbox with a Q&A instruction |
-| `Plan` | read-only sandbox with a planning instruction | `--mode plan` | `--mode plan --sandbox` |
-| `Implement` | workspace-write sandbox, approvals `never` | `--force --sandbox enabled` (macOS/Linux only; unavailable on Windows) | `--mode accept-edits --sandbox` |
+| Turn | Codex | Cursor (legacy) | Cursor (ACP, Linux) | AGY |
+| --- | --- | --- | --- | --- |
+| User (agent) | workspace-write sandbox | `--force --sandbox enabled` | `cursor-agent acp …` | `--mode accept-edits --sandbox` |
+| Internal read-only | read-only sandbox | `--mode ask` | ACP with read-only policy | `--mode plan --sandbox` |
 
-`Implement` is the only mode intended to modify project files. It must be
-selected explicitly with `/mode`; commands remain constrained to the provider's
-workspace/sandbox configuration. DmuxAI never enables Codex danger-full-access,
-Cursor's unsandboxed mode, or AGY's `--dangerously-skip-permissions` flag.
+Agent turns may modify project files inside the provider workspace/sandbox.
+DmuxAI never enables Codex danger-full-access, Cursor's unsandboxed mode, or
+AGY's `--dangerously-skip-permissions` for read-only turns.
 
-Cursor Implement is unavailable on Windows because Cursor sandbox mode requires
-macOS or Linux. DmuxAI rejects that mode before changing the selected mode or
-starting a provider process; use Cursor Ask or Plan on Windows.
+On **Linux**, Cursor and grok default to **ACP** (`[cursor] protocol = "acp"`,
+`[agents] grok_protocol = "acp"`). Set `protocol = "legacy"` in config to keep
+the previous stream-json / grok argv paths. **ACP is supported on Linux only** in
+this release; Windows continues to use legacy Cursor stream-json where available.
 
-The active mode is shown in the bottom status bar and in the `/agent` picker.
-Mode changes are rejected by the UI while that agent has an active turn.
+Cursor agent turns that write files are unavailable on Windows when the Cursor
+sandbox is unavailable; DmuxAI surfaces `CursorWritesUnavailable` before starting
+a provider process.
 
 Windows uses `codex.exe` and `agy.exe`. Cursor's Windows installer exposes shell
 wrappers, so DmuxAI resolves the latest installed Cursor version and launches

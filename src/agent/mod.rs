@@ -1,3 +1,5 @@
+pub(crate) mod acp;
+mod acp_runner;
 mod agy;
 mod codex;
 mod cursor;
@@ -67,30 +69,28 @@ impl fmt::Display for Agent {
     }
 }
 
-/// A provider-independent description of what an agent may do during a turn.
+/// Per-turn policy (SPEC-acp-runners FR-1306, FR-1307). User turns use [`Agent`];
+/// internal judge/plan/replan turns use [`ReadOnly`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub enum ExecutionMode {
+pub enum TurnPolicy {
     #[default]
-    Ask,
-    Plan,
-    Implement,
+    Agent,
+    ReadOnly,
 }
 
-impl ExecutionMode {
-    pub const ALL: [Self; 3] = [Self::Ask, Self::Plan, Self::Implement];
-
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Ask => "Ask",
-            Self::Plan => "Plan",
-            Self::Implement => "Implement",
-        }
+impl TurnPolicy {
+    #[allow(dead_code)]
+    pub const fn is_read_only(self) -> bool {
+        matches!(self, Self::ReadOnly)
     }
 }
 
-impl fmt::Display for ExecutionMode {
+impl fmt::Display for TurnPolicy {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.name())
+        match self {
+            Self::Agent => formatter.write_str("agent"),
+            Self::ReadOnly => formatter.write_str("read-only"),
+        }
     }
 }
 
@@ -108,7 +108,6 @@ pub enum AgentEvent {
     },
     ModelSelected(String),
     EffortSelected(String),
-    ModeSelected(ExecutionMode),
     ToolProgress {
         item_id: String,
         summary: String,
@@ -168,12 +167,13 @@ pub struct AgentRequest {
     pub prompt: String,
     pub resume_session: Option<String>,
     pub image_paths: Vec<PathBuf>,
+    pub policy: TurnPolicy,
 }
 
 #[derive(Debug, Clone)]
-struct OutputContext {
-    conversation_id: ConversationId,
-    turn_id: TurnId,
+pub(crate) struct OutputContext {
+    pub conversation_id: ConversationId,
+    pub turn_id: TurnId,
 }
 
 impl From<&AgentRequest> for OutputContext {
@@ -231,7 +231,8 @@ pub enum AdapterError {
     CommandQueueFull,
     RuntimeStopped,
     Unsupported,
-    UnsupportedMode { agent: Agent, mode: ExecutionMode },
+    /// Cursor workspace writes unavailable on this platform (legacy path only).
+    CursorWritesUnavailable,
 }
 
 impl fmt::Display for AdapterError {
@@ -240,15 +241,8 @@ impl fmt::Display for AdapterError {
             Self::CommandQueueFull => formatter.write_str("agent command queue is full"),
             Self::RuntimeStopped => formatter.write_str("agent runtime has stopped"),
             Self::Unsupported => formatter.write_str("agent does not support this command"),
-            Self::UnsupportedMode { agent, mode }
-                if *agent == Agent::Cursor && *mode == ExecutionMode::Implement && cfg!(windows) =>
-            {
-                formatter.write_str(
-                    "Cursor Implement mode is unavailable on Windows unless cursor.windows_unsandboxed = true in dmuxai.toml or DMUXAI_CURSOR_WINDOWS_UNSANDBOXED is set (unsandboxed; not recommended)",
-                )
-            }
-            Self::UnsupportedMode { agent, mode } => formatter.write_str(
-                &format!("{agent} {mode} mode is unavailable on this platform"),
+            Self::CursorWritesUnavailable => formatter.write_str(
+                "Cursor agent mode is unavailable on Windows unless cursor.windows_unsandboxed = true in dmuxai.toml or DMUXAI_CURSOR_WINDOWS_UNSANDBOXED is set (unsandboxed; not recommended)",
             ),
         }
     }
@@ -268,10 +262,6 @@ pub fn is_adapter_turn_busy_rejection(message: &str) -> bool {
 }
 
 /// The synchronous UI-facing handle for an asynchronous agent runtime.
-///
-/// Commands are deliberately non-blocking: the UI either enqueues one or gets
-/// a visible backpressure error. The runtime owns the process and emits events
-/// through a separate bounded channel.
 pub trait AgentAdapter: Send {
     fn agent(&self) -> Agent;
     fn send(&self, request: AgentRequest) -> Result<(), AdapterError>;
@@ -281,10 +271,6 @@ pub trait AgentAdapter: Send {
     fn select_effort(&self, _effort: String) -> Result<(), AdapterError> {
         Err(AdapterError::Unsupported)
     }
-    fn validate_mode(&self, _mode: ExecutionMode) -> Result<(), AdapterError> {
-        Ok(())
-    }
-    fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError>;
     fn send_graph_node(&self, request: AgentRequest) -> Result<(), AdapterError> {
         self.send(request)
     }

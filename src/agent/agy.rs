@@ -15,8 +15,8 @@ use tokio::{
 };
 
 use super::{
-    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ExecutionMode,
-    ModelInfo, OutputContext, SpawnedAdapter,
+    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ModelInfo,
+    OutputContext, SpawnedAdapter, TurnPolicy,
     implement_outcome::{
         ImplementTurnTracker, is_plan_only_implement_outcome, is_plan_review_response,
     },
@@ -128,7 +128,6 @@ enum AgyCommand {
     Cancel,
     ListModels,
     SelectModel(String),
-    SelectMode(ExecutionMode),
 }
 
 pub struct AgyAdapter {
@@ -163,12 +162,6 @@ impl AgentAdapter for AgyAdapter {
             .try_send(AgyCommand::SelectModel(model))
             .map_err(map_send_error)
     }
-
-    fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
-        self.command_tx
-            .try_send(AgyCommand::SelectMode(mode))
-            .map_err(map_send_error)
-    }
 }
 
 fn map_send_error(error: mpsc::error::TrySendError<AgyCommand>) -> AdapterError {
@@ -191,7 +184,6 @@ async fn runtime_loop(
 ) {
     let mut active: Option<ActiveTurn> = None;
     let mut selected_model: Option<String> = None;
-    let mut selected_mode = ExecutionMode::default();
     let memory_models_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
 
     loop {
@@ -204,7 +196,6 @@ async fn runtime_loop(
                     active = Some(spawn_turn(
                         request,
                         selected_model.clone(),
-                        selected_mode,
                         cwd.clone(),
                         event_tx.clone(),
                     ));
@@ -319,10 +310,6 @@ async fn runtime_loop(
                     selected_model = Some(model.clone());
                     send_event(&event_tx, None, AgentEvent::ModelSelected(model)).await;
                 }
-                AgyCommand::SelectMode(mode) => {
-                    selected_mode = mode;
-                    send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
-                }
             }
             continue;
         }
@@ -366,17 +353,6 @@ async fn runtime_loop(
                             ),
                         ).await;
                     }
-                    Some(AgyCommand::SelectMode(mode)) => {
-                        selected_mode = mode;
-                        send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
-                        send_event(
-                            &event_tx,
-                            None,
-                            AgentEvent::Notice(
-                                "AGY mode changed; it will apply to the next turn".to_owned(),
-                            ),
-                        ).await;
-                    }
                     None => {
                         stop_turn(active.take(), &event_tx).await;
                         break;
@@ -390,14 +366,13 @@ async fn runtime_loop(
 fn spawn_turn(
     request: AgentRequest,
     selected_model: Option<String>,
-    mode: ExecutionMode,
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
 ) -> ActiveTurn {
     let context = OutputContext::from(&request);
     let error_context = context.clone();
     let handle = tokio::spawn(async move {
-        if let Err(error) = run_turn(&request, selected_model, mode, &cwd, &event_tx).await {
+        if let Err(error) = run_turn(&request, selected_model, &cwd, &event_tx).await {
             send_event(
                 &event_tx,
                 Some(&error_context),
@@ -425,13 +400,13 @@ async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput
 async fn run_turn(
     request: &AgentRequest,
     selected_model: Option<String>,
-    mode: ExecutionMode,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
 ) -> io::Result<Option<String>> {
     let context = OutputContext::from(request);
     send_event(event_tx, Some(&context), AgentEvent::Started).await;
 
+    let policy = request.policy;
     let base_prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
     let mut resume_session = request.resume_session.clone();
     let mut attempt = 0usize;
@@ -441,13 +416,13 @@ async fn run_turn(
         let user_prompt = if strict {
             agy_implement_retry_prompt(&base_prompt)
         } else {
-            agy_prompt(mode, &base_prompt)
+            agy_prompt(policy, &base_prompt)
         };
 
         let outcome = run_single_agy_process(
             request,
             selected_model.as_deref(),
-            mode,
+            policy,
             cwd,
             event_tx,
             &context,
@@ -461,7 +436,7 @@ async fn run_turn(
         // A failed `finish` (permission denial, protocol, or status check)
         // surfaces as an `Error` terminal; only a `Completed` turn with no
         // writes and a plan-like reply counts as a plan-only retry.
-        if mode != ExecutionMode::Implement
+        if policy != TurnPolicy::Agent
             || !matches!(outcome.terminal, AgentEvent::Completed)
             || !is_plan_only_implement_outcome(outcome.writes_observed, &outcome.response_text)
         {
@@ -501,7 +476,7 @@ struct SingleAgyOutcome {
 async fn run_single_agy_process(
     request: &AgentRequest,
     selected_model: Option<&str>,
-    mode: ExecutionMode,
+    mode: TurnPolicy,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
@@ -549,7 +524,7 @@ fn configure_command_for_resume(
     command: &mut tokio::process::Command,
     request: &AgentRequest,
     selected_model: Option<&str>,
-    mode: ExecutionMode,
+    mode: TurnPolicy,
     resume_session: Option<&str>,
 ) {
     configure_command(command, selected_model, mode);
@@ -567,15 +542,10 @@ async fn emit_terminal_event(
     send_event(event_tx, Some(context), event).await;
 }
 
-fn agy_prompt(mode: ExecutionMode, prompt: &str) -> String {
-    match mode {
-        ExecutionMode::Ask => format!(
-            "Answer the question only. Do not modify files or execute implementation steps.\n\n{prompt}"
-        ),
-        ExecutionMode::Plan => format!(
-            "Create a plan only. Do not modify files or execute implementation steps.\n\n{prompt}"
-        ),
-        ExecutionMode::Implement => format!(
+fn agy_prompt(policy: TurnPolicy, prompt: &str) -> String {
+    match policy {
+        TurnPolicy::ReadOnly => prompt.to_owned(),
+        TurnPolicy::Agent => format!(
             "Apply edits directly to files in the workspace. Do not produce plans, plan artifacts, or ask for review before editing. Run every command in the foreground with a bounded timeout. Do not start background or detached processes.\n\n{prompt}"
         ),
     }
@@ -590,7 +560,7 @@ fn agy_implement_retry_prompt(prompt: &str) -> String {
 fn configure_command(
     command: &mut tokio::process::Command,
     selected_model: Option<&str>,
-    mode: ExecutionMode,
+    mode: TurnPolicy,
 ) {
     command.args([
         "--input-format",
@@ -599,10 +569,10 @@ fn configure_command(
         "stream-json",
     ]);
     match mode {
-        ExecutionMode::Ask | ExecutionMode::Plan => {
+        TurnPolicy::ReadOnly => {
             command.args(["--mode", "plan", "--sandbox"]);
         }
-        ExecutionMode::Implement => {
+        TurnPolicy::Agent => {
             // Headless AGY auto-denies tools it cannot prompt for (e.g. run_command),
             // which silently produced empty Implement turns. The sandbox still applies.
             command.args([
@@ -624,7 +594,7 @@ async fn stream_child(
     stderr: ChildStderr,
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
-    mode: ExecutionMode,
+    mode: TurnPolicy,
 ) -> io::Result<SingleAgyOutcome> {
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
@@ -705,12 +675,12 @@ async fn stream_child(
     let status = exit_status.expect("child.wait runs before the loop can finish");
     let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
     let protocol_completed = state.pending_terminal.is_some();
-    let plan_only = mode == ExecutionMode::Implement
+    let plan_only = mode == TurnPolicy::Agent
         && is_plan_only_implement_outcome(
             implement_tracker.writes_observed(),
             &state.response_text,
         );
-    let require_writes = mode == ExecutionMode::Implement && !plan_only;
+    let require_writes = mode == TurnPolicy::Agent && !plan_only;
     let writes_observed = implement_tracker.writes_observed();
     if let Err(reason) = implement_tracker.finish(
         &status,
@@ -777,7 +747,7 @@ fn denied_actions_summary(message: &Value) -> Option<String> {
 
 fn normalize_event(
     message: &Value,
-    mode: ExecutionMode,
+    mode: TurnPolicy,
     state: &mut AgyStreamState,
 ) -> Vec<AgentEvent> {
     let mut events = Vec::new();
@@ -842,9 +812,7 @@ fn normalize_event(
                         ));
                         return events;
                     }
-                    if is_plan_review_response(&state.response_text)
-                        && mode != ExecutionMode::Implement
-                    {
+                    if is_plan_review_response(&state.response_text) && mode != TurnPolicy::Agent {
                         events.push(AgentEvent::Notice(
                             "AGY returned a plan for review; no file changes were executed (plan+sandbox mode)."
                                 .to_owned(),
@@ -965,14 +933,14 @@ mod tests {
         });
 
         assert_eq!(
-            normalize_event(&delta, ExecutionMode::Ask, &mut state),
+            normalize_event(&delta, TurnPolicy::ReadOnly, &mut state),
             vec![
                 AgentEvent::ProviderSessionBound("conversation".to_owned()),
                 AgentEvent::TextDelta("AGY_OK".to_owned()),
             ]
         );
         assert_eq!(
-            normalize_event(&result, ExecutionMode::Ask, &mut state),
+            normalize_event(&result, TurnPolicy::ReadOnly, &mut state),
             vec![]
         );
         assert!(matches!(
@@ -1013,6 +981,7 @@ mod tests {
             prompt: "hello".to_owned(),
             resume_session: Some("agy-conversation".to_owned()),
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         let mut command = tokio::process::Command::new("agy");
 
@@ -1020,7 +989,7 @@ mod tests {
             &mut command,
             &request,
             Some("agy-model"),
-            ExecutionMode::Ask,
+            TurnPolicy::Agent,
             Some("agy-conversation"),
         );
 
@@ -1049,9 +1018,10 @@ mod tests {
                 PathBuf::from("/tmp/shot.png"),
                 PathBuf::from("/tmp/other.png"),
             ],
+            policy: TurnPolicy::ReadOnly,
         };
         let mut command = tokio::process::Command::new("agy");
-        configure_command(&mut command, None, ExecutionMode::Ask);
+        configure_command(&mut command, None, TurnPolicy::ReadOnly);
         let args = command
             .as_std()
             .get_args()
@@ -1060,7 +1030,7 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "--image"));
         let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
         assert_eq!(prompt, "describe @/tmp/shot.png @/tmp/other.png");
-        assert!(agy_prompt(ExecutionMode::Ask, &prompt).ends_with(&prompt));
+        assert!(agy_prompt(TurnPolicy::ReadOnly, &prompt).ends_with(&prompt));
     }
 
     #[test]
@@ -1075,20 +1045,17 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let ask = args_for(ExecutionMode::Ask);
-        assert!(ask.windows(2).any(|args| args == ["--mode", "plan"]));
-        assert!(agy_prompt(ExecutionMode::Ask, "hello").starts_with("Answer"));
-        let plan = args_for(ExecutionMode::Plan);
-        assert!(plan.windows(2).any(|args| args == ["--mode", "plan"]));
-        assert!(agy_prompt(ExecutionMode::Plan, "hello").starts_with("Create a plan"));
-        let implement = args_for(ExecutionMode::Implement);
+        let read_only = args_for(TurnPolicy::ReadOnly);
+        assert!(read_only.windows(2).any(|args| args == ["--mode", "plan"]));
+        assert_eq!(agy_prompt(TurnPolicy::ReadOnly, "hello"), "hello");
+        let implement = args_for(TurnPolicy::Agent);
         assert!(
             implement
                 .windows(2)
                 .any(|args| args == ["--mode", "accept-edits"])
         );
         assert!(implement.iter().any(|arg| arg == "--sandbox"));
-        assert!(agy_prompt(ExecutionMode::Implement, "hello").ends_with("\n\nhello"));
+        assert!(agy_prompt(TurnPolicy::Agent, "hello").ends_with("\n\nhello"));
     }
 
     #[test]
@@ -1103,7 +1070,7 @@ mod tests {
         });
 
         assert_eq!(
-            normalize_event(&result, ExecutionMode::Plan, &mut state),
+            normalize_event(&result, TurnPolicy::ReadOnly, &mut state),
             vec![
                 AgentEvent::TextDelta(
                     "I created the implementation plan artifact at plan.md. Please review and approve the plan to proceed.".to_owned()
@@ -1131,10 +1098,9 @@ mod tests {
             prompt: "Reply with exactly AGY_OK. Do not use tools or modify files.".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::ReadOnly,
         };
-        let turn = tokio::spawn(async move {
-            run_turn(&request, None, ExecutionMode::Ask, &cwd, &event_tx).await
-        });
+        let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
 
         let answer = timeout(Duration::from_secs(90), async {
             let mut answer = String::new();
@@ -1149,7 +1115,6 @@ mod tests {
                     | AgentEvent::ModelsListed { .. }
                     | AgentEvent::ModelSelected(_)
                     | AgentEvent::EffortSelected(_)
-                    | AgentEvent::ModeSelected(_)
                     | AgentEvent::ToolProgress { .. }
                     | AgentEvent::Activity(_)
                     | AgentEvent::Status(_)
@@ -1174,7 +1139,7 @@ mod tests {
     fn denied_actions_and_empty_output_are_errors() {
         let mut state = AgyStreamState::default();
         let denied = json!({"event":"result","result":{"status":"SUCCESS","response":"","denied_actions":[{"action":"command","display_name":"RunCommand"}]}});
-        let events = normalize_event(&denied, ExecutionMode::Implement, &mut state);
+        let events = normalize_event(&denied, TurnPolicy::Agent, &mut state);
         assert!(events.is_empty());
         assert!(matches!(
             state.pending_terminal,
@@ -1183,7 +1148,7 @@ mod tests {
 
         let mut state = AgyStreamState::default();
         let empty = json!({"event":"result","result":{"status":"SUCCESS","response":""}});
-        let _events = normalize_event(&empty, ExecutionMode::Ask, &mut state);
+        let _events = normalize_event(&empty, TurnPolicy::ReadOnly, &mut state);
         assert!(matches!(
             state.pending_terminal,
             Some(AgentEvent::Error(e)) if e.contains("without producing")
@@ -1247,7 +1212,7 @@ mod tests {
                 "state": "ACTIVE"
             }
         });
-        let events = normalize_event(&tool_update, ExecutionMode::Implement, &mut state);
+        let events = normalize_event(&tool_update, TurnPolicy::Agent, &mut state);
         assert_eq!(
             events,
             vec![AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
@@ -1269,7 +1234,7 @@ mod tests {
                 "thinking_delta": "thinking about code"
             }
         });
-        let events = normalize_event(&thinking_update, ExecutionMode::Implement, &mut state);
+        let events = normalize_event(&thinking_update, TurnPolicy::Agent, &mut state);
         assert_eq!(
             events,
             vec![AgentEvent::Activity(
@@ -1302,7 +1267,7 @@ mod tests {
         // FR-443 / TC-443, FR-502 / TC-502: Implement mode must apply edits,
         // keep commands in the foreground with a bounded timeout, and avoid
         // background or detached processes; Ask/Plan stay untouched.
-        let wrapped = agy_prompt(ExecutionMode::Implement, "build the thing");
+        let wrapped = agy_prompt(TurnPolicy::Agent, "build the thing");
         assert!(
             wrapped.starts_with("Apply edits directly"),
             "unexpected Implement prompt: {wrapped}"
@@ -1316,8 +1281,8 @@ mod tests {
             "unexpected Implement prompt: {wrapped}"
         );
         assert!(wrapped.ends_with("\n\nbuild the thing"));
-        assert!(!agy_prompt(ExecutionMode::Ask, "hi").contains("background"));
-        assert!(!agy_prompt(ExecutionMode::Plan, "hi").contains("background"));
+        assert!(!agy_prompt(TurnPolicy::ReadOnly, "hi").contains("background"));
+        assert!(!agy_prompt(TurnPolicy::ReadOnly, "hi").contains("background"));
     }
 
     #[test]
@@ -1327,7 +1292,7 @@ mod tests {
             "event": "result",
             "result": { "status": "SUCCESS", "response": "AGY_OK" }
         });
-        let events = normalize_event(&result, ExecutionMode::Implement, &mut state);
+        let events = normalize_event(&result, TurnPolicy::Agent, &mut state);
         assert!(!events.iter().any(|event| {
             matches!(
                 event,
@@ -1351,7 +1316,7 @@ mod tests {
                 "response": "I wrote the plan to plan.md. Please review and approve before I edit files."
             }
         });
-        let events = normalize_event(&result, ExecutionMode::Implement, &mut state);
+        let events = normalize_event(&result, TurnPolicy::Agent, &mut state);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], AgentEvent::TextDelta(_)));
         assert!(matches!(
@@ -1402,17 +1367,18 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn run_fake_agy_turn(mode: ExecutionMode) -> io::Result<Option<String>> {
+    async fn run_fake_agy_turn(mode: TurnPolicy) -> io::Result<Option<String>> {
         let request = AgentRequest {
             conversation_id: super::super::ConversationId::new("fake-conversation"),
             turn_id: super::super::TurnId::new("fake-turn"),
             prompt: "hello".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: mode,
         };
         let (event_tx, _event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
-        run_turn(&request, None, mode, &cwd, &event_tx).await
+        run_turn(&request, None, &cwd, &event_tx).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1442,7 +1408,7 @@ mod tests {
         let outcome = with_agy_spawn_env(&fake, "1", async {
             timeout(
                 Duration::from_secs(20),
-                run_fake_agy_turn(ExecutionMode::Implement),
+                run_fake_agy_turn(TurnPolicy::Agent),
             )
             .await
             .expect("the idle timeout should end the turn far before the child settles")
@@ -1523,7 +1489,7 @@ mod tests {
         let outcome = with_agy_spawn_env(&fake, "2", async {
             timeout(
                 Duration::from_secs(20),
-                run_fake_agy_turn(ExecutionMode::Ask),
+                run_fake_agy_turn(TurnPolicy::ReadOnly),
             )
             .await
             .expect("a continuously streaming child should finish promptly")
@@ -1553,7 +1519,7 @@ mod tests {
             let started = Instant::now();
             let outcome = timeout(
                 Duration::from_secs(15),
-                run_fake_agy_turn(ExecutionMode::Ask),
+                run_fake_agy_turn(TurnPolicy::ReadOnly),
             )
             .await
             .expect("grace kill should finish quickly");
@@ -1588,8 +1554,7 @@ mod tests {
             "result": { "status": "SUCCESS", "response": "AGY_OK" }
         });
         let script = format!(
-            "#!/bin/sh\nread -r _dmuxai_user\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\nsleep 60\n",
-            write_step, result_event
+            "#!/bin/sh\nread -r _dmuxai_user\nprintf '%s\\n' '{write_step}'\nprintf '%s\\n' '{result_event}'\nsleep 60\n"
         );
         let (_dir, fake) = write_fake_agy(|_| script);
 
@@ -1599,6 +1564,7 @@ mod tests {
             prompt: "hello".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1606,9 +1572,7 @@ mod tests {
         let (outcome, terminals, elapsed) = with_agy_spawn_env(&fake, "0", async {
             // Measure inside the env lock; AGY spawn tests serialize on it.
             let started = Instant::now();
-            let turn = tokio::spawn(async move {
-                run_turn(&request, None, ExecutionMode::Implement, &cwd, &event_tx).await
-            });
+            let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
 
             let terminals = timeout(Duration::from_secs(10), async {
                 let mut terminals = Vec::new();
@@ -1667,8 +1631,7 @@ mod tests {
             "result": { "status": "SUCCESS", "response": "AGY_OK" }
         });
         let script = format!(
-            "#!/bin/sh\nread -r _dmuxai_user\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\n( sleep 60 >&2 ) &\nexit 0\n",
-            write_step, result_event
+            "#!/bin/sh\nread -r _dmuxai_user\nprintf '%s\\n' '{write_step}'\nprintf '%s\\n' '{result_event}'\n( sleep 60 >&2 ) &\nexit 0\n"
         );
         let (_dir, fake) = write_fake_agy(|_| script);
 
@@ -1678,6 +1641,7 @@ mod tests {
             prompt: "hello".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1685,9 +1649,7 @@ mod tests {
         let (outcome, terminals, elapsed) = with_agy_spawn_env(&fake, "0", async {
             // Measure inside the env lock; AGY spawn tests serialize on it.
             let started = Instant::now();
-            let turn = tokio::spawn(async move {
-                run_turn(&request, None, ExecutionMode::Implement, &cwd, &event_tx).await
-            });
+            let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
 
             let terminals = timeout(Duration::from_secs(10), async {
                 let mut terminals = Vec::new();
@@ -1747,7 +1709,7 @@ mod tests {
         let outcome = with_agy_spawn_env(&fake, "0", async {
             timeout(
                 Duration::from_secs(20),
-                run_fake_agy_turn(ExecutionMode::Implement),
+                run_fake_agy_turn(TurnPolicy::Agent),
             )
             .await
             .expect("plan-only retry should finish promptly")
@@ -1788,14 +1750,13 @@ mod tests {
             prompt: "hello".to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
 
         let (outcome, terminals) = with_agy_spawn_env(&fake, "0", async {
-            let turn = tokio::spawn(async move {
-                run_turn(&request, None, ExecutionMode::Implement, &cwd, &event_tx).await
-            });
+            let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
 
             let terminals = timeout(Duration::from_secs(10), async {
                 let mut terminals = Vec::new();

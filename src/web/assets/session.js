@@ -6,7 +6,6 @@
 
 (function () {
   var TOKEN_KEY = 'dmuxai.token';
-  var MODES = ['ask', 'plan', 'implement'];
   var PROMPT_ROUTES = [
     { value: 'auto', label: 'Auto' },
     { value: 'plan', label: 'Plan' },
@@ -284,9 +283,6 @@
     ui.agent = picker('Agent', 'agent', function () {
       command({ command: 'select_agent', agent: ui.agent.value });
     });
-    ui.mode = picker('Mode', 'mode', function () {
-      command({ command: 'set_mode', agent: session.selected_agent, mode: ui.mode.value });
-    });
     ui.model = picker('Model', 'model', function () {
       if (ui.model.value === '__load__') {
         command({ command: 'load_models', agent: session.selected_agent });
@@ -305,7 +301,7 @@
     ui.effort = picker('Effort', 'effort', function () {
       command({ command: 'set_effort', agent: session.selected_agent, effort: ui.effort.value });
     });
-    [ui.agent, ui.mode, ui.model, ui.effort].forEach(function (select) {
+    [ui.agent, ui.model, ui.effort].forEach(function (select) {
       bar.appendChild(select.parentNode);
     });
 
@@ -945,11 +941,6 @@
       };
     }), session.selected_agent);
 
-    var modes = (agent && agent.modes.length) ? agent.modes : MODES;
-    setOptions(ui.mode, modes.map(function (m) {
-      return { value: m, label: m.charAt(0).toUpperCase() + m.slice(1) };
-    }), agent ? agent.mode : 'ask');
-
     var modelOptions = [];
     if (agent && agent.models.length) {
       modelOptions = agent.models.map(function (m) { return { value: m.id, label: m.label }; });
@@ -969,7 +960,6 @@
       agent && agent.effort ? agent.effort : (efforts[0] || ''));
 
     // UX-780: pickers are disabled while the agent works; Cancel shows instead.
-    ui.mode.disabled = viewOnly || busy;
     ui.model.disabled = viewOnly || busy;
     ui.effort.disabled = viewOnly || busy;
     ui.agent.disabled = viewOnly;
@@ -1314,7 +1304,7 @@
 
   var ACTIONS = {
     '/agent': function () { ask('Agent', agentChoices(), function (v) { command({ command: 'select_agent', agent: v }); }); },
-    '/mode': function () { ask('Mode', MODES.map(choice), function (v) { command({ command: 'set_mode', agent: session.selected_agent, mode: v }); }); },
+    '/mode': function () { notify('Mode selection was removed; every turn runs in agent mode.', true); },
     '/effort': function () {
       var agent = selectedAgent();
       var efforts = [];
@@ -1528,7 +1518,7 @@
     } else if (viewOnly) {
       root.classList.add('session-disabled');
       session = null;
-      [ui.agent, ui.mode, ui.model, ui.effort, ui.input, ui.send].forEach(function (c) { c.disabled = true; });
+      [ui.agent, ui.model, ui.effort, ui.input, ui.send].forEach(function (c) { c.disabled = true; });
       renderConversations();
       renderChatAux();
     }

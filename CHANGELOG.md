@@ -7,6 +7,15 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Changed
 
+- **ACP runners for Cursor and grok (SPEC-acp-runners).** `[cursor] protocol` and
+  `[agents] grok_protocol` default to `acp` (Linux). Set `legacy` to keep
+  stream-json / grok streaming-json argv. Cursor prewarm applies only to legacy
+  stream-json.
+- **Single agent turn mode.** Removed `/mode`, the mode picker, and per-agent
+  mode state. Every user turn runs in agent mode; judge/plan/replan use
+  read-only adapter flags internally. CLI `--mode` and dashboard `set_mode` are
+  ignored with a notice.
+
 - **Dashboard center column uses the full width (SPEC-dashboard-fullwidth FR-1200..FR-1204).**
   The chat, graph and task checklist now fill the whole area between the
   sidebars instead of an 880px column, and the Documents panel is collapsible

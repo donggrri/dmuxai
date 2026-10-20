@@ -577,8 +577,7 @@ async fn mcp_client_bounds_writes_and_streams_sse() {
     );
     assert!(
         elapsed < Duration::from_millis(2500),
-        "stdio timeout must complete in ~1s, took {:?}",
-        elapsed
+        "stdio timeout must complete in ~1s, took {elapsed:?}"
     );
 
     // 2. HTTP server whose SSE stream stays open after response and splits over two data: lines
@@ -661,8 +660,7 @@ async fn mcp_client_bounds_writes_and_streams_sse() {
 
     assert!(
         elapsed < Duration::from_millis(1500),
-        "SSE should stream-parse immediately before timeout, took {:?}",
-        elapsed
+        "SSE should stream-parse immediately before timeout, took {elapsed:?}"
     );
     assert_eq!(
         res["content"][0]["text"], "reassembled-ok",

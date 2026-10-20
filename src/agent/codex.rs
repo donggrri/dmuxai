@@ -17,7 +17,7 @@ use dmuxai::attachments::prompt_with_image_references;
 
 use super::{
     AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ConversationId,
-    ExecutionMode, ModelInfo, OutputContext, SpawnedAdapter,
+    ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy,
 };
 use dmuxai::process::{headless_command, resolve_program};
 
@@ -33,7 +33,6 @@ enum CodexCommand {
     ListModels,
     SelectModel(String),
     SelectEffort(String),
-    SelectMode(ExecutionMode),
     RequestStatus,
 }
 
@@ -73,12 +72,6 @@ impl AgentAdapter for CodexAdapter {
     fn select_effort(&self, effort: String) -> Result<(), AdapterError> {
         self.command_tx
             .try_send(CodexCommand::SelectEffort(effort))
-            .map_err(map_send_error)
-    }
-
-    fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
-        self.command_tx
-            .try_send(CodexCommand::SelectMode(mode))
             .map_err(map_send_error)
     }
 
@@ -148,7 +141,7 @@ struct CodexClient {
     interrupt_sent: bool,
     cancel_requested: bool,
     next_request_id: u64,
-    active_mode: ExecutionMode,
+    active_mode: TurnPolicy,
     implement_write_observed: bool,
 }
 
@@ -212,7 +205,7 @@ impl CodexClient {
             interrupt_sent: false,
             cancel_requested: false,
             next_request_id: 1,
-            active_mode: ExecutionMode::default(),
+            active_mode: TurnPolicy::default(),
             implement_write_observed: false,
         };
 
@@ -280,7 +273,7 @@ impl CodexClient {
         request: &AgentRequest,
         model: Option<&str>,
         effort: Option<&str>,
-        mode: ExecutionMode,
+        mode: TurnPolicy,
     ) -> io::Result<()> {
         let thread_id = self
             .thread_id
@@ -468,7 +461,7 @@ fn turn_start_request(
     request: &AgentRequest,
     model: Option<&str>,
     effort: Option<&str>,
-    mode: ExecutionMode,
+    mode: TurnPolicy,
 ) -> Value {
     let mut params = json!({
         "threadId": thread_id,
@@ -479,8 +472,8 @@ fn turn_start_request(
         "approvalPolicy": "never",
         "sandboxPolicy": {
             "type": match mode {
-                ExecutionMode::Ask | ExecutionMode::Plan => "readOnly",
-                ExecutionMode::Implement => "workspaceWrite",
+                TurnPolicy::ReadOnly => "readOnly",
+                TurnPolicy::Agent => "workspaceWrite",
             }
         }
     });
@@ -497,12 +490,9 @@ fn turn_start_request(
     })
 }
 
-fn codex_prompt(mode: ExecutionMode, prompt: &str) -> String {
+fn codex_prompt(mode: TurnPolicy, prompt: &str) -> String {
     match mode {
-        ExecutionMode::Plan => {
-            format!("Plan only. Do not modify files or execute implementation steps.\n\n{prompt}")
-        }
-        ExecutionMode::Ask | ExecutionMode::Implement => prompt.to_owned(),
+        TurnPolicy::ReadOnly | TurnPolicy::Agent => prompt.to_owned(),
     }
 }
 
@@ -511,7 +501,7 @@ async fn begin_request(
     request: &AgentRequest,
     selected_model: Option<&str>,
     selected_effort: Option<&str>,
-    mode: ExecutionMode,
+    mode: TurnPolicy,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
 ) -> io::Result<()> {
@@ -561,7 +551,6 @@ async fn connect_for_request(
     request: &AgentRequest,
     selected_model: Option<&str>,
     selected_effort: Option<&str>,
-    mode: ExecutionMode,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
@@ -574,7 +563,7 @@ async fn connect_for_request(
                 request,
                 selected_model,
                 selected_effort,
-                mode,
+                request.policy,
                 cwd,
                 event_tx,
             )
@@ -614,7 +603,6 @@ async fn runtime_loop(
     let mut selected_model: Option<String> = None;
     let mut selected_effort: Option<String> = None;
     let mut model_catalog = Vec::new();
-    let mut selected_mode = ExecutionMode::default();
 
     loop {
         if client.is_none() {
@@ -624,7 +612,6 @@ async fn runtime_loop(
                         &request,
                         selected_model.as_deref(),
                         selected_effort.as_deref(),
-                        selected_mode,
                         &cwd,
                         &event_tx,
                         &mcp_servers,
@@ -639,10 +626,6 @@ async fn runtime_loop(
                 Some(CodexCommand::SelectEffort(effort)) => {
                     selected_effort = Some(effort.clone());
                     send_event(&event_tx, None, AgentEvent::EffortSelected(effort)).await;
-                }
-                Some(CodexCommand::SelectMode(mode)) => {
-                    selected_mode = mode;
-                    send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
                 }
                 Some(CodexCommand::ListModels) => {
                     match CodexClient::start(&cwd, &event_tx, &mcp_servers).await {
@@ -743,7 +726,7 @@ async fn runtime_loop(
                             &request,
                             selected_model.as_deref(),
                             selected_effort.as_deref(),
-                            selected_mode,
+                            request.policy,
                             &cwd,
                             &event_tx,
                         ).await {
@@ -843,21 +826,6 @@ async fn runtime_loop(
                             send_event(&event_tx, None, AgentEvent::EffortSelected(effort)).await;
                         }
                     }
-                    Some(CodexCommand::SelectMode(mode)) => {
-                        let busy = active_client.active_turn_id.is_some()
-                            || active_client.pending_turn_request_id.is_some();
-                        selected_mode = mode;
-                        send_event(&event_tx, None, AgentEvent::ModeSelected(mode)).await;
-                        if busy {
-                            send_event(
-                                &event_tx,
-                                None,
-                                AgentEvent::Notice(
-                                    "Codex mode changed; it will apply to the next turn".to_owned(),
-                                ),
-                            ).await;
-                        }
-                    }
                     Some(CodexCommand::RequestStatus) => {
                         if active_client.active_turn_id.is_some()
                             || active_client.pending_turn_request_id.is_some()
@@ -903,7 +871,6 @@ async fn runtime_loop(
                 &request,
                 selected_model.as_deref(),
                 selected_effort.as_deref(),
-                selected_mode,
                 &cwd,
                 &event_tx,
                 &mcp_servers,
@@ -966,7 +933,7 @@ async fn handle_message(
         }
         let context = client.output_context.clone();
         if terminal
-            && client.active_mode == ExecutionMode::Implement
+            && client.active_mode == TurnPolicy::Agent
             && matches!(&event, AgentEvent::Completed)
             && !client.implement_write_observed
         {
@@ -1348,6 +1315,7 @@ mod tests {
             prompt: prompt.to_owned(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
         }
     }
 
@@ -1379,7 +1347,7 @@ mod tests {
             interrupt_sent: false,
             cancel_requested: false,
             next_request_id: 1,
-            active_mode: ExecutionMode::default(),
+            active_mode: TurnPolicy::default(),
             implement_write_observed: false,
         }
     }
@@ -1555,7 +1523,7 @@ mod tests {
             &request,
             Some("gpt-test"),
             Some("high"),
-            ExecutionMode::Ask,
+            TurnPolicy::ReadOnly,
         );
 
         assert_eq!(payload.pointer("/params/effort"), Some(&json!("high")));
@@ -1686,7 +1654,7 @@ mod tests {
     fn codex_execution_modes_set_per_turn_sandbox_and_approval_policy() {
         let request = request("implement this");
 
-        let ask = turn_start_request(1, "thread", &request, None, None, ExecutionMode::Ask);
+        let ask = turn_start_request(1, "thread", &request, None, None, TurnPolicy::ReadOnly);
         assert_eq!(
             ask.pointer("/params/sandboxPolicy/type"),
             Some(&json!("readOnly"))
@@ -1694,17 +1662,14 @@ mod tests {
         assert!(ask.pointer("/params/sandboxPolicy").unwrap().is_object());
         assert_eq!(ask.pointer("/params/approvalPolicy"), Some(&json!("never")));
 
-        let plan = turn_start_request(2, "thread", &request, None, None, ExecutionMode::Plan);
+        let read_only = turn_start_request(2, "thread", &request, None, None, TurnPolicy::ReadOnly);
         assert_eq!(
-            plan.pointer("/params/sandboxPolicy/type"),
+            read_only.pointer("/params/sandboxPolicy/type"),
             Some(&json!("readOnly"))
         );
-        assert!(plan.pointer("/params/sandboxPolicy").unwrap().is_object());
-        assert!(
-            plan.pointer("/params/input/0/text")
-                .and_then(Value::as_str)
-                .unwrap()
-                .starts_with("Plan only")
+        assert_eq!(
+            read_only.pointer("/params/input/0/text"),
+            Some(&json!("implement this"))
         );
 
         let implement = turn_start_request(
@@ -1713,7 +1678,7 @@ mod tests {
             &request,
             Some("model"),
             None,
-            ExecutionMode::Implement,
+            TurnPolicy::Agent,
         );
         assert_eq!(
             implement.pointer("/params/sandboxPolicy/type"),
@@ -1755,7 +1720,7 @@ mod tests {
         let request = request("Reply with exactly CODEX_OK. Do not use tools or modify files.");
         client.open_thread(&cwd, &request, &event_tx).await.unwrap();
         client
-            .start_turn(&request, None, None, ExecutionMode::Ask)
+            .start_turn(&request, None, None, TurnPolicy::ReadOnly)
             .await
             .unwrap();
 
@@ -1786,7 +1751,6 @@ mod tests {
                         | AgentEvent::ModelsListed { .. }
                         | AgentEvent::ModelSelected(_)
                         | AgentEvent::EffortSelected(_)
-                        | AgentEvent::ModeSelected(_)
                         | AgentEvent::ToolProgress { .. }
                         | AgentEvent::Activity(_)
                         | AgentEvent::Status(_)
@@ -1815,7 +1779,7 @@ mod tests {
         );
         client.open_thread(&cwd, &request, &event_tx).await.unwrap();
         client
-            .start_turn(&request, None, None, ExecutionMode::Ask)
+            .start_turn(&request, None, None, TurnPolicy::ReadOnly)
             .await
             .unwrap();
         client.request_cancel().await.unwrap();
@@ -1848,8 +1812,7 @@ mod tests {
                         | AgentEvent::Notice(_)
                         | AgentEvent::ModelsListed { .. }
                         | AgentEvent::ModelSelected(_)
-                        | AgentEvent::EffortSelected(_)
-                        | AgentEvent::ModeSelected(_) => {}
+                        | AgentEvent::EffortSelected(_) => {}
                         AgentEvent::ToolProgress { .. }
                         | AgentEvent::Activity(_)
                         | AgentEvent::Status(_) => {}

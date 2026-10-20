@@ -28,7 +28,7 @@ mod tests {
     async fn static_page_is_embedded_and_hardened() {
         assert!(INDEX_HTML.contains("/assets/app.js"));
         assert!(APP_JS.contains("/api/events"));
-        assert!(!APP_CSS.is_empty());
+        assert!(APP_CSS.contains('{'));
 
         let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
         let token = "testtoken123".to_string();
@@ -158,8 +158,8 @@ mod tests {
         assert!(SESSION_JS.contains("ui.input.value === '/'"));
         assert!(SESSION_JS.contains("e.key === 'Escape'"));
         // UX-780: pickers are disabled and Cancel is shown while busy.
-        assert!(SESSION_JS.contains("ui.mode.disabled = viewOnly || busy"));
         assert!(SESSION_JS.contains("ui.model.disabled = viewOnly || busy"));
+        assert!(SESSION_JS.contains("Mode selection was removed"));
         assert!(SESSION_JS.contains("ui.cancel.hidden = !busy"));
         assert!(SESSION_JS.contains("/api/command"));
         assert!(SESSION_JS.contains("/api/prompt"));
@@ -1288,11 +1288,11 @@ mod tests {
     fn js_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
         let from = src
             .find(start)
-            .unwrap_or_else(|| panic!("missing JS marker {:?}", start));
+            .unwrap_or_else(|| panic!("missing JS marker {start:?}"));
         let tail = &src[from..];
         let to = tail
             .find(end)
-            .unwrap_or_else(|| panic!("missing JS marker {:?} after {:?}", end, start));
+            .unwrap_or_else(|| panic!("missing JS marker {end:?} after {start:?}"));
         &tail[..to]
     }
 

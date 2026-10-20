@@ -14,7 +14,6 @@ use dmuxai::events::{EventLog, EventSink};
 use dmuxai::mcp_server::{McpBackend, RunArgs};
 use dmuxai::settings::DmuxSettings;
 
-use crate::agent::ExecutionMode;
 use crate::app::{App, HeadlessOutcome, HeadlessRequest};
 
 /// A parsed agent-facing subcommand.
@@ -494,15 +493,6 @@ async fn print_events(root: &Path, since: u64, limit: Option<usize>, follow: boo
     }
 }
 
-fn parse_execution_mode(mode: &str) -> Option<ExecutionMode> {
-    match mode {
-        "ask" => Some(ExecutionMode::Ask),
-        "plan" => Some(ExecutionMode::Plan),
-        "implement" => Some(ExecutionMode::Implement),
-        _ => None,
-    }
-}
-
 fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Value {
     json!({
         "ok": outcome.ok,
@@ -565,11 +555,9 @@ async fn run_headless(
     for warning in &settings.config_warnings {
         eprintln!("warning: {warning}");
     }
-    let mode = options
-        .mode
-        .as_deref()
-        .map(|m| parse_execution_mode(m).ok_or_else(|| ApiError::new(exit::USAGE, "invalid mode")));
-    let mode = mode.transpose()?;
+    if options.mode.is_some() {
+        eprintln!("warning: --mode is ignored; DmuxAI uses a single agent mode (former implement)");
+    }
     let (db_path, notice) =
         dmuxai::state_path::prepare_repo_db(workspace_root).map_err(|e| internal(&e))?;
     if let Some(notice) = notice {
@@ -605,7 +593,7 @@ async fn run_headless(
     let request = HeadlessRequest {
         prompt: prompt.unwrap_or_default(),
         agent: options.agent.clone(),
-        mode,
+        mode: options.mode.clone(),
         graph: options.graph,
         approve_plan: options.approve_plan,
         todo_id,
