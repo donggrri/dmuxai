@@ -49,6 +49,10 @@
   var conversationShown = null;
   var messageNodes = {};
   var stickToBottom = true;
+  // Last full dashboard snapshot (graph, agents) for the inline activity rows.
+  var lastSnap = null;
+  // Expanded state of inline rows, keyed by data-aux-key (default collapsed).
+  var auxExpanded = {};
   var palette = null;
   var workspaceKey = '';
   var workspaceInitialized = null;
@@ -249,6 +253,7 @@
         command({ command: 'new_conversation' });
       });
     }
+    window.addEventListener('dmuxai:workspace-info', function () { renderConversations(); });
     if (ui.sessionsFilter) {
       ui.sessionsFilter.addEventListener('input', function () {
         sessionsFilter = ui.sessionsFilter.value || '';
@@ -341,7 +346,7 @@
 
     var form = el('div', 'session-prompt');
     ui.input = el('textarea', 'session-input');
-    ui.input.rows = 3;
+    ui.input.rows = 1;
     ui.input.placeholder = 'Message the selected agent. Enter sends, Shift+Enter adds a line, / opens commands.';
     ui.input.setAttribute('data-parity', 'prompt-newline');
     ui.input.setAttribute('aria-label', 'Prompt');
@@ -351,6 +356,7 @@
         ui.input.value = '';
         openPalette('', true);
       }
+      autoGrowInput();
     });
     form.appendChild(ui.input);
     var sendCol = el('div', 'session-send-col');
@@ -362,6 +368,8 @@
     form.appendChild(sendCol);
 
     root.appendChild(form);
+    trackHeaderHeight();
+    window.setInterval(tickLiveRows, 1000);
 
     document.addEventListener('keydown', function (e) {
       if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
@@ -381,6 +389,477 @@
         }
       }
     });
+  }
+
+  // ---- Inline activity rows (SPEC-dashboard-fullwidth FR-1217..FR-1221) ----
+  // Grok-app style: the agent's processing shows in the chat stream as muted,
+  // one-line, collapsible rows. They are rebuilt from the current snapshot on
+  // every render and live in <li class="chat-aux"> elements between messages.
+
+  var STEP_ICONS = { completed: '\u2713', running: '\u25CF', failed: '\u2717', skipped: '\u2013',
+    waiting_gate: '\u23F8', ready: '\u25CB', pending: '\u25CB' };
+
+  function fmtElapsed(ms) {
+    var total = Math.max(0, Math.floor(ms / 1000));
+    var h = Math.floor(total / 3600);
+    var m = Math.floor((total % 3600) / 60);
+    var sec = total % 60;
+    if (h > 0) { return h + 'h' + (m ? ' ' + m + 'm' : ''); }
+    if (m > 0) { return m + 'm' + (sec ? ' ' + sec + 's' : ''); }
+    return sec + 's';
+  }
+
+  function serverNow() {
+    return typeof window.dmuxaiServerNow === 'function' ? window.dmuxaiServerNow() : Date.now();
+  }
+
+  // A collapsible row: a one-line header button and an optional detail list.
+  function auxRow(key, cls, headParts, detail) {
+    var li = el('li', 'chat-aux ' + cls);
+    li.setAttribute('data-aux-key', key);
+    var head = el(detail ? 'button' : 'div', 'chat-aux-head');
+    if (detail) {
+      head.type = 'button';
+      head.setAttribute('data-aux-key', key);
+      var open = !!auxExpanded[key];
+      head.setAttribute('aria-expanded', open ? 'true' : 'false');
+      head.appendChild(el('span', 'chat-aux-caret'));
+      head.lastChild.setAttribute('aria-hidden', 'true');
+      head.addEventListener('click', function () {
+        auxExpanded[key] = !auxExpanded[key];
+        head.setAttribute('aria-expanded', auxExpanded[key] ? 'true' : 'false');
+        detail.hidden = !auxExpanded[key];
+      });
+      detail.hidden = !open;
+    }
+    headParts.forEach(function (part) { if (part) { head.appendChild(part); } });
+    li.appendChild(head);
+    if (detail) { li.appendChild(detail); }
+    return li;
+  }
+
+  // Live rows keep their elapsed time current between snapshots.
+  function liveText(lineFn, live) {
+    var span = el('span', 'chat-aux-text', lineFn());
+    if (live) { span.dmuxLine = lineFn; }
+    return span;
+  }
+
+  function tickLiveRows() {
+    if (!ui.transcript) { return; }
+    ui.transcript.querySelectorAll('li.chat-aux-live .chat-aux-text').forEach(function (span) {
+      if (typeof span.dmuxLine === 'function') { span.textContent = span.dmuxLine(); }
+    });
+  }
+
+  function graphElapsed(graph, now) {
+    var start = null;
+    var end = 0;
+    (graph.nodes || []).forEach(function (n) {
+      if (typeof n.started_at_ms === 'number' && (start === null || n.started_at_ms < start)) { start = n.started_at_ms; }
+      if (typeof n.finished_at_ms === 'number' && n.finished_at_ms > end) { end = n.finished_at_ms; }
+    });
+    if (start === null) { return null; }
+    var finished = graph.phase === 'completed' || graph.phase === 'failed';
+    return (finished && end ? end : now) - start;
+  }
+
+  // FR-1217, FR-1218: the graph run as one status row with an expandable step
+  // list; a step opens the Graph view focused on that node.
+  function graphRunRow(graph) {
+    var nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+    if (!nodes.length || graph.phase === 'awaiting_approval') { return null; }
+    var done = 0;
+    var running = [];
+    nodes.forEach(function (n) {
+      var st = String(n.status || 'pending');
+      if (st === 'completed' || st === 'skipped') { done++; }
+      if (st === 'running') { running.push(String(n.id) + (n.runner ? ' on ' + n.runner : '')); }
+    });
+    var active = LIVE_PHASES.indexOf(String(graph.phase)) >= 0;
+    var verb = active ? (running.length ? 'Running ' + running.join(', ') : 'Waiting') : finishedVerb(graph.phase);
+    var parts = [active ? el('span', 'spinner') : phaseIcon(graph.phase)];
+    var lineFn = function () {
+      var line = verb + ' \u00b7 ' + done + '/' + nodes.length + ' steps';
+      var ms = graphElapsed(graph, serverNow());
+      if (ms !== null) { line += ' \u00b7 ' + fmtElapsed(ms); }
+      return line;
+    };
+    parts.push(liveText(lineFn, active));
+    var list = el('ul', 'chat-aux-steps');
+    nodes.forEach(function (n) {
+      var st = String(n.status || 'pending');
+      var item = el('li', 'chat-aux-step chat-aux-step-' + st);
+      var b = el('button', 'chat-aux-step-btn');
+      b.type = 'button';
+      b.title = 'Show ' + n.id + ' in the Graph view';
+      b.appendChild(el('span', 'chat-aux-icon', STEP_ICONS[st] || '\u25CB'));
+      b.lastChild.setAttribute('aria-hidden', 'true');
+      b.appendChild(el('span', 'chat-aux-step-id', String(n.id)));
+      b.appendChild(el('span', 'chat-aux-step-meta',
+        [n.role, n.runner].filter(Boolean).join(' \u00b7 ') + ' \u00b7 ' + st.replace('_', ' ') +
+        (typeof n.elapsed_ms === 'number' ? ' \u00b7 ' + fmtElapsed(n.elapsed_ms) : '')));
+      b.addEventListener('click', function () {
+        if (typeof window.dmuxaiFocusGraphNode === 'function') { window.dmuxaiFocusGraphNode(String(n.id)); }
+      });
+      item.appendChild(b);
+      list.appendChild(item);
+    });
+    return withOpenButton(auxRow('graph:' + graph.id, 'chat-aux-run' + (active ? ' chat-aux-live' : ''), parts, list),
+      graph.id, null);
+  }
+
+  // SPEC-dashboard-fullwidth FR-1223: phases where the run is still moving.
+  var LIVE_PHASES = ['active', 'waiting_gate', 'triage', 'planning'];
+
+  function finishedVerb(phase) {
+    switch (String(phase)) {
+      case 'failed': return 'Run failed';
+      case 'cancelled': return 'Run stopped';
+      case 'rejected': return 'Plan rejected';
+      case 'awaiting_approval': return 'Plan waiting for approval';
+      default: return 'Ran';
+    }
+  }
+
+  function phaseIcon(phase) {
+    var p = String(phase);
+    var bad = p === 'failed';
+    var neutral = p === 'cancelled' || p === 'rejected' || p === 'awaiting_approval';
+    var icon = el('span', 'chat-aux-icon chat-aux-' + (bad ? 'failed' : neutral ? 'neutral' : 'ok'),
+      bad ? '\u2717' : neutral ? '\u2013' : '\u2713');
+    icon.setAttribute('aria-hidden', 'true');
+    return icon;
+  }
+
+  // FR-1224: open the Graph view on a run of this conversation (an older run
+  // is fetched by `show_graph_run`), optionally focused on one step.
+  function showRun(runId, nodeId) {
+    if (typeof window.dmuxaiShowGraphRun !== 'function') { return; }
+    window.dmuxaiShowGraphRun(runId, nodeId).then(function (res) {
+      if (res && res.error) { notify(res.error, true); }
+    });
+  }
+
+  function withOpenButton(li, runId, band) {
+    var b = el('button', 'chat-aux-open-run', 'Open in Graph');
+    b.type = 'button';
+    b.setAttribute('data-run-id', runId);
+    var older = !!band;
+    if (older && viewOnly) {
+      b.disabled = true;
+      b.title = 'The read-only view (dmuxai serve) shows the latest run only';
+    } else {
+      b.title = 'Show this run in the Graph view';
+    }
+    b.addEventListener('click', function () { showRun(runId, null); });
+    var head = li.querySelector(':scope > .chat-aux-head');
+    if (head && head.nextSibling) { li.insertBefore(b, head.nextSibling); } else { li.appendChild(b); }
+    return li;
+  }
+
+  // FR-1223: a collapsed run row for an earlier run of this conversation,
+  // built from its turn band (`graph.turns[]`).
+  function bandRunRow(band) {
+    var steps = Array.isArray(band.steps) ? band.steps : [];
+    if (!steps.length) { return null; }
+    var done = 0;
+    var start = null;
+    var end = null;
+    var allEnded = true;
+    steps.forEach(function (st) {
+      var status = String(st.status || 'pending');
+      if (status === 'completed' || status === 'skipped') { done++; }
+      if (typeof st.started_at_ms === 'number' && (start === null || st.started_at_ms < start)) { start = st.started_at_ms; }
+      if (typeof st.finished_at_ms === 'number') { end = end === null ? st.finished_at_ms : Math.max(end, st.finished_at_ms); }
+      else { allEnded = false; }
+    });
+    var line = finishedVerb(LIVE_PHASES.indexOf(String(band.phase)) >= 0 ? 'cancelled' : band.phase) +
+      ' \u00b7 ' + done + '/' + steps.length + ' steps';
+    if (start !== null && end !== null && allEnded) { line += ' \u00b7 ' + fmtElapsed(end - start); }
+    var parts = [phaseIcon(LIVE_PHASES.indexOf(String(band.phase)) >= 0 ? 'cancelled' : band.phase),
+      el('span', 'chat-aux-text', line)];
+    var list = el('ul', 'chat-aux-steps');
+    steps.forEach(function (st) {
+      var status = String(st.status || 'pending');
+      var item = el('li', 'chat-aux-step chat-aux-step-' + status);
+      var b = el('button', 'chat-aux-step-btn');
+      b.type = 'button';
+      b.title = 'Show ' + st.id + ' of this run in the Graph view';
+      if (viewOnly) {
+        b.disabled = true;
+        b.title = 'The read-only view (dmuxai serve) shows the latest run only';
+      }
+      b.appendChild(el('span', 'chat-aux-icon', STEP_ICONS[status] || '\u25CB'));
+      b.lastChild.setAttribute('aria-hidden', 'true');
+      b.appendChild(el('span', 'chat-aux-step-id', String(st.id)));
+      var ms = typeof st.started_at_ms === 'number' && typeof st.finished_at_ms === 'number'
+        ? st.finished_at_ms - st.started_at_ms : null;
+      b.appendChild(el('span', 'chat-aux-step-meta',
+        [st.role, st.runner].filter(Boolean).join(' \u00b7 ') + ' \u00b7 ' + status.replace('_', ' ') +
+        (ms !== null ? ' \u00b7 ' + fmtElapsed(ms) : '')));
+      b.addEventListener('click', function () { showRun(String(band.run_id), String(st.id)); });
+      item.appendChild(b);
+      list.appendChild(item);
+    });
+    var li = auxRow('graph:' + band.run_id, 'chat-aux-run chat-aux-run-earlier', parts, list);
+    li.setAttribute('data-run-id', String(band.run_id));
+    return withOpenButton(li, String(band.run_id), band);
+  }
+
+  // Single-agent turn in progress: the live activity line from the snapshot.
+  function agentRunRow(agent) {
+    if (!agent || !agent.run || agent.run.state !== 'running') { return null; }
+    var parts = [el('span', 'spinner')];
+    var lineFn = function () {
+      var line = String(agent.label || agent.id || 'agent');
+      var act = agent.activity ? String(agent.activity) : 'working';
+      line += ' \u00b7 ' + act.replace(/^\u25B8\s*/, '');
+      if (typeof agent.run.started_at_ms === 'number') {
+        line += ' \u00b7 ' + fmtElapsed(serverNow() - agent.run.started_at_ms);
+      }
+      return line;
+    };
+    parts.push(liveText(lineFn, true));
+    return auxRow('agent:' + agent.id, 'chat-aux-run chat-aux-live', parts, null);
+  }
+
+  // FR-1221: a pending plan is an inline card with Approve / Edit / Reject.
+  function approvalRow(graph) {
+    if (!graph || graph.phase !== 'awaiting_approval' || !graph.approval) { return null; }
+    var gate = window.dmuxaiChatPlanGate || null;
+    var approval = graph.approval;
+    var steps = Array.isArray(approval.steps) ? approval.steps.length : 0;
+    var li = el('li', 'chat-aux chat-aux-approval');
+    li.setAttribute('data-aux-key', 'approval:' + graph.id + ':' + approval.rev);
+    li.setAttribute('role', 'group');
+    li.setAttribute('aria-label', 'Plan approval');
+    var head = el('div', 'chat-aux-head');
+    head.appendChild(el('span', 'chat-aux-icon chat-aux-warn', '!'));
+    head.lastChild.setAttribute('aria-hidden', 'true');
+    head.appendChild(el('span', 'chat-aux-text',
+      'Plan rev ' + approval.rev + ' is waiting for your approval \u00b7 ' + steps + (steps === 1 ? ' step' : ' steps')));
+    li.appendChild(head);
+    var actions = el('div', 'chat-aux-actions');
+    var disabled = !gate || gate.disabled();
+    [['Approve', 'approve', 'btn-primary'], ['Edit', 'edit', ''], ['Reject', 'reject', 'btn-danger'],
+      ['Open graph', 'open', '']].forEach(function (spec) {
+      var b = el('button', 'btn btn-small chat-aux-approval-' + spec[1] + (spec[2] ? ' ' + spec[2] : ''), spec[0]);
+      b.type = 'button';
+      b.disabled = spec[1] !== 'open' && disabled;
+      b.addEventListener('click', function () { if (gate) { gate.action(spec[1]); } });
+      actions.appendChild(b);
+    });
+    li.appendChild(actions);
+    if (disabled && viewOnly) {
+      li.appendChild(el('div', 'chat-aux-note', 'View-only: start dmuxai --web to decide from the browser.'));
+    }
+    return li;
+  }
+
+  // FR-1219: consecutive activity messages (tool calls, commands, thinking)
+  // fold into one row: "N actions · <latest>"; expanding shows each line.
+  function groupActivities() {
+    var t = ui.transcript;
+    var child = t.firstChild;
+    while (child) {
+      if (child.classList && child.classList.contains('msg-activity')) {
+        var members = [];
+        var cur = child;
+        while (cur && cur.classList && cur.classList.contains('msg-activity')) {
+          members.push(cur);
+          cur = cur.nextSibling;
+        }
+        var key = 'acts:' + members[0].getAttribute('data-msg-id');
+        var last = members[members.length - 1].dmuxText ? members[members.length - 1].dmuxText.textContent : '';
+        var running = members.some(function (m) {
+          var txt = m.dmuxText ? m.dmuxText.textContent : '';
+          return txt.indexOf('\u2713') < 0 && txt.indexOf('\u2717') < 0 && /^\u25B8/.test(txt);
+        });
+        var parts = [];
+        parts.push(running ? el('span', 'spinner') : el('span', 'chat-aux-icon', '\u2699'));
+        if (!running) { parts[0].setAttribute('aria-hidden', 'true'); }
+        parts.push(el('span', 'chat-aux-text',
+          members.length + (members.length === 1 ? ' action' : ' actions') + ' \u00b7 ' + last.replace(/^\u25B8\s*/, '')));
+        var detail = el('div', 'chat-aux-detail-marker');
+        var row = auxRow(key, 'chat-aux-acts', parts, detail);
+        // The members stay in place; the row only shows or hides them.
+        detail.hidden = true;
+        row.removeChild(detail);
+        var open = !!auxExpanded[key];
+        members.forEach(function (m) { m.hidden = !open; m.classList.add('msg-activity-grouped'); });
+        var head = row.querySelector('.chat-aux-head');
+        head.addEventListener('click', function () {
+          members.forEach(function (m) { m.hidden = !auxExpanded[key]; });
+        });
+        t.insertBefore(row, members[0]);
+        child = cur;
+      } else {
+        child = child.nextSibling;
+      }
+    }
+  }
+
+  // Index of the chat <li> after which the graph rows go: the last message of
+  // the exchange whose user prompt started this graph, else the end.
+  function graphAnchor(graph) {
+    var t = ui.transcript;
+    var prompt = String(graph.user_prompt || '').trim();
+    var users = t.querySelectorAll(':scope > li.msg-user');
+    var start = null;
+    for (var i = users.length - 1; i >= 0 && prompt; i--) {
+      if ((users[i].dmuxText ? users[i].dmuxText.textContent : '').trim() === prompt) { start = users[i]; break; }
+    }
+    return start ? exchangeEnd(start) : null;
+  }
+
+  // The last chat message of the exchange that starts at user message `start`.
+  function exchangeEnd(start) {
+    var anchor = start;
+    var next = start.nextSibling;
+    while (next && !(next.classList && next.classList.contains('msg-user'))) {
+      if (next.classList && next.classList.contains('msg')) { anchor = next; }
+      next = next.nextSibling;
+    }
+    return anchor;
+  }
+
+  function insertAfter(node, anchor) {
+    var t = ui.transcript;
+    if (anchor && anchor.parentNode === t) { t.insertBefore(node, anchor.nextSibling); }
+    else { t.appendChild(node); }
+  }
+
+  function renderChatAux() {
+    if (!ui.transcript) { return; }
+    var t = ui.transcript;
+    var active = document.activeElement;
+    var focusKey = active && active.closest && t.contains(active) && active.getAttribute('data-aux-key');
+    Array.prototype.slice.call(t.querySelectorAll(':scope > li.chat-aux')).forEach(function (n) { t.removeChild(n); });
+    Array.prototype.slice.call(t.querySelectorAll(':scope > li.msg-activity-grouped')).forEach(function (n) {
+      n.hidden = false;
+      n.classList.remove('msg-activity-grouped');
+    });
+    groupActivities();
+    var snap = lastSnap || {};
+    var graph = snap.graph || null;
+    if (graph) {
+      // FR-1223: one row per exchange that had a run, from the turn bands.
+      var placed = false;
+      (Array.isArray(graph.turns) ? graph.turns : []).forEach(function (band) {
+        if (!band || !band.message_id) { return; }
+        var user = null;
+        t.querySelectorAll(':scope > li.msg-user').forEach(function (li) {
+          if (li.getAttribute('data-msg-id') === String(band.message_id)) { user = li; }
+        });
+        if (!user) { return; }
+        var end = exchangeEnd(user);
+        if (band.run_id === graph.id) {
+          placed = true;
+          var apprHere = approvalRow(graph);
+          if (apprHere) { insertAfter(apprHere, end); }
+          var cur = graphRunRow(graph);
+          if (cur) { cur.setAttribute('data-run-id', String(graph.id)); insertAfter(cur, end); }
+        } else {
+          var row = bandRunRow(band);
+          if (row) { insertAfter(row, end); }
+        }
+      });
+      if (!placed) {
+        var anchor = graphAnchor(graph);
+        var runRow = graphRunRow(graph);
+        var appr = approvalRow(graph);
+        if (appr) { insertAfter(appr, anchor); }
+        if (runRow) { runRow.setAttribute('data-run-id', String(graph.id)); insertAfter(runRow, anchor); }
+      }
+    }
+    var graphLive = graph && graph.phase !== 'completed' && graph.phase !== 'failed';
+    if (graphLive && t.querySelector(':scope > li.chat-aux-run.chat-aux-live')) {
+      var busy = t.querySelector(':scope > li.msg-working');
+      if (busy) { busy.parentNode.removeChild(busy); }
+    }
+    if (!graphLive) {
+      (snap.agents || []).forEach(function (a) {
+        var row = agentRunRow(a);
+        if (row) {
+          var working = t.querySelector(':scope > li.msg-working');
+          if (working) { working.parentNode.removeChild(working); }
+          t.appendChild(row);
+        }
+      });
+    }
+    if (focusKey) {
+      var again = t.querySelector('button[data-aux-key="' + String(focusKey).replace(/["\\]/g, '\\$&') + '"]');
+      if (again) { again.focus(); }
+    }
+  }
+
+  // ---- ChatGPT-style layout (SPEC-dashboard-fullwidth FR-1205..FR-1208) ----
+
+  // The chat panel fills the viewport below the sticky header; the header
+  // wraps on narrow windows, so its height is measured, not assumed.
+  function trackHeaderHeight() {
+    var header = document.querySelector('header.top');
+    if (!header) { return; }
+    var sync = function () {
+      document.documentElement.style.setProperty('--top-h', header.offsetHeight + 'px');
+    };
+    sync();
+    if (typeof window.ResizeObserver === 'function') {
+      new window.ResizeObserver(sync).observe(header);
+    } else {
+      window.addEventListener('resize', sync);
+    }
+  }
+
+  // The composer grows with its text up to the CSS max-height, then scrolls.
+  function autoGrowInput() {
+    var input = ui.input;
+    if (!input) { return; }
+    input.style.height = 'auto';
+    input.style.height = input.scrollHeight + 'px';
+  }
+
+  function scrollTranscriptToEnd() {
+    if (ui.transcript) { ui.transcript.scrollTop = ui.transcript.scrollHeight; }
+  }
+
+  // FR-1207: fenced ``` blocks become <pre><code>, `inline` spans become
+  // <code>; everything is a text node (no HTML parsing), so agent output can
+  // not inject markup. An unclosed fence (still streaming) renders as code.
+  function renderMessageText(target, content) {
+    if (target.dmuxContent === content) { return; }
+    target.dmuxContent = content;
+    target.textContent = '';
+    var text = String(content || '');
+    var fence = /```([^\n`]*)\n?([\s\S]*?)(?:```|$)/g;
+    var last = 0;
+    var match;
+    while ((match = fence.exec(text)) !== null) {
+      // The line breaks around a fence belong to the block, not the prose.
+      if (match.index > last) { appendInline(target, text.slice(last, match.index).replace(/\n+$/, '')); }
+      var pre = el('pre', 'msg-code');
+      var lang = match[1].trim();
+      if (lang) { pre.setAttribute('data-lang', lang); }
+      pre.appendChild(el('code', null, match[2].replace(/\n$/, '')));
+      target.appendChild(pre);
+      last = fence.lastIndex;
+      if (match[0].length === 0) { fence.lastIndex++; }
+      if (text.charAt(last) === '\n') { last++; }
+    }
+    if (last < text.length) { appendInline(target, text.slice(last).replace(/^\n+/, '')); }
+  }
+
+  function appendInline(target, text) {
+    var parts = text.split(/`([^`\n]+)`/);
+    for (var i = 0; i < parts.length; i++) {
+      if (!parts[i]) { continue; }
+      if (i % 2 === 1) {
+        target.appendChild(el('code', 'msg-inline-code', parts[i]));
+      } else {
+        target.appendChild(document.createTextNode(parts[i]));
+      }
+    }
   }
 
   function picker(label, parity, onChange) {
@@ -423,7 +902,13 @@
     ui.send.disabled = true;
     sendPrompt(text).then(function (ok) {
       ui.send.disabled = viewOnly;
-      if (ok) { ui.input.value = ''; }
+      if (ok) {
+        ui.input.value = '';
+        autoGrowInput();
+        // UX-1203: your own message always brings the view to the latest turn.
+        stickToBottom = true;
+        scrollTranscriptToEnd();
+      }
       ui.input.focus();
     });
   }
@@ -513,8 +998,11 @@
       var node = messageNodes[m.id];
       if (!node) {
         node = el('li', 'msg msg-' + m.role);
-        node.appendChild(el('span', 'msg-who'));
-        node.appendChild(el('div', 'msg-text'));
+        node.setAttribute('data-msg-id', m.id);
+        node.dmuxWho = el('span', 'msg-who');
+        node.dmuxText = el('div', 'msg-text');
+        node.appendChild(node.dmuxWho);
+        node.appendChild(node.dmuxText);
         messageNodes[m.id] = node;
         if (previous && previous.nextSibling) {
           ui.transcript.insertBefore(node, previous.nextSibling);
@@ -525,12 +1013,12 @@
         }
       }
       var who = m.role === 'agent' ? (m.agent || 'agent') : m.role;
-      if (node.firstChild.textContent !== who) { node.firstChild.textContent = who; }
+      if (node.dmuxWho.textContent !== who) { node.dmuxWho.textContent = who; }
       // The agent color marks the message edge; the label keeps the theme's
       // text color so it stays readable for any configured agent color.
       var color = m.agent ? agentColor(m.agent) : null;
-      node.style.borderLeftColor = color || '';
-      if (node.lastChild.textContent !== m.content) { node.lastChild.textContent = m.content; }
+      if (color) { node.style.setProperty('--agent-color', color); } else { node.style.removeProperty('--agent-color'); }
+      renderMessageText(node.dmuxText, m.content);
       node.classList.toggle('msg-streaming', !!m.streaming);
       previous = node;
     });
@@ -566,12 +1054,174 @@
     } else if (workingNode) {
       workingNode.parentNode.removeChild(workingNode);
     }
-    if (stickToBottom) { ui.transcript.scrollTop = ui.transcript.scrollHeight; }
+    renderChatAux();
+    // docs.js links agent turns that changed files to their chat message
+    // (SPEC-dashboard-fullwidth FR-1209, FR-1210).
+    window.dispatchEvent(new window.CustomEvent('dmuxai:transcript-rendered'));
+    if (stickToBottom) { scrollTranscriptToEnd(); }
   }
 
   function openSessionsAndFocusFilter() {
     setSessionsOpen(true, true);
     if (ui.sessionsFilter) { ui.sessionsFilter.focus(); }
+  }
+
+  // SPEC-dashboard-fullwidth FR-1225..FR-1227: the Sessions list is grouped
+  // by workspace folder (current workspace first), 3 rows per group with
+  // More/Less, compact relative times, and per-tab collapse state.
+  var SESSIONS_GROUP_VISIBLE = 3;
+  var SESSIONS_COLLAPSED_KEY = 'dmuxai.sessions.collapsed';
+  var sessionsMore = {};
+
+  function sessionsCollapsed() {
+    try {
+      var raw = window.sessionStorage.getItem(SESSIONS_COLLAPSED_KEY);
+      var parsed = raw ? JSON.parse(raw) : {};
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (err) { return {}; }
+  }
+
+  function setSessionsCollapsed(path, collapsed) {
+    var map = sessionsCollapsed();
+    if (collapsed) { map[path] = true; } else { delete map[path]; }
+    try { window.sessionStorage.setItem(SESSIONS_COLLAPSED_KEY, JSON.stringify(map)); } catch (err) { /* ignore */ }
+  }
+
+  function compactTime(ms) {
+    var ts = Number(ms) || 0;
+    if (!ts) { return ''; }
+    var sec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+    if (sec < 60) { return sec + 's'; }
+    var min = Math.floor(sec / 60);
+    if (min < 60) { return min + 'm'; }
+    var hr = Math.floor(min / 60);
+    if (hr < 24) { return hr + 'h'; }
+    var day = Math.floor(hr / 24);
+    if (day < 7) { return day + 'd'; }
+    if (day < 365) { return Math.floor(day / 7) + 'w'; }
+    return Math.floor(day / 365) + 'y';
+  }
+
+  function folderIcon() {
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('class', 'sessions-group-icon');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('aria-hidden', 'true');
+    var path = document.createElementNS(ns, 'path');
+    path.setAttribute('d', 'M1.5 3.5h4.2l1.5 1.5h7.3v7.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1z');
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', 'currentColor');
+    path.setAttribute('stroke-width', '1.3');
+    path.setAttribute('stroke-linejoin', 'round');
+    svg.appendChild(path);
+    return svg;
+  }
+
+  function sessionGroups() {
+    var groups = Array.isArray(session.workspaces) ? session.workspaces.slice() : [];
+    var current = null;
+    groups = groups.filter(function (g) {
+      if (g && g.current) { current = g; return false; }
+      return !!g;
+    });
+    if (!current) {
+      current = { path: '', name: 'This workspace', label: '', current: true, available: true };
+    }
+    var currentGroup = {
+      path: current.path, name: current.name, label: current.label,
+      current: true, available: true, conversations: session.conversations || []
+    };
+    groups.sort(function (a, b) { return (Number(b.updated_at_ms) || 0) - (Number(a.updated_at_ms) || 0); });
+    return [currentGroup].concat(groups);
+  }
+
+  function focusSessionRow(from, delta) {
+    var rows = Array.prototype.slice.call(ui.sessionsList.querySelectorAll('.sessions-row'));
+    var index = rows.indexOf(from);
+    var next = rows[index + delta];
+    if (next) { next.focus(); }
+  }
+
+  function openOtherWorkspaceConversation(group, c) {
+    var switcher = window.dmuxaiSwitchWorkspace;
+    if (typeof switcher !== 'function') {
+      notify('Switching workspace is not available in this dashboard.', true);
+      return;
+    }
+    command({ command: 'prepare_open_conversation', workspace: group.path, id: c.id }).then(function (data) {
+      if (!data) { return; }
+      notify('Switching to ' + (group.name || group.path) + '\u2026');
+      switcher(group.path).then(function (res) {
+        if (!res || !res.ok) { notify((res && res.error) || 'Workspace switch failed.', true); }
+      });
+    });
+  }
+
+  function sessionRow(group, c, canSwitch) {
+    var isActive = group.current && c.id === session.conversation_id;
+    var reason = '';
+    if (viewOnly) {
+      reason = 'View-only dashboard';
+    } else if (!group.current && !group.available) {
+      reason = 'This workspace folder no longer exists';
+    } else if (!group.current && !canSwitch) {
+      reason = 'Switching workspace is not available in this dashboard';
+    }
+    var disabled = !!reason;
+    var li = el('li', 'sessions-row' + (isActive ? ' sessions-row-active' : '') + (disabled ? ' sessions-row-disabled' : ''));
+    li.tabIndex = 0;
+    li.setAttribute('data-id', c.id);
+    li.setAttribute('data-parity', 'resume');
+    li.setAttribute('data-agent', c.last_agent || '');
+    if (disabled) { li.setAttribute('aria-disabled', 'true'); }
+    if (isActive) { li.setAttribute('aria-current', 'true'); }
+
+    var titleText = c.title || c.id.slice(0, 8);
+    var tip = titleText + (c.last_agent ? ' \u00b7 ' + c.last_agent : '');
+    if (!group.current && !disabled) { tip += ' \u00b7 opens in ' + (group.name || group.path); }
+    if (reason) { tip += ' \u2014 ' + reason; }
+    li.title = tip;
+
+    var top = el('div', 'sessions-row-head');
+    if (c.running) {
+      var spin = el('span', 'spinner');
+      spin.setAttribute('role', 'img');
+      spin.setAttribute('aria-label', 'running');
+      top.appendChild(spin);
+    }
+    top.appendChild(el('span', 'sessions-row-title', titleText));
+    top.appendChild(el('span', 'sessions-row-agent sr-only', c.last_agent || 'none'));
+    var timeEl = el('span', 'sessions-row-time', compactTime(c.updated_at_ms));
+    if (c.updated_at_ms) {
+      try { timeEl.title = new Date(c.updated_at_ms).toISOString(); } catch (err) { /* ignore */ }
+    }
+    top.appendChild(timeEl);
+    li.appendChild(top);
+
+    function activateRow() {
+      if (disabled || isActive) { return; }
+      if (group.current) {
+        command({ command: 'load_conversation', id: c.id });
+      } else {
+        openOtherWorkspaceConversation(group, c);
+      }
+    }
+    li.addEventListener('click', activateRow);
+    li.addEventListener('keydown', function (e) {
+      if (e.isComposing || e.keyCode === 229) { return; }
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        activateRow();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        focusSessionRow(li, 1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        focusSessionRow(li, -1);
+      }
+    });
+    return li;
   }
 
   function renderConversations() {
@@ -585,80 +1235,79 @@
       return;
     }
     var q = (sessionsFilter || '').trim().toLowerCase();
-    var key = JSON.stringify(session.conversations) + '|' + session.conversation_id + '|' + q + '|' + (viewOnly ? '1' : '0');
+    var canSwitch = typeof window.dmuxaiWorkspaceCanSwitch === 'function' && window.dmuxaiWorkspaceCanSwitch();
+    var collapsed = sessionsCollapsed();
+    var key = JSON.stringify([session.conversations, session.workspaces || [], session.conversation_id, q,
+      viewOnly, canSwitch, collapsed, sessionsMore, Math.floor(Date.now() / 60000)]);
     if (ui.sessionsList.getAttribute('data-key') === key) { return; }
     ui.sessionsList.setAttribute('data-key', key);
     ui.sessionsList.textContent = '';
 
-    var filtered = session.conversations.filter(function (c) {
+    function matches(c) {
       if (!q) { return true; }
       var title = (c.title || '').toLowerCase();
       var id = (c.id || '').toLowerCase();
       var agent = (c.last_agent || '').toLowerCase();
       return title.indexOf(q) >= 0 || id.indexOf(q) >= 0 || agent.indexOf(q) >= 0;
-    });
-
-    if (!filtered.length) {
-      ui.sessionsList.appendChild(el('li', 'sessions-empty', q ? 'No matching sessions.' : 'No conversations yet.'));
-      return;
     }
 
-    filtered.forEach(function (c) {
-      var isActive = c.id === session.conversation_id;
-      var li = el('li', 'sessions-row' + (isActive ? ' sessions-row-active' : '') + (viewOnly ? ' sessions-row-disabled' : ''));
-      li.tabIndex = 0;
-      li.setAttribute('data-id', c.id);
-      li.setAttribute('data-parity', 'resume');
-      if (isActive) {
-        li.setAttribute('aria-current', 'true');
-      }
-
-      var top = el('div', 'sessions-row-head');
-      if (c.running) {
-        var spin = el('span', 'spinner');
-        spin.setAttribute('role', 'img');
-        spin.setAttribute('aria-label', 'running');
-        top.appendChild(spin);
-      }
-      var titleText = c.title || c.id.slice(0, 8);
-      var titleEl = el('span', 'sessions-row-title', titleText);
-      titleEl.title = titleText;
-      top.appendChild(titleEl);
-      li.appendChild(top);
-
-      var meta = el('div', 'sessions-row-meta');
-      meta.appendChild(el('span', 'sessions-row-agent', c.last_agent || 'none'));
-      var timeEl = el('span', 'sessions-row-time', relativeTime(c.updated_at_ms));
-      if (c.updated_at_ms) {
-        try { timeEl.title = new Date(c.updated_at_ms).toISOString(); } catch (err) { /* ignore */ }
-      }
-      meta.appendChild(timeEl);
-      li.appendChild(meta);
-
-      function activateRow() {
-        if (viewOnly || isActive) { return; }
-        command({ command: 'load_conversation', id: c.id });
-      }
-
-      li.addEventListener('click', activateRow);
-      li.addEventListener('keydown', function (e) {
-        if (e.isComposing || e.keyCode === 229) { return; }
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          activateRow();
-        } else if (e.key === 'ArrowDown') {
-          e.preventDefault();
-          var next = li.nextElementSibling;
-          if (next && next.classList.contains('sessions-row')) { next.focus(); }
-        } else if (e.key === 'ArrowUp') {
-          e.preventDefault();
-          var prev = li.previousElementSibling;
-          if (prev && prev.classList.contains('sessions-row')) { prev.focus(); }
-        }
+    var shown = 0;
+    sessionGroups().forEach(function (group) {
+      var list = (group.conversations || []).filter(matches).slice().sort(function (a, b) {
+        return (Number(b.updated_at_ms) || 0) - (Number(a.updated_at_ms) || 0);
       });
+      if (!list.length && (q || !group.current)) { return; }
+      var path = group.path || '';
+      var isCollapsed = !q && !!collapsed[path];
+      var gli = el('li', 'sessions-group' + (group.current ? ' sessions-group-current' : '') + (isCollapsed ? ' sessions-group-collapsed' : ''));
+      gli.setAttribute('data-workspace', path);
+      var head = el('button', 'sessions-group-head');
+      head.type = 'button';
+      head.title = path;
+      head.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
+      head.appendChild(folderIcon());
+      head.appendChild(el('span', 'sessions-group-name', group.name || path || 'Workspace'));
+      if (group.label) { head.appendChild(el('span', 'sessions-group-label', group.label)); }
+      head.addEventListener('click', function () {
+        setSessionsCollapsed(path, !isCollapsed);
+        renderConversations();
+      });
+      gli.appendChild(head);
 
-      ui.sessionsList.appendChild(li);
+      var ul = el('ul', 'sessions-group-list');
+      ul.hidden = isCollapsed;
+      var expanded = !!q || !!sessionsMore[path];
+      var visible = expanded ? list : list.slice(0, SESSIONS_GROUP_VISIBLE);
+      if (!expanded && group.current) {
+        var active = list.filter(function (c) { return c.id === session.conversation_id; })[0];
+        if (active && visible.indexOf(active) < 0) { visible = visible.concat([active]); }
+      }
+      visible.forEach(function (c) { ul.appendChild(sessionRow(group, c, canSwitch)); });
+      if (!list.length) {
+        ul.appendChild(el('li', 'sessions-empty', 'No conversations yet.'));
+      }
+      if (!q && list.length > SESSIONS_GROUP_VISIBLE) {
+        var moreLi = el('li', 'sessions-more');
+        var more = el('button', 'sessions-more-btn', expanded ? 'Less' : 'More');
+        more.type = 'button';
+        more.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+        if (!expanded) { more.title = (list.length - visible.length) + ' more'; }
+        more.addEventListener('click', function () {
+          if (expanded) { delete sessionsMore[path]; } else { sessionsMore[path] = true; }
+          renderConversations();
+        });
+        moreLi.appendChild(more);
+        ul.appendChild(moreLi);
+      }
+      gli.appendChild(ul);
+      ui.sessionsList.appendChild(gli);
+      shown += list.length;
     });
+
+    if (!shown && q) {
+      ui.sessionsList.textContent = '';
+      ui.sessionsList.appendChild(el('li', 'sessions-empty', 'No matching sessions.'));
+    }
   }
 
   // ---- palette ----------------------------------------------------------
@@ -861,6 +1510,7 @@
 
   function applySnapshot(snap) {
     if (!snap) { return; }
+    lastSnap = snap;
     if (snap.workspace) {
       initSessionsSidebarForWorkspace(snap.workspace);
     }
@@ -880,6 +1530,7 @@
       session = null;
       [ui.agent, ui.mode, ui.model, ui.effort, ui.input, ui.send].forEach(function (c) { c.disabled = true; });
       renderConversations();
+      renderChatAux();
     }
   }
 

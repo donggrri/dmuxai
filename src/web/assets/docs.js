@@ -70,6 +70,68 @@
     return node;
   }
 
+  // -----------------------------------------------------------------------
+  // SPEC-dashboard-fullwidth FR-1202..FR-1204: the center Documents panel is
+  // collapsed by default; the toggle state lives in sessionStorage only.
+  // -----------------------------------------------------------------------
+
+  var DOCS_EXPANDED_KEY = 'dmuxai.docsExpanded';
+
+  function readDocsExpanded() {
+    try { return window.sessionStorage.getItem(DOCS_EXPANDED_KEY) === '1'; } catch (err) { return false; }
+  }
+
+  function writeDocsExpanded(expanded) {
+    try { window.sessionStorage.setItem(DOCS_EXPANDED_KEY, expanded ? '1' : '0'); } catch (err) { /* ignore */ }
+  }
+
+  function setDocsExpanded(expanded) {
+    var toggle = $('docs-toggle');
+    var body = $('docs-body');
+    var panel = $('docs');
+    if (!toggle || !body) { return; }
+    toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    body.hidden = !expanded;
+    if (panel) { panel.setAttribute('data-collapsed', expanded ? 'false' : 'true'); }
+  }
+
+  function initDocsToggle() {
+    var toggle = $('docs-toggle');
+    if (!toggle) { return; }
+    var panel = $('docs');
+    // An open Diff view (restored by app.js) always shows the list.
+    setDocsExpanded(readDocsExpanded() || !!(panel && !panel.hidden));
+    // A native <button> already handles Enter and Space.
+    toggle.addEventListener('click', function () {
+      var expanded = toggle.getAttribute('aria-expanded') !== 'true';
+      setDocsExpanded(expanded);
+      writeDocsExpanded(expanded);
+    });
+  }
+
+  function setDocsCount(n) {
+    // FR-1212: the header Diff button carries the same count.
+    var diffCount = $('diff-count');
+    if (diffCount) {
+      diffCount.textContent = String(n || 0);
+      diffCount.hidden = !(typeof n === 'number' && n > 0);
+      var diffToggle = $('diff-toggle');
+      if (diffToggle) {
+        diffToggle.setAttribute('aria-label', n > 0 ? 'Diff, ' + n + ' changed' : 'Diff');
+      }
+    }
+    var count = $('docs-count');
+    if (!count) { return; }
+    if (typeof n === 'number' && n > 0) {
+      count.textContent = String(n);
+      count.title = n + (n === 1 ? ' agent turn changed files' : ' agent turns changed files');
+      count.hidden = false;
+    } else {
+      count.textContent = '';
+      count.hidden = true;
+    }
+  }
+
   function docBadge(label, className, title) {
     var node = el('span', 'badge' + (className ? ' ' + className : ''), label);
     if (title) { node.title = title; }
@@ -1034,6 +1096,10 @@
 
   function changesRow(turn) {
     var li = el('li', 'doc-turn');
+    li.id = docTurnDomId(turn.id);
+    li.setAttribute('data-turn-id', String(turn.id || ''));
+    if (turn.message_id) { li.setAttribute('data-msg-id', String(turn.message_id)); }
+    li.dmuxTurn = turn;
 
     var head = el('div', 'doc-turn-head');
     head.appendChild(el('span', 'doc-agent', String(turn.agent || '?')));
@@ -1068,18 +1134,229 @@
       li.appendChild(wrap);
     }
 
+    // The agent output goes in its own slot: syncChatLinks() fills it with
+    // the full tail, or with a one-line reference when the chat already shows
+    // that text (FR-1209).
+    li.appendChild(el('div', 'doc-turn-out'));
+    return li;
+  }
+
+  function turnTailText(turn) {
     // FR-748: output_tail is a JSON array of lines; join with real line
-    // breaks so the tail reads as the agent's output, then linkify.
+    // breaks so the tail reads as the agent's output.
     var tailLines = Array.isArray(turn.output_tail) ? turn.output_tail : [];
-    var tailText = tailLines.length
-      ? tailLines.join('\n')
-      : String(turn.output_tail || '');
-    var tail = el('pre', 'doc-tail', truncate(tailText, 2000));
-    li.appendChild(tail);
+    return tailLines.length ? tailLines.join('\n') : String(turn.output_tail || '');
+  }
+
+  function firstLine(text) {
+    var lines = String(text || '').split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].replace(/^[#>*\-\s`]+/, '').trim();
+      if (line) { return truncate(line, 140); }
+    }
+    return '';
+  }
+
+  // The kind the file list reported, else a guess from the extension
+  // (mirrors DocKind::for_path for the common cases).
+  function entryKind(path) {
+    for (var i = 0; i < entries.length; i++) {
+      if (entries[i] && entries[i].path === path && entries[i].kind) { return entries[i].kind; }
+    }
+    var ext = String(path).toLowerCase().split('/').pop();
+    ext = ext.indexOf('.') >= 0 ? ext.split('.').pop() : '';
+    if (ext === 'md' || ext === 'markdown' || ext === 'mdx') { return 'markdown'; }
+    if (ext === 'html' || ext === 'htm') { return 'html'; }
+    if (ext === 'pdf') { return 'pdf'; }
+    if (['docx', 'xlsx', 'pptx', 'doc', 'xls', 'ppt'].indexOf(ext) >= 0) { return 'office'; }
+    return 'text';
+  }
+
+  function docTurnDomId(id) {
+    return 'doc-turn-' + String(id || '').replace(/[^A-Za-z0-9_-]/g, '_');
+  }
+
+  function cssEscapeAttr(value) {
+    return String(value).replace(/["\\]/g, '\\$&');
+  }
+
+  // The chat <li> that shows this turn's text, if it is on screen.
+  function chatMessageNode(messageId) {
+    if (!messageId) { return null; }
+    var transcript = document.querySelector('#session .session-transcript');
+    if (!transcript) { return null; }
+    return transcript.querySelector('li.msg[data-msg-id="' + cssEscapeAttr(messageId) + '"]');
+  }
+
+  function flash(node) {
+    if (!node) { return; }
+    node.classList.remove('flash');
+    // Restart the highlight animation.
+    void node.offsetWidth;
+    node.classList.add('flash');
+    window.setTimeout(function () { node.classList.remove('flash'); }, 1600);
+  }
+
+  // FR-1210: expand the Documents panel and bring one turn into view.
+  function revealTurn(turnId) {
+    if (typeof window.dmuxaiSetCenterView === 'function') { window.dmuxaiSetCenterView('diff'); }
+    setDocsExpanded(true);
+    writeDocsExpanded(true);
+    var row = document.getElementById(docTurnDomId(turnId));
+    if (!row) { return; }
+    row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    flash(row);
+  }
+
+  // FR-1220: open the Diff view at one file of one turn.
+  function revealFile(turnId, path) {
+    revealTurn(turnId);
+    var row = document.getElementById(docTurnDomId(turnId));
+    if (!row) { return; }
+    var links = row.querySelectorAll('.doc-file');
+    for (var i = 0; i < links.length; i++) {
+      var a = links[i].querySelector('.doc-link');
+      if (a && a.textContent === path) {
+        links[i].scrollIntoView({ block: 'center' });
+        flash(links[i]);
+        var focusable = links[i].querySelector('a');
+        if (focusable) { focusable.focus(); }
+        return;
+      }
+    }
+  }
+
+  function revealMessage(messageId) {
+    // The chat sits under the Diff view; close the view first.
+    if (typeof window.dmuxaiSetCenterView === 'function') { window.dmuxaiSetCenterView(null); }
+    var node = chatMessageNode(messageId);
+    if (!node) { return; }
+    node.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    flash(node);
+  }
+
+  // FR-1209: one place renders an agent turn's text. When the chat shows the
+  // message, the Documents row keeps only a one-line reference to it; when
+  // the message is not in the chat (graph node, older conversation, capped
+  // transcript), the row shows the full tail as before.
+  function fillTurnOutput(row, turn, inChat) {
+    var slot = row.querySelector('.doc-turn-out');
+    if (!slot) { return; }
+    var mode = inChat ? 'chat' : 'tail';
+    if (slot.getAttribute('data-mode') === mode) { return; }
+    slot.setAttribute('data-mode', mode);
+    slot.replaceChildren();
+    var text = turnTailText(turn);
+    if (inChat) {
+      var ref = el('div', 'doc-turn-ref');
+      ref.appendChild(el('span', 'doc-turn-preview', firstLine(text) || '(no text output)'));
+      var show = el('button', 'btn btn-small doc-show-chat', 'Show in chat');
+      show.type = 'button';
+      show.addEventListener('click', function () { revealMessage(turn.message_id); });
+      ref.appendChild(show);
+      slot.appendChild(ref);
+      return;
+    }
+    if (!text) { return; }
+    var tail = el('pre', 'doc-tail', truncate(text, 2000));
+    slot.appendChild(tail);
     // FR-749: exactly the workspace paths listed in `links` become clickable;
     // everything else in the output tail stays plain text.
     linkify(tail, Array.isArray(turn.links) ? turn.links : []);
-    return li;
+  }
+
+  // FR-1210: a compact document card under the chat message whose turn
+  // changed files: title and type, a one-line preview and a button that opens
+  // the turn in the Documents panel. The file contents stay in Documents.
+  function docCard(turn) {
+    var files = Array.isArray(turn.files) ? turn.files : [];
+    var card = el('div', 'msg-doc-card');
+    card.setAttribute('data-turn-id', String(turn.id || ''));
+    var first = files[0] || {};
+    var path = String(first.path || '');
+    var name = path.split('/').pop() || path;
+    var head = el('div', 'msg-doc-card-head');
+    head.appendChild(el('span', 'msg-doc-card-icon', '\u{1F4C4}'));
+    head.lastChild.setAttribute('aria-hidden', 'true');
+    head.appendChild(el('span', 'msg-doc-card-title',
+      files.length > 1 ? name + ' +' + (files.length - 1) + ' more' : name));
+    head.appendChild(kindBadge(entryKind(path)));
+    card.appendChild(head);
+    // FR-1220: one muted row per changed file; a row opens the Diff view at
+    // that file. The change log has no line counts, so no +N/-M is shown.
+    var list = el('ul', 'msg-doc-card-files');
+    var VERBS = { created: 'Created', modified: 'Edited', deleted: 'Deleted' };
+    files.slice(0, 5).forEach(function (f) {
+      var fpath = String(f.path || '');
+      var change = String(f.change || 'modified');
+      var li = el('li', 'msg-doc-card-file');
+      var b = el('button', 'msg-doc-card-file-btn');
+      b.type = 'button';
+      b.title = 'Show ' + fpath + ' in the Diff view';
+      b.appendChild(el('span', 'msg-doc-card-verb doc-chg-' + change, VERBS[change] || 'Edited'));
+      b.appendChild(el('span', 'msg-doc-card-path', fpath));
+      b.addEventListener('click', function () { revealFile(turn.id, fpath); });
+      li.appendChild(b);
+      list.appendChild(li);
+    });
+    if (files.length > 5) {
+      list.appendChild(el('li', 'msg-doc-card-more', '+' + (files.length - 5) + ' more files'));
+    }
+    card.appendChild(list);
+    var open = el('button', 'btn btn-small msg-doc-card-open', 'Open in Diff');
+    open.type = 'button';
+    open.setAttribute('aria-controls', 'docs');
+    open.addEventListener('click', function () { revealTurn(turn.id); });
+    card.appendChild(open);
+    return card;
+  }
+
+  function syncChatLinks() {
+    var wrap = $('docs-changes');
+    var shown = 0;
+    var cards = {};
+    if (wrap) {
+      var rows = wrap.querySelectorAll('li.doc-turn');
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i];
+        var turn = row.dmuxTurn || {};
+        var files = Array.isArray(turn.files) ? turn.files : [];
+        var links = Array.isArray(turn.links) ? turn.links : [];
+        var msgNode = chatMessageNode(turn.message_id);
+        fillTurnOutput(row, turn, !!msgNode);
+        // A turn that changed nothing and whose text is in the chat has
+        // nothing left to show here.
+        row.hidden = !!msgNode && files.length === 0 && links.length === 0;
+        if (!row.hidden) { shown++; }
+        if (msgNode && files.length > 0 && !cards[turn.message_id]) {
+          cards[turn.message_id] = true;
+          var existing = msgNode.querySelector('.msg-doc-card');
+          if (!existing || existing.getAttribute('data-turn-id') !== String(turn.id || '')) {
+            if (existing) { existing.parentNode.removeChild(existing); }
+            var transcript = msgNode.parentNode;
+            var atEnd = transcript &&
+              transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 40;
+            msgNode.appendChild(docCard(turn));
+            // Keep following the latest turn when the card lands under it.
+            if (atEnd) { transcript.scrollTop = transcript.scrollHeight; }
+          }
+        }
+      }
+      var empty = wrap.querySelector('.docs-none-shown');
+      if (rows.length > 0 && shown === 0) {
+        if (!empty) { wrap.appendChild(el('p', 'empty docs-none-shown', 'no file changes yet')); }
+      } else if (empty) {
+        empty.parentNode.removeChild(empty);
+      }
+    }
+    var stale = document.querySelectorAll('#session .msg-doc-card');
+    for (var j = 0; j < stale.length; j++) {
+      var li = stale[j].closest('li.msg');
+      if (!li || !cards[li.getAttribute('data-msg-id')]) {
+        stale[j].parentNode.removeChild(stale[j]);
+      }
+    }
+    setDocsCount(shown);
   }
 
   function renderChanges(turns) {
@@ -1088,6 +1365,7 @@
     wrap.replaceChildren();
     if (turns.length === 0) {
       wrap.appendChild(el('p', 'empty', 'no agent changes yet'));
+      syncChatLinks();
       return;
     }
     var frag = document.createDocumentFragment();
@@ -1095,6 +1373,7 @@
       frag.appendChild(changesRow(turns[i] || {}));
     }
     wrap.appendChild(frag);
+    syncChatLinks();
   }
 
   // -----------------------------------------------------------------------
@@ -1917,6 +2196,9 @@
   }
 
   function init() {
+    initDocsToggle();
+    // session.js fires this after every chat render (new or streamed messages).
+    window.addEventListener('dmuxai:transcript-rendered', syncChatLinks);
     initSidebar();
     bindFilter();
     if (!currentToken()) {

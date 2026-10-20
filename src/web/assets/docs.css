@@ -912,6 +912,118 @@ body.sidebar-resizing .sidebar-resize-handle.is-dragging::after {
   font-variant-numeric: tabular-nums;
 }
 
+/* SPEC-dashboard-fullwidth FR-1225..FR-1227: Sessions grouped by folder. */
+.sessions-group {
+  margin: 0 0 10px;
+  padding: 0;
+  list-style: none;
+}
+
+.sessions-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.86em;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sessions-group-head:hover,
+.sessions-group-head:focus-visible {
+  background: var(--bg-chip);
+  outline: none;
+}
+
+.sessions-group-current > .sessions-group-head {
+  background: var(--bg-chip);
+}
+
+.sessions-group-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+}
+
+.sessions-group-current .sessions-group-icon {
+  color: var(--accent);
+}
+
+.sessions-group-name {
+  flex: none;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+}
+
+.sessions-group-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 0.92em;
+}
+
+.sessions-group-collapsed .sessions-group-icon {
+  opacity: 0.7;
+}
+
+.sessions-group-list {
+  margin: 2px 0 0;
+  padding: 0 0 0 14px;
+  list-style: none;
+}
+
+.sessions-group-list .sessions-row {
+  padding: 4px 8px;
+  margin-bottom: 1px;
+}
+
+.sessions-group-list .sessions-row-time {
+  margin-left: auto;
+  font-size: 0.78em;
+}
+
+.sessions-more-btn {
+  padding: 3px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.8em;
+  cursor: pointer;
+}
+
+.sessions-more-btn:hover,
+.sessions-more-btn:focus-visible {
+  color: var(--accent);
+  outline: none;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .sidebar-tabs {
   display: flex;
   gap: 4px;
@@ -1099,4 +1211,146 @@ body.sidebar-resizing .sidebar-resize-handle.is-dragging::after {
   font-weight: 700;
   line-height: 1.5;
   text-align: center;
+}
+
+/* SPEC-dashboard-fullwidth FR-1209, FR-1210: a turn whose text is in the chat
+   keeps a one-line reference here instead of the full output tail. */
+.doc-turn[hidden] { display: none; }
+.doc-turn-ref {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  min-width: 0;
+}
+.doc-turn-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 0.85em;
+}
+.doc-turn.flash { animation: doc-flash 1.6s ease-out; }
+@keyframes doc-flash {
+  from { box-shadow: 0 0 0 2px var(--accent); }
+  to { box-shadow: 0 0 0 2px transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .doc-turn.flash, .session-transcript li.flash { animation: none; }
+}
+
+/* ---------------------------------------------------------------------------
+ * SPEC-dashboard-fullwidth FR-1211..FR-1216: Diff and Graph center views.
+ * Hidden by default; an open view covers the center area between the docked
+ * sidebars and below the sticky header, so the graph gets the full width.
+ * ------------------------------------------------------------------------- */
+
+.center-view[hidden] {
+  display: none !important;
+}
+
+.center-view.open {
+  position: fixed;
+  top: calc(var(--top-h, 56px) + 10px);
+  left: calc(var(--left-dock, 0px) + 14px);
+  right: calc(var(--right-dock, 0px) + 14px);
+  bottom: 14px;
+  z-index: 9;
+  margin: 0;
+  overflow: auto;
+  box-sizing: border-box;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
+  transition: left 0.2s ease-in-out, right 0.2s ease-in-out;
+}
+
+.center-view-head {
+  display: none;
+}
+
+.center-view.open .center-view-head {
+  position: sticky;
+  top: -12px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: -12px -14px 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-panel);
+}
+
+.center-view-title {
+  margin: 0;
+  font-size: 0.8em;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* In the Diff view the change list uses the whole view height. */
+.center-view.open .docs-changes {
+  max-height: none;
+}
+
+.view-indicator {
+  display: inline-block;
+  min-width: 0.6em;
+  height: 0.6em;
+  margin-left: 4px;
+  border-radius: 999px;
+  vertical-align: 0.05em;
+}
+
+.view-indicator[hidden] {
+  display: none;
+}
+
+.view-indicator-running {
+  width: 0.6em;
+  background: var(--accent);
+  animation: view-pulse 1.4s ease-in-out infinite;
+}
+
+.view-indicator-approval {
+  min-width: 1.4em;
+  height: auto;
+  padding: 0 5px;
+  background: var(--warn);
+  color: var(--bg-panel);
+  font-size: 0.8em;
+  font-weight: 700;
+  line-height: 1.5;
+  text-align: center;
+  vertical-align: baseline;
+}
+
+@keyframes view-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .view-indicator-running { animation: none; }
+  .center-view.open { transition: none; }
+}
+
+.reduced-motion .view-indicator-running { animation: none; }
+.reduced-motion .center-view.open { transition: none; }
+
+
+@media (max-width: 900px) {
+  .center-view.open {
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+  }
+}
+
+.todos-count[hidden] {
+  display: none;
 }

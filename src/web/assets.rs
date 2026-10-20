@@ -310,7 +310,10 @@ mod tests {
         // the docs panel section.
         assert!(INDEX_HTML.contains(r#"<link rel="stylesheet" href="/assets/docs.css">"#));
         assert!(INDEX_HTML.contains(r#"<script src="/assets/docs.js" defer></script>"#));
-        assert!(INDEX_HTML.contains(r#"<section id="docs" class="panel">"#));
+        assert!(
+            INDEX_HTML
+                .contains(r#"<section id="docs" class="panel panel-collapsible center-view""#)
+        );
 
         // FR-746: the HTML preview iframe is set with an empty sandbox
         // attribute (setAttribute('sandbox', '')) and never grants scripts or
@@ -1021,7 +1024,8 @@ mod tests {
         assert!(DOCS_CSS.contains("padding-left: var(--left-dock);"));
         assert!(DOCS_CSS.contains("padding-right: var(--right-dock);"));
         assert!(DOCS_CSS.contains("margin-inline: auto;"));
-        assert!(APP_CSS.contains("max-width: 880px;"));
+        // SPEC-dashboard-fullwidth FR-1200 replaced the 880px column.
+        assert!(!APP_CSS.contains("max-width: 880px;"));
 
         // The old per-state margin rule is gone.
         assert!(!DOCS_CSS.contains("margin-right: 320px"));
@@ -1514,5 +1518,257 @@ mod tests {
             "plan history panel must not use innerHTML"
         );
         assert!(history_js.contains("createTextNode"));
+    }
+
+    /// The declarations of the first top-level `selector {` rule in `css`.
+    fn css_rule<'a>(css: &'a str, selector: &str) -> &'a str {
+        let open = format!("\n{selector} {{\n");
+        let start = css
+            .find(&open)
+            .unwrap_or_else(|| panic!("missing CSS rule {selector}"))
+            + open.len();
+        let end = css[start..].find("\n}").expect("rule closes") + start;
+        &css[start..end]
+    }
+
+    // TC-1200 (SPEC-dashboard-fullwidth FR-1200, FR-1201): the center column
+    // has no width cap and no centered fixed container; the graph re-lays out
+    // when the column width changes without a window resize.
+    #[test]
+    fn center_column_uses_full_width() {
+        let main_rule = css_rule(APP_CSS, "main");
+        assert!(main_rule.contains("max-width: none;"), "{main_rule}");
+        assert!(main_rule.contains("margin: 0;"), "{main_rule}");
+        assert!(!main_rule.contains("margin: 0 auto"), "{main_rule}");
+        for css in [APP_CSS, DOCS_CSS, SESSION_CSS] {
+            assert!(!css.contains("max-width: 880px"));
+        }
+        // Narrow windows keep the existing small-screen padding.
+        assert!(APP_CSS.contains("main { padding: 0 10px 28px; }"));
+        // Docked sidebars still reserve their width (SPEC-centered-prompt).
+        assert!(DOCS_CSS.contains("padding-left: var(--left-dock);"));
+        assert!(DOCS_CSS.contains("padding-right: var(--right-dock);"));
+        // The chat transcript grows with the viewport instead of a fixed 26rem.
+        assert!(SESSION_CSS.contains("height: clamp(26rem, 55vh, 48rem);"));
+        assert!(APP_JS.contains("new window.ResizeObserver("));
+    }
+
+    // TC-1201 (SPEC-dashboard-fullwidth FR-1202, FR-1203, UX-1200): the center
+    // Documents panel is collapsed in the served HTML, with an accessible
+    // toggle button.
+    #[test]
+    fn documents_panel_is_collapsed_by_default() {
+        let start = INDEX_HTML.find("<section id=\"docs\"").expect("docs panel");
+        let end = INDEX_HTML[start..].find("</section>").expect("closes") + start;
+        let panel = &INDEX_HTML[start..end];
+        assert!(panel.contains("data-collapsed=\"true\""), "{panel}");
+        assert!(panel.contains("<button id=\"docs-toggle\" type=\"button\""));
+        assert!(panel.contains("aria-expanded=\"false\""));
+        assert!(panel.contains("aria-controls=\"docs-body\""));
+        assert!(panel.contains("<div id=\"docs-body\" class=\"panel-body\" hidden>"));
+        // The change list lives inside the collapsed body.
+        let body = panel.find("id=\"docs-body\"").unwrap();
+        assert!(panel.find("id=\"docs-changes\"").unwrap() > body);
+        assert!(APP_CSS.contains(".panel-body[hidden]"));
+        assert!(APP_CSS.contains(".panel-toggle:focus-visible"));
+        assert!(APP_CSS.contains(".panel-toggle[aria-expanded=\"true\"] .panel-caret"));
+    }
+
+    // TC-1202 (SPEC-dashboard-fullwidth FR-1203, FR-1204): the toggle flips
+    // aria-expanded and hidden together, defaults to collapsed, keeps the state
+    // in sessionStorage only, and the header shows the change count.
+    #[test]
+    fn documents_toggle_script() {
+        let toggle_js = js_between(DOCS_JS, "var DOCS_EXPANDED_KEY", "function docBadge");
+        assert!(toggle_js.contains("'dmuxai.docsExpanded'"));
+        assert!(toggle_js.contains("window.sessionStorage.getItem(DOCS_EXPANDED_KEY) === '1'"));
+        assert!(toggle_js.contains("return false;"));
+        assert!(!toggle_js.contains("localStorage"));
+        assert!(toggle_js.contains("toggle.setAttribute('aria-expanded'"));
+        assert!(toggle_js.contains("body.hidden = !expanded;"));
+        assert!(!toggle_js.contains("innerHTML"));
+        assert!(DOCS_JS.contains("initDocsToggle();"));
+        assert!(DOCS_JS.contains("setDocsCount(shown);"));
+    }
+
+    // TC-1206 (SPEC-dashboard-fullwidth FR-1206..FR-1210): ChatGPT-style chat
+    // and the single place an agent turn's text is rendered.
+    #[test]
+    fn chatgpt_style_chat_assets() {
+        let text_js = js_between(SESSION_JS, "function renderMessageText", "function picker(");
+        assert!(!text_js.contains("innerHTML"));
+        assert!(text_js.contains("el('pre', 'msg-code')"));
+        assert!(text_js.contains("'msg-inline-code'"));
+        assert!(text_js.contains("document.createTextNode"));
+        assert!(SESSION_JS.contains("e.key === 'Enter' && !e.shiftKey"));
+        assert!(SESSION_JS.contains("node.setAttribute('data-msg-id', m.id);"));
+        assert!(SESSION_JS.contains("'dmuxai:transcript-rendered'"));
+        assert!(SESSION_CSS.contains("--chat-col: 860px;"));
+        assert!(SESSION_CSS.contains(".session-transcript .msg-user { align-items: flex-end; }"));
+        assert!(SESSION_CSS.contains("border-radius: 1.5rem;"));
+        assert!(SESSION_CSS.contains("height: calc(100dvh - var(--top-h, 56px) - 32px);"));
+        assert!(SESSION_CSS.contains(".msg-doc-card {"));
+
+        let docs_js = js_between(DOCS_JS, "function fillTurnOutput", "function syncChatLinks");
+        assert!(!docs_js.contains("innerHTML"));
+        // The tail <pre> is only built after the in-chat branch returned.
+        let in_chat = docs_js.find("if (inChat) {").expect("in-chat branch");
+        let tail = docs_js.find("el('pre', 'doc-tail'").expect("tail pre");
+        assert!(in_chat < tail);
+        let card_js = js_between(DOCS_JS, "function docCard", "function syncChatLinks");
+        assert!(!card_js.contains("output_tail"));
+        assert!(!card_js.contains("turnTailText"));
+        assert!(card_js.contains("'Open in Diff'"));
+        assert!(DOCS_JS.contains("'Show in chat'"));
+    }
+
+    // TC-1209 (SPEC-dashboard-fullwidth FR-1211, FR-1212, FR-1213, FR-1214, FR-1215, FR-1216): Diff and Graph are
+    // header-button center views, hidden in the served HTML.
+    #[test]
+    fn diff_and_graph_center_view_assets() {
+        for (id, panel, view) in [
+            ("diff-toggle", "docs", "diff"),
+            ("graph-toggle", "graph", "graph"),
+        ] {
+            let start = INDEX_HTML
+                .find(&format!("<button id=\"{id}\""))
+                .unwrap_or_else(|| panic!("missing {id}"));
+            let tag = &INDEX_HTML[start..INDEX_HTML[start..].find('>').unwrap() + start];
+            assert!(
+                tag.contains("class=\"btn sidebar-toggle view-toggle\""),
+                "{tag}"
+            );
+            assert!(tag.contains(&format!("aria-controls=\"{panel}\"")), "{tag}");
+            assert!(tag.contains("aria-expanded=\"false\""), "{tag}");
+            assert!(tag.contains(&format!("data-view=\"{view}\"")), "{tag}");
+            let section = format!("<section id=\"{panel}\" class=\"panel");
+            let at = INDEX_HTML.find(&section).expect("view section");
+            let open_tag = &INDEX_HTML[at..INDEX_HTML[at..].find('>').unwrap() + at];
+            assert!(open_tag.contains("center-view"), "{open_tag}");
+            assert!(open_tag.ends_with(" hidden"), "{open_tag}");
+        }
+        // The buttons sit right after To-dos in the header.
+        let todos = INDEX_HTML.find("id=\"todos-toggle\"").unwrap();
+        let diff = INDEX_HTML.find("id=\"diff-toggle\"").unwrap();
+        let graph = INDEX_HTML.find("id=\"graph-toggle\"").unwrap();
+        let status = INDEX_HTML.find("<nav id=\"status\"").unwrap();
+        assert!(todos < diff && diff < graph && graph < status);
+        assert!(INDEX_HTML.contains("id=\"graph-indicator\""));
+        // FR-1215: the chat reminder is the inline approval card (FR-1221),
+        // not a separate callout.
+        assert!(!INDEX_HTML.contains("approval-callout"));
+
+        let views_js = js_between(APP_JS, "var CENTER_VIEW_KEY", "function bindGraphControls");
+        assert!(views_js.contains("'dmuxai.centerView'"));
+        assert!(views_js.contains("window.sessionStorage"));
+        assert!(!views_js.contains("localStorage"));
+        assert!(views_js.contains("toggle.setAttribute('aria-expanded'"));
+        assert!(views_js.contains("e.key !== 'Escape'"));
+        assert!(views_js.contains("graph.phase === 'awaiting_approval'"));
+        assert!(views_js.contains("approvalAutoOpened[key]"));
+        assert!(!views_js.contains("innerHTML"));
+        assert!(APP_JS.contains("bindCenterViews();"));
+        assert!(APP_JS.contains("syncCenterViewsWithSnapshot(snap);"));
+        assert!(DOCS_CSS.contains(".center-view[hidden]"));
+        assert!(DOCS_CSS.contains("left: calc(var(--left-dock, 0px) + 14px);"));
+        assert!(DOCS_CSS.contains("right: calc(var(--right-dock, 0px) + 14px);"));
+        assert!(DOCS_CSS.contains(".view-indicator-approval"));
+        assert!(DOCS_CSS.contains(".todos-count[hidden]"));
+        assert!(DOCS_JS.contains("window.dmuxaiSetCenterView('diff')"));
+        assert!(DOCS_JS.contains("$('diff-count')"));
+    }
+
+    // TC-1212 (SPEC-dashboard-fullwidth FR-1217, FR-1218, FR-1219, FR-1220,
+    // FR-1221, UX-1202): inline agent-processing rows in the chat.
+    #[test]
+    fn chat_inline_activity_assets() {
+        let aux = js_between(
+            SESSION_JS,
+            "function fmtElapsed",
+            "// ---- ChatGPT-style layout",
+        );
+        // Rows are built with DOM APIs and stay collapsed until clicked.
+        assert!(!aux.contains("innerHTML"));
+        assert!(aux.contains("head.setAttribute('aria-expanded', open ? 'true' : 'false')"));
+        assert!(aux.contains("detail.hidden = !open;"));
+        // FR-1217: "Running X · done/total steps · elapsed", live-updated.
+        assert!(aux.contains("'Running ' + running.join(', ')"));
+        assert!(aux.contains("' steps'"));
+        assert!(SESSION_JS.contains("window.setInterval(tickLiveRows, 1000)"));
+        // FR-1218: a step opens Graph focused on that node.
+        assert!(aux.contains("window.dmuxaiFocusGraphNode(String(n.id))"));
+        assert!(APP_JS.contains("window.dmuxaiFocusGraphNode = function (id)"));
+        // FR-1219: consecutive activity lines fold into one actions row.
+        assert!(aux.contains("' action' : ' actions'"));
+        assert!(aux.contains("msg-activity-grouped"));
+        // FR-1221: inline approval card with Approve / Edit / Reject.
+        for label in [
+            "'Approve', 'approve'",
+            "'Edit', 'edit'",
+            "'Reject', 'reject'",
+        ] {
+            assert!(aux.contains(label), "{label}");
+        }
+        assert!(aux.contains("window.dmuxaiChatPlanGate"));
+        assert!(APP_JS.contains("window.dmuxaiChatPlanGate = {"));
+        // The plan-gate API used elsewhere is still defined once.
+        assert_eq!(APP_JS.matches("window.dmuxaiPlanGate = {").count(), 1);
+        // FR-1220: doc card file rows open Diff at that file.
+        assert!(DOCS_JS.contains("msg-doc-card-file-btn"));
+        assert!(DOCS_JS.contains("function revealFile(turnId, path)"));
+        // UX-1202: muted one-line rows in both themes, reduced motion honoured.
+        assert!(SESSION_CSS.contains(".session-transcript > li.chat-aux {"));
+        assert!(SESSION_CSS.contains(".chat-aux-approval"));
+        assert!(SESSION_CSS.contains("li.chat-aux { margin-bottom: .5rem; color: var(--muted)"));
+        assert!(SESSION_CSS.contains("@media (prefers-reduced-motion: reduce) { .chat-aux-caret"));
+    }
+
+    // TC-1219 (SPEC-dashboard-fullwidth FR-1223, FR-1224): one run row per
+    // exchange from the turn bands; older runs open through `show_graph_run`.
+    #[test]
+    fn per_turn_run_row_assets() {
+        let aux = js_between(
+            SESSION_JS,
+            "function fmtElapsed",
+            "// ---- ChatGPT-style layout",
+        );
+        assert!(aux.contains("Array.isArray(graph.turns) ? graph.turns : []"));
+        assert!(aux.contains("li.getAttribute('data-msg-id') === String(band.message_id)"));
+        assert!(aux.contains("function bandRunRow(band)"));
+        assert!(aux.contains("'Open in Graph'"));
+        assert!(aux.contains("window.dmuxaiShowGraphRun(runId, nodeId)"));
+        // Cancelled, rejected and stored mid-run phases never show a spinner.
+        assert!(
+            aux.contains("var LIVE_PHASES = ['active', 'waiting_gate', 'triage', 'planning'];")
+        );
+        assert!(!aux.contains("innerHTML"));
+        assert!(APP_JS.contains("command: 'show_graph_run', run_id: runId"));
+        assert!(APP_JS.contains("applyPendingRunFocus(snap);"));
+        assert!(SESSION_CSS.contains(".chat-aux-open-run {"));
+    }
+
+    // TC-1225 / SPEC-dashboard-fullwidth FR-1225..FR-1227
+    #[test]
+    fn sessions_grouped_by_workspace_assets() {
+        let list = js_between(
+            SESSION_JS,
+            "var SESSIONS_GROUP_VISIBLE = 3;",
+            "// ---- palette",
+        );
+        assert!(list.contains("SESSIONS_COLLAPSED_KEY = 'dmuxai.sessions.collapsed'"));
+        assert!(list.contains("window.sessionStorage.setItem(SESSIONS_COLLAPSED_KEY"));
+        assert!(list.contains("function compactTime(ms)"));
+        assert!(list.contains("expanded ? 'Less' : 'More'"));
+        assert!(list.contains("head.title = path;"));
+        assert!(
+            list.contains("command: 'prepare_open_conversation', workspace: group.path, id: c.id")
+        );
+        assert!(list.contains("'This workspace folder no longer exists'"));
+        assert!(list.contains("if (!list.length && (q || !group.current)) { return; }"));
+        assert!(!list.contains("innerHTML"));
+        assert!(WORKSPACE_JS.contains("window.dmuxaiSwitchWorkspace = function (path)"));
+        assert!(WORKSPACE_JS.contains("apiPost('/api/workspace/switch', { path: path })"));
+        assert!(DOCS_CSS.contains(".sessions-group-name {"));
+        assert!(DOCS_CSS.contains(".sessions-group-label {"));
     }
 }

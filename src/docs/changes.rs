@@ -192,6 +192,12 @@ pub struct TurnChanges {
     pub truncated: bool,
     pub output_tail: Vec<String>,
     pub links: Vec<String>,
+    /// Dashboard chat message (`<conversation id>:<index>`, the
+    /// `SessionMessage.id`) whose text is `output_tail`. When set, the chat
+    /// already shows that text, so the Documents panel does not render it
+    /// again (SPEC-dashboard-fullwidth FR-1209).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 /// In-memory turn history shared with the web API (FR-748).
@@ -252,6 +258,7 @@ mod tests {
             truncated: false,
             output_tail: Vec::new(),
             links: Vec::new(),
+            message_id: None,
         }
     }
 

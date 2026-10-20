@@ -635,6 +635,16 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     let custom_warnings = dmuxai::custom_agent::install_registry(settings.custom_agents.clone());
     let config_warnings = settings.config_warnings.clone();
     let mut app = App::new_interactive(engine, workspace_root.clone(), settings.clone())?;
+    app.set_state_repos_dir(
+        dmuxai::state_path::state_base()
+            .ok()
+            .map(|b| b.join("repos")),
+    );
+    // SPEC-dashboard-fullwidth FR-1227: a dashboard switch asked to open one
+    // conversation of this workspace.
+    if let Ok(id) = std::env::var(OPEN_CONVERSATION_ENV) {
+        app.open_conversation_on_startup(&id);
+    }
     for warning in config_warnings.into_iter().chain(custom_warnings) {
         app.push_startup_notice(warning);
     }
@@ -662,6 +672,9 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     let mut session = TerminalSession::start()?;
     let result = app.run(session.terminal_mut()).await;
     let switch_target = app.take_switch_ready();
+    let open_conversation = switch_target
+        .as_deref()
+        .and_then(|target| app.take_switch_open_conversation(target));
     app.shutdown().await;
     drop(app);
     drop(session);
@@ -674,16 +687,25 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
         dmuxai::web::discovery::remove_discovery(&workspace_root);
     }
     if let Some(target_workspace) = switch_target {
-        exec_workspace_switch(&target_workspace, bound_port, dashboard_tok.as_deref());
+        exec_workspace_switch(
+            &target_workspace,
+            bound_port,
+            dashboard_tok.as_deref(),
+            open_conversation.as_deref(),
+        );
     }
     result.map_err(Into::into)
 }
+
+/// Conversation id the re-exec'd process opens on startup (FR-1227).
+const OPEN_CONVERSATION_ENV: &str = "DMUXAI_OPEN_CONVERSATION";
 
 #[cfg(unix)]
 fn exec_workspace_switch(
     target_workspace: &Path,
     bound_port: Option<u16>,
     token: Option<&str>,
+    open_conversation: Option<&str>,
 ) -> ! {
     use std::os::unix::process::CommandExt;
 
@@ -703,6 +725,10 @@ fn exec_workspace_switch(
         cmd.env("DMUXAI_WEB_TOKEN", tok);
     }
     cmd.env("DMUXAI_WORKSPACE", target_workspace);
+    match open_conversation {
+        Some(id) => cmd.env(OPEN_CONVERSATION_ENV, id),
+        None => cmd.env_remove(OPEN_CONVERSATION_ENV),
+    };
     let err = cmd.exec();
     let msg = dmuxai::web::format_reexec_failure(&exe, &new_args, &err);
     eprint!("{msg}");
@@ -714,6 +740,7 @@ fn exec_workspace_switch(
     target_workspace: &Path,
     _bound_port: Option<u16>,
     _token: Option<&str>,
+    _open_conversation: Option<&str>,
 ) -> ! {
     eprintln!(
         "error: workspace switch is only supported on Unix\nrestart command: dmuxai -C {}",

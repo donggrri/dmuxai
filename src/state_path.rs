@@ -61,6 +61,12 @@ pub fn state_base() -> io::Result<PathBuf> {
 /// `<sanitized basename>-<16 hex FNV-1a 64 of the canonical workspace root>`.
 pub fn repo_key(workspace_root: &Path) -> io::Result<String> {
     let canonical = normalize_workspace_path(workspace_root)?;
+    Ok(repo_key_for_canonical(&canonical))
+}
+
+/// [`repo_key`] for an already-normalized workspace key, e.g. a stored
+/// `conversations.workspace_root` whose folder may no longer exist.
+pub fn repo_key_for_canonical(canonical: &str) -> String {
     let basename = Path::new(&canonical)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -80,7 +86,7 @@ pub fn repo_key(workspace_root: &Path) -> io::Result<String> {
     } else {
         sanitized
     };
-    Ok(format!("{sanitized}-{:016x}", fnv1a64(&canonical)))
+    format!("{sanitized}-{:016x}", fnv1a64(canonical))
 }
 
 /// `conversations.sqlite3` inside a per-workspace directory under the state
@@ -133,6 +139,18 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use std::{sync::MutexGuard, time::Duration};
+
+    // TC-1221 / SPEC-dashboard-fullwidth FR-1225: a stored workspace key maps
+    // to the same repo directory as the live path.
+    #[test]
+    fn repo_key_for_canonical_matches_repo_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = normalize_workspace_path(dir.path()).unwrap();
+        assert_eq!(
+            repo_key(dir.path()).unwrap(),
+            repo_key_for_canonical(&canonical)
+        );
+    }
 
     fn lock_env() -> MutexGuard<'static, ()> {
         test_env_lock()

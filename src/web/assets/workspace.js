@@ -314,6 +314,7 @@
         state.canSwitch = !!res.body.can_switch;
         state.viewOnly = !state.canSwitch && state.viewOnly;
         updateHeaderButton();
+        try { window.dispatchEvent(new Event('dmuxai:workspace-info')); } catch (err) { /* ignore */ }
       }
       if (onDone) { onDone(); }
     }).catch(function () {
@@ -411,6 +412,41 @@
       updateSwitchButton();
     });
   }
+
+  // SPEC-dashboard-fullwidth FR-1227: the Sessions sidebar opens a
+  // conversation of another workspace through the same switch + poll flow.
+  window.dmuxaiWorkspaceCanSwitch = function () {
+    return !!state.canSwitch && !state.viewOnly;
+  };
+  window.dmuxaiSwitchWorkspace = function (path) {
+    return new Promise(function (resolve) {
+      fetchWorkspaceInfo(function () {
+        if (!state.canSwitch || state.viewOnly) {
+          resolve({ ok: false, error: 'Switching workspace is not available in this dashboard.' });
+          return;
+        }
+        if (state.switching) {
+          resolve({ ok: false, error: 'A workspace switch is already in progress.' });
+          return;
+        }
+        var previousCurrent = state.current;
+        state.switching = true;
+        apiPost('/api/workspace/switch', { path: path }).then(function (res) {
+          if (res.status === 202) {
+            var canonical = (res.body && res.body.path) ? String(res.body.path) : path;
+            startSwitchPoll(canonical, previousCurrent);
+            resolve({ ok: true });
+            return;
+          }
+          state.switching = false;
+          resolve({ ok: false, error: (res.body && (res.body.error || res.body.reason)) || ('HTTP ' + res.status) });
+        }).catch(function () {
+          state.switching = false;
+          resolve({ ok: false, error: 'Workspace switch request failed.' });
+        });
+      });
+    });
+  };
 
   function init() {
     var btn = $('workspace-button');

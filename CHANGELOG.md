@@ -5,6 +5,49 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Changed
+
+- **Dashboard center column uses the full width (SPEC-dashboard-fullwidth FR-1200..FR-1204).**
+  The chat, graph and task checklist now fill the whole area between the
+  sidebars instead of an 880px column, and the Documents panel is collapsible
+  and collapsed by default.
+- **ChatGPT-style dashboard chat (FR-1205..FR-1208).** The chat fills the
+  window height with its own scrolling transcript, a rounded composer pinned at
+  the bottom (Send inside), right-aligned user bubbles, plain agent text with
+  styled code blocks, and a centered ~860px reading column.
+
+- **Diff and Graph open from header buttons (FR-1211..FR-1216).** The change
+  list (Diff) and the graph run (swimlane, plan approval, task checklist) are no
+  longer inline in the center. `Diff` and `Graph` buttons next to To-dos open
+  them over the center area (Esc or a second click closes; kept per tab). The
+  Graph button shows `!` while a plan waits for approval and a dot while a run
+  is active; a pending plan opens the Graph view once, and the chat always
+  shows an inline approval card.
+
+- **Agent processing inline in the chat (FR-1217..FR-1221).** Compact, muted,
+  collapsible one-line rows: a live "Running <step> on <runner> · 2/8 steps ·
+  29s" row whose steps open the Graph view at that node; "N actions" rows that
+  fold the turn's tool activity; per-file rows on the document card that open
+  Diff at that file; and an inline plan approval card with Approve / Edit /
+  Reject. Line counts (+N/−M) are not shown because change records do not
+  carry them.
+
+- **Graphs follow the conversation (FR-1222..FR-1224).** Opening or switching
+  to a conversation shows its latest stored graph run again (read-only; never
+  another conversation's; a live run still wins; a run left mid-run shows as
+  cancelled and is not resumed). Every chat exchange that started a run gets
+  its own collapsed run row, and "Open in Graph" on an earlier run loads that
+  run into the Graph view (`show_graph_run` command).
+
+- **Sessions grouped by workspace folder (FR-1225..FR-1227).** The Sessions
+  sidebar lists every workspace's sessions from the state dir (read-only),
+  one group per folder: folder icon, bold name, muted parent path (or WSL
+  distro), full path on hover. Rows are newest first with a compact time
+  ("5h"); 3 per group with More/Less; the current workspace and the active
+  session are highlighted; the filter spans all groups; collapsed groups are
+  remembered per tab. Opening another workspace's session switches workspace
+  and opens it there.
+
 ### Fixed
 
 - **Approving a fallback plan works again (FR-941, FR-950, TC-1011).** The
@@ -12,6 +55,12 @@ All notable changes to dmuxai are listed here. Versions follow
   turn error/timeout, busy agent) stored its step without the implicit
   `task-1` reference, so `/graph approve` and the dashboard Approve were
   refused with "Approved plan steps are invalid: step must reference a task".
+
+- **Agent replies no longer show twice (FR-1209, FR-1210).** The Documents
+  panel printed each turn's output tail, which is the same text as the chat
+  reply. Change records now carry the chat `message_id`; the reply stays in the
+  chat with a compact document card ("Open in Diff"), and the Documents row
+  keeps the changed files plus a one-line "Show in chat" reference.
 
 ## [0.2.2] - 2026-10-19
 

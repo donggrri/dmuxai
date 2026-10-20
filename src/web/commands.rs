@@ -94,6 +94,17 @@ pub enum SessionCommand {
         #[serde(default)]
         note: Option<String>,
     },
+    /// SPEC-dashboard-fullwidth FR-1224: show a stored run of the current
+    /// conversation in the Graph view (read-only history).
+    ShowGraphRun {
+        run_id: String,
+    },
+    /// SPEC-dashboard-fullwidth FR-1227: remember a conversation of another
+    /// workspace to open after the next workspace switch to that workspace.
+    PrepareOpenConversation {
+        workspace: String,
+        id: String,
+    },
     PlanTaskEdit {
         action: String,
         task_id: String,
