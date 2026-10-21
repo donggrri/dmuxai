@@ -17,6 +17,37 @@ const MAX_HIGHLIGHT_BYTES: usize = 200 * 1024;
 const USER_CONTENT_ID_PREFIX: &str = "user-content-";
 
 /// Renders Markdown to sanitized, GitHub-flavoured HTML (FR-743).
+/// Chat bubbles use `default-src 'self'`; render images as links instead of `<img>`.
+pub fn chat_images_as_links(html: &str) -> String {
+    static IMG: OnceLock<Regex> = OnceLock::new();
+    let re = IMG
+        .get_or_init(|| Regex::new(r#"<img\b([^>]*?)(?:\s*/)?>"#).expect("static img tag regex"));
+    static SRC: OnceLock<Regex> = OnceLock::new();
+    static ALT: OnceLock<Regex> = OnceLock::new();
+    let src_re = SRC.get_or_init(|| Regex::new(r#"(?i)src="([^"]*)""#).expect("src attr"));
+    let alt_re = ALT.get_or_init(|| Regex::new(r#"(?i)alt="([^"]*)""#).expect("alt attr"));
+    re.replace_all(html, |caps: &regex::Captures<'_>| {
+        let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let src = src_re
+            .captures(attrs)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str());
+        let alt = alt_re
+            .captures(attrs)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str())
+            .filter(|a| !a.is_empty());
+        match src {
+            Some(url) if url.starts_with("https://") => {
+                let label = alt.unwrap_or(url);
+                format!(r#"<a href="{url}" rel="noopener noreferrer" target="_blank">{label}</a>"#)
+            }
+            _ => alt.unwrap_or("").to_owned(),
+        }
+    })
+    .into_owned()
+}
+
 pub fn render_markdown(source: &str) -> String {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_TASKLISTS
@@ -341,9 +372,11 @@ fn main() { let x = 1; }
         let html = render_markdown(
             "![x](https://example.com/a.png)\n![y](/local.png)\n![z](http://track.example/x.gif)",
         );
-        assert!(html.contains("https://example.com/a.png"));
         assert!(!html.contains("/local.png"));
         assert!(!html.contains("http://track.example"));
+        let chat = chat_images_as_links(&html);
+        assert!(chat.contains("href=\"https://example.com/a.png\""));
+        assert!(!chat.contains("<img"));
     }
 
     #[test]

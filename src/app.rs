@@ -1208,8 +1208,8 @@ pub struct App {
     pub(crate) switch_ready: Option<PathBuf>,
     /// Next user/agent turn policy from dashboard `mode` or headless `mode` (cleared on send).
     pending_turn_policy: Option<TurnPolicy>,
-    /// Cached assistant `content_html` keyed by `message_id:content_hash`.
-    chat_markdown_cache: HashMap<String, String>,
+    /// Cached assistant HTML keyed by transcript message id (`conversation:index`).
+    chat_markdown_cache: HashMap<String, (u64, String)>,
 }
 
 impl App {
@@ -1952,12 +1952,15 @@ impl App {
             };
             let content_html = if role == "agent" && !content.is_empty() {
                 let id = format!("{conversation_id}:{index}");
-                let cache_key = dmuxai::web::chat_markdown::cache_key(&id, &content);
-                if let Some(cached) = self.chat_markdown_cache.get(&cache_key) {
-                    Some(cached.clone())
+                let fingerprint = dmuxai::web::chat_markdown::content_fingerprint(&content);
+                if let Some((cached_fp, html)) = self.chat_markdown_cache.get(&id)
+                    && *cached_fp == fingerprint
+                {
+                    Some(html.clone())
                 } else {
                     let html = dmuxai::web::chat_markdown::render_chat_markdown(&content);
-                    self.chat_markdown_cache.insert(cache_key, html.clone());
+                    self.chat_markdown_cache
+                        .insert(id, (fingerprint, html.clone()));
                     Some(html)
                 }
             } else {
@@ -1971,6 +1974,10 @@ impl App {
                 content_html,
                 streaming: streaming.contains(&index),
             });
+        }
+        if self.chat_markdown_cache.len() > 256 {
+            let live: HashSet<String> = messages.iter().map(|m| m.id.clone()).collect();
+            self.chat_markdown_cache.retain(|id, _| live.contains(id));
         }
         let (transcript, omitted) = cap_session_transcript(messages);
 
@@ -1995,6 +2002,10 @@ impl App {
                             catalog
                                 .models
                                 .iter()
+                                .filter(|model| {
+                                    dmuxai::model_policy::validate_model_for_runner(&id, &model.id)
+                                        .is_ok()
+                                })
                                 .map(|model| SessionModel {
                                     id: model.id.clone(),
                                     label: model.label.clone(),
@@ -3482,6 +3493,10 @@ impl App {
         let _ = self.try_submit_to_agent(agent, prompt, restore_input_on_failure, true);
     }
 
+    fn clear_pending_turn_policy(&mut self) {
+        self.pending_turn_policy = None;
+    }
+
     fn try_submit_to_agent(
         &mut self,
         agent: Agent,
@@ -3496,10 +3511,12 @@ impl App {
             self.push_system(format!(
                 "{agent} is busy; cancel the active turn before sending another prompt."
             ));
+            self.clear_pending_turn_policy();
             return Err(RunTodoError::Busy(format!("{agent} is busy")));
         }
 
         if !allow_defer && self.pending_summary.is_some() {
+            self.clear_pending_turn_policy();
             return Err(RunTodoError::Busy(
                 "conversation summary is in progress".to_owned(),
             ));
@@ -3515,6 +3532,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|p| p.deferred.is_some()))
         {
+            self.clear_pending_turn_policy();
             return Err(RunTodoError::Busy(
                 "a deferred prompt is pending".to_owned(),
             ));
@@ -3592,6 +3610,7 @@ impl App {
                 } else {
                     self.start_summary(job, None, None);
                 }
+                self.clear_pending_turn_policy();
                 return Err(RunTodoError::Busy(format!(
                     "{agent} requires conversation summary"
                 )));
@@ -3601,6 +3620,7 @@ impl App {
                     self.input = prompt;
                 }
                 self.push_system(format!("Could not start {agent} turn: {error}"));
+                self.clear_pending_turn_policy();
                 return Err(RunTodoError::Internal(format!(
                     "Could not start {agent} turn: {error}"
                 )));
@@ -3617,9 +3637,10 @@ impl App {
             if restore_input_on_failure {
                 self.input = prompt;
             }
+            self.clear_pending_turn_policy();
             return Err(RunTodoError::Internal(message.to_owned()));
         }
-        let policy = self.pending_turn_policy.take().unwrap_or(TurnPolicy::Agent);
+        let policy = self.pending_turn_policy.unwrap_or(TurnPolicy::Agent);
         let require_file_edits = self.graph_node_expects_file_edits(agent);
         let mut adapter_request = adapter_request(request, image_paths, policy, require_file_edits);
         let injected_memory = self.inject_memory(agent, &mut adapter_request);
@@ -3675,9 +3696,13 @@ impl App {
                 self.agent_lifecycle
                     .insert(agent, AgentLifecycleState::default());
                 self.emit_agent_lifecycle(agent, "pending", None);
+                if !is_graph {
+                    self.clear_pending_turn_policy();
+                }
                 Ok(stored_turn_id)
             }
             Err(error) => {
+                self.clear_pending_turn_policy();
                 let failed = TurnOutput {
                     conversation_id: stored_conversation_id,
                     turn_id: stored_turn_id,
@@ -3893,6 +3918,8 @@ impl App {
         self.conversation_id = snapshot.id;
         self.conversation_title = snapshot.title;
         self.session_conversations = None;
+        self.chat_markdown_cache.clear();
+        self.clear_pending_turn_policy();
         for adapter in &self.adapters {
             let _ = adapter.reset();
         }
@@ -8958,6 +8985,7 @@ impl App {
                     self.graph_session = None;
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
+                    self.clear_pending_turn_policy();
                     if let Some((_plan_id, todo_id)) = self.graph_todo.take()
                         && let Some(store) = self.todo_store.clone()
                     {
@@ -8999,6 +9027,7 @@ impl App {
                     self.graph_session = None;
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
+                    self.clear_pending_turn_policy();
                     if let Some((_plan_id, todo_id)) = self.graph_todo.take()
                         && let Some(store) = self.todo_store.clone()
                     {
@@ -9023,6 +9052,11 @@ impl App {
     }
 
     fn graph_node_expects_file_edits(&self, agent: Agent) -> bool {
+        // Direct/auto 1-node runs use an Implement node but must not trigger AGY's
+        // plan-only forced-edit retry (FR-937 quiet graph).
+        if self.quiet_graph_run {
+            return false;
+        }
         let Some(node_id) = self.graph_agent_nodes.get(&agent) else {
             return false;
         };
@@ -13945,6 +13979,42 @@ mod tests {
             })
             .map(|(_, request)| request.clone())
             .collect()
+    }
+
+    // FR-937 / quiet graph: direct/auto 1-node runs must not enable AGY edit retries.
+    #[test]
+    fn direct_one_node_run_does_not_require_file_edits() {
+        let (mut app, sent) = test_app();
+        app.selected = adapter_index(Agent::Agy);
+        app.submit_direct_run(
+            "What does PLAN.md propose? Don't modify anything.".into(),
+            Agent::Agy,
+            OverrideKind::Direct,
+        );
+        assert!(app.quiet_graph_run);
+        assert!(!app.graph_node_expects_file_edits(Agent::Agy));
+        let graph = graph_node_requests(&sent);
+        assert_eq!(graph.len(), 1);
+        assert!(!graph[0].require_file_edits);
+    }
+
+    #[test]
+    fn pending_turn_policy_survives_first_graph_send_and_clears_on_busy() {
+        let (mut app, sent) = test_app();
+        app.pending_turn_policy = Some(TurnPolicy::ReadOnly);
+        app.selected = adapter_index(Agent::Codex);
+        app.submit_direct_run("question".into(), Agent::Codex, OverrideKind::Direct);
+        assert_eq!(
+            app.pending_turn_policy,
+            Some(TurnPolicy::ReadOnly),
+            "policy applies to the whole quiet graph run"
+        );
+        assert_eq!(graph_node_requests(&sent)[0].policy, TurnPolicy::ReadOnly);
+
+        app.busy_agents.insert(Agent::Agy);
+        let err = app.try_submit_to_agent(Agent::Agy, "next".into(), false, true);
+        assert!(err.is_err());
+        assert!(app.pending_turn_policy.is_none());
     }
 
     fn complete_replan_keep(h: &mut PlanGateHarness) {
@@ -20542,8 +20612,8 @@ mod tests {
     fn codex_catalog() -> ModelCatalog {
         ModelCatalog {
             models: vec![ModelInfo {
-                id: "m1".to_owned(),
-                label: "Model One".to_owned(),
+                id: dmuxai::model_policy::ALLOWED_MODEL.to_owned(),
+                label: "Allowed".to_owned(),
                 efforts: vec!["low".to_owned(), "high".to_owned()],
                 default_effort: Some("low".to_owned()),
             }],
@@ -20769,14 +20839,15 @@ mod tests {
         ));
 
         app.model_catalogs.insert(Agent::Codex, codex_catalog());
+        let allowed = dmuxai::model_policy::ALLOWED_MODEL;
         let session = app
             .handle_session_command(SessionCommand::SelectModel {
                 agent: Some("codex".to_owned()),
-                model: "m1".to_owned(),
+                model: allowed.to_owned(),
             })
             .unwrap();
         let codex = session.agents.iter().find(|a| a.id == "codex").unwrap();
-        assert_eq!(codex.model.as_deref(), Some("m1"));
+        assert_eq!(codex.model.as_deref(), Some(allowed));
         assert_eq!(codex.effort.as_deref(), Some("low"));
         assert_eq!(codex.models[0].efforts, vec!["low", "high"]);
         assert!(matches!(
@@ -20813,7 +20884,7 @@ mod tests {
         for command in [
             SessionCommand::SelectModel {
                 agent: Some("codex".to_owned()),
-                model: "m1".to_owned(),
+                model: allowed.to_owned(),
             },
             SessionCommand::SetEffort {
                 agent: Some("codex".to_owned()),
@@ -20869,9 +20940,10 @@ mod tests {
     fn dashboard_commands_cover_models_share_and_policy() {
         let (mut app, sent, _hub) = web_app();
         app.model_catalogs.insert(Agent::Codex, codex_catalog());
+        let allowed = dmuxai::model_policy::ALLOWED_MODEL;
         app.handle_session_command(SessionCommand::SelectModel {
             agent: Some("codex".to_owned()),
-            model: "m1".to_owned(),
+            model: allowed.to_owned(),
         })
         .unwrap();
         let session = app

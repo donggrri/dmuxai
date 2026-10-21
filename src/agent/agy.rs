@@ -416,7 +416,7 @@ async fn run_turn(
         let user_prompt = if strict {
             agy_implement_retry_prompt(&base_prompt)
         } else {
-            agy_prompt(policy, &base_prompt)
+            agy_prompt(policy, &base_prompt, request.require_file_edits)
         };
 
         let outcome = run_single_agy_process(
@@ -543,12 +543,13 @@ async fn emit_terminal_event(
     send_event(event_tx, Some(context), event).await;
 }
 
-fn agy_prompt(policy: TurnPolicy, prompt: &str) -> String {
+fn agy_prompt(policy: TurnPolicy, prompt: &str, require_file_edits: bool) -> String {
     match policy {
         TurnPolicy::ReadOnly => prompt.to_owned(),
-        TurnPolicy::Agent => format!(
+        TurnPolicy::Agent if require_file_edits => format!(
             "Apply edits directly to files in the workspace. Do not produce plans, plan artifacts, or ask for review before editing. Run every command in the foreground with a bounded timeout. Do not start background or detached processes.\n\n{prompt}"
         ),
+        TurnPolicy::Agent => prompt.to_owned(),
     }
 }
 
@@ -1028,7 +1029,7 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "--image"));
         let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
         assert_eq!(prompt, "describe @/tmp/shot.png @/tmp/other.png");
-        assert!(agy_prompt(TurnPolicy::ReadOnly, &prompt).ends_with(&prompt));
+        assert!(agy_prompt(TurnPolicy::ReadOnly, &prompt, false).ends_with(&prompt));
     }
 
     #[test]
@@ -1045,7 +1046,7 @@ mod tests {
 
         let read_only = args_for(TurnPolicy::ReadOnly);
         assert!(read_only.windows(2).any(|args| args == ["--mode", "plan"]));
-        assert_eq!(agy_prompt(TurnPolicy::ReadOnly, "hello"), "hello");
+        assert_eq!(agy_prompt(TurnPolicy::ReadOnly, "hello", false), "hello");
         let implement = args_for(TurnPolicy::Agent);
         assert!(
             implement
@@ -1053,7 +1054,8 @@ mod tests {
                 .any(|args| args == ["--mode", "accept-edits"])
         );
         assert!(implement.iter().any(|arg| arg == "--sandbox"));
-        assert!(agy_prompt(TurnPolicy::Agent, "hello").ends_with("\n\nhello"));
+        assert!(agy_prompt(TurnPolicy::Agent, "hello", true).ends_with("\n\nhello"));
+        assert_eq!(agy_prompt(TurnPolicy::Agent, "hello", false), "hello");
     }
 
     #[test]
@@ -1266,7 +1268,7 @@ mod tests {
         // FR-443 / TC-443, FR-502 / TC-502: Implement mode must apply edits,
         // keep commands in the foreground with a bounded timeout, and avoid
         // background or detached processes; Ask/Plan stay untouched.
-        let wrapped = agy_prompt(TurnPolicy::Agent, "build the thing");
+        let wrapped = agy_prompt(TurnPolicy::Agent, "build the thing", true);
         assert!(
             wrapped.starts_with("Apply edits directly"),
             "unexpected Implement prompt: {wrapped}"
@@ -1280,8 +1282,8 @@ mod tests {
             "unexpected Implement prompt: {wrapped}"
         );
         assert!(wrapped.ends_with("\n\nbuild the thing"));
-        assert!(!agy_prompt(TurnPolicy::ReadOnly, "hi").contains("background"));
-        assert!(!agy_prompt(TurnPolicy::ReadOnly, "hi").contains("background"));
+        assert!(!agy_prompt(TurnPolicy::ReadOnly, "hi", false).contains("background"));
+        assert!(!agy_prompt(TurnPolicy::Agent, "hi", false).contains("background"));
     }
 
     #[test]

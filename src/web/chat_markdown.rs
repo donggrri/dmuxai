@@ -2,32 +2,31 @@
 
 use std::hash::{Hash, Hasher};
 
-/// Cache key for rendered assistant HTML (`message_id` + content hash).
-pub fn cache_key(message_id: &str, content: &str) -> String {
+/// Stable fingerprint of assistant message text for HTML cache invalidation.
+pub fn content_fingerprint(content: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     content.hash(&mut hasher);
-    format!("{message_id}:{:016x}", hasher.finish())
+    hasher.finish()
 }
 
 /// Renders assistant chat Markdown to sanitized HTML (GFM, external links hardened).
 pub fn render_chat_markdown(source: &str) -> String {
-    crate::docs::markdown::render_markdown(source)
+    let html = crate::docs::markdown::render_markdown(source);
+    crate::docs::markdown::chat_images_as_links(&html)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_key, render_chat_markdown};
+    use super::{content_fingerprint, render_chat_markdown};
 
-    // TC-1401 / FR-1401: chat markdown renders common GFM and strips scripts.
     #[test]
-    fn cache_key_changes_when_content_changes() {
-        let a = cache_key("m1", "hello");
-        let b = cache_key("m1", "hello");
-        let c = cache_key("m1", "hello!");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
+    fn content_fingerprint_changes_when_content_changes() {
+        let a = content_fingerprint("hello");
+        let b = content_fingerprint("hello!");
+        assert_ne!(a, b);
     }
 
+    // TC-1401 / FR-1401: chat markdown renders common GFM and strips scripts.
     #[test]
     fn tc_1401_chat_markdown_renders_gfm_and_sanitizes() {
         let source = r"## Summary

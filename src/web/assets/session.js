@@ -849,10 +849,28 @@
     return run.state || '';
   }
 
+  function hubRunningAgent() {
+    var hub = window.__dmuxHubAgents || [];
+    for (var i = 0; i < hub.length; i++) {
+      var a = hub[i];
+      if (a && (a.busy || (a.run && a.run.state === 'running'))) { return a; }
+    }
+    return null;
+  }
+
   function updateAgentPickerLabel() {
     if (!ui.agentPicker) { return; }
     var agent = selectedAgent();
-    var running = !!(agent && (agent.busy || (agent.run && agent.run.state === 'running')));
+    var running = false;
+    if (agent) {
+      running = !!(agent.busy || (agent.run && agent.run.state === 'running'));
+    } else {
+      var hubRun = hubRunningAgent();
+      if (hubRun) {
+        agent = hubRun;
+        running = true;
+      }
+    }
     ui.agentPicker.classList.toggle('session-agent-picker-running', running);
     if (!agent) {
       ui.agentPicker.textContent = 'Agent';
@@ -960,6 +978,7 @@
     if (!agentPopover || !session) { return; }
     var panel = agentPopover.querySelector('.session-agent-popover');
     if (!panel) { return; }
+    var hadFocus = document.activeElement && panel.contains(document.activeElement);
     var list = buildAgentPopoverList();
     var old = panel.querySelector('.session-agent-list');
     if (old) {
@@ -967,6 +986,7 @@
     } else {
       panel.appendChild(list);
     }
+    if (hadFocus) { panel.focus(); }
   }
 
   function openAgentPopover() {
@@ -1668,6 +1688,7 @@
     if (snap.workspace) {
       initSessionsSidebarForWorkspace(snap.workspace);
     }
+    window.__dmuxHubAgents = snap.agents || [];
     var colors = {};
     (snap.agents || []).forEach(function (a) { if (a.color) { colors[a.id] = a.color; } });
     window.__dmuxSessionAgents = colors;
@@ -1706,6 +1727,10 @@
   // Plan-gate approval buttons are rendered in app.js via parityButton (parity ids).
   window.dmuxaiSession = {
     parityButton: button,
-    updateAgentRunIndicators: function () { updateAgentPickerLabel(); if (agentPopover) { syncAgentPopover(); } },
+    updateAgentRunIndicators: function (hubAgents) {
+      if (hubAgents) { window.__dmuxHubAgents = hubAgents; }
+      updateAgentPickerLabel();
+      if (agentPopover) { syncAgentPopover(); }
+    },
   };
 })();
