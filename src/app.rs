@@ -254,6 +254,36 @@ enum Role {
     Activity(dmuxai::activity::ActivityItem),
 }
 
+/// A dashboard prompt that has no user message of its own in the transcript
+/// (yet). The session view shows it in place, so the browser's optimistic copy
+/// can be replaced by a server copy for every route: a direct step posts the
+/// prompt itself later (then this record goes away), while a plan run's steps
+/// post their own prompts (then this record stays, marked `ran`). A prompt
+/// whose work ends without anything running is dropped, so a later refusal
+/// leaves no ghost message.
+#[derive(Debug, Clone)]
+struct DashboardPrompt {
+    id: u64,
+    conversation_id: String,
+    /// Transcript position the prompt is shown at (messages.len() on accept).
+    anchor: usize,
+    text: String,
+    images: Vec<String>,
+    /// A turn of the prompt's run posted a different user message (a plan
+    /// step), so the prompt stays visible after the run.
+    ran: bool,
+}
+
+/// Cap on dashboard prompt records kept for display.
+const DASHBOARD_PROMPTS_MAX: usize = 64;
+
+/// Whether a transcript user message is the server copy of a dashboard prompt.
+fn dashboard_prompt_matches(prompt: &str, content: &str) -> bool {
+    let prompt = prompt.trim();
+    let content = content.trim();
+    content == prompt || (prompt.starts_with("//") && content == &prompt[1..])
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Message {
     role: Role,
@@ -1088,6 +1118,14 @@ pub struct App {
     /// runner refused as busy; the retry reuses it instead of appending the
     /// same prompt again.
     busy_retry_user_message: HashMap<Agent, usize>,
+    /// Transcript index of the user message each agent's latest turn pushed
+    /// (or reused). A busy refusal of that turn marks exactly this message for
+    /// reuse, even when parallel steps on other runners pushed theirs after it.
+    turn_user_message: HashMap<Agent, usize>,
+    /// See [`DashboardPrompt`].
+    dashboard_prompts: Vec<DashboardPrompt>,
+    /// Last id handed to a dashboard prompt (`PromptAccepted::prompt_id`).
+    dashboard_prompt_seq: u64,
     #[allow(dead_code)]
     settings: DmuxSettings,
     input: String,
@@ -1337,6 +1375,9 @@ impl App {
             settings,
             pending_images: ImageAttachmentStore::new(),
             busy_retry_user_message: HashMap::new(),
+            turn_user_message: HashMap::new(),
+            dashboard_prompts: Vec::new(),
+            dashboard_prompt_seq: 0,
             input: String::new(),
             messages: Vec::new(),
             adapters,
@@ -1784,6 +1825,8 @@ impl App {
                 "workspace switch in progress".to_owned(),
             ));
         }
+        let display_text = text.clone();
+        let display_is_slash = display_text.starts_with('/') && !display_text.starts_with("//");
         let text = Self::preprocess_dashboard_prompt_text(&text, route.as_deref())?;
         if self.plan_gate_blocks_send() && Self::prompt_blocked_by_plan_gate(&text) {
             return Err(RunTodoError::Busy(PLAN_AWAITING_APPROVAL_MSG.to_owned()));
@@ -1844,6 +1887,10 @@ impl App {
                 missing.display()
             )));
         }
+        let image_names: Vec<String> = images
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .collect();
         let before = self.pending_images.len();
         for path in images {
             if let Err(error) = self.pending_images.ingest_saved_file(path) {
@@ -1855,14 +1902,102 @@ impl App {
                 )));
             }
         }
+        let messages_before = self.messages.len();
         let tui_draft = mem::replace(&mut self.input, text);
         self.submit_prompt();
         self.input = tui_draft;
 
+        let (prompt_id, message_id) = if display_is_slash {
+            (None, None)
+        } else {
+            self.record_dashboard_prompt(messages_before, display_text, image_names)
+        };
         Ok(PromptAccepted {
             conversation_id: self.conversation_id.as_str().to_owned(),
             agent: runner_id.to_owned(),
+            prompt_id,
+            message_id,
         })
+    }
+
+    /// After a dashboard prompt was submitted: hand it an id and either point
+    /// at the user message it already posted, or keep a [`DashboardPrompt`]
+    /// while its run (judge, plan, approval, graph) is in progress. A prompt
+    /// refused on the spot gets neither, and the browser drops its copy.
+    fn record_dashboard_prompt(
+        &mut self,
+        messages_before: usize,
+        text: String,
+        images: Vec<String>,
+    ) -> (Option<u64>, Option<String>) {
+        self.dashboard_prompt_seq += 1;
+        let id = self.dashboard_prompt_seq;
+        let conversation_id = self.conversation_id.as_str().to_owned();
+        let posted = self
+            .messages
+            .iter()
+            .enumerate()
+            .skip(messages_before)
+            .find(|(_, message)| {
+                message.role == Role::User
+                    && !message.local_only
+                    && dashboard_prompt_matches(&text, &message.content)
+            })
+            .map(|(index, _)| index);
+        if let Some(index) = posted {
+            return (Some(id), Some(format!("{conversation_id}:{index}")));
+        }
+        if self.dashboard_prompt_work_in_progress() {
+            self.dashboard_prompts.push(DashboardPrompt {
+                id,
+                conversation_id,
+                anchor: messages_before.min(self.messages.len()),
+                text,
+                images,
+                ran: false,
+            });
+            if self.dashboard_prompts.len() > DASHBOARD_PROMPTS_MAX {
+                self.dashboard_prompts.remove(0);
+            }
+        }
+        (Some(id), None)
+    }
+
+    /// Whether a prompt's run may still post its user message (or is a plan
+    /// waiting for approval).
+    fn dashboard_prompt_work_in_progress(&self) -> bool {
+        self.pending_triage.is_some()
+            || self.pending_plan.is_some()
+            || self.pending_summary.is_some()
+            || self.graph_session.is_some()
+            || !self.deferred_turns.is_empty()
+            || !self.busy_agents.is_empty()
+            || self
+                .last_graph_run
+                .as_ref()
+                .is_some_and(|run| run.phase == GraphRunPhase::AwaitingApproval)
+    }
+
+    /// A user message was posted at `index`: it replaces the matching
+    /// dashboard prompt record, or marks the pending ones as having run.
+    fn note_user_message_posted(&mut self, index: usize) {
+        let Some(content) = self.messages.get(index).map(|m| m.content.clone()) else {
+            return;
+        };
+        let conversation_id = self.conversation_id.as_str();
+        if let Some(pos) = self.dashboard_prompts.iter().position(|prompt| {
+            !prompt.ran
+                && prompt.conversation_id == conversation_id
+                && dashboard_prompt_matches(&prompt.text, &content)
+        }) {
+            self.dashboard_prompts.remove(pos);
+            return;
+        }
+        for prompt in &mut self.dashboard_prompts {
+            if prompt.conversation_id == conversation_id {
+                prompt.ran = true;
+            }
+        }
     }
 
     /// Whether `[graph] allowed_runners` permits a runner (unset = every runner).
@@ -1964,6 +2099,30 @@ impl App {
             .map(|(_, _, list)| list.clone())
             .unwrap_or_default();
 
+        if !self.dashboard_prompt_work_in_progress() {
+            // Nothing can post these prompts any more: drop the ones that ran
+            // nothing (refused later), keep plan prompts whose steps ran.
+            self.dashboard_prompts.retain(|prompt| prompt.ran);
+        }
+        let mut shown_prompts: VecDeque<DashboardPrompt> = self
+            .dashboard_prompts
+            .iter()
+            .filter(|prompt| prompt.conversation_id == conversation_id)
+            .cloned()
+            .collect();
+        shown_prompts
+            .make_contiguous()
+            .sort_by_key(|prompt| (prompt.anchor, prompt.id));
+        let prompt_message = |prompt: DashboardPrompt| SessionMessage {
+            id: format!("{conversation_id}:prompt-{}", prompt.id),
+            role: "user".to_owned(),
+            agent: None,
+            content: prompt.text,
+            content_html: None,
+            streaming: false,
+            images: prompt.images,
+            prompt_id: Some(prompt.id),
+        };
         let streaming: HashSet<usize> = self.streaming_messages.values().copied().collect();
         let start = self
             .messages
@@ -1971,10 +2130,16 @@ impl App {
             .saturating_sub(dmuxai::web::SESSION_TRANSCRIPT_MAX_MESSAGES);
         let mut messages = Vec::new();
         for (offset, message) in self.messages[start..].iter().enumerate() {
+            let index = start + offset;
+            while shown_prompts
+                .front()
+                .is_some_and(|prompt| prompt.anchor <= index)
+            {
+                messages.push(prompt_message(shown_prompts.pop_front().unwrap()));
+            }
             if message.local_only {
                 continue;
             }
-            let index = start + offset;
             let images = match &message.role {
                 Role::User => message.images.clone(),
                 _ => Vec::new(),
@@ -2013,8 +2178,10 @@ impl App {
                 content_html,
                 streaming: streaming.contains(&index),
                 images,
+                prompt_id: None,
             });
         }
+        messages.extend(shown_prompts.into_iter().map(prompt_message));
         if self.chat_markdown_cache.len() > 256 {
             let live: HashSet<String> = messages.iter().map(|m| m.id.clone()).collect();
             self.chat_markdown_cache.retain(|id, _| live.contains(id));
@@ -2083,6 +2250,7 @@ impl App {
             agents,
             transcript,
             transcript_omitted: start + omitted,
+            prompt_seq: self.dashboard_prompt_seq,
             workspaces: {
                 let mut groups = Vec::with_capacity(self.session_workspaces.len() + 1);
                 let key = self.engine.workspace_key().to_owned();
@@ -3715,10 +3883,18 @@ impl App {
                 matches!(message.role, Role::User) && message.content == user_message.content
             })
         });
-        match reuse {
-            Some(index) => self.messages[index].images = user_message.images,
-            None => self.messages.push(user_message),
-        }
+        let user_index = match reuse {
+            Some(index) => {
+                self.messages[index].images = user_message.images;
+                index
+            }
+            None => {
+                self.messages.push(user_message);
+                self.messages.len() - 1
+            }
+        };
+        self.turn_user_message.insert(agent, user_index);
+        self.note_user_message_posted(user_index);
         match send_result {
             Ok(()) => {
                 if let Some(hash) = injected_memory {
@@ -3999,6 +4175,8 @@ impl App {
         self.graph_agent_nodes.clear();
         self.clear_graph_defer_state();
         self.messages.clear();
+        self.turn_user_message.clear();
+        self.dashboard_prompts.clear();
         self.streaming_messages.clear();
         self.last_group_expanded = false;
         self.all_details_expanded = false;
@@ -8602,9 +8780,7 @@ impl App {
                     catalog.loading = false;
                 }
                 self.finish_turn_outcome_with_error(agent, false, Some(error.clone()));
-                if is_adapter_turn_busy_rejection(&error)
-                    && self.busy_retry_user_message.contains_key(&agent)
-                {
+                if is_adapter_turn_busy_rejection(&error) && self.busy_retry_pending(agent) {
                     // The step is retried automatically; keep this out of the
                     // dashboard and the agent context (TUI-only notice).
                     self.messages.push(Message::local_only(
@@ -8822,11 +8998,9 @@ impl App {
                 && let Some(assignment) = session.assignment_for_node(&node_id)
             {
                 self.defer_graph_node_start(agent, assignment);
-                if let Some(index) = self
-                    .messages
-                    .iter()
-                    .rposition(|message| matches!(message.role, Role::User))
-                {
+                // This agent's own turn message, not just the newest user
+                // message (a parallel step may have pushed one since).
+                if let Some(index) = self.turn_user_message.get(&agent).copied() {
                     self.busy_retry_user_message.insert(agent, index);
                 }
                 return;
@@ -9072,6 +9246,7 @@ impl App {
                         self.end_run_state(agent, true, false);
                     }
                     self.graph_session = None;
+                    self.busy_retry_user_message.clear();
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
                     self.clear_pending_turn_policy();
@@ -9114,6 +9289,7 @@ impl App {
                         self.tool_messages.remove(&agent);
                     }
                     self.graph_session = None;
+                    self.busy_retry_user_message.clear();
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
                     self.clear_pending_turn_policy();
@@ -9181,6 +9357,19 @@ impl App {
         self.graph_deferred_starts.clear();
         self.graph_defer_retry_after.clear();
         self.graph_defer_since.clear();
+        // No step is retried any more; a later busy refusal is a real error.
+        self.busy_retry_user_message.clear();
+    }
+
+    /// Whether `agent` has a graph step queued for an automatic retry after a
+    /// busy refusal (the refusal is then only a TUI notice).
+    fn busy_retry_pending(&self, agent: Agent) -> bool {
+        self.graph_session.is_some()
+            && self.busy_retry_user_message.contains_key(&agent)
+            && self
+                .graph_deferred_starts
+                .get(&agent)
+                .is_some_and(|queue| !queue.is_empty())
     }
 
     fn remove_deferred_assignment_for_node(&mut self, node_id: &str) {
@@ -9351,6 +9540,7 @@ impl App {
                 }
                 self.graph_agent_nodes.remove(&agent);
                 self.graph_session = None;
+                self.busy_retry_user_message.clear();
                 self.graph_assignment_line.clear();
                 self.quiet_graph_run = false;
                 return Err(format!(
@@ -14621,6 +14811,125 @@ mod tests {
         assert_eq!(user_count(&app), users_before);
     }
 
+    fn busy_refusal(agent: Agent, request: &AgentRequest) -> AgentOutput {
+        AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(request.turn_id.as_str())),
+            event: AgentEvent::Error(format!(
+                "{agent} is already running a turn; cancel it before sending another prompt"
+            )),
+        }
+    }
+
+    fn parallel_cursor_codex_plan(id: &str) -> dmuxai::graph::GraphPlan {
+        let node = |id: &str, job: &str, runner: &str, model: &str| dmuxai::graph::GraphNode {
+            id: id.to_owned(),
+            role: NodeRole::Research,
+            job: job.to_owned(),
+            runner: runner.to_owned(),
+            model_id: model.to_owned(),
+            skill: None,
+            requires_gate: false,
+            status: dmuxai::graph::GraphNodeStatus::Pending,
+            attempt: 0,
+            task: None,
+            started_at_ms: None,
+            finished_at_ms: None,
+        };
+        dmuxai::graph::GraphPlan {
+            schema: "dmuxai.graph/v1".to_owned(),
+            id: id.to_owned(),
+            orchestrator_model: "composer-2.5".to_owned(),
+            user_prompt: "parallel".to_owned(),
+            nodes: vec![
+                node("step-a", "cursor job", "cursor", "composer-2.5"),
+                node("step-b", "codex job", "codex", "composer-2.5"),
+            ],
+            edges: Vec::new(),
+            limits: dmuxai::graph::GraphLimits {
+                max_parallel: 2,
+                max_retries: 2,
+                ..dmuxai::graph::GraphLimits::default()
+            },
+            tasks: Vec::new(),
+        }
+    }
+
+    // Review fix (#82): with parallel steps on two runners, a busy retry
+    // reuses the refused step's own user message, not the newest one (which
+    // belongs to the other runner's step).
+    #[test]
+    fn busy_retry_reuses_own_message_with_parallel_steps() {
+        let (mut app, sent, _tx) = test_app_with_event_sender();
+        app.selected = adapter_index(Agent::Cursor);
+        app.quiet_graph_run = false;
+        app.start_graph_run(parallel_cursor_codex_plan("dup-parallel"));
+        let requests = sent.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "both steps start in parallel");
+        let (cursor_agent, cursor_request) = requests
+            .iter()
+            .find(|(agent, _)| *agent == Agent::Cursor)
+            .cloned()
+            .expect("cursor step sent");
+        assert!(
+            requests.iter().any(|(agent, _)| *agent == Agent::Codex),
+            "codex step sent"
+        );
+        // The cursor step's message is not the newest user message.
+        let last_user = app
+            .messages
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, Role::User))
+            .unwrap();
+        assert_ne!(last_user.content, cursor_request.prompt);
+        let copies = |app: &App, prompt: &str| {
+            app.messages
+                .iter()
+                .filter(|message| matches!(message.role, Role::User) && message.content == prompt)
+                .count()
+        };
+        assert_eq!(copies(&app, &cursor_request.prompt), 1);
+
+        assert!(app.apply_agent_output(busy_refusal(cursor_agent, &cursor_request)));
+        assert!(app.tick());
+        let retried = sent.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(retried.0, Agent::Cursor, "cursor step retried");
+        assert_eq!(retried.1.prompt, cursor_request.prompt);
+        assert_eq!(
+            copies(&app, &cursor_request.prompt),
+            1,
+            "retry must reuse the cursor step's own message"
+        );
+    }
+
+    // Review fix (#82): a retry entry does not outlive its graph. After the
+    // run ends before the retry, a later busy refusal is a real chat error.
+    #[test]
+    fn busy_retry_entry_cleared_when_graph_ends() {
+        let (mut app, sent, _tx) = test_app_with_event_sender();
+        app.selected = adapter_index(Agent::Cursor);
+        app.quiet_graph_run = false;
+        app.start_graph_run(two_step_cursor_chain_plan("dup-stale", 2));
+        complete_sent_graph_turn(&mut app, &sent, 0);
+        let (agent, request) = sent.lock().unwrap()[1].clone();
+        assert!(app.apply_agent_output(busy_refusal(agent, &request)));
+        assert!(app.busy_retry_user_message.contains_key(&Agent::Cursor));
+
+        app.dispatch_graph_actions(vec![GraphAction::Failed("stopped".to_owned())]);
+        assert!(app.graph_session.is_none());
+        assert!(
+            app.busy_retry_user_message.is_empty(),
+            "graph end clears the retry entry"
+        );
+
+        // Nothing is waiting for a retry any more, so a later busy refusal
+        // on Cursor takes the chat-error path (see
+        // busy_refusal_not_retried_is_a_chat_error).
+        assert!(!app.busy_retry_pending(Agent::Cursor));
+    }
+
     // TC-1001 / FR-976: per-runner FIFO for deferred starts (no overwrite).
     #[test]
     fn deferred_starts_queue_per_runner() {
@@ -18558,6 +18867,39 @@ mod tests {
         assert!(!app.busy_agents.contains(&Agent::Agy));
         assert_eq!(app.messages.last().unwrap().role, Role::System);
         assert_eq!(app.messages.last().unwrap().content, "AGY turn cancelled.");
+    }
+
+    // Review fix (#82): a busy refusal that is NOT retried (no graph step is
+    // waiting for a retry, e.g. the step was not deferred) still reaches the
+    // user as a shared chat error, not a TUI-only "retrying" note.
+    #[test]
+    fn busy_refusal_not_retried_is_a_chat_error() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_allowed_runners = Some(Vec::new());
+        app.input = "first".to_owned();
+        app.submit_prompt();
+        let first = sent.lock().unwrap()[0].clone();
+        // The step is no longer tracked as a graph node (e.g. the run ended),
+        // so nothing will retry it.
+        app.graph_agent_nodes.remove(&first.0);
+        app.clear_graph_defer_state();
+        assert!(app.apply_agent_output(busy_refusal(first.0, &first.1)));
+        assert!(!app.busy_agents.contains(&first.0));
+        let last = app.messages.last().unwrap();
+        assert!(!last.local_only, "{}", last.content);
+        assert_eq!(
+            last.content,
+            format!(
+                "{} error: {} is already running a turn; cancel it before sending another prompt",
+                first.0, first.0
+            )
+        );
+        assert!(
+            app.graph_deferred_starts
+                .get(&first.0)
+                .is_none_or(|queue| queue.is_empty()),
+            "not queued for a retry"
+        );
     }
 
     #[test]
@@ -25615,6 +25957,146 @@ mod tests {
         assert_eq!(no_model.app.input, "fix");
         assert!(last_system(&no_model.app).contains("fast models"));
         assert!(no_model.app.last_graph_run.is_none());
+    }
+
+    fn session_user_lines(app: &mut App) -> Vec<(String, Option<u64>)> {
+        app.session_view()
+            .transcript
+            .into_iter()
+            .filter(|message| message.role == "user")
+            .map(|message| (message.content, message.prompt_id))
+            .collect()
+    }
+
+    // Review fix (#82): a dashboard prompt that goes to a plan has no user
+    // message of its own. The session view shows it once while the judge,
+    // the planner and the approval run, and keeps it after the plan's steps
+    // posted their own prompts (no timeout, no duplicate).
+    #[test]
+    fn dashboard_plan_prompt_is_shown_once_through_approval() {
+        let mut h = plan_gate_test_app();
+        let accepted = h
+            .app
+            .handle_dashboard_submit_prompt(
+                "build a multi-step feature".to_owned(),
+                Some("codex".to_owned()),
+                None,
+                None,
+                Vec::new(),
+            )
+            .expect("accepted");
+        let prompt_id = accepted.prompt_id.expect("prompt id");
+        assert_eq!(accepted.message_id, None, "the judge runs first");
+        let view = h.app.session_view();
+        assert_eq!(view.prompt_seq, prompt_id);
+        let typed = |lines: &[(String, Option<u64>)]| {
+            lines
+                .iter()
+                .filter(|(content, _)| content == "build a multi-step feature")
+                .count()
+        };
+        let lines = session_user_lines(&mut h.app);
+        assert_eq!(typed(&lines), 1, "{lines:?}");
+        assert!(lines.iter().any(|(_, id)| *id == Some(prompt_id)));
+
+        let judge = h.sent.lock().unwrap()[0].1.clone();
+        for event in [
+            AgentEvent::TextDelta(
+                "{\"route\":\"complex\",\"reason\":\"needs several steps\"}".to_owned(),
+            ),
+            AgentEvent::Completed,
+        ] {
+            assert!(
+                h.app
+                    .apply_agent_output(triage_output(Agent::Codex, &judge, event))
+            );
+        }
+        let plan_req = h.sent.lock().unwrap()[1].1.clone();
+        for event in [
+            AgentEvent::TextDelta(three_step_codex_plan_json().to_owned()),
+            AgentEvent::Completed,
+        ] {
+            assert!(
+                h.app
+                    .apply_agent_output(triage_output(Agent::Codex, &plan_req, event))
+            );
+        }
+        assert_eq!(
+            h.app.last_graph_run.as_ref().map(|run| run.phase),
+            Some(GraphRunPhase::AwaitingApproval)
+        );
+        let lines = session_user_lines(&mut h.app);
+        assert_eq!(typed(&lines), 1, "waiting for approval: {lines:?}");
+
+        let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        h.app
+            .decide_plan(PlanDecisionKind::Approve, plan_id, 1, DecisionBy::Tui)
+            .unwrap();
+        let step1 = last_graph_node_request_index(&h.sent);
+        complete_sent_graph_turn(&mut h.app, &h.sent, step1);
+        let lines = session_user_lines(&mut h.app);
+        assert_eq!(typed(&lines), 1, "steps running: {lines:?}");
+        assert!(lines.len() >= 2, "step prompts are shown too: {lines:?}");
+        // The prompt stays in place (before the step prompts) for good.
+        assert_eq!(lines[0].0, "build a multi-step feature");
+    }
+
+    // Review fix (#82): a direct prompt posts its own user message at once;
+    // the reply names it and no pending copy is kept.
+    #[test]
+    fn dashboard_direct_prompt_names_its_message() {
+        let mut h = plan_gate_test_app();
+        let accepted = h
+            .app
+            .handle_dashboard_submit_prompt(
+                "fix the typo".to_owned(),
+                Some("codex".to_owned()),
+                None,
+                Some("direct".to_owned()),
+                Vec::new(),
+            )
+            .expect("accepted");
+        let message_id = accepted.message_id.expect("posted at once");
+        let view = h.app.session_view();
+        assert_eq!(view.prompt_seq, accepted.prompt_id.unwrap());
+        let users: Vec<_> = view
+            .transcript
+            .iter()
+            .filter(|message| message.role == "user")
+            .collect();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].id, message_id);
+        assert_eq!(users[0].content, "fix the typo");
+        assert_eq!(users[0].prompt_id, None);
+    }
+
+    // Review fix (#82): accepted, then the judge fails and nothing runs: the
+    // pending copy goes away (no ghost) once nothing is in progress.
+    #[test]
+    fn dashboard_prompt_refused_later_leaves_no_copy() {
+        let mut h = plan_gate_test_app();
+        let accepted = h
+            .app
+            .handle_dashboard_submit_prompt(
+                "hello there".to_owned(),
+                Some("codex".to_owned()),
+                None,
+                None,
+                Vec::new(),
+            )
+            .expect("accepted");
+        assert!(accepted.prompt_id.is_some());
+        assert_eq!(session_user_lines(&mut h.app).len(), 1);
+        let judge = h.sent.lock().unwrap()[0].1.clone();
+        // Cancel the judge: the prompt goes back to the input, nothing runs.
+        h.app.cancel_selected();
+        let _ =
+            h.app
+                .apply_agent_output(triage_output(Agent::Codex, &judge, AgentEvent::Cancelled));
+        assert!(!h.app.dashboard_prompt_work_in_progress());
+        let lines = session_user_lines(&mut h.app);
+        assert!(lines.is_empty(), "no ghost prompt: {lines:?}");
+        assert_eq!(h.app.session_view().prompt_seq, accepted.prompt_id.unwrap());
     }
 
     fn start_approved_three_step_run(h: &mut PlanGateHarness) -> String {

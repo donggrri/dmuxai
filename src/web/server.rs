@@ -1029,6 +1029,8 @@ async fn post_prompt(
             "accepted": true,
             "conversation_id": result.conversation_id,
             "agent": result.agent,
+            "prompt_id": result.prompt_id,
+            "message_id": result.message_id,
         }),
     )
 }
@@ -3450,6 +3452,8 @@ mod tests {
         let accepted = PromptAccepted {
             conversation_id: "conv-1".to_string(),
             agent: "codex".to_string(),
+            prompt_id: None,
+            message_id: None,
         };
         let router = build_router_with(
             test_hub(),
@@ -3665,6 +3669,8 @@ mod tests {
         let accepted = PromptAccepted {
             conversation_id: "conv-route".to_string(),
             agent: "codex".to_string(),
+            prompt_id: None,
+            message_id: None,
         };
         let (tx, mut rx) = mpsc::channel(16);
         tokio::spawn(async move {
@@ -5019,6 +5025,8 @@ mod tests {
                             let _ = reply.send(Ok(crate::web::commands::PromptAccepted {
                                 agent: "codex".to_owned(),
                                 conversation_id: "c1".to_owned(),
+                                prompt_id: None,
+                                message_id: None,
                             }));
                         }
                     }
@@ -5243,6 +5251,8 @@ mod tests {
         let accepted = crate::web::commands::PromptAccepted {
             conversation_id: "conv-route".to_string(),
             agent: "codex".to_string(),
+            prompt_id: None,
+            message_id: None,
         };
         let (tx, mut rx) = mpsc::channel(16);
         tokio::spawn(async move {

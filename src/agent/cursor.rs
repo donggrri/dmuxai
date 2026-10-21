@@ -25,6 +25,11 @@ use dmuxai::settings::DmuxSettings;
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const STDERR_HISTORY_CAPACITY: usize = 8;
+/// How long cursor-agent may keep running after its terminal `result` line
+/// before its whole process group is stopped. The turn is already finished,
+/// and a prompt queued behind it must not wait on a lingering CLI (or on a
+/// child that keeps its pipes open).
+const TERMINAL_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 enum CursorCommand {
     Send {
@@ -584,11 +589,23 @@ async fn runtime_loop(
                 apply_pending_reset!();
                 match command {
                     Some(CursorCommand::Cancel) if queued_send.is_some() => {
-                        // The app's current turn is the queued one; the draining
-                        // turn already finished and is left to exit on its own.
-                        if let Some(CursorCommand::Send { request, .. }) = queued_send.take() {
-                            let context = OutputContext::from(&request);
-                            send_event(&event_tx, Some(&context), AgentEvent::Cancelled).await;
+                        // The app's current turn is the queued one. The draining
+                        // turn already reported its result, so stop its process
+                        // group without a second terminal event, then drop the
+                        // queued prompt.
+                        let draining = active.take();
+                        let was_graph = draining.as_ref().is_some_and(|t| t.is_graph);
+                        kill_turn(draining).await;
+                        cancel_queued(&mut queued_send, &event_tx).await;
+                        if can_prewarm && !was_graph {
+                            warm_process = spawn_warm_process(
+                                latest_session_id.as_deref(),
+                                selected_model.as_deref(),
+                                TurnPolicy::Agent,
+                                &cwd,
+                                windows_unsandboxed,
+                            )
+                            .ok();
                         }
                     }
                     Some(CursorCommand::Cancel) => {
@@ -647,7 +664,14 @@ async fn runtime_loop(
                     // Wake-up only; handled by apply_pending_reset! above.
                     Some(CursorCommand::Reset) => {}
                     None => {
-                        stop_turn(active.take(), &event_tx).await;
+                        if queued_send.is_some() {
+                            // The draining turn already finished for the app;
+                            // the queued prompt never starts, so say so.
+                            kill_turn(active.take()).await;
+                            cancel_queued(&mut queued_send, &event_tx).await;
+                        } else {
+                            stop_turn(active.take(), &event_tx).await;
+                        }
                         if let Some(warm) = warm_process.take() {
                             reap_warm_process(warm).await;
                         }
@@ -673,7 +697,10 @@ fn spawn_turn(
     is_graph: bool,
     reset_epoch: u64,
 ) -> ActiveTurn {
-    let warm_pgid = warm_child.as_ref().and_then(|c| c.id());
+    let pgid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+        warm_child.as_ref().and_then(|c| c.id()).unwrap_or(0),
+    ));
+    let turn_pgid = pgid.clone();
     let context = OutputContext::from(&request);
     let error_context = context.clone();
     let terminal_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -690,6 +717,7 @@ fn spawn_turn(
             &mcp_servers,
             &cursor_notice_emitted,
             &turn_terminal_seen,
+            &turn_pgid,
         )
         .await
         {
@@ -710,7 +738,7 @@ fn spawn_turn(
         context,
         is_graph,
         reset_epoch,
-        warm_pgid,
+        pgid,
         terminal_seen,
     }
 }
@@ -720,22 +748,42 @@ struct ActiveTurn {
     context: OutputContext,
     is_graph: bool,
     reset_epoch: u64,
-    // Only used for group kills on Unix (Windows support is postponed).
+    /// Process group of the turn's CLI (its pid; 0 until spawned). Only used
+    /// for group kills on Unix (Windows support is postponed).
     #[cfg_attr(not(unix), allow(dead_code))]
-    warm_pgid: Option<u32>,
+    pgid: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Set once the stream reported its terminal `result` line.
     terminal_seen: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
     if let Some(turn) = turn {
+        let context = turn.context.clone();
+        kill_turn(Some(turn)).await;
+        send_event(event_tx, Some(&context), AgentEvent::Cancelled).await;
+    }
+}
+
+/// Stops a turn's whole process group and its task, without reporting it.
+async fn kill_turn(turn: Option<ActiveTurn>) {
+    if let Some(turn) = turn {
         #[cfg(unix)]
-        if let Some(pgid) = turn.warm_pgid {
-            terminate_group(pgid).await;
+        {
+            let pgid = turn.pgid.load(std::sync::atomic::Ordering::SeqCst);
+            if pgid > 0 {
+                terminate_group(pgid).await;
+            }
         }
         turn.handle.abort();
         let _ = turn.handle.await;
-        send_event(event_tx, Some(&turn.context), AgentEvent::Cancelled).await;
+    }
+}
+
+/// Drops the queued prompt and tells the app it will not run.
+async fn cancel_queued(queued: &mut Option<CursorCommand>, event_tx: &mpsc::Sender<AgentOutput>) {
+    if let Some(CursorCommand::Send { request, .. }) = queued.take() {
+        let context = OutputContext::from(&request);
+        send_event(event_tx, Some(&context), AgentEvent::Cancelled).await;
     }
 }
 
@@ -762,6 +810,7 @@ pub(crate) async fn run_turn(
         mcp_servers,
         cursor_notice_emitted,
         &std::sync::atomic::AtomicBool::new(false),
+        &std::sync::atomic::AtomicU32::new(0),
     )
     .await
 }
@@ -778,6 +827,7 @@ async fn run_turn_with_child(
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     cursor_notice_emitted: &std::sync::atomic::AtomicBool,
     terminal_seen: &std::sync::atomic::AtomicBool,
+    pgid: &std::sync::atomic::AtomicU32,
 ) -> io::Result<Option<String>> {
     validate_cursor_policy(mode, windows_unsandboxed)
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -831,9 +881,16 @@ async fn run_turn_with_child(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
+            // Own process group, so a lingering CLI and its children can be
+            // stopped together (cancel, or after the terminal result).
+            #[cfg(unix)]
+            command.process_group(0);
             command.spawn()?
         }
     };
+    if let Some(id) = child.id() {
+        pgid.store(id, std::sync::atomic::Ordering::SeqCst);
+    }
 
     let mut stdin = child
         .stdin
@@ -936,8 +993,17 @@ async fn stream_child(
     let mut exit_status = None;
     let mut state = CursorStreamState::default();
     let mut implement_tracker = ImplementTurnTracker::new(mode);
+    // The CLI's process group (it is the group leader); kept for after reaping.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    let pgid = child.id();
+    // Set when the terminal `result` line arrives: past it the process gets
+    // TERMINAL_EXIT_GRACE to exit and close its pipes, then it is stopped.
+    let mut exit_deadline: Option<tokio::time::Instant> = None;
+    let mut forced_after_result = false;
 
     while stdout_open || stderr_open || exit_status.is_none() {
+        let deadline = exit_deadline
+            .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
         tokio::select! {
             line = stdout_lines.next_line(), if stdout_open => {
                 match line? {
@@ -951,6 +1017,9 @@ async fn stream_child(
                         let events = normalize_event(&message, &mut state);
                         if state.terminal {
                             terminal_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                            exit_deadline.get_or_insert_with(|| {
+                                tokio::time::Instant::now() + TERMINAL_EXIT_GRACE
+                            });
                         }
                         for event in events {
                             send_event(event_tx, Some(context), event).await;
@@ -968,14 +1037,41 @@ async fn stream_child(
             status = child.wait(), if exit_status.is_none() => {
                 exit_status = Some(status?);
             }
+            _ = tokio::time::sleep_until(deadline), if exit_deadline.is_some() => {
+                // Still running (or a child holds its pipes) after the grace
+                // period: stop the whole group and finish the turn.
+                #[cfg(unix)]
+                if let Some(pgid) = pgid {
+                    terminate_group(pgid).await;
+                }
+                if exit_status.is_none() {
+                    let _ = child.start_kill();
+                    exit_status = Some(child.wait().await?);
+                }
+                forced_after_result = true;
+                break;
+            }
         }
+    }
+    // A finished turn leaves nothing behind: reap any child of the CLI that
+    // detached its pipes (no-op when the group is already gone).
+    #[cfg(unix)]
+    if state.terminal
+        && !forced_after_result
+        && let Some(pgid) = pgid
+    {
+        let _ = signal_group(pgid, "-KILL").await;
     }
 
     let status = exit_status.expect("child.wait runs before the loop can finish");
     let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
-    if let Err(reason) =
-        implement_tracker.finish(&status, &diagnostic, state.terminal, false, false)
-    {
+    if let Err(reason) = implement_tracker.finish(
+        &status,
+        &diagnostic,
+        state.terminal,
+        false,
+        forced_after_result,
+    ) {
         return Err(io::Error::other(reason));
     }
     if !state.terminal {
@@ -2206,6 +2302,262 @@ pub(crate) mod tests {
 
         drop(adapter);
         let _ = worker.await;
+        unsafe {
+            std::env::remove_var("DMUXAI_CURSOR_BIN");
+        }
+    }
+
+    /// A fake cursor-agent: the first run reports its result, then lingers
+    /// (with a child that keeps stdout open) for `linger_secs`; later runs
+    /// exit right after their result. Logs `PROMPT`, `LEADER` and `CHILD`.
+    #[cfg(unix)]
+    fn lingering_cursor_script(dir: &Path, linger_secs: u32) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log_path = dir.join("linger.log");
+        let marker = dir.join("first-run-done");
+        let script_path = dir.join("cursor-agent");
+        let script = format!(
+            "#!/bin/sh\n\
+             if read -r line; then\n\
+                 echo \"PROMPT $line\" >> \"{log}\"\n\
+                 echo '{{\"type\":\"assistant\",\"session_id\":\"sess-1\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"OK\"}}]}}}}'\n\
+                 echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"OK\",\"session_id\":\"sess-1\"}}'\n\
+                 if [ ! -e \"{marker}\" ]; then\n\
+                     : > \"{marker}\"\n\
+                     echo \"LEADER $$\" >> \"{log}\"\n\
+                     sleep {linger} &\n\
+                     echo \"CHILD $!\" >> \"{log}\"\n\
+                     sleep {linger}\n\
+                 fi\n\
+             fi\n",
+            log = log_path.display(),
+            marker = marker.display(),
+            linger = linger_secs,
+        );
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script_path, log_path)
+    }
+
+    #[cfg(unix)]
+    fn logged_pids(log_path: &Path, tag: &str) -> Vec<u32> {
+        std::fs::read_to_string(log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.strip_prefix(tag)?.trim().parse().ok())
+            .collect()
+    }
+
+    /// Gone or a zombie waiting for its parent.
+    #[cfg(unix)]
+    fn pid_gone(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rfind(')')
+                .and_then(|idx| stat[idx + 1..].split_whitespace().next())
+                .is_some_and(|state| state == "Z" || state == "X"),
+            Err(_) => true,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_pids_gone(pids: &[u32], within: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < within {
+            if pids.iter().all(|pid| pid_gone(*pid)) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        pids.iter().all(|pid| pid_gone(*pid))
+    }
+
+    #[cfg(unix)]
+    fn linger_request(turn: &str, prompt: &str) -> AgentRequest {
+        AgentRequest {
+            conversation_id: super::super::ConversationId::new("conv-1"),
+            turn_id: super::super::TurnId::new(turn),
+            prompt: prompt.to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+        }
+    }
+
+    // Review fix (#82): a cursor-agent that never exits after its result (a
+    // child even keeps its stdout open) is stopped after TERMINAL_EXIT_GRACE,
+    // its whole group is gone, and the prompt queued behind it then runs.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn lingering_cli_is_stopped_after_grace_and_queued_prompt_runs() {
+        let _guard = TEST_CURSOR_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (script_path, log_path) = lingering_cursor_script(dir.path(), 60);
+        // SAFETY: TEST_CURSOR_MUTEX is held for the whole test.
+        unsafe {
+            std::env::set_var("DMUXAI_CURSOR_BIN", &script_path);
+        }
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let config = CursorAdapterConfig {
+            windows_unsandboxed: false,
+            prewarm: false,
+            prewarm_idle_secs: 300,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config, Vec::new());
+        adapter.send(linger_request("turn-1", "first")).unwrap();
+        wait_for_turn_completion(&mut event_rx).await;
+        let sent_at = Instant::now();
+        adapter.send(linger_request("turn-2", "second")).unwrap();
+        let mut errors = Vec::new();
+        let mut completed_at = None;
+        while sent_at.elapsed() < TERMINAL_EXIT_GRACE + Duration::from_secs(5)
+            && completed_at.is_none()
+        {
+            if let Ok(Some(output)) = timeout(Duration::from_millis(200), event_rx.recv()).await {
+                let turn = output.turn_id.as_ref().map(|t| t.as_str().to_owned());
+                match output.event {
+                    AgentEvent::Error(message) => errors.push(message),
+                    AgentEvent::Completed if turn.as_deref() == Some("turn-2") => {
+                        completed_at = Some(sent_at.elapsed());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(errors.is_empty(), "no error expected: {errors:?}");
+        let completed_at = completed_at.expect("the queued prompt must run");
+        assert!(
+            completed_at < TERMINAL_EXIT_GRACE + Duration::from_secs(2),
+            "queued prompt waited {completed_at:?}"
+        );
+        let mut pids = logged_pids(&log_path, "LEADER ");
+        pids.extend(logged_pids(&log_path, "CHILD "));
+        assert_eq!(pids.len(), 2, "leader and child pids logged");
+        assert!(
+            wait_pids_gone(&pids, Duration::from_secs(2)).await,
+            "the lingering group must be gone: {pids:?}"
+        );
+        let prompts = std::fs::read_to_string(&log_path).unwrap();
+        let prompts: Vec<_> = prompts
+            .lines()
+            .filter(|l| l.starts_with("PROMPT"))
+            .collect();
+        assert_eq!(prompts, vec!["PROMPT first", "PROMPT second"]);
+
+        drop(adapter);
+        let _ = worker.await;
+        unsafe {
+            std::env::remove_var("DMUXAI_CURSOR_BIN");
+        }
+    }
+
+    // Review fix (#82): Cancel while a prompt waits behind a lingering CLI
+    // stops that CLI's whole group and drops the queued prompt (Cancelled).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cancel_while_queued_kills_lingering_cli_and_drops_prompt() {
+        let _guard = TEST_CURSOR_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (script_path, log_path) = lingering_cursor_script(dir.path(), 60);
+        // SAFETY: TEST_CURSOR_MUTEX is held for the whole test.
+        unsafe {
+            std::env::set_var("DMUXAI_CURSOR_BIN", &script_path);
+        }
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let config = CursorAdapterConfig {
+            windows_unsandboxed: false,
+            prewarm: false,
+            prewarm_idle_secs: 300,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config, Vec::new());
+        adapter.send(linger_request("turn-1", "first")).unwrap();
+        wait_for_turn_completion(&mut event_rx).await;
+        adapter.send(linger_request("turn-2", "second")).unwrap();
+        // Let the runtime queue it behind the lingering process.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let cancelled_at = Instant::now();
+        adapter.cancel().unwrap();
+        let mut cancelled_turn = None;
+        while cancelled_at.elapsed() < Duration::from_secs(3) && cancelled_turn.is_none() {
+            if let Ok(Some(output)) = timeout(Duration::from_millis(200), event_rx.recv()).await
+                && output.event == AgentEvent::Cancelled
+            {
+                cancelled_turn = output.turn_id.map(|t| t.as_str().to_owned());
+            }
+        }
+        assert_eq!(cancelled_turn.as_deref(), Some("turn-2"));
+        assert!(
+            cancelled_at.elapsed() < TERMINAL_EXIT_GRACE,
+            "cancel must not wait for the grace period"
+        );
+        let mut pids = logged_pids(&log_path, "LEADER ");
+        pids.extend(logged_pids(&log_path, "CHILD "));
+        assert_eq!(pids.len(), 2, "leader and child pids logged");
+        assert!(
+            wait_pids_gone(&pids, Duration::from_secs(2)).await,
+            "cancel must stop the lingering group: {pids:?}"
+        );
+        // The queued prompt never runs, even after the grace period.
+        tokio::time::sleep(TERMINAL_EXIT_GRACE + Duration::from_millis(500)).await;
+        let prompts = std::fs::read_to_string(&log_path).unwrap();
+        let prompts: Vec<_> = prompts
+            .lines()
+            .filter(|l| l.starts_with("PROMPT"))
+            .collect();
+        assert_eq!(prompts, vec!["PROMPT first"]);
+
+        drop(adapter);
+        let _ = worker.await;
+        unsafe {
+            std::env::remove_var("DMUXAI_CURSOR_BIN");
+        }
+    }
+
+    // Review fix (#82): the adapter closing while a prompt is queued reports
+    // Cancelled for it instead of dropping it silently.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn adapter_close_while_queued_reports_cancelled() {
+        let _guard = TEST_CURSOR_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (script_path, log_path) = lingering_cursor_script(dir.path(), 60);
+        // SAFETY: TEST_CURSOR_MUTEX is held for the whole test.
+        unsafe {
+            std::env::set_var("DMUXAI_CURSOR_BIN", &script_path);
+        }
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let config = CursorAdapterConfig {
+            windows_unsandboxed: false,
+            prewarm: false,
+            prewarm_idle_secs: 300,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config, Vec::new());
+        adapter.send(linger_request("turn-1", "first")).unwrap();
+        wait_for_turn_completion(&mut event_rx).await;
+        adapter.send(linger_request("turn-2", "second")).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(adapter);
+        let _ = timeout(Duration::from_secs(3), worker).await;
+        let mut cancelled = Vec::new();
+        while let Ok(Some(output)) = timeout(Duration::from_millis(200), event_rx.recv()).await {
+            if output.event == AgentEvent::Cancelled {
+                cancelled.push(output.turn_id.map(|t| t.as_str().to_owned()));
+            }
+        }
+        assert_eq!(cancelled, vec![Some("turn-2".to_owned())]);
+        let mut pids = logged_pids(&log_path, "LEADER ");
+        pids.extend(logged_pids(&log_path, "CHILD "));
+        assert!(
+            wait_pids_gone(&pids, Duration::from_secs(2)).await,
+            "closing the adapter must stop the lingering group: {pids:?}"
+        );
         unsafe {
             std::env::remove_var("DMUXAI_CURSOR_BIN");
         }
