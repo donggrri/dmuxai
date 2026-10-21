@@ -462,6 +462,71 @@ pub fn ensure_directory_writable(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// `true` when `pid` is still a live process. Linux checks `/proc`.
+pub fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Arguments for a second dashboard that does not replace this process.
+pub fn open_dashboard_args(workspace: &Path) -> Vec<String> {
+    vec![
+        "--web".to_owned(),
+        "-C".to_owned(),
+        workspace.display().to_string(),
+        "--port".to_owned(),
+        "0".to_owned(),
+    ]
+}
+
+/// Browser URL for a discovery record (`base_url` has no token).
+pub fn discovery_dashboard_url(discovery: &crate::web::discovery::Discovery) -> String {
+    format!(
+        "{}/?token={}",
+        discovery.base_url.trim_end_matches('/'),
+        discovery.token
+    )
+}
+
+/// Spawn `exe --web -C workspace --port 0` in its own process group.
+/// The child does not inherit `DMUXAI_WEB_TOKEN` or `DMUXAI_OPEN_CONVERSATION`.
+pub fn spawn_dashboard(exe: &Path, workspace: &Path) -> io::Result<std::process::Child> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(open_dashboard_args(workspace))
+        .env_remove("DMUXAI_WEB_TOKEN")
+        .env_remove("DMUXAI_OPEN_CONVERSATION")
+        .env("DMUXAI_WORKSPACE", workspace)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn()
+}
+
+/// If `workspace` already has a live dashboard, return its URL.
+pub fn live_dashboard_url(workspace: &Path) -> Option<String> {
+    let discovery = crate::web::discovery::read_discovery(workspace)?;
+    if process_alive(discovery.pid) {
+        Some(discovery_dashboard_url(&discovery))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
 

@@ -1484,6 +1484,80 @@ async fn post_workspace_validate(ApiJson(body): ApiJson<WorkspacePathBody>) -> R
     }
 }
 
+/// How long `POST /api/workspace/open` waits for the new dashboard's `web.json`.
+const OPEN_DISCOVERY_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_secs(20)
+};
+
+/// Start another dashboard for `path` without stopping this one (FR-876).
+/// A live discovery file is reused. Otherwise the current executable is spawned
+/// with `--web -C <path> --port 0` and this handler waits until that process
+/// writes `<path>/.dmuxai/web.json`.
+async fn post_workspace_open(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<WorkspacePathBody>,
+) -> Response {
+    if !state.services.web_attached {
+        return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
+    }
+    let canonical = match crate::workspace::validate_workspace_dir(std::path::Path::new(&body.path))
+    {
+        Ok(path) => path,
+        Err(reason) => return error_json(StatusCode::BAD_REQUEST, &reason.to_string()),
+    };
+    if let Some(url) = crate::workspace::live_dashboard_url(&canonical) {
+        return json_ok(
+            StatusCode::OK,
+            &serde_json::json!({ "ok": true, "url": url }),
+        );
+    }
+    let cfg = state.hub.switch_config().unwrap_or_default();
+    let exe = match cfg
+        .current_exe
+        .clone()
+        .or_else(|| std::env::current_exe().ok())
+    {
+        Some(exe) if exe.is_file() => exe,
+        _ => {
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not resolve the dmuxai executable",
+            );
+        }
+    };
+    let child = match crate::workspace::spawn_dashboard(&exe, &canonical) {
+        Ok(child) => child,
+        Err(error) => {
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not start a dashboard for this workspace: {error}"),
+            );
+        }
+    };
+    let pid = child.id();
+    let deadline = std::time::Instant::now() + OPEN_DISCOVERY_TIMEOUT;
+    loop {
+        if let Some(discovery) = crate::web::discovery::read_discovery(&canonical)
+            && discovery.pid == pid
+        {
+            let url = crate::workspace::discovery_dashboard_url(&discovery);
+            return json_ok(
+                StatusCode::OK,
+                &serde_json::json!({ "ok": true, "url": url }),
+            );
+        }
+        if std::time::Instant::now() >= deadline || !crate::workspace::process_alive(pid) {
+            return error_json(
+                StatusCode::GATEWAY_TIMEOUT,
+                "the new dashboard did not publish a URL",
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn post_workspace_switch(
     State(state): State<AppState>,
     ApiJson(body): ApiJson<WorkspacePathBody>,
@@ -1641,6 +1715,7 @@ pub fn build_router_with(
         .route("/api/workspace/dirs", get(get_workspace_dirs))
         .route("/api/workspace/validate", post(post_workspace_validate))
         .route("/api/workspace/switch", post(post_workspace_switch))
+        .route("/api/workspace/open", post(post_workspace_open))
         .route("/api/memory", get(get_memory))
         .route("/api/memory/save", post(post_memory_save))
         .route(
@@ -4997,6 +5072,97 @@ mod tests {
             cmd_rx.recv().await,
             Some(DashboardCommand::CancelSwitchWorkspace { .. })
         ));
+    }
+
+    // TC-876 (FR-876): opening another workspace does not need the App lock and
+    // reuses a live discovery file. A second call spawns the given executable.
+    #[tokio::test]
+    async fn workspace_open_reuses_live_dashboard_and_spawns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("proj");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let token = "workspace-open-token-000000000000";
+        crate::web::discovery::write_discovery(
+            &workspace,
+            &crate::web::discovery::Discovery {
+                base_url: "http://127.0.0.1:7421".to_owned(),
+                port: 7421,
+                pid: std::process::id(),
+                token: "abcdefghijklmnopqrstuvwxyz012345".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let hub = test_hub();
+        let router = build_router_with(
+            hub,
+            token.to_owned(),
+            allowed_localhost(),
+            DashboardServices {
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        );
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/workspace/open",
+                token,
+                &serde_json::json!({ "path": workspace }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp).await;
+        assert!(body.contains("http://127.0.0.1:7421/?token=abcdefghijklmnopqrstuvwxyz012345"));
+
+        std::fs::remove_file(crate::web::discovery::discovery_path(&workspace)).unwrap();
+        let script = tmp.path().join("fake-dmuxai.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nws=\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-C\" ]; then ws=\"$a\"; fi\n  prev=\"$a\"\ndone\nmkdir -p \"$ws/.dmuxai\"\nprintf '{\"base_url\":\"http://127.0.0.1:9\",\"port\":9,\"pid\":%s,\"token\":\"abcdefghijklmnopqrstuvwxyz012345\"}\\n' \"$$\" > \"$ws/.dmuxai/web.json\"\nsleep 30\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        let hub = test_hub();
+        hub.set_switch_config(WorkspaceSwitchConfig {
+            current_exe: Some(script),
+            ..WorkspaceSwitchConfig::default()
+        });
+        let router = build_router_with(
+            hub,
+            token.to_owned(),
+            allowed_localhost(),
+            DashboardServices {
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        );
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/workspace/open",
+                token,
+                &serde_json::json!({ "path": workspace }).to_string(),
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = read_body(resp).await;
+        if let Some(discovery) = crate::web::discovery::read_discovery(&workspace) {
+            let _ = std::process::Command::new("kill")
+                .arg(discovery.pid.to_string())
+                .status();
+        }
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("http://127.0.0.1:9/?token="), "{body}");
     }
 
     // TC-875 (FR-874)

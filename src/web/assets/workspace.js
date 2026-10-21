@@ -118,8 +118,10 @@
 
   function updateSwitchButton() {
     var switchBtn = $('workspace-switch');
-    if (!switchBtn) { return; }
-    switchBtn.disabled = !state.canSwitch || state.viewOnly || !state.validPath || state.switching;
+    if (switchBtn) {
+      switchBtn.disabled = !state.canSwitch || state.viewOnly || !state.validPath || state.switching;
+    }
+    updateOpenButton();
   }
 
   function setReason(message, kind) {
@@ -393,6 +395,7 @@
     var previousCurrent = state.current;
     state.switching = true;
     updateSwitchButton();
+    updateOpenButton();
     setReason('Switching\u2026', 'info');
 
     apiPost('/api/workspace/switch', { path: target }).then(function (res) {
@@ -406,10 +409,48 @@
       var errMsg = (res.body && (res.body.error || res.body.reason)) || ('HTTP ' + res.status);
       setReason(errMsg, 'error');
       updateSwitchButton();
+      updateOpenButton();
     }).catch(function () {
       state.switching = false;
       setReason('Workspace switch request failed.', 'error');
       updateSwitchButton();
+      updateOpenButton();
+    });
+  }
+
+  function updateOpenButton() {
+    var btn = $('workspace-open');
+    if (!btn) { return; }
+    var input = $('workspace-path');
+    var target = state.validPath || (input ? input.value.trim() : '');
+    btn.disabled = state.viewOnly || state.switching || !target;
+  }
+
+  function submitOpen() {
+    if (state.switching || state.viewOnly) { return; }
+    var input = $('workspace-path');
+    var target = state.validPath || (input ? input.value.trim() : '');
+    if (!target) { return; }
+    state.switching = true;
+    updateSwitchButton();
+    updateOpenButton();
+    setReason('Opening\u2026', 'info');
+    apiPost('/api/workspace/open', { path: target }).then(function (res) {
+      state.switching = false;
+      updateSwitchButton();
+      updateOpenButton();
+      if (res.ok && res.body && res.body.url) {
+        window.open(String(res.body.url), '_blank', 'noopener');
+        setReason('Opened another dashboard. This window stays on the current workspace.', 'info');
+        return;
+      }
+      var errMsg = (res.body && (res.body.error || res.body.reason)) || ('HTTP ' + res.status);
+      setReason(errMsg, 'error');
+    }).catch(function () {
+      state.switching = false;
+      updateSwitchButton();
+      updateOpenButton();
+      setReason('Could not open another dashboard.', 'error');
     });
   }
 
@@ -460,6 +501,10 @@
     var cancelBtn = $('workspace-cancel');
     if (cancelBtn) {
       cancelBtn.addEventListener('click', closeDialog);
+    }
+    var openBtn = $('workspace-open');
+    if (openBtn) {
+      openBtn.addEventListener('click', submitOpen);
     }
     var dialog = $('workspace-dialog');
     if (dialog) {

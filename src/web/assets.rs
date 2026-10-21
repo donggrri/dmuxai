@@ -1096,6 +1096,8 @@ mod tests {
         assert!(INDEX_HTML.contains("id=\"workspace-recent\""));
         assert!(INDEX_HTML.contains("id=\"workspace-browser\""));
         assert!(INDEX_HTML.contains("id=\"workspace-switch\""));
+        assert!(INDEX_HTML.contains("id=\"workspace-open\""));
+        assert!(WORKSPACE_JS.contains("/api/workspace/open"));
         assert!(INDEX_HTML.contains("/assets/workspace.js"));
 
         assert!(WORKSPACE_JS.contains("function middleEllipsis"));

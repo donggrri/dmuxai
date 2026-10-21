@@ -1615,10 +1615,7 @@ mod memory_settings_tests {
         std::fs::create_dir(ws.path().join("vault")).unwrap();
         let s = load(None, Some("[memory]\nvault = \"vault\"\n"), ws.path());
         let m = s.memory.expect("enabled");
-        assert_eq!(
-            m.root,
-            ws.path().join("vault").join("memory")
-        );
+        assert_eq!(m.root, ws.path().join("vault").join("memory"));
     }
 
     // TC-720 (FR-720): `~/` expands to HOME.
