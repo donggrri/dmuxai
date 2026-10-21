@@ -51,6 +51,7 @@ fn message(index: usize, role: &str, content: &str) -> SessionMessage {
         content_html: (role == "agent").then(|| render_chat_markdown(content)),
         streaming: false,
         images: Vec::new(),
+        prompt_id: None,
     }
 }
 

@@ -81,6 +81,11 @@ pub struct SessionView {
     /// `conversations` above); the others follow by most recent activity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<SessionWorkspaceGroup>,
+    /// The newest dashboard prompt id this snapshot reflects (see
+    /// `PromptAccepted::prompt_id`): the browser drops its optimistic copy of
+    /// a prompt once `prompt_seq` reaches it.
+    #[serde(default)]
+    pub prompt_seq: u64,
 }
 
 /// One workspace folder in the Sessions sidebar (FR-1225).
@@ -166,6 +171,10 @@ pub struct SessionMessage {
     pub streaming: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// Set on a dashboard prompt that has no user message of its own yet (or
+    /// never gets one, like a plan run whose steps post their own prompts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

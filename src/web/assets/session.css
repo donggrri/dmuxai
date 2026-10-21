@@ -190,3 +190,4 @@ button.chat-aux-head:focus-visible, .chat-aux-step-btn:focus-visible { outline: 
 .msg-copy:focus-visible { outline: 2px solid var(--accent); }
 .msg-copy.msg-copy-done { color: var(--ok); }
 .msg-copy-tip { font-size: .75rem; color: var(--muted); }
+.msg-pending { opacity: .75; }

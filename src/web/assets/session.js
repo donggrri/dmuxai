@@ -46,6 +46,12 @@
   var viewOnly = false;
   var pending = null;
   var conversationShown = null;
+  var promptInFlight = false;
+  // Optimistic copies of sent prompts, oldest first. Each is replaced by its
+  // own server copy (by message id, prompt id, or a new user message with the
+  // same text) and dropped when the server reports the prompt went nowhere.
+  var pendingEchoes = [];
+  var echoSeq = 0;
   // Web image attachments (paste, drop, paperclip) waiting for the next prompt.
   var pendingAttachments = [];
   var ATTACH_ALLOWED = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
@@ -293,9 +299,9 @@
     if (ui.route && ui.route.value && ui.route.value !== 'auto') {
       body.route = ui.route.value;
     }
-    return api('/api/prompt', body).then(function () {
+    return api('/api/prompt', body).then(function (data) {
       stickToBottom = true;
-      return true;
+      return data || true;
     }).catch(function (err) {
       notify(err.message, true);
       return false;
@@ -1616,6 +1622,14 @@
     select.value = value;
   }
 
+  function userMessageIds() {
+    var ids = {};
+    ((session && session.transcript) || []).forEach(function (m) {
+      if (m.role === 'user') { ids[m.id] = true; }
+    });
+    return ids;
+  }
+
   function onPromptKey(e) {
     if (e.isComposing || e.keyCode === 229) { return; }
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -1627,6 +1641,7 @@
   }
 
   function submitPrompt() {
+    if (promptInFlight || viewOnly) { return; }
     var text = ui.input.value;
     if (!text.trim()) { return; }
     var uploading = pendingAttachments.some(function (item) { return item.status === 'uploading'; });
@@ -1637,18 +1652,61 @@
     var readyNames = pendingAttachments
       .filter(function (item) { return item.status === 'ready' && item.name; })
       .map(function (item) { return item.name; });
+    var isSlashCommand = (text.indexOf('/') === 0) && (text.indexOf('//') !== 0);
+    var echoItems = pendingAttachments.filter(function (item) { return item.status === 'ready'; });
     ui.send.disabled = true;
-    sendPrompt(text, readyNames).then(function (ok) {
+    promptInFlight = true;
+    var echo = null;
+    if (!isSlashCommand) {
+      echoSeq += 1;
+      echo = {
+        key: 'echo-' + echoSeq,
+        text: text,
+        images: echoItems.map(function (item) { return item.previewUrl; }),
+        conversationId: session && session.conversation_id,
+        baseline: userMessageIds(),
+        promptId: null,
+        messageId: null,
+        items: echoItems
+      };
+      pendingEchoes.push(echo);
+      ui.input.value = '';
+      autoGrowInput();
+      pendingAttachments = [];
+      renderAttachTray();
+      renderPendingEchoes();
+      scrollTranscriptToEnd();
+    }
+    sendPrompt(text, readyNames).then(function (result) {
+      promptInFlight = false;
       ui.send.disabled = viewOnly;
-      if (ok) {
-        ui.input.value = '';
-        autoGrowInput();
-        revokeAttachmentUrls(pendingAttachments);
-        pendingAttachments = [];
-        renderAttachTray();
+      if (result) {
+        if (isSlashCommand) {
+          ui.input.value = '';
+          autoGrowInput();
+          revokeAttachmentUrls(pendingAttachments);
+          pendingAttachments = [];
+          renderAttachTray();
+        } else if (echo && typeof result === 'object') {
+          // Server outcome of this prompt: once a snapshot reaches promptId,
+          // it either shows the prompt's own copy or the prompt went nowhere.
+          if (typeof result.prompt_id === 'number') { echo.promptId = result.prompt_id; }
+          if (typeof result.message_id === 'string') { echo.messageId = result.message_id; }
+          if (reconcilePendingEchoes()) { renderPendingEchoes(); }
+        }
         // UX-1203: your own message always brings the view to the latest turn.
         stickToBottom = true;
         scrollTranscriptToEnd();
+      } else if (echo) {
+        var index = pendingEchoes.indexOf(echo);
+        if (index >= 0) { pendingEchoes.splice(index, 1); }
+        renderPendingEchoes();
+        if (!ui.input.value) {
+          ui.input.value = text;
+          autoGrowInput();
+        }
+        pendingAttachments = echo.items.concat(pendingAttachments);
+        renderAttachTray();
       }
       ui.input.focus();
     });
@@ -1674,6 +1732,7 @@
     [ui.newConv, ui.status, ui.details, ui.share, ui.palette, ui.quit, ui.send].forEach(function (b) {
       b.disabled = viewOnly;
     });
+    if (promptInFlight && ui.send) { ui.send.disabled = true; }
     if (ui.attachBtn) { ui.attachBtn.disabled = viewOnly; }
     if (ui.attachInput) { ui.attachInput.disabled = viewOnly; }
     if (ui.route) { ui.route.disabled = viewOnly; }
@@ -1682,7 +1741,103 @@
     renderConversations();
   }
 
+  function releaseEcho(echo) {
+    var trayUrls = {};
+    (pendingAttachments || []).forEach(function (item) {
+      if (item && item.previewUrl) { trayUrls[item.previewUrl] = true; }
+    });
+    (echo.images || []).forEach(function (url) {
+      if (!trayUrls[url]) {
+        try { URL.revokeObjectURL(url); } catch (err) { /* ignore */ }
+      }
+    });
+  }
+
+  // Drops echoes whose server copy arrived or whose prompt went nowhere.
+  // Returns whether any echo was dropped.
+  function reconcilePendingEchoes() {
+    if (!pendingEchoes.length || !session) { return false; }
+    var users = (session.transcript || []).filter(function (m) { return m.role === 'user'; });
+    var seq = session.prompt_seq || 0;
+    var claimed = {};
+    var ownedPromptIds = {};
+    var done = [];
+    pendingEchoes.forEach(function (echo) {
+      if (echo.promptId !== null) { ownedPromptIds[echo.promptId] = echo; }
+    });
+    // Pass 1: copies that name their prompt (message id or prompt id).
+    pendingEchoes.forEach(function (echo) {
+      if (session.conversation_id !== echo.conversationId) { done.push(echo); return; }
+      for (var i = 0; i < users.length; i++) {
+        var m = users[i];
+        if (claimed[m.id]) { continue; }
+        if ((echo.messageId && m.id === echo.messageId) ||
+            (echo.promptId !== null && m.prompt_id === echo.promptId)) {
+          claimed[m.id] = true; done.push(echo); return;
+        }
+      }
+    });
+    // Pass 2: a new user message with the same text (the step posted it).
+    pendingEchoes.forEach(function (echo) {
+      if (done.indexOf(echo) >= 0) { return; }
+      var want = echo.text.trim();
+      for (var i = 0; i < users.length; i++) {
+        var m = users[i];
+        if (claimed[m.id] || echo.baseline[m.id]) { continue; }
+        var owner = (typeof m.prompt_id === 'number') ? ownedPromptIds[m.prompt_id] : null;
+        if (owner && owner !== echo) { continue; }
+        if ((m.content || '').trim() === want) { claimed[m.id] = true; done.push(echo); return; }
+      }
+      // The snapshot reflects this prompt's outcome and has no copy of it:
+      // it was refused after the server accepted it.
+      if (echo.promptId !== null && seq >= echo.promptId) { done.push(echo); }
+    });
+    if (!done.length) { return false; }
+    pendingEchoes = pendingEchoes.filter(function (echo) {
+      if (done.indexOf(echo) < 0) { return true; }
+      releaseEcho(echo);
+      return false;
+    });
+    return true;
+  }
+
+  function renderPendingEchoes() {
+    if (!ui.transcript) { return; }
+    var existing = ui.transcript.querySelectorAll('li.msg-pending');
+    Array.prototype.forEach.call(existing, function (n) {
+      if (n.parentNode) { n.parentNode.removeChild(n); }
+    });
+    if (!pendingEchoes.length) { return; }
+    var empty = ui.transcript.querySelector('.session-empty');
+    if (empty && empty.parentNode) { empty.parentNode.removeChild(empty); }
+    pendingEchoes.forEach(function (echo) {
+      var li = el('li', 'msg msg-user msg-pending');
+      li.setAttribute('data-echo', echo.key);
+      li.appendChild(el('span', 'msg-who', 'user'));
+      var textNode = el('div', 'msg-text');
+      textNode.textContent = echo.text;
+      li.appendChild(textNode);
+      if (echo.images && echo.images.length) {
+        var imgWrap = el('div', 'msg-images');
+        echo.images.forEach(function (url) {
+          var img = el('img', 'msg-image');
+          img.src = url;
+          img.alt = 'Attached image';
+          imgWrap.appendChild(img);
+        });
+        li.appendChild(imgWrap);
+      }
+      ui.transcript.appendChild(li);
+    });
+    var working = ui.transcript.querySelector('.msg-working');
+    if (working && working.parentNode) {
+      working.parentNode.removeChild(working);
+      ui.transcript.appendChild(working);
+    }
+  }
+
   function renderTranscript() {
+    reconcilePendingEchoes();
     if (conversationShown !== session.conversation_id) {
       conversationShown = session.conversation_id;
       ui.transcript.textContent = '';
@@ -1826,7 +1981,7 @@
         delete messageNodes[id];
       }
     });
-    if (!session.transcript.length) {
+    if (!session.transcript.length && !pendingEchoes.length) {
       if (!ui.transcript.querySelector('.session-empty')) {
         ui.transcript.appendChild(el('li', 'session-empty', 'No messages yet.'));
       }
@@ -1851,6 +2006,7 @@
     } else if (workingNode) {
       workingNode.parentNode.removeChild(workingNode);
     }
+    renderPendingEchoes();
     renderChatAux();
     // docs.js links agent turns that changed files to their chat message
     // (SPEC-dashboard-fullwidth FR-1209, FR-1210).

@@ -37,6 +37,13 @@ pub enum RunTodoError {
 pub struct PromptAccepted {
     pub conversation_id: String,
     pub agent: String,
+    /// Sequence number of this dashboard prompt; the session snapshot's
+    /// `prompt_seq` reaches it once the snapshot reflects the prompt's outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<u64>,
+    /// The transcript id of the user message the prompt posted right away.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 /// A picker or lifecycle action from `POST /api/command`
