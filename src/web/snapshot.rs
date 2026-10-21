@@ -117,6 +117,10 @@ pub struct SessionAgent {
     pub allowed: bool,
     pub models_loading: bool,
     pub models: Vec<SessionModel>,
+    /// The model the runner reported as its default the first time its
+    /// models were listed; the menu's "Default model" entry selects it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunStateView>,
 }
@@ -140,7 +144,11 @@ pub struct RunStateView {
 pub struct SessionModel {
     pub id: String,
     pub label: String,
+    /// Reasoning efforts the runner can apply to this model (empty when it
+    /// can not set one).
     pub efforts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

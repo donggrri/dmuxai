@@ -63,6 +63,10 @@
   var palette = null;
   var agentPopover = null;
   var agentPopoverKeyHandler = null;
+  // Composer agent/model menu state; reset each time the menu opens.
+  var agentMenu = { query: '', active: '', expanded: {} };
+  // Hub agent views (run state, colors) from the latest snapshot.
+  var hubAgents = [];
   var workspaceKey = '';
   var workspaceInitialized = null;
   var sessionsOpen = false;
@@ -977,9 +981,8 @@
   }
 
   function hubAgent(id) {
-    if (!lastSnap || !lastSnap.agents) { return null; }
-    for (var i = 0; i < lastSnap.agents.length; i++) {
-      if (lastSnap.agents[i].id === id) { return lastSnap.agents[i]; }
+    for (var i = 0; i < hubAgents.length; i++) {
+      if (hubAgents[i] && hubAgents[i].id === id) { return hubAgents[i]; }
     }
     return null;
   }
@@ -1008,12 +1011,55 @@
   }
 
   function hubRunningAgent() {
-    var hub = window.__dmuxHubAgents || [];
-    for (var i = 0; i < hub.length; i++) {
-      var a = hub[i];
+    for (var i = 0; i < hubAgents.length; i++) {
+      var a = hubAgents[i];
       if (a && (a.busy || (a.run && a.run.state === 'running'))) { return a; }
     }
     return null;
+  }
+
+  // Fast model variants are blocked by policy (model_policy.rs); the server
+  // already drops them, and the menu drops anything that still says "fast".
+  function isFastName(value) {
+    return /fast/i.test(String(value || ''));
+  }
+
+  function menuModels(agent) {
+    return (agent.models || []).filter(function (m) {
+      return !isFastName(m.id) && !isFastName(m.label);
+    });
+  }
+
+  function menuEfforts(model) {
+    return (model.efforts || []).filter(function (eff) { return !isFastName(eff); });
+  }
+
+  var EFFORT_LABELS = {
+    none: 'None', minimal: 'Minimal', low: 'Low', medium: 'Medium',
+    high: 'High', xhigh: 'Extra High', max: 'Max',
+  };
+
+  function effortLabel(effort) {
+    var key = String(effort || '');
+    if (EFFORT_LABELS[key]) { return EFFORT_LABELS[key]; }
+    return key ? key.charAt(0).toUpperCase() + key.slice(1) : '';
+  }
+
+  function modelLabel(agent, id) {
+    var found = null;
+    (agent.models || []).forEach(function (m) { if (m.id === id) { found = m; } });
+    return found ? (found.label || found.id) : id;
+  }
+
+  // The effort a model would run with: the chosen one for the selected
+  // model, else the runner's default for that model.
+  function modelEffort(agent, model) {
+    var efforts = menuEfforts(model);
+    if (!efforts.length) { return ''; }
+    if (agent.model === model.id && agent.effort && efforts.indexOf(agent.effort) >= 0) {
+      return agent.effort;
+    }
+    return model.default_effort && efforts.indexOf(model.default_effort) >= 0 ? model.default_effort : '';
   }
 
   function updateAgentPickerLabel() {
@@ -1050,24 +1096,143 @@
     }
   }
 
-  function closeAgentPopover() {
+  function closeAgentPopover(refocusChip) {
     detachAgentPopoverKey();
     if (agentPopover && agentPopover.parentNode) {
       agentPopover.parentNode.removeChild(agentPopover);
     }
     agentPopover = null;
-    if (ui.agentPicker) { ui.agentPicker.setAttribute('aria-expanded', 'false'); }
+    if (ui.agentPicker) {
+      ui.agentPicker.setAttribute('aria-expanded', 'false');
+      if (refocusChip) { ui.agentPicker.focus(); }
+    }
+  }
+
+  function menuMatches(query, values) {
+    if (!query) { return true; }
+    for (var i = 0; i < values.length; i++) {
+      if (String(values[i] || '').toLowerCase().indexOf(query) >= 0) { return true; }
+    }
+    return false;
+  }
+
+  // Selecting a model (or an effort) of another agent first selects that agent;
+  // each step is one existing /api/command call. A refused step stops the chain.
+  // `reselect` re-sends select_model for the current model: the server then
+  // resets the effort to that model's default ("Default model").
+  function menuSelectModel(a, modelId, effort, reselect) {
+    var chain = Promise.resolve(true);
+    if (session && a.id !== session.selected_agent) {
+      chain = command({ command: 'select_agent', agent: a.id });
+    }
+    if (reselect || a.model !== modelId) {
+      chain = chain.then(function (ok) {
+        return ok ? command({ command: 'select_model', agent: a.id, model: modelId }) : null;
+      });
+    }
+    if (effort) {
+      chain = chain.then(function (ok) {
+        return ok ? command({ command: 'set_effort', agent: a.id, effort: effort }) : null;
+      });
+    }
+    return chain;
+  }
+
+  function menuItem(tag, className, key, activate) {
+    var node = el(tag, className);
+    if (tag === 'button') { node.type = 'button'; }
+    node.setAttribute('data-nav-key', key);
+    node.setAttribute('role', 'option');
+    node.id = 'session-menu-' + key.replace(/[^A-Za-z0-9_-]/g, '_');
+    node.dmuxActivate = activate;
+    node.addEventListener('click', function (e) {
+      e.preventDefault();
+      if (node.disabled) { return; }
+      agentMenu.active = key;
+      activate();
+    });
+    return node;
+  }
+
+  function buildModelRow(a, m, query, models) {
+    var efforts = menuEfforts(m);
+    var key = 'model:' + a.id + ':' + m.id;
+    var selected = a.id === session.selected_agent && a.model === m.id;
+    var row = el('div', 'session-model-line');
+    var btn = menuItem('button', 'session-menu-row session-model-row' + (selected ? ' on' : ''), key, function () {
+      menuSelectModel(a, m.id, '').then(function (ok) { if (ok) { closeAgentPopover(true); } });
+    });
+    btn.setAttribute('aria-selected', selected ? 'true' : 'false');
+    btn.appendChild(el('span', 'session-menu-check', selected ? '✓' : ''));
+    btn.appendChild(el('span', 'session-model-name', m.label || m.id));
+    var current = modelEffort(a, m);
+    if (current) { btn.appendChild(el('span', 'session-model-effort', effortLabel(current))); }
+    row.appendChild(btn);
+    if (efforts.length) {
+      var open = !!agentMenu.expanded[key];
+      var more = el('button', 'session-model-more' + (open ? ' open' : ''), '›');
+      more.type = 'button';
+      more.tabIndex = -1;
+      more.setAttribute('aria-label', 'Effort for ' + (m.label || m.id));
+      more.setAttribute('aria-expanded', open ? 'true' : 'false');
+      more.addEventListener('click', function (e) {
+        e.preventDefault();
+        agentMenu.expanded[key] = !agentMenu.expanded[key];
+        agentMenu.active = key;
+        syncAgentPopover();
+      });
+      row.appendChild(more);
+    }
+    models.appendChild(row);
+    if (efforts.length && agentMenu.expanded[key]) {
+      var sub = el('div', 'session-model-sub');
+      sub.appendChild(el('p', 'session-model-sub-title', 'Effort'));
+      efforts.forEach(function (eff) {
+        var on = selected && current === eff;
+        var eb = menuItem('button', 'session-menu-row session-effort-row' + (on ? ' on' : ''),
+          'effort:' + a.id + ':' + m.id + ':' + eff, function () {
+            menuSelectModel(a, m.id, eff).then(function (ok) { if (ok) { closeAgentPopover(true); } });
+          });
+        eb.setAttribute('aria-selected', on ? 'true' : 'false');
+        eb.appendChild(el('span', 'session-menu-check', on ? '✓' : ''));
+        eb.appendChild(el('span', 'session-model-name', effortLabel(eff)));
+        sub.appendChild(eb);
+      });
+      models.appendChild(sub);
+    }
   }
 
   function buildAgentPopoverList() {
-    var list = el('ul', 'session-agent-list');
+    var list = el('div', 'session-agent-list');
+    list.setAttribute('role', 'listbox');
+    list.setAttribute('aria-label', 'Agents and models');
     if (!session) { return list; }
+    var query = (agentMenu.query || '').trim().toLowerCase();
+    var shown = 0;
     session.agents.forEach(function (a) {
       var hub = hubAgent(a.id);
-      var li = el('li', 'session-agent-item');
-      var row = el('button', 'session-agent-row');
-      row.type = 'button';
-      if (a.id === session.selected_agent) { row.classList.add('session-agent-row-active'); }
+      var isSelected = a.id === session.selected_agent;
+      var allModels = menuModels(a);
+      var agentHit = menuMatches(query, [a.label, a.id]);
+      var models = allModels.filter(function (m) {
+        return agentHit || menuMatches(query, [m.label, m.id]);
+      });
+      var showModels = isSelected ? (agentHit || models.length > 0) : (!!query && models.length > 0);
+      if (!agentHit && !showModels) { return; }
+      shown += 1;
+      var group = el('div', 'session-agent-item');
+      group.setAttribute('role', 'group');
+      group.setAttribute('aria-label', a.label || a.id);
+      var row = menuItem('button', 'session-menu-row session-agent-row', 'agent:' + a.id, function () {
+        if (!a.allowed) { return; }
+        command({ command: 'select_agent', agent: a.id }).then(function (ok) {
+          if (ok && !a.models.length && !a.models_loading) {
+            command({ command: 'load_models', agent: a.id });
+          }
+        });
+      });
+      if (isSelected) { row.classList.add('session-agent-row-active'); }
+      row.setAttribute('aria-selected', isSelected ? 'true' : 'false');
       if (!a.allowed) { row.disabled = true; }
       var dot = el('span', 'session-agent-dot');
       var color = (hub && hub.color) || agentColor(a.id);
@@ -1075,68 +1240,151 @@
       row.appendChild(dot);
       var main = el('span', 'session-agent-main');
       main.appendChild(el('span', 'session-agent-name', a.label || a.id));
-      var meta = el('span', 'session-agent-meta', (a.model || 'default model') +
+      var meta = el('span', 'session-agent-meta', (a.model ? modelLabel(a, a.model) : 'default model') +
         (runStatusLabel(a, hub) ? (' · ' + runStatusLabel(a, hub)) : ''));
       main.appendChild(meta);
       row.appendChild(main);
-      row.addEventListener('click', function () {
-        if (!a.allowed) { return; }
-        command({ command: 'select_agent', agent: a.id }).then(function () {
-          if (!a.models.length && !a.models_loading) {
-            command({ command: 'load_models', agent: a.id });
-          }
-        });
-      });
-      li.appendChild(row);
+      group.appendChild(row);
 
-      if (a.id === session.selected_agent) {
-        var models = el('div', 'session-agent-models');
-        if (a.models.length) {
-          a.models.forEach(function (m) {
-            var mb = el('button', 'session-model-chip' + (a.model === m.id ? ' on' : ''), m.label || m.id);
-            mb.type = 'button';
-            mb.addEventListener('click', function () {
-              command({ command: 'select_model', agent: a.id, model: m.id });
+      if (showModels || (isSelected && !query)) {
+        var box = el('div', 'session-agent-models');
+        if (allModels.length) {
+          if (a.default_model && menuMatches(query, ['default model', 'auto'].concat(agentHit ? [a.label, a.id] : []))) {
+            var isDefault = a.model === a.default_model;
+            var def = menuItem('button', 'session-menu-row session-model-row session-model-default', 'default:' + a.id, function () {
+              menuSelectModel(a, a.default_model, '', true).then(function (ok) { if (ok) { closeAgentPopover(true); } });
             });
-            models.appendChild(mb);
-          });
-        } else {
-          var load = el('button', 'btn btn-small', a.models_loading ? 'Loading…' : 'Load models');
-          load.type = 'button';
-          load.disabled = !!a.models_loading;
-          load.addEventListener('click', function () {
+            def.setAttribute('aria-selected', 'false');
+            def.appendChild(el('span', 'session-menu-check', ''));
+            def.appendChild(el('span', 'session-model-name', 'Default model'));
+            def.appendChild(el('span', 'session-model-effort', modelLabel(a, a.default_model) + (isDefault ? ' · current' : '')));
+            box.appendChild(def);
+          }
+          models.forEach(function (m) { buildModelRow(a, m, query, box); });
+        } else if (isSelected) {
+          var load = menuItem('button', 'session-menu-row session-model-load', 'load:' + a.id, function () {
             command({ command: 'load_models', agent: a.id });
           });
-          models.appendChild(load);
+          load.appendChild(el('span', 'session-menu-check', ''));
+          load.appendChild(el('span', 'session-model-name', a.models_loading ? 'Loading models…' : 'Load models'));
+          load.disabled = !!a.models_loading;
+          box.appendChild(load);
         }
-        if (a.model) {
-          var efforts = [];
-          a.models.forEach(function (m) { if (m.id === a.model) { efforts = m.efforts || []; } });
-          if (efforts.length) {
-            var effortRow = el('div', 'session-agent-efforts');
-            efforts.forEach(function (eff) {
-              var eb = el('button', 'session-model-chip' + (a.effort === eff ? ' on' : ''), eff);
-              eb.type = 'button';
-              eb.addEventListener('click', function () {
-                command({ command: 'set_effort', agent: a.id, effort: eff });
-              });
-              effortRow.appendChild(eb);
-            });
-            models.appendChild(effortRow);
-          }
-        }
-        li.appendChild(models);
+        if (box.childNodes.length) { group.appendChild(box); }
       }
-      list.appendChild(li);
+      list.appendChild(group);
     });
+    if (!shown) { list.appendChild(el('p', 'session-menu-empty', 'No matching agents or models')); }
     return list;
   }
 
+  function menuNavItems(panel) {
+    return Array.prototype.slice.call(panel.querySelectorAll('[data-nav-key]')).filter(function (n) {
+      return !n.disabled;
+    });
+  }
+
+  function menuDefaultActive(panel) {
+    var items = menuNavItems(panel);
+    if (!items.length) { return ''; }
+    if (!agentMenu.query) {
+      var on = panel.querySelector('.session-model-row.on[data-nav-key]') ||
+        panel.querySelector('.session-agent-row-active[data-nav-key]');
+      if (on && !on.disabled) { return on.getAttribute('data-nav-key'); }
+    } else {
+      // While searching, Enter should pick the first matching model.
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].classList.contains('session-model-row') &&
+            !items[i].classList.contains('session-model-default')) {
+          return items[i].getAttribute('data-nav-key');
+        }
+      }
+    }
+    return items[0].getAttribute('data-nav-key');
+  }
+
+  function paintMenuActive(panel, scroll) {
+    var items = menuNavItems(panel);
+    var keys = items.map(function (n) { return n.getAttribute('data-nav-key'); });
+    if (keys.indexOf(agentMenu.active) < 0) { agentMenu.active = menuDefaultActive(panel); }
+    var search = panel.querySelector('.session-agent-search');
+    items.forEach(function (n) {
+      var on = n.getAttribute('data-nav-key') === agentMenu.active;
+      n.classList.toggle('session-menu-active', on);
+      n.tabIndex = on ? 0 : -1;
+      if (on && search) { search.setAttribute('aria-activedescendant', n.id); }
+    });
+    var active = menuItemByKey(panel, agentMenu.active);
+    if (scroll && active && active.scrollIntoView) { active.scrollIntoView({ block: 'nearest' }); }
+  }
+
+  function menuItemByKey(panel, key) {
+    var items = menuNavItems(panel);
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].getAttribute('data-nav-key') === key) { return items[i]; }
+    }
+    return null;
+  }
+
+  function menuMove(panel, delta) {
+    var items = menuNavItems(panel);
+    if (!items.length) { return; }
+    var keys = items.map(function (n) { return n.getAttribute('data-nav-key'); });
+    var i = keys.indexOf(agentMenu.active);
+    i = i < 0 ? 0 : (i + delta + keys.length) % keys.length;
+    agentMenu.active = keys[i];
+    paintMenuActive(panel, true);
+    var focused = document.activeElement;
+    if (focused && focused.hasAttribute && focused.hasAttribute('data-nav-key')) { items[i].focus(); }
+  }
+
+  function menuToggleEffort(panel, open) {
+    var key = agentMenu.active || '';
+    if (key.indexOf('effort:') === 0 && !open) {
+      var parts = key.split(':');
+      key = 'model:' + parts[1] + ':' + parts.slice(2, parts.length - 1).join(':');
+    }
+    if (key.indexOf('model:') !== 0) { return false; }
+    var item = menuItemByKey(panel, key);
+    if (!item || !item.parentNode.querySelector('.session-model-more')) { return false; }
+    agentMenu.expanded[key] = open;
+    agentMenu.active = key;
+    syncAgentPopover();
+    return true;
+  }
+
+  function menuKeydown(e) {
+    if (!agentPopover) { return; }
+    var panel = agentPopover.querySelector('.session-agent-popover');
+    if (!panel) { return; }
+    var inSearch = e.target && e.target.classList && e.target.classList.contains('session-agent-search');
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      menuMove(panel, e.key === 'ArrowDown' ? 1 : -1);
+    } else if (e.key === 'ArrowRight' && (!inSearch || e.target.selectionStart === e.target.value.length)) {
+      if (menuToggleEffort(panel, true)) { e.preventDefault(); }
+    } else if (e.key === 'ArrowLeft' && (!inSearch || e.target.selectionStart === 0)) {
+      if (menuToggleEffort(panel, false)) { e.preventDefault(); }
+    } else if (e.key === 'Enter') {
+      var item = menuItemByKey(panel, agentMenu.active);
+      if (item && item.dmuxActivate) {
+        e.preventDefault();
+        item.dmuxActivate();
+      }
+    }
+  }
+
+  // Rebuilds the list in place on every snapshot. The search box is kept, so
+  // the typed query survives; focus stays on the search box or on the same
+  // row (by data-nav-key), and falls back to the search box when that row is
+  // gone, never to the panel itself.
   function syncAgentPopover() {
     if (!agentPopover || !session) { return; }
     var panel = agentPopover.querySelector('.session-agent-popover');
     if (!panel) { return; }
-    var hadFocus = document.activeElement && panel.contains(document.activeElement);
+    var focused = document.activeElement;
+    var hadFocus = !!(focused && panel.contains(focused));
+    var focusKey = hadFocus && focused.getAttribute ? focused.getAttribute('data-nav-key') : null;
     var list = buildAgentPopoverList();
     var old = panel.querySelector('.session-agent-list');
     if (old) {
@@ -1144,34 +1392,59 @@
     } else {
       panel.appendChild(list);
     }
-    if (hadFocus) { panel.focus(); }
+    if (focusKey) { agentMenu.active = focusKey; }
+    paintMenuActive(panel);
+    if (!hadFocus) { return; }
+    var search = panel.querySelector('.session-agent-search');
+    var again = focusKey ? menuItemByKey(panel, focusKey) : null;
+    if (again) {
+      again.focus();
+    } else if (search && document.activeElement !== search) {
+      search.focus();
+    }
   }
 
   function openAgentPopover() {
     if (!session || viewOnly) { return; }
-    closeAgentPopover();
+    closeAgentPopover(false);
+    agentMenu = { query: '', active: '', expanded: {} };
     var overlay = el('div', 'session-agent-overlay');
     var panel = el('div', 'session-agent-popover');
     panel.setAttribute('role', 'dialog');
     panel.setAttribute('aria-label', 'Choose agent and model');
     panel.tabIndex = -1;
     panel.appendChild(el('p', 'session-agent-popover-title', 'Agent for next message'));
+    var search = el('input', 'session-agent-search');
+    search.type = 'search';
+    search.placeholder = 'Search models';
+    search.setAttribute('aria-label', 'Search agents and models');
+    search.setAttribute('role', 'combobox');
+    search.setAttribute('aria-expanded', 'true');
+    search.autocomplete = 'off';
+    search.spellcheck = false;
+    search.addEventListener('input', function () {
+      agentMenu.query = search.value;
+      agentMenu.active = '';
+      syncAgentPopover();
+    });
+    panel.appendChild(search);
     panel.appendChild(buildAgentPopoverList());
+    panel.addEventListener('keydown', menuKeydown);
 
     overlay.addEventListener('click', function (e) {
-      if (e.target === overlay) { closeAgentPopover(); }
+      if (e.target === overlay) { closeAgentPopover(false); }
     });
     overlay.appendChild(panel);
     document.body.appendChild(overlay);
     agentPopover = overlay;
     ui.agentPicker.setAttribute('aria-expanded', 'true');
-    panel.focus();
+    paintMenuActive(panel, true);
+    search.focus();
     agentPopoverKeyHandler = function (e) {
       if (e.key !== 'Escape' || !agentPopover) { return; }
       e.preventDefault();
       e.stopPropagation();
-      closeAgentPopover();
-      if (ui.agentPicker) { ui.agentPicker.focus(); }
+      closeAgentPopover(true);
     };
     document.addEventListener('keydown', agentPopoverKeyHandler, true);
   }
@@ -1900,7 +2173,7 @@
     if (snap.workspace) {
       initSessionsSidebarForWorkspace(snap.workspace);
     }
-    window.__dmuxHubAgents = snap.agents || [];
+    hubAgents = snap.agents || [];
     var colors = {};
     (snap.agents || []).forEach(function (a) { if (a.color) { colors[a.id] = a.color; } });
     window.__dmuxSessionAgents = colors;
@@ -1939,8 +2212,8 @@
   // Plan-gate approval buttons are rendered in app.js via parityButton (parity ids).
   window.dmuxaiSession = {
     parityButton: button,
-    updateAgentRunIndicators: function (hubAgents) {
-      if (hubAgents) { window.__dmuxHubAgents = hubAgents; }
+    updateAgentRunIndicators: function (agents) {
+      if (agents) { hubAgents = agents; }
       updateAgentPickerLabel();
       if (agentPopover) { syncAgentPopover(); }
     },
