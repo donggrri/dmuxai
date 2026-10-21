@@ -10045,7 +10045,7 @@ impl App {
         Some(hash)
     }
 
-    const MEMORY_OFF: &'static str = "Memory is off. Set [memory] vault = \"~/Obsidian/Vault\" in ~/.config/dmuxai/dmuxai.toml (dir defaults to cursor-workflow/memory).";
+    const MEMORY_OFF: &'static str = "Memory is off. Set [memory] vault = \"~/Obsidian/Vault\" in ~/.config/dmuxai/dmuxai.toml (dir defaults to memory).";
 
     /// FR-726: `/remember [--human | --decision <name> | --gotcha <name>] <text>`.
     fn remember_command(&mut self, args: &str) {

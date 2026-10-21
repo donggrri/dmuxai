@@ -19,7 +19,7 @@ pub const SECTION_BUDGET: usize = 900;
 /// Max chars of one entry text (FR-723).
 pub const MAX_ENTRY_CHARS: usize = 200;
 /// Default memory directory inside the vault (FR-720).
-pub const DEFAULT_DIR: &str = "cursor-workflow/memory";
+pub const DEFAULT_DIR: &str = "memory";
 
 static ENTRY_RE: std::sync::LazyLock<Regex> =
     std::sync::LazyLock::new(|| Regex::new(r"^- \[\d{4}-\d{2}-\d{2}\] ").unwrap());
@@ -1637,7 +1637,7 @@ mod tests {
 
         let (root, dir) = resolve_root(vault.path(), None).unwrap();
         assert_eq!(dir, DEFAULT_DIR);
-        assert_eq!(root, vault.path().join("cursor-workflow").join("memory"));
+        assert_eq!(root, vault.path().join("memory"));
 
         let (root2, dir2) = resolve_root(vault.path(), Some("notes\\memory")).unwrap();
         assert_eq!(dir2, "notes/memory");

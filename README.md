@@ -150,19 +150,19 @@ left click opens the dashboard preview when `--web` runs, else the OS opener.
 DmuxAI can keep durable notes in an Obsidian vault and prepend them to every
 agent's prompt (Cursor, AGY, Codex, opencode and any custom agent, graph
 nodes included). It uses the same layout as the cursor-atomic-workflow
-memory, so an existing `cursor-workflow/memory` folder works as is.
+memory. Set `dir` if the notes already live somewhere else in the vault.
 
 ```toml
 # ~/.config/dmuxai/dmuxai.toml (or the repo's dmuxai.toml, which wins per key)
 [memory]
 vault = "~/Obsidian/Vault"       # an existing directory; memory is off without it
-dir = "cursor-workflow/memory"   # default; relative to the vault, no ".."
+dir = "memory"                   # default; relative to the vault, no ".."
 # project = "my-repo"            # default: the workspace folder name
 # inject = false                 # keep saving/searching, stop prompt injection
 ```
 
 ```text
-<vault>/cursor-workflow/memory/
+<vault>/memory/
   human.md                 # about you
   projects/<project>.md    # this repo
   decisions/<name>.md

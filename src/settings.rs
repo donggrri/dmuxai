@@ -1527,8 +1527,8 @@ mod memory_settings_tests {
             ws.path(),
         );
         let m = s.memory.expect("enabled");
-        assert_eq!(m.dir, "cursor-workflow/memory");
-        assert_eq!(m.root, vault.path().join("cursor-workflow").join("memory"));
+        assert_eq!(m.dir, "memory");
+        assert_eq!(m.root, vault.path().join("memory"));
         assert_eq!(m.project, None);
         assert!(m.inject);
 
@@ -1617,10 +1617,7 @@ mod memory_settings_tests {
         let m = s.memory.expect("enabled");
         assert_eq!(
             m.root,
-            ws.path()
-                .join("vault")
-                .join("cursor-workflow")
-                .join("memory")
+            ws.path().join("vault").join("memory")
         );
     }
 

@@ -148,7 +148,7 @@ fn tool_response(response: &Value) -> (&str, bool) {
 #[test]
 fn mcp_memory_serves_tools_against_a_vault() {
     let vault = tempfile::tempdir().expect("vault");
-    let root = vault.path().join("cursor-workflow").join("memory");
+    let root = vault.path().join("memory");
     std::fs::create_dir_all(root.join("gotchas")).expect("mkdir gotchas");
     std::fs::write(
         root.join("human.md"),
@@ -281,7 +281,6 @@ fn mcp_memory_serves_tools_against_a_vault() {
     // The proposal was persisted to the queue.
     let queue = vault
         .path()
-        .join("cursor-workflow")
         .join("memory")
         .join("queue")
         .join("proposals.json");
@@ -447,7 +446,6 @@ fn mcp_memory_applies_project_override_to_settings() {
 
     let queue = vault
         .path()
-        .join("cursor-workflow")
         .join("memory")
         .join("queue")
         .join("proposals.json");
