@@ -2,7 +2,9 @@
 //!
 //! Contract:
 //! - `pub struct DocFile { pub path: String, pub kind: DocKind, pub editable: bool, pub size: u64,
-//!    pub mtime_ms: u64, pub sha256: String, pub content: Option<String> }` (Serialize)
+//!    pub mtime_ms: u64, pub sha256: String, pub content: Option<String>,
+//!    pub code_html: Option<String>, pub language: Option<String>, pub content_omitted: bool }`
+//! - `pub fn read_file_with_view(ws: &Workspace, path: &str, code_view: bool) -> Result<DocFile, DocsError>`
 //! - `pub fn read_file(ws: &Workspace, path: &str) -> Result<DocFile, DocsError>`
 //! - `pub fn read_bytes(ws: &Workspace, path: &str, max: u64) -> Result<(ResolvedPath, Vec<u8>), DocsError>`
 //! - `pub struct SaveOutcome { pub sha256: String, pub mtime_ms: u64, pub size: u64 }` (Serialize)
@@ -28,6 +30,18 @@ pub struct DocFile {
     pub mtime_ms: u64,
     pub sha256: String,
     pub content: Option<String>,
+    /// Code-view reads of text kinds only: highlighted, line-split HTML
+    /// (`crate::docs::highlight`). Absent when the file has no known syntax
+    /// or exceeds a highlight budget; the viewer then numbers `content`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_html: Option<String>,
+    /// syntect syntax name for `code_html`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// `content` was left out because `code_html` is present (code-view
+    /// reads only); a plain read returns it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub content_omitted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +78,18 @@ fn hash_file_stream(path: &Path) -> Result<String, DocsError> {
 
 /// Reads a document file's metadata and content (FR-742).
 pub fn read_file(ws: &Workspace, path: &str) -> Result<DocFile, DocsError> {
+    read_file_with_view(ws, path, false)
+}
+
+/// Like [`read_file`]; with `code_view` a text file that can be
+/// highlighted carries `code_html` instead of `content` (the viewer fetches
+/// the raw text with a plain read when the user starts editing), so the
+/// response never holds both.
+pub fn read_file_with_view(
+    ws: &Workspace,
+    path: &str,
+    code_view: bool,
+) -> Result<DocFile, DocsError> {
     let resolved = ws.resolve(path)?;
     let metadata = std::fs::metadata(&resolved.absolute)?;
     if metadata.is_dir() {
@@ -91,6 +117,21 @@ pub fn read_file(ws: &Workspace, path: &str) -> Result<DocFile, DocsError> {
     };
 
     let editable = kind.editable() && size <= MAX_TEXT_BYTES && is_valid_utf8;
+    let view = match (code_view, &kind, &content) {
+        (true, DocKind::Text, Some(text)) => {
+            crate::docs::highlight::highlight_file_cached(&resolved.relative, &sha256, text)
+        }
+        _ => None,
+    };
+    let (content, code_html, language, content_omitted) = match view {
+        Some(view) => (
+            None,
+            Some(view.html.clone()),
+            Some(view.language.clone()),
+            true,
+        ),
+        None => (content, None, None, false),
+    };
 
     Ok(DocFile {
         path: resolved.relative,
@@ -100,6 +141,9 @@ pub fn read_file(ws: &Workspace, path: &str) -> Result<DocFile, DocsError> {
         mtime_ms: mtime,
         sha256,
         content,
+        code_html,
+        language,
+        content_omitted,
     })
 }
 

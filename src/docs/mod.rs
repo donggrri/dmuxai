@@ -7,6 +7,7 @@
 pub mod changes;
 pub mod confine;
 pub mod file;
+pub mod highlight;
 pub mod links;
 pub mod list;
 pub mod markdown;

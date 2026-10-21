@@ -1659,6 +1659,8 @@
       sha256: null,
       text: null,
       html: null,
+      codeHtml: null,
+      contentOmitted: false,
       download: null,
       editing: false,
       dirty: false
@@ -1667,12 +1669,16 @@
     docBody.appendChild(el('p', 'empty', 'Loading ' + path + ' \u2026'));
     updateDocControls();
 
-    api('GET', '/api/docs/file?path=' + encodeURIComponent(path))
+    // view=code: highlightable text files come as code_html without the raw
+    // content (fetched with a plain read when editing starts).
+    api('GET', '/api/docs/file?view=code&path=' + encodeURIComponent(path))
       .then(function (doc) {
         current.kind = String(doc.kind || 'binary');
         current.editable = Boolean(doc.editable);
         current.sha256 = doc.sha256 ? String(doc.sha256) : null;
         current.text = typeof doc.content === 'string' ? doc.content : null;
+        current.codeHtml = typeof doc.code_html === 'string' ? doc.code_html : null;
+        current.contentOmitted = Boolean(doc.content_omitted);
         setBadges(doc);
         renderDocument();
       })
@@ -1692,12 +1698,49 @@
     }
   }
 
+  // Text kinds: the server sends `code_html` (syntax classes, one
+  // .code-line per source line, numbered by a CSS counter so the numbers
+  // are not copied). It goes through sanitizeInto like rendered Markdown.
+  // Files without a known syntax or over the highlight budgets come as raw
+  // content and get a plain view with a line-number gutter: two text nodes,
+  // cheap even for very large files.
   function showTextView() {
+    if (current.kind === 'text' && current.codeHtml) {
+      var view = el('div', 'doc-code-view');
+      sanitizeInto(view, current.codeHtml);
+      docBody.replaceChildren();
+      docBody.appendChild(view);
+      return;
+    }
+    if (current.kind === 'text' && current.text !== null) {
+      docBody.replaceChildren();
+      docBody.appendChild(plainNumberedView(current.text));
+      return;
+    }
     var pre = el('pre', 'doc-code');
     var code = el('code', null, current.text === null ? '' : current.text);
     pre.appendChild(code);
     docBody.replaceChildren();
     docBody.appendChild(pre);
+  }
+
+  function plainNumberedView(raw) {
+    // Display only: CR LF and lone CR are one line break (raw text unchanged).
+    var text = String(raw).replace(/\r\n?/g, '\n');
+    var body = text.charAt(text.length - 1) === '\n' ? text.slice(0, -1) : text;
+    var count = body.split('\n').length;
+    var numbers = new Array(count);
+    for (var i = 0; i < count; i++) { numbers[i] = String(i + 1); }
+    var wrap = el('div', 'doc-plain-view');
+    var gutter = el('pre', 'doc-plain-gutter', numbers.join('\n'));
+    gutter.setAttribute('aria-hidden', 'true');
+    var pre = el('pre', 'doc-plain-code');
+    // A pre drops one trailing line break, so end with one: a last empty
+    // line then still gets its row next to its number.
+    pre.appendChild(el('code', null, body + '\n'));
+    wrap.appendChild(gutter);
+    wrap.appendChild(pre);
+    return wrap;
   }
 
   var ALLOWED_TAGS = {
@@ -1715,7 +1758,7 @@
     template: 1, noscript: 1, textarea: 1, select: 1, form: 1, title: 1,
     head: 1, link: 1, meta: 1, base: 1, frame: 1, frameset: 1
   };
-  var SANITIZER_CLASS_RE = /^(hl-|language-|footnote)/;
+  var SANITIZER_CLASS_RE = /^(hl-|language-|footnote|code-(line|view)$)/;
   var SANITIZER_ID_RE = /^user-content-/;
 
   function isSafeUrl(value, img) {
@@ -1939,6 +1982,34 @@
     if (!current || !current.editable || !readOnlyKnown || readOnly || current.editing) {
       return;
     }
+    if (current.text === null && current.contentOmitted) {
+      // The code view came without the raw text: fetch it for the editor.
+      if (current.loadingRaw) { return; }
+      current.loadingRaw = true;
+      var opened = current;
+      setStatus('Loading\u2026');
+      api('GET', '/api/docs/file?path=' + encodeURIComponent(opened.path))
+        .then(function (doc) {
+          opened.loadingRaw = false;
+          if (current !== opened) { return; }
+          if (typeof doc.content !== 'string') {
+            setStatus('Cannot edit: the file is no longer editable text.', true);
+            return;
+          }
+          var changed = opened.sha256 !== null && String(doc.sha256 || '') !== opened.sha256;
+          opened.text = doc.content;
+          opened.sha256 = doc.sha256 ? String(doc.sha256) : opened.sha256;
+          opened.contentOmitted = false;
+          setStatus('');
+          startEdit();
+          if (changed) { setStatus('The file changed on disk; editing the current version.'); }
+        })
+        .catch(function (err) {
+          opened.loadingRaw = false;
+          setStatus('Cannot edit: ' + err.message, true);
+        });
+      return;
+    }
     current.editing = true;
     current.dirty = false;
     hideConflict();
@@ -2048,6 +2119,10 @@
       .then(function (res) {
         current.sha256 = res && res.sha256 ? String(res.sha256) : usedBase;
         current.text = content;
+        // The old code view no longer matches; show plain text until the
+        // highlighted view of the saved content arrives.
+        current.codeHtml = null;
+        if (current.kind === 'text') { refreshCodeView(current.path, current.sha256); }
         current.dirty = false;
         hideConflict();
         setStatus('Saved.');
@@ -2069,6 +2144,17 @@
           setStatus('Save failed: ' + err.message, true);
         }
       });
+  }
+
+  function refreshCodeView(path, sha256) {
+    api('GET', '/api/docs/file?view=code&path=' + encodeURIComponent(path))
+      .then(function (doc) {
+        if (!current || current.path !== path || current.sha256 !== sha256) { return; }
+        if (String(doc.sha256 || '') !== sha256) { return; }
+        current.codeHtml = typeof doc.code_html === 'string' ? doc.code_html : null;
+        if (!current.editing && current.codeHtml) { showTextView(); }
+      })
+      .catch(function () { /* keep the plain text view */ });
   }
 
   function exitEditingAfterSave() {
