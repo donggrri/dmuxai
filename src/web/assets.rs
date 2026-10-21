@@ -1484,6 +1484,14 @@ mod tests {
             checklist_js.contains("task-checklist-label") && checklist_js.contains("done_check"),
             "task title and done_check must render via DOM helpers"
         );
+        // TC-1310 / UX-1310: a selected task shows the run prompt and node progress.
+        assert!(checklist_js.contains("task-checklist-prompt"));
+        assert!(checklist_js.contains("user_prompt"));
+        assert!(checklist_js.contains("task-checklist-progress"));
+        assert!(checklist_js.contains("agent.activity"));
+        assert!(checklist_js.contains("\\u00b7 unknown"));
+        assert!(APP_CSS.contains(".task-checklist-row.task-checklist-row-expanded .task-checklist-prompt"));
+        assert!(APP_JS.contains("if (taskChecklistSelectedId) { renderTaskChecklist(graph); }"));
     }
 
     // TC-979 (UX-934, UX-935): revision badges on nodes and plan-history list.
