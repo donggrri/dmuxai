@@ -2,6 +2,8 @@
 
 One terminal. Multiple AI coding agents.
 
+Licensed under the [MIT License](LICENSE).
+
 Product direction and model policy: see [MISSION.md](MISSION.md) (primary CLIs: **cursor-agent** then **agy**; graph workflows use **composer-2.5** only).
 
 DmuxAI is a Ratatui client for three real, structured, headless coding-agent
