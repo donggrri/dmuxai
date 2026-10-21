@@ -1,0 +1,47 @@
+name: Feature request
+description: Propose new behavior or a change to existing behavior
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Behavior changes in this repository follow **Spec → Plan → Execute → Review → Test**.
+        A merged feature usually includes `docs/specs/SPEC-<slug>.md` and linked tasks/review docs.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or opportunity
+      description: What user or operator problem does this solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Observable outcomes, not implementation sketches
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: What should explicitly stay out of scope?
+
+  - type: checkboxes
+    id: spec_ack
+    attributes:
+      label: Delivery expectations
+      options:
+        - label: I am willing to help author or review a `docs/specs/SPEC-<slug>.md` before implementation
+          required: true
+        - label: I checked [docs/specs/DMUXAI-BASELINE.md](https://github.com/donggrri/dmuxai/blob/main/docs/specs/DMUXAI-BASELINE.md) for overlap with shipped behavior
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you evaluated and why they were not chosen

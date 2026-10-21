@@ -1,0 +1,14 @@
+title = "DmuxAI gitleaks config"
+
+[extend]
+useDefault = true
+
+# Deterministic test fixtures and secret-validation strings (not real credentials).
+[allowlist]
+description = "test and validation fixtures"
+paths = [
+  '''(?:^|/)tests/web_workspace_dir\.rs$''',
+  '''(?:^|/)tests/web_session_sidebar\.rs$''',
+  '''(?:^|/)src/web/auth\.rs$''',
+  '''(?:^|/)src/memory\.rs$''',
+]

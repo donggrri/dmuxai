@@ -1,0 +1,77 @@
+name: Bug report
+description: Report incorrect or broken behavior
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. For security-sensitive issues, use **Security → Report a vulnerability** instead of this form.
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - TUI (terminal)
+        - Web dashboard (`dmuxai --web` / `dmuxai serve`)
+        - Graph execution
+        - Agent adapter (Cursor / AGY / Codex / custom)
+        - Packaging / install
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: DmuxAI version
+      description: Output of `dmuxai --version` or the release tag you installed
+      placeholder: "v0.2.2"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps from a clean workspace when possible
+      placeholder: |
+        1. Run `dmuxai` in ...
+        2. Select agent ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Redact access tokens, API keys, and private paths before pasting
+      render: shell
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - WSL on Windows
+        - macOS
+        - Other
+    validations:
+      required: true
