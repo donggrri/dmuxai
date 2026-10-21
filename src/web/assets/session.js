@@ -45,6 +45,7 @@
   var session = null;
   var viewOnly = false;
   var pending = null;
+  var INPUT_PLACEHOLDER = 'Message the selected agent. Enter sends, Shift+Enter adds a line, / opens commands.';
   var conversationShown = null;
   var promptInFlight = false;
   // Optimistic copies of sent prompts, oldest first. Each is replaced by its
@@ -546,7 +547,7 @@
     composerTop.appendChild(ui.agentPicker);
     ui.input = el('textarea', 'session-input');
     ui.input.rows = 1;
-    ui.input.placeholder = 'Message the selected agent. Enter sends, Shift+Enter adds a line, / opens commands.';
+    ui.input.placeholder = INPUT_PLACEHOLDER;
     ui.input.setAttribute('data-parity', 'prompt-newline');
     ui.input.setAttribute('aria-label', 'Prompt');
     ui.input.addEventListener('keydown', onPromptKey);
@@ -582,6 +583,18 @@
     setOptions(ui.route, PROMPT_ROUTES, 'auto');
     sendLeft.appendChild(ui.route.parentNode);
     sendCol.appendChild(sendLeft);
+    ui.stop = button('Stop', 'prompt-stop', function () {
+      var agent = (session && session.selected_agent) || null;
+      if (session && session.agents) {
+        for (var i = 0; i < session.agents.length; i++) {
+          var a = session.agents[i];
+          if (a && (a.busy || (a.run && a.run.state === 'running'))) { agent = a.id; break; }
+        }
+      }
+      command({ command: 'cancel', agent: agent });
+    }, 'btn-danger');
+    ui.stop.hidden = true;
+    sendCol.appendChild(ui.stop);
     ui.send = button('Send', 'prompt-send', submitPrompt, 'btn-primary');
     sendCol.appendChild(ui.send);
     form.appendChild(sendCol);
@@ -1667,7 +1680,9 @@
         baseline: userMessageIds(),
         promptId: null,
         messageId: null,
-        items: echoItems
+        items: echoItems,
+        // Sent while a run is active: it reads after the working node.
+        followup: !!(session && session.run_active)
       };
       pendingEchoes.push(echo);
       ui.input.value = '';
@@ -1728,6 +1743,12 @@
     if (ui.agentPicker) { ui.agentPicker.disabled = viewOnly; }
     if (agentPopover) { syncAgentPopover(); }
     ui.cancel.hidden = !busy;
+    if (ui.stop) {
+      ui.stop.hidden = !(session && session.run_active && !viewOnly);
+    }
+    if (ui.input) {
+      ui.input.placeholder = (session && session.run_active && !viewOnly) ? 'Send follow-up' : INPUT_PLACEHOLDER;
+    }
     ui.details.classList.toggle('btn-on', !!session.details_expanded);
     [ui.newConv, ui.status, ui.details, ui.share, ui.palette, ui.quit, ui.send].forEach(function (b) {
       b.disabled = viewOnly;
@@ -1801,6 +1822,55 @@
     return true;
   }
 
+  function leaveEditMode(node) {
+    if (!node) { return; }
+    node.dmuxEditing = false;
+    if (node.dmuxText) { node.dmuxText.hidden = false; }
+    if (node.dmuxQueuedEditBox && node.dmuxQueuedEditBox.parentNode) {
+      node.dmuxQueuedEditBox.parentNode.removeChild(node.dmuxQueuedEditBox);
+    }
+    node.dmuxQueuedEditBox = null;
+    if (node.dmuxQueuedActions) { node.dmuxQueuedActions.hidden = false; }
+  }
+
+  function enterEditMode(node, m) {
+    if (!node || node.dmuxEditing) { return; }
+    node.dmuxEditing = true;
+    if (node.dmuxText) { node.dmuxText.hidden = true; }
+    if (node.dmuxQueuedActions) { node.dmuxQueuedActions.hidden = true; }
+    if (!node.dmuxQueuedTextarea) {
+      node.dmuxQueuedTextarea = el('textarea', 'msg-queued-edit');
+    }
+    node.dmuxQueuedTextarea.value =
+      (node.dmuxContentText != null ? String(node.dmuxContentText) : ((m && m.content) ? String(m.content) : ''));
+    if (!node.dmuxQueuedSaveBtn) {
+      node.dmuxQueuedSaveBtn = button('Save', null, function () {
+        var text = node.dmuxQueuedTextarea.value.trim();
+        if (text) {
+          command({ command: 'queue_edit', id: node.dmuxPromptId, text: text });
+        }
+        leaveEditMode(node);
+      });
+    }
+    if (!node.dmuxQueuedCancelBtn) {
+      node.dmuxQueuedCancelBtn = button('Cancel', null, function () {
+        leaveEditMode(node);
+      });
+    }
+    if (!node.dmuxQueuedEditBox) {
+      var box = el('div', 'msg-queued-editbox');
+      box.appendChild(node.dmuxQueuedTextarea);
+      var btnRow = el('div', 'msg-queued-actions');
+      btnRow.appendChild(node.dmuxQueuedSaveBtn);
+      btnRow.appendChild(node.dmuxQueuedCancelBtn);
+      box.appendChild(btnRow);
+      node.dmuxQueuedEditBox = box;
+    }
+    node.dmuxQueuedEditBox.hidden = false;
+    if (!node.dmuxQueuedEditBox.parentNode) { node.appendChild(node.dmuxQueuedEditBox); }
+    try { node.dmuxQueuedTextarea.focus(); } catch (err) { /* ignore */ }
+  }
+
   function renderPendingEchoes() {
     if (!ui.transcript) { return; }
     var existing = ui.transcript.querySelectorAll('li.msg-pending');
@@ -1810,6 +1880,7 @@
     if (!pendingEchoes.length) { return; }
     var empty = ui.transcript.querySelector('.session-empty');
     if (empty && empty.parentNode) { empty.parentNode.removeChild(empty); }
+    var hasFollowupEcho = pendingEchoes.some(function (echo) { return !!echo.followup; });
     pendingEchoes.forEach(function (echo) {
       var li = el('li', 'msg msg-user msg-pending');
       li.setAttribute('data-echo', echo.key);
@@ -1829,10 +1900,12 @@
       }
       ui.transcript.appendChild(li);
     });
-    var working = ui.transcript.querySelector('.msg-working');
-    if (working && working.parentNode) {
-      working.parentNode.removeChild(working);
-      ui.transcript.appendChild(working);
+    if (!hasFollowupEcho) {
+      var working = ui.transcript.querySelector('.msg-working');
+      if (working && working.parentNode) {
+        working.parentNode.removeChild(working);
+        ui.transcript.appendChild(working);
+      }
     }
   }
 
@@ -1918,19 +1991,63 @@
           ui.transcript.appendChild(node);
         }
       }
+      var queued = !!m.queued;
+      node.dmuxPromptId = m.prompt_id;
+      node.dmuxContentText = m.content;
+      node.classList.toggle('msg-queued', queued);
+      // The queued badge and its actions (Edit, x) sit in one row under the
+      // bubble; they are removed once the follow-up starts.
+      if (node.dmuxQueuedActions && (!queued || node.dmuxQueuedViewOnly !== viewOnly)) {
+        if (node.dmuxQueuedActions.parentNode) {
+          node.dmuxQueuedActions.parentNode.removeChild(node.dmuxQueuedActions);
+        }
+        node.dmuxQueuedActions = null;
+      }
+      if (!queued || viewOnly) {
+        if (node.dmuxQueuedEditBox && node.dmuxQueuedEditBox.parentNode) {
+          node.dmuxQueuedEditBox.parentNode.removeChild(node.dmuxQueuedEditBox);
+        }
+        node.dmuxQueuedEditBox = null;
+        node.dmuxEditing = false;
+        if (node.dmuxText) { node.dmuxText.hidden = false; }
+      }
+      if (queued && !node.dmuxQueuedActions) {
+        var actions = el('div', 'msg-queued-actions');
+        actions.appendChild(el('span', 'msg-queued-badge', 'queued'));
+        if (!viewOnly) {
+          var editBtn = button('Edit', null, function () {
+            enterEditMode(node, m);
+          });
+          var removeBtn = button('\u00D7', null, function () {
+            command({ command: 'queue_remove', id: node.dmuxPromptId });
+          });
+          removeBtn.setAttribute('aria-label', 'Remove queued follow-up');
+          actions.appendChild(editBtn);
+          actions.appendChild(removeBtn);
+        }
+        node.dmuxQueuedActions = actions;
+        node.dmuxQueuedViewOnly = viewOnly;
+        if (node.dmuxEditing) { actions.hidden = true; }
+      }
       var who = m.role === 'agent' ? (m.agent || 'agent') : m.role;
       if (node.dmuxWho.textContent !== who) { node.dmuxWho.textContent = who; }
       // The agent color marks the message edge; the label keeps the theme's
       // text color so it stays readable for any configured agent color.
       var color = m.agent ? agentColor(m.agent) : null;
       if (color) { node.style.setProperty('--agent-color', color); } else { node.style.removeProperty('--agent-color'); }
-      renderMessageText(node.dmuxText, m);
+      if (!node.dmuxEditing) { renderMessageText(node.dmuxText, m); }
       // Copy reply: the raw Markdown source, not the rendered HTML.
       if (m.role === 'agent') { node.dmuxRaw = String(m.content || ''); }
       if (node.dmuxActions) {
         node.dmuxActions.classList.toggle('msg-actions-hidden', !!m.streaming || !m.content);
       }
       node.classList.toggle('msg-streaming', !!m.streaming);
+      if (queued && node.dmuxQueuedActions && !node.dmuxQueuedActions.parentNode) {
+        node.appendChild(node.dmuxQueuedActions);
+      }
+      if (node.dmuxEditing && node.dmuxQueuedEditBox && !node.dmuxQueuedEditBox.parentNode) {
+        node.appendChild(node.dmuxQueuedEditBox);
+      }
       var imageKey = (m.images && m.images.length) ? m.images.join(',') : '';
       if (node.dmuxImagesKey !== imageKey) {
         var oldImages = node.querySelector ? node.querySelector('.msg-images') : null;
@@ -2006,6 +2123,12 @@
     } else if (workingNode) {
       workingNode.parentNode.removeChild(workingNode);
     }
+    // Queued follow-ups read after the current working node.
+    var queuedOrder = [];
+    (session.transcript || []).forEach(function (m) {
+      if (m.queued && messageNodes[m.id]) { queuedOrder.push(messageNodes[m.id]); }
+    });
+    queuedOrder.forEach(function (n) { ui.transcript.appendChild(n); });
     renderPendingEchoes();
     renderChatAux();
     // docs.js links agent turns that changed files to their chat message

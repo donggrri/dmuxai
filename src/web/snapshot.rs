@@ -86,6 +86,10 @@ pub struct SessionView {
     /// a prompt once `prompt_seq` reaches it.
     #[serde(default)]
     pub prompt_seq: u64,
+    /// A run or turn is active: the composer sends follow-ups (queued) and
+    /// shows Stop.
+    #[serde(default)]
+    pub run_active: bool,
 }
 
 /// One workspace folder in the Sessions sidebar (FR-1225).
@@ -175,6 +179,9 @@ pub struct SessionMessage {
     /// never gets one, like a plan run whose steps post their own prompts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_id: Option<u64>,
+    /// A follow-up waiting for the active run to end (not in agent context).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub queued: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

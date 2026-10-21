@@ -941,6 +941,8 @@ fn session_command_needs_web_write(command: &SessionCommand) -> bool {
         SessionCommand::PlanDecision { .. }
             | SessionCommand::PlanReplan { .. }
             | SessionCommand::PlanTaskEdit { .. }
+            | SessionCommand::QueueRemove { .. }
+            | SessionCommand::QueueEdit { .. }
     )
 }
 
@@ -1008,6 +1010,7 @@ async fn post_prompt(
             mode: body.mode,
             route: body.route,
             images: resolved_images,
+            allow_queue: state.services.web_attached,
             reply,
         })
         .await
@@ -1031,6 +1034,7 @@ async fn post_prompt(
             "agent": result.agent,
             "prompt_id": result.prompt_id,
             "message_id": result.message_id,
+            "queued": result.queued,
         }),
     )
 }
@@ -2538,6 +2542,88 @@ mod tests {
         assert!(read_body(resp).await.contains("view-only"));
     }
 
+    // Follow-up queue: a view-only dashboard cannot queue (the prompt is
+    // sent with allow_queue off) and cannot remove or edit queued items.
+    #[tokio::test]
+    async fn view_only_dashboard_cannot_queue_followups() {
+        let token = generate_token();
+        for attached in [true, false] {
+            let (tx, mut rx) = mpsc::channel(4);
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen_by_app = seen.clone();
+            tokio::spawn(async move {
+                while let Some(command) = rx.recv().await {
+                    match command {
+                        DashboardCommand::SubmitPrompt {
+                            allow_queue, reply, ..
+                        } => {
+                            seen_by_app.lock().unwrap().push(allow_queue);
+                            let _ = reply.send(if allow_queue {
+                                Ok(PromptAccepted {
+                                    conversation_id: "c".to_owned(),
+                                    agent: "cursor".to_owned(),
+                                    prompt_id: Some(7),
+                                    message_id: None,
+                                    queued: true,
+                                })
+                            } else {
+                                Err(RunTodoError::Busy("agent 'cursor' is busy".to_owned()))
+                            });
+                        }
+                        DashboardCommand::Session { reply, .. } => {
+                            let _ = reply.send(Ok(crate::web::SessionView::default()));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            let router = build_router_with(
+                test_hub(),
+                token.clone(),
+                allowed_localhost(),
+                DashboardServices {
+                    commands: Some(tx),
+                    web_attached: attached,
+                    ..DashboardServices::default()
+                },
+            );
+            let resp = router
+                .clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/prompt",
+                    &token,
+                    r#"{"text":"next step"}"#,
+                ))
+                .await
+                .unwrap();
+            if attached {
+                assert_eq!(resp.status(), StatusCode::ACCEPTED);
+                let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+                assert_eq!(body["queued"], true);
+                assert_eq!(body["prompt_id"], 7);
+            } else {
+                assert_eq!(resp.status(), StatusCode::CONFLICT);
+            }
+            assert_eq!(*seen.lock().unwrap(), vec![attached]);
+            for command in [
+                r#"{"command":"queue_remove","id":7}"#,
+                r#"{"command":"queue_edit","id":7,"text":"x"}"#,
+            ] {
+                let resp = router
+                    .clone()
+                    .oneshot(json_request("POST", "/api/command", &token, command))
+                    .await
+                    .unwrap();
+                if attached {
+                    assert_eq!(resp.status(), StatusCode::OK, "{command}");
+                } else {
+                    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{command}");
+                }
+            }
+        }
+    }
+
     fn spawn_plan_gate_session_double() -> (
         mpsc::Sender<DashboardCommand>,
         Arc<std::sync::Mutex<Vec<SessionCommand>>>,
@@ -3454,6 +3540,7 @@ mod tests {
             agent: "codex".to_string(),
             prompt_id: None,
             message_id: None,
+            queued: false,
         };
         let router = build_router_with(
             test_hub(),
@@ -3671,6 +3758,7 @@ mod tests {
             agent: "codex".to_string(),
             prompt_id: None,
             message_id: None,
+            queued: false,
         };
         let (tx, mut rx) = mpsc::channel(16);
         tokio::spawn(async move {
@@ -5027,6 +5115,7 @@ mod tests {
                                 conversation_id: "c1".to_owned(),
                                 prompt_id: None,
                                 message_id: None,
+                                queued: false,
                             }));
                         }
                     }
@@ -5253,6 +5342,7 @@ mod tests {
             agent: "codex".to_string(),
             prompt_id: None,
             message_id: None,
+            queued: false,
         };
         let (tx, mut rx) = mpsc::channel(16);
         tokio::spawn(async move {

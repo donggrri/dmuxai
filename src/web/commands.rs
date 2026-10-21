@@ -44,6 +44,10 @@ pub struct PromptAccepted {
     /// The transcript id of the user message the prompt posted right away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
+    /// The prompt was queued as a follow-up: a run is active, and it starts
+    /// on its own once the run ends.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub queued: bool,
 }
 
 /// A picker or lifecycle action from `POST /api/command`
@@ -112,6 +116,15 @@ pub enum SessionCommand {
         workspace: String,
         id: String,
     },
+    /// Remove a queued follow-up before it starts (`id` = its prompt id).
+    QueueRemove {
+        id: u64,
+    },
+    /// Replace the text of a queued follow-up before it starts.
+    QueueEdit {
+        id: u64,
+        text: String,
+    },
     PlanTaskEdit {
         action: String,
         task_id: String,
@@ -147,6 +160,9 @@ pub enum DashboardCommand {
         mode: Option<String>,
         route: Option<String>,
         images: Vec<std::path::PathBuf>,
+        /// Queue the prompt as a follow-up when a run is active (writable
+        /// dashboards only; a read-only one gets the busy refusal).
+        allow_queue: bool,
         reply: oneshot::Sender<Result<PromptAccepted, RunTodoError>>,
     },
     Session {

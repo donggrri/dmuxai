@@ -52,6 +52,7 @@ fn message(index: usize, role: &str, content: &str) -> SessionMessage {
         streaming: false,
         images: Vec::new(),
         prompt_id: None,
+        queued: false,
     }
 }
 

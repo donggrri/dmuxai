@@ -77,6 +77,7 @@ fn message(index: usize, role: &str, content: &str, streaming: bool) -> SessionM
         streaming,
         images: Vec::new(),
         prompt_id: None,
+        queued: false,
     }
 }
 
@@ -179,6 +180,7 @@ async fn run_scenario(scenario: Scenario) -> Option<Outcome> {
                 agent: "cursor".to_owned(),
                 prompt_id: Some(id),
                 message_id: None,
+                queued: false,
             }));
             let hub = fake_hub.clone();
             let accepted = accepted.clone();
