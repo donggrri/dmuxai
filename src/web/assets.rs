@@ -1594,6 +1594,22 @@ mod tests {
         assert!(DOCS_JS.contains("setDocsCount(shown);"));
     }
 
+    // Chat "copy reply": agent messages get one copy button that copies the
+    // raw Markdown (`m.content`), with an execCommand fallback and hover CSS.
+    #[test]
+    fn copy_reply_button_assets() {
+        assert!(SESSION_JS.contains("if (m.role === 'agent') {\n          var actionsBar"));
+        assert!(SESSION_JS.contains("node.dmuxRaw = String(m.content || '')"));
+        assert!(SESSION_JS.contains("copyText(n.dmuxRaw || '')"));
+        assert!(SESSION_JS.contains("navigator.clipboard.writeText(text)"));
+        assert!(SESSION_JS.contains("window.isSecureContext"));
+        assert!(SESSION_JS.contains("document.execCommand('copy')"));
+        assert!(SESSION_JS.contains("'aria-label', 'Copy reply'"));
+        assert!(SESSION_JS.contains("'aria-label', 'Copied'"));
+        assert!(SESSION_CSS.contains(".msg-agent:hover .msg-actions"));
+        assert!(SESSION_CSS.contains("@media (hover: none) { .msg-actions { opacity: 1; } }"));
+    }
+
     // TC-1206 (SPEC-dashboard-fullwidth FR-1206..FR-1210): ChatGPT-style chat
     // and the single place an agent turn's text is rendered.
     #[test]
