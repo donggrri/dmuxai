@@ -245,6 +245,14 @@ fn sanitizer() -> Builder<'static> {
                 }
             }
             "href" if element == "a" => Some(prefix_fragment_href(value).into_owned().into()),
+            "src" if element == "img" => {
+                let trimmed = value.trim();
+                if trimmed.starts_with("https://") {
+                    Some(trimmed.into())
+                } else {
+                    None
+                }
+            }
             _ => Some(value.into()),
         });
     builder
@@ -328,6 +336,16 @@ fn main() { let x = 1; }
     }
 
     // TC-745: sanitizes_script_and_handlers (FR-743)
+    #[test]
+    fn drops_non_https_images() {
+        let html = render_markdown(
+            "![x](https://example.com/a.png)\n![y](/local.png)\n![z](http://track.example/x.gif)",
+        );
+        assert!(html.contains("https://example.com/a.png"));
+        assert!(!html.contains("/local.png"));
+        assert!(!html.contains("http://track.example"));
+    }
+
     #[test]
     fn sanitizes_script_and_handlers() {
         let source = "\

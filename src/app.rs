@@ -1206,6 +1206,10 @@ pub struct App {
     pub(crate) injected_now: Option<Instant>,
     pub(crate) switch_pending: Option<PathBuf>,
     pub(crate) switch_ready: Option<PathBuf>,
+    /// Next user/agent turn policy from dashboard `mode` or headless `mode` (cleared on send).
+    pending_turn_policy: Option<TurnPolicy>,
+    /// Cached assistant `content_html` keyed by `message_id:content_hash`.
+    chat_markdown_cache: HashMap<String, String>,
 }
 
 impl App {
@@ -1423,6 +1427,8 @@ impl App {
             injected_now: None,
             switch_pending: None,
             switch_ready: None,
+            pending_turn_policy: None,
+            chat_markdown_cache: HashMap::new(),
         };
         let runners = app.registered_runner_names();
         app.messages
@@ -1805,9 +1811,9 @@ impl App {
         }
 
         if let Some(mode_str) = mode.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            let _ = mode_str;
-            self.push_system(
-                "Mode selection was removed; every turn runs in agent mode.".to_owned(),
+            self.pending_turn_policy = Some(
+                crate::agent::turn_policy_from_legacy_mode(mode_str)
+                    .map_err(RunTodoError::Invalid)?,
             );
         }
 
@@ -1928,41 +1934,44 @@ impl App {
             .messages
             .len()
             .saturating_sub(dmuxai::web::SESSION_TRANSCRIPT_MAX_MESSAGES);
-        let messages = self.messages[start..]
-            .iter()
-            .enumerate()
-            .filter(|(_, message)| !message.local_only)
-            .map(|(offset, message)| {
-                // Ids stay the index in `self.messages`, so a local-only notice
-                // does not shift streaming updates (FR-984).
-                let index = start + offset;
-                let (role, agent, content) = match &message.role {
-                    Role::User => ("user", None, message.content.clone()),
-                    Role::Agent(agent) => (
-                        "agent",
-                        Some(self.agent_runner_name(*agent)),
-                        message.content.clone(),
-                    ),
-                    Role::System => ("system", None, message.content.clone()),
-                    Role::Activity(item) => {
-                        ("activity", None, dmuxai::activity::collapsed_line(item))
-                    }
-                };
-                let content_html = if role == "agent" && !content.is_empty() {
-                    Some(dmuxai::web::chat_markdown::render_chat_markdown(&content))
+        let mut messages = Vec::new();
+        for (offset, message) in self.messages[start..].iter().enumerate() {
+            if message.local_only {
+                continue;
+            }
+            let index = start + offset;
+            let (role, agent, content) = match &message.role {
+                Role::User => ("user", None, message.content.clone()),
+                Role::Agent(agent) => (
+                    "agent",
+                    Some(self.agent_runner_name(*agent)),
+                    message.content.clone(),
+                ),
+                Role::System => ("system", None, message.content.clone()),
+                Role::Activity(item) => ("activity", None, dmuxai::activity::collapsed_line(item)),
+            };
+            let content_html = if role == "agent" && !content.is_empty() {
+                let id = format!("{conversation_id}:{index}");
+                let cache_key = dmuxai::web::chat_markdown::cache_key(&id, &content);
+                if let Some(cached) = self.chat_markdown_cache.get(&cache_key) {
+                    Some(cached.clone())
                 } else {
-                    None
-                };
-                SessionMessage {
-                    id: format!("{conversation_id}:{index}"),
-                    role: role.to_owned(),
-                    agent,
-                    content,
-                    content_html,
-                    streaming: streaming.contains(&index),
+                    let html = dmuxai::web::chat_markdown::render_chat_markdown(&content);
+                    self.chat_markdown_cache.insert(cache_key, html.clone());
+                    Some(html)
                 }
-            })
-            .collect();
+            } else {
+                None
+            };
+            messages.push(SessionMessage {
+                id: format!("{conversation_id}:{index}"),
+                role: role.to_owned(),
+                agent,
+                content,
+                content_html,
+                streaming: streaming.contains(&index),
+            });
+        }
         let (transcript, omitted) = cap_session_transcript(messages);
 
         let agents = self
@@ -2182,10 +2191,11 @@ impl App {
                 self.request_builtin_grok_models(target);
                 self.push_system(format!("Active agent: {target}."));
             }
-            SessionCommand::SetMode { agent: _, mode: _ } => {
-                self.push_system(
-                    "Mode selection was removed; dashboard mode changes are ignored.".to_owned(),
-                );
+            SessionCommand::SetMode { mode, .. } => {
+                return Err(RunTodoError::Invalid(format!(
+                    "mode selection was removed; omit mode or pass ask/plan (read-only) or implement (agent) on POST /api/prompt (got '{}')",
+                    mode.trim()
+                )));
             }
             SessionCommand::LoadModels { agent } => {
                 let target = self.resolve_dashboard_agent(agent.as_deref())?;
@@ -3609,7 +3619,9 @@ impl App {
             }
             return Err(RunTodoError::Internal(message.to_owned()));
         }
-        let mut adapter_request = adapter_request(request, image_paths);
+        let policy = self.pending_turn_policy.take().unwrap_or(TurnPolicy::Agent);
+        let require_file_edits = self.graph_node_expects_file_edits(agent);
+        let mut adapter_request = adapter_request(request, image_paths, policy, require_file_edits);
         let injected_memory = self.inject_memory(agent, &mut adapter_request);
         let is_graph = self.active_graph_node_for_agent(agent).is_some();
         let send_result = if is_graph {
@@ -4024,6 +4036,7 @@ impl App {
             resume_session: None,
             image_paths: vec![],
             policy: TurnPolicy::Agent,
+            require_file_edits: false,
         };
         match self.adapters[adapter_index(agent)].send(request) {
             Ok(()) => {
@@ -4232,6 +4245,7 @@ impl App {
             resume_session: None,
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         let run_id = self
             .pending_todo_run_id
@@ -5960,6 +5974,7 @@ impl App {
             resume_session: None,
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         let triage = Triage {
             route,
@@ -7074,6 +7089,7 @@ impl App {
             resume_session: None,
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         match self.adapters[index].send(request) {
             Ok(()) => {
@@ -7325,6 +7341,7 @@ impl App {
             resume_session: None,
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         let now = Instant::now();
         pending.started = now;
@@ -7368,6 +7385,7 @@ impl App {
             resume_session: None,
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         let now = Instant::now();
         pending.started = now;
@@ -7404,6 +7422,7 @@ impl App {
             resume_session: None,
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         let now = Instant::now();
         pending.started = now;
@@ -9003,6 +9022,34 @@ impl App {
         self.flush_deferred_graph_starts();
     }
 
+    fn graph_node_expects_file_edits(&self, agent: Agent) -> bool {
+        let Some(node_id) = self.graph_agent_nodes.get(&agent) else {
+            return false;
+        };
+        let role = self
+            .graph_session
+            .as_ref()
+            .and_then(|session| {
+                session
+                    .run()
+                    .plan
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == *node_id)
+                    .map(|node| node.role)
+            })
+            .or_else(|| {
+                self.last_graph_run.as_ref().and_then(|run| {
+                    run.plan
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == *node_id)
+                        .map(|node| node.role)
+                })
+            });
+        role == Some(dmuxai::graph::NodeRole::Implement)
+    }
+
     fn active_graph_node_for_agent(&self, agent: Agent) -> Option<String> {
         self.graph_agent_nodes.get(&agent).cloned()
     }
@@ -10273,8 +10320,25 @@ impl App {
             }
         }
 
-        if req.mode.is_some() {
-            self.push_system("CLI --mode is ignored; every turn runs in agent mode.".to_owned());
+        if let Some(ref mode_str) = req.mode {
+            match crate::agent::turn_policy_from_legacy_mode(mode_str) {
+                Ok(policy) => self.pending_turn_policy = Some(policy),
+                Err(message) => {
+                    return HeadlessOutcome {
+                        ok: false,
+                        exit_code: dmuxai::agent_api::exit::USAGE,
+                        conversation_id: self.conversation_id.as_str().to_owned(),
+                        agent: req.agent.clone(),
+                        graph_id: None,
+                        text: String::new(),
+                        messages: Vec::new(),
+                        error: Some(message),
+                        todo: None,
+                        triage: None,
+                        plan: None,
+                    };
+                }
+            }
         }
 
         let headless_title = {
@@ -12705,6 +12769,8 @@ fn fallback_cause_label(cause: FallbackCause) -> &'static str {
 fn adapter_request(
     request: dmuxai::conversation::AgentRequest,
     image_paths: Vec<PathBuf>,
+    policy: TurnPolicy,
+    require_file_edits: bool,
 ) -> AgentRequest {
     let prompt = if request.resume_session.is_some() {
         request.prompt
@@ -12717,7 +12783,8 @@ fn adapter_request(
         prompt,
         resume_session: request.resume_session,
         image_paths,
-        policy: TurnPolicy::Agent,
+        policy,
+        require_file_edits,
     }
 }
 
@@ -19509,6 +19576,7 @@ mod tests {
             resume_session: resume.map(str::to_owned),
             image_paths: vec![],
             policy: TurnPolicy::Agent,
+            require_file_edits: false,
         };
         // Empty memory: unchanged.
         let mut r = request(None);
@@ -20685,21 +20753,20 @@ mod tests {
             Err(RunTodoError::UnknownAgent(_))
         ));
 
-        app.handle_session_command(SessionCommand::SetMode {
-            agent: Some("codex".to_owned()),
-            mode: "plan".to_owned(),
-        })
-        .unwrap();
-        app.handle_session_command(SessionCommand::SetMode {
-            agent: Some("codex".to_owned()),
-            mode: "turbo".to_owned(),
-        })
-        .unwrap();
-        assert!(
-            app.messages
-                .iter()
-                .any(|m| m.content.contains("dashboard mode changes are ignored"))
-        );
+        assert!(matches!(
+            app.handle_session_command(SessionCommand::SetMode {
+                agent: Some("codex".to_owned()),
+                mode: "plan".to_owned(),
+            }),
+            Err(RunTodoError::Invalid(message)) if message.contains("mode selection was removed")
+        ));
+        assert!(matches!(
+            app.handle_session_command(SessionCommand::SetMode {
+                agent: Some("codex".to_owned()),
+                mode: "turbo".to_owned(),
+            }),
+            Err(RunTodoError::Invalid(_))
+        ));
 
         app.model_catalogs.insert(Agent::Codex, codex_catalog());
         let session = app
@@ -20734,13 +20801,15 @@ mod tests {
             Err(RunTodoError::Invalid(message)) if message.contains("Codex only")
         ));
 
-        // UX-780: a busy agent refuses model/effort changes; mode is a no-op.
+        // UX-780: a busy agent refuses model/effort changes; set_mode is rejected.
         app.busy_agents.insert(Agent::Codex);
-        app.handle_session_command(SessionCommand::SetMode {
-            agent: Some("codex".to_owned()),
-            mode: "ask".to_owned(),
-        })
-        .unwrap();
+        assert!(matches!(
+            app.handle_session_command(SessionCommand::SetMode {
+                agent: Some("codex".to_owned()),
+                mode: "ask".to_owned(),
+            }),
+            Err(RunTodoError::Invalid(_))
+        ));
         for command in [
             SessionCommand::SelectModel {
                 agent: Some("codex".to_owned()),

@@ -93,6 +93,19 @@ impl fmt::Display for TurnPolicy {
     }
 }
 
+/// Legacy dashboard/MCP mode strings (`ask`, `plan`, `implement`). Omitted mode
+/// means the default write-capable agent policy.
+/// Maps legacy mode strings from the dashboard/MCP/CLI to a [`TurnPolicy`].
+pub fn turn_policy_from_legacy_mode(mode: &str) -> Result<TurnPolicy, String> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "ask" | "plan" => Ok(TurnPolicy::ReadOnly),
+        "implement" | "agent" => Ok(TurnPolicy::Agent),
+        other => Err(format!(
+            "invalid mode '{other}'; use ask or plan (read-only), implement (agent), or omit mode"
+        )),
+    }
+}
+
 /// Provider-independent events emitted by a runtime and consumed by the UI.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AgentEvent {
@@ -167,6 +180,9 @@ pub struct AgentRequest {
     pub resume_session: Option<String>,
     pub image_paths: Vec<PathBuf>,
     pub policy: TurnPolicy,
+    /// When true (graph implement steps), AGY may retry once if the model replies
+    /// with plan-only text and no writes. Ordinary user questions leave this false.
+    pub require_file_edits: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -315,4 +331,29 @@ pub const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 pub fn event_channel() -> (mpsc::Sender<AgentOutput>, mpsc::Receiver<AgentOutput>) {
     mpsc::channel(EVENT_CHANNEL_CAPACITY)
+}
+
+#[cfg(test)]
+mod legacy_mode_tests {
+    use super::{TurnPolicy, turn_policy_from_legacy_mode};
+
+    #[test]
+    fn legacy_ask_and_plan_are_read_only() {
+        assert_eq!(
+            turn_policy_from_legacy_mode("ask").unwrap(),
+            TurnPolicy::ReadOnly
+        );
+        assert_eq!(
+            turn_policy_from_legacy_mode("plan").unwrap(),
+            TurnPolicy::ReadOnly
+        );
+    }
+
+    #[test]
+    fn legacy_implement_is_agent() {
+        assert_eq!(
+            turn_policy_from_legacy_mode("implement").unwrap(),
+            TurnPolicy::Agent
+        );
+    }
 }

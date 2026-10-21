@@ -1316,6 +1316,7 @@ mod tests {
             resume_session: None,
             image_paths: vec![],
             policy: TurnPolicy::Agent,
+            require_file_edits: false,
         }
     }
 

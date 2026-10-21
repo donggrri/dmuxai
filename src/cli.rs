@@ -55,6 +55,7 @@ pub struct RunOptions {
     pub prompt: String,
     pub agent: Option<String>,
     pub mode: Option<String>,
+    pub read_only: bool,
     pub graph: bool,
     pub approve_plan: bool,
     pub json: bool,
@@ -93,6 +94,7 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
                     );
                 }
                 "--graph" => options.graph = true,
+                "--read-only" => options.read_only = true,
                 "--approve-plan" => options.approve_plan = true,
                 "--json" => options.json = true,
                 flag if flag.starts_with("--") => {
@@ -586,10 +588,15 @@ async fn run_headless(
             cancel_signal.store(true, Ordering::SeqCst);
         }
     });
+    let mode = if options.read_only {
+        Some("ask".to_owned())
+    } else {
+        options.mode.clone()
+    };
     let request = HeadlessRequest {
         prompt: prompt.unwrap_or_default(),
         agent: options.agent.clone(),
-        mode: options.mode.clone(),
+        mode,
         graph: options.graph,
         approve_plan: options.approve_plan,
         todo_id,
@@ -713,8 +720,8 @@ impl McpBackend for CliMcpBackend {
         if let Some(agent) = args.agent {
             argv.extend(["--agent".into(), agent]);
         }
-        if args.mode.is_some() {
-            eprintln!("dmuxai mcp: run.mode is ignored (execution modes were removed); omit mode.");
+        if args.read_only {
+            argv.push("--read-only".into());
         }
         if args.graph {
             argv.push("--graph".into());
@@ -758,6 +765,7 @@ mod tests {
                 prompt: "fix the bug".into(),
                 agent: Some("agy".into()),
                 mode: None,
+                read_only: false,
                 graph: false,
                 approve_plan: false,
                 json: true,

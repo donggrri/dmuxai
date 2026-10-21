@@ -436,7 +436,8 @@ async fn run_turn(
         // A failed `finish` (permission denial, protocol, or status check)
         // surfaces as an `Error` terminal; only a `Completed` turn with no
         // writes and a plan-like reply counts as a plan-only retry.
-        if policy != TurnPolicy::Agent
+        if !request.require_file_edits
+            || policy != TurnPolicy::Agent
             || !matches!(outcome.terminal, AgentEvent::Completed)
             || !is_plan_only_implement_outcome(outcome.writes_observed, &outcome.response_text)
         {
@@ -447,7 +448,7 @@ async fn run_turn(
         attempt += 1;
         if attempt >= AGY_PLAN_ONLY_MAX_ATTEMPTS {
             return Err(io::Error::other(
-                "AGY returned plan-only responses twice without applying edits in Implement mode.",
+                "AGY returned plan-only responses twice without applying file edits.",
             ));
         }
 
@@ -455,7 +456,7 @@ async fn run_turn(
             event_tx,
             Some(&context),
             AgentEvent::Notice(
-                "AGY returned a plan without file edits; retrying once with a stricter Implement instruction."
+                "AGY returned a plan without file edits; retrying once with a stricter edit instruction."
                     .to_owned(),
             ),
         )
@@ -553,7 +554,7 @@ fn agy_prompt(policy: TurnPolicy, prompt: &str) -> String {
 
 fn agy_implement_retry_prompt(prompt: &str) -> String {
     format!(
-        "CRITICAL: Implement mode requires immediate file edits. Do not write plans, do not create plan.md, and do not ask for approval. Apply every change now.\n\n{prompt}"
+        "CRITICAL: Apply file edits now. Do not write plans, do not create plan.md, and do not ask for approval. Implement every change in the workspace immediately.\n\n{prompt}"
     )
 }
 
@@ -675,11 +676,6 @@ async fn stream_child(
     let status = exit_status.expect("child.wait runs before the loop can finish");
     let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
     let protocol_completed = state.pending_terminal.is_some();
-    let _plan_only = mode == TurnPolicy::Agent
-        && is_plan_only_implement_outcome(
-            implement_tracker.writes_observed(),
-            &state.response_text,
-        );
     let require_writes = false;
     let writes_observed = implement_tracker.writes_observed();
     if let Err(reason) = implement_tracker.finish(
@@ -794,7 +790,7 @@ fn normalize_event(
                 "SUCCESS" => {
                     if let Some(denied) = denied_actions_summary(message) {
                         state.pending_terminal = Some(AgentEvent::Error(format!(
-                            "AGY denied permission for: {denied}. Headless AGY cannot prompt; allow it in AGY settings or use Implement mode."
+                            "AGY denied permission for: {denied}. Headless AGY cannot prompt; allow it in AGY settings or run with write access."
                         )));
                         return events;
                     }
@@ -982,6 +978,7 @@ mod tests {
             resume_session: Some("agy-conversation".to_owned()),
             image_paths: vec![],
             policy: TurnPolicy::Agent,
+            require_file_edits: false,
         };
         let mut command = tokio::process::Command::new("agy");
 
@@ -1019,6 +1016,7 @@ mod tests {
                 PathBuf::from("/tmp/other.png"),
             ],
             policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         let mut command = tokio::process::Command::new("agy");
         configure_command(&mut command, None, TurnPolicy::ReadOnly);
@@ -1099,6 +1097,7 @@ mod tests {
             resume_session: None,
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
 
@@ -1367,7 +1366,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn run_fake_agy_turn(mode: TurnPolicy) -> io::Result<Option<String>> {
+    async fn run_fake_agy_turn(
+        mode: TurnPolicy,
+        require_file_edits: bool,
+    ) -> io::Result<Option<String>> {
         let request = AgentRequest {
             conversation_id: super::super::ConversationId::new("fake-conversation"),
             turn_id: super::super::TurnId::new("fake-turn"),
@@ -1375,6 +1377,7 @@ mod tests {
             resume_session: None,
             image_paths: vec![],
             policy: mode,
+            require_file_edits,
         };
         let (event_tx, _event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1408,7 +1411,7 @@ mod tests {
         let outcome = with_agy_spawn_env(&fake, "1", async {
             timeout(
                 Duration::from_secs(20),
-                run_fake_agy_turn(TurnPolicy::Agent),
+                run_fake_agy_turn(TurnPolicy::Agent, false),
             )
             .await
             .expect("the idle timeout should end the turn far before the child settles")
@@ -1489,7 +1492,7 @@ mod tests {
         let outcome = with_agy_spawn_env(&fake, "5", async {
             timeout(
                 Duration::from_secs(45),
-                run_fake_agy_turn(TurnPolicy::ReadOnly),
+                run_fake_agy_turn(TurnPolicy::ReadOnly, false),
             )
             .await
             .expect("a continuously streaming child should finish promptly")
@@ -1519,7 +1522,7 @@ mod tests {
             let started = Instant::now();
             let outcome = timeout(
                 Duration::from_secs(15),
-                run_fake_agy_turn(TurnPolicy::ReadOnly),
+                run_fake_agy_turn(TurnPolicy::ReadOnly, false),
             )
             .await
             .expect("grace kill should finish quickly");
@@ -1565,6 +1568,7 @@ mod tests {
             resume_session: None,
             image_paths: vec![],
             policy: TurnPolicy::Agent,
+            require_file_edits: false,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1642,6 +1646,7 @@ mod tests {
             resume_session: None,
             image_paths: vec![],
             policy: TurnPolicy::Agent,
+            require_file_edits: false,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1709,7 +1714,7 @@ mod tests {
         let outcome = with_agy_spawn_env(&fake, "0", async {
             timeout(
                 Duration::from_secs(20),
-                run_fake_agy_turn(TurnPolicy::Agent),
+                run_fake_agy_turn(TurnPolicy::Agent, true),
             )
             .await
             .expect("plan-only retry should finish promptly")
@@ -1721,6 +1726,52 @@ mod tests {
             error.to_string().contains("plan-only"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn agy_question_plan_review_text_does_not_force_edit_retry() {
+        // FR-506: ordinary questions must not trigger the plan-only edit retry.
+        let plan_response = json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "Please review plan.md and confirm before I edit anything."
+            }
+        });
+        let plan_line = plan_response.to_string();
+        let (_dir, fake) = write_fake_agy(|_| {
+            format!("#!/bin/sh\nread -r _dmuxai_user\nprintf '%s\\n' '{plan_line}'\n")
+        });
+
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("question-conversation"),
+            turn_id: super::super::TurnId::new("question-turn"),
+            prompt: "What does PLAN.md propose? Don't modify anything.".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let cwd = std::env::temp_dir();
+
+        let outcome = with_agy_spawn_env(&fake, "0", async {
+            let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
+            let mut terminals = Vec::new();
+            while let Some(output) = event_rx.recv().await {
+                if matches!(
+                    output.event,
+                    AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_)
+                ) {
+                    terminals.push(output.event);
+                }
+            }
+            turn.await.expect("turn task")
+        })
+        .await;
+
+        outcome.expect("question turn should complete without edit retry");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1751,6 +1802,7 @@ mod tests {
             resume_session: None,
             image_paths: vec![],
             policy: TurnPolicy::Agent,
+            require_file_edits: false,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();

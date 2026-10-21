@@ -2814,8 +2814,12 @@ function computeAgentsKey(list) {
 }
 
 function renderAgents(agents, nowMs) {
+  if (window.dmuxaiSession && typeof window.dmuxaiSession.updateAgentRunIndicators === 'function') {
+    window.dmuxaiSession.updateAgentRunIndicators(agents, nowMs);
+    return;
+  }
   var wrap = $('agents');
-  if (!wrap) { return; } // Agents card removed; composer picker owns agent UI.
+  if (!wrap) { return; }
   var list = Array.isArray(agents) ? agents : [];
   var now = typeof nowMs === 'number' ? nowMs : Date.now();
   var key = computeAgentsKey(list);

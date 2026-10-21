@@ -54,6 +54,7 @@
   var auxExpanded = {};
   var palette = null;
   var agentPopover = null;
+  var agentPopoverKeyHandler = null;
   var workspaceKey = '';
   var workspaceInitialized = null;
   var sessionsOpen = false;
@@ -851,6 +852,8 @@
   function updateAgentPickerLabel() {
     if (!ui.agentPicker) { return; }
     var agent = selectedAgent();
+    var running = !!(agent && (agent.busy || (agent.run && agent.run.state === 'running')));
+    ui.agentPicker.classList.toggle('session-agent-picker-running', running);
     if (!agent) {
       ui.agentPicker.textContent = 'Agent';
       return;
@@ -864,7 +867,15 @@
     }
   }
 
+  function detachAgentPopoverKey() {
+    if (agentPopoverKeyHandler) {
+      document.removeEventListener('keydown', agentPopoverKeyHandler, true);
+      agentPopoverKeyHandler = null;
+    }
+  }
+
   function closeAgentPopover() {
+    detachAgentPopoverKey();
     if (agentPopover && agentPopover.parentNode) {
       agentPopover.parentNode.removeChild(agentPopover);
     }
@@ -872,17 +883,9 @@
     if (ui.agentPicker) { ui.agentPicker.setAttribute('aria-expanded', 'false'); }
   }
 
-  function openAgentPopover() {
-    if (!session || viewOnly) { return; }
-    closeAgentPopover();
-    var overlay = el('div', 'session-agent-overlay');
-    var panel = el('div', 'session-agent-popover');
-    panel.setAttribute('role', 'dialog');
-    panel.setAttribute('aria-label', 'Choose agent and model');
-    panel.tabIndex = -1;
-    panel.appendChild(el('p', 'session-agent-popover-title', 'Agent for next message'));
-
+  function buildAgentPopoverList() {
     var list = el('ul', 'session-agent-list');
+    if (!session) { return list; }
     session.agents.forEach(function (a) {
       var hub = hubAgent(a.id);
       var li = el('li', 'session-agent-item');
@@ -950,7 +953,32 @@
       }
       list.appendChild(li);
     });
-    panel.appendChild(list);
+    return list;
+  }
+
+  function syncAgentPopover() {
+    if (!agentPopover || !session) { return; }
+    var panel = agentPopover.querySelector('.session-agent-popover');
+    if (!panel) { return; }
+    var list = buildAgentPopoverList();
+    var old = panel.querySelector('.session-agent-list');
+    if (old) {
+      panel.replaceChild(list, old);
+    } else {
+      panel.appendChild(list);
+    }
+  }
+
+  function openAgentPopover() {
+    if (!session || viewOnly) { return; }
+    closeAgentPopover();
+    var overlay = el('div', 'session-agent-overlay');
+    var panel = el('div', 'session-agent-popover');
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-label', 'Choose agent and model');
+    panel.tabIndex = -1;
+    panel.appendChild(el('p', 'session-agent-popover-title', 'Agent for next message'));
+    panel.appendChild(buildAgentPopoverList());
 
     overlay.addEventListener('click', function (e) {
       if (e.target === overlay) { closeAgentPopover(); }
@@ -960,16 +988,14 @@
     agentPopover = overlay;
     ui.agentPicker.setAttribute('aria-expanded', 'true');
     panel.focus();
-    document.addEventListener('keydown', agentPopoverKey, true);
-  }
-
-  function agentPopoverKey(e) {
-    if (e.key !== 'Escape' || !agentPopover) { return; }
-    e.preventDefault();
-    e.stopPropagation();
-    document.removeEventListener('keydown', agentPopoverKey, true);
-    closeAgentPopover();
-    if (ui.agentPicker) { ui.agentPicker.focus(); }
+    agentPopoverKeyHandler = function (e) {
+      if (e.key !== 'Escape' || !agentPopover) { return; }
+      e.preventDefault();
+      e.stopPropagation();
+      closeAgentPopover();
+      if (ui.agentPicker) { ui.agentPicker.focus(); }
+    };
+    document.addEventListener('keydown', agentPopoverKeyHandler, true);
   }
 
   // FR-1207: fenced ``` blocks become <pre><code>, `inline` spans become
@@ -1100,7 +1126,7 @@
 
     updateAgentPickerLabel();
     if (ui.agentPicker) { ui.agentPicker.disabled = viewOnly; }
-    if (agentPopover) { closeAgentPopover(); }
+    if (agentPopover) { syncAgentPopover(); }
     ui.cancel.hidden = !busy;
     ui.details.classList.toggle('btn-on', !!session.details_expanded);
     [ui.newConv, ui.status, ui.details, ui.share, ui.palette, ui.quit, ui.send].forEach(function (b) {
@@ -1678,5 +1704,8 @@
   });
 
   // Plan-gate approval buttons are rendered in app.js via parityButton (parity ids).
-  window.dmuxaiSession = { parityButton: button };
+  window.dmuxaiSession = {
+    parityButton: button,
+    updateAgentRunIndicators: function () { updateAgentPickerLabel(); if (agentPopover) { syncAgentPopover(); } },
+  };
 })();
