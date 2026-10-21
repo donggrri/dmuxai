@@ -2462,9 +2462,17 @@ function tasksForChecklist(graph) {
     id: 'task-1',
     title: job,
     done_check: '',
-    status: 'pending',
+    status: checklistStatusFromNode(node),
     nodes: [String(node.id || '')]
   }];
+}
+
+function checklistStatusFromNode(node) {
+  var status = graphNodeStatus(node);
+  if (status === 'running') { return 'running'; }
+  if (status === 'completed' || status === 'skipped') { return 'done'; }
+  if (status === 'failed') { return 'failed'; }
+  return 'pending';
 }
 
 function taskChecklistNodeIdsText(nodes) {
@@ -2533,8 +2541,10 @@ function taskProgressLine(node, nowMs) {
   if (job.length > 80) { job = job.slice(0, 79) + '\u2026'; }
   var line = String(node.id) + ' \u00b7 ' + status + ' \u00b7 ' + runner + ' ' + model + ' \u00b7 ' + elapsed;
   if (job) { line += ' \u00b7 ' + job; }
-  var activity = agentActivityForRunner(node.runner);
-  if (activity) { line += ' \u00b7 ' + activity; }
+  if (status === 'running') {
+    var activity = agentActivityForRunner(node.runner);
+    if (activity) { line += ' \u00b7 ' + activity; }
+  }
   return line;
 }
 
@@ -2586,7 +2596,8 @@ function updateTaskChecklistRow(row, task, graph, nowMs) {
     meta.appendChild(promptEl);
   }
   var prompt = graph && typeof graph.user_prompt === 'string' ? graph.user_prompt : '';
-  promptEl.textContent = 'prompt: ' + (prompt ? prompt : '\u2014');
+  var promptText = 'prompt: ' + (prompt ? prompt : '\u2014');
+  if (promptEl.textContent !== promptText) { promptEl.textContent = promptText; }
   var progress = meta.querySelector('.task-checklist-progress');
   if (!progress) {
     progress = el('div', 'task-checklist-progress');
