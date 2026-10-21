@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/donggrri/dmuxai/blob/main/README.md
+    about: Install, verify commands, and operator reference
+  - name: Workflow and specs
+    url: https://github.com/donggrri/dmuxai/blob/main/docs/WORKFLOW.md
+    about: Spec-first delivery and traceability gates
