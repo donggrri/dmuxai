@@ -331,6 +331,11 @@ async fn runtime_loop(
     let mut reset_epoch: u64 = 0;
     let mut warm_process: Option<WarmProcess> = None;
     let mut resets_seen: u64 = 0;
+    // A prompt that arrived after the active turn already reported its result
+    // but before the CLI process exited. It starts as soon as that turn ends,
+    // instead of being refused as "already running a turn" (the app already
+    // considers the agent idle once it saw `Completed`).
+    let mut queued_send: Option<CursorCommand> = None;
 
     // Applies resets requested via `CursorAdapter::reset` since the last check:
     // forget the --resume session, bump the epoch, and discard the warm process.
@@ -363,20 +368,24 @@ async fn runtime_loop(
                 None => std::time::Duration::from_secs(3600),
             };
 
-            let command = tokio::select! {
-                _ = tokio::time::sleep(sleep_duration), if warm_process.is_some() => {
-                    if let Some(warm) = warm_process.take() {
-                        reap_warm_process(warm).await;
-                    }
-                    continue;
-                }
-                cmd = command_rx.recv() => match cmd {
-                    Some(c) => c,
-                    None => {
+            let command = if let Some(queued) = queued_send.take() {
+                queued
+            } else {
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep_duration), if warm_process.is_some() => {
                         if let Some(warm) = warm_process.take() {
                             reap_warm_process(warm).await;
                         }
-                        break;
+                        continue;
+                    }
+                    cmd = command_rx.recv() => match cmd {
+                        Some(c) => c,
+                        None => {
+                            if let Some(warm) = warm_process.take() {
+                                reap_warm_process(warm).await;
+                            }
+                            break;
+                        }
                     }
                 }
             };
@@ -574,6 +583,14 @@ async fn runtime_loop(
             command = command_rx.recv() => {
                 apply_pending_reset!();
                 match command {
+                    Some(CursorCommand::Cancel) if queued_send.is_some() => {
+                        // The app's current turn is the queued one; the draining
+                        // turn already finished and is left to exit on its own.
+                        if let Some(CursorCommand::Send { request, .. }) = queued_send.take() {
+                            let context = OutputContext::from(&request);
+                            send_event(&event_tx, Some(&context), AgentEvent::Cancelled).await;
+                        }
+                    }
                     Some(CursorCommand::Cancel) => {
                         let cancelled_turn = active.take();
                         let was_graph = cancelled_turn.as_ref().is_some_and(|t| t.is_graph);
@@ -588,6 +605,14 @@ async fn runtime_loop(
                             )
                             .ok();
                         }
+                    }
+                    Some(CursorCommand::Send { request, is_graph })
+                        if queued_send.is_none()
+                            && active
+                                .as_ref()
+                                .is_some_and(|turn| turn.terminal_seen.load(std::sync::atomic::Ordering::SeqCst)) =>
+                    {
+                        queued_send = Some(CursorCommand::Send { request, is_graph });
                     }
                     Some(CursorCommand::Send { request, .. }) => {
                         let context = OutputContext::from(&request);
@@ -651,6 +676,8 @@ fn spawn_turn(
     let warm_pgid = warm_child.as_ref().and_then(|c| c.id());
     let context = OutputContext::from(&request);
     let error_context = context.clone();
+    let terminal_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let turn_terminal_seen = terminal_seen.clone();
     let handle = tokio::spawn(async move {
         match run_turn_with_child(
             &request,
@@ -662,6 +689,7 @@ fn spawn_turn(
             windows_unsandboxed,
             &mcp_servers,
             &cursor_notice_emitted,
+            &turn_terminal_seen,
         )
         .await
         {
@@ -683,6 +711,7 @@ fn spawn_turn(
         is_graph,
         reset_epoch,
         warm_pgid,
+        terminal_seen,
     }
 }
 
@@ -694,6 +723,8 @@ struct ActiveTurn {
     // Only used for group kills on Unix (Windows support is postponed).
     #[cfg_attr(not(unix), allow(dead_code))]
     warm_pgid: Option<u32>,
+    /// Set once the stream reported its terminal `result` line.
+    terminal_seen: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
@@ -730,6 +761,7 @@ pub(crate) async fn run_turn(
         windows_unsandboxed,
         mcp_servers,
         cursor_notice_emitted,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await
 }
@@ -745,6 +777,7 @@ async fn run_turn_with_child(
     windows_unsandboxed: bool,
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     cursor_notice_emitted: &std::sync::atomic::AtomicBool,
+    terminal_seen: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Option<String>> {
     validate_cursor_policy(mode, windows_unsandboxed)
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -833,7 +866,16 @@ async fn run_turn_with_child(
     stdin.shutdown().await?;
     drop(stdin);
 
-    stream_child(&mut child, stdout, stderr, event_tx, &context, mode).await
+    stream_child(
+        &mut child,
+        stdout,
+        stderr,
+        event_tx,
+        &context,
+        mode,
+        terminal_seen,
+    )
+    .await
 }
 
 fn configure_command(
@@ -884,6 +926,7 @@ async fn stream_child(
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
     mode: TurnPolicy,
+    terminal_seen: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Option<String>> {
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
@@ -903,7 +946,13 @@ async fn stream_child(
                         let message: Value = serde_json::from_str(&line).map_err(|error| {
                             io::Error::other(format!("invalid Cursor NDJSON: {error}"))
                         })?;
-                        for event in normalize_event(&message, &mut state) {
+                        // Mark the turn terminal before its `Completed` reaches the
+                        // app, so a follow-up prompt is queued, not refused.
+                        let events = normalize_event(&message, &mut state);
+                        if state.terminal {
+                            terminal_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        for event in events {
                             send_event(event_tx, Some(context), event).await;
                         }
                     }
@@ -2080,6 +2129,86 @@ pub(crate) mod tests {
 
         drop(adapter);
         let _ = worker.await;
+    }
+
+    // Dashboard double-message bug: a real cursor-agent keeps running for a
+    // moment after its `result` line. A prompt sent in that window (the app
+    // already saw `Completed`) must start after the old process exits, not be
+    // refused with "already running a turn".
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn send_right_after_result_is_queued_not_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = TEST_CURSOR_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("linger.log");
+        let script_path = dir.path().join("cursor-agent");
+        let script = format!(
+            "#!/bin/sh\n\
+             if read -r line; then\n\
+                 echo \"PROMPT $line\" >> \"{}\"\n\
+                 echo '{{\"type\":\"assistant\",\"session_id\":\"sess-1\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"OK\"}}]}}}}'\n\
+                 echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"OK\",\"session_id\":\"sess-1\"}}'\n\
+                 sleep 1\n\
+             fi\n",
+            log_path.display()
+        );
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: TEST_CURSOR_MUTEX is held for the whole test.
+        unsafe {
+            std::env::set_var("DMUXAI_CURSOR_BIN", &script_path);
+        }
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let config = CursorAdapterConfig {
+            windows_unsandboxed: false,
+            prewarm: false,
+            prewarm_idle_secs: 300,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config, Vec::new());
+        let request = |turn: &str, prompt: &str| AgentRequest {
+            conversation_id: super::super::ConversationId::new("conv-1"),
+            turn_id: super::super::TurnId::new(turn),
+            prompt: prompt.to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+        };
+        adapter.send(request("turn-1", "first")).unwrap();
+        wait_for_turn_completion(&mut event_rx).await;
+        // The first process is still alive (sleep 1): send the next prompt now.
+        adapter.send(request("turn-2", "second")).unwrap();
+        let mut errors = Vec::new();
+        let mut completed_turn2 = false;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) && !completed_turn2 {
+            if let Ok(Some(output)) = timeout(Duration::from_millis(500), event_rx.recv()).await {
+                let turn = output.turn_id.as_ref().map(|t| t.as_str().to_owned());
+                match output.event {
+                    AgentEvent::Error(message) => errors.push(message),
+                    AgentEvent::Completed if turn.as_deref() == Some("turn-2") => {
+                        completed_turn2 = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(errors.is_empty(), "no busy refusal expected: {errors:?}");
+        assert!(completed_turn2, "the queued prompt must run");
+        let prompts = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            prompts.lines().collect::<Vec<_>>(),
+            vec!["PROMPT first", "PROMPT second"]
+        );
+
+        drop(adapter);
+        let _ = worker.await;
+        unsafe {
+            std::env::remove_var("DMUXAI_CURSOR_BIN");
+        }
     }
 
     #[tokio::test]

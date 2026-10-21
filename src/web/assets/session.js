@@ -46,6 +46,8 @@
   var viewOnly = false;
   var pending = null;
   var conversationShown = null;
+  var promptInFlight = false;
+  var pendingEcho = null;
   // Web image attachments (paste, drop, paperclip) waiting for the next prompt.
   var pendingAttachments = [];
   var ATTACH_ALLOWED = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
@@ -1616,6 +1618,14 @@
     select.value = value;
   }
 
+  function lastUserMessageId() {
+    if (!session || !session.transcript || !session.transcript.length) { return null; }
+    for (var i = session.transcript.length - 1; i >= 0; i--) {
+      if (session.transcript[i].role === 'user') { return session.transcript[i].id; }
+    }
+    return null;
+  }
+
   function onPromptKey(e) {
     if (e.isComposing || e.keyCode === 229) { return; }
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -1627,6 +1637,7 @@
   }
 
   function submitPrompt() {
+    if (promptInFlight || viewOnly) { return; }
     var text = ui.input.value;
     if (!text.trim()) { return; }
     var uploading = pendingAttachments.some(function (item) { return item.status === 'uploading'; });
@@ -1637,18 +1648,50 @@
     var readyNames = pendingAttachments
       .filter(function (item) { return item.status === 'ready' && item.name; })
       .map(function (item) { return item.name; });
+    var isSlashCommand = (text.indexOf('/') === 0) && (text.indexOf('//') !== 0);
+    var echoItems = pendingAttachments.filter(function (item) { return item.status === 'ready'; });
     ui.send.disabled = true;
+    promptInFlight = true;
+    if (!isSlashCommand) {
+      pendingEcho = {
+        text: text,
+        images: echoItems.map(function (item) { return item.previewUrl; }),
+        conversationId: session && session.conversation_id,
+        lastUserId: lastUserMessageId(),
+        sentAt: Date.now(),
+        items: echoItems
+      };
+      ui.input.value = '';
+      autoGrowInput();
+      pendingAttachments = [];
+      renderAttachTray();
+      renderPendingEcho();
+      scrollTranscriptToEnd();
+    }
     sendPrompt(text, readyNames).then(function (ok) {
+      promptInFlight = false;
       ui.send.disabled = viewOnly;
       if (ok) {
-        ui.input.value = '';
-        autoGrowInput();
-        revokeAttachmentUrls(pendingAttachments);
-        pendingAttachments = [];
-        renderAttachTray();
+        if (isSlashCommand) {
+          ui.input.value = '';
+          autoGrowInput();
+          revokeAttachmentUrls(pendingAttachments);
+          pendingAttachments = [];
+          renderAttachTray();
+        }
         // UX-1203: your own message always brings the view to the latest turn.
         stickToBottom = true;
         scrollTranscriptToEnd();
+      } else {
+        if (!isSlashCommand && pendingEcho) {
+          var pendingNode = ui.transcript ? ui.transcript.querySelector('li.msg-pending') : null;
+          if (pendingNode && pendingNode.parentNode) { pendingNode.parentNode.removeChild(pendingNode); }
+          ui.input.value = text;
+          autoGrowInput();
+          pendingAttachments = pendingEcho.items;
+          renderAttachTray();
+          pendingEcho = null;
+        }
       }
       ui.input.focus();
     });
@@ -1674,6 +1717,7 @@
     [ui.newConv, ui.status, ui.details, ui.share, ui.palette, ui.quit, ui.send].forEach(function (b) {
       b.disabled = viewOnly;
     });
+    if (promptInFlight && ui.send) { ui.send.disabled = true; }
     if (ui.attachBtn) { ui.attachBtn.disabled = viewOnly; }
     if (ui.attachInput) { ui.attachInput.disabled = viewOnly; }
     if (ui.route) { ui.route.disabled = viewOnly; }
@@ -1682,7 +1726,61 @@
     renderConversations();
   }
 
+  function reconcilePendingEcho() {
+    if (!pendingEcho) { return; }
+    var remove = false;
+    if (session && session.conversation_id !== pendingEcho.conversationId) { remove = true; }
+    else if (lastUserMessageId() !== pendingEcho.lastUserId) { remove = true; }
+    else if (Date.now() - pendingEcho.sentAt > 120000) { remove = true; }
+    if (!remove) { return; }
+    if (ui.transcript) {
+      var node = ui.transcript.querySelector('li.msg-pending');
+      if (node && node.parentNode) { node.parentNode.removeChild(node); }
+    }
+    var trayUrls = {};
+    (pendingAttachments || []).forEach(function (item) {
+      if (item && item.previewUrl) { trayUrls[item.previewUrl] = true; }
+    });
+    (pendingEcho.images || []).forEach(function (url) {
+      if (!trayUrls[url]) {
+        try { URL.revokeObjectURL(url); } catch (err) { /* ignore */ }
+      }
+    });
+    pendingEcho = null;
+  }
+
+  function renderPendingEcho() {
+    if (!ui.transcript) { return; }
+    var existing = ui.transcript.querySelectorAll('li.msg-pending');
+    Array.prototype.forEach.call(existing, function (n) {
+      if (n.parentNode) { n.parentNode.removeChild(n); }
+    });
+    if (!pendingEcho) { return; }
+    var li = el('li', 'msg msg-user msg-pending');
+    li.appendChild(el('span', 'msg-who', 'user'));
+    var textNode = el('div', 'msg-text');
+    textNode.textContent = pendingEcho.text;
+    li.appendChild(textNode);
+    if (pendingEcho.images && pendingEcho.images.length) {
+      var imgWrap = el('div', 'msg-images');
+      pendingEcho.images.forEach(function (url) {
+        var img = el('img', 'msg-image');
+        img.src = url;
+        img.alt = 'Attached image';
+        imgWrap.appendChild(img);
+      });
+      li.appendChild(imgWrap);
+    }
+    ui.transcript.appendChild(li);
+    var working = ui.transcript.querySelector('.msg-working');
+    if (working && working.parentNode) {
+      working.parentNode.removeChild(working);
+      ui.transcript.appendChild(working);
+    }
+  }
+
   function renderTranscript() {
+    reconcilePendingEcho();
     if (conversationShown !== session.conversation_id) {
       conversationShown = session.conversation_id;
       ui.transcript.textContent = '';
@@ -1826,7 +1924,7 @@
         delete messageNodes[id];
       }
     });
-    if (!session.transcript.length) {
+    if (!session.transcript.length && !pendingEcho) {
       if (!ui.transcript.querySelector('.session-empty')) {
         ui.transcript.appendChild(el('li', 'session-empty', 'No messages yet.'));
       }
@@ -1851,6 +1949,7 @@
     } else if (workingNode) {
       workingNode.parentNode.removeChild(workingNode);
     }
+    renderPendingEcho();
     renderChatAux();
     // docs.js links agent turns that changed files to their chat message
     // (SPEC-dashboard-fullwidth FR-1209, FR-1210).

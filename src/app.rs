@@ -1084,6 +1084,10 @@ pub struct App {
     selected: usize,
     workspace_root: PathBuf,
     pending_images: ImageAttachmentStore,
+    /// Transcript index of the user message of a graph step whose start the
+    /// runner refused as busy; the retry reuses it instead of appending the
+    /// same prompt again.
+    busy_retry_user_message: HashMap<Agent, usize>,
     #[allow(dead_code)]
     settings: DmuxSettings,
     input: String,
@@ -1332,6 +1336,7 @@ impl App {
             workspace_root,
             settings,
             pending_images: ImageAttachmentStore::new(),
+            busy_retry_user_message: HashMap::new(),
             input: String::new(),
             messages: Vec::new(),
             adapters,
@@ -3703,7 +3708,17 @@ impl App {
                 }
             })
             .collect();
-        self.messages.push(user_message);
+        // A retried graph step whose first start was refused as busy already
+        // has its user message in the transcript; reuse it (no duplicate).
+        let reuse = self.busy_retry_user_message.remove(&agent).filter(|index| {
+            self.messages.get(*index).is_some_and(|message| {
+                matches!(message.role, Role::User) && message.content == user_message.content
+            })
+        });
+        match reuse {
+            Some(index) => self.messages[index].images = user_message.images,
+            None => self.messages.push(user_message),
+        }
         match send_result {
             Ok(()) => {
                 if let Some(hash) = injected_memory {
@@ -8587,10 +8602,21 @@ impl App {
                     catalog.loading = false;
                 }
                 self.finish_turn_outcome_with_error(agent, false, Some(error.clone()));
-                self.messages.push(Message::new(
-                    Role::System,
-                    format!("{agent} error: {error}"),
-                ));
+                if is_adapter_turn_busy_rejection(&error)
+                    && self.busy_retry_user_message.contains_key(&agent)
+                {
+                    // The step is retried automatically; keep this out of the
+                    // dashboard and the agent context (TUI-only notice).
+                    self.messages.push(Message::local_only(
+                        Role::System,
+                        format!("{agent} is still finishing its previous turn; retrying the step."),
+                    ));
+                } else {
+                    self.messages.push(Message::new(
+                        Role::System,
+                        format!("{agent} error: {error}"),
+                    ));
+                }
             }
         }
     }
@@ -8796,6 +8822,13 @@ impl App {
                 && let Some(assignment) = session.assignment_for_node(&node_id)
             {
                 self.defer_graph_node_start(agent, assignment);
+                if let Some(index) = self
+                    .messages
+                    .iter()
+                    .rposition(|message| matches!(message.role, Role::User))
+                {
+                    self.busy_retry_user_message.insert(agent, index);
+                }
                 return;
             }
             self.intercept_graph_node_finished(agent, node_id, success, &output_text);
@@ -14539,6 +14572,55 @@ mod tests {
         assert_eq!(stored.phase, GraphRunPhase::Completed);
     }
 
+    // Dashboard double-message bug: a step refused as "already running" and
+    // started again later keeps exactly one user message for that step and
+    // does not post a "Cursor error" line to the dashboard transcript.
+    #[test]
+    fn busy_retry_keeps_one_user_message_per_step() {
+        let (mut app, sent, _tx) = test_app_with_event_sender();
+        app.selected = adapter_index(Agent::Cursor);
+        app.quiet_graph_run = false;
+        app.start_graph_run(two_step_cursor_chain_plan("dup-send", 2));
+        complete_sent_graph_turn(&mut app, &sent, 0);
+        assert_eq!(sent.lock().unwrap().len(), 2);
+        let user_count = |app: &App| {
+            app.messages
+                .iter()
+                .filter(|message| matches!(message.role, Role::User))
+                .count()
+        };
+        let users_before = user_count(&app);
+
+        let (agent, request) = sent.lock().unwrap()[1].clone();
+        assert!(
+            app.apply_agent_output(AgentOutput {
+                agent,
+                conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+                turn_id: Some(TurnId::new(request.turn_id.as_str())),
+                event: AgentEvent::Error(
+                    "Cursor is already running a turn; cancel it before sending another prompt"
+                        .to_owned(),
+                ),
+            })
+        );
+        assert!(app.tick());
+        assert_eq!(sent.lock().unwrap().len(), 3);
+        assert_eq!(sent.lock().unwrap()[2].1.prompt, request.prompt);
+        assert_eq!(
+            user_count(&app),
+            users_before,
+            "retry must not add a user message"
+        );
+        assert!(
+            !app.messages
+                .iter()
+                .any(|message| !message.local_only && message.content.contains("already running")),
+            "auto-retried busy refusal must stay out of the shared transcript"
+        );
+        complete_sent_graph_turn(&mut app, &sent, 2);
+        assert_eq!(user_count(&app), users_before);
+    }
+
     // TC-1001 / FR-976: per-runner FIFO for deferred starts (no overwrite).
     #[test]
     fn deferred_starts_queue_per_runner() {
@@ -18545,16 +18627,41 @@ mod tests {
                 ),
             })
         );
-        // The agent is not stuck busy forever: the B entry is fully unwound
-        // and the rejection is surfaced to the user as a system message. If a
-        // terminal event for A were replayed afterwards it would be dropped
-        // (no matching entry), which is safe because A already finished.
+        // The agent is not stuck busy forever: the B entry is fully unwound.
+        // If a terminal event for A were replayed afterwards it would be
+        // dropped (no matching entry), which is safe because A already
+        // finished.
         assert!(!app.busy_agents.contains(&Agent::Codex));
         assert!(!app.active_turns.contains_key(&Agent::Codex));
-        assert_eq!(
-            app.messages.last().unwrap().content,
-            "Codex error: Codex is already running a turn; cancel it before sending another prompt"
+        let deferred = app
+            .graph_deferred_starts
+            .get(&Agent::Codex)
+            .map(|queue| queue.len())
+            .unwrap_or(0);
+        let last = app.messages.last().unwrap();
+        assert_eq!(deferred, 1, "the refused step is queued for a retry");
+        // The step is retried once Codex is free, so the refusal is only a
+        // TUI notice and the retry reuses the "second" user message.
+        assert!(last.local_only, "{}", last.content);
+        assert!(
+            last.content.contains("retrying the step"),
+            "{}",
+            last.content
         );
+        let users_before = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, Role::User))
+            .count();
+        let sent_before = sent.lock().unwrap().len();
+        assert!(app.tick());
+        assert_eq!(sent.lock().unwrap().len(), sent_before + 1, "step retried");
+        let users_after = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, Role::User))
+            .count();
+        assert_eq!(users_after, users_before, "no duplicate user message");
     }
 
     #[test]
