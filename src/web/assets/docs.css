@@ -327,6 +327,64 @@
   overflow: auto;
 }
 
+/*
+ * Files code view: one .code-line per source line, numbered with a CSS
+ * counter in a gutter. Generated content is not selectable or copied, and
+ * each number sits at the top of its (possibly wrapped) line.
+ */
+.doc-code-view {
+  min-height: 100%;
+}
+
+.code-view {
+  margin: 0;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px 10px 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85em;
+  line-height: 1.5;
+  overflow: auto;
+  counter-reset: code-line;
+  tab-size: 4;
+}
+
+.code-view code {
+  display: block;
+  font: inherit;
+  background: none;
+  padding: 0;
+}
+
+.code-view .code-line {
+  display: block;
+  position: relative;
+  padding-left: 4.5em;
+  min-height: 1.5em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.code-view .code-line::before {
+  counter-increment: code-line;
+  content: counter(code-line);
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 3.4em;
+  padding-right: 0.6em;
+  text-align: right;
+  color: var(--faint);
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: none;
+}
+
+.code-view .code-line:hover {
+  background-color: var(--bg-chip);
+}
+
 .doc-editor {
   width: 100%;
   height: 100%;
@@ -505,42 +563,51 @@
  * theme variables so light/dark/accent themes all stay readable.
  */
 
-.md-body .hl-keyword {
+.md-body .hl-keyword,
+.code-view .hl-keyword {
   color: var(--gate);
   font-weight: 600;
 }
 
-.md-body .hl-string {
+.md-body .hl-string,
+.code-view .hl-string {
   color: var(--ok);
 }
 
-.md-body .hl-comment {
+.md-body .hl-comment,
+.code-view .hl-comment {
   color: var(--faint);
   font-style: italic;
 }
 
-.md-body .hl-constant {
+.md-body .hl-constant,
+.code-view .hl-constant {
   color: var(--warn);
 }
 
-.md-body .hl-entity {
+.md-body .hl-entity,
+.code-view .hl-entity {
   color: var(--accent);
   font-weight: 600;
 }
 
-.md-body .hl-storage {
+.md-body .hl-storage,
+.code-view .hl-storage {
   color: var(--err);
 }
 
-.md-body .hl-support {
+.md-body .hl-support,
+.code-view .hl-support {
   color: var(--gate);
 }
 
-.md-body .hl-variable {
+.md-body .hl-variable,
+.code-view .hl-variable {
   color: var(--text);
 }
 
-.md-body .hl-punctuation {
+.md-body .hl-punctuation,
+.code-view .hl-punctuation {
   color: var(--muted);
 }
 

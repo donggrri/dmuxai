@@ -1032,6 +1032,122 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
+    async fn get_json(router: &axum::Router, uri: &str, token: &str) -> serde_json::Value {
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // Files code view: text kinds carry highlighted, line-split `code_html`
+    // next to the raw `content`; large files fall back to plain text; file
+    // markup is escaped; saving still works on the raw text.
+    #[tokio::test]
+    async fn read_text_file_has_code_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        let cpp = "#include <cstdio>\nint main() {\n  return 0;\n}\n";
+        let py = "def add(a, b):\n    return a + b\n";
+        let sh = "#!/bin/sh\necho \"hi\"\n";
+        let evil = "x = 1\n</code></pre><script>alert(1)</script>\n";
+        std::fs::write(dir.path().join("main.cpp"), cpp).unwrap();
+        std::fs::write(dir.path().join("tool.py"), py).unwrap();
+        std::fs::write(dir.path().join("run.sh"), sh).unwrap();
+        std::fs::write(dir.path().join("evil.py"), evil).unwrap();
+        let big = "x = 1\n".repeat(crate::docs::highlight::MAX_CODE_VIEW_BYTES / 6 + 10);
+        std::fs::write(dir.path().join("big.py"), &big).unwrap();
+        std::fs::write(dir.path().join("ok.md"), "# Title\n").unwrap();
+
+        let token = "testtoken";
+        let service =
+            test_docs_service(ws, false, crate::docs::changes::ChangeLog::default(), None);
+        let router = test_router(Some(service), token);
+
+        for (path, raw, language, lines) in [
+            ("main.cpp", cpp, "C++", 4),
+            ("tool.py", py, "Python", 2),
+            ("run.sh", sh, "Bourne Again Shell (bash)", 2),
+        ] {
+            let val = get_json(&router, &format!("/api/docs/file?path={path}"), token).await;
+            assert_eq!(val["kind"], "text", "{path}");
+            assert_eq!(val["content"], raw, "{path}: raw content kept for editing");
+            assert_eq!(val["editable"], true, "{path}");
+            assert_eq!(val["language"], language, "{path}");
+            let html = val["code_html"].as_str().expect("code_html");
+            assert!(
+                html.starts_with("<pre class=\"code-view\"><code"),
+                "{path}: {html}"
+            );
+            assert!(html.contains("class=\"hl-"), "{path}: {html}");
+            assert_eq!(html.matches("class=\"code-line\"").count(), lines, "{path}");
+        }
+
+        let val = get_json(&router, "/api/docs/file?path=evil.py", token).await;
+        let html = val["code_html"].as_str().unwrap();
+        assert!(!html.contains("<script"), "{html}");
+        assert!(!html.contains("</code></pre><"), "{html}");
+        assert_eq!(val["content"], evil);
+
+        let val = get_json(&router, "/api/docs/file?path=big.py", token).await;
+        assert_eq!(val["content"], big.as_str(), "plain text still returned");
+        assert!(val.get("code_html").is_none(), "over the cap: no code view");
+        assert!(val.get("language").is_none());
+
+        let val = get_json(&router, "/api/docs/file?path=ok.md", token).await;
+        assert!(
+            val.get("code_html").is_none(),
+            "markdown keeps its own renderer"
+        );
+
+        // Save the raw text, then read back a fresh code view.
+        let base = crate::docs::sha256_hex(py.as_bytes());
+        let updated = "def add(a, b):\n    return a + b\n\nprint(add(1, 2))\n";
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/docs/file")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({ "path": "tool.py", "content": updated, "base_sha256": base })
+                    .to_string(),
+            ))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tool.py")).unwrap(),
+            updated
+        );
+        let val = get_json(&router, "/api/docs/file?path=tool.py", token).await;
+        assert_eq!(val["content"], updated);
+        assert_eq!(val["sha256"], crate::docs::sha256_hex(updated.as_bytes()));
+        let html = val["code_html"].as_str().unwrap();
+        assert_eq!(html.matches("class=\"code-line\"").count(), 4);
+        assert!(html.contains("print"));
+
+        // A stale base hash is still a conflict.
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/docs/file")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({ "path": "tool.py", "content": "x", "base_sha256": base })
+                    .to_string(),
+            ))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
     // TC-746: save_with_concurrency_check (FR-744, NFR-752)
     #[tokio::test]
     async fn save_with_concurrency_check() {

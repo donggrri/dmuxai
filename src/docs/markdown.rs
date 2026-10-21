@@ -138,7 +138,7 @@ fn push_text_with_links<'a>(out: &mut Vec<Event<'a>>, text: &str) {
     }
 }
 
-fn syntax_set() -> &'static SyntaxSet {
+pub(crate) fn syntax_set() -> &'static SyntaxSet {
     static SET: OnceLock<SyntaxSet> = OnceLock::new();
     SET.get_or_init(SyntaxSet::load_defaults_newlines)
 }

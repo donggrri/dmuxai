@@ -2,7 +2,8 @@
 //!
 //! Contract:
 //! - `pub struct DocFile { pub path: String, pub kind: DocKind, pub editable: bool, pub size: u64,
-//!    pub mtime_ms: u64, pub sha256: String, pub content: Option<String> }` (Serialize)
+//!    pub mtime_ms: u64, pub sha256: String, pub content: Option<String>,
+//!    pub code_html: Option<String>, pub language: Option<String> }` (Serialize)
 //! - `pub fn read_file(ws: &Workspace, path: &str) -> Result<DocFile, DocsError>`
 //! - `pub fn read_bytes(ws: &Workspace, path: &str, max: u64) -> Result<(ResolvedPath, Vec<u8>), DocsError>`
 //! - `pub struct SaveOutcome { pub sha256: String, pub mtime_ms: u64, pub size: u64 }` (Serialize)
@@ -28,6 +29,14 @@ pub struct DocFile {
     pub mtime_ms: u64,
     pub sha256: String,
     pub content: Option<String>,
+    /// Text kinds only: highlighted, line-split HTML for the code view
+    /// (`crate::docs::highlight`). Absent above the size cap or for non-text
+    /// kinds; `content` stays the raw text used for editing and saving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_html: Option<String>,
+    /// syntect syntax name for `code_html` (`None` for plain text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +100,16 @@ pub fn read_file(ws: &Workspace, path: &str) -> Result<DocFile, DocsError> {
     };
 
     let editable = kind.editable() && size <= MAX_TEXT_BYTES && is_valid_utf8;
+    let code_view = match (&kind, &content) {
+        (DocKind::Text, Some(text)) => {
+            crate::docs::highlight::highlight_file(&resolved.relative, text)
+        }
+        _ => None,
+    };
+    let (code_html, language) = match code_view {
+        Some(view) => (Some(view.html), view.language),
+        None => (None, None),
+    };
 
     Ok(DocFile {
         path: resolved.relative,
@@ -100,6 +119,8 @@ pub fn read_file(ws: &Workspace, path: &str) -> Result<DocFile, DocsError> {
         mtime_ms: mtime,
         sha256,
         content,
+        code_html,
+        language,
     })
 }
 

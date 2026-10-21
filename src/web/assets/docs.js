@@ -1659,6 +1659,7 @@
       sha256: null,
       text: null,
       html: null,
+      codeHtml: null,
       download: null,
       editing: false,
       dirty: false
@@ -1673,6 +1674,7 @@
         current.editable = Boolean(doc.editable);
         current.sha256 = doc.sha256 ? String(doc.sha256) : null;
         current.text = typeof doc.content === 'string' ? doc.content : null;
+        current.codeHtml = typeof doc.code_html === 'string' ? doc.code_html : null;
         setBadges(doc);
         renderDocument();
       })
@@ -1692,7 +1694,18 @@
     }
   }
 
+  // Text kinds: the server sends `code_html` (syntax classes, one
+  // .code-line per source line, numbered by a CSS counter so the numbers
+  // are not copied). It goes through sanitizeInto like rendered Markdown;
+  // large files have no code_html and fall back to plain text.
   function showTextView() {
+    if (current.kind === 'text' && current.codeHtml) {
+      var view = el('div', 'doc-code-view');
+      sanitizeInto(view, current.codeHtml);
+      docBody.replaceChildren();
+      docBody.appendChild(view);
+      return;
+    }
     var pre = el('pre', 'doc-code');
     var code = el('code', null, current.text === null ? '' : current.text);
     pre.appendChild(code);
@@ -1715,7 +1728,7 @@
     template: 1, noscript: 1, textarea: 1, select: 1, form: 1, title: 1,
     head: 1, link: 1, meta: 1, base: 1, frame: 1, frameset: 1
   };
-  var SANITIZER_CLASS_RE = /^(hl-|language-|footnote)/;
+  var SANITIZER_CLASS_RE = /^(hl-|language-|footnote|code-(line|view)$)/;
   var SANITIZER_ID_RE = /^user-content-/;
 
   function isSafeUrl(value, img) {
@@ -2048,6 +2061,10 @@
       .then(function (res) {
         current.sha256 = res && res.sha256 ? String(res.sha256) : usedBase;
         current.text = content;
+        // The old code view no longer matches; show plain text until the
+        // highlighted view of the saved content arrives.
+        current.codeHtml = null;
+        if (current.kind === 'text') { refreshCodeView(current.path, current.sha256); }
         current.dirty = false;
         hideConflict();
         setStatus('Saved.');
@@ -2069,6 +2086,17 @@
           setStatus('Save failed: ' + err.message, true);
         }
       });
+  }
+
+  function refreshCodeView(path, sha256) {
+    api('GET', '/api/docs/file?path=' + encodeURIComponent(path))
+      .then(function (doc) {
+        if (!current || current.path !== path || current.sha256 !== sha256) { return; }
+        if (String(doc.sha256 || '') !== sha256) { return; }
+        current.codeHtml = typeof doc.code_html === 'string' ? doc.code_html : null;
+        if (!current.editing && current.codeHtml) { showTextView(); }
+      })
+      .catch(function () { /* keep the plain text view */ });
   }
 
   function exitEditingAfterSave() {
