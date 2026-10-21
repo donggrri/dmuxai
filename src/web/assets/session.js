@@ -6,7 +6,6 @@
 
 (function () {
   var TOKEN_KEY = 'dmuxai.token';
-  var MODES = ['ask', 'plan', 'implement'];
   var PROMPT_ROUTES = [
     { value: 'auto', label: 'Auto' },
     { value: 'plan', label: 'Plan' },
@@ -54,6 +53,8 @@
   // Expanded state of inline rows, keyed by data-aux-key (default collapsed).
   var auxExpanded = {};
   var palette = null;
+  var agentPopover = null;
+  var agentPopoverKeyHandler = null;
   var workspaceKey = '';
   var workspaceInitialized = null;
   var sessionsOpen = false;
@@ -281,34 +282,6 @@
     root.appendChild(ui.viewOnly);
 
     var bar = el('div', 'session-bar');
-    ui.agent = picker('Agent', 'agent', function () {
-      command({ command: 'select_agent', agent: ui.agent.value });
-    });
-    ui.mode = picker('Mode', 'mode', function () {
-      command({ command: 'set_mode', agent: session.selected_agent, mode: ui.mode.value });
-    });
-    ui.model = picker('Model', 'model', function () {
-      if (ui.model.value === '__load__') {
-        command({ command: 'load_models', agent: session.selected_agent });
-        return;
-      }
-      if (ui.model.value) {
-        command({ command: 'select_model', agent: session.selected_agent, model: ui.model.value });
-      }
-    });
-    ui.model.addEventListener('focus', function () {
-      var agent = selectedAgent();
-      if (agent && !agent.models.length && !agent.models_loading) {
-        command({ command: 'load_models', agent: agent.id });
-      }
-    });
-    ui.effort = picker('Effort', 'effort', function () {
-      command({ command: 'set_effort', agent: session.selected_agent, effort: ui.effort.value });
-    });
-    [ui.agent, ui.mode, ui.model, ui.effort].forEach(function (select) {
-      bar.appendChild(select.parentNode);
-    });
-
     var actions = el('div', 'session-actions');
     ui.cancel = button('Cancel', 'cancel', function () {
       command({ command: 'cancel', agent: session.selected_agent });
@@ -345,6 +318,18 @@
     root.appendChild(ui.notice);
 
     var form = el('div', 'session-prompt');
+    var composerTop = el('div', 'session-composer-top');
+    ui.agentPicker = el('button', 'session-agent-picker');
+    ui.agentPicker.type = 'button';
+    ui.agentPicker.setAttribute('data-parity', 'agent');
+    ui.agentPicker.setAttribute('aria-haspopup', 'dialog');
+    ui.agentPicker.setAttribute('aria-expanded', 'false');
+    ui.agentPicker.addEventListener('click', function (e) {
+      e.preventDefault();
+      if (viewOnly) { return; }
+      if (agentPopover) { closeAgentPopover(); } else { openAgentPopover(); }
+    });
+    composerTop.appendChild(ui.agentPicker);
     ui.input = el('textarea', 'session-input');
     ui.input.rows = 1;
     ui.input.placeholder = 'Message the selected agent. Enter sends, Shift+Enter adds a line, / opens commands.';
@@ -358,7 +343,8 @@
       }
       autoGrowInput();
     });
-    form.appendChild(ui.input);
+    composerTop.appendChild(ui.input);
+    form.appendChild(composerTop);
     var sendCol = el('div', 'session-send-col');
     ui.route = picker('Route', 'route', function () { /* value read on send */ });
     setOptions(ui.route, PROMPT_ROUTES, 'auto');
@@ -368,6 +354,14 @@
     form.appendChild(sendCol);
 
     root.appendChild(form);
+    var parityModel = el('span', 'session-parity-anchor');
+    parityModel.hidden = true;
+    parityModel.setAttribute('data-parity', 'model');
+    root.appendChild(parityModel);
+    var parityEffort = el('span', 'session-parity-anchor');
+    parityEffort.hidden = true;
+    parityEffort.setAttribute('data-parity', 'effort');
+    root.appendChild(parityEffort);
     trackHeaderHeight();
     window.setInterval(tickLiveRows, 1000);
 
@@ -824,12 +818,214 @@
     if (ui.transcript) { ui.transcript.scrollTop = ui.transcript.scrollHeight; }
   }
 
+  function hubAgent(id) {
+    if (!lastSnap || !lastSnap.agents) { return null; }
+    for (var i = 0; i < lastSnap.agents.length; i++) {
+      if (lastSnap.agents[i].id === id) { return lastSnap.agents[i]; }
+    }
+    return null;
+  }
+
+  function runStatusLabel(agent, hub) {
+    var run = (hub && hub.run) || (agent && agent.run);
+    if (!run) {
+      if (agent && agent.busy) { return 'busy'; }
+      return '';
+    }
+    if (run.state === 'running') {
+      var ms = typeof run.started_at_ms === 'number'
+        ? Math.max(0, serverNow() - run.started_at_ms)
+        : 0;
+      return fmtElapsed(ms) || 'running';
+    }
+    if (run.state === 'done') {
+      var dur = typeof run.duration_ms === 'number' ? fmtElapsed(run.duration_ms) : '';
+      return dur ? ('✓ ' + dur) : '✓';
+    }
+    if (run.state === 'failed') {
+      return '✗ failed';
+    }
+    if (run.state === 'cancelled') { return 'cancelled'; }
+    return run.state || '';
+  }
+
+  function hubRunningAgent() {
+    var hub = window.__dmuxHubAgents || [];
+    for (var i = 0; i < hub.length; i++) {
+      var a = hub[i];
+      if (a && (a.busy || (a.run && a.run.state === 'running'))) { return a; }
+    }
+    return null;
+  }
+
+  function updateAgentPickerLabel() {
+    if (!ui.agentPicker) { return; }
+    var agent = selectedAgent();
+    var running = false;
+    if (agent) {
+      running = !!(agent.busy || (agent.run && agent.run.state === 'running'));
+    } else {
+      var hubRun = hubRunningAgent();
+      if (hubRun) {
+        agent = hubRun;
+        running = true;
+      }
+    }
+    ui.agentPicker.classList.toggle('session-agent-picker-running', running);
+    if (!agent) {
+      ui.agentPicker.textContent = 'Agent';
+      return;
+    }
+    var label = agent.label || agent.id;
+    var model = agent.model ? (' · ' + agent.model) : '';
+    ui.agentPicker.textContent = label + model;
+    var color = agentColor(agent.id);
+    if (color) {
+      ui.agentPicker.style.setProperty('--agent-picker-dot', color);
+    }
+  }
+
+  function detachAgentPopoverKey() {
+    if (agentPopoverKeyHandler) {
+      document.removeEventListener('keydown', agentPopoverKeyHandler, true);
+      agentPopoverKeyHandler = null;
+    }
+  }
+
+  function closeAgentPopover() {
+    detachAgentPopoverKey();
+    if (agentPopover && agentPopover.parentNode) {
+      agentPopover.parentNode.removeChild(agentPopover);
+    }
+    agentPopover = null;
+    if (ui.agentPicker) { ui.agentPicker.setAttribute('aria-expanded', 'false'); }
+  }
+
+  function buildAgentPopoverList() {
+    var list = el('ul', 'session-agent-list');
+    if (!session) { return list; }
+    session.agents.forEach(function (a) {
+      var hub = hubAgent(a.id);
+      var li = el('li', 'session-agent-item');
+      var row = el('button', 'session-agent-row');
+      row.type = 'button';
+      if (a.id === session.selected_agent) { row.classList.add('session-agent-row-active'); }
+      if (!a.allowed) { row.disabled = true; }
+      var dot = el('span', 'session-agent-dot');
+      var color = (hub && hub.color) || agentColor(a.id);
+      if (color) { dot.style.backgroundColor = color; }
+      row.appendChild(dot);
+      var main = el('span', 'session-agent-main');
+      main.appendChild(el('span', 'session-agent-name', a.label || a.id));
+      var meta = el('span', 'session-agent-meta', (a.model || 'default model') +
+        (runStatusLabel(a, hub) ? (' · ' + runStatusLabel(a, hub)) : ''));
+      main.appendChild(meta);
+      row.appendChild(main);
+      row.addEventListener('click', function () {
+        if (!a.allowed) { return; }
+        command({ command: 'select_agent', agent: a.id }).then(function () {
+          if (!a.models.length && !a.models_loading) {
+            command({ command: 'load_models', agent: a.id });
+          }
+        });
+      });
+      li.appendChild(row);
+
+      if (a.id === session.selected_agent) {
+        var models = el('div', 'session-agent-models');
+        if (a.models.length) {
+          a.models.forEach(function (m) {
+            var mb = el('button', 'session-model-chip' + (a.model === m.id ? ' on' : ''), m.label || m.id);
+            mb.type = 'button';
+            mb.addEventListener('click', function () {
+              command({ command: 'select_model', agent: a.id, model: m.id });
+            });
+            models.appendChild(mb);
+          });
+        } else {
+          var load = el('button', 'btn btn-small', a.models_loading ? 'Loading…' : 'Load models');
+          load.type = 'button';
+          load.disabled = !!a.models_loading;
+          load.addEventListener('click', function () {
+            command({ command: 'load_models', agent: a.id });
+          });
+          models.appendChild(load);
+        }
+        if (a.model) {
+          var efforts = [];
+          a.models.forEach(function (m) { if (m.id === a.model) { efforts = m.efforts || []; } });
+          if (efforts.length) {
+            var effortRow = el('div', 'session-agent-efforts');
+            efforts.forEach(function (eff) {
+              var eb = el('button', 'session-model-chip' + (a.effort === eff ? ' on' : ''), eff);
+              eb.type = 'button';
+              eb.addEventListener('click', function () {
+                command({ command: 'set_effort', agent: a.id, effort: eff });
+              });
+              effortRow.appendChild(eb);
+            });
+            models.appendChild(effortRow);
+          }
+        }
+        li.appendChild(models);
+      }
+      list.appendChild(li);
+    });
+    return list;
+  }
+
+  function syncAgentPopover() {
+    if (!agentPopover || !session) { return; }
+    var panel = agentPopover.querySelector('.session-agent-popover');
+    if (!panel) { return; }
+    var hadFocus = document.activeElement && panel.contains(document.activeElement);
+    var list = buildAgentPopoverList();
+    var old = panel.querySelector('.session-agent-list');
+    if (old) {
+      panel.replaceChild(list, old);
+    } else {
+      panel.appendChild(list);
+    }
+    if (hadFocus) { panel.focus(); }
+  }
+
+  function openAgentPopover() {
+    if (!session || viewOnly) { return; }
+    closeAgentPopover();
+    var overlay = el('div', 'session-agent-overlay');
+    var panel = el('div', 'session-agent-popover');
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-label', 'Choose agent and model');
+    panel.tabIndex = -1;
+    panel.appendChild(el('p', 'session-agent-popover-title', 'Agent for next message'));
+    panel.appendChild(buildAgentPopoverList());
+
+    overlay.addEventListener('click', function (e) {
+      if (e.target === overlay) { closeAgentPopover(); }
+    });
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+    agentPopover = overlay;
+    ui.agentPicker.setAttribute('aria-expanded', 'true');
+    panel.focus();
+    agentPopoverKeyHandler = function (e) {
+      if (e.key !== 'Escape' || !agentPopover) { return; }
+      e.preventDefault();
+      e.stopPropagation();
+      closeAgentPopover();
+      if (ui.agentPicker) { ui.agentPicker.focus(); }
+    };
+    document.addEventListener('keydown', agentPopoverKeyHandler, true);
+  }
+
   // FR-1207: fenced ``` blocks become <pre><code>, `inline` spans become
   // <code>; everything is a text node (no HTML parsing), so agent output can
   // not inject markup. An unclosed fence (still streaming) renders as code.
-  function renderMessageText(target, content) {
-    if (target.dmuxContent === content) { return; }
+  function renderMessagePlain(target, content) {
+    if (target.dmuxContent === content && !target.dmuxHtmlKey) { return; }
     target.dmuxContent = content;
+    target.dmuxHtmlKey = '';
+    target.classList.remove('md-body', 'msg-md');
     target.textContent = '';
     var text = String(content || '');
     var fence = /```([^\n`]*)\n?([\s\S]*?)(?:```|$)/g;
@@ -848,6 +1044,29 @@
       if (text.charAt(last) === '\n') { last++; }
     }
     if (last < text.length) { appendInline(target, text.slice(last).replace(/^\n+/, '')); }
+  }
+
+  function renderMessageText(target, message) {
+    var content = String(message.content || '');
+    var htmlKey = message.content_html || '';
+    if (message.role === 'agent' && htmlKey) {
+      if (target.dmuxContent === content && target.dmuxHtmlKey === htmlKey) { return; }
+      target.dmuxContent = content;
+      target.dmuxHtmlKey = htmlKey;
+      target.classList.add('md-body', 'msg-md');
+      target.innerHTML = htmlKey;
+      return;
+    }
+    if (message.role === 'user') {
+      if (target.dmuxContent === content && !target.dmuxHtmlKey) { return; }
+      target.dmuxContent = content;
+      target.dmuxHtmlKey = '';
+      target.classList.remove('md-body', 'msg-md');
+      target.textContent = '';
+      target.appendChild(document.createTextNode(content));
+      return;
+    }
+    renderMessagePlain(target, content);
   }
 
   function appendInline(target, text) {
@@ -925,54 +1144,9 @@
       ? session.conversation_title + ' · ' + session.conversation_id.slice(0, 8)
       : session.conversation_id.slice(0, 8);
 
-    setOptions(ui.agent, session.agents.map(function (a) {
-      var stateSuffix = '';
-      if (a.run && a.run.state === 'running') {
-        stateSuffix = ' · ⏳ running';
-      } else if (a.run && a.run.state === 'done') {
-        stateSuffix = ' · ✓ done';
-      } else if (a.run && a.run.state === 'failed') {
-        stateSuffix = ' · ✗ failed';
-      } else if (a.run && a.run.state === 'cancelled') {
-        stateSuffix = ' · ■ cancelled';
-      } else if (a.busy) {
-        stateSuffix = ' · busy';
-      }
-      return {
-        value: a.id,
-        label: a.label + (a.allowed ? '' : ' (not allowed)') + stateSuffix,
-        disabled: !a.allowed
-      };
-    }), session.selected_agent);
-
-    var modes = (agent && agent.modes.length) ? agent.modes : MODES;
-    setOptions(ui.mode, modes.map(function (m) {
-      return { value: m, label: m.charAt(0).toUpperCase() + m.slice(1) };
-    }), agent ? agent.mode : 'ask');
-
-    var modelOptions = [];
-    if (agent && agent.models.length) {
-      modelOptions = agent.models.map(function (m) { return { value: m.id, label: m.label }; });
-      if (!agent.model) { modelOptions.unshift({ value: '', label: 'provider default' }); }
-    } else {
-      modelOptions.push({ value: agent && agent.model ? agent.model : '', label: agent && agent.model ? agent.model : 'provider default' });
-      modelOptions.push({ value: '__load__', label: agent && agent.models_loading ? 'Loading models…' : 'Load models…' });
-    }
-    setOptions(ui.model, modelOptions, agent && agent.model ? agent.model : '');
-
-    var efforts = [];
-    if (agent && agent.model) {
-      agent.models.forEach(function (m) { if (m.id === agent.model) { efforts = m.efforts; } });
-    }
-    ui.effort.parentNode.hidden = !efforts.length;
-    setOptions(ui.effort, efforts.map(function (x) { return { value: x, label: x }; }),
-      agent && agent.effort ? agent.effort : (efforts[0] || ''));
-
-    // UX-780: pickers are disabled while the agent works; Cancel shows instead.
-    ui.mode.disabled = viewOnly || busy;
-    ui.model.disabled = viewOnly || busy;
-    ui.effort.disabled = viewOnly || busy;
-    ui.agent.disabled = viewOnly;
+    updateAgentPickerLabel();
+    if (ui.agentPicker) { ui.agentPicker.disabled = viewOnly; }
+    if (agentPopover) { syncAgentPopover(); }
     ui.cancel.hidden = !busy;
     ui.details.classList.toggle('btn-on', !!session.details_expanded);
     [ui.newConv, ui.status, ui.details, ui.share, ui.palette, ui.quit, ui.send].forEach(function (b) {
@@ -1018,7 +1192,7 @@
       // text color so it stays readable for any configured agent color.
       var color = m.agent ? agentColor(m.agent) : null;
       if (color) { node.style.setProperty('--agent-color', color); } else { node.style.removeProperty('--agent-color'); }
-      renderMessageText(node.dmuxText, m.content);
+      renderMessageText(node.dmuxText, m);
       node.classList.toggle('msg-streaming', !!m.streaming);
       previous = node;
     });
@@ -1314,7 +1488,7 @@
 
   var ACTIONS = {
     '/agent': function () { ask('Agent', agentChoices(), function (v) { command({ command: 'select_agent', agent: v }); }); },
-    '/mode': function () { ask('Mode', MODES.map(choice), function (v) { command({ command: 'set_mode', agent: session.selected_agent, mode: v }); }); },
+    '/mode': function () { notify('Mode selection was removed; every turn runs in agent mode.', true); },
     '/effort': function () {
       var agent = selectedAgent();
       var efforts = [];
@@ -1514,6 +1688,7 @@
     if (snap.workspace) {
       initSessionsSidebarForWorkspace(snap.workspace);
     }
+    window.__dmuxHubAgents = snap.agents || [];
     var colors = {};
     (snap.agents || []).forEach(function (a) { if (a.color) { colors[a.id] = a.color; } });
     window.__dmuxSessionAgents = colors;
@@ -1528,7 +1703,7 @@
     } else if (viewOnly) {
       root.classList.add('session-disabled');
       session = null;
-      [ui.agent, ui.mode, ui.model, ui.effort, ui.input, ui.send].forEach(function (c) { c.disabled = true; });
+      [ui.agentPicker, ui.input, ui.send].forEach(function (c) { if (c) { c.disabled = true; } });
       renderConversations();
       renderChatAux();
     }
@@ -1550,5 +1725,12 @@
   });
 
   // Plan-gate approval buttons are rendered in app.js via parityButton (parity ids).
-  window.dmuxaiSession = { parityButton: button };
+  window.dmuxaiSession = {
+    parityButton: button,
+    updateAgentRunIndicators: function (hubAgents) {
+      if (hubAgents) { window.__dmuxHubAgents = hubAgents; }
+      updateAgentPickerLabel();
+      if (agentPopover) { syncAgentPopover(); }
+    },
+  };
 })();

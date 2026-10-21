@@ -5,6 +5,7 @@
 
 pub mod assets;
 mod auth;
+pub mod chat_markdown;
 pub mod commands;
 pub mod discovery;
 pub mod docs_api;

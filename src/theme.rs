@@ -573,7 +573,7 @@ pub fn colors_enabled(no_color: Option<&str>, force: Option<bool>, env_force: bo
     if env_force || force == Some(true) {
         return true;
     }
-    !no_color.is_some_and(|v| !v.is_empty())
+    no_color.is_none_or(|v| v.is_empty())
 }
 
 #[cfg(test)]

@@ -1011,6 +1011,12 @@ async fn post_command(
     State(state): State<AppState>,
     ApiJson(command): ApiJson<SessionCommand>,
 ) -> Response {
+    if matches!(&command, SessionCommand::SetMode { .. }) {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "mode selection was removed; pass ask, plan, or implement on POST /api/prompt instead",
+        );
+    }
     if !state.services.web_attached && session_command_needs_web_write(&command) {
         return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
     }
@@ -2101,7 +2107,6 @@ mod tests {
         let router = router_with(tx);
         let bodies = [
             r#"{"command":"select_agent","agent":"agy"}"#,
-            r#"{"command":"set_mode","mode":"plan"}"#,
             r#"{"command":"load_models","agent":"codex"}"#,
             r#"{"command":"select_model","agent":"codex","model":"m1"}"#,
             r#"{"command":"set_effort","effort":"high"}"#,
@@ -2125,13 +2130,18 @@ mod tests {
             assert_eq!(json["session"]["conversation_id"], "conv-1");
         }
         assert_eq!(seen.lock().unwrap().len(), bodies.len());
-        assert_eq!(
-            seen.lock().unwrap()[1],
-            SessionCommand::SetMode {
-                agent: None,
-                mode: "plan".to_owned()
-            }
-        );
+
+        let set_mode = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                r#"{"command":"set_mode","mode":"plan"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(set_mode.status(), StatusCode::BAD_REQUEST);
 
         for body in [
             r#"{"command":"warp"}"#,
@@ -3194,7 +3204,7 @@ mod tests {
                         let mut guard = state.lock().unwrap();
                         let result = match mode {
                             RunMode::Graph => {
-                                let plan_id = format!("plan-{}", todo_id);
+                                let plan_id = format!("plan-{todo_id}");
                                 guard.awaiting = Some((plan_id.clone(), 1, todo_id.clone()));
                                 guard
                                     .store

@@ -350,7 +350,7 @@ fn override_line_text(kind: Option<OverrideKind>, runner: &str) -> String {
     match kind {
         Some(OverrideKind::Plan) => "/plan".to_owned(),
         Some(OverrideKind::Direct) => "/direct".to_owned(),
-        Some(OverrideKind::Agent) => format!("agent {}", runner),
+        Some(OverrideKind::Agent) => format!("agent {runner}"),
         Some(OverrideKind::NoAllowedRunners) => "no allowed runners".to_owned(),
         None => "override".to_owned(),
     }

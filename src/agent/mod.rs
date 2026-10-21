@@ -67,30 +67,42 @@ impl fmt::Display for Agent {
     }
 }
 
-/// A provider-independent description of what an agent may do during a turn.
+/// Per-turn policy for adapter runs. User-facing Ask/Plan/Implement modes are
+/// removed; user turns use [`Agent`], internal judge/plan/replan turns use
+/// [`ReadOnly`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub enum ExecutionMode {
+pub enum TurnPolicy {
     #[default]
-    Ask,
-    Plan,
-    Implement,
+    Agent,
+    ReadOnly,
 }
 
-impl ExecutionMode {
-    pub const ALL: [Self; 3] = [Self::Ask, Self::Plan, Self::Implement];
+impl TurnPolicy {
+    #[allow(dead_code)]
+    pub const fn is_read_only(self) -> bool {
+        matches!(self, Self::ReadOnly)
+    }
+}
 
-    pub const fn name(self) -> &'static str {
+impl fmt::Display for TurnPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ask => "Ask",
-            Self::Plan => "Plan",
-            Self::Implement => "Implement",
+            Self::Agent => formatter.write_str("agent"),
+            Self::ReadOnly => formatter.write_str("read-only"),
         }
     }
 }
 
-impl fmt::Display for ExecutionMode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.name())
+/// Legacy dashboard/MCP mode strings (`ask`, `plan`, `implement`). Omitted mode
+/// means the default write-capable agent policy.
+/// Maps legacy mode strings from the dashboard/MCP/CLI to a [`TurnPolicy`].
+pub fn turn_policy_from_legacy_mode(mode: &str) -> Result<TurnPolicy, String> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "ask" | "plan" => Ok(TurnPolicy::ReadOnly),
+        "implement" | "agent" => Ok(TurnPolicy::Agent),
+        other => Err(format!(
+            "invalid mode '{other}'; use ask or plan (read-only), implement (agent), or omit mode"
+        )),
     }
 }
 
@@ -108,7 +120,6 @@ pub enum AgentEvent {
     },
     ModelSelected(String),
     EffortSelected(String),
-    ModeSelected(ExecutionMode),
     ToolProgress {
         item_id: String,
         summary: String,
@@ -168,6 +179,10 @@ pub struct AgentRequest {
     pub prompt: String,
     pub resume_session: Option<String>,
     pub image_paths: Vec<PathBuf>,
+    pub policy: TurnPolicy,
+    /// When true (graph implement steps), AGY may retry once if the model replies
+    /// with plan-only text and no writes. Ordinary user questions leave this false.
+    pub require_file_edits: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -231,7 +246,8 @@ pub enum AdapterError {
     CommandQueueFull,
     RuntimeStopped,
     Unsupported,
-    UnsupportedMode { agent: Agent, mode: ExecutionMode },
+    /// Cursor workspace writes unavailable on this platform (legacy path only).
+    CursorWritesUnavailable,
 }
 
 impl fmt::Display for AdapterError {
@@ -240,15 +256,8 @@ impl fmt::Display for AdapterError {
             Self::CommandQueueFull => formatter.write_str("agent command queue is full"),
             Self::RuntimeStopped => formatter.write_str("agent runtime has stopped"),
             Self::Unsupported => formatter.write_str("agent does not support this command"),
-            Self::UnsupportedMode { agent, mode }
-                if *agent == Agent::Cursor && *mode == ExecutionMode::Implement && cfg!(windows) =>
-            {
-                formatter.write_str(
-                    "Cursor Implement mode is unavailable on Windows unless cursor.windows_unsandboxed = true in dmuxai.toml or DMUXAI_CURSOR_WINDOWS_UNSANDBOXED is set (unsandboxed; not recommended)",
-                )
-            }
-            Self::UnsupportedMode { agent, mode } => formatter.write_str(
-                &format!("{agent} {mode} mode is unavailable on this platform"),
+            Self::CursorWritesUnavailable => formatter.write_str(
+                "Cursor agent mode is unavailable on Windows unless cursor.windows_unsandboxed = true in dmuxai.toml or DMUXAI_CURSOR_WINDOWS_UNSANDBOXED is set (unsandboxed; not recommended)",
             ),
         }
     }
@@ -281,10 +290,6 @@ pub trait AgentAdapter: Send {
     fn select_effort(&self, _effort: String) -> Result<(), AdapterError> {
         Err(AdapterError::Unsupported)
     }
-    fn validate_mode(&self, _mode: ExecutionMode) -> Result<(), AdapterError> {
-        Ok(())
-    }
-    fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError>;
     fn send_graph_node(&self, request: AgentRequest) -> Result<(), AdapterError> {
         self.send(request)
     }
@@ -326,4 +331,29 @@ pub const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 pub fn event_channel() -> (mpsc::Sender<AgentOutput>, mpsc::Receiver<AgentOutput>) {
     mpsc::channel(EVENT_CHANNEL_CAPACITY)
+}
+
+#[cfg(test)]
+mod legacy_mode_tests {
+    use super::{TurnPolicy, turn_policy_from_legacy_mode};
+
+    #[test]
+    fn legacy_ask_and_plan_are_read_only() {
+        assert_eq!(
+            turn_policy_from_legacy_mode("ask").unwrap(),
+            TurnPolicy::ReadOnly
+        );
+        assert_eq!(
+            turn_policy_from_legacy_mode("plan").unwrap(),
+            TurnPolicy::ReadOnly
+        );
+    }
+
+    #[test]
+    fn legacy_implement_is_agent() {
+        assert_eq!(
+            turn_policy_from_legacy_mode("implement").unwrap(),
+            TurnPolicy::Agent
+        );
+    }
 }

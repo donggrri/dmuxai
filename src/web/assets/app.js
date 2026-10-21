@@ -2814,6 +2814,10 @@ function computeAgentsKey(list) {
 }
 
 function renderAgents(agents, nowMs) {
+  if (window.dmuxaiSession && typeof window.dmuxaiSession.updateAgentRunIndicators === 'function') {
+    window.dmuxaiSession.updateAgentRunIndicators(agents, nowMs);
+    return;
+  }
   var wrap = $('agents');
   if (!wrap) { return; }
   var list = Array.isArray(agents) ? agents : [];

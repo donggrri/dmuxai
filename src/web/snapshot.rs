@@ -152,6 +152,9 @@ pub struct SessionMessage {
     pub role: String,
     pub agent: Option<String>,
     pub content: String,
+    /// Sanitized HTML for agent turns when Markdown rendering is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_html: Option<String>,
     pub streaming: bool,
 }
 

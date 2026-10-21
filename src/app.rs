@@ -84,8 +84,8 @@ use dmuxai::{
 };
 
 use crate::agent::{
-    Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ConversationId,
-    CursorAdapterConfig, ExecutionMode, ModelInfo, TurnId, event_channel,
+    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ConversationId,
+    CursorAdapterConfig, ModelInfo, TurnId, TurnPolicy, event_channel,
     is_adapter_turn_busy_rejection, spawn_agy_adapter, spawn_codex_adapter, spawn_cursor_adapter,
     spawn_custom_adapter,
 };
@@ -163,16 +163,11 @@ struct SlashCommand {
     action: SlashAction,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 17] = [
+const SLASH_COMMANDS: [SlashCommand; 16] = [
     SlashCommand {
         name: "/agent",
         description: "Switch the active agent",
         action: SlashAction::Agent,
-    },
-    SlashCommand {
-        name: "/mode",
-        description: "Choose Ask, Plan, or Implement",
-        action: SlashAction::Mode,
     },
     SlashCommand {
         name: "/plan",
@@ -289,7 +284,7 @@ impl Message {
 /// First-session help. Runners follow adapter / picker order (FR-983).
 fn welcome_message(runners: &[String]) -> String {
     format!(
-        "Runners: {}. Completed turns are shared automatically with every agent; /share is optional. If another DmuxAI window is already running in this workspace, this window starts a separate conversation. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /image to attach screenshots, /effort to choose Codex reasoning effort, /status to view Codex usage, /quit to exit, F2 to choose a model, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
+        "Runners: {}. Completed turns are shared automatically with every agent; /share is optional. If another DmuxAI window is already running in this workspace, this window starts a separate conversation. Type /agent to switch providers, /image to attach screenshots, /effort to choose Codex reasoning effort, /status to view Codex usage, /quit to exit, F2 to choose a model, or Ctrl+C to cancel the selected turn. Agent turns may modify files inside the workspace.",
         runners.join(", ")
     )
 }
@@ -298,7 +293,7 @@ fn welcome_message(runners: &[String]) -> String {
 /// new-window /image /quit notes (FR-983).
 fn restored_welcome_message(runners: &[String]) -> String {
     format!(
-        "Runners: {}. Completed turns are shared automatically with every agent; /share is optional. Type /agent to switch providers, /mode to choose Ask, Plan, or Implement, /effort to choose Codex reasoning effort, /status to view Codex usage, F2 to choose a model, F3 to load a conversation, or Ctrl+C to cancel the selected turn. Implement mode may modify files inside the workspace.",
+        "Runners: {}. Completed turns are shared automatically with every agent; /share is optional. Type /agent to switch providers, /effort to choose Codex reasoning effort, /status to view Codex usage, F2 to choose a model, F3 to load a conversation, or Ctrl+C to cancel the selected turn. Agent turns may modify files inside the workspace.",
         runners.join(", ")
     )
 }
@@ -322,11 +317,6 @@ struct EffortPicker {
 }
 
 struct AgentPicker {
-    cursor: usize,
-}
-
-struct ModePicker {
-    agent: Agent,
     cursor: usize,
 }
 
@@ -599,7 +589,6 @@ impl AgentActivity {
             | AgentEvent::ModelsListed { .. }
             | AgentEvent::ModelSelected(_)
             | AgentEvent::EffortSelected(_)
-            | AgentEvent::ModeSelected(_)
             | AgentEvent::Status(_) => None,
         };
         if let Some(phase) = phase {
@@ -670,7 +659,6 @@ struct PendingTriage {
     started: Instant,
     last_event: Instant,
     prompt: String,
-    saved_mode: ExecutionMode,
     run_id: String,
     judge_calls: u32,
 }
@@ -689,7 +677,6 @@ struct PendingPlan {
     started: Instant,
     last_event: Instant,
     prompt: String,
-    saved_mode: ExecutionMode,
     run_id: String,
     route: Route,
     verdict_reason: String,
@@ -722,7 +709,6 @@ struct PendingReplan {
     started: Instant,
     last_event: Instant,
     prompt: String,
-    saved_mode: ExecutionMode,
     #[allow(dead_code)]
     run_id: String,
     rev: u32,
@@ -851,7 +837,7 @@ struct UiAreas {
 pub struct HeadlessRequest {
     pub prompt: String,
     pub agent: Option<String>,
-    pub mode: Option<ExecutionMode>,
+    pub mode: Option<String>,
     pub graph: bool,
     pub approve_plan: bool,
     pub todo_id: Option<String>,
@@ -1127,10 +1113,8 @@ pub struct App {
     model_picker: Option<ModelPicker>,
     effort_picker: Option<EffortPicker>,
     agent_picker: Option<AgentPicker>,
-    mode_picker: Option<ModePicker>,
     conversation_picker: Option<ConversationPicker>,
     slash_preview: Option<SlashPreview>,
-    modes: HashMap<Agent, ExecutionMode>,
     tool_messages: HashMap<Agent, HashMap<String, usize>>,
     chat_scroll: usize,
     approval_panel_scroll: usize,
@@ -1158,7 +1142,7 @@ pub struct App {
     quiet_graph_run: bool,
     /// Test-only escape hatch: legacy app tests assume a direct send, so they
     /// skip the judge and start a quiet 1-node run with override kind `agent`.
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     skip_judge_for_tests: bool,
     last_group_expanded: bool,
     all_details_expanded: bool,
@@ -1222,6 +1206,10 @@ pub struct App {
     pub(crate) injected_now: Option<Instant>,
     pub(crate) switch_pending: Option<PathBuf>,
     pub(crate) switch_ready: Option<PathBuf>,
+    /// Next user/agent turn policy from dashboard `mode` or headless `mode` (cleared on send).
+    pending_turn_policy: Option<TurnPolicy>,
+    /// Cached assistant HTML keyed by transcript message id (`conversation:index`).
+    chat_markdown_cache: HashMap<String, (u64, String)>,
 }
 
 impl App {
@@ -1376,13 +1364,8 @@ impl App {
             model_picker: None,
             effort_picker: None,
             agent_picker: None,
-            mode_picker: None,
             conversation_picker: None,
             slash_preview: None,
-            modes: Agent::all()
-                .into_iter()
-                .map(|agent| (agent, ExecutionMode::default()))
-                .collect(),
             tool_messages: HashMap::new(),
             chat_scroll: 0,
             approval_panel_scroll: 0,
@@ -1404,7 +1387,6 @@ impl App {
             graph_node_details: HashMap::new(),
             single_graph_plan: None,
             quiet_graph_run: false,
-            #[cfg(test)]
             skip_judge_for_tests: false,
             last_group_expanded: false,
             all_details_expanded: false,
@@ -1445,6 +1427,8 @@ impl App {
             injected_now: None,
             switch_pending: None,
             switch_ready: None,
+            pending_turn_policy: None,
+            chat_markdown_cache: HashMap::new(),
         };
         let runners = app.registered_runner_names();
         app.messages
@@ -1625,7 +1609,6 @@ impl App {
                         if self.model_picker.is_none()
                             && self.effort_picker.is_none()
                             && self.agent_picker.is_none()
-                            && self.mode_picker.is_none()
                             && self.conversation_picker.is_none() =>
                     {
                         self.handle_paste(text);
@@ -1827,18 +1810,11 @@ impl App {
             return Err(RunTodoError::Busy(format!("agent '{runner_id}' is busy")));
         }
 
-        if let Some(ref mode_str) = mode {
-            let exec_mode = match mode_str.trim().to_ascii_lowercase().as_str() {
-                "ask" => Some(ExecutionMode::Ask),
-                "plan" => Some(ExecutionMode::Plan),
-                "implement" => Some(ExecutionMode::Implement),
-                _ => None,
-            };
-            if let Some(m) = exec_mode
-                && let Err(err) = self.set_agent_mode(target_agent, m)
-            {
-                return Err(RunTodoError::Internal(err));
-            }
+        if let Some(mode_str) = mode.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            self.pending_turn_policy = Some(
+                crate::agent::turn_policy_from_legacy_mode(mode_str)
+                    .map_err(RunTodoError::Invalid)?,
+            );
         }
 
         self.selected = adapter_index(target_agent);
@@ -1958,35 +1934,51 @@ impl App {
             .messages
             .len()
             .saturating_sub(dmuxai::web::SESSION_TRANSCRIPT_MAX_MESSAGES);
-        let messages = self.messages[start..]
-            .iter()
-            .enumerate()
-            .filter(|(_, message)| !message.local_only)
-            .map(|(offset, message)| {
-                // Ids stay the index in `self.messages`, so a local-only notice
-                // does not shift streaming updates (FR-984).
-                let index = start + offset;
-                let (role, agent, content) = match &message.role {
-                    Role::User => ("user", None, message.content.clone()),
-                    Role::Agent(agent) => (
-                        "agent",
-                        Some(self.agent_runner_name(*agent)),
-                        message.content.clone(),
-                    ),
-                    Role::System => ("system", None, message.content.clone()),
-                    Role::Activity(item) => {
-                        ("activity", None, dmuxai::activity::collapsed_line(item))
-                    }
-                };
-                SessionMessage {
-                    id: format!("{conversation_id}:{index}"),
-                    role: role.to_owned(),
-                    agent,
-                    content,
-                    streaming: streaming.contains(&index),
+        let mut messages = Vec::new();
+        for (offset, message) in self.messages[start..].iter().enumerate() {
+            if message.local_only {
+                continue;
+            }
+            let index = start + offset;
+            let (role, agent, content) = match &message.role {
+                Role::User => ("user", None, message.content.clone()),
+                Role::Agent(agent) => (
+                    "agent",
+                    Some(self.agent_runner_name(*agent)),
+                    message.content.clone(),
+                ),
+                Role::System => ("system", None, message.content.clone()),
+                Role::Activity(item) => ("activity", None, dmuxai::activity::collapsed_line(item)),
+            };
+            let content_html = if role == "agent" && !content.is_empty() {
+                let id = format!("{conversation_id}:{index}");
+                let fingerprint = dmuxai::web::chat_markdown::content_fingerprint(&content);
+                if let Some((cached_fp, html)) = self.chat_markdown_cache.get(&id)
+                    && *cached_fp == fingerprint
+                {
+                    Some(html.clone())
+                } else {
+                    let html = dmuxai::web::chat_markdown::render_chat_markdown(&content);
+                    self.chat_markdown_cache
+                        .insert(id, (fingerprint, html.clone()));
+                    Some(html)
                 }
-            })
-            .collect();
+            } else {
+                None
+            };
+            messages.push(SessionMessage {
+                id: format!("{conversation_id}:{index}"),
+                role: role.to_owned(),
+                agent,
+                content,
+                content_html,
+                streaming: streaming.contains(&index),
+            });
+        }
+        if self.chat_markdown_cache.len() > 256 {
+            let live: HashSet<String> = messages.iter().map(|m| m.id.clone()).collect();
+            self.chat_markdown_cache.retain(|id, _| live.contains(id));
+        }
         let (transcript, omitted) = cap_session_transcript(messages);
 
         let agents = self
@@ -1999,18 +1991,8 @@ impl App {
                 SessionAgent {
                     allowed: self.runner_is_allowed(&id),
                     label: agent.name().to_owned(),
-                    mode: self
-                        .modes
-                        .get(&agent)
-                        .copied()
-                        .unwrap_or_default()
-                        .name()
-                        .to_ascii_lowercase(),
-                    modes: ExecutionMode::ALL
-                        .iter()
-                        .filter(|mode| adapter.validate_mode(**mode).is_ok())
-                        .map(|mode| mode.name().to_ascii_lowercase())
-                        .collect(),
+                    mode: "agent".to_owned(),
+                    modes: Vec::new(),
                     model: catalog.and_then(|catalog| catalog.selected.clone()),
                     effort: catalog.and_then(|catalog| catalog.selected_effort.clone()),
                     busy: self.busy_agents.contains(&agent),
@@ -2020,6 +2002,10 @@ impl App {
                             catalog
                                 .models
                                 .iter()
+                                .filter(|model| {
+                                    dmuxai::model_policy::validate_model_for_runner(&id, &model.id)
+                                        .is_ok()
+                                })
                                 .map(|model| SessionModel {
                                     id: model.id.clone(),
                                     label: model.label.clone(),
@@ -2216,31 +2202,11 @@ impl App {
                 self.request_builtin_grok_models(target);
                 self.push_system(format!("Active agent: {target}."));
             }
-            SessionCommand::SetMode { agent, mode } => {
-                let target = self.resolve_dashboard_agent(agent.as_deref())?;
-                let Some(mode) = ExecutionMode::ALL
-                    .into_iter()
-                    .find(|candidate| candidate.name().eq_ignore_ascii_case(mode.trim()))
-                else {
-                    return Err(RunTodoError::Invalid(
-                        "mode must be ask, plan or implement".to_owned(),
-                    ));
-                };
-                if self.busy_agents.contains(&target) {
-                    return Err(RunTodoError::Busy(format!(
-                        "Finish or cancel the {target} turn before changing modes."
-                    )));
-                }
-                let changed = self
-                    .set_agent_mode(target, mode)
-                    .map_err(RunTodoError::Invalid)?;
-                self.push_system(if changed {
-                    format!(
-                        "{target} mode selected: {mode}. The next prompt opens a new session with shared context."
-                    )
-                } else {
-                    format!("{target} mode is already selected: {mode}.")
-                });
+            SessionCommand::SetMode { mode, .. } => {
+                return Err(RunTodoError::Invalid(format!(
+                    "mode selection was removed; omit mode or pass ask/plan (read-only) or implement (agent) on POST /api/prompt (got '{}')",
+                    mode.trim()
+                )));
             }
             SessionCommand::LoadModels { agent } => {
                 let target = self.resolve_dashboard_agent(agent.as_deref())?;
@@ -2595,10 +2561,6 @@ impl App {
             self.handle_agent_picker_key(key);
             return;
         }
-        if self.mode_picker.is_some() {
-            self.handle_mode_picker_key(key);
-            return;
-        }
         if self.effort_picker.is_some() {
             self.handle_effort_picker_key(key);
             return;
@@ -2726,7 +2688,9 @@ impl App {
     fn execute_slash_action(&mut self, action: SlashAction) {
         match action {
             SlashAction::Agent => self.open_agent_picker(),
-            SlashAction::Mode => self.open_mode_picker(),
+            SlashAction::Mode => self.push_system(
+                "Mode selection was removed; every turn runs in agent mode.".to_owned(),
+            ),
             SlashAction::Effort => self.open_effort_picker(),
             SlashAction::Status => self.request_status(),
             SlashAction::Quit => self.exit = true,
@@ -2766,7 +2730,6 @@ impl App {
         }
 
         if self.agent_picker.is_some()
-            || self.mode_picker.is_some()
             || self.model_picker.is_some()
             || self.effort_picker.is_some()
             || self.conversation_picker.is_some()
@@ -2954,106 +2917,6 @@ impl App {
                 ));
             }
             _ => self.agent_picker = Some(picker),
-        }
-    }
-
-    fn open_mode_picker(&mut self) {
-        let agent = self.adapters[self.selected].agent();
-        if self.busy_agents.contains(&agent) {
-            self.messages.push(Message::new(
-                Role::System,
-                format!("Finish or cancel the {agent} turn before changing modes."),
-            ));
-            return;
-        }
-
-        let selected_mode = self.modes.get(&agent).copied().unwrap_or_default();
-        let cursor = ExecutionMode::ALL
-            .iter()
-            .position(|mode| *mode == selected_mode)
-            .unwrap_or(0);
-        self.mode_picker = Some(ModePicker { agent, cursor });
-    }
-
-    fn set_agent_mode(&mut self, agent: Agent, mode: ExecutionMode) -> Result<bool, String> {
-        if self.busy_agents.contains(&agent) {
-            return Err(format!(
-                "Finish or cancel the {agent} turn before changing modes."
-            ));
-        }
-        let adapter_index = Agent::all()
-            .iter()
-            .position(|candidate| *candidate == agent)
-            .expect("agent belongs to Agent::all()");
-        if let Err(error) = self.adapters[adapter_index].validate_mode(mode) {
-            return Err(format!("Could not select {mode} for {agent}: {error}"));
-        }
-        let mode_changed = self.modes.get(&agent).copied() != Some(mode);
-        if mode_changed && let Err(error) = self.engine.retire_active_binding(agent_key(agent)) {
-            return Err(format!("Could not change {mode} mode for {agent}: {error}"));
-        }
-        if let Err(error) = self.adapters[adapter_index].select_mode(mode) {
-            return Err(format!("Could not select {mode} for {agent}: {error}"));
-        }
-        self.modes.insert(agent, mode);
-        Ok(mode_changed)
-    }
-
-    fn select_active_agent_mode(&mut self, mode: ExecutionMode) {
-        let agent = self.adapters[self.selected].agent();
-        match self.set_agent_mode(agent, mode) {
-            Ok(mode_changed) => {
-                let message = if mode_changed {
-                    format!(
-                        "{agent} mode selected: {mode}. The next prompt opens a new session with shared context."
-                    )
-                } else {
-                    format!("{agent} mode is already selected: {mode}.")
-                };
-                self.messages.push(Message::new(Role::System, message));
-            }
-            Err(error) => {
-                self.messages.push(Message::new(Role::System, error));
-            }
-        }
-    }
-
-    fn handle_mode_picker_key(&mut self, key: KeyEvent) {
-        let Some(mut picker) = self.mode_picker.take() else {
-            return;
-        };
-
-        match key.code {
-            KeyCode::Esc => {}
-            KeyCode::Up => {
-                picker.cursor = picker.cursor.saturating_sub(1);
-                self.mode_picker = Some(picker);
-            }
-            KeyCode::Down => {
-                picker.cursor = (picker.cursor + 1).min(ExecutionMode::ALL.len() - 1);
-                self.mode_picker = Some(picker);
-            }
-            KeyCode::Enter => {
-                let mode = ExecutionMode::ALL[picker.cursor];
-                match self.set_agent_mode(picker.agent, mode) {
-                    Ok(mode_changed) => {
-                        let message = if mode_changed {
-                            format!(
-                                "{} mode selected: {mode}. The next prompt opens a new session with shared context.",
-                                picker.agent
-                            )
-                        } else {
-                            format!("{} mode is already selected: {mode}.", picker.agent)
-                        };
-                        self.messages.push(Message::new(Role::System, message));
-                    }
-                    Err(error) => {
-                        self.messages.push(Message::new(Role::System, error));
-                        self.mode_picker = Some(picker);
-                    }
-                }
-            }
-            _ => self.mode_picker = Some(picker),
         }
     }
 
@@ -3386,17 +3249,7 @@ impl App {
                     return;
                 }
                 "/mode" => {
-                    let arg = prompt.strip_prefix("/mode").unwrap().trim();
-                    if arg.is_empty() {
-                        self.execute_slash_action(SlashAction::Mode);
-                    } else {
-                        match arg.to_ascii_lowercase().as_str() {
-                            "ask" => self.select_active_agent_mode(ExecutionMode::Ask),
-                            "plan" => self.select_active_agent_mode(ExecutionMode::Plan),
-                            "implement" => self.select_active_agent_mode(ExecutionMode::Implement),
-                            _ => self.push_system("Usage: /mode <ask|plan|implement>"),
-                        }
-                    }
+                    self.execute_slash_action(SlashAction::Mode);
                     return;
                 }
                 "/summarize" | "/compact" => {
@@ -3640,6 +3493,10 @@ impl App {
         let _ = self.try_submit_to_agent(agent, prompt, restore_input_on_failure, true);
     }
 
+    fn clear_pending_turn_policy(&mut self) {
+        self.pending_turn_policy = None;
+    }
+
     fn try_submit_to_agent(
         &mut self,
         agent: Agent,
@@ -3654,10 +3511,12 @@ impl App {
             self.push_system(format!(
                 "{agent} is busy; cancel the active turn before sending another prompt."
             ));
+            self.clear_pending_turn_policy();
             return Err(RunTodoError::Busy(format!("{agent} is busy")));
         }
 
         if !allow_defer && self.pending_summary.is_some() {
+            self.clear_pending_turn_policy();
             return Err(RunTodoError::Busy(
                 "conversation summary is in progress".to_owned(),
             ));
@@ -3673,22 +3532,13 @@ impl App {
                     .as_ref()
                     .is_some_and(|p| p.deferred.is_some()))
         {
+            self.clear_pending_turn_policy();
             return Err(RunTodoError::Busy(
                 "a deferred prompt is pending".to_owned(),
             ));
         }
 
         let adapter_index = adapter_index(agent);
-        let mode = self.modes.get(&agent).copied().unwrap_or_default();
-        if let Err(error) = self.adapters[adapter_index].validate_mode(mode) {
-            if restore_input_on_failure {
-                self.input = prompt;
-            }
-            self.push_system(format!("Could not start {agent} in {mode} mode: {error}"));
-            return Err(RunTodoError::Internal(format!(
-                "Could not start {agent} in {mode} mode: {error}"
-            )));
-        }
 
         if agent == Agent::Cursor {
             let current = self
@@ -3760,6 +3610,7 @@ impl App {
                 } else {
                     self.start_summary(job, None, None);
                 }
+                self.clear_pending_turn_policy();
                 return Err(RunTodoError::Busy(format!(
                     "{agent} requires conversation summary"
                 )));
@@ -3769,6 +3620,7 @@ impl App {
                     self.input = prompt;
                 }
                 self.push_system(format!("Could not start {agent} turn: {error}"));
+                self.clear_pending_turn_policy();
                 return Err(RunTodoError::Internal(format!(
                     "Could not start {agent} turn: {error}"
                 )));
@@ -3785,9 +3637,12 @@ impl App {
             if restore_input_on_failure {
                 self.input = prompt;
             }
+            self.clear_pending_turn_policy();
             return Err(RunTodoError::Internal(message.to_owned()));
         }
-        let mut adapter_request = adapter_request(request, image_paths);
+        let policy = self.pending_turn_policy.unwrap_or(TurnPolicy::Agent);
+        let require_file_edits = self.graph_node_expects_file_edits(agent);
+        let mut adapter_request = adapter_request(request, image_paths, policy, require_file_edits);
         let injected_memory = self.inject_memory(agent, &mut adapter_request);
         let is_graph = self.active_graph_node_for_agent(agent).is_some();
         let send_result = if is_graph {
@@ -3841,9 +3696,13 @@ impl App {
                 self.agent_lifecycle
                     .insert(agent, AgentLifecycleState::default());
                 self.emit_agent_lifecycle(agent, "pending", None);
+                if !is_graph {
+                    self.clear_pending_turn_policy();
+                }
                 Ok(stored_turn_id)
             }
             Err(error) => {
+                self.clear_pending_turn_policy();
                 let failed = TurnOutput {
                     conversation_id: stored_conversation_id,
                     turn_id: stored_turn_id,
@@ -3918,7 +3777,6 @@ impl App {
             self.busy_agents.remove(&plan_agent);
             self.activities.remove(&plan_agent);
             self.end_run_state(plan_agent, false, true);
-            let _ = self.adapters[adapter_index(plan_agent)].select_mode(pending.saved_mode);
             if pending.edit_previous_json.is_some() {
                 self.record_pending_plan_io(&pending, false);
                 self.restore_awaiting_after_edit_failure(&pending, "cancelled by user");
@@ -3953,7 +3811,6 @@ impl App {
             self.busy_agents.remove(&agent);
             self.activities.remove(&agent);
             self.end_run_state(agent, false, true);
-            let _ = self.adapters[adapter_index(agent)].select_mode(pending.saved_mode);
             self.record_pending_triage_io(&pending, false);
             self.input = pending.prompt.clone();
             let runner = runner_name(agent).to_owned();
@@ -4061,6 +3918,8 @@ impl App {
         self.conversation_id = snapshot.id;
         self.conversation_title = snapshot.title;
         self.session_conversations = None;
+        self.chat_markdown_cache.clear();
+        self.clear_pending_turn_policy();
         for adapter in &self.adapters {
             let _ = adapter.reset();
         }
@@ -4203,6 +4062,8 @@ impl App {
             prompt,
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
         };
         match self.adapters[adapter_index(agent)].send(request) {
             Ok(()) => {
@@ -4359,7 +4220,6 @@ impl App {
             AgentEvent::ModelsListed { .. }
             | AgentEvent::ModelSelected(_)
             | AgentEvent::EffortSelected(_)
-            | AgentEvent::ModeSelected(_)
             | AgentEvent::ToolProgress { .. }
             | AgentEvent::Activity(_)
             | AgentEvent::Status(_) => false,
@@ -4393,61 +4253,12 @@ impl App {
             return;
         }
         let index = adapter_index(agent);
-        let judge_mode = if self.adapters[index]
-            .validate_mode(ExecutionMode::Ask)
-            .is_ok()
-        {
-            Some(ExecutionMode::Ask)
-        } else if self.adapters[index]
-            .validate_mode(ExecutionMode::Plan)
-            .is_ok()
-        {
-            Some(ExecutionMode::Plan)
-        } else {
-            None
-        };
-        let saved_mode = self.modes.get(&agent).copied().unwrap_or_default();
-        let Some(judge_mode) = judge_mode else {
-            // FR-932: no read-only mode means no judge turn at all.
-            let run_id = Uuid::new_v4().to_string();
-            self.triage_fallback(
-                prompt,
-                agent,
-                saved_mode,
-                FallbackCause::NoReadOnlyMode,
-                run_id,
-                0,
-                0,
-            );
-            return;
-        };
-        if self.adapters[index].select_mode(judge_mode).is_err() {
-            let run_id = Uuid::new_v4().to_string();
-            self.triage_fallback(
-                prompt,
-                agent,
-                saved_mode,
-                FallbackCause::NoReadOnlyMode,
-                run_id,
-                0,
-                0,
-            );
-            return;
-        }
         let nonce = Uuid::new_v4().simple().to_string();
         let judge_prompt = match build_judge_prompt(&prompt, &nonce) {
             Ok(judge_prompt) => judge_prompt,
             Err(_) => {
                 let run_id = Uuid::new_v4().to_string();
-                self.triage_fallback(
-                    prompt,
-                    agent,
-                    saved_mode,
-                    FallbackCause::InvalidVerdict,
-                    run_id,
-                    0,
-                    0,
-                );
+                self.triage_fallback(prompt, agent, FallbackCause::InvalidVerdict, run_id, 0, 0);
                 return;
             }
         };
@@ -4460,6 +4271,8 @@ impl App {
             prompt: judge_prompt,
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         let run_id = self
             .pending_todo_run_id
@@ -4491,22 +4304,18 @@ impl App {
                     started: now,
                     last_event: now,
                     prompt,
-                    saved_mode,
                     run_id,
                     judge_calls: 1,
                 });
             }
             Err(error) => {
-                self.push_system(format!("Could not start judge turn with {agent}: {error}"));
-                self.triage_fallback(
-                    prompt,
-                    agent,
-                    saved_mode,
-                    FallbackCause::Error,
-                    run_id,
-                    0,
-                    0,
-                );
+                let cause = if matches!(error, AdapterError::Unsupported) {
+                    FallbackCause::NoReadOnlyMode
+                } else {
+                    self.push_system(format!("Could not start judge turn with {agent}: {error}"));
+                    FallbackCause::Error
+                };
+                self.triage_fallback(prompt, agent, cause, run_id, 0, 0);
             }
         }
     }
@@ -4538,7 +4347,6 @@ impl App {
                     self.triage_fallback(
                         pending.prompt,
                         pending.agent,
-                        pending.saved_mode,
                         FallbackCause::InvalidVerdict,
                         pending.run_id,
                         pending.judge_calls,
@@ -4558,7 +4366,6 @@ impl App {
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, true, false);
                 let elapsed_ms = pending.started.elapsed().as_millis() as u64;
-                let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
                 let verdict_result = parse_verdict(&pending.buffer);
                 self.record_pending_triage_io(&pending, verdict_result.is_ok());
                 match verdict_result {
@@ -4591,7 +4398,6 @@ impl App {
                     Err(_) => self.triage_fallback(
                         pending.prompt,
                         pending.agent,
-                        pending.saved_mode,
                         FallbackCause::InvalidVerdict,
                         pending.run_id,
                         pending.judge_calls,
@@ -4608,8 +4414,6 @@ impl App {
                     self.busy_agents.remove(&pending.agent);
                     self.activities.remove(&pending.agent);
                     self.end_run_state(pending.agent, false, false);
-                    let _ =
-                        self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
                     self.defer_internal_turn(DeferredInternalTurn::Triage(pending));
                     return true;
                 }
@@ -4621,7 +4425,6 @@ impl App {
                 self.triage_fallback(
                     pending.prompt,
                     pending.agent,
-                    pending.saved_mode,
                     FallbackCause::Error,
                     pending.run_id,
                     pending.judge_calls,
@@ -4632,7 +4435,6 @@ impl App {
             AgentEvent::ModelsListed { .. }
             | AgentEvent::ModelSelected(_)
             | AgentEvent::EffortSelected(_)
-            | AgentEvent::ModeSelected(_)
             | AgentEvent::ToolProgress { .. }
             | AgentEvent::Activity(_)
             | AgentEvent::Status(_) => false,
@@ -4646,13 +4448,11 @@ impl App {
         &mut self,
         prompt: String,
         agent: Agent,
-        saved_mode: ExecutionMode,
         cause: FallbackCause,
         run_id: String,
         judge_calls: u32,
         elapsed_ms: u64,
     ) {
-        let _ = self.adapters[adapter_index(agent)].select_mode(saved_mode);
         let reason = "heuristic fallback".to_owned();
         match heuristic_route(&prompt) {
             Route::Simple => self.start_one_node_run(
@@ -5788,8 +5588,7 @@ impl App {
             && let Err(error) = dmuxai::model_policy::validate_model_for_runner(&runner, &selected)
         {
             return Err(format!(
-                "Model policy rejected the 1-node run on {}: {error}",
-                runner
+                "Model policy rejected the 1-node run on {runner}: {error}"
             ));
         }
         let model_hint = self.selected_run_model(agent).ok();
@@ -5911,7 +5710,6 @@ impl App {
                 judge: judge_calls,
                 ..Default::default()
             },
-            None,
             override_kind,
             None,
         );
@@ -6074,7 +5872,6 @@ impl App {
             Vec::new(),
             planner_calls,
             None,
-            None,
             Some((previous_json, feedback)),
         );
         Ok(())
@@ -6098,7 +5895,6 @@ impl App {
         attempt: u8,
         repair_errors: Vec<String>,
         planner_calls: PlannerCalls,
-        user_saved_mode: Option<ExecutionMode>,
         override_kind: Option<OverrideKind>,
         edit: Option<(String, String)>,
     ) {
@@ -6122,60 +5918,6 @@ impl App {
             return;
         }
         let index = adapter_index(agent);
-        let plan_mode = if self.adapters[index]
-            .validate_mode(ExecutionMode::Ask)
-            .is_ok()
-        {
-            Some(ExecutionMode::Ask)
-        } else if self.adapters[index]
-            .validate_mode(ExecutionMode::Plan)
-            .is_ok()
-        {
-            Some(ExecutionMode::Plan)
-        } else {
-            None
-        };
-        let saved_mode = user_saved_mode
-            .or_else(|| self.modes.get(&agent).copied())
-            .unwrap_or_default();
-        let Some(plan_mode) = plan_mode else {
-            self.park_fallback_plan(
-                prompt,
-                agent,
-                route,
-                verdict_reason,
-                triage_source,
-                triage_cause,
-                run_id,
-                judge_calls,
-                triage_elapsed_ms,
-                override_kind,
-                planner_calls,
-                "no_read_only_mode",
-                None,
-                None,
-            );
-            return;
-        };
-        if self.adapters[index].select_mode(plan_mode).is_err() {
-            self.park_fallback_plan(
-                prompt,
-                agent,
-                route,
-                verdict_reason,
-                triage_source,
-                triage_cause,
-                run_id,
-                judge_calls,
-                triage_elapsed_ms,
-                override_kind,
-                planner_calls,
-                "no_read_only_mode",
-                None,
-                None,
-            );
-            return;
-        }
         let nonce = Uuid::new_v4().simple().to_string();
         let (runner_names, model_lists) = self.plan_prompt_runners();
         let model_refs: Vec<Vec<&str>> = model_lists
@@ -6230,7 +5972,6 @@ impl App {
         } {
             Ok(plan_prompt) => plan_prompt,
             Err(_) => {
-                let _ = self.adapters[index].select_mode(saved_mode);
                 self.park_fallback_plan(
                     prompt,
                     agent,
@@ -6259,6 +6000,8 @@ impl App {
             prompt: plan_prompt,
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         let triage = Triage {
             route,
@@ -6380,7 +6123,6 @@ impl App {
                     started: now,
                     last_event: now,
                     prompt,
-                    saved_mode,
                     run_id,
                     route,
                     verdict_reason,
@@ -6401,7 +6143,6 @@ impl App {
                 });
             }
             Err(error) => {
-                let _ = self.adapters[index].select_mode(saved_mode);
                 self.push_system(format!("Could not start plan turn with {agent}: {error}"));
                 if edit.is_some() {
                     let pending = PendingPlan {
@@ -6415,7 +6156,6 @@ impl App {
                         started: Instant::now(),
                         last_event: Instant::now(),
                         prompt,
-                        saved_mode,
                         run_id,
                         route,
                         verdict_reason,
@@ -6520,7 +6260,6 @@ impl App {
         doc: &PlanDoc,
         mut graph_plan: GraphPlan,
     ) {
-        let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
         graph_plan.id = pending.run_id.clone();
         graph_plan.orchestrator_model = pending.model.clone();
         graph_plan.limits = self.graph_limits();
@@ -6578,7 +6317,6 @@ impl App {
         doc: &PlanDoc,
         mut graph_plan: GraphPlan,
     ) {
-        let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
         graph_plan.id = pending.run_id.clone();
         graph_plan.orchestrator_model = pending.model.clone();
         graph_plan.limits = self.graph_limits();
@@ -6704,8 +6442,6 @@ impl App {
                     self.busy_agents.remove(&pending.agent);
                     self.activities.remove(&pending.agent);
                     self.end_run_state(pending.agent, false, false);
-                    let _ =
-                        self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
                     self.record_pending_plan_io(&pending, false);
                     if pending.edit_previous_json.is_some() {
                         self.restore_awaiting_after_edit_failure(&pending, "error");
@@ -6775,12 +6511,9 @@ impl App {
                                 }
                             }
                             Err(errors) if pending.attempt == 0 => {
-                                let _ = self.adapters[adapter_index(pending.agent)]
-                                    .select_mode(pending.saved_mode);
                                 self.record_pending_plan_io(&pending, false);
                                 let messages: Vec<String> =
                                     errors.iter().map(|err| err.to_string()).collect();
-                                let saved_mode = pending.saved_mode;
                                 let edit_ctx = Self::pending_plan_edit(&pending);
                                 let planner_calls = self.planner_calls_for_pending(&pending);
                                 self.start_plan_turn(
@@ -6799,14 +6532,11 @@ impl App {
                                     1,
                                     messages,
                                     planner_calls,
-                                    Some(saved_mode),
                                     pending.override_kind,
                                     edit_ctx,
                                 );
                             }
                             Err(errors) => {
-                                let _ = self.adapters[adapter_index(pending.agent)]
-                                    .select_mode(pending.saved_mode);
                                 self.record_pending_plan_io(&pending, false);
                                 if pending.edit_previous_json.is_some() {
                                     self.restore_awaiting_after_edit_failure(
@@ -6843,12 +6573,9 @@ impl App {
                         }
                     }
                     Err(errors) if pending.attempt == 0 => {
-                        let _ = self.adapters[adapter_index(pending.agent)]
-                            .select_mode(pending.saved_mode);
                         self.record_pending_plan_io(&pending, false);
                         let messages: Vec<String> =
                             errors.iter().map(|err| err.to_string()).collect();
-                        let saved_mode = pending.saved_mode;
                         let edit_ctx = Self::pending_plan_edit(&pending);
                         let planner_calls = self.planner_calls_for_pending(&pending);
                         self.start_plan_turn(
@@ -6867,14 +6594,11 @@ impl App {
                             1,
                             messages,
                             planner_calls,
-                            Some(saved_mode),
                             pending.override_kind,
                             edit_ctx,
                         );
                     }
                     Err(errors) => {
-                        let _ = self.adapters[adapter_index(pending.agent)]
-                            .select_mode(pending.saved_mode);
                         self.record_pending_plan_io(&pending, false);
                         if pending.edit_previous_json.is_some() {
                             self.restore_awaiting_after_edit_failure(
@@ -6919,8 +6643,6 @@ impl App {
                     self.busy_agents.remove(&pending.agent);
                     self.activities.remove(&pending.agent);
                     self.end_run_state(pending.agent, false, false);
-                    let _ =
-                        self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
                     self.defer_internal_turn(DeferredInternalTurn::Plan(pending));
                     return true;
                 }
@@ -6928,7 +6650,6 @@ impl App {
                 self.busy_agents.remove(&pending.agent);
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, false, false);
-                let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
                 let detail = match output.event {
                     AgentEvent::Error(message) => message,
                     _ => "cancelled".to_owned(),
@@ -6964,7 +6685,6 @@ impl App {
             AgentEvent::ModelsListed { .. }
             | AgentEvent::ModelSelected(_)
             | AgentEvent::EffortSelected(_)
-            | AgentEvent::ModeSelected(_)
             | AgentEvent::ToolProgress { .. }
             | AgentEvent::Activity(_)
             | AgentEvent::Status(_) => false,
@@ -6988,7 +6708,6 @@ impl App {
         self.busy_agents.remove(&pending.agent);
         self.activities.remove(&pending.agent);
         self.end_run_state(pending.agent, false, false);
-        let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
         self.record_pending_plan_io(&pending, false);
         if pending.edit_previous_json.is_some() {
             self.restore_awaiting_after_edit_failure(&pending, "timeout");
@@ -7389,28 +7108,6 @@ impl App {
         from_flush: bool,
     ) {
         let index = adapter_index(agent);
-        let plan_mode = if self.adapters[index]
-            .validate_mode(ExecutionMode::Ask)
-            .is_ok()
-        {
-            Some(ExecutionMode::Ask)
-        } else if self.adapters[index]
-            .validate_mode(ExecutionMode::Plan)
-            .is_ok()
-        {
-            Some(ExecutionMode::Plan)
-        } else {
-            None
-        };
-        let saved_mode = self.modes.get(&agent).copied().unwrap_or_default();
-        let Some(plan_mode) = plan_mode else {
-            self.push_replan_skipped("unsupported mode", trigger, failure_node_id, from_flush);
-            return;
-        };
-        if self.adapters[index].select_mode(plan_mode).is_err() {
-            self.push_replan_skipped("mode select failed", trigger, failure_node_id, from_flush);
-            return;
-        }
         let turn_id = TurnId::new(format!("replan-{rev}"));
         let request = AgentRequest {
             conversation_id: ConversationId::new(self.conversation_id.as_str()),
@@ -7418,6 +7115,8 @@ impl App {
             prompt: replan_prompt.clone(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         match self.adapters[index].send(request) {
             Ok(()) => {
@@ -7455,7 +7154,6 @@ impl App {
                     started: now,
                     last_event: now,
                     prompt: replan_prompt,
-                    saved_mode,
                     run_id,
                     rev,
                     trigger,
@@ -7468,7 +7166,6 @@ impl App {
                 self.replan_summaries.clear();
             }
             Err(error) => {
-                let _ = self.adapters[index].select_mode(saved_mode);
                 self.push_system(format!("Could not start replan turn with {agent}: {error}"));
                 self.push_replan_skipped("send error", trigger, failure_node_id, from_flush);
             }
@@ -7560,7 +7257,6 @@ impl App {
                 self.triage_fallback(
                     pending.prompt,
                     pending.agent,
-                    pending.saved_mode,
                     FallbackCause::Error,
                     pending.run_id,
                     pending.judge_calls,
@@ -7665,32 +7361,14 @@ impl App {
 
     fn resend_internal_triage(&mut self, mut pending: PendingTriage) {
         let index = adapter_index(pending.agent);
-        let judge_mode = if self.adapters[index]
-            .validate_mode(ExecutionMode::Ask)
-            .is_ok()
-        {
-            ExecutionMode::Ask
-        } else {
-            ExecutionMode::Plan
-        };
-        if self.adapters[index].select_mode(judge_mode).is_err() {
-            self.triage_fallback(
-                pending.prompt,
-                pending.agent,
-                pending.saved_mode,
-                FallbackCause::Error,
-                pending.run_id,
-                pending.judge_calls,
-                0,
-            );
-            return;
-        }
         let request = AgentRequest {
             conversation_id: ConversationId::new(pending.conversation_id.as_str()),
             turn_id: TurnId::new(pending.turn_id.as_str()),
             prompt: pending.adapter_prompt.clone(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         let now = Instant::now();
         pending.started = now;
@@ -7713,11 +7391,9 @@ impl App {
                 self.pending_triage = Some(pending);
             }
             Err(_) => {
-                let _ = self.adapters[index].select_mode(pending.saved_mode);
                 self.triage_fallback(
                     pending.prompt,
                     pending.agent,
-                    pending.saved_mode,
                     FallbackCause::Error,
                     pending.run_id,
                     pending.judge_calls,
@@ -7729,24 +7405,14 @@ impl App {
 
     fn resend_internal_plan(&mut self, mut pending: PendingPlan) {
         let index = adapter_index(pending.agent);
-        let plan_mode = if self.adapters[index]
-            .validate_mode(ExecutionMode::Ask)
-            .is_ok()
-        {
-            ExecutionMode::Ask
-        } else {
-            ExecutionMode::Plan
-        };
-        if self.adapters[index].select_mode(plan_mode).is_err() {
-            self.restore_or_fallback_after_plan_error(&pending, "mode select failed");
-            return;
-        }
         let request = AgentRequest {
             conversation_id: ConversationId::new(pending.conversation_id.as_str()),
             turn_id: TurnId::new(pending.turn_id.as_str()),
             prompt: pending.adapter_prompt.clone(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         let now = Instant::now();
         pending.started = now;
@@ -7769,7 +7435,6 @@ impl App {
                 self.pending_plan = Some(pending);
             }
             Err(_) => {
-                let _ = self.adapters[index].select_mode(pending.saved_mode);
                 self.restore_or_fallback_after_plan_error(&pending, "send error");
             }
         }
@@ -7777,24 +7442,14 @@ impl App {
 
     fn resend_internal_replan(&mut self, mut pending: PendingReplan) {
         let index = adapter_index(pending.agent);
-        let plan_mode = if self.adapters[index]
-            .validate_mode(ExecutionMode::Ask)
-            .is_ok()
-        {
-            ExecutionMode::Ask
-        } else {
-            ExecutionMode::Plan
-        };
-        if self.adapters[index].select_mode(plan_mode).is_err() {
-            self.finish_replan_rejected(pending, "mode select failed".to_owned(), true);
-            return;
-        }
         let request = AgentRequest {
             conversation_id: ConversationId::new(pending.conversation_id.as_str()),
             turn_id: TurnId::new(pending.turn_id.as_str()),
             prompt: pending.prompt.clone(),
             resume_session: None,
             image_paths: vec![],
+            policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
         };
         let now = Instant::now();
         pending.started = now;
@@ -7817,7 +7472,6 @@ impl App {
                 self.pending_replan = Some(pending);
             }
             Err(_) => {
-                let _ = self.adapters[index].select_mode(pending.saved_mode);
                 self.finish_replan_rejected(pending, "send error".to_owned(), true);
             }
         }
@@ -8275,8 +7929,6 @@ impl App {
                     self.busy_agents.remove(&pending.agent);
                     self.activities.remove(&pending.agent);
                     self.end_run_state(pending.agent, false, false);
-                    let _ =
-                        self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
                     self.finish_replan_rejected(pending, "buffer overflow".to_owned(), true);
                 } else if let Some(pending) = self.pending_replan.as_mut() {
                     pending.buffer_chars += delta_chars;
@@ -8292,7 +7944,6 @@ impl App {
                 self.busy_agents.remove(&pending.agent);
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, true, false);
-                let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
                 match parse_replan(&pending.buffer) {
                     Ok(ReplanDoc::Keep { reason }) => {
                         self.finish_replan_kept(pending, reason);
@@ -8364,8 +8015,6 @@ impl App {
                     self.busy_agents.remove(&pending.agent);
                     self.activities.remove(&pending.agent);
                     self.end_run_state(pending.agent, false, false);
-                    let _ =
-                        self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
                     self.defer_internal_turn(DeferredInternalTurn::Replan(pending));
                     return true;
                 }
@@ -8373,7 +8022,6 @@ impl App {
                 self.busy_agents.remove(&pending.agent);
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, false, false);
-                let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
                 let message = match output.event {
                     AgentEvent::Error(message) => message,
                     _ => "cancelled".to_owned(),
@@ -8384,7 +8032,6 @@ impl App {
             AgentEvent::ModelsListed { .. }
             | AgentEvent::ModelSelected(_)
             | AgentEvent::EffortSelected(_)
-            | AgentEvent::ModeSelected(_)
             | AgentEvent::ToolProgress { .. }
             | AgentEvent::Activity(_)
             | AgentEvent::Status(_) => false,
@@ -8408,7 +8055,6 @@ impl App {
         self.busy_agents.remove(&pending.agent);
         self.activities.remove(&pending.agent);
         self.end_run_state(pending.agent, false, false);
-        let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
         self.finish_replan_rejected(pending, "timeout".to_owned(), true);
     }
 
@@ -8732,7 +8378,6 @@ impl App {
         self.triage_fallback(
             pending.prompt,
             pending.agent,
-            pending.saved_mode,
             FallbackCause::Timeout,
             pending.run_id,
             pending.judge_calls,
@@ -8865,9 +8510,6 @@ impl App {
                     .expect("every agent has a model catalog");
                 catalog.selected_effort = Some(effort.clone());
                 self.push_system(format!("{agent} reasoning effort selected: {effort}."));
-            }
-            AgentEvent::ModeSelected(mode) => {
-                self.modes.insert(agent, mode);
             }
             AgentEvent::ToolProgress {
                 item_id,
@@ -9206,7 +8848,6 @@ impl App {
             self.busy_agents.remove(&pending.agent);
             self.activities.remove(&pending.agent);
             self.end_run_state(pending.agent, false, false);
-            let _ = self.adapters[adapter_index(pending.agent)].select_mode(pending.saved_mode);
         }
         self.deferred_internal_turn = None;
     }
@@ -9344,6 +8985,7 @@ impl App {
                     self.graph_session = None;
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
+                    self.clear_pending_turn_policy();
                     if let Some((_plan_id, todo_id)) = self.graph_todo.take()
                         && let Some(store) = self.todo_store.clone()
                     {
@@ -9385,6 +9027,7 @@ impl App {
                     self.graph_session = None;
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
+                    self.clear_pending_turn_policy();
                     if let Some((_plan_id, todo_id)) = self.graph_todo.take()
                         && let Some(store) = self.todo_store.clone()
                     {
@@ -9406,6 +9049,39 @@ impl App {
             self.sync_tasks_file_for_run(&run);
         }
         self.flush_deferred_graph_starts();
+    }
+
+    fn graph_node_expects_file_edits(&self, agent: Agent) -> bool {
+        // Direct/auto 1-node runs use an Implement node but must not trigger AGY's
+        // plan-only forced-edit retry (FR-937 quiet graph).
+        if self.quiet_graph_run {
+            return false;
+        }
+        let Some(node_id) = self.graph_agent_nodes.get(&agent) else {
+            return false;
+        };
+        let role = self
+            .graph_session
+            .as_ref()
+            .and_then(|session| {
+                session
+                    .run()
+                    .plan
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == *node_id)
+                    .map(|node| node.role)
+            })
+            .or_else(|| {
+                self.last_graph_run.as_ref().and_then(|run| {
+                    run.plan
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == *node_id)
+                        .map(|node| node.role)
+                })
+            });
+        role == Some(dmuxai::graph::NodeRole::Implement)
     }
 
     fn active_graph_node_for_agent(&self, agent: Agent) -> Option<String> {
@@ -9707,7 +9383,7 @@ impl App {
         if updated.is_some() {
             self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
             let snapshot = session.run().clone();
-            self.push_system(format!("Overrode {} → {} {}", node_id, runner, model_id));
+            self.push_system(format!("Overrode {node_id} → {runner} {model_id}"));
             let _ = save_run(&self.workspace_root, &snapshot);
         } else {
             self.push_system(format!("No graph node named {node_id}"));
@@ -10678,23 +10354,25 @@ impl App {
             }
         }
 
-        let target_agent = self.adapters[self.selected].agent();
-        if let Some(mode) = req.mode
-            && let Err(msg) = self.set_agent_mode(target_agent, mode)
-        {
-            return HeadlessOutcome {
-                ok: false,
-                exit_code: 6,
-                conversation_id: self.conversation_id.as_str().to_owned(),
-                agent: Some(runner_name(target_agent).to_owned()),
-                graph_id: None,
-                text: String::new(),
-                messages: Vec::new(),
-                error: Some(msg),
-                todo: None,
-                triage: None,
-                plan: None,
-            };
+        if let Some(ref mode_str) = req.mode {
+            match crate::agent::turn_policy_from_legacy_mode(mode_str) {
+                Ok(policy) => self.pending_turn_policy = Some(policy),
+                Err(message) => {
+                    return HeadlessOutcome {
+                        ok: false,
+                        exit_code: dmuxai::agent_api::exit::USAGE,
+                        conversation_id: self.conversation_id.as_str().to_owned(),
+                        agent: req.agent.clone(),
+                        graph_id: None,
+                        text: String::new(),
+                        messages: Vec::new(),
+                        error: Some(message),
+                        todo: None,
+                        triage: None,
+                        plan: None,
+                    };
+                }
+            }
         }
 
         let headless_title = {
@@ -11312,8 +10990,6 @@ impl App {
             self.draw_conversation_picker(frame, picker);
         } else if let Some(picker) = &self.agent_picker {
             self.draw_agent_picker(frame, picker);
-        } else if let Some(picker) = &self.mode_picker {
-            self.draw_mode_picker(frame, picker);
         } else if let Some(preview) = &self.slash_preview {
             self.draw_slash_preview(frame, preview, areas.input);
         }
@@ -11650,10 +11326,10 @@ impl App {
                         label,
                         body_style.add_modifier(Modifier::BOLD),
                     )));
-                    let cacheable = !self
+                    let cacheable = self
                         .streaming_messages
                         .get(agent)
-                        .is_some_and(|message_index| *message_index == i);
+                        .is_none_or(|message_index| *message_index != i);
                     for line in message.content.lines() {
                         let line_index = lines.len();
                         if docs_workspace.is_some() {
@@ -12073,7 +11749,6 @@ impl App {
             .min(area.right().saturating_sub(2));
         if self.model_picker.is_none()
             && self.agent_picker.is_none()
-            && self.mode_picker.is_none()
             && self.effort_picker.is_none()
             && self.conversation_picker.is_none()
         {
@@ -12138,7 +11813,6 @@ impl App {
                 })
                 .unwrap_or("provider default")
         };
-        let mode_name = format!("{}", self.modes.get(&selected).copied().unwrap_or_default());
         let effort_name = self
             .model_catalogs
             .get(&selected)
@@ -12177,7 +11851,6 @@ impl App {
             state,
             badge: Some(&badge_content),
             model,
-            mode: &mode_name,
             effort: effort_name,
             activity: &activity,
             other_activity: &other_activity,
@@ -12477,8 +12150,7 @@ impl App {
             .enumerate()
             .map(|(index, agent)| {
                 let current = if index == self.selected { "*" } else { " " };
-                let mode = self.modes.get(&agent).copied().unwrap_or_default();
-                ListItem::new(format!("{current} {agent}  [{mode}]"))
+                ListItem::new(format!("{current} {agent}"))
             })
             .collect::<Vec<_>>();
         let mut block = Block::default()
@@ -12610,79 +12282,6 @@ impl App {
             (!picker.conversations.is_empty())
                 .then_some(picker.cursor.min(picker.conversations.len() - 1)),
         );
-        frame.render_stateful_widget(list, area, &mut state);
-    }
-
-    fn draw_mode_picker(&self, frame: &mut Frame, picker: &ModePicker) {
-        let area = centered_fixed_rect(56, 7, frame.area());
-        let colors = self.colors_enabled();
-        let border = if colors {
-            self.settings.theme.border
-        } else {
-            None
-        };
-        let bg = if colors {
-            self.settings.theme.background
-        } else {
-            None
-        };
-        let fg = if colors {
-            self.settings.theme.foreground
-        } else {
-            None
-        };
-        let accent = if colors {
-            self.settings.theme.accent
-        } else {
-            None
-        };
-
-        frame.render_widget(Clear, area);
-        if let Some(bg) = bg {
-            frame.render_widget(Block::default().style(Style::default().bg(bg)), area);
-        }
-
-        let selected_mode = self.modes.get(&picker.agent).copied().unwrap_or_default();
-        let items = ExecutionMode::ALL
-            .into_iter()
-            .map(|mode| {
-                let current = if mode == selected_mode { "*" } else { " " };
-                let description = match mode {
-                    ExecutionMode::Ask => "read-only questions and explanations",
-                    ExecutionMode::Plan => "read-only implementation planning",
-                    ExecutionMode::Implement => "workspace edits and sandboxed commands",
-                };
-                ListItem::new(format!("{current} {mode:<9} {description}"))
-            })
-            .collect::<Vec<_>>();
-        let mut block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {} mode ", picker.agent))
-            .title_bottom(" Up/Down move  Enter select  Esc close ");
-        if let Some(border) = border {
-            block = block.border_style(Style::default().fg(border));
-        }
-        if let Some(bg) = bg {
-            block = block.style(Style::default().bg(bg));
-        }
-        let highlight_style = if colors {
-            let hl_bg = accent.unwrap_or(Color::Yellow);
-            let hl_fg = dmuxai::theme::text_on(hl_bg);
-            Style::default()
-                .fg(hl_fg)
-                .bg(hl_bg)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        };
-        let mut list = List::new(items)
-            .block(block)
-            .highlight_style(highlight_style)
-            .highlight_symbol("> ");
-        if let Some(fg) = fg {
-            list = list.style(Style::default().fg(fg));
-        }
-        let mut state = ListState::default().with_selected(Some(picker.cursor));
         frame.render_stateful_widget(list, area, &mut state);
     }
 
@@ -13111,7 +12710,7 @@ fn percent_encode_uri_path(path: &str) -> String {
                 encoded.push(byte as char);
             }
             b':' => encoded.push(':'),
-            _ => encoded.push_str(&format!("%{:02X}", byte)),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
         }
     }
     encoded
@@ -13204,6 +12803,8 @@ fn fallback_cause_label(cause: FallbackCause) -> &'static str {
 fn adapter_request(
     request: dmuxai::conversation::AgentRequest,
     image_paths: Vec<PathBuf>,
+    policy: TurnPolicy,
+    require_file_edits: bool,
 ) -> AgentRequest {
     let prompt = if request.resume_session.is_some() {
         request.prompt
@@ -13216,6 +12817,8 @@ fn adapter_request(
         prompt,
         resume_session: request.resume_session,
         image_paths,
+        policy,
+        require_file_edits,
     }
 }
 
@@ -13278,7 +12881,6 @@ pub(crate) struct StatusSegments<'a> {
     pub state: &'a str,
     pub badge: Option<&'a str>,
     pub model: &'a str,
-    pub mode: &'a str,
     pub effort: &'a str,
     pub activity: &'a str,
     pub other_activity: &'a str,
@@ -13314,8 +12916,8 @@ pub(crate) fn fit_status_segments(segments: &StatusSegments<'_>, width: usize) -
 
     // Candidate 1: Full status with all slash commands and all key hints
     let full = format!(
-        "{agent_state}  {}{other}  Model: {}  Effort: {}  Mode: {}{graph}{notice}  /effort  /status  /mode  /agent  /graph  /quit exit  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close",
-        segments.activity, segments.model, segments.effort, segments.mode
+        "{agent_state}  {}{other}  Model: {}  Effort: {}{graph}{notice}  /effort  /status  /agent  /graph  /quit exit  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close",
+        segments.activity, segments.model, segments.effort
     );
     if full.chars().count() <= width {
         return full;
@@ -13323,8 +12925,8 @@ pub(crate) fn fit_status_segments(segments: &StatusSegments<'_>, width: usize) -
 
     // Candidate 2: Drop low-priority slash commands
     let no_slash = format!(
-        "{agent_state}  {}{other}  Model: {}  Effort: {}  Mode: {}{graph}{notice}  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close",
-        segments.activity, segments.model, segments.effort, segments.mode
+        "{agent_state}  {}{other}  Model: {}  Effort: {}{graph}{notice}  F2 model  F3 chats  Enter send  Ctrl+C cancel  Esc close",
+        segments.activity, segments.model, segments.effort
     );
     if no_slash.chars().count() <= width {
         return no_slash;
@@ -13332,8 +12934,8 @@ pub(crate) fn fit_status_segments(segments: &StatusSegments<'_>, width: usize) -
 
     // Candidate 3: Drop secondary navigation keys (F2, F3)
     let core_hints = format!(
-        "{agent_state}  {}{other}  Model: {}  Effort: {}  Mode: {}{graph}{notice}  Enter send  Ctrl+C cancel  Esc close",
-        segments.activity, segments.model, segments.effort, segments.mode
+        "{agent_state}  {}{other}  Model: {}  Effort: {}{graph}{notice}  Enter send  Ctrl+C cancel  Esc close",
+        segments.activity, segments.model, segments.effort
     );
     if core_hints.chars().count() <= width {
         return core_hints;
@@ -13346,8 +12948,8 @@ pub(crate) fn fit_status_segments(segments: &StatusSegments<'_>, width: usize) -
         segments.effort
     };
     let abbr_hints = format!(
-        "{agent_state}{other}  Model: {}  Effort: {effort_display}  Mode: {}  Enter  Ctrl+C  Esc",
-        segments.model, segments.mode
+        "{agent_state}{other}  Model: {}  Effort: {effort_display}  Enter  Ctrl+C  Esc",
+        segments.model
     );
     if abbr_hints.chars().count() <= width {
         return abbr_hints;
@@ -13355,24 +12957,21 @@ pub(crate) fn fit_status_segments(segments: &StatusSegments<'_>, width: usize) -
 
     // Candidate 5: Abbreviated keys without effort
     let no_effort_hints = format!(
-        "{agent_state}{other}  Model: {}  Mode: {}  Enter  Ctrl+C  Esc",
-        segments.model, segments.mode
+        "{agent_state}{other}  Model: {}  Enter  Ctrl+C  Esc",
+        segments.model
     );
     if no_effort_hints.chars().count() <= width {
         return no_effort_hints;
     }
 
     // Candidate 6: Drop all hints, keep essential (agent+state, model, mode)
-    let essential = format!(
-        "{agent_state}  Model: {}  Mode: {}",
-        segments.model, segments.mode
-    );
+    let essential = format!("{agent_state}  Model: {}", segments.model);
     if essential.chars().count() <= width {
         return essential;
     }
 
     // Candidate 7: Tight format for narrow width (<= 40)
-    let tight = format!("{agent_state}  {}  {}", segments.model, segments.mode);
+    let tight = format!("{agent_state}  {}", segments.model);
     if tight.chars().count() <= width {
         return tight;
     }
@@ -13419,7 +13018,14 @@ fn stored_event(event: &AgentEvent) -> Option<TurnEvent> {
         AgentEvent::TextDelta(delta) => Some(TurnEvent::TextDelta(delta.clone())),
         AgentEvent::Notice(notice) => Some(TurnEvent::Notice(notice.clone())),
         AgentEvent::ToolProgress { summary, state, .. } => {
-            Some(TurnEvent::Notice(format!("Tool [{state}]: {summary}")))
+            if summary.eq_ignore_ascii_case("tool")
+                || format!("Tool [{state}]: {summary}")
+                    .eq_ignore_ascii_case("Tool [completed]: tool")
+            {
+                None
+            } else {
+                Some(TurnEvent::Notice(format!("Tool [{state}]: {summary}")))
+            }
         }
         AgentEvent::Activity(_) => None,
         AgentEvent::Completed => Some(TurnEvent::Completed),
@@ -13430,8 +13036,7 @@ fn stored_event(event: &AgentEvent) -> Option<TurnEvent> {
         }),
         AgentEvent::ModelsListed { .. }
         | AgentEvent::ModelSelected(_)
-        | AgentEvent::EffortSelected(_)
-        | AgentEvent::ModeSelected(_) => None,
+        | AgentEvent::EffortSelected(_) => None,
         AgentEvent::Status(_) => None,
     }
 }
@@ -14016,7 +13621,6 @@ mod tests {
     //! - [`test_app_with_engine`] / [`test_app_with_engine_and_failure`] — reuse a
     //!   [`ConversationEngine`] (persistence or schema scenarios).
     //! - [`test_app_runtime`] — also returns cancel-request recording (`CancelRequests`).
-    //! - [`test_app_with_unsupported_mode`] — one agent rejects a mode via [`AdapterError`].
     //! - [`submit_prompt`] — send the prompt buffer to the selected agent (set `app.input`
     //!   first). There is no `handle_enter` in production; [`App::handle_enter`] is a
     //!   `#[cfg(test)]` alias that forwards here.
@@ -14034,9 +13638,8 @@ mod tests {
         agent: Agent,
         sent: SentRequests,
         cancelled: CancelRequests,
-        selected_modes: Arc<Mutex<Vec<(Agent, ExecutionMode)>>>,
         fail_send: bool,
-        unsupported_modes: Vec<ExecutionMode>,
+        unsupported_modes: Vec<TurnPolicy>,
     }
 
     impl AgentAdapter for RecordingAdapter {
@@ -14047,6 +13650,9 @@ mod tests {
         fn send(&self, request: AgentRequest) -> Result<(), AdapterError> {
             if self.fail_send {
                 return Err(AdapterError::CommandQueueFull);
+            }
+            if self.unsupported_modes.contains(&request.policy) {
+                return Err(AdapterError::Unsupported);
             }
             self.sent.lock().unwrap().push((self.agent, request));
             Ok(())
@@ -14068,24 +13674,26 @@ mod tests {
         fn select_effort(&self, _effort: String) -> Result<(), AdapterError> {
             Ok(())
         }
+    }
 
-        fn validate_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
-            if self.unsupported_modes.contains(&mode) {
-                return Err(AdapterError::UnsupportedMode {
-                    agent: self.agent,
-                    mode,
-                });
+    static TEST_STATE_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+
+    fn pin_test_state_dir() {
+        TEST_STATE_DIR.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("test state tempdir");
+            let state = dir.path().join("dmuxai");
+            std::fs::create_dir_all(&state).expect("dmuxai state dir");
+            // SAFETY: tests should not share the developer's real state directory.
+            unsafe {
+                std::env::set_var("XDG_STATE_HOME", dir.path());
+                std::env::set_var("DMUXAI_STATE_DIR", state);
             }
-            Ok(())
-        }
-
-        fn select_mode(&self, mode: ExecutionMode) -> Result<(), AdapterError> {
-            self.selected_modes.lock().unwrap().push((self.agent, mode));
-            Ok(())
-        }
+            dir
+        });
     }
 
     fn test_app() -> (App, SentRequests) {
+        pin_test_state_dir();
         let workspace = std::env::current_dir().unwrap();
         let engine =
             ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
@@ -14110,7 +13718,6 @@ mod tests {
     ) -> (App, SentRequests, CancelRequests) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let selected_modes = Arc::new(Mutex::new(Vec::new()));
         let adapters = Agent::all()
             .into_iter()
             .map(|agent| {
@@ -14118,7 +13725,6 @@ mod tests {
                     agent,
                     sent: Arc::clone(&sent),
                     cancelled: Arc::clone(&cancelled),
-                    selected_modes: Arc::clone(&selected_modes),
                     fail_send: failing_agent == Some(agent),
                     unsupported_modes: Vec::new(),
                 }) as Box<dyn AgentAdapter>
@@ -14151,7 +13757,6 @@ mod tests {
             ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let selected_modes = Arc::new(Mutex::new(Vec::new()));
         let adapters = Agent::all()
             .into_iter()
             .map(|agent| {
@@ -14159,7 +13764,6 @@ mod tests {
                     agent,
                     sent: Arc::clone(&sent),
                     cancelled: Arc::clone(&cancelled),
-                    selected_modes: Arc::clone(&selected_modes),
                     fail_send: false,
                     unsupported_modes: Vec::new(),
                 }) as Box<dyn AgentAdapter>
@@ -14184,55 +13788,10 @@ mod tests {
         (app, sent, event_tx)
     }
 
-    fn test_app_with_unsupported_mode(
-        engine: ConversationEngine,
-        agent: Agent,
-        mode: ExecutionMode,
-    ) -> (App, SentRequests) {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let selected_modes = Arc::new(Mutex::new(Vec::new()));
-        let adapters = Agent::all()
-            .into_iter()
-            .map(|candidate| {
-                Box::new(RecordingAdapter {
-                    agent: candidate,
-                    sent: Arc::clone(&sent),
-                    cancelled: Arc::clone(&cancelled),
-                    selected_modes: Arc::clone(&selected_modes),
-                    fail_send: false,
-                    unsupported_modes: if candidate == agent {
-                        vec![mode]
-                    } else {
-                        Vec::new()
-                    },
-                }) as Box<dyn AgentAdapter>
-            })
-            .collect();
-        let (event_tx, event_rx) = event_channel();
-        drop(event_tx);
-
-        let mut app = App::with_runtime(
-            adapters,
-            event_rx,
-            Vec::new(),
-            engine,
-            std::env::current_dir().unwrap_or_default(),
-            DmuxSettings::default(),
-            Vec::new(),
-            Vec::new(),
-        )
-        .unwrap();
-        app.selected = adapter_index(Agent::Codex);
-        app.skip_judge_for_tests = true;
-        (app, sent)
-    }
-
     struct PlanGateHarness {
         app: App,
         sent: SentRequests,
         cancelled: CancelRequests,
-        modes: Arc<Mutex<Vec<(Agent, ExecutionMode)>>>,
     }
 
     /// A recording-adapter app with the judge enabled (`skip_judge_for_tests`
@@ -14245,14 +13804,13 @@ mod tests {
     /// Like [`plan_gate_test_app`] but some agents reject the listed modes.
     fn plan_gate_harness_in_workspace(
         workspace: std::path::PathBuf,
-        unsupported: &[(Agent, ExecutionMode)],
+        unsupported: &[(Agent, TurnPolicy)],
     ) -> PlanGateHarness {
         let _ = std::fs::create_dir_all(&workspace);
         let engine =
             ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let modes = Arc::new(Mutex::new(Vec::new()));
         let adapters = Agent::all()
             .into_iter()
             .map(|agent| {
@@ -14260,7 +13818,6 @@ mod tests {
                     agent,
                     sent: Arc::clone(&sent),
                     cancelled: Arc::clone(&cancelled),
-                    selected_modes: Arc::clone(&modes),
                     fail_send: false,
                     unsupported_modes: unsupported
                         .iter()
@@ -14288,11 +13845,10 @@ mod tests {
             app,
             sent,
             cancelled,
-            modes,
         }
     }
 
-    fn plan_gate_harness(unsupported: &[(Agent, ExecutionMode)]) -> PlanGateHarness {
+    fn plan_gate_harness(unsupported: &[(Agent, TurnPolicy)]) -> PlanGateHarness {
         let workspace = std::env::temp_dir().join(format!("dmuxai-plan-gate-{}", Uuid::new_v4()));
         plan_gate_harness_in_workspace(workspace, unsupported)
     }
@@ -14423,6 +13979,42 @@ mod tests {
             })
             .map(|(_, request)| request.clone())
             .collect()
+    }
+
+    // FR-937 / quiet graph: direct/auto 1-node runs must not enable AGY edit retries.
+    #[test]
+    fn direct_one_node_run_does_not_require_file_edits() {
+        let (mut app, sent) = test_app();
+        app.selected = adapter_index(Agent::Agy);
+        app.submit_direct_run(
+            "What does PLAN.md propose? Don't modify anything.".into(),
+            Agent::Agy,
+            OverrideKind::Direct,
+        );
+        assert!(app.quiet_graph_run);
+        assert!(!app.graph_node_expects_file_edits(Agent::Agy));
+        let graph = graph_node_requests(&sent);
+        assert_eq!(graph.len(), 1);
+        assert!(!graph[0].require_file_edits);
+    }
+
+    #[test]
+    fn pending_turn_policy_survives_first_graph_send_and_clears_on_busy() {
+        let (mut app, sent) = test_app();
+        app.pending_turn_policy = Some(TurnPolicy::ReadOnly);
+        app.selected = adapter_index(Agent::Codex);
+        app.submit_direct_run("question".into(), Agent::Codex, OverrideKind::Direct);
+        assert_eq!(
+            app.pending_turn_policy,
+            Some(TurnPolicy::ReadOnly),
+            "policy applies to the whole quiet graph run"
+        );
+        assert_eq!(graph_node_requests(&sent)[0].policy, TurnPolicy::ReadOnly);
+
+        app.busy_agents.insert(Agent::Agy);
+        let err = app.try_submit_to_agent(Agent::Agy, "next".into(), false, true);
+        assert!(err.is_err());
+        assert!(app.pending_turn_policy.is_none());
     }
 
     fn complete_replan_keep(h: &mut PlanGateHarness) {
@@ -17246,7 +16838,6 @@ mod tests {
             started: start,
             last_event: start,
             prompt: "hello".to_owned(),
-            saved_mode: ExecutionMode::Implement,
             run_id: "run-judge".to_owned(),
             judge_calls: 1,
         });
@@ -17886,10 +17477,40 @@ mod tests {
     }
 
     #[test]
-    // TC-048 / FR-043: a mode change retires native resume but keeps shared context.
-    fn mode_change_reopens_the_agent_with_shared_context() {
+    // TC-048 / FR-043: agent turns resume native sessions when a binding exists.
+    fn agent_turn_resumes_provider_session_after_completion() {
         let (mut app, sent) = test_app();
         app.input = "first question".to_owned();
+        app.submit_prompt();
+        let first = sent.lock().unwrap()[0].1.clone();
+        assert_eq!(first.policy, TurnPolicy::Agent);
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(first.conversation_id.clone()),
+            turn_id: Some(first.turn_id.clone()),
+            event: AgentEvent::ProviderSessionBound("codex-thread".to_owned()),
+        }));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(first.conversation_id),
+            turn_id: Some(first.turn_id),
+            event: AgentEvent::Completed,
+        }));
+
+        app.input = "second".to_owned();
+        app.submit_prompt();
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent[1].1.resume_session.as_deref(), Some("codex-thread"));
+        assert_eq!(sent[1].1.prompt, "second");
+        assert_eq!(sent[1].1.policy, TurnPolicy::Agent);
+    }
+
+    #[test]
+    // TC-480 / INT-480: /mode is gone; bindings stay active after the warning.
+    fn typed_mode_command_does_not_retire_binding() {
+        let (mut app, sent) = test_app();
+        app.input = "first".to_owned();
         app.submit_prompt();
         let first = sent.lock().unwrap()[0].1.clone();
         assert!(app.apply_agent_output(AgentOutput {
@@ -17900,65 +17521,18 @@ mod tests {
         }));
         assert!(app.apply_agent_output(AgentOutput {
             agent: Agent::Codex,
-            conversation_id: Some(first.conversation_id.clone()),
-            turn_id: Some(first.turn_id.clone()),
-            event: AgentEvent::TextDelta("first answer".to_owned()),
-        }));
-        assert!(app.apply_agent_output(AgentOutput {
-            agent: Agent::Codex,
             conversation_id: Some(first.conversation_id),
             turn_id: Some(first.turn_id),
             event: AgentEvent::Completed,
         }));
 
-        app.open_mode_picker();
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        app.input = "implement it".to_owned();
+        app.input = "/mode implement".to_owned();
         app.submit_prompt();
-
-        let sent = sent.lock().unwrap();
-        assert_eq!(app.modes[&Agent::Codex], ExecutionMode::Implement);
-        assert!(sent[1].1.resume_session.is_none());
-        assert!(sent[1].1.prompt.contains("[DmuxAI shared context]"));
-        assert!(sent[1].1.prompt.contains("first answer"));
-    }
-
-    #[test]
-    // TC-480 / INT-480: unsupported modes do not retire a binding or change UI state.
-    fn unsupported_mode_is_rejected_before_binding_retirement() {
-        let workspace = std::env::current_dir().unwrap();
-        let engine =
-            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
-        let (mut app, sent) =
-            test_app_with_unsupported_mode(engine, Agent::Cursor, ExecutionMode::Implement);
-        app.selected = adapter_index(Agent::Cursor);
-        app.input = "first".to_owned();
-        app.submit_prompt();
-        let first = sent.lock().unwrap()[0].1.clone();
-        assert!(app.apply_agent_output(AgentOutput {
-            agent: Agent::Cursor,
-            conversation_id: Some(first.conversation_id.clone()),
-            turn_id: Some(first.turn_id.clone()),
-            event: AgentEvent::ProviderSessionBound("cursor-session".to_owned()),
-        }));
-        assert!(app.apply_agent_output(AgentOutput {
-            agent: Agent::Cursor,
-            conversation_id: Some(first.conversation_id),
-            turn_id: Some(first.turn_id),
-            event: AgentEvent::Completed,
-        }));
-
-        app.open_mode_picker();
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(app.modes[&Agent::Cursor], ExecutionMode::Ask);
-        assert!(app.mode_picker.is_some());
-        assert!(app.messages.last().unwrap().content.contains("unavailable"));
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Mode selection was removed"))
+        );
         let snapshot = app
             .engine
             .select(ConversationSelection::Existing(app.conversation_id.clone()))
@@ -19272,11 +18846,12 @@ mod tests {
     }
 
     #[test]
-    fn startup_message_explains_provider_safety_modes() {
+    fn startup_message_explains_provider_safety() {
         let (app, _) = test_app();
 
-        assert!(app.messages[0].content.contains("/mode"));
-        assert!(app.messages[0].content.contains("Implement mode"));
+        assert!(app.messages[0].content.contains("/agent"));
+        assert!(app.messages[0].content.contains("modify files"));
+        assert!(!app.messages[0].content.contains("/mode"));
     }
 
     #[test]
@@ -19344,7 +18919,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_preview_filters_and_executes_mode_with_tab() {
+    fn slash_preview_filters_and_completes_memory_with_tab() {
         let (mut app, _) = test_app();
 
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
@@ -19355,12 +18930,16 @@ mod tests {
         assert!(app.slash_preview.is_some());
 
         app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
-        assert_eq!(matching_slash_commands(&app.input)[0].name, "/mode");
+        assert_eq!(matching_slash_commands(&app.input)[0].name, "/memory");
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(app.slash_preview.is_none());
-        assert!(app.mode_picker.is_some());
         assert!(app.input.is_empty());
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Obsidian memory") || m.content.contains("memory"))
+        );
     }
 
     #[test]
@@ -19423,7 +19002,7 @@ mod tests {
         let regular = render_text_at(&mut app, 80, 24);
         assert!(regular.contains("Commands"));
         assert!(regular.contains("/agent"));
-        assert!(regular.contains("/mode"));
+        assert!(regular.contains("/memory"));
 
         let small = render_text_at(&mut app, 40, 10);
         assert!(small.contains("Commands"));
@@ -19431,35 +19010,33 @@ mod tests {
     }
 
     #[test]
-    fn mode_picker_keeps_a_separate_mode_for_each_agent() {
-        let (mut app, _) = test_app();
+    fn typed_mode_slash_shows_removal_notice() {
+        let (mut app, sent) = test_app();
         app.input = "/mode".to_owned();
         app.submit_prompt();
 
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(app.modes[&Agent::Codex], ExecutionMode::Implement);
-        assert_eq!(app.modes[&Agent::Cursor], ExecutionMode::Ask);
-        assert!(app.mode_picker.is_none());
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Mode selection was removed"))
+        );
     }
 
     #[test]
-    fn busy_agent_cannot_open_mode_picker() {
+    fn busy_agent_still_gets_mode_removal_notice() {
         let (mut app, _) = test_app();
         app.busy_agents.insert(Agent::Codex);
         app.input = "/mode".to_owned();
 
         app.submit_prompt();
 
-        assert!(app.mode_picker.is_none());
         assert!(
             app.messages
                 .last()
                 .unwrap()
                 .content
-                .contains("before changing modes")
+                .contains("Mode selection was removed")
         );
     }
 
@@ -19731,7 +19308,6 @@ mod tests {
             state: "IDLE",
             badge: None,
             model: "composer-2.5",
-            mode: "ask",
             effort: "provider default",
             activity: "IDLE",
             other_activity: "",
@@ -19743,7 +19319,8 @@ mod tests {
         let at_200 = fit_status_segments(&segments, 200);
         assert!(at_200.chars().count() <= 200);
         assert!(at_200.contains("Model: composer-2.5"));
-        assert!(at_200.contains("Mode: ask"));
+        assert!(!at_200.contains("Mode:"));
+        assert!(!at_200.contains("/mode"));
         assert!(at_200.contains("/effort"));
         assert!(at_200.contains("/status"));
         assert!(at_200.contains("F2 model"));
@@ -19754,7 +19331,7 @@ mod tests {
         assert!(at_80.chars().count() <= 80);
         assert!(!at_80.contains("/effort"));
         assert!(at_80.contains("Model: composer-2.5"));
-        assert!(at_80.contains("Mode: ask"));
+        assert!(!at_80.contains("Mode:"));
         assert!(at_80.contains("Esc"));
 
         // Width 40: essential info fits within 40
@@ -19762,7 +19339,7 @@ mod tests {
         assert!(at_40.chars().count() <= 40);
         assert!(at_40.contains("Cursor"));
         assert!(at_40.contains("IDLE"));
-        assert!(at_40.contains("ask"));
+        assert!(at_40.contains("composer"));
     }
 
     #[test]
@@ -20068,6 +19645,8 @@ mod tests {
             prompt: "next".to_owned(),
             resume_session: resume.map(str::to_owned),
             image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
         };
         // Empty memory: unchanged.
         let mut r = request(None);
@@ -20327,22 +19906,17 @@ mod tests {
     }
 
     #[test]
-    // TC-423 / FR-422: "/mode implement" sets mode.
+    // TC-1309: /mode is removed; typed /mode does not send a prompt.
     fn fast_typed_mode_command_sets_mode_without_sending() {
         let (mut app, sent) = test_app();
-        let selected_agent = app.adapters[app.selected].agent();
-        assert_eq!(
-            app.modes.get(&selected_agent).copied(),
-            Some(ExecutionMode::Ask)
-        );
-
         app.input = "/mode implement".to_owned();
         app.submit_prompt();
 
         assert!(sent.lock().unwrap().is_empty());
-        assert_eq!(
-            app.modes.get(&selected_agent).copied(),
-            Some(ExecutionMode::Implement)
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Mode selection was removed"))
         );
         assert_eq!(app.input, "");
     }
@@ -20675,7 +20249,7 @@ mod tests {
         let req = HeadlessRequest {
             prompt: "Say hello".to_owned(),
             agent: Some("codex".to_owned()),
-            mode: Some(ExecutionMode::Ask),
+            mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
             todo_id: None,
@@ -20805,7 +20379,7 @@ mod tests {
         let req = HeadlessRequest {
             prompt: "Never finishes".to_owned(),
             agent: Some("codex".to_owned()),
-            mode: Some(ExecutionMode::Ask),
+            mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
             todo_id: None,
@@ -21021,7 +20595,6 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].0, Agent::Codex);
         assert!(requests[0].1.prompt.contains("hello from dashboard"));
-        assert_eq!(app.modes[&Agent::Codex], ExecutionMode::Ask);
     }
 
     fn web_app() -> (App, SentRequests, dmuxai::web::DashboardHub) {
@@ -21039,8 +20612,8 @@ mod tests {
     fn codex_catalog() -> ModelCatalog {
         ModelCatalog {
             models: vec![ModelInfo {
-                id: "m1".to_owned(),
-                label: "Model One".to_owned(),
+                id: dmuxai::model_policy::ALLOWED_MODEL.to_owned(),
+                label: "Allowed".to_owned(),
                 efforts: vec!["low".to_owned(), "high".to_owned()],
                 default_effort: Some("low".to_owned()),
             }],
@@ -21250,12 +20823,13 @@ mod tests {
             Err(RunTodoError::UnknownAgent(_))
         ));
 
-        app.handle_session_command(SessionCommand::SetMode {
-            agent: Some("codex".to_owned()),
-            mode: "plan".to_owned(),
-        })
-        .unwrap();
-        assert_eq!(app.modes[&Agent::Codex], ExecutionMode::Plan);
+        assert!(matches!(
+            app.handle_session_command(SessionCommand::SetMode {
+                agent: Some("codex".to_owned()),
+                mode: "plan".to_owned(),
+            }),
+            Err(RunTodoError::Invalid(message)) if message.contains("mode selection was removed")
+        ));
         assert!(matches!(
             app.handle_session_command(SessionCommand::SetMode {
                 agent: Some("codex".to_owned()),
@@ -21265,14 +20839,15 @@ mod tests {
         ));
 
         app.model_catalogs.insert(Agent::Codex, codex_catalog());
+        let allowed = dmuxai::model_policy::ALLOWED_MODEL;
         let session = app
             .handle_session_command(SessionCommand::SelectModel {
                 agent: Some("codex".to_owned()),
-                model: "m1".to_owned(),
+                model: allowed.to_owned(),
             })
             .unwrap();
         let codex = session.agents.iter().find(|a| a.id == "codex").unwrap();
-        assert_eq!(codex.model.as_deref(), Some("m1"));
+        assert_eq!(codex.model.as_deref(), Some(allowed));
         assert_eq!(codex.effort.as_deref(), Some("low"));
         assert_eq!(codex.models[0].efforts, vec!["low", "high"]);
         assert!(matches!(
@@ -21297,16 +20872,19 @@ mod tests {
             Err(RunTodoError::Invalid(message)) if message.contains("Codex only")
         ));
 
-        // UX-780: a busy agent refuses mode/model/effort changes.
+        // UX-780: a busy agent refuses model/effort changes; set_mode is rejected.
         app.busy_agents.insert(Agent::Codex);
-        for command in [
-            SessionCommand::SetMode {
+        assert!(matches!(
+            app.handle_session_command(SessionCommand::SetMode {
                 agent: Some("codex".to_owned()),
                 mode: "ask".to_owned(),
-            },
+            }),
+            Err(RunTodoError::Invalid(_))
+        ));
+        for command in [
             SessionCommand::SelectModel {
                 agent: Some("codex".to_owned()),
-                model: "m1".to_owned(),
+                model: allowed.to_owned(),
             },
             SessionCommand::SetEffort {
                 agent: Some("codex".to_owned()),
@@ -21362,9 +20940,10 @@ mod tests {
     fn dashboard_commands_cover_models_share_and_policy() {
         let (mut app, sent, _hub) = web_app();
         app.model_catalogs.insert(Agent::Codex, codex_catalog());
+        let allowed = dmuxai::model_policy::ALLOWED_MODEL;
         app.handle_session_command(SessionCommand::SelectModel {
             agent: Some("codex".to_owned()),
-            model: "m1".to_owned(),
+            model: allowed.to_owned(),
         })
         .unwrap();
         let session = app
@@ -22198,7 +21777,7 @@ mod tests {
         let req = HeadlessRequest {
             prompt: "headless prompt".to_owned(),
             agent: Some("cursor".to_owned()),
-            mode: Some(ExecutionMode::Ask),
+            mode: None,
             graph: false,
             approve_plan: false,
             todo_id: None,
@@ -22355,7 +21934,6 @@ mod tests {
                 agent: Agent::Custom(0),
                 sent,
                 cancelled,
-                selected_modes: Arc::new(Mutex::new(Vec::new())),
                 fail_send: false,
                 unsupported_modes: Vec::new(),
             }));
@@ -22609,7 +22187,6 @@ mod tests {
     fn app_with_runner_agents(agents: Vec<Agent>, settings: DmuxSettings) -> App {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let selected_modes = Arc::new(Mutex::new(Vec::new()));
         let adapters = agents
             .into_iter()
             .map(|agent| {
@@ -22617,7 +22194,6 @@ mod tests {
                     agent,
                     sent: Arc::clone(&sent),
                     cancelled: Arc::clone(&cancelled),
-                    selected_modes: Arc::clone(&selected_modes),
                     fail_send: false,
                     unsupported_modes: Vec::new(),
                 }) as Box<dyn AgentAdapter>
@@ -22661,8 +22237,8 @@ mod tests {
         assert!(first.starts_with(listed), "{first}");
         assert!(first.contains("F3 to load a conversation"), "{first}");
         assert!(first.contains("/agent"), "{first}");
-        assert!(first.contains("/mode"), "{first}");
-        assert!(first.contains("Implement mode"), "{first}");
+        assert!(!first.contains("/mode"), "{first}");
+        assert!(first.contains("modify files"), "{first}");
         assert!(
             first.contains("Completed turns are shared automatically"),
             "{first}"
@@ -23245,10 +22821,6 @@ mod tests {
         harness.app.selected = adapter_index(Agent::Agy);
         harness
             .app
-            .modes
-            .insert(Agent::Agy, ExecutionMode::Implement);
-        harness
-            .app
             .model_catalogs
             .get_mut(&Agent::Agy)
             .unwrap()
@@ -23260,10 +22832,7 @@ mod tests {
         assert_eq!(harness.sent.lock().unwrap()[0].0, Agent::Agy);
         assert!(judge.turn_id.as_str().starts_with("judge-"));
         assert!(judge.resume_session.is_none());
-        assert_eq!(
-            harness.modes.lock().unwrap().last().copied(),
-            Some((Agent::Agy, ExecutionMode::Ask))
-        );
+        assert_eq!(judge.policy, TurnPolicy::ReadOnly);
 
         let reply = "{\"route\":\"simple\",\"reason\":\"tiny\"}";
         assert!(harness.app.apply_agent_output(triage_output(
@@ -23286,16 +22855,6 @@ mod tests {
             harness.app.current_judge_reason_line_raw()
         );
 
-        let modes = harness.modes.lock().unwrap();
-        assert_eq!(
-            modes.first().copied(),
-            Some((Agent::Agy, ExecutionMode::Ask))
-        );
-        assert_eq!(
-            modes.last().copied(),
-            Some((Agent::Agy, ExecutionMode::Implement))
-        );
-        drop(modes);
         assert!(
             !harness
                 .app
@@ -23315,14 +22874,7 @@ mod tests {
         );
 
         // No read-only mode: no judge turn, fallback with no_read_only_mode.
-        let mut no_mode = plan_gate_harness(&[
-            (Agent::Codex, ExecutionMode::Ask),
-            (Agent::Codex, ExecutionMode::Plan),
-        ]);
-        no_mode
-            .app
-            .modes
-            .insert(Agent::Codex, ExecutionMode::Implement);
+        let mut no_mode = plan_gate_harness(&[(Agent::Codex, TurnPolicy::ReadOnly)]);
         no_mode.app.input = "hello".to_owned();
         no_mode.app.submit_prompt();
         let sent = no_mode.sent.lock().unwrap();
@@ -23833,7 +23385,7 @@ mod tests {
 
         let approved = std::fs::read_to_string(&path).unwrap();
         assert!(approved.contains("- [ ] task-2 renamed two"), "{approved}");
-        assert!(approved.contains(&format!("# Tasks {}", plan_id)));
+        assert!(approved.contains(&format!("# Tasks {plan_id}")));
         assert!(approved.contains("- [ ] task-1 one"));
         assert!(!approved.contains(&user_prompt));
 
@@ -25339,11 +24891,7 @@ mod tests {
     #[test]
     fn invalid_plan_gets_one_repair() {
         let mut h = plan_gate_test_app();
-        h.app
-            .set_agent_mode(Agent::Codex, ExecutionMode::Implement)
-            .unwrap();
         let plan_req = complete_complex_judge(&mut h);
-        h.app.modes.insert(Agent::Codex, ExecutionMode::Ask);
         assert!(h.app.apply_agent_output(triage_output(
             Agent::Codex,
             &plan_req,
@@ -25354,9 +24902,12 @@ mod tests {
             &plan_req,
             AgentEvent::Completed
         )));
-        assert!(h.app.pending_plan.as_ref().is_some_and(|pending| {
-            pending.saved_mode == ExecutionMode::Implement && pending.attempt == 1
-        }));
+        assert!(
+            h.app
+                .pending_plan
+                .as_ref()
+                .is_some_and(|pending| pending.attempt == 1)
+        );
         let sent = h.sent.lock().unwrap();
         assert_eq!(sent.len(), 3, "judge + plan + repair");
         assert!(
@@ -25394,9 +24945,6 @@ mod tests {
     #[test]
     fn plan_turn_cancel_restores_prompt_and_mode() {
         let mut h = plan_gate_test_app();
-        h.app
-            .set_agent_mode(Agent::Codex, ExecutionMode::Implement)
-            .unwrap();
         let plan_req = complete_complex_judge(&mut h);
         // Ctrl+C on another tab cancels only that tab: the plan keeps running
         // and that tab's draft is untouched.
@@ -25410,7 +24958,6 @@ mod tests {
         h.app.selected = adapter_index(Agent::Codex);
         h.app.cancel_selected();
         assert_eq!(h.app.input, "build a multi-step feature");
-        assert_eq!(h.app.modes[&Agent::Codex], ExecutionMode::Implement);
         assert!(h.cancelled.lock().unwrap().contains(&Agent::Codex));
         assert!(h.app.pending_plan.is_none());
         let run = h.app.last_graph_run.as_ref().expect("cancelled run");
@@ -26069,10 +25616,9 @@ mod tests {
             .filter(|run| run.conversation_id == conversation_id)
             .collect::<Vec<_>>();
         assert_eq!(runs.len(), 2);
-        assert_eq!(
-            runs.iter().map(|run| run.turn_index).collect::<Vec<_>>(),
-            vec![1, 2]
-        );
+        let mut turn_indices: Vec<_> = runs.iter().map(|run| run.turn_index).collect();
+        turn_indices.sort();
+        assert_eq!(turn_indices, vec![1, 2]);
         let second_node = last_graph_node_request_index(&h.sent);
         complete_sent_graph_turn(&mut h.app, &h.sent, second_node);
 
@@ -26084,10 +25630,9 @@ mod tests {
             .filter(|run| run.conversation_id == conversation_id)
             .collect::<Vec<_>>();
         assert_eq!(runs.len(), 3);
-        assert_eq!(
-            runs.iter().map(|run| run.turn_index).collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
+        let mut turn_indices: Vec<_> = runs.iter().map(|run| run.turn_index).collect();
+        turn_indices.sort();
+        assert_eq!(turn_indices, vec![1, 2, 3]);
         let planned = runs.iter().find(|run| run.turn_index == 3).unwrap();
         assert_eq!(planned.phase, GraphRunPhase::Planning);
         assert!(h.app.pending_plan.is_some());
@@ -26262,10 +25807,6 @@ impl AgentAdapter for ProbeAdapter {
     }
 
     fn select_model(&self, _model: String) -> Result<(), crate::agent::AdapterError> {
-        Ok(())
-    }
-
-    fn select_mode(&self, _mode: ExecutionMode) -> Result<(), crate::agent::AdapterError> {
         Ok(())
     }
 }

@@ -425,8 +425,9 @@ async fn running_indicator_renders_in_headless_chrome() {
     // 2. Assert agent chip has .spinner
     let mut has_chip_spinner = false;
     for _ in 0..20 {
-        if let Ok(val) = cdp.eval("document.querySelector('#agents .chip .spinner') !== null")
-            && val.as_bool() == Some(true)
+        if let Ok(val) = cdp.eval(
+            "document.querySelector('.session-agent-picker.session-agent-picker-running') !== null",
+        ) && val.as_bool() == Some(true)
         {
             has_chip_spinner = true;
             break;
@@ -435,7 +436,7 @@ async fn running_indicator_renders_in_headless_chrome() {
     }
     assert!(
         has_chip_spinner,
-        "expected agent chip to contain a .spinner element"
+        "expected composer agent picker to show running state"
     );
 
     // 3. Assert tab title starts with ⏳

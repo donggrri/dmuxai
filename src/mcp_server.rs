@@ -16,6 +16,8 @@ pub struct RunArgs {
     pub prompt: Option<String>,
     pub agent: Option<String>,
     pub mode: Option<String>,
+    /// When true, the child `dmuxai run` uses `--read-only` (legacy ask/plan modes).
+    pub read_only: bool,
     pub graph: bool,
     pub todo_id: Option<String>,
 }
@@ -62,7 +64,10 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "prompt": { "type": "string" },
                     "agent": { "type": "string", "description": "Runner id, e.g. agy or a custom agent name" },
-                    "mode": { "type": "string", "enum": ["ask", "plan", "implement"] },
+                    "mode": {
+                        "type": "string",
+                        "description": "Deprecated, ignored. DmuxAI runs a single write-capable agent policy."
+                    },
                     "graph": { "type": "boolean", "description": "Use the graph planner" },
                     "todo_id": { "type": "string", "description": "Run this to-do instead of a prompt" }
                 }
@@ -124,10 +129,24 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
         }
         "todo_list" => backend.todo_list(str_arg(args, "status")),
         "run" => {
+            let mode = str_arg(args, "mode");
+            let read_only = match mode {
+                None => false,
+                Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+                    "ask" | "plan" => true,
+                    "implement" | "agent" => false,
+                    other => {
+                        return Err(format!(
+                            "invalid mode '{other}'; use ask or plan (read-only), implement (agent), or omit mode"
+                        ));
+                    }
+                },
+            };
             let run = RunArgs {
                 prompt: str_arg(args, "prompt").map(str::to_owned),
                 agent: str_arg(args, "agent").map(str::to_owned),
-                mode: str_arg(args, "mode").map(str::to_owned),
+                mode: mode.map(str::to_owned),
+                read_only,
                 graph: args.get("graph").and_then(Value::as_bool).unwrap_or(false),
                 todo_id: str_arg(args, "todo_id").map(str::to_owned),
             };

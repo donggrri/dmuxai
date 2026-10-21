@@ -676,7 +676,7 @@ impl McpClient {
                         }
                         return Err(McpError::new(
                             &self.server_name,
-                            format!("notification failed with status {}", status),
+                            format!("notification failed with status {status}"),
                         ));
                     }
                     Ok(())

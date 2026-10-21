@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<title>DmuxAI memory top bar demo</title>
+<link rel="stylesheet" href="/assets/app.css">
+<style>
+body { margin: 0; font-family: system-ui, sans-serif; min-height: 100vh; }
+.wrap { position: relative; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="top">
+  <h1 class="brand">DmuxAI<span class="brand-sub">dashboard</span></h1>
+  <button type="button" class="btn accent-reset">Reset</button>
+  <button type="button" class="btn sidebar-toggle">Sessions</button>
+  <button type="button" class="btn sidebar-toggle">Files</button>
+  <button type="button" class="btn sidebar-toggle">To-dos <span class="todos-count">0</span></button>
+  <button type="button" class="btn sidebar-toggle">Diff <span class="todos-count">1</span></button>
+  <button type="button" class="btn sidebar-toggle">Graph</button>
+  <button type="button" class="btn sidebar-toggle memory-top-btn" aria-expanded="true">Memory <span class="memory-badge memory-badge-off">Off</span></button>
+</header>
+<div id="memory-popover" class="memory-popover" role="dialog" aria-label="Memory" style="position:absolute;right:1rem;top:3.25rem;">
+  <p class="memory-popover-title">Memory</p>
+  <p class="memory-popover-hint">Memory is off. Set [memory] vault = &quot;~/Obsidian/Vault&quot; in ~/.config/dmuxai/dmuxai.toml</p>
+</div>
+</div>
+</body>
+</html>

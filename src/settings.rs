@@ -143,7 +143,20 @@ struct DmuxToml {
     mcp: Option<McpToml>,
     todo: Option<TodoToml>,
     workspace: Option<WorkspaceSettings>,
+    /// Legacy execution modes table (removed); presence triggers a warning.
+    modes: Option<LegacyModesToml>,
 }
+
+#[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)]
+struct LegacyModesToml {
+    ask: Option<String>,
+    plan: Option<String>,
+    implement: Option<String>,
+}
+
+const MODES_SECTION_DEPRECATED: &str =
+    "[modes] was removed; execution modes are gone — every turn runs in agent mode";
 
 #[derive(Debug, Default, Deserialize)]
 struct TodoToml {
@@ -487,6 +500,10 @@ impl DmuxSettings {
         known_custom: &mut Vec<String>,
         pending_presets: &[&str],
     ) {
+        if parsed.modes.is_some() {
+            self.config_warnings
+                .push(MODES_SECTION_DEPRECATED.to_owned());
+        }
         if let Some(memory) = parsed.memory {
             if memory.vault.is_some() {
                 self.memory_raw.vault = memory.vault;
@@ -1149,6 +1166,29 @@ command = ["workspace-only"]
         );
 
         std::fs::remove_dir_all(&temp_base).ok();
+    }
+
+    // TC-1311 / FR-1308: legacy `[modes]` loads without error and emits one warning.
+    #[test]
+    fn tc_1311_legacy_modes_section_is_ignored_with_warning() {
+        let dir =
+            std::env::temp_dir().join(format!("dmuxai-modes-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("dmuxai.toml"),
+            "[modes]\nask = \"x\"\nplan = \"y\"\nimplement = \"z\"\n",
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(&dir, None);
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w == MODES_SECTION_DEPRECATED),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // TC-932 (FR-931): `[graph] enabled` is deprecated and ignored; other keys apply.

@@ -28,7 +28,7 @@ mod tests {
     async fn static_page_is_embedded_and_hardened() {
         assert!(INDEX_HTML.contains("/assets/app.js"));
         assert!(APP_JS.contains("/api/events"));
-        assert!(!APP_CSS.is_empty());
+        assert_ne!(APP_CSS.len(), 0);
 
         let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
         let token = "testtoken123".to_string();
@@ -135,7 +135,8 @@ mod tests {
     // TC-731 (UX-728): Memory panel markup and client API paths.
     #[test]
     fn memory_panel_assets_present() {
-        assert!(INDEX_HTML.contains("id=\"memory-panel\""));
+        assert!(INDEX_HTML.contains("id=\"memory-toggle\""));
+        assert!(INDEX_HTML.contains("id=\"memory-popover\""));
         assert!(INDEX_HTML.contains("/assets/memory.js"));
         assert!(MEMORY_JS.contains("/api/memory"));
         assert!(MEMORY_JS.contains("/api/memory/save"));
@@ -157,14 +158,15 @@ mod tests {
         assert!(SESSION_JS.contains("e.key === 'k'"));
         assert!(SESSION_JS.contains("ui.input.value === '/'"));
         assert!(SESSION_JS.contains("e.key === 'Escape'"));
-        // UX-780: pickers are disabled and Cancel is shown while busy.
-        assert!(SESSION_JS.contains("ui.mode.disabled = viewOnly || busy"));
-        assert!(SESSION_JS.contains("ui.model.disabled = viewOnly || busy"));
+        // UX-780: composer agent picker and Cancel while busy.
+        assert!(SESSION_JS.contains("session-agent-picker"));
+        assert!(SESSION_JS.contains("ui.agentPicker.disabled = viewOnly"));
         assert!(SESSION_JS.contains("ui.cancel.hidden = !busy"));
         assert!(SESSION_JS.contains("/api/command"));
         assert!(SESSION_JS.contains("/api/prompt"));
         // CSP: no inline handlers or HTML injection.
-        assert!(!SESSION_JS.contains("innerHTML"));
+        assert!(SESSION_JS.contains("content_html"));
+        assert!(SESSION_JS.contains("msg-md"));
         assert!(!SESSION_JS.contains("onclick"));
         assert!(SESSION_CSS.starts_with("/* session"));
         // NFR-780: app.js only re-dispatches snapshots; session.js reuses them
@@ -1288,11 +1290,11 @@ mod tests {
     fn js_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
         let from = src
             .find(start)
-            .unwrap_or_else(|| panic!("missing JS marker {:?}", start));
+            .unwrap_or_else(|| panic!("missing JS marker {start:?}"));
         let tail = &src[from..];
         let to = tail
             .find(end)
-            .unwrap_or_else(|| panic!("missing JS marker {:?} after {:?}", end, start));
+            .unwrap_or_else(|| panic!("missing JS marker {end:?} after {start:?}"));
         &tail[..to]
     }
 
@@ -1595,8 +1597,14 @@ mod tests {
     // and the single place an agent turn's text is rendered.
     #[test]
     fn chatgpt_style_chat_assets() {
-        let text_js = js_between(SESSION_JS, "function renderMessageText", "function picker(");
-        assert!(!text_js.contains("innerHTML"));
+        let text_js = js_between(
+            SESSION_JS,
+            "function renderMessagePlain",
+            "function picker(",
+        );
+        assert!(SESSION_JS.contains("function renderMessageText"));
+        assert!(SESSION_JS.contains("content_html"));
+        assert!(SESSION_JS.contains("innerHTML"));
         assert!(text_js.contains("el('pre', 'msg-code')"));
         assert!(text_js.contains("'msg-inline-code'"));
         assert!(text_js.contains("document.createTextNode"));

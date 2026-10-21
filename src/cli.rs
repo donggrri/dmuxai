@@ -14,7 +14,6 @@ use dmuxai::events::{EventLog, EventSink};
 use dmuxai::mcp_server::{McpBackend, RunArgs};
 use dmuxai::settings::DmuxSettings;
 
-use crate::agent::ExecutionMode;
 use crate::app::{App, HeadlessOutcome, HeadlessRequest};
 
 /// A parsed agent-facing subcommand.
@@ -56,6 +55,7 @@ pub struct RunOptions {
     pub prompt: String,
     pub agent: Option<String>,
     pub mode: Option<String>,
+    pub read_only: bool,
     pub graph: bool,
     pub approve_plan: bool,
     pub json: bool,
@@ -72,13 +72,6 @@ fn value<'a>(args: &'a [String], index: &mut usize, flag: &str) -> Result<&'a st
         .ok_or_else(|| format!("{flag} needs a value"))
 }
 
-fn parse_mode(raw: &str) -> Result<String, String> {
-    match raw.to_ascii_lowercase().as_str() {
-        m @ ("ask" | "plan" | "implement") => Ok(m.to_owned()),
-        _ => Err("--mode must be ask, plan or implement".to_owned()),
-    }
-}
-
 /// Parses run-style flags; positional words become the prompt.
 fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, String> {
     let mut options = RunOptions::default();
@@ -93,8 +86,15 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
             match arg {
                 "--" => rest_is_prompt = true,
                 "--agent" => options.agent = Some(value(args, &mut index, "--agent")?.to_owned()),
-                "--mode" => options.mode = Some(parse_mode(value(args, &mut index, "--mode")?)?),
+                "--mode" => {
+                    let _ = value(args, &mut index, "--mode")?;
+                    return Err(
+                        "--mode was removed; DmuxAI runs a single agent mode (write-capable). Omit --mode."
+                            .to_owned(),
+                    );
+                }
                 "--graph" => options.graph = true,
+                "--read-only" => options.read_only = true,
                 "--approve-plan" => options.approve_plan = true,
                 "--json" => options.json = true,
                 flag if flag.starts_with("--") => {
@@ -494,15 +494,6 @@ async fn print_events(root: &Path, since: u64, limit: Option<usize>, follow: boo
     }
 }
 
-fn parse_execution_mode(mode: &str) -> Option<ExecutionMode> {
-    match mode {
-        "ask" => Some(ExecutionMode::Ask),
-        "plan" => Some(ExecutionMode::Plan),
-        "implement" => Some(ExecutionMode::Implement),
-        _ => None,
-    }
-}
-
 fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Value {
     json!({
         "ok": outcome.ok,
@@ -565,11 +556,6 @@ async fn run_headless(
     for warning in &settings.config_warnings {
         eprintln!("warning: {warning}");
     }
-    let mode = options
-        .mode
-        .as_deref()
-        .map(|m| parse_execution_mode(m).ok_or_else(|| ApiError::new(exit::USAGE, "invalid mode")));
-    let mode = mode.transpose()?;
     let (db_path, notice) =
         dmuxai::state_path::prepare_repo_db(workspace_root).map_err(|e| internal(&e))?;
     if let Some(notice) = notice {
@@ -602,6 +588,11 @@ async fn run_headless(
             cancel_signal.store(true, Ordering::SeqCst);
         }
     });
+    let mode = if options.read_only {
+        Some("ask".to_owned())
+    } else {
+        options.mode.clone()
+    };
     let request = HeadlessRequest {
         prompt: prompt.unwrap_or_default(),
         agent: options.agent.clone(),
@@ -729,8 +720,8 @@ impl McpBackend for CliMcpBackend {
         if let Some(agent) = args.agent {
             argv.extend(["--agent".into(), agent]);
         }
-        if let Some(mode) = args.mode {
-            argv.extend(["--mode".into(), mode]);
+        if args.read_only {
+            argv.push("--read-only".into());
         }
         if args.graph {
             argv.push("--graph".into());
@@ -768,17 +759,19 @@ mod tests {
     fn parse_cli_agent_api_subcommands() {
         assert_eq!(
             parse(&args(&[
-                "run", "fix", "the", "bug", "--agent", "agy", "--mode", "Plan", "--json"
+                "run", "fix", "the", "bug", "--agent", "agy", "--json"
             ])),
             Ok(AgentCommand::Run(RunOptions {
                 prompt: "fix the bug".into(),
                 agent: Some("agy".into()),
-                mode: Some("plan".into()),
+                mode: None,
+                read_only: false,
                 graph: false,
                 approve_plan: false,
                 json: true,
             }))
         );
+        assert!(parse(&args(&["run", "x", "--mode", "ask"])).is_err());
         assert_eq!(
             parse(&args(&["run", "--graph", "--", "--literal prompt"])),
             Ok(AgentCommand::Run(RunOptions {
