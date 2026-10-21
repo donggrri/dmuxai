@@ -163,7 +163,9 @@ clean exit. Read it instead of parsing logs.
 | GET | `/api/state` | — | `200` dashboard snapshot | 401, 403 |
 | GET | `/api/events` | `?since=N` | `200` SSE | 401, 403 |
 | GET | `/api/events/log` | `?since=N&limit=M` | `200` `{events, last_seq}` | 400, 401, 403 |
-| POST | `/api/prompt` | `{text, agent?, mode?}` | `202` `{accepted, conversation_id, agent}` | 400, 401, 403, 404, 409, 415, 504 (prompt not accepted within 10 s) |
+| POST | `/api/prompt` | `{text, agent?, mode?, attachments?}` | `202` `{accepted, conversation_id, agent}` | 400, 401, 403, 404, 409, 415, 504 (prompt not accepted within 10 s) |
+| POST | `/api/attachments` | raw image bytes (png, jpeg, gif or webp; ≤ 10 MiB) | `201` `{name, bytes, mime}` | 400, 401, 403, 409, 413, 415 |
+| GET | `/api/attachments/{name}` | — | `200` image bytes | 401, 403, 404 |
 | POST | `/api/command` | `{command, ...}` (see below) | `200` `{ok, session}` | 400, 401, 403, 404, 409, 415, 504 |
 | GET | `/api/todos` | — | `200` `[Todo]` | 401, 403, 503 |
 | POST | `/api/todos` | `{title, body?}` | `201` `Todo` | 400, 401, 403, 413, 415, 503 |
@@ -202,7 +204,13 @@ snapshots also carry `session` (conversation, per-agent pickers, transcript
 tail, recent conversations, slash commands).
 
 `POST /api/prompt` submits the text exactly like pressing Enter in the TUI
-(slash commands included). `GET /api/events/log` returns events with
+(slash commands included). `attachments` lists up to 10 names returned by
+`POST /api/attachments`; the images join the next turn like `/image` or a
+clipboard paste in the TUI (Cursor and AGY get `@<absolute path>` tokens, Codex
+an "Attached images" line). Uploads need `dmuxai --web` (`403` on a view-only
+`serve`); the type is checked by magic bytes, the server always picks the file
+name (`<workspace>/.dmuxai/attachments/web-<uuid>.<ext>`), and only names of that
+shape are served back. `GET /api/events/log` returns events with
 `seq > since` (default `0`), oldest first; `limit` is capped at `1000`.
 
 `GET /api/events` is a Server-Sent Events stream:

@@ -58,7 +58,8 @@ mod tests {
         );
         assert_eq!(
             resp_root.headers().get("content-security-policy").unwrap(),
-            "default-src 'self'"
+            // Only images may also come from blob: object URLs (chat attachments).
+            "default-src 'self'; img-src 'self' blob:"
         );
         assert_eq!(
             resp_root.headers().get("referrer-policy").unwrap(),

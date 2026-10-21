@@ -139,6 +139,7 @@ pub enum DashboardCommand {
         agent: Option<String>,
         mode: Option<String>,
         route: Option<String>,
+        images: Vec<std::path::PathBuf>,
         reply: oneshot::Sender<Result<PromptAccepted, RunTodoError>>,
     },
     Session {
