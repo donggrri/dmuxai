@@ -1489,8 +1489,25 @@ mod tests {
         assert!(checklist_js.contains("user_prompt"));
         assert!(checklist_js.contains("task-checklist-progress"));
         assert!(checklist_js.contains("agent.activity"));
+        assert!(checklist_js.contains("agentActivityForRunner(node.runner)"));
+        assert!(
+            !checklist_js.contains("if (status === 'running') {\n    var activity"),
+            "agent activity must not be gated on node running (UX-1310)"
+        );
         assert!(checklist_js.contains("\\u00b7 unknown"));
-        assert!(APP_CSS.contains(".task-checklist-row.task-checklist-row-expanded .task-checklist-prompt"));
+        assert!(
+            checklist_js.contains("checklistStatusFromNode(node)")
+                && checklist_js.contains("status: checklistStatusFromNode(node)"),
+            "single-node fallback task status must derive from node status"
+        );
+        assert!(
+            checklist_js.contains("\\u2014"),
+            "missing runner/model/elapsed must use em dash (UX-1310)"
+        );
+        assert!(
+            APP_CSS
+                .contains(".task-checklist-row.task-checklist-row-expanded .task-checklist-prompt")
+        );
         assert!(APP_JS.contains("if (taskChecklistSelectedId) { renderTaskChecklist(graph); }"));
     }
 

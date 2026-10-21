@@ -38,6 +38,10 @@ using the snapshot already on the page.
 No open questions. The prompt is `graph.user_prompt` (already truncated by the
 snapshot). A node id that is not in `graph.nodes` is shown as unknown.
 
+When `graph.tasks` is empty but the graph has exactly one node, the checklist
+synthesizes one task (`task-1`) from that node; its `status` is derived from the
+node via `checklistStatusFromNode` (same mapping as per-node checklist icons).
+
 ## 3. Terms and state model
 
 | Term | Meaning | Not to be confused with |

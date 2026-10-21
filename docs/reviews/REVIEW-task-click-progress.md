@@ -8,4 +8,7 @@ Spec: [SPEC-task-click-progress.md](../specs/SPEC-task-click-progress.md)
 
 Non-goals hold: no snapshot or API change, hover still shows only `done_check` and node ids, TUI unchanged.
 
+Known limitation: live `activity` is matched when `agent.id` equals the node
+`runner`, so parallel nodes on the same runner share one activity string.
+
 Residual risk: TC-1310 checks the bundled script and CSS, not a browser click. Elapsed time uses the existing `nodeElapsed` clock. `scripts/check-spec.ps1` was not run because PowerShell is not installed in this environment.

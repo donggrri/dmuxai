@@ -2533,18 +2533,16 @@ function agentActivityForRunner(runner) {
 
 function taskProgressLine(node, nowMs) {
   var status = graphNodeStatus(node);
-  var runner = runnerShortName(node.runner) || '\u2013';
-  var model = String(node.model_id || '\u2013');
+  var runner = runnerShortName(node.runner) || '\u2014';
+  var model = String(node.model_id || '\u2014');
   var ms = nodeElapsed(node, snapshot, nowMs);
-  var elapsed = ms === null ? '\u2013' : fmtElapsed(ms);
+  var elapsed = ms === null ? '\u2014' : fmtElapsed(ms);
   var job = String(node.job || '');
   if (job.length > 80) { job = job.slice(0, 79) + '\u2026'; }
   var line = String(node.id) + ' \u00b7 ' + status + ' \u00b7 ' + runner + ' ' + model + ' \u00b7 ' + elapsed;
   if (job) { line += ' \u00b7 ' + job; }
-  if (status === 'running') {
-    var activity = agentActivityForRunner(node.runner);
-    if (activity) { line += ' \u00b7 ' + activity; }
-  }
+  var activity = agentActivityForRunner(node.runner);
+  if (activity) { line += ' \u00b7 ' + activity; }
   return line;
 }
 
