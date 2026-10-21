@@ -191,3 +191,10 @@ button.chat-aux-head:focus-visible, .chat-aux-step-btn:focus-visible { outline: 
 .msg-copy.msg-copy-done { color: var(--ok); }
 .msg-copy-tip { font-size: .75rem; color: var(--muted); }
 .msg-pending { opacity: .75; }
+.session-transcript .msg-queued { opacity: .85; }
+.session-transcript .msg-user.msg-queued .msg-text { border-style: dashed; background: transparent; }
+.msg-queued-actions { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
+.msg-queued-actions .btn { padding: 0 .5rem; min-height: 1.5rem; font-size: .75rem; }
+.msg-queued-badge { display: inline-block; padding: 0 .45rem; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .7rem; font-weight: 600; text-transform: lowercase; }
+.msg-queued-editbox { display: flex; flex-direction: column; gap: 6px; width: min(80%, 40rem); }
+.msg-queued-edit { width: 100%; min-height: 60px; box-sizing: border-box; font: inherit; }

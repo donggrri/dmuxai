@@ -7,6 +7,12 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Added
 
+- **Follow-ups while a reply streams (SPEC-chat-followup-queue).** During a
+  run the dashboard composer says "Send follow-up" and shows a Stop button. A
+  prompt sent then is queued (marked `queued` in the chat) and starts on its
+  own, in order, when the run ends. Queued follow-ups can be edited or removed
+  (x) before they start, and Stop keeps the queue. View-only dashboards cannot
+  queue.
 - **Image attachments in the dashboard chat.** Paste an image (Ctrl/Cmd+V),
   drop it on the composer, or pick files with the paperclip button. Thumbnails
   (with a remove button) show before sending, and the sent message keeps them.

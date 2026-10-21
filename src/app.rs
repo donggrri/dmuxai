@@ -274,6 +274,37 @@ struct DashboardPrompt {
     ran: bool,
 }
 
+/// A dashboard follow-up sent while a run was active. It waits here (never in
+/// `messages`, so never in agent context) and starts in order once the run
+/// ends; until then it can be edited or removed from the dashboard.
+#[derive(Debug, Clone)]
+struct QueuedFollowup {
+    /// Its dashboard prompt id (`PromptAccepted::prompt_id`), kept on start.
+    id: u64,
+    conversation_id: String,
+    text: String,
+    agent: Option<String>,
+    mode: Option<String>,
+    route: Option<String>,
+    images: Vec<PathBuf>,
+}
+
+/// Cap on queued follow-ups.
+const FOLLOWUP_QUEUE_MAX: usize = 20;
+
+fn run_todo_error_text(error: &RunTodoError) -> String {
+    match error {
+        RunTodoError::Busy(message)
+        | RunTodoError::Forbidden(message)
+        | RunTodoError::UnknownAgent(message)
+        | RunTodoError::Missing(message)
+        | RunTodoError::Invalid(message)
+        | RunTodoError::Internal(message) => message.clone(),
+        RunTodoError::AlreadyRunning => "already running".to_owned(),
+        RunTodoError::NotFound => "not found".to_owned(),
+    }
+}
+
 /// Cap on dashboard prompt records kept for display.
 const DASHBOARD_PROMPTS_MAX: usize = 64;
 
@@ -1126,6 +1157,8 @@ pub struct App {
     dashboard_prompts: Vec<DashboardPrompt>,
     /// Last id handed to a dashboard prompt (`PromptAccepted::prompt_id`).
     dashboard_prompt_seq: u64,
+    /// See [`QueuedFollowup`].
+    followup_queue: VecDeque<QueuedFollowup>,
     #[allow(dead_code)]
     settings: DmuxSettings,
     input: String,
@@ -1378,6 +1411,7 @@ impl App {
             turn_user_message: HashMap::new(),
             dashboard_prompts: Vec::new(),
             dashboard_prompt_seq: 0,
+            followup_queue: VecDeque::new(),
             input: String::new(),
             messages: Vec::new(),
             adapters,
@@ -1588,7 +1622,7 @@ impl App {
         self.check_plan_timeout(Instant::now());
         self.check_replan_timeout(Instant::now());
         let flushed_internal = self.flush_deferred_internal_turns();
-        let flushed = self.flush_deferred_graph_starts();
+        let flushed = self.flush_deferred_graph_starts() | self.flush_followup_queue();
         let busy = !self.busy_agents.is_empty();
         if busy || flushed || flushed_internal {
             self.dirty = true;
@@ -1635,7 +1669,9 @@ impl App {
 
             let cmd_changed = self.drain_dashboard_commands();
             let drain = self.drain_agent_events();
-            dirty |= cmd_changed || drain.changed || self.dirty;
+            // Start the next queued dashboard follow-up as soon as a run ends.
+            let followup_started = self.flush_followup_queue();
+            dirty |= cmd_changed || drain.changed || followup_started || self.dirty;
             self.dirty = false;
 
             // FR-530: publish on completed turns immediately, coalesce other
@@ -1747,10 +1783,18 @@ impl App {
                         mode,
                         route,
                         images,
+                        allow_queue,
                         reply,
                     } => {
-                        let result =
-                            self.handle_dashboard_submit_prompt(text, agent, mode, route, images);
+                        let result = self.submit_dashboard_prompt(
+                            text,
+                            agent,
+                            mode,
+                            route,
+                            images,
+                            allow_queue,
+                            None,
+                        );
                         let _ = reply.send(result);
                         changed = true;
                     }
@@ -1812,6 +1856,7 @@ impl App {
         self.publish_dashboard();
     }
 
+    #[cfg(test)]
     fn handle_dashboard_submit_prompt(
         &mut self,
         text: String,
@@ -1820,6 +1865,23 @@ impl App {
         route: Option<String>,
         images: Vec<std::path::PathBuf>,
     ) -> Result<PromptAccepted, RunTodoError> {
+        self.submit_dashboard_prompt(text, agent, mode, route, images, true, None)
+    }
+
+    /// `allow_queue`: a follow-up sent while a run is active is queued
+    /// instead of refused (writable dashboards only). `queued_id`: the prompt
+    /// id of a queued follow-up that is starting now.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_dashboard_prompt(
+        &mut self,
+        text: String,
+        agent: Option<String>,
+        mode: Option<String>,
+        route: Option<String>,
+        images: Vec<std::path::PathBuf>,
+        allow_queue: bool,
+        queued_id: Option<u64>,
+    ) -> Result<PromptAccepted, RunTodoError> {
         if self.switch_pending.is_some() {
             return Err(RunTodoError::Busy(
                 "workspace switch in progress".to_owned(),
@@ -1827,6 +1889,7 @@ impl App {
         }
         let display_text = text.clone();
         let display_is_slash = display_text.starts_with('/') && !display_text.starts_with("//");
+        let raw_route = route.clone();
         let text = Self::preprocess_dashboard_prompt_text(&text, route.as_deref())?;
         if self.plan_gate_blocks_send() && Self::prompt_blocked_by_plan_gate(&text) {
             return Err(RunTodoError::Busy(PLAN_AWAITING_APPROVAL_MSG.to_owned()));
@@ -1860,10 +1923,27 @@ impl App {
             }
         }
 
+        // A follow-up sent while a run is active waits in the queue and starts
+        // on its own once the run ends (see `flush_followup_queue`).
+        if allow_queue && queued_id.is_none() && !display_is_slash && self.followup_should_queue() {
+            if let Some(mode_str) = mode.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                crate::agent::turn_policy_from_legacy_mode(mode_str)
+                    .map_err(RunTodoError::Invalid)?;
+            }
+            if let Some(missing) = images.iter().find(|path| !path.is_file()) {
+                return Err(RunTodoError::Invalid(format!(
+                    "Could not attach image: image file not found: {}",
+                    missing.display()
+                )));
+            }
+            return self.queue_followup(display_text, agent, mode, raw_route, images, runner_id);
+        }
+
         // Slash commands (except the `//` escape) are allowed while the agent
         // works, exactly like typing them in the TUI (SPEC-dashboard-parity FR-783).
-        let is_slash = text.starts_with('/') && !text.starts_with("//");
-        if !is_slash && self.busy_agents.contains(&target_agent) {
+        // The typed text decides: a route turns a prompt into `/plan …` or
+        // `/direct …`, which is still a prompt and still waits for the agent.
+        if !display_is_slash && self.busy_agents.contains(&target_agent) {
             return Err(RunTodoError::Busy(format!("agent '{runner_id}' is busy")));
         }
 
@@ -1910,14 +1990,141 @@ impl App {
         let (prompt_id, message_id) = if display_is_slash {
             (None, None)
         } else {
-            self.record_dashboard_prompt(messages_before, display_text, image_names)
+            self.record_dashboard_prompt(messages_before, display_text, image_names, queued_id)
         };
         Ok(PromptAccepted {
             conversation_id: self.conversation_id.as_str().to_owned(),
             agent: runner_id.to_owned(),
             prompt_id,
             message_id,
+            queued: false,
         })
+    }
+
+    /// A run or turn is active, so a new dashboard prompt would be refused
+    /// as busy. A plan waiting for approval is not active (its gate decides).
+    fn followup_run_active(&self) -> bool {
+        !self.busy_agents.is_empty()
+            || !self.active_turns.is_empty()
+            || self.pending_triage.is_some()
+            || self.pending_plan.is_some()
+            || self.pending_summary.is_some()
+            || self.graph_session.is_some()
+            || !self.deferred_turns.is_empty()
+    }
+
+    /// Queue a new follow-up when a run is active, or when earlier follow-ups
+    /// of this conversation still wait (keeps their order).
+    fn followup_should_queue(&self) -> bool {
+        self.followup_run_active()
+            || self
+                .followup_queue
+                .iter()
+                .any(|item| item.conversation_id == self.conversation_id.as_str())
+    }
+
+    fn queue_followup(
+        &mut self,
+        text: String,
+        agent: Option<String>,
+        mode: Option<String>,
+        route: Option<String>,
+        images: Vec<std::path::PathBuf>,
+        runner_id: &str,
+    ) -> Result<PromptAccepted, RunTodoError> {
+        if self.followup_queue.len() >= FOLLOWUP_QUEUE_MAX {
+            return Err(RunTodoError::Busy(format!(
+                "{FOLLOWUP_QUEUE_MAX} follow-ups are already queued"
+            )));
+        }
+        self.dashboard_prompt_seq += 1;
+        let id = self.dashboard_prompt_seq;
+        let conversation_id = self.conversation_id.as_str().to_owned();
+        self.followup_queue.push_back(QueuedFollowup {
+            id,
+            conversation_id: conversation_id.clone(),
+            text,
+            agent,
+            mode,
+            route,
+            images,
+        });
+        self.dirty = true;
+        Ok(PromptAccepted {
+            conversation_id,
+            agent: runner_id.to_owned(),
+            prompt_id: Some(id),
+            message_id: None,
+            queued: true,
+        })
+    }
+
+    /// Starts the oldest queued follow-up of the current conversation once
+    /// nothing is running. Stop/cancel of a run does not clear the queue: the
+    /// next follow-up starts after the cancelled run ends, unless the user
+    /// removed it (the user already said what to do next by queueing it).
+    fn flush_followup_queue(&mut self) -> bool {
+        if self.followup_queue.is_empty()
+            || self.switch_pending.is_some()
+            || self.followup_run_active()
+            || self
+                .last_graph_run
+                .as_ref()
+                .is_some_and(|run| run.phase == GraphRunPhase::AwaitingApproval)
+        {
+            return false;
+        }
+        let Some(pos) = self
+            .followup_queue
+            .iter()
+            .position(|item| item.conversation_id == self.conversation_id.as_str())
+        else {
+            return false;
+        };
+        let item = self.followup_queue.remove(pos).expect("position is valid");
+        if let Err(error) = self.submit_dashboard_prompt(
+            item.text,
+            item.agent,
+            item.mode,
+            item.route,
+            item.images,
+            false,
+            Some(item.id),
+        ) {
+            self.push_system(format!(
+                "Queued follow-up could not start: {}",
+                run_todo_error_text(&error)
+            ));
+        }
+        self.dirty = true;
+        true
+    }
+
+    fn edit_queued_followup(&mut self, id: u64, text: Option<String>) -> Result<(), RunTodoError> {
+        let Some(pos) = self.followup_queue.iter().position(|item| item.id == id) else {
+            return Err(RunTodoError::Missing(
+                "that follow-up already started or was removed".to_owned(),
+            ));
+        };
+        match text {
+            None => {
+                self.followup_queue.remove(pos);
+            }
+            Some(text) => {
+                let text = text.trim().to_owned();
+                if text.is_empty() {
+                    return Err(RunTodoError::Invalid("text is required".to_owned()));
+                }
+                if text.starts_with('/') && !text.starts_with("//") {
+                    return Err(RunTodoError::Invalid(
+                        "a queued follow-up cannot become a slash command".to_owned(),
+                    ));
+                }
+                self.followup_queue[pos].text = text;
+            }
+        }
+        self.dirty = true;
+        Ok(())
     }
 
     /// After a dashboard prompt was submitted: hand it an id and either point
@@ -1929,9 +2136,12 @@ impl App {
         messages_before: usize,
         text: String,
         images: Vec<String>,
+        queued_id: Option<u64>,
     ) -> (Option<u64>, Option<String>) {
-        self.dashboard_prompt_seq += 1;
-        let id = self.dashboard_prompt_seq;
+        let id = queued_id.unwrap_or_else(|| {
+            self.dashboard_prompt_seq += 1;
+            self.dashboard_prompt_seq
+        });
         let conversation_id = self.conversation_id.as_str().to_owned();
         let posted = self
             .messages
@@ -2122,6 +2332,7 @@ impl App {
             streaming: false,
             images: prompt.images,
             prompt_id: Some(prompt.id),
+            queued: false,
         };
         let streaming: HashSet<usize> = self.streaming_messages.values().copied().collect();
         let start = self
@@ -2179,9 +2390,32 @@ impl App {
                 streaming: streaming.contains(&index),
                 images,
                 prompt_id: None,
+                queued: false,
             });
         }
         messages.extend(shown_prompts.into_iter().map(prompt_message));
+        // Queued follow-ups come last, in order (never part of `messages`).
+        for item in self
+            .followup_queue
+            .iter()
+            .filter(|item| item.conversation_id == conversation_id)
+        {
+            messages.push(SessionMessage {
+                id: format!("{conversation_id}:queued-{}", item.id),
+                role: "user".to_owned(),
+                agent: None,
+                content: item.text.clone(),
+                content_html: None,
+                streaming: false,
+                images: item
+                    .images
+                    .iter()
+                    .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+                    .collect(),
+                prompt_id: Some(item.id),
+                queued: true,
+            });
+        }
         if self.chat_markdown_cache.len() > 256 {
             let live: HashSet<String> = messages.iter().map(|m| m.id.clone()).collect();
             self.chat_markdown_cache.retain(|id, _| live.contains(id));
@@ -2251,6 +2485,7 @@ impl App {
             transcript,
             transcript_omitted: start + omitted,
             prompt_seq: self.dashboard_prompt_seq,
+            run_active: self.followup_run_active(),
             workspaces: {
                 let mut groups = Vec::with_capacity(self.session_workspaces.len() + 1);
                 let key = self.engine.workspace_key().to_owned();
@@ -2516,6 +2751,8 @@ impl App {
                     catalog.selected_effort = Some(effort);
                 }
             }
+            SessionCommand::QueueRemove { id } => self.edit_queued_followup(id, None)?,
+            SessionCommand::QueueEdit { id, text } => self.edit_queued_followup(id, Some(text))?,
             SessionCommand::Cancel { agent } => {
                 let target = self.resolve_dashboard_agent(agent.as_deref())?;
                 let previous = self.selected;
@@ -21111,6 +21348,7 @@ mod tests {
             mode: Some("ask".to_string()),
             route: None,
             images: Vec::new(),
+            allow_queue: true,
             reply,
         })
         .await
@@ -21161,6 +21399,7 @@ mod tests {
             mode: None,
             route: None,
             images: vec![path.clone()],
+            allow_queue: true,
             reply,
         })
         .await
@@ -21277,6 +21516,7 @@ mod tests {
             mode: None,
             route: None,
             images: vec![missing],
+            allow_queue: true,
             reply,
         })
         .await
@@ -21537,6 +21777,7 @@ mod tests {
             mode: None,
             route: None,
             images: Vec::new(),
+            allow_queue: true,
             reply,
         })
         .await
@@ -21944,6 +22185,7 @@ mod tests {
                 mode: None,
                 route: None,
                 images: Vec::new(),
+                allow_queue: true,
                 reply,
             })
             .await
@@ -21955,22 +22197,31 @@ mod tests {
         assert!(sent.lock().unwrap().is_empty());
         assert!(app.messages.iter().any(|m| m.role == Role::System));
 
-        let (reply, reply_rx) = tokio::sync::oneshot::channel();
-        tx.send(DashboardCommand::SubmitPrompt {
-            text: "plain text".to_owned(),
-            agent: Some("codex".to_owned()),
-            mode: None,
-            route: None,
-            images: Vec::new(),
-            reply,
-        })
-        .await
-        .unwrap();
-        app.drain_dashboard_commands();
-        assert!(matches!(
-            reply_rx.await.unwrap(),
-            Err(RunTodoError::Busy(_))
-        ));
+        // Plain text while the agent works: refused as busy when the
+        // dashboard may not queue, queued as a follow-up when it may.
+        for allow_queue in [false, true] {
+            let (reply, reply_rx) = tokio::sync::oneshot::channel();
+            tx.send(DashboardCommand::SubmitPrompt {
+                text: "plain text".to_owned(),
+                agent: Some("codex".to_owned()),
+                mode: None,
+                route: None,
+                images: Vec::new(),
+                allow_queue,
+                reply,
+            })
+            .await
+            .unwrap();
+            app.drain_dashboard_commands();
+            let result = reply_rx.await.unwrap();
+            if allow_queue {
+                assert!(result.expect("queued").queued);
+            } else {
+                assert!(matches!(result, Err(RunTodoError::Busy(_))), "{result:?}");
+            }
+        }
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(app.followup_queue.len(), 1);
     }
 
     // TC-787 (FR-784): every TUI slash command has a dashboard control.
@@ -26097,6 +26348,214 @@ mod tests {
         let lines = session_user_lines(&mut h.app);
         assert!(lines.is_empty(), "no ghost prompt: {lines:?}");
         assert_eq!(h.app.session_view().prompt_seq, accepted.prompt_id.unwrap());
+    }
+
+    fn submit_followup(app: &mut App, text: &str) -> PromptAccepted {
+        app.handle_dashboard_submit_prompt(
+            text.to_owned(),
+            Some("codex".to_owned()),
+            None,
+            Some("direct".to_owned()),
+            Vec::new(),
+        )
+        .expect("accepted")
+    }
+
+    /// Completes the newest sent turn, then runs the queue flush `tick` does.
+    fn finish_last_turn(h: &mut PlanGateHarness) {
+        let (agent, request) = h.sent.lock().unwrap().last().unwrap().clone();
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request, AgentEvent::Completed))
+        );
+        h.app.flush_followup_queue();
+    }
+
+    fn queued_lines(app: &mut App) -> Vec<(String, Option<u64>)> {
+        app.session_view()
+            .transcript
+            .into_iter()
+            .filter(|message| message.queued)
+            .map(|message| (message.content, message.prompt_id))
+            .collect()
+    }
+
+    fn sent_prompts(h: &PlanGateHarness) -> Vec<String> {
+        h.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, request)| request.prompt.clone())
+            .collect()
+    }
+
+    // Follow-ups sent while a reply streams are queued (not refused as busy),
+    // shown as queued user messages, kept out of the agent context, and run
+    // one by one in the order they were sent.
+    #[test]
+    fn followup_during_run_is_queued_and_runs_in_order() {
+        let mut h = plan_gate_test_app();
+        let first = submit_followup(&mut h.app, "first task");
+        assert!(!first.queued);
+        assert!(h.app.session_view().run_active);
+        let second = submit_followup(&mut h.app, "second task");
+        let third = submit_followup(&mut h.app, "third task");
+        assert!(second.queued && third.queued);
+        assert_eq!(second.message_id, None);
+        let (second_id, third_id) = (second.prompt_id.unwrap(), third.prompt_id.unwrap());
+        assert!(second_id < third_id);
+        assert_eq!(h.app.session_view().prompt_seq, third_id);
+        assert_eq!(
+            queued_lines(&mut h.app),
+            vec![
+                ("second task".to_owned(), Some(second_id)),
+                ("third task".to_owned(), Some(third_id)),
+            ]
+        );
+        // Nothing queued reached the agent or the conversation.
+        assert_eq!(h.sent.lock().unwrap().len(), 1);
+        assert!(
+            !h.app
+                .messages
+                .iter()
+                .any(|m| m.content.contains("second task") || m.content.contains("third task"))
+        );
+
+        finish_last_turn(&mut h);
+        let prompts = sent_prompts(&h);
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("second task"), "{prompts:?}");
+        assert!(!prompts[1].contains("third task"), "{prompts:?}");
+        assert_eq!(
+            queued_lines(&mut h.app),
+            vec![("third task".to_owned(), Some(third_id))]
+        );
+        let users = session_user_lines(&mut h.app);
+        assert_eq!(
+            users.iter().filter(|(c, _)| c == "second task").count(),
+            1,
+            "{users:?}"
+        );
+
+        finish_last_turn(&mut h);
+        let prompts = sent_prompts(&h);
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts[2].contains("third task"), "{prompts:?}");
+        assert!(queued_lines(&mut h.app).is_empty());
+        finish_last_turn(&mut h);
+        assert_eq!(sent_prompts(&h).len(), 3);
+        assert!(!h.app.session_view().run_active);
+    }
+
+    #[test]
+    fn queued_followup_can_be_removed_or_edited_before_it_starts() {
+        let mut h = plan_gate_test_app();
+        submit_followup(&mut h.app, "first task");
+        let drop_me = submit_followup(&mut h.app, "drop me").prompt_id.unwrap();
+        let edit_me = submit_followup(&mut h.app, "edit me").prompt_id.unwrap();
+
+        h.app
+            .handle_session_command(SessionCommand::QueueRemove { id: drop_me })
+            .expect("removed");
+        h.app
+            .handle_session_command(SessionCommand::QueueEdit {
+                id: edit_me,
+                text: "  edited task  ".to_owned(),
+            })
+            .expect("edited");
+        assert_eq!(
+            queued_lines(&mut h.app),
+            vec![("edited task".to_owned(), Some(edit_me))]
+        );
+        assert!(
+            h.app
+                .handle_session_command(SessionCommand::QueueEdit {
+                    id: edit_me,
+                    text: "   ".to_owned(),
+                })
+                .is_err()
+        );
+        assert!(
+            h.app
+                .handle_session_command(SessionCommand::QueueRemove { id: drop_me })
+                .is_err(),
+            "already removed"
+        );
+
+        finish_last_turn(&mut h);
+        let prompts = sent_prompts(&h);
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("edited task"), "{prompts:?}");
+        assert!(prompts.iter().all(|p| !p.contains("drop me")));
+        // A started follow-up can no longer be edited.
+        assert!(
+            h.app
+                .handle_session_command(SessionCommand::QueueEdit {
+                    id: edit_me,
+                    text: "late".to_owned(),
+                })
+                .is_err()
+        );
+    }
+
+    // Documented choice: Stop/cancel keeps the queue; the next follow-up
+    // starts once the cancelled run has ended.
+    #[test]
+    fn stop_keeps_the_followup_queue() {
+        let mut h = plan_gate_test_app();
+        submit_followup(&mut h.app, "first task");
+        let next = submit_followup(&mut h.app, "next task").prompt_id.unwrap();
+        h.app
+            .handle_session_command(SessionCommand::Cancel {
+                agent: Some("codex".to_owned()),
+            })
+            .expect("cancel");
+        assert_eq!(
+            queued_lines(&mut h.app),
+            vec![("next task".to_owned(), Some(next))]
+        );
+        let (agent, request) = h.sent.lock().unwrap().last().unwrap().clone();
+        let _ = h
+            .app
+            .apply_agent_output(triage_output(agent, &request, AgentEvent::Cancelled));
+        h.app.flush_followup_queue();
+        let prompts = sent_prompts(&h);
+        assert_eq!(prompts.len(), 2, "{prompts:?}");
+        assert!(prompts[1].contains("next task"));
+        assert!(queued_lines(&mut h.app).is_empty());
+    }
+
+    // A read-only dashboard cannot queue: the prompt is refused as busy.
+    #[test]
+    fn followup_without_queue_permission_is_refused_as_busy() {
+        let mut h = plan_gate_test_app();
+        submit_followup(&mut h.app, "first task");
+        let refused = h.app.submit_dashboard_prompt(
+            "second task".to_owned(),
+            Some("codex".to_owned()),
+            None,
+            Some("direct".to_owned()),
+            Vec::new(),
+            false,
+            None,
+        );
+        assert!(matches!(refused, Err(RunTodoError::Busy(_))), "{refused:?}");
+        assert!(queued_lines(&mut h.app).is_empty());
+    }
+
+    // Queued follow-ups belong to their conversation; a new conversation
+    // does not run them.
+    #[test]
+    fn queued_followup_stays_with_its_conversation() {
+        let mut h = plan_gate_test_app();
+        submit_followup(&mut h.app, "first task");
+        submit_followup(&mut h.app, "later task");
+        let other = h.app.followup_queue[0].conversation_id.clone();
+        h.app.followup_queue[0].conversation_id = format!("{other}-elsewhere");
+        finish_last_turn(&mut h);
+        assert_eq!(sent_prompts(&h).len(), 1);
+        assert!(queued_lines(&mut h.app).is_empty());
+        assert_eq!(h.app.followup_queue.len(), 1);
     }
 
     fn start_approved_three_step_run(h: &mut PlanGateHarness) -> String {
