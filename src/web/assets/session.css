@@ -150,3 +150,17 @@ button.chat-aux-head:focus-visible, .chat-aux-step-btn:focus-visible { outline: 
 .chat-aux-open-run:disabled, .chat-aux-step-btn:disabled { color: var(--faint); cursor: not-allowed; text-decoration: none; }
 @media (prefers-reduced-motion: reduce) { .chat-aux-caret { transition: none; } }
 
+/* Image attachments in composer and transcript */
+.session-attach-tray { display: flex; flex-wrap: wrap; gap: .5rem; width: 100%; }
+.session-attach-tray[hidden] { display: none; }
+.session-attach-item { position: relative; }
+.session-attach-thumb { width: 64px; height: 64px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); display: block; }
+.session-attach-item.is-uploading .session-attach-thumb { opacity: .5; }
+.session-attach-item.is-error .session-attach-thumb { border-color: var(--err); }
+.session-attach-remove { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%; background: var(--bg-panel); border: 1px solid var(--line); color: var(--text); font-size: 12px; line-height: 1; padding: 0; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.session-prompt.is-dragover { outline: 2px dashed var(--accent); }
+.session-send-left { display: flex; align-items: center; gap: .35rem; min-width: 0; }
+.session-attach { width: 2rem; height: 2rem; background: transparent; border: 1px solid transparent; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 8px; cursor: pointer; color: var(--text); }
+.session-attach:hover:not(:disabled) { background: var(--bg-badge); }
+.msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.msg-image { max-width: 220px; max-height: 160px; border-radius: 8px; border: 1px solid var(--line); cursor: zoom-in; }

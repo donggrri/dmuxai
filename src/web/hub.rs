@@ -229,6 +229,7 @@ impl DashboardHub {
                 content: notice,
                 content_html: None,
                 streaming: false,
+                images: Vec::new(),
             });
         state.snapshot.revision += 1;
         state.snapshot.generated_at_ms = std::time::SystemTime::now()

@@ -46,6 +46,14 @@
   var viewOnly = false;
   var pending = null;
   var conversationShown = null;
+  // Web image attachments (paste, drop, paperclip) waiting for the next prompt.
+  var pendingAttachments = [];
+  var ATTACH_ALLOWED = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+  var ATTACH_MAX_BYTES = 10 * 1024 * 1024;
+  var ATTACH_MAX_COUNT = 10;
+  // Object URLs of sent images by attachment name, so re-renders do not refetch.
+  var imageUrlCache = {};
+  var attachIdCounter = 0;
   var messageNodes = {};
   var stickToBottom = true;
   // Last full dashboard snapshot (graph, agents) for the inline activity rows.
@@ -192,10 +200,11 @@
     });
   }
 
-  function sendPrompt(text) {
+  function sendPrompt(text, names) {
     if (viewOnly || !text.trim()) { return Promise.resolve(false); }
     notify('');
     var body = { text: text };
+    if (names && names.length) { body.attachments = names; }
     if (session && session.selected_agent) { body.agent = session.selected_agent; }
     if (ui.route && ui.route.value && ui.route.value !== 'auto') {
       body.route = ui.route.value;
@@ -206,6 +215,97 @@
     }).catch(function (err) {
       notify(err.message, true);
       return false;
+    });
+  }
+
+  function nextAttachId() { attachIdCounter += 1; return 'attach-' + attachIdCounter; }
+
+  function revokeAttachmentUrls(items) {
+    (items || []).forEach(function (item) {
+      if (item && item.previewUrl) {
+        try { URL.revokeObjectURL(item.previewUrl); } catch (err) { /* ignore */ }
+      }
+    });
+  }
+
+  function renderAttachTray() {
+    if (!ui.attachTray) { return; }
+    ui.attachTray.textContent = '';
+    if (!pendingAttachments.length) { ui.attachTray.hidden = true; return; }
+    ui.attachTray.hidden = false;
+    pendingAttachments.forEach(function (item, index) {
+      var div = el('div', 'session-attach-item');
+      if (item.status === 'uploading') { div.classList.add('is-uploading'); }
+      if (item.status === 'error') { div.classList.add('is-error'); }
+      var img = el('img', 'session-attach-thumb');
+      img.src = item.previewUrl;
+      img.alt = 'Attached image ' + (index + 1);
+      div.appendChild(img);
+      var removeBtn = button('\u00D7', null, function () {
+        removeAttachment(item.id);
+      }, 'session-attach-remove');
+      removeBtn.textContent = '\u00D7';
+      removeBtn.setAttribute('aria-label', 'Remove image ' + (index + 1));
+      div.appendChild(removeBtn);
+      ui.attachTray.appendChild(div);
+    });
+  }
+
+  function removeAttachment(id) {
+    var idx = -1;
+    for (var i = 0; i < pendingAttachments.length; i++) {
+      if (pendingAttachments[i].id === id) { idx = i; break; }
+    }
+    if (idx < 0) { return; }
+    var item = pendingAttachments.splice(idx, 1)[0];
+    if (item && item.previewUrl) {
+      try { URL.revokeObjectURL(item.previewUrl); } catch (err) { /* ignore */ }
+    }
+    renderAttachTray();
+  }
+
+  function uploadAttachment(item) {
+    fetch('/api/attachments', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': item.file.type },
+      cache: 'no-store',
+      body: item.file
+    }).then(function (resp) {
+      return resp.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (err) { data = null; }
+        if (!resp.ok) {
+          var message = (data && data.error) ? data.error : ('HTTP ' + resp.status);
+          throw new Error(message);
+        }
+        return data;
+      });
+    }).then(function (data) {
+      if (data && data.name) { item.name = data.name; }
+      item.status = 'ready';
+      item.error = null;
+      renderAttachTray();
+    }).catch(function (err) {
+      item.status = 'error';
+      item.error = err && err.message ? err.message : String(err);
+      notify(item.error, true);
+      renderAttachTray();
+    });
+  }
+
+  function addFiles(fileList) {
+    if (viewOnly) { return; }
+    var files = [];
+    try { files = Array.prototype.slice.call(fileList || []); } catch (err) { files = []; }
+    files.forEach(function (file) {
+      if (!file) { return; }
+      if (ATTACH_ALLOWED.indexOf(file.type) < 0) { notify('Unsupported image type', true); return; }
+      if (file.size > ATTACH_MAX_BYTES) { notify('Image too large', true); return; }
+      if (pendingAttachments.length + 1 > ATTACH_MAX_COUNT) { notify('Too many images', true); return; }
+      var item = { id: nextAttachId(), file: file, previewUrl: URL.createObjectURL(file), name: null, status: 'uploading', error: null };
+      pendingAttachments.push(item);
+      renderAttachTray();
+      uploadAttachment(item);
     });
   }
 
@@ -318,6 +418,30 @@
     root.appendChild(ui.notice);
 
     var form = el('div', 'session-prompt');
+    ui.attachTray = el('div', 'session-attach-tray');
+    ui.attachTray.hidden = true;
+    form.appendChild(ui.attachTray);
+
+    ui.attachBtn = button('', 'prompt-attach', function () {
+      if (ui.attachInput) { ui.attachInput.click(); }
+    }, 'btn session-attach');
+    ui.attachBtn.textContent = '\uD83D\uDCCE';
+    ui.attachBtn.setAttribute('aria-label', 'Attach images');
+    ui.attachBtn.setAttribute('title', 'Attach images');
+
+    ui.attachInput = el('input');
+    ui.attachInput.type = 'file';
+    ui.attachInput.accept = 'image/png,image/jpeg,image/gif,image/webp';
+    ui.attachInput.multiple = true;
+    ui.attachInput.hidden = true;
+    ui.attachInput.addEventListener('change', function () {
+      if (ui.attachInput.files && ui.attachInput.files.length) {
+        addFiles(ui.attachInput.files);
+      }
+      ui.attachInput.value = '';
+    });
+    form.appendChild(ui.attachInput);
+
     var composerTop = el('div', 'session-composer-top');
     ui.agentPicker = el('button', 'session-agent-picker');
     ui.agentPicker.type = 'button';
@@ -343,15 +467,49 @@
       }
       autoGrowInput();
     });
+    ui.input.addEventListener('paste', function (e) {
+      if (!e || !e.clipboardData || !e.clipboardData.items) { return; }
+      var files = [];
+      Array.prototype.forEach.call(e.clipboardData.items, function (item) {
+        if (item && item.kind === 'file') {
+          var f = item.getAsFile ? item.getAsFile() : null;
+          if (f && ATTACH_ALLOWED.indexOf(f.type) >= 0) { files.push(f); }
+        }
+      });
+      if (files.length) {
+        e.preventDefault();
+        addFiles(files);
+      }
+    });
+
     composerTop.appendChild(ui.input);
     form.appendChild(composerTop);
     var sendCol = el('div', 'session-send-col');
+    // ChatGPT-style footer: paperclip and route on the left, Send on the right.
+    var sendLeft = el('div', 'session-send-left');
+    sendLeft.appendChild(ui.attachBtn);
     ui.route = picker('Route', 'route', function () { /* value read on send */ });
     setOptions(ui.route, PROMPT_ROUTES, 'auto');
-    sendCol.appendChild(ui.route.parentNode);
+    sendLeft.appendChild(ui.route.parentNode);
+    sendCol.appendChild(sendLeft);
     ui.send = button('Send', 'prompt-send', submitPrompt, 'btn-primary');
     sendCol.appendChild(ui.send);
     form.appendChild(sendCol);
+
+    form.addEventListener('dragover', function (e) {
+      if (e) { e.preventDefault(); }
+      form.classList.add('is-dragover');
+    });
+    form.addEventListener('dragleave', function (e) {
+      form.classList.remove('is-dragover');
+    });
+    form.addEventListener('drop', function (e) {
+      if (e) { e.preventDefault(); }
+      form.classList.remove('is-dragover');
+      if (e && e.dataTransfer && e.dataTransfer.files) {
+        addFiles(e.dataTransfer.files);
+      }
+    });
 
     root.appendChild(form);
     var parityModel = el('span', 'session-parity-anchor');
@@ -1118,12 +1276,23 @@
   function submitPrompt() {
     var text = ui.input.value;
     if (!text.trim()) { return; }
+    var uploading = pendingAttachments.some(function (item) { return item.status === 'uploading'; });
+    if (uploading) {
+      notify('Images are still uploading\u2026', true);
+      return;
+    }
+    var readyNames = pendingAttachments
+      .filter(function (item) { return item.status === 'ready' && item.name; })
+      .map(function (item) { return item.name; });
     ui.send.disabled = true;
-    sendPrompt(text).then(function (ok) {
+    sendPrompt(text, readyNames).then(function (ok) {
       ui.send.disabled = viewOnly;
       if (ok) {
         ui.input.value = '';
         autoGrowInput();
+        revokeAttachmentUrls(pendingAttachments);
+        pendingAttachments = [];
+        renderAttachTray();
         // UX-1203: your own message always brings the view to the latest turn.
         stickToBottom = true;
         scrollTranscriptToEnd();
@@ -1152,6 +1321,8 @@
     [ui.newConv, ui.status, ui.details, ui.share, ui.palette, ui.quit, ui.send].forEach(function (b) {
       b.disabled = viewOnly;
     });
+    if (ui.attachBtn) { ui.attachBtn.disabled = viewOnly; }
+    if (ui.attachInput) { ui.attachInput.disabled = viewOnly; }
     if (ui.route) { ui.route.disabled = viewOnly; }
     ui.input.disabled = viewOnly;
     renderTranscript();
@@ -1194,6 +1365,47 @@
       if (color) { node.style.setProperty('--agent-color', color); } else { node.style.removeProperty('--agent-color'); }
       renderMessageText(node.dmuxText, m);
       node.classList.toggle('msg-streaming', !!m.streaming);
+      var imageKey = (m.images && m.images.length) ? m.images.join(',') : '';
+      if (node.dmuxImagesKey !== imageKey) {
+        var oldImages = node.querySelector ? node.querySelector('.msg-images') : null;
+        if (oldImages && oldImages.parentNode) { oldImages.parentNode.removeChild(oldImages); }
+        node.dmuxImagesKey = imageKey;
+        if (imageKey) {
+          var imgWrap = el('div', 'msg-images');
+          m.images.forEach(function (name) {
+            var img = el('img', 'msg-image');
+            img.alt = 'Attached image';
+            if (imageUrlCache[name]) {
+              img.src = imageUrlCache[name];
+            } else {
+              fetch('/api/attachments/' + encodeURIComponent(name), {
+                headers: { Authorization: 'Bearer ' + token }
+              }).then(function (resp) {
+                if (!resp.ok) { throw new Error('HTTP ' + resp.status); }
+                return resp.blob();
+              }).then(function (blob) {
+                var url = URL.createObjectURL(blob);
+                imageUrlCache[name] = url;
+                img.src = url;
+              }).catch(function () { /* leave unloaded */ });
+            }
+            img.addEventListener('click', function () {
+              var url = imageUrlCache[name];
+              if (url) { window.open(url, '_blank'); }
+            });
+            imgWrap.appendChild(img);
+          });
+          if (node.dmuxText && node.dmuxText.parentNode === node) {
+            if (node.dmuxText.nextSibling) {
+              node.insertBefore(imgWrap, node.dmuxText.nextSibling);
+            } else {
+              node.appendChild(imgWrap);
+            }
+          } else {
+            node.appendChild(imgWrap);
+          }
+        }
+      }
       previous = node;
     });
     Object.keys(messageNodes).forEach(function (id) {

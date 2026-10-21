@@ -355,6 +355,11 @@ where
     }
 }
 
+/// The page CSP. `img-src blob:` lets the chat show image attachments from
+/// object URLs (fetched with the Bearer token, so no token ever sits in an
+/// image URL); everything else stays `'self'`.
+pub(crate) const INDEX_CSP: &str = "default-src 'self'; img-src 'self' blob:";
+
 async fn get_index() -> impl IntoResponse {
     (
         [
@@ -362,7 +367,7 @@ async fn get_index() -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-store"),
             (
                 HeaderName::from_static("content-security-policy"),
-                "default-src 'self'",
+                INDEX_CSP,
             ),
             (HeaderName::from_static("referrer-policy"), "no-referrer"),
             (HeaderName::from_static("x-content-type-options"), "nosniff"),
@@ -926,6 +931,8 @@ struct PromptBody {
     agent: Option<String>,
     mode: Option<String>,
     route: Option<String>,
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 fn session_command_needs_web_write(command: &SessionCommand) -> bool {
@@ -969,6 +976,26 @@ async fn post_prompt(
         }
     }
 
+    if body.attachments.len() > crate::web::attachments_api::MAX_PROMPT_ATTACHMENTS {
+        return error_json(StatusCode::BAD_REQUEST, "too many attachments");
+    }
+    if !body.attachments.is_empty() && !state.services.web_attached {
+        return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
+    }
+    let mut resolved_images: Vec<std::path::PathBuf> = Vec::new();
+    if !body.attachments.is_empty() {
+        let workspace = state.hub.snapshot().workspace;
+        for name in &body.attachments {
+            match crate::web::attachments_api::resolve_attachment(
+                std::path::Path::new(&workspace),
+                name,
+            ) {
+                Some(path) => resolved_images.push(path),
+                None => return error_json(StatusCode::BAD_REQUEST, "unknown attachment"),
+            }
+        }
+    }
+
     let Some(sender) = state.services.commands.clone() else {
         return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
     };
@@ -980,6 +1007,7 @@ async fn post_prompt(
             agent: body.agent,
             mode: body.mode,
             route: body.route,
+            images: resolved_images,
             reply,
         })
         .await
@@ -1003,6 +1031,69 @@ async fn post_prompt(
             "agent": result.agent,
         }),
     )
+}
+
+async fn post_attachment(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
+    if !state.services.web_attached {
+        return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
+    }
+    let workspace = state.hub.snapshot().workspace;
+    if workspace.is_empty() {
+        return error_json(StatusCode::CONFLICT, "no workspace");
+    }
+    let workspace_path = std::path::Path::new(&workspace);
+    match crate::web::attachments_api::save_web_attachment(workspace_path, &body) {
+        Ok(saved) => json_ok(
+            StatusCode::CREATED,
+            &serde_json::json!({
+                "name": saved.name,
+                "bytes": saved.bytes,
+                "mime": saved.mime,
+            }),
+        ),
+        Err(crate::web::attachments_api::UploadError::Empty) => {
+            error_json(StatusCode::BAD_REQUEST, "empty upload")
+        }
+        Err(crate::web::attachments_api::UploadError::TooLarge) => {
+            error_json(StatusCode::PAYLOAD_TOO_LARGE, "image is larger than 10 MiB")
+        }
+        Err(crate::web::attachments_api::UploadError::UnsupportedType) => error_json(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "only png, jpeg, gif or webp images are allowed",
+        ),
+        Err(crate::web::attachments_api::UploadError::Io(_)) => {
+            error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    }
+}
+
+async fn get_attachment(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let workspace = state.hub.snapshot().workspace;
+    let workspace_path = std::path::Path::new(&workspace);
+    let Some(path) = crate::web::attachments_api::resolve_attachment(workspace_path, &name) else {
+        return error_json(StatusCode::NOT_FOUND, "attachment not found");
+    };
+    let mime =
+        crate::web::attachments_api::mime_for_name(&name).unwrap_or("application/octet-stream");
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let mut resp = (StatusCode::OK, bytes).into_response();
+            let headers = resp.headers_mut();
+            if let Ok(v) = axum::http::HeaderValue::from_str(mime) {
+                headers.insert(axum::http::header::CONTENT_TYPE, v);
+            }
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("private, max-age=3600"),
+            );
+            headers.insert(
+                axum::http::HeaderName::from_static("x-content-type-options"),
+                axum::http::HeaderValue::from_static("nosniff"),
+            );
+            resp
+        }
+        Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
 }
 
 /// `POST /api/command`: picker and lifecycle actions (SPEC-dashboard-parity
@@ -1561,6 +1652,13 @@ pub fn build_router_with(
         .route("/api/todos/{id}/run", post(run_todo))
         .route("/api/mcp/servers", get(list_mcp_servers))
         .route("/api/import", post(import_todos))
+        .route(
+            "/api/attachments",
+            post(post_attachment).layer(axum::extract::DefaultBodyLimit::max(
+                crate::web::attachments_api::MAX_WEB_IMAGE_BYTES + 64 * 1024,
+            )),
+        )
+        .route("/api/attachments/{name}", get(get_attachment))
         .route("/api/prompt", post(post_prompt))
         .route("/api/command", post(post_command))
         .merge(crate::web::docs_api::router(state.services.docs.clone()))
@@ -5129,5 +5227,302 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("DMUXAI_STATE_DIR", v) },
             None => unsafe { std::env::remove_var("DMUXAI_STATE_DIR") },
         }
+    }
+
+    #[derive(Clone)]
+    struct CapturedPrompt {
+        images: Vec<std::path::PathBuf>,
+    }
+
+    fn spawn_prompt_capture() -> (
+        mpsc::Sender<DashboardCommand>,
+        Arc<std::sync::Mutex<Vec<CapturedPrompt>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_task = Arc::clone(&seen);
+        let accepted = crate::web::commands::PromptAccepted {
+            conversation_id: "conv-route".to_string(),
+            agent: "codex".to_string(),
+        };
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                if let DashboardCommand::SubmitPrompt { images, reply, .. } = command {
+                    seen_task.lock().unwrap().push(CapturedPrompt { images });
+                    let _ = reply.send(Ok(accepted.clone()));
+                }
+            }
+        });
+        (tx, seen)
+    }
+
+    // attachment tests
+    fn make_png() -> Vec<u8> {
+        let mut v = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        v.extend_from_slice(b"rest");
+        v
+    }
+
+    fn raw_request(
+        method: &str,
+        uri: &str,
+        token: &str,
+        bytes: Vec<u8>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut b = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Host", "localhost:7420")
+            .header("Origin", "http://localhost:7420")
+            .header("Authorization", format!("Bearer {token}"));
+        if !bytes.is_empty() {
+            b = b.header("Content-Type", "image/png");
+        }
+        b.body(axum::body::Body::from(bytes)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_accepts_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "att-token".to_string();
+        let hub = DashboardHub::new(SnapshotSource::Tui, dir.path().display().to_string());
+        let services = DashboardServices {
+            web_attached: true,
+            ..DashboardServices::default()
+        };
+        let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
+        let bytes = make_png();
+        let resp = router
+            .clone()
+            .oneshot(raw_request(
+                "POST",
+                "/api/attachments",
+                &token,
+                bytes.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let name = v["name"].as_str().unwrap().to_string();
+        assert!(name.starts_with("web-"));
+        assert!(name.ends_with(".png"));
+        assert_eq!(v["mime"], "image/png");
+        let path = dir.path().join(".dmuxai").join("attachments").join(&name);
+        assert!(path.is_file());
+
+        // GET
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/attachments/{}", name))
+                    .header("Host", "localhost:7420")
+                    .header("Origin", "http://localhost:7420")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "image/png");
+        let got = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(got.as_ref(), bytes.as_slice());
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_rejects_non_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "att-token".to_string();
+        let hub = DashboardHub::new(SnapshotSource::Tui, dir.path().display().to_string());
+        let services = DashboardServices {
+            web_attached: true,
+            ..DashboardServices::default()
+        };
+        let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
+        let resp = router
+            .oneshot(raw_request(
+                "POST",
+                "/api/attachments",
+                &token,
+                b"hello".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_rejects_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "att-token".to_string();
+        let hub = DashboardHub::new(SnapshotSource::Tui, dir.path().display().to_string());
+        let services = DashboardServices {
+            web_attached: true,
+            ..DashboardServices::default()
+        };
+        let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
+        let mut bytes = make_png();
+        bytes.resize(crate::web::attachments_api::MAX_WEB_IMAGE_BYTES + 1, 0);
+        // ensure signature at start already
+        let resp = router
+            .oneshot(raw_request("POST", "/api/attachments", &token, bytes))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_rejects_bad_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "att-token".to_string();
+        let hub = DashboardHub::new(SnapshotSource::Tui, dir.path().display().to_string());
+        let services = DashboardServices {
+            web_attached: true,
+            ..DashboardServices::default()
+        };
+        let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
+        let before: Vec<_> = std::fs::read_dir(dir.path().join(".dmuxai").join("attachments"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .collect();
+        let _ = before;
+        let resp = router
+            .oneshot(raw_request("POST", "/api/attachments", "wrong", make_png()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // nothing written: attachments dir may not exist or empty
+        let count = std::fs::read_dir(dir.path().join(".dmuxai").join("attachments"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_view_only_forbidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "att-token".to_string();
+        let hub = DashboardHub::new(SnapshotSource::Tui, dir.path().display().to_string());
+        let services = DashboardServices {
+            web_attached: false,
+            ..DashboardServices::default()
+        };
+        let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
+        let resp = router
+            .oneshot(raw_request("POST", "/api/attachments", &token, make_png()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn attachment_get_rejects_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "att-token".to_string();
+        let hub = DashboardHub::new(SnapshotSource::Tui, dir.path().display().to_string());
+        let services = DashboardServices {
+            web_attached: true,
+            ..DashboardServices::default()
+        };
+        let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
+        for path in [
+            "/api/attachments/..%2F..%2Fetc%2Fpasswd",
+            "/api/attachments/web-x.png",
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .header("Host", "localhost:7420")
+                        .header("Origin", "http://localhost:7420")
+                        .header("Authorization", format!("Bearer {}", token))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{}", path);
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_prompt_forwards_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "att-token".to_string();
+        // upload a file first
+        let hub = DashboardHub::new(SnapshotSource::Tui, dir.path().display().to_string());
+        let services_upload = DashboardServices {
+            web_attached: true,
+            ..DashboardServices::default()
+        };
+        let router = build_router_with(
+            hub.clone(),
+            token.clone(),
+            allowed_localhost(),
+            services_upload,
+        );
+        let resp = router
+            .oneshot(raw_request("POST", "/api/attachments", &token, make_png()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let name = v["name"].as_str().unwrap().to_string();
+
+        // prompt with command capture
+        let (tx, seen) = spawn_prompt_capture();
+        let services = DashboardServices {
+            commands: Some(tx),
+            web_attached: true,
+            ..DashboardServices::default()
+        };
+        let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
+        let body = format!(r#"{{"text":"look","attachments":["{}"]}}"#, name);
+        let resp = router
+            .oneshot(json_request("POST", "/api/prompt", &token, &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        {
+            let captured = seen.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].images.len(), 1);
+            assert!(captured[0].images[0].is_absolute());
+            assert!(captured[0].images[0].ends_with(&name));
+        }
+
+        // unknown name -> 400
+        let (tx2, _seen2) = spawn_prompt_capture();
+        let services2 = DashboardServices {
+            commands: Some(tx2),
+            web_attached: true,
+            ..DashboardServices::default()
+        };
+        let hub2 = DashboardHub::new(SnapshotSource::Tui, dir.path().display().to_string());
+        let router2 = build_router_with(hub2, token.clone(), allowed_localhost(), services2);
+        let resp = router2
+            .oneshot(json_request(
+                "POST",
+                "/api/prompt",
+                &token,
+                r#"{"text":"look","attachments":["nope.png"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

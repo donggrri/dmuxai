@@ -261,6 +261,8 @@ struct Message {
     /// Shown in the TUI only. Dashboard snapshots, HTTP payloads, headless
     /// output, and agent context skip these messages (FR-984).
     local_only: bool,
+    /// File names of images attached to a user turn (web dashboard attachments).
+    images: Vec<String>,
 }
 
 impl Message {
@@ -269,6 +271,7 @@ impl Message {
             role,
             content: content.into(),
             local_only: false,
+            images: Vec::new(),
         }
     }
 
@@ -277,6 +280,7 @@ impl Message {
             role,
             content: content.into(),
             local_only: true,
+            images: Vec::new(),
         }
     }
 }
@@ -1694,9 +1698,11 @@ impl App {
                         agent,
                         mode,
                         route,
+                        images,
                         reply,
                     } => {
-                        let result = self.handle_dashboard_submit_prompt(text, agent, mode, route);
+                        let result =
+                            self.handle_dashboard_submit_prompt(text, agent, mode, route, images);
                         let _ = reply.send(result);
                         changed = true;
                     }
@@ -1764,6 +1770,7 @@ impl App {
         agent: Option<String>,
         mode: Option<String>,
         route: Option<String>,
+        images: Vec<std::path::PathBuf>,
     ) -> Result<PromptAccepted, RunTodoError> {
         if self.switch_pending.is_some() {
             return Err(RunTodoError::Busy(
@@ -1820,6 +1827,27 @@ impl App {
         self.selected = adapter_index(target_agent);
         // Keep whatever the TUI user is typing; the dashboard text is submitted
         // on its own (SPEC-dashboard-parity FR-782).
+        // Web attachments join the pending images of the next turn, exactly like
+        // `/image <path>` or a clipboard paste in the TUI. They are not passed
+        // straight to the adapter because the turn may first go through the
+        // triage judge or a plan; the store is drained when the turn is sent.
+        if let Some(missing) = images.iter().find(|path| !path.is_file()) {
+            return Err(RunTodoError::Invalid(format!(
+                "Could not attach image: image file not found: {}",
+                missing.display()
+            )));
+        }
+        let before = self.pending_images.len();
+        for path in images {
+            if let Err(error) = self.pending_images.ingest_saved_file(path) {
+                while self.pending_images.len() > before {
+                    self.pending_images.remove(self.pending_images.len() - 1);
+                }
+                return Err(RunTodoError::Invalid(format!(
+                    "Could not attach image: {error}"
+                )));
+            }
+        }
         let tui_draft = mem::replace(&mut self.input, text);
         self.submit_prompt();
         self.input = tui_draft;
@@ -1940,6 +1968,10 @@ impl App {
                 continue;
             }
             let index = start + offset;
+            let images = match &message.role {
+                Role::User => message.images.clone(),
+                _ => Vec::new(),
+            };
             let (role, agent, content) = match &message.role {
                 Role::User => ("user", None, message.content.clone()),
                 Role::Agent(agent) => (
@@ -1973,6 +2005,7 @@ impl App {
                 content,
                 content_html,
                 streaming: streaming.contains(&index),
+                images,
             });
         }
         if self.chat_markdown_cache.len() > 256 {
@@ -3642,6 +3675,7 @@ impl App {
         }
         let policy = self.pending_turn_policy.unwrap_or(TurnPolicy::Agent);
         let require_file_edits = self.graph_node_expects_file_edits(agent);
+        let image_paths_for_message = image_paths.clone();
         let mut adapter_request = adapter_request(request, image_paths, policy, require_file_edits);
         let injected_memory = self.inject_memory(agent, &mut adapter_request);
         let is_graph = self.active_graph_node_for_agent(agent).is_some();
@@ -3650,7 +3684,23 @@ impl App {
         } else {
             self.adapters[adapter_index].send(adapter_request)
         };
-        self.messages.push(Message::new(Role::User, prompt.clone()));
+        let mut user_message = Message::new(Role::User, prompt.clone());
+        let attachments_dir = dmuxai::attachments::attachments_dir(&self.workspace_root);
+        user_message.images = image_paths_for_message
+            .iter()
+            .filter_map(|path| {
+                if !path.starts_with(&attachments_dir) {
+                    return None;
+                }
+                let name = path.file_name()?.to_str()?.to_owned();
+                if dmuxai::web::attachments_api::is_valid_attachment_name(&name) {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.messages.push(user_message);
         match send_result {
             Ok(()) => {
                 if let Some(hash) = injected_memory {
@@ -20580,6 +20630,7 @@ mod tests {
             agent: Some("codex".to_string()),
             mode: Some("ask".to_string()),
             route: None,
+            images: Vec::new(),
             reply,
         })
         .await
@@ -20595,6 +20646,171 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].0, Agent::Codex);
         assert!(requests[0].1.prompt.contains("hello from dashboard"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn web_prompt_images_reach_cursor_prompt() {
+        let fixture = crate::agent::FakeCursorFixture::new().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), temp_dir.path()).unwrap();
+        let mut app = App::new_interactive(
+            engine,
+            temp_dir.path().to_path_buf(),
+            DmuxSettings::default(),
+        )
+        .unwrap();
+        app.selected = adapter_index(Agent::Cursor);
+        app.skip_judge_for_tests = true;
+
+        let attach_dir = dmuxai::attachments::attachments_dir(&app.workspace_root);
+        std::fs::create_dir_all(&attach_dir).unwrap();
+        let uuid = uuid::Uuid::new_v4().simple().to_string();
+        let name = format!("web-{}.png", uuid);
+        let path = attach_dir.join(&name);
+        std::fs::write(&path, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+
+        let (tx, rx_cmd) = mpsc::channel(16);
+        app.dashboard_commands = Some(rx_cmd);
+
+        let (reply, rx_reply) = tokio::sync::oneshot::channel();
+        tx.send(DashboardCommand::SubmitPrompt {
+            text: "describe".to_string(),
+            agent: Some("cursor".to_string()),
+            mode: None,
+            route: None,
+            images: vec![path.clone()],
+            reply,
+        })
+        .await
+        .unwrap();
+
+        assert!(app.drain_dashboard_commands());
+
+        let accepted = rx_reply.await.unwrap().unwrap();
+        assert_eq!(accepted.agent, "cursor");
+
+        let mut prompts = Vec::new();
+        for _ in 0..50 {
+            prompts = fixture.prompts_received();
+            if !prompts.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!prompts.is_empty(), "no prompt reached cursor");
+        assert!(
+            prompts
+                .iter()
+                .any(|(_, p)| p.contains(&format!("@{}", path.display()))),
+            "prompt missing image token: {prompts:?}"
+        );
+
+        let user_msg = app
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, Role::User))
+            .expect("user message");
+        assert_eq!(user_msg.images, vec![name.clone()]);
+
+        // The images went out with the turn; nothing stays pending.
+        assert!(app.pending_images.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Web images wait in the pending store while the triage judge runs, then
+    // ride on the real turn (the live dashboard path, judge enabled).
+    #[test]
+    fn web_prompt_images_survive_triage_judge() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut h = plan_gate_harness_in_workspace(workspace.path().to_path_buf(), &[]);
+        let attach_dir = dmuxai::attachments::attachments_dir(&h.app.workspace_root);
+        std::fs::create_dir_all(&attach_dir).unwrap();
+        let name = format!("web-{}.png", Uuid::new_v4().simple());
+        let path = attach_dir.join(&name);
+        std::fs::write(&path, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+
+        h.app
+            .handle_dashboard_submit_prompt(
+                "what does this chart show?".to_owned(),
+                Some("codex".to_owned()),
+                None,
+                None,
+                vec![path.clone()],
+            )
+            .expect("accepted");
+        let judge = h
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, request)| request.turn_id.as_str().starts_with("judge-"))
+            .map(|(_, request)| request.clone())
+            .expect("judge request");
+        assert!(judge.image_paths.is_empty(), "the judge never sees images");
+        assert_eq!(h.app.pending_images.paths(), vec![path.clone()]);
+
+        for event in [
+            AgentEvent::TextDelta("{\"route\":\"simple\",\"reason\":\"one step\"}".to_owned()),
+            AgentEvent::Completed,
+        ] {
+            h.app.apply_agent_output(AgentOutput {
+                agent: Agent::Codex,
+                conversation_id: Some(ConversationId::new(judge.conversation_id.as_str())),
+                turn_id: Some(TurnId::new(judge.turn_id.as_str())),
+                event,
+            });
+        }
+        let turn = h
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, request)| !request.turn_id.as_str().starts_with("judge-"))
+            .map(|(_, request)| request.clone())
+            .expect("real turn after the judge");
+        assert_eq!(turn.image_paths, vec![path.clone()]);
+        assert!(h.app.pending_images.is_empty());
+        let user = h
+            .app
+            .messages
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, Role::User))
+            .expect("user message");
+        assert_eq!(user.images, vec![name]);
+    }
+
+    #[tokio::test]
+    async fn web_prompt_images_rejects_missing_file() {
+        let (mut app, sent) = test_app();
+        let (tx, rx_cmd) = mpsc::channel(16);
+        app.dashboard_commands = Some(rx_cmd);
+
+        let (reply, rx_reply) = tokio::sync::oneshot::channel();
+        let missing = app.workspace_root.join("does-not-exist.png");
+        tx.send(DashboardCommand::SubmitPrompt {
+            text: "describe".to_string(),
+            agent: Some("codex".to_string()),
+            mode: None,
+            route: None,
+            images: vec![missing],
+            reply,
+        })
+        .await
+        .unwrap();
+
+        assert!(app.drain_dashboard_commands());
+
+        let result = rx_reply.await.unwrap();
+        assert!(result.is_err(), "expected rejection, got {result:?}");
+        assert!(app.pending_images.is_empty());
+
+        let requests = sent.lock().unwrap();
+        assert!(requests.is_empty(), "no turn should start");
+        assert!(app.active_turns.is_empty());
     }
 
     fn web_app() -> (App, SentRequests, dmuxai::web::DashboardHub) {
@@ -20740,6 +20956,7 @@ mod tests {
             agent: Some("codex".to_owned()),
             mode: None,
             route: None,
+            images: Vec::new(),
             reply,
         })
         .await
@@ -21146,6 +21363,7 @@ mod tests {
                 agent: Some("codex".to_owned()),
                 mode: None,
                 route: None,
+                images: Vec::new(),
                 reply,
             })
             .await
@@ -21163,6 +21381,7 @@ mod tests {
             agent: Some("codex".to_owned()),
             mode: None,
             route: None,
+            images: Vec::new(),
             reply,
         })
         .await

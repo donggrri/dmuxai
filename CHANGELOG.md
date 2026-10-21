@@ -5,6 +5,16 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Added
+
+- **Image attachments in the dashboard chat.** Paste an image (Ctrl/Cmd+V),
+  drop it on the composer, or pick files with the paperclip button. Thumbnails
+  (with a remove button) show before sending, and the sent message keeps them.
+  Images are uploaded to `POST /api/attachments` (png, jpeg, gif or webp checked
+  by magic bytes, up to 10 MiB each and 10 per prompt), saved under
+  `.dmuxai/attachments/`, and reach the runner the same way as TUI clipboard
+  images.
+
 ### Changed
 
 - **Dashboard center column uses the full width (SPEC-dashboard-fullwidth FR-1200..FR-1204).**
