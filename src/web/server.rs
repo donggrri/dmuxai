@@ -5074,7 +5074,7 @@ mod tests {
         ));
     }
 
-    // TC-876 (FR-876): opening another workspace does not need the App lock and
+    // TC-879 (FR-876): opening another workspace does not need the App lock and
     // reuses a live discovery file. A second call spawns the given executable.
     #[tokio::test]
     async fn workspace_open_reuses_live_dashboard_and_spawns() {

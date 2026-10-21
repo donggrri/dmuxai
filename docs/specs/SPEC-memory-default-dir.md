@@ -41,17 +41,17 @@ When `[memory] vault` is set and `dir` is omitted, DmuxAI stores notes under `<v
 
 | ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| FR-740 | Must | Given a valid `[memory] vault` and no `dir`, or `dir` empty or whitespace | Memory root is `<vault>/memory` and the reported dir is `memory` | An explicit relative `dir` is used as before; absolute or `..` still disables memory with a config warning | TC-740 |
+| FR-878 | Must | Given a valid `[memory] vault` and no `dir`, or `dir` empty or whitespace | Memory root is `<vault>/memory` and the reported dir is `memory` | An explicit relative `dir` is used as before; absolute or `..` still disables memory with a config warning | TC-878 |
 
 ## 5. Acceptance scenarios and test design
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-740 | FR-740, FR-720 | unit | Temporary vault directory | `resolve_root` with omitted and empty `dir`; settings load with vault only | Root is `<vault>/memory`; dir string is `memory` | `src/memory.rs` `resolve_root_rejects_absolute_and_dotdot`; `src/settings.rs` `memory_settings_resolve_root_dir_project_and_inject`, `memory_settings_relative_vault_is_workspace_relative` |
+| TC-878 | FR-878, FR-720 | unit | Temporary vault directory | `resolve_root` with omitted and empty `dir`; settings load with vault only | Root is `<vault>/memory`; dir string is `memory` | `src/memory.rs` `resolve_root_rejects_absolute_and_dotdot`; `src/settings.rs` `memory_settings_resolve_root_dir_project_and_inject`, `memory_settings_relative_vault_is_workspace_relative` |
 
 ## 6. Data, integration, and safety contracts
 
 | Area | Contract | Evidence |
 | --- | --- | --- |
-| Persistence | New default writes go to `<vault>/memory/`. Existing trees stay where they are until `dir` points at them. | TC-740 |
+| Persistence | New default writes go to `<vault>/memory/`. Existing trees stay where they are until `dir` points at them. | TC-878 |
 | Compatibility | Configs that already set `dir = "cursor-workflow/memory"` keep that root. | existing TC-720 override case |
