@@ -164,3 +164,12 @@ button.chat-aux-head:focus-visible, .chat-aux-step-btn:focus-visible { outline: 
 .session-attach:hover:not(:disabled) { background: var(--bg-badge); }
 .msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .msg-image { max-width: 220px; max-height: 160px; border-radius: 8px; border: 1px solid var(--line); cursor: zoom-in; }
+.msg-actions { display: flex; align-items: center; gap: 6px; margin-top: 4px; opacity: 0; transition: opacity .12s; }
+.msg-agent:hover .msg-actions, .msg-agent:focus-within .msg-actions { opacity: 1; }
+@media (hover: none) { .msg-actions { opacity: 1; } }
+.msg-actions.msg-actions-hidden { display: none; }
+.msg-copy { width: 26px; height: 26px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid transparent; border-radius: 6px; color: var(--muted); cursor: pointer; }
+.msg-copy:hover, .msg-copy:focus-visible { background: var(--bg-badge); color: var(--text); }
+.msg-copy:focus-visible { outline: 2px solid var(--accent); }
+.msg-copy.msg-copy-done { color: var(--ok); }
+.msg-copy-tip { font-size: .75rem; color: var(--muted); }
