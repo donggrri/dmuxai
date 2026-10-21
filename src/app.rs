@@ -307,6 +307,8 @@ struct ModelCatalog {
     models: Vec<ModelInfo>,
     selected: Option<String>,
     selected_effort: Option<String>,
+    /// The runner's default model: `selected` from the first non-empty listing.
+    default_model: Option<String>,
     loading: bool,
 }
 
@@ -2039,14 +2041,15 @@ impl App {
                                     dmuxai::model_policy::validate_model_for_runner(&id, &model.id)
                                         .is_ok()
                                 })
-                                .map(|model| SessionModel {
-                                    id: model.id.clone(),
-                                    label: model.label.clone(),
-                                    efforts: model.efforts.clone(),
-                                })
+                                .map(|model| session_model(agent, model))
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    default_model: catalog
+                        .and_then(|catalog| catalog.default_model.clone())
+                        .filter(|model| {
+                            dmuxai::model_policy::validate_model_for_runner(&id, model).is_ok()
+                        }),
                     id,
                     run: Some(self.run_state(agent).to_view()),
                 }
@@ -8504,6 +8507,9 @@ impl App {
                     selected
                 };
                 catalog.selected_effort = selected_effort;
+                if catalog.default_model.is_none() && !catalog.models.is_empty() {
+                    catalog.default_model = catalog.selected.clone();
+                }
                 catalog.loading = false;
                 if let Some(picker) = self.model_picker.as_mut()
                     && picker.agent == agent
@@ -13293,6 +13299,31 @@ fn bounded_activity_detail(value: &str) -> String {
         format!("{prefix}…")
     } else {
         prefix
+    }
+}
+
+/// Dashboard view of one model. Efforts are listed only for runners that can
+/// apply one (`set_effort` is Codex-only), and never a fast-named value.
+fn session_model(agent: Agent, model: &ModelInfo) -> SessionModel {
+    let efforts: Vec<String> = if agent == Agent::Codex {
+        model
+            .efforts
+            .iter()
+            .filter(|effort| !effort.to_ascii_lowercase().contains("fast"))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let default_effort = model
+        .default_effort
+        .clone()
+        .filter(|effort| efforts.contains(effort));
+    SessionModel {
+        id: model.id.clone(),
+        label: model.label.clone(),
+        efforts,
+        default_effort,
     }
 }
 
@@ -20835,8 +20866,108 @@ mod tests {
             }],
             selected: None,
             selected_effort: None,
+            default_model: None,
             loading: false,
         }
+    }
+
+    // Composer model menu: the session view carries the runner default model,
+    // per-model default efforts for Codex only, and never a fast model or a
+    // fast-named effort.
+    #[test]
+    fn dashboard_model_menu_view_has_default_model_and_no_fast_options() {
+        let (mut app, _sent, _hub) = web_app();
+        let allowed = dmuxai::model_policy::ALLOWED_MODEL;
+        app.apply_agent_event(
+            Agent::Codex,
+            AgentEvent::ModelsListed {
+                models: vec![
+                    ModelInfo::with_efforts(
+                        allowed,
+                        "Composer 2.5",
+                        vec![
+                            "low".to_owned(),
+                            "medium".to_owned(),
+                            "fast".to_owned(),
+                            "high".to_owned(),
+                        ],
+                        Some("medium".to_owned()),
+                    ),
+                    ModelInfo::with_efforts(
+                        "composer-2.5-fast",
+                        "Composer 2.5 Fast",
+                        vec!["low".to_owned()],
+                        Some("low".to_owned()),
+                    ),
+                ],
+                selected: Some(allowed.to_owned()),
+                selected_effort: Some("medium".to_owned()),
+            },
+        );
+        app.apply_agent_event(
+            Agent::Cursor,
+            AgentEvent::ModelsListed {
+                models: vec![
+                    ModelInfo::with_efforts(
+                        allowed,
+                        "Composer 2.5",
+                        vec!["low".to_owned(), "high".to_owned()],
+                        Some("low".to_owned()),
+                    ),
+                    ModelInfo::new("composer-2.5-fast", "Composer 2.5 Fast"),
+                ],
+                selected: Some(allowed.to_owned()),
+                selected_effort: None,
+            },
+        );
+        // A later pick does not move the runner default.
+        app.apply_agent_event(Agent::Codex, AgentEvent::EffortSelected("high".to_owned()));
+        app.apply_agent_event(
+            Agent::Codex,
+            AgentEvent::ModelsListed {
+                models: vec![ModelInfo::new("gpt-other", "Other")],
+                selected: Some("gpt-other".to_owned()),
+                selected_effort: None,
+            },
+        );
+        app.apply_agent_event(
+            Agent::Codex,
+            AgentEvent::ModelsListed {
+                models: vec![ModelInfo::with_efforts(
+                    allowed,
+                    "Composer 2.5",
+                    vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
+                    Some("medium".to_owned()),
+                )],
+                selected: Some(allowed.to_owned()),
+                selected_effort: Some("high".to_owned()),
+            },
+        );
+
+        let session = app.session_view();
+        let codex = session.agents.iter().find(|a| a.id == "codex").unwrap();
+        assert_eq!(codex.default_model.as_deref(), Some(allowed));
+        assert_eq!(codex.effort.as_deref(), Some("high"));
+        assert_eq!(codex.models.len(), 1);
+        assert_eq!(codex.models[0].efforts, vec!["low", "medium", "high"]);
+        assert_eq!(codex.models[0].default_effort.as_deref(), Some("medium"));
+
+        let cursor = session.agents.iter().find(|a| a.id == "cursor").unwrap();
+        assert_eq!(cursor.default_model.as_deref(), Some(allowed));
+        assert_eq!(cursor.models.len(), 1);
+        assert!(
+            cursor.models[0].efforts.is_empty(),
+            "Cursor can not set an effort"
+        );
+        assert!(cursor.models[0].default_effort.is_none());
+
+        let json = serde_json::to_string(&session)
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            !json.contains("fast"),
+            "fast leaked into the session view: {json}"
+        );
     }
 
     // TC-780 (FR-780): `--web` snapshots carry the session with every contract key;
