@@ -270,6 +270,10 @@ where
 struct FilePathQuery {
     #[serde(default)]
     path: String,
+    /// `code`: the Files viewer's read; text files that can be highlighted
+    /// get `code_html` instead of `content`.
+    #[serde(default)]
+    view: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -368,9 +372,19 @@ async fn get_file(
     let Some(service) = &state.docs else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
     };
-    match crate::docs::file::read_file(&service.workspace, &query.path) {
-        Ok(doc_file) => json_ok(StatusCode::OK, &doc_file),
-        Err(e) => docs_error_response(e),
+    // Reading, hashing and highlighting are blocking work: keep them off
+    // the async runtime threads.
+    let workspace = service.workspace.clone();
+    let code_view = query.view.as_deref() == Some("code");
+    let path = query.path;
+    let read = tokio::task::spawn_blocking(move || {
+        crate::docs::file::read_file_with_view(&workspace, &path, code_view)
+    })
+    .await;
+    match read {
+        Ok(Ok(doc_file)) => json_ok(StatusCode::OK, &doc_file),
+        Ok(Err(e)) => docs_error_response(e),
+        Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "read failed"),
     }
 }
 
@@ -1045,9 +1059,10 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    // Files code view: text kinds carry highlighted, line-split `code_html`
-    // next to the raw `content`; large files fall back to plain text; file
-    // markup is escaped; saving still works on the raw text.
+    // Files code view: `view=code` reads of highlightable text files carry
+    // `code_html` (not `content`); a plain read still returns the raw text
+    // for editing; unknown syntax and over-budget files get `content` only;
+    // file markup is escaped; CRLF is one line; saving works on raw text.
     #[tokio::test]
     async fn read_text_file_has_code_view() {
         let dir = tempfile::tempdir().unwrap();
@@ -1056,12 +1071,17 @@ mod tests {
         let py = "def add(a, b):\n    return a + b\n";
         let sh = "#!/bin/sh\necho \"hi\"\n";
         let evil = "x = 1\n</code></pre><script>alert(1)</script>\n";
+        let crlf = "a = 1\r\nb = 2\r\n";
         std::fs::write(dir.path().join("main.cpp"), cpp).unwrap();
         std::fs::write(dir.path().join("tool.py"), py).unwrap();
         std::fs::write(dir.path().join("run.sh"), sh).unwrap();
         std::fs::write(dir.path().join("evil.py"), evil).unwrap();
-        let big = "x = 1\n".repeat(crate::docs::highlight::MAX_CODE_VIEW_BYTES / 6 + 10);
+        std::fs::write(dir.path().join("crlf.py"), crlf).unwrap();
+        std::fs::write(dir.path().join("notes.log"), "plain\n").unwrap();
+        let big = "x = 1\n".repeat(crate::docs::highlight::MAX_HIGHLIGHT_BYTES / 6 + 10);
         std::fs::write(dir.path().join("big.py"), &big).unwrap();
+        let nested = "[\n".repeat(128 * 1024);
+        std::fs::write(dir.path().join("nested.json"), &nested).unwrap();
         std::fs::write(dir.path().join("ok.md"), "# Title\n").unwrap();
 
         let token = "testtoken";
@@ -1074,36 +1094,70 @@ mod tests {
             ("tool.py", py, "Python", 2),
             ("run.sh", sh, "Bourne Again Shell (bash)", 2),
         ] {
-            let val = get_json(&router, &format!("/api/docs/file?path={path}"), token).await;
+            let val = get_json(
+                &router,
+                &format!("/api/docs/file?path={path}&view=code"),
+                token,
+            )
+            .await;
             assert_eq!(val["kind"], "text", "{path}");
-            assert_eq!(val["content"], raw, "{path}: raw content kept for editing");
             assert_eq!(val["editable"], true, "{path}");
             assert_eq!(val["language"], language, "{path}");
+            assert!(val["content"].is_null(), "{path}: no duplicate raw text");
+            assert_eq!(val["content_omitted"], true, "{path}");
+            assert_eq!(val["sha256"], crate::docs::sha256_hex(raw.as_bytes()));
             let html = val["code_html"].as_str().expect("code_html");
             assert!(
-                html.starts_with("<pre class=\"code-view\"><code"),
+                html.starts_with("<pre class=\"code-view\"><code class=\"language-"),
                 "{path}: {html}"
             );
             assert!(html.contains("class=\"hl-"), "{path}: {html}");
             assert_eq!(html.matches("class=\"code-line\"").count(), lines, "{path}");
+            // The plain read (used to start editing) returns the raw text.
+            let plain = get_json(&router, &format!("/api/docs/file?path={path}"), token).await;
+            assert_eq!(plain["content"], raw, "{path}");
+            assert!(plain.get("code_html").is_none(), "{path}");
+            assert!(plain.get("content_omitted").is_none(), "{path}");
         }
 
-        let val = get_json(&router, "/api/docs/file?path=evil.py", token).await;
+        let val = get_json(&router, "/api/docs/file?path=evil.py&view=code", token).await;
         let html = val["code_html"].as_str().unwrap();
         assert!(!html.contains("<script"), "{html}");
         assert!(!html.contains("</code></pre><"), "{html}");
-        assert_eq!(val["content"], evil);
 
-        let val = get_json(&router, "/api/docs/file?path=big.py", token).await;
-        assert_eq!(val["content"], big.as_str(), "plain text still returned");
-        assert!(val.get("code_html").is_none(), "over the cap: no code view");
-        assert!(val.get("language").is_none());
+        let val = get_json(&router, "/api/docs/file?path=crlf.py&view=code", token).await;
+        let html = val["code_html"].as_str().unwrap();
+        assert_eq!(html.matches("class=\"code-line\"").count(), 2, "{html}");
+        assert!(!html.contains('\r'));
+        let plain = get_json(&router, "/api/docs/file?path=crlf.py", token).await;
+        assert_eq!(plain["content"], crlf, "raw CRLF kept for editing");
 
-        let val = get_json(&router, "/api/docs/file?path=ok.md", token).await;
+        for path in ["notes.log", "big.py", "nested.json"] {
+            let val = get_json(
+                &router,
+                &format!("/api/docs/file?path={path}&view=code"),
+                token,
+            )
+            .await;
+            assert!(val.get("code_html").is_none(), "{path}: plain view");
+            assert!(
+                val["content"].is_string(),
+                "{path}: raw text for the plain view"
+            );
+        }
+        let val = get_json(&router, "/api/docs/file?path=nested.json&view=code", token).await;
+        let bytes = serde_json::to_vec(&val).unwrap().len();
+        assert!(
+            bytes < nested.len() * 2,
+            "nested file response stays small: {bytes}"
+        );
+
+        let val = get_json(&router, "/api/docs/file?path=ok.md&view=code", token).await;
         assert!(
             val.get("code_html").is_none(),
             "markdown keeps its own renderer"
         );
+        assert_eq!(val["content"], "# Title\n");
 
         // Save the raw text, then read back a fresh code view.
         let base = crate::docs::sha256_hex(py.as_bytes());
@@ -1125,8 +1179,7 @@ mod tests {
             std::fs::read_to_string(dir.path().join("tool.py")).unwrap(),
             updated
         );
-        let val = get_json(&router, "/api/docs/file?path=tool.py", token).await;
-        assert_eq!(val["content"], updated);
+        let val = get_json(&router, "/api/docs/file?path=tool.py&view=code", token).await;
         assert_eq!(val["sha256"], crate::docs::sha256_hex(updated.as_bytes()));
         let html = val["code_html"].as_str().unwrap();
         assert_eq!(html.matches("class=\"code-line\"").count(), 4);

@@ -1,71 +1,136 @@
 //! Code view for text files in the dashboard Files viewer: syntax
-//! highlighting (syntect `hl-*` classes, like Markdown code blocks) split
-//! into one `<span class="code-line">` per source line so the viewer can
-//! number lines with a CSS counter (not part of the copied text).
+//! highlighting with one `<span class="code-line">` per source line so the
+//! viewer can number lines with a CSS counter (not part of the copied text).
 //!
-//! Contract: `pub fn highlight_file(name: &str, text: &str) -> Option<CodeView>`
-//! returns `None` above `MAX_CODE_VIEW_BYTES` (the viewer shows plain text).
+//! Contract: `pub fn highlight_file(name: &str, text: &str) -> Option<CodeView>`.
+//! `None` means "no highlighted view": the viewer then shows the raw text
+//! with a plain line-number gutter. That happens for files without a known
+//! syntax and whenever a budget below is exceeded.
+//!
+//! The output is flat: every token is at most one `<span class="hl-...">`
+//! inside its line (the class of the innermost styled scope), never nested
+//! and never reopened across lines, so its size is bounded by the budgets.
 //! All file text is HTML-escaped; the only markup is `<pre>`, `<code>` and
-//! `<span class="...">`.
+//! `<span class="...">`. CR LF and lone CR line ends are shown as one line
+//! break; callers keep the raw text for editing.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
-use syntect::html::{ClassStyle, ClassedHTMLGenerator};
-use syntect::parsing::{SyntaxReference, SyntaxSet};
-use syntect::util::LinesWithEndings;
+use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
 use crate::docs::markdown::syntax_set;
 
-/// Above this size the viewer gets no code view and shows plain text.
-pub const MAX_CODE_VIEW_BYTES: usize = 256 * 1024;
-/// Lines longer than this (minified bundles, data blobs) make syntect slow;
-/// such files get line numbers without syntax colors.
-pub const MAX_HIGHLIGHT_LINE_BYTES: usize = 8 * 1024;
+/// Largest input that is highlighted. Measured in a release build: 64 KiB
+/// of C++ takes about 0.25 s and gives about 0.6 MB of HTML (syntect with
+/// the pure-Rust regex engine runs at roughly 250 KB/s); 96 KiB already took
+/// 0.39 s. Larger files get the plain view.
+pub const MAX_HIGHLIGHT_BYTES: usize = 64 * 1024;
+/// Largest number of lines that is highlighted (every line costs a
+/// `code-line` element in the browser).
+pub const MAX_HIGHLIGHT_LINES: usize = 3_000;
+/// A line longer than this (minified bundles, data blobs) disables
+/// highlighting for the file; syntect gets slow on such lines.
+pub const MAX_HIGHLIGHT_LINE_BYTES: usize = 4 * 1024;
+/// Hard cap on the generated HTML; above it the viewer shows plain text.
+pub const MAX_CODE_HTML_BYTES: usize = 2 * 1024 * 1024;
+/// Hard cap on syntax spans in one file.
+pub const MAX_SPANS: usize = 60_000;
+/// Per-line span budget; the rest of a busier line is emitted unstyled.
+pub const MAX_SPANS_PER_LINE: usize = 200;
+
+/// Classes styled by docs.css, in the order of their CSS rules.
+const STYLED: &[&str] = &[
+    "keyword",
+    "string",
+    "comment",
+    "constant",
+    "entity",
+    "storage",
+    "support",
+    "variable",
+    "punctuation",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeView {
-    /// syntect syntax name (e.g. `C++`, `Python`), `None` for plain text.
-    pub language: Option<String>,
-    /// `<pre class="code-view"><code>` with one `code-line` span per line.
+    /// syntect syntax name (e.g. `C++`, `Python`).
+    pub language: String,
+    /// `<pre class="code-view"><code class="language-…">` with one
+    /// `code-line` span per line.
     pub html: String,
 }
 
+/// Highlighted view of `text`, or `None` for the plain line-numbered view.
+/// Results are cached by file name and content hash.
+pub fn highlight_file_cached(name: &str, sha256: &str, text: &str) -> Option<Arc<CodeView>> {
+    type Cache = Mutex<VecDeque<((String, String), Option<Arc<CodeView>>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    const CACHE_ENTRIES: usize = 16;
+    let cache = CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
+    let key = (name.to_owned(), sha256.to_owned());
+    if let Some((_, hit)) = cache.lock().unwrap().iter().find(|(k, _)| *k == key) {
+        return hit.clone();
+    }
+    let view = highlight_file(name, text).map(Arc::new);
+    let mut guard = cache.lock().unwrap();
+    guard.push_front((key, view.clone()));
+    guard.truncate(CACHE_ENTRIES);
+    view
+}
+
 pub fn highlight_file(name: &str, text: &str) -> Option<CodeView> {
-    if text.len() > MAX_CODE_VIEW_BYTES {
+    if text.len() > MAX_HIGHLIGHT_BYTES {
+        return None;
+    }
+    let text = normalize_line_ends(text);
+    let lines: Vec<&str> = split_view_lines(&text);
+    if lines.len() > MAX_HIGHLIGHT_LINES
+        || lines
+            .iter()
+            .any(|line| line.len() > MAX_HIGHLIGHT_LINE_BYTES)
+    {
         return None;
     }
     let set = syntax_set();
-    let long_lines = text
-        .lines()
-        .any(|line| line.len() > MAX_HIGHLIGHT_LINE_BYTES);
-    let syntax = if long_lines {
-        None
-    } else {
-        detect_syntax(set, name, text)
-    };
-    let body = syntax
-        .and_then(|syntax| classed_html(set, syntax, text))
-        .unwrap_or_else(|| escape_html(text));
-    let language = syntax.map(|syntax| syntax.name.clone());
-    let code_class = syntax
-        .and_then(|syntax| syntax.file_extensions.first())
+    let syntax = detect_syntax(set, name, &text)?;
+    let body = highlight_lines(set, syntax, &lines)?;
+    let token: String = syntax
+        .file_extensions
+        .first()
         .map(|ext| {
-            let token: String = ext
-                .to_ascii_lowercase()
+            ext.to_ascii_lowercase()
                 .chars()
                 .filter(|c| c.is_ascii_alphanumeric())
-                .collect();
-            format!(" class=\"language-{token}\"")
+                .collect()
         })
         .unwrap_or_default();
+    let code_open = if token.is_empty() {
+        "<code>".to_owned()
+    } else {
+        format!("<code class=\"language-{token}\">")
+    };
     Some(CodeView {
-        html: format!(
-            "<pre class=\"code-view\"><code{code_class}>{}</code></pre>",
-            split_lines(&body)
-        ),
-        language,
+        language: syntax.name.clone(),
+        html: format!("<pre class=\"code-view\">{code_open}{body}</code></pre>"),
     })
+}
+
+/// CR LF and lone CR become LF (display only).
+fn normalize_line_ends(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\r') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+/// Lines as the viewer shows them: a final line end does not start an
+/// extra empty line; an empty file is one empty line.
+fn split_view_lines(text: &str) -> Vec<&str> {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    body.split('\n').collect()
 }
 
 fn detect_syntax<'a>(set: &'a SyntaxSet, name: &str, text: &str) -> Option<&'a SyntaxReference> {
@@ -101,83 +166,118 @@ fn detect_syntax<'a>(set: &'a SyntaxSet, name: &str, text: &str) -> Option<&'a S
         })
 }
 
-fn classed_html(set: &SyntaxSet, syntax: &SyntaxReference, text: &str) -> Option<String> {
-    let mut generator = ClassedHTMLGenerator::new_with_class_style(
-        syntax,
-        set,
-        ClassStyle::SpacedPrefixed { prefix: "hl-" },
-    );
-    for line in LinesWithEndings::from(text) {
-        generator
-            .parse_html_for_line_which_includes_newline(line)
-            .ok()?;
-    }
-    Some(generator.finalize())
+/// The styled class for a scope: its first atom (`keyword` in
+/// `keyword.control.c++`) when docs.css styles it.
+fn scope_class(
+    scope: Scope,
+    memo: &mut HashMap<Scope, Option<&'static str>>,
+) -> Option<&'static str> {
+    *memo.entry(scope).or_insert_with(|| {
+        let name = scope.build_string();
+        let first = name.split('.').next().unwrap_or("");
+        STYLED.iter().copied().find(|styled| *styled == first)
+    })
 }
 
-/// Splits escaped/highlighted HTML at newlines into `code-line` spans,
-/// closing the syntax spans still open at each line end and reopening them
-/// on the next line so every line is a self-contained element. The text is
-/// already escaped, so `<` only ever starts one of syntect's span tags.
-fn split_lines(html: &str) -> String {
-    let mut pieces: Vec<String> = html.split('\n').map(str::to_owned).collect();
-    // After the file's final newline only closing tags remain: they belong
-    // to the last line instead of starting an empty extra line.
-    if pieces.len() > 1 && pieces.last().is_some_and(|last| !has_text(last)) {
-        let tail = pieces.pop().unwrap_or_default();
-        if let Some(last) = pieces.last_mut() {
-            last.push_str(&tail);
-        }
-    }
-    let mut out = String::with_capacity(html.len() + pieces.len() * 40);
-    let mut open: Vec<String> = Vec::new();
-    for piece in &pieces {
+/// The class of the innermost styled scope on the stack.
+fn stack_class(
+    stack: &ScopeStack,
+    memo: &mut HashMap<Scope, Option<&'static str>>,
+) -> Option<&'static str> {
+    stack
+        .as_slice()
+        .iter()
+        .rev()
+        .find_map(|scope| scope_class(*scope, memo))
+}
+
+fn highlight_lines(set: &SyntaxSet, syntax: &SyntaxReference, lines: &[&str]) -> Option<String> {
+    let mut state = ParseState::new(syntax);
+    let mut stack = ScopeStack::new();
+    let mut memo = HashMap::new();
+    let mut out = String::with_capacity(lines.iter().map(|l| l.len() + 40).sum());
+    let mut spans_total = 0usize;
+    let mut with_newline = String::new();
+    for line in lines {
+        with_newline.clear();
+        with_newline.push_str(line);
+        with_newline.push('\n');
+        let ops = state.parse_line(&with_newline, set).ok()?;
         out.push_str("<span class=\"code-line\">");
-        for tag in &open {
-            out.push_str(tag);
+        let mut spans_line = 0usize;
+        let mut cursor = 0usize;
+        let mut pending: Option<&'static str> = stack_class(&stack, &mut memo);
+        let mut run = String::new();
+        let mut run_class: Option<&'static str> = None;
+        let line_len = line.len();
+        let mut segments: Vec<(usize, usize, Option<&'static str>)> = Vec::new();
+        for (pos, op) in &ops {
+            let pos = (*pos).min(line_len);
+            if pos > cursor {
+                segments.push((cursor, pos, pending));
+                cursor = pos;
+            }
+            stack.apply(op).ok()?;
+            pending = stack_class(&stack, &mut memo);
         }
-        out.push_str(piece);
-        track_tags(piece, &mut open);
-        for _ in 0..open.len() {
-            out.push_str("</span>");
+        if cursor < line_len {
+            segments.push((cursor, line_len, pending));
         }
+        for (start, end, class) in segments {
+            if class != run_class {
+                flush_run(
+                    &mut run,
+                    run_class,
+                    &mut out,
+                    &mut spans_line,
+                    &mut spans_total,
+                );
+                run_class = class;
+            }
+            escape_into(&line[start..end], &mut run);
+        }
+        flush_run(
+            &mut run,
+            run_class,
+            &mut out,
+            &mut spans_line,
+            &mut spans_total,
+        );
         out.push_str("\n</span>");
-    }
-    out
-}
-
-fn track_tags(line: &str, open: &mut Vec<String>) {
-    let mut rest = line;
-    while let Some(start) = rest.find('<') {
-        let after = &rest[start..];
-        let Some(end) = after.find('>') else {
-            break;
-        };
-        let tag = &after[..=end];
-        if tag.starts_with("</") {
-            open.pop();
-        } else {
-            open.push(tag.to_owned());
-        }
-        rest = &after[end + 1..];
-    }
-}
-
-fn has_text(piece: &str) -> bool {
-    let mut in_tag = false;
-    for ch in piece.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => return true,
-            _ => {}
+        if spans_total > MAX_SPANS || out.len() > MAX_CODE_HTML_BYTES {
+            return None;
         }
     }
-    false
+    Some(out)
 }
 
-fn escape_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+/// Emits a run of escaped text, styled while the line's span budget lasts.
+fn flush_run(
+    run: &mut String,
+    class: Option<&'static str>,
+    out: &mut String,
+    spans_line: &mut usize,
+    spans_total: &mut usize,
+) {
+    if run.is_empty() {
+        return;
+    }
+    match class {
+        Some(class) if *spans_line < MAX_SPANS_PER_LINE => {
+            out.push_str("<span class=\"hl-");
+            out.push_str(class);
+            out.push_str("\">");
+            out.push_str(run);
+            out.push_str("</span>");
+            *spans_line += 1;
+            *spans_total += 1;
+        }
+        _ => out.push_str(run),
+    }
+    run.clear();
+}
+
+fn escape_into(text: &str, out: &mut String) {
     for ch in text.chars() {
         match ch {
             '&' => out.push_str("&amp;"),
@@ -188,7 +288,6 @@ fn escape_html(text: &str) -> String {
             _ => out.push(ch),
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -214,8 +313,9 @@ mod tests {
         html.matches("<span class=\"code-line\">").count()
     }
 
-    /// Every tag is balanced inside each `code-line`.
-    fn assert_balanced_lines(html: &str) {
+    /// Tags are balanced, `code-line` spans sit directly in `<code>` and
+    /// syntax spans are never nested.
+    fn assert_flat_and_balanced(html: &str) {
         let inner = html
             .strip_prefix("<pre class=\"code-view\">")
             .and_then(|rest| rest.strip_suffix("</pre>"))
@@ -227,7 +327,9 @@ mod tests {
             let end = after.find('>').expect("closed tag");
             let tag = &after[..=end];
             if tag.starts_with("<span class=\"code-line\">") {
-                assert_eq!(depth, 1, "code-line opens inside <code> only: {html}");
+                assert_eq!(depth, 1, "code-line directly inside <code>: {html}");
+            } else if tag.starts_with("<span class=\"hl-") {
+                assert_eq!(depth, 2, "syntax spans are flat: {html}");
             }
             if tag.starts_with("</") {
                 depth -= 1;
@@ -247,30 +349,28 @@ mod tests {
                 "src/main.cpp",
                 "#include <vector>\n/* multi\n   line */\nint main() { return 0; }\n",
                 "C++",
-                "int",
+                "<span class=\"hl-storage\">int</span>",
             ),
             (
                 "tool.py",
                 "def greet(name):\n    \"\"\"Doc\n    string\"\"\"\n    return name\n",
                 "Python",
-                "def",
+                "<span class=\"hl-storage\">def</span>",
             ),
             (
                 "build.sh",
                 "#!/bin/sh\nfor f in *.c; do\n  echo \"$f\"\ndone\n",
                 "Bourne Again Shell (bash)",
-                "for",
+                "<span class=\"hl-keyword\">for</span>",
             ),
         ] {
             let view = highlight_file(name, text).expect("code view");
-            assert_eq!(view.language.as_deref(), Some(language), "{name}");
-            assert!(view.html.contains("hl-"), "{name}: {}", view.html);
-            assert!(view.html.contains(keyword), "{name}");
+            assert_eq!(view.language, language, "{name}");
+            assert!(view.html.contains(keyword), "{name}: {}", view.html);
             assert_eq!(lines(&view.html), 4, "{name}: {}", view.html);
-            assert_balanced_lines(&view.html);
+            assert_flat_and_balanced(&view.html);
         }
-        // `<vector>` is escaped, never markup.
-        let cpp = highlight_file("a.cpp", "#include <vector>\n").unwrap();
+        let cpp = highlight_file("a.cpp", "#include <vector>\n/* a\n b */\n").unwrap();
         assert!(!cpp.html.contains("<vector"), "{}", cpp.html);
         assert!(
             text_of(&cpp.html).contains("&lt;vector&gt;"),
@@ -282,58 +382,102 @@ mod tests {
             "{}",
             cpp.html
         );
+        // A comment spanning lines is styled on both lines.
+        assert_eq!(
+            cpp.html.matches("<span class=\"hl-comment\">").count(),
+            2,
+            "{}",
+            cpp.html
+        );
     }
 
     #[test]
     fn known_names_and_shebangs_pick_a_syntax() {
         let make = highlight_file("Makefile", "all:\n\tcc -o app main.c\n").unwrap();
-        assert_eq!(make.language.as_deref(), Some("Makefile"));
+        assert_eq!(make.language, "Makefile");
         let script = highlight_file("scripts/run", "#!/usr/bin/env python3\nprint(1)\n").unwrap();
-        assert_eq!(script.language.as_deref(), Some("Python"));
+        assert_eq!(script.language, "Python");
     }
 
     #[test]
-    fn unknown_extension_is_plain_text_with_lines() {
-        let view = highlight_file("notes.zzz", "a < b\n\nlast").unwrap();
-        assert_eq!(view.language, None);
-        assert!(!view.html.contains("hl-"));
-        assert_eq!(lines(&view.html), 3);
-        assert!(view.html.contains("a &lt; b"));
-        assert_balanced_lines(&view.html);
+    fn unknown_syntax_gets_the_plain_view() {
+        assert_eq!(highlight_file("notes.zzz", "a < b\n"), None);
+        assert_eq!(highlight_file("notes.log", "a < b\n"), None);
     }
 
     #[test]
-    fn over_the_cap_falls_back_to_plain_text() {
-        let big = "x = 1\n".repeat(MAX_CODE_VIEW_BYTES / 6 + 10);
-        assert!(big.len() > MAX_CODE_VIEW_BYTES);
+    fn input_caps_fall_back_to_plain() {
+        let big = "x = 1\n".repeat(MAX_HIGHLIGHT_BYTES / 6 + 10);
+        assert!(big.len() > MAX_HIGHLIGHT_BYTES);
         assert_eq!(highlight_file("big.py", &big), None);
-        // Very long lines keep line numbers but skip syntax colors.
-        let long = format!(
-            "x = '{}'\nprint(x)\n",
-            "a".repeat(MAX_HIGHLIGHT_LINE_BYTES + 1)
+        let many = "\n".repeat(MAX_HIGHLIGHT_LINES + 1);
+        assert_eq!(highlight_file("blank.py", &many), None);
+        let long = format!("x = '{}'\n", "a".repeat(MAX_HIGHLIGHT_LINE_BYTES + 1));
+        assert_eq!(highlight_file("long.py", &long), None);
+    }
+
+    // Review blocker: '[' nesting made the old output grow quadratically
+    // (a 256 KiB file produced ~780 MB). The flat output stays bounded.
+    #[test]
+    fn pathological_nesting_is_bounded() {
+        let nested = "[\n".repeat(MAX_HIGHLIGHT_LINES);
+        let view = highlight_file("nested.json", &nested).expect("within the line cap");
+        assert_eq!(lines(&view.html), MAX_HIGHLIGHT_LINES);
+        assert_flat_and_balanced(&view.html);
+        assert!(
+            view.html.len() < nested.len() * 40,
+            "{} bytes for {} input bytes",
+            view.html.len(),
+            nested.len()
         );
-        let view = highlight_file("long.py", &long).unwrap();
-        assert_eq!(view.language, None);
-        assert_eq!(lines(&view.html), 2);
+        // Inputs just under every input cap still respect the output caps.
+        for (name, unit) in [
+            ("a.json", "[{\"a\":[1,{\"b\":[\"c\"]}]},\n"),
+            ("a.cpp", "int f(int a){return a<1?(a+2)*3:f(a-1);} // c\n"),
+            ("a.py", "x = [f(a, b) for a, b in zip(\"ab\", 'cd')]  # c\n"),
+        ] {
+            let text = unit.repeat((MAX_HIGHLIGHT_BYTES - 1) / unit.len());
+            if let Some(view) = highlight_file(name, &text) {
+                assert!(view.html.len() <= MAX_CODE_HTML_BYTES + 64 * 1024, "{name}");
+                assert!(
+                    view.html.matches("<span class=\"hl-").count()
+                        <= MAX_SPANS + MAX_SPANS_PER_LINE
+                );
+                assert_flat_and_balanced(&view.html);
+            }
+        }
+    }
+
+    #[test]
+    fn per_line_span_budget() {
+        let busy = format!("{}\n", "1,".repeat(MAX_SPANS_PER_LINE * 2));
+        let view = highlight_file("busy.json", &busy).unwrap();
+        assert!(view.html.matches("<span class=\"hl-").count() <= MAX_SPANS_PER_LINE);
+        assert!(text_of(&view.html).contains(&busy[..busy.len() - 1]));
+    }
+
+    #[test]
+    fn crlf_and_lone_cr_are_single_line_breaks() {
+        let crlf = highlight_file("w.py", "a = 1\r\nb = 2\r\n").unwrap();
+        assert_eq!(lines(&crlf.html), 2, "{}", crlf.html);
+        assert!(!crlf.html.contains('\r'), "{}", crlf.html);
+        let cr = highlight_file("m.py", "a = 1\rb = 2\r").unwrap();
+        assert_eq!(lines(&cr.html), 2, "{}", cr.html);
+        assert!(!cr.html.contains('\r'));
     }
 
     #[test]
     fn markup_in_content_is_escaped() {
         let evil = "</code></pre><script>alert(1)</script>\n<img src=x onerror=alert(2)>\n\"'&\n";
-        for name in ["evil.py", "evil.zzz", "evil.html.txt"] {
+        for name in ["evil.py", "evil.cpp", "evil.sh"] {
             let view = highlight_file(name, evil).unwrap();
             assert!(!view.html.contains("<script"), "{name}: {}", view.html);
             assert!(!view.html.contains("<img"), "{name}: {}", view.html);
             assert!(
-                !view.html.contains("</code></pre><"),
-                "{name}: {}",
-                view.html
-            );
-            assert!(
                 text_of(&view.html).contains("&lt;/code&gt;&lt;/pre&gt;&lt;script&gt;"),
                 "{name}"
             );
-            assert_balanced_lines(&view.html);
+            assert_flat_and_balanced(&view.html);
         }
     }
 
@@ -346,5 +490,13 @@ mod tests {
             1
         );
         assert_eq!(lines(&highlight_file("e.rs", "\n\n").unwrap().html), 2);
+    }
+
+    #[test]
+    fn cache_returns_the_same_view() {
+        let a = highlight_file_cached("c.py", "sha-1", "x = 1\n").unwrap();
+        let b = highlight_file_cached("c.py", "sha-1", "ignored on a hit\n").unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(highlight_file_cached("c.zzz", "sha-2", "x\n"), None);
     }
 }
