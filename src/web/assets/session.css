@@ -64,6 +64,27 @@
 /* Composer: a rounded box pinned under the transcript; Send sits inside it. */
 .session-prompt { flex: none; box-sizing: border-box; display: flex; flex-direction: column; gap: .35rem; width: calc(100% - 2rem); max-width: calc(var(--chat-col) - 2rem); margin: .5rem auto 0; padding: .6rem .75rem .5rem; background: var(--bg-chip); border: 1px solid var(--line); border-radius: 1.5rem; box-shadow: 0 2px 10px rgba(0, 0, 0, .06); }
 .session-prompt:focus-within { border-color: var(--accent); }
+.session-composer-top { display: flex; align-items: flex-end; gap: .5rem; width: 100%; }
+.session-agent-picker { flex: none; display: inline-flex; align-items: center; gap: .35rem; max-width: 11rem; padding: .25rem .55rem; border: 1px solid var(--line); border-radius: 999px; background: var(--bg); color: var(--text); font: inherit; font-size: .78rem; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session-agent-picker::before { content: ""; width: .5rem; height: .5rem; border-radius: 50%; background: var(--agent-picker-dot, var(--accent)); flex: none; }
+.session-agent-picker:disabled { opacity: .55; cursor: not-allowed; }
+.session-agent-overlay { position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-end; justify-content: center; padding: 1rem; background: rgba(0, 0, 0, .25); }
+.session-agent-popover { width: min(24rem, 96vw); max-height: min(70vh, 28rem); overflow-y: auto; padding: .75rem; background: var(--bg-panel); border: 1px solid var(--line); border-radius: .75rem; box-shadow: 0 8px 32px rgba(0, 0, 0, .12); }
+.session-agent-popover-title { margin: 0 0 .5rem; font-size: .8rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.session-agent-list { list-style: none; margin: 0; padding: 0; }
+.session-agent-row { display: flex; align-items: center; gap: .5rem; width: 100%; padding: .45rem .5rem; border: 0; border-radius: .5rem; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.session-agent-row:hover { background: var(--bg-chip); }
+.session-agent-row-active { background: var(--current-bg); outline: 1px solid var(--accent); }
+.session-agent-row:disabled { opacity: .45; cursor: not-allowed; }
+.session-agent-dot { width: .55rem; height: .55rem; border-radius: 50%; flex: none; }
+.session-agent-main { display: flex; flex-direction: column; min-width: 0; gap: .1rem; }
+.session-agent-name { font-weight: 600; font-size: .9rem; }
+.session-agent-meta { font-size: .75rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-agent-models { display: flex; flex-wrap: wrap; gap: .35rem; padding: .35rem .5rem .5rem 1.4rem; }
+.session-model-chip { border: 1px solid var(--line); border-radius: 999px; padding: .15rem .55rem; background: var(--bg-chip); color: var(--text); font: inherit; font-size: .75rem; cursor: pointer; }
+.session-model-chip.on { border-color: var(--accent); color: var(--accent); }
+.session-transcript .msg-agent .msg-text.msg-md { white-space: normal; }
+.session-transcript .msg-agent .msg-text.msg-md pre { overflow-x: auto; }
 .session-send-col { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: .5rem; flex-shrink: 0; }
 .session-send-col .session-picker { flex-direction: row; align-items: center; gap: .35rem; min-width: 0; }
 .session-send-col .btn-primary { border-radius: 999px; padding: .3rem .9rem; }

@@ -60,8 +60,47 @@
     });
   }
 
-  var root = document.getElementById('memory-panel');
-  if (!root) { return; }
+  var toggle = document.getElementById('memory-toggle');
+  var badge = document.getElementById('memory-badge');
+  var root = document.getElementById('memory-popover');
+  if (!root || !toggle) { return; }
+
+  var popoverOpen = false;
+
+  function setPopoverOpen(open) {
+    popoverOpen = !!open;
+    root.hidden = !popoverOpen;
+    toggle.setAttribute('aria-expanded', popoverOpen ? 'true' : 'false');
+    if (popoverOpen) {
+      root.focus();
+    }
+  }
+
+  function updateBadge(enabled) {
+    if (!badge) { return; }
+    badge.textContent = enabled ? 'On' : 'Off';
+    badge.classList.toggle('memory-badge-on', enabled);
+    badge.classList.toggle('memory-badge-off', !enabled);
+    badge.hidden = false;
+  }
+
+  toggle.addEventListener('click', function (e) {
+    e.stopPropagation();
+    setPopoverOpen(!popoverOpen);
+  });
+
+  document.addEventListener('click', function (e) {
+    if (!popoverOpen) { return; }
+    if (root.contains(e.target) || toggle.contains(e.target)) { return; }
+    setPopoverOpen(false);
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && popoverOpen) {
+      setPopoverOpen(false);
+      toggle.focus();
+    }
+  });
 
   var state = {
     project: '',
@@ -146,8 +185,9 @@
     targetSelect = null;
     textInput = null;
     uiMode = 'no-token';
-    root.appendChild(el('h2', 'panel-title', 'Memory'));
+    root.appendChild(el('p', 'memory-popover-title', 'Memory'));
     root.appendChild(el('p', 'memory-off', NO_TOKEN_MSG));
+    updateBadge(false);
   }
 
   function renderMemoryOff() {
@@ -163,8 +203,9 @@
     targetSelect = null;
     textInput = null;
     uiMode = 'disabled';
-    root.appendChild(el('h2', 'panel-title', 'Memory'));
+    root.appendChild(el('p', 'memory-popover-title', 'Memory'));
     root.appendChild(el('p', 'memory-off', MEMORY_OFF_MSG));
+    updateBadge(false);
   }
 
   function proposalAction(path, busyLabel, doneLabel) {
@@ -233,7 +274,7 @@
     root.textContent = '';
     uiMode = 'enabled';
 
-    root.appendChild(el('h2', 'panel-title', 'Memory'));
+    root.appendChild(el('p', 'memory-popover-title', 'Memory'));
     metaEl = el('p', 'memory-meta');
     root.appendChild(metaEl);
 
@@ -357,11 +398,13 @@
           if (uiMode !== 'disabled') {
             renderMemoryOff();
           }
+          updateBadge(false);
           return;
         }
         if (uiMode !== 'enabled') {
           mountEnabledShell();
         }
+        updateBadge(true);
         applyEnabledData(data);
       })
       .catch(function (err) {

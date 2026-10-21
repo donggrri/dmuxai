@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<title>DmuxAI dashboard demo</title>
+<link rel="stylesheet" href="/assets/app.css">
+<link rel="stylesheet" href="/assets/session.css">
+<link rel="stylesheet" href="/assets/docs.css">
+<style>
+body { margin: 0; font-family: system-ui, sans-serif; }
+.top { display: flex; gap: .5rem; padding: .75rem 1rem; border-bottom: 1px solid var(--line); align-items: center; }
+.demo-chat { max-width: 860px; margin: 1rem auto; padding: 0 1rem; }
+.msg-agent .msg-text.msg-md h2 { margin: .5rem 0; }
+</style>
+</head>
+<body>
+<header class="top">
+  <button type="button" class="btn sidebar-toggle">Reset</button>
+  <button type="button" class="btn sidebar-toggle active">Sessions</button>
+  <button type="button" class="btn sidebar-toggle">Graph</button>
+  <button type="button" class="btn sidebar-toggle memory-top-btn">Memory <span class="memory-badge memory-badge-off">Off</span></button>
+</header>
+<div class="demo-chat">
+  <div class="session-prompt" style="margin-bottom:1rem;">
+    <div class="session-composer-top">
+      <button type="button" class="session-agent-picker" style="--agent-picker-dot:#22c55e">Cursor · demo-model</button>
+      <textarea class="session-input" rows="2" readonly>Sample user message (plain text)</textarea>
+    </div>
+  </div>
+  <div class="msg msg-agent">
+    <span class="msg-who">cursor</span>
+    <div class="msg-text msg-md md-body">
+      <h2>Sample assistant reply</h2>
+      <p><strong>Bold</strong> text and a <a href="https://example.com" rel="noopener noreferrer" target="_blank">link</a>.</p>
+      <table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table>
+      <pre><code>fn demo() {}</code></pre>
+    </div>
+  </div>
+</div>
+</body>
+</html>

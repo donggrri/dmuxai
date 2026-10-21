@@ -168,7 +168,7 @@ pub fn convert_to_pdf(
     }
 
     let run_id = uuid::Uuid::new_v4().simple();
-    let work_dir = std::env::temp_dir().join(format!("dmuxai-office-run-{}", run_id));
+    let work_dir = std::env::temp_dir().join(format!("dmuxai-office-run-{run_id}"));
     let profile_dir = work_dir.join("profile");
     let out_dir = work_dir.join("out");
 
@@ -190,9 +190,9 @@ pub fn convert_to_pdf(
 
     let profile_str = profile_dir.to_string_lossy().replace('\\', "/");
     let profile_arg = if profile_str.starts_with('/') {
-        format!("-env:UserInstallation=file://{}", profile_str)
+        format!("-env:UserInstallation=file://{profile_str}")
     } else {
-        format!("-env:UserInstallation=file:///{}", profile_str)
+        format!("-env:UserInstallation=file:///{profile_str}")
     };
 
     let can_unshare = {
@@ -323,7 +323,7 @@ pub fn convert_to_pdf(
         };
     };
 
-    let temp_cache_file = cache_dir.join(format!(".tmp-{}", run_id));
+    let temp_cache_file = cache_dir.join(format!(".tmp-{run_id}"));
     if let Err(e) = std::fs::copy(&pdf_file, &temp_cache_file) {
         return OfficePreview::Unavailable {
             reason: format!("failed to cache PDF: {e}"),

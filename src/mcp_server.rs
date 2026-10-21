@@ -62,7 +62,10 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "prompt": { "type": "string" },
                     "agent": { "type": "string", "description": "Runner id, e.g. agy or a custom agent name" },
-                    "mode": { "type": "string", "enum": ["ask", "plan", "implement"] },
+                    "mode": {
+                        "type": "string",
+                        "description": "Deprecated, ignored. DmuxAI runs a single write-capable agent policy."
+                    },
                     "graph": { "type": "boolean", "description": "Use the graph planner" },
                     "todo_id": { "type": "string", "description": "Run this to-do instead of a prompt" }
                 }

@@ -227,6 +227,7 @@ impl DashboardHub {
                 role: "system".to_owned(),
                 agent: None,
                 content: notice,
+                content_html: None,
                 streaming: false,
             });
         state.snapshot.revision += 1;

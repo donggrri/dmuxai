@@ -744,7 +744,7 @@ fn percent_encode_doc_fragment(path: &str) -> String {
                 encoded.push(byte as char);
             }
             b'/' => encoded.push_str("%2F"),
-            _ => encoded.push_str(&format!("%{:02X}", byte)),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
         }
     }
     encoded

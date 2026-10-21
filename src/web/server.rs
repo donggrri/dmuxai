@@ -3194,7 +3194,7 @@ mod tests {
                         let mut guard = state.lock().unwrap();
                         let result = match mode {
                             RunMode::Graph => {
-                                let plan_id = format!("plan-{}", todo_id);
+                                let plan_id = format!("plan-{todo_id}");
                                 guard.awaiting = Some((plan_id.clone(), 1, todo_id.clone()));
                                 guard
                                     .store

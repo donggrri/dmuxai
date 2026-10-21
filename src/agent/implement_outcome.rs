@@ -2,7 +2,7 @@ use std::process::ExitStatus;
 
 use serde_json::Value;
 
-use super::ExecutionMode;
+use super::TurnPolicy;
 
 const AGY_WRITE_TOOL_NAMES: &[&str] = &[
     "write_to_file",
@@ -15,20 +15,20 @@ const AGY_WRITE_TOOL_NAMES: &[&str] = &[
 ];
 
 pub(crate) struct ImplementTurnTracker {
-    mode: ExecutionMode,
+    policy: TurnPolicy,
     writes_observed: bool,
 }
 
 impl ImplementTurnTracker {
-    pub(crate) fn new(mode: ExecutionMode) -> Self {
+    pub(crate) fn new(policy: TurnPolicy) -> Self {
         Self {
-            mode,
+            policy,
             writes_observed: false,
         }
     }
 
     pub(crate) fn observe_provider_line(&mut self, line: &str) {
-        if self.mode != ExecutionMode::Implement {
+        if self.policy != TurnPolicy::Agent {
             return;
         }
         if provider_line_suggests_write(line) {
@@ -37,7 +37,7 @@ impl ImplementTurnTracker {
     }
 
     pub(crate) fn observe_agy_message(&mut self, message: &Value) {
-        if self.mode == ExecutionMode::Implement && agy_message_indicates_write(message) {
+        if self.policy == TurnPolicy::Agent && agy_message_indicates_write(message) {
             self.writes_observed = true;
         }
     }
@@ -54,7 +54,7 @@ impl ImplementTurnTracker {
         require_writes: bool,
         exit_forced_after_result: bool,
     ) -> Result<(), String> {
-        if self.mode != ExecutionMode::Implement {
+        if self.policy != TurnPolicy::Agent {
             if !exit_forced_after_result {
                 if !status.success() && !stderr.trim().is_empty() {
                     return Err(stderr.trim().to_owned());
@@ -71,21 +71,21 @@ impl ImplementTurnTracker {
         }
         if !status.success() && !exit_forced_after_result {
             return Err(if stderr.trim().is_empty() {
-                format!("implement mode failed: provider exited with {status}")
+                format!("agent turn failed: provider exited with {status}")
             } else {
                 stderr.trim().to_owned()
             });
         }
         if !protocol_completed {
             return Err(if stderr.trim().is_empty() {
-                "implement mode failed: provider exited without a terminal result".to_owned()
+                "agent turn failed: provider exited without a terminal result".to_owned()
             } else {
                 stderr.trim().to_owned()
             });
         }
         if require_writes && !self.writes_observed {
             return Err(
-                "implement mode completed without any observed file changes; stderr had no writes"
+                "agent turn completed without any observed file changes; stderr had no writes"
                     .to_owned(),
             );
         }
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn implement_without_writes_fails() {
-        let tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        let tracker = ImplementTurnTracker::new(TurnPolicy::Agent);
         let status = ExitStatus::from_raw(0);
         let error = tracker
             .finish(&status, "", true, true, false)
@@ -198,21 +198,18 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn ask_mode_does_not_require_writes() {
-        let tracker = ImplementTurnTracker::new(ExecutionMode::Ask);
+    fn read_only_does_not_require_writes() {
+        let tracker = ImplementTurnTracker::new(TurnPolicy::ReadOnly);
         let status = ExitStatus::from_raw(0);
         assert!(tracker.finish(&status, "", true, true, false).is_ok());
     }
 
     #[test]
     #[cfg(unix)]
-    fn finish_accepts_forced_kill_after_result_in_implement_mode() {
-        // FR-503 / TC-505: a successful result followed by a grace kill yields a
-        // signal exit status; `exit_forced_after_result` must skip only the
-        // `status.success()` checks in Implement mode.
+    fn finish_accepts_forced_kill_after_result_in_agent_mode() {
         let killed = ExitStatus::from_raw(9);
 
-        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        let mut tracker = ImplementTurnTracker::new(TurnPolicy::Agent);
         tracker.observe_provider_line(r#"{"name":"create_file"}"#);
         assert!(tracker.writes_observed());
         assert!(
@@ -220,11 +217,11 @@ mod tests {
             "forced kill after a successful result should finish Ok"
         );
 
-        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        let mut tracker = ImplementTurnTracker::new(TurnPolicy::Agent);
         tracker.observe_provider_line(r#"{"name":"run_command"}"#);
         assert!(tracker.finish(&killed, "", true, true, true).is_err());
 
-        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        let mut tracker = ImplementTurnTracker::new(TurnPolicy::Agent);
         tracker.observe_provider_line(r#"{"name":"create_file"}"#);
         assert!(
             tracker.finish(&killed, "", true, true, false).is_err(),
@@ -256,12 +253,12 @@ mod tests {
         });
         assert!(agy_message_indicates_write(&write));
         assert!(!agy_message_indicates_write(&init));
-        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        let mut tracker = ImplementTurnTracker::new(TurnPolicy::Agent);
         tracker.observe_provider_line(&init.to_string());
         assert!(!tracker.writes_observed());
         assert!(!agy_message_indicates_write(&run));
 
-        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        let mut tracker = ImplementTurnTracker::new(TurnPolicy::Agent);
         tracker.observe_agy_message(&write);
         assert!(tracker.writes_observed());
     }
@@ -269,40 +266,39 @@ mod tests {
     #[test]
     fn init_line_does_not_count_as_write_via_text_scan() {
         let init_line = r#"{"event":"init","tools":["write_to_file","replace_file_content"]}"#;
-        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        let mut tracker = ImplementTurnTracker::new(TurnPolicy::Agent);
         tracker.observe_provider_line(init_line);
         assert!(!tracker.writes_observed());
     }
 
     #[test]
     fn provider_line_write_needles_cover_cursor_and_custom() {
-        // FR-501 / TC-501: Cursor (and custom) providers are scanned as raw text
-        // via `observe_provider_line`, so their write tool names must be
-        // recognized. AGY uses `observe_agy_message` and never calls this scan,
-        // so its init tool list cannot trip these needles.
         let cursor_edit = r#"{"type":"tool_call","tool":{"name":"edit_file","args":{}}}"#;
         let cursor_write = r#"{"type":"tool_call","tool":{"name":"write_file","args":{}}}"#;
         let assistant_text = r#"{"type":"assistant","text":"Updated the configuration file"}"#;
 
-        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        let mut tracker = ImplementTurnTracker::new(TurnPolicy::Agent);
         tracker.observe_provider_line(cursor_edit);
         assert!(tracker.writes_observed(), "edit_file should mark a write");
 
-        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        let mut tracker = ImplementTurnTracker::new(TurnPolicy::Agent);
         tracker.observe_provider_line(cursor_write);
         assert!(tracker.writes_observed(), "write_file should mark a write");
 
-        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Implement);
+        let mut tracker = ImplementTurnTracker::new(TurnPolicy::Agent);
         tracker.observe_provider_line(assistant_text);
         assert!(
             !tracker.writes_observed(),
             "plain assistant text should not mark a write"
         );
 
-        let mut tracker = ImplementTurnTracker::new(ExecutionMode::Ask);
+        let mut tracker = ImplementTurnTracker::new(TurnPolicy::ReadOnly);
         tracker.observe_provider_line(cursor_edit);
         tracker.observe_provider_line(cursor_write);
-        assert!(!tracker.writes_observed(), "Ask mode never records writes");
+        assert!(
+            !tracker.writes_observed(),
+            "read-only turns never record writes"
+        );
     }
 
     #[test]

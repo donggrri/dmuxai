@@ -2815,7 +2815,7 @@ function computeAgentsKey(list) {
 
 function renderAgents(agents, nowMs) {
   var wrap = $('agents');
-  if (!wrap) { return; }
+  if (!wrap) { return; } // Agents card removed; composer picker owns agent UI.
   var list = Array.isArray(agents) ? agents : [];
   var now = typeof nowMs === 'number' ? nowMs : Date.now();
   var key = computeAgentsKey(list);

@@ -34,11 +34,6 @@ pub const PARITY: &[ParityEntry] = &[
         action: "select_agent",
     },
     ParityEntry {
-        tui: "/mode",
-        control: "mode",
-        action: "set_mode",
-    },
-    ParityEntry {
         tui: "F2",
         control: "model",
         action: "load_models, select_model",
