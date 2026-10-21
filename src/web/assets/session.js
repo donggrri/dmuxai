@@ -147,6 +147,86 @@
     return node;
   }
 
+  function buildCopyIcon() {
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('width', '16');
+    svg.setAttribute('height', '16');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('aria-hidden', 'true');
+    var r1 = document.createElementNS(ns, 'rect');
+    r1.setAttribute('x', '5');
+    r1.setAttribute('y', '5');
+    r1.setAttribute('width', '9');
+    r1.setAttribute('height', '9');
+    r1.setAttribute('rx', '2');
+    var r2 = document.createElementNS(ns, 'rect');
+    r2.setAttribute('x', '2');
+    r2.setAttribute('y', '2');
+    r2.setAttribute('width', '9');
+    r2.setAttribute('height', '9');
+    r2.setAttribute('rx', '2');
+    svg.appendChild(r1);
+    svg.appendChild(r2);
+    return svg;
+  }
+
+  function buildCheckIcon() {
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('width', '16');
+    svg.setAttribute('height', '16');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('aria-hidden', 'true');
+    var poly = document.createElementNS(ns, 'polyline');
+    poly.setAttribute('points', '3,8 6,11 13,4');
+    svg.appendChild(poly);
+    return svg;
+  }
+
+  function legacyCopyText(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.readOnly = true;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    ta.style.opacity = '0';
+    var prev = document.activeElement;
+    document.body.appendChild(ta);
+    var ok = false;
+    try {
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      ok = document.execCommand('copy');
+    } catch (err) {
+      ok = false;
+    }
+    if (ta.parentNode) { ta.parentNode.removeChild(ta); }
+    if (prev && typeof prev.focus === 'function') {
+      try { prev.focus(); } catch (err) { /* ignore */ }
+    }
+    return !!ok;
+  }
+
+  function copyText(text) {
+    return new Promise(function (resolve) {
+      if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(function () {
+          resolve(true);
+        }, function () {
+          resolve(legacyCopyText(text));
+        });
+        return;
+      }
+      resolve(legacyCopyText(text));
+    });
+  }
+
   function button(label, parity, onClick, extraClass) {
     var b = el('button', 'btn', label);
     b.type = 'button';
@@ -1348,6 +1428,59 @@
         node.dmuxText = el('div', 'msg-text');
         node.appendChild(node.dmuxWho);
         node.appendChild(node.dmuxText);
+        if (m.role === 'agent') {
+          var actionsBar = el('div', 'msg-actions');
+          var copyBtn = el('button', 'msg-copy');
+          copyBtn.type = 'button';
+          copyBtn.setAttribute('aria-label', 'Copy reply');
+          copyBtn.setAttribute('title', 'Copy');
+          var copyIcon = buildCopyIcon();
+          var checkIcon = buildCheckIcon();
+          copyBtn.appendChild(copyIcon);
+          copyBtn.dmuxCopyIcon = copyIcon;
+          copyBtn.dmuxCheckIcon = checkIcon;
+          var copyTip = el('span', 'msg-copy-tip');
+          copyTip.setAttribute('role', 'status');
+          actionsBar.appendChild(copyBtn);
+          actionsBar.appendChild(copyTip);
+          node.appendChild(actionsBar);
+          node.dmuxCopy = copyBtn;
+          node.dmuxActions = actionsBar;
+          node.dmuxCopyTip = copyTip;
+          copyBtn.dmuxNode = node;
+          copyBtn.addEventListener('click', function () {
+            var btn = this;
+            var n = btn.dmuxNode;
+            var tip = n.dmuxCopyTip;
+            if (n.dmuxCopyTimer) {
+              clearTimeout(n.dmuxCopyTimer);
+              n.dmuxCopyTimer = null;
+            }
+            copyText(n.dmuxRaw || '').then(function (ok) {
+              if (ok) {
+                btn.classList.add('msg-copy-done');
+                while (btn.firstChild) { btn.removeChild(btn.firstChild); }
+                btn.appendChild(btn.dmuxCheckIcon);
+                btn.setAttribute('aria-label', 'Copied');
+                btn.setAttribute('title', 'Copied');
+                if (tip) { tip.textContent = 'Copied'; }
+              } else {
+                if (tip) { tip.textContent = 'Copy failed'; }
+              }
+              n.dmuxCopyTimer = setTimeout(function () {
+                if (ok) {
+                  btn.classList.remove('msg-copy-done');
+                  while (btn.firstChild) { btn.removeChild(btn.firstChild); }
+                  btn.appendChild(btn.dmuxCopyIcon);
+                  btn.setAttribute('aria-label', 'Copy reply');
+                  btn.setAttribute('title', 'Copy');
+                }
+                if (tip) { tip.textContent = ''; }
+                n.dmuxCopyTimer = null;
+              }, 1500);
+            });
+          });
+        }
         messageNodes[m.id] = node;
         if (previous && previous.nextSibling) {
           ui.transcript.insertBefore(node, previous.nextSibling);
@@ -1364,6 +1497,11 @@
       var color = m.agent ? agentColor(m.agent) : null;
       if (color) { node.style.setProperty('--agent-color', color); } else { node.style.removeProperty('--agent-color'); }
       renderMessageText(node.dmuxText, m);
+      // Copy reply: the raw Markdown source, not the rendered HTML.
+      if (m.role === 'agent') { node.dmuxRaw = String(m.content || ''); }
+      if (node.dmuxActions) {
+        node.dmuxActions.classList.toggle('msg-actions-hidden', !!m.streaming || !m.content);
+      }
       node.classList.toggle('msg-streaming', !!m.streaming);
       var imageKey = (m.images && m.images.length) ? m.images.join(',') : '';
       if (node.dmuxImagesKey !== imageKey) {
