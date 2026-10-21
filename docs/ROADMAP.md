@@ -2,6 +2,16 @@
 
 Release history is in [CHANGELOG.md](../CHANGELOG.md). Each item links its SPEC (the contract) and its GitHub issue (status). GitHub milestones: [v0.2.1](https://github.com/donggrri/dmuxai/milestone/1) (released), [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2) (released).
 
+## v0.2.4 (planned, after v0.2.3)
+
+Source: Dongjin, 2026-10-18 23:3x KST: "모든 TUI 기능이 대시보드에서 구현이 된다면 TUI는 사용하지 않고 제거하는 방향으로 간다" and "그 기능은 다음 릴리즈에". Not part of v0.2.2 or v0.2.3.
+
+| # | Item | Kind | SPEC (IDs) | Issue | Status |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Dashboard full parity and TUI retirement: headless interactive `dmuxai serve`, every TUI-only feature on the dashboard with logic in the shared Rust core, then remove the TUI | feature | [SPEC-dashboard-full-parity](specs/SPEC-dashboard-full-parity.md) (FR-1100..) | — | spec draft; gap list awaiting Dongjin's review |
+
+The grok runner ([#66](https://github.com/donggrri/dmuxai/pull/66), merged for v0.2.2) is already on the dashboard under `--web`; it must also work under the new interactive `serve`. The plan gate ([#67](https://github.com/donggrri/dmuxai/pull/67)) and the rest of v0.2.3 must be reachable from the dashboard before the TUI is removed. #70 (TUI picker width, merged (f1b36ae)) is TUI-only and #71 (resizable sidebars) is dashboard-only; neither adds a parity gap.
+
 ## v0.2.2 (released 2026-10-19)
 
 Source: Dongjin, 2026-10-18 09:42 KST; item 5 added by Dongjin 2026-10-19 00:00 KST.
