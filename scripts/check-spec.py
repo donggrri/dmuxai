@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Baseline/feature spec traceability gate (same rules as check-spec.ps1)."""
+"""Baseline/feature spec traceability gate."""
 
 from __future__ import annotations
 

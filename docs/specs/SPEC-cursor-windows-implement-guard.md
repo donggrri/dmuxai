@@ -58,10 +58,10 @@ non-Cursor agent modes retain their existing behavior.
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-480 | INT-480 | unit | Construct a Cursor adapter mode request on the current target platform. | Validate and attempt Cursor Implement selection. | Windows returns the platform-specific `UnsupportedMode` error and does not queue a mode-change event; supported platforms accept it. The UI does not retire the binding or change mode state. | `src/agent/cursor.rs`: `cursor_mode_validation_matches_platform`; Windows `windows_cursor_implement_mode_is_rejected_before_queueing`; `src/app.rs`: `unsupported_mode_is_rejected_before_binding_retirement` |
-| TC-481 | NFR-480 | unit | Construct a Cursor Implement turn request on Windows with an unusable working directory. | Call the adapter's turn runner directly. | It returns the platform error before any provider event or process-spawn error can occur. | `src/agent/cursor.rs`: `windows_cursor_implement_turn_is_rejected_before_process_spawn` |
+| TC-480 | INT-480 | unit | Construct a Cursor adapter mode request on the current target platform. | Validate and attempt Cursor Implement selection. | Windows returns the platform-specific `UnsupportedMode` error and does not queue a mode-change event; supported platforms accept it. The UI does not retire the binding or change mode state. | Deferred (test removed with Windows support) |
+| TC-481 | NFR-480 | unit | Construct a Cursor Implement turn request on Windows with an unusable working directory. | Call the adapter's turn runner directly. | It returns the platform error before any provider event or process-spawn error can occur. | Deferred (test removed with Windows support) |
 | TC-482 | INT-481 | unit | Build Cursor command arguments for Ask, Plan, and Implement. | Inspect the constructed arguments on a supported target. | Existing flags remain exact, including Implement's `--force --sandbox enabled`. | `cargo test cursor_execution_modes_use_native_cli_flags` |
-| TC-483 | INT-481 | boundary | Validate Cursor Ask and Plan on every target. | Select each mode through the adapter capability check. | Both modes remain accepted on Windows and non-Windows targets. | `src/agent/cursor.rs`: `cursor_mode_validation_matches_platform` |
+| TC-483 | INT-481 | boundary | Validate Cursor Ask and Plan on every target. | Select each mode through the adapter capability check. | Both modes remain accepted on Windows and non-Windows targets. | Deferred (test removed with Windows support) |
 
 ## 6. Data, integration, and safety contracts
 

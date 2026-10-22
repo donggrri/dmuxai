@@ -60,7 +60,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets
 ```
 
-Native Windows is not supported (no cross-target lint); WSL counts as Linux.
+Native Windows is not supported; the Windows cross-target lint in CI is being removed. DmuxAI runs on Linux (WSL counts as Linux).
 
 When you change `docs/specs/SPEC-*.md` or the baseline spec, validate traceability:
 

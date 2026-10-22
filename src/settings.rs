@@ -983,20 +983,13 @@ fn find_on_path_in(name: &str, path_var: Option<&std::ffi::OsStr>) -> Option<Pat
         .find(|candidate| is_executable_file(candidate))
 }
 
-/// A regular file the current user may execute (on Unix, any execute bit).
+/// A regular file the current user may execute (any execute bit).
 fn is_executable_file(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.is_file() && meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        meta.is_file()
-    }
+    use std::os::unix::fs::PermissionsExt;
+    meta.is_file() && meta.permissions().mode() & 0o111 != 0
 }
 
 fn env_flag(name: &str) -> bool {

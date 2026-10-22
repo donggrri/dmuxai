@@ -338,32 +338,18 @@ impl Drop for TempFile {
     }
 }
 
-/// Writes content to a private temp file with 0600 permissions on unix (create_new).
+/// Writes content to a private temp file with 0600 permissions (create_new).
 fn write_private_temp_file(path: &Path, content: &str, label: &str) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|e| format!("{label}: {e}"))?;
-        file.write_all(content.as_bytes())
-            .map_err(|e| format!("{label}: {e}"))?;
-    }
-    #[cfg(not(unix))]
-    {
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|e| format!("{label}: {e}"))?;
-        file.write_all(content.as_bytes())
-            .map_err(|e| format!("{label}: {e}"))?;
-    }
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("{label}: {e}"))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("{label}: {e}"))?;
     Ok(())
 }
 

@@ -127,7 +127,7 @@ installed and authenticated independently.
 | NFR-003 | Must | The application restores raw terminal mode, alternate screen, mouse capture, and cursor visibility on normal and error return paths. |
 | NFR-050 | Must | Runtime-session storage is an additive transactional extension; provider request/event protocols and existing conversation data remain compatible. |
 | FR-030 | Should | **Deferred (Windows dropped 2026-10-22).** Windows installation downloads a published release asset, verifies its SHA-256 checksum, installs `dmuxai.exe` under the current user's local application data, and adds that directory to the user PATH without requiring administrator privileges. |
-| NFR-004 | Should | Linux defaults to `codex`, `cursor-agent`, and `agy`, and resolves Cursor's bundled Node entrypoint, when no override is supplied. |
+| NFR-004 | Should | Linux defaults to `codex`, `cursor-agent`, and `agy`, and runs Cursor through the `cursor-agent` command from PATH (honouring a `DMUXAI_CURSOR_BIN` override) instead of resolving any bundled Node entrypoint. |
 
 ## 3. Data and safety invariants
 
