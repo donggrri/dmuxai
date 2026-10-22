@@ -127,7 +127,7 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | TC-1483 | FR-1410 | manual | cursor-agent logged in | `dmuxai run --agent cursor "say hi"` | Legacy stream-json with `composer-2.5` (non-fast) replies | hands-on |
 | TC-1491 | NFR-1301, FR-1315, FR-1324, FR-1329 | review | PR diff | Code review + `DMUXAI_ACP_LOG=/tmp/x.log dmuxai run --agent grok "say hi"` | No ACP trace on stderr; trace in the log file; no Windows/WSL doc added; denied permission ends cancelled (see TC-1420) | review / hands-on |
 | TC-1492 | FR-1318 | unit | CLI args | `dmuxai run x --mode ask` | Parse error, not ignored | `src/cli.rs` (`--mode` rejection asserts) |
-| TC-1484 | FR-1411 | manual | `[agents] cursor_protocol = "acp"` | `dmuxai run --agent cursor "say hi"` | Refused before any prompt: error names the fast model | hands-on |
+| TC-1484 | FR-1411 | manual | `[cursor] protocol = "acp"` in `dmuxai.toml` | `dmuxai run --agent cursor "say hi"` | Refused before any prompt: error names the fast model | hands-on |
 | TC-1300 | FR-1300, NFR-1300 | integration | Fake ACP binary as `DMUXAI_CURSOR_BIN` parent | Send prompt | Streaming text, `Completed`, session bound | `src/agent/acp.rs` |
 | TC-1301 | FR-1301 | unit | grok preset + `acp` protocol | Build argv | Contains `agent`, `stdio`, `-m` | `src/custom_agent.rs` |
 | TC-1302 | FR-1302 | unit | Fixture NDJSON | Parse updates | Expected `AgentEvent` sequence | `src/acp/` |
