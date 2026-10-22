@@ -45,6 +45,7 @@ fn base_command(workspace: &std::path::Path, state: &std::path::Path) -> Command
         .env("HOME", state)
         .env_remove("DMUXAI_WEB_TOKEN")
         .env_remove("DMUXAI_WORKSPACE")
+        .env_remove("DMUXAI_HEADLESS_DASHBOARD")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
