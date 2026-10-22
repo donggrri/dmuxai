@@ -18,11 +18,13 @@ ships only after the owner approves it (step 7) and is published by hand (step 8
      `dmuxai` entry in `Cargo.lock` matches. Commit both files; CI builds with `--locked`.
    - The ACP client reports its version in `initialize` (`CLIENT_VERSION` in
      `src/agent/acp/client.rs`). It reads `env!("CARGO_PKG_VERSION")`, so it follows `Cargo.toml`.
-     Check it with `rg -n CLIENT_VERSION src/agent/acp/client.rs`; if it is a hard-coded string,
-     update it too.
+     Confirm it still reads `env!("CARGO_PKG_VERSION")` with
+     `grep -n CLIENT_VERSION src/agent/acp/client.rs`.
    - In `CHANGELOG.md`, add a `## [X.Y.Z] - YYYY-MM-DD` heading (Asia/Seoul date) right below
-     `## Unreleased`, and move every entry from `Unreleased` under it, keeping the `### Added`,
-     `### Changed`, `### Fixed` subsections. Leave `## Unreleased` in place, empty.
+     `## Unreleased`, and move every entry from `Unreleased` under it, keeping the existing
+     subsection headings (for example `### Added`, `### Changed`, `### Fixed`). Leave
+     `## Unreleased` in place, empty. Add the `[X.Y.Z]: .../compare/vPREV...vX.Y.Z` link at the
+     bottom of the file next to the other release links.
 1. **Audit specs against the implementation.** For every `docs/specs/SPEC-*.md` and
    [docs/specs/DMUXAI-BASELINE.md](specs/DMUXAI-BASELINE.md), list requirements that the code
    does not implement, implements differently, or only partly implements. Record each gap as an
