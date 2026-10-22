@@ -71,6 +71,8 @@ Per-task override: `/plan --skills grill-me,-implement:tdd,review:local-review <
 | FR-1513 | The dashboard writes `[stages.<stage>] skills` into the workspace `dmuxai.toml` (other keys kept) after a confirm dialog. Changes apply to the next prompt (settings are re-read at preflight). |
 | FR-1514 | Stage skills attach to graph stages by default: judge (forced only), planner, and nodes of multi-step or complex runs. A 1-node run (simple route or `/direct`) gets them only with `[skills] chat = true` or an explicit per-task override. |
 | FR-1515 | `dmuxai skills [list\|sync\|approve <source>]` CLI and TUI `/skills [list\|sync\|approve <source>\|done]`. |
+| FR-1516 | The read-only policy of an interview round applies to that round only; later graph nodes run with their own policy. Cursor CLI keeps a chat in ask mode once a read-only turn ran in it, so after a read-only Cursor turn the next write turn starts a fresh Cursor chat and gets the transcript as context. Implement and draft steps are told they have write access, so earlier read-only replies in the context are not copied. Interview rounds tell the agent not to run shell commands (agy headless denies them in read-only mode and fails the turn). |
+| FR-1517 | Skills, overrides and interview state are per run. In one long conversation, a new `/plan` starts from the stage map again: the overrides, the interview answers and the run-skills folder of an earlier topic are not reused, while the chat context still carries over. |
 | UX-1500 | TUI `/skills` shows the stage→skill map with source and status (ok, missing, unpinned, oversize). The dashboard Settings page shows and edits the same map, writing `dmuxai.toml` after confirmation. |
 | UX-1501 | The plan approval card shows the skills of each step and lets the user remove or add them before approving. |
 | NFR-1500 | Skill text is treated as untrusted prompt content. It never changes runner permissions, the model policy, the allowed runners or the sandbox. |
@@ -104,6 +106,22 @@ Per-task override: `/plan --skills grill-me,-implement:tdd,review:local-review <
 | TC-1512 | Skill text that asks for `--yolo` or a different model changes nothing (NFR-1500). |
 | TC-1513 | Sync from a local fixture git repo (no network), approval required, a new pinned commit needs approval again (FR-1502, FR-1515). |
 | TC-1514 | Interview round cap, `/skills done`, and no stage skills on a 1-node run (FR-1512, FR-1514). |
+| TC-1515 | Interview policy is cleared after the round; a Cursor write turn after a read-only one starts a fresh chat; implement steps get the write note (FR-1516, unit). |
+
+Hands-on (§8): one long TUI session per agent: Grok ACP, agy headless with `gemini-3.8-flash`, Cursor legacy with composer-2.5 (non-fast only).
+
+| ID | Test |
+|---|---|
+| TC-1516 | Topic A: `/plan` with grill-me on planner runs a visible interview that follows the skill, stops at `max_rounds` (5, or lower when set) or `/skills done`, and the plan uses the answers (FR-1512, OQ-1500). |
+| TC-1517 | Topic A implement: after approval the implement node edits the file (FR-1516). |
+| TC-1518 | Topic B, unrelated, `/plan --skills=-grill-me` with the review stage: no interview, the review node follows the local skill (`REVIEW-CHECKLIST-V1`), native delivery creates `.dmuxai/run-skills/<run>/<runner dir>/review-checklist` (FR-1504, FR-1509). |
+| TC-1519 | Run records `.dmuxai/skill-runs/<run>.json` hold stage, node, origin, sha256, commit and delivery (FR-1510). |
+| TC-1520 | Topic A follow-up after topic B: the agent recalls topic A decisions (context carries over) and no topic B skill or plan leaks into it (FR-1517). |
+| TC-1521 | Plain chat question in the same session: a 1-node turn gets no stage skills (FR-1514, OQ-1502). |
+| TC-1522 | The status bar keeps the chosen model through all topics (Cursor composer-2.5, agy gemini-3.8-flash, Grok default). |
+| TC-1523 | A follow-up sent from the dashboard lands in the same conversation and is answered (dashboard parity). |
+| TC-1524 | A changed pin is blocked until `/skills approve` (OQ-1501; covered by TC-1513 with a fixture repo, checked once by hand). |
+| TC-1525 | Light-theme screenshots: TUI `/skills`, dashboard Skills map, approval card with a `skills:` line (UX-1500, UX-1501). |
 
 ## 7. Decisions (Dongjin 2026-10-22 14:25 KST)
 
