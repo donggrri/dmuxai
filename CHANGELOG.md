@@ -23,32 +23,20 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Changed
 
-- **ACP runners for Cursor and grok (SPEC-acp-runners).** `[agents] grok_protocol`
-  defaults to `acp` on Linux (`grok agent -m <model> stdio`; dmuxai handles
-  permissions, no `--always-approve`). `[cursor] protocol` defaults to **`legacy`**
-  because Cursor ACP currently exposes only fast composer models; set
-  `protocol = "acp"` explicitly to use `cursor-agent acp` (fast-model guard
-  applies). ACP turns always `initialize`, then `session/load` / `session/resume`
-  (with `cwd` and `mcpServers: []`) or `session/new`; resume failures surface a
-  notice. Cursor reads `models.currentModelId`, attempts non-fast model selection,
-  and refuses fast-only sessions. Read-only turns use `session/set_mode` with
-  `modeId` or fail closed on permissions. Permission prompts prefer `allow_once`.
-  Cancel is polled independently and sends `session/cancel` before kill. Generic
-  `tool` activity rows are suppressed. Fake ACP tests use `--features test-fixtures`.
-  Cursor ACP argv includes `--sandbox enabled` when supported (OQ-1326).
-  ACP turns always terminate the child process group on error/cancel/success.
-  Read-only internal turns pick `modeId` from `modes.availableModes` and refuse
-  when unsettable. Permission-denied turns report failure. Composer fast-model
-  guard only switches within the requested model family. `DMUXAI_ACP_LOG` logs
-  compact mode/model summaries (not truncated raw JSON). Reject/deny permission
-  options fail the turn. Tool dashboard rows merge by `toolCallId`. Agent text
-  after tools only inserts `\n\n` when prior agent text exists. Opencode model
-  listing checks `DMUXAI_OPENCODE_BIN` before invoking `models`. Unit tests pin
-  `XDG_STATE_HOME` / `DMUXAI_STATE_DIR` to a temp directory. Cursor prewarm
-  applies only to legacy stream-json. Built-in **opencode** uses
-  `opencode acp --cwd <workspace>` when `[agents] opencode_protocol = "acp"`
-  (default); model via ACP `session/set_config_option` with verified free-model
-  policy (turn aborts if config fails or a paid default would be used).
+- **ACP runners for Cursor and grok (SPEC-acp-runners).** grok defaults to
+  ACP (`grok agent -m <model> stdio`); read-only internal turns start it as
+  `grok --permission-mode plan agent ... stdio` and dmuxai also denies write and
+  exec permissions itself. `[agents] grok_protocol = "legacy"` keeps
+  streaming-json. Cursor stays on **legacy** stream-json with non-fast
+  `composer-2.5` by default, because Cursor ACP only offers
+  `composer-2.5[fast=true]`; with `[cursor] protocol = "acp"` a fast session is
+  refused before any prompt is sent. Read-only turns use `session/set_mode` or a
+  mode `configOptions` entry when the agent offers one. Configured MCP servers
+  are passed as ACP `mcpServers`. A disallowed model is an error, not silently
+  dropped. A denied permission or cancel ends the turn as cancelled (graph shows
+  "Graph cancelled"). Execute activity rows show the command. agy and opencode
+  keep their headless CLI modes (`[agents] opencode_protocol` is ignored with a
+  warning).
 - **CLI:** `dmuxai run` / `todo run` reject `--mode` with an error instead of
   running write-capable turns silently.
 - **AGY:** normal agent turns no longer require observed file writes to succeed.

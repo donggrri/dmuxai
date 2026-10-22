@@ -83,7 +83,7 @@ jobs:
       - name: Lint
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Run tests
-        run: cargo test --locked --all-targets --features test-fixtures --no-fail-fast
+        run: cargo test --locked --all-targets --no-fail-fast
       # Windows stays a compile target: clippy for x86_64-pc-windows-gnu on
       # Linux (needs the MinGW C compiler for bundled C dependencies). The
       # Windows release build in release.yml still runs on windows-latest, on tags only.

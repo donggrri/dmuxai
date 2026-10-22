@@ -1,4 +1,4 @@
-//! Shared ACP turn helper for Cursor, grok, and opencode (FR-1300, FR-1301, FR-1320).
+//! Shared ACP turn helper for Cursor and grok (FR-1300, FR-1301, FR-1412).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -30,7 +30,8 @@ pub async fn run_agent_acp_turn(
     requested_model: Option<String>,
     session_config_model: Option<&str>,
     reasoning_effort: Option<&str>,
-) -> Result<Option<String>, String> {
+    mcp_servers: serde_json::Value,
+) -> Result<AcpTurnResult, String> {
     let context = OutputContext::from(request);
     let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
     let config = AcpTurnConfig {
@@ -41,6 +42,7 @@ pub async fn run_agent_acp_turn(
         session_config_model: session_config_model.map(str::to_owned),
         reasoning_effort: reasoning_effort.map(str::to_owned),
         cancel,
+        mcp_servers,
     };
     let outcome = run_acp_turn(
         program,
@@ -56,28 +58,54 @@ pub async fn run_agent_acp_turn(
     )
     .await
     .map_err(|e| e.to_string())?;
-    Ok(outcome.session_id)
+    Ok(AcpTurnResult {
+        cancelled: outcome.cancelled(),
+        session_id: outcome.session_id,
+    })
 }
 
-pub fn cursor_acp_argv(model: Option<&str>, cwd: &Path) -> Vec<String> {
-    let mut args = vec!["acp".to_owned()];
-    if let Some(model) = model
-        && dmuxai::model_policy::validate_model_for_runner("cursor", model).is_ok()
-    {
+/// Result of one ACP turn for the caller's lifecycle handling (FR-1416).
+#[derive(Debug, Clone, Default)]
+pub struct AcpTurnResult {
+    pub session_id: Option<String>,
+    pub cancelled: bool,
+}
+
+/// Validate a requested model for an ACP runner; never drop it silently (FR-1415).
+pub fn acp_model_arg(runner: &str, model: Option<&str>) -> Result<Option<String>, String> {
+    match model.map(str::trim).filter(|m| !m.is_empty()) {
+        None => Ok(None),
+        Some(model) => dmuxai::model_policy::validate_model_for_runner(runner, model)
+            .map(|()| Some(model.to_owned()))
+            .map_err(|error| format!("{runner} ACP refused model `{model}`: {error}")),
+    }
+}
+
+/// Cursor ACP argv: root options before the `acp` subcommand (FR-1300, FR-1415).
+pub fn cursor_acp_argv(model: Option<&str>, cwd: &Path) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    if let Some(model) = acp_model_arg("cursor", model)? {
         args.push("--model".to_owned());
-        args.push(model.to_owned());
+        args.push(model);
     }
     // Best-effort: match legacy stream-json sandbox when the ACP CLI supports it (OQ-1326).
     args.push("--sandbox".to_owned());
     args.push("enabled".to_owned());
     args.push("--workspace".to_owned());
     args.push(cwd.to_string_lossy().into_owned());
-    args
+    args.push("acp".to_owned());
+    Ok(args)
 }
 
-/// Grok requires global flags before the `stdio` subcommand (FR-1316).
-pub fn grok_acp_argv(model: &str, reasoning_effort: Option<&str>) -> Vec<String> {
-    let mut args = vec!["agent".to_owned(), "-m".to_owned(), model.to_owned()];
+/// Grok ACP argv (FR-1412): root flags (`--permission-mode`) precede `agent`;
+/// agent flags (`-m`, `--reasoning-effort`) precede `stdio`.
+pub fn grok_acp_argv(model: &str, reasoning_effort: Option<&str>, read_only: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if read_only {
+        args.push("--permission-mode".to_owned());
+        args.push("plan".to_owned());
+    }
+    args.extend(["agent".to_owned(), "-m".to_owned(), model.to_owned()]);
     if let Some(effort) = reasoning_effort.filter(|e| !e.is_empty()) {
         args.push("--reasoning-effort".to_owned());
         args.push(effort.to_owned());
@@ -86,24 +114,14 @@ pub fn grok_acp_argv(model: &str, reasoning_effort: Option<&str>) -> Vec<String>
     args
 }
 
-/// argv for `opencode acp` (SPEC-acp-runners FR-1320). Model is set via ACP
-/// `session/set_config_option`, not CLI flags.
-pub fn opencode_acp_argv(cwd: &Path) -> Vec<String> {
-    vec![
-        "acp".to_owned(),
-        "--cwd".to_owned(),
-        cwd.to_string_lossy().into_owned(),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // TC-1316 / FR-1301: grok global flags precede `stdio`.
+    // TC-1316, TC-1414 / FR-1301, FR-1412: agent-mode grok argv.
     #[test]
     fn grok_acp_argv_puts_model_before_stdio() {
-        let args = grok_acp_argv("grok-4.7", Some("high"));
+        let args = grok_acp_argv("grok-4.7", Some("high"), false);
         assert_eq!(
             args,
             vec![
@@ -115,16 +133,47 @@ mod tests {
                 "stdio"
             ]
         );
-        assert!(!args.iter().any(|a| a == "--always-approve"));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--always-approve" || a == "--permission-mode")
+        );
     }
 
-    // TC-1320 / FR-1320: opencode ACP argv shape.
+    // TC-1413 / FR-1412: read-only grok puts the root flag before `agent`.
     #[test]
-    fn opencode_acp_argv_includes_acp_and_cwd() {
-        let cwd = std::path::Path::new("/tmp/proj");
-        let args = opencode_acp_argv(cwd);
-        assert_eq!(args[0], "acp");
-        assert_eq!(args[1], "--cwd");
-        assert_eq!(args[2], "/tmp/proj");
+    fn tc_1413_grok_read_only_root_flag_before_agent() {
+        let args = grok_acp_argv("grok-4.7", None, true);
+        assert_eq!(
+            args,
+            vec![
+                "--permission-mode",
+                "plan",
+                "agent",
+                "-m",
+                "grok-4.7",
+                "stdio"
+            ]
+        );
+    }
+
+    // FR-1300: cursor root options precede `acp`.
+    #[test]
+    fn cursor_acp_argv_root_options_before_acp() {
+        let args = cursor_acp_argv(Some("composer-2.5"), std::path::Path::new("/p")).unwrap();
+        assert_eq!(args.last().map(String::as_str), Some("acp"));
+        assert_eq!(&args[..2], ["--model", "composer-2.5"]);
+    }
+
+    // TC-1419 / FR-1415: disallowed model fails instead of being dropped.
+    #[test]
+    fn tc_1419_disallowed_model_is_an_error() {
+        assert!(cursor_acp_argv(Some("composer-2.5-fast"), std::path::Path::new("/p")).is_err());
+        assert!(acp_model_arg("grok", Some("grok-4.7-build-fast")).is_err());
+        assert_eq!(
+            acp_model_arg("grok", Some("grok-4.7")).unwrap().as_deref(),
+            Some("grok-4.7")
+        );
+        assert_eq!(acp_model_arg("cursor", None).unwrap(), None);
     }
 }

@@ -112,12 +112,12 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | TC-1417 | FR-1413 | unit | No mode support | Permission policy read-only | Edit denied | `src/agent/acp/permissions.rs` |
 | TC-1418 | FR-1414 | unit | MCP settings with stdio server | `session_new_params` | `mcpServers` populated | `src/agent/acp/session.rs` |
 | TC-1419 | FR-1415 | unit | Disallowed model | `acp_model_arg` | Err | `src/agent/acp_runner.rs` |
-| TC-1420 | FR-1416 | unit | stopReason `cancelled` after deny | Map outcome | `Cancelled` | `src/agent/acp/client.rs` |
-| TC-1421 | FR-1416 | unit | Cancelled turn | Graph status | not failed | `src/agent/acp/client.rs` |
+| TC-1420 | FR-1416 | integration | Fake agent denies outside-workspace permission | Cursor ACP turn | `Cancelled` + notice, no `Error` | `src/agent/cursor.rs` |
+| TC-1421 | FR-1416 | unit | Cancelled graph step | `graph_stop_notice` | "Graph cancelled" | `src/app.rs` |
 | TC-1422 | FR-1417 | unit | `execute` tool_call with command | Map update | Command in row | `src/agent/acp/updates.rs` |
 | TC-1423 | FR-1418 | unit | Settings with `opencode_protocol` | Load | No ACP for opencode | `src/settings.rs` |
-| TC-1424 | NFR-1410 | unit | Fake env `FAKE_ACP_MODES=config` | session/new | configOptions mode only | `tests/fixtures/fake_acp_agent.rs` |
-| TC-1425 | NFR-1410 | unit | Fake env `FAKE_ACP_MODES=both` | session/new | both shapes | `tests/fixtures/fake_acp_agent.rs` |
+| TC-1424 | NFR-1410, FR-1413 | integration | Fake `FAKE_ACP_MODES` = modes / config / none | Read-only Cursor ACP turn | set_mode ask / set_config_option plan / none | `src/agent/cursor.rs` |
+| TC-1425 | NFR-1410, FR-1413 | integration | Fake `FAKE_ACP_MODES=both` | Read-only Cursor ACP turn | set_mode preferred | `src/agent/cursor.rs` |
 
 ## 5. Acceptance scenarios
 
@@ -150,7 +150,7 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | TC-1331 | FR-1329 | integration | Fake agent permission outside | ACP turn | `Cancelled`, not `Completed` | `src/agent/cursor.rs` |
 | TC-1332 | FR-1302 | unit | Duplicate `tool_call_update` ids | Map updates | Single activity row | `src/agent/acp/updates.rs` |
 
-Deterministic ACP integration tests require `cargo test --features test-fixtures` (builds `fake-acp-agent`); plain `cargo test` must pass without the fixture binary.
+Deterministic ACP integration tests run under plain `cargo test`: the test helper builds the `fake-acp-agent` bin (`--features test-fixtures`) on first use.
 
 ### Live smoke (manual, Linux only)
 

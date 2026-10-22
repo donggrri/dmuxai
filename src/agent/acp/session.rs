@@ -31,21 +31,118 @@ pub fn parse_agent_capabilities(init_result: &Value) -> AgentCapabilities {
     }
 }
 
-pub fn session_load_params(session_id: &str, cwd: &Path) -> Value {
+fn mcp_array(mcp_servers: &Value) -> Value {
+    if mcp_servers.is_array() {
+        mcp_servers.clone()
+    } else {
+        json!([])
+    }
+}
+
+/// `session/new` params with the runner's MCP servers (FR-1414).
+pub fn session_new_params(cwd: &Path, mcp_servers: &Value) -> Value {
     json!({
-        "sessionId": session_id,
         "cwd": cwd.to_string_lossy(),
-        "mcpServers": []
+        "mcpServers": mcp_array(mcp_servers)
     })
 }
 
-pub fn session_resume_params(session_id: &str, cwd: &Path) -> Value {
-    session_load_params(session_id, cwd)
+pub fn session_load_params(session_id: &str, cwd: &Path, mcp_servers: &Value) -> Value {
+    json!({
+        "sessionId": session_id,
+        "cwd": cwd.to_string_lossy(),
+        "mcpServers": mcp_array(mcp_servers)
+    })
 }
 
+pub fn session_resume_params(session_id: &str, cwd: &Path, mcp_servers: &Value) -> Value {
+    session_load_params(session_id, cwd, mcp_servers)
+}
+
+/// Fast variants: `*-fast`, `*-build-fast`, or a `fast=true` bracket parameter (FR-1411).
 pub fn is_fast_model_label(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
-    lower.contains("fast") || lower.contains("[fast=true]")
+    let stem = lower.split('[').next().unwrap_or(&lower).trim();
+    if stem.ends_with("-fast") {
+        return true;
+    }
+    lower
+        .split(['[', ']', ','])
+        .any(|part| part.trim().replace(' ', "") == "fast=true")
+}
+
+fn config_options(session_result: &Value) -> Vec<&Value> {
+    session_result
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().collect())
+        .unwrap_or_default()
+}
+
+/// `currentValue` of a `configOptions` entry by id (or category).
+pub fn config_option_current(session_result: &Value, id: &str) -> Option<String> {
+    config_options(session_result)
+        .into_iter()
+        .find(|opt| {
+            opt.get("id")
+                .or_else(|| opt.get("configId"))
+                .and_then(Value::as_str)
+                == Some(id)
+                || opt.get("category").and_then(Value::as_str) == Some(id)
+        })
+        .and_then(|opt| opt.get("currentValue").or_else(|| opt.get("value")))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Read-only mode switch for an internal turn (FR-1413): `session/set_mode` when `modes`
+/// is advertised, else `session/set_config_option` on the mode-category config option.
+/// `None` means the agent has no ACP mode; the client-side permission deny still applies.
+pub fn read_only_mode_request(
+    session_result: &Value,
+    session_id: &str,
+) -> Option<(&'static str, Value)> {
+    if let Some(mode_id) = pick_read_only_mode_id(session_result) {
+        return Some((
+            "session/set_mode",
+            session_set_mode_params(session_id, &mode_id),
+        ));
+    }
+    for opt in config_options(session_result) {
+        let is_mode = opt.get("category").and_then(Value::as_str) == Some("mode")
+            || opt.get("id").and_then(Value::as_str) == Some("mode");
+        if !is_mode {
+            continue;
+        }
+        let config_id = opt
+            .get("id")
+            .or_else(|| opt.get("configId"))
+            .and_then(Value::as_str)?;
+        let values: Vec<String> = opt
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        item.get("value")
+                            .or_else(|| item.get("id"))
+                            .and_then(Value::as_str)
+                    })
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for preferred in READ_ONLY_MODE_PREFERENCES {
+            if let Some(value) = values.iter().find(|v| v.eq_ignore_ascii_case(preferred)) {
+                return Some((
+                    "session/set_config_option",
+                    json!({ "sessionId": session_id, "configId": config_id, "value": value }),
+                ));
+            }
+        }
+    }
+    None
 }
 
 pub fn model_family_base(model: &str) -> String {
@@ -65,6 +162,7 @@ pub fn extract_reported_model(session_result: &Value) -> Option<String> {
         .or_else(|| session_result.pointer("/currentModel"))
         .and_then(Value::as_str)
         .map(str::to_owned)
+        .or_else(|| config_option_current(session_result, "model"))
 }
 
 pub fn available_model_ids(session_result: &Value) -> Vec<String> {
@@ -141,12 +239,6 @@ pub fn pick_read_only_mode_id(session_result: &Value) -> Option<String> {
     None
 }
 
-pub fn read_only_turn_refusal(agent: &str) -> String {
-    format!(
-        "ACP runner `{agent}` has no read-only mode available for this internal turn; refusing to run writable agent mode."
-    )
-}
-
 /// Inspect session payload; does not call ACP (used after open when no model switch is needed).
 pub fn cursor_acp_model_check(
     session_result: &Value,
@@ -165,7 +257,7 @@ pub fn cursor_acp_model_check(
 pub fn fast_model_refusal(effective: &str) -> String {
     format!(
         "Cursor ACP session is using fast model `{effective}` and no non-fast composer model could be selected. \
-Set `[cursor] protocol = \"legacy\"` in dmuxai.toml or choose a non-fast model in Cursor."
+No prompt was sent. Use the default `[cursor] protocol = \"legacy\"` (non-fast composer-2.5)."
     )
 }
 
@@ -230,7 +322,7 @@ mod tests {
     // TC-1323 / FR-1316: session/load params include cwd and mcpServers.
     #[test]
     fn session_load_params_schema() {
-        let params = session_load_params("sid-1", Path::new("/proj"));
+        let params = session_load_params("sid-1", Path::new("/proj"), &json!([]));
         assert_eq!(params["sessionId"], "sid-1");
         assert_eq!(params["cwd"], "/proj");
         assert_eq!(params["mcpServers"], json!([]));
@@ -250,5 +342,66 @@ mod tests {
             "modes": { "availableModes": ["agent", "plan", "debug"] }
         });
         assert_eq!(pick_read_only_mode_id(&payload).as_deref(), Some("plan"));
+    }
+
+    // TC-1411 / FR-1411: fast variants detected, fast=false is not fast.
+    #[test]
+    fn tc_1411_fast_model_labels() {
+        assert!(is_fast_model_label("composer-2.5[fast=true]"));
+        assert!(is_fast_model_label("composer-2.5-fast"));
+        assert!(is_fast_model_label("grok-4.7[context=256k,fast=true]"));
+        assert!(!is_fast_model_label("composer-2.5"));
+        assert!(!is_fast_model_label("gpt-5.5[context=272k,fast=false]"));
+    }
+
+    // TC-1415 / FR-1413: modes advertised → session/set_mode.
+    #[test]
+    fn tc_1415_read_only_uses_set_mode_when_modes_advertised() {
+        let payload = json!({
+            "modes": { "availableModes": [{"id": "agent"}, {"id": "plan"}, {"id": "ask"}] },
+            "configOptions": [{"id": "mode", "category": "mode", "options": [{"value": "ask"}]}]
+        });
+        let (method, params) = read_only_mode_request(&payload, "s").unwrap();
+        assert_eq!(method, "session/set_mode");
+        assert_eq!(params["modeId"], "ask");
+    }
+
+    // TC-1416 / FR-1413: configOptions only → session/set_config_option.
+    #[test]
+    fn tc_1416_read_only_uses_config_option_when_only_config_options() {
+        let payload = json!({
+            "configOptions": [
+                {"id": "model", "category": "model", "currentValue": "m", "options": [{"value": "m"}]},
+                {"id": "mode", "category": "mode", "currentValue": "agent",
+                 "options": [{"value": "agent"}, {"value": "plan"}]}
+            ]
+        });
+        let (method, params) = read_only_mode_request(&payload, "s").unwrap();
+        assert_eq!(method, "session/set_config_option");
+        assert_eq!(params["configId"], "mode");
+        assert_eq!(params["value"], "plan");
+        let grok = json!({"configOptions": [{"id": "model", "category": "model", "options": []}]});
+        assert!(read_only_mode_request(&grok, "s").is_none());
+    }
+
+    // TC-1418 / FR-1414: mcpServers passed through.
+    #[test]
+    fn tc_1418_session_new_params_carry_mcp_servers() {
+        let servers = json!([{"name": "mem", "command": "/bin/mem", "args": [], "env": []}]);
+        let params = session_new_params(Path::new("/proj"), &servers);
+        assert_eq!(params["mcpServers"], servers);
+        assert_eq!(
+            session_new_params(Path::new("/p"), &Value::Null)["mcpServers"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn reported_model_falls_back_to_config_options() {
+        let payload = json!({"configOptions": [{"id": "model", "currentValue": "grok-4.7"}]});
+        assert_eq!(
+            extract_reported_model(&payload).as_deref(),
+            Some("grok-4.7")
+        );
     }
 }

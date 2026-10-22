@@ -8,8 +8,8 @@ use std::{
 
 use dmuxai::custom_agent::{
     BUILTIN_MODELS_TIMEOUT, CustomAgentOutput, CustomAgentSpec, SubstitutionContext, build_argv,
-    failure_reason, grok_no_allowed_model_message, is_builtin_grok, is_builtin_opencode,
-    list_model_ids, parse_jsonl_line, policy_message, select_grok_model, spec_at, substitute,
+    failure_reason, grok_no_allowed_model_message, is_builtin_grok, list_model_ids,
+    parse_jsonl_line, policy_message, select_grok_model, spec_at, substitute,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -272,6 +272,9 @@ fn mode_names(policy: TurnPolicy) -> (&'static str, &'static str) {
     }
 }
 
+/// Sentinel from `run_turn` meaning the ACP turn ended cancelled (FR-1416).
+const ACP_TURN_CANCELLED: &str = "\u{0}acp-turn-cancelled";
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_turn(
     agent: Agent,
@@ -287,10 +290,8 @@ fn spawn_turn(
     let context = OutputContext::from(&request);
     let pgid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let settings = dmuxai::settings::DmuxSettings::load(&cwd);
-    let uses_acp = (is_builtin_grok(spec)
-        && settings.grok_protocol == dmuxai::runner_protocol::RunnerProtocol::Acp)
-        || (is_builtin_opencode(spec)
-            && settings.opencode_protocol == dmuxai::runner_protocol::RunnerProtocol::Acp);
+    let uses_acp = is_builtin_grok(spec)
+        && settings.grok_protocol == dmuxai::runner_protocol::RunnerProtocol::Acp;
     let acp_cancel = uses_acp.then(super::acp::new_cancel_flag);
     let turn_context = context.clone();
     let turn_pgid = pgid.clone();
@@ -314,6 +315,7 @@ fn spawn_turn(
         .await
         {
             Ok(()) => AgentEvent::Completed,
+            Err(error) if error == ACP_TURN_CANCELLED => AgentEvent::Cancelled,
             Err(error) => AgentEvent::Error(error),
         };
         send(&event_tx, agent, Some(&turn_context), event).await;
@@ -384,7 +386,9 @@ async fn run_turn(
     if is_builtin_grok(spec)
         && settings.grok_protocol == dmuxai::runner_protocol::RunnerProtocol::Acp
     {
-        let model_id = model.as_deref().ok_or_else(grok_no_allowed_model_message)?;
+        let model_id = super::acp_runner::acp_model_arg("grok", model.as_deref())?
+            .ok_or_else(grok_no_allowed_model_message)?;
+        let model_id = model_id.as_str();
         let program = spec
             .command
             .first()
@@ -394,14 +398,17 @@ async fn run_turn(
             .get("GROK_REASONING_EFFORT")
             .cloned()
             .or_else(|| std::env::var("GROK_REASONING_EFFORT").ok());
-        let args = super::acp_runner::grok_acp_argv(model_id, effort.as_deref());
+        let read_only = request.policy == TurnPolicy::ReadOnly;
+        let args = super::acp_runner::grok_acp_argv(model_id, effort.as_deref(), read_only);
         let permission_ctx = super::acp::PermissionContext {
             workspace: cwd.to_string_lossy().into_owned(),
             sensitive_gate_active: false,
-            read_only_fail_closed: false,
+            // FR-1413: grok has no ACP modes; dmuxai denies writes itself.
+            read_only_fail_closed: read_only,
         };
         let cancel = acp_cancel.unwrap_or_else(super::acp::new_cancel_flag);
-        super::acp_runner::run_agent_acp_turn(
+        let user_cancel = cancel.clone();
+        let outcome = super::acp_runner::run_agent_acp_turn(
             Path::new(program),
             &args,
             cwd,
@@ -415,57 +422,23 @@ async fn run_turn(
             Some(model_id.to_owned()),
             None,
             None,
+            dmuxai::mcp::propagate::acp_mcp_servers(mcp_servers, "grok"),
         )
         .await?;
-        return Ok(());
-    }
-    if is_builtin_opencode(spec)
-        && settings.opencode_protocol == dmuxai::runner_protocol::RunnerProtocol::Acp
-    {
-        let model_id = model
-            .as_deref()
-            .ok_or_else(|| dmuxai::custom_agent::policy_message(spec, None))?;
-        dmuxai::custom_agent::validate_custom_model(spec, model_id)?;
-        let program = spec
-            .command
-            .first()
-            .ok_or_else(|| format!("{}: empty command", spec.label()))?;
-        let program_path = Path::new(program);
-        if !program_path.is_file() {
-            if let Some(message) = dmuxai::settings::opencode_bin_explicit_missing_message() {
-                return Err(message);
-            }
-            return Err(format!(
-                "opencode binary not found at {}",
-                program_path.display()
-            ));
+        if outcome.cancelled && !user_cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            send(
+                event_tx,
+                agent,
+                Some(&OutputContext::from(request)),
+                AgentEvent::Notice(super::acp::PERMISSION_DENIED_NOTICE.to_owned()),
+            )
+            .await;
         }
-        let args = super::acp_runner::opencode_acp_argv(cwd);
-        let permission_ctx = super::acp::PermissionContext {
-            workspace: cwd.to_string_lossy().into_owned(),
-            sensitive_gate_active: false,
-            read_only_fail_closed: false,
-        };
-        let cancel = acp_cancel.unwrap_or_else(super::acp::new_cancel_flag);
-        super::acp_runner::run_agent_acp_turn(
-            Path::new(program),
-            &args,
-            cwd,
-            request,
-            agent,
-            event_tx,
-            permission_ctx,
-            super::acp::AcpRunnerKind::Opencode,
-            super::acp::AcpLifecycle::Delegate,
-            cancel,
-            Some(model_id.to_owned()),
-            Some(model_id),
-            None,
-        )
-        .await?;
+        if outcome.cancelled {
+            return Err(ACP_TURN_CANCELLED.to_owned());
+        }
         return Ok(());
     }
-
     let (mode_name, edit) = mode_names(request.policy);
     let mut ctx = SubstitutionContext::new(
         request.prompt.clone(),
@@ -1576,96 +1549,5 @@ temp_config_template = '{"mcp": "not-an-object"}'
         );
         drop(tx);
         worker.await.unwrap();
-    }
-
-    #[cfg(feature = "test-fixtures")]
-    mod opencode_acp_fake_tests {
-        use super::*;
-
-        fn fake_acp_agent_bin() -> std::path::PathBuf {
-            let mut path = std::env::current_exe().expect("test exe");
-            path.pop();
-            if path.ends_with("deps") {
-                path.pop();
-            }
-            path.push("fake-acp-agent");
-            path
-        }
-
-        fn opencode_acp_spec(program: &str) -> &'static CustomAgentSpec {
-            let mut spec = dmuxai::custom_agent::opencode_preset(program);
-            spec.default_model = Some("opencode/glm-5.3-flash-free".to_owned());
-            Box::leak(Box::new(spec))
-        }
-
-        async fn drive_opencode_acp(
-            spec: &'static CustomAgentSpec,
-        ) -> (
-            mpsc::Sender<CustomCommand>,
-            mpsc::Receiver<AgentOutput>,
-            JoinHandle<()>,
-        ) {
-            let workspace = tempfile::tempdir().expect("opencode test workspace");
-            std::fs::write(
-                workspace.path().join("dmuxai.toml"),
-                "[agents]\nopencode_protocol = \"acp\"\n",
-            )
-            .expect("opencode acp settings");
-            let (event_tx, event_rx) = mpsc::channel(64);
-            let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-            let worker = tokio::spawn(runtime_loop_with_spec(
-                Agent::Custom(0),
-                spec,
-                command_rx,
-                event_tx,
-                workspace.path().to_path_buf(),
-                Vec::new(),
-            ));
-            std::mem::forget(workspace);
-            (command_tx, event_rx, worker)
-        }
-
-        // TC-1327 / FR-1326: opencode ACP turn sets model via session config.
-        #[tokio::test]
-        async fn opencode_acp_turn_with_fake_agent() {
-            let fake = fake_acp_agent_bin();
-            assert!(
-                fake.is_file(),
-                "build fake-acp-agent first (expected at {})",
-                fake.display()
-            );
-            let dir = tempfile::tempdir().unwrap();
-            let model_capture = dir.path().join("model.txt");
-            unsafe {
-                std::env::set_var(
-                    "FAKE_ACP_MODEL_CAPTURE",
-                    model_capture.to_str().expect("utf8"),
-                );
-            }
-            let spec = opencode_acp_spec(&fake.to_string_lossy());
-            assert!(spec.builtin && spec.name == "opencode");
-            let (tx, mut rx, worker) = drive_opencode_acp(spec).await;
-            tx.send(CustomCommand::Send(request("hello acp", None)))
-                .await
-                .unwrap();
-            let events = until_terminal(&mut rx).await;
-            let text: String = events
-                .iter()
-                .filter_map(|event| match event {
-                    AgentEvent::TextDelta(delta) => Some(delta.as_str()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(text, "ACP_OK");
-            assert!(
-                events
-                    .iter()
-                    .any(|event| matches!(event, AgentEvent::Completed))
-            );
-            let captured = std::fs::read_to_string(&model_capture).unwrap_or_default();
-            assert_eq!(captured, "opencode/glm-5.3-flash-free");
-            drop(tx);
-            worker.await.unwrap();
-        }
     }
 }

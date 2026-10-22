@@ -22,8 +22,8 @@ use super::permissions::{PermissionContext, choose_permission_option, permission
 use super::session::{
     AgentCapabilities, SessionOpenNote, available_model_ids, cursor_acp_model_check,
     extract_reported_model, is_fast_model_label, parse_agent_capabilities, pick_non_fast_model,
-    pick_read_only_mode_id, read_only_turn_refusal, session_load_params, session_resume_params,
-    session_set_mode_params, session_set_model_params,
+    read_only_mode_request, session_load_params, session_new_params, session_resume_params,
+    session_set_model_params,
 };
 use super::updates::{ToolCallCache, map_session_update};
 
@@ -32,12 +32,13 @@ const CLIENT_VERSION: &str = "0.2.2";
 const PROTOCOL_VERSION: i64 = 1;
 const STDERR_TAIL: usize = 8;
 const CANCEL_GRACE_MS: u64 = 1500;
+pub const PERMISSION_DENIED_NOTICE: &str =
+    "dmuxai denied an ACP tool permission (outside workspace or read-only turn); turn cancelled.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpRunnerKind {
     Cursor,
     Grok,
-    Opencode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +59,8 @@ pub struct AcpTurnConfig {
     #[allow(dead_code)]
     pub reasoning_effort: Option<String>,
     pub cancel: Arc<AtomicBool>,
+    /// ACP `mcpServers` array passed on session/new|load|resume (FR-1414).
+    pub mcp_servers: Value,
 }
 
 pub struct AcpRunOutcome {
@@ -65,6 +68,13 @@ pub struct AcpRunOutcome {
     pub stop_reason: Option<String>,
     #[allow(dead_code)]
     pub effective_model: Option<String>,
+}
+
+impl AcpRunOutcome {
+    /// FR-1416: a turn the agent ended with `cancelled` (user cancel or denied permission).
+    pub fn cancelled(&self) -> bool {
+        self.stop_reason.as_deref() == Some("cancelled")
+    }
 }
 
 struct SharedState {
@@ -170,7 +180,6 @@ pub async fn run_acp_turn(
     let runner_label = match config.runner {
         AcpRunnerKind::Cursor => "cursor",
         AcpRunnerKind::Grok => "grok",
-        AcpRunnerKind::Opencode => "opencode",
     };
 
     let turn_result: Result<AcpRunOutcome, String> = async {
@@ -212,19 +221,22 @@ pub async fn run_acp_turn(
         .await;
 
         if config.policy == TurnPolicy::ReadOnly {
-            let mode_id = pick_read_only_mode_id(&open.session_payload)
-                .ok_or_else(|| read_only_turn_refusal(runner_label))?;
-            if !apply_read_only_mode(
-                &mut stdin,
-                &mut line_rx,
-                &state,
-                &session_id,
-                &mode_id,
-                &config.cancel,
-            )
-            .await?
-            {
-                return Err(read_only_turn_refusal(runner_label));
+            // FR-1413: modes → set_mode, configOptions → set_config_option, else rely on
+            // the client-side read-only permission deny (read_only_fail_closed).
+            match read_only_mode_request(&open.session_payload, &session_id) {
+                Some((method, params)) => {
+                    match request(&mut stdin, &mut line_rx, &state, method, params, &config.cancel)
+                        .await
+                    {
+                        Ok(_) => acp_trace(format!("{method} read-only ok")),
+                        Err(error) => acp_trace(format!(
+                            "{method} read-only failed ({runner_label}): {error}; permissions stay fail-closed"
+                        )),
+                    }
+                }
+                None => acp_trace(format!(
+                    "{runner_label}: no ACP read-only mode; permissions stay fail-closed"
+                )),
             }
         }
 
@@ -247,18 +259,10 @@ pub async fn run_acp_turn(
             )
             .await
             {
-                Ok(result) => {
-                    if config.runner == AcpRunnerKind::Opencode {
-                        ensure_opencode_model_config(&result, model)?;
-                    }
+                Ok(_) => {
                     acp_trace(format!("session/set_config_option model={model} ok"));
                 }
                 Err(error) => {
-                    if config.runner == AcpRunnerKind::Opencode {
-                        return Err(format!(
-                            "opencode ACP model config failed for `{model}`: {error}"
-                        ));
-                    }
                     acp_trace(format!("session/set_config_option failed: {error}"));
                 }
             }
@@ -309,9 +313,31 @@ pub async fn run_acp_turn(
 
     let prompt_result = turn_result;
 
+    if config.cancel.load(Ordering::SeqCst) || state.permission_denied.load(Ordering::SeqCst) {
+        // FR-1416: user cancel or a denied permission ends the turn as cancelled.
+        if config.lifecycle == AcpLifecycle::Managed {
+            if state.permission_denied.load(Ordering::SeqCst) {
+                send_event(
+                    event_tx,
+                    agent,
+                    context,
+                    AgentEvent::Notice(PERMISSION_DENIED_NOTICE.to_owned()),
+                )
+                .await;
+            }
+            send_event(event_tx, agent, context, AgentEvent::Cancelled).await;
+        }
+        let session_id = state.session_id.lock().unwrap().clone();
+        return Ok(AcpRunOutcome {
+            session_id,
+            stop_reason: Some("cancelled".to_owned()),
+            effective_model: None,
+        });
+    }
+
     match prompt_result {
         Ok(outcome) => {
-            if config.cancel.load(Ordering::SeqCst) {
+            if outcome.cancelled() {
                 if config.lifecycle == AcpLifecycle::Managed {
                     send_event(event_tx, agent, context, AgentEvent::Cancelled).await;
                 }
@@ -409,7 +435,7 @@ async fn open_session(
                 line_rx,
                 state,
                 "session/load",
-                session_load_params(id, cwd),
+                session_load_params(id, cwd, &config.mcp_servers),
                 &config.cancel,
             )
             .await
@@ -445,7 +471,7 @@ async fn open_session(
                 line_rx,
                 state,
                 "session/resume",
-                session_resume_params(id, cwd),
+                session_resume_params(id, cwd, &config.mcp_servers),
                 &config.cancel,
             )
             .await
@@ -482,10 +508,7 @@ async fn open_session(
         line_rx,
         state,
         "session/new",
-        json!({
-            "cwd": cwd.to_string_lossy(),
-            "mcpServers": []
-        }),
+        session_new_params(cwd, &config.mcp_servers),
         &config.cancel,
     )
     .await?;
@@ -560,46 +583,6 @@ async fn finish_open(
     })
 }
 
-async fn apply_read_only_mode(
-    stdin: &mut ChildStdin,
-    line_rx: &mut mpsc::Receiver<String>,
-    state: &Arc<SharedState>,
-    session_id: &str,
-    mode_id: &str,
-    cancel: &Arc<AtomicBool>,
-) -> Result<bool, String> {
-    match request(
-        stdin,
-        line_rx,
-        state,
-        "session/set_mode",
-        session_set_mode_params(session_id, mode_id),
-        cancel,
-    )
-    .await
-    {
-        Ok(result) => {
-            if result.get("error").is_some() {
-                acp_trace(format!(
-                    "session/set_mode modeId={mode_id} rejected: {}",
-                    compact_json(&result)
-                ));
-                Ok(false)
-            } else {
-                acp_trace(format!(
-                    "session/set_mode modeId={mode_id} ok: {}",
-                    compact_json(&result)
-                ));
-                Ok(true)
-            }
-        }
-        Err(error) => {
-            acp_trace(format!("session/set_mode failed: {error}"));
-            Ok(false)
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_prompt(
     stdin: &mut ChildStdin,
@@ -672,10 +655,6 @@ async fn run_prompt(
             state,
         )
         .await?;
-    }
-
-    if state.permission_denied.load(Ordering::SeqCst) {
-        return Err("ACP permission denied".to_owned());
     }
 
     Ok(AcpRunOutcome {
@@ -1014,7 +993,7 @@ fn acp_result_trace_summary(method: &str, result: &Value) -> String {
         .pointer("/modes/currentModeId")
         .and_then(Value::as_str);
     let current_model = super::session::extract_reported_model(result);
-    let config_model = opencode_config_model_value(result);
+    let config_model = super::session::config_option_current(result, "model");
     format!(
         "modes.currentModeId={current_mode:?} modes.availableModes={mode_ids:?} \
 models.currentModelId={current_model:?} models.availableModels={model_ids:?} \
@@ -1029,48 +1008,4 @@ fn compact_json(value: &Value) -> String {
     } else {
         raw
     }
-}
-
-fn ensure_opencode_model_config(result: &Value, requested: &str) -> Result<(), String> {
-    if result.get("error").is_some() {
-        return Err(format!("opencode rejected model `{requested}`"));
-    }
-    let applied = opencode_config_model_value(result).unwrap_or_else(|| requested.to_owned());
-    if applied != requested {
-        return Err(format!(
-            "opencode ACP applied model `{applied}` but dmuxai requested `{requested}`"
-        ));
-    }
-    if !applied.contains("-free") {
-        return Err(format!(
-            "opencode model `{applied}` does not match dmuxai free-model policy"
-        ));
-    }
-    Ok(())
-}
-
-fn opencode_config_model_value(result: &Value) -> Option<String> {
-    if let Some(value) = result.get("value").and_then(Value::as_str) {
-        return Some(value.to_owned());
-    }
-    if let Some(options) = result.get("configOptions").and_then(Value::as_array) {
-        for option in options {
-            let id = option
-                .get("configId")
-                .or_else(|| option.get("id"))
-                .and_then(Value::as_str);
-            if id == Some("model")
-                && let Some(current) = option
-                    .get("currentValue")
-                    .or_else(|| option.get("value"))
-                    .and_then(Value::as_str)
-            {
-                return Some(current.to_owned());
-            }
-        }
-    }
-    result
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
 }

@@ -17,6 +17,7 @@ struct CachedToolCall {
     kind: String,
     title: String,
     location: Option<String>,
+    command: Option<String>,
     activity_emitted: bool,
 }
 
@@ -84,6 +85,7 @@ impl ToolCallCache {
                 kind: "tool".to_owned(),
                 title: "tool".to_owned(),
                 location: None,
+                command: None,
                 activity_emitted: false,
             });
         let kind = read_field(update, "kind");
@@ -102,6 +104,9 @@ impl ToolCallCache {
         if location.is_some() {
             entry.location = location;
         }
+        if let Some(command) = raw_command(update) {
+            entry.command = Some(command);
+        }
         let status = tool_status_str(update);
         json!({
             "sessionUpdate": "tool_call_update",
@@ -109,7 +114,8 @@ impl ToolCallCache {
             "kind": entry.kind,
             "title": entry.title,
             "status": status,
-            "locations": entry.location.as_ref().map(|path| json!([{"path": path}]))
+            "locations": entry.location.as_ref().map(|path| json!([{"path": path}])),
+            "command": entry.command
         })
     }
 
@@ -140,6 +146,24 @@ fn read_field(update: &Value, field: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned()
+}
+
+/// `rawInput.command` as a string (joined when the agent sends argv).
+fn raw_command(update: &Value) -> Option<String> {
+    let raw = update
+        .pointer("/rawInput/command")
+        .or_else(|| update.pointer("/toolCall/rawInput/command"))?;
+    let command = match raw {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return None,
+    };
+    let command = command.trim().to_owned();
+    (!command.is_empty()).then_some(command)
 }
 
 fn tool_call_id(update: &Value) -> Option<String> {
@@ -209,9 +233,19 @@ fn map_tool_call_update(update: &Value) -> Option<ActivityItem> {
         .or_else(|| update.pointer("/toolCall/kind"))
         .and_then(Value::as_str)
         .unwrap_or("tool");
+    // FR-1417: execute rows show the command, never the cwd location.
+    let command = update
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let target = if kind.eq_ignore_ascii_case("execute") {
+        command.unwrap_or_else(|| title.clone())
+    } else {
+        location.unwrap_or_else(|| title.clone())
+    };
     Some(ActivityItem::Tool {
         name: kind.to_owned(),
-        target: location.unwrap_or_else(|| title.clone()),
+        target,
         status,
         duration_ms: None,
         detail: diff.unwrap_or(title),
@@ -316,5 +350,26 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::ToolProgress { .. }))
         );
+    }
+
+    // TC-1422 / FR-1417: execute activity shows the command, not the cwd.
+    #[test]
+    fn tc_1422_execute_row_shows_command() {
+        let mut cache = ToolCallCache::default();
+        let start = json!({
+            "sessionUpdate": "tool_call", "toolCallId": "t1", "kind": "execute",
+            "title": "Terminal", "status": "pending",
+            "locations": [{"path": "/proj"}],
+            "rawInput": {"command": "cargo test --lib"}
+        });
+        map_session_update(&start, &mut cache);
+        let done =
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed"});
+        let events = map_session_update(&done, &mut cache);
+        let target = events.iter().find_map(|e| match e {
+            AgentEvent::Activity(ActivityItem::Tool { target, .. }) => Some(target.clone()),
+            _ => None,
+        });
+        assert_eq!(target.as_deref(), Some("cargo test --lib"));
     }
 }

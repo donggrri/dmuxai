@@ -72,20 +72,32 @@ fn main() {
                     } else {
                         serde_json::json!(["composer-2.5", "composer-2.5[fast=true]"])
                     };
-                    respond(
-                        &mut stdout,
-                        id,
-                        serde_json::json!({
-                            "sessionId": session,
-                            "models": {
-                                "currentModelId": current,
-                                "availableModels": available
-                            },
-                            "modes": {
-                                "availableModes": ["agent", "ask"]
-                            }
-                        }),
-                    );
+                    if let Some(path) = std::env::var_os("FAKE_ACP_MCP_CAPTURE") {
+                        let _ = std::fs::write(path, params["mcpServers"].to_string());
+                    }
+                    // NFR-1410: FAKE_ACP_MODES = modes (default) | config | both | none.
+                    let shape = std::env::var("FAKE_ACP_MODES").unwrap_or_else(|_| "modes".into());
+                    let mut result = serde_json::json!({
+                        "sessionId": session,
+                        "models": {
+                            "currentModelId": current,
+                            "availableModels": available
+                        }
+                    });
+                    if shape == "modes" || shape == "both" {
+                        result["modes"] = serde_json::json!({
+                            "currentModeId": "agent",
+                            "availableModes": [{"id": "agent"}, {"id": "ask"}]
+                        });
+                    }
+                    if shape == "config" || shape == "both" {
+                        result["configOptions"] = serde_json::json!([{
+                            "id": "mode", "category": "mode", "type": "select",
+                            "currentValue": "agent",
+                            "options": [{"value": "agent"}, {"value": "plan"}]
+                        }]);
+                    }
+                    respond(&mut stdout, id, result);
                 }
             }
             "session/load" => {
@@ -117,6 +129,17 @@ fn main() {
                 }
             }
             "session/set_config_option" | "session/set_mode" | "session/set_model" => {
+                if let Some(path) = std::env::var_os("FAKE_ACP_MODE_CAPTURE")
+                    && (method == "session/set_mode"
+                        || params.get("configId").and_then(|v| v.as_str()) == Some("mode"))
+                {
+                    let value = params
+                        .get("modeId")
+                        .or_else(|| params.get("value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let _ = std::fs::write(path, format!("{method} {value}"));
+                }
                 if method == "session/set_mode"
                     && let Err(msg) = require_set_mode_params(&params)
                     && let Some(req_id) = id.clone()
@@ -163,6 +186,10 @@ fn main() {
                 }
             }
             "session/prompt" => {
+                if let Some(path) = std::env::var_os("FAKE_ACP_PROMPT_CAPTURE") {
+                    let _ = std::fs::write(path, b"1");
+                }
+                let mut denied = false;
                 if std::env::var("FAKE_ACP_PERMISSION_OUTSIDE").is_ok() {
                     let perm = serde_json::json!({
                         "jsonrpc": "2.0",
@@ -180,7 +207,18 @@ fn main() {
                     stdout.flush().unwrap();
                     line_buf.clear();
                     let _ = reader.read_line(&mut line_buf);
+                    denied = !line_buf.contains("\"optionId\":\"allow\"");
                     line_buf.clear();
+                }
+                if denied {
+                    if let Some(id) = id {
+                        respond(
+                            &mut stdout,
+                            id,
+                            serde_json::json!({ "stopReason": "cancelled" }),
+                        );
+                    }
+                    continue;
                 }
                 if std::env::var("FAKE_ACP_SLEEP_MS").is_ok() {
                     let ms = std::env::var("FAKE_ACP_SLEEP_MS")

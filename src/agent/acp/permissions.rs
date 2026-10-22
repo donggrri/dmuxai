@@ -27,7 +27,7 @@ pub fn choose_permission_option(params: &Value, ctx: &PermissionContext) -> Opti
     if ctx.sensitive_gate_active {
         return None;
     }
-    if ctx.read_only_fail_closed {
+    if ctx.read_only_fail_closed && !is_read_only_tool(params) {
         return deny_option(options).or_else(|| deny_write_options(options));
     }
 
@@ -37,6 +37,17 @@ pub fn choose_permission_option(params: &Value, ctx: &PermissionContext) -> Opti
     }
 
     allow_workspace_option(options)
+}
+
+/// Read-only tool kinds that stay allowed on read-only turns (FR-1413).
+fn is_read_only_tool(params: &Value) -> bool {
+    let kind = params
+        .pointer("/toolCall/kind")
+        .or_else(|| params.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(kind.as_str(), "read" | "search" | "fetch" | "think")
 }
 
 fn path_outside_workspace(params: &Value, workspace: &str) -> bool {
@@ -329,5 +340,29 @@ mod tests {
             read_only_fail_closed: false,
         };
         assert!(choose_permission_option(&params, &ctx).is_none());
+    }
+
+    // TC-1417 / FR-1413: read-only turn denies edits, keeps in-workspace reads.
+    #[test]
+    fn tc_1417_read_only_denies_edit_allows_read() {
+        let ctx = PermissionContext {
+            workspace: "/proj".to_owned(),
+            sensitive_gate_active: false,
+            read_only_fail_closed: true,
+        };
+        let options = serde_json::json!([
+            {"optionId": "allow", "kind": "allow_once"},
+            {"optionId": "reject", "kind": "reject_once"}
+        ]);
+        let edit = serde_json::json!({"toolCall": {"kind": "edit", "locations": [{"path": "/proj/x"}]}, "options": options});
+        assert_eq!(
+            choose_permission_option(&edit, &ctx).as_deref(),
+            Some("reject")
+        );
+        let read = serde_json::json!({"toolCall": {"kind": "read", "locations": [{"path": "/proj/x"}]}, "options": options});
+        assert_eq!(
+            choose_permission_option(&read, &ctx).as_deref(),
+            Some("allow")
+        );
     }
 }

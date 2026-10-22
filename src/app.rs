@@ -292,6 +292,17 @@ struct QueuedFollowup {
 /// Cap on queued follow-ups.
 const FOLLOWUP_QUEUE_MAX: usize = 20;
 
+/// Marks a graph stop caused by a cancelled step (FR-1416), shown as cancelled.
+const GRAPH_CANCELLED_PREFIX: &str = "\u{0}cancelled:";
+
+/// User-facing line when a graph stops: cancelled steps never read "Graph failed".
+fn graph_stop_notice(message: &str) -> String {
+    match message.strip_prefix(GRAPH_CANCELLED_PREFIX) {
+        Some(detail) => format!("Graph cancelled: {detail}"),
+        None => format!("Graph failed: {message}"),
+    }
+}
+
 fn run_todo_error_text(error: &RunTodoError) -> String {
     match error {
         RunTodoError::Busy(message)
@@ -9254,6 +9265,14 @@ impl App {
                 }
                 return;
             }
+            if !success && error.as_deref() == Some("cancelled") {
+                // FR-1416: a cancelled step (user cancel or denied ACP permission)
+                // stops the graph as cancelled, without retry or failure replan.
+                self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
+                    "{GRAPH_CANCELLED_PREFIX}step {node_id} was cancelled"
+                ))]);
+                return;
+            }
             self.intercept_graph_node_finished(agent, node_id, success, &output_text);
         }
         self.flush_deferred_graph_starts();
@@ -9510,7 +9529,7 @@ impl App {
                     break;
                 }
                 GraphAction::Failed(message) => {
-                    self.push_system(format!("Graph failed: {message}"));
+                    self.push_system(graph_stop_notice(&message));
                     self.quiet_graph_run = false;
                     if let Some(session) = self.graph_session.as_mut() {
                         session.finalize_failure();
@@ -9545,7 +9564,11 @@ impl App {
                     if let Some((_plan_id, todo_id)) = self.graph_todo.take()
                         && let Some(store) = self.todo_store.clone()
                     {
-                        if let Err(err) = store.finish_run(&todo_id, false, Some(message)) {
+                        if let Err(err) = store.finish_run(
+                            &todo_id,
+                            false,
+                            Some(message.replace(GRAPH_CANCELLED_PREFIX, "cancelled: ")),
+                        ) {
                             self.push_system(format!("Failed to finish to-do run: {err}"));
                         }
                         self.publish_todos();
@@ -14168,6 +14191,7 @@ fn link_turn_bands_to_messages(
 
 #[cfg(test)]
 mod tests {
+
     //! Integration helpers for `App` unit tests (see `AGENTS.md` § Agent test helpers).
     //!
     //! - [`test_app`] — in-memory conversation DB, recording adapters, Codex selected.
@@ -27252,5 +27276,19 @@ mod speaker_style_tests {
             t.color_for(speaker_for(Agent::Cursor)),
             t.color_for(speaker_for(Agent::Agy))
         );
+    }
+}
+
+#[cfg(test)]
+mod graph_stop_notice_tests {
+    // TC-1421 / FR-1416: a cancelled step is reported as cancelled, not failed.
+    #[test]
+    fn tc_1421_cancelled_graph_step_not_reported_as_failed() {
+        let msg = format!("{}step n1 was cancelled", super::GRAPH_CANCELLED_PREFIX);
+        assert_eq!(
+            super::graph_stop_notice(&msg),
+            "Graph cancelled: step n1 was cancelled"
+        );
+        assert_eq!(super::graph_stop_notice("boom"), "Graph failed: boom");
     }
 }

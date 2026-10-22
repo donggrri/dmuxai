@@ -44,12 +44,10 @@ pub struct DmuxSettings {
     pub cursor_windows_unsandboxed: bool,
     pub cursor_prewarm: bool,
     pub cursor_prewarm_idle_secs: u64,
-    /// `[cursor] protocol` (default ACP on Linux-supported builds).
+    /// `[cursor] protocol` (default legacy stream-json; FR-1410).
     pub cursor_protocol: RunnerProtocol,
     /// `[agents] grok_protocol` (default ACP).
     pub grok_protocol: RunnerProtocol,
-    /// `[agents] opencode_protocol` (default ACP).
-    pub opencode_protocol: RunnerProtocol,
     pub routing_default_agent: Option<String>,
     pub routing_cursor_models: Vec<String>,
     pub graph_max_parallel: usize,
@@ -549,13 +547,12 @@ impl DmuxSettings {
                     )),
                 }
             }
-            if let Some(protocol) = agents.opencode_protocol {
-                match RunnerProtocol::parse_config(&protocol) {
-                    Some(value) => self.opencode_protocol = value,
-                    None => self.config_warnings.push(format!(
-                        "[agents] opencode_protocol ignored: expected acp or legacy, got {protocol:?}"
-                    )),
-                }
+            if agents.opencode_protocol.is_some() {
+                // FR-1418: opencode stays on the headless `opencode run` path.
+                self.config_warnings.push(
+                    "[agents] opencode_protocol ignored: opencode runs headless (`opencode run`)"
+                        .to_owned(),
+                );
             }
         }
         if let Some(mcp) = parsed.mcp {
@@ -768,7 +765,6 @@ impl Default for DmuxSettings {
             cursor_prewarm_idle_secs: 300,
             cursor_protocol: RunnerProtocol::Legacy,
             grok_protocol: RunnerProtocol::Acp,
-            opencode_protocol: RunnerProtocol::Acp,
             routing_default_agent: None,
             routing_cursor_models: Vec::new(),
             graph_max_parallel: 2,
@@ -2053,13 +2049,12 @@ mod builtin_memory_mcp_tests {
         assert_eq!(settings.cursor_prewarm_idle_secs, 120);
     }
 
-    // TC-1305 / FR-1300, FR-1301: runner protocol defaults and TOML parsing.
+    // TC-1305, TC-1410 / FR-1300, FR-1301, FR-1410: runner protocol defaults and TOML parsing.
     #[test]
     fn tc_1305_runner_protocol_defaults_and_parse() {
         let defaults = DmuxSettings::default();
         assert_eq!(defaults.cursor_protocol, RunnerProtocol::Legacy);
         assert_eq!(defaults.grok_protocol, RunnerProtocol::Acp);
-        assert_eq!(defaults.opencode_protocol, RunnerProtocol::Acp);
 
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2070,7 +2065,13 @@ mod builtin_memory_mcp_tests {
         let settings = DmuxSettings::load(ws.path());
         assert_eq!(settings.cursor_protocol, RunnerProtocol::Legacy);
         assert_eq!(settings.grok_protocol, RunnerProtocol::Legacy);
-        assert_eq!(settings.opencode_protocol, RunnerProtocol::Legacy);
+        // TC-1423 / FR-1418: opencode has no ACP switch.
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("opencode_protocol ignored"))
+        );
     }
 
     // TC-1322 / FR-1321: opencode binary resolution includes ~/.opencode/bin/opencode.
