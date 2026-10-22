@@ -91,7 +91,7 @@ accidental scope expansion.
 | Persistence | <schema/invariant or "No schema change"> | <migration/recovery behavior> | TC-… |
 | Provider protocol | <request/event contract> | <unknown/malformed event handling> | TC-… |
 | Security / permissions | <sandbox, approval, sensitive data rule> | <must not weaken…> | TC-… |
-| Platform | <Windows/Linux behavior> | <fallback or limitation> | TC-… |
+| Platform | <Linux behavior> | <fallback or limitation> | TC-… |
 
 ## 7. Implementation plan
 

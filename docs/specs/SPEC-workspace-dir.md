@@ -14,7 +14,7 @@ Decision:
 2. **Dashboard.** A workspace control in the header shows the current path. It opens a dialog with a path input, server-side validation, a directory-only browser and recent paths. Confirming a switch **re-executes the process** in the new workspace (Unix `exec`, same port, bind and token), so every component re-opens cleanly on the new directory. The page reconnects by itself.
 3. **Runners** always get the active workspace as their working directory and `{workspace}` value. This is checked by a test.
 
-Re-exec is simpler and safer than re-wiring the live App, which holds about 40 workspace-bound handles (DB, event sink, docs, to-dos, MCP, warm cursor process). On Windows the switch endpoint answers 501 (Windows compatibility is postponed); the CLI and config parts work there too.
+Re-exec is simpler and safer than re-wiring the live App, which holds about 40 workspace-bound handles (DB, event sink, docs, to-dos, MCP, warm cursor process).
 
 ## 2. Requirements
 

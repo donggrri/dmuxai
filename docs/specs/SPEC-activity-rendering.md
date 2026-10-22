@@ -110,7 +110,7 @@ Tool calls and model thinking are rendered concisely in the chat stream instead 
 | Persistence | Thinking tokens are NEVER stored in SQLite `messages` or `turn_events` tables. Stored transcript and shared context projections remain strictly thinking-free. | Zero database schema change. Fully backward and forward compatible. | TC-364 |
 | Provider protocol | Codex tool events, Cursor `stream-json` tool blocks, AGY `step_update` (`tool_call`, `thinking`), and custom agent JSONL paths (`tool_name_path`, `tool_status_path`, `thinking_path`) map into standard internal events. Unknown events are dropped. | No provider protocol breaking changes; existing adapters remain functional if new events are absent. | TC-366, TC-367 |
 | Security / permissions | Rendered tool details (commands, file paths, diffs) must respect terminal escape sanitization. Raw ANSI escape injections from tool output are stripped before rendering. | Safe rendering in all standard terminal backends. | TC-361 |
-| Platform | Keybinding `Ctrl+O` and `/details` slash command work across Linux TUI and Windows/WSL environments. Line truncation handles standard UTF-8 and narrow terminal widths gracefully. | Text clipping uses terminal width without wrapping breaks. | TC-360, TC-361 |
+| Platform | Keybinding `Ctrl+O` and `/details` slash command work across the Linux TUI and WSL environments. Line truncation handles standard UTF-8 and narrow terminal widths gracefully. | Text clipping uses terminal width without wrapping breaks. | TC-360, TC-361 |
 
 ## 7. Implementation plan
 

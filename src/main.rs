@@ -758,17 +758,15 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     result.map_err(Into::into)
 }
 
-/// Signal listeners for a headless `--web` run (FR-1601): SIGINT and, on
-/// Unix, SIGTERM. Creating the stream registers the OS handler synchronously
-/// (see the regression guard in [`run_tui`]); a failed registration for one
-/// signal never blocks the other.
-#[cfg(unix)]
+/// Signal listeners for a headless `--web` run (FR-1601): SIGINT and SIGTERM.
+/// Creating the stream registers the OS handler synchronously (see the
+/// regression guard in [`run_tui`]); a failed registration for one signal
+/// never blocks the other.
 struct ShutdownSignals {
     interrupt: Option<tokio::signal::unix::Signal>,
     sigterm: Option<tokio::signal::unix::Signal>,
 }
 
-#[cfg(unix)]
 impl ShutdownSignals {
     fn register() -> Self {
         Self {
@@ -802,36 +800,9 @@ impl ShutdownSignals {
     }
 }
 
-/// Windows counterpart of [`ShutdownSignals`] (FR-1601).
-#[cfg(not(unix))]
-struct ShutdownSignals {
-    interrupt: Option<tokio::signal::windows::CtrlC>,
-}
-
-#[cfg(not(unix))]
-impl ShutdownSignals {
-    fn register() -> Self {
-        Self {
-            interrupt: tokio::signal::windows::ctrl_c().ok(),
-        }
-    }
-
-    /// Resolves after Ctrl-C; never resolves if the stream could not be
-    /// registered.
-    async fn recv(&mut self) {
-        match self.interrupt.as_mut() {
-            Some(interrupt) => {
-                let _ = interrupt.recv().await;
-            }
-            None => std::future::pending::<()>().await,
-        }
-    }
-}
-
 /// Conversation id the re-exec'd process opens on startup (FR-1227).
 const OPEN_CONVERSATION_ENV: &str = "DMUXAI_OPEN_CONVERSATION";
 
-#[cfg(unix)]
 fn exec_workspace_switch(
     target_workspace: &Path,
     bound_port: Option<u16>,
@@ -863,20 +834,6 @@ fn exec_workspace_switch(
     let err = cmd.exec();
     let msg = dmuxai::web::format_reexec_failure(&exe, &new_args, &err);
     eprint!("{msg}");
-    std::process::exit(1);
-}
-
-#[cfg(not(unix))]
-fn exec_workspace_switch(
-    target_workspace: &Path,
-    _bound_port: Option<u16>,
-    _token: Option<&str>,
-    _open_conversation: Option<&str>,
-) -> ! {
-    eprintln!(
-        "error: workspace switch is only supported on Unix\nrestart command: dmuxai -C {}",
-        target_workspace.display()
-    );
     std::process::exit(1);
 }
 

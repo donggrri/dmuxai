@@ -837,18 +837,7 @@ fn confined_ticket_path(service: &DocsService, path: &std::path::Path) -> Option
         return Some(canonical);
     }
     let cache = std::fs::canonicalize(crate::docs::office::cache_dir()).ok()?;
-    #[cfg(windows)]
-    let (canonical, cache) = (strip_verbatim(canonical), strip_verbatim(cache));
     canonical.starts_with(&cache).then_some(canonical)
-}
-
-#[cfg(windows)]
-fn strip_verbatim(path: PathBuf) -> PathBuf {
-    let text = path.to_string_lossy().into_owned();
-    match text.strip_prefix(r"\\?\") {
-        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
-        _ => path,
-    }
 }
 
 #[allow(clippy::result_large_err)]

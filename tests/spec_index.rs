@@ -11,10 +11,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-#[cfg(not(windows))]
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(not(windows))]
 use std::process::Command;
 
 use regex::Regex;
@@ -49,7 +47,6 @@ fn status_line(contents: &str) -> Option<String> {
 
 /// Min and max ID number per ID prefix, over table rows whose first cell is an
 /// ID definition (the same contract FR-471 protects).
-#[cfg(not(windows))]
 fn defined_id_ranges(contents: &str) -> BTreeMap<String, (u32, u32)> {
     let row_id = Regex::new(r"^\|[[:space:]]*((FR|NFR|UX|INT|TC)-([0-9]+))[[:space:]]*\|")
         .expect("valid ID regex");
@@ -70,7 +67,6 @@ fn defined_id_ranges(contents: &str) -> BTreeMap<String, (u32, u32)> {
     ranges
 }
 
-#[cfg(not(windows))]
 fn format_id_ranges(ranges: &BTreeMap<String, (u32, u32)>) -> String {
     if ranges.is_empty() {
         return "—".to_string();
@@ -130,8 +126,6 @@ fn spec_ids_are_unique_across_specs() {
     );
 }
 
-// bash on Windows runners resolves to WSL/absent; the script is a Linux/macOS dev tool.
-#[cfg(not(windows))]
 #[test]
 fn spec_index_script_lists_every_spec() {
     let output = Command::new("bash")

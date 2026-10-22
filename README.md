@@ -54,8 +54,8 @@ or browse directories and switch the running session to another workspace.
 
 The dashboard binds `127.0.0.1` only and needs the per-start token printed at
 startup; other origins/hosts are rejected. Binding elsewhere requires
-`--bind ADDR --allow-remote` and prints a warning. On Windows, run DmuxAI inside
-WSL and open the printed URL in the Windows browser (`localhost` is forwarded).
+`--bind ADDR --allow-remote` and prints a warning. On Linux (WSL included),
+open the printed URL in the browser (`localhost` is forwarded).
 Details: [SPEC-web-dashboard](docs/specs/SPEC-web-dashboard.md).
 
 ### Graph view
@@ -251,7 +251,7 @@ Claude Desktop on Linux (`claude_desktop_config.json`):
 }
 ```
 
-Claude Desktop on Windows, calling dmuxai inside WSL (`--cd` sets the repo):
+Claude Desktop with dmuxai inside WSL (`--cd` sets the repo):
 
 ```json
 {
@@ -388,9 +388,8 @@ fake fixture data only.
 
 ## Requirements
 
-The Windows release installer does not require Rust, Cargo, or Git. It installs
-the DmuxAI executable only; coding-agent CLIs remain independently installed and
-authenticated tools.
+The release binary does not require Rust, Cargo, or Git; coding-agent CLIs
+remain independently installed and authenticated tools.
 
 - Codex CLI, authenticated with `codex login`
 - Cursor Agent CLI, authenticated with `cursor-agent login`
@@ -398,7 +397,7 @@ authenticated tools.
 
 Installed CLI status can be checked with:
 
-```powershell
+```bash
 codex --version
 codex login status
 cursor-agent --version
@@ -412,58 +411,24 @@ pi --version
 
 ## Install and run in any project
 
-### Windows
-
-Install the latest published Windows release for the current user. No
-administrator permissions are required. The installer downloads the release,
-verifies its SHA-256 checksum, installs `dmuxai.exe` to
-`%LOCALAPPDATA%\DmuxAI\bin`, and adds that directory to the user `PATH`.
-
-PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/donggrri/dmuxai/main/install.ps1 | iex
-```
-
-Or, after cloning the repository, run `install.cmd` from Command Prompt or
-`install.ps1` from PowerShell. These use the same published release; they do
-not build from source.
-
-```cmd
-cd C:\path\to\DmuxAI
-install.cmd
-```
-
-At the end of installation, DmuxAI reports whether Codex, Cursor Agent, AGY,
-OpenCode, Claude Code, and Pi are available on `PATH`. Missing tools do not
-prevent DmuxAI from installing. To omit that report, run
-`./install.ps1 -SkipProviderCheck`.
-
-Then move to any project and run `dmuxai` with no path argument:
-
-```powershell
-cd C:\path\to\project
-dmuxai
-```
-
-DmuxAI uses the folder from which it was started as its workspace, so its agents
-operate on that project. To update it, run the installer again; it replaces the
-current-user executable with the latest published release.
-
-You can start multiple DmuxAI windows from the same project at the same time.
-When another live DmuxAI window already owns that workspace, a new window
-starts in its own conversation and provider processes; the existing workspace
-conversation list remains available from `/conversations` or `F3`.
+Native Windows is not supported for now; use WSL (Linux). See
+[Linux / WSL release binary](#linux--wsl-release-binary) or
+[Build from source](#build-from-source).
 
 ### Build from source
 
 Rust and Cargo are required only when building from source:
 
-```powershell
+```bash
 cargo install --path . --locked --force
 ```
 
 Conversations remain scoped by the canonical project path.
+
+You can start multiple DmuxAI windows from the same project at the same time.
+When another live DmuxAI window already owns that workspace, a new window
+starts in its own conversation and provider processes; the existing workspace
+conversation list remains available from `/conversations` or `F3`.
 
 ## First run
 
@@ -544,19 +509,6 @@ dmuxai --version
 
 ## Run from source
 
-Windows PowerShell:
-
-```powershell
-cd C:\path\to\DmuxAI
-cargo run
-
-# Open another project without changing directories (the workspace is
-# DMUXAI_WORKSPACE, or the current directory when it is unset):
-$env:DMUXAI_WORKSPACE = 'C:\path\to\project'; cargo run
-```
-
-Linux shell:
-
 ```bash
 cd /path/to/DmuxAI
 cargo run
@@ -623,8 +575,8 @@ head, DmuxAI injects the shared rolling summary and recent completed turns from
 all agents into a fresh session. The full transcript is retained; summarization
 only changes the bounded context projection sent to the provider.
 
-The database is stored at `%LOCALAPPDATA%\DmuxAI\conversations.sqlite3` on
-Windows, `$XDG_STATE_HOME/dmuxai/conversations.sqlite3` when `XDG_STATE_HOME` is
+The database is stored at
+`$XDG_STATE_HOME/dmuxai/conversations.sqlite3` when `XDG_STATE_HOME` is
 set, or `~/.local/state/dmuxai/conversations.sqlite3` otherwise. Conversations
 are scoped by the canonical current workspace path.
 
@@ -648,18 +600,7 @@ On **Linux**, **grok** defaults to **ACP** (`[agents] grok_protocol = "acp"`).
 because Cursor ACP currently exposes fast-only composer models; set
 `protocol = "acp"` for `cursor-agent acp` (DmuxAI refuses stuck fast models).
 Set `grok_protocol = "legacy"` to keep grok streaming-json argv. **ACP is
-supported on Linux only** in this release; Windows continues to use legacy
-Cursor stream-json where available.
-
-Cursor agent turns that write files are unavailable on Windows when the Cursor
-sandbox is unavailable; DmuxAI surfaces `CursorWritesUnavailable` before starting
-a provider process.
-
-Windows uses `codex.exe` and `agy.exe`. Cursor's Windows installer exposes shell
-wrappers, so DmuxAI resolves the latest installed Cursor version and launches
-its bundled `node.exe index.js` directly. Linux uses `codex`, `cursor-agent`,
-and `agy`. Windows children receive `CREATE_NO_WINDOW`; Cursor Implement remains
-disabled on Windows because its sandbox is unavailable there.
+supported on Linux only** in this release.
 
 Executable overrides:
 
@@ -667,8 +608,8 @@ Executable overrides:
 - `DMUXAI_CURSOR_BIN`
 - `DMUXAI_AGY_BIN`
 
-Prompts are written to child stdin. Neither Windows nor Linux routes prompt text
-through `cmd.exe`, PowerShell command strings, or `/bin/sh`.
+Prompts are written to child stdin; prompt text is never assembled into
+shell command strings (`/bin/sh` included).
 
 ### Cursor latency
 
@@ -766,7 +707,7 @@ text (the app-server JSON has no separate image field in DmuxAI today).
 
 ## Verify
 
-```powershell
+```bash
 cargo fmt --check
 cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
@@ -787,7 +728,7 @@ GitHub milestone per release).
 Real-provider smoke tests are ignored in the ordinary suite because they need
 installed, authenticated CLIs and make real model requests:
 
-```powershell
+```bash
 cargo test real_codex_app_server_handshake -- --ignored --nocapture
 cargo test real_codex_turn_streams_to_completion -- --ignored --nocapture
 cargo test real_codex_turn_can_be_interrupted -- --ignored --nocapture
@@ -876,7 +817,7 @@ similar to move-capturing owning C++ values in a task lambda.
 - `src/agent/codex.rs`: Codex App Server client
 - `src/agent/cursor.rs`: Cursor NDJSON process and session adapter
 - `src/agent/agy.rs`: AGY NDJSON process and conversation adapter
-- `src/process/mod.rs`: Windows/Linux executable and headless-process boundary
+- `src/process/mod.rs`: executable resolution and headless-process boundary
 - `src/cli.rs`, `src/agent_api.rs`: headless `run`/`todo`/`status`/`events` subcommands, JSON output and exit codes
 - `src/mcp_server.rs`: `dmuxai mcp` stdio MCP server for other agents
 - `src/events.rs`, `src/notify.rs`: `.dmuxai/events.jsonl` state-change log, webhooks and command hooks

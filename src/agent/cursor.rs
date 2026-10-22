@@ -50,7 +50,6 @@ enum CursorCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorAdapterConfig {
-    pub windows_unsandboxed: bool,
     pub prewarm: bool,
     pub prewarm_idle_secs: u64,
     pub protocol: RunnerProtocol,
@@ -59,7 +58,6 @@ pub struct CursorAdapterConfig {
 impl Default for CursorAdapterConfig {
     fn default() -> Self {
         Self {
-            windows_unsandboxed: false,
             prewarm: false,
             prewarm_idle_secs: 300,
             protocol: RunnerProtocol::Acp,
@@ -70,7 +68,6 @@ impl Default for CursorAdapterConfig {
 impl From<DmuxSettings> for CursorAdapterConfig {
     fn from(settings: DmuxSettings) -> Self {
         Self {
-            windows_unsandboxed: settings.cursor_windows_unsandboxed,
             prewarm: settings.cursor_prewarm,
             prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
             protocol: settings.cursor_protocol,
@@ -81,7 +78,6 @@ impl From<DmuxSettings> for CursorAdapterConfig {
 impl From<&DmuxSettings> for CursorAdapterConfig {
     fn from(settings: &DmuxSettings) -> Self {
         Self {
-            windows_unsandboxed: settings.cursor_windows_unsandboxed,
             prewarm: settings.cursor_prewarm,
             prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
             protocol: settings.cursor_protocol,
@@ -92,7 +88,6 @@ impl From<&DmuxSettings> for CursorAdapterConfig {
 impl CursorAdapterConfig {
     pub fn from_settings(settings: &DmuxSettings, prewarm: bool) -> Self {
         Self {
-            windows_unsandboxed: settings.cursor_windows_unsandboxed,
             prewarm: prewarm && settings.cursor_prewarm,
             prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
             protocol: settings.cursor_protocol,
@@ -103,7 +98,6 @@ impl CursorAdapterConfig {
 pub struct CursorAdapter {
     command_tx: mpsc::Sender<CursorCommand>,
     #[allow(dead_code)]
-    windows_unsandboxed: bool,
     /// Bumped synchronously by `reset()`. The runtime applies a pending reset
     /// before handling any later command, so a reset is never lost or
     /// reordered behind a prompt sent after `/new` (FR-807).
@@ -189,7 +183,6 @@ pub fn spawn_cursor_adapter(
     mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
 ) -> SpawnedAdapter {
     let config = config.into();
-    let windows_unsandboxed = config.windows_unsandboxed;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let reset_requests = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let worker = tokio::spawn(runtime_loop(
@@ -203,7 +196,6 @@ pub fn spawn_cursor_adapter(
     (
         Box::new(CursorAdapter {
             command_tx,
-            windows_unsandboxed,
             reset_requests,
         }),
         worker,
@@ -286,17 +278,9 @@ fn spawn_warm_process(
     selected_model: Option<&str>,
     mode: TurnPolicy,
     cwd: &Path,
-    windows_unsandboxed: bool,
 ) -> io::Result<WarmProcess> {
     let mut command = cursor_command()?;
-    configure_command(
-        &mut command,
-        resume_session,
-        selected_model,
-        mode,
-        cwd,
-        windows_unsandboxed,
-    );
+    configure_command(&mut command, resume_session, selected_model, mode, cwd);
     let program = command.as_std().get_program().to_os_string();
     let argv = command
         .as_std()
@@ -331,7 +315,6 @@ async fn runtime_loop(
     mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
     reset_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
-    let windows_unsandboxed = config.windows_unsandboxed;
     let protocol = config.protocol;
     let idle_limit = std::time::Duration::from_secs(config.prewarm_idle_secs);
     let applicable: Vec<dmuxai::mcp::ResolvedMcpServer> = mcp_servers
@@ -408,16 +391,7 @@ async fn runtime_loop(
 
             match command {
                 CursorCommand::Send { request, is_graph } => {
-                    if let Err(error) = validate_cursor_policy(request.policy, windows_unsandboxed)
-                    {
-                        let context = OutputContext::from(&request);
-                        send_event(
-                            &event_tx,
-                            Some(&context),
-                            AgentEvent::Error(error.to_string()),
-                        )
-                        .await;
-                    } else if is_graph {
+                    if is_graph {
                         if let Some(warm) = warm_process.take() {
                             reap_warm_process(warm).await;
                         }
@@ -429,7 +403,6 @@ async fn runtime_loop(
                             policy,
                             cwd.clone(),
                             event_tx.clone(),
-                            windows_unsandboxed,
                             protocol,
                             applicable.clone(),
                             cursor_notice_emitted.clone(),
@@ -445,7 +418,6 @@ async fn runtime_loop(
                                 selected_model.as_deref(),
                                 request.policy,
                                 &cwd,
-                                windows_unsandboxed,
                             );
                         }
                         let turn_program = check_cmd
@@ -501,7 +473,6 @@ async fn runtime_loop(
                             policy,
                             cwd.clone(),
                             event_tx.clone(),
-                            windows_unsandboxed,
                             protocol,
                             applicable.clone(),
                             cursor_notice_emitted.clone(),
@@ -550,7 +521,6 @@ async fn runtime_loop(
                                 selected_model.as_deref(),
                                 TurnPolicy::Agent,
                                 &cwd,
-                                windows_unsandboxed,
                             )
                             .ok();
                         }
@@ -564,7 +534,6 @@ async fn runtime_loop(
                             selected_model.as_deref(),
                             TurnPolicy::Agent,
                             &cwd,
-                            windows_unsandboxed,
                         )
                         .ok();
                     }
@@ -592,7 +561,6 @@ async fn runtime_loop(
                         selected_model.as_deref(),
                         TurnPolicy::Agent,
                         &cwd,
-                        windows_unsandboxed,
                     )
                     .ok();
                 }
@@ -615,7 +583,6 @@ async fn runtime_loop(
                                 selected_model.as_deref(),
                                 TurnPolicy::Agent,
                                 &cwd,
-                                windows_unsandboxed,
                             )
                             .ok();
                         }
@@ -630,7 +597,6 @@ async fn runtime_loop(
                                 selected_model.as_deref(),
                                 TurnPolicy::Agent,
                                 &cwd,
-                                windows_unsandboxed,
                             )
                             .ok();
                         }
@@ -703,7 +669,6 @@ fn spawn_turn(
     mode: TurnPolicy,
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
-    windows_unsandboxed: bool,
     protocol: RunnerProtocol,
     mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
     cursor_notice_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -728,7 +693,6 @@ fn spawn_turn(
             mode,
             &cwd,
             &event_tx,
-            windows_unsandboxed,
             protocol,
             &mcp_servers,
             &cursor_notice_emitted,
@@ -767,7 +731,7 @@ struct ActiveTurn {
     is_graph: bool,
     reset_epoch: u64,
     /// Process group of the turn's CLI (its pid; 0 until spawned). Only used
-    /// for group kills on Unix (Windows support is postponed).
+    /// for group kills on Unix.
     #[cfg_attr(not(unix), allow(dead_code))]
     pgid: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Set once the stream reported its terminal `result` line.
@@ -820,7 +784,6 @@ pub(crate) async fn run_turn(
     mode: TurnPolicy,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
-    windows_unsandboxed: bool,
     protocol: RunnerProtocol,
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     cursor_notice_emitted: &std::sync::atomic::AtomicBool,
@@ -832,7 +795,6 @@ pub(crate) async fn run_turn(
         mode,
         cwd,
         event_tx,
-        windows_unsandboxed,
         protocol,
         mcp_servers,
         cursor_notice_emitted,
@@ -851,7 +813,6 @@ async fn run_turn_with_child(
     mode: TurnPolicy,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
-    windows_unsandboxed: bool,
     protocol: RunnerProtocol,
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     cursor_notice_emitted: &std::sync::atomic::AtomicBool,
@@ -859,9 +820,6 @@ async fn run_turn_with_child(
     pgid: &std::sync::atomic::AtomicU32,
     acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> io::Result<Option<String>> {
-    validate_cursor_policy(mode, windows_unsandboxed)
-        .map_err(|error| io::Error::other(error.to_string()))?;
-
     let context = OutputContext::from(request);
     let _guard = if protocol != RunnerProtocol::Acp && !mcp_servers.is_empty() {
         match dmuxai::mcp::propagate::cursor_mcp_guard(cwd, mcp_servers) {
@@ -941,7 +899,6 @@ async fn run_turn_with_child(
                 selected_model.as_deref(),
                 mode,
                 cwd,
-                windows_unsandboxed,
             );
             command
                 .current_dir(cwd)
@@ -974,16 +931,6 @@ async fn run_turn_with_child(
         .ok_or_else(|| io::Error::other("Cursor stderr was not piped"))?;
 
     let context = OutputContext::from(request);
-    if mode == TurnPolicy::Agent && cfg!(windows) && windows_unsandboxed {
-        send_event(
-            event_tx,
-            Some(&context),
-            AgentEvent::Notice(
-                "Warning: Cursor Implement is running without sandbox on Windows (opt-in). The agent can modify files outside the workspace sandbox.".to_owned(),
-            ),
-        )
-        .await;
-    }
     send_event(event_tx, Some(&context), AgentEvent::Started).await;
     let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
     stdin.write_all(prompt.as_bytes()).await?;
@@ -1009,15 +956,11 @@ fn configure_command(
     selected_model: Option<&str>,
     mode: TurnPolicy,
     cwd: &Path,
-    windows_unsandboxed: bool,
 ) {
     command.arg("--print");
     match mode {
         TurnPolicy::ReadOnly => {
             command.args(["--mode", "ask"]);
-        }
-        TurnPolicy::Agent if cfg!(windows) && windows_unsandboxed => {
-            command.arg("--force");
         }
         TurnPolicy::Agent => {
             command.args(["--force", "--sandbox", "enabled"]);
@@ -1150,13 +1093,6 @@ async fn stream_child(
         }));
     }
     Ok(state.session_id)
-}
-
-fn validate_cursor_policy(mode: TurnPolicy, windows_unsandboxed: bool) -> Result<(), AdapterError> {
-    if mode == TurnPolicy::Agent && cfg!(windows) && !windows_unsandboxed {
-        return Err(AdapterError::CursorWritesUnavailable);
-    }
-    Ok(())
 }
 
 #[derive(Default)]
@@ -1349,17 +1285,6 @@ pub(crate) mod tests {
     use tokio::time::{Duration, timeout};
 
     use super::*;
-
-    #[test]
-    // TC-480, TC-483 / INT-480, INT-481: only Windows Cursor Implement is blocked.
-    fn cursor_mode_validation_matches_platform() {
-        assert_eq!(validate_cursor_policy(TurnPolicy::ReadOnly, false), Ok(()));
-        assert_eq!(
-            validate_cursor_policy(TurnPolicy::Agent, false).is_ok(),
-            !cfg!(windows)
-        );
-        assert_eq!(validate_cursor_policy(TurnPolicy::Agent, true), Ok(()));
-    }
 
     #[test]
     fn parses_cursor_models_and_default() {
@@ -1616,7 +1541,6 @@ pub(crate) mod tests {
             Some("composer-2.5"),
             TurnPolicy::ReadOnly,
             cwd,
-            false,
         );
 
         let args = command
@@ -1654,7 +1578,6 @@ pub(crate) mod tests {
             None,
             TurnPolicy::ReadOnly,
             cwd,
-            false,
         );
 
         let args = command
@@ -1691,7 +1614,6 @@ pub(crate) mod tests {
                 Some(disallowed),
                 TurnPolicy::ReadOnly,
                 cwd,
-                false,
             );
 
             let args = command
@@ -1737,7 +1659,6 @@ pub(crate) mod tests {
             None,
             TurnPolicy::ReadOnly,
             cwd,
-            false,
         );
         let args = command
             .as_std()
@@ -1772,7 +1693,6 @@ pub(crate) mod tests {
                 None,
                 mode,
                 cwd,
-                false,
             );
             command
                 .as_std()
@@ -1791,42 +1711,6 @@ pub(crate) mod tests {
                 .any(|args| args == ["--sandbox", "enabled"])
         );
         assert!(!implement.iter().any(|arg| arg == "--mode"));
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    // TC-481 / NFR-480: the runtime guard runs before Cursor command lookup or spawning.
-    async fn windows_cursor_implement_turn_is_rejected_before_process_spawn() {
-        let (event_tx, mut event_rx) = mpsc::channel(8);
-        let request = AgentRequest {
-            conversation_id: super::super::ConversationId::new("conversation"),
-            turn_id: super::super::TurnId::new("turn"),
-            prompt: "hello".to_owned(),
-            resume_session: None,
-            image_paths: vec![],
-            policy: TurnPolicy::Agent,
-            require_file_edits: false,
-        };
-
-        let error = run_turn(
-            &request,
-            None,
-            TurnPolicy::Agent,
-            Path::new("missing-workspace"),
-            &event_tx,
-            false,
-            RunnerProtocol::Legacy,
-            &[],
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .await
-        .expect_err("Windows Cursor Implement must be blocked");
-
-        assert_eq!(
-            error.to_string(),
-            AdapterError::CursorWritesUnavailable.to_string()
-        );
-        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1850,7 +1734,6 @@ pub(crate) mod tests {
                 TurnPolicy::ReadOnly,
                 &cwd,
                 &event_tx,
-                false,
                 RunnerProtocol::Legacy,
                 &[],
                 &std::sync::atomic::AtomicBool::new(false),
@@ -1948,7 +1831,6 @@ pub(crate) mod tests {
             TurnPolicy::ReadOnly,
             temp.path(),
             &event_tx,
-            false,
             RunnerProtocol::Legacy,
             std::slice::from_ref(&server),
             &notice_shown,
@@ -1986,7 +1868,6 @@ pub(crate) mod tests {
             TurnPolicy::ReadOnly,
             temp.path(),
             &event_tx,
-            false,
             RunnerProtocol::Legacy,
             std::slice::from_ref(&server),
             &notice_shown,
@@ -2209,7 +2090,6 @@ pub(crate) mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
             protocol: RunnerProtocol::Legacy,
-            windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 300,
         };
@@ -2330,7 +2210,6 @@ pub(crate) mod tests {
         }
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
-            windows_unsandboxed: false,
             protocol: RunnerProtocol::Legacy,
             prewarm: false,
             prewarm_idle_secs: 300,
@@ -2474,7 +2353,6 @@ pub(crate) mod tests {
         }
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
-            windows_unsandboxed: false,
             protocol: RunnerProtocol::Legacy,
             prewarm: false,
             prewarm_idle_secs: 300,
@@ -2543,7 +2421,6 @@ pub(crate) mod tests {
         }
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
-            windows_unsandboxed: false,
             protocol: RunnerProtocol::Legacy,
             prewarm: false,
             prewarm_idle_secs: 300,
@@ -2608,7 +2485,6 @@ pub(crate) mod tests {
         }
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
-            windows_unsandboxed: false,
             protocol: RunnerProtocol::Legacy,
             prewarm: false,
             prewarm_idle_secs: 300,
@@ -2651,7 +2527,6 @@ pub(crate) mod tests {
         let (event_tx, _) = mpsc::channel(64);
         let config = CursorAdapterConfig {
             protocol: RunnerProtocol::Legacy,
-            windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 300,
         };
@@ -2698,7 +2573,6 @@ pub(crate) mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
             protocol: RunnerProtocol::Legacy,
-            windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 300,
         };
@@ -2795,7 +2669,7 @@ pub(crate) mod tests {
         // SAFETY: the fixture holds TEST_CURSOR_MUTEX for the whole test.
         unsafe { std::env::set_var("DMUXAI_CURSOR_BIN", &script) };
 
-        let warm = spawn_warm_process(None, None, TurnPolicy::ReadOnly, dir.path(), false).unwrap();
+        let warm = spawn_warm_process(None, None, TurnPolicy::ReadOnly, dir.path()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let grandchild = loop {
             if let Ok(text) = std::fs::read_to_string(&pid_file)
@@ -2834,7 +2708,6 @@ pub(crate) mod tests {
         // 2. Disabled config: no warm spawn
         let disabled_config = CursorAdapterConfig {
             protocol: RunnerProtocol::Legacy,
-            windows_unsandboxed: false,
             prewarm: false,
             prewarm_idle_secs: 300,
         };
@@ -2875,7 +2748,6 @@ pub(crate) mod tests {
         // 3. Graph nodes never prewarm
         let enabled_config = CursorAdapterConfig {
             protocol: RunnerProtocol::Legacy,
-            windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 1, // short idle expiry for step 4
         };
@@ -2956,7 +2828,6 @@ pub(crate) mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
             protocol: RunnerProtocol::Legacy,
-            windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 300,
         };
@@ -3121,7 +2992,6 @@ pub(crate) mod tests {
                 policy,
                 workspace,
                 &event_tx,
-                false,
                 RunnerProtocol::Acp,
                 &[],
                 &notice,

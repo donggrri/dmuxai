@@ -108,7 +108,7 @@ existing token/Host/Origin checks, and `dmuxai serve` stays read-only.
 | --- | --- | --- | --- |
 | Persistence | No schema change. Turn changes live in memory only. Office PDFs are cached under the dmuxai state dir (`office-cache/<sha256>.pdf`, falling back to the OS temp dir) and re-checked for a `%PDF-` header on every hit. | Removing the feature leaves no state | TC-751 |
 | Security / permissions | Workspace confinement, token + Host/Origin checks, sandboxed HTML with CSP, no HTML saves, serve read-only, atomic writes to the canonical target | Must not weaken FR-523/FR-526 | TC-740, TC-741, TC-745..TC-748, TC-756 |
-| Platform | Windows: drive and UNC paths rejected, symlink test unix-only, `rename` replaces existing files; opener `cmd /c start`, macOS `open`, Linux `xdg-open` | Without `soffice` Office falls back to download | TC-740, TC-749, TC-754 |
+| Platform | Drive/UNC path rejection and the `cmd /c start` opener are deferred with Windows; symlink test is Unix-only, `rename` replaces existing files; openers are macOS `open` and Linux `xdg-open` | Without `soffice` Office falls back to download | TC-740, TC-749, TC-754 |
 
 ## 7. Implementation plan
 

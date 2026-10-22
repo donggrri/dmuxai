@@ -2,7 +2,7 @@
 //!
 //! Contract:
 //! - `pub fn find_soffice() -> Option<PathBuf>`: `DMUXAI_SOFFICE` (must exist; if set but
-//!   missing -> None), else `soffice` / `libreoffice` on PATH (`.exe`/`.com` on Windows).
+//!   missing -> None), else `soffice` / `libreoffice` on PATH.
 //! - `pub enum OfficePreview { Pdf(PathBuf), Unavailable { reason: String } }`
 //! - `pub fn convert_to_pdf(soffice: Option<&Path>, source: &Path, sha256: &str, timeout: Duration)
 //!    -> OfficePreview`: cache `temp_dir()/dmuxai-office/<sha256>.pdf`; fresh temp dir per run,
@@ -22,7 +22,7 @@ pub enum OfficePreview {
 /// Locates the `soffice` / `libreoffice` binary.
 ///
 /// If `DMUXAI_SOFFICE` is set in the environment, it must exist; if missing, returns None.
-/// Otherwise searches `PATH` for `soffice` or `libreoffice` (`.exe` / `.com` on Windows).
+/// Otherwise searches `PATH` for `soffice` or `libreoffice`.
 pub fn find_soffice() -> Option<PathBuf> {
     if let Ok(val) = std::env::var("DMUXAI_SOFFICE") {
         let path = PathBuf::from(&val);
@@ -33,16 +33,7 @@ pub fn find_soffice() -> Option<PathBuf> {
         }
     }
 
-    let names = if cfg!(windows) {
-        &[
-            "soffice.exe",
-            "soffice.com",
-            "libreoffice.exe",
-            "libreoffice.com",
-        ][..]
-    } else {
-        &["soffice", "libreoffice"][..]
-    };
+    let names = &["soffice", "libreoffice"][..];
 
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
@@ -92,25 +83,13 @@ fn is_pdf_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Kills the conversion process and, on unix, its whole process group.
+/// Kills the conversion process and its whole process group.
 fn kill_tree(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", child.id())])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-    #[cfg(windows)]
-    {
-        // soffice.exe spawns soffice.bin; kill the whole tree.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &child.id().to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     let _ = child.kill();
     let _ = child.wait();
 }

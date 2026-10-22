@@ -35,7 +35,7 @@ The following table explicitly accounts for every other item, gap, and warning i
 | FR-COMPACT-1..3 | TEST-PLAN §2.5 | `/compact` alias and `/summarize <focus>` command | Out of scope; already specified in draft [SPEC-compact-summarize-focus.md](SPEC-compact-summarize-focus.md). |
 | FR-SKILL-1..2 | TEST-PLAN §2.9 | Frontmatter parsing, invalid SKILL.md skipping, and node prompt injection | Out of scope; deferred to a future dedicated skill integration spec. |
 | FR-GRAPH-8..9, NFR-GRAPH-2 | TEST-PLAN §2.10 | `/graph override`, graph restart persistence/resume, and concurrency/retry caps | Out of scope; belongs to runtime graph orchestrator enhancements. |
-| FR-WIN-1..3 | TEST-PLAN §2.11 | Windows launcher, WSL path conversion, and Windows clipboard image bridge | Out of scope; tracked as release gate prerequisites for Windows WSL packaging. |
+| FR-WIN-1..3 | TEST-PLAN §2.11 | Windows launcher, WSL path conversion, and Windows clipboard image bridge | **Deferred (Windows dropped 2026-10-22).** Out of scope; tracked as release gate prerequisites for Windows WSL packaging. |
 | NFR-REPORT-1 | TEST-PLAN §2.12 | Enforcing `docs/graph-runs/<topic>.md` report presence in CI | Out of scope; repository CI workflow automation task. |
 | UX-QUIT-2 | TEST-PLAN §2.12 | Ctrl+C cancels running turn; idle notice (Esc already non-exiting) | Out of scope; separate keybinding and signal-handling consistency spec. |
 | Dogfood #7 | dogfood README #7 | AGY Implement turns silently empty due to auto-denied actions | Out of scope; already resolved in PR #8 via `--dangerously-skip-permissions`. |
@@ -56,7 +56,7 @@ The following table explicitly accounts for every other item, gap, and warning i
 | OQ-380 | Should disk caching of models apply to all runners or AGY only? | DmuxAI | Implementation |
 | *Resolution* | Disk caching architecture is designed generically for any runner whose discovery is an expensive CLI subprocess, but initialized and verified first for AGY where the 20-second delay is observed. | DmuxAI | Accepted |
 | OQ-381 | Where should the on-disk model cache file reside? | DmuxAI | Implementation |
-| *Resolution* | Under the user state/cache directory (`$XDG_STATE_HOME/dmuxai/model-cache/` or `%LOCALAPPDATA%\DmuxAI\model-cache\`), falling back to `.dmuxai/cache/` within the workspace if state home is unavailable. | DmuxAI | Accepted |
+| *Resolution* | Under the user state/cache directory (`$XDG_STATE_HOME/dmuxai/model-cache/`), falling back to `.dmuxai/cache/` within the workspace if state home is unavailable. | DmuxAI | Accepted |
 
 ## 3. Terms and state model
 
@@ -126,7 +126,7 @@ F2 Pressed (AGY)
 | Persistence | On-disk model cache stored as JSON: `{"timestamp": <epoch_secs>, "models": [{"id": "...", "label": "..."}]}` under state directory. | If the cache file cannot be parsed or schema changes, it is cleanly discarded and regenerated from the provider CLI. | TC-386, TC-387 |
 | CLI / Protocol | Non-TTY CLI invocation prints plain text usage or version to `stdout` and exits 0. Non-TTY startup prints plain text to `stderr` and exits 1. | Fully backward compatible; does not alter existing interactive terminal experience. | TC-380, TC-381, TC-382 |
 | Security / permissions | Non-TTY startup rejection prevents headless background processes from inadvertently acquiring terminal control or hanging. | Prevents silent zombie processes in automated scripts. | TC-382 |
-| Platform | Standard `std::io::IsTerminal` checks for stdin/stdout across Linux and Windows. Bracketed paste sequences supported across ANSI/VT100 terminals. | Falls back gracefully if terminal does not support bracketed paste. | TC-382, TC-490 |
+| Platform | Standard `std::io::IsTerminal` checks for stdin/stdout across Linux, WSL included. Bracketed paste sequences supported across ANSI/VT100 terminals. | Falls back gracefully if terminal does not support bracketed paste. | TC-382, TC-490 |
 
 ## 7. Implementation plan
 
@@ -144,4 +144,4 @@ F2 Pressed (AGY)
 - [ ] The diff has been reviewed against scope and non-goals.
 - [ ] Required Rust checks pass: format, all targets test, and clippy.
 - [ ] Dogfood bugs #1, #4, #5, and #6 are verified fixed and closed in `docs/dogfood/README.md`.
-- [ ] `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/SPEC-tui-stabilize.md` passes with zero errors.
+- [ ] `bash scripts/check-spec.sh docs/specs/SPEC-tui-stabilize.md` passes with zero errors.

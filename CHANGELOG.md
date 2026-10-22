@@ -5,6 +5,11 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Removed
+
+- Removed: native Windows support (packaging, launcher, docs). WSL keeps
+  working. Revertable in one commit.
+
 ### Added
 
 - **Follow-ups while a reply streams (SPEC-chat-followup-queue).** During a

@@ -112,7 +112,7 @@ Both are terminal; deciding a non-pending proposal is an error.
 | Persistence | Markdown files and `queue/proposals.json` in the vault; no SQLite change | Same layout as `memory.mjs`; removing `[memory]` disables everything | TC-724, TC-725 |
 | Provider protocol | Prompt prefix only; no adapter protocol change | `inject = false` turns it off | TC-726 |
 | Security / permissions | Secret filter; fixed target pattern; agents only propose; dashboard token required; no absolute path in API output | Must not weaken existing token/Host/Origin checks | TC-723, TC-728 |
-| Platform | CRLF-tolerant reads; LF writes; paths via `Path::join` | Windows and Linux | TC-721 |
+| Platform | CRLF-tolerant reads; LF writes; paths via `Path::join` | Linux | TC-721 |
 
 ## 7. Implementation plan
 

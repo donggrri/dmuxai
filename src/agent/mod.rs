@@ -248,19 +248,13 @@ pub enum AdapterError {
     CommandQueueFull,
     RuntimeStopped,
     Unsupported,
-    /// Cursor workspace writes unavailable on this platform (legacy path only).
-    CursorWritesUnavailable,
 }
-
 impl fmt::Display for AdapterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CommandQueueFull => formatter.write_str("agent command queue is full"),
             Self::RuntimeStopped => formatter.write_str("agent runtime has stopped"),
             Self::Unsupported => formatter.write_str("agent does not support this command"),
-            Self::CursorWritesUnavailable => formatter.write_str(
-                "Cursor agent mode is unavailable on Windows unless cursor.windows_unsandboxed = true in dmuxai.toml or DMUXAI_CURSOR_WINDOWS_UNSANDBOXED is set (unsandboxed; not recommended)",
-            ),
         }
     }
 }

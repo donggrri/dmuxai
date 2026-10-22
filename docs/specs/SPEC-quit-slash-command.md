@@ -78,7 +78,7 @@ change the application exit state.
 | Persistence | No schema or canonical transcript change. | Reverting the feature restores `Esc` as the main-prompt exit action; existing stored conversations are unaffected. | TC-019, TC-021 |
 | Provider protocol | `/quit` never becomes a provider request; whitespace-bearing `/quit ` retains existing prompt routing. | No provider protocol changes or live credentials are required. | TC-019, TC-022 |
 | Security / permissions | Existing shutdown cleanup and provider ownership boundaries remain unchanged. | The command only selects the existing exit path and cannot grant provider capabilities. | TC-019 |
-| Platform | Normal terminal restoration remains owned by the existing shutdown/drop path on Windows and Linux. | No platform-specific command or fallback is introduced. | Manual smoke check in review |
+| Platform | Normal terminal restoration remains owned by the existing shutdown/drop path on Linux, WSL included. | No platform-specific command or fallback is introduced. | Manual smoke check in review |
 
 ## 7. Implementation plan
 

@@ -77,5 +77,5 @@ See [PLAN-implement-plan-only.md](../plans/PLAN-implement-plan-only.md).
 
 ## 8. Review and test exit criteria
 
-- All TC-500..509 pass under `cargo test --all-targets` and `cargo clippy --all-targets --all-features -- -D warnings` (including Windows target cfg tests where present).
+- All TC-500..509 pass under `cargo test --all-targets` and `cargo clippy --all-targets --all-features -- -D warnings`.
 - Review recorded in [REVIEW-implement-plan-only.md](../reviews/REVIEW-implement-plan-only.md).

@@ -338,32 +338,18 @@ impl Drop for TempFile {
     }
 }
 
-/// Writes content to a private temp file with 0600 permissions on unix (create_new).
+/// Writes content to a private temp file with 0600 permissions (create_new).
 fn write_private_temp_file(path: &Path, content: &str, label: &str) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|e| format!("{label}: {e}"))?;
-        file.write_all(content.as_bytes())
-            .map_err(|e| format!("{label}: {e}"))?;
-    }
-    #[cfg(not(unix))]
-    {
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|e| format!("{label}: {e}"))?;
-        file.write_all(content.as_bytes())
-            .map_err(|e| format!("{label}: {e}"))?;
-    }
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("{label}: {e}"))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("{label}: {e}"))?;
     Ok(())
 }
 
@@ -654,15 +640,8 @@ async fn finish_after_done(
     }
 }
 
-#[cfg(unix)]
 fn exit_status_ok() -> std::process::ExitStatus {
     use std::os::unix::process::ExitStatusExt;
-    std::process::ExitStatus::from_raw(0)
-}
-
-#[cfg(not(unix))]
-fn exit_status_ok() -> std::process::ExitStatus {
-    use std::os::windows::process::ExitStatusExt;
     std::process::ExitStatus::from_raw(0)
 }
 
@@ -671,7 +650,6 @@ fn kill_group(pgid: u32) {
 }
 
 fn kill_group_with(pgid: u32, signal: &str) {
-    #[cfg(unix)]
     if pgid > 0 {
         let _ = std::process::Command::new("kill")
             .args([signal, "--", &format!("-{pgid}")])
@@ -680,8 +658,6 @@ fn kill_group_with(pgid: u32, signal: &str) {
             .stderr(std::process::Stdio::null())
             .status();
     }
-    #[cfg(not(unix))]
-    let _ = (pgid, signal);
 }
 
 async fn stop_turn(agent: Agent, turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
@@ -714,8 +690,7 @@ async fn send(
         .await;
 }
 
-// The fake agent is a POSIX shell script; Windows CI covers the pure parts in
-// `dmuxai::custom_agent` tests.
+// The fake agent is a POSIX shell script; keep test-only on unix.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

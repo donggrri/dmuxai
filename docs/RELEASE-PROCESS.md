@@ -47,8 +47,8 @@ ships only after the owner approves it (step 7) and is published by hand (step 8
    explicit OK. Only then merge the release PR (`release-candidate-vX.Y.Z` -> `main`) and push
    tag `vX.Y.Z` on the merge commit.
 8. **Publish.** GitHub Actions is billing-blocked, so tag pushes do not publish anything (see
-   `.github/workflows/release.yml`). Create the GitHub release for `vX.Y.Z` by hand, build the
-   Linux and Windows binaries locally, attach them, and check that the assets download and run
+   `.github/workflows/release.yml`). Create the GitHub release for `vX.Y.Z` by hand, build the Linux
+   binary locally, attach it, and check that the assets download and run
    (`--version` prints `X.Y.Z`). When Actions is available again, run the "Release binaries"
    workflow manually with the tag instead.
 

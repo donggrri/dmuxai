@@ -51,7 +51,7 @@ fn prepare() -> Option<(PathBuf, &'static str)> {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
         return None;
     };
-    let python = if cfg!(windows) { "python" } else { "python3" };
+    let python = "python3";
     let probe = Command::new(python)
         .args(["-c", "import playwright"])
         .stdout(Stdio::null())
@@ -111,7 +111,7 @@ fn start_dashboard() -> Dashboard {
 }
 
 fn run_probe(chrome: &Path, url: &str, script: &str) -> Value {
-    let python = if cfg!(windows) { "python" } else { "python3" };
+    let python = "python3";
     let mut py_child = Command::new(python)
         .args(["-c", script])
         .arg(chrome)

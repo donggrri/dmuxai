@@ -60,18 +60,12 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets
 ```
 
-Windows cross-target lint (matches the Verify workflow on Linux):
-
-```bash
-rustup target add x86_64-pc-windows-gnu
-sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64   # Debian/Ubuntu
-cargo clippy --locked --all-targets --all-features --target x86_64-pc-windows-gnu -- -D warnings
-```
+Native Windows is not supported; the Windows cross-target lint in CI is being removed. DmuxAI runs on Linux (WSL counts as Linux).
 
 When you change `docs/specs/SPEC-*.md` or the baseline spec, validate traceability:
 
-```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath <path-to-spec>
+```bash
+bash scripts/check-spec.sh <path-to-spec>
 ```
 
 Optional helper: `scripts/spec-index.sh` lists spec files.

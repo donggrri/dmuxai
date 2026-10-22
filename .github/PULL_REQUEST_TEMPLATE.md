@@ -6,7 +6,7 @@
 
 - [ ] Behavior change includes `docs/specs/SPEC-<slug>.md` (or only docs/markdown with no behavior change)
 - [ ] Plan/tasks/review artifacts added under `docs/` when required by [AGENTS.md](../AGENTS.md)
-- [ ] `scripts/check-spec.ps1` run for any changed `docs/specs/SPEC-*.md` or baseline spec
+- [ ] `bash scripts/check-spec.sh` run for any changed `docs/specs/SPEC-*.md` or baseline spec
 - [ ] Tests map to requirement or scenario IDs from the spec
 
 ## Test evidence

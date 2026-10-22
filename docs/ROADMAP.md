@@ -30,7 +30,7 @@ Source: Dongjin's dogfooding of the v0.2.0 release binary on Linux (`dmuxai --we
 | 5 | Documents: collapsible folder tree in a right sidebar | UX | [SPEC-docs-tree](specs/SPEC-docs-tree.md) (FR-830..833, UX-830) | [#43](https://github.com/donggrri/dmuxai/issues/43) | merged #50 (9c258eb) |
 | 6 | To-dos: header button and sidebar panel | UX | [SPEC-todo-sidebar](specs/SPEC-todo-sidebar.md) (FR-840..842, UX-840) | [#44](https://github.com/donggrri/dmuxai/issues/44) | merged #52 (0c25cac) |
 | 7 | Cursor latency: measured; pre-warm the next cursor-agent | perf | [SPEC-cursor-latency](specs/SPEC-cursor-latency.md) (FR-805..807, NFR-805) | [#41](https://github.com/donggrri/dmuxai/issues/41) | merged #51 (bf31a2e) |
-| 8 | Release v0.2.1: CHANGELOG, version bump, tag, verify the Linux and Windows assets | release | — | — | release PR; tag `v0.2.1` on its merge commit |
+| 8 | Release v0.2.1: CHANGELOG, version bump, tag, verify the Linux assets | release | — | — | release PR; tag `v0.2.1` on its merge commit |
 
 Order: 1 → 2+3 → 4 → 5 → 6 (4–6 share the web assets, so they go in sequence). 7 runs in parallel with 4–6. The release waits for all of 1–7.
 
@@ -39,4 +39,3 @@ Order: 1 → 2+3 → 4 → 5 → 6 (4–6 share the web assets, so they go in se
 - Persistent cursor-agent session server, if cursor-agent ever ships one (would remove the cold start that pre-warm only hides).
 - Tree view in the TUI file picker (the dashboard tree comes first).
 - TUI workspace switcher (v0.2.2 switches from the dashboard and with `-C`).
-- Windows compatibility (postponed in v0.2.1; v0.2.2 workspace switch answers 501 on Windows): job objects for Cursor warm processes (SPEC-cursor-latency FR-807), and re-check v0.2.1 features on Windows.

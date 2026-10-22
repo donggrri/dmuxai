@@ -23,7 +23,7 @@ pub struct ResolvedPath {
 impl Workspace {
     pub fn new(root: &Path) -> std::io::Result<Self> {
         Ok(Self {
-            root: dunce_canonicalize(root)?,
+            root: canonicalize_path(root)?,
         })
     }
 
@@ -67,7 +67,7 @@ impl Workspace {
     pub fn resolve(&self, requested: &str) -> Result<ResolvedPath, DocsError> {
         let relative = Self::normalize_relative(requested)?;
         let joined = self.root.join(&relative);
-        let absolute = match dunce_canonicalize(&joined) {
+        let absolute = match canonicalize_path(&joined) {
             Ok(path) => path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // A dangling symlink is reported as outside rather than missing
@@ -103,7 +103,7 @@ impl Workspace {
     /// Maps an absolute path (e.g. from a `file://` URI) to a workspace path,
     /// if it exists and is inside the root after canonicalization.
     pub fn relative_of(&self, absolute: &Path) -> Option<String> {
-        let canonical = dunce_canonicalize(absolute).ok()?;
+        let canonical = canonicalize_path(absolute).ok()?;
         let rel = canonical.strip_prefix(&self.root).ok()?;
         let parts: Vec<String> = rel
             .components()
@@ -119,19 +119,9 @@ impl Workspace {
     }
 }
 
-/// `fs::canonicalize` without the Windows `\\?\` verbatim prefix when the
-/// path can be expressed without it, so `starts_with` comparisons agree.
-fn dunce_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+/// Canonicalizes `path`.
+fn canonicalize_path(path: &Path) -> std::io::Result<PathBuf> {
     let canonical = std::fs::canonicalize(path)?;
-    #[cfg(windows)]
-    {
-        let text = canonical.to_string_lossy();
-        if let Some(rest) = text.strip_prefix(r"\\?\")
-            && !rest.starts_with("UNC\\")
-        {
-            return Ok(PathBuf::from(rest));
-        }
-    }
     Ok(canonical)
 }
 

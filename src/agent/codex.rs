@@ -157,7 +157,7 @@ impl CodexClient {
         event_tx: &mpsc::Sender<AgentOutput>,
         mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     ) -> io::Result<Self> {
-        let program = resolve_program(CODEX_BINARY_OVERRIDE, "codex.exe", "codex");
+        let program = resolve_program(CODEX_BINARY_OVERRIDE, "codex");
         let mut command = headless_command(program);
         let (args, env, notices) = build_codex_app_server_args_and_env(mcp_servers);
         for notice in notices {

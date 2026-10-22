@@ -1,5 +1,7 @@
 # DmuxAI 분석: Windows+WSL 앱, 권한/편집 차단, `.agents/skills`
 
+> Historical (2026-10). Native Windows support was dropped on 2026-10-22; Windows sections below are kept for history only.
+
 **범위:** `main` 워크트리 코드 읽기 전용 분석 (본 문서·그래프·agent-graph-engineering 설치 파일만 변경).  
 **작성:** Cloud Agent 분석 턴 (2026-10-16).  
 

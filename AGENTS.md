@@ -71,11 +71,11 @@ observable behavior. Do not commit unless the user explicitly requests it.
 - Run the narrow tests from the spec first, then repository gates appropriate to
   the changed area.
 - For every changed `docs/specs/SPEC-*.md` or baseline spec, run
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath <path>`
+  `bash scripts/check-spec.sh <path>`
   before review.
 - Default Rust gates:
 
-  ```powershell
+  ```bash
   cargo fmt --check
   cargo test --all-targets
   cargo clippy --all-targets --all-features -- -D warnings

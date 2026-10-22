@@ -548,10 +548,7 @@ async fn mcp_client_bounds_writes_and_streams_sse() {
     use tokio::net::TcpListener;
 
     // 1. Stdio: server that never reads stdin
-    #[cfg(unix)]
     let (stdio_cmd, stdio_args) = ("sleep", vec!["60".to_owned()]);
-    #[cfg(windows)]
-    let (stdio_cmd, stdio_args) = ("timeout", vec!["/t".to_owned(), "60".to_owned()]);
 
     let stdio_server = ResolvedMcpServer {
         name: "unresponsive-stdio".to_owned(),

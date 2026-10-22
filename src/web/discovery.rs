@@ -34,33 +34,20 @@ pub fn write_discovery(workspace_root: &Path, d: &Discovery) -> io::Result<PathB
     let path = dir.join("web.json");
     let body = serde_json::to_string_pretty(d)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let temp_path = dir.join(format!("web.json.{}.tmp", std::process::id()));
-        // create_new guarantees a fresh file, so mode(0o600) applies at
-        // creation; clear any stale temp left by a failed earlier attempt.
-        let _ = std::fs::remove_file(&temp_path);
-        let mut temp = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp_path)?;
-        temp.write_all(body.as_bytes())?;
-        temp.flush()?;
-        drop(temp);
-        std::fs::rename(&temp_path, &path)?;
-    }
-    #[cfg(not(unix))]
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
-        file.write_all(body.as_bytes())?;
-        file.flush()?;
-    }
+    use std::os::unix::fs::OpenOptionsExt;
+    let temp_path = dir.join(format!("web.json.{}.tmp", std::process::id()));
+    // create_new guarantees a fresh file, so mode(0o600) applies at
+    // creation; clear any stale temp left by a failed earlier attempt.
+    let _ = std::fs::remove_file(&temp_path);
+    let mut temp = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp_path)?;
+    temp.write_all(body.as_bytes())?;
+    temp.flush()?;
+    drop(temp);
+    std::fs::rename(&temp_path, &path)?;
     Ok(path)
 }
 

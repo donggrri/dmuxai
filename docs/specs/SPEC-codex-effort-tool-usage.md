@@ -90,7 +90,7 @@ misowned events are ignored using the existing active-turn ownership gate.
 | Persistence | No schema change; tool and account status are transient UI notices. | Remove the feature without migration or transcript rewrite. | TC-043, TC-044 |
 | Provider protocol | Use documented `turn/start.effort`, `item/*`, `account/rateLimits/read`, and `account/usage/read` fields; tolerate omissions. | Older CLIs leave optional information unavailable. | TC-040, TC-042, TC-045 |
 | Security / permissions | Keep `approvalPolicy: never` and Ask/Plan read-only; do not log full tool arguments/output or account data. | No sandbox or approval change. | TC-040, TC-043 |
-| Platform | Uses existing stdio App Server transport on Windows and Linux. | Existing process-launch behavior is unchanged. | TC-040 |
+| Platform | Uses the existing stdio App Server transport on Linux. | Existing process-launch behavior is unchanged. | TC-040 |
 
 ## 7. Implementation plan
 

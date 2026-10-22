@@ -56,7 +56,7 @@ fn prompt_stays_centered_in_headless_chrome() {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
         return;
     };
-    let python = if cfg!(windows) { "python" } else { "python3" };
+    let python = "python3";
     let probe = Command::new(python)
         .args(["-c", "import playwright"])
         .stdout(Stdio::null())

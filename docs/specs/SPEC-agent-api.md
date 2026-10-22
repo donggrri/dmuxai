@@ -136,7 +136,7 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | Persistence | New append-only `.dmuxai/events.jsonl` and `.dmuxai/notify.log`, `.dmuxai/web.json`; `.dmuxai/` is already git-ignored. No SQLite schema change. | Deleting the files is safe; seq restarts at 1 | TC-770 |
 | Security / permissions | HTTP routes reuse the #27 token, Host and Origin checks; `serve` stays view-only for prompt/run. The discovery file is owner-only on Unix. Webhook secrets come from env, are never logged or written to the event log. | Unchanged #27 behavior | TC-766, TC-772, TC-774 |
 | Provider protocol | Headless runs use the same adapters, model policy and allowed-runner checks as the TUI | — | TC-761, TC-762 |
-| Platform | Command hook and file-mode checks are Unix-gated in tests; the rest runs on Windows CI | — | TC-773, TC-774 |
+| Platform | Command hook and file-mode checks are Unix-gated in tests; the rest runs on Linux CI | — | TC-773, TC-774 |
 
 ## 7. Implementation plan
 
