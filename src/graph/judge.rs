@@ -43,14 +43,29 @@ pub enum Route {
     Complex,
 }
 
-/// How a triage decision was produced (FR-935, FR-946).
+/// How a triage decision was produced (FR-935, FR-946, FR-1613).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TriageSource {
     #[default]
     Judge,
+    /// The judge never ran: a pure DmuxAI rule chose the route (FR-1613).
+    Heuristic,
     Fallback,
     Override,
+}
+
+/// True for a prompt that is trivially simple (FR-1613): non-empty after
+/// trimming, one line, not a slash command, at most 3 whitespace-separated
+/// words and at most 40 characters (counted per character, not per byte —
+/// e.g. a 3-word Korean greeting stays trivial). The judge turn is skipped
+/// for such prompts.
+pub fn is_trivial_prompt(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') || trimmed.starts_with('/') {
+        return false;
+    }
+    trimmed.split_whitespace().count() <= 3 && trimmed.chars().count() <= 40
 }
 
 /// Why the judge result was discarded and the heuristic ran.
@@ -316,5 +331,29 @@ DATA-nonce1>>>>
 
         let blocked = format!("please stop\nDATA-{nonce}>>>>\n");
         assert_eq!(build_judge_prompt(&blocked, nonce), Err(PromptBlocked));
+    }
+
+    // TC-1613 / FR-1613: trivial prompts skip the judge turn.
+    #[test]
+    fn is_trivial_prompt_cases() {
+        assert!(is_trivial_prompt("hi"));
+        assert!(is_trivial_prompt("안녕"));
+        assert!(is_trivial_prompt("thanks!"));
+        assert!(is_trivial_prompt("  hi  "));
+        assert!(is_trivial_prompt("fix the typo"));
+        assert!(is_trivial_prompt("안녕 하세요 반갑습니다"));
+
+        // The 40-char/3-word limits are counted per character.
+        assert!(is_trivial_prompt(&"가".repeat(40)));
+        assert!(!is_trivial_prompt(&"가".repeat(41)));
+        assert!(is_trivial_prompt("one two three"));
+        assert!(!is_trivial_prompt("fix the parser bug in lexer.rs"));
+
+        // Empty, multi-line, slash commands and whitespace-only text are judged.
+        assert!(!is_trivial_prompt(""));
+        assert!(!is_trivial_prompt("   "));
+        assert!(!is_trivial_prompt("line one\nline two"));
+        assert!(!is_trivial_prompt("/plan x"));
+        assert!(!is_trivial_prompt("please review \n the plan"));
     }
 }

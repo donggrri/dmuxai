@@ -63,10 +63,10 @@ use dmuxai::{
         apply_replan, approval_panel_lines_with_skills, budget_allows, build_judge_prompt,
         build_plan_prompt, build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary,
         cap_revision_raw, diff_plan_steps, diff_plan_tasks, fallback_plan,
-        graph_plan_from_revision_steps, heuristic_route, judge_line_text, judging_line_text,
-        next_plan_change_rev, parse_plan, parse_replan, parse_replan_marker, parse_verdict,
-        plan_json_for_edit, replan_allowed, replan_revision_steps, revision_needs_approval,
-        save_run, strip_replan_marker, task_counter_text, validate_plan,
+        graph_plan_from_revision_steps, heuristic_route, is_trivial_prompt, judge_line_text,
+        judging_line_text, next_plan_change_rev, parse_plan, parse_replan, parse_replan_marker,
+        parse_verdict, plan_json_for_edit, replan_allowed, replan_revision_steps,
+        revision_needs_approval, save_run, strip_replan_marker, task_counter_text, validate_plan,
         write_tasks_file_if_enabled,
     },
     mcp::config::ResolvedMcpServer,
@@ -4841,6 +4841,28 @@ impl App {
     /// buffered, never shown, and the user's mode is restored on every ending.
     fn start_judge_turn(&mut self, agent: Agent, prompt: String) {
         if self.refuse_plan_gate_prompt(prompt.clone()) {
+            return;
+        }
+        // FR-1613: trivially simple prompts skip the judge turn entirely and
+        // run as the same 1-node graph a `simple` verdict produces, with the
+        // triage recorded as a heuristic decision (`short prompt`).
+        if is_trivial_prompt(&prompt) {
+            let run_id = self
+                .pending_todo_run_id
+                .take()
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            self.start_one_node_run(
+                prompt,
+                agent,
+                Route::Simple,
+                "short prompt".to_owned(),
+                TriageSource::Heuristic,
+                None,
+                None,
+                run_id,
+                0,
+                0,
+            );
             return;
         }
         let index = adapter_index(agent);
@@ -17195,7 +17217,7 @@ mod tests {
 
         let todo = store
             .create(dmuxai::todo::NewTodo {
-                title: "ship feature".to_owned(),
+                title: "ship the widget loader feature".to_owned(),
                 body: String::new(),
                 source: dmuxai::todo::TodoSource::Manual,
                 source_ref: None,
@@ -17242,7 +17264,7 @@ mod tests {
         // Cancelling the judge turn of a to-do run sends the to-do back to open.
         let todo_cancel = store
             .create(dmuxai::todo::NewTodo {
-                title: "cancel me".to_owned(),
+                title: "cancel this graph run right away".to_owned(),
                 body: String::new(),
                 source: dmuxai::todo::TodoSource::Manual,
                 source_ref: None,
@@ -17264,7 +17286,7 @@ mod tests {
 
         let todo_complex = store
             .create(dmuxai::todo::NewTodo {
-                title: "multi".to_owned(),
+                title: "multi stage rollout needs a plan".to_owned(),
                 body: String::new(),
                 source: dmuxai::todo::TodoSource::Manual,
                 source_ref: None,
@@ -24434,11 +24456,13 @@ mod tests {
             .unwrap_or_default()
     }
 
-    // TC-930 / FR-930: every non-slash prompt starts a judge turn.
+    // TC-930 / FR-930: every non-slash prompt starts a judge turn (FR-1613's
+    // short-prompt fast path needs more than 3 words / 40 chars, so this uses a
+    // longer prompt).
     #[test]
     fn plan_gate_every_prompt_enters_triage() {
         let mut harness = plan_gate_test_app();
-        harness.app.input = "hello".to_owned();
+        harness.app.input = "please explain the build steps".to_owned();
         harness.app.submit_prompt();
 
         let sent = harness.sent.lock().unwrap();
@@ -24460,6 +24484,64 @@ mod tests {
                 .iter()
                 .any(|message| message.content.contains("triage judge"))
         );
+    }
+
+    // TC-1613 / FR-1613: trivially simple prompts skip the judge turn; the
+    // user turn goes out at once with a heuristic triage (`short prompt`), and
+    // the third, longer prompt still starts a judge turn as TC-930 does.
+    #[test]
+    fn tc_1613_short_prompt_skips_judge() {
+        let mut harness = plan_gate_test_app();
+
+        for text in ["hi", "안녕"] {
+            // The sent channel is cumulative across prompts: note the baseline.
+            let before = harness.sent.lock().unwrap().len();
+            harness.app.input = text.to_owned();
+            harness.app.submit_prompt();
+            {
+                let sent = harness.sent.lock().unwrap();
+                assert_eq!(
+                    sent.len(),
+                    before + 1,
+                    "the user turn is sent at once for {text}"
+                );
+                let (agent, request) = sent[before].clone();
+                drop(sent);
+                assert_eq!(agent, Agent::Codex);
+                assert!(
+                    request.prompt.ends_with(text),
+                    "prompt ends with the user text"
+                );
+                assert!(!request.turn_id.as_str().starts_with("judge-"));
+            }
+            let session = harness
+                .app
+                .graph_session
+                .as_ref()
+                .expect("1-node run without a judge");
+            let triage = session.run().triage.as_ref().unwrap();
+            assert_eq!(triage.route, Route::Simple);
+            assert_eq!(triage.source, TriageSource::Heuristic);
+            assert_eq!(triage.reason, "short prompt");
+            assert_eq!(triage.cause, None);
+            assert_eq!(triage.override_kind, None);
+            assert_eq!(session.run().planner_calls.judge, 0);
+            let node = last_graph_node_request_index(&harness.sent);
+            complete_sent_graph_turn(&mut harness.app, &harness.sent, node);
+            assert!(harness.app.graph_session.is_none());
+            assert!(harness.app.pending_triage.is_none());
+        }
+
+        // A longer prompt still enters triage (TC-930).
+        let before = harness.sent.lock().unwrap().len();
+        harness.app.input = "fix the parser bug in lexer.rs".to_owned();
+        harness.app.submit_prompt();
+        let sent = harness.sent.lock().unwrap();
+        assert_eq!(sent.len(), before + 1);
+        assert!(sent[before].1.turn_id.as_str().starts_with("judge-"));
+        assert!(sent[before].1.prompt.contains("triage judge"));
+        drop(sent);
+        assert!(harness.app.pending_triage.is_some());
     }
 
     // TC-931 / FR-930: an empty allowed_runners list notices and sends directly.
@@ -24500,7 +24582,8 @@ mod tests {
             .get_mut(&Agent::Agy)
             .unwrap()
             .selected = Some("gemini-3.8-flash-medium".to_owned());
-        harness.app.input = "hello".to_owned();
+        // Longer than FR-1613's short-prompt fast path so the judge runs.
+        harness.app.input = "please compare the two import paths".to_owned();
         harness.app.submit_prompt();
 
         let judge = harness.sent.lock().unwrap()[0].1.clone();
@@ -24550,7 +24633,7 @@ mod tests {
 
         // No read-only mode: no judge turn, fallback with no_read_only_mode.
         let mut no_mode = plan_gate_harness(&[(Agent::Codex, TurnPolicy::ReadOnly)]);
-        no_mode.app.input = "hello".to_owned();
+        no_mode.app.input = "please compare the two import paths".to_owned();
         no_mode.app.submit_prompt();
         let sent = no_mode.sent.lock().unwrap();
         assert_eq!(sent.len(), 1, "no judge turn, only the fallback node");
@@ -24568,10 +24651,10 @@ mod tests {
     fn judge_refused_when_selected_agent_busy() {
         let mut harness = plan_gate_test_app();
         harness.app.busy_agents.insert(Agent::Codex);
-        harness.app.input = "hello".to_owned();
+        harness.app.input = "please review this busy path".to_owned();
         harness.app.submit_prompt();
 
-        assert_eq!(harness.app.input, "hello");
+        assert_eq!(harness.app.input, "please review this busy path");
         assert!(harness.sent.lock().unwrap().is_empty());
         assert!(harness.app.pending_triage.is_none());
         assert!(last_system(&harness.app).contains("busy"));
@@ -24635,14 +24718,16 @@ mod tests {
     #[test]
     fn judge_overflow_cancels_and_hides_judge_text() {
         let mut harness = plan_gate_test_app();
-        harness.app.input = "hello".to_owned();
+        harness.app.input = "please review this overflow path".to_owned();
         harness.app.submit_prompt();
         let judge = harness.sent.lock().unwrap()[0].1.clone();
         harness.app.pending_triage.as_mut().unwrap().buffer_chars = MAX_SUMMARY_BUFFER_CHARS;
+        // The user prompt deliberately contains "overflow", so the judge delta
+        // must be matched (and asserted absent) by a distinct leaked-text marker.
         assert!(harness.app.apply_agent_output(triage_output(
             Agent::Codex,
             &judge,
-            AgentEvent::TextDelta("overflow".to_owned())
+            AgentEvent::TextDelta("overflow burst leaked".to_owned())
         )));
         assert_eq!(&*harness.cancelled.lock().unwrap(), &[Agent::Codex]);
         assert!(
@@ -24650,7 +24735,7 @@ mod tests {
                 .app
                 .messages
                 .iter()
-                .any(|message| message.content.contains("overflow"))
+                .any(|message| message.content.contains("overflow burst leaked"))
         );
         assert!(!harness.app.apply_agent_output(triage_output(
             Agent::Codex,
@@ -24675,7 +24760,7 @@ mod tests {
     #[test]
     fn judge_timeout_falls_back_to_heuristic() {
         let mut harness = plan_gate_test_app();
-        harness.app.input = "hello".to_owned();
+        harness.app.input = "please explain the retry schedule".to_owned();
         harness.app.submit_prompt();
 
         {
@@ -24702,7 +24787,7 @@ mod tests {
 
         // The hard cap trips even while events stream.
         let mut capped = plan_gate_test_app();
-        capped.app.input = "hello".to_owned();
+        capped.app.input = "please explain the retry schedule".to_owned();
         capped.app.submit_prompt();
         {
             let now = Instant::now();
@@ -24756,7 +24841,7 @@ mod tests {
         assert_eq!(approval.revisions[0].source, "fallback");
 
         let mut e = plan_gate_test_app();
-        e.app.input = "hello".to_owned();
+        e.app.input = "please explain the retry schedule".to_owned();
         e.app.submit_prompt();
         let judge = e.sent.lock().unwrap()[0].1.clone();
         assert!(e.app.apply_agent_output(triage_output(
@@ -24771,10 +24856,10 @@ mod tests {
         );
 
         let mut c = plan_gate_test_app();
-        c.app.input = "hello".to_owned();
+        c.app.input = "please explain the retry schedule".to_owned();
         c.app.submit_prompt();
         c.app.cancel_selected();
-        assert_eq!(c.app.input, "hello");
+        assert_eq!(c.app.input, "please explain the retry schedule");
         assert!(c.app.pending_triage.is_none());
         let run = c.app.last_graph_run.as_ref().expect("cancelled run");
         assert_eq!(run.phase, GraphRunPhase::Cancelled);
@@ -24867,7 +24952,7 @@ mod tests {
         assert!(h.app.graph_session.is_none(), "multi-node run finished");
 
         let mut simple = plan_gate_test_app();
-        simple.app.input = "deploy the app".to_owned();
+        simple.app.input = "please deploy the app today".to_owned();
         simple.app.submit_prompt();
         let judge = simple.sent.lock().unwrap()[0].1.clone();
         assert!(simple.app.apply_agent_output(triage_output(
@@ -24933,7 +25018,7 @@ mod tests {
             .get_mut(&Agent::Cursor)
             .unwrap()
             .selected = None;
-        h.app.input = "hello".to_owned();
+        h.app.input = "please verify the release notes".to_owned();
         h.app.submit_prompt();
         let judge = h.sent.lock().unwrap()[0].1.clone();
         let simple = "{\"route\":\"simple\",\"reason\":\"tiny\"}";
@@ -24960,7 +25045,7 @@ mod tests {
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].id, "step-1");
         assert_eq!(steps[0].runner, "cursor");
-        assert_eq!(steps[0].job, "hello");
+        assert_eq!(steps[0].job, "please verify the release notes");
         assert_eq!(steps[0].model_id, "composer-2.5");
 
         // The selected agent's own node runs even though it is not allowed.
@@ -24981,7 +25066,7 @@ mod tests {
             .get_mut(&Agent::Cursor)
             .unwrap()
             .selected = Some("composer-2.5-fast".to_owned());
-        fast.app.input = "hello".to_owned();
+        fast.app.input = "please verify the release notes".to_owned();
         fast.app.submit_prompt();
         let judge = fast.sent.lock().unwrap()[0].1.clone();
         assert!(fast.app.apply_agent_output(triage_output(
@@ -24994,7 +25079,7 @@ mod tests {
             &judge,
             AgentEvent::Completed
         )));
-        assert_eq!(fast.app.input, "hello");
+        assert_eq!(fast.app.input, "please verify the release notes");
         assert!(fast.app.graph_session.is_none());
         assert!(fast.app.last_graph_run.is_none());
         assert!(last_system(&fast.app).contains("Model policy rejected"));
@@ -27259,7 +27344,8 @@ mod tests {
         let accepted = h
             .app
             .handle_dashboard_submit_prompt(
-                "hello there".to_owned(),
+                // Longer than FR-1613's short-prompt limit so a judge turn runs.
+                "please review the dashboard ghost path".to_owned(),
                 Some("codex".to_owned()),
                 None,
                 None,
@@ -27913,7 +27999,8 @@ mod tests {
         let conversation_id = h.app.conversation_id.as_str().to_owned();
         let store = dmuxai::graph::GraphStore::new(&h.app.workspace_root);
 
-        h.app.input = "simple turn".to_owned();
+        // Longer than FR-1613's short-prompt fast path so the judge runs.
+        h.app.input = "please record this simple turn".to_owned();
         h.app.submit_prompt();
         let judge = h.sent.lock().unwrap()[0].1.clone();
         assert!(h.app.apply_agent_output(triage_output(

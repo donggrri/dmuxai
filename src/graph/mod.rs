@@ -12,7 +12,7 @@ mod types;
 pub use executor::{GraphAction, GraphRunSession, GraphSession, NodeAssignment};
 pub use judge::{
     FallbackCause, JUDGE_PROMPT, OverrideKind, Route, TriageSource, Verdict, build_judge_prompt,
-    parse_verdict,
+    is_trivial_prompt, parse_verdict,
 };
 pub use plan_doc::{
     AllowedRunner, FallbackPlan, PLAN_PROMPT, PlanContext, PlanDoc, PlanError, PlanPromptMode,

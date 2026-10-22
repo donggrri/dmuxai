@@ -106,8 +106,9 @@ pub struct CustomAgentSpec {
     pub builtin: bool,
 }
 
-/// The built-in `opencode` runner (SPEC-first-run FR-810..FR-812): the documented
-/// opencode custom agent with the free-model policy. `program` is the executable
+/// The built-in `opencode` runner (SPEC-first-run FR-810..FR-812, SPEC-custom-agent-provider
+/// FR-1610): the documented opencode custom agent with the free-model policy, with no
+/// `--dir` flag — the workspace comes only from the child's cwd. `program` is the executable
 /// that was found. `default_model` stays unset, so the first allowed listed model
 /// is used.
 pub fn opencode_preset(program: &str) -> CustomAgentSpec {
@@ -117,15 +118,7 @@ pub fn opencode_preset(program: &str) -> CustomAgentSpec {
         label: Some("opencode".to_owned()),
         color: Some("#ffa500".to_owned()),
         command: [
-            program,
-            "run",
-            "--format",
-            "json",
-            "-m",
-            "{model}",
-            "--dir",
-            "{workspace}",
-            "{prompt}",
+            program, "run", "--format", "json", "-m", "{model}", "{prompt}",
         ]
         .map(str::to_owned)
         .to_vec(),
@@ -502,6 +495,12 @@ pub fn build_argv(spec: &CustomAgentSpec, ctx: &SubstitutionContext) -> Vec<Stri
         push_substituted(&mut argv, arg, ctx, None, prompt_for_argv.as_deref());
     }
 
+    // FR-1611: an opencode build can run in any directory (the child's cwd is
+    // already the workspace), while older configurations still pass the legacy
+    // pair `--dir {workspace}`. Drop exactly that pair; other programs and
+    // other `--dir` values are left unchanged.
+    drop_legacy_opencode_dir_pair(spec, ctx, &mut argv);
+
     // 2. Mode args appended
     let mode_args: &[String] = match ctx.mode {
         "ask" => &spec.modes.ask,
@@ -530,6 +529,49 @@ pub fn build_argv(spec: &CustomAgentSpec, ctx: &SubstitutionContext) -> Vec<Stri
     }
 
     argv
+}
+
+/// FR-1611: removes the adjacent `--dir {workspace}` pair that some opencode
+/// builds reject. Applies only when the first argv element's basename, with a
+/// trailing `.exe` stripped (ASCII case-insensitive), is `opencode`, and only
+/// when the spec's base `command` itself contains the adjacent pair. Other
+/// programs and `--dir` with any other value are left untouched.
+fn drop_legacy_opencode_dir_pair(
+    spec: &CustomAgentSpec,
+    ctx: &SubstitutionContext,
+    argv: &mut Vec<String>,
+) {
+    if !argv
+        .first()
+        .is_some_and(|program| program_is_opencode(program))
+    {
+        return;
+    }
+    if !spec
+        .command
+        .windows(2)
+        .any(|pair| pair == ["--dir", "{workspace}"])
+    {
+        return;
+    }
+    if let Some(index) = argv
+        .windows(2)
+        .position(|pair| pair == ["--dir", ctx.workspace.as_str()])
+    {
+        let tail = argv.split_off(index + 2);
+        argv.truncate(index);
+        argv.extend(tail);
+    }
+}
+
+/// True when `program`'s basename is `opencode` (or `opencode.exe`,
+/// ASCII case-insensitive). Directory components are ignored.
+fn program_is_opencode(program: &str) -> bool {
+    let basename = Path::new(program)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_else(|| program.to_ascii_lowercase());
+    basename.strip_suffix(".exe").unwrap_or(&basename) == "opencode"
 }
 
 /// Builds a headless `tokio::process::Command` for a custom agent turn with
@@ -956,7 +998,7 @@ mod tests {
 name = "opencode"
 label = "opencode"
 color = "#ffa500"
-command = ["opencode", "run", "--format", "json", "-m", "{model}", "--dir", "{workspace}", "{prompt}"]
+command = ["opencode", "run", "--format", "json", "-m", "{model}", "{prompt}"]
 prompt_via = "arg"
 image_arg = ["-f", "{image}"]
 default_model = "opencode/glm-5.3-flash-free"
@@ -1158,12 +1200,10 @@ command = ["pi", "run"]
                 "json",
                 "-m",
                 "good-model",
-                "--dir",
-                "/workspace",
                 "--model x; rm -rf /",
             ]
         );
-        assert_eq!(argv[8], injection_prompt);
+        assert_eq!(argv[6], injection_prompt);
     }
 
     #[test]
@@ -1183,17 +1223,149 @@ command = ["pi", "run"]
 
         let argv = build_argv(&spec, &ctx);
         // "-m" and "{model}" must both be dropped
+        assert_eq!(argv, vec!["opencode", "run", "--format", "json", "Hello"]);
+    }
+
+    // TC-1610 / FR-1610: the built-in opencode preset carries no `--dir`; the
+    // workspace reaches the child only through the built command's cwd, which
+    // every opencode build honours. The documented examples stay in sync.
+    #[test]
+    fn tc_1610_opencode_preset_has_no_dir_flag() {
+        let spec = opencode_preset("opencode");
+        assert!(
+            spec.command.iter().all(|arg| arg != "--dir"),
+            "{:?}",
+            spec.command
+        );
         assert_eq!(
-            argv,
+            spec.command,
+            vec![
+                "opencode", "run", "--format", "json", "-m", "{model}", "{prompt}",
+            ]
+        );
+
+        let mut ctx = SubstitutionContext::new("explain this", "/ws", "ask", "deny");
+        ctx.model = Some("opencode/glm-5.3-flash-free".to_owned());
+        assert_eq!(
+            build_argv(&spec, &ctx),
             vec![
                 "opencode",
                 "run",
                 "--format",
                 "json",
-                "--dir",
-                "/workspace",
-                "Hello",
+                "-m",
+                "opencode/glm-5.3-flash-free",
+                "explain this",
             ]
+        );
+
+        // The workspace is passed as the child's cwd (FR-875), not a flag.
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(workspace.path()).unwrap();
+        let ctx = SubstitutionContext::new(
+            "explain this",
+            workspace.to_string_lossy().into_owned(),
+            "ask",
+            "deny",
+        );
+        let command = build_custom_command(&spec, &ctx, &workspace).unwrap();
+        assert_eq!(
+            command.as_std().get_current_dir(),
+            Some(workspace.as_path())
+        );
+
+        // The documented examples match the preset shape (no `--dir`).
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for file in [
+            "README.md",
+            "docs/agents/presets.toml",
+            "docs/agents/custom-agents.md",
+        ] {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            assert!(
+                !text.contains(r#""--dir", "{workspace}""#),
+                "{file} must pass the workspace as cwd, not --dir"
+            );
+        }
+    }
+
+    // TC-1611 / FR-1611: `build_argv` drops the legacy `--dir {workspace}` pair
+    // for opencode programs only; other programs and other `--dir` values are
+    // left unchanged.
+    #[test]
+    fn tc_1611_opencode_dir_pair_dropped() {
+        let ctx = SubstitutionContext::new("hello there", "/ws", "ask", "deny");
+        let spec_with_pair = |program: &str| -> CustomAgentSpec {
+            toml::from_str(&format!(
+                r#"
+name = "legacy"
+command = ["{program}", "run", "--format", "json", "--dir", "{{workspace}}", "{{prompt}}"]
+"#
+            ))
+            .unwrap()
+        };
+        let spec_with_other_dir = |program: &str| -> CustomAgentSpec {
+            toml::from_str(&format!(
+                r#"
+name = "other"
+command = ["{program}", "run", "--dir", "/other", "{{prompt}}"]
+"#
+            ))
+            .unwrap()
+        };
+
+        // opencode: the pair is dropped after substitution.
+        assert_eq!(
+            build_argv(&spec_with_pair("opencode"), &ctx),
+            vec!["opencode", "run", "--format", "json", "hello there"]
+        );
+        // `opencode.exe` (ASCII case-insensitive basename) drops it too.
+        assert_eq!(
+            build_argv(&spec_with_pair("OPENCODE.EXE"), &ctx),
+            vec!["OPENCODE.EXE", "run", "--format", "json", "hello there"]
+        );
+        // The pair is dropped from a mid-command position.
+        let mid: CustomAgentSpec = toml::from_str(
+            r#"
+name = "mid"
+command = ["opencode", "--dir", "{workspace}", "run", "{prompt}"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            build_argv(&mid, &ctx),
+            vec!["opencode", "run", "hello there"]
+        );
+
+        // A different program keeps the pair, even one whose name contains opencode.
+        assert_eq!(
+            build_argv(&spec_with_pair("myagent"), &ctx),
+            vec![
+                "myagent",
+                "run",
+                "--format",
+                "json",
+                "--dir",
+                "/ws",
+                "hello there"
+            ]
+        );
+        assert_eq!(
+            build_argv(&spec_with_pair("./tools/my-opencode"), &ctx),
+            vec![
+                "./tools/my-opencode",
+                "run",
+                "--format",
+                "json",
+                "--dir",
+                "/ws",
+                "hello there"
+            ]
+        );
+        // `--dir` with any value other than {workspace} stays.
+        assert_eq!(
+            build_argv(&spec_with_other_dir("opencode"), &ctx),
+            vec!["opencode", "run", "--dir", "/other", "hello there"]
         );
     }
 

@@ -9,7 +9,7 @@ It then shows in `/agent` and F2, gets its own chat color, and can be a graph ru
 name = "opencode"                 # runner id: lowercase [a-z0-9_-]
 label = "opencode"                # shown in /agent and the chat (default: name)
 color = "#ffa500"                 # theme color (default: white)
-command = ["opencode", "run", "--format", "json", "-m", "{model}", "--dir", "{workspace}", "{prompt}"]
+command = ["opencode", "run", "--format", "json", "-m", "{model}", "{prompt}"]  # no --dir: the workspace is the child's cwd, which every opencode build honours
 prompt_via = "arg"                # "arg" ({prompt} placeholder) or "stdin" (prompt written to stdin)
 image_arg = ["-f", "{image}"]     # optional, repeated per image; else "@path" appended to the prompt
 default_model = "opencode/glm-5.3-flash-free"
