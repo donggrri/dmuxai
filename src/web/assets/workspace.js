@@ -421,9 +421,8 @@
   function updateOpenButton() {
     var btn = $('workspace-open');
     if (!btn) { return; }
-    var input = $('workspace-path');
-    var target = state.validPath || (input ? input.value.trim() : '');
-    btn.disabled = state.viewOnly || state.switching || !target;
+    // FR-1473: like Switch, only a validated path can be opened.
+    btn.disabled = state.viewOnly || state.switching || !state.validPath;
   }
 
   function submitOpen() {

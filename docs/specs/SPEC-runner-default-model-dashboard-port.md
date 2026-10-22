@@ -32,6 +32,9 @@ Baseline: `main` (`1b9861a`)
 | TC-1461 | FR-1460 | `cargo test tc_1461_default_model_for_runner_is_per_runner` |
 | TC-1462 | FR-1461 | `cargo test tc_1462_fallback_plan_uses_runner_default` |
 | TC-1463 | FR-1462 | `cargo test tc_1463_explicit_port_in_use_falls_back_with_warning` |
+| TC-1485 | FR-1460 | Manual: TUI on a grok conversation with no model picked; type a follow-up and press Enter. Pass: grok replies; no "composer-2.5 is not allowed for grok" |
+| TC-1486 | FR-1460 | Manual: same follow-up sent from the web dashboard (`POST /api/prompt` with `agent=grok` or the composer). Pass: grok reply appears in the dashboard chat |
+| TC-1487 | FR-1462 | Manual: hold port N with another `--web`; start `dmuxai --web --port N`. Pass: warning names N and the new port; the new URL loads and shows "live" |
 
 ## Root causes
 
