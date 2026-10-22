@@ -600,8 +600,6 @@ pub fn build_custom_command(
 
     if let Some(mcp_path) = &ctx.mcp_config {
         command.env("DMUXAI_MCP_CONFIG", mcp_path);
-    } else {
-        command.env_remove("DMUXAI_MCP_CONFIG");
     }
 
     for (key, value) in &spec.env {
