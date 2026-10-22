@@ -28,7 +28,7 @@ use super::session::{
 use super::updates::{ToolCallCache, map_session_update};
 
 const CLIENT_NAME: &str = "dmuxai";
-const CLIENT_VERSION: &str = "0.2.2";
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: i64 = 1;
 const STDERR_TAIL: usize = 8;
 const CANCEL_GRACE_MS: u64 = 1500;
@@ -1014,5 +1014,15 @@ fn compact_json(value: &Value) -> String {
         format!("{}…", &raw[..256])
     } else {
         raw
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // FR-1494: the ACP `initialize` clientInfo version tracks the crate
+    // version instead of a hard-coded string.
+    #[test]
+    fn acp_client_version_matches_crate() {
+        assert_eq!(super::CLIENT_VERSION, env!("CARGO_PKG_VERSION"));
     }
 }
