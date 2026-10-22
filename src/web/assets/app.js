@@ -2462,9 +2462,17 @@ function tasksForChecklist(graph) {
     id: 'task-1',
     title: job,
     done_check: '',
-    status: 'pending',
+    status: checklistStatusFromNode(node),
     nodes: [String(node.id || '')]
   }];
+}
+
+function checklistStatusFromNode(node) {
+  var status = graphNodeStatus(node);
+  if (status === 'running') { return 'running'; }
+  if (status === 'completed' || status === 'skipped') { return 'done'; }
+  if (status === 'failed') { return 'failed'; }
+  return 'pending';
 }
 
 function taskChecklistNodeIdsText(nodes) {
@@ -2502,7 +2510,43 @@ function selectTaskChecklistTask(taskId) {
   updateGraphNodeSelection();
 }
 
-function updateTaskChecklistRow(row, task) {
+function taskNodeById(graph, id) {
+  var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+  var want = String(id || '');
+  for (var i = 0; i < nodes.length; i++) {
+    if (String(nodes[i].id) === want) { return nodes[i]; }
+  }
+  return null;
+}
+
+function agentActivityForRunner(runner) {
+  if (!snapshot || !runner) { return ''; }
+  var agents = Array.isArray(snapshot.agents) ? snapshot.agents : [];
+  var want = String(runner);
+  for (var i = 0; i < agents.length; i++) {
+    var agent = agents[i];
+    if (!agent || String(agent.id) !== want) { continue; }
+    if (typeof agent.activity === 'string' && agent.activity) { return agent.activity; }
+  }
+  return '';
+}
+
+function taskProgressLine(node, nowMs) {
+  var status = graphNodeStatus(node);
+  var runner = runnerShortName(node.runner) || '\u2014';
+  var model = String(node.model_id || '\u2014');
+  var ms = nodeElapsed(node, snapshot, nowMs);
+  var elapsed = ms === null ? '\u2014' : fmtElapsed(ms);
+  var job = String(node.job || '');
+  if (job.length > 80) { job = job.slice(0, 79) + '\u2026'; }
+  var line = String(node.id) + ' \u00b7 ' + status + ' \u00b7 ' + runner + ' ' + model + ' \u00b7 ' + elapsed;
+  if (job) { line += ' \u00b7 ' + job; }
+  var activity = agentActivityForRunner(node.runner);
+  if (activity) { line += ' \u00b7 ' + activity; }
+  return line;
+}
+
+function updateTaskChecklistRow(row, task, graph, nowMs) {
   var taskId = String(task.id || '');
   var statusClass = taskChecklistStatusClass(task.status);
   row.className = 'task-checklist-row';
@@ -2544,6 +2588,31 @@ function updateTaskChecklistRow(row, task) {
     nodesEl.textContent = nodesText;
     nodesEl.hidden = !nodesText;
   }
+  var promptEl = meta.querySelector('.task-checklist-prompt');
+  if (!promptEl) {
+    promptEl = el('p', 'task-checklist-prompt');
+    meta.appendChild(promptEl);
+  }
+  var prompt = graph && typeof graph.user_prompt === 'string' ? graph.user_prompt : '';
+  var promptText = 'prompt: ' + (prompt ? prompt : '\u2014');
+  if (promptEl.textContent !== promptText) { promptEl.textContent = promptText; }
+  var progress = meta.querySelector('.task-checklist-progress');
+  if (!progress) {
+    progress = el('div', 'task-checklist-progress');
+    meta.appendChild(progress);
+  }
+  progress.replaceChildren();
+  var nodeIds = Array.isArray(task.nodes) ? task.nodes : [];
+  if (!nodeIds.length) {
+    progress.appendChild(el('p', 'task-checklist-progress-line', 'progress: \u2014'));
+  } else {
+    for (var p = 0; p < nodeIds.length; p++) {
+      var nodeId = String(nodeIds[p]);
+      var node = taskNodeById(graph, nodeId);
+      var text = node ? taskProgressLine(node, nowMs) : (nodeId + ' \u00b7 unknown');
+      progress.appendChild(el('p', 'task-checklist-progress-line', text));
+    }
+  }
 }
 
 function createTaskChecklistRow(task) {
@@ -2559,7 +2628,7 @@ function createTaskChecklistRow(task) {
       selectTaskChecklistTask(taskId);
     }
   });
-  updateTaskChecklistRow(row, task);
+  updateTaskChecklistRow(row, task, null, Date.now());
   return row;
 }
 
@@ -2604,9 +2673,10 @@ function renderTaskChecklist(graph) {
     seen[taskId] = true;
     var rowNode = existing[taskId];
     if (rowNode) {
-      updateTaskChecklistRow(rowNode, task);
+      updateTaskChecklistRow(rowNode, task, graph, Date.now());
     } else {
       rowNode = createTaskChecklistRow(task);
+      updateTaskChecklistRow(rowNode, task, graph, Date.now());
     }
     if (list.children[i] !== rowNode) {
       list.insertBefore(rowNode, list.children[i] || null);
@@ -4012,6 +4082,7 @@ function tickDashboard() {
   if (!graph) { return; }
   renderGraphSummary(graph);
   renderNodes(graph, now);
+  if (taskChecklistSelectedId) { renderTaskChecklist(graph); }
   if (graphViewMode === 'graph') {
     updateRunningGraphCards(graph, now);
     if (graphSelectedId) {
