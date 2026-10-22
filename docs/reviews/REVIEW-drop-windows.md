@@ -47,7 +47,7 @@ of the original Windows-removal PR.
 
 Recorded exact commands and results for this pass are in the PR description /
 commit message; deterministic gates were run on Linux with
-`CARGO_TARGET_DIR=/workspace/dmux-wt/drop-windows-target`.
+`CARGO_TARGET_DIR=a separate target dir`.
 
 ## Residual risk
 
