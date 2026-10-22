@@ -7,7 +7,7 @@
 name = "opencode"
 label = "opencode"
 color = "#ffa500"
-command = ["opencode", "run", "--format", "json", "-m", "{model}", "--dir", "{workspace}", "{prompt}"]
+command = ["opencode", "run", "--format", "json", "-m", "{model}", "{prompt}"]
 prompt_via = "arg"
 image_arg = ["-f", "{image}"]
 default_model = "opencode/glm-5.3-flash-free"

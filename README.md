@@ -298,7 +298,7 @@ continuity via their session id, and can run graph nodes:
 ```toml
 [[agents.custom]]
 name = "opencode-glm"
-command = ["opencode", "run", "--format", "json", "-m", "{model}", "--dir", "{workspace}", "{prompt}"]
+command = ["opencode", "run", "--format", "json", "-m", "{model}", "{prompt}"]
 default_model = "opencode/glm-5.3-flash-free"
 output = "jsonl"
 text_path = "/part/text"

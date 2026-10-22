@@ -300,6 +300,23 @@ pub fn judge_line_text(triage: &Triage) -> String {
                 route_label(triage.route),
             )
         }
+        TriageSource::Heuristic => {
+            let runner = plain_label_text(&triage.runner);
+            let model = plain_label_text(&triage.model);
+            let reason = plain_reason_text(&triage.reason);
+            if reason.is_empty() {
+                format!(
+                    "Judge heuristic ({runner} {model}): {}",
+                    route_label(triage.route),
+                )
+            } else {
+                format!(
+                    "Judge heuristic ({runner} {model}): {} — {}",
+                    route_label(triage.route),
+                    reason,
+                )
+            }
+        }
         TriageSource::Override => {
             override_line_text(triage.override_kind, &plain_label_text(&triage.runner))
         }
@@ -457,6 +474,16 @@ mod tests {
         assert_eq!(
             judge_line_text(&triage),
             "Judge fallback: timeout (heuristic) — complex"
+        );
+    }
+
+    // FR-1613: a skipped judge shows the heuristic source, not a judge verdict.
+    #[test]
+    fn judge_line_heuristic_skips_the_model_call() {
+        let triage = sample_triage(TriageSource::Heuristic, "short prompt");
+        assert_eq!(
+            judge_line_text(&triage),
+            "Judge heuristic (cursor composer): simple — short prompt"
         );
     }
 

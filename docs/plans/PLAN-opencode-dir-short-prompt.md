@@ -1,0 +1,5 @@
+# PLAN: opencode without `--dir`, judge skipped for short prompts
+
+FR-1610 and FR-1611 ([SPEC-custom-agent-provider](../specs/SPEC-custom-agent-provider.md)): the built-in opencode preset and the documented examples in `README.md`, `docs/agents/presets.toml` and `docs/agents/custom-agents.md` become `opencode run --format json -m {model} {prompt}` with no `--dir`; the workspace is passed only as the child's cwd, which every opencode version honours. `build_argv` additionally drops a `--dir {workspace}` pair from user-defined custom agents whose program basename is `opencode`/`opencode.exe`, so old configs keep working; other programs, and `--dir` with any other value, are left unchanged.
+
+FR-1613 ([SPEC-plan-gate](../specs/SPEC-plan-gate.md)): a one-line prompt with at most 3 whitespace-separated words and at most 40 chars that is not a slash command skips the judge turn — route simple with source `heuristic` and reason `short prompt` — and the 1-node run starts at once. Longer prompts still go to the judge and `/plan` still forces planning.

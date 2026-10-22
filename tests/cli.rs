@@ -282,7 +282,12 @@ fn run_complex_needs_approve_plan() {
     use plan_gate::{Sandbox, plan_gate_config, stdout_json};
 
     let sandbox = Sandbox::new(&plan_gate_config("plan"));
-    let first = sandbox.run(&["run", "ship the feature", "--json"]);
+    // Longer than FR-1613's short-prompt fast path so the judge still runs (TC-955).
+    let first = sandbox.run(&[
+        "run",
+        "ship the whole feature across several steps",
+        "--json",
+    ]);
     let json = stdout_json(&first);
     assert_eq!(first.status.code(), Some(7), "{json}");
     assert_eq!(json["ok"], false);
@@ -304,7 +309,12 @@ fn run_complex_needs_approve_plan() {
             .any(|change| change.reason == "approval required (headless)")
     );
 
-    let approved = sandbox.run(&["run", "ship the feature", "--json", "--approve-plan"]);
+    let approved = sandbox.run(&[
+        "run",
+        "ship the whole feature across several steps",
+        "--json",
+        "--approve-plan",
+    ]);
     let approved_json = stdout_json(&approved);
     assert_eq!(approved.status.code(), Some(0), "{approved_json}");
     assert_eq!(approved_json["ok"], true);
@@ -317,7 +327,13 @@ fn run_complex_needs_approve_plan() {
         Some(dmuxai::graph::DecisionBy::Cli)
     );
 
-    let direct = sandbox.run(&["run", "ship the feature", "--json", "--agent", "fake"]);
+    let direct = sandbox.run(&[
+        "run",
+        "ship the whole feature across several steps",
+        "--json",
+        "--agent",
+        "fake",
+    ]);
     let direct_json = stdout_json(&direct);
     assert_eq!(direct_json["triage"]["source"].as_str(), Some("override"));
 }
@@ -330,7 +346,8 @@ fn run_sensitive_gate_exits_7_headless() {
     use plan_gate::{Sandbox, plan_gate_config, stdout_json};
 
     let sandbox = Sandbox::new(&plan_gate_config("judge-simple"));
-    let output = sandbox.run(&["run", "deploy the app", "--json"]);
+    // Longer than FR-1613's short-prompt fast path so the judge still runs.
+    let output = sandbox.run(&["run", "please deploy the app today", "--json"]);
     let json = stdout_json(&output);
     assert_eq!(output.status.code(), Some(7), "{json}");
     assert_eq!(
@@ -346,7 +363,12 @@ fn run_sensitive_gate_exits_7_headless() {
             .any(|change| change.reason == "sensitive step needs /graph continue (headless)")
     );
 
-    let with_approve = sandbox.run(&["run", "deploy the app", "--json", "--approve-plan"]);
+    let with_approve = sandbox.run(&[
+        "run",
+        "please deploy the app today",
+        "--json",
+        "--approve-plan",
+    ]);
     let approve_json = stdout_json(&with_approve);
     assert_eq!(with_approve.status.code(), Some(7), "{approve_json}");
     assert_eq!(
