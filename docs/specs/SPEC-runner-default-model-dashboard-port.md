@@ -16,7 +16,7 @@ Baseline: `main` (`1b9861a`)
    dashboard unstarted (only a chat notice). A browser on `N` reached the other
    process and hung on "connecting" / `GET /api/state`.
 
-## Requirements
+## 4. Requirements
 
 | ID | Priority | Given | Then | Edge cases | Tests |
 | --- | --- | --- | --- | --- | --- |
@@ -24,7 +24,7 @@ Baseline: `main` (`1b9861a`)
 | FR-1461 | Must | The 1-node fallback plan for runner R with no valid hint | The node model is R's default per FR-1460 instead of an error | A disallowed explicit selection is still rejected | TC-1462 |
 | FR-1462 | Must | `--web`/`serve` with an explicit `--port N` already in use | The dashboard binds a free port and reports a warning naming N and the real URL | Non-AddrInUse bind errors still fail as before | TC-1463 |
 
-## Test mapping
+## 5. Acceptance scenarios and test design
 
 | Test ID | Requirement | Command |
 | --- | --- | --- |
@@ -32,3 +32,14 @@ Baseline: `main` (`1b9861a`)
 | TC-1461 | FR-1460 | `cargo test tc_1461_default_model_for_runner_is_per_runner` |
 | TC-1462 | FR-1461 | `cargo test tc_1462_fallback_plan_uses_runner_default` |
 | TC-1463 | FR-1462 | `cargo test tc_1463_explicit_port_in_use_falls_back_with_warning` |
+
+## Root causes
+
+- FR-1460/1461: `App::selected_run_model` (`src/app.rs`) used
+  `model_policy::default_model()` for every runner with no selection, and
+  `graph::fallback_plan` did the same. Both now use
+  `model_policy::default_model_for_runner`, and `validate_model_for_runner`
+  accepts the `provider default` sentinel for non-Cursor runners only.
+- FR-1462: `web::server::start_server` only fell back to a free port for the
+  default port 7420; an explicit `--port` in use returned an error that the
+  TUI showed as one chat notice while the dashboard stayed down.

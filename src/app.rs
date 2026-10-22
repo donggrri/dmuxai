@@ -6097,7 +6097,7 @@ impl App {
                 "Model policy rejected the 1-node run on {runner}: {error}"
             ));
         }
-        let model_hint = self.selected_run_model(agent).ok();
+        let model_hint = self.selected_run_model(agent).ok().flatten();
         // FR-937: an agent without an explicit model runs on its provider
         // default, exactly like the old direct send.
         let built = match fallback_plan(prompt, &runner, model_hint.as_deref(), "direct") {
@@ -6165,7 +6165,7 @@ impl App {
         if self.refuse_plan_gate_prompt(prompt.clone()) {
             return;
         }
-        let model = match self.selected_run_model(agent) {
+        let model = match self.selected_run_model_label(agent) {
             Ok(model) => model,
             Err(error) => {
                 self.input = prompt;
@@ -8848,18 +8848,27 @@ impl App {
 
     /// The model the selected agent will actually run with, validated against
     /// the model policy before any record is created (FR-937).
-    fn selected_run_model(&self, agent: Agent) -> Result<String, String> {
+    /// The model a turn on `agent` runs with: the explicit selection (checked
+    /// by policy), else the runner's own default (FR-1460). `Ok(None)` means
+    /// provider default (no `--model`).
+    fn selected_run_model(&self, agent: Agent) -> Result<Option<String>, String> {
         let runner = runner_name(agent);
         let selected = self
             .model_catalogs
             .get(&agent)
             .and_then(|catalog| catalog.selected.clone());
-        let model = match selected {
-            Some(model) => model,
-            None if agent == Agent::Cursor => dmuxai::model_policy::ALLOWED_MODEL.to_owned(),
-            None => dmuxai::model_policy::default_model().to_owned(),
+        let Some(model) = selected
+            .or_else(|| dmuxai::model_policy::default_model_for_runner(runner).map(str::to_owned))
+        else {
+            return Ok(None);
         };
-        dmuxai::model_policy::validate_model_for_runner(runner, &model).map(|()| model)
+        dmuxai::model_policy::validate_model_for_runner(runner, &model).map(|()| Some(model))
+    }
+
+    /// [`App::selected_run_model`] as a display/plan label.
+    fn selected_run_model_label(&self, agent: Agent) -> Result<String, String> {
+        self.selected_run_model(agent)
+            .map(|model| model.unwrap_or_else(|| dmuxai::model_policy::PROVIDER_DEFAULT.to_owned()))
     }
 
     /// OQ-931: judge 90 s since the last streamed event, hard cap 270 s.
@@ -11498,7 +11507,7 @@ impl App {
     }
 
     fn judge_line_model_for_agent(&self, agent: Agent) -> String {
-        self.selected_run_model(agent)
+        self.selected_run_model_label(agent)
             .unwrap_or_else(|_| "provider default".to_owned())
     }
 
@@ -26256,6 +26265,70 @@ mod tests {
         assert_eq!(no_model.app.input, "fix");
         assert!(last_system(&no_model.app).contains("fast models"));
         assert!(no_model.app.last_graph_run.is_none());
+    }
+
+    // TC-1460 / FR-1460: a grok follow-up with no selected model is not
+    // pinned to Cursor's composer-2.5; it plans and runs on provider default.
+    #[test]
+    fn tc_1460_grok_follow_up_without_model_uses_provider_default() {
+        let mut h = plan_gate_test_app();
+        h.app.settings.custom_agents = vec![dmuxai::custom_agent::grok_preset("grok")];
+        let grok = Agent::Custom(0);
+        assert_eq!(h.app.selected_run_model(grok), Ok(None));
+        assert_eq!(
+            h.app.selected_run_model_label(grok).as_deref(),
+            Ok("provider default")
+        );
+        assert_eq!(
+            h.app.selected_run_model(Agent::Cursor),
+            Ok(Some("composer-2.5".to_owned()))
+        );
+        h.app.begin_planning(
+            "Q1 yes. Q2 no".to_owned(),
+            grok,
+            Route::Complex,
+            "follow-up".to_owned(),
+            TriageSource::Judge,
+            None,
+            Uuid::new_v4().to_string(),
+            1,
+            0,
+            None,
+        );
+        let notices = h
+            .app
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("is not allowed for grok"))
+            .count();
+        assert_eq!(notices, 0, "no composer-2.5 rejection for grok");
+        assert!(h.app.input.is_empty(), "prompt was not bounced back");
+        assert!(h.app.last_graph_run.is_some(), "planning started");
+
+        // Busy path (park_fallback_plan) uses the runner default as well.
+        let mut busy = plan_gate_test_app();
+        busy.app.settings.custom_agents = vec![dmuxai::custom_agent::grok_preset("grok")];
+        busy.app.park_fallback_plan(
+            "Q1 yes".to_owned(),
+            grok,
+            Route::Complex,
+            "busy".to_owned(),
+            TriageSource::Judge,
+            None,
+            Uuid::new_v4().to_string(),
+            1,
+            0,
+            None,
+            PlannerCalls::default(),
+            "agent busy",
+            None,
+            None,
+        );
+        let run = busy.app.last_graph_run.as_ref().expect("fallback run");
+        let model = run.approval.as_ref().unwrap().revisions[0].steps[0]
+            .model
+            .clone();
+        assert_ne!(model.as_deref(), Some("composer-2.5"));
     }
 
     fn session_user_lines(app: &mut App) -> Vec<(String, Option<u64>)> {

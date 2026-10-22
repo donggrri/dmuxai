@@ -39,6 +39,17 @@ pub fn validate_model_for_runner(runner: &str, model_id: &str) -> Result<(), Str
         return Err(format!("fast models are blocked by policy: {trimmed}"));
     }
     let runner_key = runner.trim().to_ascii_lowercase();
+    // FR-1460: the provider-default sentinel (no `--model`) is every
+    // non-Cursor runner's own default; Cursor stays pinned to composer-2.5.
+    if trimmed.eq_ignore_ascii_case(PROVIDER_DEFAULT) {
+        return if default_model_for_runner(&runner_key).is_none() {
+            Ok(())
+        } else {
+            Err(format!(
+                "model {trimmed} is not allowed for {runner_key}; only {ALLOWED_MODEL} is permitted"
+            ))
+        };
+    }
     if crate::custom_agent::is_grok_model_id(trimmed) {
         return if runner_key == "grok" {
             Ok(())
@@ -68,6 +79,20 @@ pub fn validate_model_for_runner(runner: &str, model_id: &str) -> Result<(), Str
 /// Default model for graph nodes, subagents, and auto-routing.
 pub fn default_model() -> &'static str {
     ALLOWED_MODEL
+}
+
+/// Sentinel for "let the provider pick its own default" (no `--model`).
+pub const PROVIDER_DEFAULT: &str = "provider default";
+
+/// Per-runner default when no model was selected (SPEC FR-1460): Cursor gets
+/// the pinned non-fast `composer-2.5`; every other runner gets `None`
+/// (provider default). Never another runner's model, never a fast model.
+pub fn default_model_for_runner(runner: &str) -> Option<&'static str> {
+    if runner.trim().eq_ignore_ascii_case("cursor") {
+        Some(ALLOWED_MODEL)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -152,5 +177,19 @@ mod tests {
         // or custom runner never accepts them (no global registry mutation).
         assert!(validate_model_for_runner("zz-grok-policy", "grok-4.7").is_err());
         assert!(validate_model_for_runner("grok", "composer-2.5").is_err());
+    }
+
+    #[test]
+    fn tc_1461_default_model_for_runner_is_per_runner() {
+        assert_eq!(default_model_for_runner("cursor"), Some("composer-2.5"));
+        assert_eq!(default_model_for_runner("Cursor"), Some("composer-2.5"));
+        for runner in ["grok", "agy", "opencode", "codex", "custom-x"] {
+            assert_eq!(default_model_for_runner(runner), None, "{runner}");
+        }
+        assert!(validate_model_for_runner("grok", PROVIDER_DEFAULT).is_ok());
+        assert!(validate_model_for_runner("cursor", PROVIDER_DEFAULT).is_err());
+        let cursor = default_model_for_runner("cursor").unwrap();
+        assert!(!cursor.contains("fast"));
+        assert!(validate_model_for_runner("cursor", cursor).is_ok());
     }
 }
