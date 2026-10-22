@@ -518,7 +518,9 @@ pub fn spawn_dashboard(exe: &Path, workspace: &Path) -> io::Result<std::process:
     cmd.spawn()
 }
 
-/// Env var that lets a spawned `--web` dashboard run without a TTY (FR-1470).
+/// Set by [`spawn_dashboard`] for a terminal-less re-exec (FR-1470); kept only
+/// so child binaries older than FR-1600 still see it. Since FR-1600 `--web` is
+/// always headless, so the variable no longer gates behaviour.
 pub const HEADLESS_DASHBOARD_ENV: &str = "DMUXAI_HEADLESS_DASHBOARD";
 
 /// If `workspace` already has a live dashboard, return its URL.

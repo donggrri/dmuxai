@@ -5,6 +5,8 @@ Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `5ff8c93`
 Related: SPEC-agent-graph-orchestration, SPEC-graph-default-status, SPEC-state-per-repo, SPEC-windows-desktop
+Superseded (in part): FR-1600 in SPEC-web-dashboard-only — `dmuxai --web` now runs
+the dashboard with no TUI; see the inline notes on FR-520, FR-521 and FR-984.
 
 ## 1. Decision summary
 
@@ -13,7 +15,9 @@ pull work from Jira/Confluence without staring at the TUI or installing a
 desktop app. DmuxAI serves a local web dashboard from the same binary: `dmuxai
 --web` runs the TUI and a dashboard that share one in-process App/graph state,
 and `dmuxai serve` runs a read-only dashboard over persisted graph runs without a
-TTY. The server binds `127.0.0.1` by default, requires a random per-start access
+TTY. (Superseded by FR-1600, SPEC-web-dashboard-only: `--web` now runs the
+dashboard with the full App and no TUI, printing `dmuxai dashboard: <url>` to
+stdout.) The server binds `127.0.0.1` by default, requires a random per-start access
 token, and rejects foreign origins and hosts. The UI is static HTML/JS/CSS
 embedded in the binary (no frontend build); the browser on Linux, or on Windows
 via WSL `localhost` forwarding, opens the printed URL. Delivery is three PRs:
@@ -29,7 +33,7 @@ client and Jira/Confluence import, mock-tested only).
   renders live graph progress (current node, status, runner/model, timings) and
   agent busy state.
 - Slice B: to-do board persisted in the per-repo DB; add/edit/done/delete;
-  "run with agent" and "run as graph" from a to-do (TUI `--web` mode only).
+  "run with agent" and "run as graph" from a to-do (writable `--web` mode only).
 - Slice C: one shared MCP server list (`[[mcp.servers]]` in user config,
   merged with repo config) propagated to every runner in its native per-run
   form; the dashboard's own MCP client (stdio and streamable HTTP) on the same
@@ -72,10 +76,10 @@ client and Jira/Confluence import, mock-tested only).
 
 | ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| FR-520 | Must | Given the CLI, when the user runs `dmuxai serve [--port N] [--bind ADDR] [--allow-remote]` or `dmuxai --web [--port N] [--bind ADDR] [--allow-remote]` | `serve` starts the dashboard without requiring a TTY; `--web` starts the TUI plus the dashboard; `--help` documents both | Unknown flags or a missing/invalid flag value exit 2 with usage; `--help`/`--version` keep current behavior | TC-520, TC-531 |
-| FR-521 | Must | Given a server start | A fresh random access token of at least 32 lowercase hex characters is generated and the URL `http://<host>:<port>/?token=<token>` is printed (stdout for `serve`; a TUI startup notice for `--web`) | Two starts never reuse a token | TC-521, TC-531 |
+| FR-520 | Must | Given the CLI, when the user runs `dmuxai serve [--port N] [--bind ADDR] [--allow-remote]` or `dmuxai --web [--port N] [--bind ADDR] [--allow-remote]` | `serve` starts the dashboard without requiring a TTY; `--web` starts the TUI plus the dashboard; `--help` documents both. Superseded by FR-1600 (SPEC-web-dashboard-only): `--web` now runs the full App (agents, conversations, prompts, graphs) with the dashboard and no terminal UI — no TTY needed — printing `dmuxai dashboard: <url>` to stdout; `--help` documents both | Unknown flags or a missing/invalid flag value exit 2 with usage; `--help`/`--version` keep current behavior | TC-520, TC-531 |
+| FR-521 | Must | Given a server start | A fresh random access token of at least 32 lowercase hex characters is generated and the URL `http://<host>:<port>/?token=<token>` is printed (stdout for `serve`; a TUI startup notice for `--web`). Superseded by FR-1600 (SPEC-web-dashboard-only): the URL is printed to stdout for `--web` too (`dmuxai dashboard: <url>`); there is no TUI startup notice because `--web` runs no TUI | Two starts never reuse a token | TC-521, TC-531 |
 | FR-522 | Must | Given a request to any `/api/*` path | It succeeds only with `Authorization: Bearer <token>` or `?token=<token>` (constant-time compare) | Missing or wrong token returns 401 with no state in the body | TC-522 |
-| FR-984 | Must | Given `dmuxai --web` started the dashboard and the TUI shows the startup notice with the full `?token=` URL (FR-521) | The TUI still shows the full URL, but the notice is local-only: it is not in any `DashboardSnapshot` / `SessionView` transcript, `/api/state`, `/api/session` or SSE payload, and it is not stored in the conversation database, shared with agents, or sent in agent context. Other startup notices are unchanged | A snapshot that would contain the token string is a bug; the dashboard shows the URL without the token at most | TC-986, TC-987 |
+| FR-984 | Must | Given `dmuxai --web` started the dashboard and the full `?token=` URL was shown locally at startup (FR-521; since FR-1600 it is printed to stdout, not as a TUI notice) | The full URL stays local-only: it is not in any `DashboardSnapshot` / `SessionView` transcript, `/api/state`, `/api/session` or SSE payload, and it is not stored in the conversation database, shared with agents, or sent in agent context. Superseded by FR-1600 (SPEC-web-dashboard-only): the URL is printed to stdout as `dmuxai dashboard: <url>`; the TUI startup notice no longer exists because `--web` runs no TUI. The no-token-in-payload guarantee and other startup notices are unchanged | A snapshot that would contain the token string is a bug; the dashboard shows the URL without the token at most | TC-986, TC-987 |
 | FR-523 | Must | Given a request with an `Origin` header, or a `Host` header | For loopback binds the Host must be `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>`; for opt-in remote binds any Host is accepted (the token is the guard). In both cases a present Origin must equal `http://<Host>` | Mismatch, a missing Host, or `Origin: null` returns 403 before auth; protects against cross-site and DNS-rebinding access | TC-523 |
 | FR-524 | Must | Given `--bind ADDR` | Loopback addresses bind normally; a non-loopback address binds only with `--allow-remote` and prints a warning that anyone who can reach the port and has the token can control agents | Non-loopback without `--allow-remote` refuses to start (exit 2) | TC-524 |
 | FR-525 | Must | Given a graph run is active or the latest persisted run exists | `GET /api/state` returns snapshot `dmuxai.dashboard/v1` with `revision`, `generated_at_ms` (last change), `sent_at_ms` (server clock at send time, used for live elapsed), `source`, `agents[]` (`id`, `label`, `busy`, `phase`, `model`), and `graph` (`id`, `phase`, `orchestrator_model`, `current_nodes[]`, `waiting_gate_node`, `counts`, `nodes[]` with `id`, `role`, `job`, `runner`, `model_id`, `status`, `attempt`, `started_at_ms`, `finished_at_ms`, `elapsed_ms`, and `edges[]`) | No graph gives `graph: null`; long `job`/prompt text is truncated to 200 chars | TC-525 |

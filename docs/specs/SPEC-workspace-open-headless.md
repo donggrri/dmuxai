@@ -19,7 +19,7 @@ with Switch and Open disabled for that whole time, and no window ever opened.
 
 | ID | Priority | Given | Then | Edge cases | Tests |
 | --- | --- | --- | --- | --- | --- |
-| FR-1470 | Must | A dashboard spawned by `POST /api/workspace/open` (env `DMUXAI_HEADLESS_DASHBOARD=1`, no TTY) | It runs the full App (agents, conversations, prompts) with the web dashboard and no terminal UI, writes `web.json`, and exits on the dashboard `quit` command | Without the env var, `--web` without a TTY still fails with the TTY error | TC-1470, TC-1471 |
+| FR-1470 | Must | A dashboard spawned by `POST /api/workspace/open` (env `DMUXAI_HEADLESS_DASHBOARD=1`, no TTY) | It runs the full App (agents, conversations, prompts) with the web dashboard and no terminal UI, writes `web.json`, and exits on the dashboard `quit` command | Superseded by FR-1600 (SPEC-web-dashboard-only): `--web` no longer needs a TTY, with or without `DMUXAI_HEADLESS_DASHBOARD` | TC-1470, TC-1471 |
 | FR-1471 | Must | The spawned child exits before publishing `web.json` | The open request fails within about 1 s with `the new dashboard exited before publishing a URL (<status>)`; the child is reaped (no zombie) | A child that stays alive but never publishes still times out after 20 s | TC-1472 |
 | FR-1472 | Must | A spawned child that published its URL | Its exit is reaped in the background so it never lingers as a zombie | — | TC-1472 |
 | FR-1473 | Must | The workspace dialog path is empty, invalid, missing or not writable | "Open in new window" is disabled like "Switch" until the path validates | Path still validating → disabled | TC-1473, TC-1490 |

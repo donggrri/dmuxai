@@ -1,7 +1,8 @@
 //! TC-1471 (SPEC-workspace-open-headless FR-1470): a `--web` dashboard spawned
 //! for "Open in new window" runs without a TTY, publishes `web.json`, serves
-//! the API, and exits on the dashboard `quit` command. Without the headless
-//! env it still refuses to run without a TTY.
+//! the API, and exits on the dashboard `quit` command. Since FR-1600 `--web`
+//! is headless with or without `DMUXAI_HEADLESS_DASHBOARD`, so that variable
+//! no longer gates the run (see SPEC-web-dashboard-only).
 
 #![cfg(unix)]
 
@@ -61,15 +62,9 @@ fn tc_1471_open_in_new_window_starts_headless_dashboard() {
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir_all(&state).unwrap();
 
-    // Without the env var a TTY is still required.
-    let out = base_command(&workspace, &state).output().unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("interactive terminal"));
-
-    let child = base_command(&workspace, &state)
-        .env("DMUXAI_HEADLESS_DASHBOARD", "1")
-        .spawn()
-        .unwrap();
+    // FR-1600 supersedes the TTY-only part of FR-1470, so the run below works
+    // with `DMUXAI_HEADLESS_DASHBOARD` unset; see tests/web_dashboard_only.rs.
+    let child = base_command(&workspace, &state).spawn().unwrap();
     let mut guard = ChildGuard(Some(child));
     let discovery_path = workspace.join(".dmuxai").join("web.json");
     let deadline = Instant::now() + Duration::from_secs(20);
