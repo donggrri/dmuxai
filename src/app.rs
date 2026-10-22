@@ -8846,8 +8846,6 @@ impl App {
         }
     }
 
-    /// The model the selected agent will actually run with, validated against
-    /// the model policy before any record is created (FR-937).
     /// The model a turn on `agent` runs with: the explicit selection (checked
     /// by policy), else the runner's own default (FR-1460). `Ok(None)` means
     /// provider default (no `--model`).
@@ -26271,6 +26269,13 @@ mod tests {
     // pinned to Cursor's composer-2.5; it plans and runs on provider default.
     #[test]
     fn tc_1460_grok_follow_up_without_model_uses_provider_default() {
+        let warnings =
+            dmuxai::custom_agent::install_registry(vec![dmuxai::custom_agent::grok_preset("grok")]);
+        assert_eq!(
+            dmuxai::custom_agent::index_of("grok"),
+            Some(0),
+            "warnings {warnings:?}"
+        );
         let mut h = plan_gate_test_app();
         h.app.settings.custom_agents = vec![dmuxai::custom_agent::grok_preset("grok")];
         let grok = Agent::Custom(0);

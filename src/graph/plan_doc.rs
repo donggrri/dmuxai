@@ -945,8 +945,9 @@ pub struct FallbackPlan {
 
 /// Builds the 1-node fallback plan (FR-941, FR-950): one step `step-1`, role
 /// `implement`, job = the user prompt verbatim, model = `effective_model` when
-/// it passes `validate_model_for_runner`, else `model_policy::default_model()`
-/// when that passes, else the `no allowed model for fallback plan` error. The
+/// it passes `validate_model_for_runner`, else the runner's own default
+/// (`model_policy::default_model_for_runner`, FR-1461): `composer-2.5` for
+/// Cursor, `provider default` for every other runner. The
 /// keyword gate of FR-944 decides the note-attached `sensitive` flag.
 pub fn fallback_plan(
     prompt: &str,
