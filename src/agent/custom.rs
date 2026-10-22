@@ -81,6 +81,7 @@ struct ActiveTurn {
     handle: JoinHandle<()>,
     context: OutputContext,
     pgid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 async fn runtime_loop(
@@ -271,6 +272,9 @@ fn mode_names(policy: TurnPolicy) -> (&'static str, &'static str) {
     }
 }
 
+/// Sentinel from `run_turn` meaning the ACP turn ended cancelled (FR-1416).
+const ACP_TURN_CANCELLED: &str = "\u{0}acp-turn-cancelled";
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_turn(
     agent: Agent,
@@ -285,8 +289,13 @@ fn spawn_turn(
 ) -> ActiveTurn {
     let context = OutputContext::from(&request);
     let pgid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let settings = dmuxai::settings::DmuxSettings::load(&cwd);
+    let uses_acp = is_builtin_grok(spec)
+        && settings.grok_protocol == dmuxai::runner_protocol::RunnerProtocol::Acp;
+    let acp_cancel = uses_acp.then(super::acp::new_cancel_flag);
     let turn_context = context.clone();
     let turn_pgid = pgid.clone();
+    let cancel_for_turn = acp_cancel.clone();
     let handle = tokio::spawn(async move {
         send(&event_tx, agent, Some(&turn_context), AgentEvent::Started).await;
         let event = match run_turn(
@@ -301,10 +310,12 @@ fn spawn_turn(
             &turn_pgid,
             &mcp_servers,
             &mcp_notice_shown,
+            cancel_for_turn,
         )
         .await
         {
             Ok(()) => AgentEvent::Completed,
+            Err(error) if error == ACP_TURN_CANCELLED => AgentEvent::Cancelled,
             Err(error) => AgentEvent::Error(error),
         };
         send(&event_tx, agent, Some(&turn_context), event).await;
@@ -313,6 +324,7 @@ fn spawn_turn(
         handle,
         context,
         pgid,
+        acp_cancel,
     }
 }
 
@@ -361,15 +373,73 @@ async fn run_turn(
     spec: &CustomAgentSpec,
     request: &AgentRequest,
     model: Option<String>,
-    mode: TurnPolicy,
+    _mode: TurnPolicy,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
     pgid: &std::sync::atomic::AtomicU32,
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     mcp_notice_shown: &AtomicBool,
+    acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), String> {
-    let (mode_name, edit) = mode_names(mode);
+    let settings = dmuxai::settings::DmuxSettings::load(cwd);
+    if is_builtin_grok(spec)
+        && settings.grok_protocol == dmuxai::runner_protocol::RunnerProtocol::Acp
+    {
+        let model_id = super::acp_runner::acp_model_arg("grok", model.as_deref())?
+            .ok_or_else(grok_no_allowed_model_message)?;
+        let model_id = model_id.as_str();
+        let program = spec
+            .command
+            .first()
+            .ok_or_else(|| format!("{}: empty command", spec.label()))?;
+        let effort = spec
+            .env
+            .get("GROK_REASONING_EFFORT")
+            .cloned()
+            .or_else(|| std::env::var("GROK_REASONING_EFFORT").ok());
+        let read_only = request.policy == TurnPolicy::ReadOnly;
+        let args = super::acp_runner::grok_acp_argv(model_id, effort.as_deref(), read_only);
+        let permission_ctx = super::acp::PermissionContext {
+            workspace: cwd.to_string_lossy().into_owned(),
+            sensitive_gate_active: false,
+            // FR-1413: grok has no ACP modes; dmuxai denies writes itself.
+            read_only_fail_closed: read_only,
+        };
+        let cancel = acp_cancel.unwrap_or_else(super::acp::new_cancel_flag);
+        let user_cancel = cancel.clone();
+        let outcome = super::acp_runner::run_agent_acp_turn(
+            Path::new(program),
+            &args,
+            cwd,
+            request,
+            agent,
+            event_tx,
+            permission_ctx,
+            super::acp::AcpRunnerKind::Grok,
+            super::acp::AcpLifecycle::Delegate,
+            cancel,
+            Some(model_id.to_owned()),
+            None,
+            None,
+            dmuxai::mcp::propagate::acp_mcp_servers(mcp_servers, "grok"),
+        )
+        .await?;
+        if outcome.cancelled && !user_cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            send(
+                event_tx,
+                agent,
+                Some(&OutputContext::from(request)),
+                AgentEvent::Notice(super::acp::PERMISSION_DENIED_NOTICE.to_owned()),
+            )
+            .await;
+        }
+        if outcome.cancelled {
+            return Err(ACP_TURN_CANCELLED.to_owned());
+        }
+        return Ok(());
+    }
+    let (mode_name, edit) = mode_names(request.policy);
     let mut ctx = SubstitutionContext::new(
         request.prompt.clone(),
         cwd.display().to_string(),
@@ -616,9 +686,14 @@ fn kill_group_with(pgid: u32, signal: &str) {
 
 async fn stop_turn(agent: Agent, turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
     if let Some(turn) = turn {
-        kill_group(turn.pgid.load(std::sync::atomic::Ordering::SeqCst));
-        turn.handle.abort();
-        let _ = turn.handle.await;
+        if let Some(cancel) = &turn.acp_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(1600), turn.handle).await;
+        } else {
+            kill_group(turn.pgid.load(std::sync::atomic::Ordering::SeqCst));
+            turn.handle.abort();
+            let _ = turn.handle.await;
+        }
         send(event_tx, agent, Some(&turn.context), AgentEvent::Cancelled).await;
     }
 }
@@ -696,6 +771,7 @@ mod tests {
             &pgid,
             mcp_servers,
             &notice_shown,
+            None,
         )
         .await;
         drop(tx);
@@ -888,6 +964,7 @@ env = { FAKE_CFG = "{temp_config}" }
             &pgid,
             mcp_servers,
             notice_shown,
+            None,
         )
         .await;
         drop(tx);
@@ -1000,6 +1077,12 @@ temp_config_template = '{"mcp": "not-an-object"}'
         mpsc::Receiver<AgentOutput>,
         JoinHandle<()>,
     ) {
+        let workspace = tempfile::tempdir().expect("grok test workspace");
+        std::fs::write(
+            workspace.path().join("dmuxai.toml"),
+            "[agents]\ngrok_protocol = \"legacy\"\n",
+        )
+        .expect("grok legacy settings");
         let (event_tx, event_rx) = mpsc::channel(64);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let worker = tokio::spawn(runtime_loop_with_spec(
@@ -1007,9 +1090,10 @@ temp_config_template = '{"mcp": "not-an-object"}'
             spec,
             command_rx,
             event_tx,
-            std::env::temp_dir(),
+            workspace.path().to_path_buf(),
             Vec::new(),
         ));
+        std::mem::forget(workspace);
         (command_tx, event_rx, worker)
     }
 

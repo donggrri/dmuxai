@@ -1,3 +1,5 @@
+pub(crate) mod acp;
+mod acp_runner;
 mod agy;
 mod codex;
 mod cursor;
@@ -186,9 +188,9 @@ pub struct AgentRequest {
 }
 
 #[derive(Debug, Clone)]
-struct OutputContext {
-    conversation_id: ConversationId,
-    turn_id: TurnId,
+pub(crate) struct OutputContext {
+    pub conversation_id: ConversationId,
+    pub turn_id: TurnId,
 }
 
 impl From<&AgentRequest> for OutputContext {
@@ -277,10 +279,6 @@ pub fn is_adapter_turn_busy_rejection(message: &str) -> bool {
 }
 
 /// The synchronous UI-facing handle for an asynchronous agent runtime.
-///
-/// Commands are deliberately non-blocking: the UI either enqueues one or gets
-/// a visible backpressure error. The runtime owns the process and emits events
-/// through a separate bounded channel.
 pub trait AgentAdapter: Send {
     fn agent(&self) -> Agent;
     fn send(&self, request: AgentRequest) -> Result<(), AdapterError>;

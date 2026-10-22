@@ -188,7 +188,7 @@ defaults to the selected agent:
 | `command` | Fields | TUI equivalent |
 | --- | --- | --- |
 | `select_agent` | `agent` | `/agent` |
-| `set_mode` | `agent?`, `mode` (`ask`/`plan`/`implement`) | `/mode` |
+| `set_mode` | `agent?`, `mode` (ignored; one notice) | removed `/mode` (SPEC-acp-runners) |
 | `load_models` | `agent?` | opening F2 |
 | `select_model` | `agent?`, `model` | F2 |
 | `set_effort` | `agent?`, `effort` (Codex) | `/effort` |

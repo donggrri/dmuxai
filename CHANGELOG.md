@@ -23,6 +23,28 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Changed
 
+- **ACP runners for Cursor and grok (SPEC-acp-runners).** grok defaults to
+  ACP (`grok agent -m <model> stdio`); read-only internal turns start it as
+  `grok --permission-mode plan agent ... stdio` and dmuxai also denies write and
+  exec permissions itself. `[agents] grok_protocol = "legacy"` keeps
+  streaming-json. Cursor stays on **legacy** stream-json with non-fast
+  `composer-2.5` by default, because Cursor ACP only offers
+  `composer-2.5[fast=true]`; with `[cursor] protocol = "acp"` a fast session is
+  refused before any prompt is sent. Read-only turns use `session/set_mode` or a
+  mode `configOptions` entry when the agent offers one. Configured MCP servers
+  are passed as ACP `mcpServers`. A disallowed model is an error, not silently
+  dropped. A denied permission or cancel ends the turn as cancelled (graph shows
+  "Graph cancelled"). Execute activity rows show the command. agy and opencode
+  keep their headless CLI modes (`[agents] opencode_protocol` is ignored with a
+  warning).
+- **CLI:** `dmuxai run` / `todo run` reject `--mode` with an error instead of
+  running write-capable turns silently.
+- **AGY:** normal agent turns no longer require observed file writes to succeed.
+- **Single agent turn mode.** Removed `/mode`, the mode picker, and per-agent
+  mode state. Every user turn runs in agent mode; judge/plan/replan use
+  read-only adapter flags internally. CLI `--mode` and dashboard `set_mode` are
+  ignored with a notice.
+
 - **Dashboard center column uses the full width (SPEC-dashboard-fullwidth FR-1200..FR-1204).**
   The chat, graph and task checklist now fill the whole area between the
   sidebars instead of an 880px column, and the Documents panel is collapsible

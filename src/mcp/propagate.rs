@@ -682,3 +682,35 @@ mod builtin_memory_tests {
         );
     }
 }
+
+/// ACP `mcpServers` array for `session/new|load|resume` (SPEC-acp-runners FR-1414).
+/// Only servers that apply to `runner` are included.
+pub fn acp_mcp_servers(servers: &[ResolvedMcpServer], runner: &str) -> Value {
+    let pairs = |map: &BTreeMap<String, String>| -> Value {
+        Value::Array(
+            map.iter()
+                .map(|(name, value)| json!({ "name": name, "value": value }))
+                .collect(),
+        )
+    };
+    Value::Array(
+        servers
+            .iter()
+            .filter(|server| server.applies_to(runner))
+            .map(|server| match &server.transport {
+                Transport::Stdio { command, args, env } => json!({
+                    "name": server.name,
+                    "command": command,
+                    "args": args,
+                    "env": pairs(env),
+                }),
+                Transport::Http { url, headers } => json!({
+                    "type": "http",
+                    "name": server.name,
+                    "url": url,
+                    "headers": pairs(headers),
+                }),
+            })
+            .collect(),
+    )
+}

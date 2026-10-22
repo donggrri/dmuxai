@@ -292,6 +292,17 @@ struct QueuedFollowup {
 /// Cap on queued follow-ups.
 const FOLLOWUP_QUEUE_MAX: usize = 20;
 
+/// Marks a graph stop caused by a cancelled step (FR-1416), shown as cancelled.
+const GRAPH_CANCELLED_PREFIX: &str = "\u{0}cancelled:";
+
+/// User-facing line when a graph stops: cancelled steps never read "Graph failed".
+fn graph_stop_notice(message: &str) -> String {
+    match message.strip_prefix(GRAPH_CANCELLED_PREFIX) {
+        Some(detail) => format!("Graph cancelled: {detail}"),
+        None => format!("Graph failed: {message}"),
+    }
+}
+
 fn run_todo_error_text(error: &RunTodoError) -> String {
     match error {
         RunTodoError::Busy(message)
@@ -1901,6 +1912,11 @@ impl App {
                 .iter()
                 .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean);
             let Some(adapter) = adapter else {
+                if runner_clean == "opencode"
+                    && let Some(message) = dmuxai::settings::opencode_bin_explicit_missing_message()
+                {
+                    return Err(RunTodoError::Missing(message));
+                }
                 return Err(RunTodoError::UnknownAgent(agent_str.clone()));
             };
             adapter.agent()
@@ -2240,7 +2256,14 @@ impl App {
             .iter()
             .map(|adapter| adapter.agent())
             .find(|candidate| self.agent_runner_name(*candidate).eq_ignore_ascii_case(raw))
-            .ok_or_else(|| RunTodoError::UnknownAgent(format!("unknown agent '{raw}'")))
+            .ok_or_else(|| {
+                if raw.eq_ignore_ascii_case("opencode")
+                    && let Some(message) = dmuxai::settings::opencode_bin_explicit_missing_message()
+                {
+                    return RunTodoError::Missing(message);
+                }
+                RunTodoError::UnknownAgent(format!("unknown agent '{raw}'"))
+            })
     }
 
     fn agent_key_display_name(&self, key: AgentKey) -> String {
@@ -9242,6 +9265,14 @@ impl App {
                 }
                 return;
             }
+            if !success && error.as_deref() == Some("cancelled") {
+                // FR-1416: a cancelled step (user cancel or denied ACP permission)
+                // stops the graph as cancelled, without retry or failure replan.
+                self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
+                    "{GRAPH_CANCELLED_PREFIX}step {node_id} was cancelled"
+                ))]);
+                return;
+            }
             self.intercept_graph_node_finished(agent, node_id, success, &output_text);
         }
         self.flush_deferred_graph_starts();
@@ -9498,10 +9529,14 @@ impl App {
                     break;
                 }
                 GraphAction::Failed(message) => {
-                    self.push_system(format!("Graph failed: {message}"));
+                    self.push_system(graph_stop_notice(&message));
                     self.quiet_graph_run = false;
                     if let Some(session) = self.graph_session.as_mut() {
                         session.finalize_failure();
+                        if message.starts_with(GRAPH_CANCELLED_PREFIX) {
+                            // FR-1416: cancelled, not failed, in run history and UI.
+                            session.run_mut().phase = GraphRunPhase::Cancelled;
+                        }
                         let run = session.run().clone();
                         let _ = save_run(&self.workspace_root, &run);
                         self.last_graph_run = Some(run);
@@ -9533,7 +9568,11 @@ impl App {
                     if let Some((_plan_id, todo_id)) = self.graph_todo.take()
                         && let Some(store) = self.todo_store.clone()
                     {
-                        if let Err(err) = store.finish_run(&todo_id, false, Some(message)) {
+                        if let Err(err) = store.finish_run(
+                            &todo_id,
+                            false,
+                            Some(message.replace(GRAPH_CANCELLED_PREFIX, "cancelled: ")),
+                        ) {
                             self.push_system(format!("Failed to finish to-do run: {err}"));
                         }
                         self.publish_todos();
@@ -11157,7 +11196,13 @@ impl App {
             .find(|m| m.role == Role::System && !m.local_only)
             .map(|m| m.content.clone());
 
-        let (ok, exit_code, error) = if cancelled {
+        // FR-1416: a graph stopped by a cancelled step is not a success.
+        let graph_cancelled = last_graph_id.as_ref().is_some_and(|graph_id| {
+            self.last_graph_run.as_ref().is_some_and(|run| {
+                run.plan.id == *graph_id && run.phase == GraphRunPhase::Cancelled
+            })
+        });
+        let (ok, exit_code, error) = if cancelled || graph_cancelled {
             (
                 false,
                 130,
@@ -14156,6 +14201,7 @@ fn link_turn_bands_to_messages(
 
 #[cfg(test)]
 mod tests {
+
     //! Integration helpers for `App` unit tests (see `AGENTS.md` § Agent test helpers).
     //!
     //! - [`test_app`] — in-memory conversation DB, recording adapters, Codex selected.
@@ -22752,6 +22798,7 @@ mod tests {
             ConversationEngine::open(std::path::Path::new(":memory:"), temp_dir.path()).unwrap();
         let mut settings = DmuxSettings::default();
         settings.cursor_prewarm = true;
+        settings.cursor_protocol = dmuxai::runner_protocol::RunnerProtocol::Legacy;
 
         let mut app =
             App::new_interactive(engine, temp_dir.path().to_path_buf(), settings).unwrap();
@@ -22811,6 +22858,7 @@ mod tests {
             ConversationEngine::open(std::path::Path::new(":memory:"), temp_dir.path()).unwrap();
         let mut settings = DmuxSettings::default();
         settings.cursor_prewarm = true;
+        settings.cursor_protocol = dmuxai::runner_protocol::RunnerProtocol::Legacy;
 
         // Headless App::new explicitly disables prewarm
         let mut app = App::new(engine, temp_dir.path().to_path_buf(), settings).unwrap();
@@ -27238,5 +27286,19 @@ mod speaker_style_tests {
             t.color_for(speaker_for(Agent::Cursor)),
             t.color_for(speaker_for(Agent::Agy))
         );
+    }
+}
+
+#[cfg(test)]
+mod graph_stop_notice_tests {
+    // TC-1421 / FR-1416: a cancelled step is reported as cancelled, not failed.
+    #[test]
+    fn tc_1421_cancelled_graph_step_not_reported_as_failed() {
+        let msg = format!("{}step n1 was cancelled", super::GRAPH_CANCELLED_PREFIX);
+        assert_eq!(
+            super::graph_stop_notice(&msg),
+            "Graph cancelled: step n1 was cancelled"
+        );
+        assert_eq!(super::graph_stop_notice("boom"), "Graph failed: boom");
     }
 }

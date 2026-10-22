@@ -7,6 +7,7 @@ use crate::activity::UiSettings;
 use crate::mcp::config::ToolNames;
 use crate::mcp::{McpServerSpec, ServerKind};
 use crate::notify::NotifySettings;
+use crate::runner_protocol::RunnerProtocol;
 use crate::theme::{Theme, ThemeToml};
 
 /// Web dashboard theme settings loaded from `[web]`.
@@ -43,6 +44,10 @@ pub struct DmuxSettings {
     pub cursor_windows_unsandboxed: bool,
     pub cursor_prewarm: bool,
     pub cursor_prewarm_idle_secs: u64,
+    /// `[cursor] protocol` (default legacy stream-json; FR-1410).
+    pub cursor_protocol: RunnerProtocol,
+    /// `[agents] grok_protocol` (default ACP).
+    pub grok_protocol: RunnerProtocol,
     pub routing_default_agent: Option<String>,
     pub routing_cursor_models: Vec<String>,
     pub graph_max_parallel: usize,
@@ -186,6 +191,8 @@ struct AgentsToml {
     custom: Option<Vec<crate::custom_agent::CustomAgentSpec>>,
     builtin_opencode: Option<bool>,
     builtin_grok: Option<bool>,
+    grok_protocol: Option<String>,
+    opencode_protocol: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -238,6 +245,7 @@ struct CursorToml {
     windows_unsandboxed: Option<bool>,
     prewarm: Option<bool>,
     prewarm_idle_secs: Option<u64>,
+    protocol: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -354,8 +362,14 @@ impl DmuxSettings {
         let names_grok = agents()
             .flat_map(|agents| agents.custom.iter().flatten())
             .any(|spec| spec.name.eq_ignore_ascii_case("grok"));
-        let opencode_preset_bin =
-            opencode_bin.filter(|_| settings.builtin_opencode && !names_opencode);
+        let explicit_opencode = std::env::var_os("DMUXAI_OPENCODE_BIN")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let opencode_preset_bin = if settings.builtin_opencode && !names_opencode {
+            opencode_bin.or(explicit_opencode)
+        } else {
+            None
+        };
         let grok_preset_bin = grok_bin.filter(|_| settings.builtin_grok && !names_grok);
 
         // Custom agent names seen in *either* config, so an id defined only in
@@ -518,13 +532,28 @@ impl DmuxSettings {
                 self.memory_raw.inject = memory.inject;
             }
         }
-        if let Some(agents) = parsed.agents
-            && let Some(custom) = agents.custom
-        {
-            for spec in &custom {
-                known_custom.push(spec.name.clone());
+        if let Some(agents) = parsed.agents {
+            if let Some(custom) = agents.custom {
+                for spec in &custom {
+                    known_custom.push(spec.name.clone());
+                }
+                self.custom_agents = custom;
             }
-            self.custom_agents = custom;
+            if let Some(protocol) = agents.grok_protocol {
+                match RunnerProtocol::parse_config(&protocol) {
+                    Some(value) => self.grok_protocol = value,
+                    None => self.config_warnings.push(format!(
+                        "[agents] grok_protocol ignored: expected acp or legacy, got {protocol:?}"
+                    )),
+                }
+            }
+            if agents.opencode_protocol.is_some() {
+                // FR-1418: opencode stays on the headless `opencode run` path.
+                self.config_warnings.push(
+                    "[agents] opencode_protocol ignored: opencode runs headless (`opencode run`)"
+                        .to_owned(),
+                );
+            }
         }
         if let Some(mcp) = parsed.mcp {
             self.merge_mcp_servers(mcp.servers);
@@ -548,6 +577,14 @@ impl DmuxSettings {
             }
             if let Some(idle) = cursor.prewarm_idle_secs {
                 self.cursor_prewarm_idle_secs = idle;
+            }
+            if let Some(protocol) = cursor.protocol {
+                match RunnerProtocol::parse_config(&protocol) {
+                    Some(value) => self.cursor_protocol = value,
+                    None => self.config_warnings.push(format!(
+                        "[cursor] protocol ignored: expected acp or legacy, got {protocol:?}"
+                    )),
+                }
             }
         }
         if let Some(routing) = parsed.routing {
@@ -726,6 +763,8 @@ impl Default for DmuxSettings {
             cursor_windows_unsandboxed: false,
             cursor_prewarm: true,
             cursor_prewarm_idle_secs: 300,
+            cursor_protocol: RunnerProtocol::Legacy,
+            grok_protocol: RunnerProtocol::Acp,
             routing_default_agent: None,
             routing_cursor_models: Vec::new(),
             graph_max_parallel: 2,
@@ -844,13 +883,50 @@ fn normalize_jira_base_url(value: &str) -> Result<String, String> {
 /// is authoritative when set: it must name an existing file. Otherwise the first
 /// `opencode` file on `PATH` is used.
 pub fn find_opencode_bin() -> Option<PathBuf> {
-    match std::env::var_os("DMUXAI_OPENCODE_BIN").filter(|value| !value.is_empty()) {
-        Some(raw) => {
-            let path = PathBuf::from(raw);
-            path.is_file().then_some(path)
-        }
-        None => find_on_path("opencode"),
+    find_opencode_bin_from(
+        std::env::var_os("DMUXAI_OPENCODE_BIN").filter(|value| !value.is_empty()),
+        std::env::var_os("PATH"),
+        home_dir(),
+    )
+}
+
+/// Lookup used by [`find_opencode_bin`]. `explicit` is authoritative when set.
+fn find_opencode_bin_from(
+    explicit: Option<std::ffi::OsString>,
+    path_var: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(raw) = explicit {
+        let path = PathBuf::from(raw);
+        return path.is_file().then_some(path);
     }
+    if let Some(found) = find_on_path_in("opencode", path_var.as_deref()) {
+        return Some(found);
+    }
+    home.map(|h| h.join(".opencode").join("bin").join("opencode"))
+        .filter(|p| p.is_file())
+}
+
+/// When `DMUXAI_OPENCODE_BIN` is set but does not name an existing file, returns
+/// a user-facing message (SPEC-acp-runners FR-1326).
+pub fn opencode_bin_explicit_missing_message() -> Option<String> {
+    opencode_bin_explicit_missing_message_from(
+        std::env::var_os("DMUXAI_OPENCODE_BIN").filter(|value| !value.is_empty()),
+    )
+}
+
+fn opencode_bin_explicit_missing_message_from(
+    explicit: Option<std::ffi::OsString>,
+) -> Option<String> {
+    let raw = explicit?;
+    let path = PathBuf::from(raw);
+    if path.is_file() {
+        return None;
+    }
+    Some(format!(
+        "opencode binary not found at {} (set by DMUXAI_OPENCODE_BIN)",
+        path.display()
+    ))
 }
 
 /// Finds the grok executable (SPEC-grok-runner FR-890). A non-empty
@@ -1971,6 +2047,62 @@ mod builtin_memory_mcp_tests {
         let settings = DmuxSettings::load(ws.path());
         assert!(!settings.cursor_prewarm);
         assert_eq!(settings.cursor_prewarm_idle_secs, 120);
+    }
+
+    // TC-1305, TC-1410 / FR-1300, FR-1301, FR-1410: runner protocol defaults and TOML parsing.
+    #[test]
+    fn tc_1305_runner_protocol_defaults_and_parse() {
+        let defaults = DmuxSettings::default();
+        assert_eq!(defaults.cursor_protocol, RunnerProtocol::Legacy);
+        assert_eq!(defaults.grok_protocol, RunnerProtocol::Acp);
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            "[cursor]\nprotocol = \"legacy\"\n[agents]\ngrok_protocol = \"legacy\"\nopencode_protocol = \"legacy\"\n",
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(ws.path());
+        assert_eq!(settings.cursor_protocol, RunnerProtocol::Legacy);
+        assert_eq!(settings.grok_protocol, RunnerProtocol::Legacy);
+        // TC-1423 / FR-1418: opencode has no ACP switch.
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("opencode_protocol ignored"))
+        );
+    }
+
+    // TC-1322 / FR-1321: opencode binary resolution includes ~/.opencode/bin/opencode.
+    #[test]
+    fn tc_1322_find_opencode_bin_home_install() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".opencode").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("opencode");
+        std::fs::write(&exe, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(
+            find_opencode_bin_from(None, None, Some(home.path().to_path_buf())),
+            Some(exe)
+        );
+    }
+
+    // FR-1326: explicit DMUXAI_OPENCODE_BIN missing file → clear message.
+    #[test]
+    fn opencode_explicit_bin_missing_message() {
+        let msg = opencode_bin_explicit_missing_message_from(Some(std::ffi::OsString::from(
+            "/nonexistent/opencode",
+        )))
+        .expect("message");
+        assert!(msg.contains("opencode binary not found"));
+        assert!(msg.contains("/nonexistent/opencode"));
+        assert!(msg.contains("DMUXAI_OPENCODE_BIN"));
     }
 }
 
