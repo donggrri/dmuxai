@@ -893,7 +893,6 @@ fn signal_group(pgid: u32, signal: &str) -> bool {
         .unwrap_or(false)
 }
 
-
 pub fn new_cancel_flag() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
