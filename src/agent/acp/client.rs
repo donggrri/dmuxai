@@ -377,6 +377,7 @@ struct OpenSessionOutcome {
     session_payload: Value,
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 async fn shutdown_acp_child(child: &mut tokio::process::Child, child_pid: Option<u32>) {
     let _ = child.start_kill();
     #[cfg(unix)]
@@ -892,8 +893,6 @@ fn signal_group(pgid: u32, signal: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(unix))]
-async fn terminate_group(_pid: u32) {}
 
 pub fn new_cancel_flag() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
