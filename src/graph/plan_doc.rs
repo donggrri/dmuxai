@@ -945,8 +945,9 @@ pub struct FallbackPlan {
 
 /// Builds the 1-node fallback plan (FR-941, FR-950): one step `step-1`, role
 /// `implement`, job = the user prompt verbatim, model = `effective_model` when
-/// it passes `validate_model_for_runner`, else `model_policy::default_model()`
-/// when that passes, else the `no allowed model for fallback plan` error. The
+/// it passes `validate_model_for_runner`, else the runner's own default
+/// (`model_policy::default_model_for_runner`, FR-1461): `composer-2.5` for
+/// Cursor, `provider default` for every other runner. The
 /// keyword gate of FR-944 decides the note-attached `sensitive` flag.
 pub fn fallback_plan(
     prompt: &str,
@@ -959,13 +960,16 @@ pub fn fallback_plan(
         Some(model) if crate::model_policy::validate_model_for_runner(&runner, model).is_ok() => {
             model.trim().to_owned()
         }
-        _ => {
-            let default = crate::model_policy::default_model();
-            if crate::model_policy::validate_model_for_runner(&runner, default).is_err() {
-                return Err("no allowed model for fallback plan".to_owned());
+        // FR-1461: fall back to this runner's own default (FR-1460).
+        _ => match crate::model_policy::default_model_for_runner(&runner) {
+            Some(default) => {
+                if crate::model_policy::validate_model_for_runner(&runner, default).is_err() {
+                    return Err("no allowed model for fallback plan".to_owned());
+                }
+                default.to_owned()
             }
-            default.to_owned()
-        }
+            None => crate::model_policy::PROVIDER_DEFAULT.to_owned(),
+        },
     };
     Ok(one_node_plan_on(prompt, &runner, &model, cause))
 }
@@ -1590,9 +1594,28 @@ DATA-nonce1>>>>
             fallback.plan.nodes[0].requires_gate,
             "the keyword gate marks the fallback sensitive"
         );
-        // A runner whose default model fails the policy fails FR-941.
-        let error = fallback_plan("fix", "grok", None, "plan invalid twice").unwrap_err();
-        assert_eq!(error, "no allowed model for fallback plan");
+        // FR-1461: a non-Cursor runner without a valid hint uses its own default.
+        let grok = fallback_plan("fix", "grok", None, "plan invalid twice").unwrap();
+        assert_eq!(grok.plan.nodes[0].model_id, "provider default");
+    }
+
+    #[test]
+    fn tc_1462_fallback_plan_uses_runner_default() {
+        for runner in ["grok", "agy", "opencode", "codex"] {
+            let built = fallback_plan("follow up", runner, None, "direct").unwrap();
+            assert_eq!(built.plan.nodes[0].model_id, "provider default", "{runner}");
+        }
+        for runner in ["grok"] {
+            for hint in [Some("composer-2.5"), Some("composer-2.5-fast")] {
+                let built = fallback_plan("follow up", runner, hint, "direct").unwrap();
+                let model = &built.plan.nodes[0].model_id;
+                assert_eq!(model, "provider default", "{runner} {hint:?}");
+            }
+        }
+        let cursor = fallback_plan("follow up", "cursor", None, "direct").unwrap();
+        assert_eq!(cursor.plan.nodes[0].model_id, "composer-2.5");
+        let grok = fallback_plan("x", "grok", Some("grok-4.7"), "direct").unwrap();
+        assert_eq!(grok.plan.nodes[0].model_id, "grok-4.7");
     }
 
     // TC-991 / FR-963, FR-975: tasks parse in list order with their fields,

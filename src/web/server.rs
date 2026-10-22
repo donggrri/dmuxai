@@ -1750,6 +1750,14 @@ pub fn build_router_with(
         .with_state(state)
 }
 
+/// FR-1462 warning when an explicit `--port` was taken by another process.
+fn port_in_use_warning(requested: u16, actual: u16) -> String {
+    format!(
+        "dmuxai dashboard: port {requested} is already in use by another process; \
+         using port {actual} instead (open the URL above, not :{requested})"
+    )
+}
+
 pub async fn start_server(
     config: ServerConfig,
     hub: DashboardHub,
@@ -1757,15 +1765,19 @@ pub async fn start_server(
     let bind_check = check_bind(config.bind, config.allow_remote)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    let warning = match bind_check {
+    let mut warning = match bind_check {
         BindCheck::Remote { warning } => Some(warning),
         BindCheck::Loopback => None,
     };
 
     let bind_addr = SocketAddr::new(config.bind, config.port);
+    // FR-1462: a port held by another process falls back to a free port for
+    // the default and an explicit `--port` alike; an explicit one is reported.
+    let mut port_in_use = false;
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && config.port == DEFAULT_PORT => {
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && config.port != 0 => {
+            port_in_use = config.port != DEFAULT_PORT;
             tokio::net::TcpListener::bind(SocketAddr::new(config.bind, 0)).await?
         }
         Err(e) => return Err(e),
@@ -1773,6 +1785,13 @@ pub async fn start_server(
 
     let addr = listener.local_addr()?;
     let port = addr.port();
+    if port_in_use {
+        let notice = port_in_use_warning(config.port, port);
+        warning = Some(match warning {
+            Some(existing) => format!("{existing}\n{notice}"),
+            None => notice,
+        });
+    }
 
     let allowed_hosts = if config.bind.is_loopback() {
         Some(vec![
@@ -5072,6 +5091,44 @@ mod tests {
             cmd_rx.recv().await,
             Some(DashboardCommand::CancelSwitchWorkspace { .. })
         ));
+    }
+
+    // TC-1463 / FR-1462: an explicit --port held by another process falls back
+    // to a free port with a warning instead of leaving the dashboard down.
+    #[tokio::test]
+    async fn tc_1463_explicit_port_in_use_falls_back_with_warning() {
+        let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let taken = squatter.local_addr().unwrap().port();
+        let services = DashboardServices {
+            mcp: None,
+            todos: None,
+            commands: None,
+            web_attached: false,
+            events_path: None,
+            memory: None,
+            docs: None,
+        };
+        let config = ServerConfig {
+            bind: "127.0.0.1".parse().unwrap(),
+            port: taken,
+            allow_remote: false,
+            token: "port-in-use-token-0123456789abcdef".to_owned(),
+            services,
+        };
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        let server = start_server(config, hub).await.expect("falls back");
+        assert_ne!(server.addr.port(), taken);
+        let warning = server.warning.clone().expect("warning");
+        assert!(
+            warning.contains(&format!("port {taken} is already in use")),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(&server.addr.port().to_string()),
+            "{warning}"
+        );
+        assert!(server.url.contains(&format!(":{}/", server.addr.port())));
+        drop(squatter);
     }
 
     // TC-879 (FR-876): opening another workspace does not need the App lock and
