@@ -23,6 +23,40 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Changed
 
+- **ACP runners for Cursor and grok (SPEC-acp-runners).** `[agents] grok_protocol`
+  defaults to `acp` on Linux (`grok agent -m <model> stdio`; dmuxai handles
+  permissions, no `--always-approve`). `[cursor] protocol` defaults to **`legacy`**
+  because Cursor ACP currently exposes only fast composer models; set
+  `protocol = "acp"` explicitly to use `cursor-agent acp` (fast-model guard
+  applies). ACP turns always `initialize`, then `session/load` / `session/resume`
+  (with `cwd` and `mcpServers: []`) or `session/new`; resume failures surface a
+  notice. Cursor reads `models.currentModelId`, attempts non-fast model selection,
+  and refuses fast-only sessions. Read-only turns use `session/set_mode` with
+  `modeId` or fail closed on permissions. Permission prompts prefer `allow_once`.
+  Cancel is polled independently and sends `session/cancel` before kill. Generic
+  `tool` activity rows are suppressed. Fake ACP tests use `--features test-fixtures`.
+  Cursor ACP argv includes `--sandbox enabled` when supported (OQ-1326).
+  ACP turns always terminate the child process group on error/cancel/success.
+  Read-only internal turns pick `modeId` from `modes.availableModes` and refuse
+  when unsettable. Permission-denied turns report failure. Composer fast-model
+  guard only switches within the requested model family. `DMUXAI_ACP_LOG` logs
+  compact mode/model summaries (not truncated raw JSON). Reject/deny permission
+  options fail the turn. Tool dashboard rows merge by `toolCallId`. Agent text
+  after tools only inserts `\n\n` when prior agent text exists. Opencode model
+  listing checks `DMUXAI_OPENCODE_BIN` before invoking `models`. Unit tests pin
+  `XDG_STATE_HOME` / `DMUXAI_STATE_DIR` to a temp directory. Cursor prewarm
+  applies only to legacy stream-json. Built-in **opencode** uses
+  `opencode acp --cwd <workspace>` when `[agents] opencode_protocol = "acp"`
+  (default); model via ACP `session/set_config_option` with verified free-model
+  policy (turn aborts if config fails or a paid default would be used).
+- **CLI:** `dmuxai run` / `todo run` reject `--mode` with an error instead of
+  running write-capable turns silently.
+- **AGY:** normal agent turns no longer require observed file writes to succeed.
+- **Single agent turn mode.** Removed `/mode`, the mode picker, and per-agent
+  mode state. Every user turn runs in agent mode; judge/plan/replan use
+  read-only adapter flags internally. CLI `--mode` and dashboard `set_mode` are
+  ignored with a notice.
+
 - **Dashboard center column uses the full width (SPEC-dashboard-fullwidth FR-1200..FR-1204).**
   The chat, graph and task checklist now fill the whole area between the
   sidebars instead of an 880px column, and the Documents panel is collapsible

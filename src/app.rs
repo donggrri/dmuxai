@@ -1901,6 +1901,11 @@ impl App {
                 .iter()
                 .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean);
             let Some(adapter) = adapter else {
+                if runner_clean == "opencode"
+                    && let Some(message) = dmuxai::settings::opencode_bin_explicit_missing_message()
+                {
+                    return Err(RunTodoError::Missing(message));
+                }
                 return Err(RunTodoError::UnknownAgent(agent_str.clone()));
             };
             adapter.agent()
@@ -2240,7 +2245,14 @@ impl App {
             .iter()
             .map(|adapter| adapter.agent())
             .find(|candidate| self.agent_runner_name(*candidate).eq_ignore_ascii_case(raw))
-            .ok_or_else(|| RunTodoError::UnknownAgent(format!("unknown agent '{raw}'")))
+            .ok_or_else(|| {
+                if raw.eq_ignore_ascii_case("opencode")
+                    && let Some(message) = dmuxai::settings::opencode_bin_explicit_missing_message()
+                {
+                    return RunTodoError::Missing(message);
+                }
+                RunTodoError::UnknownAgent(format!("unknown agent '{raw}'"))
+            })
     }
 
     fn agent_key_display_name(&self, key: AgentKey) -> String {
@@ -22752,6 +22764,7 @@ mod tests {
             ConversationEngine::open(std::path::Path::new(":memory:"), temp_dir.path()).unwrap();
         let mut settings = DmuxSettings::default();
         settings.cursor_prewarm = true;
+        settings.cursor_protocol = dmuxai::runner_protocol::RunnerProtocol::Legacy;
 
         let mut app =
             App::new_interactive(engine, temp_dir.path().to_path_buf(), settings).unwrap();
@@ -22811,6 +22824,7 @@ mod tests {
             ConversationEngine::open(std::path::Path::new(":memory:"), temp_dir.path()).unwrap();
         let mut settings = DmuxSettings::default();
         settings.cursor_prewarm = true;
+        settings.cursor_protocol = dmuxai::runner_protocol::RunnerProtocol::Legacy;
 
         // Headless App::new explicitly disables prewarm
         let mut app = App::new(engine, temp_dir.path().to_path_buf(), settings).unwrap();

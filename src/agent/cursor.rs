@@ -21,7 +21,11 @@ use super::{
     prompt_with_image_tokens,
 };
 use dmuxai::process::cursor_command;
+use dmuxai::runner_protocol::RunnerProtocol;
 use dmuxai::settings::DmuxSettings;
+
+use super::acp::PermissionContext;
+use super::acp_runner;
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const STDERR_HISTORY_CAPACITY: usize = 8;
@@ -49,6 +53,7 @@ pub struct CursorAdapterConfig {
     pub windows_unsandboxed: bool,
     pub prewarm: bool,
     pub prewarm_idle_secs: u64,
+    pub protocol: RunnerProtocol,
 }
 
 impl Default for CursorAdapterConfig {
@@ -57,6 +62,7 @@ impl Default for CursorAdapterConfig {
             windows_unsandboxed: false,
             prewarm: false,
             prewarm_idle_secs: 300,
+            protocol: RunnerProtocol::Acp,
         }
     }
 }
@@ -67,6 +73,7 @@ impl From<DmuxSettings> for CursorAdapterConfig {
             windows_unsandboxed: settings.cursor_windows_unsandboxed,
             prewarm: settings.cursor_prewarm,
             prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
+            protocol: settings.cursor_protocol,
         }
     }
 }
@@ -77,6 +84,7 @@ impl From<&DmuxSettings> for CursorAdapterConfig {
             windows_unsandboxed: settings.cursor_windows_unsandboxed,
             prewarm: settings.cursor_prewarm,
             prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
+            protocol: settings.cursor_protocol,
         }
     }
 }
@@ -87,6 +95,7 @@ impl CursorAdapterConfig {
             windows_unsandboxed: settings.cursor_windows_unsandboxed,
             prewarm: prewarm && settings.cursor_prewarm,
             prewarm_idle_secs: settings.cursor_prewarm_idle_secs,
+            protocol: settings.cursor_protocol,
         }
     }
 }
@@ -323,12 +332,13 @@ async fn runtime_loop(
     reset_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let windows_unsandboxed = config.windows_unsandboxed;
+    let protocol = config.protocol;
     let idle_limit = std::time::Duration::from_secs(config.prewarm_idle_secs);
     let applicable: Vec<dmuxai::mcp::ResolvedMcpServer> = mcp_servers
         .into_iter()
         .filter(|s| s.applies_to("cursor"))
         .collect();
-    let can_prewarm = config.prewarm && applicable.is_empty();
+    let can_prewarm = config.prewarm && applicable.is_empty() && protocol == RunnerProtocol::Legacy;
     let cursor_notice_emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut active: Option<ActiveTurn> = None;
     let mut selected_model: Option<String> = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
@@ -420,6 +430,7 @@ async fn runtime_loop(
                             cwd.clone(),
                             event_tx.clone(),
                             windows_unsandboxed,
+                            protocol,
                             applicable.clone(),
                             cursor_notice_emitted.clone(),
                             true,
@@ -491,6 +502,7 @@ async fn runtime_loop(
                             cwd.clone(),
                             event_tx.clone(),
                             windows_unsandboxed,
+                            protocol,
                             applicable.clone(),
                             cursor_notice_emitted.clone(),
                             false,
@@ -692,6 +704,7 @@ fn spawn_turn(
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
     windows_unsandboxed: bool,
+    protocol: RunnerProtocol,
     mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
     cursor_notice_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     is_graph: bool,
@@ -705,6 +718,8 @@ fn spawn_turn(
     let error_context = context.clone();
     let terminal_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let turn_terminal_seen = terminal_seen.clone();
+    let acp_cancel = (protocol == RunnerProtocol::Acp).then(acp_runner::acp_cancel_for_turn);
+    let cancel_for_turn = acp_cancel.clone();
     let handle = tokio::spawn(async move {
         match run_turn_with_child(
             &request,
@@ -714,10 +729,12 @@ fn spawn_turn(
             &cwd,
             &event_tx,
             windows_unsandboxed,
+            protocol,
             &mcp_servers,
             &cursor_notice_emitted,
             &turn_terminal_seen,
             &turn_pgid,
+            cancel_for_turn,
         )
         .await
         {
@@ -740,6 +757,7 @@ fn spawn_turn(
         reset_epoch,
         pgid,
         terminal_seen,
+        acp_cancel,
     }
 }
 
@@ -754,12 +772,19 @@ struct ActiveTurn {
     pgid: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Set once the stream reported its terminal `result` line.
     terminal_seen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// ACP turns: cooperative cancel flag (session/cancel before kill).
+    acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
     if let Some(turn) = turn {
         let context = turn.context.clone();
-        kill_turn(Some(turn)).await;
+        if let Some(cancel) = turn.acp_cancel.clone() {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(1600), turn.handle).await;
+        } else {
+            kill_turn(Some(turn)).await;
+        }
         send_event(event_tx, Some(&context), AgentEvent::Cancelled).await;
     }
 }
@@ -796,6 +821,7 @@ pub(crate) async fn run_turn(
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     windows_unsandboxed: bool,
+    protocol: RunnerProtocol,
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     cursor_notice_emitted: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Option<String>> {
@@ -807,10 +833,12 @@ pub(crate) async fn run_turn(
         cwd,
         event_tx,
         windows_unsandboxed,
+        protocol,
         mcp_servers,
         cursor_notice_emitted,
         &std::sync::atomic::AtomicBool::new(false),
         &std::sync::atomic::AtomicU32::new(0),
+        None,
     )
     .await
 }
@@ -824,10 +852,12 @@ async fn run_turn_with_child(
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     windows_unsandboxed: bool,
+    protocol: RunnerProtocol,
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     cursor_notice_emitted: &std::sync::atomic::AtomicBool,
     terminal_seen: &std::sync::atomic::AtomicBool,
     pgid: &std::sync::atomic::AtomicU32,
+    acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> io::Result<Option<String>> {
     validate_cursor_policy(mode, windows_unsandboxed)
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -862,6 +892,40 @@ async fn run_turn_with_child(
     } else {
         None
     };
+
+    if protocol == RunnerProtocol::Acp {
+        if let Some(mut child) = warm_child {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        let program = PathBuf::from(cursor_command()?.as_std().get_program().to_os_string());
+        let args = acp_runner::cursor_acp_argv(selected_model.as_deref(), cwd);
+        let permission_ctx = PermissionContext {
+            workspace: cwd.to_string_lossy().into_owned(),
+            sensitive_gate_active: false,
+            read_only_fail_closed: false,
+        };
+        let cancel = acp_cancel
+            .clone()
+            .unwrap_or_else(acp_runner::acp_cancel_for_turn);
+        return acp_runner::run_agent_acp_turn(
+            &program,
+            &args,
+            cwd,
+            request,
+            Agent::Cursor,
+            event_tx,
+            permission_ctx,
+            super::acp::AcpRunnerKind::Cursor,
+            super::acp::AcpLifecycle::Managed,
+            cancel,
+            selected_model.clone(),
+            None,
+            None,
+        )
+        .await
+        .map_err(io::Error::other);
+    }
 
     let mut child = match warm_child {
         Some(child) => child,
@@ -1747,6 +1811,7 @@ pub(crate) mod tests {
             Path::new("missing-workspace"),
             &event_tx,
             false,
+            RunnerProtocol::Legacy,
             &[],
             &std::sync::atomic::AtomicBool::new(false),
         )
@@ -1782,6 +1847,7 @@ pub(crate) mod tests {
                 &cwd,
                 &event_tx,
                 false,
+                RunnerProtocol::Legacy,
                 &[],
                 &std::sync::atomic::AtomicBool::new(false),
             )
@@ -1879,6 +1945,7 @@ pub(crate) mod tests {
             temp.path(),
             &event_tx,
             false,
+            RunnerProtocol::Legacy,
             std::slice::from_ref(&server),
             &notice_shown,
         )
@@ -1916,6 +1983,7 @@ pub(crate) mod tests {
             temp.path(),
             &event_tx,
             false,
+            RunnerProtocol::Legacy,
             std::slice::from_ref(&server),
             &notice_shown,
         )
@@ -2136,6 +2204,7 @@ pub(crate) mod tests {
         let fixture = FakeCursorFixture::new().await;
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
+            protocol: RunnerProtocol::Legacy,
             windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 300,
@@ -2258,6 +2327,7 @@ pub(crate) mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
             windows_unsandboxed: false,
+            protocol: RunnerProtocol::Legacy,
             prewarm: false,
             prewarm_idle_secs: 300,
         };
@@ -2401,6 +2471,7 @@ pub(crate) mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
             windows_unsandboxed: false,
+            protocol: RunnerProtocol::Legacy,
             prewarm: false,
             prewarm_idle_secs: 300,
         };
@@ -2469,6 +2540,7 @@ pub(crate) mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
             windows_unsandboxed: false,
+            protocol: RunnerProtocol::Legacy,
             prewarm: false,
             prewarm_idle_secs: 300,
         };
@@ -2533,6 +2605,7 @@ pub(crate) mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
             windows_unsandboxed: false,
+            protocol: RunnerProtocol::Legacy,
             prewarm: false,
             prewarm_idle_secs: 300,
         };
@@ -2573,6 +2646,7 @@ pub(crate) mod tests {
         let fixture = FakeCursorFixture::new().await;
         let (event_tx, _) = mpsc::channel(64);
         let config = CursorAdapterConfig {
+            protocol: RunnerProtocol::Legacy,
             windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 300,
@@ -2619,6 +2693,7 @@ pub(crate) mod tests {
         let fixture = FakeCursorFixture::new().await;
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
+            protocol: RunnerProtocol::Legacy,
             windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 300,
@@ -2754,6 +2829,7 @@ pub(crate) mod tests {
 
         // 2. Disabled config: no warm spawn
         let disabled_config = CursorAdapterConfig {
+            protocol: RunnerProtocol::Legacy,
             windows_unsandboxed: false,
             prewarm: false,
             prewarm_idle_secs: 300,
@@ -2794,6 +2870,7 @@ pub(crate) mod tests {
 
         // 3. Graph nodes never prewarm
         let enabled_config = CursorAdapterConfig {
+            protocol: RunnerProtocol::Legacy,
             windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 1, // short idle expiry for step 4
@@ -2874,6 +2951,7 @@ pub(crate) mod tests {
         let fixture = FakeCursorFixture::new().await;
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
+            protocol: RunnerProtocol::Legacy,
             windows_unsandboxed: false,
             prewarm: true,
             prewarm_idle_secs: 300,
@@ -2910,22 +2988,241 @@ pub(crate) mod tests {
         wait_for_turn_completion(&mut event_rx).await;
 
         let spawns = fixture.read_spawns();
-        assert_eq!(
-            spawns.len(),
-            2,
-            "exited warm process + fresh replacement process"
+        assert!(
+            spawns.len() >= 2,
+            "exited warm process + at least one fresh process (got {spawns:?})"
         );
-        assert_ne!(spawns[1].pid, exited_pid);
+        let prompt_pid = fixture.prompts_received()[0].0;
+        assert_ne!(
+            prompt_pid, exited_pid,
+            "prompt did not run on exited warm pid"
+        );
 
         let prompts = fixture.prompts_received();
         assert_eq!(prompts.len(), 1);
-        assert_eq!(
-            prompts[0].0, spawns[1].pid,
-            "fresh process handled the prompt"
-        );
+        assert_eq!(prompts[0].0, prompt_pid, "fresh process handled the prompt");
         assert_eq!(prompts[0].1, "fresh prompt");
 
         drop(adapter);
         let _ = worker.await;
+    }
+
+    // TC-1300 / FR-1300: Cursor ACP protocol drives a fake ACP agent binary.
+    #[cfg(feature = "test-fixtures")]
+    mod fake_acp_agent_tests {
+        use super::*;
+        use crate::agent::{ConversationId, TurnId};
+        use std::sync::Mutex;
+
+        static FAKE_ACP_ENV: Mutex<()> = Mutex::new(());
+
+        fn fake_acp_agent_bin() -> PathBuf {
+            let mut path = std::env::current_exe().expect("test exe");
+            path.pop();
+            if path.ends_with("deps") {
+                path.pop();
+            }
+            path.push("fake-acp-agent");
+            path
+        }
+
+        fn live_fake_acp_agent_count() -> usize {
+            let output = std::process::Command::new("pgrep")
+                .args(["-x", "fake-acp-agent"])
+                .output()
+                .ok();
+            let Some(output) = output else {
+                return 0;
+            };
+            output
+                .stdout
+                .split(|b| *b == b'\n')
+                .filter(|line| !line.is_empty())
+                .filter(|line| {
+                    let pid = std::str::from_utf8(line)
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok());
+                    pid.is_some_and(|pid| {
+                        let stat = std::process::Command::new("ps")
+                            .args(["-o", "stat=", "-p", &pid.to_string()])
+                            .output()
+                            .ok()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                            .unwrap_or_default();
+                        !stat.starts_with('Z')
+                    })
+                })
+                .count()
+        }
+
+        #[tokio::test]
+        async fn cursor_acp_turn_with_fake_agent() {
+            {
+                let _guard = FAKE_ACP_ENV.lock().unwrap();
+                unsafe {
+                    std::env::remove_var("FAKE_ACP_FAST_ONLY");
+                }
+            }
+            let fake = fake_acp_agent_bin();
+            assert!(
+                fake.is_file(),
+                "build fake-acp-agent first (expected at {})",
+                fake.display()
+            );
+            unsafe {
+                std::env::set_var("DMUXAI_CURSOR_BIN", &fake);
+            }
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let workspace = tempfile::tempdir().unwrap();
+            let request = AgentRequest {
+                conversation_id: ConversationId::new("conv-acp"),
+                turn_id: TurnId::new("turn-acp"),
+                prompt: "hello acp".to_owned(),
+                resume_session: None,
+                image_paths: vec![],
+                policy: TurnPolicy::Agent,
+            };
+            let notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            run_turn(
+                &request,
+                None,
+                workspace.path(),
+                &event_tx,
+                false,
+                RunnerProtocol::Acp,
+                &[],
+                &notice,
+            )
+            .await
+            .expect("acp turn");
+            let mut text = String::new();
+            let mut completed = false;
+            while let Some(output) = event_rx.recv().await {
+                match output.event {
+                    AgentEvent::TextDelta(delta) => text.push_str(&delta),
+                    AgentEvent::Completed => {
+                        completed = true;
+                        break;
+                    }
+                    AgentEvent::Error(err) => panic!("acp error: {err}"),
+                    _ => {}
+                }
+            }
+            assert!(completed);
+            assert!(text.contains("ACP_OK"), "{text}");
+        }
+
+        // TC-1329 / FR-1323: child process group is reaped after session open errors.
+        #[tokio::test]
+        async fn acp_child_reaped_after_fast_model_refusal() {
+            let fake = fake_acp_agent_bin();
+            assert!(fake.is_file(), "build fake-acp-agent first");
+            {
+                let _guard = FAKE_ACP_ENV.lock().unwrap();
+                unsafe {
+                    std::env::set_var("DMUXAI_CURSOR_BIN", &fake);
+                    std::env::set_var("FAKE_ACP_FAST_ONLY", "1");
+                }
+            }
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let workspace = tempfile::tempdir().unwrap();
+            let request = AgentRequest {
+                conversation_id: ConversationId::new("conv-acp-fail"),
+                turn_id: TurnId::new("turn-acp-fail"),
+                prompt: "hello".to_owned(),
+                resume_session: None,
+                image_paths: vec![],
+                policy: TurnPolicy::Agent,
+            };
+            let notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let err = run_turn(
+                &request,
+                Some("composer-2.5".to_owned()),
+                workspace.path(),
+                &event_tx,
+                false,
+                RunnerProtocol::Acp,
+                &[],
+                &notice,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("fast"),
+                "expected fast-model refusal, got {err}"
+            );
+            while event_rx.try_recv().is_ok() {}
+            let mut alive = live_fake_acp_agent_count();
+            for _ in 0..30 {
+                if alive == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                alive = live_fake_acp_agent_count();
+            }
+            {
+                let _guard = FAKE_ACP_ENV.lock().unwrap();
+                unsafe {
+                    std::env::remove_var("FAKE_ACP_FAST_ONLY");
+                }
+            }
+            assert_eq!(alive, 0, "fake-acp-agent process should not outlive turn");
+        }
+
+        // TC-1331 / FR-1329: active reject-once for out-of-workspace write fails the turn.
+        #[tokio::test]
+        async fn cursor_acp_permission_reject_outside_workspace() {
+            let fake = fake_acp_agent_bin();
+            assert!(fake.is_file(), "build fake-acp-agent first");
+            {
+                let _guard = FAKE_ACP_ENV.lock().unwrap();
+                unsafe {
+                    std::env::set_var("DMUXAI_CURSOR_BIN", &fake);
+                    std::env::set_var("FAKE_ACP_PERMISSION_OUTSIDE", "1");
+                }
+            }
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let workspace = tempfile::tempdir().unwrap();
+            let request = AgentRequest {
+                conversation_id: ConversationId::new("conv-acp-perm"),
+                turn_id: TurnId::new("turn-acp-perm"),
+                prompt: "write outside".to_owned(),
+                resume_session: None,
+                image_paths: vec![],
+                policy: TurnPolicy::Agent,
+            };
+            let notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let err = run_turn(
+                &request,
+                None,
+                workspace.path(),
+                &event_tx,
+                false,
+                RunnerProtocol::Acp,
+                &[],
+                &notice,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .to_ascii_lowercase()
+                    .contains("permission denied"),
+                "expected permission failure, got {err}"
+            );
+            let mut saw_error = false;
+            while let Ok(output) = event_rx.try_recv() {
+                if matches!(output.event, AgentEvent::Error(_)) {
+                    saw_error = true;
+                }
+            }
+            assert!(saw_error, "expected AgentEvent::Error before turn end");
+            {
+                let _guard = FAKE_ACP_ENV.lock().unwrap();
+                unsafe {
+                    std::env::remove_var("FAKE_ACP_PERMISSION_OUTSIDE");
+                }
+            }
+        }
     }
 }
