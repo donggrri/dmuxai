@@ -505,6 +505,7 @@ pub fn spawn_dashboard(exe: &Path, workspace: &Path) -> io::Result<std::process:
     cmd.args(open_dashboard_args(workspace))
         .env_remove("DMUXAI_WEB_TOKEN")
         .env_remove("DMUXAI_OPEN_CONVERSATION")
+        .env(HEADLESS_DASHBOARD_ENV, "1")
         .env("DMUXAI_WORKSPACE", workspace)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -516,6 +517,9 @@ pub fn spawn_dashboard(exe: &Path, workspace: &Path) -> io::Result<std::process:
     }
     cmd.spawn()
 }
+
+/// Env var that lets a spawned `--web` dashboard run without a TTY (FR-1470).
+pub const HEADLESS_DASHBOARD_ENV: &str = "DMUXAI_HEADLESS_DASHBOARD";
 
 /// If `workspace` already has a live dashboard, return its URL.
 pub fn live_dashboard_url(workspace: &Path) -> Option<String> {
@@ -529,6 +533,14 @@ pub fn live_dashboard_url(workspace: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    // TC-1470 (FR-1470): "Open in new window" asks for a headless dashboard.
+    #[test]
+    fn tc_1470_spawn_dashboard_sets_headless_env() {
+        assert_eq!(super::HEADLESS_DASHBOARD_ENV, "DMUXAI_HEADLESS_DASHBOARD");
+        let args = super::open_dashboard_args(std::path::Path::new("/w"));
+        assert_eq!(args, ["--web", "-C", "/w", "--port", "0"]);
+    }
 
     // TC-873 (FR-872): listing recents (every GET /api/workspace) must not
     // write probe files into the listed directories.

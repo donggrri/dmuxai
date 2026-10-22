@@ -1153,6 +1153,8 @@ fn normalize_workspace_path(target: &str, workspace_root: &Path) -> Option<Strin
 
 pub struct App {
     exit: bool,
+    /// FR-1470: no terminal; skip key/mouse polling (dashboard-only process).
+    headless: bool,
     selected: usize,
     workspace_root: PathBuf,
     pending_images: ImageAttachmentStore,
@@ -1414,6 +1416,7 @@ impl App {
             memory,
             memory_injected: HashMap::new(),
             exit: false,
+            headless: false,
             selected: adapter_index(Agent::default()),
             workspace_root,
             settings,
@@ -1700,7 +1703,7 @@ impl App {
                 dashboard_dirty = false;
             }
 
-            while event::poll(Duration::ZERO)? {
+            while !self.headless && event::poll(Duration::ZERO)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key),
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
@@ -10181,6 +10184,12 @@ impl App {
 
     fn push_system(&mut self, content: impl Into<String>) {
         self.messages.push(Message::new(Role::System, content));
+    }
+
+    /// FR-1470: run without a terminal (dashboard-only); input comes from the
+    /// web dashboard and the `quit` command ends the run.
+    pub fn set_headless(&mut self, headless: bool) {
+        self.headless = headless;
     }
 
     pub fn push_startup_notice(&mut self, content: impl Into<String>) {

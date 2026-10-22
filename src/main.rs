@@ -603,7 +603,9 @@ fn publish_discovery(
 
 /// Run the TUI, optionally alongside the in-process dashboard (FR-520, FR-530).
 async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+    // FR-1470: a dashboard started by "Open in new window" has no terminal.
+    let headless = web.is_some() && std::env::var_os(HEADLESS_DASHBOARD_ENV).is_some();
+    if !headless && (!io::stdin().is_terminal() || !io::stdout().is_terminal()) {
         eprintln!(
             "dmuxai needs an interactive terminal (TTY); run it in a terminal, or see dmuxai --help"
         );
@@ -669,8 +671,26 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
         app.attach_dashboard(DashboardHub::new(SnapshotSource::Tui, workspace).with_events(sink));
         None
     };
-    let mut session = TerminalSession::start()?;
-    let result = app.run(session.terminal_mut()).await;
+    let mut session = if headless {
+        app.set_headless(true);
+        None
+    } else {
+        Some(TerminalSession::start()?)
+    };
+    let result = match session.as_mut() {
+        Some(session) => app.run(session.terminal_mut()).await,
+        None => {
+            // Renders into a sink; the fixed viewport avoids a terminal size query.
+            let backend = ratatui::backend::CrosstermBackend::new(io::sink());
+            let mut terminal = ratatui::Terminal::with_options(
+                backend,
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 120, 40)),
+                },
+            )?;
+            app.run(&mut terminal).await
+        }
+    };
     let switch_target = app.take_switch_ready();
     let open_conversation = switch_target
         .as_deref()
@@ -696,6 +716,9 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     }
     result.map_err(Into::into)
 }
+
+/// Set by `workspace::spawn_dashboard` for a terminal-less `--web` (FR-1470).
+const HEADLESS_DASHBOARD_ENV: &str = dmuxai::workspace::HEADLESS_DASHBOARD_ENV;
 
 /// Conversation id the re-exec'd process opens on startup (FR-1227).
 const OPEN_CONVERSATION_ENV: &str = "DMUXAI_OPEN_CONVERSATION";
