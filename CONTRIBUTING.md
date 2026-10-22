@@ -95,6 +95,11 @@ authenticated CLIs when your change requires live verification (see [README.md](
 Fill out the pull request template and, for product changes that use the graph workflow,
 include an honest graph execution report as described in [MISSION.md](MISSION.md).
 
+## Releases
+
+Releases follow [docs/RELEASE-PROCESS.md](docs/RELEASE-PROCESS.md), including the
+[manual TC template](docs/RELEASE-PROCESS.md#manual-tc-template) for test cases without automation.
+
 ## Security
 
 Report vulnerabilities through GitHub **private vulnerability reporting** (repository
