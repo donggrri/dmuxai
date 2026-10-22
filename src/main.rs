@@ -677,6 +677,12 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     if let Some(warning) = startup_warning {
         app.push_startup_notice(warning);
     }
+    // FR-1601 regression guard: registering the signal handlers must happen
+    // before the dashboard attaches and the URL is printed. Signal stream
+    // creation installs the OS handler synchronously, so a SIGINT arriving
+    // right after stdout cannot default-kill the process and strand the
+    // discovery file behind.
+    let mut shutdown = headless.then(ShutdownSignals::register);
     let dashboard = if let Some(options) = web {
         let dashboard = attach_web_dashboard(&mut app, &workspace_root, &settings, options).await;
         // FR-1600: with no TUI to show the local notice, the URL must reach
@@ -717,7 +723,12 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
             // the shutdown path below with an `Ok` result.
             tokio::select! {
                 result = app.run(&mut terminal) => result,
-                _ = headless_shutdown_signal() => Ok(()),
+                _ = async {
+                    match shutdown.as_mut() {
+                        Some(shutdown) => shutdown.recv().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => Ok(()),
             }
         }
     };
@@ -747,37 +758,75 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     result.map_err(Into::into)
 }
 
-/// Resolves after SIGINT (Ctrl-C) or, on Unix, SIGTERM (FR-1601). A failed
-/// SIGTERM registration never blocks SIGINT handling.
+/// Signal listeners for a headless `--web` run (FR-1601): SIGINT and, on
+/// Unix, SIGTERM. Creating the stream registers the OS handler synchronously
+/// (see the regression guard in [`run_tui`]); a failed registration for one
+/// signal never blocks the other.
 #[cfg(unix)]
-async fn headless_shutdown_signal() {
-    let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate()).ok();
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = async move {
-            match sigterm.as_mut() {
+struct ShutdownSignals {
+    interrupt: Option<tokio::signal::unix::Signal>,
+    sigterm: Option<tokio::signal::unix::Signal>,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn register() -> Self {
+        Self {
+            interrupt: tokio::signal::unix::signal(SignalKind::interrupt()).ok(),
+            sigterm: tokio::signal::unix::signal(SignalKind::terminate()).ok(),
+        }
+    }
+
+    /// Resolves after SIGINT (Ctrl-C) or SIGTERM; never resolves if neither
+    /// stream could be registered.
+    async fn recv(&mut self) {
+        let sigterm = async {
+            match self.sigterm.as_mut() {
                 Some(sigterm) => {
                     let _ = sigterm.recv().await;
                 }
                 None => std::future::pending::<()>().await,
             }
-        } => {}
+        };
+        tokio::select! {
+            _ = async {
+                match self.interrupt.as_mut() {
+                    Some(interrupt) => {
+                        let _ = interrupt.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+            _ = sigterm => {}
+        }
     }
 }
 
-/// Resolves after Ctrl-C (SIGINT); Unix platforms also watch SIGTERM above.
+/// Windows counterpart of [`ShutdownSignals`] (FR-1601).
 #[cfg(not(unix))]
-async fn headless_shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+struct ShutdownSignals {
+    interrupt: Option<tokio::signal::windows::CtrlC>,
 }
 
-/// Set by `workspace::spawn_dashboard` for a terminal-less re-exec (FR-1470).
-///
-/// Since FR-1600 `--web` is always headless, so the variable no longer gates
-/// behaviour; the constant stays only so `workspace::spawn_dashboard` and its
-/// tests keep agreeing on the reserved name.
-#[allow(dead_code)]
-const HEADLESS_DASHBOARD_ENV: &str = dmuxai::workspace::HEADLESS_DASHBOARD_ENV;
+#[cfg(not(unix))]
+impl ShutdownSignals {
+    fn register() -> Self {
+        Self {
+            interrupt: tokio::signal::windows::ctrl_c().ok(),
+        }
+    }
+
+    /// Resolves after Ctrl-C; never resolves if the stream could not be
+    /// registered.
+    async fn recv(&mut self) {
+        match self.interrupt.as_mut() {
+            Some(interrupt) => {
+                let _ = interrupt.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
 
 /// Conversation id the re-exec'd process opens on startup (FR-1227).
 const OPEN_CONVERSATION_ENV: &str = "DMUXAI_OPEN_CONVERSATION";
@@ -930,8 +979,11 @@ async fn attach_web_dashboard(
             std::process::exit(2);
         }
         Err(error) => {
-            app.push_startup_notice(format!("dmuxai dashboard failed to start: {error}"));
-            None
+            // Headless `--web` (FR-1600) has no TUI to show a startup notice,
+            // so the failure must reach stderr and the process must not keep
+            // running with no UI.
+            eprintln!("dmuxai dashboard failed to start: {error}");
+            std::process::exit(2);
         }
     }
 }

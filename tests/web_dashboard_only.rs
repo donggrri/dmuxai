@@ -39,9 +39,12 @@ fn spawn_web_dashboard(
         .arg(workspace)
         .args(["--port", "0"])
         .env("XDG_STATE_HOME", state)
+        // Same pattern as tests/web_workspace_open.rs base_command:
+        // `state_base()` ignores XDG_STATE_HOME on Windows, so keep per-user
+        // state (e.g. record_recent_workspace) inside the temp dir (FR-451).
+        .env("DMUXAI_STATE_DIR", state)
         .env_remove("DMUXAI_WEB_TOKEN")
         .env_remove("DMUXAI_WORKSPACE")
-        .env_remove("DMUXAI_STATE_DIR")
         .env_remove("DMUXAI_HEADLESS_DASHBOARD")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
