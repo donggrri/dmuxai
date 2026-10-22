@@ -43,6 +43,8 @@ Any agent CLI with a headless command (opencode, Hermes, pi, ...) can be connect
 | FR-333 | Must | Process exits non-zero, matches a failure regex, or exceeds `timeout_secs`. | Turn is Failed with reason; on timeout/cancel the whole process group is killed. | No orphan processes remain. | TC-333, TC-334 |
 | FR-334 | Must | Agent registered. | Appears in `/agent`, F2 (from `models_command` filtered by `models_filter`) and graph nodes; models outside `allowed_models` are rejected. | models_command failure shows an error, not a hang. | TC-335 |
 | FR-335 | Should | Second turn in the same conversation. | `resume_arg` with stored session id is passed; per-mode args, `env` and rendered `temp_config_template` are applied. | Temp config is deleted after the turn. | TC-336 |
+| FR-1610 | Must | The built-in opencode preset (and the documented example in `README.md`, `docs/agents/presets.toml`, `docs/agents/custom-agents.md`) | The command is `opencode run --format json -m {model} {prompt}` with **no `--dir`**; the workspace is passed only as the child's cwd, which every opencode version honours | opencode builds that reject `--dir` ("Unrecognized flag: --dir in command opencode run") now work | TC-1610, TC-1612 |
+| FR-1611 | Must | A user-defined custom agent whose program basename is `opencode` (or `opencode.exe`) and whose command contains the pair `--dir {workspace}` | `build_argv` drops that pair (cwd is already the workspace) so old configs keep working on every opencode version | Other programs, and `--dir` with any value other than `{workspace}`, are left unchanged | TC-1611 |
 | UX-330 | Should | Custom agent replies. | Lines use the configured `color`. | — | TC-337 |
 
 ## 5. Acceptance scenarios and test design
@@ -57,6 +59,9 @@ Any agent CLI with a headless command (opencode, Hermes, pi, ...) can be connect
 | TC-335 | FR-334 | unit | one custom agent, models_command fake | open picker | filtered list; disallowed model rejected | `models_are_filtered_and_policy_enforced`; picker listing verified live (TEST-PLAN L-12) |
 | TC-336 | FR-335 | unit | stored session id | build second turn | resume arg + env + temp config | `test_build_argv_images_and_resume`, `temp_config_is_written_passed_and_removed` (unix) |
 | TC-337 | UX-330 | manual | opencode example config, `opencode/glm-5.3-flash-free` | send prompt in TUI | reply in configured color | TEST-PLAN L-12 |
+| TC-1610 | FR-1610 | unit | opencode preset | build argv | no `--dir` element; cwd of the built command is the workspace | `cargo test tc_1610_opencode_preset_has_no_dir_flag` |
+| TC-1611 | FR-1611 | unit | custom spec `opencode … --dir {workspace} …`; and a non-opencode program with `--dir {workspace}` | build argv | pair dropped for opencode only | `cargo test tc_1611_opencode_dir_pair_dropped` |
+| TC-1612 | FR-1610 | manual | dashboard, runner opencode `opencode/glm-5.3-flash-free` | ask "run pwd" | reply shows the workspace path; no "Unrecognized flag" | dashboard screenshot |
 
 ## 6. Data, integration, and safety contracts
 
