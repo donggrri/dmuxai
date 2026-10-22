@@ -1527,7 +1527,7 @@ async fn post_workspace_open(
             );
         }
     };
-    let child = match crate::workspace::spawn_dashboard(&exe, &canonical) {
+    let mut child = match crate::workspace::spawn_dashboard(&exe, &canonical) {
         Ok(child) => child,
         Err(error) => {
             return error_json(
@@ -1542,13 +1542,28 @@ async fn post_workspace_open(
         if let Some(discovery) = crate::web::discovery::read_discovery(&canonical)
             && discovery.pid == pid
         {
+            // FR-1472: reap the child when it exits later.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
             let url = crate::workspace::discovery_dashboard_url(&discovery);
             return json_ok(
                 StatusCode::OK,
                 &serde_json::json!({ "ok": true, "url": url }),
             );
         }
-        if std::time::Instant::now() >= deadline || !crate::workspace::process_alive(pid) {
+        // FR-1471: an exited child is reaped and reported at once.
+        if let Ok(Some(status)) = child.try_wait() {
+            return error_json(
+                StatusCode::BAD_GATEWAY,
+                &format!("the new dashboard exited before publishing a URL ({status})"),
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
             return error_json(
                 StatusCode::GATEWAY_TIMEOUT,
                 "the new dashboard did not publish a URL",
@@ -5220,6 +5235,67 @@ mod tests {
         }
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("http://127.0.0.1:9/?token="), "{body}");
+    }
+
+    // TC-1470 (FR-1470) + TC-1472 (FR-1471): the spawned dashboard gets the
+    // headless env, and a child that exits before publishing fails fast.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tc_1472_open_fails_fast_when_child_exits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("proj");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let marker = tmp.path().join("headless-env.txt");
+        let script = tmp.path().join("exits.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$DMUXAI_HEADLESS_DASHBOARD\" > '{}'\nexit 3\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        let token = "workspace-open-token-000000000000";
+        let hub = test_hub();
+        hub.set_switch_config(WorkspaceSwitchConfig {
+            current_exe: Some(script),
+            ..WorkspaceSwitchConfig::default()
+        });
+        let router = build_router_with(
+            hub,
+            token.to_owned(),
+            allowed_localhost(),
+            DashboardServices {
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        );
+        let started = std::time::Instant::now();
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/workspace/open",
+                token,
+                &serde_json::json!({ "path": workspace }).to_string(),
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = read_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(body.contains("exited before publishing a URL"), "{body}");
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "fails fast, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "1");
     }
 
     // TC-875 (FR-874)
