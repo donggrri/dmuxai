@@ -2331,3 +2331,11 @@ main {
   gap: 8px;
   margin-top: 4px;
 }
+
+/* SPEC-stage-skills UX-1500 / UX-1501 */
+.skills-popover { width: min(46rem, 96vw); max-height: min(80vh, 40rem); }
+.skills-table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+.skills-table th, .skills-table td { border-bottom: 1px solid var(--border, #ddd); padding: 4px 6px; text-align: left; vertical-align: middle; }
+.skills-input { width: 100%; min-width: 180px; }
+.skills-status { color: var(--muted, #666); }
+.graph-approval-skills { font-style: italic; }

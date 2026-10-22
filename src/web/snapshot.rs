@@ -374,6 +374,9 @@ pub struct ApprovalView {
     pub decided_by: Option<DecisionBy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<ApprovalStepView>,
+    /// SPEC-stage-skills UX-1501: skills per step role (after task overrides).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub stage_skills: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -659,6 +662,7 @@ fn approval_view(run: &GraphRun) -> Option<ApprovalView> {
         notes,
         decided_by: approval.decided_by,
         steps,
+        stage_skills: Default::default(),
     })
 }
 

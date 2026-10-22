@@ -33,6 +33,7 @@
   <button id="diff-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="diff" aria-controls="docs" aria-expanded="false" title="Show files changed by agents (Esc closes)" aria-label="Diff">Diff <span id="diff-count" class="todos-count" aria-hidden="true" hidden>0</span></button>
   <button id="graph-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="graph" aria-controls="graph" aria-expanded="false" title="Show the graph run and plan (Esc closes)" aria-label="Graph">Graph <span id="graph-indicator" class="view-indicator" aria-hidden="true" hidden></span></button>
   <button id="memory-toggle" type="button" class="btn sidebar-toggle memory-top-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="memory-popover" title="Memory vault status">Memory <span id="memory-badge" class="memory-badge" aria-hidden="true">Off</span></button>
+  <button id="skills-toggle" type="button" class="btn sidebar-toggle memory-top-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="skills-popover" title="Stage skills">Skills</button>
   <nav id="status" class="status" aria-label="dashboard status">
     <span id="run-status" class="run-status run-status-idle" role="status" aria-live="polite">Idle</span>
     <span class="stat"><span class="stat-k">workspace</span><button id="workspace-button" type="button" class="btn stat-v workspace-button" aria-haspopup="dialog" title="">&ndash;</button></span>
@@ -122,6 +123,7 @@
   </section>
 
   <div id="memory-popover" class="memory-popover" role="dialog" aria-label="Memory" hidden></div>
+<div id="skills-popover" class="memory-popover skills-popover" role="dialog" aria-label="Stage skills" tabindex="-1" hidden></div>
 </main>
 <nav id="sessions-sidebar" class="sessions-sidebar" aria-label="Sessions" data-parity="conversations" inert>
   <div class="sidebar-header sessions-header">
@@ -250,6 +252,7 @@
   </div>
 </div>
 <script src="/assets/memory.js" defer></script>
+<script src="/assets/skills.js" defer></script>
 <script src="/assets/session.js" defer></script>
 <script src="/assets/workspace.js" defer></script>
 <script src="/assets/sidebar-resize.js" defer></script>

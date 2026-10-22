@@ -323,6 +323,18 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn async_main(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    // SPEC-stage-skills FR-1515: `dmuxai skills [list|sync|approve <source>]`.
+    if args.first().map(String::as_str) == Some("skills") {
+        let workspace = std::env::var_os("DMUXAI_WORKSPACE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or(std::env::current_dir()?);
+        let settings = dmuxai::settings::DmuxSettings::load(&workspace);
+        for warning in &settings.config_warnings {
+            eprintln!("warning: {warning}");
+        }
+        let code = dmuxai::stage_skills::run_cli(&args[1..], &workspace, &settings.stage_skills);
+        std::process::exit(code);
+    }
     let action = parse_cli(args);
     match action {
         CliAction::Help => {
