@@ -22,7 +22,7 @@ TUI (`dmuxai` in a project directory; here AGY answering in Ask mode):
 
 ![DmuxAI TUI](docs/images/tui.png)
 
-Web dashboard (`dmuxai --web` for TUI + dashboard, or `dmuxai serve` view-only).
+Web dashboard (`dmuxai --web` for dashboard only (no TUI); the URL is printed, or `dmuxai serve` view-only).
 From the top: the Chat panel (same session as the TUI), agents, to-dos,
 documents changed by agents, the live graph run as a subway map, and memory.
 The graph in this shot is demo data and the token is redacted:
@@ -33,7 +33,7 @@ The graph in this shot is demo data and the token is redacted:
 cd /path/to/project
 dmuxai                          # TUI
 dmuxai -C /path/to/project      # run in /path/to/project from any directory (also --workspace-dir DIR)
-dmuxai --web                    # TUI + local dashboard; the URL with its access token is shown as a notice
+dmuxai --web                    # dashboard only (no TUI); the URL with its access token is printed
 dmuxai serve                    # dashboard only (no TTY needed); prints: dmuxai dashboard: http://127.0.0.1:7420/?token=...
 dmuxai serve --port 0           # pick a free port
 ```

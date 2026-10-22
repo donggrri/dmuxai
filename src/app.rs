@@ -2755,8 +2755,7 @@ impl App {
                 let Some(info) = self
                     .model_catalogs
                     .get(&target)
-                    .and_then(|catalog| catalog.models.iter().find(|m| m.id == model.trim()))
-                    .cloned()
+                    .and_then(|catalog| resolve_catalog_model_id(target, &catalog.models, &model))
                 else {
                     return Err(RunTodoError::Missing(format!(
                         "unknown model '{}' for {target}",
@@ -14387,6 +14386,31 @@ fn bounded_activity_detail(value: &str) -> String {
     } else {
         prefix
     }
+}
+
+/// Resolve a requested model id against a runner's catalog (SPEC-agy-bare-model).
+/// Exact matches win; for the agy runner only, a bare id falls back to its
+/// `-medium` variant when present.
+fn resolve_catalog_model_id(
+    target: Agent,
+    models: &[ModelInfo],
+    requested: &str,
+) -> Option<ModelInfo> {
+    let requested = requested.trim();
+    models
+        .iter()
+        .find(|m| m.id == requested)
+        .cloned()
+        .or_else(|| {
+            if target == Agent::Agy {
+                models
+                    .iter()
+                    .find(|m| m.id == format!("{requested}-medium"))
+                    .cloned()
+            } else {
+                None
+            }
+        })
 }
 
 /// Dashboard view of one model. Efforts are listed only for runners that can
@@ -28213,6 +28237,36 @@ mod tests {
         assert_eq!(sent.lock().unwrap().len(), 2);
         complete_sent_graph_turn(&mut app, &sent, 1);
         assert!(app.graph_session.is_none());
+    }
+
+    // TC-1493 (FR-1493): exact matches win; only agy falls back to `-medium`
+    // for a bare id; unknown ids and non-agy fallbacks stay unresolved.
+    #[test]
+    fn agy_bare_model_resolves_to_medium() {
+        let agy_models = vec![
+            ModelInfo::new("gemini-3.8-flash-medium", "Gemini 3.8 Flash Medium"),
+            ModelInfo::new("gemini-3.8-flash-high", "Gemini 3.8 Flash High"),
+        ];
+        // Bare agy id resolves to the `-medium` catalog entry.
+        assert_eq!(
+            resolve_catalog_model_id(Agent::Agy, &agy_models, "gemini-3.8-flash"),
+            Some(agy_models[0].clone())
+        );
+        // Exact match is kept even with the `-medium` fallback available.
+        assert_eq!(
+            resolve_catalog_model_id(Agent::Agy, &agy_models, "gemini-3.8-flash-high"),
+            Some(agy_models[1].clone())
+        );
+        // Unknown agy id (no exact or `-medium` entry) still fails.
+        assert_eq!(
+            resolve_catalog_model_id(Agent::Agy, &agy_models, "gemini-3.8-ultra"),
+            None
+        );
+        // Non-agy runners never apply the bare-name fallback.
+        assert_eq!(
+            resolve_catalog_model_id(Agent::Cursor, &agy_models, "gemini-3.8-flash"),
+            None
+        );
     }
 }
 

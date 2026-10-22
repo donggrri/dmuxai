@@ -6,7 +6,7 @@ All commands run against the workspace (repo) they are started in.
 | Surface | Entry point | Use it when |
 | --- | --- | --- |
 | CLI | `dmuxai run`, `todo`, `status`, `events` | A one-shot prompt, a to-do action or a status/event query from a script. |
-| HTTP | `dmuxai serve` (view-only) or `dmuxai --web` | You want to drive a dashboard that is already running (another process owns the TUI). |
+| HTTP | `dmuxai serve` (view-only) or `dmuxai --web` | You want to drive a dashboard that is already running (another process owns the writable dashboard). |
 | MCP | `dmuxai mcp` (stdio) | An agent client (IDE, chat bot) needs DmuxAI as tools. |
 | Events | `.dmuxai/events.jsonl` + HTTP/CLI/MCP readers | Following progress and reconstructing state changes. |
 
@@ -120,7 +120,7 @@ Start a dashboard, then drive it over HTTP:
 
 ```bash
 dmuxai serve            # dashboard only, view-only for prompt/run
-dmuxai --web            # TUI + dashboard, prompt/run enabled
+dmuxai --web            # dashboard only, no TUI; prompt/run enabled, prints the URL
 dmuxai serve --port 0   # pick a free port
 ```
 
