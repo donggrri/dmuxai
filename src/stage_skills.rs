@@ -1015,7 +1015,7 @@ pub fn interview_prompt(
 ) -> String {
     let mut out = String::new();
     out.push_str(prefix);
-    out.push_str("You are in the planning interview for the task below. Do not change files.\n");
+    out.push_str("You are in the planning interview for the task below. Do not change files and do not run shell commands; read files only if you need to.\n");
     if round >= max_rounds {
         out.push_str(&format!(
             "This is round {round} of {max_rounds}, the last one. Do not ask more questions. Summarize the decisions in a short list and end with a line `{INTERVIEW_DONE_MARKER}`.\n"

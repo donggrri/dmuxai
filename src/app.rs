@@ -785,6 +785,9 @@ struct PendingPlan {
 
 /// SPEC-stage-skills FR-1512: a planning interview run by a question skill
 /// (for example grill-me) before the plan turn.
+/// Prefix for write-capable graph steps (implement, draft).
+const WRITE_STEP_NOTE: &str = "This step runs with file write access. Earlier read-only turns in this conversation (interview, explore, ask mode) no longer apply: make the change in the files directly.\n\n";
+
 struct SkillInterview {
     agent: Agent,
     prompt: String,
@@ -1337,6 +1340,10 @@ pub struct App {
     pub(crate) switch_ready: Option<PathBuf>,
     /// Next user/agent turn policy from dashboard `mode` or headless `mode` (cleared on send).
     pending_turn_policy: Option<TurnPolicy>,
+    /// Cursor CLI keeps a chat in ask mode once a read-only turn ran in it, even
+    /// when a later turn passes `--force`. True when the stored Cursor session may
+    /// be such a chat (also at startup, when it is unknown).
+    cursor_session_maybe_read_only: bool,
     /// Cached assistant HTML keyed by transcript message id (`conversation:index`).
     chat_markdown_cache: HashMap<String, (u64, String)>,
 }
@@ -1567,6 +1574,7 @@ impl App {
             switch_pending: None,
             switch_ready: None,
             pending_turn_policy: None,
+            cursor_session_maybe_read_only: true,
             chat_markdown_cache: HashMap::new(),
         };
         let runners = app.registered_runner_names();
@@ -4175,6 +4183,14 @@ impl App {
             return Err(RunTodoError::Internal(message.to_owned()));
         }
         let policy = self.pending_turn_policy.unwrap_or(TurnPolicy::Agent);
+        let mut request = request;
+        if agent == Agent::Cursor {
+            if policy == TurnPolicy::Agent && self.cursor_session_maybe_read_only {
+                // Start a fresh Cursor chat; the transcript is replayed as context.
+                request.resume_session = None;
+            }
+            self.cursor_session_maybe_read_only = policy == TurnPolicy::ReadOnly;
+        }
         let require_file_edits = self.graph_node_expects_file_edits(agent);
         let image_paths_for_message = image_paths.clone();
         let mut adapter_request = adapter_request(request, image_paths, policy, require_file_edits);
@@ -4489,6 +4505,7 @@ impl App {
         self.session_conversations = None;
         self.chat_markdown_cache.clear();
         self.clear_pending_turn_policy();
+        self.cursor_session_maybe_read_only = true;
         for adapter in &self.adapters {
             let _ = adapter.reset();
         }
@@ -9877,6 +9894,25 @@ impl App {
             );
             prompt = format!("{prefix}{prompt}");
         }
+        // Read-only turns earlier in the conversation (planning interview, explore
+        // nodes) can leave replies such as "I'm in ask mode" in the context; a
+        // write step must not mimic them.
+        let multi_step = self.graph_session.as_ref().is_some_and(|session| {
+            session
+                .run()
+                .plan
+                .nodes
+                .iter()
+                .filter(|node| node.role != NodeRole::Orchestrate)
+                .count()
+                > 1
+        });
+        if multi_step
+            && matches!(assignment.role, NodeRole::Implement | NodeRole::Draft)
+            && self.pending_turn_policy.unwrap_or(TurnPolicy::Agent) == TurnPolicy::Agent
+        {
+            prompt = format!("{WRITE_STEP_NOTE}{prompt}");
+        }
         if let Some(session) = &self.graph_session {
             let skill_id = session
                 .run()
@@ -10485,6 +10521,9 @@ impl App {
             self.skill_interview_finish = Some(String::new());
             return;
         }
+        // The read-only policy belongs to this interview turn only; later graph
+        // nodes of the same conversation must run with their own policy.
+        self.clear_pending_turn_policy();
         for message in self.messages.iter_mut().skip(before) {
             if message.role == Role::User {
                 message.content = label.clone();
@@ -15093,6 +15132,25 @@ mod tests {
         let graph = graph_node_requests(&sent);
         assert_eq!(graph.len(), 1);
         assert!(!graph[0].require_file_edits);
+    }
+
+    #[test]
+    fn cursor_read_only_turn_marks_session_for_fresh_chat() {
+        let (mut app, sent) = test_app();
+        app.cursor_session_maybe_read_only = false;
+        app.pending_turn_policy = Some(TurnPolicy::ReadOnly);
+        app.try_submit_to_agent(Agent::Cursor, "ask".into(), false, false)
+            .unwrap();
+        assert!(app.cursor_session_maybe_read_only);
+        let first = sent.lock().unwrap().last().unwrap().1.clone();
+        app.apply_agent_output(triage_output(Agent::Cursor, &first, AgentEvent::Completed));
+        app.clear_pending_turn_policy();
+        app.try_submit_to_agent(Agent::Cursor, "edit".into(), false, false)
+            .unwrap();
+        let last = sent.lock().unwrap().last().unwrap().1.clone();
+        assert_eq!(last.policy, TurnPolicy::Agent);
+        assert!(last.resume_session.is_none(), "fresh chat after ask mode");
+        assert!(!app.cursor_session_maybe_read_only);
     }
 
     #[test]
@@ -26060,6 +26118,10 @@ mod tests {
         assert_eq!(first[0].policy, TurnPolicy::ReadOnly);
         assert!(first[0].prompt.contains("GRILL-BODY"));
         assert!(first[0].prompt.contains("Round 1 of at most 5"));
+        assert!(
+            h.app.pending_turn_policy.is_none(),
+            "read-only applies to the interview turn only"
+        );
         assert!(requests_with_prefix(&h.sent, "plan-").is_empty());
         finish_plain(&mut h, &first[0], "Q1. Which auth provider?");
         h.app.input = "OAuth with GitHub".to_owned();
