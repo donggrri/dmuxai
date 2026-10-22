@@ -300,7 +300,7 @@ continuity via their session id, and can run graph nodes:
 name = "opencode-glm"
 command = ["opencode", "run", "--format", "json", "-m", "{model}", "{prompt}"]
 default_model = "opencode/glm-5.3-flash-free"
-output = "jsonl"
+output = "jsonl"                  # required for --format json
 text_path = "/part/text"
 text_when = { path = "/type", equals = "text" }
 session_id_path = "/sessionID"

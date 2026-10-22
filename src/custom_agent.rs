@@ -71,7 +71,7 @@ pub struct CustomAgentSpec {
     #[serde(default)]
     pub allowed_models: Option<String>,
     #[serde(default)]
-    pub output: CustomAgentOutput,
+    pub output: Option<CustomAgentOutput>,
     #[serde(default)]
     pub text_path: Option<String>,
     #[serde(default)]
@@ -128,7 +128,7 @@ pub fn opencode_preset(program: &str) -> CustomAgentSpec {
         models_command: words(&[program, "models"]),
         models_filter: Some("-free$".to_owned()),
         allowed_models: Some("^opencode/.*-free$".to_owned()),
-        output: CustomAgentOutput::Jsonl,
+        output: Some(CustomAgentOutput::Jsonl),
         text_path: Some("/part/text".to_owned()),
         text_when: Some(TextWhen {
             path: "/type".to_owned(),
@@ -178,7 +178,7 @@ pub fn grok_preset(program: &str) -> CustomAgentSpec {
         default_model: None,
         models_command: words(&[program, "models"]),
         allowed_models: Some(r"(?i)^grok-[a-z0-9][a-z0-9._-]*$".to_owned()),
-        output: CustomAgentOutput::Jsonl,
+        output: Some(CustomAgentOutput::Jsonl),
         text_path: Some("/data".to_owned()),
         text_when: Some(TextWhen {
             path: "/type".to_owned(),
@@ -298,6 +298,36 @@ impl CustomAgentSpec {
     /// Returns the timeout in seconds, defaulting to 900.
     pub fn timeout_secs(&self) -> u64 {
         self.timeout_secs.unwrap_or(900)
+    }
+
+    /// Returns whether any of `text_path`, `text_when`, `error_path`, `session_id_path`,
+    /// `done_when`, or `text_break_when` is set.
+    pub fn has_jsonl_path_fields(&self) -> bool {
+        self.text_path.is_some()
+            || self.text_when.is_some()
+            || self.error_path.is_some()
+            || self.session_id_path.is_some()
+            || self.done_when.is_some()
+            || self.text_break_when.is_some()
+    }
+
+    /// Returns the effective output format, inferring Jsonl when JSONL path fields
+    /// are set but output is not explicitly set to Jsonl.
+    ///
+    /// - If `output` is `Some(Jsonl)`, the output is `Jsonl`.
+    /// - If `output` is `Some(Text)`, the output is `Text` (path fields are ignored
+    ///   even when configured, because the user explicitly chose text mode).
+    /// - If `output` is `None` (not set in config) and any JSONL path field is configured,
+    ///   the output is inferred as `Jsonl`.
+    /// - If `output` is `None` and no JSONL path field is configured, the output is `Text`
+    ///   (backward‑compatible default).
+    pub fn effective_output(&self) -> CustomAgentOutput {
+        match self.output {
+            Some(CustomAgentOutput::Jsonl) => CustomAgentOutput::Jsonl,
+            Some(CustomAgentOutput::Text) => CustomAgentOutput::Text,
+            None if self.has_jsonl_path_fields() => CustomAgentOutput::Jsonl,
+            None => CustomAgentOutput::Text,
+        }
     }
 
     /// Validates the specification according to documentation constraints.
@@ -1029,7 +1059,7 @@ implement = []
         assert_eq!(spec.label(), "opencode");
         assert_eq!(spec.color(), "#ffa500");
         assert_eq!(spec.prompt_via, PromptVia::Arg);
-        assert_eq!(spec.output, CustomAgentOutput::Jsonl);
+        assert_eq!(spec.effective_output(), CustomAgentOutput::Jsonl);
         assert_eq!(spec.timeout_secs(), 900);
         assert_eq!(
             spec.default_model.as_deref(),
@@ -1061,11 +1091,72 @@ command = ["pi", "run"]
         assert_eq!(spec.label(), "pi");
         assert_eq!(spec.color(), "white");
         assert_eq!(spec.prompt_via, PromptVia::Arg);
-        assert_eq!(spec.output, CustomAgentOutput::Text);
+        assert_eq!(spec.effective_output(), CustomAgentOutput::Text);
         assert_eq!(spec.timeout_secs(), 900);
         assert!(spec.image_arg.is_empty());
         assert!(spec.env.is_empty());
         assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn tc_345_effective_output_infers_jsonl_when_text_path_set() {
+        let toml_str = r#"
+name = "test-agent"
+command = ["sh", "-c", "{prompt}"]
+text_path = "/part/text"
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            spec.effective_output(),
+            CustomAgentOutput::Jsonl,
+            "inference: no output set but text_path configured => Jsonl"
+        );
+    }
+
+    #[test]
+    fn tc_346_effective_output_explicit_text_ignores_path_fields() {
+        let toml_str = r#"
+name = "test-agent"
+command = ["sh", "-c", "{prompt}"]
+output = "text"
+text_path = "/part/text"
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            spec.effective_output(),
+            CustomAgentOutput::Text,
+            "explicit output = text with text_path => Text (path fields ignored)"
+        );
+    }
+
+    #[test]
+    fn tc_347_effective_output_defaults_to_text_without_paths() {
+        let toml_str = r#"
+name = "test-agent"
+command = ["sh", "-c", "{prompt}"]
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            spec.effective_output(),
+            CustomAgentOutput::Text,
+            "no output, no path fields => Text (backward compat)"
+        );
+    }
+
+    #[test]
+    fn explicit_jsonl_output_preserved() {
+        let toml_str = r#"
+name = "test-agent"
+command = ["sh", "-c", "{prompt}"]
+output = "jsonl"
+text_path = "/part/text"
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            spec.effective_output(),
+            CustomAgentOutput::Jsonl,
+            "output = jsonl with text_path => Jsonl"
+        );
     }
 
     #[test]
