@@ -26,6 +26,8 @@ use dmuxai::web::{
     SnapshotSource, check_bind, generate_token, start_server,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
+#[cfg(unix)]
+use tokio::signal::unix::SignalKind;
 
 type DmuxTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -95,7 +97,7 @@ Options:
   -V, --version          Print version information and exit
   -C, --workspace-dir DIR  Run in DIR instead of the current directory
   serve            Run the local dashboard server without the TUI
-  --web            Run the TUI and the local dashboard server
+  --web            Run the local dashboard with agents (no TUI)
   --port N         Dashboard port (default 7420)
   --bind ADDR      Dashboard bind address (default 127.0.0.1)
   --allow-remote   Allow binding to a non-loopback address
@@ -614,9 +616,11 @@ fn publish_discovery(
 }
 
 /// Run the TUI, optionally alongside the in-process dashboard (FR-520, FR-530).
+///
+/// FR-1600: `--web` runs headless on its own — the terminal UI is never
+/// started, so no TTY is required. Only plain `dmuxai` keeps the TTY check.
 async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
-    // FR-1470: a dashboard started by "Open in new window" has no terminal.
-    let headless = web.is_some() && std::env::var_os(HEADLESS_DASHBOARD_ENV).is_some();
+    let headless = web.is_some();
     if !headless && (!io::stdin().is_terminal() || !io::stdout().is_terminal()) {
         eprintln!(
             "dmuxai needs an interactive terminal (TTY); run it in a terminal, or see dmuxai --help"
@@ -674,7 +678,15 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
         app.push_startup_notice(warning);
     }
     let dashboard = if let Some(options) = web {
-        attach_web_dashboard(&mut app, &workspace_root, &settings, options).await
+        let dashboard = attach_web_dashboard(&mut app, &workspace_root, &settings, options).await;
+        // FR-1600: with no TUI to show the local notice, the URL must reach
+        // stdout so scripts can find the dashboard; `serve` prints the same
+        // line. This branch is always headless.
+        if let Some(server) = dashboard.as_ref() {
+            println!("dmuxai dashboard: {}", server.url);
+            io::stdout().flush()?;
+        }
+        dashboard
     } else {
         // No server, but a hub still feeds the event log (FR-768).
         let workspace = dmuxai::workspace::normalize_workspace_path(&workspace_root)
@@ -700,7 +712,13 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
                     viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 120, 40)),
                 },
             )?;
-            app.run(&mut terminal).await
+            // FR-1601: SIGINT/SIGTERM also end a headless `--web` run. When a
+            // signal wins, the run future is dropped and control continues to
+            // the shutdown path below with an `Ok` result.
+            tokio::select! {
+                result = app.run(&mut terminal) => result,
+                _ = headless_shutdown_signal() => Ok(()),
+            }
         }
     };
     let switch_target = app.take_switch_ready();
@@ -729,7 +747,36 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     result.map_err(Into::into)
 }
 
-/// Set by `workspace::spawn_dashboard` for a terminal-less `--web` (FR-1470).
+/// Resolves after SIGINT (Ctrl-C) or, on Unix, SIGTERM (FR-1601). A failed
+/// SIGTERM registration never blocks SIGINT handling.
+#[cfg(unix)]
+async fn headless_shutdown_signal() {
+    let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate()).ok();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = async move {
+            match sigterm.as_mut() {
+                Some(sigterm) => {
+                    let _ = sigterm.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        } => {}
+    }
+}
+
+/// Resolves after Ctrl-C (SIGINT); Unix platforms also watch SIGTERM above.
+#[cfg(not(unix))]
+async fn headless_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Set by `workspace::spawn_dashboard` for a terminal-less re-exec (FR-1470).
+///
+/// Since FR-1600 `--web` is always headless, so the variable no longer gates
+/// behaviour; the constant stays only so `workspace::spawn_dashboard` and its
+/// tests keep agreeing on the reserved name.
+#[allow(dead_code)]
 const HEADLESS_DASHBOARD_ENV: &str = dmuxai::workspace::HEADLESS_DASHBOARD_ENV;
 
 /// Conversation id the re-exec'd process opens on startup (FR-1227).
