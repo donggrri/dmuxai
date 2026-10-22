@@ -9533,6 +9533,10 @@ impl App {
                     self.quiet_graph_run = false;
                     if let Some(session) = self.graph_session.as_mut() {
                         session.finalize_failure();
+                        if message.starts_with(GRAPH_CANCELLED_PREFIX) {
+                            // FR-1416: cancelled, not failed, in run history and UI.
+                            session.run_mut().phase = GraphRunPhase::Cancelled;
+                        }
                         let run = session.run().clone();
                         let _ = save_run(&self.workspace_root, &run);
                         self.last_graph_run = Some(run);
