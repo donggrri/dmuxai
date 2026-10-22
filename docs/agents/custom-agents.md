@@ -25,7 +25,7 @@ done_when = { path = "/type", equals = "end" }        # optional: this line ends
                                   # DmuxAI stops reading, waits 3 s, then stops the process group
 text_break_when = { path = "/type", equals = "tool_call" }   # optional: next text starts a new paragraph
 resume_arg = ["--session", "{session_id}"]   # appended when resuming
-timeout_secs = 900
+timeout_secs = 1800
 failure_stderr = "(?i)permission denied|rejected permission"
 temp_config_template = '{"permission":{"edit":"{edit}","bash":"{edit}","webfetch":"allow"}}'
 env = { OPENCODE_CONFIG = "{temp_config}" }
@@ -43,6 +43,7 @@ prompt text can never inject arguments. An argument whose placeholder has no val
 (e.g. `{model}` with no model chosen) is dropped together with the flag right before it
 when that flag starts with `-`.
 
+The default `timeout_secs` is 1800 (30 minutes); long implement turns often need a larger value.
 Failure (shown as an error turn): spawn error, non-zero exit, timeout, empty reply text,
 a jsonl `error_path` hit, or stderr matching `failure_stderr`.
 Process: own process group; Ctrl+C kills the whole group. The temp config is deleted after the turn.

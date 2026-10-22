@@ -9,7 +9,7 @@ use std::{
 use dmuxai::custom_agent::{
     BUILTIN_MODELS_TIMEOUT, CustomAgentOutput, CustomAgentSpec, SubstitutionContext, build_argv,
     failure_reason, grok_no_allowed_model_message, is_builtin_grok, list_model_ids,
-    parse_jsonl_line, policy_message, select_grok_model, spec_at, substitute,
+    parse_jsonl_line, policy_message, select_grok_model, spec_at, substitute, timeout_message,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -586,7 +586,7 @@ async fn run_turn(
         .await
         .map_err(|_| {
             kill_group(pgid.load(std::sync::atomic::Ordering::SeqCst));
-            format!("{} timed out after {}s", spec.label(), spec.timeout_secs())
+            timeout_message(spec)
         })??;
     // A leftover child that inherited stderr must not block the turn either.
     let stderr_text = match tokio::time::timeout(STDERR_DRAIN_GRACE, stderr_task).await {
@@ -827,7 +827,11 @@ mod tests {
         let spec = spec("sleep", "timeout_secs = 1");
         let started = std::time::Instant::now();
         let (result, _) = run(spec, None).await;
-        assert!(result.unwrap_err().contains("timed out"));
+        let err = result.unwrap_err();
+        assert!(err.contains("timed out"));
+        assert!(err.contains("timeout_secs"));
+        assert!(err.contains("name = \"fake\""));
+        assert!(err.contains("partial edits"));
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
