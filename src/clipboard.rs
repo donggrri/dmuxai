@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-/// Copies text through the native clipboard implementation on Windows and Linux.
+/// Copies text through the native clipboard implementation.
 ///
 /// A clipboard connection is deliberately opened for each copy. This keeps the
 /// TUI's application state independent of platform clipboard handles and makes

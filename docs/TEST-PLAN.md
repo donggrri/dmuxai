@@ -110,10 +110,10 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M2 (optional Codex) | SPEC-codex-model-effort-mode-context | FR-043, NFR-042 | TC-048 | `mode_change_reopens_the_agent_with_shared_context` | integration | ✅ |  |
 | M2 (optional Codex) | SPEC-codex-model-effort-mode-context | BR-042, NFR-042 | TC-049 | `busy_agent_cannot_open_mode_picker` | unit | ✅ |  |
 | M4 | SPEC-codex-sandbox-policy | INT-040, NFR-041 | TC-046 | `codex_execution_modes_set_per_turn_sandbox_and_approval_policy` | unit | ✅ |  |
-| M4,M6 | SPEC-cursor-windows-implement-guard | INT-480 | TC-480 | `cursor_mode_validation_matches_platform`, `windows_cursor_implement_mode_is_rejected_before_queueing`, `unsupported_mode_is_rejected_before_binding_retirement` | unit | ✅ |  |
-| M4,M6 | SPEC-cursor-windows-implement-guard | NFR-480 | TC-481 | `windows_cursor_implement_turn_is_rejected_before_process_spawn` | unit | ✅ |  |
+| M4,M6 | SPEC-cursor-windows-implement-guard | INT-480 | TC-480 | `cursor_mode_validation_matches_platform`, `windows_cursor_implement_mode_is_rejected_before_queueing`, `unsupported_mode_is_rejected_before_binding_retirement` | unit | Deferred (Windows dropped 2026-10-22) |  |
+| M4,M6 | SPEC-cursor-windows-implement-guard | NFR-480 | TC-481 | `windows_cursor_implement_turn_is_rejected_before_process_spawn` | unit | Deferred (Windows dropped 2026-10-22) |  |
 | M4,M6 | SPEC-cursor-windows-implement-guard | INT-481 | TC-482 | `cursor_execution_modes_use_native_cli_flags` | unit | ✅ |  |
-| M4,M6 | SPEC-cursor-windows-implement-guard | INT-481 | TC-483 | `cursor_mode_validation_matches_platform` | unit | ✅ |  |
+| M4,M6 | SPEC-cursor-windows-implement-guard | INT-481 | TC-483 | `cursor_mode_validation_matches_platform` | unit | Deferred (Windows dropped 2026-10-22) |  |
 | M5 | SPEC-image-attachment | FR-IMG-1 | (req row) | `image_slash_command_attaches_supported_file` | unit | ✅ |  |
 | M5 | SPEC-image-attachment | FR-IMG-2 | (req row) | `rejects_oversized_images`, `copies_supported_image_into_workspace_store` | unit | ✅ |  |
 | M5 | SPEC-image-attachment | FR-IMG-3 | (req row) | `submit_prompt_forwards_image_paths_to_adapter` | unit | ✅ |  |
@@ -394,7 +394,7 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | TC-PERM-1 | FR-PERM-1 | Implement 턴, stderr에 permission denied | 턴 종료 | 상태 Failed, stderr 이유 저장 | `permission_denial_is_detected_in_stderr` (✅ 존재) + `implement_failure_reason_is_persisted` | unit+integration |
 | TC-PERM-2 | FR-PERM-1 | Implement 턴, 쓰기 이벤트 없음 | 턴 종료 | Failed("no observable writes") | `implement_without_writes_fails` (✅) | unit |
 | TC-PERM-3 | FR-PERM-2 | Plan 모드, 쓰기 없음 | 턴 종료 | Completed | `plan_mode_never_fails_for_missing_writes` | unit |
-| TC-PERM-4 | FR-PERM-3 | 설정 없음 / `windows_unsandboxed=true` | Windows Cursor Implement | 기본 거부, opt-in 시 허용 | `windows_unsandboxed_requires_explicit_opt_in` | unit |
+| TC-PERM-4 | FR-PERM-3 | 설정 없음 / `windows_unsandboxed=true` | Windows Cursor Implement | 기본 거부, opt-in 시 허용 | Deferred (Windows dropped 2026-10-22) | unit |
 
 ### 2.2 화자별 색상 + NO_COLOR/force_color (M6, dogfood #2)
 기존 테스트: `color_for_maps_each_speaker`, `no_color_disables_unless_forced`, `parses_theme_section`.

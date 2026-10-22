@@ -36,7 +36,6 @@ const STARTER_CONFIG: &str = r##"# DmuxAI configuration (dmuxai.toml). Everythin
 # allowed_runners = ["cursor", "agy", "codex"]
 
 # [cursor]
-# windows_unsandboxed = false
 # Pre-warm the next cursor-agent process in the background (TUI / web only).
 # prewarm = true
 # Idle expiry for the pre-warmed process in seconds.

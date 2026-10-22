@@ -1163,9 +1163,8 @@ fn normalize_workspace_path(target: &str, workspace_root: &Path) -> Option<Strin
         None
     } else {
         let clean = target.trim_start_matches("./").replace('\\', "/");
-        // Root-relative (`/etc/x`, `\\x`) or drive-prefixed (`C:x`) paths are
-        // not relative to the workspace on any platform (Windows treats
-        // `/etc/x` as non-absolute), so drop them like other outside paths.
+        // Root-relative (`/etc/x`) or drive-prefixed (`C:x`) paths are not
+        // relative to the workspace, so drop them like other outside paths.
         let drive_prefixed = clean.as_bytes().get(1) == Some(&b':');
         if clean.starts_with('/')
             || drive_prefixed
@@ -13605,18 +13604,6 @@ fn spawn_opener(target: &str) -> Result<(), String> {
     if target.is_empty() {
         return Err("empty target".to_owned());
     }
-    #[cfg(target_os = "windows")]
-    {
-        // ShellExecute via rundll32 avoids cmd.exe re-parsing `&`, `%`, `^`.
-        std::process::Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", target])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
@@ -13819,28 +13806,10 @@ pub(crate) fn link_target_to_string(target: &LinkTarget) -> String {
 
 fn file_uri_from_path(path: &Path) -> String {
     let path = path.to_string_lossy();
-    #[cfg(windows)]
-    {
-        let mut normalized = path.replace('\\', "/");
-        // Drop the verbatim prefix canonicalize() adds (`\\?\C:\..`, `\\?\UNC\..`).
-        if let Some(rest) = normalized.strip_prefix("//?/UNC/") {
-            normalized = format!("//{rest}");
-        } else if let Some(rest) = normalized.strip_prefix("//?/") {
-            normalized = rest.to_owned();
-        }
-        if normalized.len() >= 2 && normalized.as_bytes()[1] == b':' {
-            format!("file:///{}", percent_encode_uri_path(normalized.as_ref()))
-        } else {
-            format!("file:{}", percent_encode_uri_path(normalized.as_ref()))
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        if path.starts_with('/') {
-            format!("file://{}", percent_encode_uri_path(path.as_ref()))
-        } else {
-            format!("file:///{}", percent_encode_uri_path(path.as_ref()))
-        }
+    if path.starts_with('/') {
+        format!("file://{}", percent_encode_uri_path(path.as_ref()))
+    } else {
+        format!("file:///{}", percent_encode_uri_path(path.as_ref()))
     }
 }
 

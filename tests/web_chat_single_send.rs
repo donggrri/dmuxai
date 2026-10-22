@@ -112,7 +112,7 @@ async fn run_scenario(scenario: Scenario) -> Option<Outcome> {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
         return None;
     };
-    let python = if cfg!(windows) { "python" } else { "python3" };
+    let python = "python3";
     let probe = Command::new(python)
         .args(["-c", "import playwright"])
         .stdout(Stdio::null())

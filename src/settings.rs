@@ -41,7 +41,6 @@ pub struct WorkspaceSettings {
 /// Workspace-local and environment overrides for DmuxAI behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DmuxSettings {
-    pub cursor_windows_unsandboxed: bool,
     pub cursor_prewarm: bool,
     pub cursor_prewarm_idle_secs: u64,
     /// `[cursor] protocol` (default legacy stream-json; FR-1410).
@@ -248,7 +247,6 @@ fn clamp_replan_limit(
 
 #[derive(Debug, Default, Deserialize)]
 struct CursorToml {
-    windows_unsandboxed: Option<bool>,
     prewarm: Option<bool>,
     prewarm_idle_secs: Option<u64>,
     protocol: Option<String>,
@@ -313,9 +311,6 @@ impl DmuxSettings {
         grok_bin: Option<PathBuf>,
     ) -> Self {
         let mut settings = Self::default();
-        if env_flag("DMUXAI_CURSOR_WINDOWS_UNSANDBOXED") {
-            settings.cursor_windows_unsandboxed = true;
-        }
 
         let mut configs: Vec<DmuxToml> = Vec::new();
         if let Some(user_path) = user_config_path
@@ -578,9 +573,6 @@ impl DmuxSettings {
             }
         }
         if let Some(cursor) = parsed.cursor {
-            if cursor.windows_unsandboxed.unwrap_or(false) {
-                self.cursor_windows_unsandboxed = true;
-            }
             if let Some(prewarm) = cursor.prewarm {
                 self.cursor_prewarm = prewarm;
             }
@@ -769,7 +761,6 @@ impl DmuxSettings {
 impl Default for DmuxSettings {
     fn default() -> Self {
         Self {
-            cursor_windows_unsandboxed: false,
             cursor_prewarm: true,
             cursor_prewarm_idle_secs: 300,
             cursor_protocol: RunnerProtocol::Legacy,
@@ -941,8 +932,7 @@ fn opencode_bin_explicit_missing_message_from(
 
 /// Finds the grok executable (SPEC-grok-runner FR-890). A non-empty
 /// `DMUXAI_GROK_BIN` is authoritative and does not fall through. Otherwise the
-/// first `grok` on `PATH`, then `~/.grok/bin/grok` (`grok.exe` on Windows) when
-/// that file is executable.
+/// first `grok` on `PATH`, then `~/.grok/bin/grok` when that file is executable.
 pub fn find_grok_bin() -> Option<PathBuf> {
     let explicit = std::env::var_os("DMUXAI_GROK_BIN").filter(|value| !value.is_empty());
     find_grok_bin_from(explicit, std::env::var_os("PATH"), home_dir())
@@ -964,8 +954,7 @@ fn find_grok_bin_from(
         return Some(found);
     }
     let home = home?;
-    let file_name = if cfg!(windows) { "grok.exe" } else { "grok" };
-    let candidate = home.join(".grok").join("bin").join(file_name);
+    let candidate = home.join(".grok").join("bin").join("grok");
     is_executable_file(&candidate).then_some(candidate)
 }
 
@@ -976,24 +965,14 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Searches `PATH` for the first file called `name` (`name.exe`, `name.cmd`,
-/// or `name.bat` on Windows). No shell is involved.
+/// Searches `PATH` for the first file called `name`. No shell is involved.
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
     find_on_path_in(name, std::env::var_os("PATH").as_deref())
 }
 
 fn find_on_path_in(name: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     let path_var = path_var?;
-    let file_names: Vec<String> = if cfg!(windows) {
-        vec![
-            format!("{name}.exe"),
-            format!("{name}.cmd"),
-            format!("{name}.bat"),
-            name.to_owned(),
-        ]
-    } else {
-        vec![name.to_owned()]
-    };
+    let file_names = [name.to_owned()];
     std::env::split_paths(path_var)
         .flat_map(|dir| {
             file_names
@@ -2361,7 +2340,7 @@ mod builtin_grok_tests {
     }
 
     fn bin_name() -> &'static str {
-        if cfg!(windows) { "grok.exe" } else { "grok" }
+        "grok"
     }
 
     // TC-890 / FR-890, FR-891

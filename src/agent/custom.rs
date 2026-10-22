@@ -654,15 +654,8 @@ async fn finish_after_done(
     }
 }
 
-#[cfg(unix)]
 fn exit_status_ok() -> std::process::ExitStatus {
     use std::os::unix::process::ExitStatusExt;
-    std::process::ExitStatus::from_raw(0)
-}
-
-#[cfg(not(unix))]
-fn exit_status_ok() -> std::process::ExitStatus {
-    use std::os::windows::process::ExitStatusExt;
     std::process::ExitStatus::from_raw(0)
 }
 
@@ -671,7 +664,6 @@ fn kill_group(pgid: u32) {
 }
 
 fn kill_group_with(pgid: u32, signal: &str) {
-    #[cfg(unix)]
     if pgid > 0 {
         let _ = std::process::Command::new("kill")
             .args([signal, "--", &format!("-{pgid}")])
@@ -680,8 +672,6 @@ fn kill_group_with(pgid: u32, signal: &str) {
             .stderr(std::process::Stdio::null())
             .status();
     }
-    #[cfg(not(unix))]
-    let _ = (pgid, signal);
 }
 
 async fn stop_turn(agent: Agent, turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
@@ -714,8 +704,7 @@ async fn send(
         .await;
 }
 
-// The fake agent is a POSIX shell script; Windows CI covers the pure parts in
-// `dmuxai::custom_agent` tests.
+// The fake agent is a POSIX shell script; keep test-only on unix.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

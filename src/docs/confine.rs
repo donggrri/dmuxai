@@ -119,19 +119,9 @@ impl Workspace {
     }
 }
 
-/// `fs::canonicalize` without the Windows `\\?\` verbatim prefix when the
-/// path can be expressed without it, so `starts_with` comparisons agree.
+/// Canonicalizes `path`.
 fn dunce_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
     let canonical = std::fs::canonicalize(path)?;
-    #[cfg(windows)]
-    {
-        let text = canonical.to_string_lossy();
-        if let Some(rest) = text.strip_prefix(r"\\?\")
-            && !rest.starts_with("UNC\\")
-        {
-            return Ok(PathBuf::from(rest));
-        }
-    }
     Ok(canonical)
 }
 

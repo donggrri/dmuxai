@@ -69,12 +69,6 @@ pub(crate) fn agy_models_cache_path() -> io::Result<PathBuf> {
     if let Some(base) = std::env::var_os("XDG_STATE_HOME") {
         return Ok(PathBuf::from(base).join("dmuxai").join("agy-models.json"));
     }
-    #[cfg(windows)]
-    {
-        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-            return Ok(PathBuf::from(base).join("DmuxAI").join("agy-models.json"));
-        }
-    }
     let home = std::env::var_os("HOME").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -484,7 +478,7 @@ async fn run_single_agy_process(
     resume_session: Option<&str>,
     user_prompt: &str,
 ) -> io::Result<SingleAgyOutcome> {
-    let program = resolve_program(AGY_BINARY_OVERRIDE, "agy.exe", "agy");
+    let program = resolve_program(AGY_BINARY_OVERRIDE, "agy");
     let mut command = headless_command(program);
     configure_command_for_resume(&mut command, request, selected_model, mode, resume_session);
     command
@@ -837,7 +831,7 @@ fn normalize_event(
 }
 
 async fn list_models(cwd: &Path) -> io::Result<Vec<ModelInfo>> {
-    let program = resolve_program(AGY_BINARY_OVERRIDE, "agy.exe", "agy");
+    let program = resolve_program(AGY_BINARY_OVERRIDE, "agy");
     let mut command = headless_command(program);
     command
         .arg("models")
@@ -959,15 +953,8 @@ mod tests {
         }
         let command = dmuxai::process::headless_command(std::path::PathBuf::from("agy"));
         assert!(token_removed(&command), "headless_command");
-        match dmuxai::process::cursor_command() {
-            Ok(command) => assert!(token_removed(&command), "cursor_command"),
-            // Windows without LOCALAPPDATA cannot build the command at all.
-            Err(error) => {
-                if !cfg!(windows) {
-                    panic!("cursor_command failed: {error}");
-                }
-            }
-        }
+        let command = dmuxai::process::cursor_command().expect("cursor_command");
+        assert!(token_removed(&command), "cursor_command");
     }
 
     #[test]

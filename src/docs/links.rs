@@ -185,16 +185,6 @@ fn file_uri_path(ws: &Workspace, raw: &str, ctx: &mut ResolveCtx) -> Option<Stri
         Some(_) => return None,
     };
     let decoded = percent_decode(rest);
-    #[cfg(windows)]
-    let decoded = {
-        let bytes = decoded.as_bytes();
-        if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b':' {
-            decoded[1..].to_owned()
-        } else {
-            decoded
-        }
-    };
-    #[cfg(not(windows))]
     if !decoded.starts_with('/') {
         return None;
     }
@@ -354,14 +344,5 @@ mod tests {
             start.elapsed().as_secs() < 2,
             "resolution cap should keep turn-end path bounded"
         );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn file_uri_windows_drive_form() {
-        let (dir, ws) = workspace();
-        let root = file_uri_root(dir.path());
-        let text = format!("open {root}/docs/a.md");
-        assert_eq!(extract_doc_links(&ws, &text), vec!["docs/a.md"]);
     }
 }

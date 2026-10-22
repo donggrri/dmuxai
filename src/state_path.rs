@@ -17,44 +17,28 @@ pub fn fnv1a64(value: &str) -> u64 {
 }
 
 /// State base directory for DmuxAI-owned state (FR-451): `$DMUXAI_STATE_DIR`
-/// when set, otherwise `$XDG_STATE_HOME/dmuxai`, `~/.local/state/dmuxai`, or
-/// (Windows) `%LOCALAPPDATA%\DmuxAI`.
+/// when set, otherwise `$XDG_STATE_HOME/dmuxai` or `~/.local/state/dmuxai`.
 pub fn state_base() -> io::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("DMUXAI_STATE_DIR")
         && !dir.is_empty()
     {
         return Ok(PathBuf::from(dir));
     }
-    #[cfg(windows)]
+    if let Some(base) = std::env::var_os("XDG_STATE_HOME")
+        && !base.is_empty()
     {
-        if let Some(base) = std::env::var_os("LOCALAPPDATA")
-            && !base.is_empty()
-        {
-            return Ok(PathBuf::from(base).join("DmuxAI"));
-        }
-        Err(io::Error::new(
+        return Ok(PathBuf::from(base).join("dmuxai"));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::NotFound,
-            "neither DMUXAI_STATE_DIR nor LOCALAPPDATA is configured",
-        ))
-    }
-    #[cfg(not(windows))]
-    {
-        if let Some(base) = std::env::var_os("XDG_STATE_HOME")
-            && !base.is_empty()
-        {
-            return Ok(PathBuf::from(base).join("dmuxai"));
-        }
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "neither DMUXAI_STATE_DIR nor XDG_STATE_HOME nor HOME is configured",
-            )
-        })?;
-        Ok(PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("dmuxai"))
-    }
+            "neither DMUXAI_STATE_DIR nor XDG_STATE_HOME nor HOME is configured",
+        )
+    })?;
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("state")
+        .join("dmuxai"))
 }
 
 /// Stable key for a workspace (FR-450, FR-453):

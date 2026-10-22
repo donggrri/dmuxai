@@ -99,7 +99,7 @@ with sync_playwright() as p:
     print(pg.content())
     b.close()
 "#;
-    let python = if cfg!(windows) { "python" } else { "python3" };
+    let python = "python3";
     let probe = Command::new(python)
         .args(["-c", "import playwright"])
         .stdout(Stdio::null())
@@ -203,7 +203,7 @@ with sync_playwright() as p:
     print(pg.content())
     b.close()
 "##;
-    let python = if cfg!(windows) { "python" } else { "python3" };
+    let python = "python3";
     let probe = Command::new(python)
         .args(["-c", "import playwright"])
         .stdout(Stdio::null())
