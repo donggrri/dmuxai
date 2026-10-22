@@ -772,6 +772,7 @@ mod tests {
             }))
         );
         assert!(parse(&args(&["run", "x", "--mode", "ask"])).is_err());
+        assert!(parse(&args(&["todo", "run", "abc", "--mode", "ask"])).is_err());
         assert_eq!(
             parse(&args(&["run", "--graph", "--", "--literal prompt"])),
             Ok(AgentCommand::Run(RunOptions {
