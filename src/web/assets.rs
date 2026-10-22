@@ -1823,4 +1823,13 @@ mod tests {
         assert!(DOCS_CSS.contains(".sessions-group-name {"));
         assert!(DOCS_CSS.contains(".sessions-group-label {"));
     }
+
+    // TC-1473 (FR-1473): "Open in new window" needs a validated path.
+    #[test]
+    fn tc_1473_open_button_requires_validated_path() {
+        let start = WORKSPACE_JS.find("function updateOpenButton").unwrap();
+        let body = &WORKSPACE_JS[start..start + 400];
+        assert!(body.contains("!state.validPath"), "{body}");
+        assert!(!body.contains("|| !target"), "{body}");
+    }
 }
