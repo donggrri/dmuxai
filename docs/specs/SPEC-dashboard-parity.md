@@ -1,5 +1,9 @@
 # SPEC: Dashboard parity with the TUI
 
+> **Superseded (mode picker):** User-facing Ask/Plan/Implement selection was removed in
+> SPEC-acp-runners FR-1306. `set_mode` and dashboard mode fields are ignored with a notice;
+> other parity rows in this spec remain in force.
+
 Status: Implemented in v0.2.0 (slice G2)
 Owner: DmuxAI
 Created: 2026-10-17

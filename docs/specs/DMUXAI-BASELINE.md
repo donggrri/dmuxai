@@ -57,6 +57,10 @@ installed and authenticated independently.
 
 ### 2.2 Agent selection, modes, and models
 
+> **Superseded (user-facing modes):** SPEC-acp-runners FR-1306..FR-1308 removed Ask/Plan/Implement
+> pickers and `/mode`. The baseline rows below remain historical; shipped behavior is single
+> agent mode (former Implement) plus internal read-only turns.
+
 | ID | Priority | Requirement |
 | --- | --- | --- |
 | UX-001 | Must | `/agent` opens an agent picker. Changing the selected agent affects only later submissions; completed turns from the active conversation are automatically projected into the next request. |
