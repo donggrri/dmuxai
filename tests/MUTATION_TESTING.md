@@ -124,14 +124,14 @@ fixture 테스트는 결과 이벤트 전체와 parser의 최종 상태를 함�
 
 ### 로컬 빠른 검사
 
-```powershell
+```bash
 cargo test --all-targets
 cargo mutants
 ```
 
 ### 특정 파일 조사
 
-```powershell
+```bash
 cargo mutants --file src/conversation.rs
 ```
 
@@ -152,7 +152,7 @@ main branch 또는 정기 schedule에서 전체 설정으로 실행하고 `mutan
 
 모든 릴리즈 후보는 tag 생성, 배포 artifact 생성 또는 배포 작업보다 먼저 전체 Mutation Testing을 통과해야 한다. 정기 실행이나 이전 commit의 성공 결과로 대체할 수 없으며, 실제 릴리즈 대상 commit에서 다시 실행한다.
 
-```powershell
+```bash
 cargo fmt --check
 cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings

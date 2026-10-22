@@ -4,7 +4,7 @@ Status: draft · 기준 커밋: `73e3f4d` (main, PR #6 이후) · 작성일: 202
 
 이 문서는 [MISSION.md](../MISSION.md) → `docs/specs/*.md` → FR/NFR → TC → 실제 테스트 이름으로 이어지는 추적성을 정리하고, 아직 SPEC이나 테스트가 없는 기능에 대한 새 FR/TC를 제안한다. ID와 테스트 이름은 영어로 유지한다.
 
-> CI의 `Spec traceability` 잡은 `scripts/check-spec.ps1 -SpecPath docs/specs/DMUXAI-BASELINE.md` 하나만 검사한다(Must 요구사항마다 TC 매핑 존재, ID 중복 금지). 따라서 아래 갭 제안은 별도 SPEC stub 없이 이 문서 안에 둔다. 제안이 확정되면 `docs/templates/FEATURE-SPEC.md` 형식으로 SPEC을 만든다.
+> CI의 `Spec traceability` 잡은 `scripts/check-spec.sh docs/specs/DMUXAI-BASELINE.md` 하나만 검사한다(Must 요구사항마다 TC 매핑 존재, ID 중복 금지). 따라서 아래 갭 제안은 별도 SPEC stub 없이 이 문서 안에 둔다. 제안이 확정되면 `docs/templates/FEATURE-SPEC.md` 형식으로 SPEC을 만든다.
 
 ## 0. Mission 목표 ID
 
@@ -15,7 +15,7 @@ Status: draft · 기준 커밋: `73e3f4d` (main, PR #6 이후) · 작성일: 202
 | M3 | Skills (`.agents/skills/*/SKILL.md`) |
 | M4 | Permissions (Ask/Plan 읽기 전용, Implement 쓰기 차단 시 실패 기록) |
 | M5 | Direct image attach (Ctrl+V / Alt+V) |
-| M6 | Platforms: Linux TUI 우선, Windows는 WSL 런처 |
+| M6 | Platforms: Linux TUI 우선, Linux 전용(WSL은 Linux로 동작). Windows는 2026-10-22부터 지원 중단 |
 | M7 | Model policy: composer-2.5 only (그래프/서브에이전트/기본값) |
 | M8 | Graph execution report (`docs/graph-runs/`) |
 
@@ -387,7 +387,7 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 |---|---|---|
 | FR-PERM-1 | Must | Implement 턴에서 권한 거부 stderr가 있거나 관찰 가능한 쓰기가 없으면 턴을 실패로 기록하고 이유를 저장 |
 | FR-PERM-2 | Must | Plan/Ask 턴은 쓰기 없음으로 실패 처리되지 않음(Plan은 절대 차단되지 않음) |
-| FR-PERM-3 | Must | Windows의 unsandboxed Cursor는 `cursor.windows_unsandboxed = true` 명시적 opt-in일 때만 |
+| FR-PERM-3 | Must | **Deferred (Windows dropped 2026-10-22).** Windows의 unsandboxed Cursor는 `cursor.windows_unsandboxed = true` 명시적 opt-in일 때만 |
 
 | TC | FR | Given | When | Then | Test name | Type |
 |---|---|---|---|---|---|---|
@@ -526,7 +526,10 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | TC-GRAPH-10 | NFR-GRAPH-2 | 독립 노드 4개, 항상 실패 노드 | 실행 | 동시 ≤2, 재시도 2회 후 실패 | `executor_caps_parallelism_and_retries` | unit |
 | TC-GRAPH-11 | UX-GRAPH-1 | 다단계 프롬프트 | `/graph` | 노드별 러너·모델 요약 표시 | live checklist L-08 | live-TUI |
 
-### 2.11 Windows + WSL 런처 (M6, 미래)
+### 2.11 Windows 런처 (M6, 보류) — **Deferred (Windows dropped 2026-10-22).**
+
+Windows 지원이 중단되어 아래 FR/TC는 보류 상태로 유지한다. WSL은 Linux로 계속
+지원되며 (WSL 런처가 아닌) Linux 방식으로 검증한다.
 
 | FR | Pri | 요구사항 |
 |---|---|---|
@@ -545,7 +548,7 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 - **Esc/Ctrl+C 종료 동작**: `escape_never_exits_the_application`은 있으나 Ctrl+C 정책이 SPEC에 없음 → `UX-QUIT-2`: Ctrl+C는 실행 중 턴 취소, 유휴 상태에서는 안내만(종료는 `/quit`). TC-QUIT-2 `ctrl_c_cancels_running_turn_without_exit`(unit).
 
 ### 2.13 갭 요약 (❌ 14)
-Permissions SPEC 부재 · 색상/NO_COLOR SPEC 부재 · 러너별 모델 선택 · custom agent · /compact · 헤드리스/--help · 상태줄 잘림 · F2 느림 · skills 파싱/주입 · graph override · graph resume · 병렬/재시도 상한 · Windows/WSL 런처 · graph-run report 검사.
+Permissions SPEC 부재 · 색상/NO_COLOR SPEC 부재 · 러너별 모델 선택 · custom agent · /compact · 헤드리스/--help · 상태줄 잘림 · F2 느림 · skills 파싱/주입 · graph override · graph resume · 병렬/재시도 상한 · Windows 런처(보류; WSL은 Linux로 지원) · graph-run report 검사.
 
 ## 3. 수동 live-TUI 체크리스트
 
@@ -569,22 +572,15 @@ Permissions SPEC 부재 · 색상/NO_COLOR SPEC 부재 · 러너별 모델 선�
 
 판정: 모든 행 Pass(또는 "기록" 항목은 값 기록) → 체크리스트 통과. 실패 시 `docs/dogfood/README.md`에 번호를 붙여 기록.
 
-### 3.1 Windows / WSL 데스크톱 수동 체크리스트 (W-rows)
+### 3.1 Windows 데스크톱 수동 체크리스트 (W-rows) — **Deferred (Windows dropped 2026-10-22).**
 
-SPEC: [SPEC-windows-desktop.md](specs/SPEC-windows-desktop.md) (FR-390~FR-396, UX-390)
+Windows zip/installer/시작 메뉴 설치 절차는 지원 중단으로 문서에서 제외되었다.
+WSL 클립보드 이미지(구 W-03 항목)는 L-03 절차로 대체 검증한다.
 
-| # | TC ID | 항목 | 절차 | 기대 결과 | Status |
-|---|---|---|---|---|---|
-| W-01 | TC-390, TC-400 | install from zip on clean profile, shortcut opens Windows Terminal in WSL | 클린 Windows 사용자 프로필에서 `dmuxai-windows-x86_64.zip` 압축 해제 후 `install.ps1` 실행, 생성된 시작 메뉴 바로가기("DmuxAI.lnk") 클릭 | `%LOCALAPPDATA%\Programs\DmuxAI`에 `dmuxai-launcher.exe`와 `dmuxai.exe` 복사, 시작 메뉴에 바로가기 생성, 실행 시 Windows Terminal(wt.exe)이 열리고 WSL 내 dmuxai 세션 정상 시작 | Status: not run |
-| W-02 | TC-400 | reinstall no duplicate | 이미 설치된 상태에서 `install.ps1`을 다시 실행 | 파일 덮어쓰기 완료, 시작 메뉴 바로가기 중복 생성 없이 단일 항목 유지 | Status: not run |
-| W-03 | TC-399 | Ctrl+V image paste in WSL session | Windows 클립보드에 PNG 복사 후 WSL TUI 세션에서 Ctrl+V 입력 | Windows 클립보드 브리지(powershell Get-Clipboard) 경유하여 이미지 첨부([Image #1]), `.dmuxai/attachments/`에 PNG 저장 | Status: not run |
-| W-04 | TC-400 | uninstall | `uninstall.ps1` 실행 | 시작 메뉴 바로가기("DmuxAI.lnk") 삭제 및 `%LOCALAPPDATA%\Programs\DmuxAI` 폴더 완전 제거 | Status: not run |
-| W-05 | TC-395, TC-396, TC-404 | missing WSL/distro/dmuxai fix-it messages | WSL 미설치, 배포판 없음, 또는 배포판 내 dmuxai 미설치 상태에서 런처 실행 | 각 단계별로 정확한 조치 명령어(fix-it command)가 한 화면에 표시되고 안전하게 블록됨 | Status: not run |
-| W-06 | TC-398, TC-404 | /mnt warning | `/mnt/c/...` 경로를 작업 디렉터리로 전달하여 런처 실행 | 성능 경고 표시 및 계속 진행 여부 명시적 확인(확인 없이 실행 차단, 확인 저장 시 다음부터 생략) | Status: not run |
+## 4. Release gate
 
-## 4. Release gate — Windows 앱 착수 조건
-
-다음이 모두 녹색이어야 Windows/WSL 런처 작업(§2.11)을 시작한다.
+다음이 모두 녹색이어야 릴리즈한다(Windows 관련 항목은 2026-10-22 지원 중단으로
+제외; Linux + WSL 대상만 검사한다).
 
 1. CI `Verify` 전부 통과: `Spec traceability`, `cargo fmt --check`, `cargo test --all-targets`, `cargo clippy -D warnings`.
 2. 기존 SPEC의 모든 **Must** 요구사항이 ✅ 자동 테스트에 매핑됨: 현재 ⚠️ 19건 중 Must에 해당하는 항목(특히 cross-agent sharing TC-001~007, TC-045, NFR-GRAPH-1, UX-GRAPH-1)을 해소.

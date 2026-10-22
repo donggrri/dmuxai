@@ -8,7 +8,7 @@ Related: MISSION §4, SPEC-cursor-windows-implement-guard, SPEC-codex-sandbox-po
 
 ## 1. Decision summary
 
-Implement turns must never silently succeed when writes are blocked: a permission denial in stderr or an Implement turn with no observable writes fails the turn and records the reason. Ask/Plan stay read-only and are never failed for missing writes. Unsandboxed Cursor on Windows requires explicit opt-in (`[cursor] windows_unsandboxed = true` or env).
+Implement turns must never silently succeed when writes are blocked: a permission denial in stderr or an Implement turn with no observable writes fails the turn and records the reason. Ask/Plan stay read-only and are never failed for missing writes. The Windows-only unsandboxed Cursor opt-in guard (`[cursor] windows_unsandboxed = true` or env) is deferred with Windows support (see [SPEC-cursor-windows-implement-guard.md](SPEC-cursor-windows-implement-guard.md)).
 
 ## 2. Scope
 
@@ -16,7 +16,6 @@ Implement turns must never silently succeed when writes are blocked: a permissio
 
 - `src/agent/implement_outcome.rs` outcome classification
 - Failure reason persistence on the turn
-- `cursor_windows_unsandboxed` setting
 
 ### Out of scope / non-goals
 
@@ -40,7 +39,7 @@ Implement turns must never silently succeed when writes are blocked: a permissio
 | FR-300 | Must | Implement turn ends; stderr contains a permission-denial pattern. | Turn is Failed and the stderr reason is stored on the turn. | Unrelated stderr does not fail the turn. | TC-300 |
 | FR-301 | Must | Implement turn ends with no observable writes. | Turn is Failed with a 'no observable writes' reason. | A turn with any write is Completed. | TC-301 |
 | FR-302 | Must | Ask or Plan turn ends without writes. | Turn is Completed; Plan is never blocked by the write check. | — | TC-302, TC-303 |
-| FR-303 | Must | Windows Cursor Implement without opt-in. | Rejected before mode queueing and before process spawn. | With `windows_unsandboxed = true` the guard allows it. | TC-304, TC-305 |
+| FR-303 | Must | Windows Cursor Implement without opt-in. | **Deferred (Windows dropped 2026-10-22).** Rejected before mode queueing and before process spawn. | With `windows_unsandboxed = true` the guard allows it. | TC-304, TC-305 |
 
 ## 5. Acceptance scenarios and test design
 

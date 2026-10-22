@@ -81,7 +81,7 @@ still compiles.
 | Persistence | No schema change | N/A | TC-516 |
 | Provider protocol | No adapter change | N/A | — |
 | Security / permissions | Test-only alias; not compiled in release binaries | Remove alias if it hides real API mistakes | TC-511 |
-| Platform | Documentation only + `cfg(test)` code | Linux/macOS/Windows test builds | TC-511 |
+| Platform | Documentation only + `cfg(test)` code | Linux/macOS test builds | TC-511 |
 
 ## 7. Implementation plan
 

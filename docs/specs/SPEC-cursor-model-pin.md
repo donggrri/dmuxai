@@ -68,7 +68,7 @@ Every Cursor turn in DmuxAI must pass `--model composer-2.5` to `cursor-agent` u
 | Persistence | Recorded turn outputs in conversation store store `composer-2.5` as `model_id` for Cursor turns. | Fully compatible with schema v2. | TC-413 |
 | Provider protocol | `cursor-agent` CLI is always invoked with `--model composer-2.5` unless an allowed model is chosen. | Prevents silent fallback to non-composer or fast models. | TC-410, TC-411 |
 | Security / permissions | Enforces model policy at both app orchestrator and adapter process levels (defense in depth). | Disallowed models cannot leak through any submission path. | TC-411, TC-412 |
-| Platform | Cross-platform (Linux / macOS / Windows WSL). | No platform dependencies. | TC-410 |
+| Platform | Cross-platform (Linux / macOS / WSL). | No platform dependencies. | TC-410 |
 
 ## 7. Implementation plan
 

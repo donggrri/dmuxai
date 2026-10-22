@@ -67,8 +67,8 @@ reproducible without a real provider whenever possible.
 | Agent adapter/protocol | JSON/NDJSON parser and command-construction tests; error and cancellation normalization | ignored authenticated-provider smoke test |
 | TUI state/input | unit/state tests for keys, overlays, routing, and rendered output | interactive terminal smoke test |
 | Chat selection/clipboard | Unicode grapheme and terminal-cell tests | OS clipboard smoke test |
-| Process resolution | platform-independent resolution tests; Windows-specific command setup where applicable | installed CLI launch check |
-| Installer/release | static script review and checksum-path test where feasible | Windows install/update/uninstall path |
+| Process resolution | platform-independent resolution tests | installed CLI launch check |
+| Installer/release | static script review and checksum-path test where feasible | Linux install/unpack path |
 
 Run `cargo fmt --check`, `cargo test --all-targets`, and
 `cargo clippy --all-targets --all-features -- -D warnings` for code changes
@@ -77,8 +77,8 @@ not a pass; record the cause and the exact unrun command.
 
 Run the documentation traceability gate whenever a spec changes:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-spec.ps1 -SpecPath docs/specs/DMUXAI-BASELINE.md
+```bash
+bash scripts/check-spec.sh docs/specs/DMUXAI-BASELINE.md
 ```
 
 ## Review checklist

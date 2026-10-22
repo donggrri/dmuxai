@@ -6,7 +6,7 @@ Status: Implemented · Dogfood: #12
 The conversation DB was one global file, `$XDG_STATE_HOME/dmuxai/conversations.sqlite3`, shared by every worktree and binary version. A newer schema in one worktree broke older builds in other worktrees with `UnsupportedSchema(2)`. The DB is now keyed by the workspace root, there is an explicit override, and old data is migrated by copy.
 
 ## Terms / state
-- State base: `$DMUXAI_STATE_DIR` if set. Otherwise `$XDG_STATE_HOME/dmuxai` or `~/.local/state/dmuxai` (Windows: `%LOCALAPPDATA%\DmuxAI`).
+- State base: `$DMUXAI_STATE_DIR` if set. Otherwise `$XDG_STATE_HOME/dmuxai` or `~/.local/state/dmuxai`.
 - Repo key: `<sanitized basename>-<16 hex FNV-1a 64 of the canonical workspace root path>`.
 - Per-repo DB: `<base>/repos/<repo key>/conversations.sqlite3`.
 - Legacy DB: `<base>/conversations.sqlite3`.

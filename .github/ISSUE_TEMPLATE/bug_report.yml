@@ -70,7 +70,7 @@ body:
       label: Platform
       options:
         - Linux
-        - WSL on Windows
+        - WSL
         - macOS
         - Other
     validations:

@@ -83,7 +83,7 @@ Runtime sessions transition as follows:
 | TC-053 | FR-052 | application integration | A prior app runtime is dropped cleanly and its database contains a completed conversation. | Open a new app runtime with no live peer. | The latest persisted conversation is restored, preserving baseline restart behavior. | `cargo test a_new_app_instance_loads_the_latest_conversation` |
 | TC-054 | BR-051 | persistence integration | Two engines use separate connections, select the same conversation, and engine A owns a Codex turn. | Engine B attempts a Codex turn in that same conversation. | Engine B gets `ConversationError::AgentBusy`; no second turn row is inserted. | `cargo test busy_agent_is_rejected_across_runtime_sessions` |
 | TC-055 | BR-051 | boundary/concurrency | Two independent instance conversations are active in one workspace. | Both engines begin a turn for the same agent. | Both requests are accepted because their conversation ownership boundaries differ. | `cargo test same_agent_can_run_in_separate_instance_conversations` |
-| TC-056 | NFR-050 | persistence migration | A v1 database without runtime-session objects and a fresh database. | Open each with the new engine, then inspect schema/data and reopen with the old-shaped tables. | The additive schema is installed atomically, old durable rows remain readable, and no provider protocol fields change. | `cargo test runtime_session_schema_extension_preserves_existing_data`; `scripts/check-spec.ps1` |
+| TC-056 | NFR-050 | persistence migration | A v1 database without runtime-session objects and a fresh database. | Open each with the new engine, then inspect schema/data and reopen with the old-shaped tables. | The additive schema is installed atomically, old durable rows remain readable, and no provider protocol fields change. | `cargo test runtime_session_schema_extension_preserves_existing_data`; `scripts/check-spec.sh docs/specs/SPEC-multi-instance-workspace.md` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -92,7 +92,7 @@ Runtime sessions transition as follows:
 | Persistence | Add `runtime_sessions` plus nullable `turns.owner_session_id`; use a transactional additive extension and keep the existing SQLite user-version contract. | Existing rows with no owner are recoverable on next startup. The old binary can ignore the extra table/column; reverting code restores the old recovery behavior without requiring a destructive downgrade. | TC-052, TC-056 |
 | Provider protocol | No Codex, Cursor, or AGY request/event shape changes; each runtime continues to own its own adapter and child process. | Provider smoke tests remain ignored unless installed/authenticated; code rollback is provider-neutral. | TC-051 |
 | Security / permissions | Multiple instances do not expand sandbox, approval, credential, or workspace permissions. | Existing Ask/Plan/Implement safety mapping is unchanged. | TC-051 |
-| Platform | Session identity and recovery use the existing SQLite/WAL path and work on Windows and Linux; no OS-specific singleton lock is introduced. | If a process crashes, lease expiry is the bounded fallback; normal shutdown closes immediately. | TC-052; Rust gates |
+| Platform | Session identity and recovery use the existing SQLite/WAL path and work on Linux, WSL included; no OS-specific singleton lock is introduced. | If a process crashes, lease expiry is the bounded fallback; normal shutdown closes immediately. | TC-052; Rust gates |
 
 ## 7. Implementation plan
 

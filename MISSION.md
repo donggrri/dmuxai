@@ -14,9 +14,9 @@ DmuxAI is a **Rust + Ratatui** terminal orchestrator. It does not scrape ANSI te
 
 5. **Direct image attach** — Ctrl+V (and Alt+V where terminals use it) attaches clipboard images:
    - **Interactive cursor-agent on Linux/WSL**: pass Ctrl+V through so the CLI’s native paste works when DmuxAI is not managing the turn.
-   - **Headless runs and CLIs without paste (agy, Codex, Windows cursor-agent)**: DmuxAI reads the clipboard (`wl-paste`, `xclip`, or WSL `powershell.exe` image), saves PNG under the workspace `.dmuxai/attachments/`, shows `[Image #N]` chips, and passes paths via `@path` and/or each CLI’s `--image` flag (verified per provider).
+   - **Headless runs and CLIs without paste (agy, Codex, headless cursor-agent)**: DmuxAI reads the clipboard (`wl-paste`, `xclip`, or WSL `powershell.exe` image), saves PNG under the workspace `.dmuxai/attachments/`, shows `[Image #N]` chips, and passes paths via `@path` and/or each CLI’s `--image` flag (verified per provider).
 
-6. **Platforms** — **Linux TUI first** (primary dev and CI target). **Windows** ships as a launcher that runs DmuxAI **inside WSL** with a Linux workspace canonical path.
+6. **Platforms** — **Linux only** (WSL counts as Linux and keeps working). Native **Windows** support was dropped on 2026-10-22 (see [docs/plans/PLAN-drop-windows.md](docs/plans/PLAN-drop-windows.md)); the removal is revertable in one commit.
 
 7. **Model policy** — **Only `composer-2.5`** may be used or defaulted for any graph node, subagent, or DmuxAI routing default. No haiku, grok, sonnet, gpt, gemini, or `*-fast` models. Guards/tests enforce this in-repo. Exception (2026-10-17, dogfooding): a model the user picks with F2 for a non-Cursor runner is honored under that runner's policy (AGY `gemini-*-flash-*`; custom agents' `allowed_models`); graph defaults stay `composer-2.5`.
 
@@ -27,7 +27,6 @@ DmuxAI is a **Rust + Ratatui** terminal orchestrator. It does not scrape ANSI te
 ## Non-goals (for now)
 
 - Replacing Ratatui with another UI framework.
-- Enabling unsandboxed Cursor on Windows without explicit opt-in.
 - Defaulting to Codex or non–composer-2.5 models.
 
 ## Related docs

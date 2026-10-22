@@ -68,8 +68,8 @@ test are removed because the shot files are no longer kept in repo.
 | TC-110 | FR-208 | review | repo tree | grep/lint pass | no `docs/screenshots` files remain and no `DMUXAI_EXPORT_SCREENSHOTS`/`export_documentation_screenshots` test references remain | see test evidence in `REVIEW-clipboard-image-paste.md` |
 | TC-111 | FR-201, FR-206 | manual | WSL session with a screenshot in the clipboard | Ctrl+V in the prompt | chip `[Image #1]` appears and the image lands under `.dmuxai/attachments/` | manual only: requires a live WSL + PowerShell clipboard |
 
-TC-111 is manual because a WSL clipboard and a Windows PowerShell clipboard
-runtime cannot be exercised deterministically in CI; FR-205's injectable
+TC-111 is manual because a live WSL + PowerShell clipboard runtime cannot be
+exercised deterministically in CI; FR-205's injectable
 commands plus TC-105's base64 validation cover the same code deterministically.
 
 ## 5. Data, integration, and safety contracts

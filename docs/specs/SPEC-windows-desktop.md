@@ -1,6 +1,6 @@
 # SPEC: Windows desktop launcher (DmuxAI inside WSL)
 
-Status: In progress — steps 1–3 implemented (launcher core, config, `dmuxai-launcher` bin, zip packaging + installer scripts); step 4 live W-rows pending (W-01..W-06 defined in TEST-PLAN §3, not run)
+Status: Deferred — Windows support dropped 2026-10-22 (see PLAN-drop-windows.md)
 Owner: DmuxAI
 Created: 2026-10-17
 Baseline: `bcdb0eb`

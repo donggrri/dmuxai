@@ -100,7 +100,7 @@ summary/failure limits (TC-005).
 | Persistence | No schema change. Existing checkpoints remain valid only when their source hash matches the common-turn set. | Reverting the code restores same-agent projection; stored canonical turns and checkpoints remain readable. | TC-003, TC-005 |
 | Provider protocol | Requests keep the existing structured `resume_session` field. A stale common-head binding uses `None` and the existing restored-context envelope. | No provider CLI changes; live provider tests remain ignored. | TC-001, TC-004 |
 | Security / permissions | Shared context is bounded, marked as untrusted historical data, and never interpolated into shell commands. | Existing sandbox/mode policy is unchanged. | TC-005, default Rust gates |
-| Platform | No platform-specific behavior change. | Existing Windows/Linux process launch paths are unchanged. | Default Rust gates |
+| Platform | No platform-specific behavior change. | Existing Linux process launch paths are unchanged. | Default Rust gates |
 
 ## 7. Implementation plan
 

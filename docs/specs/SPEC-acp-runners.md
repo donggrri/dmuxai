@@ -12,7 +12,7 @@ Cursor and the built-in grok runner use the [Agent Client Protocol](https://agen
 
 DmuxAI removes user-facing **ExecutionMode** (Ask / Plan / Implement): every user turn runs in a single agent mode equivalent to former Implement (workspace writes and normal tool use). Plan approval (#67), sensitive-step gates, and internal read-only judge/plan/replan turns (FR-932) stay. Legacy runners always use their former Implement CLI flags. Stored or API `mode` values are ignored once with a warning.
 
-**Platform:** Behavior in this spec is supported on **Linux only**. Existing Windows code in the repository is unchanged and out of scope; this spec does not add Windows- or WSL-specific handling or documentation for ACP or single agent mode.
+**Platform:** Behavior in this spec is supported on **Linux only**. This spec does not add any extra platform–specific handling or documentation for ACP or single agent mode.
 
 ## 2. Scope
 
@@ -27,8 +27,7 @@ DmuxAI removes user-facing **ExecutionMode** (Ask / Plan / Implement): every use
 ### Out of scope / non-goals
 
 - AGY and opencode on ACP (both stay on their headless CLI modes; FR-1418)
-- Removing or refactoring existing Windows-specific code paths elsewhere in the repo
-- Windows/WSL caveats or new Windows behavior for ACP or single agent mode
+- Extra platform–specific handling or documentation for ACP or single agent mode
 - Release workflow changes
 
 ### Assumptions and open questions
@@ -64,7 +63,7 @@ No Must requirement depends on an unanswered question for CI; live smoke is manu
 | FR-1307 | Must | Internal judge/plan/replan turn (FR-932). | `TurnPolicy::ReadOnly` on the request; adapter uses read-only CLI/ACP behavior; user agent policy unchanged after turn. | No read-only support → existing fallback paths. | TC-1333 |
 | FR-1309 | Must | Docs updated. | README and CHANGELOG describe ACP default, legacy switch, single agent mode, Linux-only support for this feature set. Older mode specs carry a superseded note. | — | TC-1312 |
 | NFR-1300 | Must | ACP or legacy turn. | MCP merge behavior unchanged from baseline. | — | TC-1300 |
-| NFR-1301 | Must | This spec’s ACP and agent-mode contracts. | Documented supported platform is Linux; no new Windows/WSL documentation for these features. | — | TC-1491 |
+| NFR-1301 | Must | This spec’s ACP and agent-mode contracts. | Documented supported platform is Linux, with no extra platform–specific documentation for these features. | — | TC-1491 |
 | FR-1313 | Must | Cursor `protocol = "acp"`. | After `session/new`/`load`, if effective model is a fast variant and cannot be switched off, refuse turn with clear error; emit `ModelSelected` with agent-reported model, not requested id. | Default Cursor protocol is `legacy`. | TC-1318 |
 | FR-1314 | Must | ACP `session/request_permission` paths. | Only structured path fields are checked; normalized component-wise workspace prefix ( `/proj-evil` ∉ `/proj` ). | Session ids/titles are not paths. | TC-1313, TC-1314 |
 | FR-1315 | Must | ACP debug / stderr. | Trace via `DMUXAI_ACP_LOG` file only (not stderr). Child stderr drained; tail included in errors. | — | TC-1491 |
@@ -125,7 +124,7 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | TC-1481 | FR-1416, FR-1314 | manual | Same | Ask grok to write `/tmp/outside-<rand>.txt` | No file outside workspace; turn ends cancelled with a denial notice (not "Graph failed") | hands-on |
 | TC-1482 | FR-1417 | manual | Same | Ask grok to run `ls -1 \| wc -l` | Reply has the count; activity row shows the command | hands-on |
 | TC-1483 | FR-1410 | manual | cursor-agent logged in | `dmuxai run --agent cursor "say hi"` | Legacy stream-json with `composer-2.5` (non-fast) replies | hands-on |
-| TC-1491 | NFR-1301, FR-1315, FR-1324, FR-1329 | review | PR diff | Code review + `DMUXAI_ACP_LOG=/tmp/x.log dmuxai run --agent grok "say hi"` | No ACP trace on stderr; trace in the log file; no Windows/WSL doc added; denied permission ends cancelled (see TC-1420) | review / hands-on |
+| TC-1491 | NFR-1301, FR-1315, FR-1324, FR-1329 | review | PR diff | Code review + `DMUXAI_ACP_LOG=/tmp/x.log dmuxai run --agent grok "say hi"` | No ACP trace on stderr; trace in the log file; denied permission ends cancelled (see TC-1420) | review / hands-on |
 | TC-1492 | FR-1318 | unit | CLI args | `dmuxai run x --mode ask` | Parse error, not ignored | `src/cli.rs` (`--mode` rejection asserts) |
 | TC-1484 | FR-1411 | manual | `[cursor] protocol = "acp"` in `dmuxai.toml` | `dmuxai run --agent cursor "say hi"` | Refused before any prompt: error names the fast model | hands-on |
 | TC-1300 | FR-1300, NFR-1300 | integration | Fake ACP binary as `DMUXAI_CURSOR_BIN` parent | Send prompt | Streaming text, `Completed`, session bound | `src/agent/acp.rs` |
@@ -169,7 +168,7 @@ Deterministic ACP integration tests run under plain `cargo test`: the test helpe
 | --- | --- |
 | Persistence | No schema change; legacy mode fields in JSON ignored. |
 | Security | ACP permissions: allow in-workspace; deny outside; sensitive gates unchanged. Cursor ACP passes `--sandbox enabled` when supported (OQ-1326 for grok). Shell redirection outside the workspace is not parsed heuristically. |
-| Platform | **Linux only** for FR-1300..FR-1309 and NFR-1301; do not extend Windows handling in this change. |
+| Platform | **Linux only** for FR-1300..FR-1309 and NFR-1301; no additional platform handling in this change. |
 
 ## 7. Implementation plan
 
@@ -180,4 +179,4 @@ See `docs/plans/PLAN-acp-runners.md` and `docs/tasks/TASKS-acp-runners.md`.
 The following are superseded for **user-facing** Ask/Plan/Implement selection by FR-1306..FR-1307 and SPEC-remove-modes-chat-markdown FR-1308; internal read-only behavior remains via FR-1307 / FR-932:
 
 - SPEC-agent-modes-copy (user mode picker copy)
-- Mode-related rows in SPEC-permission-hardening and SPEC-cursor-windows-implement-guard **for user mode selection only** (Windows guard code may remain untouched)
+- Mode-related rows in SPEC-permission-hardening and SPEC-cursor-windows-implement-guard **for user mode selection only** (the Windows guard is deferred with Windows support; see SPEC-cursor-windows-implement-guard)

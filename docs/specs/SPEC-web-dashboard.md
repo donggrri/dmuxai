@@ -19,8 +19,8 @@ TTY. (Superseded by FR-1600, SPEC-web-dashboard-only: `--web` now runs the
 dashboard with the full App and no TUI, printing `dmuxai dashboard: <url>` to
 stdout.) The server binds `127.0.0.1` by default, requires a random per-start access
 token, and rejects foreign origins and hosts. The UI is static HTML/JS/CSS
-embedded in the binary (no frontend build); the browser on Linux, or on Windows
-via WSL `localhost` forwarding, opens the printed URL. Delivery is three PRs:
+embedded in the binary (no frontend build); the browser on Linux, WSL included
+with `localhost` forwarding, opens the printed URL. Delivery is three PRs:
 slice A (server, auth, live graph state), slice B (to-do board), slice C (MCP
 client and Jira/Confluence import, mock-tested only).
 
@@ -42,7 +42,7 @@ client and Jira/Confluence import, mock-tested only).
 ### Out of scope / non-goals
 
 - Remote/multi-user hosting, TLS, accounts. Non-loopback bind is opt-in only.
-- A desktop app shell (the WSL launcher remains as-is).
+- A desktop app shell.
 - Editing chat history or driving arbitrary TUI keystrokes from the browser.
 - Writing to Jira/Confluence (import is read-only).
 - Connecting to any real company Jira/Confluence in tests or CI; only a local
@@ -88,7 +88,7 @@ client and Jira/Confluence import, mock-tested only).
 | FR-528 | Must | Given `dmuxai serve` in a workspace | The snapshot source is `files`: the most recently modified parseable `.dmuxai/graphs/*.json`, re-read at least every second | Missing directory gives `graph: null`; a malformed or partially written file is ignored and the previous snapshot is kept | TC-528 |
 | FR-529 | Must | Given `GET /` and `/assets/*` | The embedded page renders the graph as an ordered node list with status badges, runner/model, live elapsed time, the current node highlighted, and agent busy chips; it reads the token from the URL, uses `/api/events`, and falls back to polling `/api/state` if SSE fails | Static responses carry `Cache-Control: no-store` and a CSP of `default-src 'self'`; static assets contain no workspace data and do not require the token | TC-529 |
 | FR-530 | Must | Given `dmuxai --web` | The App publishes its agents and active graph session to the dashboard at least on every state change in the event loop (source `tui`) | Dashboard publishing never blocks the TUI loop and server errors surface as a TUI notice, not a crash | TC-530 |
-| NFR-520 | Must | Given the build | No frontend toolchain is needed: assets are embedded with `include_str!`; Linux and Windows (`cargo clippy -D warnings`) both build | Windows CI stays green | TC-529, CI |
+| NFR-520 | Must | Given the build | No frontend toolchain is needed: assets are embedded with `include_str!`; Linux (`cargo clippy -D warnings`) builds | CI stays green | TC-529, CI |
 | NFR-521 | Must | Given any snapshot or log line | The access token is never included in `/api/state` or SSE payloads | Only the startup URL contains it | TC-525 |
 
 ### Slice B: to-do board
@@ -173,7 +173,7 @@ MCP servers are defined once and used by every runner and by the dashboard.
 | Security / permissions | Loopback default, per-start token, Origin/Host allow-list, opt-in remote bind with warning, token never in payloads; static assets carry no data | Must not weaken provider sandboxes or `allowed_runners` | TC-522..TC-524, TC-529 |
 | Secrets | MCP secrets are referenced by env var name; never persisted or rendered | — | TC-560 |
 | Company data | No real Jira/Confluence in tests, CI or dogfood prompts | — | NFR-560 |
-| Platform | Linux native; Windows via WSL with the Windows browser on `localhost`; native Windows build compiles and passes tests | Unix-only tests are `#[cfg(unix)]` | CI |
+| Platform | Linux native, WSL included with the browser on `localhost` | Unix-only tests are `#[cfg(unix)]` | CI |
 
 ### MCP runner matrix (slice C; verified against each CLI's `--help` on 2026-10-17)
 
@@ -206,7 +206,7 @@ See [PLAN-web-dashboard](../plans/PLAN-web-dashboard.md) and
 
 - [ ] All Must requirements of the delivered slice map to passing evidence.
 - [ ] The diff has been reviewed against scope and non-goals.
-- [ ] Required Rust checks pass: format, all targets test, and clippy (Linux and Windows CI).
+- [ ] Required Rust checks pass: format, all targets test, and clippy.
 - [ ] External-provider smoke tests are marked run, skipped, or blocked with a
   reason; skipped is never reported as passing.
 - [ ] [REVIEW-web-dashboard](../reviews/REVIEW-web-dashboard.md) records commands, result, residual risk, and rollback

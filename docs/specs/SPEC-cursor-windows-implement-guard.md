@@ -1,6 +1,6 @@
 # SPEC: Disable Cursor Implement mode on Windows
 
-Status: complete  
+Status: Deferred — Windows support dropped 2026-10-22 (see PLAN-drop-windows.md)
 Owner: DmuxAI  
 Created: 2026-08-24  
 Baseline: `675d9df`  
