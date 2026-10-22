@@ -39,6 +39,21 @@ fn mcp_array(mcp_servers: &Value) -> Value {
     }
 }
 
+/// Drop HTTP/SSE MCP entries unless `initialize` advertised `mcpCapabilities.http`.
+pub fn filter_mcp_for_agent(mcp_servers: &Value, init_result: &Value) -> Value {
+    let http = init_result
+        .pointer("/agentCapabilities/mcpCapabilities/http")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let items = mcp_servers.as_array().cloned().unwrap_or_default();
+    Value::Array(
+        items
+            .into_iter()
+            .filter(|server| http || server.get("type").is_none())
+            .collect(),
+    )
+}
+
 /// `session/new` params with the runner's MCP servers (FR-1414).
 pub fn session_new_params(cwd: &Path, mcp_servers: &Value) -> Value {
     json!({
@@ -402,6 +417,28 @@ mod tests {
         assert_eq!(
             extract_reported_model(&payload).as_deref(),
             Some("grok-4.7")
+        );
+    }
+
+    #[test]
+    fn http_mcp_servers_need_agent_capability() {
+        let servers =
+            json!([{"name": "a", "command": "x"}, {"type": "http", "name": "b", "url": "u"}]);
+        let none = json!({"agentCapabilities": {}});
+        assert_eq!(
+            filter_mcp_for_agent(&servers, &none)
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let http = json!({"agentCapabilities": {"mcpCapabilities": {"http": true}}});
+        assert_eq!(
+            filter_mcp_for_agent(&servers, &http)
+                .as_array()
+                .unwrap()
+                .len(),
+            2
         );
     }
 }

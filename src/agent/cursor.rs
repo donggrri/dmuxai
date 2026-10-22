@@ -3084,7 +3084,7 @@ pub(crate) mod tests {
 
         fn set_fake_env(vars: &[(&str, &std::ffi::OsStr)]) {
             let fake = fake_acp_agent_bin();
-            // SAFETY: callers hold FAKE_ACP_ENV for the whole test.
+            // SAFETY: callers hold TEST_CURSOR_MUTEX (lock_env) for the whole test.
             unsafe {
                 for key in FAKE_VARS {
                     std::env::remove_var(key);

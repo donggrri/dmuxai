@@ -313,7 +313,14 @@ pub async fn run_acp_turn(
 
     let prompt_result = turn_result;
 
-    if config.cancel.load(Ordering::SeqCst) || state.permission_denied.load(Ordering::SeqCst) {
+    let crashed = matches!(&prompt_result, Err(error) if error != "cancelled")
+        || (prompt_result
+            .as_ref()
+            .is_ok_and(|o| o.stop_reason.is_none())
+            && !status.success());
+    if (config.cancel.load(Ordering::SeqCst) || state.permission_denied.load(Ordering::SeqCst))
+        && !(crashed && !config.cancel.load(Ordering::SeqCst))
+    {
         // FR-1416: user cancel or a denied permission ends the turn as cancelled.
         if config.lifecycle == AcpLifecycle::Managed {
             if state.permission_denied.load(Ordering::SeqCst) {
@@ -427,6 +434,8 @@ async fn open_session(
     )
     .await?;
     let caps = parse_agent_capabilities(&init);
+    // GLM review: only send HTTP MCP servers when the agent advertises them.
+    let mcp_servers = super::session::filter_mcp_for_agent(&config.mcp_servers, &init);
     let mut resume_warnings: Vec<String> = Vec::new();
 
     if let Some(id) = resume_session.filter(|s| !s.is_empty()) {
@@ -436,7 +445,7 @@ async fn open_session(
                 line_rx,
                 state,
                 "session/load",
-                session_load_params(id, cwd, &config.mcp_servers),
+                session_load_params(id, cwd, &mcp_servers),
                 &config.cancel,
             )
             .await
@@ -472,7 +481,7 @@ async fn open_session(
                 line_rx,
                 state,
                 "session/resume",
-                session_resume_params(id, cwd, &config.mcp_servers),
+                session_resume_params(id, cwd, &mcp_servers),
                 &config.cancel,
             )
             .await
@@ -509,7 +518,7 @@ async fn open_session(
         line_rx,
         state,
         "session/new",
-        session_new_params(cwd, &config.mcp_servers),
+        session_new_params(cwd, &mcp_servers),
         &config.cancel,
     )
     .await?;

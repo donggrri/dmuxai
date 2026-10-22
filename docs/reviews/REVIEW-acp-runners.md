@@ -31,3 +31,8 @@ All passed on Linux (2026-10-20).
 ## Rollback
 
 Set `[cursor] protocol = "legacy"` and `[agents] grok_protocol = "legacy"`.
+
+## Round 5 (FR-1410..FR-1418) — opencode free-model review
+
+- `opencode/glm-5.3-flash-free`: **no blockers**; 10 minor findings. Fixed: fmt, `?` in the mode-config scan, crash after denial stays `Error`, HTTP MCP servers only when the agent advertises `mcpCapabilities.http`, stale test comments. Deferred (minor): capability-gating set_mode, dead `session_config_model` path, fixture build into the shared target dir, end-to-end MCP passthrough test, duplicate cancel line on user stop.
+- `opencode/deepseek-v4.1-flash-free`: timed out (900 s) without a report.
