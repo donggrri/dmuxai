@@ -4845,8 +4845,10 @@ impl App {
         }
         // FR-1613: trivially simple prompts skip the judge turn entirely and
         // run as the same 1-node graph a `simple` verdict produces, with the
-        // triage recorded as a heuristic decision (`short prompt`).
-        if is_trivial_prompt(&prompt) {
+        // triage recorded as a heuristic decision (`short prompt`). A short
+        // prompt the FR-936 heuristic calls complex (e.g. `plan the refactor`)
+        // does not take this fast path and still starts a judge turn.
+        if is_trivial_prompt(&prompt) && heuristic_route(&prompt) == Route::Simple {
             let run_id = self
                 .pending_todo_run_id
                 .take()
@@ -24542,6 +24544,28 @@ mod tests {
         assert!(sent[before].1.prompt.contains("triage judge"));
         drop(sent);
         assert!(harness.app.pending_triage.is_some());
+    }
+
+    // TC-1615 / FR-1613: `plan the refactor` fits the short-prompt shape
+    // (one line, 3 words, 17 chars) but the FR-936 heuristic infers two roles
+    // (plan + implement), so the judge fast path must not fire: the judge turn
+    // starts and no 1-node run exists yet.
+    #[test]
+    fn tc_1613_short_planning_prompt_still_judged() {
+        assert_eq!(heuristic_route("plan the refactor"), Route::Complex);
+        assert!(is_trivial_prompt("plan the refactor"));
+
+        let mut harness = plan_gate_test_app();
+        harness.app.input = "plan the refactor".to_owned();
+        harness.app.submit_prompt();
+
+        let sent = harness.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].1.turn_id.as_str().starts_with("judge-"));
+        assert!(sent[0].1.prompt.contains("triage judge"));
+        drop(sent);
+        assert!(harness.app.pending_triage.is_some());
+        assert!(harness.app.graph_session.is_none());
     }
 
     // TC-931 / FR-930: an empty allowed_runners list notices and sends directly.
