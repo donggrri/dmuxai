@@ -9,7 +9,7 @@ Date: 2026-10-22
 | Requirement | Status | Notes |
 | --- | --- | --- |
 | FR-1600 | Met | `--web` never enters `TerminalSession` (`headless = web.is_some()`), crossterm polling is off, stdout prints `dmuxai dashboard: <url>` first (TC-1600, TC-1603) |
-| FR-1601 | Met | SIGINT exits 0, stops the server and removes `.dmuxai/web.json` (TC-1601); SIGTERM verified manually (see manual evidence below); the dashboard `quit` command also shuts down (TC-1471 path) |
+| FR-1601 | Met | SIGINT exits 0, stops the server and removes `.dmuxai/web.json` (TC-1601); SIGTERM verified manually (see manual evidence below); the dashboard `quit` command also shuts down (TC-1471 path). Review follow-up: signal handlers are registered before the URL is printed (see test evidence) |
 | FR-1602 | Met | plain `dmuxai` without a TTY still fails with the TTY error (TC-1602) |
 | FR-1603 | Met | `--help` says "Run the local dashboard with agents (no TUI)" (TC-1602) |
 | FR-1604 | Met | dashboard-initiated switch re-execs with the same port/token and no TUI (TC-1604) |
@@ -33,6 +33,12 @@ the unused `HEADLESS_DASHBOARD_ENV` copy in `src/main.rs`, updated the
 `tests/web_dashboard_only.rs`, and made a non-`InvalidInput` dashboard-start
 failure print to stderr and exit 2 in headless `--web` instead of running with
 no UI. Not re-run with cargo in this round per instruction.
+
+Review round (2026-10-22): the review found a SIGINT race in headless startup —
+a Ctrl-C arriving before the shutdown signal handlers were registered could
+bypass clean shutdown. Fixed by registering the SIGINT/SIGTERM handlers before
+the dashboard URL is printed to stdout. Re-ran `cargo test
+--test web_dashboard_only`: TC-1601 ran 5/5 green.
 
 Manual (real terminal, verified by the operator):
 
