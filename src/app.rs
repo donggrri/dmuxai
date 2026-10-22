@@ -11196,7 +11196,13 @@ impl App {
             .find(|m| m.role == Role::System && !m.local_only)
             .map(|m| m.content.clone());
 
-        let (ok, exit_code, error) = if cancelled {
+        // FR-1416: a graph stopped by a cancelled step is not a success.
+        let graph_cancelled = last_graph_id.as_ref().is_some_and(|graph_id| {
+            self.last_graph_run.as_ref().is_some_and(|run| {
+                run.plan.id == *graph_id && run.phase == GraphRunPhase::Cancelled
+            })
+        });
+        let (ok, exit_code, error) = if cancelled || graph_cancelled {
             (
                 false,
                 130,
