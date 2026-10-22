@@ -2224,6 +2224,11 @@ function appendApprovalStep(panel, step) {
   if (job) {
     panel.appendChild(el('div', 'graph-approval-job', job));
   }
+  var stageSkills = snapshot && snapshot.graph && snapshot.graph.approval && snapshot.graph.approval.stage_skills;
+  var stepSkills = stageSkills && stageSkills[String(step.role || '')];
+  if (Array.isArray(stepSkills) && stepSkills.length) {
+    panel.appendChild(el('div', 'graph-approval-job graph-approval-skills', 'skills: ' + stepSkills.join(', ')));
+  }
 }
 
 function planGateActionButton(label, extraClass, onClick) {

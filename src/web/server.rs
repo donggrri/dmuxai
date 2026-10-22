@@ -217,6 +217,96 @@ struct MemoryActionResponse {
     message: String,
 }
 
+/// SPEC-stage-skills UX-1500: stage → skill map of the dashboard workspace.
+async fn get_skills(State(state): State<AppState>) -> Response {
+    let workspace = std::path::PathBuf::from(state.hub.snapshot().workspace);
+    let settings = crate::settings::DmuxSettings::load(&workspace);
+    let ctx = crate::stage_skills::SkillContext::new(&workspace);
+    let rows = crate::stage_skills::map_rows(&settings.stage_skills, &ctx);
+    let stages: Vec<serde_json::Value> = crate::stage_skills::KNOWN_STAGES
+        .iter()
+        .map(|stage| {
+            serde_json::json!({
+                "stage": stage,
+                "skills": settings
+                    .stage_skills
+                    .stages
+                    .get(*stage)
+                    .map(|cfg| cfg.skills.clone())
+                    .unwrap_or_default(),
+            })
+        })
+        .collect();
+    json_ok(
+        StatusCode::OK,
+        &serde_json::json!({ "stages": stages, "rows": rows }),
+    )
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SkillsPostBody {
+    stage: String,
+    skills: Vec<String>,
+}
+
+/// UX-1500: writes `[stages.<stage>] skills` to the workspace dmuxai.toml.
+async fn post_skills(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<SkillsPostBody>,
+) -> Response {
+    let workspace = std::path::PathBuf::from(state.hub.snapshot().workspace);
+    let path = workspace.join("dmuxai.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let skills: Vec<String> = body
+        .skills
+        .iter()
+        .map(|skill| skill.trim().to_owned())
+        .filter(|skill| !skill.is_empty())
+        .collect();
+    match crate::stage_skills::set_stage_skills_in_toml(&text, &body.stage, &skills) {
+        Ok(updated) => match std::fs::write(&path, updated) {
+            Ok(()) => get_skills(State(state)).await,
+            Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        },
+        Err(error) => error_json(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SkillsApproveBody {
+    source: String,
+}
+
+/// FR-1502: one-time approval of a pinned git skill commit from the dashboard.
+async fn post_skills_approve(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<SkillsApproveBody>,
+) -> Response {
+    let workspace = std::path::PathBuf::from(state.hub.snapshot().workspace);
+    let settings = crate::settings::DmuxSettings::load(&workspace);
+    let ctx = crate::stage_skills::SkillContext::new(&workspace);
+    match crate::stage_skills::Approvals::approve(&ctx, &settings.stage_skills, &body.source) {
+        Ok(_) => get_skills(State(state)).await,
+        Err(error) => error_json(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn get_skills_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::SKILLS_JS,
+    )
+}
+
 async fn get_memory(State(state): State<AppState>) -> Response {
     let Some(memory) = memory_handle(&state) else {
         return json_ok(StatusCode::OK, &serde_json::json!({ "enabled": false }));
@@ -1701,6 +1791,7 @@ pub fn build_router_with(
         .route("/", get(get_index))
         .route("/assets/app.js", get(get_app_js))
         .route("/assets/memory.js", get(get_memory_js))
+        .route("/assets/skills.js", get(get_skills_js))
         .route("/assets/session.js", get(get_session_js))
         .route("/assets/workspace.js", get(get_workspace_js))
         .route("/assets/sidebar-resize.js", get(get_sidebar_resize_js))
@@ -1716,6 +1807,8 @@ pub fn build_router_with(
         .route("/api/workspace/validate", post(post_workspace_validate))
         .route("/api/workspace/switch", post(post_workspace_switch))
         .route("/api/workspace/open", post(post_workspace_open))
+        .route("/api/skills", get(get_skills).post(post_skills))
+        .route("/api/skills/approve", post(post_skills_approve))
         .route("/api/memory", get(get_memory))
         .route("/api/memory/save", post(post_memory_save))
         .route(

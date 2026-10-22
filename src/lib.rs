@@ -22,6 +22,7 @@ pub mod process;
 pub mod runner_protocol;
 pub mod settings;
 pub mod skills;
+pub mod stage_skills;
 pub mod state_path;
 pub mod theme;
 pub mod todo;

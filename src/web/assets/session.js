@@ -2446,7 +2446,7 @@
     '/agent': 'agent', '/mode': 'mode', '/effort': 'effort', '/status': 'status', '/quit': 'quit',
     '/new': 'new', '/conversations': 'conversations', '/resume': 'resume', '/summarize': 'summarize',
     '/compact': 'compact', '/plan': 'route', '/direct': 'route', '/share': 'share', '/image': 'image', '/details': 'details', '/graph': 'graph',
-    '/remember': 'remember', '/memory': 'memory'
+    '/remember': 'remember', '/memory': 'memory', '/skills': 'skills'
   };
 
   function choice(v) { return { value: v, label: v }; }

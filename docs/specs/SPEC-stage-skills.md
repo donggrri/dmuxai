@@ -1,6 +1,6 @@
 # SPEC: stage-skills (map skills to graph stages)
 
-Status: Draft (spec only, not implemented). Requested by Dongjin 2026-10-22 KST.
+Status: Implemented in tree (PR #93). Requested by Dongjin 2026-10-22 KST; open questions decided 2026-10-22 14:25 KST.
 Owner: donggrri
 Created: 2026-10-22
 Baseline: `1b9861a` (origin/main)
@@ -40,7 +40,16 @@ skills = ["tdd"]          # resolved from discovered dirs
 delivery = "auto"         # auto | native | inject
 ```
 
-Per-task override: `/plan --skills grill-me,-tdd <prompt>`. The plan JSON step can also carry `skills: [...]`, which the approval card shows and lets the user edit.
+```toml
+[skills]
+chat = false              # FR-1514: true also attaches stage skills to 1-node chat runs
+
+[stages.planner]
+max_rounds = 5            # FR-1512: interview cap (1..5)
+optional = []             # FR-1507: names that may be missing
+```
+
+Per-task override: `/plan --skills grill-me,-implement:tdd,review:local-review <prompt>`. `stage:name` targets a stage; a bare name targets `planner`; `-` removes. The approval card shows the effective skills of each step.
 
 ## 4. Requirements
 
@@ -48,17 +57,20 @@ Per-task override: `/plan --skills grill-me,-tdd <prompt>`. The plan JSON step c
 |---|---|
 | FR-1500 | `[stages.<stage>] skills = [..]` is accepted for `judge`, `planner` and every `NodeRole` name. An unknown stage name is a startup config problem, not a crash. |
 | FR-1501 | A skill reference resolves in this order: an explicit `[skills.sources]` entry, then a workspace path (`./...`), then discovered dirs `.agents/skills`, `.claude/skills`, `.cursor/skills`, `.grok/skills`, then the user-level dirs `~/.agents/skills` and `~/.claude/skills`. The first match wins, and the resolved path is shown. |
-| FR-1502 | A git source needs `rev` as a full commit SHA. dmuxai never downloads an unpinned or branch-only source. A fetch is an explicit `dmuxai skills sync` command, never automatic at run time, and it stores the result under the dmuxai state dir by SHA. |
+| FR-1502 | A git source needs `rev` as a full 40-character commit SHA. dmuxai never downloads an unpinned or branch-only source. A fetch is only the explicit `dmuxai skills sync` (or `/skills sync`) command, never automatic at run time; it checks out exactly that commit under `.dmuxai/skills-cache/<name>-<sha>` and verifies `HEAD`. **Every pinned commit also needs a one-time approval** (`/skills approve <source>`, stored in `.dmuxai/skill-approvals.json`); when the pin changes, the skill is blocked until approved again. |
 | FR-1503 | Delivery `auto` uses `inject` for every runner. `native` is opt-in per runner (FR-1504). This keeps behaviour identical across Cursor, agy, Grok, opencode and codex. |
-| FR-1504 | `native` delivery links (or copies on Windows) the resolved skill folder into a per-run temp dir that the runner reads (see table in §5). It never writes into the user's repo or home skill dirs. |
+| FR-1504 | `native` delivery copies the resolved skill folder into the per-run folder `.dmuxai/run-skills/<run>/<runner skill dir>/<id>` and the prompt only points the agent at that SKILL.md, which it reads with its own file tool. It never writes into the user's repo skill dirs or home dirs. Runners without a mapping fall back to `inject`. |
 | FR-1505 | `inject` puts the full SKILL.md body, without frontmatter, into the stage prompt inside a `<skill name=…>` block, before the task text. Referenced files are listed by path, not inlined. |
 | FR-1506 | Limits: 32 KB per SKILL.md and 64 KB per stage in total. If either limit is exceeded, preflight fails with a clear message. Nothing is truncated silently. |
 | FR-1507 | Preflight runs before the judge. It lists missing, unpinned, oversize or unreadable skills. A missing skill on a required stage blocks the run. With `optional = true`, the run continues with a warning. |
 | FR-1508 | Judge output must stay strict JSON, so skills on `judge` are rejected unless `force = true`. A judge with injected skills still uses the existing JSON fallback rules. |
-| FR-1509 | Per-task overrides (`/plan --skills`, a plan step's `skills`) add to or remove from the stage mapping (`-name` removes) for that run only. They are recorded in the run record. |
-| FR-1510 | Every node record stores the skill ids, resolved source, SHA or file hash, and delivery mode used. |
+| FR-1509 | Per-task overrides (`/plan --skills a,-stage:b`) add to or remove from the stage mapping for that run only. `stage:name` targets a stage, a bare name targets `planner`, `-` removes. Skills cannot be added to `judge` this way. They are recorded in the run record. |
+| FR-1510 | `.dmuxai/skill-runs/<run id>.json` stores, per stage and node, the skill id, runner, origin, SHA-256 of SKILL.md, git commit (if any), delivery mode, the overrides and the interview round count. |
 | FR-1511 | The existing `.agents/skills` picker (`app.rs:9778`) switches to `inject` of the full body under the same limits. |
-| FR-1512 | A skill that asks the user questions (for example `grill-me`) works through the question layer. Grok ACP `_x.ai/ask_user_question` shows a blocking card. On headless runners, text questions are detected at turn end and answered next turn with choice chips. The stage stays open across these turns until the agent marks it done or the user ends it. |
+| FR-1512 | A question-asking skill on `planner` (frontmatter `interactive: true`, source `interactive = true`, or a name/description mentioning grill, interview or questions) runs a read-only **planning interview** before the JSON plan turn. Each round is a visible chat turn; the user answers with the next chat message. The interview ends when the agent prints `DMUXAI_INTERVIEW_DONE`, the user types `/skills done`, or **round 5** (or a lower `max_rounds`) is reached; the last round tells the agent not to ask more. The answers and summary go to the plan turn; the question skill is not injected into the JSON plan turn. Cancelling a round cancels the interview and restores the prompt. |
+| FR-1513 | The dashboard writes `[stages.<stage>] skills` into the workspace `dmuxai.toml` (other keys kept) after a confirm dialog. Changes apply to the next prompt (settings are re-read at preflight). |
+| FR-1514 | Stage skills attach to graph stages by default: judge (forced only), planner, and nodes of multi-step or complex runs. A 1-node run (simple route or `/direct`) gets them only with `[skills] chat = true` or an explicit per-task override. |
+| FR-1515 | `dmuxai skills [list\|sync\|approve <source>]` CLI and TUI `/skills [list\|sync\|approve <source>\|done]`. |
 | UX-1500 | TUI `/skills` shows the stage→skill map with source and status (ok, missing, unpinned, oversize). The dashboard Settings page shows and edits the same map, writing `dmuxai.toml` after confirmation. |
 | UX-1501 | The plan approval card shows the skills of each step and lets the user remove or add them before approving. |
 | NFR-1500 | Skill text is treated as untrusted prompt content. It never changes runner permissions, the model policy, the allowed runners or the sandbox. |
@@ -67,11 +79,11 @@ Per-task override: `/plan --skills grill-me,-tdd <prompt>`. The plan JSON step c
 
 | Runner | Native skill dir (FR-1504, opt-in) | Default (inject) | Notes |
 |---|---|---|---|
-| Cursor legacy (`cursor-agent --print`) | `.cursor/skills` / `.agents/skills` in the temp workspace overlay | yes | Native needs an overlay because the cwd is the repo. Keep `--disable-slash-commands` off only when native. |
-| Grok ACP | `.grok/skills` or `.agents/skills` | yes | Questions go through `_x.ai/ask_user_question`. |
-| agy headless | `~/.gemini/config/skills` (user level) | yes | Native would touch the home dir, so inject only. |
-| opencode headless | `.opencode/skill` / `.agents/skills` | yes | To verify on the box. |
-| codex | `.agents/skills` (to verify) | yes | |
+| Cursor legacy (`cursor-agent --print`, composer-2.5 non-fast) | `.dmuxai/run-skills/<run>/.cursor/skills/<id>` + pointer | yes | |
+| Grok ACP | `.dmuxai/run-skills/<run>/.grok/skills/<id>` + pointer | yes | Interview rounds are normal chat turns. |
+| agy headless | `.dmuxai/run-skills/<run>/.agents/skills/<id>` + pointer | yes | The home dir (`~/.gemini/config/skills`) is never written. |
+| opencode headless | `.dmuxai/run-skills/<run>/.agents/skills/<id>` + pointer | yes | |
+| codex | `.dmuxai/run-skills/<run>/.agents/skills/<id>` + pointer | yes | |
 
 ## 6. Tests
 
@@ -90,9 +102,11 @@ Per-task override: `/plan --skills grill-me,-tdd <prompt>`. The plan JSON step c
 | TC-1510 | Hands-on: grill-me on planner with Grok ACP (card) and Cursor legacy (next-turn chips) (FR-1512). |
 | TC-1511 | UI map, the edit round-trip and the approval card skills (UX-1500, UX-1501). |
 | TC-1512 | Skill text that asks for `--yolo` or a different model changes nothing (NFR-1500). |
+| TC-1513 | Sync from a local fixture git repo (no network), approval required, a new pinned commit needs approval again (FR-1502, FR-1515). |
+| TC-1514 | Interview round cap, `/skills done`, and no stage skills on a 1-node run (FR-1512, FR-1514). |
 
-## 7. Open questions
+## 7. Decisions (Dongjin 2026-10-22 14:25 KST)
 
-- OQ-1500: Should the default stays-open behaviour for question skills (FR-1512) end after N rounds (proposed: 5) or only on explicit user end?
-- OQ-1501: Is a pinned git source enough, or should the first use of a new SHA also need a one-time approval in the UI?
-- OQ-1502: Should skills attach only to graph stages, or also to a free chat turn (single node) by default?
+- OQ-1500 → a question skill runs at most 5 rounds; the user can end earlier (`/skills done`).
+- OQ-1501 → a git skill needs a full SHA pin **and** a one-time UI approval whenever the pinned commit changes.
+- OQ-1502 → skills attach to graph stages by default; 1-node chat runs only when chosen explicitly (`[skills] chat = true` or a per-task override).

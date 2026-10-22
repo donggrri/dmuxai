@@ -86,6 +86,8 @@ pub struct DmuxSettings {
     pub notify: NotifySettings,
     /// User-config `[workspace]` settings (FR-870, FR-872).
     pub workspace: WorkspaceSettings,
+    /// Stage → skill mapping (SPEC-stage-skills).
+    pub stage_skills: crate::stage_skills::StageSkillSettings,
     /// Problems found while reading dmuxai.toml, shown at startup.
     pub config_warnings: Vec<String>,
     /// Resolved `[memory]` (SPEC-obsidian-memory FR-720); `None` = disabled.
@@ -148,6 +150,10 @@ struct DmuxToml {
     mcp: Option<McpToml>,
     todo: Option<TodoToml>,
     workspace: Option<WorkspaceSettings>,
+    /// `[stages.<stage>]` skill mapping (SPEC-stage-skills FR-1500).
+    stages: Option<std::collections::BTreeMap<String, crate::stage_skills::StageToml>>,
+    /// `[skills]` sources (SPEC-stage-skills FR-1501).
+    skills: Option<crate::stage_skills::SkillsToml>,
     /// Legacy execution modes table (removed); presence triggers a warning.
     modes: Option<LegacyModesToml>,
 }
@@ -388,6 +394,8 @@ impl DmuxSettings {
         for parsed in configs {
             settings.apply_toml(parsed, &mut known_custom, &pending_presets);
         }
+        let skill_warnings = settings.stage_skills.warnings();
+        settings.config_warnings.extend(skill_warnings);
         // Appended last so existing custom agent indices do not move.
         // Opencode stays before grok.
         if let Some(program) = opencode_preset_bin
@@ -518,6 +526,7 @@ impl DmuxSettings {
             self.config_warnings
                 .push(MODES_SECTION_DEPRECATED.to_owned());
         }
+        self.stage_skills.merge(parsed.stages, parsed.skills);
         if let Some(memory) = parsed.memory {
             if memory.vault.is_some() {
                 self.memory_raw.vault = memory.vault;
@@ -786,6 +795,7 @@ impl Default for DmuxSettings {
             web_theme: WebThemeSettings::default(),
             notify: NotifySettings::default(),
             workspace: WorkspaceSettings::default(),
+            stage_skills: Default::default(),
             config_warnings: Vec::new(),
             memory: None,
             memory_raw: MemoryToml::default(),

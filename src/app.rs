@@ -60,18 +60,20 @@ use dmuxai::{
         PlanChange, PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode,
         PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls, PlannerIo,
         PlannerIoKind, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage, TriageSource,
-        apply_replan, approval_panel_lines, budget_allows, build_judge_prompt, build_plan_prompt,
-        build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary, cap_revision_raw,
-        diff_plan_steps, diff_plan_tasks, fallback_plan, graph_plan_from_revision_steps,
-        heuristic_route, judge_line_text, judging_line_text, next_plan_change_rev, parse_plan,
-        parse_replan, parse_replan_marker, parse_verdict, plan_json_for_edit, replan_allowed,
-        replan_revision_steps, revision_needs_approval, save_run, strip_replan_marker,
-        task_counter_text, validate_plan, write_tasks_file_if_enabled,
+        apply_replan, approval_panel_lines_with_skills, budget_allows, build_judge_prompt,
+        build_plan_prompt, build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary,
+        cap_revision_raw, diff_plan_steps, diff_plan_tasks, fallback_plan,
+        graph_plan_from_revision_steps, heuristic_route, judge_line_text, judging_line_text,
+        next_plan_change_rev, parse_plan, parse_replan, parse_replan_marker, parse_verdict,
+        plan_json_for_edit, replan_allowed, replan_revision_steps, revision_needs_approval,
+        save_run, strip_replan_marker, task_counter_text, validate_plan,
+        write_tasks_file_if_enabled,
     },
     mcp::config::ResolvedMcpServer,
     mcp::registry::McpRegistry,
     settings::DmuxSettings,
     skills::{discover_skills, skill_prompt_prefix},
+    stage_skills::{self, SkillContext, SkillOverride},
     theme::{Speaker, Theme},
     todo::{Todo, TodoError, TodoStatus, TodoStore},
     web::commands::{
@@ -145,6 +147,7 @@ enum SlashAction {
     Details,
     Remember,
     Memory,
+    Skills,
     Direct,
     Plan,
 }
@@ -163,7 +166,7 @@ struct SlashCommand {
     action: SlashAction,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 16] = [
+const SLASH_COMMANDS: [SlashCommand; 17] = [
     SlashCommand {
         name: "/agent",
         description: "Switch the active agent",
@@ -243,6 +246,11 @@ const SLASH_COMMANDS: [SlashCommand; 16] = [
         name: "/memory",
         description: "List memory proposals; /memory approve|reject <id>",
         action: SlashAction::Memory,
+    },
+    SlashCommand {
+        name: "/skills",
+        description: "Show stage skills; /skills approve <source>|sync|done",
+        action: SlashAction::Skills,
     },
 ];
 
@@ -775,6 +783,25 @@ struct PendingPlan {
     adapter_sent: bool,
 }
 
+/// SPEC-stage-skills FR-1512: a planning interview run by a question skill
+/// (for example grill-me) before the plan turn.
+struct SkillInterview {
+    agent: Agent,
+    prompt: String,
+    route: Route,
+    reason: String,
+    source: TriageSource,
+    cause: Option<FallbackCause>,
+    run_id: String,
+    judge_calls: u32,
+    elapsed_ms: u64,
+    override_kind: Option<OverrideKind>,
+    round: u32,
+    max_rounds: u32,
+    answers: Vec<(u32, String)>,
+    prefix: String,
+}
+
 /// FR-956: internal read-only replan turn (buffer hidden like [`PendingPlan`]).
 struct PendingReplan {
     agent: Agent,
@@ -1187,6 +1214,16 @@ pub struct App {
     pending_summary: Option<PendingSummary>,
     pending_triage: Option<PendingTriage>,
     pending_plan: Option<PendingPlan>,
+    /// SPEC-stage-skills FR-1509: per-task overrides keyed by run id.
+    skill_overrides: HashMap<String, Vec<SkillOverride>>,
+    /// Overrides parsed from the `/plan --skills` prompt being submitted.
+    pending_skill_overrides: Vec<SkillOverride>,
+    /// FR-1512: planning interview of a question skill.
+    skill_interview: Option<SkillInterview>,
+    /// FR-1512: interview output that ended the interview (handled on tick).
+    skill_interview_finish: Option<String>,
+    /// FR-1512: run id whose planning skips the interview (already done).
+    skill_interview_skip: Option<String>,
     pending_replan: Option<PendingReplan>,
     queued_replan: Option<QueuedReplan>,
     /// Step result summaries since the last replan turn (FR-956).
@@ -1437,6 +1474,11 @@ impl App {
             pending_summary: None,
             pending_triage: None,
             pending_plan: None,
+            skill_overrides: HashMap::new(),
+            pending_skill_overrides: Vec::new(),
+            skill_interview: None,
+            skill_interview_finish: None,
+            skill_interview_skip: None,
             pending_replan: None,
             queued_replan: None,
             replan_summaries: Vec::new(),
@@ -1632,6 +1674,9 @@ impl App {
         self.check_triage_timeout(Instant::now());
         self.check_plan_timeout(Instant::now());
         self.check_replan_timeout(Instant::now());
+        if let Some(summary) = self.skill_interview_finish.take() {
+            self.finish_skill_interview(summary);
+        }
         let flushed_internal = self.flush_deferred_internal_turns();
         let flushed = self.flush_deferred_graph_starts() | self.flush_followup_queue();
         let busy = !self.busy_agents.is_empty();
@@ -3174,6 +3219,7 @@ impl App {
                 "Usage: /remember [--human | --decision <name> | --gotcha <name>] <text>",
             ),
             SlashAction::Memory => self.memory_command(""),
+            SlashAction::Skills => self.skills_command(""),
             SlashAction::Direct => self.push_system("Usage: /direct <prompt>"),
             SlashAction::Plan => self.push_system("Usage: /plan <prompt>"),
         }
@@ -3793,8 +3839,19 @@ impl App {
                     self.memory_command(&rest);
                     return;
                 }
+                "/skills" => {
+                    let rest = prompt.strip_prefix("/skills").unwrap().trim().to_owned();
+                    self.skills_command(&rest);
+                    return;
+                }
                 "/plan" => {
-                    let rest = prompt.strip_prefix("/plan").unwrap_or("").trim().to_owned();
+                    let raw = prompt.strip_prefix("/plan").unwrap_or("").trim().to_owned();
+                    let (overrides, rest) = stage_skills::parse_skill_overrides(&raw);
+                    if !rest.is_empty() && self.skill_preflight_blocks(&overrides) {
+                        self.input = prompt;
+                        return;
+                    }
+                    self.pending_skill_overrides = overrides;
                     if rest.is_empty() {
                         self.push_system("Usage: /plan <prompt>");
                     } else if self.refuse_plan_gate_prompt(prompt) {
@@ -3935,6 +3992,14 @@ impl App {
                     "Graph disabled: allowed_runners list is empty. Falling back to single-agent mode.",
                 );
                 self.submit_direct_run(prompt, agent, OverrideKind::NoAllowedRunners);
+                return;
+            }
+            if self.skill_interview.is_some() {
+                self.answer_skill_interview(prompt);
+                return;
+            }
+            if self.skill_preflight_blocks(&[]) {
+                self.input = prompt;
                 return;
             }
             #[cfg(test)]
@@ -4760,8 +4825,9 @@ impl App {
         }
         let index = adapter_index(agent);
         let nonce = Uuid::new_v4().simple().to_string();
+        let judge_skill_prefix = self.stage_skill_prefix("judge", runner_name(agent), None, None);
         let judge_prompt = match build_judge_prompt(&prompt, &nonce) {
-            Ok(judge_prompt) => judge_prompt,
+            Ok(judge_prompt) => format!("{judge_skill_prefix}{judge_prompt}"),
             Err(_) => {
                 let run_id = Uuid::new_v4().to_string();
                 self.triage_fallback(prompt, agent, FallbackCause::InvalidVerdict, run_id, 0, 0);
@@ -6165,6 +6231,26 @@ impl App {
         if self.refuse_plan_gate_prompt(prompt.clone()) {
             return;
         }
+        let overrides = std::mem::take(&mut self.pending_skill_overrides);
+        if !overrides.is_empty() {
+            self.skill_overrides.insert(run_id.clone(), overrides);
+        }
+        if self.skill_interview_skip.as_deref() != Some(run_id.as_str())
+            && self.start_skill_interview(
+                &prompt,
+                agent,
+                route,
+                &reason,
+                source,
+                cause,
+                &run_id,
+                judge_calls,
+                elapsed_ms,
+                override_kind,
+            )
+        {
+            return;
+        }
         let model = match self.selected_run_model_label(agent) {
             Ok(model) => model,
             Err(error) => {
@@ -6476,7 +6562,10 @@ impl App {
                 mode: PlanPromptMode::Repair { errors: &errors },
             })
         } {
-            Ok(plan_prompt) => plan_prompt,
+            Ok(plan_prompt) => {
+                let prefix = self.stage_skill_prefix("planner", &runner, Some(&run_id), None);
+                format!("{prefix}{plan_prompt}")
+            }
             Err(_) => {
                 self.park_fallback_plan(
                     prompt,
@@ -9206,6 +9295,7 @@ impl App {
         self.activities.remove(&agent);
         self.end_run_state(agent, success, error.as_deref() == Some("cancelled"));
         let output_text = self.last_agent_output_text(agent);
+        self.note_skill_interview_turn_end(agent, success, error.as_deref(), &output_text);
         // FR-1209: the chat message that holds this output, so the dashboard
         // links the change record to it instead of rendering the text twice.
         let output_message_id = self
@@ -9773,6 +9863,20 @@ impl App {
         self.graph_agent_nodes
             .insert(agent, assignment.node_id.clone());
         let mut prompt = assignment.prompt;
+        if let Some(run_id) = self
+            .graph_session
+            .as_ref()
+            .map(|session| session.run().plan.id.clone())
+        {
+            let stage = assignment.role.to_string();
+            let prefix = self.stage_skill_prefix(
+                &stage,
+                &assignment.runner,
+                Some(&run_id),
+                Some(&assignment.node_id),
+            );
+            prompt = format!("{prefix}{prompt}");
+        }
         if let Some(session) = &self.graph_session {
             let skill_id = session
                 .run()
@@ -10135,6 +10239,389 @@ impl App {
                 self.push_system(format!("Already in memory: {target}"));
             }
             Err(error) => self.push_system(format!("Memory not saved: {error}")),
+        }
+    }
+
+    // ---- SPEC-stage-skills (FR-1500..FR-1515) ----
+
+    fn skill_ctx(&self) -> SkillContext {
+        SkillContext::new(&self.workspace_root)
+    }
+
+    /// Re-reads `[stages]` and `[skills]` so dashboard edits apply to the next prompt.
+    fn refresh_stage_skills(&mut self) {
+        let fresh = DmuxSettings::load(&self.workspace_root);
+        self.settings.stage_skills = fresh.stage_skills;
+    }
+
+    /// FR-1507: preflight of every configured stage before the judge.
+    fn skill_preflight_blocks(&mut self, overrides: &[SkillOverride]) -> bool {
+        self.refresh_stage_skills();
+        let cfg = self.settings.stage_skills.clone();
+        if cfg.is_empty() && overrides.is_empty() {
+            return false;
+        }
+        let ctx = self.skill_ctx();
+        let approvals = stage_skills::Approvals::load(&ctx);
+        let mut blocking = Vec::new();
+        for stage in stage_skills::KNOWN_STAGES {
+            let report = stage_skills::preflight(stage, &cfg, overrides, &ctx, &approvals);
+            for issue in report.issues.iter().filter(|issue| !issue.blocking) {
+                self.push_system(format!(
+                    "Skill {} for {} skipped ({}): {}",
+                    issue.skill,
+                    stage,
+                    issue.kind.as_str(),
+                    issue.message
+                ));
+            }
+            if let Some(message) = report.blocking_message() {
+                blocking.push(message);
+            }
+        }
+        if blocking.is_empty() {
+            return false;
+        }
+        self.push_system(format!(
+            "{}\nFix dmuxai.toml, run `dmuxai skills sync`, or approve with /skills approve <source>. See /skills.",
+            blocking.join("\n")
+        ));
+        true
+    }
+
+    /// FR-1514: stage skills attach to graph stages; a 1-node chat turn only
+    /// when `[skills] chat = true` or the task chose skills explicitly.
+    fn skills_apply_to_run(&self, run_id: &str) -> bool {
+        if self.settings.stage_skills.chat || self.skill_overrides.contains_key(run_id) {
+            return true;
+        }
+        self.graph_session
+            .as_ref()
+            .filter(|session| session.run().plan.id == run_id)
+            .is_none_or(|session| {
+                let run = session.run();
+                let executable = run
+                    .plan
+                    .nodes
+                    .iter()
+                    .filter(|node| node.role != NodeRole::Orchestrate)
+                    .count();
+                executable > 1
+                    || run
+                        .triage
+                        .as_ref()
+                        .is_some_and(|triage| triage.route == Route::Complex)
+            })
+    }
+
+    /// FR-1503..FR-1505, FR-1510: prompt prefix for a stage and its run record.
+    fn stage_skill_prefix(
+        &mut self,
+        stage: &str,
+        runner: &str,
+        run_id: Option<&str>,
+        node_id: Option<&str>,
+    ) -> String {
+        let overrides = run_id
+            .and_then(|id| self.skill_overrides.get(id).cloned())
+            .unwrap_or_default();
+        let cfg = &self.settings.stage_skills;
+        if cfg.stage_skills(stage, &overrides).is_empty() {
+            return String::new();
+        }
+        if node_id.is_some()
+            && let Some(id) = run_id
+            && !self.skills_apply_to_run(id)
+        {
+            return String::new();
+        }
+        let ctx = self.skill_ctx();
+        let approvals = stage_skills::Approvals::load(&ctx);
+        let report = stage_skills::preflight(stage, cfg, &overrides, &ctx, &approvals);
+        let skills: Vec<_> = report
+            .skills
+            .into_iter()
+            .filter(|skill| stage != "planner" || !skill.interactive)
+            .collect();
+        if skills.is_empty() {
+            return String::new();
+        }
+        let root = ctx.native_root(run_id.unwrap_or("adhoc"));
+        let (text, used) =
+            stage_skills::stage_prompt_prefix(cfg.delivery(stage), runner, &skills, &root);
+        if let Some(id) = run_id {
+            let uses = stage_skills::uses_for(stage, node_id, runner, &skills, used);
+            let labels: Vec<String> = overrides.iter().map(|o| format!("{o:?}")).collect();
+            if let Err(error) = stage_skills::SkillRunRecord::append(&ctx, id, |record| {
+                record.uses.extend(uses);
+                if record.overrides.is_empty() {
+                    record.overrides = labels;
+                }
+            }) {
+                self.push_system(format!("Could not save the skill record: {error}"));
+            }
+        }
+        if !self.quiet_graph_run {
+            let names: Vec<&str> = skills.iter().map(|skill| skill.id.as_str()).collect();
+            self.push_system(format!(
+                "Skills for {stage} via {runner} ({}): {}",
+                used.as_str(),
+                names.join(", ")
+            ));
+        }
+        text
+    }
+
+    /// UX-1501: approval panel with the skills of each step.
+    fn approval_lines(&self, run: &GraphRun, width: usize) -> Vec<dmuxai::graph::PanelLine> {
+        let overrides = self
+            .skill_overrides
+            .get(&run.plan.id)
+            .cloned()
+            .unwrap_or_default();
+        let cfg = &self.settings.stage_skills;
+        approval_panel_lines_with_skills(run, width, &|role| cfg.stage_skills(role, &overrides))
+    }
+
+    /// FR-1512: starts the planning interview when the planner has a question skill.
+    #[allow(clippy::too_many_arguments)]
+    fn start_skill_interview(
+        &mut self,
+        prompt: &str,
+        agent: Agent,
+        route: Route,
+        reason: &str,
+        source: TriageSource,
+        cause: Option<FallbackCause>,
+        run_id: &str,
+        judge_calls: u32,
+        elapsed_ms: u64,
+        override_kind: Option<OverrideKind>,
+    ) -> bool {
+        if self.skill_interview.is_some() {
+            return false;
+        }
+        let overrides = self
+            .skill_overrides
+            .get(run_id)
+            .cloned()
+            .unwrap_or_default();
+        let cfg = self.settings.stage_skills.clone();
+        if cfg.stage_skills("planner", &overrides).is_empty() {
+            return false;
+        }
+        let ctx = self.skill_ctx();
+        let approvals = stage_skills::Approvals::load(&ctx);
+        let report = stage_skills::preflight("planner", &cfg, &overrides, &ctx, &approvals);
+        let skills: Vec<_> = report
+            .skills
+            .into_iter()
+            .filter(|skill| skill.interactive)
+            .collect();
+        if skills.is_empty() {
+            return false;
+        }
+        let runner = runner_name(agent);
+        let (prefix, used) = stage_skills::stage_prompt_prefix(
+            cfg.delivery("planner"),
+            runner,
+            &skills,
+            &ctx.native_root(run_id),
+        );
+        let uses = stage_skills::uses_for("planner", None, runner, &skills, used);
+        let _ =
+            stage_skills::SkillRunRecord::append(&ctx, run_id, |record| record.uses.extend(uses));
+        let max_rounds = cfg.max_rounds("planner");
+        let names: Vec<&str> = skills.iter().map(|skill| skill.id.as_str()).collect();
+        self.push_system(format!(
+            "Planning interview with {} via {runner} ({}): up to {max_rounds} rounds. Answer in the chat; /skills done ends it early.",
+            names.join(", "),
+            used.as_str()
+        ));
+        self.skill_interview = Some(SkillInterview {
+            agent,
+            prompt: prompt.to_owned(),
+            route,
+            reason: reason.to_owned(),
+            source,
+            cause,
+            run_id: run_id.to_owned(),
+            judge_calls,
+            elapsed_ms,
+            override_kind,
+            round: 1,
+            max_rounds,
+            answers: Vec::new(),
+            prefix,
+        });
+        self.send_skill_interview_turn();
+        true
+    }
+
+    fn send_skill_interview_turn(&mut self) {
+        let Some(interview) = self.skill_interview.as_ref() else {
+            return;
+        };
+        let text = stage_skills::interview_prompt(
+            &interview.prefix,
+            &interview.prompt,
+            &interview.answers,
+            interview.round,
+            interview.max_rounds,
+        );
+        let agent = interview.agent;
+        let shown = match interview.answers.last() {
+            Some((_, answer)) => answer.clone(),
+            None => interview.prompt.clone(),
+        };
+        let label = format!(
+            "[planning interview {}/{}] {shown}",
+            interview.round, interview.max_rounds
+        );
+        self.pending_turn_policy = Some(TurnPolicy::ReadOnly);
+        let before = self.messages.len();
+        if self.try_submit_to_agent(agent, text, false, true).is_err() {
+            self.push_system("The planning interview could not start; planning without it.");
+            self.skill_interview_finish = Some(String::new());
+            return;
+        }
+        for message in self.messages.iter_mut().skip(before) {
+            if message.role == Role::User {
+                message.content = label.clone();
+            }
+        }
+    }
+
+    fn answer_skill_interview(&mut self, answer: String) {
+        let Some(agent) = self.skill_interview.as_ref().map(|iv| iv.agent) else {
+            return;
+        };
+        if self.busy_agents.contains(&agent) {
+            self.input = answer;
+            self.push_system("Wait for the interview question to finish, then answer.");
+            return;
+        }
+        let finish_now = {
+            let interview = self.skill_interview.as_mut().expect("interview");
+            interview.answers.push((interview.round, answer));
+            interview.round += 1;
+            interview.round > interview.max_rounds
+        };
+        if finish_now {
+            self.finish_skill_interview(String::new());
+        } else {
+            self.send_skill_interview_turn();
+        }
+    }
+
+    /// Called when any turn ends (FR-1512): the marker or the last round ends the interview.
+    fn note_skill_interview_turn_end(
+        &mut self,
+        agent: Agent,
+        success: bool,
+        error: Option<&str>,
+        output: &str,
+    ) {
+        let Some(interview) = self.skill_interview.as_ref() else {
+            return;
+        };
+        if interview.agent != agent || self.active_graph_node_for_agent(agent).is_some() {
+            return;
+        }
+        if error == Some("cancelled") {
+            let prompt = interview.prompt.clone();
+            self.skill_interview = None;
+            self.input = prompt;
+            self.push_system("Planning interview cancelled.");
+            return;
+        }
+        if !success {
+            self.push_system("The interview turn failed; planning with the answers so far.");
+            self.skill_interview_finish = Some(String::new());
+            return;
+        }
+        if output.contains(stage_skills::INTERVIEW_DONE_MARKER)
+            || interview.round >= interview.max_rounds
+        {
+            self.skill_interview_finish = Some(output.to_owned());
+        }
+    }
+
+    fn finish_skill_interview(&mut self, summary: String) {
+        let Some(interview) = self.skill_interview.take() else {
+            return;
+        };
+        let rounds = interview.round.min(interview.max_rounds);
+        let ctx = self.skill_ctx();
+        let _ = stage_skills::SkillRunRecord::append(&ctx, &interview.run_id, |record| {
+            record.interview_rounds = rounds;
+        });
+        self.push_system(format!(
+            "Planning interview finished after {rounds} round(s); planning now."
+        ));
+        let prompt =
+            stage_skills::prompt_with_interview(&interview.prompt, &interview.answers, &summary);
+        self.skill_interview_skip = Some(interview.run_id.clone());
+        self.begin_planning(
+            prompt,
+            interview.agent,
+            interview.route,
+            interview.reason,
+            interview.source,
+            interview.cause,
+            interview.run_id,
+            interview.judge_calls,
+            interview.elapsed_ms,
+            interview.override_kind,
+        );
+    }
+
+    /// UX-1500: `/skills [list|approve <source>|sync|done]`.
+    fn skills_command(&mut self, args: &str) {
+        self.refresh_stage_skills();
+        let ctx = self.skill_ctx();
+        let mut parts = args.split_whitespace();
+        match parts.next() {
+            None | Some("list") => {
+                let text = stage_skills::render_map(&self.settings.stage_skills, &ctx);
+                self.push_system(text);
+            }
+            Some("approve") => match parts.next() {
+                Some(name) => {
+                    match stage_skills::Approvals::approve(&ctx, &self.settings.stage_skills, name) {
+                        Ok(rev) => self.push_system(format!("Approved {name} at {rev}.")),
+                        Err(error) => self.push_system(format!("Could not approve {name}: {error}")),
+                    }
+                }
+                None => self.push_system("Usage: /skills approve <source>"),
+            },
+            Some("sync") => {
+                let results = stage_skills::sync_sources(&self.settings.stage_skills, &ctx);
+                if results.is_empty() {
+                    self.push_system("No git skill sources configured.");
+                }
+                for (name, result) in results {
+                    match result {
+                        Ok(message) => self.push_system(format!("{name}: {message}")),
+                        Err(error) => self.push_system(format!("{name}: sync failed: {error}")),
+                    }
+                }
+            }
+            Some("done") => {
+                let Some(agent) = self.skill_interview.as_ref().map(|iv| iv.agent) else {
+                    self.push_system("No planning interview is running.");
+                    return;
+                };
+                if self.busy_agents.contains(&agent) {
+                    self.push_system("Wait for the current interview turn to finish (or press Esc).");
+                    return;
+                }
+                let last = self.last_agent_output_text(agent);
+                self.finish_skill_interview(last);
+            }
+            Some(other) => self.push_system(format!(
+                "Unknown /skills command '{other}'. Use /skills, /skills approve <source>, /skills sync or /skills done."
+            )),
         }
     }
 
@@ -10543,6 +11030,22 @@ impl App {
                 Some(conversation_run_total),
             )
         });
+
+        if let Some(graph) = graph.as_mut()
+            && let Some(approval) = graph.approval.as_mut()
+        {
+            let overrides = self
+                .skill_overrides
+                .get(&graph.id)
+                .cloned()
+                .unwrap_or_default();
+            for stage in stage_skills::KNOWN_STAGES {
+                let list = self.settings.stage_skills.stage_skills(stage, &overrides);
+                if !list.is_empty() {
+                    approval.stage_skills.insert(stage.to_owned(), list);
+                }
+            }
+        }
 
         if let Some(graph) = graph.as_mut() {
             let history = self.graph_history_run_id.as_deref() == Some(graph.id.as_str());
@@ -11622,7 +12125,7 @@ impl App {
             return 0;
         }
         let run = self.awaiting_approval_run().expect("approval panel wanted");
-        let line_count = approval_panel_lines(run, width.max(1) as usize).len();
+        let line_count = self.approval_lines(run, width.max(1) as usize).len();
         if line_count == 0 {
             return 0;
         }
@@ -11649,7 +12152,7 @@ impl App {
             .approval_panel
             .map(|area| area.width.max(1) as usize)
             .unwrap_or(1);
-        let line_count = approval_panel_lines(run, width).len();
+        let line_count = self.approval_lines(run, width).len();
         let visible = self.approval_panel_page_lines();
         line_count.saturating_sub(visible)
     }
@@ -12124,7 +12627,7 @@ impl App {
     fn draw_approval_panel(&mut self, frame: &mut Frame, area: Rect) {
         let run = self.awaiting_approval_run().expect("approval panel area");
         let width = area.width.max(1) as usize;
-        let panel_lines = approval_panel_lines(run, width);
+        let panel_lines = self.approval_lines(run, width);
         if panel_lines.is_empty() {
             return;
         }
@@ -25481,6 +25984,236 @@ mod tests {
         );
     }
 
+    // ---- SPEC-stage-skills app tests ----
+
+    fn stage_skill_harness(toml: &str) -> PlanGateHarness {
+        let workspace =
+            std::env::temp_dir().join(format!("dmuxai-stage-skills-{}", Uuid::new_v4()));
+        let write = |rel: &str, name: &str, desc: &str, body: &str| {
+            let dir = workspace.join(rel);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {desc}\n---\n{body}\n"),
+            )
+            .unwrap();
+        };
+        write(
+            ".agents/skills/grill-me",
+            "grill-me",
+            "Interview the user relentlessly",
+            "GRILL-BODY ask one question at a time.",
+        );
+        write(
+            "skills/review-list",
+            "review-list",
+            "Review checklist",
+            "REVIEW-BODY check error handling.",
+        );
+        std::fs::write(workspace.join("dmuxai.toml"), toml).unwrap();
+        plan_gate_harness_in_workspace(workspace, &[])
+    }
+
+    fn requests_with_prefix(sent: &SentRequests, prefix: &str) -> Vec<AgentRequest> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, request)| request.turn_id.as_str().starts_with(prefix))
+            .map(|(_, request)| request.clone())
+            .collect()
+    }
+
+    fn plain_requests(sent: &SentRequests) -> Vec<AgentRequest> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, request)| {
+                let turn = request.turn_id.as_str();
+                !turn.starts_with("judge-")
+                    && !turn.starts_with("plan-")
+                    && !turn.starts_with("replan-")
+            })
+            .map(|(_, request)| request.clone())
+            .collect()
+    }
+
+    fn finish_plain(h: &mut PlanGateHarness, request: &AgentRequest, text: &str) {
+        h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            request,
+            AgentEvent::TextDelta(text.to_owned()),
+        ));
+        h.app
+            .apply_agent_output(triage_output(Agent::Codex, request, AgentEvent::Completed));
+        h.app.tick();
+    }
+
+    // TC-1510: grill-me on the planner runs a read-only interview, the answer
+    // reaches the next round, and the marker hands the notes to the plan turn.
+    #[test]
+    fn stage_skills_planner_interview_flow() {
+        let mut h = stage_skill_harness("[stages.planner]\nskills = [\"grill-me\"]\n");
+        h.app.input = "/plan build a login page".to_owned();
+        h.app.submit_prompt();
+        let first = plain_requests(&h.sent);
+        assert_eq!(first.len(), 1, "one interview turn");
+        assert_eq!(first[0].policy, TurnPolicy::ReadOnly);
+        assert!(first[0].prompt.contains("GRILL-BODY"));
+        assert!(first[0].prompt.contains("Round 1 of at most 5"));
+        assert!(requests_with_prefix(&h.sent, "plan-").is_empty());
+        finish_plain(&mut h, &first[0], "Q1. Which auth provider?");
+        h.app.input = "OAuth with GitHub".to_owned();
+        h.app.submit_prompt();
+        let second = plain_requests(&h.sent);
+        assert_eq!(second.len(), 2);
+        assert!(second[1].prompt.contains("[round 1] OAuth with GitHub"));
+        assert!(second[1].prompt.contains("Round 2 of at most 5"));
+        finish_plain(
+            &mut h,
+            &second[1],
+            "Decided: GitHub OAuth\nDMUXAI_INTERVIEW_DONE",
+        );
+        let plans = requests_with_prefix(&h.sent, "plan-");
+        assert_eq!(plans.len(), 1, "plan turn after the interview");
+        assert!(plans[0].prompt.contains("answer 1: OAuth with GitHub"));
+        assert!(
+            !plans[0].prompt.contains("GRILL-BODY"),
+            "interactive skill not injected into the JSON plan turn"
+        );
+        let ctx = SkillContext::new(&h.app.workspace_root);
+        let run_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
+        let record = stage_skills::SkillRunRecord::load(&ctx, &run_id).expect("record");
+        assert_eq!(record.interview_rounds, 2);
+        assert_eq!(record.uses[0].skill, "grill-me");
+        assert_eq!(record.uses[0].hash.len(), 64);
+    }
+
+    // TC-1514: the round cap ends the interview without the marker.
+    #[test]
+    fn stage_skills_interview_round_cap() {
+        let mut h =
+            stage_skill_harness("[stages.planner]\nskills = [\"grill-me\"]\nmax_rounds = 2\n");
+        h.app.input = "/plan build it".to_owned();
+        h.app.submit_prompt();
+        let first = plain_requests(&h.sent);
+        finish_plain(&mut h, &first[0], "Q1?");
+        h.app.input = "yes".to_owned();
+        h.app.submit_prompt();
+        let second = plain_requests(&h.sent);
+        assert!(second[1].prompt.contains("the last one"));
+        finish_plain(&mut h, &second[1], "Q2? (no marker)");
+        assert_eq!(
+            requests_with_prefix(&h.sent, "plan-").len(),
+            1,
+            "cap reached"
+        );
+        assert!(h.app.skill_interview.is_none());
+    }
+
+    // TC-1514: /skills done ends the interview early.
+    #[test]
+    fn stage_skills_done_command_ends_interview() {
+        let mut h = stage_skill_harness("[stages.planner]\nskills = [\"grill-me\"]\n");
+        h.app.input = "/plan build it".to_owned();
+        h.app.submit_prompt();
+        let first = plain_requests(&h.sent);
+        finish_plain(&mut h, &first[0], "Q1?");
+        h.app.input = "/skills done".to_owned();
+        h.app.submit_prompt();
+        assert_eq!(requests_with_prefix(&h.sent, "plan-").len(), 1);
+    }
+
+    // TC-1506: a missing required skill blocks before the judge.
+    #[test]
+    fn stage_skills_preflight_blocks_missing() {
+        let mut h = stage_skill_harness("[stages.review]\nskills = [\"nope\"]\n");
+        h.app.input = "build a multi-step feature".to_owned();
+        h.app.submit_prompt();
+        assert!(h.sent.lock().unwrap().is_empty(), "no judge turn");
+        assert!(
+            h.app
+                .messages
+                .iter()
+                .any(|m| m.content.contains("not ready"))
+        );
+        assert_eq!(h.app.input, "build a multi-step feature");
+    }
+
+    // TC-1503, TC-1511: implement-stage skill shows on the approval card and
+    // is injected into the node prompt, recorded with its hash.
+    #[test]
+    fn stage_skills_node_injection_and_approval_card() {
+        let mut h =
+            stage_skill_harness("[stages.implement]\nskills = [\"./skills/review-list\"]\n");
+        reach_awaiting_approval(&mut h);
+        let run = h.app.last_graph_run.clone().unwrap();
+        let lines: Vec<String> = h
+            .app
+            .approval_lines(&run, 120)
+            .into_iter()
+            .map(|line| line.text)
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("skills: ./skills/review-list")),
+            "{lines:?}"
+        );
+        h.app
+            .decide_plan(
+                PlanDecisionKind::Approve,
+                run.plan.id.clone(),
+                1,
+                DecisionBy::Tui,
+            )
+            .unwrap();
+        let nodes = graph_node_requests(&h.sent);
+        assert!(
+            nodes.iter().any(|r| r.prompt.contains("REVIEW-BODY")),
+            "skill injected into node"
+        );
+        let ctx = SkillContext::new(&h.app.workspace_root);
+        let record = stage_skills::SkillRunRecord::load(&ctx, &run.plan.id).expect("record");
+        assert!(
+            record
+                .uses
+                .iter()
+                .any(|u| u.stage == "implement" && u.node_id.as_deref() == Some("step-1"))
+        );
+    }
+
+    // FR-1514: a 1-node run does not get stage skills by default.
+    #[test]
+    fn stage_skills_skip_single_node_chat() {
+        let mut h =
+            stage_skill_harness("[stages.implement]\nskills = [\"./skills/review-list\"]\n");
+        h.app.input = "/direct fix the typo".to_owned();
+        h.app.submit_prompt();
+        let nodes = graph_node_requests(&h.sent);
+        assert!(!nodes.is_empty());
+        assert!(nodes.iter().all(|r| !r.prompt.contains("REVIEW-BODY")));
+    }
+
+    // UX-1500: /skills lists the map.
+    #[test]
+    fn stage_skills_slash_lists_map() {
+        let mut h = stage_skill_harness(
+            "[stages.planner]\nskills = [\"grill-me\"]\n[stages.review]\nskills = [\"missing-one\"]\n",
+        );
+        h.app.input = "/skills".to_owned();
+        h.app.submit_prompt();
+        let text = h
+            .app
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.content.contains("Stage skills"))
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        assert!(text.contains("grill-me") && text.contains(" ok "), "{text}");
+        assert!(text.contains("missing-one") && text.contains("missing"));
+    }
+
     fn valid_codex_plan_json() -> &'static str {
         r#"{"tasks":[{"id":"task-1","title":"work","done_check":"done","areas":[],"size":"small","depends_on":[]}],"steps":[{"id":"step-1","role":"implement","job":"ship","runner":"codex","model":"composer-2.5","depends_on":[],"task":"task-1"}]}"#
     }
@@ -27001,7 +27734,7 @@ mod tests {
             assert!(areas.graph_status.is_some());
 
             let run = h.app.last_graph_run.as_ref().unwrap();
-            let panel_texts: Vec<String> = approval_panel_lines(run, width as usize)
+            let panel_texts: Vec<String> = dmuxai::graph::approval_panel_lines(run, width as usize)
                 .into_iter()
                 .map(|line| line.text)
                 .collect();

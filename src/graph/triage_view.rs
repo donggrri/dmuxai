@@ -40,6 +40,16 @@ pub fn task_counter_text(run: &GraphRun) -> Option<String> {
 
 /// Plain-text approval panel rows for `awaiting_approval` (UX-931, FR-975).
 pub fn approval_panel_lines(run: &GraphRun, width: usize) -> Vec<PanelLine> {
+    approval_panel_lines_with_skills(run, width, &|_| Vec::new())
+}
+
+/// [`approval_panel_lines`] plus a `skills:` line under each step whose role
+/// has stage skills (SPEC-stage-skills UX-1501).
+pub fn approval_panel_lines_with_skills(
+    run: &GraphRun,
+    width: usize,
+    skills_for_role: &dyn Fn(&str) -> Vec<String>,
+) -> Vec<PanelLine> {
     if run.phase != GraphRunPhase::AwaitingApproval {
         return Vec::new();
     }
@@ -91,7 +101,7 @@ pub fn approval_panel_lines(run: &GraphRun, width: usize) -> Vec<PanelLine> {
 
     if tasks.is_empty() {
         for step in steps {
-            push_step_block(&mut lines, revision, step, width);
+            push_step_block(&mut lines, revision, step, width, skills_for_role);
         }
     } else {
         for task in tasks {
@@ -101,11 +111,11 @@ pub fn approval_panel_lines(run: &GraphRun, width: usize) -> Vec<PanelLine> {
                 ellipsize_to_width(&task_row, width),
             ));
             for step in steps_for_task(steps, &task.id) {
-                push_step_block(&mut lines, revision, step, width);
+                push_step_block(&mut lines, revision, step, width, skills_for_role);
             }
         }
         for step in unassigned_steps(steps, tasks) {
-            push_step_block(&mut lines, revision, step, width);
+            push_step_block(&mut lines, revision, step, width, skills_for_role);
         }
     }
 
@@ -159,6 +169,7 @@ fn push_step_block(
     revision: &PlanRevision,
     step: &PlanStep,
     width: usize,
+    skills_for_role: &dyn Fn(&str) -> Vec<String>,
 ) {
     lines.push(panel_line(
         PanelLineKind::Step,
@@ -175,6 +186,13 @@ fn push_step_block(
         lines.push(panel_line(
             PanelLineKind::Job,
             ellipsize_to_width(&text, width),
+        ));
+    }
+    let skills = skills_for_role(&step.role);
+    if !skills.is_empty() {
+        lines.push(panel_line(
+            PanelLineKind::Job,
+            ellipsize_to_width(&format!("{JOB_INDENT}skills: {}", skills.join(", ")), width),
         ));
     }
 }

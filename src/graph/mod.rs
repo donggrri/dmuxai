@@ -38,8 +38,8 @@ pub use tasks::{
     tasks_file_path, write_tasks_file, write_tasks_file_if_enabled,
 };
 pub use triage_view::{
-    PanelLine, PanelLineKind, approval_panel_lines, ellipsize_to_width, judge_line_text,
-    judging_line_text, task_counter_text,
+    PanelLine, PanelLineKind, approval_panel_lines, approval_panel_lines_with_skills,
+    ellipsize_to_width, judge_line_text, judging_line_text, task_counter_text,
 };
 pub use types::{
     Approval, ApprovalState, DecisionBy, ExecutionPlan, GraphEdge, GraphLimits, GraphNode,
