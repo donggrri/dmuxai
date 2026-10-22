@@ -26333,7 +26333,7 @@ mod tests {
         let model = run.approval.as_ref().unwrap().revisions[0].steps[0]
             .model
             .clone();
-        assert_ne!(model.as_deref(), Some("composer-2.5"));
+        assert_eq!(model.as_deref(), Some("provider default"));
     }
 
     fn session_user_lines(app: &mut App) -> Vec<(String, Option<u64>)> {
