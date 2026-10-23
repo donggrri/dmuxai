@@ -1254,6 +1254,8 @@ pub struct App {
     replan_summaries: Vec<(String, String)>,
     /// Node id whose terminal failure is held until replan finishes (FR-956).
     graph_failure_replan: Option<String>,
+    /// Typed error reported by the failing node held for replan (FR-956 / #134).
+    graph_failure_replan_error: Option<String>,
     deferred_internal_turn: Option<DeferredInternalTurnWait>,
     /// FR-1008: planner_io recorded before the run row exists (e.g. judge).
     deferred_planner_io: HashMap<String, Vec<PlannerIo>>,
@@ -1518,6 +1520,7 @@ impl App {
             queued_replan: None,
             replan_summaries: Vec::new(),
             graph_failure_replan: None,
+            graph_failure_replan_error: None,
             deferred_internal_turn: None,
             deferred_planner_io: HashMap::new(),
             deferred_turns: Vec::new(),
@@ -8010,12 +8013,15 @@ impl App {
         let Some(node_id) = self.graph_failure_replan.take() else {
             return;
         };
+        let error = self.graph_failure_replan_error.take();
         if let Some(session) = self.graph_session.as_mut() {
             session.run_mut().phase = GraphRunPhase::Failed;
         }
-        self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
-            "graph node {node_id} failed"
-        ))]);
+        let message = match error {
+            Some(error) => format!("graph node {node_id} failed: {error}"),
+            None => format!("graph node {node_id} failed"),
+        };
+        self.dispatch_graph_actions(vec![GraphAction::Failed(message)]);
     }
 
     /// FR-956: user or dashboard replan request.
@@ -8871,6 +8877,7 @@ impl App {
         self.push_replan_applied_notice(&change);
         if pending.trigger == ReplanTrigger::Failure || pending.failure_node_id.is_some() {
             self.graph_failure_replan = None;
+            self.graph_failure_replan_error = None;
         }
         self.resume_graph_after_replan();
     }
@@ -8926,6 +8933,7 @@ impl App {
         }
         // An approved failure replan replaces the held failure (FR-956).
         self.graph_failure_replan = None;
+        self.graph_failure_replan_error = None;
         self.graph_approval_stale = None;
         self.resume_graph_after_replan();
         Ok(())
@@ -9324,6 +9332,7 @@ impl App {
         node_id: String,
         success: bool,
         output_text: &str,
+        error: Option<&str>,
     ) {
         let mut display_text = output_text.to_owned();
         let mut marker_reason = None;
@@ -9364,6 +9373,7 @@ impl App {
             }
             if self.graph_failure_replan.is_none() {
                 self.graph_failure_replan = Some(node_id.clone());
+                self.graph_failure_replan_error = error.map(str::to_owned);
             }
             let replan_reason = match marker_reason {
                 Some(marker) => Self::merge_replan_reasons(&message, &marker),
@@ -9781,19 +9791,27 @@ impl App {
                 if let Some(catalog) = self.model_catalogs.get_mut(&agent) {
                     catalog.loading = false;
                 }
+                // Push the agent-error message before finishing the turn so that,
+                // for a multi-node graph, it precedes the "Graph failed: ..."
+                // notice that finishing may emit. If the turn turns out to be a
+                // busy retry, remove this just-pushed message again below.
+                let agent_error_text = format!("{agent} error: {error}");
+                let pushed_index = self.messages.len();
+                self.messages
+                    .push(Message::new(Role::System, agent_error_text.clone()));
                 self.finish_turn_outcome_with_error(agent, false, Some(error.clone()));
                 if is_adapter_turn_busy_rejection(&error.message) && self.busy_retry_pending(agent)
                 {
+                    if pushed_index < self.messages.len()
+                        && self.messages[pushed_index].content == agent_error_text
+                    {
+                        self.messages.remove(pushed_index);
+                    }
                     // The step is retried automatically; keep this out of the
                     // dashboard and the agent context (TUI-only notice).
                     self.messages.push(Message::local_only(
                         Role::System,
                         format!("{agent} is still finishing its previous turn; retrying the step."),
-                    ));
-                } else {
-                    self.messages.push(Message::new(
-                        Role::System,
-                        format!("{agent} error: {error}"),
                     ));
                 }
             }
@@ -10230,7 +10248,13 @@ impl App {
                         .is_some_and(|id| session.run().conversation_id == id.as_str())
                         || !background_graph_turn)
             }) {
-                self.intercept_graph_node_finished(agent, node_id, success, &output_text);
+                self.intercept_graph_node_finished(
+                    agent,
+                    node_id,
+                    success,
+                    &output_text,
+                    error_string.as_deref(),
+                );
             } else if let Some(conversation_id) = finished_conversation.as_ref() {
                 self.complete_background_graph_node(
                     agent,
@@ -10421,6 +10445,7 @@ impl App {
         self.queued_replan = None;
         self.replan_summaries.clear();
         self.graph_failure_replan = None;
+        self.graph_failure_replan_error = None;
         // FR-937: triage/direct 1-node runs are quiet; multi-step plans with an
         // orchestrate node keep the normal graph banners.
         self.quiet_graph_run = run
@@ -10566,7 +10591,11 @@ impl App {
                     break;
                 }
                 GraphAction::Failed(message) => {
-                    self.push_system(graph_stop_notice(&GraphStopReason::Failed(message.clone())));
+                    if self.graph_session_is_multi_step() {
+                        self.push_system(graph_stop_notice(&GraphStopReason::Failed(
+                            message.clone(),
+                        )));
+                    }
                     self.quiet_graph_run = false;
                     if let Some(session) = self.graph_session.as_mut() {
                         session.finalize_failure();
@@ -25373,6 +25402,80 @@ mod tests {
             .find(|message| matches!(message.role, Role::System))
             .map(|message| message.content.clone())
             .unwrap_or_default()
+    }
+
+    // TC-1680 / #134: a single-node graph's agent failure reports the agent error
+    // first and never emits a "Graph failed" notice.
+    #[test]
+    fn tc_1680_single_node_graph_agent_failure_reports_agent_error_first() {
+        let (mut app, sent) = test_app();
+        app.submit_direct_run("hi".to_owned(), Agent::Codex, OverrideKind::Agent);
+        let (agent, request) = sent.lock().unwrap()[0].clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(request.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("boom")),
+        }));
+        let system_messages: Vec<&str> = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, Role::System))
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(
+            system_messages.contains(&"Codex error: boom"),
+            "{system_messages:?}"
+        );
+        assert!(
+            !system_messages
+                .iter()
+                .any(|content| content.contains("Graph failed")),
+            "{system_messages:?}"
+        );
+        let agent_idx = app
+            .messages
+            .iter()
+            .position(|message| message.content == "Codex error: boom")
+            .expect("agent error message");
+        assert!(
+            !app.messages[..agent_idx]
+                .iter()
+                .any(|message| message.content.contains("Graph failed"))
+        );
+    }
+
+    // TC-1681 / #134: a two-node graph failure reports the agent error before
+    // the "Graph failed: ..." notice, which names the node's error text.
+    #[test]
+    fn tc_1681_two_node_graph_failure_reports_agent_error_before_graph_failed() {
+        let (mut app, sent) = test_app();
+        app.selected = adapter_index(Agent::Cursor);
+        app.quiet_graph_run = false;
+        app.start_graph_run(two_step_cursor_chain_plan("tc-1681", 1));
+        let (agent, request) = sent.lock().unwrap()[0].clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(request.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("boom")),
+        }));
+        let agent_idx = app
+            .messages
+            .iter()
+            .position(|message| message.content == "Cursor error: boom")
+            .expect("agent error message");
+        let graph_idx = app
+            .messages
+            .iter()
+            .position(|message| message.content.contains("Graph failed"))
+            .expect("graph failed message");
+        assert!(agent_idx < graph_idx, "agent error must come first");
+        let graph_message = &app.messages[graph_idx].content;
+        assert!(
+            graph_message.contains("boom"),
+            "graph failed notice must name the node's error: {graph_message}"
+        );
     }
 
     fn system_containing(app: &App, needle: &str) -> String {
