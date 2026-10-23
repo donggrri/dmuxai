@@ -125,9 +125,21 @@ pub fn delivery(runner: &str, custom_spec: Option<&CustomAgentSpec>) -> Delivery
         "opencode" | "codex" => Delivery::Native,
         "cursor" | "agy" | "grok" => Delivery::Prepend,
         _ => {
-            if let Some(_spec) = custom_spec {
-                // Hook for later parts: custom native via placeholders will opt in here.
-                Delivery::Prepend
+            if let Some(spec) = custom_spec {
+                let contains =
+                    |v: &str| v.contains("{system_prompt}") || v.contains("{system_prompt_file}");
+                let opted = !spec.system_prompt_arg.is_empty()
+                    || spec.command.iter().any(|v| contains(v))
+                    || spec.env.values().any(|v| contains(v))
+                    || spec
+                        .temp_config_template
+                        .as_ref()
+                        .is_some_and(|t| contains(t));
+                if opted {
+                    Delivery::Native
+                } else {
+                    Delivery::Prepend
+                }
             } else {
                 Delivery::Prepend
             }
@@ -401,6 +413,7 @@ mod tests {
             timeout_secs: None,
             failure_stderr: None,
             temp_config_template: None,
+            system_prompt_arg: vec![],
             env: BTreeMap::new(),
             modes: Default::default(),
             done_when: None,
@@ -527,5 +540,58 @@ mod tests {
         assert!(resolve(&settings, "cursor", PromptRole::Replan).is_none());
         assert!(resolve(&settings, "cursor", PromptRole::Summary).is_none());
         assert!(resolve(&settings, "cursor", PromptRole::Interview).is_none());
+    }
+    #[test]
+    fn agent_prompt_delivery_native_for_opted_in_custom() {
+        use crate::custom_agent::CustomAgentSpec;
+        // system_prompt_arg opts in
+        let spec = CustomAgentSpec {
+            name: "custom".to_owned(),
+            label: None,
+            color: None,
+            command: vec!["custom-binary".to_owned()],
+            prompt_via: Default::default(),
+            image_arg: vec![],
+            default_model: None,
+            models_command: vec![],
+            models_filter: None,
+            allowed_models: None,
+            output: None,
+            text_path: None,
+            text_when: None,
+            error_path: None,
+            session_id_path: None,
+            resume_arg: vec![],
+            timeout_secs: None,
+            failure_stderr: None,
+            temp_config_template: None,
+            system_prompt_arg: vec!["--system".to_owned(), "{system_prompt}".to_owned()],
+            env: BTreeMap::new(),
+            modes: Default::default(),
+            done_when: None,
+            text_break_when: None,
+            builtin: false,
+        };
+        assert_eq!(delivery("custom", Some(&spec)), Delivery::Native);
+
+        // placeholder in command opts in
+        let spec2 = CustomAgentSpec {
+            system_prompt_arg: vec![],
+            command: vec![
+                "custom-binary".to_owned(),
+                "{system_prompt_file}".to_owned(),
+            ],
+            ..spec.clone()
+        };
+        // fix name? clone ok
+        assert_eq!(delivery("custom", Some(&spec2)), Delivery::Native);
+
+        // plain remains prepend
+        let plain = CustomAgentSpec {
+            name: "plain".to_owned(),
+            command: vec!["plain".to_owned()],
+            ..Default::default()
+        };
+        assert_eq!(delivery("plain", Some(&plain)), Delivery::Prepend);
     }
 }
