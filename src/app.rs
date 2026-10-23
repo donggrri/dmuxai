@@ -422,6 +422,8 @@ struct ActiveTurn {
     graph_node_id: Option<String>,
     /// Activity rows received while this turn's conversation was not displayed.
     offscreen_activity: Vec<Message>,
+    /// Catalog-check hint remembered for this turn (FR-1729).
+    model_catalog_hint: Option<String>,
 }
 
 /// Where to re-insert retained offscreen activity after `restore_snapshot`.
@@ -3244,7 +3246,8 @@ impl App {
 
     fn drain_agent_events(&mut self) -> DrainEventsOutcome {
         let mut outcome = DrainEventsOutcome::default();
-        while let Ok(output) = self.event_rx.try_recv() {
+        while let Ok(mut output) = self.event_rx.try_recv() {
+            self.attach_model_catalog_hint(&mut output);
             if let AgentEvent::Error(ref err) = output.event {
                 outcome.errored = true;
                 outcome.error_kind = Some(err.kind.as_str().to_owned());
@@ -3262,7 +3265,27 @@ impl App {
         outcome
     }
 
-    fn apply_agent_output(&mut self, output: AgentOutput) -> bool {
+    fn attach_model_catalog_hint(&self, output: &mut AgentOutput) {
+        if let AgentEvent::Error(err) = &mut output.event
+            && let Some(hint) = self
+                .active_turns
+                .get(&output.agent)
+                .and_then(|turn| turn.model_catalog_hint.clone())
+        {
+            if err.hint.is_none() {
+                err.hint = Some(hint);
+            }
+            if matches!(
+                err.kind,
+                AgentErrorKind::Provider | AgentErrorKind::ProcessExit
+            ) {
+                err.kind = AgentErrorKind::ModelUnavailable;
+            }
+        }
+    }
+
+    fn apply_agent_output(&mut self, mut output: AgentOutput) -> bool {
+        self.attach_model_catalog_hint(&mut output);
         if output
             .turn_id
             .as_ref()
@@ -4599,6 +4622,33 @@ impl App {
             }
         }
 
+        // FR-1729: catalog check before the turn is sent.
+        let resolved_model = self.selected_run_model(agent).ok().flatten();
+        let catalog_ids: Vec<String> = self
+            .model_catalogs
+            .get(&agent)
+            .map(|catalog| catalog.models.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default();
+        let catalog_command = custom_spec
+            .as_ref()
+            .map(|spec| spec.models_command.join(" "))
+            .filter(|joined| !joined.trim().is_empty());
+        let catalog_hint = match dmuxai::model_policy::check_catalog(
+            resolved_model.as_deref(),
+            if catalog_ids.is_empty() {
+                None
+            } else {
+                Some(catalog_ids.as_slice())
+            },
+            catalog_command.as_deref(),
+        ) {
+            dmuxai::model_policy::CatalogCheck::NotListed { hint } => {
+                self.push_system(hint.clone());
+                Some(hint)
+            }
+            _ => None,
+        };
+
         let is_graph = self.active_graph_node_for_agent(agent).is_some();
         let send_result = if is_graph {
             self.adapters[adapter_index].send_graph_node(adapter_request)
@@ -4680,6 +4730,7 @@ impl App {
                         workspace_scan,
                         graph_node_id: self.active_graph_node_for_agent(agent),
                         offscreen_activity: Vec::new(),
+                        model_catalog_hint: catalog_hint,
                     },
                 );
                 self.conversation_turn_ids
@@ -12604,6 +12655,38 @@ impl App {
         };
         self.create_conversation(Some(headless_title));
         let headless_conversation_id = self.conversation_id.as_str().to_owned();
+
+        // FR-1729: pre-load a custom agent's model catalog once so the
+        // catalog check can run in the turn path (interactive catalogs are
+        // already loaded by the adapter).
+        let headless_target_agent = self.adapters[self.selected].agent();
+        if let Agent::Custom(idx) = headless_target_agent
+            && let Some(spec) = dmuxai::custom_agent::spec_at(idx)
+            && !spec.models_command.is_empty()
+        {
+            let resolved = self
+                .selected_run_model(headless_target_agent)
+                .ok()
+                .flatten();
+            if resolved.is_some()
+                && let Ok(ids) = dmuxai::custom_agent::list_model_ids(
+                    spec,
+                    &self.workspace_root,
+                    Some(dmuxai::custom_agent::BUILTIN_MODELS_TIMEOUT),
+                )
+                .await
+            {
+                let catalog = self
+                    .model_catalogs
+                    .entry(headless_target_agent)
+                    .or_default();
+                catalog.models = ids
+                    .into_iter()
+                    .map(|id| ModelInfo::new(id.clone(), id))
+                    .collect();
+                catalog.loading = false;
+            }
+        }
 
         let start_msg_count = self.messages.len();
 
@@ -21000,6 +21083,7 @@ mod tests {
                 workspace_scan: Arc::new(Mutex::new(None)),
                 graph_node_id: None,
                 offscreen_activity: Vec::new(),
+                model_catalog_hint: None,
             },
         );
 
@@ -22447,6 +22531,7 @@ mod tests {
                 workspace_scan: Arc::new(Mutex::new(None)),
                 graph_node_id: None,
                 offscreen_activity: Vec::new(),
+                model_catalog_hint: None,
             },
         );
         app.busy_agents.insert(Agent::Cursor);
@@ -22494,6 +22579,7 @@ mod tests {
                 workspace_scan: Arc::new(Mutex::new(None)),
                 graph_node_id: None,
                 offscreen_activity: Vec::new(),
+                model_catalog_hint: None,
             },
         );
         app.activities.insert(
@@ -28721,6 +28807,126 @@ mod tests {
         assert_eq!(
             app.selected_run_model_label(Agent::Codex).as_deref(),
             Ok(dmuxai::model_policy::PROVIDER_DEFAULT)
+        );
+    }
+    // TC-1746 / FR-1729: catalog missing default_model pushes exact hint and turn is still sent
+    #[test]
+    fn tc_1746_catalog_missing_pushes_warning() {
+        let _ = install_shared_test_registry();
+        let idx = dmuxai::custom_agent::index_of("opencode-step")
+            .expect("shared test registry has opencode-step");
+        let agent = Agent::Custom(idx);
+        let (mut app, sent) = test_app();
+        app.model_catalogs.get_mut(&agent).unwrap().models = vec![ModelInfo::new(
+            "opencode/other-free".to_owned(),
+            "opencode/other-free".to_owned(),
+        )];
+        app.selected = adapter_index(agent);
+        let _ = app.try_submit_to_agent(agent, "hello".into(), false, true);
+        let msgs: Vec<String> = app.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+             msgs.iter()
+                 .any(|m| m == "model opencode/beam-free is not offered by 'opencode-step models'; pick another model"),
+             "{msgs:?}"
+         );
+        assert!(
+            !sent.lock().unwrap().is_empty(),
+            "turn should still be sent"
+        );
+    }
+
+    // TC-1747 / FR-1729: listed model and empty/not-loaded catalog produce no message
+    #[test]
+    fn tc_1747_catalog_listed_or_empty_no_message() {
+        let _ = install_shared_test_registry();
+        let idx = dmuxai::custom_agent::index_of("opencode-step")
+            .expect("shared test registry has opencode-step");
+        let agent = Agent::Custom(idx);
+        let (mut app, _sent) = test_app();
+        app.model_catalogs.get_mut(&agent).unwrap().models = vec![ModelInfo::new(
+            "opencode/beam-free".to_owned(),
+            "opencode/beam-free".to_owned(),
+        )];
+        app.selected = adapter_index(agent);
+        let _ = app.try_submit_to_agent(agent, "hello".into(), false, true);
+        let msgs: Vec<String> = app.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            !msgs.iter().any(|m| m.contains("is not offered by")),
+            "{msgs:?}"
+        );
+
+        let (mut app2, _sent2) = test_app();
+        app2.model_catalogs.get_mut(&agent).unwrap().models.clear();
+        app2.selected = adapter_index(agent);
+        let _ = app2.try_submit_to_agent(agent, "hello".into(), false, true);
+        let msgs2: Vec<String> = app2.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            !msgs2.iter().any(|m| m.contains("is not offered by")),
+            "{msgs2:?}"
+        );
+    }
+
+    // TC-1748 / FR-1729: failing turn after NotListed warning gets hint
+    #[test]
+    fn tc_1748_notlisted_error_gets_hint() {
+        let _ = install_shared_test_registry();
+        let idx = dmuxai::custom_agent::index_of("opencode-step")
+            .expect("shared test registry has opencode-step");
+        let agent = Agent::Custom(idx);
+        let (mut app, sent, _event_tx) = test_app_with_event_sender();
+        app.model_catalogs.get_mut(&agent).unwrap().models = vec![ModelInfo::new(
+            "opencode/other-free".to_owned(),
+            "opencode/other-free".to_owned(),
+        )];
+        app.selected = adapter_index(agent);
+        let _ = app.try_submit_to_agent(agent, "hello".into(), false, true);
+        let (a, req) = sent.lock().unwrap()[0].clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: a,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("boom")),
+        }));
+        let msgs: Vec<String> = app.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("boom") && m.contains("is not offered")),
+            "{msgs:?}"
+        );
+    }
+
+    // TC-1748 / FR-1729: drain path captures model_unavailable kind
+    #[test]
+    fn tc_1748_drain_error_kind_is_model_unavailable() {
+        let _ = install_shared_test_registry();
+        let idx = dmuxai::custom_agent::index_of("opencode-step")
+            .expect("shared test registry has opencode-step");
+        let agent = Agent::Custom(idx);
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        app.model_catalogs.get_mut(&agent).unwrap().models = vec![ModelInfo::new(
+            "opencode/other-free".to_owned(),
+            "opencode/other-free".to_owned(),
+        )];
+        app.selected = adapter_index(agent);
+        let _ = app.try_submit_to_agent(agent, "hello".into(), false, true);
+        let (a, req) = sent.lock().unwrap()[0].clone();
+        event_tx
+            .try_send(AgentOutput {
+                agent: a,
+                conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+                turn_id: Some(TurnId::new(req.turn_id.as_str())),
+                event: AgentEvent::Error(AgentError::provider("boom")),
+            })
+            .unwrap();
+        let outcome = app.drain_agent_events();
+        assert!(outcome.errored);
+        assert_eq!(outcome.error_kind.as_deref(), Some("model_unavailable"));
+        assert!(
+            app.active_turns
+                .get(&agent)
+                .map(|t| t.model_catalog_hint.clone())
+                .unwrap_or(None)
+                .is_none()
         );
     }
 
