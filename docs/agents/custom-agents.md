@@ -19,7 +19,7 @@ allowed_models = "^opencode/.*-free$"     # optional regex; model policy for thi
 output = "jsonl"                  # "text" (stdout is the reply) or "jsonl"
 text_path = "/part/text"          # jsonl: JSON pointer of a text chunk
 text_when = { path = "/type", equals = "text" }   # optional: only lines matching this
-error_path = ["/error/data/message", "/error/message"]   # jsonl: JSON pointer(s) of an error message; a list is tried in order, and an `/error` object without a message string falls back to its compact JSON
+error_path = ["/error/data/message", "/error/message"]   # jsonl: JSON pointer(s) of an error message; a list is tried in order, and an `/error` object without a message string falls back to its compact JSON. The fallback fires only for an object that is itself the error container (a pointer segment literally named "error").
 session_id_path = "/sessionID"    # jsonl: JSON pointer of the provider session id
 done_when = { path = "/type", equals = "end" }        # optional: this line ends the turn;
                                   # DmuxAI stops reading, waits 3 s, then stops the process group

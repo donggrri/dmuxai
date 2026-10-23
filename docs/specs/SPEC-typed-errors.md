@@ -5,7 +5,7 @@ Status: Implemented
 Owner: dmuxai
 Created: 2026-10-24
 Baseline: `4841710`
-Related: #133, #134; SPEC-plan-gate FR-977 (TC-1680, TC-1681); SPEC-cursor-stream-dedupe FR-800 (TC-1684, TC-1685, TC-1686)
+Related: #133, #134, #156; SPEC-plan-gate FR-977 (TC-1680, TC-1681); SPEC-cursor-stream-dedupe FR-800 (TC-1684, TC-1685, TC-1686)
 
 ## 1. Decision summary
 
@@ -48,6 +48,7 @@ Runner failures are no longer reported as bare strings or NUL-prefixed sentinels
 | FR-1679 | Must | Given a runner condition: non-zero exit or spawn failure; total timeout; idle watchdog; permission, sandbox, or model-policy refusal; unknown model; provider-reported error; cancellation | Map respectively to `process_exit`, `timeout`, `idle`, `policy`, `model_unavailable`, `provider`, `cancelled`; cancellation uses `AgentError::cancelled` and no NUL-prefixed sentinel strings are sent | Conditions not otherwise classified default to `provider` where applicable | TC-1689, TC-1690, TC-1691, TC-1692, TC-1693 |
 | FR-1682 | Must | Given a headless `dmuxai run --json` or an event-log emission on an agent error | The JSON object and event record include `error_kind` next to the existing `error`; all other fields are unchanged | `error_kind` is null or absent when there is no error | TC-1694, TC-1695 |
 | FR-1683 | Must | Given a custom-agent JSONL line carrying an `/error` object | `error_path` accepts one pointer or an ordered list tried in sequence, with a compact-JSON fallback for an `/error` object; the opencode preset, `docs/agents/presets.toml`, `docs/agents/custom-agents.md`, and the init template use `["/error/data/message", "/error/message"]`; a test guards drift | Pointers that do not resolve are skipped | TC-1696, TC-1697, TC-1698, TC-1699 |
+| FR-1721 | Must | Given a custom-agent JSONL line whose `error_path` resolves to null or is absent inside a non-error container | the compact-JSON fallback fires only for an object at a pointer segment literally named `error` (the pointer's ancestor whose last segment is `error`), so a null or missing `error` field in a success payload such as `/result` yields no error and an empty error container surfaces its compact JSON `{}` | Pointers that do not resolve are skipped | TC-1722, TC-1723, TC-1724 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -66,6 +67,9 @@ Runner failures are no longer reported as bare strings or NUL-prefixed sentinels
 | TC-1697 | FR-1683 | unit | opencode error JSONL line | parse line | provider message surfaces | `src/custom_agent.rs` `opencode_error_jsonl_surfaces_provider_message` |
 | TC-1698 | FR-1683 | unit | TOML with single `error_path` | parse line | single pointer still works | `src/custom_agent.rs` `single_string_error_path_still_works` |
 | TC-1699 | FR-1683 | unit | `/error` object without message | parse line | compact JSON fallback | `src/custom_agent.rs` `error_object_without_message_surfaces_compact_json` |
+| TC-1722 | FR-1721 | unit | agy success line with `/result.error` null | parse line | no error and text "done" | `src/custom_agent.rs` `tc_1722_agy_success_result_object_is_not_an_error` |
+| TC-1723 | FR-1721 | unit | agy success line with `/result.error` missing | parse line | no error and text "done" | `src/custom_agent.rs` `tc_1723_agy_missing_error_key_is_not_an_error`, `src/custom_agent.rs` `tc_1723_empty_error_container_still_surfaces` |
+| TC-1724 | FR-1721 | unit | agy error line with `/result.error` string | parse line | error "quota exhausted" | `src/custom_agent.rs` `tc_1724_agy_error_result_surfaces_error_string`, `src/agent/custom.rs` `tc_1724_e2e_agy_success_line_finishes_without_error` |
 
 ## 6. Data, integration, and safety contracts
 

@@ -731,15 +731,30 @@ fn json_matches(val: &serde_json::Value, when: &TextWhen) -> bool {
     }
 }
 
-/// Returns the first (top-level) segment of a JSON pointer, e.g. "/error" for
-/// "/error/data/message". Used for the object fallback when no pointer yields a string.
-fn top_level_pointer_segment(pointer: &str) -> &str {
+/// Returns the JSON pointer to the error container for `pointer`, if any: the
+/// nearest ancestor of `pointer` (including `pointer` itself) whose final path
+/// segment is literally "error". The compact-JSON fallback may only fire for an
+/// object located at this pointer, so a success payload such as `/result` (whose
+/// own `error` field is null or absent) is never reported as an error. Returns
+/// an empty string when no such segment exists.
+fn error_container_pointer(pointer: &str) -> &str {
     if !pointer.starts_with('/') {
-        return pointer;
+        return "";
     }
-    match pointer[1..].find('/') {
-        Some(offset) => &pointer[..offset + 1],
-        None => pointer,
+    let mut seg_start = 1usize;
+    let mut container_end: Option<usize> = None;
+    for slash in pointer[1..].match_indices('/').map(|(o, _)| 1 + o) {
+        if &pointer[seg_start..slash] == "error" {
+            container_end = Some(slash);
+        }
+        seg_start = slash + 1;
+    }
+    if seg_start <= pointer.len() && &pointer[seg_start..] == "error" {
+        container_end = Some(pointer.len());
+    }
+    match container_end {
+        Some(end) => &pointer[..end],
+        None => "",
     }
 }
 
@@ -794,8 +809,14 @@ pub fn parse_jsonl_line(spec: &CustomAgentSpec, line: &str) -> ParsedLine {
             && !yielded_string
             && let Some(first) = paths.first()
         {
-            let top = top_level_pointer_segment(first);
-            if let Some(serde_json::Value::Object(_)) = val.pointer(top) {
+            // The compact-JSON fallback only applies to an object that is itself
+            // the error container (a pointer segment literally named "error");
+            // never to an arbitrary success object that merely contains a
+            // null/missing `error` field.
+            let top = error_container_pointer(first);
+            if !top.is_empty()
+                && let Some(serde_json::Value::Object(_)) = val.pointer(top)
+            {
                 result = val.pointer(top).map(|v| v.to_string());
             }
         }
@@ -2250,6 +2271,68 @@ error_path = "/error/message"
             parsed.error.as_deref(),
             Some(r#"{"data":{"foo":"bar"},"name":"UnknownError"}"#)
         );
+    }
+
+    // TC-1722 / FR-1721: agy success /result object is not an error.
+    #[test]
+    fn tc_1722_agy_success_result_object_is_not_an_error() {
+        let toml_str = r#"
+name = "agy"
+command = ["agy"]
+output = "jsonl"
+text_path = "/result/response"
+text_when = { path = "/event", equals = "result" }
+error_path = "/result/error"
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        let line = r#"{"event":"result","conversation_id":"c1","result":{"status":"SUCCESS","response":"done","error":null}}"#;
+        let parsed = parse_jsonl_line(&spec, line);
+        assert_eq!(parsed.error, None);
+        assert_eq!(parsed.text.as_deref(), Some("done"));
+    }
+
+    // TC-1723 / FR-1721: agy success with a missing error key is not an error.
+    #[test]
+    fn tc_1723_agy_missing_error_key_is_not_an_error() {
+        let toml_str = r#"
+name = "agy"
+command = ["agy"]
+output = "jsonl"
+text_path = "/result/response"
+text_when = { path = "/event", equals = "result" }
+error_path = "/result/error"
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        let line = r#"{"event":"result","conversation_id":"c1","result":{"status":"SUCCESS","response":"done"}}"#;
+        let parsed = parse_jsonl_line(&spec, line);
+        assert_eq!(parsed.error, None);
+        assert_eq!(parsed.text.as_deref(), Some("done"));
+    }
+
+    // TC-1723 / FR-1721: empty error container still surfaces compact JSON.
+    #[test]
+    fn tc_1723_empty_error_container_still_surfaces() {
+        let spec = opencode_preset("opencode");
+        let line = r#"{"type":"error","error":{}}"#;
+        let parsed = parse_jsonl_line(&spec, line);
+        assert_eq!(parsed.error.as_deref(), Some("{}"));
+    }
+
+    // TC-1724 / FR-1721: agy error result surfaces the error string.
+    #[test]
+    fn tc_1724_agy_error_result_surfaces_error_string() {
+        let toml_str = r#"
+name = "agy"
+command = ["agy"]
+output = "jsonl"
+text_path = "/result/response"
+text_when = { path = "/event", equals = "result" }
+error_path = "/result/error"
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        let line = r#"{"event":"result","conversation_id":"c1","result":{"status":"ERROR","error":"quota exhausted"}}"#;
+        let parsed = parse_jsonl_line(&spec, line);
+        assert_eq!(parsed.error.as_deref(), Some("quota exhausted"));
     }
 
     // TC-917 / FR-916: a pending break adds one blank line only between two
