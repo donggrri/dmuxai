@@ -518,6 +518,7 @@ async fn run_turn(
         String::from_utf8_lossy(&buffer).into_owned()
     });
 
+    let effective_output = spec.effective_output();
     let mut reply = String::new();
     let mut jsonl_error: Option<String> = None;
     let mut bound_session: Option<String> = None;
@@ -528,8 +529,28 @@ async fn run_turn(
     let mut lines = BufReader::new(stdout).lines();
     let pgid_value = || pgid.load(std::sync::atomic::Ordering::SeqCst);
     let read = async {
+        let mut checked_first_nonempty_stdout = false;
         while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
-            match spec.output {
+            if !checked_first_nonempty_stdout && !line.trim().is_empty() {
+                checked_first_nonempty_stdout = true;
+                if effective_output == CustomAgentOutput::Text
+                    && serde_json::from_str::<serde_json::Value>(line.trim())
+                        .ok()
+                        .is_some_and(|v| v.is_object())
+                {
+                    send(
+                        event_tx,
+                        agent,
+                        Some(context),
+                        AgentEvent::Notice(
+                            "output looks like JSONL; set output = \"jsonl\" and text_path in dmuxai.toml (docs/agents/custom-agents.md)"
+                                .to_string(),
+                        ),
+                    )
+                    .await;
+                }
+            }
+            match effective_output {
                 CustomAgentOutput::Text => {
                     let chunk = format!("{line}\n");
                     reply.push_str(&chunk);
@@ -757,6 +778,62 @@ mod tests {
             }
         }
         (result, text)
+    }
+
+    #[tokio::test]
+    async fn tc_348_text_mode_json_stdout_emits_jsonl_notice() {
+        let spec = spec("jsonl", "output = \"text\"\nlabel = \"json-hint-runner\"");
+        let notice_shown = AtomicBool::new(false);
+        let (result, events) = run_turn_capture_events(spec, &[], &notice_shown).await;
+        assert_eq!(result, Ok(()));
+        let jsonl_notices: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Notice(msg) if msg.contains("output looks like JSONL") => {
+                    Some(msg.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(jsonl_notices.len(), 1, "events: {:?}", events);
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TextDelta(delta) => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains("{\"type\":\"step_start\""),
+            "text mode must keep raw stdout: {text}"
+        );
+        assert!(text.contains("echo:hi --model x"));
+    }
+
+    #[tokio::test]
+    async fn tc_349_inferred_jsonl_stdout_no_jsonl_notice() {
+        let spec = spec(
+            "jsonl",
+            "text_path = \"/part/text\"\nsession_id_path = \"/sessionID\"",
+        );
+        let notice_shown = AtomicBool::new(false);
+        let (result, events) = run_turn_capture_events(spec, &[], &notice_shown).await;
+        assert_eq!(result, Ok(()));
+        assert!(
+            !events.iter().any(|e| {
+                matches!(e, AgentEvent::Notice(msg) if msg.contains("output looks like JSONL"))
+            }),
+            "inferred jsonl must not emit JSONL hint: {:?}",
+            events
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TextDelta(delta) => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "echo:hi --model x");
     }
 
     #[tokio::test]

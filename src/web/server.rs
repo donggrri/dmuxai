@@ -2235,7 +2235,7 @@ mod tests {
             earlier_turns: 0,
             follow_up: Vec::new(),
         };
-        hub.publish(Vec::new(), Some(test_graph));
+        hub.publish(Vec::new(), Some(test_graph), None);
 
         // Read updated snapshot event within 5s
         let update_read = tokio::time::timeout(Duration::from_secs(5), async {
@@ -3731,6 +3731,42 @@ mod tests {
         assert_eq!(agent_resp.status(), StatusCode::ACCEPTED);
         let running = store.get(&todo_agent.id).unwrap();
         assert_eq!(running.run_kind.as_deref(), Some("agent"));
+    }
+
+    // TC-1650 / FR-1650: GET /api/state exposes turn.awaiting_approval.
+    #[tokio::test]
+    async fn tc_1650_state_includes_turn_awaiting_approval() {
+        use crate::web::snapshot::TurnView;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let hub = test_hub();
+        hub.publish(
+            Vec::new(),
+            None,
+            Some(TurnView {
+                state: "awaiting_approval".to_owned(),
+                conversation_id: "conv-1".to_owned(),
+                graph_id: Some("plan-1".to_owned()),
+                since_ms: 42,
+            }),
+        );
+        let token = "test-token-turn".to_string();
+        let router = build_router(hub, token.clone(), allowed_localhost());
+        let req = axum::http::Request::builder()
+            .uri("/api/state")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["turn"]["state"], "awaiting_approval");
+        assert_eq!(json["turn"]["conversation_id"], "conv-1");
+        assert_eq!(json["turn"]["graph_id"], "plan-1");
+        assert_eq!(json["turn"]["since_ms"], 42);
     }
 
     // TC-766 / FR-765: prompt route contract

@@ -11,14 +11,14 @@ mod types;
 
 pub use executor::{GraphAction, GraphRunSession, GraphSession, NodeAssignment};
 pub use judge::{
-    FallbackCause, JUDGE_PROMPT, OverrideKind, Route, TriageSource, Verdict, build_judge_prompt,
-    is_trivial_prompt, parse_verdict,
+    FallbackCause, JUDGE_PROMPT, OverrideKind, QUESTION_ANSWER_HINT, Route, TriageSource, Verdict,
+    build_judge_prompt, is_question_prompt, is_trivial_prompt, parse_verdict,
 };
 pub use plan_doc::{
     AllowedRunner, FallbackPlan, PLAN_PROMPT, PlanContext, PlanDoc, PlanError, PlanPromptMode,
     PlanPromptRequest, PlanStep, build_plan_prompt, diff_plan_steps, fallback_plan,
-    graph_plan_from_revision_steps, one_node_plan_on, parse_plan, plan_json_for_edit,
-    validate_plan,
+    graph_plan_from_revision_steps, one_node_plan_on, parse_plan, pin_graph_plan_runners,
+    plan_json_for_edit, validate_plan,
 };
 pub use planner::heuristic_route;
 pub use policy::{

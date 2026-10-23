@@ -29,6 +29,8 @@ fn resolve_program_value(
 pub fn headless_command(program: PathBuf) -> Command {
     let mut command = Command::new(program);
     strip_dashboard_env(command.as_std_mut());
+    // FR-1663: built-in runners never pass MCP via env; drop a parent value.
+    command.env_remove("DMUXAI_MCP_CONFIG");
     command
 }
 

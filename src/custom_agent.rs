@@ -74,7 +74,7 @@ pub struct CustomAgentSpec {
     #[serde(default)]
     pub allowed_models: Option<String>,
     #[serde(default)]
-    pub output: CustomAgentOutput,
+    pub output: Option<CustomAgentOutput>,
     #[serde(default)]
     pub text_path: Option<String>,
     #[serde(default)]
@@ -131,7 +131,7 @@ pub fn opencode_preset(program: &str) -> CustomAgentSpec {
         models_command: words(&[program, "models"]),
         models_filter: Some("-free$".to_owned()),
         allowed_models: Some("^opencode/.*-free$".to_owned()),
-        output: CustomAgentOutput::Jsonl,
+        output: Some(CustomAgentOutput::Jsonl),
         text_path: Some("/part/text".to_owned()),
         text_when: Some(TextWhen {
             path: "/type".to_owned(),
@@ -181,7 +181,7 @@ pub fn grok_preset(program: &str) -> CustomAgentSpec {
         default_model: None,
         models_command: words(&[program, "models"]),
         allowed_models: Some(r"(?i)^grok-[a-z0-9][a-z0-9._-]*$".to_owned()),
-        output: CustomAgentOutput::Jsonl,
+        output: Some(CustomAgentOutput::Jsonl),
         text_path: Some("/data".to_owned()),
         text_when: Some(TextWhen {
             path: "/type".to_owned(),
@@ -318,6 +318,36 @@ impl CustomAgentSpec {
     /// Returns the timeout in seconds, defaulting to [`DEFAULT_TIMEOUT_SECS`].
     pub fn timeout_secs(&self) -> u64 {
         self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)
+    }
+
+    /// Returns whether any of `text_path`, `text_when`, `error_path`, `session_id_path`,
+    /// `done_when`, or `text_break_when` is set.
+    pub fn has_jsonl_path_fields(&self) -> bool {
+        self.text_path.is_some()
+            || self.text_when.is_some()
+            || self.error_path.is_some()
+            || self.session_id_path.is_some()
+            || self.done_when.is_some()
+            || self.text_break_when.is_some()
+    }
+
+    /// Returns the effective output format, inferring Jsonl when JSONL path fields
+    /// are set but output is not explicitly set to Jsonl.
+    ///
+    /// - If `output` is `Some(Jsonl)`, the output is `Jsonl`.
+    /// - If `output` is `Some(Text)`, the output is `Text` (path fields are ignored
+    ///   even when configured, because the user explicitly chose text mode).
+    /// - If `output` is `None` (not set in config) and any JSONL path field is configured,
+    ///   the output is inferred as `Jsonl`.
+    /// - If `output` is `None` and no JSONL path field is configured, the output is `Text`
+    ///   (backward‑compatible default).
+    pub fn effective_output(&self) -> CustomAgentOutput {
+        match self.output {
+            Some(CustomAgentOutput::Jsonl) => CustomAgentOutput::Jsonl,
+            Some(CustomAgentOutput::Text) => CustomAgentOutput::Text,
+            None if self.has_jsonl_path_fields() => CustomAgentOutput::Jsonl,
+            None => CustomAgentOutput::Text,
+        }
     }
 
     /// Validates the specification according to documentation constraints.
@@ -620,6 +650,8 @@ pub fn build_custom_command(
 
     if let Some(mcp_path) = &ctx.mcp_config {
         command.env("DMUXAI_MCP_CONFIG", mcp_path);
+    } else {
+        command.env_remove("DMUXAI_MCP_CONFIG");
     }
 
     for (key, value) in &spec.env {
@@ -1049,7 +1081,7 @@ implement = []
         assert_eq!(spec.label(), "opencode");
         assert_eq!(spec.color(), "#ffa500");
         assert_eq!(spec.prompt_via, PromptVia::Arg);
-        assert_eq!(spec.output, CustomAgentOutput::Jsonl);
+        assert_eq!(spec.effective_output(), CustomAgentOutput::Jsonl);
         assert_eq!(spec.timeout_secs(), 900);
         assert_eq!(
             spec.default_model.as_deref(),
@@ -1121,11 +1153,72 @@ command = ["pi", "run"]
         assert_eq!(spec.label(), "pi");
         assert_eq!(spec.color(), "white");
         assert_eq!(spec.prompt_via, PromptVia::Arg);
-        assert_eq!(spec.output, CustomAgentOutput::Text);
+        assert_eq!(spec.effective_output(), CustomAgentOutput::Text);
         assert_eq!(spec.timeout_secs(), DEFAULT_TIMEOUT_SECS);
         assert!(spec.image_arg.is_empty());
         assert!(spec.env.is_empty());
         assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn tc_345_effective_output_infers_jsonl_when_text_path_set() {
+        let toml_str = r#"
+name = "test-agent"
+command = ["sh", "-c", "{prompt}"]
+text_path = "/part/text"
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            spec.effective_output(),
+            CustomAgentOutput::Jsonl,
+            "inference: no output set but text_path configured => Jsonl"
+        );
+    }
+
+    #[test]
+    fn tc_346_effective_output_explicit_text_ignores_path_fields() {
+        let toml_str = r#"
+name = "test-agent"
+command = ["sh", "-c", "{prompt}"]
+output = "text"
+text_path = "/part/text"
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            spec.effective_output(),
+            CustomAgentOutput::Text,
+            "explicit output = text with text_path => Text (path fields ignored)"
+        );
+    }
+
+    #[test]
+    fn tc_347_effective_output_defaults_to_text_without_paths() {
+        let toml_str = r#"
+name = "test-agent"
+command = ["sh", "-c", "{prompt}"]
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            spec.effective_output(),
+            CustomAgentOutput::Text,
+            "no output, no path fields => Text (backward compat)"
+        );
+    }
+
+    #[test]
+    fn explicit_jsonl_output_preserved() {
+        let toml_str = r#"
+name = "test-agent"
+command = ["sh", "-c", "{prompt}"]
+output = "jsonl"
+text_path = "/part/text"
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            spec.effective_output(),
+            CustomAgentOutput::Jsonl,
+            "output = jsonl with text_path => Jsonl"
+        );
     }
 
     #[test]
@@ -1673,6 +1766,39 @@ image_arg = []
         )
         .await;
         assert_eq!(ids, Ok(vec!["opencode/a-free".to_owned()]));
+    }
+
+    // TC-1663 / FR-1663
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tc_1663_custom_child_clears_inherited_mcp_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(tmp.path()).unwrap();
+        let spec = CustomAgentSpec {
+            name: "env-probe".to_owned(),
+            command: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "echo env=${DMUXAI_MCP_CONFIG:-}".to_owned(),
+            ],
+            ..Default::default()
+        };
+        let ctx = SubstitutionContext::new(
+            "probe",
+            workspace.to_string_lossy().into_owned(),
+            "ask",
+            "deny",
+        );
+        unsafe {
+            std::env::set_var("DMUXAI_MCP_CONFIG", "/inherited/leak");
+        }
+        let mut cmd = build_custom_command(&spec, &ctx, &workspace).unwrap();
+        let out = cmd.output().await.unwrap();
+        unsafe {
+            std::env::remove_var("DMUXAI_MCP_CONFIG");
+        }
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "env=");
     }
 
     // TC-877 (FR-875)

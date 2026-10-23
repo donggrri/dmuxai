@@ -161,7 +161,7 @@ async fn followups_queue_in_order_and_survive_stop_in_headless_chrome() {
 
     let fake = Arc::new(Mutex::new(Fake::default()));
     let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_owned());
-    hub.publish(Vec::new(), None);
+    hub.publish(Vec::new(), None, None);
     hub.set_session(Some(fake.lock().unwrap().view()));
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(8);
     let config = ServerConfig {

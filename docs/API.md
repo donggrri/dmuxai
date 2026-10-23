@@ -21,7 +21,7 @@ print usage to stderr and exit `2`.
 
 | Command | Flags | stdout |
 | --- | --- | --- |
-| `dmuxai run <prompt\|->` | `--agent ID`, `--mode ask\|plan\|implement`, `--approve-plan`, `--graph` (no-op), `--json` | Final agent text, or one JSON object with `--json` |
+| `dmuxai run <prompt\|->` | `--agent ID`, `--mode ask\|plan\|implement`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--json` | Final agent text, or one JSON object with `--json` |
 | `dmuxai todo add <title>` | `--body TEXT`, `--json` | The created to-do (TSV or JSON) |
 | `dmuxai todo list` | `--status open\|running\|done`, `--json` | To-dos (TSV lines or a JSON array) |
 | `dmuxai todo run <id>` | `--agent ID \| --graph`, `--mode M`, `--json` | Same as `run`; the to-do is marked running then done/open |
@@ -35,8 +35,10 @@ Notes:
   no-op (legacy scripts); it does not change judge routing. `--` ends flag parsing
   (`dmuxai run -- --literal prompt`).
 - Without `--agent`, headless `run` uses the same judge → plan path as the TUI.
-  Exit `7` means plan approval (`--approve-plan`) or a sensitive gate (not bypassable
-  by `--approve-plan`). JSON includes `triage` and, when applicable, `plan`.
+  Exit `7` means plan approval (`--approve-plan`) or a sensitive gate. Use
+  `--allow-sensitive`, or `--agent` with `--approve-plan` on a one-step run, to
+  confirm sensitive gates headlessly. JSON includes `triage` and, when applicable,
+  `plan`.
 - `dmuxai run -` reads the prompt from stdin:
   `echo "summarize the repo" | dmuxai run - --agent agy --json`.
 - With `--json`, stdout carries only the JSON document(s); warnings/diagnostics go
@@ -91,7 +93,7 @@ Failures with `--json` print `{ "ok": false, "exit_code": <n>, "error": "<messag
 | 4 | Busy / conflict (already running) |
 | 5 | Runner not in `[graph] allowed_runners` |
 | 6 | Internal error |
-| 7 | Plan approval or sensitive gate required (headless); use `--approve-plan` for plans only |
+| 7 | Plan approval or sensitive gate required (headless); `--approve-plan` for plans; `--allow-sensitive` or `--agent` + `--approve-plan` for sensitive gates |
 | 130 | Cancelled (Ctrl+C) |
 
 ### Examples
@@ -202,6 +204,21 @@ Busy agents refuse mode/model/effort changes (409); runners outside
 `allowed_runners` are refused (403). With `dmuxai --web`, `/api/state` and SSE
 snapshots also carry `session` (conversation, per-agent pickers, transcript
 tail, recent conversations, slash commands).
+
+Each snapshot includes a top-level `turn` object (FR-1650) for polling clients:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `state` | string | `idle`, `running`, `awaiting_approval`, `needs_input`, `done`, or `failed` |
+| `conversation_id` | string | Active conversation |
+| `graph_id` | string\|null | Graph run id when a graph turn is in progress or awaiting approval |
+| `since_ms` | int | Unix ms when this turn state began (0 when idle) |
+
+`awaiting_approval` means a plan or sensitive replan revision waits for
+`/graph approve` (dashboard or `POST /api/command`). `needs_input` means a
+sensitive step gate (`waiting_gate`) needs `/graph continue`. While
+`awaiting_approval`, the planning runner's `agents[].run.state` is also
+`awaiting_approval`, not `done`.
 
 `POST /api/prompt` submits the text exactly like pressing Enter in the TUI
 (slash commands included). `attachments` lists up to 10 names returned by

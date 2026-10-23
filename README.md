@@ -277,6 +277,8 @@ token-authenticated HTTP API:
 ```bash
 TOKEN="<token from .dmuxai/web.json>"
 curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:7420/api/state"
+# Snapshot includes `turn`: { state, conversation_id, graph_id?, since_ms }.
+# Poll `turn.state` — use `awaiting_approval` (not agent `run.state` `done`) when a plan waits for approve/reject.
 ```
 
 With `dmuxai --web` the dashboard's Chat panel does everything the TUI does:
@@ -300,7 +302,7 @@ continuity via their session id, and can run graph nodes:
 name = "opencode-glm"
 command = ["opencode", "run", "--format", "json", "-m", "{model}", "{prompt}"]
 default_model = "opencode/glm-5.3-flash-free"
-output = "jsonl"
+output = "jsonl"                  # required for --format json
 text_path = "/part/text"
 text_when = { path = "/type", equals = "text" }
 session_id_path = "/sessionID"
@@ -651,8 +653,10 @@ ignored (warning once per settings load).
 `--approve-plan`, a complex plan is printed (JSON or one line per step), the record
 is saved `cancelled` with `approval required (headless)`, exit **7**. With
 `--approve-plan`, approve with `decided_by: cli` and run through. Sensitive gates
-save `waiting_gate` and exit **7**; `--approve-plan` does not bypass them. `--graph`
-is a no-op. JSON output includes `triage` and `plan`.
+save `waiting_gate` and exit **7** unless you pass `--allow-sensitive`, or you set
+`--agent` together with `--approve-plan` on a one-step explicit-agent run (both
+confirm the sensitive gate). `--graph` is a no-op. JSON output includes `triage`
+and `plan`.
 
 ```toml
 [graph]

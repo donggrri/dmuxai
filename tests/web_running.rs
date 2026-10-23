@@ -312,6 +312,7 @@ async fn running_indicator_renders_in_headless_chrome() {
             activity: None,
         }],
         None,
+        None,
     );
 
     let token = "test-token-running".to_string();
