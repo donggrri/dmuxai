@@ -59,15 +59,15 @@ use dmuxai::{
         GraphStore, MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind, PanelLineKind,
         PlanChange, PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode,
         PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls, PlannerIo,
-        PlannerIoKind, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage, TriageSource,
-        apply_replan, approval_panel_lines_with_skills, budget_allows, build_judge_prompt,
-        build_plan_prompt, build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary,
-        cap_revision_raw, diff_plan_steps, diff_plan_tasks, fallback_plan,
-        graph_plan_from_revision_steps, heuristic_route, is_trivial_prompt, judge_line_text,
-        judging_line_text, next_plan_change_rev, parse_plan, parse_replan, parse_replan_marker,
-        parse_verdict, plan_json_for_edit, replan_allowed, replan_revision_steps,
-        revision_needs_approval, save_run, strip_replan_marker, task_counter_text, validate_plan,
-        write_tasks_file_if_enabled,
+        PlannerIoKind, QUESTION_ANSWER_HINT, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage,
+        TriageSource, apply_replan, approval_panel_lines_with_skills, budget_allows,
+        build_judge_prompt, build_plan_prompt, build_replan_prompt, cap_plan_response_excerpt,
+        cap_replan_step_summary, cap_revision_raw, diff_plan_steps, diff_plan_tasks, fallback_plan,
+        graph_plan_from_revision_steps, heuristic_route, is_question_prompt, is_trivial_prompt,
+        judge_line_text, judging_line_text, next_plan_change_rev, parse_plan, parse_replan,
+        parse_replan_marker, parse_verdict, pin_graph_plan_runners, plan_json_for_edit,
+        replan_allowed, replan_revision_steps, revision_needs_approval, save_run,
+        strip_replan_marker, task_counter_text, validate_plan, write_tasks_file_if_enabled,
     },
     mcp::config::ResolvedMcpServer,
     mcp::registry::McpRegistry,
@@ -1342,6 +1342,10 @@ pub struct App {
     pub(crate) switch_ready: Option<PathBuf>,
     /// Next user/agent turn policy from dashboard `mode` or headless `mode` (cleared on send).
     pending_turn_policy: Option<TurnPolicy>,
+    /// When set, planner nodes are rewritten to this runner and model (FR-1645).
+    turn_runner_pin: Option<(String, String)>,
+    /// Explicit graph requests may assign multiple runners (FR-1645).
+    allow_multi_runner_graph: bool,
     /// Cursor CLI keeps a chat in ask mode once a read-only turn ran in it, even
     /// when a later turn passes `--force`. True when the stored Cursor session may
     /// be such a chat (also at startup, when it is unknown).
@@ -1577,6 +1581,8 @@ impl App {
             switch_pending: None,
             switch_ready: None,
             pending_turn_policy: None,
+            turn_runner_pin: None,
+            allow_multi_runner_graph: false,
             cursor_session_maybe_read_only: true,
             chat_markdown_cache: HashMap::new(),
         };
@@ -2055,6 +2061,8 @@ impl App {
             }
         }
         let messages_before = self.messages.len();
+        self.allow_multi_runner_graph = false;
+        self.set_turn_runner_pin_from_agent(target_agent);
         let tui_draft = mem::replace(&mut self.input, text);
         self.submit_prompt();
         self.input = tui_draft;
@@ -2301,6 +2309,69 @@ impl App {
             }
             _ => RunTodoError::Forbidden(format!("runner '{runner_id}' is not in allowed_runners")),
         }
+    }
+
+    fn first_allowed_runner_id(&self) -> Option<String> {
+        match &self.settings.graph_allowed_runners {
+            None => self.registered_runner_names().into_iter().next(),
+            Some(allowed) if allowed.is_empty() => None,
+            Some(allowed) => allowed.first().map(|r| r.trim().to_ascii_lowercase()),
+        }
+    }
+
+    fn set_turn_runner_pin_from_agent(&mut self, agent: Agent) {
+        let runner = runner_name(agent).to_owned();
+        let model = self
+            .selected_run_model_label(agent)
+            .unwrap_or_else(|_| "provider default".to_owned());
+        self.turn_runner_pin = Some((runner, model));
+    }
+
+    fn clear_turn_runner_pin(&mut self) {
+        self.turn_runner_pin = None;
+        self.allow_multi_runner_graph = false;
+    }
+
+    fn apply_runner_pin_to_plan(&mut self, plan: &mut dmuxai::graph::GraphPlan) {
+        if self.allow_multi_runner_graph {
+            return;
+        }
+        let Some((runner, model)) = self.turn_runner_pin.clone() else {
+            return;
+        };
+        let notes = pin_graph_plan_runners(plan, &runner, &model, &|candidate| {
+            self.runner_is_allowed(candidate)
+        });
+        for note in notes {
+            self.push_system(format!("Plan: {note}"));
+        }
+    }
+
+    fn restore_conversation_runner(&mut self, agent: Agent) {
+        let runner = runner_name(agent);
+        if self.runner_is_allowed(runner) {
+            self.selected = adapter_index(agent);
+            return;
+        }
+        let Some(replacement) = self.first_allowed_runner_id() else {
+            return;
+        };
+        if let Some(rep_agent) = runner_from_str(&replacement) {
+            self.selected = adapter_index(rep_agent);
+            self.push_system(format!(
+                "Runner '{runner}' is not in allowed_runners; using '{replacement}'"
+            ));
+        }
+    }
+
+    fn simple_question_turn_active(&self, prompt: &str) -> bool {
+        if !is_question_prompt(prompt) {
+            return false;
+        }
+        self.graph_session
+            .as_ref()
+            .and_then(|session| session.run().triage.as_ref())
+            .is_some_and(|triage| triage.route == Route::Simple)
     }
 
     /// Maps a dashboard agent id to an adapter; `None` means the selected agent.
@@ -3992,6 +4063,14 @@ impl App {
                 return;
             }
             self.begin_user_prompt_turn();
+            if self.pending_turn_policy == Some(TurnPolicy::ReadOnly) {
+                self.allow_multi_runner_graph = false;
+                self.set_turn_runner_pin_from_agent(agent);
+                self.submit_direct_run(prompt, agent, OverrideKind::Agent);
+                return;
+            }
+            self.allow_multi_runner_graph = false;
+            self.set_turn_runner_pin_from_agent(agent);
             if self
                 .settings
                 .graph_allowed_runners
@@ -4184,8 +4263,15 @@ impl App {
             self.clear_pending_turn_policy();
             return Err(RunTodoError::Internal(message.to_owned()));
         }
-        let policy = self.pending_turn_policy.unwrap_or(TurnPolicy::Agent);
+        let simple_question = self.simple_question_turn_active(&prompt);
+        let mut policy = self.pending_turn_policy.unwrap_or(TurnPolicy::Agent);
+        if simple_question && agent == Agent::Agy && policy == TurnPolicy::Agent {
+            policy = TurnPolicy::ReadOnly;
+        }
         let mut request = request;
+        if simple_question && !request.prompt.starts_with(QUESTION_ANSWER_HINT) {
+            request.prompt = format!("{}\n\n{}", QUESTION_ANSWER_HINT, request.prompt);
+        }
         if agent == Agent::Cursor {
             if policy == TurnPolicy::Agent && self.cursor_session_maybe_read_only {
                 // Start a fresh Cursor chat; the transcript is replayed as context.
@@ -4502,11 +4588,13 @@ impl App {
     }
 
     fn restore_snapshot(&mut self, snapshot: ConversationSnapshot) {
+        let restored_runner = snapshot.turns.last().map(|turn| agent_from_key(turn.agent));
         self.conversation_id = snapshot.id;
         self.conversation_title = snapshot.title;
         self.session_conversations = None;
         self.chat_markdown_cache.clear();
         self.clear_pending_turn_policy();
+        self.clear_turn_runner_pin();
         self.cursor_session_maybe_read_only = true;
         for adapter in &self.adapters {
             let _ = adapter.reset();
@@ -4549,6 +4637,9 @@ impl App {
                 Role::System,
                 restored_welcome_message(&runners),
             ));
+        }
+        if let Some(agent) = restored_runner {
+            self.restore_conversation_runner(agent);
         }
         self.chat_scroll = 0;
         self.message_link_cache.clear();
@@ -6087,6 +6178,8 @@ impl App {
             return;
         }
         self.begin_user_prompt_turn();
+        self.allow_multi_runner_graph = false;
+        self.set_turn_runner_pin_from_agent(agent);
         let run_id = Uuid::new_v4().to_string();
         self.begin_planning(
             prompt,
@@ -6125,6 +6218,8 @@ impl App {
             return;
         }
         self.begin_user_prompt_turn();
+        self.allow_multi_runner_graph = false;
+        self.set_turn_runner_pin_from_agent(agent);
         let run_id = Uuid::new_v4().to_string();
         self.start_one_node_run(
             prompt,
@@ -6405,6 +6500,7 @@ impl App {
             .unwrap_or_else(|| model_hint.unwrap_or_default());
         let run_id_for_io = run_id.clone();
         let mut plan = built.plan;
+        self.apply_runner_pin_to_plan(&mut plan);
         plan.id = run_id;
         plan.orchestrator_model = model.clone();
         plan.limits = self.graph_limits();
@@ -6898,6 +6994,7 @@ impl App {
         doc: &PlanDoc,
         mut graph_plan: GraphPlan,
     ) {
+        self.apply_runner_pin_to_plan(&mut graph_plan);
         graph_plan.id = pending.run_id.clone();
         graph_plan.orchestrator_model = pending.model.clone();
         graph_plan.limits = self.graph_limits();
@@ -6955,6 +7052,7 @@ impl App {
         doc: &PlanDoc,
         mut graph_plan: GraphPlan,
     ) {
+        self.apply_runner_pin_to_plan(&mut graph_plan);
         graph_plan.id = pending.run_id.clone();
         graph_plan.orchestrator_model = pending.model.clone();
         graph_plan.limits = self.graph_limits();
@@ -9658,6 +9756,7 @@ impl App {
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
                     self.clear_pending_turn_policy();
+                    self.clear_turn_runner_pin();
                     if let Some((_plan_id, todo_id)) = self.graph_todo.take()
                         && let Some(store) = self.todo_store.clone()
                     {
@@ -11323,8 +11422,17 @@ impl App {
             self.submit_prompt();
             return;
         }
+        if self.pending_turn_policy == Some(TurnPolicy::ReadOnly) {
+            let agent = self.adapters[self.selected].agent();
+            self.allow_multi_runner_graph = false;
+            self.set_turn_runner_pin_from_agent(agent);
+            self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::Agent);
+            return;
+        }
         if req.agent.is_some() {
             let agent = self.adapters[self.selected].agent();
+            self.allow_multi_runner_graph = false;
+            self.set_turn_runner_pin_from_agent(agent);
             self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::Agent);
             return;
         }
@@ -11929,6 +12037,8 @@ impl App {
                     return Err(RunTodoError::Forbidden("no allowed runners".to_owned()));
                 }
 
+                self.allow_multi_runner_graph = true;
+                self.turn_runner_pin = None;
                 let agent = self.adapters[self.selected].agent();
                 if self.busy_agents.contains(&agent) {
                     return Err(RunTodoError::Busy(format!(
@@ -24570,6 +24680,135 @@ mod tests {
         drop(sent);
         assert!(harness.app.pending_triage.is_some());
         assert!(harness.app.graph_session.is_none());
+    }
+
+    // TC-1640 / FR-1640, TC-1641 / FR-1641: simple question on agy is read-only with a hint.
+    #[test]
+    fn tc_1640_1641_agy_simple_question_is_read_only_with_hint() {
+        let mut harness = plan_gate_test_app();
+        harness.app.selected = adapter_index(Agent::Agy);
+        harness.app.input = "Why?".to_owned();
+        harness.app.submit_prompt();
+        let sent = harness.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1.policy, TurnPolicy::ReadOnly);
+        assert!(sent[0].1.prompt.contains(QUESTION_ANSWER_HINT));
+    }
+
+    // TC-1642 / FR-1642: non-question implement turns stay in agent mode.
+    #[test]
+    fn tc_1642_non_question_implement_unchanged() {
+        let mut harness = plan_gate_test_app();
+        harness.app.selected = adapter_index(Agent::Agy);
+        harness.app.input = "fix typo".to_owned();
+        harness.app.submit_prompt();
+        let sent = harness.sent.lock().unwrap();
+        assert_eq!(sent[0].1.policy, TurnPolicy::Agent);
+        assert!(!sent[0].1.prompt.contains(QUESTION_ANSWER_HINT));
+    }
+
+    // TC-1643 / FR-1643: resume clamps disallowed saved runner to allowed list.
+    #[test]
+    fn tc_1643_resume_honours_allowed_runners() {
+        let mut harness = plan_gate_test_app();
+        harness.app.skip_judge_for_tests = true;
+        harness.app.selected = adapter_index(Agent::Cursor);
+        harness.app.input = "hello".to_owned();
+        harness.app.submit_prompt();
+        let conv = harness.app.conversation_id.clone();
+        harness.app.create_conversation(Some("other".to_owned()));
+        harness.app.settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
+        harness.app.selected = adapter_index(Agent::Agy);
+        harness.app.resume_conversation(conv.as_str());
+        assert_eq!(harness.app.selected, adapter_index(Agent::Agy));
+        assert!(harness.app.messages.iter().any(|message| {
+            message
+                .content
+                .contains("Runner 'cursor' is not in allowed_runners; using 'agy'")
+        }));
+    }
+
+    // TC-1647 / FR-1647: startup-style open uses the same runner clamp as resume.
+    #[test]
+    fn tc_1647_startup_restore_honours_allowed_runners() {
+        let mut harness = plan_gate_test_app();
+        harness.app.skip_judge_for_tests = true;
+        harness.app.selected = adapter_index(Agent::Cursor);
+        harness.app.input = "hello".to_owned();
+        harness.app.submit_prompt();
+        let conv = harness.app.conversation_id.as_str().to_owned();
+        harness.app.create_conversation(Some("other".to_owned()));
+        harness.app.settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
+        harness.app.open_conversation_on_startup(&conv);
+        assert_eq!(harness.app.selected, adapter_index(Agent::Agy));
+    }
+
+    // TC-1648 / FR-1648: dashboard load conversation clamps runner.
+    #[test]
+    fn tc_1648_dashboard_load_honours_allowed_runners() {
+        let mut harness = plan_gate_test_app();
+        harness.app.skip_judge_for_tests = true;
+        harness.app.selected = adapter_index(Agent::Cursor);
+        harness.app.input = "hello".to_owned();
+        harness.app.submit_prompt();
+        let conv = harness.app.conversation_id.as_str().to_owned();
+        harness
+            .app
+            .handle_session_command(SessionCommand::NewConversation {
+                title: Some("other".to_owned()),
+            })
+            .unwrap();
+        harness.app.settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
+        harness
+            .app
+            .handle_session_command(SessionCommand::LoadConversation { id: conv })
+            .unwrap();
+        assert_eq!(harness.app.selected, adapter_index(Agent::Agy));
+    }
+
+    // TC-1644 / FR-1644: ask/plan mode never enters triage.
+    #[test]
+    fn tc_1644_ask_mode_skips_judge() {
+        let mut harness = plan_gate_test_app();
+        harness.app.pending_turn_policy = Some(TurnPolicy::ReadOnly);
+        harness.app.input = "Explain the build steps?".to_owned();
+        harness.app.submit_prompt();
+        let sent = harness.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(!sent[0].1.turn_id.as_str().starts_with("judge-"));
+        assert!(harness.app.pending_triage.is_none());
+    }
+
+    // TC-1645 / FR-1645: pinned runner rewrites planner nodes.
+    #[test]
+    fn tc_1645_pins_planned_runners() {
+        let mut harness = plan_gate_test_app();
+        harness.app.set_turn_runner_pin_from_agent(Agent::Codex);
+        let mut plan = dmuxai::graph::GraphPlan {
+            schema: "cursor-agent-graph/v1".to_owned(),
+            id: "plan".to_owned(),
+            orchestrator_model: "composer-2.5".to_owned(),
+            user_prompt: "work".to_owned(),
+            limits: dmuxai::graph::default_limits(),
+            nodes: vec![dmuxai::graph::GraphNode {
+                id: "step-1".to_owned(),
+                role: dmuxai::graph::NodeRole::Implement,
+                job: "work".to_owned(),
+                runner: "cursor".to_owned(),
+                model_id: "composer-2.5".to_owned(),
+                requires_gate: false,
+                status: dmuxai::graph::GraphNodeStatus::Pending,
+                attempt: 0,
+                task: None,
+                skill: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+            }],
+            edges: vec![],
+            tasks: vec![],
+        };
+        harness.app.apply_runner_pin_to_plan(&mut plan);
+        assert_eq!(plan.nodes[0].runner, "codex");
     }
 
     // TC-931 / FR-930: an empty allowed_runners list notices and sends directly.
