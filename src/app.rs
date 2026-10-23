@@ -2134,6 +2134,15 @@ impl App {
 
         // A follow-up sent while a run is active waits in the queue and starts
         // on its own once the run ends (see `flush_followup_queue`).
+        if let Some(active) = self.active_turns.get(&target_agent)
+            && active.conversation_id.as_str() != self.conversation_id.as_str()
+        {
+            let title = self.conversation_title_for(active.conversation_id.as_str());
+            return Err(RunTodoError::Busy(format!(
+                "agent '{runner_id}' is running in another conversation ({title}); wait or pick another agent"
+            )));
+        }
+
         if allow_queue && queued_id.is_none() && !display_is_slash && self.followup_should_queue() {
             if let Some(mode_str) = mode.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
                 crate::agent::turn_policy_from_legacy_mode(mode_str)
@@ -2212,22 +2221,85 @@ impl App {
         })
     }
 
-    /// A run or turn is active, so a new dashboard prompt would be refused
-    /// as busy. A plan waiting for approval is not active (its gate decides).
+    /// Whether `conversation_id` has a run that blocks new prompts there (FR-1620).
+    fn conversation_run_active(&self, conversation_id: &str) -> bool {
+        if self
+            .active_turns
+            .values()
+            .any(|active| active.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .pending_triage
+            .as_ref()
+            .is_some_and(|pending| pending.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .pending_plan
+            .as_ref()
+            .is_some_and(|pending| pending.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .pending_summary
+            .as_ref()
+            .is_some_and(|pending| pending.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .graph_session
+            .as_ref()
+            .is_some_and(|session| session.run().conversation_id == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .deferred_turns
+            .iter()
+            .any(|turn| turn.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if conversation_id != self.conversation_id.as_str() {
+            return false;
+        }
+        self.busy_agents
+            .iter()
+            .any(|agent| !self.active_turns.contains_key(agent))
+    }
+
+    fn conversation_title_for(&self, conversation_id: &str) -> String {
+        if self.conversation_id.as_str() == conversation_id {
+            return self.conversation_title.clone();
+        }
+        self.engine
+            .list()
+            .ok()
+            .and_then(|cards| {
+                cards
+                    .iter()
+                    .find(|card| card.id.as_str() == conversation_id)
+                    .map(|card| card.title.clone())
+            })
+            .unwrap_or_else(|| conversation_id.to_owned())
+    }
+
+    /// A run or turn is active in the displayed conversation, so a new
+    /// dashboard prompt would be refused as busy or queued. A plan waiting for
+    /// approval is not active (its gate decides).
     fn followup_run_active(&self) -> bool {
-        !self.busy_agents.is_empty()
-            || !self.active_turns.is_empty()
-            || self.pending_triage.is_some()
-            || self.pending_plan.is_some()
-            || self.pending_summary.is_some()
-            || self.graph_session.is_some()
-            || !self.deferred_turns.is_empty()
+        self.conversation_run_active(self.conversation_id.as_str())
     }
 
     /// Queue a new follow-up when a run is active, or when earlier follow-ups
     /// of this conversation still wait (keeps their order).
     fn followup_should_queue(&self) -> bool {
-        self.followup_run_active()
+        self.conversation_run_active(self.conversation_id.as_str())
             || self
                 .followup_queue
                 .iter()
@@ -2277,7 +2349,7 @@ impl App {
     fn flush_followup_queue(&mut self) -> bool {
         if self.followup_queue.is_empty()
             || self.switch_pending.is_some()
-            || self.followup_run_active()
+            || self.conversation_run_active(self.conversation_id.as_str())
             || self
                 .last_graph_run
                 .as_ref()
@@ -2558,15 +2630,16 @@ impl App {
                         Vec::with_capacity(cards.len().min(SESSION_CONVERSATIONS_MAX));
                     let mut rest = Vec::with_capacity(cards.len());
                     for card in cards {
+                        let id = card.id.as_str().to_owned();
                         let entry = SessionConversation {
-                            id: card.id.as_str().to_owned(),
+                            id: id.clone(),
                             title: card.title,
                             updated_at_ms: card.updated_at_ms.max(0) as u64,
                             last_agent: card
                                 .last_agent
                                 .map(|agent| self.agent_key_display_name(agent)),
                             turn_count: card.turn_count,
-                            running: card.running,
+                            running: card.running || self.conversation_run_active(&id),
                         };
                         if entry.id == conversation_id && ordered.is_empty() {
                             ordered.push(entry);
@@ -4728,6 +4801,10 @@ impl App {
         self.clear_turn_runner_pin();
         self.cursor_session_maybe_read_only = true;
         for adapter in &self.adapters {
+            let agent = adapter.agent();
+            if self.active_turns.contains_key(&agent) {
+                continue;
+            }
             let _ = adapter.reset();
         }
         // Switching conversations clears the dashboard's retained graph so the
@@ -4788,6 +4865,7 @@ impl App {
             self.submit_to_agent(deferred.agent, deferred.prompt, true);
         }
         self.restore_graph_runs_on_startup();
+        self.flush_followup_queue();
         self.publish_dashboard();
     }
 
@@ -9579,6 +9657,9 @@ impl App {
             .last_agent_output_index(agent)
             .map(|index| format!("{}:{index}", self.conversation_id.as_str()));
         let active_turn = self.active_turns.remove(&agent);
+        let finished_conversation = active_turn
+            .as_ref()
+            .map(|active| active.conversation_id.clone());
         self.streaming_messages.remove(&agent);
         self.tool_messages.remove(&agent);
         let graph_node_id = active_turn
@@ -9651,6 +9732,9 @@ impl App {
         }
         self.flush_deferred_graph_starts();
         self.try_flush_queued_replan();
+        if finished_conversation.as_ref() == Some(&self.conversation_id) {
+            self.flush_followup_queue();
+        }
     }
 
     /// The model a planned step should actually use on `agent`.
@@ -28038,6 +28122,120 @@ mod tests {
         assert_eq!(sent_prompts(&h).len(), 1);
         assert!(queued_lines(&mut h.app).is_empty());
         assert_eq!(h.app.followup_queue.len(), 1);
+    }
+
+    fn submit_direct_agent(app: &mut App, agent: &str, text: &str) -> PromptAccepted {
+        app.handle_dashboard_submit_prompt(
+            text.to_owned(),
+            Some(agent.to_owned()),
+            None,
+            Some("direct".to_owned()),
+            Vec::new(),
+        )
+        .expect("accepted")
+    }
+
+    // TC-1620 / FR-1620: another agent in another conversation starts immediately.
+    #[test]
+    fn concurrent_send_other_conversation_other_agent_starts() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        let first = submit_direct_agent(&mut h.app, "codex", "task in A");
+        assert!(!first.queued);
+        assert!(h.app.conversation_run_active(a.as_str()));
+        h.app.create_conversation(Some("conversation B".to_owned()));
+        assert_ne!(h.app.conversation_id, a);
+        assert!(!h.app.session_view().run_active);
+        let second = submit_direct_agent(&mut h.app, "cursor", "task in B");
+        assert!(!second.queued);
+        assert_eq!(h.sent.lock().unwrap().len(), 2);
+        assert_eq!(h.sent.lock().unwrap()[1].0, Agent::Cursor);
+    }
+
+    // TC-1621 / FR-1621: switching away does not drop a background turn.
+    #[test]
+    fn switch_conversation_keeps_background_turn() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "background work");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::TextDelta("done".to_owned())
+        )));
+        assert!(
+            !h.app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("done"))
+        );
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request, AgentEvent::Completed))
+        );
+        h.app.select_conversation(a);
+        assert!(
+            h.app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("done"))
+        );
+    }
+
+    // TC-1623 / FR-1623: same agent cannot run in two conversations at once.
+    #[test]
+    fn same_agent_other_conversation_refused() {
+        let mut h = plan_gate_test_app();
+        submit_direct_agent(&mut h.app, "codex", "first in A");
+        h.app.create_conversation(Some("conversation B".to_owned()));
+        let refused = h.app.submit_dashboard_prompt(
+            "second in B".to_owned(),
+            Some("codex".to_owned()),
+            None,
+            Some("direct".to_owned()),
+            Vec::new(),
+            true,
+            None,
+        );
+        assert!(
+            matches!(refused, Err(RunTodoError::Busy(message)) if message.contains("another conversation"))
+        );
+        assert_eq!(h.sent.lock().unwrap().len(), 1);
+    }
+
+    // TC-1624 / FR-1624: Sessions list marks each running conversation.
+    #[test]
+    fn sessions_running_flag_per_conversation() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.as_str().to_owned();
+        submit_direct_agent(&mut h.app, "codex", "run A");
+        h.app.create_conversation(Some("B".to_owned()));
+        let b = h.app.conversation_id.as_str().to_owned();
+        submit_direct_agent(&mut h.app, "cursor", "run B");
+        let conversations = h.app.session_view().conversations;
+        let a_row = conversations.iter().find(|c| c.id == a).expect("A listed");
+        let b_row = conversations.iter().find(|c| c.id == b).expect("B listed");
+        assert!(a_row.running);
+        assert!(b_row.running);
+        assert!(h.app.session_view().run_active);
+    }
+
+    // TC-1625 / FR-1625: a background turn ending clears process-wide queue gating.
+    #[test]
+    fn background_turn_end_clears_run_state() {
+        let mut h = plan_gate_test_app();
+        submit_direct_agent(&mut h.app, "codex", "background");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request, AgentEvent::Completed))
+        );
+        assert!(!h.app.session_view().run_active);
+        let next = submit_direct_agent(&mut h.app, "cursor", "after background done");
+        assert!(!next.queued);
     }
 
     fn start_approved_three_step_run(h: &mut PlanGateHarness) -> String {
