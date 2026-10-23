@@ -83,7 +83,7 @@ Usage:
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
-  dmuxai run <prompt|-> [--agent ID] [--approve-plan] [--graph] [--json]
+  dmuxai run <prompt|-> [--agent ID] [--approve-plan] [--allow-sensitive] [--graph] [--json]
   dmuxai todo add <title> [--body TEXT] [--json]
   dmuxai todo list [--status open|running|done] [--json]
   dmuxai todo run <id> [--agent ID | --graph] [--json]
@@ -108,7 +108,8 @@ Options:
   --project NAME   Project name for mcp-memory
   run              Run one prompt headless and exit (exit codes: 0 ok, 1 failed,
                    2 usage, 3 not found, 4 busy, 5 runner not allowed, 6 internal,
-                   7 approval or sensitive gate, 130 cancelled)
+                   7 plan approval or sensitive gate (--allow-sensitive or
+                   --agent with --approve-plan confirms sensitive gates), 130 cancelled)
   todo             Add, list or run to-dos without the TUI
   status           Print workspace status (agents, to-dos, last graph, events)
   events           Print state-change events from .dmuxai/events.jsonl
@@ -1001,6 +1002,12 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // TC-1664 / FR-1664
+    #[test]
+    fn tc_1664_help_documents_allow_sensitive() {
+        assert!(USAGE.contains("--allow-sensitive"));
+    }
 
     #[test]
     fn parse_cli_empty_args_defaults_to_run() {
