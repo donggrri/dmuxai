@@ -78,7 +78,7 @@ const OPENCODE_EXAMPLE: &str = r##"# Built-in opencode runner, as an editable [[
 # error_path = "/error/message"
 # session_id_path = "/sessionID"
 # resume_arg = ["--session", "{session_id}"]
-# timeout_secs = 900
+# timeout_secs = 1800
 # failure_stderr = "(?i)permission denied|rejected permission"
 # temp_config_template = '{"permission":{"edit":"{edit}","bash":"{edit}","webfetch":"allow"}}'
 # env = { OPENCODE_CONFIG = "{temp_config}" }
@@ -102,7 +102,7 @@ const GROK_EXAMPLE: &str = r##"# Built-in grok runner, as an editable [[agents.c
 # text_when = { path = "/type", equals = "text" }
 # session_id_path = "/sessionId"
 # resume_arg = ["-r", "{session_id}"]
-# timeout_secs = 900
+# timeout_secs = 1800
 # done_when = { path = "/type", equals = "end" }
 # text_break_when = { path = "/type", equals = "tool_call" }
 # [agents.custom.env]

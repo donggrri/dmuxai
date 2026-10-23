@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 /// Upper bound for the built-in preset's `models_command` (SPEC-first-run FR-813).
 pub const BUILTIN_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default per-turn timeout when `timeout_secs` is not set (FR-339).
+pub const DEFAULT_TIMEOUT_SECS: u64 = 1800;
+
 /// How the prompt is delivered to the runner process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -137,7 +140,7 @@ pub fn opencode_preset(program: &str) -> CustomAgentSpec {
         error_path: Some("/error/message".to_owned()),
         session_id_path: Some("/sessionID".to_owned()),
         resume_arg: words(&["--session", "{session_id}"]),
-        timeout_secs: Some(900),
+        timeout_secs: Some(DEFAULT_TIMEOUT_SECS),
         failure_stderr: Some("(?i)permission denied|rejected permission".to_owned()),
         temp_config_template: Some(
             r#"{"permission":{"edit":"{edit}","bash":"{edit}","webfetch":"allow"}}"#.to_owned(),
@@ -186,7 +189,7 @@ pub fn grok_preset(program: &str) -> CustomAgentSpec {
         }),
         session_id_path: Some("/sessionId".to_owned()),
         resume_arg: words(&["-r", "{session_id}"]),
-        timeout_secs: Some(900),
+        timeout_secs: Some(DEFAULT_TIMEOUT_SECS),
         // FR-913: a background task that finishes during the turn queues an
         // auto-wake prompt that grok 1.0.62 never runs in headless mode, so the
         // process idles forever after its reply. Auto-wake off avoids it.
@@ -284,6 +287,23 @@ pub fn grok_no_allowed_model_message() -> String {
     "grok: no allowed models (ids must match ^grok-; ids containing fast are rejected)".to_owned()
 }
 
+/// User-visible message when a custom-agent turn exceeds `timeout_secs` (FR-333).
+pub fn timeout_message(spec: &CustomAgentSpec) -> String {
+    let prefix = format!("{} timed out after {}s", spec.label(), spec.timeout_secs());
+    let hint = if spec.builtin {
+        format!(
+            "copy the built-in \"{}\" preset into dmuxai.toml as [[agents.custom]] (run dmuxai init for a commented copy) and raise its timeout_secs",
+            spec.name
+        )
+    } else {
+        format!(
+            "raise timeout_secs for [[agents.custom]] name = \"{}\" in dmuxai.toml",
+            spec.name
+        )
+    };
+    format!("{prefix}; {hint} (the turn was stopped; check the workspace for partial edits)")
+}
+
 impl CustomAgentSpec {
     /// Returns the display label, defaulting to the agent name.
     pub fn label(&self) -> &str {
@@ -295,9 +315,9 @@ impl CustomAgentSpec {
         self.color.as_deref().unwrap_or("white")
     }
 
-    /// Returns the timeout in seconds, defaulting to 900.
+    /// Returns the timeout in seconds, defaulting to [`DEFAULT_TIMEOUT_SECS`].
     pub fn timeout_secs(&self) -> u64 {
-        self.timeout_secs.unwrap_or(900)
+        self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)
     }
 
     /// Returns whether any of `text_path`, `text_when`, `error_path`, `session_id_path`,
@@ -1082,6 +1102,46 @@ implement = []
         assert!(spec.validate().is_ok());
     }
 
+    // TC-338 (FR-333)
+    #[test]
+    fn timeout_message_mentions_config_for_user_agent() {
+        let spec = CustomAgentSpec {
+            name: "my-agent".to_owned(),
+            label: Some("my-label".to_owned()),
+            command: vec!["tool".to_owned()],
+            builtin: false,
+            ..Default::default()
+        };
+        let msg = timeout_message(&spec);
+        assert!(msg.starts_with("my-label timed out after 1800s"));
+        assert!(msg.contains("timeout_secs"));
+        assert!(msg.contains("name = \"my-agent\""));
+        assert!(msg.contains("raise timeout_secs"));
+        assert!(msg.contains("partial edits"));
+    }
+
+    // TC-338 (FR-333)
+    #[test]
+    fn timeout_message_mentions_override_for_builtin_preset() {
+        let spec = opencode_preset("opencode");
+        let msg = timeout_message(&spec);
+        assert!(msg.starts_with("opencode timed out after 1800s"));
+        assert!(msg.contains("timeout_secs"));
+        assert!(msg.contains("built-in \"opencode\""));
+        assert!(msg.contains("dmuxai init"));
+        assert!(msg.contains("partial edits"));
+    }
+
+    // TC-339 (FR-339)
+    #[test]
+    fn builtin_presets_use_default_timeout() {
+        assert_eq!(
+            opencode_preset("opencode").timeout_secs(),
+            DEFAULT_TIMEOUT_SECS
+        );
+        assert_eq!(grok_preset("grok").timeout_secs(), DEFAULT_TIMEOUT_SECS);
+    }
+
     #[test]
     fn test_deserialize_minimal_spec() {
         let toml_str = r#"
@@ -1094,7 +1154,7 @@ command = ["pi", "run"]
         assert_eq!(spec.color(), "white");
         assert_eq!(spec.prompt_via, PromptVia::Arg);
         assert_eq!(spec.effective_output(), CustomAgentOutput::Text);
-        assert_eq!(spec.timeout_secs(), 900);
+        assert_eq!(spec.timeout_secs(), DEFAULT_TIMEOUT_SECS);
         assert!(spec.image_arg.is_empty());
         assert!(spec.env.is_empty());
         assert!(spec.validate().is_ok());
