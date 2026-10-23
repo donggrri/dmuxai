@@ -3259,6 +3259,20 @@ impl App {
                 self.on_agent_lifecycle_event(output.agent, &output.event);
 
                 let Some(event) = stored_event(&output.event) else {
+                    // FR-1621: live-only rows (activity, tool progress, status) of
+                    // a turn running in another conversation are not stored, so
+                    // they must not leak into the displayed transcript.
+                    let background = conversation_id.as_str() != self.conversation_id.as_str();
+                    if background
+                        && matches!(
+                            output.event,
+                            AgentEvent::Activity(_)
+                                | AgentEvent::ToolProgress { .. }
+                                | AgentEvent::Status(_)
+                        )
+                    {
+                        return true;
+                    }
                     self.apply_agent_event(output.agent, output.event);
                     return true;
                 };
@@ -28384,6 +28398,33 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.content.contains("done"))
+        );
+    }
+
+    // TC-1621 / FR-1621: live-only activity rows of a background turn never
+    // appear in the displayed conversation.
+    #[test]
+    fn background_activity_does_not_leak_into_displayed_conversation() {
+        let mut h = plan_gate_test_app();
+        submit_direct_agent(&mut h.app, "codex", "background work");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        let before = h.app.messages.len();
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::ToolProgress {
+                item_id: "t1".to_owned(),
+                summary: "execute sleep 12; echo LEAKCHECK".to_owned(),
+                state: "completed".to_owned(),
+            }
+        )));
+        assert_eq!(h.app.messages.len(), before);
+        assert!(
+            !h.app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("LEAKCHECK"))
         );
     }
 
