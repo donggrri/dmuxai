@@ -731,6 +731,8 @@ rustup target add x86_64-unknown-linux-gnu
 cargo clippy --target x86_64-unknown-linux-gnu --all-targets --all-features -- -D warnings
 ```
 
+Before a PR run `scripts/gate.sh` (add `--browser` for UI changes).
+
 ## Delivery workflow
 
 All behavior changes follow `Spec -> Plan -> Execute -> Review -> Test`.

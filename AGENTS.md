@@ -73,6 +73,7 @@ observable behavior. Do not commit unless the user explicitly requests it.
 - For every changed `docs/specs/SPEC-*.md` or baseline spec, run
   `bash scripts/check-spec.sh <path>`
   before review.
+- The spec gate is `python3 scripts/check-spec.py --all`; `scripts/spec-check-allowlist.txt` must only shrink.
 - Default Rust gates:
 
   ```bash
@@ -80,6 +81,8 @@ observable behavior. Do not commit unless the user explicitly requests it.
   cargo test --all-targets
   cargo clippy --all-targets --all-features -- -D warnings
   ```
+
+Before a PR run `scripts/gate.sh` (add `--browser` for UI changes).
 
 - Run live-provider tests only when the relevant CLI is installed, authenticated,
   and the task calls for it. Record the exact command and result separately from

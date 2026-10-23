@@ -9,6 +9,16 @@
 // FR-473 / TC-473 is a manual review of docs/TEST-PLAN.md §0.1 (kept as prose
 //   only) and has no automated test.
 
+// FR-1800 / TC-1800: `python3 scripts/check-spec.py --all` exits 0 on this repo
+//   with the committed allowlist -> `tc_1800_check_spec_all_passes_with_allowlist`.
+// FR-1801 / TC-1801: --all reports stale and unknown allowlist entries as failures
+//   -> `tc_1801_check_spec_all_flags_stale_and_unknown_allowlist`.
+// FR-1803 / TC-1803: `python3 scripts/check-tc-links.py` exits 0 on this repo
+//   with the committed allowlist -> `tc_1803_tc_links_have_tests_or_allowlist`.
+// FR-1804 / TC-1804: check-tc-links.py reports orphans both ways (unlinked specs,
+//   undefined tests, stale allowlist entries, undefined allowlist entries)
+//   -> `tc_1804_tc_link_check_reports_orphans_both_ways`.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -179,4 +189,330 @@ fn spec_index_script_lists_every_spec() {
             "spec-index.sh emitted a row for nonexistent SPEC file {name}"
         );
     }
+}
+
+#[test]
+fn tc_1800_check_spec_all_passes_with_allowlist() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new("python3")
+        .arg("scripts/check-spec.py")
+        .arg("--all")
+        .current_dir(root)
+        .output()
+        .expect("python3 must be available to run scripts/check-spec.py --all");
+    assert!(
+        output.status.success(),
+        "check-spec.py --all failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn tc_1801_check_spec_all_flags_stale_and_unknown_allowlist() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let specs_dir = std::env::temp_dir().join(format!(
+        "dmuxai-spec-gate-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&specs_dir).expect("create temp specs dir");
+
+    let passing_spec = specs_dir.join("SPEC-passing.md");
+    let failing_spec = specs_dir.join("SPEC-failing.md");
+    fs::write(
+        &passing_spec,
+        "Status: Implemented\n\n## 4. Requirements\n\n\
+         | ID | Priority | P | R | F | E |\n|---|---|---|---|---|---|\n\
+         | FR-999 | Must | given | then | none | TC-999 |\n\n\
+         ## 5. Acceptance scenarios and test design\n\n\
+         | TC-999 | FR-999 | unit | s | a | o |\n",
+    )
+    .expect("write passing spec");
+    fs::write(&failing_spec, "# failing spec\n").expect("write failing spec");
+
+    let allowlist = std::env::temp_dir().join(format!(
+        "dmuxai-spec-allowlist-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    // Bad allowlist: passing spec (stale) plus a nonexistent entry (unknown).
+    fs::write(&allowlist, "SPEC-passing.md\nSPEC-does-not-exist.md\n")
+        .expect("write bad allowlist");
+
+    let bad_output = Command::new("python3")
+        .arg("scripts/check-spec.py")
+        .arg("--all")
+        .arg("--specs-dir")
+        .arg(&specs_dir)
+        .arg("--allowlist")
+        .arg(&allowlist)
+        .current_dir(root)
+        .output()
+        .expect("python3 must be available to run scripts/check-spec.py --all");
+    assert!(
+        !bad_output.status.success(),
+        "bad allowlist run unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&bad_output.stdout),
+        String::from_utf8_lossy(&bad_output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bad_output.stdout),
+        String::from_utf8_lossy(&bad_output.stderr)
+    );
+    assert!(
+        combined.contains("STALE"),
+        "output must mention STALE:\n{combined}"
+    );
+    assert!(
+        combined.contains("SPEC-does-not-exist.md"),
+        "output must mention the unknown entry:\n{combined}"
+    );
+
+    // Single-file mode checks (TC-1802).
+    let single_fail = Command::new("python3")
+        .arg("scripts/check-spec.py")
+        .arg(&failing_spec)
+        .current_dir(root)
+        .output()
+        .expect("python3 must be available");
+    assert_eq!(
+        single_fail.status.code(),
+        Some(1),
+        "failing spec single-file should exit 1"
+    );
+
+    let single_pass = Command::new("python3")
+        .arg("scripts/check-spec.py")
+        .arg(&passing_spec)
+        .current_dir(root)
+        .output()
+        .expect("python3 must be available");
+    assert_eq!(
+        single_pass.status.code(),
+        Some(0),
+        "passing spec single-file should exit 0"
+    );
+
+    // Correct allowlist: only the failing spec.
+    fs::write(&allowlist, "SPEC-failing.md\n").expect("write good allowlist");
+    let good_output = Command::new("python3")
+        .arg("scripts/check-spec.py")
+        .arg("--all")
+        .arg("--specs-dir")
+        .arg(&specs_dir)
+        .arg("--allowlist")
+        .arg(&allowlist)
+        .current_dir(root)
+        .output()
+        .expect("python3 must be available to run scripts/check-spec.py --all");
+    assert!(
+        good_output.status.success(),
+        "good allowlist run failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        good_output.status.code(),
+        String::from_utf8_lossy(&good_output.stdout),
+        String::from_utf8_lossy(&good_output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&specs_dir);
+    let _ = fs::remove_file(&allowlist);
+}
+
+#[test]
+fn tc_1803_tc_links_have_tests_or_allowlist() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new("python3")
+        .arg("scripts/check-tc-links.py")
+        .current_dir(root)
+        .output()
+        .expect("python3 must be available to run scripts/check-tc-links.py");
+    assert!(
+        output.status.success(),
+        "check-tc-links.py failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn tc_1804_tc_link_check_reports_orphans_both_ways() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temp_root = std::env::temp_dir().join(format!(
+        "dmuxai-tc-link-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(temp_root.join("docs/specs")).expect("create temp docs/specs");
+    fs::create_dir_all(temp_root.join("src")).expect("create temp src");
+    fs::create_dir_all(temp_root.join("scripts")).expect("create temp scripts");
+
+    fs::write(
+        temp_root.join("docs/specs/SPEC-x.md"),
+        "Status: Draft\n\n## 4. Requirements\n\n\
+         | ID | Priority | P | R | F | Evidence |\n|---|---|---|---|---|---|\n\
+         | FR-1 | Must | p | r | f | TC-1 |\n\
+         | FR-2 | Must | p | r | f | TC-2 |\n\n\
+         ## 5. Acceptance scenarios and test design\n\n\
+         | TC-1 | FR-1 | unit | s | a | o | loc |\n\
+         | TC-2 | FR-2 | unit | s | a | o | loc |\n",
+    )
+    .expect("write SPEC-x.md");
+
+    fs::write(
+        temp_root.join("src/a.rs"),
+        "#[test]\nfn tc_1_ok() {}\n\n#[test]\nfn tc_9_bad() {}\n",
+    )
+    .expect("write src/a.rs");
+
+    let allowlist = temp_root.join("scripts/tc-link-allowlist.txt");
+    fs::write(&allowlist, "TC-1 manual\nTC-3 planned\n").expect("write allowlist");
+
+    let script = root.join("scripts/check-tc-links.py");
+    let bad_output = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--allowlist")
+        .arg(&allowlist)
+        .output()
+        .expect("python3 must run scripts/check-tc-links.py");
+    assert_eq!(
+        bad_output.status.code(),
+        Some(1),
+        "bad fixture should exit 1\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&bad_output.stdout),
+        String::from_utf8_lossy(&bad_output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bad_output.stdout),
+        String::from_utf8_lossy(&bad_output.stderr)
+    );
+    assert!(
+        combined.contains("TC-2") && combined.to_lowercase().contains("orphan"),
+        "output must name TC-2 (orphan):\n{combined}"
+    );
+    assert!(
+        combined.contains("TC-9") && combined.contains("undefined"),
+        "output must name TC-9 (undefined test):\n{combined}"
+    );
+    assert!(
+        combined.contains("TC-1") && combined.to_lowercase().contains("stale"),
+        "output must name TC-1 (stale):\n{combined}"
+    );
+    assert!(
+        combined.contains("TC-3") && combined.contains("undefined"),
+        "output must name TC-3 (undefined allowlist):\n{combined}"
+    );
+
+    // Clean fixture: TC-1 has test tc_1_ok; TC-2 is allowlisted; no undefined test or allowlist.
+    fs::write(temp_root.join("src/a.rs"), "#[test]\nfn tc_1_ok() {}\n")
+        .expect("write clean src/a.rs");
+    fs::write(&allowlist, "TC-2 manual\n").expect("write clean allowlist");
+
+    let good_output = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--allowlist")
+        .arg(&allowlist)
+        .output()
+        .expect("python3 must run scripts/check-tc-links.py");
+    assert!(
+        good_output.status.success(),
+        "clean fixture should exit 0, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        good_output.status.code(),
+        String::from_utf8_lossy(&good_output.stdout),
+        String::from_utf8_lossy(&good_output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn tc_1805_gate_script_help_and_linux_guard() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new("bash")
+        .arg("scripts/gate.sh")
+        .arg("--help")
+        .current_dir(root)
+        .output()
+        .expect("bash must be available to run scripts/gate.sh --help");
+    assert!(
+        output.status.success(),
+        "gate.sh --help failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for opt in ["--isolated", "--browser", "--quick", "--keep-going"] {
+        assert!(
+            combined.contains(opt),
+            "help text must mention {opt}:\n{combined}"
+        );
+    }
+}
+
+#[test]
+fn tc_1806_gate_script_isolated_mode_unsets_dmuxai_vars() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let isolated = Command::new("bash")
+        .arg("scripts/gate.sh")
+        .arg("--print-env")
+        .env("DMUXAI_OPENCODE_BIN", "/nonexistent")
+        .current_dir(root)
+        .output()
+        .expect("bash must be available to run scripts/gate.sh --print-env");
+    assert!(
+        isolated.status.success(),
+        "isolated --print-env failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        isolated.status.code(),
+        String::from_utf8_lossy(&isolated.stdout),
+        String::from_utf8_lossy(&isolated.stderr)
+    );
+    let isolated_out = String::from_utf8_lossy(&isolated.stdout);
+    assert!(
+        !isolated_out.contains("DMUXAI_OPENCODE_BIN"),
+        "isolated --print-env must not list DMUXAI_OPENCODE_BIN:\n{isolated_out}"
+    );
+
+    let non_isolated = Command::new("bash")
+        .arg("scripts/gate.sh")
+        .arg("--no-isolated")
+        .arg("--print-env")
+        .env("DMUXAI_OPENCODE_BIN", "/nonexistent")
+        .current_dir(root)
+        .output()
+        .expect("bash must be available to run scripts/gate.sh --print-env");
+    assert!(
+        non_isolated.status.success(),
+        "non-isolated --print-env failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        non_isolated.status.code(),
+        String::from_utf8_lossy(&non_isolated.stdout),
+        String::from_utf8_lossy(&non_isolated.stderr)
+    );
+    let non_isolated_out = String::from_utf8_lossy(&non_isolated.stdout);
+    assert!(
+        non_isolated_out.contains("DMUXAI_OPENCODE_BIN"),
+        "non-isolated --print-env must list DMUXAI_OPENCODE_BIN:\n{non_isolated_out}"
+    );
 }

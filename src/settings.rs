@@ -2241,9 +2241,9 @@ mod builtin_memory_mcp_tests {
         );
     }
 
-    // TC-1322 / FR-1321: opencode binary resolution includes ~/.opencode/bin/opencode.
+    // opencode binary resolution includes ~/.opencode/bin/opencode.
     #[test]
-    fn tc_1322_find_opencode_bin_home_install() {
+    fn find_opencode_bin_home_install() {
         let home = tempfile::tempdir().unwrap();
         let bin = home.path().join(".opencode").join("bin");
         std::fs::create_dir_all(&bin).unwrap();

@@ -1,0 +1,158 @@
+# TC link allowlist. This list must only shrink.
+# Format: TC-<digits> <reason>
+TC-001 legacy: no test reference yet
+TC-002 legacy: no test reference yet
+TC-003 legacy: no test reference yet
+TC-004 legacy: no test reference yet
+TC-005 legacy: no test reference yet
+TC-006 legacy: no test reference yet
+TC-007 legacy: no test reference yet
+TC-049 legacy: no test reference yet
+TC-051 legacy: no test reference yet
+TC-053 legacy: no test reference yet
+TC-064 legacy: no test reference yet
+TC-101 legacy: no test reference yet
+TC-102 legacy: no test reference yet
+TC-103 legacy: no test reference yet
+TC-104 legacy: no test reference yet
+TC-105 legacy: no test reference yet
+TC-106 legacy: no test reference yet
+TC-107 legacy: no test reference yet
+TC-108 legacy: no test reference yet
+TC-109 legacy: no test reference yet
+TC-110 legacy: no test reference yet
+TC-111 manual
+TC-300 legacy: no test reference yet
+TC-301 legacy: no test reference yet
+TC-302 legacy: no test reference yet
+TC-303 legacy: no test reference yet
+TC-304 legacy: no test reference yet
+TC-305 legacy: no test reference yet
+TC-310 legacy: no test reference yet
+TC-311 legacy: no test reference yet
+TC-312 legacy: no test reference yet
+TC-313 legacy: no test reference yet
+TC-314 legacy: no test reference yet
+TC-315 legacy: no test reference yet
+TC-320 legacy: no test reference yet
+TC-321 legacy: no test reference yet
+TC-322 legacy: no test reference yet
+TC-323 legacy: no test reference yet
+TC-324 legacy: no test reference yet
+TC-330 legacy: no test reference yet
+TC-331 legacy: no test reference yet
+TC-332 legacy: no test reference yet
+TC-333 legacy: no test reference yet
+TC-334 legacy: no test reference yet
+TC-335 legacy: no test reference yet
+TC-336 legacy: no test reference yet
+TC-337 manual
+TC-340 legacy: no test reference yet
+TC-341 legacy: no test reference yet
+TC-342 legacy: no test reference yet
+TC-362 legacy: no test reference yet
+TC-363 legacy: no test reference yet
+TC-366 e2e/browser (ignored)
+TC-367 e2e/browser (ignored)
+TC-370 legacy: no test reference yet
+TC-371 legacy: no test reference yet
+TC-372 legacy: no test reference yet
+TC-373 legacy: no test reference yet
+TC-374 legacy: no test reference yet
+TC-375 legacy: no test reference yet
+TC-383 legacy: no test reference yet
+TC-384 legacy: no test reference yet
+TC-385 legacy: no test reference yet
+TC-386 legacy: no test reference yet
+TC-387 legacy: no test reference yet
+TC-388 legacy: no test reference yet
+TC-389 legacy: no test reference yet
+TC-390 legacy: no test reference yet
+TC-391 legacy: no test reference yet
+TC-392 legacy: no test reference yet
+TC-393 legacy: no test reference yet
+TC-394 legacy: no test reference yet
+TC-395 legacy: no test reference yet
+TC-396 legacy: no test reference yet
+TC-397 legacy: no test reference yet
+TC-398 legacy: no test reference yet
+TC-399 manual
+TC-400 manual
+TC-401 manual
+TC-402 legacy: no test reference yet
+TC-403 legacy: no test reference yet
+TC-404 manual
+TC-405 legacy: no test reference yet
+TC-423 legacy: no test reference yet
+TC-481 legacy: no test reference yet
+TC-482 legacy: no test reference yet
+TC-483 legacy: no test reference yet
+TC-490 legacy: no test reference yet
+TC-491 legacy: no test reference yet
+TC-500 legacy: no test reference yet
+TC-501 legacy: no test reference yet
+TC-503 legacy: no test reference yet
+TC-504 legacy: no test reference yet
+TC-507 legacy: no test reference yet
+TC-508 legacy: no test reference yet
+TC-511 legacy: no test reference yet
+TC-513 legacy: no test reference yet
+TC-514 legacy: no test reference yet
+TC-515 legacy: no test reference yet
+TC-516 legacy: no test reference yet
+TC-517 manual
+TC-518 manual
+TC-519 manual
+TC-878 legacy: no test reference yet
+TC-962 manual
+TC-1203 manual
+TC-1210 manual
+TC-1213 manual
+TC-1220 manual
+TC-1226 manual
+TC-1230 legacy: no test reference yet
+TC-1231 legacy: no test reference yet
+TC-1232 legacy: no test reference yet
+TC-1233 legacy: no test reference yet
+TC-1234 legacy: no test reference yet
+TC-1235 legacy: no test reference yet
+TC-1236 e2e/browser (ignored)
+TC-1301 legacy: no test reference yet
+TC-1303 legacy: no test reference yet
+TC-1308 legacy: no test reference yet
+TC-1312 manual
+TC-1333 legacy: no test reference yet
+TC-1480 manual
+TC-1481 manual
+TC-1482 manual
+TC-1483 manual
+TC-1484 manual
+TC-1485 manual
+TC-1486 manual
+TC-1487 manual
+TC-1488 manual
+TC-1489 manual
+TC-1490 manual
+TC-1491 legacy: no test reference yet
+TC-1492 e2e/browser (ignored)
+TC-1494 legacy: no test reference yet
+TC-1509 legacy: no test reference yet
+TC-1515 legacy: no test reference yet
+TC-1516 legacy: no test reference yet
+TC-1517 legacy: no test reference yet
+TC-1518 legacy: no test reference yet
+TC-1519 legacy: no test reference yet
+TC-1520 legacy: no test reference yet
+TC-1521 legacy: no test reference yet
+TC-1522 legacy: no test reference yet
+TC-1523 legacy: no test reference yet
+TC-1524 legacy: no test reference yet
+TC-1525 legacy: no test reference yet
+TC-1603 manual
+TC-1604 manual
+TC-1612 manual
+TC-1614 manual
+TC-1622 manual
+TC-1654 manual
+TC-1665 manual
+TC-1807 manual
