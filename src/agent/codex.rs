@@ -1338,6 +1338,7 @@ mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         }
     }
 

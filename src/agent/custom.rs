@@ -789,6 +789,7 @@ mod tests {
             image_paths: Vec::new(),
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
@@ -1058,6 +1059,7 @@ env = { FAKE_CFG = "{temp_config}" }
             image_paths: Vec::new(),
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
@@ -1177,6 +1179,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
             image_paths: Vec::new(),
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         }
     }
 

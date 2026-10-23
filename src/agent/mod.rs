@@ -303,6 +303,9 @@ pub struct AgentRequest {
     /// When true (graph implement steps), AGY may retry once if the model replies
     /// with plan-only text and no writes. Ordinary user questions leave this false.
     pub require_file_edits: bool,
+    /// Resolved system prompt for native delivery (opencode, codex). Prepended
+    /// runners leave this `None` and prepend the block to `prompt` instead.
+    pub system_prompt: Option<dmuxai::agent_prompt::ResolvedPrompt>,
 }
 
 #[derive(Debug, Clone)]
