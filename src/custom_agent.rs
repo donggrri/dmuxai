@@ -600,6 +600,8 @@ pub fn build_custom_command(
 
     if let Some(mcp_path) = &ctx.mcp_config {
         command.env("DMUXAI_MCP_CONFIG", mcp_path);
+    } else {
+        command.env_remove("DMUXAI_MCP_CONFIG");
     }
 
     for (key, value) in &spec.env {
@@ -1613,6 +1615,39 @@ image_arg = []
         )
         .await;
         assert_eq!(ids, Ok(vec!["opencode/a-free".to_owned()]));
+    }
+
+    // TC-1663 / FR-1663
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tc_1663_custom_child_clears_inherited_mcp_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(tmp.path()).unwrap();
+        let spec = CustomAgentSpec {
+            name: "env-probe".to_owned(),
+            command: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "echo env=${DMUXAI_MCP_CONFIG:-}".to_owned(),
+            ],
+            ..Default::default()
+        };
+        let ctx = SubstitutionContext::new(
+            "probe",
+            workspace.to_string_lossy().into_owned(),
+            "ask",
+            "deny",
+        );
+        unsafe {
+            std::env::set_var("DMUXAI_MCP_CONFIG", "/inherited/leak");
+        }
+        let mut cmd = build_custom_command(&spec, &ctx, &workspace).unwrap();
+        let out = cmd.output().await.unwrap();
+        unsafe {
+            std::env::remove_var("DMUXAI_MCP_CONFIG");
+        }
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "env=");
     }
 
     // TC-877 (FR-875)

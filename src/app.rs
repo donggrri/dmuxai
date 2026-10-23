@@ -948,6 +948,7 @@ pub struct HeadlessRequest {
     pub mode: Option<String>,
     pub graph: bool,
     pub approve_plan: bool,
+    pub allow_sensitive: bool,
     pub todo_id: Option<String>,
 }
 
@@ -11353,6 +11354,10 @@ impl App {
     ) -> HeadlessIdleAction {
         let phase = self.headless_active_run_phase();
         if phase == GraphRunPhase::WaitingGate {
+            if req.allow_sensitive || (req.agent.is_some() && req.approve_plan) {
+                self.continue_graph_gate();
+                return HeadlessIdleAction::ContinueAfterApprove;
+            }
             self.headless_record_waiting_gate_note(HEADLESS_GATE_NOTE);
             let text = self
                 .messages
@@ -21659,6 +21664,7 @@ mod tests {
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            allow_sensitive: false,
             todo_id: None,
         };
         let outcome = app.run_headless(req, cancel).await;
@@ -21688,6 +21694,7 @@ mod tests {
             mode: None,
             graph: false,
             approve_plan: false,
+            allow_sensitive: false,
             todo_id: None,
         };
         let outcome = app.run_headless(req, Arc::clone(&cancel)).await;
@@ -21703,6 +21710,7 @@ mod tests {
             mode: None,
             graph: false,
             approve_plan: false,
+            allow_sensitive: false,
             todo_id: None,
         };
         let outcome = app.run_headless(req, cancel).await;
@@ -21753,6 +21761,7 @@ mod tests {
             mode: None,
             graph: false,
             approve_plan: false,
+            allow_sensitive: false,
             todo_id: None,
         };
         let outcome = app.run_headless(req, cancel).await;
@@ -21789,6 +21798,7 @@ mod tests {
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            allow_sensitive: false,
             todo_id: None,
         };
         let outcome = tokio::time::timeout(Duration::from_secs(20), app.run_headless(req, cancel))
@@ -23472,6 +23482,7 @@ mod tests {
             mode: None,
             graph: false,
             approve_plan: false,
+            allow_sensitive: false,
             todo_id: None,
         };
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -651,8 +651,10 @@ ignored (warning once per settings load).
 `--approve-plan`, a complex plan is printed (JSON or one line per step), the record
 is saved `cancelled` with `approval required (headless)`, exit **7**. With
 `--approve-plan`, approve with `decided_by: cli` and run through. Sensitive gates
-save `waiting_gate` and exit **7**; `--approve-plan` does not bypass them. `--graph`
-is a no-op. JSON output includes `triage` and `plan`.
+save `waiting_gate` and exit **7** unless you pass `--allow-sensitive`, or you set
+`--agent` together with `--approve-plan` on a one-step explicit-agent run (both
+confirm the sensitive gate). `--graph` is a no-op. JSON output includes `triage`
+and `plan`.
 
 ```toml
 [graph]
