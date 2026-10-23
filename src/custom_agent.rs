@@ -600,6 +600,8 @@ pub fn build_custom_command(
 
     if let Some(mcp_path) = &ctx.mcp_config {
         command.env("DMUXAI_MCP_CONFIG", mcp_path);
+    } else {
+        command.env_remove("DMUXAI_MCP_CONFIG");
     }
 
     for (key, value) in &spec.env {
@@ -1460,6 +1462,86 @@ image_arg = []
 
         let argv = build_argv(&spec, &ctx);
         assert_eq!(argv, vec!["pi", "Look at this @a.png @b.png"]);
+    }
+
+    fn dmuxai_mcp_config_env(
+        command: &tokio::process::Command,
+    ) -> Option<Option<&std::ffi::OsStr>> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("DMUXAI_MCP_CONFIG"))
+            .map(|(_, value)| value)
+    }
+
+    fn tc_580_probe_spec() -> CustomAgentSpec {
+        toml::from_str(
+            r#"
+name = "probe"
+command = ["echo", "hi"]
+"#,
+        )
+        .unwrap()
+    }
+
+    // TC-580 / INT-579: without per-run MCP, inherited DMUXAI_MCP_CONFIG is cleared.
+    #[test]
+    fn tc_580_custom_agent_clears_inherited_dmuxai_mcp_config() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(workspace.path()).unwrap();
+        let ctx = SubstitutionContext::new(
+            "hi",
+            workspace.to_string_lossy().into_owned(),
+            "ask",
+            "deny",
+        );
+        let command =
+            build_custom_command(&tc_580_probe_spec(), &ctx, &workspace).expect("command");
+        assert_eq!(dmuxai_mcp_config_env(&command), Some(None));
+    }
+
+    #[test]
+    fn tc_580_custom_agent_sets_dmuxai_mcp_config_from_per_run_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(workspace.path()).unwrap();
+        let mut ctx = SubstitutionContext::new(
+            "hi",
+            workspace.to_string_lossy().into_owned(),
+            "ask",
+            "deny",
+        );
+        ctx.mcp_config = Some("/tmp/dmuxai-mcp-probe.json".to_owned());
+        let command =
+            build_custom_command(&tc_580_probe_spec(), &ctx, &workspace).expect("command");
+        assert_eq!(
+            dmuxai_mcp_config_env(&command).and_then(|v| v.map(|s| s.to_str())),
+            Some(Some("/tmp/dmuxai-mcp-probe.json"))
+        );
+    }
+
+    #[test]
+    fn tc_580_custom_agent_env_table_overrides_cleared_dmuxai_mcp_config() {
+        let spec: CustomAgentSpec = toml::from_str(
+            r#"
+name = "probe"
+command = ["echo", "hi"]
+env = { DMUXAI_MCP_CONFIG = "x" }
+"#,
+        )
+        .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(workspace.path()).unwrap();
+        let ctx = SubstitutionContext::new(
+            "hi",
+            workspace.to_string_lossy().into_owned(),
+            "ask",
+            "deny",
+        );
+        let command = build_custom_command(&spec, &ctx, &workspace).expect("command");
+        assert_eq!(
+            dmuxai_mcp_config_env(&command).and_then(|v| v.map(|s| s.to_str())),
+            Some(Some("x"))
+        );
     }
 
     #[test]
