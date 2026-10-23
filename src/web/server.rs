@@ -291,6 +291,179 @@ async fn post_skills_approve(
     }
 }
 
+/// PR-2.5 part 4: per-agent system prompts dashboard API.
+async fn get_agent_prompts(State(state): State<AppState>) -> Response {
+    let workspace = std::path::PathBuf::from(state.hub.snapshot().workspace);
+    let settings = crate::settings::DmuxSettings::load(&workspace);
+
+    let mut runner_ids: Vec<String> =
+        vec!["cursor".to_owned(), "agy".to_owned(), "codex".to_owned()];
+    for spec in &settings.custom_agents {
+        let id = spec.name.trim().to_ascii_lowercase();
+        if !runner_ids.iter().any(|existing| existing == &id) {
+            runner_ids.push(id);
+        }
+    }
+
+    let build_row = |runner: &str,
+                     custom_spec: Option<&crate::custom_agent::CustomAgentSpec>|
+     -> serde_json::Value {
+        let resolved =
+            crate::agent_prompt::resolve(&settings, runner, crate::agent_prompt::PromptRole::Chat);
+        let cfg = settings.runner_prompts.get(runner);
+        let roles = cfg.and_then(|c| c.roles.clone()).unwrap_or_else(|| {
+            vec![
+                crate::agent_prompt::PromptRole::Chat,
+                crate::agent_prompt::PromptRole::Worker,
+            ]
+        });
+        let roles_str: Vec<&str> = roles
+            .iter()
+            .map(|r| match r {
+                crate::agent_prompt::PromptRole::Chat => "chat",
+                crate::agent_prompt::PromptRole::Worker => "worker",
+                _ => "chat",
+            })
+            .collect();
+        let inject = resolved
+            .as_ref()
+            .map(|r| r.inject)
+            .or_else(|| cfg.and_then(|c| c.inject))
+            .unwrap_or(crate::agent_prompt::PromptInject::Session);
+        let delivery = crate::agent_prompt::delivery(runner, custom_spec);
+        let delivery_str = match delivery {
+            crate::agent_prompt::Delivery::Native => "native",
+            crate::agent_prompt::Delivery::Prepend => "prepend",
+        };
+        let inject_str = match inject {
+            crate::agent_prompt::PromptInject::Session => "session",
+            crate::agent_prompt::PromptInject::Always => "always",
+        };
+        let set = resolved.is_some();
+        let source = resolved.as_ref().map(|r| r.source.clone());
+        let hash = resolved.as_ref().map(|r| r.hash.clone());
+        let preview = resolved
+            .as_ref()
+            .map(|r| r.text.chars().take(200).collect::<String>());
+        serde_json::json!({
+            "runner": runner,
+            "set": set,
+            "source": source,
+            "hash": hash,
+            "delivery": delivery_str,
+            "inject": inject_str,
+            "roles": roles_str,
+            "preview": preview,
+        })
+    };
+
+    let mut runners_json: Vec<serde_json::Value> = Vec::new();
+    for runner in &runner_ids {
+        let spec = settings
+            .custom_agents
+            .iter()
+            .find(|s| s.name.trim().eq_ignore_ascii_case(runner));
+        runners_json.push(build_row(runner, spec));
+    }
+
+    // default row
+    let default_row = build_row("default", None);
+
+    json_ok(
+        StatusCode::OK,
+        &serde_json::json!({
+            "runners": runners_json,
+            "default": default_row,
+            "warnings": settings.config_warnings,
+        }),
+    )
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AgentPromptsPostBody {
+    runner: String,
+    system_prompt: Option<String>,
+    #[serde(default)]
+    prompt_inject: Option<Option<String>>,
+}
+
+async fn post_agent_prompts(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<AgentPromptsPostBody>,
+) -> Response {
+    let workspace = std::path::PathBuf::from(state.hub.snapshot().workspace);
+    let settings = crate::settings::DmuxSettings::load(&workspace);
+
+    let runner = body.runner.trim().to_ascii_lowercase();
+    let mut known: Vec<String> = vec![
+        "cursor".to_owned(),
+        "agy".to_owned(),
+        "codex".to_owned(),
+        "default".to_owned(),
+    ];
+    for spec in &settings.custom_agents {
+        let id = spec.name.trim().to_ascii_lowercase();
+        if !known.iter().any(|existing| existing == &id) {
+            known.push(id);
+        }
+    }
+    if !known.iter().any(|existing| existing == &runner) {
+        return error_json(StatusCode::BAD_REQUEST, "unknown runner");
+    }
+
+    if let Some(text) = &body.system_prompt
+        && text.len() > crate::agent_prompt::MAX_PROMPT_BYTES
+    {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "system_prompt exceeds 32 KiB ({} bytes) limit ({} bytes)",
+                crate::agent_prompt::MAX_PROMPT_BYTES,
+                text.len()
+            ),
+        );
+    }
+
+    if let Some(Some(raw_inject)) = &body.prompt_inject
+        && crate::agent_prompt::PromptInject::parse(raw_inject).is_none()
+    {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            &format!("unknown prompt_inject '{raw_inject}'"),
+        );
+    }
+
+    let path = workspace.join("dmuxai.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let sp = Some(body.system_prompt.as_deref());
+    let pi = body.prompt_inject.as_ref().map(|opt| opt.as_deref());
+
+    match crate::agent_prompt::set_runner_prompt_in_toml(&text, &runner, sp, pi) {
+        Ok(updated) => match std::fs::write(&path, updated) {
+            Ok(()) => get_agent_prompts(State(state)).await,
+            Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        },
+        Err(error) => error_json(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn get_agent_prompts_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::AGENT_PROMPTS_JS,
+    )
+}
+
 async fn get_skills_js() -> impl IntoResponse {
     (
         [
@@ -1807,6 +1980,7 @@ pub fn build_router_with(
         .route("/assets/app.js", get(get_app_js))
         .route("/assets/memory.js", get(get_memory_js))
         .route("/assets/skills.js", get(get_skills_js))
+        .route("/assets/agent-prompts.js", get(get_agent_prompts_js))
         .route("/assets/session.js", get(get_session_js))
         .route("/assets/workspace.js", get(get_workspace_js))
         .route("/assets/sidebar-resize.js", get(get_sidebar_resize_js))
@@ -1824,6 +1998,10 @@ pub fn build_router_with(
         .route("/api/workspace/open", post(post_workspace_open))
         .route("/api/skills", get(get_skills).post(post_skills))
         .route("/api/skills/approve", post(post_skills_approve))
+        .route(
+            "/api/agent-prompts",
+            get(get_agent_prompts).post(post_agent_prompts),
+        )
         .route("/api/memory", get(get_memory))
         .route("/api/memory/save", post(post_memory_save))
         .route(
@@ -6056,5 +6234,266 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // PR-2.5 part 4: agent prompt API tests
+    // TC-1719 (FR-1706): api get unset
+    #[tokio::test]
+    async fn agent_prompt_api_get_lists_runners_unset_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("proj");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let token = "agent-prompt-token-000000000000";
+        let hub = DashboardHub::new(SnapshotSource::Tui, workspace.to_string_lossy().to_string());
+        let router = build_router_with(
+            hub,
+            token.to_owned(),
+            allowed_localhost(),
+            DashboardServices::default(),
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(json_request("GET", "/api/agent-prompts", token, ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["runners"].is_array());
+        let runners = v["runners"].as_array().unwrap();
+        assert!(!runners.is_empty());
+        for r in runners {
+            assert_eq!(r["set"], false);
+            assert!(r["source"].is_null());
+            assert!(r["hash"].is_null());
+            assert!(r["preview"].is_null());
+        }
+        assert!(v["default"]["set"] == false);
+        assert!(v["warnings"].is_array());
+        // ensure full text not present: no system_prompt field
+        assert!(v.get("system_prompt").is_none());
+        for r in runners {
+            assert!(r.get("system_prompt").is_none());
+            assert!(r.get("text").is_none());
+        }
+    }
+
+    // TC-1719 (FR-1706): api post roundtrip
+    #[tokio::test]
+    async fn agent_prompt_api_post_then_get_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("proj");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let token = "agent-prompt-token-000000000001";
+        let hub = DashboardHub::new(SnapshotSource::Tui, workspace.to_string_lossy().to_string());
+        let router = build_router_with(
+            hub,
+            token.to_owned(),
+            allowed_localhost(),
+            DashboardServices::default(),
+        );
+
+        // pick codex runner (native)
+        let body = serde_json::json!({
+            "runner": "codex",
+            "system_prompt": "Follow these rules.",
+            "prompt_inject": "session"
+        })
+        .to_string();
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/agent-prompts", token, &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let codex = v["runners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["runner"] == "codex")
+            .unwrap();
+        assert_eq!(codex["set"], true);
+        assert!(codex["source"].as_str().unwrap().contains("workspace"));
+        assert!(codex["hash"].as_str().is_some());
+        assert_eq!(codex["delivery"], "native");
+        // preview is truncated / present
+        assert_eq!(codex["preview"], "Follow these rules.");
+
+        // cursor runner prepend check via default? test a cursor post
+        let body2 = serde_json::json!({
+            "runner": "cursor",
+            "system_prompt": "Cursor rules.",
+            "prompt_inject": "always"
+        })
+        .to_string();
+        let resp2 = router
+            .clone()
+            .oneshot(json_request("POST", "/api/agent-prompts", token, &body2))
+            .await
+            .unwrap();
+        let body2 = read_body(resp2).await;
+        let v2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        let cursor = v2["runners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["runner"] == "cursor")
+            .unwrap();
+        assert_eq!(cursor["delivery"], "prepend");
+        let agy = v2["runners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["runner"] == "agy")
+            .unwrap();
+        // agy unset -> prepend still
+        assert_eq!(agy["delivery"], "prepend");
+
+        // opencode native if present
+        if let Some(oc) = v2["runners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["runner"] == "opencode")
+        {
+            assert_eq!(oc["delivery"], "native");
+        }
+    }
+
+    // TC-1719 (FR-1706): api post null clears
+    #[tokio::test]
+    async fn agent_prompt_api_post_null_clears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("proj");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let token = "agent-prompt-token-000000000002";
+        let hub = DashboardHub::new(SnapshotSource::Tui, workspace.to_string_lossy().to_string());
+        let router = build_router_with(
+            hub,
+            token.to_owned(),
+            allowed_localhost(),
+            DashboardServices::default(),
+        );
+
+        let body =
+            serde_json::json!({"runner":"codex","system_prompt":"x","prompt_inject":"session"})
+                .to_string();
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/agent-prompts", token, &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body =
+            serde_json::json!({"runner":"codex","system_prompt":null,"prompt_inject":"session"})
+                .to_string();
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/agent-prompts", token, &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let codex = v["runners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["runner"] == "codex")
+            .unwrap();
+        assert_eq!(codex["set"], false);
+    }
+
+    // TC-1719 (FR-1706): api post over 32kib
+    #[tokio::test]
+    async fn agent_prompt_api_post_over_32kib_returns_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("proj");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let token = "agent-prompt-token-000000000003";
+        let hub = DashboardHub::new(SnapshotSource::Tui, workspace.to_string_lossy().to_string());
+        let router = build_router_with(
+            hub,
+            token.to_owned(),
+            allowed_localhost(),
+            DashboardServices::default(),
+        );
+
+        let big = "a".repeat(32769);
+        let body =
+            serde_json::json!({"runner":"codex","system_prompt":big,"prompt_inject":"session"})
+                .to_string();
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/agent-prompts", token, &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // TC-1719 (FR-1706): api post unknown inject
+    #[tokio::test]
+    async fn agent_prompt_api_post_unknown_inject_returns_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("proj");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let token = "agent-prompt-token-000000000004";
+        let hub = DashboardHub::new(SnapshotSource::Tui, workspace.to_string_lossy().to_string());
+        let router = build_router_with(
+            hub,
+            token.to_owned(),
+            allowed_localhost(),
+            DashboardServices::default(),
+        );
+
+        let body =
+            serde_json::json!({"runner":"codex","system_prompt":"x","prompt_inject":"bogus"})
+                .to_string();
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/agent-prompts", token, &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // TC-1719 (FR-1706): api text preview only
+    #[tokio::test]
+    async fn agent_prompt_api_text_never_full_beyond_preview() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("proj");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let token = "agent-prompt-token-000000000005";
+        let hub = DashboardHub::new(SnapshotSource::Tui, workspace.to_string_lossy().to_string());
+        let router = build_router_with(
+            hub,
+            token.to_owned(),
+            allowed_localhost(),
+            DashboardServices::default(),
+        );
+
+        let long = "b".repeat(500);
+        let body =
+            serde_json::json!({"runner":"codex","system_prompt":long,"prompt_inject":"session"})
+                .to_string();
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/agent-prompts", token, &body))
+            .await
+            .unwrap();
+        let body = read_body(resp).await;
+        assert!(!body.contains(&long)); // full text not in response
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let codex = v["runners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["runner"] == "codex")
+            .unwrap();
+        assert_eq!(codex["preview"].as_str().unwrap().len(), 200);
     }
 }

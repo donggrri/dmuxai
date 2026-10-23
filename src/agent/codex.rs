@@ -253,6 +253,7 @@ impl CodexClient {
             request_id,
             cwd,
             request.resume_session.as_deref(),
+            request.system_prompt.as_ref().map(|p| p.text.as_str()),
         ))
         .await?;
         let response = self.wait_for_success_response(request_id, event_tx).await?;
@@ -436,12 +437,20 @@ impl CodexClient {
     }
 }
 
-fn thread_open_request(request_id: u64, cwd: &Path, resume_session: Option<&str>) -> Value {
+fn thread_open_request(
+    request_id: u64,
+    cwd: &Path,
+    resume_session: Option<&str>,
+    system_prompt: Option<&str>,
+) -> Value {
     let mut params = json!({
         "cwd": cwd.to_string_lossy(),
         "approvalPolicy": "never",
         "sandbox": "read-only"
     });
+    if let Some(text) = system_prompt {
+        params["developerInstructions"] = Value::String(text.to_owned());
+    }
     let method = if let Some(thread_id) = resume_session {
         params["threadId"] = Value::String(thread_id.to_owned());
         "thread/resume"
@@ -1338,6 +1347,7 @@ mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         }
     }
 
@@ -1386,8 +1396,8 @@ mod tests {
     #[test]
     fn builds_fresh_and_resumed_thread_payloads() {
         let cwd = Path::new("workspace");
-        let fresh = thread_open_request(10, cwd, None);
-        let resumed = thread_open_request(11, cwd, Some("thr_existing"));
+        let fresh = thread_open_request(10, cwd, None, None);
+        let resumed = thread_open_request(11, cwd, Some("thr_existing"), None);
 
         assert_eq!(
             fresh.get("method").and_then(Value::as_str),
@@ -1456,7 +1466,7 @@ mod tests {
             &conversation,
             None,
         ));
-        let request = thread_open_request(12, Path::new("workspace"), None);
+        let request = thread_open_request(12, Path::new("workspace"), None, None);
         assert_eq!(
             request.get("method").and_then(Value::as_str),
             Some("thread/start")
@@ -2001,5 +2011,50 @@ mod tests {
             ),
             "expected mcp_servers.remote-vault.env_http_headers in argv: {args:?}"
         );
+    }
+    // TC-1716 (FR-1704): codex thread/start developerInstructions
+    #[test]
+    fn agent_prompt_codex_thread_start_developer_instructions() {
+        let v = thread_open_request(1, std::path::Path::new("workspace"), None, Some("SYS"));
+        assert_eq!(
+            v.get("method").and_then(serde_json::Value::as_str),
+            Some("thread/start")
+        );
+        assert_eq!(
+            v.pointer("/params/developerInstructions")
+                .and_then(serde_json::Value::as_str),
+            Some("SYS")
+        );
+        assert!(v.pointer("/params/baseInstructions").is_none());
+    }
+
+    // TC-1716 (FR-1704): codex thread/resume developerInstructions
+    #[test]
+    fn agent_prompt_codex_thread_resume_developer_instructions() {
+        let v = thread_open_request(
+            2,
+            std::path::Path::new("workspace"),
+            Some("thr_existing"),
+            Some("SYS"),
+        );
+        assert_eq!(
+            v.get("method").and_then(serde_json::Value::as_str),
+            Some("thread/resume")
+        );
+        assert_eq!(
+            v.pointer("/params/developerInstructions")
+                .and_then(serde_json::Value::as_str),
+            Some("SYS")
+        );
+        assert!(v.pointer("/params/baseInstructions").is_none());
+    }
+
+    // TC-1716 (FR-1704): codex no prompt omits developerInstructions
+    #[test]
+    fn agent_prompt_codex_no_prompt_no_developer_instructions() {
+        let fresh = thread_open_request(3, std::path::Path::new("workspace"), None, None);
+        let resumed = thread_open_request(4, std::path::Path::new("workspace"), Some("thr"), None);
+        assert!(fresh.pointer("/params/developerInstructions").is_none());
+        assert!(resumed.pointer("/params/developerInstructions").is_none());
     }
 }

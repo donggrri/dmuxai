@@ -37,7 +37,11 @@ implement = []
 ```
 
 Placeholders: `{prompt}`, `{model}`, `{workspace}`, `{image}`, `{session_id}`, `{temp_config}`, `{mode}`
-(`ask|plan|implement`), `{edit}` (`allow` in Implement, else `deny`).
+(`ask|plan|implement`), `{edit}` (`allow` in Implement, else `deny`), `{system_prompt}` (resolved
+prompt text), `{system_prompt_file}` (absolute temp file path, only when referenced).
+A custom agent that references `{system_prompt}`/`{system_prompt_file}` or sets
+`system_prompt_arg = [...]` opts into native delivery; otherwise the prompt is
+prepended as `<agent-instructions>`.
 Each argv element is substituted separately and passed directly to the process (no shell), so
 prompt text can never inject arguments. An argument whose placeholder has no value
 (e.g. `{model}` with no model chosen) is dropped together with the flag right before it

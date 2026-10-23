@@ -510,6 +510,7 @@ fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Val
         "todo": outcome.todo,
         "triage": outcome.triage,
         "plan": outcome.plan,
+        "system_prompt": outcome.system_prompt,
         // Both `null` when the run wrote no events (e.g. rejected before start).
         "events": if last_seq >= first_seq {
             json!({ "first_seq": first_seq, "last_seq": last_seq })
@@ -893,6 +894,7 @@ mod tests {
             todo: None,
             triage: None,
             plan: None,
+            system_prompt: None,
         };
         let json = outcome_json(&outcome, 1, 2);
         assert_eq!(json["error"], "boom");
@@ -911,6 +913,7 @@ mod tests {
             todo: None,
             triage: None,
             plan: None,
+            system_prompt: None,
         };
         let json = outcome_json(&outcome, 0, 0);
         assert!(json["error"].is_null());

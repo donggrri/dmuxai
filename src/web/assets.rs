@@ -2,6 +2,7 @@ pub const INDEX_HTML: &str = include_str!("assets/index.html");
 pub const APP_JS: &str = include_str!("assets/app.js");
 pub const MEMORY_JS: &str = include_str!("assets/memory.js");
 pub const SKILLS_JS: &str = include_str!("assets/skills.js");
+pub const AGENT_PROMPTS_JS: &str = include_str!("assets/agent-prompts.js");
 pub const SESSION_JS: &str = include_str!("assets/session.js");
 pub const WORKSPACE_JS: &str = include_str!("assets/workspace.js");
 pub const SIDEBAR_RESIZE_JS: &str = include_str!("assets/sidebar-resize.js");

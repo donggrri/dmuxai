@@ -2005,6 +2005,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let mut command = tokio::process::Command::new("cursor-agent");
 
@@ -2043,6 +2044,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let mut command = tokio::process::Command::new("cursor-agent");
         configure_command(
@@ -2077,6 +2079,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
 
         for disallowed in ["composer-2.5-fast", "claude-3-5-sonnet-fast", "gpt-5", ""] {
@@ -2124,6 +2127,7 @@ pub(crate) mod tests {
             ],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let mut command = tokio::process::Command::new("cursor-agent");
         configure_command(
@@ -2155,6 +2159,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let cwd = Path::new("workspace");
 
@@ -2199,6 +2204,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let turn = tokio::spawn(async move {
             run_turn(
@@ -2292,6 +2298,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
 
         // Override cursor binary so the test does not spawn a live external cursor-agent CLI
@@ -2334,6 +2341,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
 
         // Turn 2
@@ -2584,6 +2592,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         adapter.send(req1).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -2633,6 +2642,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         adapter.send(req2).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -2705,6 +2715,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         adapter.send(request("turn-1", "first")).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -2815,6 +2826,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         }
     }
 
@@ -3118,6 +3130,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         adapter.send(req).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -3219,6 +3232,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         disabled_adapter.send(req).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -3256,6 +3270,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         enabled_adapter.send_graph_node(graph_req).unwrap();
         assert!(
@@ -3344,6 +3359,7 @@ pub(crate) mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         adapter.send(req).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -3468,6 +3484,7 @@ pub(crate) mod tests {
                 image_paths: vec![],
                 policy,
                 require_file_edits: false,
+                system_prompt: None,
             }
         }
 

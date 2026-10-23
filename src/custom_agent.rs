@@ -111,6 +111,8 @@ pub struct CustomAgentSpec {
     #[serde(default)]
     pub temp_config_template: Option<String>,
     #[serde(default)]
+    pub system_prompt_arg: Vec<String>,
+    #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub modes: CustomAgentModes,
@@ -445,6 +447,8 @@ pub struct SubstitutionContext {
     pub mcp_config: Option<String>,
     pub mode: &'static str,
     pub edit: &'static str,
+    pub system_prompt: Option<String>,
+    pub system_prompt_file: Option<String>,
 }
 
 impl SubstitutionContext {
@@ -464,6 +468,8 @@ impl SubstitutionContext {
             mcp_config: None,
             mode,
             edit,
+            system_prompt: None,
+            system_prompt_file: None,
         }
     }
 }
@@ -495,6 +501,8 @@ fn substitute_internal(
             "session_id" => Some(ctx.session_id.as_deref()?),
             "temp_config" => Some(ctx.temp_config.as_deref()?),
             "mcp_config" => Some(ctx.mcp_config.as_deref()?),
+            "system_prompt" => Some(ctx.system_prompt.as_deref().unwrap_or("")),
+            "system_prompt_file" => Some(ctx.system_prompt_file.as_deref().unwrap_or("")),
             "mode" => Some(ctx.mode),
             "edit" => Some(ctx.edit),
             _ => None,
@@ -602,6 +610,13 @@ pub fn build_argv(spec: &CustomAgentSpec, ctx: &SubstitutionContext) -> Vec<Stri
     // 4. resume_arg when session_id is set
     if ctx.session_id.is_some() {
         for arg in &spec.resume_arg {
+            push_substituted(&mut argv, arg, ctx, None, prompt_for_argv.as_deref());
+        }
+    }
+
+    // 5. system_prompt_arg when a prompt is applied
+    if ctx.system_prompt.is_some() {
+        for arg in &spec.system_prompt_arg {
             push_substituted(&mut argv, arg, ctx, None, prompt_for_argv.as_deref());
         }
     }
@@ -1342,6 +1357,8 @@ text_path = "/part/text"
             mcp_config: Some("/tmp/mcp.json".to_string()),
             mode: "implement",
             edit: "allow",
+            system_prompt: None,
+            system_prompt_file: None,
         };
 
         assert_eq!(
@@ -1387,6 +1404,8 @@ text_path = "/part/text"
             mcp_config: None,
             mode: "ask",
             edit: "deny",
+            system_prompt: None,
+            system_prompt_file: None,
         };
 
         assert_eq!(substitute("-m {model}", &ctx), None);
@@ -1414,6 +1433,8 @@ text_path = "/part/text"
             mcp_config: None,
             mode: "ask",
             edit: "deny",
+            system_prompt: None,
+            system_prompt_file: None,
         };
 
         let argv = build_argv(&spec, &ctx);
@@ -1446,6 +1467,8 @@ text_path = "/part/text"
             mcp_config: None,
             mode: "ask",
             edit: "deny",
+            system_prompt: None,
+            system_prompt_file: None,
         };
 
         let argv = build_argv(&spec, &ctx);
@@ -1614,6 +1637,8 @@ prompt_via = "stdin"
             mcp_config: None,
             mode: "ask",
             edit: "deny",
+            system_prompt: None,
+            system_prompt_file: None,
         };
 
         let argv = build_argv(&spec, &ctx);
@@ -1645,6 +1670,8 @@ implement = ["--mode", "implement"]
             mcp_config: None,
             mode: "implement",
             edit: "allow",
+            system_prompt: None,
+            system_prompt_file: None,
         };
 
         let argv = build_argv(&spec, &ctx);
@@ -1683,6 +1710,8 @@ image_arg = []
             mcp_config: None,
             mode: "ask",
             edit: "deny",
+            system_prompt: None,
+            system_prompt_file: None,
         };
 
         let argv = build_argv(&spec, &ctx);

@@ -982,6 +982,7 @@ mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let mut command = tokio::process::Command::new("agy");
 
@@ -1020,6 +1021,7 @@ mod tests {
             ],
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
+            system_prompt: None,
         };
         let mut command = tokio::process::Command::new("agy");
         configure_command(&mut command, None, TurnPolicy::ReadOnly);
@@ -1102,6 +1104,7 @@ mod tests {
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
+            system_prompt: None,
         };
         let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
 
@@ -1384,6 +1387,7 @@ mod tests {
             image_paths: vec![],
             policy: mode,
             require_file_edits,
+            system_prompt: None,
         };
         let (event_tx, _event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1577,6 +1581,7 @@ mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1655,6 +1660,7 @@ mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1760,6 +1766,7 @@ mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1811,6 +1818,7 @@ mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();

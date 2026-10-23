@@ -976,6 +976,13 @@ pub struct HeadlessMessage {
     pub content: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct HeadlessSystemPrompt {
+    pub source: String,
+    pub hash: String,
+    pub delivery: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HeadlessOutcome {
     pub ok: bool,
@@ -993,6 +1000,8 @@ pub struct HeadlessOutcome {
     pub triage: Option<Triage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<HeadlessPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<HeadlessSystemPrompt>,
 }
 
 enum HeadlessIdleAction {
@@ -1335,6 +1344,14 @@ pub struct App {
     memory: Option<dmuxai::memory::MemoryHandle>,
     /// Hash of the memory context each agent last received (FR-722).
     memory_injected: HashMap<(StoredConversationId, Agent), u64>,
+    /// Hash of the last injected system prompt per (conversation, agent).
+    prompt_injected: HashMap<(StoredConversationId, Agent), String>,
+    /// Pending system-prompt application to record after a successful send.
+    pending_prompt_application: Option<(String, String, dmuxai::agent_prompt::Delivery)>,
+    /// Most recently applied system prompt (headless reporting).
+    system_prompt_applied: Option<HeadlessSystemPrompt>,
+    /// Hint for todo runs so try_submit_to_agent maps them to Worker.
+    submitting_todo_run: bool,
     pub(crate) mcp_servers: Vec<ResolvedMcpServer>,
     mcp_registry: Arc<McpRegistry>,
     agy_mcp_notice_shown: bool,
@@ -1484,6 +1501,10 @@ impl App {
         let mut app = Self {
             memory,
             memory_injected: HashMap::new(),
+            prompt_injected: HashMap::new(),
+            pending_prompt_application: None,
+            system_prompt_applied: None,
+            submitting_todo_run: false,
             exit: false,
             headless: false,
             selected: adapter_index(Agent::default()),
@@ -4365,6 +4386,10 @@ impl App {
         restore_input_on_failure: bool,
         allow_defer: bool,
     ) -> Result<StoredTurnId, RunTodoError> {
+        // Consume the todo-run hint up front so it can never leak across an
+        // early return (busy, deferred, summary-in-progress, ...).
+        let submitting_todo_run = self.submitting_todo_run;
+        self.submitting_todo_run = false;
         if self.busy_agents.contains(&agent) {
             if restore_input_on_failure {
                 self.input = prompt;
@@ -4521,6 +4546,59 @@ impl App {
         let image_paths_for_message = image_paths.clone();
         let mut adapter_request = adapter_request(request, image_paths, policy, require_file_edits);
         let injected_memory = self.inject_memory(agent, &mut adapter_request);
+
+        // Determine the prompt role for this turn.
+        let prompt_role =
+            if self.active_graph_node_for_agent(agent).is_some() || submitting_todo_run {
+                dmuxai::agent_prompt::PromptRole::Worker
+            } else if self.skill_interview.is_some() {
+                dmuxai::agent_prompt::PromptRole::Interview
+            } else {
+                dmuxai::agent_prompt::PromptRole::Chat
+            };
+        let runner = runner_name(agent);
+        let custom_spec = match agent {
+            Agent::Custom(idx) => dmuxai::custom_agent::spec_at(idx),
+            _ => None,
+        };
+        let delivery = dmuxai::agent_prompt::delivery(runner, custom_spec);
+        let resolved_prompt = self.settings.resolve_agent_prompt(runner, prompt_role);
+
+        let mut injected_prompt_hash: Option<String> = None;
+        if let Some(resolved) = resolved_prompt {
+            let key = (
+                StoredConversationId::new(adapter_request.conversation_id.as_str()),
+                agent,
+            );
+            let fresh_session = adapter_request.resume_session.is_none();
+            let last_hash = self.prompt_injected.get(&key).cloned();
+            if dmuxai::agent_prompt::should_inject(
+                resolved.inject,
+                fresh_session,
+                last_hash.as_deref(),
+                &resolved.hash,
+            ) {
+                injected_prompt_hash = Some(resolved.hash.clone());
+                self.push_system(format!(
+                    "system prompt applied ({}, {})",
+                    resolved.source, resolved.hash
+                ));
+                match delivery {
+                    dmuxai::agent_prompt::Delivery::Prepend => {
+                        adapter_request.prompt = format!(
+                            "{}{}",
+                            dmuxai::agent_prompt::prepend_block(&resolved.text),
+                            adapter_request.prompt
+                        );
+                    }
+                    dmuxai::agent_prompt::Delivery::Native => {
+                        adapter_request.system_prompt = Some(resolved.clone());
+                    }
+                }
+                self.pending_prompt_application = Some((resolved.source, resolved.hash, delivery));
+            }
+        }
+
         let is_graph = self.active_graph_node_for_agent(agent).is_some();
         let send_result = if is_graph {
             self.adapters[adapter_index].send_graph_node(adapter_request)
@@ -4567,6 +4645,20 @@ impl App {
                 if let Some(hash) = injected_memory {
                     self.memory_injected
                         .insert((stored_conversation_id.clone(), agent), hash);
+                }
+                if let Some(hash) = injected_prompt_hash {
+                    self.prompt_injected
+                        .insert((stored_conversation_id.clone(), agent), hash);
+                }
+                if let Some((source, hash, delivery)) = self.pending_prompt_application.take() {
+                    self.system_prompt_applied = Some(HeadlessSystemPrompt {
+                        source,
+                        hash,
+                        delivery: match delivery {
+                            dmuxai::agent_prompt::Delivery::Native => "native".to_owned(),
+                            dmuxai::agent_prompt::Delivery::Prepend => "prepend".to_owned(),
+                        },
+                    });
                 }
                 self.pending_images.clear();
                 let started_ms = unix_ms_now();
@@ -4618,6 +4710,7 @@ impl App {
                 Ok(stored_turn_id)
             }
             Err(error) => {
+                self.pending_prompt_application = None;
                 self.clear_pending_turn_policy();
                 let failed = TurnOutput {
                     conversation_id: stored_conversation_id,
@@ -5030,6 +5123,7 @@ impl App {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         match self.adapters[adapter_index(agent)].send(request) {
             Ok(()) => {
@@ -5264,6 +5358,7 @@ impl App {
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
+            system_prompt: None,
         };
         let run_id = self
             .pending_todo_run_id
@@ -7081,6 +7176,7 @@ impl App {
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
+            system_prompt: None,
         };
         let triage = Triage {
             route,
@@ -8203,6 +8299,7 @@ impl App {
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
+            system_prompt: None,
         };
         match self.adapters[index].send(request) {
             Ok(()) => {
@@ -8455,6 +8552,7 @@ impl App {
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
+            system_prompt: None,
         };
         let now = Instant::now();
         pending.started = now;
@@ -8499,6 +8597,7 @@ impl App {
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
+            system_prompt: None,
         };
         let now = Instant::now();
         pending.started = now;
@@ -8536,6 +8635,7 @@ impl App {
             image_paths: vec![],
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
+            system_prompt: None,
         };
         let now = Instant::now();
         pending.started = now;
@@ -12239,6 +12339,7 @@ impl App {
             todo: None,
             triage,
             plan,
+            system_prompt: self.system_prompt_applied.clone(),
         }
     }
 
@@ -12327,6 +12428,7 @@ impl App {
                         todo: None,
                         triage: None,
                         plan: None,
+                        system_prompt: None,
                     }));
                 }
                 return HeadlessIdleAction::ContinueAfterApprove;
@@ -12377,6 +12479,7 @@ impl App {
                     todo: None,
                     triage: None,
                     plan: None,
+                    system_prompt: None,
                 };
             };
             let target_agent = adapter.agent();
@@ -12400,6 +12503,7 @@ impl App {
                     todo: None,
                     triage: None,
                     plan: None,
+                    system_prompt: None,
                 };
             }
             self.selected = adapter_index(target_agent);
@@ -12431,6 +12535,7 @@ impl App {
                     todo: None,
                     triage: None,
                     plan: None,
+                    system_prompt: None,
                 };
             }
         }
@@ -12452,6 +12557,7 @@ impl App {
                         todo: None,
                         triage: None,
                         plan: None,
+                        system_prompt: None,
                     };
                 }
             }
@@ -12522,6 +12628,7 @@ impl App {
                             todo: None,
                             triage: None,
                             plan: None,
+                            system_prompt: None,
                         };
                     }
                 } else {
@@ -12769,6 +12876,7 @@ impl App {
             todo,
             triage,
             plan,
+            system_prompt: self.system_prompt_applied.clone(),
         }
     }
 
@@ -12966,6 +13074,7 @@ impl App {
         }
 
         self.begin_user_prompt_turn();
+        self.submitting_todo_run = true;
         let turn_id = self.try_submit_to_agent(target_agent, prompt, false, false)?;
         self.todo_turns
             .insert((target_agent, turn_id), todo_id.to_owned());
@@ -14890,6 +14999,7 @@ fn adapter_request(
         image_paths,
         policy,
         require_file_edits,
+        system_prompt: None,
     }
 }
 
@@ -22009,6 +22119,7 @@ mod tests {
             image_paths: vec![],
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         // Empty memory: unchanged.
         let mut r = request(None);
@@ -30055,6 +30166,323 @@ mod tests {
             resolve_catalog_model_id(Agent::Cursor, &agy_models, "gemini-3.8-flash"),
             None
         );
+    }
+    fn agent_prompt_configure(
+        app: &mut App,
+        runner: &str,
+        text: &str,
+        inject: dmuxai::agent_prompt::PromptInject,
+    ) {
+        use dmuxai::agent_prompt::{PromptTextWithSource, RunnerPromptConfig};
+        app.settings.runner_prompts.insert(
+            runner.to_owned(),
+            RunnerPromptConfig {
+                prompt: Some(PromptTextWithSource {
+                    text: text.to_owned(),
+                    source: "testsrc".to_owned(),
+                }),
+                inject: Some(inject),
+                roles: None,
+            },
+        );
+    }
+
+    // TC-1715 (FR-1705): session injects fresh only
+    #[test]
+    fn agent_prompt_session_injects_on_fresh_session_only() {
+        let (mut app, sent) = test_app();
+        use dmuxai::agent_prompt::PromptInject;
+        agent_prompt_configure(&mut app, "agy", "INSTR", PromptInject::Session);
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "hello".to_owned();
+        app.submit_prompt();
+        {
+            let reqs = sent.lock().unwrap();
+            assert!(reqs[0].1.prompt.starts_with("<agent-instructions>"));
+        }
+        let first = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(first.conversation_id.clone()),
+            turn_id: Some(first.turn_id.clone()),
+            event: AgentEvent::ProviderSessionBound("agy-thread".to_owned()),
+        }));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(first.conversation_id),
+            turn_id: Some(first.turn_id),
+            event: AgentEvent::Completed,
+        }));
+        app.input = "second".to_owned();
+        app.submit_prompt();
+        {
+            let reqs = sent.lock().unwrap();
+            assert_eq!(reqs.len(), 2);
+            assert!(!reqs[1].1.prompt.starts_with("<agent-instructions>"));
+            assert_eq!(reqs[1].1.prompt, "second");
+        }
+        let second = sent.lock().unwrap()[1].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(second.conversation_id.clone()),
+            turn_id: Some(second.turn_id.clone()),
+            event: AgentEvent::ProviderSessionBound("agy-thread".to_owned()),
+        }));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(second.conversation_id),
+            turn_id: Some(second.turn_id),
+            event: AgentEvent::Completed,
+        }));
+        app.settings
+            .runner_prompts
+            .get_mut("agy")
+            .unwrap()
+            .prompt
+            .as_mut()
+            .unwrap()
+            .text = "INSTR2".to_owned();
+        app.input = "third".to_owned();
+        app.submit_prompt();
+        {
+            let reqs = sent.lock().unwrap();
+            assert_eq!(reqs.len(), 3);
+            assert!(reqs[2].1.prompt.starts_with("<agent-instructions>"));
+        }
+    }
+
+    // TC-1715 (FR-1705): always injects every turn
+    #[test]
+    fn agent_prompt_always_injects_every_turn() {
+        let (mut app, sent) = test_app();
+        use dmuxai::agent_prompt::PromptInject;
+        agent_prompt_configure(&mut app, "agy", "INSTR", PromptInject::Always);
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "hello".to_owned();
+        app.submit_prompt();
+        let first = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(first.conversation_id.clone()),
+            turn_id: Some(first.turn_id.clone()),
+            event: AgentEvent::ProviderSessionBound("agy-thread".to_owned()),
+        }));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(first.conversation_id),
+            turn_id: Some(first.turn_id),
+            event: AgentEvent::Completed,
+        }));
+        app.input = "second".to_owned();
+        app.submit_prompt();
+        let reqs = sent.lock().unwrap();
+        assert!(reqs[0].1.prompt.starts_with("<agent-instructions>"));
+        assert!(reqs[1].1.prompt.starts_with("<agent-instructions>"));
+    }
+
+    // TC-1715 (FR-1705): block precedes memory
+    #[test]
+    fn agent_prompt_block_precedes_memory() {
+        let vault = tempfile::tempdir().unwrap();
+        let (mut app, sent) = memory_test_app(vault.path());
+        use dmuxai::agent_prompt::PromptInject;
+        agent_prompt_configure(&mut app, "agy", "INSTR", PromptInject::Session);
+        app.memory.as_mut().unwrap().inject = true;
+        app.remember_command("a note");
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "hello".to_owned();
+        app.submit_prompt();
+        let reqs = sent.lock().unwrap();
+        let prompt = &reqs[0].1.prompt;
+        assert!(prompt.starts_with("<agent-instructions>"));
+        let i_block = prompt.find("<agent-instructions>").unwrap();
+        let i_mem = prompt.find("<memory>").unwrap();
+        assert!(i_block < i_mem);
+    }
+
+    // TC-1715 (FR-1705): internal roles get nothing
+    #[test]
+    fn agent_prompt_internal_roles_get_nothing() {
+        let (mut app, sent) = test_app();
+        use dmuxai::agent_prompt::PromptInject;
+        agent_prompt_configure(&mut app, "codex", "INSTR", PromptInject::Session);
+        // judge turn
+        app.skip_judge_for_tests = true;
+        app.selected = adapter_index(Agent::Codex);
+        app.start_judge_turn(
+            Agent::Codex,
+            "plan something complex and detailed across modules".to_owned(),
+        );
+        {
+            let reqs = sent.lock().unwrap();
+            let r = reqs.last().unwrap();
+            assert!(!r.1.prompt.contains("<agent-instructions>"));
+            assert!(r.1.system_prompt.is_none());
+        }
+        app.skip_judge_for_tests = true;
+        // interview role
+        app.skill_interview = Some(SkillInterview {
+            agent: Agent::Codex,
+            prompt: "p".to_owned(),
+            route: dmuxai::graph::Route::Simple,
+            reason: "r".to_owned(),
+            source: dmuxai::graph::TriageSource::Heuristic,
+            cause: None,
+            run_id: "run".to_owned(),
+            judge_calls: 0,
+            elapsed_ms: 0,
+            override_kind: None,
+            round: 1,
+            max_rounds: 1,
+            answers: Vec::new(),
+            prefix: String::new(),
+        });
+        let _ = app.try_submit_to_agent(Agent::Codex, "hello".into(), false, true);
+        {
+            let reqs = sent.lock().unwrap();
+            let r = reqs.last().unwrap();
+            assert!(!r.1.prompt.contains("<agent-instructions>"));
+            assert!(r.1.system_prompt.is_none());
+        }
+        // resolve returns None for all internal roles
+        use dmuxai::agent_prompt::PromptRole;
+        for role in [
+            PromptRole::Judge,
+            PromptRole::Triage,
+            PromptRole::Planner,
+            PromptRole::Replan,
+            PromptRole::Summary,
+            PromptRole::Interview,
+        ] {
+            assert!(app.settings.resolve_agent_prompt("codex", role).is_none());
+        }
+        let _ = sent;
+    }
+
+    // TC-1715 (FR-1705): graph worker gets prompt
+    #[test]
+    fn agent_prompt_graph_worker_gets_prompt() {
+        let (mut app, sent) = test_app();
+        use dmuxai::agent_prompt::PromptInject;
+        agent_prompt_configure(&mut app, "agy", "INSTR", PromptInject::Session);
+        app.graph_agent_nodes
+            .insert(Agent::Agy, "node-1".to_owned());
+        app.selected = adapter_index(Agent::Agy);
+        let _ = app.try_submit_to_agent(Agent::Agy, "hello".into(), false, true);
+        let reqs = sent.lock().unwrap();
+        assert!(reqs[0].1.prompt.starts_with("<agent-instructions>"));
+    }
+
+    // TC-1715 (FR-1705): transcript has no block
+    #[test]
+    fn agent_prompt_transcript_has_no_block() {
+        let (mut app, sent) = test_app();
+        use dmuxai::agent_prompt::PromptInject;
+        agent_prompt_configure(&mut app, "agy", "INSTR", PromptInject::Session);
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "hello".to_owned();
+        app.submit_prompt();
+        assert!(
+            sent.lock().unwrap()[0]
+                .1
+                .prompt
+                .starts_with("<agent-instructions>")
+        );
+        let users: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.content.clone())
+            .collect();
+        assert!(users.iter().all(|p| p == "hello"), "{users:?}");
+    }
+
+    // TC-1715 (FR-1705): native runner no prepend
+    #[test]
+    fn agent_prompt_native_runner_no_prepend() {
+        let (mut app, sent) = test_app();
+        use dmuxai::agent_prompt::PromptInject;
+        agent_prompt_configure(&mut app, "codex", "INSTR", PromptInject::Session);
+        app.selected = adapter_index(Agent::Codex);
+        let _ = app.try_submit_to_agent(Agent::Codex, "hello".into(), false, true);
+        let reqs = sent.lock().unwrap();
+        let r = &reqs[0].1;
+        assert!(!r.prompt.starts_with("<agent-instructions>"));
+        assert!(r.system_prompt.is_some());
+        let sp = r.system_prompt.as_ref().unwrap();
+        assert_eq!(sp.hash, dmuxai::agent_prompt::hash_prompt("INSTR"));
+    }
+
+    // TC-1718 (FR-1706): headless json source/hash
+    #[tokio::test]
+    async fn agent_prompt_headless_json_reports_source_and_hash() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        use dmuxai::agent_prompt::{PromptInject, PromptTextWithSource, RunnerPromptConfig};
+        app.settings.runner_prompts.insert(
+            "codex".to_owned(),
+            RunnerPromptConfig {
+                prompt: Some(PromptTextWithSource {
+                    text: "INSTR".to_owned(),
+                    source: "testsrc".to_owned(),
+                }),
+                inject: Some(PromptInject::Session),
+                roles: None,
+            },
+        );
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent_clone = std::sync::Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("hi".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        let req = HeadlessRequest {
+            prompt: "Say hello".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        let sp = outcome
+            .system_prompt
+            .as_ref()
+            .expect("system_prompt applied");
+        assert_eq!(sp.source, "testsrc");
+        assert_eq!(sp.hash, dmuxai::agent_prompt::hash_prompt("INSTR"));
+        assert_eq!(sp.delivery, "native");
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("\"source\""));
+        assert!(json.contains("\"hash\""));
+        assert!(json.contains("\"delivery\""));
+        assert!(!json.contains("INSTR"));
     }
 }
 

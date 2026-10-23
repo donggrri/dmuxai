@@ -451,7 +451,57 @@ async fn run_turn(
         .collect();
     ctx.session_id = request.resume_session.clone();
 
+    // Per-agent system prompt (PR-2.5 part 3): expose text to placeholders.
+    let system_prompt_text = request.system_prompt.as_ref().map(|p| p.text.clone());
+    ctx.system_prompt = system_prompt_text.clone();
+
+    // Create a temp file containing the prompt text only when {system_prompt_file}
+    // is actually used in the spec (command, env, template, or system_prompt_arg).
+    let contains_placeholder = |value: &str, needle: &str| value.contains(needle);
+    let uses_system_prompt_file = system_prompt_text.is_some()
+        && (spec
+            .command
+            .iter()
+            .any(|v| contains_placeholder(v, "{system_prompt_file}"))
+            || spec
+                .env
+                .values()
+                .any(|v| contains_placeholder(v, "{system_prompt_file}"))
+            || spec
+                .temp_config_template
+                .as_ref()
+                .is_some_and(|t| contains_placeholder(t, "{system_prompt_file}"))
+            || spec
+                .system_prompt_arg
+                .iter()
+                .any(|v| contains_placeholder(v, "{system_prompt_file}")));
+    let mut temp_system_prompt = TempFile(None);
+    if uses_system_prompt_file && let Some(text) = &system_prompt_text {
+        let path = std::env::temp_dir().join(format!(
+            "dmuxai-{}-{}-system-prompt.txt",
+            spec.name,
+            uuid::Uuid::new_v4()
+        ));
+        write_private_temp_file(&path, text, "system prompt").map_err(AgentError::process_exit)?;
+        ctx.system_prompt_file = Some(path.display().to_string());
+        temp_system_prompt.0 = Some(path);
+    }
+
+    // opencode builtin: native delivery via temp config `instructions` array.
+    // Fallback when no temp_config_template: prepend the block to the prompt.
+    if dmuxai::custom_agent::is_builtin_opencode(spec)
+        && let Some(sp) = &request.system_prompt
+        && spec.temp_config_template.is_none()
+    {
+        ctx.prompt = format!(
+            "{}{}",
+            dmuxai::agent_prompt::prepend_block(&sp.text),
+            ctx.prompt
+        );
+    }
+
     let mut temp = TempFile(None);
+    let mut temp_system_prompt_instructions = TempFile(None);
     if let Some(template) = &spec.temp_config_template {
         let path = std::env::temp_dir().join(format!(
             "dmuxai-{}-{}.json",
@@ -459,6 +509,38 @@ async fn run_turn(
             uuid::Uuid::new_v4()
         ));
         let mut body = substitute(template, &ctx).unwrap_or_else(|| template.clone());
+
+        // opencode: write prompt text to a temp file and merge `instructions`.
+        if dmuxai::custom_agent::is_builtin_opencode(spec)
+            && let Some(sp) = &request.system_prompt
+        {
+            let path = std::env::temp_dir().join(format!(
+                "dmuxai-{}-{}-instructions.txt",
+                spec.name,
+                uuid::Uuid::new_v4()
+            ));
+            write_private_temp_file(&path, &sp.text, "system prompt")
+                .map_err(AgentError::process_exit)?;
+            let abs = path.display().to_string();
+            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&body)
+                && let Some(obj) = json.as_object_mut()
+            {
+                let entry = obj
+                    .entry("instructions".to_owned())
+                    .or_insert_with(|| serde_json::json!([]));
+                if let Some(arr) = entry.as_array_mut() {
+                    arr.push(serde_json::Value::String(abs.clone()));
+                } else {
+                    // replace non-array with array containing path
+                    obj.insert("instructions".to_owned(), serde_json::json!([abs]));
+                }
+                if let Ok(serialized) = serde_json::to_string(&json) {
+                    body = serialized;
+                }
+            }
+            temp_system_prompt_instructions.0 = Some(path);
+        }
+
         if !mcp_servers.is_empty() {
             let (merged, applied) = dmuxai::mcp::propagate::merge_opencode_mcp(&body, mcp_servers);
             body = merged;
@@ -789,6 +871,7 @@ mod tests {
             image_paths: Vec::new(),
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
@@ -1058,6 +1141,7 @@ env = { FAKE_CFG = "{temp_config}" }
             image_paths: Vec::new(),
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
@@ -1177,6 +1261,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
             image_paths: Vec::new(),
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            system_prompt: None,
         }
     }
 
@@ -1673,5 +1758,259 @@ temp_config_template = '{"mcp": "not-an-object"}'
             Err(error) => AgentEvent::Error(error),
         };
         assert_eq!(event, AgentEvent::Cancelled);
+    }
+    // TC-1717 (FR-1704): custom placeholders render
+    #[tokio::test]
+    async fn agent_prompt_custom_placeholders_render() {
+        let toml = r#"
+name = "sp-agent"
+command = ["sh", "-c", "echo sys=[$SYS]; echo file=[$SYSFILE]; echo cfg=[$FAKE_CFG]; if [ -n \"$SYSFILE\" ]; then echo content=[$(cat \"$SYSFILE\")]; fi", "--", "{prompt}"]
+temp_config_template = "{\"sp\":\"{system_prompt}\"}"
+env = { FAKE_CFG = "{temp_config}", SYS = "{system_prompt}", SYSFILE = "{system_prompt_file}" }
+system_prompt_arg = ["--system", "{system_prompt}"]
+"#;
+        let spec: &'static CustomAgentSpec = Box::leak(Box::new(toml::from_str(toml).unwrap()));
+        let sp = dmuxai::agent_prompt::ResolvedPrompt {
+            text: "SYS".to_owned(),
+            hash: "h".to_owned(),
+            source: "s".to_owned(),
+            inject: dmuxai::agent_prompt::PromptInject::Session,
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: ConversationId::new("c"),
+            turn_id: TurnId::new("t"),
+            prompt: "hi".to_owned(),
+            resume_session: None,
+            image_paths: Vec::new(),
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: Some(sp),
+        };
+        let context = OutputContext::from(&request);
+        let pgid = std::sync::atomic::AtomicU32::new(0);
+        let cwd = std::env::temp_dir();
+        let notice_shown = AtomicBool::new(false);
+        let result = run_turn(
+            Agent::Custom(0),
+            spec,
+            &request,
+            None,
+            TurnPolicy::Agent,
+            &cwd,
+            &tx,
+            &context,
+            &pgid,
+            &[],
+            &notice_shown,
+            None,
+        )
+        .await;
+        drop(tx);
+        let mut text = String::new();
+        while let Some(output) = rx.recv().await {
+            if let AgentEvent::TextDelta(delta) = output.event {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(result, Ok(()));
+        assert!(text.contains("sys=[SYS]"), "{text}");
+        assert!(text.contains("content=[SYS]"), "{text}");
+        // file removed after turn
+        let file_path = text
+            .lines()
+            .find_map(|l| l.strip_prefix("file=["))
+            .and_then(|l| l.strip_suffix(']'))
+            .unwrap();
+        assert!(!std::path::Path::new(file_path).exists());
+    }
+
+    // TC-1717 (FR-1704): custom placeholders absent without prompt
+    #[tokio::test]
+    async fn agent_prompt_custom_placeholders_absent_without_prompt() {
+        let toml = r#"
+name = "sp-agent2"
+command = ["sh", "-c", "echo sys=[$SYS]; echo file=[$SYSFILE]; echo cfg=[$FAKE_CFG]", "--", "{prompt}"]
+temp_config_template = "{\"sp\":\"{system_prompt}\"}"
+env = { FAKE_CFG = "{temp_config}", SYS = "{system_prompt}", SYSFILE = "{system_prompt_file}" }
+system_prompt_arg = ["--system", "{system_prompt}"]
+"#;
+        let spec: &'static CustomAgentSpec = Box::leak(Box::new(toml::from_str(toml).unwrap()));
+        let (tx, mut rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: ConversationId::new("c"),
+            turn_id: TurnId::new("t"),
+            prompt: "hi".to_owned(),
+            resume_session: None,
+            image_paths: Vec::new(),
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+        let context = OutputContext::from(&request);
+        let pgid = std::sync::atomic::AtomicU32::new(0);
+        let cwd = std::env::temp_dir();
+        let notice_shown = AtomicBool::new(false);
+        let result = run_turn(
+            Agent::Custom(0),
+            spec,
+            &request,
+            None,
+            TurnPolicy::Agent,
+            &cwd,
+            &tx,
+            &context,
+            &pgid,
+            &[],
+            &notice_shown,
+            None,
+        )
+        .await;
+        drop(tx);
+        let mut text = String::new();
+        while let Some(output) = rx.recv().await {
+            if let AgentEvent::TextDelta(delta) = output.event {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(result, Ok(()));
+        assert!(text.contains("sys=[]"), "{text}");
+        assert!(text.contains("file=[]"), "{text}");
+        assert!(!text.contains("--system"), "{text}");
+    }
+
+    // TC-1717 (FR-1704): opencode temp config instructions
+    #[tokio::test]
+    async fn agent_prompt_opencode_temp_config_instructions() {
+        let spec = {
+            let mut s = dmuxai::custom_agent::opencode_preset(&fixture());
+            s.command = vec![fixture().to_owned(), "env".to_owned()];
+            s.output = Some(dmuxai::custom_agent::CustomAgentOutput::Text);
+            s.text_path = None;
+            s.text_when = None;
+            s.error_path = None;
+            s.session_id_path = None;
+            s.env
+                .insert("FAKE_CFG".to_owned(), "{temp_config}".to_owned());
+            Box::leak(Box::new(s))
+        };
+        let sp_text = "SYS instructions";
+        let sp = dmuxai::agent_prompt::ResolvedPrompt {
+            text: sp_text.to_owned(),
+            hash: "h".to_owned(),
+            source: "s".to_owned(),
+            inject: dmuxai::agent_prompt::PromptInject::Session,
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: ConversationId::new("c"),
+            turn_id: TurnId::new("t"),
+            prompt: "hi".to_owned(),
+            resume_session: None,
+            image_paths: Vec::new(),
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: Some(sp),
+        };
+        let context = OutputContext::from(&request);
+        let pgid = std::sync::atomic::AtomicU32::new(0);
+        let cwd = std::env::temp_dir();
+        let notice_shown = AtomicBool::new(false);
+        let result = run_turn(
+            Agent::Custom(0),
+            spec,
+            &request,
+            None,
+            TurnPolicy::Agent,
+            &cwd,
+            &tx,
+            &context,
+            &pgid,
+            &[],
+            &notice_shown,
+            None,
+        )
+        .await;
+        drop(tx);
+        let mut text = String::new();
+        while let Some(output) = rx.recv().await {
+            if let AgentEvent::TextDelta(delta) = output.event {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(result, Ok(()));
+        assert!(text.contains("instructions"), "{text}");
+        // prompt arg has no agent-instructions block
+        assert!(!text.contains("<agent-instructions>"), "{text}");
+    }
+
+    // TC-1717 (FR-1704): temp files removed
+    #[tokio::test]
+    async fn agent_prompt_opencode_temp_files_removed() {
+        let spec = {
+            let mut s = dmuxai::custom_agent::opencode_preset(&fixture());
+            s.command = vec![fixture().to_owned(), "env".to_owned()];
+            s.output = Some(dmuxai::custom_agent::CustomAgentOutput::Text);
+            s.text_path = None;
+            s.text_when = None;
+            s.error_path = None;
+            s.session_id_path = None;
+            s.env
+                .insert("FAKE_CFG".to_owned(), "{temp_config}".to_owned());
+            Box::leak(Box::new(s))
+        };
+        let sp = dmuxai::agent_prompt::ResolvedPrompt {
+            text: "SYS".to_owned(),
+            hash: "h".to_owned(),
+            source: "s".to_owned(),
+            inject: dmuxai::agent_prompt::PromptInject::Session,
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: ConversationId::new("c"),
+            turn_id: TurnId::new("t"),
+            prompt: "hi".to_owned(),
+            resume_session: None,
+            image_paths: Vec::new(),
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: Some(sp),
+        };
+        let context = OutputContext::from(&request);
+        let pgid = std::sync::atomic::AtomicU32::new(0);
+        let cwd = std::env::temp_dir();
+        let notice_shown = AtomicBool::new(false);
+        let _ = run_turn(
+            Agent::Custom(0),
+            spec,
+            &request,
+            None,
+            TurnPolicy::Agent,
+            &cwd,
+            &tx,
+            &context,
+            &pgid,
+            &[],
+            &notice_shown,
+            None,
+        )
+        .await;
+        drop(tx);
+        let mut text = String::new();
+        while let Some(output) = rx.recv().await {
+            if let AgentEvent::TextDelta(delta) = output.event {
+                text.push_str(&delta);
+            }
+        }
+        // extract any /tmp dmuxai instructions path and ensure removed
+        for token in text.split_whitespace() {
+            if token.contains("dmuxai-") && token.contains("instructions.txt") {
+                let cleaned =
+                    token.trim_matches(|c: char| c == ',' || c == '"' || c == '[' || c == ']');
+                if !cleaned.is_empty() {
+                    assert!(!std::path::Path::new(cleaned).exists(), "{cleaned}");
+                }
+            }
+        }
     }
 }
