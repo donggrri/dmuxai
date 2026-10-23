@@ -158,6 +158,10 @@ Run phases (persisted as `GraphRun.phase`):
 | NFR-930 | Must | Given the judge and plan prompts | Then the user prompt, edit feedback and repair errors are each passed as data inside a block delimited by a per-turn random nonce (`<<<DATA-<nonce>` … `DATA-<nonce>>>>`); a text that contains the closing marker is rejected and the turn falls back. Data is never interpolated into instructions, and the internal turns never receive dashboard tokens, config secrets or other conversations' transcripts | The prompt templates are constants covered by a snapshot test | TC-961 |
 | NFR-931 | Must | Given CI | Then every judge/plan test uses a scripted mock adapter or the `tests/fixtures/fake-agent.sh` `judge`/`plan` behaviors; no test needs provider auth. A live smoke test against a real runner is `#[ignore]` | | TC-962 |
 | NFR-932 | Should | Given a simple prompt | Then the added latency over today's direct send is one judge turn; no second internal turn is added for simple prompts. Complex prompts add one plan turn, plus at most one repair turn | | Manual: latency depends on the live provider; recorded in REVIEW-plan-gate |
+| FR-1828 | Must | Given a headless run whose graph reaches `AwaitingApproval` without `--approve-plan` | Then the process exits 7 with the plan text and cancels the run; the record is `cancelled` | `--approve-plan` is required to continue | TC-1828 |
+| FR-1829 | Must | Given `dmuxai run ... --approve-plan` headless | Then a pending plan gate is auto-approved with `decided_by: cli` and the run continues | without the flag the gate stays pending (exit 7) | TC-1829 |
+| FR-1830 | Must | Given the same plan approval in dashboard/TUI vs headless | Then dashboard uses `POST /api/command` with `"command":"plan_decision"`, TUI uses `/graph approve|edit|reject`, headless uses `--approve-plan`; all mutate the same run record | view-only `serve` can approve via API but cannot run agents | TC-1830 |
+| FR-1831 | Must | Given `--graph` on `todo run` | Then the to-do runs in graph mode and waits for plan approval like FR-947 | `--graph` with `--agent` is rejected | TC-1831 |
 
 ### 4.1 Planner cost estimate (model calls per run)
 
@@ -175,6 +179,13 @@ Internal calls go to the selected agent; prompt sizes are the DmuxAI-built text 
 | **Typical multi-step run** | **2** (replans 0) | ~5–8 k chars |
 
 Compared with replanning after every step (rejected design), an 8-step run saves up to 7 calls and never re-sends transcripts. Recording every turn, appending follow-up turns and the live swimlane redraw use no model call.
+
+### Code-vs-spec mismatches
+
+| ID | Spec says | Code does (file:function) | Proposed resolution |
+| --- | --- | --- | --- |
+| OQ-1810 | `--graph` becomes a no-op (CLI data contract) | `src/cli.rs` `run_headless` stores `graph` and `todo run --graph` selects `RunMode::Graph` | Clarify that `--graph` is a no-op only for `dmuxai run`; `todo run --graph` enables graph mode |
+| OQ-1811 | `--graph` is accepted as a no-op for legacy scripts | `src/app.rs` `headless_submit_prompt` does not branch on `req.graph` for direct runs, so the flag has no effect on `run` | Keep no-op for `run`; document todo-run exception (OQ-1810) |
 
 ## 5. Acceptance scenarios and test design
 
@@ -251,6 +262,10 @@ Compared with replanning after every step (rejected design), an 8-step run saves
 | TC-1010 | FR-1010 | unit (agent) | `headless_command` and `cursor_command` builders | Inspect `get_envs` | `DMUXAI_WEB_TOKEN` removed (`None`) without a separate call | `src/agent/agy.rs` `agent_child_env_drops_web_token` |
 | TC-1011 | FR-941, FR-950 | unit (app) | Plan invalid twice -> 1-node fallback revision | `/graph approve` in the TUI; dashboard `PlanDecision` approve | The revision step carries `task: task-1` like the plan node, approval is accepted (no `Approved plan steps are invalid`), and the run is `active` | `src/app.rs` `plan_fallback_approve_starts_run` |
 | TC-962 | NFR-931 | integration (ignored) | A real logged-in runner | Submit a Korean simple and a complex prompt | Verdicts parse; a plan validates; the complex plan has at least one parallel branch (manual dogfood: screenshot `v023-plangate-*`) | `tests/graph_orchestration.rs` `live_judge_and_plan_smoke` (`#[ignore]`) |
+| TC-1828 | FR-1828 | integration (CLI) | fake agent plan | `dmuxai run ...` without `--approve-plan` | exit 7, record cancelled | `tests/cli.rs` `run_complex_needs_approve_plan` |
+| TC-1829 | FR-1829 | integration (CLI) | fake agent plan | `dmuxai run ... --approve-plan` | exit 0, decided_by cli | `tests/cli.rs` `run_complex_needs_approve_plan` |
+| TC-1830 | FR-1830 | integration | dashboard router | `plan_decision` approve | 200 + session view | `src/web/server.rs` `plan_decision_command_contract` |
+| TC-1831 | FR-1831 | unit (app) | todo graph run | run to-do with `--graph` | graph mode and plan gate | `src/web/server.rs` `todo_graph_run_waits_for_plan_approval` |
 
 ## 6. Data, integration, and safety contracts
 

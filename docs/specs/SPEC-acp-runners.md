@@ -8,7 +8,7 @@ Related: SPEC-grok-runner, SPEC-cursor-model-pin, SPEC-plan-gate (#67), FR-932 (
 
 ## 1. Decision summary
 
-Cursor and the built-in grok runner use the [Agent Client Protocol](https://agentclientprotocol.com) over stdio (`cursor-agent acp`, `grok agent stdio`) so streaming, tool calls, permission prompts, cancel, and session resume share one integration path. A `[cursor]` / `[agents]` `protocol = "acp" | "legacy"` switch (default `acp`) keeps the previous CLI formats available. AGY stays on `agy --print` stream-json until its ACP server ships; the runner abstraction allows moving it later.
+Cursor and the built-in grok runner use the [Agent Client Protocol](https://agentclientprotocol.com) over stdio (`cursor-agent acp`, `grok agent stdio`) so streaming, tool calls, permission prompts, cancel, and session resume share one integration path. A `[cursor]` / `[agents]` `protocol = "acp" | "legacy"` switch (default `acp`) (see OQ-1845) keeps the previous CLI formats available. AGY stays on `agy --print` stream-json until its ACP server ships; the runner abstraction allows moving it later.
 
 DmuxAI removes user-facing **ExecutionMode** (Ask / Plan / Implement): every user turn runs in a single agent mode equivalent to former Implement (workspace writes and normal tool use). Plan approval (#67), sensitive-step gates, and internal read-only judge/plan/replan turns (FR-932) stay. Legacy runners always use their former Implement CLI flags. Stored or API `mode` values are ignored once with a warning.
 
@@ -37,6 +37,12 @@ DmuxAI removes user-facing **ExecutionMode** (Ask / Plan / Implement): every use
 | OQ-1300 | Cursor and grok ACP servers speak ACP v1 with blocking `session/prompt` completion (stop reason on response or terminal `session/update`). | DmuxAI | Live smoke on Linux |
 | OQ-1301 | `grok agent stdio` accepts `-m`, optional `--reasoning-effort`, and `--always-approve` for agent-mode turns. | DmuxAI | Live smoke on Linux |
 | OQ-1326 | Native sandbox for ACP stdio agents (`cursor-agent acp --sandbox enabled` is best-effort; grok ACP sandbox flags unknown). | DmuxAI | Live smoke on Linux |
+
+### Code-vs-spec mismatches
+
+| ID | Spec says | Code does (file:function) | Proposed resolution |
+| --- | --- | --- | --- |
+| OQ-1845 | Section 1 states default is "acp" for cursor protocol switch | `src/settings.rs:774` sets `cursor_protocol: RunnerProtocol::Legacy` matching FR-1300/1305/1410, whereas `src/agent/cursor.rs:63` sets `CursorAdapterConfig::default().protocol = RunnerProtocol::Acp` | Clarify in FR-1862 that DmuxSettings defaults to Legacy while standalone CursorAdapterConfig defaults to ACP |
 
 No Must requirement depends on an unanswered question for CI; live smoke is manual on Linux.
 
@@ -98,6 +104,8 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | FR-1417 | Must | ACP `execute` tool call. | Activity row shows the command (`rawInput.command` or title), not the cwd. | — | TC-1422 |
 | FR-1418 | Must | agy and opencode runners. | Keep existing headless modes (`agy --print` stream-json, `opencode run` jsonl); no ACP path or `*_protocol` switch for them. | — | TC-1423 |
 | NFR-1410 | Must | Test fixtures. | Fake ACP agent can advertise `modes` only, `configOptions` only, both, or a fast-only model. | — | TC-1424, TC-1425 |
+| FR-1862 | Must | Cursor adapter protocol configuration defaults (`src/settings.rs`, `src/agent/cursor.rs`). | In application settings (`DmuxSettings`), `cursor_protocol` defaults to `RunnerProtocol::Legacy`. When constructed from settings (`CursorAdapterConfig::from(&settings)`), the adapter uses `settings.cursor_protocol` (`Legacy`). Standalone `CursorAdapterConfig::default()` specifies `RunnerProtocol::Acp`. | Standalone adapter tests defaulting to ACP do not override repository settings default `legacy`. | TC-1862 |
+| FR-1863 | Must | ACP tool execution and permission denial lifecycle (`src/agent/acp/client.rs`, `src/agent/acp/permissions.rs`). | `session/request_permission` checks target file paths against the normalized workspace root; if a path lies outside workspace or the turn policy is ReadOnly, the permission is denied client-side, `AgentEvent::Notice` with `PERMISSION_DENIED_NOTICE` is emitted, and the turn terminates with `AgentEvent::Cancelled`. | Child process is terminated without leaving background orphans. | TC-1863 |
 
 
 ## 5. Acceptance scenarios and test design
@@ -120,6 +128,8 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | TC-1423 | FR-1418 | unit | Settings with `opencode_protocol` | Load | No ACP for opencode | `src/settings.rs` |
 | TC-1424 | NFR-1410, FR-1413 | integration | Fake `FAKE_ACP_MODES` = modes / config / none | Read-only Cursor ACP turn | set_mode ask / set_config_option plan / none | `src/agent/cursor.rs` |
 | TC-1425 | NFR-1410, FR-1413 | integration | Fake `FAKE_ACP_MODES=both` | Read-only Cursor ACP turn | set_mode preferred | `src/agent/cursor.rs` |
+| TC-1862 | FR-1862 | unit | `DmuxSettings::default()` and `CursorAdapterConfig::default()` | Compare protocol fields | settings default is Legacy, adapter default is Acp | `src/settings.rs` |
+| TC-1863 | FR-1863 | unit | unauthorized or read-only tool request | `session/request_permission` evaluation | permission denied; notice emitted; turn cancelled | `src/agent/acp/client.rs` `acp_permission_denied_emits_notice_and_cancels` |
 | TC-1480 | FR-1412, FR-1301 | manual | Built `dmuxai`, grok logged in, temp git workspace | `dmuxai run --agent grok "create hello.txt containing hi"` | File created in workspace; reply text shown | hands-on |
 | TC-1481 | FR-1416, FR-1314 | manual | Same | Ask grok to write `/tmp/outside-<rand>.txt` | No file outside workspace; turn ends cancelled with a denial notice (not "Graph failed") | hands-on |
 | TC-1482 | FR-1417 | manual | Same | Ask grok to run `ls -1 \| wc -l` | Reply has the count; activity row shows the command | hands-on |

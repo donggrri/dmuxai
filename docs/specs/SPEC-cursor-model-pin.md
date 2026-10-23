@@ -50,6 +50,7 @@ Every Cursor turn in DmuxAI must pass `--model composer-2.5` to `cursor-agent` u
 | FR-412 | Must | Given a prompt starting with `/` (e.g. `/custom prompt`) submitted to Cursor outside graph auto-planning, when `submit_to_agent` executes | Then the request sent to Cursor agent has model pinned to `composer-2.5` | If previously unset, the model catalog selection becomes `composer-2.5` | TC-413 |
 | UX-410 | Must | Given Cursor is the selected agent, when the status bar is rendered | Then the model segment displays `composer-2.5` instead of `provider default` | If a disallowed model is currently selected in the catalog, `composer-2.5` is displayed | TC-414 |
 | INT-410 | Must | Given the Cursor adapter builds CLI arguments in `configure_command`, when `--model` is configured | Then the argv contains `--model composer-2.5` by default, and any disallowed or fast model is replaced with `composer-2.5` | If `selected_model` is `None`, `--model composer-2.5` is emitted | TC-410, TC-411 |
+| FR-1866 | Must | Cursor adapter configure_command model validation (`src/agent/cursor.rs`, `src/model_policy.rs`). | `--model <model>` verifies `validate_model_for_runner("cursor", model)`. If None or invalid, falls back to `ALLOWED_MODEL` (`composer-2.5`). | Neither foreign nor fast models are ever passed to cursor-agent. | TC-1866 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -60,6 +61,7 @@ Every Cursor turn in DmuxAI must pass `--model composer-2.5` to `cursor-agent` u
 | TC-412 | FR-411 | unit | App state with Cursor selected and catalog model set to `"composer-2.5-fast"` | User submits prompt or calls `submit_to_agent` | Model is replaced with `composer-2.5`, system notice is emitted | `src/app.rs` |
 | TC-413 | FR-410, FR-412 | unit | Fresh app with Cursor agent and unset model catalog, input starting with `/test` | `app.handle_enter()` / `submit_to_agent` | Model passed to adapter and catalog selected is `composer-2.5` | `src/app.rs` |
 | TC-414 | UX-410 | unit | Fresh app or app with Cursor selected and no F2 model selected | Render status bar or inspect status segments | Model segment displays `"composer-2.5"`, not `"provider default"` | `src/app.rs` |
+| TC-1866 | FR-1866 | unit | `configure_command` with unset or foreign model | build argv | argv contains `["--model", "composer-2.5"]` | `src/agent/cursor.rs` `cursor_legacy_argv_pins_composer_2_5` |
 
 ## 6. Data, integration, and safety contracts
 
