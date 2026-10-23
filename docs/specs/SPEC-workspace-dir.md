@@ -16,7 +16,7 @@ Decision:
 
 Re-exec is simpler and safer than re-wiring the live App, which holds about 40 workspace-bound handles (DB, event sink, docs, to-dos, MCP, warm cursor process).
 
-## 2. Requirements
+## 4. Requirements
 
 | ID | Priority | Requirement | Tests |
 | --- | --- | --- | --- |
@@ -44,7 +44,7 @@ Re-exec is simpler and safer than re-wiring the live App, which holds about 40 w
 - `POST /api/workspace/validate` stays available in view-only mode, and works for paths outside the browse roots, as FR-872 specifies. It needs the dashboard token, returns only ok or a reason (never directory contents), and uses the same write probe as the CLI.
 - The header path button shows a `▾` caret, so you can tell it opens the dialog.
 
-## 3. Tests
+## 5. Acceptance scenarios and test design
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |

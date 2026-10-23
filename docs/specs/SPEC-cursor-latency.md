@@ -27,7 +27,7 @@ Findings:
 
 Decision: pre-warm the next cursor-agent process (FR-805..FR-807) and document what is left as cursor-agent's own latency.
 
-## 2. Requirements
+## 4. Requirements
 
 | ID | Priority | Requirement | Tests |
 | --- | --- | --- | --- |
@@ -44,7 +44,7 @@ Decision: pre-warm the next cursor-agent process (FR-805..FR-807) and document w
 - **MCP.** Pre-warm is skipped when any MCP server applies to Cursor, because MCP setup and the one-time notice belong to the turn.
 - **Idle expiry** runs on a timer in the adapter's runtime loop rather than on the App tick.
 
-## 3. Tests
+## 5. Acceptance scenarios and test design
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |
@@ -53,6 +53,6 @@ Decision: pre-warm the next cursor-agent process (FR-805..FR-807) and document w
 | TC-807 | FR-807, NFR-805 | unit | fake binary, `prewarm = false` | No warm spawn when disabled, in headless `run`, or for graph nodes; idle expiry and quit kill it (pid gone) | `src/agent/cursor.rs` `prewarm_disabled_and_expiry` |
 | TC-808 | FR-806 | unit | fake binary that exits immediately | A warm process that has exited is reaped and the prompt runs in a fresh process | `src/agent/cursor.rs` `prewarm_exited_process_is_replaced` |
 
-## 4. Out of scope
+## 6. Out of scope
 
 cursor-agent's own startup and model latency. They are documented in the README (Cursor section) together with the numbers above.

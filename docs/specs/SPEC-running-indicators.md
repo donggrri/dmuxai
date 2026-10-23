@@ -15,7 +15,7 @@ Decision: one shared run-state model (`idle | running | done | failed | cancelle
 
 It applies to the TUI and the dashboard, and respects `NO_COLOR` and `prefers-reduced-motion`.
 
-## 2. Requirements
+## 4. Requirements
 
 | ID | Priority | Requirement | Tests |
 | --- | --- | --- | --- |
@@ -30,7 +30,7 @@ It applies to the TUI and the dashboard, and respects `NO_COLOR` and `prefers-re
 | FR-981 | Must | Dashboard parity for the activity detail: while an agent is running, `DashboardSnapshot` `agents[].activity` carries the same bounded detail the TUI status bar shows (latest tool or progress line, for example `▸ read src/app.rs`), or null when there is none. The agent chip and the header `Running` pill show it after the elapsed time. It is cleared when the turn ends | TC-982, TC-983 |
 | FR-982 | Must | Cancel notice, all runners: when a running turn is cancelled (TUI Ctrl+C, dashboard cancel, `/api/command cancel`), the visible transcript gets exactly one system line `<agent> turn cancelled.` after the partial reply, in the TUI and in the dashboard transcript. The stored turn status becomes `cancelled`, so reopening the conversation shows the same line. A later `Cancelled` event from the adapter for the same turn adds no second line | TC-984, TC-985 |
 
-## 3. Tests
+## 5. Acceptance scenarios and test design
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |

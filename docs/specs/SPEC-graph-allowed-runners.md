@@ -2,18 +2,20 @@
 
 Status: Implemented (PR #19) · Dogfood: #20
 
-## Decision summary
+## 1. Decision summary
 Graph orchestration is on by default, so a machine needs a way to keep graph nodes away from particular runners. One example is the box's company-account cursor-agent. This adds `[graph] allowed_runners` and a user-level config file. The user file is read first, and the workspace `dmuxai.toml` then overrides it key by key.
 
-## Scope
+## 2. Scope
+
 In scope: allowlist for graph node runners, user-level config loading and merging, `/graph` status display, `/graph override` validation.
 Out of scope: restricting the runner a user picks by hand for a single-agent turn.
 
-## Terms / state
+## 3. Terms and state model
+
 - `graph_allowed_runners: Option<Vec<String>>`. `None` means every runner is allowed. `Some([])` means no runner is allowed for graph nodes.
 - User config: `$XDG_CONFIG_HOME/dmuxai/dmuxai.toml`, falling back to `~/.config/dmuxai/dmuxai.toml`.
 
-## Requirements
+## 4. Requirements
 | ID | Pri | Requirement |
 |---|---|---|
 | FR-430 | Must | `[graph] allowed_runners` limits which runners may be assigned to graph nodes. Matching is case-insensitive. Unknown names are dropped and a warning is shown. |
@@ -23,7 +25,7 @@ Out of scope: restricting the runner a user picks by hand for a single-agent tur
 | UX-430 | Should | `/graph` status lists the allowed runners. |
 | INT-430 | Must | `/graph override` rejects a runner that is not allowed. |
 
-## Acceptance
+## 5. Acceptance scenarios and test design
 | TC | Covers | Test |
 |---|---|---|
 | TC-430 | FR-430, FR-431 | `assign_runner_honors_allowed_runners_and_order` |
@@ -33,8 +35,8 @@ Out of scope: restricting the runner a user picks by hand for a single-agent tur
 | TC-434 | UX-430 | `graph_status_shows_allowed_runners` |
 | TC-435 | INT-430 | `graph_override_rejects_disallowed_runner` |
 
-## Data / safety
+## 6. Data and safety contracts
 Box default: `~/.config/dmuxai/dmuxai.toml` sets `[graph] allowed_runners = ["agy"]`, so graph work never reaches the company-account cursor-agent.
 
-## Exit criteria
+## 7. Exit criteria
 All TCs pass in CI, and dogfood #20 is closed.

@@ -10,7 +10,7 @@ The chat column (`main`, max 880px) is centered with `margin: auto`. When the ri
 
 Decision: the layout reserves space for each open docked sidebar. The chat column, and so the prompt box, is centered in the space between them, and is never covered by a docked sidebar. Both docked sidebars are 320px wide, so with no sidebars or with both open the content center is the viewport center. Overlay drawers (narrow screens) do not move the column. A headless Chrome test measures the geometry, so the centering cannot regress silently.
 
-## 2. Requirements
+## 4. Requirements
 
 | ID | Priority | Requirement | Tests |
 | --- | --- | --- | --- |
@@ -25,9 +25,9 @@ Decision: the layout reserves space for each open docked sidebar. The chat colum
 - The left dock rule (`body.left-sidebar-open`) is in place before the left sidebar exists; SPEC-session-sidebar (#55) adds the toggle. Until then TC-851 simulates the left dock with a probe element.
 - The prompt box keeps its place in the session panel; this SPEC does not make it sticky.
 
-## 3. Tests
+## 5. Acceptance scenarios and test design
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |
 | TC-850 | FR-850, UX-850 | unit (asset) | CSS assets | Dock variables and the centering rule exist; the old `margin-right: 320px` per-state rule is gone; reduced-motion disables the transition | `src/web/assets.rs` `prompt_centering_assets` |
-| TC-851 | FR-850..FR-852, UX-850 | e2e (ignored, headless Chrome) | `dmuxai serve` on a temp workspace | For the widths 1280, 1440, 1920 and 800, and the four sidebar states, the measured `getBoundingClientRect()` of `.session-prompt` is centered (±2px) in the content area and does not intersect an open docked sidebar; typed prompt text survives the toggles | `tests/web_prompt_center.rs` `prompt_stays_centered_in_headless_chrome` |
+| TC-851 | FR-850, FR-851, FR-852, UX-850 | e2e (ignored, headless Chrome) | `dmuxai serve` on a temp workspace | For the widths 1280, 1440, 1920 and 800, and the four sidebar states, the measured `getBoundingClientRect()` of `.session-prompt` is centered (±2px) in the content area and does not intersect an open docked sidebar; typed prompt text survives the toggles | `tests/web_prompt_center.rs` `prompt_stays_centered_in_headless_chrome` |
