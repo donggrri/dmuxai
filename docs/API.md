@@ -418,6 +418,27 @@ An explicit config path passed via `--config` or `DMUXAI_CONFIG` that does not e
 tasks_file = true
 ```
 
+### `[runners.default]` / `[runners.<id>]`
+
+Per-runner system prompts. User config sets defaults; workspace `dmuxai.toml` overrides per key.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `system_prompt` | — | Inline prompt text (mutually exclusive with `system_prompt_file`). |
+| `system_prompt_file` | — | Path to a prompt file, relative to the config file that sets it unless absolute. |
+| `prompt_inject` | `session` | `session` (inject on fresh session or hash change) or `always` (every turn). |
+| `prompt_roles` | `["chat", "worker"]` | Roles that may receive the prompt; `judge`/`triage`/`planner`/`replan`/`summary`/`interview` never do. |
+
+```toml
+[runners.default]
+system_prompt = "Follow these rules."
+prompt_inject = "session"
+prompt_roles = ["chat", "worker"]
+
+[runners.codex]
+system_prompt_file = "prompts/codex.md"
+```
+
 ## 7. Environment variables and child process policy
 
 ### Environment variables

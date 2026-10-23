@@ -30187,6 +30187,7 @@ mod tests {
         );
     }
 
+    // TC-1715 (FR-1705): session injects fresh only
     #[test]
     fn agent_prompt_session_injects_on_fresh_session_only() {
         let (mut app, sent) = test_app();
@@ -30250,6 +30251,7 @@ mod tests {
         }
     }
 
+    // TC-1715 (FR-1705): always injects every turn
     #[test]
     fn agent_prompt_always_injects_every_turn() {
         let (mut app, sent) = test_app();
@@ -30278,6 +30280,7 @@ mod tests {
         assert!(reqs[1].1.prompt.starts_with("<agent-instructions>"));
     }
 
+    // TC-1715 (FR-1705): block precedes memory
     #[test]
     fn agent_prompt_block_precedes_memory() {
         let vault = tempfile::tempdir().unwrap();
@@ -30297,6 +30300,7 @@ mod tests {
         assert!(i_block < i_mem);
     }
 
+    // TC-1715 (FR-1705): internal roles get nothing
     #[test]
     fn agent_prompt_internal_roles_get_nothing() {
         let (mut app, sent) = test_app();
@@ -30355,6 +30359,7 @@ mod tests {
         let _ = sent;
     }
 
+    // TC-1715 (FR-1705): graph worker gets prompt
     #[test]
     fn agent_prompt_graph_worker_gets_prompt() {
         let (mut app, sent) = test_app();
@@ -30368,6 +30373,7 @@ mod tests {
         assert!(reqs[0].1.prompt.starts_with("<agent-instructions>"));
     }
 
+    // TC-1715 (FR-1705): transcript has no block
     #[test]
     fn agent_prompt_transcript_has_no_block() {
         let (mut app, sent) = test_app();
@@ -30391,6 +30397,7 @@ mod tests {
         assert!(users.iter().all(|p| p == "hello"), "{users:?}");
     }
 
+    // TC-1715 (FR-1705): native runner no prepend
     #[test]
     fn agent_prompt_native_runner_no_prepend() {
         let (mut app, sent) = test_app();
@@ -30406,6 +30413,7 @@ mod tests {
         assert_eq!(sp.hash, dmuxai::agent_prompt::hash_prompt("INSTR"));
     }
 
+    // TC-1718 (FR-1706): headless json source/hash
     #[tokio::test]
     async fn agent_prompt_headless_json_reports_source_and_hash() {
         let (mut app, sent, event_tx) = test_app_with_event_sender();

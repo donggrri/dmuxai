@@ -2012,6 +2012,7 @@ mod tests {
             "expected mcp_servers.remote-vault.env_http_headers in argv: {args:?}"
         );
     }
+    // TC-1716 (FR-1704): codex thread/start developerInstructions
     #[test]
     fn agent_prompt_codex_thread_start_developer_instructions() {
         let v = thread_open_request(1, std::path::Path::new("workspace"), None, Some("SYS"));
@@ -2027,6 +2028,7 @@ mod tests {
         assert!(v.pointer("/params/baseInstructions").is_none());
     }
 
+    // TC-1716 (FR-1704): codex thread/resume developerInstructions
     #[test]
     fn agent_prompt_codex_thread_resume_developer_instructions() {
         let v = thread_open_request(
@@ -2047,6 +2049,7 @@ mod tests {
         assert!(v.pointer("/params/baseInstructions").is_none());
     }
 
+    // TC-1716 (FR-1704): codex no prompt omits developerInstructions
     #[test]
     fn agent_prompt_codex_no_prompt_no_developer_instructions() {
         let fresh = thread_open_request(3, std::path::Path::new("workspace"), None, None);

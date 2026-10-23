@@ -6237,6 +6237,7 @@ mod tests {
     }
 
     // PR-2.5 part 4: agent prompt API tests
+    // TC-1719 (FR-1706): api get unset
     #[tokio::test]
     async fn agent_prompt_api_get_lists_runners_unset_by_default() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6278,6 +6279,7 @@ mod tests {
         }
     }
 
+    // TC-1719 (FR-1706): api post roundtrip
     #[tokio::test]
     async fn agent_prompt_api_post_then_get_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6361,6 +6363,7 @@ mod tests {
         }
     }
 
+    // TC-1719 (FR-1706): api post null clears
     #[tokio::test]
     async fn agent_prompt_api_post_null_clears() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6405,6 +6408,7 @@ mod tests {
         assert_eq!(codex["set"], false);
     }
 
+    // TC-1719 (FR-1706): api post over 32kib
     #[tokio::test]
     async fn agent_prompt_api_post_over_32kib_returns_400() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6431,6 +6435,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    // TC-1719 (FR-1706): api post unknown inject
     #[tokio::test]
     async fn agent_prompt_api_post_unknown_inject_returns_400() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6456,6 +6461,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    // TC-1719 (FR-1706): api text preview only
     #[tokio::test]
     async fn agent_prompt_api_text_never_full_beyond_preview() {
         let tmp = tempfile::tempdir().unwrap();

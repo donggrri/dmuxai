@@ -1759,6 +1759,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
         };
         assert_eq!(event, AgentEvent::Cancelled);
     }
+    // TC-1717 (FR-1704): custom placeholders render
     #[tokio::test]
     async fn agent_prompt_custom_placeholders_render() {
         let toml = r#"
@@ -1824,6 +1825,7 @@ system_prompt_arg = ["--system", "{system_prompt}"]
         assert!(!std::path::Path::new(file_path).exists());
     }
 
+    // TC-1717 (FR-1704): custom placeholders absent without prompt
     #[tokio::test]
     async fn agent_prompt_custom_placeholders_absent_without_prompt() {
         let toml = r#"
@@ -1877,6 +1879,7 @@ system_prompt_arg = ["--system", "{system_prompt}"]
         assert!(!text.contains("--system"), "{text}");
     }
 
+    // TC-1717 (FR-1704): opencode temp config instructions
     #[tokio::test]
     async fn agent_prompt_opencode_temp_config_instructions() {
         let spec = {
@@ -1941,6 +1944,7 @@ system_prompt_arg = ["--system", "{system_prompt}"]
         assert!(!text.contains("<agent-instructions>"), "{text}");
     }
 
+    // TC-1717 (FR-1704): temp files removed
     #[tokio::test]
     async fn agent_prompt_opencode_temp_files_removed() {
         let spec = {

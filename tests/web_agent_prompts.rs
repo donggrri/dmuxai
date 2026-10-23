@@ -43,6 +43,7 @@ fn find_chrome() -> Option<PathBuf> {
     None
 }
 
+// TC-1720 (FR-1706): panel renders
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
 fn agent_prompts_panel_renders_in_headless_chrome() {

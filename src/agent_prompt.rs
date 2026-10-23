@@ -436,6 +436,7 @@ pub fn set_runner_prompt_in_toml(
 mod tests {
     use super::*;
 
+    // TC-1714 (FR-1704): delivery per runner
     #[test]
     fn agent_prompt_delivery_per_runner() {
         assert_eq!(delivery("opencode", None), Delivery::Native);
@@ -480,6 +481,7 @@ mod tests {
         assert_eq!(delivery("custom", Some(&custom_spec)), Delivery::Prepend);
     }
 
+    // TC-1714 (FR-1704): prepend block format
     #[test]
     fn agent_prompt_prepend_block_format() {
         let text = "Follow these instructions carefully.";
@@ -490,6 +492,7 @@ mod tests {
         );
     }
 
+    // TC-1713 (FR-1701): should_inject truth table
     #[test]
     fn agent_prompt_should_inject_truth_table() {
         let hash = "abc1234567890def";
@@ -532,6 +535,7 @@ mod tests {
         ));
     }
 
+    // TC-1713 (FR-1701): hash stable
     #[test]
     fn agent_prompt_hash_stable_and_changes_with_text() {
         let h1 = hash_prompt("Instructions version 1");
@@ -547,6 +551,7 @@ mod tests {
         );
     }
 
+    // TC-1712 (FR-1702): resolve none unconfigured
     #[test]
     fn agent_prompt_resolve_none_for_unconfigured_runner() {
         let settings = Settings::default();
@@ -554,6 +559,7 @@ mod tests {
         assert!(resolve(&settings, "codex", PromptRole::Worker).is_none());
     }
 
+    // TC-1712 (FR-1702): resolve empty returns none
     #[test]
     fn agent_prompt_resolve_empty_or_whitespace_returns_none() {
         let mut settings = Settings::default();
@@ -571,6 +577,7 @@ mod tests {
         assert!(resolve(&settings, "cursor", PromptRole::Chat).is_none());
     }
 
+    // TC-1712 (FR-1702): excluded roles none
     #[test]
     fn agent_prompt_excluded_roles_always_return_none() {
         let mut settings = Settings::default();
@@ -598,6 +605,7 @@ mod tests {
         assert!(resolve(&settings, "cursor", PromptRole::Summary).is_none());
         assert!(resolve(&settings, "cursor", PromptRole::Interview).is_none());
     }
+    // TC-1714 (FR-1704): native opted-in custom
     #[test]
     fn agent_prompt_delivery_native_for_opted_in_custom() {
         use crate::custom_agent::CustomAgentSpec;

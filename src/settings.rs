@@ -2883,6 +2883,7 @@ mod agent_prompt_tests {
     use super::*;
     use crate::agent_prompt::{PromptInject, PromptRole, resolve};
 
+    // TC-1707 (FR-1700): inline text
     #[test]
     fn agent_prompt_inline_text() {
         let ws = tempfile::tempdir().unwrap();
@@ -2898,6 +2899,7 @@ system_prompt = "You are a helpful coding assistant."
         assert_eq!(resolved.inject, PromptInject::Session);
     }
 
+    // TC-1707 (FR-1700): file text
     #[test]
     fn agent_prompt_file_text() {
         let ws = tempfile::tempdir().unwrap();
@@ -2913,6 +2915,7 @@ system_prompt_file = "prompt.txt"
         assert_eq!(resolved.source, "workspace:[runners.codex] (prompt.txt)");
     }
 
+    // TC-1707 (FR-1700): relative path
     #[test]
     fn agent_prompt_relative_path_resolved_against_config_file_dir() {
         let user_dir = tempfile::tempdir().unwrap();
@@ -2945,6 +2948,7 @@ system_prompt_file = "prompts/user_prompt.txt"
         );
     }
 
+    // TC-1707 (FR-1700): absolute path
     #[test]
     fn agent_prompt_absolute_path_allowed() {
         let ws = tempfile::tempdir().unwrap();
@@ -2966,6 +2970,7 @@ system_prompt_file = "{}"
         assert!(resolved.source.starts_with("workspace:[runners.default] ("));
     }
 
+    // TC-1708 (FR-1700): both set warns
     #[test]
     fn agent_prompt_both_set_warns_and_ignored() {
         let ws = tempfile::tempdir().unwrap();
@@ -2990,6 +2995,7 @@ system_prompt_file = "some_file.txt"
         assert!(resolve(&settings, "cursor", PromptRole::Chat).is_none());
     }
 
+    // TC-1708 (FR-1700): over 32KiB warns
     #[test]
     fn agent_prompt_greater_than_32kib_warns_and_ignored() {
         let ws = tempfile::tempdir().unwrap();
@@ -3038,6 +3044,7 @@ system_prompt = "{exact_32kib}"
         assert_eq!(resolved.text.len(), 32_768);
     }
 
+    // TC-1708 (FR-1700): unreadable warns
     #[test]
     fn agent_prompt_unreadable_file_warns_and_ignored() {
         let ws = tempfile::tempdir().unwrap();
@@ -3061,6 +3068,7 @@ system_prompt_file = "missing_prompt_file.txt"
         assert!(resolve(&settings, "cursor", PromptRole::Chat).is_none());
     }
 
+    // TC-1709 (FR-1703): workspace overrides user
     #[test]
     fn agent_prompt_workspace_overrides_user() {
         let user_dir = tempfile::tempdir().unwrap();
@@ -3093,6 +3101,7 @@ system_prompt = "Workspace prompt"
         assert_eq!(resolved.inject, PromptInject::Always);
     }
 
+    // TC-1709 (FR-1703): runner overrides default
     #[test]
     fn agent_prompt_runner_id_overrides_default() {
         let ws = tempfile::tempdir().unwrap();
@@ -3120,6 +3129,7 @@ system_prompt = "Codex prompt"
         assert_eq!(cursor_prompt.inject, PromptInject::Always);
     }
 
+    // TC-1710 (FR-1701): default inject session
     #[test]
     fn agent_prompt_default_inject_session() {
         let ws = tempfile::tempdir().unwrap();
@@ -3133,6 +3143,7 @@ system_prompt = "Test prompt"
         assert_eq!(resolved.inject, PromptInject::Session);
     }
 
+    // TC-1710 (FR-1701): always parsed
     #[test]
     fn agent_prompt_always_parsed() {
         let ws = tempfile::tempdir().unwrap();
@@ -3147,6 +3158,7 @@ prompt_inject = "always"
         assert_eq!(resolved.inject, PromptInject::Always);
     }
 
+    // TC-1710 (FR-1701): unknown inject warns
     #[test]
     fn agent_prompt_unknown_inject_warns() {
         let ws = tempfile::tempdir().unwrap();
@@ -3172,6 +3184,7 @@ prompt_inject = "immediately"
         assert_eq!(resolved.inject, PromptInject::Session);
     }
 
+    // TC-1711 (FR-1702): default roles
     #[test]
     fn agent_prompt_default_roles() {
         let ws = tempfile::tempdir().unwrap();
@@ -3187,6 +3200,7 @@ system_prompt = "Default roles prompt"
         assert!(resolve(&settings, "cursor", PromptRole::Judge).is_none());
     }
 
+    // TC-1711 (FR-1702): excluded roles dropped
     #[test]
     fn agent_prompt_judge_triage_planner_replan_summary_interview_excluded_even_if_listed() {
         let ws = tempfile::tempdir().unwrap();
@@ -3251,6 +3265,7 @@ prompt_roles = [
         assert!(resolve(&settings, "cursor", PromptRole::Interview).is_none());
     }
 
+    // TC-1711 (FR-1702): runner case insensitive
     #[test]
     fn agent_prompt_runner_case_insensitive() {
         let ws = tempfile::tempdir().unwrap();
@@ -3269,6 +3284,7 @@ system_prompt = "Case-insensitive codex prompt"
         assert_eq!(r3.text, "Case-insensitive codex prompt");
     }
 
+    // TC-1709 (FR-1703): workspace runner overrides user default
     #[test]
     fn agent_prompt_workspace_runner_overrides_user_default() {
         let user_dir = tempfile::tempdir().unwrap();
