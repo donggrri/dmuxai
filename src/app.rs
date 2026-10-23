@@ -257,7 +257,7 @@ const SLASH_COMMANDS: [SlashCommand; 17] = [
     },
 ];
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Role {
     User,
     Agent(Agent),
@@ -337,7 +337,7 @@ fn dashboard_prompt_matches(prompt: &str, content: &str) -> bool {
     content == prompt || (prompt.starts_with("//") && content == &prompt[1..])
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Message {
     role: Role,
     content: String,
@@ -423,6 +423,17 @@ struct ActiveTurn {
     /// Graph node this turn was dispatched for, captured at turn start so
     /// FR-748 records keep the right node even if graph state moves on.
     graph_node_id: Option<String>,
+    /// Activity rows received while this turn's conversation was not displayed.
+    offscreen_activity: Vec<Message>,
+}
+
+/// Where to re-insert retained offscreen activity after `restore_snapshot`.
+#[derive(Default)]
+struct OffscreenActivityAnchors {
+    /// Insert immediately before the assistant line for the turn.
+    before_assistant: HashMap<StoredTurnId, usize>,
+    /// Insert immediately after the user prompt when no assistant line exists yet.
+    after_user: HashMap<StoredTurnId, usize>,
 }
 
 /// Last emitted agent lifecycle `to_state` and running-phase label (FR-768).
@@ -1219,6 +1230,11 @@ pub struct App {
     /// Internal judge (and similar) turn ids whose adapter output must be dropped.
     retired_internal_turns: HashSet<String>,
     active_turns: HashMap<Agent, ActiveTurn>,
+    /// Activity rows for turns started in this process (FR-1669); keyed by turn id so
+    /// multi-turn transcripts keep each turn's rows between its user prompt and reply.
+    retained_offscreen_activity: HashMap<StoredConversationId, HashMap<StoredTurnId, Vec<Message>>>,
+    /// Turn ids in conversation order (updated on restore and turn start).
+    conversation_turn_ids: HashMap<StoredConversationId, Vec<StoredTurnId>>,
     pending_summary: Option<PendingSummary>,
     pending_triage: Option<PendingTriage>,
     pending_plan: Option<PendingPlan>,
@@ -1488,6 +1504,8 @@ impl App {
             next_internal_turn_id: 1,
             retired_internal_turns: HashSet::new(),
             active_turns: HashMap::new(),
+            retained_offscreen_activity: HashMap::new(),
+            conversation_turn_ids: HashMap::new(),
             pending_summary: None,
             pending_triage: None,
             pending_plan: None,
@@ -3259,9 +3277,6 @@ impl App {
                 self.on_agent_lifecycle_event(output.agent, &output.event);
 
                 let Some(event) = stored_event(&output.event) else {
-                    // FR-1621: live-only rows (activity, tool progress, status) of
-                    // a turn running in another conversation are not stored, so
-                    // they must not leak into the displayed transcript.
                     let background = conversation_id.as_str() != self.conversation_id.as_str();
                     if background
                         && matches!(
@@ -3271,6 +3286,7 @@ impl App {
                                 | AgentEvent::Status(_)
                         )
                     {
+                        self.buffer_offscreen_live_event(output.agent, output.event);
                         return true;
                     }
                     self.apply_agent_event(output.agent, output.event);
@@ -4562,13 +4578,18 @@ impl App {
                 self.active_turns.insert(
                     agent,
                     ActiveTurn {
-                        conversation_id: stored_conversation_id,
+                        conversation_id: stored_conversation_id.clone(),
                         turn_id: stored_turn_id.clone(),
                         started_ms,
                         workspace_scan,
                         graph_node_id: self.active_graph_node_for_agent(agent),
+                        offscreen_activity: Vec::new(),
                     },
                 );
+                self.conversation_turn_ids
+                    .entry(stored_conversation_id.clone())
+                    .or_default()
+                    .push(stored_turn_id.clone());
                 self.busy_agents.insert(agent);
                 self.session_conversations = None;
                 let node = self.active_graph_node_for_agent(agent);
@@ -4806,6 +4827,8 @@ impl App {
     }
 
     fn restore_snapshot(&mut self, snapshot: ConversationSnapshot) {
+        let leaving = self.conversation_id.clone();
+        self.stash_visible_turn_activity_for_conversation(&leaving);
         let restored_runner = snapshot.turns.last().map(|turn| agent_from_key(turn.agent));
         self.conversation_id = snapshot.id;
         self.conversation_title = snapshot.title;
@@ -4837,19 +4860,41 @@ impl App {
         self.streaming_messages.clear();
         self.last_group_expanded = false;
         self.all_details_expanded = false;
+        self.conversation_turn_ids.insert(
+            self.conversation_id.clone(),
+            snapshot
+                .turns
+                .iter()
+                .map(|turn| StoredTurnId::new(turn.id.as_str()))
+                .collect(),
+        );
+        let mut offscreen_anchors = OffscreenActivityAnchors::default();
         for turn in &snapshot.turns {
+            let stored_turn_id = StoredTurnId::new(turn.id.as_str());
             for message in snapshot
                 .messages
                 .iter()
                 .filter(|message| message.turn_id == turn.id)
             {
-                let index = self.messages.len();
-                self.messages.push(message_from_transcript(message));
-                if message.role == MessageRole::Assistant
-                    && message.state == MessageState::Streaming
-                {
-                    self.streaming_messages
-                        .insert(agent_from_key(message.agent), index);
+                match message.role {
+                    MessageRole::User => {
+                        let index = self.messages.len();
+                        self.messages.push(message_from_transcript(message));
+                        offscreen_anchors
+                            .after_user
+                            .insert(stored_turn_id.clone(), index);
+                    }
+                    MessageRole::Assistant => {
+                        let index = self.messages.len();
+                        offscreen_anchors
+                            .before_assistant
+                            .insert(stored_turn_id.clone(), index);
+                        self.messages.push(message_from_transcript(message));
+                        if message.state == MessageState::Streaming {
+                            self.streaming_messages
+                                .insert(agent_from_key(message.agent), index);
+                        }
+                    }
                 }
             }
             if let Some(notice) = terminal_snapshot_notice(turn) {
@@ -4863,6 +4908,8 @@ impl App {
                 restored_welcome_message(&runners),
             ));
         }
+        let opened_conversation = self.conversation_id.clone();
+        self.inject_offscreen_activity_for_conversation(&opened_conversation, &offscreen_anchors);
         if let Some(agent) = restored_runner {
             self.restore_conversation_runner(agent);
         }
@@ -9736,9 +9783,13 @@ impl App {
     }
 
     fn apply_activity(&mut self, _agent: Agent, item: dmuxai::activity::ActivityItem) {
+        Self::merge_activity_item(&mut self.messages, item);
+    }
+
+    fn merge_activity_item(messages: &mut Vec<Message>, item: dmuxai::activity::ActivityItem) {
         match item {
             dmuxai::activity::ActivityItem::Tool { ref name, .. } => {
-                let found = self.messages.iter_mut().rev().find_map(|msg| {
+                let found = messages.iter_mut().rev().find_map(|msg| {
                     if let Role::Activity(dmuxai::activity::ActivityItem::Tool {
                         name: existing_name,
                         status: dmuxai::activity::ToolStatus::Running,
@@ -9754,7 +9805,7 @@ impl App {
                 if let Some(msg) = found {
                     msg.role = Role::Activity(item);
                 } else {
-                    self.messages.push(Message::new(Role::Activity(item), ""));
+                    messages.push(Message::new(Role::Activity(item), ""));
                 }
             }
             dmuxai::activity::ActivityItem::Thinking {
@@ -9762,7 +9813,7 @@ impl App {
                 started_ms: incoming_started,
                 finished_ms: incoming_finished,
             } => {
-                let found = self.messages.iter_mut().rev().find_map(|msg| {
+                let found = messages.iter_mut().rev().find_map(|msg| {
                     if let Role::Activity(dmuxai::activity::ActivityItem::Thinking {
                         text: existing_text,
                         started_ms: existing_started,
@@ -9785,7 +9836,7 @@ impl App {
                 });
 
                 if found.is_none() {
-                    self.messages.push(Message::new(
+                    messages.push(Message::new(
                         Role::Activity(dmuxai::activity::ActivityItem::Thinking {
                             text: incoming_text,
                             started_ms: incoming_started,
@@ -9793,6 +9844,165 @@ impl App {
                         }),
                         "",
                     ));
+                }
+            }
+        }
+    }
+
+    fn buffer_offscreen_live_event(&mut self, agent: Agent, event: AgentEvent) {
+        let Some(turn) = self.active_turns.get_mut(&agent) else {
+            return;
+        };
+        match event {
+            AgentEvent::Activity(item) => {
+                Self::merge_activity_item(&mut turn.offscreen_activity, item);
+            }
+            AgentEvent::ToolProgress {
+                item_id: _,
+                summary,
+                state,
+            } => {
+                let message = format!("{agent} tool [{state}]: {summary}");
+                if let Some(existing) = turn.offscreen_activity.iter_mut().rev().find(|msg| {
+                    matches!(msg.role, Role::System)
+                        && msg.content.starts_with(&format!("{agent} tool ["))
+                }) {
+                    existing.content = message;
+                } else {
+                    turn.offscreen_activity
+                        .push(Message::new(Role::System, message));
+                }
+            }
+            AgentEvent::Status(status) => {
+                turn.offscreen_activity
+                    .push(Message::new(Role::System, status));
+            }
+            _ => {}
+        }
+    }
+
+    fn merge_retained_offscreen_activity(
+        &mut self,
+        conversation_id: &StoredConversationId,
+        turn_id: StoredTurnId,
+        activity: Vec<Message>,
+    ) {
+        if activity.is_empty() {
+            return;
+        }
+        self.retained_offscreen_activity
+            .entry(conversation_id.clone())
+            .or_default()
+            .insert(turn_id, activity);
+    }
+
+    fn stash_visible_turn_activity_for_conversation(
+        &mut self,
+        conversation_id: &StoredConversationId,
+    ) {
+        let turn_ids = self
+            .conversation_turn_ids
+            .get(conversation_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut by_turn: HashMap<StoredTurnId, Vec<Message>> = HashMap::new();
+        let mut user_count = 0usize;
+        let mut current_turn_index = 0usize;
+        let mut index = 0;
+        while index < self.messages.len() {
+            match self.messages[index].role {
+                Role::User => {
+                    user_count += 1;
+                    current_turn_index = user_count - 1;
+                    index += 1;
+                }
+                Role::Activity(_) => {
+                    let message = self.messages.remove(index);
+                    if let Some(turn_id) = turn_ids.get(current_turn_index) {
+                        by_turn.entry(turn_id.clone()).or_default().push(message);
+                    }
+                }
+                _ => index += 1,
+            }
+        }
+        for turn in self.active_turns.values_mut() {
+            if turn.conversation_id.as_str() == conversation_id.as_str()
+                && !turn.offscreen_activity.is_empty()
+            {
+                by_turn
+                    .entry(turn.turn_id.clone())
+                    .or_default()
+                    .extend(turn.offscreen_activity.iter().cloned());
+                turn.offscreen_activity.clear();
+            }
+        }
+        if by_turn.is_empty() {
+            return;
+        }
+        let retained = self
+            .retained_offscreen_activity
+            .entry(conversation_id.clone())
+            .or_default();
+        for (turn_id, activity) in by_turn {
+            retained.insert(turn_id, activity);
+        }
+    }
+
+    fn inject_offscreen_activity_for_conversation(
+        &mut self,
+        conversation_id: &StoredConversationId,
+        anchors: &OffscreenActivityAnchors,
+    ) {
+        let mut by_turn = self
+            .retained_offscreen_activity
+            .get(conversation_id)
+            .cloned()
+            .unwrap_or_default();
+        for turn in self.active_turns.values() {
+            if turn.conversation_id.as_str() == conversation_id.as_str()
+                && !turn.offscreen_activity.is_empty()
+            {
+                by_turn
+                    .entry(turn.turn_id.clone())
+                    .or_default()
+                    .extend(turn.offscreen_activity.iter().cloned());
+            }
+        }
+        if by_turn.is_empty() {
+            return;
+        }
+        let mut entries: Vec<(StoredTurnId, Vec<Message>)> = by_turn.into_iter().collect();
+        entries.sort_by_key(|(turn_id, _)| {
+            if let Some(index) = anchors.before_assistant.get(turn_id) {
+                *index
+            } else if let Some(index) = anchors.after_user.get(turn_id) {
+                index + 1
+            } else {
+                usize::MAX
+            }
+        });
+        for (turn_id, activity) in entries.into_iter().rev() {
+            let insert_at = if let Some(index) = anchors.before_assistant.get(&turn_id) {
+                *index
+            } else if let Some(index) = anchors.after_user.get(&turn_id) {
+                index + 1
+            } else {
+                self.messages.len()
+            };
+            for (offset, message) in activity.into_iter().enumerate() {
+                self.messages.insert(insert_at + offset, message);
+            }
+        }
+        for (agent, turn) in self.active_turns.iter_mut() {
+            if turn.conversation_id.as_str() == conversation_id.as_str() {
+                turn.offscreen_activity.clear();
+                if !self.turn_user_message.contains_key(agent)
+                    && let Some(user_idx) = self
+                        .messages
+                        .iter()
+                        .rposition(|message| matches!(message.role, Role::User))
+                {
+                    self.turn_user_message.insert(*agent, user_idx);
                 }
             }
         }
@@ -9884,6 +10094,16 @@ impl App {
             .last_agent_output_index(agent)
             .map(|index| format!("{}:{index}", self.conversation_id.as_str()));
         let active_turn = self.active_turns.remove(&agent);
+        if let Some(active) = active_turn.as_ref()
+            && active.conversation_id.as_str() != self.conversation_id.as_str()
+            && !active.offscreen_activity.is_empty()
+        {
+            self.merge_retained_offscreen_activity(
+                &active.conversation_id,
+                active.turn_id.clone(),
+                active.offscreen_activity.clone(),
+            );
+        }
         let finished_conversation = active_turn
             .as_ref()
             .map(|active| active.conversation_id.clone());
@@ -20521,6 +20741,7 @@ mod tests {
                 started_ms: 0,
                 workspace_scan: Arc::new(Mutex::new(None)),
                 graph_node_id: None,
+                offscreen_activity: Vec::new(),
             },
         );
 
@@ -21964,6 +22185,7 @@ mod tests {
                 started_ms: 0,
                 workspace_scan: Arc::new(Mutex::new(None)),
                 graph_node_id: None,
+                offscreen_activity: Vec::new(),
             },
         );
         app.busy_agents.insert(Agent::Cursor);
@@ -22010,6 +22232,7 @@ mod tests {
                 started_ms: 0,
                 workspace_scan: Arc::new(Mutex::new(None)),
                 graph_node_id: None,
+                offscreen_activity: Vec::new(),
             },
         );
         app.activities.insert(
@@ -28498,6 +28721,280 @@ mod tests {
                 .iter()
                 .any(|message| message.content.contains("LEAKCHECK"))
         );
+    }
+
+    fn transcript_has_activity_line(app: &App, needle: &str) -> bool {
+        app.messages.iter().any(|message| {
+            matches!(&message.role, Role::Activity(item)
+                if dmuxai::activity::collapsed_line(item).contains(needle))
+        })
+    }
+
+    // TC-1669 / FR-1669: switching back mid-turn restores background activity rows.
+    #[test]
+    fn tc_1669_switch_back_mid_turn_shows_background_activity() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "background work");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "execute".to_owned(),
+                target: "sleep 12".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        )));
+        assert!(!transcript_has_activity_line(&h.app, "sleep 12"));
+        h.app.select_conversation(a);
+        assert!(transcript_has_activity_line(&h.app, "sleep 12"));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::TextDelta("still running".to_owned())
+        )));
+        assert!(
+            h.app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("still running"))
+        );
+    }
+
+    // TC-1670 / FR-1669: activity from a turn that finished in the background.
+    #[test]
+    fn tc_1670_finished_background_turn_shows_activity() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "background work");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "execute".to_owned(),
+                target: "echo DONE".to_owned(),
+                status: dmuxai::activity::ToolStatus::Ok,
+                duration_ms: Some(100),
+                detail: String::new(),
+            }),
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::TextDelta("final reply".to_owned())
+        )));
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request, AgentEvent::Completed))
+        );
+        h.app.select_conversation(a);
+        assert!(transcript_has_activity_line(&h.app, "echo DONE"));
+        assert!(
+            h.app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("final reply"))
+        );
+    }
+
+    // TC-1671 / FR-1669: retained activity survives repeated conversation switches.
+    #[test]
+    fn tc_1671_repeated_switch_back_keeps_background_activity() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "background work");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        let b = h.app.conversation_id.clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "execute".to_owned(),
+                target: "echo TWICE".to_owned(),
+                status: dmuxai::activity::ToolStatus::Ok,
+                duration_ms: Some(50),
+                detail: String::new(),
+            }),
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::TextDelta("final reply".to_owned())
+        )));
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request, AgentEvent::Completed))
+        );
+        h.app.select_conversation(a.clone());
+        assert!(transcript_has_activity_line(&h.app, "echo TWICE"));
+        h.app.select_conversation(b);
+        h.app.select_conversation(a);
+        assert!(transcript_has_activity_line(&h.app, "echo TWICE"));
+        assert_eq!(
+            h.app
+                .messages
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        &message.role,
+                        Role::Activity(item)
+                            if dmuxai::activity::collapsed_line(item).contains("echo TWICE")
+                    )
+                })
+                .count(),
+            1
+        );
+        assert!(
+            h.app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("final reply"))
+        );
+    }
+
+    fn activity_line_index(app: &App, needle: &str) -> usize {
+        app.messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    &message.role,
+                    Role::Activity(item) if dmuxai::activity::collapsed_line(item).contains(needle)
+                )
+            })
+            .expect("activity line")
+    }
+
+    fn assert_activity_between_user_and_reply(
+        app: &App,
+        user_needle: &str,
+        activity_needle: &str,
+        reply_needle: &str,
+    ) {
+        let user_idx = app
+            .messages
+            .iter()
+            .position(|message| {
+                matches!(message.role, Role::User) && message.content.contains(user_needle)
+            })
+            .expect("user prompt");
+        let activity_idx = activity_line_index(app, activity_needle);
+        let reply_idx = app
+            .messages
+            .iter()
+            .position(|message| {
+                matches!(message.role, Role::Agent(_)) && message.content.contains(reply_needle)
+            })
+            .expect("assistant reply");
+        assert!(
+            user_idx < activity_idx && activity_idx < reply_idx,
+            "user={user_idx} activity={activity_idx} reply={reply_idx}"
+        );
+    }
+
+    // TC-1672 / FR-1669: multi-turn conversations keep per-turn activity placement.
+    #[test]
+    fn tc_1672_multi_turn_offscreen_activity_stays_per_turn() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "turn one prompt");
+        let (agent, request1) = h.sent.lock().unwrap()[0].clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request1,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "execute".to_owned(),
+                target: "cargo test".to_owned(),
+                status: dmuxai::activity::ToolStatus::Ok,
+                duration_ms: Some(10),
+                detail: String::new(),
+            }),
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request1,
+            AgentEvent::TextDelta("reply one".to_owned())
+        )));
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request1, AgentEvent::Completed))
+        );
+
+        submit_direct_agent(&mut h.app, "codex", "turn two prompt");
+        let request2 = h.sent.lock().unwrap()[1].clone().1;
+        h.app.create_conversation(Some("foreground".to_owned()));
+        let b = h.app.conversation_id.clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request2,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "execute".to_owned(),
+                target: "git diff".to_owned(),
+                status: dmuxai::activity::ToolStatus::Ok,
+                duration_ms: Some(20),
+                detail: String::new(),
+            }),
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request2,
+            AgentEvent::TextDelta("reply two".to_owned())
+        )));
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request2, AgentEvent::Completed))
+        );
+
+        for _ in 0..2 {
+            h.app.select_conversation(a.clone());
+            assert_activity_between_user_and_reply(
+                &h.app,
+                "turn one prompt",
+                "cargo test",
+                "reply one",
+            );
+            assert_activity_between_user_and_reply(
+                &h.app,
+                "turn two prompt",
+                "git diff",
+                "reply two",
+            );
+            assert_eq!(
+                h.app
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        matches!(
+                            &message.role,
+                            Role::Activity(item)
+                                if dmuxai::activity::collapsed_line(item).contains("cargo test")
+                        )
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                h.app
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        matches!(
+                            &message.role,
+                            Role::Activity(item)
+                                if dmuxai::activity::collapsed_line(item).contains("git diff")
+                        )
+                    })
+                    .count(),
+                1
+            );
+            h.app.select_conversation(b.clone());
+        }
     }
 
     // TC-1623 / FR-1623: same agent cannot run in two conversations at once.
