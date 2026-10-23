@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -20,15 +22,10 @@ REQUIREMENT_ROW = re.compile(
 TEST_ROW = re.compile(r"(?m)^\|\s*(TC-\d+)\s*\|")
 
 
-def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: check-spec.py <path-to-spec.md>", file=sys.stderr)
-        return 2
-
-    spec_path = Path(sys.argv[1])
+def check_file(path) -> list[str]:
+    spec_path = Path(path)
     if not spec_path.is_file():
-        print(f"SPEC CHECK: missing file {spec_path}", file=sys.stderr)
-        return 1
+        return [f"missing file {spec_path}"]
 
     content = spec_path.read_text(encoding="utf-8")
     problems: list[str] = []
@@ -65,12 +62,119 @@ def main() -> int:
             if priority == "Must" and req_id not in scenarios:
                 problems.append(f"Must requirement {req_id} has no acceptance-scenario mapping.")
 
+    return problems
+
+
+def parse_allowlist(path: Path) -> list[str]:
+    entries: list[str] = []
+    if not path.is_file():
+        return entries
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if " # " in line:
+            name = line.split(" # ", 1)[0].strip()
+        else:
+            name = line
+        if name:
+            entries.append(name)
+    return entries
+
+
+def run_all(specs_dir: Path, allowlist_path: Path, as_json: bool) -> int:
+    spec_files = sorted(
+        p for p in specs_dir.glob("SPEC-*.md") if p.is_file()
+    )
+    allow_entries = parse_allowlist(allowlist_path)
+    allow_set = set(allow_entries)
+
+    unknown_entries = sorted(
+        name for name in allow_set if not (specs_dir / name).is_file()
+    )
+
+    results: dict[str, tuple[bool, list[str]]] = {}
+    for spec in spec_files:
+        problems = check_file(spec)
+        results[spec.name] = (len(problems) == 0, problems)
+
+    stale: list[str] = []
+    for name in sorted(allow_set):
+        if name in results and results[name][0]:
+            stale.append(name)
+
+    non_allowlisted_failures = {
+        name: problems
+        for name, (passed, problems) in results.items()
+        if name not in allow_set and not passed
+    }
+
+    n = len(spec_files)
+    p = sum(1 for passed, _ in results.values() if passed)
+    f = len(non_allowlisted_failures)
+    a = sum(1 for name in results if name in allow_set)
+    s = len(stale)
+
+    exit_ok = (
+        not unknown_entries
+        and not non_allowlisted_failures
+        and not stale
+    )
+
+    if as_json:
+        payload = {
+            "specs": n,
+            "pass": p,
+            "fail": f,
+            "allowlisted": a,
+            "stale": s,
+            "failing": sorted(non_allowlisted_failures),
+            "stale_entries": stale,
+            "unknown_entries": unknown_entries,
+        }
+        print(json.dumps(payload))
+        return 0 if exit_ok else 1
+
+    for name in unknown_entries:
+        print(f"SPEC CHECK: unknown allowlist entry: {name}")
+
+    for name in sorted(results):
+        passed, problems = results[name]
+        if name in allow_set:
+            if passed:
+                print(f"STALE allowlist entry: remove {name}")
+            continue
+        if not passed:
+            print(f"SPEC CHECK: {name}: {'; '.join(problems)}")
+
+    print(f"SPEC CHECK --all: {n} specs, {p} pass, {f} fail, {a} allowlisted, {s} stale")
+    return 0 if exit_ok else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        usage="check-spec.py <path-to-spec.md> | check-spec.py --all [--specs-dir DIR] [--allowlist FILE] [--json]"
+    )
+    parser.add_argument("path", nargs="?")
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--specs-dir", default="docs/specs")
+    parser.add_argument("--allowlist", default="scripts/spec-check-allowlist.txt")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    if args.all:
+        return run_all(Path(args.specs_dir), Path(args.allowlist), args.json)
+
+    if args.path is None:
+        print("usage: check-spec.py <path-to-spec.md>", file=sys.stderr)
+        return 2
+
+    problems = check_file(args.path)
     if problems:
         for problem in problems:
             print(f"SPEC CHECK: {problem}", file=sys.stderr)
         return 1
-
-    print(f"SPEC CHECK: PASS ({spec_path})")
+    print(f"SPEC CHECK: PASS ({args.path})")
     return 0
 
 

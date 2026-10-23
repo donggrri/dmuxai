@@ -1,0 +1,28 @@
+# Spec check allowlist. This list must only shrink.
+# A docs PR (branch docs/spec-behavior-gaps) is fixing these specs.
+SPEC-agent-graph-orchestration.md
+SPEC-agent-modes-copy.md
+SPEC-agent-test-helpers.md
+SPEC-agy-bare-model.md
+SPEC-agy-idle-timeout.md
+SPEC-centered-prompt.md
+SPEC-chat-followup-queue.md
+SPEC-cursor-latency.md
+SPEC-cursor-stream-dedupe.md
+SPEC-dashboard-parity.md
+SPEC-docs-tree.md
+SPEC-first-run.md
+SPEC-graph-allowed-runners.md
+SPEC-graph-plan-header.md
+SPEC-graph-swimlane.md
+SPEC-graph-view.md
+SPEC-image-attachment.md
+SPEC-remove-modes-chat-markdown.md
+SPEC-running-indicators.md
+SPEC-session-sidebar.md
+SPEC-sidebar-resize.md
+SPEC-spec-index.md
+SPEC-stage-skills.md
+SPEC-state-per-repo.md
+SPEC-todo-sidebar.md
+SPEC-workspace-dir.md

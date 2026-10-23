@@ -588,3 +588,8 @@ WSL 클립보드 이미지(구 W-03 항목)는 L-03 절차로 대체 검증한�
 4. §3 수동 체크리스트 L-01~L-12가 Linux에서 Pass(최근 main 기준, 결과를 `docs/dogfood/` 또는 PR에 기록).
 5. 모델 정책: `tests/model_policy_repo.rs` 통과, 그래프 기본값 composer-2.5 유지.
 6. dogfood 열린 항목 중 #1(헤드리스/--help)은 해결, #4/#5는 해결 또는 명시적 보류 결정.
+
+
+## Spec gate
+
+`python3 scripts/check-spec.py --all` is the gate; `scripts/spec-check-allowlist.txt` must only shrink.
