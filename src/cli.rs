@@ -506,6 +506,7 @@ fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Val
         "text": outcome.text,
         "messages": outcome.messages,
         "error": outcome.error,
+        "error_kind": outcome.error_kind,
         "todo": outcome.todo,
         "triage": outcome.triage,
         "plan": outcome.plan,
@@ -874,5 +875,45 @@ mod tests {
         );
         assert!(parse(&args(&["init", "--global"])).is_err());
         assert!(parse(&args(&["init", "extra"])).is_err());
+    }
+
+    // TC-1695 / FR-1682: headless JSON includes error_kind next to error.
+    #[test]
+    fn tc_1695_outcome_json_includes_error_kind() {
+        let outcome = HeadlessOutcome {
+            ok: false,
+            exit_code: 1,
+            conversation_id: "c".to_owned(),
+            agent: Some("codex".to_owned()),
+            graph_id: None,
+            text: String::new(),
+            messages: Vec::new(),
+            error: Some("boom".to_owned()),
+            error_kind: Some("provider".to_owned()),
+            todo: None,
+            triage: None,
+            plan: None,
+        };
+        let json = outcome_json(&outcome, 1, 2);
+        assert_eq!(json["error"], "boom");
+        assert_eq!(json["error_kind"], "provider");
+
+        let outcome = HeadlessOutcome {
+            ok: true,
+            exit_code: 0,
+            conversation_id: "c".to_owned(),
+            agent: Some("codex".to_owned()),
+            graph_id: None,
+            text: String::new(),
+            messages: Vec::new(),
+            error: None,
+            error_kind: None,
+            todo: None,
+            triage: None,
+            plan: None,
+        };
+        let json = outcome_json(&outcome, 0, 0);
+        assert!(json["error"].is_null());
+        assert!(json["error_kind"].is_null());
     }
 }

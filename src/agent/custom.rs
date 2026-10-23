@@ -9,7 +9,7 @@ use std::{
 use dmuxai::custom_agent::{
     BUILTIN_MODELS_TIMEOUT, CustomAgentOutput, CustomAgentSpec, SubstitutionContext, build_argv,
     failure_reason, grok_no_allowed_model_message, is_builtin_grok, list_model_ids,
-    parse_jsonl_line, policy_message, select_grok_model, spec_at, substitute, timeout_message,
+    parse_jsonl_line, policy_message, select_grok_model, spec_at, substitute, timeout_parts,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -18,8 +18,8 @@ use tokio::{
 };
 
 use super::{
-    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ModelInfo,
-    OutputContext, SpawnedAdapter, TurnPolicy,
+    AdapterError, Agent, AgentAdapter, AgentError, AgentErrorKind, AgentEvent, AgentOutput,
+    AgentRequest, ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy,
 };
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
@@ -141,10 +141,10 @@ async fn runtime_loop_with_spec(
                     &event_tx,
                     agent,
                     Some(&context),
-                    AgentEvent::Error(format!(
+                    AgentEvent::Error(AgentError::provider(format!(
                         "{} is already running a turn; cancel it before sending another prompt",
                         spec.label()
-                    )),
+                    ))),
                 )
                 .await;
             }
@@ -156,7 +156,13 @@ async fn runtime_loop_with_spec(
                 };
                 if let Err(error) = ensured {
                     let context = OutputContext::from(&request);
-                    send(&event_tx, agent, Some(&context), AgentEvent::Error(error)).await;
+                    send(
+                        &event_tx,
+                        agent,
+                        Some(&context),
+                        AgentEvent::Error(AgentError::model_unavailable(error)),
+                    )
+                    .await;
                     continue;
                 }
                 let policy = request.policy;
@@ -189,7 +195,7 @@ async fn runtime_loop_with_spec(
                             selected_effort: None,
                         }
                     }
-                    Err(error) => AgentEvent::Error(error),
+                    Err(error) => AgentEvent::Error(AgentError::model_unavailable(error)),
                 };
                 send(&event_tx, agent, None, event).await;
             }
@@ -200,7 +206,13 @@ async fn runtime_loop_with_spec(
                     dmuxai::custom_agent::validate_custom_model(spec, &model)
                 };
                 if let Err(error) = validated {
-                    send(&event_tx, agent, None, AgentEvent::Error(error)).await;
+                    send(
+                        &event_tx,
+                        agent,
+                        None,
+                        AgentEvent::Error(AgentError::model_unavailable(error)),
+                    )
+                    .await;
                     continue;
                 }
                 selected_model = Some(model.clone());
@@ -272,9 +284,6 @@ fn mode_names(policy: TurnPolicy) -> (&'static str, &'static str) {
     }
 }
 
-/// Sentinel from `run_turn` meaning the ACP turn ended cancelled (FR-1416).
-const ACP_TURN_CANCELLED: &str = "\u{0}acp-turn-cancelled";
-
 #[allow(clippy::too_many_arguments)]
 fn spawn_turn(
     agent: Agent,
@@ -315,7 +324,7 @@ fn spawn_turn(
         .await
         {
             Ok(()) => AgentEvent::Completed,
-            Err(error) if error == ACP_TURN_CANCELLED => AgentEvent::Cancelled,
+            Err(error) if error.kind == AgentErrorKind::Cancelled => AgentEvent::Cancelled,
             Err(error) => AgentEvent::Error(error),
         };
         send(&event_tx, agent, Some(&turn_context), event).await;
@@ -367,18 +376,19 @@ async fn run_turn(
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     mcp_notice_shown: &AtomicBool,
     acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-) -> Result<(), String> {
+) -> Result<(), AgentError> {
     let settings = dmuxai::settings::DmuxSettings::load(cwd);
     if is_builtin_grok(spec)
         && settings.grok_protocol == dmuxai::runner_protocol::RunnerProtocol::Acp
     {
-        let model_id = super::acp_runner::acp_model_arg("grok", model.as_deref())?
-            .ok_or_else(grok_no_allowed_model_message)?;
+        let model_id = super::acp_runner::acp_model_arg("grok", model.as_deref())
+            .map_err(AgentError::model_unavailable)?
+            .ok_or_else(|| AgentError::model_unavailable(grok_no_allowed_model_message()))?;
         let model_id = model_id.as_str();
         let program = spec
             .command
             .first()
-            .ok_or_else(|| format!("{}: empty command", spec.label()))?;
+            .ok_or_else(|| AgentError::process_exit(format!("{}: empty command", spec.label())))?;
         let effort = spec
             .env
             .get("GROK_REASONING_EFFORT")
@@ -410,7 +420,8 @@ async fn run_turn(
             None,
             dmuxai::mcp::propagate::acp_mcp_servers(mcp_servers, "grok"),
         )
-        .await?;
+        .await
+        .map_err(AgentError::provider)?;
         if outcome.cancelled && !user_cancel.load(std::sync::atomic::Ordering::SeqCst) {
             send(
                 event_tx,
@@ -421,7 +432,7 @@ async fn run_turn(
             .await;
         }
         if outcome.cancelled {
-            return Err(ACP_TURN_CANCELLED.to_owned());
+            return Err(AgentError::cancelled("ACP turn cancelled"));
         }
         return Ok(());
     }
@@ -464,7 +475,7 @@ async fn run_turn(
                 .await;
             }
         }
-        write_private_temp_file(&path, &body, "temp config")?;
+        write_private_temp_file(&path, &body, "temp config").map_err(AgentError::process_exit)?;
         ctx.temp_config = Some(path.display().to_string());
         temp.0 = Some(path);
     }
@@ -477,7 +488,7 @@ async fn run_turn(
             uuid::Uuid::new_v4()
         ));
         let body = dmuxai::mcp::propagate::custom_mcp_json(mcp_servers);
-        write_private_temp_file(&path, &body, "mcp config")?;
+        write_private_temp_file(&path, &body, "mcp config").map_err(AgentError::process_exit)?;
         ctx.mcp_config = Some(path.display().to_string());
         mcp_temp.0 = Some(path);
     }
@@ -485,12 +496,16 @@ async fn run_turn(
     let argv = build_argv(spec, &ctx);
     let program = argv
         .first()
-        .ok_or_else(|| format!("{}: empty command", spec.label()))?;
-    let mut command = dmuxai::custom_agent::build_custom_command(spec, &ctx, cwd)?;
+        .ok_or_else(|| AgentError::process_exit(format!("{}: empty command", spec.label())))?;
+    let mut command = dmuxai::custom_agent::build_custom_command(spec, &ctx, cwd)
+        .map_err(AgentError::process_exit)?;
 
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("{}: failed to start {program}: {error}", spec.label()))?;
+    let mut child = command.spawn().map_err(|error| {
+        AgentError::process_exit(format!(
+            "{}: failed to start {program}: {error}",
+            spec.label()
+        ))
+    })?;
     if let Some(id) = child.id() {
         pgid.store(id, std::sync::atomic::Ordering::SeqCst);
     }
@@ -502,11 +517,17 @@ async fn run_turn(
         stdin
             .write_all(prompt.as_bytes())
             .await
-            .map_err(|error| format!("stdin: {error}"))?;
+            .map_err(|error| AgentError::process_exit(format!("stdin: {error}")))?;
         drop(stdin);
     }
-    let stdout = child.stdout.take().ok_or("stdout not piped")?;
-    let mut stderr = child.stderr.take().ok_or("stderr not piped")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AgentError::process_exit("stdout not piped"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AgentError::process_exit("stderr not piped"))?;
     let stderr_task = tokio::spawn(async move {
         let mut buffer = Vec::new();
         let _ = (&mut stderr)
@@ -607,23 +628,41 @@ async fn run_turn(
         .await
         .map_err(|_| {
             kill_group(pgid.load(std::sync::atomic::Ordering::SeqCst));
-            timeout_message(spec)
-        })??;
+            let (msg, hint) = timeout_parts(spec);
+            AgentError::timeout(msg).with_hint(hint)
+        })?
+        .map_err(AgentError::process_exit)?;
     // A leftover child that inherited stderr must not block the turn either.
     let stderr_text = match tokio::time::timeout(STDERR_DRAIN_GRACE, stderr_task).await {
         Ok(joined) => joined.unwrap_or_default(),
         Err(_) => String::new(),
     };
-    match failure_reason(
-        spec,
-        done || status.success(),
-        &reply,
-        &stderr_text,
-        jsonl_error.as_deref(),
-    ) {
-        Some(reason) => Err(format!("{} failed: {reason}", spec.label())),
-        None => Ok(()),
+    let exit_ok = done || status.success();
+    if let Some(reason) =
+        failure_reason(spec, exit_ok, &reply, &stderr_text, jsonl_error.as_deref())
+    {
+        let message = format!("{} failed: {reason}", spec.label());
+        let err = if jsonl_error
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+        {
+            AgentError::provider(message)
+        } else if spec
+            .failure_stderr
+            .as_deref()
+            .and_then(|p| regex::Regex::new(p).ok())
+            .is_some_and(|re| re.is_match(&stderr_text))
+        {
+            AgentError::policy(message)
+        } else if !exit_ok {
+            AgentError::process_exit(message)
+        } else {
+            AgentError::provider(message)
+        };
+        return Err(err);
     }
+    Ok(())
 }
 
 /// How long the process may take to exit on its own after its `done_when` line.
@@ -732,7 +771,7 @@ mod tests {
         Box::leak(Box::new(toml::from_str(&toml).unwrap()))
     }
 
-    async fn run(spec: &CustomAgentSpec, model: Option<&str>) -> (Result<(), String>, String) {
+    async fn run(spec: &CustomAgentSpec, model: Option<&str>) -> (Result<(), AgentError>, String) {
         run_with_mcp(spec, model, &[]).await
     }
 
@@ -740,7 +779,7 @@ mod tests {
         spec: &CustomAgentSpec,
         model: Option<&str>,
         mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
-    ) -> (Result<(), String>, String) {
+    ) -> (Result<(), AgentError>, String) {
         let (tx, mut rx) = mpsc::channel(64);
         let request = AgentRequest {
             conversation_id: ConversationId::new("c"),
@@ -861,14 +900,24 @@ mod tests {
         assert_eq!(text.trim(), "stdin:hi --model x");
     }
 
+    // TC-1689 / FR-1679: runner conditions map to kinds.
     #[tokio::test]
     async fn failures_are_detected() {
         let (empty, _) = run(spec("empty", ""), None).await;
-        assert!(empty.unwrap_err().contains("empty reply"));
+        let empty_err = empty.unwrap_err();
+        assert!(empty_err.to_string().contains("empty reply"));
+        assert_eq!(empty_err.kind, AgentErrorKind::Provider);
+
         let (denied, _) = run(spec("denied", ""), None).await;
-        assert!(denied.unwrap_err().contains("permission denied"));
+        let denied_err = denied.unwrap_err();
+        assert!(denied_err.to_string().contains("permission denied"));
+        assert_eq!(denied_err.kind, AgentErrorKind::Policy);
+
         let (fail, _) = run(spec("fail", ""), None).await;
-        assert!(fail.unwrap_err().contains("boom"));
+        let fail_err = fail.unwrap_err();
+        assert!(fail_err.to_string().contains("boom"));
+        assert_eq!(fail_err.kind, AgentErrorKind::ProcessExit);
+
         let (error, _) = run(
             spec(
                 "error",
@@ -877,7 +926,9 @@ mod tests {
             None,
         )
         .await;
-        assert!(error.unwrap_err().contains("model not found"));
+        let error_err = error.unwrap_err();
+        assert!(error_err.to_string().contains("model not found"));
+        assert_eq!(error_err.kind, AgentErrorKind::Provider);
     }
 
     #[tokio::test]
@@ -899,16 +950,19 @@ mod tests {
         assert!(!std::path::Path::new(path).exists());
     }
 
+    // TC-1690 / FR-1679: total timeout maps to Timeout.
     #[tokio::test]
     async fn timeout_kills_the_process_group() {
         let spec = spec("sleep", "timeout_secs = 1");
         let started = std::time::Instant::now();
         let (result, _) = run(spec, None).await;
         let err = result.unwrap_err();
-        assert!(err.contains("timed out"));
-        assert!(err.contains("timeout_secs"));
-        assert!(err.contains("name = \"fake\""));
-        assert!(err.contains("partial edits"));
+        assert_eq!(err.kind, AgentErrorKind::Timeout);
+        let err_str = err.to_string();
+        assert!(err_str.contains("timed out"));
+        assert!(err_str.contains("timeout_secs"));
+        assert!(err_str.contains("name = \"fake\""));
+        assert!(err_str.contains("partial edits"));
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
@@ -994,7 +1048,7 @@ env = { FAKE_CFG = "{temp_config}" }
         spec: &CustomAgentSpec,
         mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
         notice_shown: &AtomicBool,
-    ) -> (Result<(), String>, Vec<AgentEvent>) {
+    ) -> (Result<(), AgentError>, Vec<AgentEvent>) {
         let (tx, mut rx) = mpsc::channel(64);
         let request = AgentRequest {
             conversation_id: ConversationId::new("c"),
@@ -1261,7 +1315,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
                 .unwrap();
             let events = until_terminal(&mut rx).await;
             let error = events.iter().find_map(|event| match event {
-                AgentEvent::Error(error) => Some(error.as_str()),
+                AgentEvent::Error(error) => Some(error.message.clone()),
                 _ => None,
             });
             assert!(
@@ -1293,7 +1347,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
             tx.send(CustomCommand::ListModels).await.unwrap();
             let listed = until_terminal(&mut rx).await;
             let list_error = listed.iter().find_map(|event| match event {
-                AgentEvent::Error(error) => Some(error.clone()),
+                AgentEvent::Error(error) => Some(error.to_string()),
                 _ => None,
             });
             let list_error = list_error.expect("models error");
@@ -1304,7 +1358,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
                 .unwrap();
             let sent = until_terminal(&mut rx).await;
             let send_error = sent.iter().find_map(|event| match event {
-                AgentEvent::Error(error) => Some(error.clone()),
+                AgentEvent::Error(error) => Some(error.to_string()),
                 _ => None,
             });
             let send_error = send_error.expect("send error");
@@ -1324,7 +1378,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
         let error = events
             .iter()
             .find_map(|event| match event {
-                AgentEvent::Error(error) => Some(error.as_str()),
+                AgentEvent::Error(error) => Some(error.to_string()),
                 _ => None,
             })
             .expect("fast-only error");
@@ -1605,5 +1659,19 @@ temp_config_template = '{"mcp": "not-an-object"}'
         );
         drop(tx);
         worker.await.unwrap();
+    }
+
+    // TC-1692 / FR-1679: cancel maps to Cancelled without NUL sentinels.
+    #[tokio::test]
+    async fn acp_cancel_emits_cancelled_event_without_sentinel() {
+        // FR-1416: ACP cancel turns return AgentError with kind Cancelled,
+        // which maps directly to AgentEvent::Cancelled without sentinel strings.
+        let err = AgentError::cancelled("ACP turn cancelled");
+        let event = match Err::<(), AgentError>(err) {
+            Ok(()) => AgentEvent::Completed,
+            Err(error) if error.kind == AgentErrorKind::Cancelled => AgentEvent::Cancelled,
+            Err(error) => AgentEvent::Error(error),
+        };
+        assert_eq!(event, AgentEvent::Cancelled);
     }
 }

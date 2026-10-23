@@ -13,11 +13,30 @@ pub struct NodeAssignment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphStopReason {
+    Failed(String),
+    Cancelled(String),
+}
+
+impl GraphStopReason {
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled(_))
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Failed(msg) | Self::Cancelled(msg) => msg,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphAction {
     StartNode(NodeAssignment),
     PauseForGate(NodeAssignment),
     Completed,
     Failed(String),
+    Cancelled(String),
 }
 
 pub struct GraphRunSession {

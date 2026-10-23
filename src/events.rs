@@ -47,6 +47,8 @@ pub struct EventRecord {
     pub to_state: String,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
 }
 
 /// An event before it is assigned a `seq` and written.
@@ -61,6 +63,7 @@ pub struct EventDraft {
     pub from_state: Option<String>,
     pub to_state: String,
     pub message: Option<String>,
+    pub error_kind: Option<String>,
 }
 
 /// `<workspace_root>/.dmuxai/events.jsonl`.
@@ -327,6 +330,7 @@ impl EventLog {
                 from_state: draft.from_state,
                 to_state: draft.to_state,
                 message: draft.message,
+                error_kind: draft.error_kind,
             };
             let line = serde_json::to_string(&record).map_err(std::io::Error::other)?;
             writeln!(file, "{line}")?;
@@ -389,6 +393,7 @@ fn node_draft(
         from_state,
         to_state,
         message: None,
+        error_kind: None,
     }
 }
 
@@ -1164,6 +1169,7 @@ mod tests {
                 from_state: None,
                 to_state: "running".to_string(),
                 message: Some("a".repeat(64)),
+                error_kind: None,
             };
             writeln!(file, "{}", serde_json::to_string(&record).unwrap()).unwrap();
         }

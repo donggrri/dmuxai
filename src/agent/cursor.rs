@@ -16,8 +16,8 @@ use tokio::{
 };
 
 use super::{
-    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ModelInfo,
-    OutputContext, SpawnedAdapter, TurnPolicy, implement_outcome::ImplementTurnTracker,
+    AdapterError, Agent, AgentAdapter, AgentError, AgentEvent, AgentOutput, AgentRequest,
+    ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy, implement_outcome::ImplementTurnTracker,
     prompt_with_image_tokens,
 };
 use dmuxai::process::cursor_command;
@@ -507,7 +507,12 @@ async fn runtime_loop(
                         .await;
                     }
                     Err(error) => {
-                        send_event(&event_tx, None, AgentEvent::Error(error.to_string())).await;
+                        send_event(
+                            &event_tx,
+                            None,
+                            AgentEvent::Error(AgentError::model_unavailable(error.to_string())),
+                        )
+                        .await;
                     }
                 },
                 CursorCommand::SelectModel(model) => {
@@ -614,10 +619,9 @@ async fn runtime_loop(
                         send_event(
                             &event_tx,
                             Some(&context),
-                            AgentEvent::Error(
-                                "Cursor is already running a turn; cancel it before sending another prompt"
-                                    .to_owned(),
-                            ),
+                            AgentEvent::Error(AgentError::provider(
+                                "Cursor is already running a turn; cancel it before sending another prompt",
+                            )),
                         ).await;
                     }
                     Some(CursorCommand::ListModels) => {
@@ -707,7 +711,7 @@ fn spawn_turn(
                 send_event(
                     &event_tx,
                     Some(&error_context),
-                    AgentEvent::Error(error.to_string()),
+                    AgentEvent::Error(error.clone()),
                 )
                 .await;
                 Err(error)
@@ -726,7 +730,7 @@ fn spawn_turn(
 }
 
 struct ActiveTurn {
-    handle: JoinHandle<io::Result<Option<String>>>,
+    handle: JoinHandle<Result<Option<String>, AgentError>>,
     context: OutputContext,
     is_graph: bool,
     reset_epoch: u64,
@@ -787,7 +791,7 @@ pub(crate) async fn run_turn(
     protocol: RunnerProtocol,
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     cursor_notice_emitted: &std::sync::atomic::AtomicBool,
-) -> io::Result<Option<String>> {
+) -> Result<Option<String>, AgentError> {
     run_turn_with_child(
         request,
         None,
@@ -819,7 +823,7 @@ async fn run_turn_with_child(
     terminal_seen: &std::sync::atomic::AtomicBool,
     pgid: &std::sync::atomic::AtomicU32,
     acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-) -> io::Result<Option<String>> {
+) -> Result<Option<String>, AgentError> {
     let context = OutputContext::from(request);
     let _guard = if protocol != RunnerProtocol::Acp && !mcp_servers.is_empty() {
         match dmuxai::mcp::propagate::cursor_mcp_guard(cwd, mcp_servers) {
@@ -856,9 +860,15 @@ async fn run_turn_with_child(
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
-        let program = PathBuf::from(cursor_command()?.as_std().get_program().to_os_string());
+        let program = PathBuf::from(
+            cursor_command()
+                .map_err(|e| AgentError::process_exit(format!("could not start Cursor: {e}")))?
+                .as_std()
+                .get_program()
+                .to_os_string(),
+        );
         let args = acp_runner::cursor_acp_argv(selected_model.as_deref(), cwd)
-            .map_err(io::Error::other)?;
+            .map_err(|e| AgentError::provider(e.to_string()))?;
         let permission_ctx = PermissionContext {
             workspace: cwd.to_string_lossy().into_owned(),
             sensitive_gate_active: false,
@@ -886,13 +896,14 @@ async fn run_turn_with_child(
         )
         .await
         .map(|outcome| outcome.session_id)
-        .map_err(io::Error::other);
+        .map_err(|e| AgentError::provider(e.to_string()));
     }
 
     let mut child = match warm_child {
         Some(child) => child,
         None => {
-            let mut command = cursor_command()?;
+            let mut command = cursor_command()
+                .map_err(|e| AgentError::process_exit(format!("could not start Cursor: {e}")))?;
             configure_command(
                 &mut command,
                 request.resume_session.as_deref(),
@@ -910,7 +921,9 @@ async fn run_turn_with_child(
             // stopped together (cancel, or after the terminal result).
             #[cfg(unix)]
             command.process_group(0);
-            command.spawn()?
+            command
+                .spawn()
+                .map_err(|e| AgentError::process_exit(format!("could not start Cursor: {e}")))?
         }
     };
     if let Some(id) = child.id() {
@@ -920,22 +933,31 @@ async fn run_turn_with_child(
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| io::Error::other("Cursor stdin was not piped"))?;
+        .ok_or_else(|| AgentError::process_exit("Cursor stdin was not piped"))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| io::Error::other("Cursor stdout was not piped"))?;
+        .ok_or_else(|| AgentError::process_exit("Cursor stdout was not piped"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| io::Error::other("Cursor stderr was not piped"))?;
+        .ok_or_else(|| AgentError::process_exit("Cursor stderr was not piped"))?;
 
     let context = OutputContext::from(request);
     send_event(event_tx, Some(&context), AgentEvent::Started).await;
     let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
-    stdin.write_all(prompt.as_bytes()).await?;
-    stdin.write_all(b"\n").await?;
-    stdin.shutdown().await?;
+    stdin
+        .write_all(prompt.as_bytes())
+        .await
+        .map_err(|e| AgentError::provider(e.to_string()))?;
+    stdin
+        .write_all(b"\n")
+        .await
+        .map_err(|e| AgentError::provider(e.to_string()))?;
+    stdin
+        .shutdown()
+        .await
+        .map_err(|e| AgentError::provider(e.to_string()))?;
     drop(stdin);
 
     stream_child(
@@ -995,7 +1017,7 @@ async fn stream_child(
     context: &OutputContext,
     mode: TurnPolicy,
     terminal_seen: &std::sync::atomic::AtomicBool,
-) -> io::Result<Option<String>> {
+) -> Result<Option<String>, AgentError> {
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
     let mut stderr_history = VecDeque::with_capacity(STDERR_HISTORY_CAPACITY);
@@ -1017,11 +1039,11 @@ async fn stream_child(
             .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
         tokio::select! {
             line = stdout_lines.next_line(), if stdout_open => {
-                match line? {
+                match line.map_err(|e| AgentError::process_exit(e.to_string()))? {
                     Some(line) => {
                         implement_tracker.observe_provider_line(&line);
                         let message: Value = serde_json::from_str(&line).map_err(|error| {
-                            io::Error::other(format!("invalid Cursor NDJSON: {error}"))
+                            AgentError::provider(format!("invalid Cursor NDJSON: {error}"))
                         })?;
                         // Mark the turn terminal before its `Completed` reaches the
                         // app, so a follow-up prompt is queued, not refused.
@@ -1040,13 +1062,13 @@ async fn stream_child(
                 }
             }
             line = stderr_lines.next_line(), if stderr_open => {
-                match line? {
+                match line.map_err(|e| AgentError::process_exit(e.to_string()))? {
                     Some(line) => push_stderr(&mut stderr_history, line),
                     None => stderr_open = false,
                 }
             }
             status = child.wait(), if exit_status.is_none() => {
-                exit_status = Some(status?);
+                exit_status = Some(status.map_err(|e| AgentError::process_exit(e.to_string()))?);
             }
             _ = tokio::time::sleep_until(deadline), if exit_deadline.is_some() => {
                 // Still running (or a child holds its pipes) after the grace
@@ -1057,7 +1079,7 @@ async fn stream_child(
                 }
                 if exit_status.is_none() {
                     let _ = child.start_kill();
-                    exit_status = Some(child.wait().await?);
+                    exit_status = Some(child.wait().await.map_err(|e| AgentError::process_exit(e.to_string()))?);
                 }
                 forced_after_result = true;
                 break;
@@ -1076,21 +1098,25 @@ async fn stream_child(
 
     let status = exit_status.expect("child.wait runs before the loop can finish");
     let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
-    if let Err(reason) = implement_tracker.finish(
+    implement_tracker.finish(
         &status,
         &diagnostic,
         state.terminal,
         false,
         forced_after_result,
-    ) {
-        return Err(io::Error::other(reason));
-    }
+    )?;
     if !state.terminal {
-        return Err(io::Error::other(if diagnostic.is_empty() {
+        let msg = if diagnostic.is_empty() {
             format!("Cursor exited with {status} without a terminal result")
         } else {
             format!("Cursor exited with {status}: {diagnostic}")
-        }));
+        };
+        let err = if !status.success() {
+            AgentError::process_exit(msg)
+        } else {
+            AgentError::provider(msg)
+        };
+        return Err(err);
     }
     Ok(state.session_id)
 }
@@ -1103,12 +1129,53 @@ struct CursorStreamState {
     /// Text streamed as partials since the last segment aggregate or tool
     /// call (FR-800).
     segment_text: String,
+    /// Text streamed as partials in the segment immediately before the last
+    /// tool call (#142).
+    last_segment_text: String,
     /// Every text delta shown so far in this turn (FR-800).
     turn_text: String,
 }
 
 impl CursorStreamState {
+    fn collapse_excess_newlines<'a>(&self, text: &'a str) -> &'a str {
+        if self.turn_text.is_empty() || text.is_empty() {
+            return text;
+        }
+        let trailing = self
+            .turn_text
+            .chars()
+            .rev()
+            .take_while(|&c| c == '\n')
+            .count();
+        let leading = text.chars().take_while(|&c| c == '\n').count();
+        if trailing + leading > 2 {
+            if trailing >= 2 {
+                &text[leading..]
+            } else {
+                let keep = 2 - trailing;
+                let trim = leading - keep;
+                &text[trim..]
+            }
+        } else {
+            text
+        }
+    }
+
+    /// Whether `text` is a complete paragraph rather than a short partial
+    /// delta. Used by `repeats_segment` to avoid dropping real deltas:
+    /// a repeat is only recognised when the whole text equals a previous
+    /// segment and is a complete paragraph (long enough, or a multi-word
+    /// segment ending in a newline).
+    fn is_complete_paragraph(&self, text: &str) -> bool {
+        let trimmed = text.trim_end_matches(['\r', '\n']);
+        if trimmed.len() >= 20 {
+            return true;
+        }
+        trimmed.chars().any(char::is_whitespace) && text.ends_with('\n')
+    }
+
     fn emit(&mut self, events: &mut Vec<AgentEvent>, text: &str) {
+        let text = self.collapse_excess_newlines(text);
         if text.is_empty() {
             return;
         }
@@ -1131,6 +1198,11 @@ impl CursorStreamState {
             if !segment.is_empty() {
                 return text.strip_prefix(segment.as_str()).unwrap_or("");
             }
+            let turn_trimmed = self.turn_text.trim_end_matches(['\r', '\n']);
+            let text_trimmed = text.trim_end_matches(['\r', '\n']);
+            if !text_trimmed.is_empty() && turn_trimmed.ends_with(text_trimmed) {
+                return "";
+            }
             return if self.turn_text.ends_with(text) {
                 ""
             } else {
@@ -1138,12 +1210,30 @@ impl CursorStreamState {
             };
         }
         if segment.is_empty() {
+            // If repeating the segment streamed before a tool call (#142),
+            // contribute only any unstreamed tail.
+            if !self.last_segment_text.is_empty() {
+                let last = std::mem::take(&mut self.last_segment_text);
+                let text_trimmed = text.trim_end_matches(['\r', '\n']);
+                let last_trimmed = last.trim_end_matches(['\r', '\n']);
+                if text_trimmed == last_trimmed {
+                    return "";
+                }
+                if let Some(tail) = text.strip_prefix(last.as_str()) {
+                    return tail;
+                }
+            }
             // No partials for this segment: the aggregate is its only copy.
             return text;
         }
         // Partials were streamed: add only an unstreamed tail. An aggregate
         // that does not extend them (e.g. re-formatted) adds nothing, since the
         // segment is already visible.
+        let text_trimmed = text.trim_end_matches(['\r', '\n']);
+        let seg_trimmed = segment.trim_end_matches(['\r', '\n']);
+        if text_trimmed == seg_trimmed {
+            return "";
+        }
         text.strip_prefix(segment.as_str()).unwrap_or("")
     }
 }
@@ -1173,20 +1263,38 @@ fn normalize_event(message: &Value, state: &mut CursorStreamState) -> Vec<AgentE
             // - a segment aggregate before each tool call (`model_call_id`,
             //   usually also `timestamp_ms`) repeating the segment's text;
             // - a final aggregate (neither key) repeating the last segment.
+            // In addition (#142), cursor-agent may repeat the segment without
+            // `model_call_id` or after a tool call.
             // Deltas are shown as they arrive; an aggregate contributes only
             // text that is not on screen yet.
             let has_model_call = message.get("model_call_id").is_some();
-            if has_model_call || message.get("timestamp_ms").is_none() {
-                let missing = state.aggregate_missing(&text, !has_model_call);
+            let is_final = message.get("timestamp_ms").is_none();
+            // A partial-looking assistant event is treated as a repeat of the
+            // current/previous segment only when its whole text (ignoring
+            // trailing newlines) equals that segment's whole text AND that
+            // text is a complete paragraph. Short deltas and prefix matches
+            // are real text, not repeats (TC-1686).
+            let repeats_segment = state.is_complete_paragraph(&text)
+                && ((!state.segment_text.is_empty()
+                    && text.trim_end_matches(['\r', '\n'])
+                        == state.segment_text.trim_end_matches(['\r', '\n']))
+                    || (!state.last_segment_text.is_empty()
+                        && text.trim_end_matches(['\r', '\n'])
+                            == state.last_segment_text.trim_end_matches(['\r', '\n'])));
+            if has_model_call || is_final || repeats_segment {
+                let missing = state.aggregate_missing(&text, is_final);
                 state.emit(&mut events, missing);
             } else {
+                state.last_segment_text.clear();
                 state.segment_text.push_str(&text);
                 state.emit(&mut events, &text);
             }
         }
         Some("tool_call") => {
             // A tool call ends the segment; the next partials start fresh.
-            state.segment_text.clear();
+            if !state.segment_text.is_empty() {
+                state.last_segment_text = std::mem::take(&mut state.segment_text);
+            }
         }
         Some("result") => {
             state.terminal = true;
@@ -1196,13 +1304,13 @@ fn normalize_event(message: &Value, state: &mut CursorStreamState) -> Vec<AgentE
                 .unwrap_or(false)
                 || message.get("subtype").and_then(Value::as_str) != Some("success")
             {
-                events.push(AgentEvent::Error(
+                events.push(AgentEvent::Error(AgentError::provider(
                     message
                         .get("result")
                         .and_then(Value::as_str)
                         .unwrap_or("Cursor turn failed")
                         .to_owned(),
-                ));
+                )));
             } else {
                 if !state.emitted_text
                     && let Some(result) = message.get("result").and_then(Value::as_str)
@@ -1284,6 +1392,7 @@ pub(crate) mod tests {
     use serde_json::json;
     use tokio::time::{Duration, timeout};
 
+    use super::super::AgentErrorKind;
     use super::*;
 
     #[test]
@@ -1517,8 +1626,372 @@ pub(crate) mod tests {
             &mut state,
         ));
         assert!(
-            matches!(events.as_slice(), [AgentEvent::TextDelta(text), AgentEvent::Error(error)] if text == "Partial" && error == "boom")
+            matches!(events.as_slice(), [AgentEvent::TextDelta(text), AgentEvent::Error(error)] if text == "Partial" && error.message == "boom" && error.kind == AgentErrorKind::Provider)
         );
+    }
+
+    // TC-1684 / #142: delta chunks of a first paragraph followed by a full
+    // assistant message repeating that paragraph, a tool call, and a second
+    // paragraph must not duplicate the first paragraph.
+    #[test]
+    fn tc_1684_no_duplicate_first_paragraph() {
+        let p1 = "Investigating repository layout and configuration.";
+        let p2 = "Completed analysis of workspace crates.";
+        let stream = vec![
+            // Delta chunks of a first paragraph
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1684",
+                "timestamp_ms": 100,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Investigating repository "}]}
+            }),
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1684",
+                "timestamp_ms": 101,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "layout and configuration.\n\n"}]}
+            }),
+            // Full assistant message repeating that paragraph
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1684",
+                "timestamp_ms": 102,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Investigating repository layout and configuration.\n\n"}]}
+            }),
+            // Tool call
+            json!({
+                "type": "tool_call",
+                "subtype": "started",
+                "call_id": "call-1",
+                "session_id": "sess-1684"
+            }),
+            json!({
+                "type": "tool_call",
+                "subtype": "completed",
+                "call_id": "call-1",
+                "session_id": "sess-1684"
+            }),
+            // Second paragraph
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1684",
+                "timestamp_ms": 200,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Completed analysis of workspace crates."}]}
+            }),
+            // Result event
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": format!("{p1}\n\n{p2}"),
+                "session_id": "sess-1684"
+            }),
+        ];
+
+        let mut state = CursorStreamState::default();
+        let mut text = String::new();
+        let mut completed = 0;
+        for message in &stream {
+            for event in normalize_event(message, &mut state) {
+                match event {
+                    AgentEvent::TextDelta(delta) => text.push_str(&delta),
+                    AgentEvent::Completed => completed += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(completed, 1);
+        assert_eq!(
+            text.matches(p1).count(),
+            1,
+            "p1 must appear exactly once: {text}"
+        );
+        assert_eq!(text, format!("{p1}\n\n{p2}"));
+    }
+
+    // TC-1684 / #142: repeating assistant message arriving after the tool call
+    // must not duplicate the first paragraph.
+    #[test]
+    fn tc_1684_no_duplicate_first_paragraph_after_tool_call() {
+        let p1 = "Scanning project files.";
+        let p2 = "Identified targets.";
+        let stream = vec![
+            // Delta chunks of a first paragraph
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1684b",
+                "timestamp_ms": 100,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Scanning project "}]}
+            }),
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1684b",
+                "timestamp_ms": 101,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "files.\n\n"}]}
+            }),
+            // Tool call
+            json!({
+                "type": "tool_call",
+                "subtype": "started",
+                "call_id": "call-2",
+                "session_id": "sess-1684b"
+            }),
+            json!({
+                "type": "tool_call",
+                "subtype": "completed",
+                "call_id": "call-2",
+                "session_id": "sess-1684b"
+            }),
+            // Full assistant message repeating that paragraph arriving after tool call
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1684b",
+                "timestamp_ms": 102,
+                "model_call_id": "mc-post",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Scanning project files.\n\n"}]}
+            }),
+            // Second paragraph
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1684b",
+                "timestamp_ms": 200,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Identified targets."}]}
+            }),
+            // Result event
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": format!("{p1}\n\n{p2}"),
+                "session_id": "sess-1684b"
+            }),
+        ];
+
+        let mut state = CursorStreamState::default();
+        let mut text = String::new();
+        let mut completed = 0;
+        for message in &stream {
+            for event in normalize_event(message, &mut state) {
+                match event {
+                    AgentEvent::TextDelta(delta) => text.push_str(&delta),
+                    AgentEvent::Completed => completed += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(completed, 1);
+        assert_eq!(
+            text.matches(p1).count(),
+            1,
+            "p1 must appear exactly once: {text}"
+        );
+        assert_eq!(text, format!("{p1}\n\n{p2}"));
+    }
+
+    // TC-1685 / #142: paragraphs separated by tool calls must have exactly one
+    // blank line ("\n\n"), collapsing any extra newlines from incoming chunks.
+    #[test]
+    fn tc_1685_single_blank_line_between_paragraphs() {
+        let p1 = "Analyzing dependencies.";
+        let p2 = "All dependencies resolved.";
+        let stream = vec![
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1685",
+                "timestamp_ms": 10,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Analyzing "}]}
+            }),
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1685",
+                "timestamp_ms": 11,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "dependencies.\n\n"}]}
+            }),
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1685",
+                "timestamp_ms": 12,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Analyzing dependencies.\n\n"}]}
+            }),
+            json!({
+                "type": "tool_call",
+                "subtype": "started",
+                "call_id": "call-1685",
+                "session_id": "sess-1685"
+            }),
+            json!({
+                "type": "tool_call",
+                "subtype": "completed",
+                "call_id": "call-1685",
+                "session_id": "sess-1685"
+            }),
+            // Second paragraph carrying a leading newline that would cause "\n\n\n" without normalization
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1685",
+                "timestamp_ms": 20,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "\nAll dependencies resolved."}]}
+            }),
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": format!("{p1}\n\n{p2}"),
+                "session_id": "sess-1685"
+            }),
+        ];
+
+        let mut state = CursorStreamState::default();
+        let mut text = String::new();
+        let mut completed = 0;
+        for message in &stream {
+            for event in normalize_event(message, &mut state) {
+                match event {
+                    AgentEvent::TextDelta(delta) => text.push_str(&delta),
+                    AgentEvent::Completed => completed += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(completed, 1);
+        assert!(
+            !text.contains("\n\n\n"),
+            "paragraphs must not have three newlines: {text:?}"
+        );
+        assert_eq!(text, format!("{p1}\n\n{p2}"));
+    }
+
+    // TC-1685 / #142: when paragraph 1 ends with a single newline and paragraph 2
+    // starts with two newlines, they collapse to exactly one blank line ("\n\n").
+    #[test]
+    fn tc_1685_single_blank_line_collapses_excess_newlines() {
+        let p1 = "Compiling crate.";
+        let p2 = "Build succeeded.";
+        let stream = vec![
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1685b",
+                "timestamp_ms": 10,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Compiling crate.\n"}]}
+            }),
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1685b",
+                "timestamp_ms": 11,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Compiling crate.\n"}]}
+            }),
+            json!({
+                "type": "tool_call",
+                "subtype": "started",
+                "call_id": "call-build",
+                "session_id": "sess-1685b"
+            }),
+            json!({
+                "type": "tool_call",
+                "subtype": "completed",
+                "call_id": "call-build",
+                "session_id": "sess-1685b"
+            }),
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1685b",
+                "timestamp_ms": 20,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "\n\nBuild succeeded."}]}
+            }),
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": format!("{p1}\n\n{p2}"),
+                "session_id": "sess-1685b"
+            }),
+        ];
+
+        let mut state = CursorStreamState::default();
+        let mut text = String::new();
+        let mut completed = 0;
+        for message in &stream {
+            for event in normalize_event(message, &mut state) {
+                match event {
+                    AgentEvent::TextDelta(delta) => text.push_str(&delta),
+                    AgentEvent::Completed => completed += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(completed, 1);
+        assert!(
+            !text.contains("\n\n\n"),
+            "paragraphs must not have three newlines: {text:?}"
+        );
+        assert_eq!(text, format!("{p1}\n\n{p2}"));
+    }
+
+    // TC-1686 / #142: short or prefix-matching deltas are real text and must
+    // not be dropped by the repeat heuristic.
+    #[test]
+    fn tc_1686_short_repeated_deltas_are_kept() {
+        // "ha" followed by "ha" must render as "haha".
+        let mut state = CursorStreamState::default();
+        let mut text = String::new();
+        for message in [
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1686a",
+                "timestamp_ms": 1,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "ha"}]}
+            }),
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1686a",
+                "timestamp_ms": 2,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "ha"}]}
+            }),
+        ] {
+            for event in normalize_event(&message, &mut state) {
+                if let AgentEvent::TextDelta(delta) = event {
+                    text.push_str(&delta);
+                }
+            }
+        }
+        assert_eq!(text, "haha");
+
+        // "I", a tool call, then "I will" keeps both deltas.
+        let mut state = CursorStreamState::default();
+        let mut text = String::new();
+        for message in [
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1686b",
+                "timestamp_ms": 1,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "I"}]}
+            }),
+            json!({
+                "type": "tool_call",
+                "subtype": "started",
+                "call_id": "call-1686",
+                "session_id": "sess-1686b"
+            }),
+            json!({
+                "type": "tool_call",
+                "subtype": "completed",
+                "call_id": "call-1686",
+                "session_id": "sess-1686b"
+            }),
+            json!({
+                "type": "assistant",
+                "session_id": "sess-1686b",
+                "timestamp_ms": 2,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "I will"}]}
+            }),
+        ] {
+            for event in normalize_event(&message, &mut state) {
+                if let AgentEvent::TextDelta(delta) = event {
+                    text.push_str(&delta);
+                }
+            }
+        }
+        assert_eq!(text, "II will");
     }
 
     #[test]
@@ -3002,7 +3475,7 @@ pub(crate) mod tests {
             policy: TurnPolicy,
             model: Option<&str>,
             workspace: &Path,
-        ) -> (io::Result<Option<String>>, Vec<AgentEvent>) {
+        ) -> (Result<Option<String>, AgentError>, Vec<AgentEvent>) {
             let (event_tx, mut event_rx) = mpsc::channel(256);
             let notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let result = run_turn(

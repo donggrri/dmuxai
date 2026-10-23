@@ -14,7 +14,7 @@ use tokio::process::{ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
-use crate::agent::{Agent, AgentEvent, AgentOutput, OutputContext, TurnPolicy};
+use crate::agent::{Agent, AgentError, AgentEvent, AgentOutput, OutputContext, TurnPolicy};
 use dmuxai::process::apply_child_env_policy;
 
 use super::debug::acp_trace;
@@ -358,19 +358,32 @@ pub async fn run_acp_turn(
             } else {
                 let msg = format_acp_exit(status, &diagnostic);
                 if config.lifecycle == AcpLifecycle::Managed {
-                    send_event(event_tx, agent, context, AgentEvent::Error(msg.clone())).await;
+                    send_event(
+                        event_tx,
+                        agent,
+                        context,
+                        AgentEvent::Error(AgentError::process_exit(msg.clone())),
+                    )
+                    .await;
                 }
                 Err(io::Error::other(msg))
             }
         }
         Err(error) => {
             let msg = if diagnostic.is_empty() || diagnostic.contains(&error) {
-                error
+                error.clone()
             } else {
                 format!("{error} ({diagnostic})")
             };
             if config.lifecycle == AcpLifecycle::Managed {
-                send_event(event_tx, agent, context, AgentEvent::Error(msg.clone())).await;
+                let err = if error == "cancelled" {
+                    AgentError::cancelled(msg.clone())
+                } else if !status.success() {
+                    AgentError::process_exit(msg.clone())
+                } else {
+                    AgentError::provider(msg.clone())
+                };
+                send_event(event_tx, agent, context, AgentEvent::Error(err)).await;
             }
             Err(io::Error::other(msg))
         }

@@ -306,6 +306,7 @@ mod tests {
             from_state: Some("idle".to_string()),
             to_state: "started".to_string(),
             message: None,
+            error_kind: None,
         };
         let rec2 = crate::events::EventRecord {
             v: 1,
@@ -322,6 +323,7 @@ mod tests {
             from_state: Some("running".to_string()),
             to_state: "pending".to_string(),
             message: None,
+            error_kind: None,
         };
         let rec3 = crate::events::EventRecord {
             v: 1,
@@ -338,6 +340,7 @@ mod tests {
             from_state: Some("running".to_string()),
             to_state: "stalled".to_string(),
             message: None,
+            error_kind: None,
         };
 
         let content = format!(

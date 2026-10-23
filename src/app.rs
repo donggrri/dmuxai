@@ -56,11 +56,11 @@ use dmuxai::{
     graph::{
         AllowedRunner, Approval, ApprovalState, DecisionBy, FallbackCause, GraphAction, GraphNode,
         GraphNodeStatus, GraphPlan, GraphRun, GraphRunListCache, GraphRunPhase, GraphRunSession,
-        GraphStore, MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind, PanelLineKind,
-        PlanChange, PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode,
-        PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls, PlannerIo,
-        PlannerIoKind, QUESTION_ANSWER_HINT, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage,
-        TriageSource, apply_replan, approval_panel_lines_with_skills, budget_allows,
+        GraphStopReason, GraphStore, MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind,
+        PanelLineKind, PlanChange, PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc,
+        PlanPromptMode, PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls,
+        PlannerIo, PlannerIoKind, QUESTION_ANSWER_HINT, ReplanDoc, ReplanTrigger, Route, TaskEdit,
+        Triage, TriageSource, apply_replan, approval_panel_lines_with_skills, budget_allows,
         build_judge_prompt, build_plan_prompt, build_replan_prompt, cap_plan_response_excerpt,
         cap_replan_step_summary, cap_revision_raw, diff_plan_steps, diff_plan_tasks, fallback_plan,
         graph_plan_from_revision_steps, heuristic_route, is_question_prompt, is_trivial_prompt,
@@ -86,10 +86,10 @@ use dmuxai::{
 };
 
 use crate::agent::{
-    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ConversationId,
-    CursorAdapterConfig, ModelInfo, TurnId, TurnPolicy, event_channel,
-    is_adapter_turn_busy_rejection, spawn_agy_adapter, spawn_codex_adapter, spawn_cursor_adapter,
-    spawn_custom_adapter,
+    AdapterError, Agent, AgentAdapter, AgentError, AgentErrorKind, AgentEvent, AgentOutput,
+    AgentRequest, ConversationId, CursorAdapterConfig, ModelInfo, TurnId, TurnPolicy,
+    event_channel, is_adapter_turn_busy_rejection, spawn_agy_adapter, spawn_codex_adapter,
+    spawn_cursor_adapter, spawn_custom_adapter,
 };
 
 /// Minimum wait between graph defer retries (FR-976); zero in unit tests.
@@ -303,14 +303,11 @@ struct QueuedFollowup {
 /// Cap on queued follow-ups.
 const FOLLOWUP_QUEUE_MAX: usize = 20;
 
-/// Marks a graph stop caused by a cancelled step (FR-1416), shown as cancelled.
-const GRAPH_CANCELLED_PREFIX: &str = "\u{0}cancelled:";
-
 /// User-facing line when a graph stops: cancelled steps never read "Graph failed".
-fn graph_stop_notice(message: &str) -> String {
-    match message.strip_prefix(GRAPH_CANCELLED_PREFIX) {
-        Some(detail) => format!("Graph cancelled: {detail}"),
-        None => format!("Graph failed: {message}"),
+fn graph_stop_notice(reason: &GraphStopReason) -> String {
+    match reason {
+        GraphStopReason::Cancelled(detail) => format!("Graph cancelled: {detail}"),
+        GraphStopReason::Failed(message) => format!("Graph failed: {message}"),
     }
 }
 
@@ -989,6 +986,8 @@ pub struct HeadlessOutcome {
     pub text: String,
     pub messages: Vec<HeadlessMessage>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
     pub todo: Option<Todo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub triage: Option<Triage>,
@@ -1002,11 +1001,12 @@ enum HeadlessIdleAction {
     Exit(Box<HeadlessOutcome>),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DrainEventsOutcome {
     pub changed: bool,
     pub completed: bool,
     pub errored: bool,
+    pub error_kind: Option<String>,
 }
 
 const NODE_DETAIL_MAX_BUFFER_LINES: usize = 100;
@@ -1254,6 +1254,8 @@ pub struct App {
     replan_summaries: Vec<(String, String)>,
     /// Node id whose terminal failure is held until replan finishes (FR-956).
     graph_failure_replan: Option<String>,
+    /// Typed error reported by the failing node held for replan (FR-956 / #134).
+    graph_failure_replan_error: Option<String>,
     deferred_internal_turn: Option<DeferredInternalTurnWait>,
     /// FR-1008: planner_io recorded before the run row exists (e.g. judge).
     deferred_planner_io: HashMap<String, Vec<PlannerIo>>,
@@ -1518,6 +1520,7 @@ impl App {
             queued_replan: None,
             replan_summaries: Vec::new(),
             graph_failure_replan: None,
+            graph_failure_replan_error: None,
             deferred_internal_turn: None,
             deferred_planner_io: HashMap::new(),
             deferred_turns: Vec::new(),
@@ -3221,8 +3224,9 @@ impl App {
     fn drain_agent_events(&mut self) -> DrainEventsOutcome {
         let mut outcome = DrainEventsOutcome::default();
         while let Ok(output) = self.event_rx.try_recv() {
-            if matches!(output.event, AgentEvent::Error(_)) {
+            if let AgentEvent::Error(ref err) = output.event {
                 outcome.errored = true;
+                outcome.error_kind = Some(err.kind.as_str().to_owned());
             }
             let terminal = matches!(
                 output.event,
@@ -3307,7 +3311,7 @@ impl App {
                         let success = matches!(output.event, AgentEvent::Completed);
                         let error = match &output.event {
                             AgentEvent::Error(err) => Some(err.clone()),
-                            AgentEvent::Cancelled => Some("cancelled".to_owned()),
+                            AgentEvent::Cancelled => Some(AgentError::cancelled("cancelled")),
                             _ => None,
                         };
                         self.finish_turn_outcome_with_error(output.agent, success, error);
@@ -3330,7 +3334,7 @@ impl App {
                     let success = matches!(output.event, AgentEvent::Completed);
                     let error = match &output.event {
                         AgentEvent::Error(err) => Some(err.clone()),
-                        AgentEvent::Cancelled => Some("cancelled".to_owned()),
+                        AgentEvent::Cancelled => Some(AgentError::cancelled("cancelled")),
                         _ => None,
                     };
                     self.finish_turn_outcome_with_error(output.agent, success, error);
@@ -4607,7 +4611,7 @@ impl App {
                 );
                 self.agent_lifecycle
                     .insert(agent, AgentLifecycleState::default());
-                self.emit_agent_lifecycle(agent, "pending", None);
+                self.emit_agent_lifecycle(agent, "pending", None, None);
                 if !is_graph {
                     self.clear_pending_turn_policy();
                 }
@@ -4781,10 +4785,18 @@ impl App {
                     );
                 }
                 let conversation_id = active.conversation_id;
-                self.finish_turn_outcome_with_error(agent, false, Some("cancelled".to_owned()));
+                self.finish_turn_outcome_with_error(
+                    agent,
+                    false,
+                    Some(AgentError::cancelled("cancelled")),
+                );
                 self.show_conversation_notice(&conversation_id, format!("{agent} turn cancelled."));
             } else {
-                self.finish_turn_outcome_with_error(agent, false, Some("cancelled".to_owned()));
+                self.finish_turn_outcome_with_error(
+                    agent,
+                    false,
+                    Some(AgentError::cancelled("cancelled")),
+                );
             }
         }
     }
@@ -5160,7 +5172,7 @@ impl App {
                     self.restore_deferred_input(deferred);
                 }
                 let detail = match output.event {
-                    AgentEvent::Error(error) => error,
+                    AgentEvent::Error(error) => error.to_string(),
                     _ => "cancelled".to_owned(),
                 };
                 let notice = format!("Summary failed: {detail}");
@@ -7722,7 +7734,7 @@ impl App {
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, false, false);
                 let detail = match output.event {
-                    AgentEvent::Error(message) => message,
+                    AgentEvent::Error(message) => message.to_string(),
                     _ => "cancelled".to_owned(),
                 };
                 self.record_pending_plan_io(&pending, false);
@@ -8001,12 +8013,15 @@ impl App {
         let Some(node_id) = self.graph_failure_replan.take() else {
             return;
         };
+        let error = self.graph_failure_replan_error.take();
         if let Some(session) = self.graph_session.as_mut() {
             session.run_mut().phase = GraphRunPhase::Failed;
         }
-        self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
-            "graph node {node_id} failed"
-        ))]);
+        let message = match error {
+            Some(error) => format!("graph node {node_id} failed: {error}"),
+            None => format!("graph node {node_id} failed"),
+        };
+        self.dispatch_graph_actions(vec![GraphAction::Failed(message)]);
     }
 
     /// FR-956: user or dashboard replan request.
@@ -8579,8 +8594,8 @@ impl App {
 
     fn internal_turn_busy_error(event: &AgentEvent) -> Option<&str> {
         match event {
-            AgentEvent::Error(message) if is_adapter_turn_busy_rejection(message) => {
-                Some(message.as_str())
+            AgentEvent::Error(message) if is_adapter_turn_busy_rejection(&message.message) => {
+                Some(message.message.as_str())
             }
             _ => None,
         }
@@ -8862,6 +8877,7 @@ impl App {
         self.push_replan_applied_notice(&change);
         if pending.trigger == ReplanTrigger::Failure || pending.failure_node_id.is_some() {
             self.graph_failure_replan = None;
+            self.graph_failure_replan_error = None;
         }
         self.resume_graph_after_replan();
     }
@@ -8917,6 +8933,7 @@ impl App {
         }
         // An approved failure replan replaces the held failure (FR-956).
         self.graph_failure_replan = None;
+        self.graph_failure_replan_error = None;
         self.graph_approval_stale = None;
         self.resume_graph_after_replan();
         Ok(())
@@ -9095,7 +9112,7 @@ impl App {
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, false, false);
                 let message = match output.event {
-                    AgentEvent::Error(message) => message,
+                    AgentEvent::Error(message) => message.to_string(),
                     _ => "cancelled".to_owned(),
                 };
                 self.finish_replan_rejected(pending, message, true);
@@ -9279,17 +9296,18 @@ impl App {
         let completed = actions
             .iter()
             .any(|action| matches!(action, GraphAction::Completed));
-        let failed_message = actions.iter().find_map(|action| match action {
-            GraphAction::Failed(message) => Some(message.clone()),
+        let stop_action = actions.iter().find_map(|action| match action {
+            GraphAction::Failed(message) => Some(GraphStopReason::Failed(message.clone())),
+            GraphAction::Cancelled(detail) => Some(GraphStopReason::Cancelled(detail.clone())),
             _ => None,
         });
         if completed {
             self.clear_background_graph_leftovers(agent, conversation_id, &run_snapshot);
-        } else if let Some(message) = failed_message {
+        } else if let Some(reason) = stop_action {
             if session_is_target {
                 if let Some(session) = self.graph_session.as_mut() {
                     session.finalize_failure();
-                    if message.starts_with(GRAPH_CANCELLED_PREFIX) {
+                    if matches!(reason, GraphStopReason::Cancelled(_)) {
                         session.run_mut().phase = GraphRunPhase::Cancelled;
                     }
                     let run = session.run().clone();
@@ -9298,7 +9316,10 @@ impl App {
                 }
             } else {
                 let mut run = run_snapshot;
-                run.phase = GraphRunPhase::Failed;
+                run.phase = match reason {
+                    GraphStopReason::Cancelled(_) => GraphRunPhase::Cancelled,
+                    GraphStopReason::Failed(_) => GraphRunPhase::Failed,
+                };
                 let _ = save_run(&self.workspace_root, &run);
                 self.clear_background_graph_leftovers(agent, conversation_id, &run);
             }
@@ -9311,6 +9332,7 @@ impl App {
         node_id: String,
         success: bool,
         output_text: &str,
+        error: Option<&str>,
     ) {
         let mut display_text = output_text.to_owned();
         let mut marker_reason = None;
@@ -9351,6 +9373,7 @@ impl App {
             }
             if self.graph_failure_replan.is_none() {
                 self.graph_failure_replan = Some(node_id.clone());
+                self.graph_failure_replan_error = error.map(str::to_owned);
             }
             let replan_reason = match marker_reason {
                 Some(marker) => Self::merge_replan_reasons(&message, &marker),
@@ -9754,7 +9777,11 @@ impl App {
             AgentEvent::Status(status) => self.apply_status(agent, status),
             AgentEvent::Completed => self.finish_turn_outcome_with_error(agent, true, None),
             AgentEvent::Cancelled => {
-                self.finish_turn_outcome_with_error(agent, false, Some("cancelled".to_owned()));
+                self.finish_turn_outcome_with_error(
+                    agent,
+                    false,
+                    Some(AgentError::cancelled("cancelled")),
+                );
                 self.messages.push(Message::new(
                     Role::System,
                     format!("{agent} turn cancelled."),
@@ -9764,18 +9791,27 @@ impl App {
                 if let Some(catalog) = self.model_catalogs.get_mut(&agent) {
                     catalog.loading = false;
                 }
+                // Push the agent-error message before finishing the turn so that,
+                // for a multi-node graph, it precedes the "Graph failed: ..."
+                // notice that finishing may emit. If the turn turns out to be a
+                // busy retry, remove this just-pushed message again below.
+                let agent_error_text = format!("{agent} error: {error}");
+                let pushed_index = self.messages.len();
+                self.messages
+                    .push(Message::new(Role::System, agent_error_text.clone()));
                 self.finish_turn_outcome_with_error(agent, false, Some(error.clone()));
-                if is_adapter_turn_busy_rejection(&error) && self.busy_retry_pending(agent) {
+                if is_adapter_turn_busy_rejection(&error.message) && self.busy_retry_pending(agent)
+                {
+                    if pushed_index < self.messages.len()
+                        && self.messages[pushed_index].content == agent_error_text
+                    {
+                        self.messages.remove(pushed_index);
+                    }
                     // The step is retried automatically; keep this out of the
                     // dashboard and the agent context (TUI-only notice).
                     self.messages.push(Message::local_only(
                         Role::System,
                         format!("{agent} is still finishing its previous turn; retrying the step."),
-                    ));
-                } else {
-                    self.messages.push(Message::new(
-                        Role::System,
-                        format!("{agent} error: {error}"),
                     ));
                 }
             }
@@ -10051,7 +10087,7 @@ impl App {
         let error = if success {
             None
         } else {
-            Some("turn failed".to_owned())
+            Some(AgentError::provider("turn failed"))
         };
         self.finish_turn_outcome_with_error(agent, success, error);
     }
@@ -10060,22 +10096,33 @@ impl App {
         &mut self,
         agent: Agent,
         success: bool,
-        error: Option<String>,
+        error: Option<AgentError>,
     ) {
+        let is_cancelled = error
+            .as_ref()
+            .is_some_and(|e| e.kind == AgentErrorKind::Cancelled)
+            || error.as_ref().map(|e| e.to_string()).as_deref() == Some("cancelled");
+        let error_string = error.as_ref().map(|e| e.to_string());
+        let error_kind = error.as_ref().map(|e| e.kind.as_str().to_owned());
         if self
             .activities
             .get(&agent)
             .is_some_and(|activity| activity.kind == ActivityKind::Turn)
         {
             if success {
-                self.emit_agent_lifecycle(agent, "completed", None);
-            } else if error.as_deref() == Some("cancelled") {
-                self.emit_agent_lifecycle(agent, "cancelled", None);
+                self.emit_agent_lifecycle(agent, "completed", None, None);
+            } else if is_cancelled {
+                self.emit_agent_lifecycle(
+                    agent,
+                    "cancelled",
+                    None,
+                    Some(AgentErrorKind::Cancelled.as_str().to_owned()),
+                );
             } else {
-                let message = error
+                let message = error_string
                     .as_ref()
                     .map(|text| Self::truncate_agent_lifecycle_message(text.clone()));
-                self.emit_agent_lifecycle(agent, "error", message);
+                self.emit_agent_lifecycle(agent, "error", message, error_kind);
             }
         }
         self.agent_lifecycle.remove(&agent);
@@ -10085,9 +10132,9 @@ impl App {
             starts.remove(&agent);
         }
         self.activities.remove(&agent);
-        self.end_run_state(agent, success, error.as_deref() == Some("cancelled"));
+        self.end_run_state(agent, success, is_cancelled);
         let output_text = self.last_agent_output_text(agent);
-        self.note_skill_interview_turn_end(agent, success, error.as_deref(), &output_text);
+        self.note_skill_interview_turn_end(agent, success, error_string.as_deref(), &output_text);
         // FR-1209: the chat message that holds this output, so the dashboard
         // links the change record to it instead of rendering the text twice.
         let output_message_id = self
@@ -10149,7 +10196,7 @@ impl App {
             && let Some(todo_id) = self.todo_turns.remove(&(agent, active.turn_id))
             && let Some(store) = self.todo_store.clone()
         {
-            if let Err(err) = store.finish_run(&todo_id, success, error.clone()) {
+            if let Err(err) = store.finish_run(&todo_id, success, error_string.clone()) {
                 self.push_system(format!("Failed to finish to-do run: {err}"));
             }
             self.publish_todos();
@@ -10165,11 +10212,13 @@ impl App {
                         conversation_id.as_str(),
                         node_id,
                         success,
-                        error.as_deref(),
+                        error_string.as_deref(),
                     );
                 }
             } else if !success
-                && error.as_deref().is_some_and(is_adapter_turn_busy_rejection)
+                && error
+                    .as_ref()
+                    .is_some_and(|e| is_adapter_turn_busy_rejection(&e.message))
                 && let Some(session) = self.graph_session.as_mut()
                 && let Some(assignment) = session.assignment_for_node(&node_id)
             {
@@ -10180,11 +10229,11 @@ impl App {
                     self.busy_retry_user_message.insert(agent, index);
                 }
                 return;
-            } else if !success && error.as_deref() == Some("cancelled") {
+            } else if !success && is_cancelled {
                 // FR-1416: a cancelled step (user cancel or denied ACP permission)
                 // stops the graph as cancelled, without retry or failure replan.
-                self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
-                    "{GRAPH_CANCELLED_PREFIX}step {node_id} was cancelled"
+                self.dispatch_graph_actions(vec![GraphAction::Cancelled(format!(
+                    "step {node_id} was cancelled"
                 ))]);
                 return;
             } else if self.graph_session.as_ref().is_some_and(|session| {
@@ -10199,14 +10248,20 @@ impl App {
                         .is_some_and(|id| session.run().conversation_id == id.as_str())
                         || !background_graph_turn)
             }) {
-                self.intercept_graph_node_finished(agent, node_id, success, &output_text);
+                self.intercept_graph_node_finished(
+                    agent,
+                    node_id,
+                    success,
+                    &output_text,
+                    error_string.as_deref(),
+                );
             } else if let Some(conversation_id) = finished_conversation.as_ref() {
                 self.complete_background_graph_node(
                     agent,
                     conversation_id.as_str(),
                     node_id,
                     success,
-                    error.as_deref(),
+                    error_string.as_deref(),
                 );
             }
         } else if let Some(node_id) = graph_node_id
@@ -10226,7 +10281,7 @@ impl App {
                 conversation_id.as_str(),
                 node_id,
                 success,
-                error.as_deref(),
+                error_string.as_deref(),
             );
         }
         self.flush_deferred_graph_starts();
@@ -10390,6 +10445,7 @@ impl App {
         self.queued_replan = None;
         self.replan_summaries.clear();
         self.graph_failure_replan = None;
+        self.graph_failure_replan_error = None;
         // FR-937: triage/direct 1-node runs are quiet; multi-step plans with an
         // orchestrate node keep the normal graph banners.
         self.quiet_graph_run = run
@@ -10486,15 +10542,14 @@ impl App {
                     }
                     break;
                 }
-                GraphAction::Failed(message) => {
-                    self.push_system(graph_stop_notice(&message));
+                GraphAction::Cancelled(detail) => {
+                    self.push_system(graph_stop_notice(&GraphStopReason::Cancelled(
+                        detail.clone(),
+                    )));
                     self.quiet_graph_run = false;
                     if let Some(session) = self.graph_session.as_mut() {
                         session.finalize_failure();
-                        if message.starts_with(GRAPH_CANCELLED_PREFIX) {
-                            // FR-1416: cancelled, not failed, in run history and UI.
-                            session.run_mut().phase = GraphRunPhase::Cancelled;
-                        }
+                        session.run_mut().phase = GraphRunPhase::Cancelled;
                         let run = session.run().clone();
                         let _ = save_run(&self.workspace_root, &run);
                         self.last_graph_run = Some(run);
@@ -10526,11 +10581,56 @@ impl App {
                     if let Some((_plan_id, todo_id)) = self.graph_todo.take()
                         && let Some(store) = self.todo_store.clone()
                     {
-                        if let Err(err) = store.finish_run(
-                            &todo_id,
-                            false,
-                            Some(message.replace(GRAPH_CANCELLED_PREFIX, "cancelled: ")),
-                        ) {
+                        if let Err(err) =
+                            store.finish_run(&todo_id, false, Some(format!("cancelled: {detail}")))
+                        {
+                            self.push_system(format!("Failed to finish to-do run: {err}"));
+                        }
+                        self.publish_todos();
+                    }
+                    break;
+                }
+                GraphAction::Failed(message) => {
+                    if self.graph_session_is_multi_step() {
+                        self.push_system(graph_stop_notice(&GraphStopReason::Failed(
+                            message.clone(),
+                        )));
+                    }
+                    self.quiet_graph_run = false;
+                    if let Some(session) = self.graph_session.as_mut() {
+                        session.finalize_failure();
+                        let run = session.run().clone();
+                        let _ = save_run(&self.workspace_root, &run);
+                        self.last_graph_run = Some(run);
+                        self.graph_assignment_line =
+                            resolved_assignment_line(&self.model_catalogs, session);
+                    }
+                    self.clear_graph_defer_state();
+                    for (agent, _node_id) in self.graph_agent_nodes.drain() {
+                        let _ = self.adapters[adapter_index(agent)].cancel();
+                        if let Some(active) = self.active_turns.remove(&agent) {
+                            let stored_output = TurnOutput {
+                                conversation_id: active.conversation_id,
+                                turn_id: active.turn_id,
+                                agent: agent_key(agent),
+                                event: TurnEvent::Cancelled,
+                            };
+                            let _ = self.engine.record_turn_outputs(&[stored_output]);
+                        }
+                        self.busy_agents.remove(&agent);
+                        self.streaming_messages.remove(&agent);
+                        self.activities.remove(&agent);
+                        self.tool_messages.remove(&agent);
+                    }
+                    self.graph_session = None;
+                    self.busy_retry_user_message.clear();
+                    self.graph_assignment_line.clear();
+                    self.single_graph_plan = None;
+                    self.clear_pending_turn_policy();
+                    if let Some((_plan_id, todo_id)) = self.graph_todo.take()
+                        && let Some(store) = self.todo_store.clone()
+                    {
+                        if let Err(err) = store.finish_run(&todo_id, false, Some(message)) {
                             self.push_system(format!("Failed to finish to-do run: {err}"));
                         }
                         self.publish_todos();
@@ -11715,7 +11815,13 @@ impl App {
         message.chars().take(AGENT_LIFECYCLE_ERROR_CHARS).collect()
     }
 
-    fn emit_agent_lifecycle(&mut self, agent: Agent, to_state: &str, message: Option<String>) {
+    fn emit_agent_lifecycle(
+        &mut self,
+        agent: Agent,
+        to_state: &str,
+        message: Option<String>,
+        error_kind: Option<String>,
+    ) {
         if self
             .activities
             .get(&agent)
@@ -11758,6 +11864,7 @@ impl App {
             from_state: Some(from_state),
             to_state: to_state.to_owned(),
             message,
+            error_kind,
         });
         lifecycle.last_to_state = to_state.to_owned();
     }
@@ -11772,7 +11879,7 @@ impl App {
         }
         match event {
             AgentEvent::Started => {
-                self.emit_agent_lifecycle(agent, "started", None);
+                self.emit_agent_lifecycle(agent, "started", None, None);
                 if let Some(lifecycle) = self.agent_lifecycle.get_mut(&agent) {
                     lifecycle.last_running_phase = None;
                 }
@@ -11801,7 +11908,7 @@ impl App {
         if duplicate {
             return;
         }
-        self.emit_agent_lifecycle(agent, "running", Some(phase.clone()));
+        self.emit_agent_lifecycle(agent, "running", Some(phase.clone()), None);
         if let Some(lifecycle) = self.agent_lifecycle.get_mut(&agent) {
             lifecycle.last_running_phase = Some(phase);
         }
@@ -12128,6 +12235,7 @@ impl App {
             text,
             messages: Vec::new(),
             error: Some(note.to_owned()),
+            error_kind: None,
             todo: None,
             triage,
             plan,
@@ -12215,6 +12323,7 @@ impl App {
                         text: String::new(),
                         messages: Vec::new(),
                         error: Some(message),
+                        error_kind: None,
                         todo: None,
                         triage: None,
                         plan: None,
@@ -12264,6 +12373,7 @@ impl App {
                     text: String::new(),
                     messages: Vec::new(),
                     error: Some(format!("unknown agent '{agent_str}'")),
+                    error_kind: None,
                     todo: None,
                     triage: None,
                     plan: None,
@@ -12286,6 +12396,7 @@ impl App {
                     text: String::new(),
                     messages: Vec::new(),
                     error: Some(format!("runner '{runner_id}' is not in allowed_runners")),
+                    error_kind: Some(AgentErrorKind::Policy.as_str().to_owned()),
                     todo: None,
                     triage: None,
                     plan: None,
@@ -12316,6 +12427,7 @@ impl App {
                     text: String::new(),
                     messages: Vec::new(),
                     error: Some(format!("runner '{runner_id}' is not in allowed_runners")),
+                    error_kind: Some(AgentErrorKind::Policy.as_str().to_owned()),
                     todo: None,
                     triage: None,
                     plan: None,
@@ -12336,6 +12448,7 @@ impl App {
                         text: String::new(),
                         messages: Vec::new(),
                         error: Some(message),
+                        error_kind: None,
                         todo: None,
                         triage: None,
                         plan: None,
@@ -12365,6 +12478,7 @@ impl App {
         let mut dashboard_dirty = false;
         let mut dirty = false;
         let mut had_agent_error = false;
+        let mut last_error_kind: Option<String> = None;
         let mut last_graph_id: Option<String> = None;
         let mut cancelled;
 
@@ -12404,6 +12518,7 @@ impl App {
                             text: String::new(),
                             messages: Vec::new(),
                             error: Some(msg),
+                            error_kind: None,
                             todo: None,
                             triage: None,
                             plan: None,
@@ -12450,6 +12565,9 @@ impl App {
                         let drain = self.drain_agent_events();
                         if drain.errored {
                             had_agent_error = true;
+                            if let Some(kind) = drain.error_kind {
+                                last_error_kind = Some(kind);
+                            }
                         }
                         self.tick();
                         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -12478,6 +12596,9 @@ impl App {
                 let drain = self.drain_agent_events();
                 if drain.errored {
                     had_agent_error = true;
+                    if let Some(kind) = drain.error_kind {
+                        last_error_kind = Some(kind);
+                    }
                 }
                 dirty |= cmd_changed || drain.changed || self.dirty;
                 self.dirty = false;
@@ -12616,20 +12737,22 @@ impl App {
                 run.plan.id == *graph_id && run.phase == GraphRunPhase::Cancelled
             })
         });
-        let (ok, exit_code, error) = if cancelled || graph_cancelled {
+        let (ok, exit_code, error, error_kind) = if cancelled || graph_cancelled {
             (
                 false,
                 130,
                 last_system_error.or_else(|| Some("cancelled".to_owned())),
+                Some(AgentErrorKind::Cancelled.as_str().to_owned()),
             )
         } else if had_agent_error || graph_failed {
             (
                 false,
                 1,
                 last_system_error.or_else(|| Some("run failed".to_owned())),
+                last_error_kind,
             )
         } else {
-            (true, 0, None)
+            (true, 0, None, None)
         };
 
         let (triage, plan) = self.headless_plan_snapshot();
@@ -12642,6 +12765,7 @@ impl App {
             text,
             messages: mapped_messages,
             error,
+            error_kind,
             todo,
             triage,
             plan,
@@ -14977,8 +15101,8 @@ fn stored_event(event: &AgentEvent) -> Option<TurnEvent> {
         AgentEvent::Activity(_) => None,
         AgentEvent::Completed => Some(TurnEvent::Completed),
         AgentEvent::Cancelled => Some(TurnEvent::Cancelled),
-        AgentEvent::Error(message) => Some(TurnEvent::Failed {
-            message: message.clone(),
+        AgentEvent::Error(err) => Some(TurnEvent::Failed {
+            message: err.to_string(),
             invalidates_binding: true,
         }),
         AgentEvent::ModelsListed { .. }
@@ -16141,16 +16265,13 @@ mod tests {
         assert_eq!(replan_req.turn_id.as_str(), "replan-2");
         let replans_before = h.app.last_graph_run.as_ref().unwrap().planner_calls.replan;
         assert_eq!(replans_before, 1);
-        assert!(
-            h.app.apply_agent_output(triage_output(
-                Agent::Codex,
-                &replan_req,
-                AgentEvent::Error(
-                    "Codex is already running a turn; cancel it before sending another prompt"
-                        .to_owned(),
-                ),
-            ))
-        );
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &replan_req,
+            AgentEvent::Error(AgentError::provider(
+                "Codex is already running a turn; cancel it before sending another prompt"
+            )),
+        )));
         assert!(h.app.deferred_internal_turn.is_some());
         assert_eq!(replan_requests(&h.sent).len(), 1);
         let graph_nodes_before = graph_node_requests(&h.sent).len();
@@ -16166,7 +16287,7 @@ mod tests {
         assert!(h.app.apply_agent_output(triage_output(
             Agent::Codex,
             &retry,
-            AgentEvent::Error("boom".to_owned()),
+            AgentEvent::Error(AgentError::provider("boom")),
         )));
         assert!(
             system_containing(&h.app, "Replan rev 2 rejected: boom")
@@ -16200,16 +16321,13 @@ mod tests {
 
     fn refuse_last_replan_busy(h: &mut PlanGateHarness) {
         let replan_req = last_replan_request(&h.sent);
-        assert!(
-            h.app.apply_agent_output(triage_output(
-                Agent::Codex,
-                &replan_req,
-                AgentEvent::Error(
-                    "Codex is already running a turn; cancel it before sending another prompt"
-                        .to_owned(),
-                ),
-            ))
-        );
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &replan_req,
+            AgentEvent::Error(AgentError::provider(
+                "Codex is already running a turn; cancel it before sending another prompt"
+            )),
+        )));
         assert!(h.app.deferred_internal_turn.is_some());
     }
 
@@ -16269,16 +16387,13 @@ mod tests {
             "done\n\nDMUXAI_REPLAN: need tests\n",
         );
         let replan_req = last_replan_request(&h.sent);
-        assert!(
-            h.app.apply_agent_output(triage_output(
-                Agent::Codex,
-                &replan_req,
-                AgentEvent::Error(
-                    "Codex is already running a turn; cancel it before sending another prompt"
-                        .to_owned(),
-                ),
-            ))
-        );
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &replan_req,
+            AgentEvent::Error(AgentError::provider(
+                "Codex is already running a turn; cancel it before sending another prompt"
+            )),
+        )));
         let old = Instant::now()
             .checked_sub(Duration::from_secs(200))
             .unwrap_or_else(Instant::now);
@@ -16435,17 +16550,14 @@ mod tests {
 
         let (agent, request) = sent.lock().unwrap()[1].clone();
         assert_eq!(agent, Agent::Cursor);
-        assert!(
-            app.apply_agent_output(AgentOutput {
-                agent,
-                conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
-                turn_id: Some(TurnId::new(request.turn_id.as_str())),
-                event: AgentEvent::Error(
-                    "Cursor is already running a turn; cancel it before sending another prompt"
-                        .to_owned(),
-                ),
-            })
-        );
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(request.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider(
+                "Cursor is already running a turn; cancel it before sending another prompt"
+            )),
+        }));
 
         let session = app.graph_session.as_ref().expect("run still active");
         let step_2 = session
@@ -16496,17 +16608,14 @@ mod tests {
         let users_before = user_count(&app);
 
         let (agent, request) = sent.lock().unwrap()[1].clone();
-        assert!(
-            app.apply_agent_output(AgentOutput {
-                agent,
-                conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
-                turn_id: Some(TurnId::new(request.turn_id.as_str())),
-                event: AgentEvent::Error(
-                    "Cursor is already running a turn; cancel it before sending another prompt"
-                        .to_owned(),
-                ),
-            })
-        );
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(request.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider(
+                "Cursor is already running a turn; cancel it before sending another prompt"
+            )),
+        }));
         assert!(app.tick());
         assert_eq!(sent.lock().unwrap().len(), 3);
         assert_eq!(sent.lock().unwrap()[2].1.prompt, request.prompt);
@@ -16530,9 +16639,9 @@ mod tests {
             agent,
             conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
             turn_id: Some(TurnId::new(request.turn_id.as_str())),
-            event: AgentEvent::Error(format!(
+            event: AgentEvent::Error(AgentError::provider(format!(
                 "{agent} is already running a turn; cancel it before sending another prompt"
-            )),
+            ))),
         }
     }
 
@@ -16765,7 +16874,7 @@ mod tests {
             agent,
             conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
             turn_id: Some(TurnId::new(request.turn_id.as_str())),
-            event: AgentEvent::Error("step-1 provider failure".to_owned()),
+            event: AgentEvent::Error(AgentError::provider("step-1 provider failure")),
         }));
 
         assert!(app.graph_session.is_none());
@@ -18331,7 +18440,7 @@ mod tests {
             agent: Agent::Agy,
             conversation_id: Some(ConversationId::new(active_err.conversation_id.as_str())),
             turn_id: Some(TurnId::new(active_err.turn_id.as_str())),
-            event: AgentEvent::Error("provider disconnected".to_owned()),
+            event: AgentEvent::Error(AgentError::provider("provider disconnected")),
         }));
         let errored_todo = store.get(&todo_err.id).unwrap();
         assert_eq!(errored_todo.status, TodoStatus::Open);
@@ -20397,7 +20506,7 @@ mod tests {
             agent: Agent::Codex,
             conversation_id: Some(summary.conversation_id),
             turn_id: Some(summary.turn_id),
-            event: AgentEvent::Error("bad summary".to_owned()),
+            event: AgentEvent::Error(AgentError::provider("bad summary")),
         }));
         assert!(app.input.is_empty());
         assert_eq!(sent.lock().unwrap().len(), 2);
@@ -20453,7 +20562,7 @@ mod tests {
     fn summary_turns_end_their_run_state() {
         for (event, expected) in [
             (AgentEvent::Completed, "done"),
-            (AgentEvent::Error("boom".to_owned()), "failed"),
+            (AgentEvent::Error(AgentError::provider("boom")), "failed"),
             (AgentEvent::Cancelled, "cancelled"),
         ] {
             let (mut app, sent) = test_app();
@@ -20680,17 +20789,14 @@ mod tests {
         // that entry: turn A's tracking was already removed with its own
         // completion and A's outcome is durably recorded, so `active_turns`
         // holds neither A nor B afterwards.
-        assert!(
-            app.apply_agent_output(AgentOutput {
-                agent: Agent::Codex,
-                conversation_id: Some(second.conversation_id),
-                turn_id: Some(second.turn_id),
-                event: AgentEvent::Error(
-                    "Codex is already running a turn; cancel it before sending another prompt"
-                        .to_owned(),
-                ),
-            })
-        );
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(second.conversation_id),
+            turn_id: Some(second.turn_id),
+            event: AgentEvent::Error(AgentError::provider(
+                "Codex is already running a turn; cancel it before sending another prompt"
+            )),
+        }));
         // The agent is not stuck busy forever: the B entry is fully unwound.
         // If a terminal event for A were replayed afterwards it would be
         // dropped (no matching entry), which is safe because A already
@@ -20909,7 +21015,10 @@ mod tests {
     fn errors_become_visible_system_messages() {
         let (mut app, _) = test_app();
 
-        app.apply_agent_event(Agent::Agy, AgentEvent::Error("offline".to_owned()));
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::Error(AgentError::provider("offline")),
+        );
 
         assert_eq!(app.messages.last().unwrap().role, Role::System);
         assert_eq!(app.messages.last().unwrap().content, "AGY error: offline");
@@ -22568,6 +22677,7 @@ mod tests {
         );
     }
 
+    // TC-1694 / FR-1682: headless outcome carries error_kind.
     // TC-761 / FR-761: an agent error yields ok=false and exit 1.
     #[tokio::test]
     async fn headless_run_reports_agent_error() {
@@ -22589,7 +22699,7 @@ mod tests {
                             agent,
                             conversation_id: Some(conv_id),
                             turn_id: Some(turn_id),
-                            event: AgentEvent::Error("fatal adapter error".to_owned()),
+                            event: AgentEvent::Error(AgentError::provider("fatal adapter error")),
                         })
                         .await;
                     break;
@@ -22610,6 +22720,7 @@ mod tests {
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
         assert_eq!(outcome.exit_code, 1);
+        assert_eq!(outcome.error_kind.as_deref(), Some("provider"));
         assert!(
             outcome
                 .error
@@ -22711,7 +22822,7 @@ mod tests {
                                 agent,
                                 conversation_id: Some(conv_id),
                                 turn_id: Some(turn_id),
-                                event: AgentEvent::Error("boom".to_owned()),
+                                event: AgentEvent::Error(AgentError::provider("boom")),
                             })
                             .await;
                         break;
@@ -24079,7 +24190,7 @@ mod tests {
             agent: Agent::Codex,
             conversation_id: Some(ConversationId::new(active2.conversation_id.as_str())),
             turn_id: Some(TurnId::new(active2.turn_id.as_str())),
-            event: AgentEvent::Error("provider failure".to_owned()),
+            event: AgentEvent::Error(AgentError::provider("provider failure")),
         }));
         let failed_state = app.run_state(Agent::Codex);
         let view_failed = failed_state.to_view();
@@ -25294,6 +25405,80 @@ mod tests {
             .unwrap_or_default()
     }
 
+    // TC-1680 / #134: a single-node graph's agent failure reports the agent error
+    // first and never emits a "Graph failed" notice.
+    #[test]
+    fn tc_1680_single_node_graph_agent_failure_reports_agent_error_first() {
+        let (mut app, sent) = test_app();
+        app.submit_direct_run("hi".to_owned(), Agent::Codex, OverrideKind::Agent);
+        let (agent, request) = sent.lock().unwrap()[0].clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(request.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("boom")),
+        }));
+        let system_messages: Vec<&str> = app
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, Role::System))
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(
+            system_messages.contains(&"Codex error: boom"),
+            "{system_messages:?}"
+        );
+        assert!(
+            !system_messages
+                .iter()
+                .any(|content| content.contains("Graph failed")),
+            "{system_messages:?}"
+        );
+        let agent_idx = app
+            .messages
+            .iter()
+            .position(|message| message.content == "Codex error: boom")
+            .expect("agent error message");
+        assert!(
+            !app.messages[..agent_idx]
+                .iter()
+                .any(|message| message.content.contains("Graph failed"))
+        );
+    }
+
+    // TC-1681 / #134: a two-node graph failure reports the agent error before
+    // the "Graph failed: ..." notice, which names the node's error text.
+    #[test]
+    fn tc_1681_two_node_graph_failure_reports_agent_error_before_graph_failed() {
+        let (mut app, sent) = test_app();
+        app.selected = adapter_index(Agent::Cursor);
+        app.quiet_graph_run = false;
+        app.start_graph_run(two_step_cursor_chain_plan("tc-1681", 1));
+        let (agent, request) = sent.lock().unwrap()[0].clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(request.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("boom")),
+        }));
+        let agent_idx = app
+            .messages
+            .iter()
+            .position(|message| message.content == "Cursor error: boom")
+            .expect("agent error message");
+        let graph_idx = app
+            .messages
+            .iter()
+            .position(|message| message.content.contains("Graph failed"))
+            .expect("graph failed message");
+        assert!(agent_idx < graph_idx, "agent error must come first");
+        let graph_message = &app.messages[graph_idx].content;
+        assert!(
+            graph_message.contains("boom"),
+            "graph failed notice must name the node's error: {graph_message}"
+        );
+    }
+
     fn system_containing(app: &App, needle: &str) -> String {
         app.messages
             .iter()
@@ -25847,7 +26032,7 @@ mod tests {
         assert!(e.app.apply_agent_output(triage_output(
             Agent::Codex,
             &judge,
-            AgentEvent::Error("boom".to_owned())
+            AgentEvent::Error(AgentError::provider("boom"))
         )));
         let session = e.app.graph_session.as_ref().expect("fallback run");
         assert_eq!(
@@ -26673,7 +26858,7 @@ mod tests {
             agent,
             conversation_id: Some(ConversationId::new(request.conversation_id.as_str())),
             turn_id: Some(TurnId::new(request.turn_id.as_str())),
-            event: AgentEvent::Error("step failed".to_owned()),
+            event: AgentEvent::Error(AgentError::provider("step failed")),
         }));
         assert!(h.app.graph_session.is_some());
         assert_ne!(
@@ -27876,7 +28061,7 @@ mod tests {
         assert!(h.app.apply_agent_output(triage_output(
             Agent::Codex,
             &plan_req,
-            AgentEvent::Error("boom".to_owned())
+            AgentEvent::Error(AgentError::provider("boom"))
         )));
         let run = h.app.last_graph_run.as_ref().unwrap();
         assert_eq!(run.planner_io.len(), 2);
@@ -28130,7 +28315,7 @@ mod tests {
         assert!(err.app.apply_agent_output(triage_output(
             Agent::Codex,
             &plan_req,
-            AgentEvent::Error("plan blew up".to_owned())
+            AgentEvent::Error(AgentError::provider("plan blew up"))
         )));
         let run = err.app.last_graph_run.as_ref().unwrap();
         assert_eq!(
@@ -29941,14 +30126,21 @@ mod speaker_style_tests {
 
 #[cfg(test)]
 mod graph_stop_notice_tests {
+    use super::*;
+
+    // TC-1693 / FR-1679: graph stop notice propagates agent error text.
     // TC-1421 / FR-1416: a cancelled step is reported as cancelled, not failed.
     #[test]
     fn tc_1421_cancelled_graph_step_not_reported_as_failed() {
-        let msg = format!("{}step n1 was cancelled", super::GRAPH_CANCELLED_PREFIX);
         assert_eq!(
-            super::graph_stop_notice(&msg),
+            super::graph_stop_notice(&GraphStopReason::Cancelled(
+                "step n1 was cancelled".to_owned()
+            )),
             "Graph cancelled: step n1 was cancelled"
         );
-        assert_eq!(super::graph_stop_notice("boom"), "Graph failed: boom");
+        assert_eq!(
+            super::graph_stop_notice(&GraphStopReason::Failed("boom".to_owned())),
+            "Graph failed: boom"
+        );
     }
 }

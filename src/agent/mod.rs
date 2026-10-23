@@ -131,8 +131,126 @@ pub enum AgentEvent {
     Status(String),
     Completed,
     Cancelled,
-    Error(String),
+    Error(AgentError),
 }
+
+/// The high-level category of an agent or runner error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentErrorKind {
+    Provider,
+    ModelUnavailable,
+    ProcessExit,
+    Timeout,
+    Idle,
+    Cancelled,
+    Policy,
+}
+
+impl AgentErrorKind {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::ModelUnavailable => "model_unavailable",
+            Self::ProcessExit => "process_exit",
+            Self::Timeout => "timeout",
+            Self::Idle => "idle",
+            Self::Cancelled => "cancelled",
+            Self::Policy => "policy",
+        }
+    }
+}
+
+impl fmt::Display for AgentErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A structured error emitted by an agent runner.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentError {
+    pub kind: AgentErrorKind,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+impl AgentError {
+    pub fn new(kind: AgentErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            hint: None,
+        }
+    }
+
+    pub fn provider(message: impl Into<String>) -> Self {
+        Self::new(AgentErrorKind::Provider, message)
+    }
+
+    pub fn model_unavailable(message: impl Into<String>) -> Self {
+        Self::new(AgentErrorKind::ModelUnavailable, message)
+    }
+
+    pub fn process_exit(message: impl Into<String>) -> Self {
+        Self::new(AgentErrorKind::ProcessExit, message)
+    }
+
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self::new(AgentErrorKind::Timeout, message)
+    }
+
+    pub fn idle(message: impl Into<String>) -> Self {
+        Self::new(AgentErrorKind::Idle, message)
+    }
+
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self::new(AgentErrorKind::Cancelled, message)
+    }
+
+    pub fn policy(message: impl Into<String>) -> Self {
+        Self::new(AgentErrorKind::Policy, message)
+    }
+
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn kind(&self) -> AgentErrorKind {
+        self.kind
+    }
+
+    #[allow(dead_code)]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    #[allow(dead_code)]
+    pub fn hint(&self) -> Option<&str> {
+        self.hint.as_deref()
+    }
+}
+
+impl fmt::Display for AgentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.hint {
+            Some(hint) => {
+                let trimmed = self.message.trim_end();
+                if trimmed.ends_with(';') || trimmed.ends_with(':') {
+                    write!(formatter, "{trimmed} {hint}")
+                } else {
+                    write!(formatter, "{}; {hint}", self.message)
+                }
+            }
+            None => formatter.write_str(&self.message),
+        }
+    }
+}
+
+impl Error for AgentError {}
 
 /// A DmuxAI-owned identifier for a conversation spanning provider sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -347,5 +465,70 @@ mod legacy_mode_tests {
             turn_policy_from_legacy_mode("implement").unwrap(),
             TurnPolicy::Agent
         );
+    }
+}
+
+#[cfg(test)]
+mod typed_error_tests {
+    use super::{AgentError, AgentErrorKind};
+
+    // TC-1687 / FR-1678: stable snake_case kind strings.
+    #[test]
+    fn agent_error_kind_strings_and_display() {
+        let cases = [
+            (AgentErrorKind::Provider, "provider"),
+            (AgentErrorKind::ModelUnavailable, "model_unavailable"),
+            (AgentErrorKind::ProcessExit, "process_exit"),
+            (AgentErrorKind::Timeout, "timeout"),
+            (AgentErrorKind::Idle, "idle"),
+            (AgentErrorKind::Cancelled, "cancelled"),
+            (AgentErrorKind::Policy, "policy"),
+        ];
+
+        for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected);
+            assert_eq!(kind.to_string(), expected);
+            let serialized = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serialized, format!("\"{expected}\""));
+        }
+    }
+
+    // TC-1688 / FR-1678: AgentError fields and Display text.
+    #[test]
+    fn agent_error_constructors_and_display() {
+        let err = AgentError::provider("connection failed");
+        assert_eq!(err.kind(), AgentErrorKind::Provider);
+        assert_eq!(err.message(), "connection failed");
+        assert_eq!(err.hint(), None);
+        assert_eq!(err.to_string(), "connection failed");
+
+        let err = AgentError::model_unavailable("model grok-99 not found");
+        assert_eq!(err.kind(), AgentErrorKind::ModelUnavailable);
+        assert_eq!(err.to_string(), "model grok-99 not found");
+
+        let err = AgentError::process_exit("runner exited with 127");
+        assert_eq!(err.kind(), AgentErrorKind::ProcessExit);
+        assert_eq!(err.to_string(), "runner exited with 127");
+
+        let err = AgentError::timeout("runner timed out after 30s")
+            .with_hint("raise timeout_secs in dmuxai.toml");
+        assert_eq!(err.kind(), AgentErrorKind::Timeout);
+        assert_eq!(err.hint(), Some("raise timeout_secs in dmuxai.toml"));
+        assert_eq!(
+            err.to_string(),
+            "runner timed out after 30s; raise timeout_secs in dmuxai.toml"
+        );
+
+        let err = AgentError::idle("silent child killed");
+        assert_eq!(err.kind(), AgentErrorKind::Idle);
+        assert_eq!(err.to_string(), "silent child killed");
+
+        let err = AgentError::cancelled("turn was cancelled");
+        assert_eq!(err.kind(), AgentErrorKind::Cancelled);
+        assert_eq!(err.to_string(), "turn was cancelled");
+
+        let err = AgentError::policy("permission denied");
+        assert_eq!(err.kind(), AgentErrorKind::Policy);
+        assert_eq!(err.to_string(), "permission denied");
     }
 }
