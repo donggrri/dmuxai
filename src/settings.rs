@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::activity::UiSettings;
+use crate::custom_agent::CustomAgentOutput;
 use crate::mcp::config::ToolNames;
 use crate::mcp::{McpServerSpec, ServerKind};
 use crate::notify::NotifySettings;
@@ -540,6 +541,13 @@ impl DmuxSettings {
             if let Some(custom) = agents.custom {
                 for spec in &custom {
                     known_custom.push(spec.name.clone());
+                    if spec.output == Some(CustomAgentOutput::Text) && spec.has_jsonl_path_fields()
+                    {
+                        self.config_warnings.push(format!(
+                            "[custom agent] {}: output = \"text\" is set but JSON-path fields are configured; set output = \"jsonl\" to use them",
+                            spec.name
+                        ));
+                    }
                 }
                 self.custom_agents = custom;
             }
@@ -1224,6 +1232,64 @@ command = ["workspace-only"]
         );
 
         std::fs::remove_dir_all(&temp_base).ok();
+    }
+
+    // TC-350 / FR-337: explicit text output with JSONL path fields warns at load.
+    #[test]
+    fn tc_350_custom_agent_text_output_with_jsonl_paths_warns() {
+        let dir = std::env::temp_dir().join(format!(
+            "dmuxai-custom-text-jsonl-warn-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("dmuxai.toml"),
+            r#"[[agents.custom]]
+name = "warn-agent"
+command = ["echo"]
+output = "text"
+text_path = "/part/text"
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(&dir, None);
+        assert!(
+            settings.config_warnings.iter().any(|w| {
+                w.contains("[custom agent] warn-agent")
+                    && w.contains("output = \"text\"")
+                    && w.contains("output = \"jsonl\"")
+            }),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // TC-351 / FR-337: inferred jsonl (path fields only) does not warn about text/jsonl mismatch.
+    #[test]
+    fn tc_351_custom_agent_inferred_jsonl_no_text_output_warning() {
+        let dir =
+            std::env::temp_dir().join(format!("dmuxai-custom-infer-jsonl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("dmuxai.toml"),
+            r#"[[agents.custom]]
+name = "infer-agent"
+command = ["echo"]
+text_path = "/part/text"
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(&dir, None);
+        assert!(
+            !settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[custom agent]")),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // TC-1311 / FR-1308: legacy `[modes]` loads without error and emits one warning.

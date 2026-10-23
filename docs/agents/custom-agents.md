@@ -43,6 +43,12 @@ prompt text can never inject arguments. An argument whose placeholder has no val
 (e.g. `{model}` with no model chosen) is dropped together with the flag right before it
 when that flag starts with `-`.
 
+When `output` is omitted but any JSONL path field (`text_path`, `text_when`, and the like) is set,
+DmuxAI treats the agent as `output = "jsonl"`. If you set `output = "text"` explicitly while
+those path fields remain, they are ignored and startup shows a config warning unless you switch
+to `output = "jsonl"`. In text mode, if the first non-empty stdout line looks like a JSON object,
+DmuxAI emits a one-time notice suggesting `output = "jsonl"` and `text_path`.
+
 Failure (shown as an error turn): spawn error, non-zero exit, timeout, empty reply text,
 a jsonl `error_path` hit, or stderr matching `failure_stderr`.
 Process: own process group; Ctrl+C kills the whole group. The temp config is deleted after the turn.
