@@ -106,54 +106,55 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+/// Replaces closed fenced, backtick and double-quoted regions with a space.
+/// An unterminated delimiter masks nothing, so a stray quote can never hide a
+/// sensitive keyword (the gate fails closed).
 fn mask_ignored_regions(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
     let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
     while i < chars.len() {
-        if chars[i..].starts_with(&['`', '`', '`']) {
-            i += 3;
-            while i < chars.len() {
-                if chars[i..].starts_with(&['`', '`', '`']) {
-                    i += 3;
-                    out.push(' ');
-                    break;
-                }
+        let end = if chars[i..].starts_with(&['`', '`', '`']) {
+            find_close(&chars, i + 3, &['`', '`', '`'], false).map(|j| j + 3)
+        } else if chars[i] == '`' {
+            find_close(&chars, i + 1, &['`'], false).map(|j| j + 1)
+        } else if chars[i] == '"' {
+            find_close(&chars, i + 1, &['"'], true).map(|j| j + 1)
+        } else {
+            None
+        };
+        match end {
+            Some(end) => {
+                out.push(' ');
+                i = end;
+            }
+            None => {
+                out.push(chars[i]);
                 i += 1;
             }
-            continue;
         }
-        if chars[i] == '`' {
-            i += 1;
-            while i < chars.len() && chars[i] != '`' {
-                i += 1;
-            }
-            if i < chars.len() {
-                i += 1;
-            }
-            out.push(' ');
-            continue;
-        }
-        if chars[i] == '"' {
-            i += 1;
-            while i < chars.len() {
-                if chars[i] == '\\' && i + 1 < chars.len() {
-                    i += 2;
-                    continue;
-                }
-                if chars[i] == '"' {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            out.push(' ');
-            continue;
-        }
-        out.push(chars[i]);
-        i += 1;
     }
     out
+}
+
+fn find_close(
+    chars: &[char],
+    from: usize,
+    close: &[char],
+    backslash_escapes: bool,
+) -> Option<usize> {
+    let mut i = from;
+    while i < chars.len() {
+        if backslash_escapes && chars[i] == '\\' && i + 1 < chars.len() {
+            i += 2;
+            continue;
+        }
+        if chars[i..].starts_with(close) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn is_word_char(c: char) -> bool {
@@ -196,6 +197,9 @@ mod tests {
         assert!(!sensitive_keyword_match(r#"say "production""#));
         assert!(!sensitive_keyword_match("```\nlogin\n```"));
         assert!(sensitive_keyword_match("touch the db schema"));
+        // An unterminated quote must not hide a keyword.
+        assert!(sensitive_keyword_match("cut a 5\" pipe then deploy"));
+        assert!(sensitive_keyword_match("use `unclosed and login"));
     }
 
     // TC-936 / FR-934, FR-936: the fallback heuristic is pure and returns
