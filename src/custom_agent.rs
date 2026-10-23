@@ -53,6 +53,23 @@ pub struct TextWhen {
     pub equals: String,
 }
 
+fn deserialize_error_path<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum ErrorPathInput {
+        Single(String),
+        Multiple(Vec<String>),
+    }
+    let value = Option::<ErrorPathInput>::deserialize(deserializer)?;
+    Ok(value.map(|v| match v {
+        ErrorPathInput::Single(s) => vec![s],
+        ErrorPathInput::Multiple(v) => v,
+    }))
+}
+
 /// Specification for a custom headless agent loaded from `[[agents.custom]]`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct CustomAgentSpec {
@@ -81,8 +98,8 @@ pub struct CustomAgentSpec {
     pub text_path: Option<String>,
     #[serde(default)]
     pub text_when: Option<TextWhen>,
-    #[serde(default)]
-    pub error_path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_error_path")]
+    pub error_path: Option<Vec<String>>,
     #[serde(default)]
     pub session_id_path: Option<String>,
     #[serde(default)]
@@ -139,7 +156,10 @@ pub fn opencode_preset(program: &str) -> CustomAgentSpec {
             path: "/type".to_owned(),
             equals: "text".to_owned(),
         }),
-        error_path: Some("/error/message".to_owned()),
+        error_path: Some(vec![
+            "/error/data/message".to_owned(),
+            "/error/message".to_owned(),
+        ]),
         session_id_path: Some("/sessionID".to_owned()),
         resume_arg: words(&["--session", "{session_id}"]),
         timeout_secs: Some(DEFAULT_TIMEOUT_SECS),
@@ -690,6 +710,18 @@ fn json_matches(val: &serde_json::Value, when: &TextWhen) -> bool {
     }
 }
 
+/// Returns the first (top-level) segment of a JSON pointer, e.g. "/error" for
+/// "/error/data/message". Used for the object fallback when no pointer yields a string.
+fn top_level_pointer_segment(pointer: &str) -> &str {
+    if !pointer.starts_with('/') {
+        return pointer;
+    }
+    match pointer[1..].find('/') {
+        Some(offset) => &pointer[..offset + 1],
+        None => pointer,
+    }
+}
+
 /// Parses a line of JSONL output according to the agent's pointer configuration.
 /// Invalid JSON lines are ignored (returning all fields `None`).
 pub fn parse_jsonl_line(spec: &CustomAgentSpec, line: &str) -> ParsedLine {
@@ -716,12 +748,36 @@ pub fn parse_jsonl_line(spec: &CustomAgentSpec, line: &str) -> ParsedLine {
         None
     };
 
-    let error = spec.error_path.as_ref().and_then(|path| {
-        val.pointer(path).and_then(|v| match v {
-            serde_json::Value::String(s) => (!s.is_empty()).then(|| s.clone()),
-            serde_json::Value::Null => None,
-            other => Some(other.to_string()),
-        })
+    let error = spec.error_path.as_ref().and_then(|paths| {
+        let mut result: Option<String> = None;
+        let mut yielded_string = false;
+        for path in paths {
+            if let Some(v) = val.pointer(path) {
+                match v {
+                    serde_json::Value::String(s) => {
+                        if !s.is_empty() {
+                            result = Some(s.clone());
+                            yielded_string = true;
+                            break;
+                        }
+                    }
+                    serde_json::Value::Null => {}
+                    other => {
+                        result = Some(other.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        if result.is_none() && !yielded_string
+            && let Some(first) = paths.first()
+        {
+            let top = top_level_pointer_segment(first);
+            if let Some(serde_json::Value::Object(_)) = val.pointer(top) {
+                result = val.pointer(top).map(|v| v.to_string());
+            }
+        }
+        result
     });
 
     let session_id = spec.session_id_path.as_ref().and_then(|path| {
@@ -1071,7 +1127,7 @@ allowed_models = "^opencode/.*-free$"
 output = "jsonl"
 text_path = "/part/text"
 text_when = { path = "/type", equals = "text" }
-error_path = "/error/message"
+error_path = ["/error/data/message", "/error/message"]
 session_id_path = "/sessionID"
 resume_arg = ["--session", "{session_id}"]
 timeout_secs = 900
@@ -2099,6 +2155,61 @@ image_arg = []
         assert!(!line(r#"{"type":"text","data":"x"}"#).done);
         assert!(line(r#"{"type":"tool_call","toolCallId":"t"}"#).text_break);
         assert!(!line(r#"{"type":"tool_call_update"}"#).text_break);
+    }
+
+    // Preset drift guard: docs/agents/presets.toml opencode error_path == built-in.
+    #[test]
+    fn presets_opencode_error_path_matches_builtin() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(root.join("docs/agents/presets.toml")).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        let customs = value
+            .get("agents")
+            .and_then(|v| v.get("custom"))
+            .and_then(|v| v.as_array())
+            .unwrap();
+        let oc = customs
+            .iter()
+            .find(|v| v.get("name").and_then(|n| n.as_str()) == Some("opencode"))
+            .unwrap();
+        let preset: CustomAgentSpec = CustomAgentSpec::deserialize(oc.clone()).unwrap();
+        let built = opencode_preset("opencode");
+        assert_eq!(preset.error_path, built.error_path);
+    }
+
+    #[test]
+    fn opencode_error_jsonl_surfaces_provider_message() {
+        let spec = opencode_preset("opencode");
+        let line = r#"{"type":"error","sessionID":"ses_x","error":{"name":"UnknownError","data":{"message":"Unexpected server error. Check server logs for details."}}}"#;
+        let parsed = parse_jsonl_line(&spec, line);
+        assert_eq!(
+            parsed.error.as_deref(),
+            Some("Unexpected server error. Check server logs for details.")
+        );
+    }
+
+    #[test]
+    fn single_string_error_path_still_works() {
+        let toml_str = r#"
+name = "x"
+command = ["x"]
+error_path = "/error/message"
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        let line = r#"{"error":{"message":"boom"}}"#;
+        let parsed = parse_jsonl_line(&spec, line);
+        assert_eq!(parsed.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn error_object_without_message_surfaces_compact_json() {
+        let spec = opencode_preset("opencode");
+        let line = r#"{"type":"error","sessionID":"ses_x","error":{"name":"UnknownError","data":{"foo":"bar"}}}"#;
+        let parsed = parse_jsonl_line(&spec, line);
+        assert_eq!(
+            parsed.error.as_deref(),
+            Some(r#"{"data":{"foo":"bar"},"name":"UnknownError"}"#)
+        );
     }
 
     // TC-917 / FR-916: a pending break adds one blank line only between two
