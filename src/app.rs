@@ -2134,6 +2134,15 @@ impl App {
 
         // A follow-up sent while a run is active waits in the queue and starts
         // on its own once the run ends (see `flush_followup_queue`).
+        if let Some(active) = self.active_turns.get(&target_agent)
+            && active.conversation_id.as_str() != self.conversation_id.as_str()
+        {
+            let title = self.conversation_title_for(active.conversation_id.as_str());
+            return Err(RunTodoError::Busy(format!(
+                "agent '{runner_id}' is running in another conversation ({title}); wait or pick another agent"
+            )));
+        }
+
         if allow_queue && queued_id.is_none() && !display_is_slash && self.followup_should_queue() {
             if let Some(mode_str) = mode.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
                 crate::agent::turn_policy_from_legacy_mode(mode_str)
@@ -2212,22 +2221,85 @@ impl App {
         })
     }
 
-    /// A run or turn is active, so a new dashboard prompt would be refused
-    /// as busy. A plan waiting for approval is not active (its gate decides).
+    /// Whether `conversation_id` has a run that blocks new prompts there (FR-1620).
+    fn conversation_run_active(&self, conversation_id: &str) -> bool {
+        if self
+            .active_turns
+            .values()
+            .any(|active| active.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .pending_triage
+            .as_ref()
+            .is_some_and(|pending| pending.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .pending_plan
+            .as_ref()
+            .is_some_and(|pending| pending.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .pending_summary
+            .as_ref()
+            .is_some_and(|pending| pending.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .graph_session
+            .as_ref()
+            .is_some_and(|session| session.run().conversation_id == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .deferred_turns
+            .iter()
+            .any(|turn| turn.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if conversation_id != self.conversation_id.as_str() {
+            return false;
+        }
+        self.busy_agents
+            .iter()
+            .any(|agent| !self.active_turns.contains_key(agent))
+    }
+
+    fn conversation_title_for(&self, conversation_id: &str) -> String {
+        if self.conversation_id.as_str() == conversation_id {
+            return self.conversation_title.clone();
+        }
+        self.engine
+            .list()
+            .ok()
+            .and_then(|cards| {
+                cards
+                    .iter()
+                    .find(|card| card.id.as_str() == conversation_id)
+                    .map(|card| card.title.clone())
+            })
+            .unwrap_or_else(|| conversation_id.to_owned())
+    }
+
+    /// A run or turn is active in the displayed conversation, so a new
+    /// dashboard prompt would be refused as busy or queued. A plan waiting for
+    /// approval is not active (its gate decides).
     fn followup_run_active(&self) -> bool {
-        !self.busy_agents.is_empty()
-            || !self.active_turns.is_empty()
-            || self.pending_triage.is_some()
-            || self.pending_plan.is_some()
-            || self.pending_summary.is_some()
-            || self.graph_session.is_some()
-            || !self.deferred_turns.is_empty()
+        self.conversation_run_active(self.conversation_id.as_str())
     }
 
     /// Queue a new follow-up when a run is active, or when earlier follow-ups
     /// of this conversation still wait (keeps their order).
     fn followup_should_queue(&self) -> bool {
-        self.followup_run_active()
+        self.conversation_run_active(self.conversation_id.as_str())
             || self
                 .followup_queue
                 .iter()
@@ -2277,7 +2349,7 @@ impl App {
     fn flush_followup_queue(&mut self) -> bool {
         if self.followup_queue.is_empty()
             || self.switch_pending.is_some()
-            || self.followup_run_active()
+            || self.conversation_run_active(self.conversation_id.as_str())
             || self
                 .last_graph_run
                 .as_ref()
@@ -2558,15 +2630,16 @@ impl App {
                         Vec::with_capacity(cards.len().min(SESSION_CONVERSATIONS_MAX));
                     let mut rest = Vec::with_capacity(cards.len());
                     for card in cards {
+                        let id = card.id.as_str().to_owned();
                         let entry = SessionConversation {
-                            id: card.id.as_str().to_owned(),
+                            id: id.clone(),
                             title: card.title,
                             updated_at_ms: card.updated_at_ms.max(0) as u64,
                             last_agent: card
                                 .last_agent
                                 .map(|agent| self.agent_key_display_name(agent)),
                             turn_count: card.turn_count,
-                            running: card.running,
+                            running: card.running || self.conversation_run_active(&id),
                         };
                         if entry.id == conversation_id && ordered.is_empty() {
                             ordered.push(entry);
@@ -3186,6 +3259,20 @@ impl App {
                 self.on_agent_lifecycle_event(output.agent, &output.event);
 
                 let Some(event) = stored_event(&output.event) else {
+                    // FR-1621: live-only rows (activity, tool progress, status) of
+                    // a turn running in another conversation are not stored, so
+                    // they must not leak into the displayed transcript.
+                    let background = conversation_id.as_str() != self.conversation_id.as_str();
+                    if background
+                        && matches!(
+                            output.event,
+                            AgentEvent::Activity(_)
+                                | AgentEvent::ToolProgress { .. }
+                                | AgentEvent::Status(_)
+                        )
+                    {
+                        return true;
+                    }
                     self.apply_agent_event(output.agent, output.event);
                     return true;
                 };
@@ -4728,6 +4815,10 @@ impl App {
         self.clear_turn_runner_pin();
         self.cursor_session_maybe_read_only = true;
         for adapter in &self.adapters {
+            let agent = adapter.agent();
+            if self.active_turns.contains_key(&agent) {
+                continue;
+            }
             let _ = adapter.reset();
         }
         // Switching conversations clears the dashboard's retained graph so the
@@ -4735,7 +4826,10 @@ impl App {
         self.last_graph_run = None;
         self.graph_approval_stale = None;
         self.graph_node_details.clear();
-        self.graph_agent_nodes.clear();
+        // Keep graph node mappings for runners still mid-turn (possibly in another
+        // conversation) so graph completion still runs when they finish (FR-1625).
+        self.graph_agent_nodes
+            .retain(|agent, _| self.active_turns.contains_key(agent));
         self.clear_graph_defer_state();
         self.messages.clear();
         self.turn_user_message.clear();
@@ -4788,6 +4882,7 @@ impl App {
             self.submit_to_agent(deferred.agent, deferred.prompt, true);
         }
         self.restore_graph_runs_on_startup();
+        self.flush_followup_queue();
         self.publish_dashboard();
     }
 
@@ -8953,6 +9048,158 @@ impl App {
         self.replan_summaries.push((node_id.to_owned(), capped));
     }
 
+    fn active_stored_graph_run_for_node(
+        workspace: &std::path::Path,
+        conversation_id: &str,
+        node_id: &str,
+    ) -> Option<GraphRun> {
+        GraphStore::new(workspace)
+            .list_runs()
+            .into_iter()
+            .filter(|run| {
+                run.conversation_id == conversation_id
+                    && run.phase == GraphRunPhase::Active
+                    && run.plan.nodes.iter().any(|node| node.id == node_id)
+            })
+            .max_by(|left, right| {
+                left.turn_index
+                    .cmp(&right.turn_index)
+                    .then_with(|| left.plan.id.cmp(&right.plan.id))
+            })
+    }
+
+    fn clear_background_graph_leftovers(
+        &mut self,
+        agent: Agent,
+        conversation_id: &str,
+        run: &GraphRun,
+    ) {
+        self.graph_agent_nodes.remove(&agent);
+        self.quiet_graph_run = false;
+        if self
+            .graph_session
+            .as_ref()
+            .is_some_and(|session| session.run().conversation_id == conversation_id)
+        {
+            self.graph_session = None;
+            self.graph_assignment_line.clear();
+            self.busy_retry_user_message.clear();
+            self.clear_graph_defer_state();
+        }
+        if self.conversation_id.as_str() == conversation_id {
+            self.last_graph_run = Some(run.clone());
+        }
+        if self
+            .graph_todo
+            .as_ref()
+            .is_some_and(|(plan_id, _)| plan_id == &run.plan.id)
+            && let Some((_plan_id, todo_id)) = self.graph_todo.take()
+            && let Some(store) = self.todo_store.clone()
+        {
+            let success = run.phase == GraphRunPhase::Completed;
+            let todo_error = if success {
+                None
+            } else if run.phase == GraphRunPhase::Cancelled {
+                Some("cancelled".to_owned())
+            } else {
+                Some("graph run failed".to_owned())
+            };
+            if let Err(err) = store.finish_run(&todo_id, success, todo_error) {
+                self.push_system(format!("Failed to finish to-do run: {err}"));
+            }
+            self.publish_todos();
+        }
+        self.session_conversations = None;
+    }
+
+    fn complete_background_graph_node(
+        &mut self,
+        agent: Agent,
+        conversation_id: &str,
+        node_id: String,
+        success: bool,
+        error: Option<&str>,
+    ) {
+        if !success && error == Some("cancelled") {
+            let session_is_target = self
+                .graph_session
+                .as_ref()
+                .is_some_and(|session| session.run().conversation_id == conversation_id);
+            let run = if session_is_target {
+                let session = self.graph_session.as_mut().expect("graph session");
+                session.finalize_failure();
+                session.run_mut().phase = GraphRunPhase::Cancelled;
+                let run = session.run().clone();
+                let _ = save_run(&self.workspace_root, &run);
+                run
+            } else if let Some(mut run) = Self::active_stored_graph_run_for_node(
+                &self.workspace_root,
+                conversation_id,
+                &node_id,
+            ) {
+                run.phase = GraphRunPhase::Cancelled;
+                let _ = save_run(&self.workspace_root, &run);
+                run
+            } else {
+                return;
+            };
+            self.clear_background_graph_leftovers(agent, conversation_id, &run);
+            return;
+        }
+
+        let session_is_target = self
+            .graph_session
+            .as_ref()
+            .is_some_and(|session| session.run().conversation_id == conversation_id);
+
+        let (actions, run_snapshot) = if session_is_target {
+            let session = self.graph_session.as_mut().expect("graph session");
+            let actions = session.on_node_finished(&node_id, success);
+            let snapshot = session.run().clone();
+            let _ = save_run(&self.workspace_root, session.run());
+            (actions, snapshot)
+        } else if let Some(run) =
+            Self::active_stored_graph_run_for_node(&self.workspace_root, conversation_id, &node_id)
+        {
+            let mut session = GraphRunSession::new(run);
+            let actions = session.on_node_finished(&node_id, success);
+            let snapshot = session.run().clone();
+            let _ = save_run(&self.workspace_root, &snapshot);
+            (actions, snapshot)
+        } else {
+            return;
+        };
+
+        self.sync_tasks_file_for_run(&run_snapshot);
+        let completed = actions
+            .iter()
+            .any(|action| matches!(action, GraphAction::Completed));
+        let failed_message = actions.iter().find_map(|action| match action {
+            GraphAction::Failed(message) => Some(message.clone()),
+            _ => None,
+        });
+        if completed {
+            self.clear_background_graph_leftovers(agent, conversation_id, &run_snapshot);
+        } else if let Some(message) = failed_message {
+            if session_is_target {
+                if let Some(session) = self.graph_session.as_mut() {
+                    session.finalize_failure();
+                    if message.starts_with(GRAPH_CANCELLED_PREFIX) {
+                        session.run_mut().phase = GraphRunPhase::Cancelled;
+                    }
+                    let run = session.run().clone();
+                    let _ = save_run(&self.workspace_root, &run);
+                    self.clear_background_graph_leftovers(agent, conversation_id, &run);
+                }
+            } else {
+                let mut run = run_snapshot;
+                run.phase = GraphRunPhase::Failed;
+                let _ = save_run(&self.workspace_root, &run);
+                self.clear_background_graph_leftovers(agent, conversation_id, &run);
+            }
+        }
+    }
+
     fn intercept_graph_node_finished(
         &mut self,
         agent: Agent,
@@ -9579,6 +9826,9 @@ impl App {
             .last_agent_output_index(agent)
             .map(|index| format!("{}:{index}", self.conversation_id.as_str()));
         let active_turn = self.active_turns.remove(&agent);
+        let finished_conversation = active_turn
+            .as_ref()
+            .map(|active| active.conversation_id.clone());
         self.streaming_messages.remove(&agent);
         self.tool_messages.remove(&agent);
         let graph_node_id = active_turn
@@ -9596,13 +9846,14 @@ impl App {
             let started_ms = active.started_ms;
             let workspace_scan = active.workspace_scan.clone();
             let output_for_docs = output_text.clone();
+            let graph_node_id_for_docs = graph_node_id.clone();
             std::thread::spawn(move || {
                 record_turn_doc_changes(
                     log,
                     turn_id,
                     agent_id,
                     graph_id,
-                    graph_node_id,
+                    graph_node_id_for_docs,
                     started_ms,
                     workspace_scan,
                     &workspace_root,
@@ -9625,8 +9876,21 @@ impl App {
             }
             self.publish_todos();
         }
+        let background_graph_turn = finished_conversation
+            .as_ref()
+            .is_some_and(|id| id.as_str() != self.conversation_id.as_str());
         if let Some(node_id) = self.graph_agent_nodes.remove(&agent) {
-            if !success
+            if background_graph_turn {
+                if let Some(conversation_id) = finished_conversation.as_ref() {
+                    self.complete_background_graph_node(
+                        agent,
+                        conversation_id.as_str(),
+                        node_id,
+                        success,
+                        error.as_deref(),
+                    );
+                }
+            } else if !success
                 && error.as_deref().is_some_and(is_adapter_turn_busy_rejection)
                 && let Some(session) = self.graph_session.as_mut()
                 && let Some(assignment) = session.assignment_for_node(&node_id)
@@ -9638,19 +9902,56 @@ impl App {
                     self.busy_retry_user_message.insert(agent, index);
                 }
                 return;
-            }
-            if !success && error.as_deref() == Some("cancelled") {
+            } else if !success && error.as_deref() == Some("cancelled") {
                 // FR-1416: a cancelled step (user cancel or denied ACP permission)
                 // stops the graph as cancelled, without retry or failure replan.
                 self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
                     "{GRAPH_CANCELLED_PREFIX}step {node_id} was cancelled"
                 ))]);
                 return;
+            } else if self.graph_session.as_ref().is_some_and(|session| {
+                session
+                    .run()
+                    .plan
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == node_id)
+            }) {
+                self.intercept_graph_node_finished(agent, node_id, success, &output_text);
+            } else if let Some(conversation_id) = finished_conversation.as_ref() {
+                self.complete_background_graph_node(
+                    agent,
+                    conversation_id.as_str(),
+                    node_id,
+                    success,
+                    error.as_deref(),
+                );
             }
-            self.intercept_graph_node_finished(agent, node_id, success, &output_text);
+        } else if let Some(node_id) = graph_node_id
+            && let Some(conversation_id) = finished_conversation.as_ref()
+            && (background_graph_turn
+                || !self.graph_session.as_ref().is_some_and(|session| {
+                    session
+                        .run()
+                        .plan
+                        .nodes
+                        .iter()
+                        .any(|node| node.id == node_id)
+                }))
+        {
+            self.complete_background_graph_node(
+                agent,
+                conversation_id.as_str(),
+                node_id,
+                success,
+                error.as_deref(),
+            );
         }
         self.flush_deferred_graph_starts();
         self.try_flush_queued_replan();
+        if finished_conversation.as_ref() == Some(&self.conversation_id) {
+            self.flush_followup_queue();
+        }
     }
 
     /// The model a planned step should actually use on `agent`.
@@ -28038,6 +28339,207 @@ mod tests {
         assert_eq!(sent_prompts(&h).len(), 1);
         assert!(queued_lines(&mut h.app).is_empty());
         assert_eq!(h.app.followup_queue.len(), 1);
+    }
+
+    fn submit_direct_agent(app: &mut App, agent: &str, text: &str) -> PromptAccepted {
+        app.handle_dashboard_submit_prompt(
+            text.to_owned(),
+            Some(agent.to_owned()),
+            None,
+            Some("direct".to_owned()),
+            Vec::new(),
+        )
+        .expect("accepted")
+    }
+
+    // TC-1620 / FR-1620: another agent in another conversation starts immediately.
+    #[test]
+    fn concurrent_send_other_conversation_other_agent_starts() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        let first = submit_direct_agent(&mut h.app, "codex", "task in A");
+        assert!(!first.queued);
+        assert!(h.app.conversation_run_active(a.as_str()));
+        h.app.create_conversation(Some("conversation B".to_owned()));
+        assert_ne!(h.app.conversation_id, a);
+        assert!(!h.app.session_view().run_active);
+        let second = submit_direct_agent(&mut h.app, "cursor", "task in B");
+        assert!(!second.queued);
+        assert_eq!(h.sent.lock().unwrap().len(), 2);
+        assert_eq!(h.sent.lock().unwrap()[1].0, Agent::Cursor);
+    }
+
+    // TC-1621 / FR-1621: switching away does not drop a background turn.
+    #[test]
+    fn switch_conversation_keeps_background_turn() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "background work");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::TextDelta("done".to_owned())
+        )));
+        assert!(
+            !h.app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("done"))
+        );
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request, AgentEvent::Completed))
+        );
+        h.app.select_conversation(a);
+        assert!(
+            h.app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("done"))
+        );
+    }
+
+    // TC-1621 / FR-1621: live-only activity rows of a background turn never
+    // appear in the displayed conversation.
+    #[test]
+    fn background_activity_does_not_leak_into_displayed_conversation() {
+        let mut h = plan_gate_test_app();
+        submit_direct_agent(&mut h.app, "codex", "background work");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        let before = h.app.messages.len();
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::ToolProgress {
+                item_id: "t1".to_owned(),
+                summary: "execute sleep 12; echo LEAKCHECK".to_owned(),
+                state: "completed".to_owned(),
+            }
+        )));
+        assert_eq!(h.app.messages.len(), before);
+        assert!(
+            !h.app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("LEAKCHECK"))
+        );
+    }
+
+    // TC-1623 / FR-1623: same agent cannot run in two conversations at once.
+    #[test]
+    fn same_agent_other_conversation_refused() {
+        let mut h = plan_gate_test_app();
+        submit_direct_agent(&mut h.app, "codex", "first in A");
+        h.app.create_conversation(Some("conversation B".to_owned()));
+        let refused = h.app.submit_dashboard_prompt(
+            "second in B".to_owned(),
+            Some("codex".to_owned()),
+            None,
+            Some("direct".to_owned()),
+            Vec::new(),
+            true,
+            None,
+        );
+        assert!(
+            matches!(refused, Err(RunTodoError::Busy(message)) if message.contains("another conversation"))
+        );
+        assert_eq!(h.sent.lock().unwrap().len(), 1);
+    }
+
+    // TC-1624 / FR-1624: Sessions list marks each running conversation.
+    #[test]
+    fn sessions_running_flag_per_conversation() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.as_str().to_owned();
+        submit_direct_agent(&mut h.app, "codex", "run A");
+        h.app.create_conversation(Some("B".to_owned()));
+        let b = h.app.conversation_id.as_str().to_owned();
+        submit_direct_agent(&mut h.app, "cursor", "run B");
+        let conversations = h.app.session_view().conversations;
+        let a_row = conversations.iter().find(|c| c.id == a).expect("A listed");
+        let b_row = conversations.iter().find(|c| c.id == b).expect("B listed");
+        assert!(a_row.running);
+        assert!(b_row.running);
+        assert!(h.app.session_view().run_active);
+    }
+
+    // TC-1625 / FR-1625: a background turn ending clears process-wide queue gating.
+    #[test]
+    fn background_turn_end_clears_run_state() {
+        let mut h = plan_gate_test_app();
+        submit_direct_agent(&mut h.app, "codex", "background");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request, AgentEvent::Completed))
+        );
+        assert!(!h.app.session_view().run_active);
+        let next = submit_direct_agent(&mut h.app, "cursor", "after background done");
+        assert!(!next.queued);
+    }
+
+    // TC-1625: background graph turn completion clears run gating for all conversations.
+    #[test]
+    fn background_graph_turn_end_clears_run_state() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "background graph");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        let b = h.app.conversation_id.clone();
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request, AgentEvent::Completed))
+        );
+        assert!(!h.app.conversation_run_active(a.as_str()));
+        assert!(!h.app.conversation_run_active(b.as_str()));
+        assert!(!h.app.session_view().run_active);
+        let store = GraphStore::new(&h.app.workspace_root);
+        assert!(
+            !store
+                .list_runs()
+                .iter()
+                .any(|run| run.conversation_id == a.as_str() && run.phase == GraphRunPhase::Active)
+        );
+        let next = submit_direct_agent(&mut h.app, "cursor", "after background graph done");
+        assert!(!next.queued);
+    }
+
+    // TC-1626: concurrent graph runs in two conversations both complete cleanly.
+    #[test]
+    fn two_conversations_graph_runs_complete_independently() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "run A");
+        let (codex_agent, codex_req) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("B".to_owned()));
+        let _b = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "cursor", "run B");
+        let (cursor_agent, cursor_req) = h.sent.lock().unwrap()[1].clone();
+        h.app.select_conversation(a.clone());
+        assert!(h.app.apply_agent_output(triage_output(
+            cursor_agent,
+            &cursor_req,
+            AgentEvent::Completed
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            codex_agent,
+            &codex_req,
+            AgentEvent::Completed
+        )));
+        let store = GraphStore::new(&h.app.workspace_root);
+        assert!(
+            !store
+                .list_runs()
+                .iter()
+                .any(|run| run.phase == GraphRunPhase::Active)
+        );
+        let conversations = h.app.session_view().conversations;
+        assert!(conversations.iter().all(|card| !card.running));
     }
 
     fn start_approved_three_step_run(h: &mut PlanGateHarness) -> String {
