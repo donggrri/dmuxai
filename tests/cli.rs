@@ -379,3 +379,49 @@ fn run_sensitive_gate_exits_7_headless() {
     let gated = load_run(sandbox.workspace(), graph_id).expect("gated run");
     assert_eq!(gated.phase, GraphRunPhase::WaitingGate);
 }
+
+/// TC-1660 / FR-1660: explicit agent + approve-plan confirms the sensitive gate.
+#[cfg(unix)]
+#[test]
+fn tc_1660_headless_agent_approve_confirms_sensitive_gate() {
+    use plan_gate::{Sandbox, plan_gate_config, stdout_json};
+
+    let sandbox = Sandbox::new(&plan_gate_config("text"));
+    let gated = sandbox.run(&["run", "fix the login form", "--agent", "fake", "--json"]);
+    let gated_json = stdout_json(&gated);
+    assert_eq!(gated.status.code(), Some(7), "{gated_json}");
+
+    let approved = sandbox.run(&[
+        "run",
+        "fix the login form",
+        "--agent",
+        "fake",
+        "--approve-plan",
+        "--json",
+    ]);
+    let approved_json = stdout_json(&approved);
+    assert_eq!(approved.status.code(), Some(0), "{approved_json}");
+    assert_eq!(approved_json["ok"], true);
+}
+
+/// TC-1661 / FR-1661: `--allow-sensitive` bypasses headless sensitive gate.
+#[cfg(unix)]
+#[test]
+fn tc_1661_allow_sensitive_bypasses_headless_gate() {
+    use dmuxai::graph::GraphRunPhase;
+    use plan_gate::{Sandbox, plan_gate_config, stdout_json};
+
+    let sandbox = Sandbox::new(&plan_gate_config("judge-simple"));
+    let output = sandbox.run(&[
+        "run",
+        "please deploy the app today",
+        "--json",
+        "--allow-sensitive",
+    ]);
+    let json = stdout_json(&output);
+    assert_eq!(output.status.code(), Some(0), "{json}");
+    assert_eq!(json["ok"], true);
+    let graph_id = json["graph_id"].as_str().expect("graph_id");
+    let run = dmuxai::graph::load_run(sandbox.workspace(), graph_id).expect("run");
+    assert_ne!(run.phase, GraphRunPhase::WaitingGate);
+}

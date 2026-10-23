@@ -58,6 +58,7 @@ pub struct RunOptions {
     pub read_only: bool,
     pub graph: bool,
     pub approve_plan: bool,
+    pub allow_sensitive: bool,
     pub json: bool,
 }
 
@@ -96,6 +97,7 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
                 "--graph" => options.graph = true,
                 "--read-only" => options.read_only = true,
                 "--approve-plan" => options.approve_plan = true,
+                "--allow-sensitive" => options.allow_sensitive = true,
                 "--json" => options.json = true,
                 flag if flag.starts_with("--") => {
                     return Err(format!("unexpected argument '{flag}'"));
@@ -599,6 +601,7 @@ async fn run_headless(
         mode,
         graph: options.graph,
         approve_plan: options.approve_plan,
+        allow_sensitive: options.allow_sensitive,
         todo_id,
     };
     let outcome = app.run_headless(request, cancel).await;
@@ -768,6 +771,7 @@ mod tests {
                 read_only: false,
                 graph: false,
                 approve_plan: false,
+                allow_sensitive: false,
                 json: true,
             }))
         );
@@ -785,6 +789,15 @@ mod tests {
         assert!(parse(&args(&["run", "x", "--agent", "a", "--graph"])).is_err());
         assert!(parse(&args(&["run", "x", "--mode", "fast"])).is_err());
         assert!(parse(&args(&["run", "x", "--nope"])).is_err());
+        assert_eq!(
+            parse(&args(&["run", "deploy", "--allow-sensitive", "--json"])),
+            Ok(AgentCommand::Run(RunOptions {
+                prompt: "deploy".into(),
+                allow_sensitive: true,
+                json: true,
+                ..RunOptions::default()
+            }))
+        );
         // A flag is never consumed as another flag's value.
         assert!(parse(&args(&["run", "x", "--agent", "--json"])).is_err());
         assert_eq!(

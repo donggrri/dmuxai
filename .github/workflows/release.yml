@@ -3,7 +3,8 @@
 # GitHub web UI, with binaries built locally and attached to the release.
 # When Actions is available again, run this workflow manually (Actions tab ->
 # "Release binaries" -> "Run workflow") with the tag of an existing release to
-# build the Windows and Linux assets and attach them to that release.
+# build the Linux asset and attach it to that release. DmuxAI is Linux-only
+# for now (Windows dropped in #115; WSL counts as Linux).
 name: Release binaries
 
 on:
@@ -18,47 +19,10 @@ permissions:
   contents: write
 
 jobs:
-  windows:
-    runs-on: windows-latest
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag }}
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Build release executable
-        run: cargo build --release --locked --bin dmuxai --bin dmuxai-launcher
-
-      - name: Package release archive and checksum
-        shell: pwsh
-        run: |
-          $archiveName = 'dmuxai-windows-x86_64.zip'
-          $distributionDirectory = Join-Path $env:RUNNER_TEMP 'dmuxai-release'
-          New-Item -ItemType Directory -Path $distributionDirectory | Out-Null
-          Copy-Item 'target\release\dmuxai.exe' (Join-Path $distributionDirectory 'dmuxai.exe')
-          Copy-Item 'target\release\dmuxai-launcher.exe' (Join-Path $distributionDirectory 'dmuxai-launcher.exe')
-          Copy-Item 'packaging\windows\install.ps1' (Join-Path $distributionDirectory 'install.ps1')
-          Copy-Item 'packaging\windows\uninstall.ps1' (Join-Path $distributionDirectory 'uninstall.ps1')
-          Copy-Item 'packaging\windows\README-windows.txt' (Join-Path $distributionDirectory 'README-windows.txt')
-          Compress-Archive -Path "$distributionDirectory\*" -DestinationPath $archiveName
-          $hash = (Get-FileHash -LiteralPath $archiveName -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $archiveName" | Set-Content -LiteralPath "$archiveName.sha256" -NoNewline -Encoding ascii
-
-      - name: Upload Windows release artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dmuxai-windows-x86_64
-          path: |
-            dmuxai-windows-x86_64.zip
-            dmuxai-windows-x86_64.zip.sha256
-          if-no-files-found: error
-
   linux:
     # Static Linux x86_64 binary (musl) for WSL and native Linux users, so it
-    # runs regardless of the distro's glibc. Attached to the same release as the
-    # Windows zip by the publish job below.
+    # runs regardless of the distro's glibc. Attached to the release by the
+    # publish job below.
     runs-on: ubuntu-latest
 
     steps:
@@ -112,9 +76,9 @@ jobs:
           if-no-files-found: error
 
   publish:
-    # One publisher so the Windows and Linux assets land on the same release
-    # without two jobs racing to create it.
-    needs: [windows, linux]
+    # Separate publisher job so build and release-write steps stay apart and
+    # more platforms can be added later without racing to create the release.
+    needs: [linux]
     runs-on: ubuntu-latest
 
     steps:
@@ -130,7 +94,5 @@ jobs:
           tag_name: ${{ inputs.tag }}
           generate_release_notes: true
           files: |
-            dist/dmuxai-windows-x86_64.zip
-            dist/dmuxai-windows-x86_64.zip.sha256
             dist/dmuxai-linux-x86_64.tar.gz
             dist/dmuxai-linux-x86_64.tar.gz.sha256

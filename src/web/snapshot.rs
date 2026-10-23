@@ -52,6 +52,40 @@ pub struct DashboardSnapshot {
     /// FR-780); absent for `serve` and headless runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionView>,
+    /// FR-1650: coarse turn state for API clients polling `/api/state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<TurnView>,
+}
+
+/// FR-1650: top-level turn state on `DashboardSnapshot`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TurnView {
+    pub state: String,
+    pub conversation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_id: Option<String>,
+    pub since_ms: u64,
+}
+
+/// True when the graph run is waiting for a plan or replan approval decision.
+pub fn graph_awaits_plan_approval(run: &GraphRun) -> bool {
+    run.phase == GraphRunPhase::AwaitingApproval || run.pending_replan_plan.is_some()
+}
+
+/// FR-1651: agent run views must not read `done` while the graph awaits approval.
+pub fn adjust_run_state_for_plan_approval(view: RunStateView, awaiting: bool) -> RunStateView {
+    if awaiting && view.state == "done" {
+        RunStateView {
+            state: "awaiting_approval".to_owned(),
+            started_at_ms: view.started_at_ms,
+            ended_at_ms: None,
+            duration_ms: view.duration_ms,
+            node: view.node,
+        }
+    } else {
+        view
+    }
 }
 
 /// Transcript limits for the snapshot (SPEC-dashboard-parity OQ-781).
@@ -1122,6 +1156,7 @@ mod tests {
             todos: Vec::new(),
             jira_base_url: None,
             session: None,
+            turn: None,
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();
@@ -1831,5 +1866,22 @@ mod tests {
         assert_eq!(approval.steps.len(), 1);
         assert_eq!(approval.steps[0].rev_change, Some(RevChangeMark::Added));
         assert_eq!(approval.notes, vec!["note"]);
+    }
+
+    // TC-1651 / FR-1651: done agent runs surface awaiting_approval in snapshots.
+    #[test]
+    fn tc_1651_adjust_run_state_for_plan_approval() {
+        let done = RunStateView {
+            state: "done".to_owned(),
+            started_at_ms: Some(100),
+            ended_at_ms: Some(200),
+            duration_ms: Some(100),
+            node: None,
+        };
+        let adjusted = adjust_run_state_for_plan_approval(done.clone(), true);
+        assert_eq!(adjusted.state, "awaiting_approval");
+        assert_eq!(adjusted.ended_at_ms, None);
+        let unchanged = adjust_run_state_for_plan_approval(done, false);
+        assert_eq!(unchanged.state, "done");
     }
 }

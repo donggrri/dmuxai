@@ -77,7 +77,7 @@
 - **DB:** Windows `%LOCALAPPDATA%\DmuxAI\conversations.sqlite3`; Linux `XDG_STATE_HOME` 또는 `~/.local/state/dmuxai/` (`src/main.rs` ~33–62)
 - **Workspace 키:** `normalize_workspace` → `canonicalize` (`src/conversation.rs` ~1729–1737)
 - **설치:** `install.ps1` / `install.cmd` — 릴리스 `dmuxai.exe`만 (에이전트 CLI는 별도)
-- **CI:** `.github/workflows/verify.yml` — spec check + `fmt` / `test` / `clippy` on ubuntu-latest, plus clippy for the `x86_64-pc-windows-gnu` target (since v0.2.2; Windows release builds stay on windows-latest in `release.yml`)
+- **CI:** `.github/workflows/verify.yml` — spec check + `fmt` / `test` / `clippy` on ubuntu-latest (Linux only; the `x86_64-pc-windows-gnu` clippy gate and the Windows release build were removed with Windows support, #115)
 - **릴리스:** `.github/workflows/release.yml` — 수동 실행(`workflow_dispatch`, 입력 `tag`) 전용. Actions 결제가 막혀 있어 태그 push로는 돌지 않음; 릴리스는 GitHub 웹 UI에서 만들고 로컬에서 빌드한 바이너리를 첨부
 - **훅:** Cursor/에이전트 훅 통합 없음; DmuxAI는 자체 슬래시 명령만 (`/agent`, `/mode`, …)
 

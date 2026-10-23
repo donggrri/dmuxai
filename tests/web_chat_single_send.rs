@@ -124,7 +124,7 @@ async fn run_scenario(scenario: Scenario) -> Option<Outcome> {
     }
 
     let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_owned());
-    hub.publish(Vec::new(), None);
+    hub.publish(Vec::new(), None, None);
     hub.set_session(Some(session(
         vec![message(0, "system", "ready", false)],
         false,
