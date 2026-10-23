@@ -106,7 +106,7 @@ Any agent CLI with a headless command (opencode, Hermes, pi, ...) can be connect
 | TC-1848 | FR-1848 | unit | opencode preset JSONL lines with `/error/message` | `parse_jsonl_line` | error message captured from `/error/message` | `src/custom_agent.rs` `test_parse_jsonl_opencode_sample`, `test_failure_reason` |
 | TC-1849 | FR-1849 | unit | custom spec, non-zero exit with empty stderr | `failure_reason` | returns direct command execution hint with binary name | `src/custom_agent.rs` `test_failure_reason` |
 | TC-1850 | FR-1850 | unit | user spec and built-in preset exceeding timeout | `timeout_message` | message cites label, timeout_secs, and override hints | `src/custom_agent.rs` `timeout_message_mentions_config_for_user_agent`, `timeout_message_mentions_override_for_builtin_preset` |
-| TC-1851 | FR-1851 | unit | resolved MCP servers and opencode config JSON | `merge_opencode_mcp`, `custom_mcp_json` | servers merged under mcp key; valid JSON with mode 0600 temp file | `src/mcp/propagate.rs` `merge_opencode_mcp_preserves_existing_keys_and_adds_servers`, `custom_mcp_json_formats_servers` |
+| TC-1851 | FR-1851 | unit | resolved MCP servers and opencode config JSON | `merge_opencode_mcp`, `custom_mcp_json` | servers merged under mcp key; valid JSON with mode 0600 temp file | `src/mcp/propagate.rs` `opencode_config_gets_mcp_key`, `custom_agent_mcp_json_shape`, `src/agent/custom.rs` `custom_turn_gets_mcp_config_file_and_env` |
 
 ## 6. Data, integration, and safety contracts
 

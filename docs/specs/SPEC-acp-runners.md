@@ -129,7 +129,7 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | TC-1424 | NFR-1410, FR-1413 | integration | Fake `FAKE_ACP_MODES` = modes / config / none | Read-only Cursor ACP turn | set_mode ask / set_config_option plan / none | `src/agent/cursor.rs` |
 | TC-1425 | NFR-1410, FR-1413 | integration | Fake `FAKE_ACP_MODES=both` | Read-only Cursor ACP turn | set_mode preferred | `src/agent/cursor.rs` |
 | TC-1862 | FR-1862 | unit | `DmuxSettings::default()` and `CursorAdapterConfig::default()` | Compare protocol fields | settings default is Legacy, adapter default is Acp | `src/settings.rs` |
-| TC-1863 | FR-1863 | unit | unauthorized or read-only tool request | `session/request_permission` evaluation | permission denied; notice emitted; turn cancelled | `src/agent/acp/client.rs` `acp_permission_denied_emits_notice_and_cancels` |
+| TC-1863 | FR-1863 | unit | unauthorized or read-only tool request | `session/request_permission` evaluation | permission denied; notice emitted; turn cancelled | `src/agent/cursor.rs` `tc_1420_permission_denied_ends_cancelled`, `src/agent/acp/permissions.rs` `denies_permission_when_path_outside_workspace` |
 | TC-1480 | FR-1412, FR-1301 | manual | Built `dmuxai`, grok logged in, temp git workspace | `dmuxai run --agent grok "create hello.txt containing hi"` | File created in workspace; reply text shown | hands-on |
 | TC-1481 | FR-1416, FR-1314 | manual | Same | Ask grok to write `/tmp/outside-<rand>.txt` | No file outside workspace; turn ends cancelled with a denial notice (not "Graph failed") | hands-on |
 | TC-1482 | FR-1417 | manual | Same | Ask grok to run `ls -1 \| wc -l` | Reply has the count; activity row shows the command | hands-on |

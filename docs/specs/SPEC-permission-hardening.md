@@ -59,7 +59,7 @@ Implement turns must never silently succeed when writes are blocked: a permissio
 | TC-303 | FR-302, FR-300 | integration | Plan turn and failed Implement turn in app | finish turns | Plan Completed; Implement reason persisted in DB | *proposed*: `plan_mode_never_fails_for_missing_writes`, `implement_failure_reason_is_persisted` |
 | TC-304 | FR-303 | unit | Windows target, no opt-in | select Implement / start turn | rejected before queue and spawn | `cargo test windows_cursor_implement_mode_is_rejected_before_queueing`; `windows_cursor_implement_turn_is_rejected_before_process_spawn` |
 | TC-305 | FR-303 | unit | settings with `windows_unsandboxed = true` | load + validate | opt-in honored; default false | *proposed*: `windows_unsandboxed_requires_explicit_opt_in` |
-| TC-1860 | FR-1860 | unit | stderr permission denied and agy denied_actions | classify and stream child | denial error recognized | `src/agent/implement_outcome.rs` `permission_denial_is_detected_in_stderr`, `src/agent/agy.rs` `stream_child_reports_error_when_denied_actions_present` |
+| TC-1860 | FR-1860 | unit | stderr permission denied and agy denied_actions | classify and stream child | denial error recognized | `src/agent/implement_outcome.rs` `permission_denial_is_detected_in_stderr`, `src/agent/agy.rs` `denied_actions_and_empty_output_are_errors` |
 | TC-1861 | FR-1861 | unit | Implement turn tracker with require_writes false vs true | `ImplementTurnTracker::finish` | missing writes ok when require_writes false, fails when true | `src/agent/implement_outcome.rs` `finish_accepts_forced_kill_after_result_in_agent_mode`, `implement_without_writes_fails` |
 
 ## 6. Data, integration, and safety contracts

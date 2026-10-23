@@ -184,8 +184,7 @@ Compared with replanning after every step (rejected design), an 8-step run saves
 
 | ID | Spec says | Code does (file:function) | Proposed resolution |
 | --- | --- | --- | --- |
-| OQ-1810 | `--graph` becomes a no-op (CLI data contract) | `src/cli.rs` `run_headless` stores `graph` and `todo run --graph` selects `RunMode::Graph` | Clarify that `--graph` is a no-op only for `dmuxai run`; `todo run --graph` enables graph mode |
-| OQ-1811 | `--graph` is accepted as a no-op for legacy scripts | `src/app.rs` `headless_submit_prompt` does not branch on `req.graph` for direct runs, so the flag has no effect on `run` | Keep no-op for `run`; document todo-run exception (OQ-1810) |
+| OQ-1811 | `--graph` is accepted as a no-op for legacy scripts | `src/app.rs` `headless_submit_prompt` does not branch on `req.graph` for direct runs, while `todo run --graph` selects `RunMode::Graph` in `src/cli.rs` | Keep no-op for `run`; document `todo run --graph` exception (see OQ-1810 in SPEC-agent-api) |
 
 ## 5. Acceptance scenarios and test design
 
@@ -264,7 +263,7 @@ Compared with replanning after every step (rejected design), an 8-step run saves
 | TC-962 | NFR-931 | integration (ignored) | A real logged-in runner | Submit a Korean simple and a complex prompt | Verdicts parse; a plan validates; the complex plan has at least one parallel branch (manual dogfood: screenshot `v023-plangate-*`) | `tests/graph_orchestration.rs` `live_judge_and_plan_smoke` (`#[ignore]`) |
 | TC-1828 | FR-1828 | integration (CLI) | fake agent plan | `dmuxai run ...` without `--approve-plan` | exit 7, record cancelled | `tests/cli.rs` `run_complex_needs_approve_plan` |
 | TC-1829 | FR-1829 | integration (CLI) | fake agent plan | `dmuxai run ... --approve-plan` | exit 0, decided_by cli | `tests/cli.rs` `run_complex_needs_approve_plan` |
-| TC-1830 | FR-1830 | integration | dashboard router | `plan_decision` approve | 200 + session view | `src/web/server.rs` `plan_decision_command_contract` |
+| TC-1830 | FR-1830 | integration | dashboard router | plan_decision approve | 200 + session view | `src/web/server.rs` `plan_decision_command_contract` |
 | TC-1831 | FR-1831 | unit (app) | todo graph run | run to-do with `--graph` | graph mode and plan gate | `src/web/server.rs` `todo_graph_run_waits_for_plan_approval` |
 
 ## 6. Data, integration, and safety contracts

@@ -61,7 +61,7 @@ Every Cursor turn in DmuxAI must pass `--model composer-2.5` to `cursor-agent` u
 | TC-412 | FR-411 | unit | App state with Cursor selected and catalog model set to `"composer-2.5-fast"` | User submits prompt or calls `submit_to_agent` | Model is replaced with `composer-2.5`, system notice is emitted | `src/app.rs` |
 | TC-413 | FR-410, FR-412 | unit | Fresh app with Cursor agent and unset model catalog, input starting with `/test` | `app.handle_enter()` / `submit_to_agent` | Model passed to adapter and catalog selected is `composer-2.5` | `src/app.rs` |
 | TC-414 | UX-410 | unit | Fresh app or app with Cursor selected and no F2 model selected | Render status bar or inspect status segments | Model segment displays `"composer-2.5"`, not `"provider default"` | `src/app.rs` |
-| TC-1866 | FR-1866 | unit | `configure_command` with unset or foreign model | build argv | argv contains `["--model", "composer-2.5"]` | `src/agent/cursor.rs` `cursor_legacy_argv_pins_composer_2_5` |
+| TC-1866 | FR-1866 | unit | `configure_command` with unset or foreign model | build argv | argv contains `["--model", "composer-2.5"]` | `src/agent/cursor.rs` `cursor_argv_always_contains_composer_2_5_by_default`, `cursor_argv_rejects_and_replaces_fast_model` |
 
 ## 6. Data, integration, and safety contracts
 

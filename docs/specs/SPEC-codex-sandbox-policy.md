@@ -51,7 +51,7 @@ and workspace-write Implement permissions.
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
 | TC-046 | INT-040, NFR-041 | unit | One request per Codex mode. | Build `turn/start` JSON. | The discriminator object is present and legacy string shape is absent; approval/model/effort values are preserved. | `cargo test codex_execution_modes_set_per_turn_sandbox_and_approval_policy` |
-| TC-1867 | FR-1867 | unit | resolved MCP servers for Codex | `build_codex_app_server_args_and_env` | CLI overrides and child env sanitized, stdio args present | `src/agent/codex.rs` `build_codex_app_server_args_stdio_and_overrides`, `src/mcp/propagate.rs` `codex_overrides_encode_env_and_headers_into_child_env` |
+| TC-1867 | FR-1867 | unit | resolved MCP servers for Codex | `build_codex_app_server_args_and_env` | CLI overrides and child env sanitized, stdio args present | `src/agent/codex.rs` `codex_argv_includes_mcp_config_overrides`, `codex_mcp_secrets_not_in_argv`, `src/mcp/propagate.rs` `codex_overrides_encode_mcp_servers` |
 
 ## 6. Data, integration, and safety contracts
 

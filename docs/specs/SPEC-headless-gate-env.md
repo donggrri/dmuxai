@@ -26,12 +26,6 @@ substrings and quoted/code text. Custom agent children can inherit
 | FR-1826 | Must | `dmuxai run` with `--allow-sensitive` in headless mode | Sensitive gates are auto-confirmed on direct, judge, and graph paths | Plan approval still required for complex plans | TC-1826 |
 | FR-1827 | Must | The same sensitive gate in dashboard (`--web`/TUI) mode | The gate pauses and `/graph continue` resumes it; there is no CLI-flag bypass | view-only `serve` cannot run agents | TC-1827 |
 
-### Code-vs-spec mismatches
-
-| ID | Spec says | Code does (file:function) | Proposed resolution |
-| --- | --- | --- | --- |
-| OQ-1812 | Headless sensitive gate auto-confirm requires `--approve-plan` with `--agent` | `src/app.rs` `headless_idle_action` auto-confirms when `req.allow_sensitive || (req.agent.is_some() && req.approve_plan)` | Keep as documented; no code change |
-
 ## 5. Acceptance scenarios and test design
 
 | Test ID | Requirement | Command |
