@@ -28,10 +28,10 @@ The following flags can be used before or after subcommands, or with the interac
 
 | Command | Flags | stdout |
 | --- | --- | --- |
-| `dmuxai run <prompt\|->` | `--agent ID`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--json` | Final agent text, or one JSON object with `--json` |
+| `dmuxai run <prompt\|->` | `--agent ID`, `--model M`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--json` | Final agent text, or one JSON object with `--json` |
 | `dmuxai todo add <title>` | `--body TEXT`, `--json` | The created to-do (TSV or JSON) |
 | `dmuxai todo list` | `--status open\|running\|done`, `--json` | To-dos (TSV lines or a JSON array) |
-| `dmuxai todo run <id>` | `--agent ID \| --graph`, `--json` | Same as `run`; the to-do is marked running then done/open |
+| `dmuxai todo run <id>` | `--agent ID \| --graph`, `--model M`, `--json` | Same as `run`; the to-do is marked running then done/open |
 | `dmuxai status` | `--json` | Workspace status (JSON if `--json`) |
 | `dmuxai events` | `--since N`, `--limit N`, `--follow`/`-f`, `--json` | Events (see §4); `--json` prints one object per line |
 | `dmuxai mcp` | — | stdio MCP server (see §3) |
@@ -50,6 +50,10 @@ Notes:
   `--allow-sensitive`, or `--agent` with `--approve-plan` on a one-step run, to
   confirm sensitive gates headlessly. JSON includes `triage` and, when applicable,
   `plan`.
+- `--model M` requires `--agent`; it sets the Explicit model source for the run
+  (validated with `validate_model_for_runner` / custom `allowed_models`). A disallowed
+  model is rejected before any turn starts with exit `5` (usage errors such as a
+  missing value exit `2`); the accepted model is echoed in `triage.model`.
 - `dmuxai run -` reads the prompt from stdin:
   `echo "summarize the repo" | dmuxai run - --agent agy --json`.
 - With `--json`, stdout carries only the JSON document(s); warnings/diagnostics go
@@ -428,6 +432,7 @@ Per-runner system prompts. User config sets defaults; workspace `dmuxai.toml` ov
 | `system_prompt_file` | — | Path to a prompt file, relative to the config file that sets it unless absolute. |
 | `prompt_inject` | `session` | `session` (inject on fresh session or hash change) or `always` (every turn). |
 | `prompt_roles` | `["chat", "worker"]` | Roles that may receive the prompt; `judge`/`triage`/`planner`/`replan`/`summary`/`interview` never do. |
+| `model` | — | Per-runner model profile (`[runners.<id>] model = "..."`); validated with `validate_model_for_runner` (built-in) / `allowed_models` (custom). Invalid values are dropped with a config warning. `[runners.default] model` is ignored with a warning. |
 
 ```toml
 [runners.default]
@@ -437,6 +442,11 @@ prompt_roles = ["chat", "worker"]
 
 [runners.codex]
 system_prompt_file = "prompts/codex.md"
+
+Precedence for a turn's effective model: explicit (`--model` / explicit request) >
+selected (F2 picker / `ModelCatalog.selected`) > `[runners.<id>] model` >
+custom agent `default_model` > runner default (Cursor → `composer-2.5`) >
+provider default (no `--model`).
 ```
 
 ## 7. Environment variables and child process policy

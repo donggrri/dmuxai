@@ -670,6 +670,10 @@ save `waiting_gate` and exit **7** unless you pass `--allow-sensitive`, or you s
 confirm the sensitive gate). `--graph` is a no-op. JSON output includes `triage`
 and `plan`.
 
+Headless `--model M` (requires `--agent`): validated with the runner/model policy;
+a disallowed model is rejected before any turn starts (exit **5**; usage errors such as
+a missing value exit **2**), and the accepted model is echoed in `triage.model`.
+
 ```toml
 [graph]
 max_parallel = 2

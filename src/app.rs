@@ -28956,7 +28956,7 @@ mod tests {
         assert!(err.contains("gpt-5"), "{err}");
     }
 
-    // TC-1742 / FR-1726: Cursor resolves to composer-2.5
+    // TC-1742 / FR-1725: Cursor resolves to composer-2.5
     #[test]
     fn tc_1742_cursor_resolves_composer_2_5() {
         let (mut app, _) = test_app();
