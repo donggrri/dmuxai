@@ -66,7 +66,7 @@ fn tool_definitions() -> Value {
                     "agent": { "type": "string", "description": "Runner id, e.g. agy or a custom agent name" },
                     "mode": {
                         "type": "string",
-                        "description": "Deprecated, ignored. DmuxAI runs a single write-capable agent policy."
+                        "description": "Deprecated legacy argument. ask or plan runs read-only; implement or agent, or omit, runs write-capable; other values are an error."
                     },
                     "graph": { "type": "boolean", "description": "Use the graph planner" },
                     "todo_id": { "type": "string", "description": "Run this to-do instead of a prompt" }
@@ -329,6 +329,17 @@ mod tests {
             names,
             ["todo_add", "todo_list", "run", "status", "events_since"]
         );
+        let run_tool = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "run")
+            .expect("run tool");
+        let mode_desc = run_tool["inputSchema"]["properties"]["mode"]["description"]
+            .as_str()
+            .expect("mode description");
+        assert!(!mode_desc.contains("ignored"));
+        assert!(mode_desc.to_ascii_lowercase().contains("read-only"));
 
         let add = call(
             &stub,

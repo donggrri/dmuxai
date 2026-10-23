@@ -21,10 +21,10 @@ print usage to stderr and exit `2`.
 
 | Command | Flags | stdout |
 | --- | --- | --- |
-| `dmuxai run <prompt\|->` | `--agent ID`, `--mode ask\|plan\|implement`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--json` | Final agent text, or one JSON object with `--json` |
+| `dmuxai run <prompt\|->` | `--agent ID`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--json` | Final agent text, or one JSON object with `--json` |
 | `dmuxai todo add <title>` | `--body TEXT`, `--json` | The created to-do (TSV or JSON) |
 | `dmuxai todo list` | `--status open\|running\|done`, `--json` | To-dos (TSV lines or a JSON array) |
-| `dmuxai todo run <id>` | `--agent ID \| --graph`, `--mode M`, `--json` | Same as `run`; the to-do is marked running then done/open |
+| `dmuxai todo run <id>` | `--agent ID \| --graph`, `--json` | Same as `run`; the to-do is marked running then done/open |
 | `dmuxai status` | `--json` | Workspace status (JSON if `--json`) |
 | `dmuxai events` | `--since N`, `--limit N`, `--follow`/`-f`, `--json` | Events (see §4); `--json` prints one object per line |
 | `dmuxai mcp` | — | stdio MCP server (see §3) |
@@ -32,7 +32,11 @@ print usage to stderr and exit `2`.
 Notes:
 
 - `run` accepts either `--agent` or `--graph`, not both. `--graph` is accepted as a
-  no-op (legacy scripts); it does not change judge routing. `--` ends flag parsing
+  no-op (legacy scripts); it does not change judge routing. `--read-only` is an internal
+  flag (not shown in `dmuxai --help`): runs the prompt's turn with the read-only turn
+  policy; the MCP `run` tool passes it for legacy `mode` `ask` or `plan`. `--mode` was removed:
+  any `--mode` on `run` or `todo run` prints a usage error to stderr and exits `2`
+  (see [SPEC-acp-runners](specs/SPEC-acp-runners.md) FR-1318). `--` ends flag parsing
   (`dmuxai run -- --literal prompt`).
 - Without `--agent`, headless `run` uses the same judge → plan path as the TUI.
   Exit `7` means plan approval (`--approve-plan`) or a sensitive gate. Use
@@ -106,7 +110,7 @@ dmuxai run "ship the feature" --json --approve-plan
 dmuxai run "plan the migration" --graph --json
 dmuxai todo add "Write docs" --body "API.md first" --json
 dmuxai todo list --status open --json
-dmuxai todo run 3f2a1c9e --agent agy --mode implement --json
+dmuxai todo run 3f2a1c9e --agent agy --json
 dmuxai events --since 0 --limit 50 --json
 dmuxai events --follow --json
 ```
@@ -270,12 +274,13 @@ Tools (`tools/list`):
 | --- | --- | --- |
 | `todo_add` | `title` (required), `body` | Created to-do |
 | `todo_list` | `status` (`open`\|`running`\|`done`) | Array of to-dos |
-| `run` | `prompt`, `agent`, `mode` (`ask`\|`plan`\|`implement`), `graph`, `todo_id` | Run outcome JSON (same keys as `run --json`) |
+| `run` | `prompt`, `agent`, `graph`, `todo_id`, `mode` (optional, deprecated legacy) | Run outcome JSON (same keys as `run --json`). Legacy `mode`: `ask`/`plan` → read-only child run (`--read-only`); `implement`/`agent` or omit → write-capable; other values error. The MCP server never passes `--mode` to the CLI. |
 | `status` | — | Status JSON (see §1) |
 | `events_since` | `since` (≥0), `limit` (1–1000, default 200) | `{events, last_seq}` |
 
-`run` spawns a child `dmuxai run --json` (or `dmuxai todo run <id> --json`) and
-blocks until it finishes, so the result is final. Tool results use
+`run` spawns a child `dmuxai run --json` (or `dmuxai todo run <id> --json`), adding
+`--read-only` when legacy `mode` is `ask` or `plan`, and blocks until it finishes,
+so the result is final. Tool results use
 `content: [{type:"text", text:"<json>"}]` with `isError: true` on failure;
 unknown tools return JSON-RPC `-32602`.
 
