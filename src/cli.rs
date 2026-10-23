@@ -506,6 +506,7 @@ fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Val
         "text": outcome.text,
         "messages": outcome.messages,
         "error": outcome.error,
+        "error_kind": outcome.error_kind,
         "todo": outcome.todo,
         "triage": outcome.triage,
         "plan": outcome.plan,

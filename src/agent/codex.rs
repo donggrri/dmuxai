@@ -16,8 +16,8 @@ use tokio::{
 use dmuxai::attachments::prompt_with_image_references;
 
 use super::{
-    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ConversationId,
-    ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy,
+    AdapterError, Agent, AgentAdapter, AgentError, AgentEvent, AgentOutput, AgentRequest,
+    ConversationId, ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy,
 };
 use dmuxai::process::{headless_command, resolve_program};
 
@@ -572,7 +572,7 @@ async fn connect_for_request(
                 send_event(
                     event_tx,
                     Some(&context),
-                    AgentEvent::Error(error.to_string()),
+                    AgentEvent::Error(AgentError::provider(error.to_string())),
                 )
                 .await;
                 started.shutdown().await;
@@ -585,7 +585,9 @@ async fn connect_for_request(
             send_event(
                 event_tx,
                 Some(&context),
-                AgentEvent::Error(format!("could not start Codex: {error}")),
+                AgentEvent::Error(AgentError::process_exit(format!(
+                    "could not start Codex: {error}"
+                ))),
             )
             .await;
             None
@@ -657,8 +659,14 @@ async fn runtime_loop(
                                 client = Some(started);
                             }
                             Err(error) => {
-                                send_event(&event_tx, None, AgentEvent::Error(error.to_string()))
-                                    .await;
+                                send_event(
+                                    &event_tx,
+                                    None,
+                                    AgentEvent::Error(AgentError::model_unavailable(
+                                        error.to_string(),
+                                    )),
+                                )
+                                .await;
                                 started.shutdown().await;
                             }
                         },
@@ -666,7 +674,9 @@ async fn runtime_loop(
                             send_event(
                                 &event_tx,
                                 None,
-                                AgentEvent::Error(format!("could not start Codex: {error}")),
+                                AgentEvent::Error(AgentError::process_exit(format!(
+                                    "could not start Codex: {error}"
+                                ))),
                             )
                             .await;
                         }
@@ -709,10 +719,9 @@ async fn runtime_loop(
                             send_event(
                                 &event_tx,
                                 Some(&context),
-                                AgentEvent::Error(
-                                    "Codex is already running a turn; cancel it before sending another prompt"
-                                        .to_owned(),
-                                ),
+                                AgentEvent::Error(AgentError::provider(
+                                    "Codex is already running a turn; cancel it before sending another prompt",
+                                )),
                             ).await;
                         } else if conversation_requires_reconnect(
                             active_client.conversation_id.as_ref(),
@@ -733,7 +742,7 @@ async fn runtime_loop(
                             send_event(
                                 &event_tx,
                                 Some(&context),
-                                AgentEvent::Error(error.to_string()),
+                                AgentEvent::Error(AgentError::provider(error.to_string())),
                             ).await;
                         }
                     }
@@ -743,7 +752,7 @@ async fn runtime_loop(
                             send_event(
                                 &event_tx,
                                 context.as_ref(),
-                                AgentEvent::Error(error.to_string()),
+                                AgentEvent::Error(AgentError::provider(error.to_string())),
                             ).await;
                         }
                     }
@@ -784,7 +793,14 @@ async fn runtime_loop(
                                     ).await;
                                 }
                                 Err(error) => {
-                                    send_event(&event_tx, None, AgentEvent::Error(error.to_string())).await;
+                                    send_event(
+                                        &event_tx,
+                                        None,
+                                        AgentEvent::Error(AgentError::model_unavailable(
+                                            error.to_string(),
+                                        )),
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -856,7 +872,9 @@ async fn runtime_loop(
                         send_event(
                             &event_tx,
                             active_client.output_context.as_ref(),
-                            AgentEvent::Error("Codex app-server stopped unexpectedly".to_owned()),
+                            AgentEvent::Error(AgentError::process_exit(
+                                "Codex app-server stopped unexpectedly",
+                            )),
                         ).await;
                         break;
                     }
@@ -894,7 +912,12 @@ async fn handle_message(
         if let Some(error) = response_error(&message) {
             let context = client.output_context.take();
             reset_turn(client);
-            send_event(event_tx, context.as_ref(), AgentEvent::Error(error)).await;
+            send_event(
+                event_tx,
+                context.as_ref(),
+                AgentEvent::Error(AgentError::provider(error)),
+            )
+            .await;
             return;
         }
         client.active_turn_id = extract_turn_id(&message);
@@ -915,7 +938,7 @@ async fn handle_message(
             send_event(
                 event_tx,
                 client.output_context.as_ref(),
-                AgentEvent::Error(error.to_string()),
+                AgentEvent::Error(AgentError::provider(error.to_string())),
             )
             .await;
         }
@@ -940,9 +963,9 @@ async fn handle_message(
             send_event(
                 event_tx,
                 context.as_ref(),
-                AgentEvent::Error(
-                    "implement mode completed without any observed file changes".to_owned(),
-                ),
+                AgentEvent::Error(AgentError::policy(
+                    "implement mode completed without any observed file changes",
+                )),
             )
             .await;
         } else {
@@ -986,13 +1009,12 @@ fn normalized_event(message: &Value) -> Option<AgentEvent> {
         {
             Some("completed") => Some(AgentEvent::Completed),
             Some("interrupted") => Some(AgentEvent::Cancelled),
-            Some("failed") => Some(AgentEvent::Error(
+            Some("failed") => Some(AgentEvent::Error(AgentError::provider(
                 message
                     .pointer("/params/turn/error/message")
                     .and_then(Value::as_str)
-                    .unwrap_or("Codex turn failed")
-                    .to_owned(),
-            )),
+                    .unwrap_or("Codex turn failed"),
+            ))),
             _ => None,
         },
         "error"
@@ -1001,13 +1023,12 @@ fn normalized_event(message: &Value) -> Option<AgentEvent> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false) =>
         {
-            Some(AgentEvent::Error(
+            Some(AgentEvent::Error(AgentError::provider(
                 message
                     .pointer("/params/error/message")
                     .and_then(Value::as_str)
-                    .unwrap_or("Codex reported an error")
-                    .to_owned(),
-            ))
+                    .unwrap_or("Codex reported an error"),
+            )))
         }
         _ => None,
     }
@@ -1628,7 +1649,7 @@ mod tests {
         assert_eq!(normalized_event(&interrupted), Some(AgentEvent::Cancelled));
         assert_eq!(
             normalized_event(&failed),
-            Some(AgentEvent::Error("boom".to_owned()))
+            Some(AgentEvent::Error(AgentError::provider("boom")))
         );
     }
 
@@ -1646,7 +1667,7 @@ mod tests {
         assert_eq!(normalized_event(&retrying), None);
         assert_eq!(
             normalized_event(&final_error),
-            Some(AgentEvent::Error("failed".to_owned()))
+            Some(AgentEvent::Error(AgentError::provider("failed")))
         );
     }
 

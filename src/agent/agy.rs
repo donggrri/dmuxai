@@ -15,8 +15,8 @@ use tokio::{
 };
 
 use super::{
-    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ModelInfo,
-    OutputContext, SpawnedAdapter, TurnPolicy,
+    AdapterError, Agent, AgentAdapter, AgentError, AgentEvent, AgentOutput, AgentRequest,
+    ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy,
     implement_outcome::{
         ImplementTurnTracker, is_plan_only_implement_outcome, is_plan_review_response,
     },
@@ -292,7 +292,9 @@ async fn runtime_loop(
                                     send_event(
                                         &event_tx_clone,
                                         None,
-                                        AgentEvent::Error(error.to_string()),
+                                        AgentEvent::Error(AgentError::model_unavailable(
+                                            error.to_string(),
+                                        )),
                                     )
                                     .await;
                                 }
@@ -323,10 +325,9 @@ async fn runtime_loop(
                         send_event(
                             &event_tx,
                             Some(&context),
-                            AgentEvent::Error(
-                                "AGY is already running a turn; cancel it before sending another prompt"
-                                    .to_owned(),
-                            ),
+                            AgentEvent::Error(AgentError::provider(
+                                "AGY is already running a turn; cancel it before sending another prompt",
+                            )),
                         ).await;
                     }
                     Some(AgyCommand::ListModels) => {
@@ -367,12 +368,7 @@ fn spawn_turn(
     let error_context = context.clone();
     let handle = tokio::spawn(async move {
         if let Err(error) = run_turn(&request, selected_model, &cwd, &event_tx).await {
-            send_event(
-                &event_tx,
-                Some(&error_context),
-                AgentEvent::Error(error.to_string()),
-            )
-            .await;
+            send_event(&event_tx, Some(&error_context), AgentEvent::Error(error)).await;
         }
     });
     ActiveTurn { handle, context }
@@ -396,7 +392,7 @@ async fn run_turn(
     selected_model: Option<String>,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
-) -> io::Result<Option<String>> {
+) -> Result<Option<String>, AgentError> {
     let context = OutputContext::from(request);
     send_event(event_tx, Some(&context), AgentEvent::Started).await;
 
@@ -441,7 +437,7 @@ async fn run_turn(
 
         attempt += 1;
         if attempt >= AGY_PLAN_ONLY_MAX_ATTEMPTS {
-            return Err(io::Error::other(
+            return Err(AgentError::policy(
                 "AGY returned plan-only responses twice without applying file edits.",
             ));
         }
@@ -477,7 +473,7 @@ async fn run_single_agy_process(
     context: &OutputContext,
     resume_session: Option<&str>,
     user_prompt: &str,
-) -> io::Result<SingleAgyOutcome> {
+) -> Result<SingleAgyOutcome, AgentError> {
     let program = resolve_program(AGY_BINARY_OVERRIDE, "agy");
     let mut command = headless_command(program);
     configure_command_for_resume(&mut command, request, selected_model, mode, resume_session);
@@ -488,28 +484,36 @@ async fn run_single_agy_process(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = command.spawn()?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| AgentError::process_exit(format!("could not start AGY: {error}")))?;
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| io::Error::other("AGY stdin was not piped"))?;
+        .ok_or_else(|| AgentError::process_exit("AGY stdin was not piped"))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| io::Error::other("AGY stdout was not piped"))?;
+        .ok_or_else(|| AgentError::process_exit("AGY stdout was not piped"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| io::Error::other("AGY stderr was not piped"))?;
+        .ok_or_else(|| AgentError::process_exit("AGY stderr was not piped"))?;
 
     let mut input = serde_json::to_vec(&json!({
         "event": "user",
         "message": { "content": user_prompt }
     }))
-    .map_err(io::Error::other)?;
+    .map_err(|error| AgentError::provider(error.to_string()))?;
     input.push(b'\n');
-    stdin.write_all(&input).await?;
-    stdin.shutdown().await?;
+    stdin
+        .write_all(&input)
+        .await
+        .map_err(|error| AgentError::provider(error.to_string()))?;
+    stdin
+        .shutdown()
+        .await
+        .map_err(|error| AgentError::provider(error.to_string()))?;
     drop(stdin);
 
     stream_child(&mut child, stdout, stderr, event_tx, context, mode).await
@@ -591,7 +595,7 @@ async fn stream_child(
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
     mode: TurnPolicy,
-) -> io::Result<SingleAgyOutcome> {
+) -> Result<SingleAgyOutcome, AgentError> {
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
     let mut stderr_history = VecDeque::with_capacity(STDERR_HISTORY_CAPACITY);
@@ -611,13 +615,13 @@ async fn stream_child(
         let grace_deadline_at = result_grace_deadline.unwrap_or_else(Instant::now);
         tokio::select! {
             line = stdout_lines.next_line(), if stdout_open => {
-                match line? {
+                match line.map_err(|e| AgentError::process_exit(e.to_string()))? {
                     Some(line) => {
                         if let Some(secs) = idle_secs {
                             idle_deadline = Some(Instant::now() + Duration::from_secs(secs));
                         }
                         let message: Value = serde_json::from_str(&line).map_err(|error| {
-                            io::Error::other(format!("invalid AGY NDJSON: {error}"))
+                            AgentError::provider(format!("invalid AGY NDJSON: {error}"))
                         })?;
                         implement_tracker.observe_agy_message(&message);
                         for event in normalize_event(&message, mode, &mut state) {
@@ -636,17 +640,17 @@ async fn stream_child(
                 }
             }
             line = stderr_lines.next_line(), if stderr_open => {
-                match line? {
+                match line.map_err(|e| AgentError::process_exit(e.to_string()))? {
                     Some(line) => push_stderr(&mut stderr_history, line),
                     None => stderr_open = false,
                 }
             }
             status = child.wait(), if exit_status.is_none() => {
-                exit_status = Some(status?);
+                exit_status = Some(status.map_err(|e| AgentError::process_exit(e.to_string()))?);
             }
             _ = tokio::time::sleep_until(idle_deadline_at), if idle_deadline.is_some() => {
                 child.kill().await.ok();
-                return Err(io::Error::other(format!(
+                return Err(AgentError::idle(format!(
                     "AGY produced no events for {}s; it may be waiting on a background command. Run commands in the foreground with a bounded timeout.",
                     idle_secs.unwrap_or(AGY_IDLE_TIMEOUT_DEFAULT_SECS)
                 )));
@@ -660,7 +664,7 @@ async fn stream_child(
                 if exit_status.is_none() {
                     killed_after_result = true;
                     child.kill().await.ok();
-                    exit_status = Some(child.wait().await?);
+                    exit_status = Some(child.wait().await.map_err(|e| AgentError::process_exit(e.to_string()))?);
                 }
                 stdout_open = false;
                 stderr_open = false;
@@ -693,11 +697,16 @@ async fn stream_child(
         } else {
             format!("AGY exited with {status}: {diagnostic}")
         };
+        let err = if !status.success() {
+            AgentError::process_exit(message)
+        } else {
+            AgentError::provider(message)
+        };
         return Ok(SingleAgyOutcome {
             conversation_id: state.conversation_id,
             response_text: state.response_text,
             writes_observed,
-            terminal: AgentEvent::Error(message),
+            terminal: AgentEvent::Error(err),
         });
     }
 
@@ -784,8 +793,10 @@ fn normalize_event(
             match status {
                 "SUCCESS" => {
                     if let Some(denied) = denied_actions_summary(message) {
-                        state.pending_terminal = Some(AgentEvent::Error(format!(
-                            "AGY denied permission for: {denied}. Headless AGY cannot prompt; allow it in AGY settings or run with write access."
+                        state.pending_terminal = Some(AgentEvent::Error(AgentError::policy(
+                            format!(
+                                "AGY denied permission for: {denied}. Headless AGY cannot prompt; allow it in AGY settings or run with write access."
+                            ),
                         )));
                         return events;
                     }
@@ -798,9 +809,9 @@ fn normalize_event(
                         events.push(AgentEvent::TextDelta(response.to_owned()));
                     }
                     if state.response_text.trim().is_empty() {
-                        state.pending_terminal = Some(AgentEvent::Error(
-                            "AGY finished without producing any output.".to_owned(),
-                        ));
+                        state.pending_terminal = Some(AgentEvent::Error(AgentError::provider(
+                            "AGY finished without producing any output.",
+                        )));
                         return events;
                     }
                     if is_plan_review_response(&state.response_text) && mode != TurnPolicy::Agent {
@@ -815,13 +826,12 @@ fn normalize_event(
                     state.pending_terminal = Some(AgentEvent::Cancelled);
                 }
                 _ => {
-                    state.pending_terminal = Some(AgentEvent::Error(
+                    state.pending_terminal = Some(AgentEvent::Error(AgentError::provider(
                         message
                             .pointer("/result/error")
                             .and_then(Value::as_str)
-                            .unwrap_or("AGY turn failed")
-                            .to_owned(),
-                    ));
+                            .unwrap_or("AGY turn failed"),
+                    )));
                 }
             }
         }
@@ -887,6 +897,7 @@ mod tests {
     use serde_json::json;
     use tokio::time::{Duration, timeout};
 
+    use super::super::AgentErrorKind;
     use super::*;
 
     #[test]
@@ -1134,16 +1145,16 @@ mod tests {
         let events = normalize_event(&denied, TurnPolicy::Agent, &mut state);
         assert!(events.is_empty());
         assert!(matches!(
-            state.pending_terminal,
-            Some(AgentEvent::Error(e)) if e.contains("RunCommand")
+            &state.pending_terminal,
+            Some(AgentEvent::Error(e)) if e.message.contains("RunCommand") && e.kind == AgentErrorKind::Policy
         ));
 
         let mut state = AgyStreamState::default();
         let empty = json!({"event":"result","result":{"status":"SUCCESS","response":""}});
         let _events = normalize_event(&empty, TurnPolicy::ReadOnly, &mut state);
         assert!(matches!(
-            state.pending_terminal,
-            Some(AgentEvent::Error(e)) if e.contains("without producing")
+            &state.pending_terminal,
+            Some(AgentEvent::Error(e)) if e.message.contains("without producing") && e.kind == AgentErrorKind::Provider
         ));
     }
 
@@ -1364,7 +1375,7 @@ mod tests {
     async fn run_fake_agy_turn(
         mode: TurnPolicy,
         require_file_edits: bool,
-    ) -> io::Result<Option<String>> {
+    ) -> Result<Option<String>, AgentError> {
         let request = AgentRequest {
             conversation_id: super::super::ConversationId::new("fake-conversation"),
             turn_id: super::super::TurnId::new("fake-turn"),
@@ -1414,6 +1425,7 @@ mod tests {
         .await;
 
         let error = outcome.expect_err("a silent child should fail the turn");
+        assert_eq!(error.kind, AgentErrorKind::Idle);
         let message = error.to_string();
         assert!(
             message.contains("no events for 1s"),
@@ -1831,7 +1843,7 @@ mod tests {
             "expected exactly one terminal event, got {terminals:?}"
         );
         assert!(
-            matches!(&terminals[0], AgentEvent::Error(message) if message.contains("permission denied")),
+            matches!(&terminals[0], AgentEvent::Error(err) if err.to_string().contains("permission denied") && err.kind == AgentErrorKind::Policy),
             "terminal event should carry the denial, got {:?}",
             terminals[0]
         );

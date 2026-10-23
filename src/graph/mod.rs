@@ -9,7 +9,7 @@ mod tasks;
 mod triage_view;
 mod types;
 
-pub use executor::{GraphAction, GraphRunSession, GraphSession, NodeAssignment};
+pub use executor::{GraphAction, GraphRunSession, GraphSession, GraphStopReason, NodeAssignment};
 pub use judge::{
     FallbackCause, JUDGE_PROMPT, OverrideKind, QUESTION_ANSWER_HINT, Route, TriageSource, Verdict,
     build_judge_prompt, is_question_prompt, is_trivial_prompt, parse_verdict,

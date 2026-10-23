@@ -2,7 +2,7 @@ use std::process::ExitStatus;
 
 use serde_json::Value;
 
-use super::TurnPolicy;
+use super::{AgentError, TurnPolicy};
 
 const AGY_WRITE_TOOL_NAMES: &[&str] = &[
     "write_to_file",
@@ -53,41 +53,46 @@ impl ImplementTurnTracker {
         protocol_completed: bool,
         require_writes: bool,
         exit_forced_after_result: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), AgentError> {
         if self.policy != TurnPolicy::Agent {
             if !exit_forced_after_result {
                 if !status.success() && !stderr.trim().is_empty() {
-                    return Err(stderr.trim().to_owned());
+                    return Err(AgentError::process_exit(stderr.trim()));
                 }
                 if !status.success() {
-                    return Err(format!("provider exited with {status}"));
+                    return Err(AgentError::process_exit(format!(
+                        "provider exited with {status}"
+                    )));
                 }
             }
             return Ok(());
         }
 
         if stderr_indicates_permission_denial(stderr) {
-            return Err(stderr.trim().to_owned());
+            return Err(AgentError::policy(stderr.trim()));
         }
         if !status.success() && !exit_forced_after_result {
             return Err(if stderr.trim().is_empty() {
-                format!("agent turn failed: provider exited with {status}")
+                AgentError::process_exit(format!(
+                    "agent turn failed: provider exited with {status}"
+                ))
             } else {
-                stderr.trim().to_owned()
+                AgentError::process_exit(stderr.trim())
             });
         }
         if !protocol_completed {
             return Err(if stderr.trim().is_empty() {
-                "agent turn failed: provider exited without a terminal result".to_owned()
+                AgentError::process_exit(
+                    "agent turn failed: provider exited without a terminal result",
+                )
             } else {
-                stderr.trim().to_owned()
+                AgentError::process_exit(stderr.trim())
             });
         }
         if require_writes && !self.writes_observed {
-            return Err(
-                "agent turn completed without any observed file changes; stderr had no writes"
-                    .to_owned(),
-            );
+            return Err(AgentError::policy(
+                "agent turn completed without any observed file changes; stderr had no writes",
+            ));
         }
         Ok(())
     }
@@ -193,7 +198,7 @@ mod tests {
         let error = tracker
             .finish(&status, "", true, true, false)
             .expect_err("should require writes");
-        assert!(error.contains("without any observed file changes"));
+        assert!(error.message.contains("without any observed file changes"));
     }
 
     #[test]

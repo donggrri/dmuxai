@@ -16,8 +16,8 @@ use tokio::{
 };
 
 use super::{
-    AdapterError, Agent, AgentAdapter, AgentEvent, AgentOutput, AgentRequest, ModelInfo,
-    OutputContext, SpawnedAdapter, TurnPolicy, implement_outcome::ImplementTurnTracker,
+    AdapterError, Agent, AgentAdapter, AgentError, AgentEvent, AgentOutput, AgentRequest,
+    ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy, implement_outcome::ImplementTurnTracker,
     prompt_with_image_tokens,
 };
 use dmuxai::process::cursor_command;
@@ -507,7 +507,12 @@ async fn runtime_loop(
                         .await;
                     }
                     Err(error) => {
-                        send_event(&event_tx, None, AgentEvent::Error(error.to_string())).await;
+                        send_event(
+                            &event_tx,
+                            None,
+                            AgentEvent::Error(AgentError::model_unavailable(error.to_string())),
+                        )
+                        .await;
                     }
                 },
                 CursorCommand::SelectModel(model) => {
@@ -614,10 +619,9 @@ async fn runtime_loop(
                         send_event(
                             &event_tx,
                             Some(&context),
-                            AgentEvent::Error(
-                                "Cursor is already running a turn; cancel it before sending another prompt"
-                                    .to_owned(),
-                            ),
+                            AgentEvent::Error(AgentError::provider(
+                                "Cursor is already running a turn; cancel it before sending another prompt",
+                            )),
                         ).await;
                     }
                     Some(CursorCommand::ListModels) => {
@@ -707,7 +711,7 @@ fn spawn_turn(
                 send_event(
                     &event_tx,
                     Some(&error_context),
-                    AgentEvent::Error(error.to_string()),
+                    AgentEvent::Error(error.clone()),
                 )
                 .await;
                 Err(error)
@@ -726,7 +730,7 @@ fn spawn_turn(
 }
 
 struct ActiveTurn {
-    handle: JoinHandle<io::Result<Option<String>>>,
+    handle: JoinHandle<Result<Option<String>, AgentError>>,
     context: OutputContext,
     is_graph: bool,
     reset_epoch: u64,
@@ -787,7 +791,7 @@ pub(crate) async fn run_turn(
     protocol: RunnerProtocol,
     mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
     cursor_notice_emitted: &std::sync::atomic::AtomicBool,
-) -> io::Result<Option<String>> {
+) -> Result<Option<String>, AgentError> {
     run_turn_with_child(
         request,
         None,
@@ -819,7 +823,7 @@ async fn run_turn_with_child(
     terminal_seen: &std::sync::atomic::AtomicBool,
     pgid: &std::sync::atomic::AtomicU32,
     acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-) -> io::Result<Option<String>> {
+) -> Result<Option<String>, AgentError> {
     let context = OutputContext::from(request);
     let _guard = if protocol != RunnerProtocol::Acp && !mcp_servers.is_empty() {
         match dmuxai::mcp::propagate::cursor_mcp_guard(cwd, mcp_servers) {
@@ -856,9 +860,15 @@ async fn run_turn_with_child(
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
-        let program = PathBuf::from(cursor_command()?.as_std().get_program().to_os_string());
+        let program = PathBuf::from(
+            cursor_command()
+                .map_err(|e| AgentError::process_exit(format!("could not start Cursor: {e}")))?
+                .as_std()
+                .get_program()
+                .to_os_string(),
+        );
         let args = acp_runner::cursor_acp_argv(selected_model.as_deref(), cwd)
-            .map_err(io::Error::other)?;
+            .map_err(|e| AgentError::provider(e.to_string()))?;
         let permission_ctx = PermissionContext {
             workspace: cwd.to_string_lossy().into_owned(),
             sensitive_gate_active: false,
@@ -886,13 +896,14 @@ async fn run_turn_with_child(
         )
         .await
         .map(|outcome| outcome.session_id)
-        .map_err(io::Error::other);
+        .map_err(|e| AgentError::provider(e.to_string()));
     }
 
     let mut child = match warm_child {
         Some(child) => child,
         None => {
-            let mut command = cursor_command()?;
+            let mut command = cursor_command()
+                .map_err(|e| AgentError::process_exit(format!("could not start Cursor: {e}")))?;
             configure_command(
                 &mut command,
                 request.resume_session.as_deref(),
@@ -910,7 +921,9 @@ async fn run_turn_with_child(
             // stopped together (cancel, or after the terminal result).
             #[cfg(unix)]
             command.process_group(0);
-            command.spawn()?
+            command
+                .spawn()
+                .map_err(|e| AgentError::process_exit(format!("could not start Cursor: {e}")))?
         }
     };
     if let Some(id) = child.id() {
@@ -920,22 +933,31 @@ async fn run_turn_with_child(
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| io::Error::other("Cursor stdin was not piped"))?;
+        .ok_or_else(|| AgentError::process_exit("Cursor stdin was not piped"))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| io::Error::other("Cursor stdout was not piped"))?;
+        .ok_or_else(|| AgentError::process_exit("Cursor stdout was not piped"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| io::Error::other("Cursor stderr was not piped"))?;
+        .ok_or_else(|| AgentError::process_exit("Cursor stderr was not piped"))?;
 
     let context = OutputContext::from(request);
     send_event(event_tx, Some(&context), AgentEvent::Started).await;
     let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
-    stdin.write_all(prompt.as_bytes()).await?;
-    stdin.write_all(b"\n").await?;
-    stdin.shutdown().await?;
+    stdin
+        .write_all(prompt.as_bytes())
+        .await
+        .map_err(|e| AgentError::provider(e.to_string()))?;
+    stdin
+        .write_all(b"\n")
+        .await
+        .map_err(|e| AgentError::provider(e.to_string()))?;
+    stdin
+        .shutdown()
+        .await
+        .map_err(|e| AgentError::provider(e.to_string()))?;
     drop(stdin);
 
     stream_child(
@@ -995,7 +1017,7 @@ async fn stream_child(
     context: &OutputContext,
     mode: TurnPolicy,
     terminal_seen: &std::sync::atomic::AtomicBool,
-) -> io::Result<Option<String>> {
+) -> Result<Option<String>, AgentError> {
     let mut stdout_lines = BufReader::new(stdout).lines();
     let mut stderr_lines = BufReader::new(stderr).lines();
     let mut stderr_history = VecDeque::with_capacity(STDERR_HISTORY_CAPACITY);
@@ -1017,11 +1039,11 @@ async fn stream_child(
             .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
         tokio::select! {
             line = stdout_lines.next_line(), if stdout_open => {
-                match line? {
+                match line.map_err(|e| AgentError::process_exit(e.to_string()))? {
                     Some(line) => {
                         implement_tracker.observe_provider_line(&line);
                         let message: Value = serde_json::from_str(&line).map_err(|error| {
-                            io::Error::other(format!("invalid Cursor NDJSON: {error}"))
+                            AgentError::provider(format!("invalid Cursor NDJSON: {error}"))
                         })?;
                         // Mark the turn terminal before its `Completed` reaches the
                         // app, so a follow-up prompt is queued, not refused.
@@ -1040,13 +1062,13 @@ async fn stream_child(
                 }
             }
             line = stderr_lines.next_line(), if stderr_open => {
-                match line? {
+                match line.map_err(|e| AgentError::process_exit(e.to_string()))? {
                     Some(line) => push_stderr(&mut stderr_history, line),
                     None => stderr_open = false,
                 }
             }
             status = child.wait(), if exit_status.is_none() => {
-                exit_status = Some(status?);
+                exit_status = Some(status.map_err(|e| AgentError::process_exit(e.to_string()))?);
             }
             _ = tokio::time::sleep_until(deadline), if exit_deadline.is_some() => {
                 // Still running (or a child holds its pipes) after the grace
@@ -1057,7 +1079,7 @@ async fn stream_child(
                 }
                 if exit_status.is_none() {
                     let _ = child.start_kill();
-                    exit_status = Some(child.wait().await?);
+                    exit_status = Some(child.wait().await.map_err(|e| AgentError::process_exit(e.to_string()))?);
                 }
                 forced_after_result = true;
                 break;
@@ -1076,21 +1098,25 @@ async fn stream_child(
 
     let status = exit_status.expect("child.wait runs before the loop can finish");
     let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
-    if let Err(reason) = implement_tracker.finish(
+    implement_tracker.finish(
         &status,
         &diagnostic,
         state.terminal,
         false,
         forced_after_result,
-    ) {
-        return Err(io::Error::other(reason));
-    }
+    )?;
     if !state.terminal {
-        return Err(io::Error::other(if diagnostic.is_empty() {
+        let msg = if diagnostic.is_empty() {
             format!("Cursor exited with {status} without a terminal result")
         } else {
             format!("Cursor exited with {status}: {diagnostic}")
-        }));
+        };
+        let err = if !status.success() {
+            AgentError::process_exit(msg)
+        } else {
+            AgentError::provider(msg)
+        };
+        return Err(err);
     }
     Ok(state.session_id)
 }
@@ -1196,13 +1222,13 @@ fn normalize_event(message: &Value, state: &mut CursorStreamState) -> Vec<AgentE
                 .unwrap_or(false)
                 || message.get("subtype").and_then(Value::as_str) != Some("success")
             {
-                events.push(AgentEvent::Error(
+                events.push(AgentEvent::Error(AgentError::provider(
                     message
                         .get("result")
                         .and_then(Value::as_str)
                         .unwrap_or("Cursor turn failed")
                         .to_owned(),
-                ));
+                )));
             } else {
                 if !state.emitted_text
                     && let Some(result) = message.get("result").and_then(Value::as_str)
@@ -1284,6 +1310,7 @@ pub(crate) mod tests {
     use serde_json::json;
     use tokio::time::{Duration, timeout};
 
+    use super::super::AgentErrorKind;
     use super::*;
 
     #[test]
@@ -1517,7 +1544,7 @@ pub(crate) mod tests {
             &mut state,
         ));
         assert!(
-            matches!(events.as_slice(), [AgentEvent::TextDelta(text), AgentEvent::Error(error)] if text == "Partial" && error == "boom")
+            matches!(events.as_slice(), [AgentEvent::TextDelta(text), AgentEvent::Error(error)] if text == "Partial" && error.message == "boom" && error.kind == AgentErrorKind::Provider)
         );
     }
 
@@ -3002,7 +3029,7 @@ pub(crate) mod tests {
             policy: TurnPolicy,
             model: Option<&str>,
             workspace: &Path,
-        ) -> (io::Result<Option<String>>, Vec<AgentEvent>) {
+        ) -> (Result<Option<String>, AgentError>, Vec<AgentEvent>) {
             let (event_tx, mut event_rx) = mpsc::channel(256);
             let notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let result = run_turn(

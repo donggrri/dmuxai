@@ -482,6 +482,7 @@ mod tests {
             from_state: Some("running".to_owned()),
             to_state: to_state.to_owned(),
             message: None,
+            error_kind: None,
         }
     }
 

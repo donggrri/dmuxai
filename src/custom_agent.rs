@@ -309,21 +309,27 @@ pub fn grok_no_allowed_model_message() -> String {
     "grok: no allowed models (ids must match ^grok-; ids containing fast are rejected)".to_owned()
 }
 
-/// User-visible message when a custom-agent turn exceeds `timeout_secs` (FR-333).
-pub fn timeout_message(spec: &CustomAgentSpec) -> String {
+/// User-visible timeout message prefix and hint when a custom-agent turn exceeds `timeout_secs` (FR-333).
+pub fn timeout_parts(spec: &CustomAgentSpec) -> (String, String) {
     let prefix = format!("{} timed out after {}s", spec.label(), spec.timeout_secs());
     let hint = if spec.builtin {
         format!(
-            "copy the built-in \"{}\" preset into dmuxai.toml as [[agents.custom]] (run dmuxai init for a commented copy) and raise its timeout_secs",
+            "copy the built-in \"{}\" preset into dmuxai.toml as [[agents.custom]] (run dmuxai init for a commented copy) and raise its timeout_secs (the turn was stopped; check the workspace for partial edits)",
             spec.name
         )
     } else {
         format!(
-            "raise timeout_secs for [[agents.custom]] name = \"{}\" in dmuxai.toml",
+            "raise timeout_secs for [[agents.custom]] name = \"{}\" in dmuxai.toml (the turn was stopped; check the workspace for partial edits)",
             spec.name
         )
     };
-    format!("{prefix}; {hint} (the turn was stopped; check the workspace for partial edits)")
+    (prefix, hint)
+}
+
+/// User-visible message when a custom-agent turn exceeds `timeout_secs` (FR-333).
+pub fn timeout_message(spec: &CustomAgentSpec) -> String {
+    let (prefix, hint) = timeout_parts(spec);
+    format!("{prefix}; {hint}")
 }
 
 impl CustomAgentSpec {
@@ -769,7 +775,8 @@ pub fn parse_jsonl_line(spec: &CustomAgentSpec, line: &str) -> ParsedLine {
                 }
             }
         }
-        if result.is_none() && !yielded_string
+        if result.is_none()
+            && !yielded_string
             && let Some(first) = paths.first()
         {
             let top = top_level_pointer_segment(first);

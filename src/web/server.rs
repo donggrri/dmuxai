@@ -4032,6 +4032,7 @@ mod tests {
                 from_state: Some("idle".to_owned()),
                 to_state: "pending".to_owned(),
                 message: None,
+                error_kind: None,
             },
             EventDraft {
                 kind: "agent".to_owned(),
@@ -4043,6 +4044,7 @@ mod tests {
                 from_state: Some("pending".to_owned()),
                 to_state: "started".to_owned(),
                 message: None,
+                error_kind: None,
             },
             EventDraft {
                 kind: "agent".to_owned(),
@@ -4054,6 +4056,7 @@ mod tests {
                 from_state: Some("started".to_owned()),
                 to_state: "running".to_owned(),
                 message: Some("responding".to_owned()),
+                error_kind: None,
             },
         ]);
 
@@ -4173,6 +4176,7 @@ mod tests {
             from_state: Some("running".to_owned()),
             to_state: "completed".to_owned(),
             message: None,
+            error_kind: None,
         }]);
 
         let appended = tokio::time::timeout(Duration::from_secs(8), async {
