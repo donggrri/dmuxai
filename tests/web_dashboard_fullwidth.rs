@@ -1078,3 +1078,175 @@ with sync_playwright() as p:
     assert!(!cmds.iter().any(|c| c["id"] == "gone-1"), "{v}");
     assert_eq!(v["switch"][0]["path"], "/home/u/src/api", "{v}");
 }
+
+// Top bar Chat button: returns to the chat from the Graph/Diff views and the
+// Memory popover, keeping the transcript scroll position and the draft.
+#[test]
+#[ignore = "needs Chrome/Chromium; run with --ignored"]
+fn chat_button_returns_from_views_in_headless_chrome() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let workspace = workspace_with_run(DONE_RUN);
+    let home = tempfile::tempdir().expect("temp home");
+    let (_guard, url) = start_serve(workspace.path(), home.path());
+    let script = r##"
+import sys, json
+from playwright.sync_api import sync_playwright
+
+STATE = """() => {
+  const q = s => document.querySelector(s);
+  const pressed = s => q(s).getAttribute('aria-pressed');
+  const t = q('#session .session-transcript');
+  const input = q('#session textarea.session-input');
+  const a = document.activeElement;
+  return {
+    chat: pressed('#chat-toggle'), chat_active: q('#chat-toggle').classList.contains('active'),
+    graph: pressed('#graph-toggle'), diff: pressed('#diff-toggle'), memory: pressed('#memory-toggle'),
+    skills: pressed('#skills-toggle'), skills_hidden: q('#skills-popover').hidden,
+    graph_hidden: q('#graph').hidden, docs_hidden: q('#docs').hidden, memory_hidden: q('#memory-popover').hidden,
+    chat_visible: !q('#session').hidden && q('#session').getClientRects().length > 0,
+    draft: input ? input.value : null, scroll: t ? t.scrollTop : null,
+    scroll_max: t ? t.scrollHeight - t.clientHeight : null,
+    open_links: document.querySelectorAll('#session .chat-aux-open-run').length,
+    focus: a ? (a.id || a.className) : null
+  };
+}"""
+
+def transcript(n):
+    out = []
+    for i in range(n):
+        out.append({"id": "c:%d" % (2 * i), "role": "user", "agent": None, "content": "question %d" % i, "streaming": False})
+        out.append({"id": "c:%d" % (2 * i + 1), "role": "agent", "agent": "demo",
+                    "content": "answer %d\\n\\nline two\\n\\nline three" % i, "streaming": False})
+    return out
+
+out = {}
+with sync_playwright() as p:
+    b = p.chromium.launch(executable_path=sys.argv[1], args=["--no-sandbox"])
+    pg = b.new_page(viewport={"width": 1440, "height": 900}, bypass_csp=True)
+    pg.on("pageerror", lambda e: print("PAGEERROR", e, file=sys.stderr))
+    pg.goto(sys.argv[2])
+    pg.wait_for_selector("#session:not([hidden]) textarea.session-input", timeout=15000)
+    pg.wait_for_function("() => document.querySelector('#graph-id').textContent.length > 0", timeout=15000)
+    out["initial"] = pg.evaluate(STATE)
+    pg.evaluate("""(msgs) => {
+      const t = document.querySelector('#session .session-transcript');
+      for (const m of msgs) {
+        const li = document.createElement('li');
+        li.className = 'msg msg-filler';
+        li.style.minHeight = '60px';
+        li.textContent = m.content;
+        t.insertBefore(li, t.firstChild);
+        t.appendChild(li.cloneNode(true));
+      }
+    }""", transcript(30))
+    # `dmuxai serve` is read-only, so the composer is disabled; set the
+    # draft directly (the Chat button must not touch it either way).
+    pg.evaluate("() => { document.querySelector('#session textarea.session-input').value = 'DRAFT-KEEP'; }")
+    # Scroll so the "Open in Graph" link sits mid-transcript (not at the end),
+    # so clicking it needs no further scrolling.
+    pg.evaluate("() => { document.querySelector('#session .chat-aux-open-run').scrollIntoView({block: 'center'}); }")
+    pg.wait_for_timeout(300)
+    out["before"] = pg.evaluate(STATE)
+    links = pg.query_selector_all("#session .chat-aux-open-run")
+    if links:
+        links[0].click()
+    else:
+        pg.evaluate("() => window.dmuxaiFocusGraphNode('a')")
+    pg.wait_for_timeout(600)
+    out["graph_open"] = pg.evaluate(STATE)
+    pg.click("#chat-toggle")
+    pg.wait_for_timeout(200)
+    out["back"] = pg.evaluate(STATE)
+    pg.click("#graph-toggle")
+    out["graph_again"] = pg.evaluate(STATE)
+    pg.click("#graph-toggle")
+    out["graph_toggled_off"] = pg.evaluate(STATE)
+    pg.click("#memory-toggle")
+    out["memory_open"] = pg.evaluate(STATE)
+    pg.click("#chat-toggle")
+    out["memory_back"] = pg.evaluate(STATE)
+    pg.click("#skills-toggle")
+    out["skills_open"] = pg.evaluate(STATE)
+    pg.click("#chat-toggle")
+    out["skills_back"] = pg.evaluate(STATE)
+    pg.click("#diff-toggle")
+    pg.focus("#chat-toggle")
+    pg.keyboard.press("Enter")
+    out["diff_back_keyboard"] = pg.evaluate(STATE)
+    pg.focus("#graph-toggle")
+    pg.keyboard.press("Enter")
+    pg.keyboard.press("Escape")
+    out["graph_esc"] = pg.evaluate(STATE)
+    print(json.dumps(out))
+    b.close()
+"##;
+    let v = run_probe(python, &chrome, &url, script);
+
+    let init = &v["initial"];
+    assert_eq!(init["chat"], "true", "{v}");
+    assert_eq!(init["chat_active"], true, "{v}");
+    assert_eq!(init["graph"], "false", "{v}");
+    assert_eq!(init["memory"], "false", "{v}");
+    let before = &v["before"];
+    let scroll = before["scroll"].as_f64().expect("transcript scrolls");
+    let scroll_max = before["scroll_max"].as_f64().unwrap();
+    assert!(
+        scroll > 100.0 && scroll < scroll_max - 100.0,
+        "transcript not scrolled to the middle: {v}"
+    );
+    assert_eq!(before["draft"], "DRAFT-KEEP", "{v}");
+    assert!(
+        before["open_links"].as_u64().unwrap() >= 1,
+        "no Open in Graph link: {v}"
+    );
+
+    // "Open in Graph" opens the view; Chat is no longer the pressed tab.
+    let open = &v["graph_open"];
+    assert_eq!(open["graph_hidden"], false, "{v}");
+    assert_eq!(open["graph"], "true", "{v}");
+    assert_eq!(open["chat"], "false", "{v}");
+    assert_eq!(open["chat_active"], false, "{v}");
+
+    // Chat closes the view and keeps the scroll spot and the draft.
+    let back = &v["back"];
+    assert_eq!(back["graph_hidden"], true, "{v}");
+    assert_eq!(back["graph"], "false", "{v}");
+    assert_eq!(back["chat"], "true", "{v}");
+    assert_eq!(back["chat_visible"], true, "{v}");
+    assert_eq!(back["draft"], "DRAFT-KEEP", "{v}");
+    assert_eq!(back["scroll"].as_f64().unwrap(), scroll, "{v}");
+    // The read-only composer is disabled, so focus lands on the Chat button.
+    assert_eq!(back["focus"], "chat-toggle", "{v}");
+
+    // Graph still toggles from its own button.
+    assert_eq!(v["graph_again"]["graph"], "true", "{v}");
+    assert_eq!(v["graph_again"]["chat"], "false", "{v}");
+    assert_eq!(v["graph_toggled_off"]["graph_hidden"], true, "{v}");
+    assert_eq!(v["graph_toggled_off"]["chat"], "true", "{v}");
+
+    // Memory popover: pressed while open; Chat closes it.
+    assert_eq!(v["memory_open"]["memory_hidden"], false, "{v}");
+    assert_eq!(v["memory_open"]["memory"], "true", "{v}");
+    assert_eq!(v["memory_open"]["chat"], "false", "{v}");
+    assert_eq!(v["memory_back"]["memory_hidden"], true, "{v}");
+    assert_eq!(v["memory_back"]["memory"], "false", "{v}");
+    assert_eq!(v["memory_back"]["chat"], "true", "{v}");
+    assert_eq!(v["memory_back"]["draft"], "DRAFT-KEEP", "{v}");
+
+    // Skills popover behaves the same way.
+    assert_eq!(v["skills_open"]["skills_hidden"], false, "{v}");
+    assert_eq!(v["skills_open"]["skills"], "true", "{v}");
+    assert_eq!(v["skills_open"]["chat"], "false", "{v}");
+    assert_eq!(v["skills_back"]["skills_hidden"], true, "{v}");
+    assert_eq!(v["skills_back"]["skills"], "false", "{v}");
+    assert_eq!(v["skills_back"]["chat"], "true", "{v}");
+
+    // Keyboard: Enter on Chat closes Diff; Esc closes Graph.
+    assert_eq!(v["diff_back_keyboard"]["docs_hidden"], true, "{v}");
+    assert_eq!(v["diff_back_keyboard"]["chat"], "true", "{v}");
+    assert_eq!(v["graph_esc"]["graph_hidden"], true, "{v}");
+    assert_eq!(v["graph_esc"]["chat"], "true", "{v}");
+    assert_eq!(v["graph_esc"]["scroll"].as_f64().unwrap(), scroll, "{v}");
+}

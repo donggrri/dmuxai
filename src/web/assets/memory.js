@@ -71,10 +71,16 @@
     popoverOpen = !!open;
     root.hidden = !popoverOpen;
     toggle.setAttribute('aria-expanded', popoverOpen ? 'true' : 'false');
+    toggle.setAttribute('aria-pressed', popoverOpen ? 'true' : 'false');
+    toggle.classList.toggle('active', popoverOpen);
+    document.dispatchEvent(new CustomEvent('dmuxai:memory-popover', { detail: { open: popoverOpen } }));
     if (popoverOpen) {
       root.focus();
     }
   }
+
+  window.dmuxaiCloseMemory = function () { if (popoverOpen) { setPopoverOpen(false); } };
+  window.dmuxaiMemoryOpen = function () { return popoverOpen; };
 
   function updateBadge(enabled) {
     if (!badge) { return; }

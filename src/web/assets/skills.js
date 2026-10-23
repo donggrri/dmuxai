@@ -106,16 +106,26 @@
       .catch(function (err) { render(null, String(err.message || err)); });
   }
 
-  toggle.addEventListener('click', function () {
-    var open = root.hidden;
+  function setOpen(open) {
     root.hidden = !open;
     toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    toggle.setAttribute('aria-pressed', open ? 'true' : 'false');
+    toggle.classList.toggle('active', open);
+    document.dispatchEvent(new CustomEvent('dmuxai:skills-popover', { detail: { open: open } }));
+  }
+
+  // The top bar Chat button (app.js) closes this popover and reads its state.
+  window.dmuxaiCloseSkills = function () { if (!root.hidden) { setOpen(false); } };
+  window.dmuxaiSkillsOpen = function () { return !root.hidden; };
+
+  toggle.addEventListener('click', function () {
+    var open = root.hidden;
+    setOpen(open);
     if (open) { load(); root.focus(); }
   });
   document.addEventListener('keydown', function (event) {
     if (event.key === 'Escape' && !root.hidden) {
-      root.hidden = true;
-      toggle.setAttribute('aria-expanded', 'false');
+      setOpen(false);
     }
   });
 })();

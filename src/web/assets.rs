@@ -1741,6 +1741,48 @@ mod tests {
         assert!(DOCS_JS.contains("$('diff-count')"));
     }
 
+    // Top bar Chat button: a view tab that returns to the chat from the
+    // Diff/Graph views and the Memory popover.
+    #[test]
+    fn chat_button_assets() {
+        let start = INDEX_HTML
+            .find("<button id=\"chat-toggle\"")
+            .expect("chat button");
+        let tag = &INDEX_HTML[start..INDEX_HTML[start..].find('>').unwrap() + start];
+        assert!(tag.contains("aria-pressed=\"true\""), "{tag}");
+        assert!(tag.contains("aria-controls=\"session\""), "{tag}");
+        // Placed after To-dos and before Diff/Graph/Memory.
+        let todos = INDEX_HTML.find("id=\"todos-toggle\"").unwrap();
+        let diff = INDEX_HTML.find("id=\"diff-toggle\"").unwrap();
+        assert!(todos < start && start < diff);
+        for id in [
+            "diff-toggle",
+            "graph-toggle",
+            "memory-toggle",
+            "skills-toggle",
+        ] {
+            let at = INDEX_HTML.find(&format!("<button id=\"{id}\"")).unwrap();
+            let tag = &INDEX_HTML[at..INDEX_HTML[at..].find('>').unwrap() + at];
+            assert!(tag.contains("aria-pressed=\"false\""), "{tag}");
+        }
+        let views_js = js_between(APP_JS, "var CENTER_VIEW_KEY", "function bindGraphControls");
+        assert!(views_js.contains("toggle.setAttribute('aria-pressed'"));
+        assert!(views_js.contains("function syncChatTab"));
+        assert!(views_js.contains("function showChat"));
+        assert!(views_js.contains("window.dmuxaiCloseMemory"));
+        assert!(views_js.contains("'dmuxai:memory-popover'"));
+        assert!(views_js.contains("preventScroll: true"));
+        assert!(MEMORY_JS.contains("window.dmuxaiCloseMemory"));
+        assert!(MEMORY_JS.contains("'dmuxai:memory-popover'"));
+        assert!(MEMORY_JS.contains("toggle.setAttribute('aria-pressed'"));
+        assert!(views_js.contains("window.dmuxaiCloseSkills"));
+        assert!(views_js.contains("'dmuxai:skills-popover'"));
+        assert!(SKILLS_JS.contains("window.dmuxaiCloseSkills"));
+        assert!(SKILLS_JS.contains("'dmuxai:skills-popover'"));
+        assert!(SKILLS_JS.contains("toggle.setAttribute('aria-pressed'"));
+        assert!(DOCS_CSS.contains(".sidebar-toggle[aria-pressed=\"true\"]"));
+    }
+
     // TC-1212 (SPEC-dashboard-fullwidth FR-1217, FR-1218, FR-1219, FR-1220,
     // FR-1221, UX-1202): inline agent-processing rows in the chat.
     #[test]

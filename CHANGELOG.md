@@ -33,6 +33,11 @@ All notable changes to dmuxai are listed here. Versions follow
   by magic bytes, up to 10 MiB each and 10 per prompt), saved under
   `.dmuxai/attachments/`, and reach the runner the same way as TUI clipboard
   images.
+- **Chat button in the dashboard top bar.** One click (or Enter) goes back to
+  the chat from the Diff or Graph view and closes the Memory and Skills
+  popovers. The chat keeps its scroll position and the composer keeps its
+  draft. Chat, Diff, Graph, Memory and Skills show which one is active
+  (`aria-pressed`).
 
 ### Changed
 
