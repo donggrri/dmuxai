@@ -103,6 +103,9 @@ pub struct DmuxSettings {
     memory_server_configured: bool,
     /// Per-runner system prompt configs keyed by normalized runner ID (or "default") (PR-2.5).
     pub runner_prompts: BTreeMap<String, crate::agent_prompt::RunnerPromptConfig>,
+    /// Per-runner model profile from `[runners.<id>] model` (FR-1731), keys
+    /// lowercased runner ids. `[runners.default] model` is ignored with a warning.
+    pub runner_models: BTreeMap<String, String>,
 }
 
 /// Convenience alias for [`DmuxSettings`].
@@ -464,6 +467,7 @@ impl DmuxSettings {
 
         settings.runner_prompts =
             crate::agent_prompt::merge_runner_prompts(user_runners, workspace_runners);
+        settings.runner_models = BTreeMap::new();
 
         // FR-810/FR-811 and FR-890/FR-891: a built-in preset is registered only
         // when its flag is not false, no config names that agent, and the
@@ -539,6 +543,74 @@ impl DmuxSettings {
             settings
                 .custom_agents
                 .push(crate::custom_agent::grok_preset(&program.to_string_lossy()));
+        }
+
+        // FR-1731: validate per-runner model profiles now that custom agents
+        // are known. Built-in runner ids use validate_model_for_runner; custom
+        // agent ids use validate_custom_model; anything else is dropped.
+        let runner_ids: Vec<String> = settings.runner_prompts.keys().cloned().collect();
+        for id in runner_ids {
+            let Some(cfg) = settings.runner_prompts.get(&id) else {
+                continue;
+            };
+            let Some(model) = cfg.model.clone() else {
+                continue;
+            };
+            let trimmed = model.trim();
+            if trimmed.is_empty() {
+                if let Some(cfg) = settings.runner_prompts.get_mut(&id) {
+                    cfg.model = None;
+                }
+                continue;
+            }
+            let is_builtin = matches!(
+                id.as_str(),
+                "cursor" | "agy" | "codex" | "opencode" | "grok"
+            );
+            let custom_spec = settings
+                .custom_agents
+                .iter()
+                .find(|spec| spec.name.eq_ignore_ascii_case(&id));
+            if is_builtin {
+                match crate::model_policy::validate_model_for_runner(&id, trimmed) {
+                    Ok(()) => {
+                        settings
+                            .runner_models
+                            .insert(id.clone(), trimmed.to_owned());
+                    }
+                    Err(err) => {
+                        settings.config_warnings.push(format!(
+                            "[runners.{id}] model '{trimmed}' is not allowed: {err}"
+                        ));
+                        if let Some(cfg) = settings.runner_prompts.get_mut(&id) {
+                            cfg.model = None;
+                        }
+                    }
+                }
+            } else if let Some(spec) = custom_spec {
+                match crate::custom_agent::validate_custom_model(spec, trimmed) {
+                    Ok(()) => {
+                        settings
+                            .runner_models
+                            .insert(id.clone(), trimmed.to_owned());
+                    }
+                    Err(err) => {
+                        settings.config_warnings.push(format!(
+                            "[runners.{id}] model '{trimmed}' is not allowed: {err}"
+                        ));
+                        if let Some(cfg) = settings.runner_prompts.get_mut(&id) {
+                            cfg.model = None;
+                        }
+                    }
+                }
+            } else {
+                settings.config_warnings.push(format!(
+                    "[runners.{id}] model '{trimmed}' ignored: unknown runner '{id}'"
+                ));
+                if let Some(cfg) = settings.runner_prompts.get_mut(&id) {
+                    cfg.model = None;
+                }
+            }
         }
 
         let mut known: Vec<&str> = vec!["cursor", "agy", "codex"];
@@ -943,6 +1015,7 @@ impl Default for DmuxSettings {
             memory_raw: MemoryToml::default(),
             memory_server_configured: false,
             runner_prompts: BTreeMap::new(),
+            runner_models: BTreeMap::new(),
         }
     }
 }
@@ -3316,5 +3389,124 @@ system_prompt = "Workspace codex"
         let cursor_prompt = resolve(&settings, "cursor", PromptRole::Chat).expect("cursor");
         assert_eq!(cursor_prompt.text, "User default");
         assert_eq!(cursor_prompt.source, "user:[runners.default]");
+    }
+
+    // TC-1753 / FR-1731: accepted runner model and workspace override; invalid dropped
+    #[test]
+    fn tc_1753_runner_model_accepted_and_invalid_dropped() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            r#"
+[runners.agy]
+model = "gemini-3.8-flash-high"
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+        assert_eq!(
+            settings.runner_models.get("agy"),
+            Some(&"gemini-3.8-flash-high".to_owned())
+        );
+
+        let user_dir = tempfile::tempdir().unwrap();
+        let user_toml = user_dir.path().join("user.toml");
+        std::fs::write(
+            &user_toml,
+            r#"
+[runners.agy]
+model = "gemini-3.0-flash-low"
+"#,
+        )
+        .unwrap();
+        let ws2 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws2.path().join("dmuxai.toml"),
+            r#"
+[runners.agy]
+model = "gemini-3.8-flash-high"
+"#,
+        )
+        .unwrap();
+        let settings2 = DmuxSettings::load_with_user_config(ws2.path(), Some(&user_toml));
+        assert_eq!(
+            settings2.runner_models.get("agy"),
+            Some(&"gemini-3.8-flash-high".to_owned())
+        );
+
+        let ws3 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws3.path().join("dmuxai.toml"),
+            r#"
+[runners.agy]
+model = "gemini-4-argon"
+"#,
+        )
+        .unwrap();
+        let settings3 = DmuxSettings::load_with_user_config(ws3.path(), None);
+        assert!(!settings3.runner_models.contains_key("agy"));
+        assert!(
+            settings3
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("gemini-4-argon") && w.contains("not allowed"))
+        );
+    }
+
+    // TC-1754 / FR-1731: default ignored, custom accepted, unknown dropped
+    #[test]
+    fn tc_1754_runner_model_default_custom_unknown() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            r#"
+[runners.default]
+model = "gemini-3.8-flash-high"
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+        assert!(!settings.runner_models.contains_key("default"));
+        assert!(settings.config_warnings.iter().any(|w| {
+            w.contains("[runners.default] model is not allowed under [runners.default]; ignored")
+        }));
+
+        let ws2 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws2.path().join("dmuxai.toml"),
+            r#"
+[[agents.custom]]
+name = "oc"
+command = ["oc"]
+allowed_models = "^opencode/.*-free$"
+
+[runners.oc]
+model = "opencode/beam-free"
+"#,
+        )
+        .unwrap();
+        let settings2 = DmuxSettings::load_with_user_config(ws2.path(), None);
+        assert_eq!(
+            settings2.runner_models.get("oc"),
+            Some(&"opencode/beam-free".to_owned())
+        );
+
+        let ws3 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws3.path().join("dmuxai.toml"),
+            r#"
+[runners.bogus]
+model = "opencode/beam-free"
+"#,
+        )
+        .unwrap();
+        let settings3 = DmuxSettings::load_with_user_config(ws3.path(), None);
+        assert!(!settings3.runner_models.contains_key("bogus"));
+        assert!(
+            settings3
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("unknown runner"))
+        );
     }
 }

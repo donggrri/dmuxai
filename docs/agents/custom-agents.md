@@ -15,6 +15,9 @@ image_arg = ["-f", "{image}"]     # optional, repeated per image; else "@path" a
 default_model = "opencode/glm-5.3-flash-free"
 models_command = ["opencode", "models"]   # optional; one model id per stdout line
 models_filter = "-free$"                  # optional regex on model ids
+# When a model catalog is loaded and the resolved model is not in it, DmuxAI pushes
+# a visible warning: `model <m> is not offered by '<command>'; pick another model`
+# (where <command> is models_command joined by spaces); the turn still runs.
 allowed_models = "^opencode/.*-free$"     # optional regex; model policy for this runner
 output = "jsonl"                  # "text" (stdout is the reply) or "jsonl"
 text_path = "/part/text"          # jsonl: JSON pointer of a text chunk

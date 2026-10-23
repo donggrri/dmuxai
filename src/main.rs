@@ -83,10 +83,10 @@ Usage:
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
-  dmuxai run <prompt|-> [--agent ID] [--approve-plan] [--allow-sensitive] [--graph] [--json]
+  dmuxai run <prompt|-> [--agent ID] [--model M] [--approve-plan] [--allow-sensitive] [--graph] [--json]
   dmuxai todo add <title> [--body TEXT] [--json]
   dmuxai todo list [--status open|running|done] [--json]
-  dmuxai todo run <id> [--agent ID | --graph] [--json]
+  dmuxai todo run <id> [--agent ID | --graph] [--model M] [--json]
   dmuxai status [--json]
   dmuxai events [--since N] [--limit N] [--follow] [--json]
   dmuxai mcp

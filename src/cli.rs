@@ -60,6 +60,7 @@ pub struct RunOptions {
     pub approve_plan: bool,
     pub allow_sensitive: bool,
     pub json: bool,
+    pub model: Option<String>,
 }
 
 /// First arguments that select an agent-facing subcommand.
@@ -99,6 +100,7 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
                 "--approve-plan" => options.approve_plan = true,
                 "--allow-sensitive" => options.allow_sensitive = true,
                 "--json" => options.json = true,
+                "--model" => options.model = Some(value(args, &mut index, "--model")?.to_owned()),
                 flag if flag.starts_with("--") => {
                     return Err(format!("unexpected argument '{flag}'"));
                 }
@@ -109,6 +111,12 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
     }
     if options.graph && options.agent.is_some() {
         return Err("use either --agent or --graph, not both".to_owned());
+    }
+    if options.model.is_some() && options.graph {
+        return Err("--model cannot be used with --graph".to_owned());
+    }
+    if options.model.is_some() && options.agent.is_none() {
+        return Err("--model needs --agent".to_owned());
     }
     if allow_prompt {
         options.prompt = words.join(" ");
@@ -605,6 +613,7 @@ async fn run_headless(
         approve_plan: options.approve_plan,
         allow_sensitive: options.allow_sensitive,
         todo_id,
+        model: options.model.clone(),
     };
     let outcome = app.run_headless(request, cancel).await;
     app.shutdown().await;
@@ -775,6 +784,7 @@ mod tests {
                 approve_plan: false,
                 allow_sensitive: false,
                 json: true,
+                model: None,
             }))
         );
         assert!(parse(&args(&["run", "x", "--mode", "ask"])).is_err());
@@ -918,5 +928,54 @@ mod tests {
         let json = outcome_json(&outcome, 0, 0);
         assert!(json["error"].is_null());
         assert!(json["error_kind"].is_null());
+    }
+
+    // TC-1750 / FR-1730: headless --model parses for run and todo run
+    #[test]
+    fn tc_1750_headless_model_parses() {
+        assert_eq!(
+            parse(&args(&[
+                "run",
+                "x",
+                "--agent",
+                "agy",
+                "--model",
+                "gemini-3.8-flash-high",
+                "--json"
+            ])),
+            Ok(AgentCommand::Run(RunOptions {
+                prompt: "x".into(),
+                agent: Some("agy".into()),
+                mode: None,
+                read_only: false,
+                graph: false,
+                approve_plan: false,
+                allow_sensitive: false,
+                json: true,
+                model: Some("gemini-3.8-flash-high".into()),
+            }))
+        );
+        assert!(parse(&args(&["run", "x", "--agent", "agy", "--model"])).is_err());
+        assert!(parse(&args(&["run", "x", "--model", "m"])).is_err());
+        assert!(parse(&args(&["run", "x", "--graph", "--model", "m"])).is_err());
+        assert!(
+            parse(&args(&[
+                "run", "x", "--agent", "agy", "--graph", "--model", "m"
+            ]))
+            .is_err()
+        );
+        assert_eq!(
+            parse(&args(&[
+                "todo", "run", "abc", "--agent", "a", "--model", "m"
+            ])),
+            Ok(AgentCommand::TodoRun {
+                id: "abc".into(),
+                run: RunOptions {
+                    agent: Some("a".into()),
+                    model: Some("m".into()),
+                    ..RunOptions::default()
+                }
+            })
+        );
     }
 }

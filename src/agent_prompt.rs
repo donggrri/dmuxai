@@ -97,6 +97,7 @@ pub struct RunnerPromptConfig {
     pub prompt: Option<PromptTextWithSource>,
     pub inject: Option<PromptInject>,
     pub roles: Option<Vec<PromptRole>>,
+    pub model: Option<String>,
 }
 
 /// Raw TOML table under `[runners.<id>]`.
@@ -106,6 +107,7 @@ pub struct RunnerPromptToml {
     pub system_prompt_file: Option<String>,
     pub prompt_inject: Option<String>,
     pub prompt_roles: Option<Vec<String>>,
+    pub model: Option<String>,
 }
 
 /// Delivery mechanism for the system prompt.
@@ -286,6 +288,22 @@ impl RunnerPromptConfig {
             config.roles = Some(roles);
         }
 
+        // 4. Per-runner model profile (FR-1731). Validation of the model id is
+        // deferred to settings load, where custom agents are already known.
+        if let Some(ref raw_model) = toml.model {
+            let trimmed = raw_model.trim();
+            if trimmed.is_empty() {
+                // ignore empty
+            } else if id.trim().eq_ignore_ascii_case("default") {
+                warnings.push(
+                    "[runners.default] model is not allowed under [runners.default]; ignored"
+                        .to_owned(),
+                );
+            } else {
+                config.model = Some(trimmed.to_owned());
+            }
+        }
+
         config
     }
 }
@@ -307,6 +325,9 @@ pub fn merge_runner_prompts(
             }
             if ws_config.roles.is_some() {
                 entry.roles = ws_config.roles;
+            }
+            if ws_config.model.is_some() {
+                entry.model = ws_config.model;
             }
         }
     }
@@ -572,6 +593,7 @@ mod tests {
                 }),
                 inject: None,
                 roles: None,
+                model: None,
             },
         );
         assert!(resolve(&settings, "cursor", PromptRole::Chat).is_none());
@@ -590,6 +612,7 @@ mod tests {
                 }),
                 inject: None,
                 roles: None,
+                model: None,
             },
         );
 
