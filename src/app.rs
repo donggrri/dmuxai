@@ -2568,7 +2568,7 @@ impl App {
         let runner = runner_name(agent).to_owned();
         let model = self
             .selected_run_model_label(agent)
-            .unwrap_or_else(|_| "provider default".to_owned());
+            .unwrap_or_else(|_| dmuxai::model_policy::PROVIDER_DEFAULT.to_owned());
         self.turn_runner_pin = Some((runner, model));
     }
 
@@ -6745,9 +6745,12 @@ impl App {
         // default, exactly like the old direct send.
         let built = match fallback_plan(prompt, &runner, model_hint.as_deref(), "direct") {
             Ok(built) => built,
-            Err(_) if model_hint.is_none() => {
-                dmuxai::graph::one_node_plan_on(prompt, &runner, "provider default", "direct")
-            }
+            Err(_) if model_hint.is_none() => dmuxai::graph::one_node_plan_on(
+                prompt,
+                &runner,
+                dmuxai::model_policy::PROVIDER_DEFAULT,
+                "direct",
+            ),
             Err(error) => return Err(error),
         };
         let model = built
@@ -9692,16 +9695,45 @@ impl App {
     /// provider default (no `--model`).
     fn selected_run_model(&self, agent: Agent) -> Result<Option<String>, String> {
         let runner = runner_name(agent);
-        let selected = self
+        // A disallowed *selected* model is an error (the submit path bounces
+        // the prompt with the validate message). Fall-through only applies to
+        // later sources.
+        if let Some(selected) = self
             .model_catalogs
             .get(&agent)
+            .and_then(|catalog| catalog.selected.clone())
+        {
+            let trimmed = selected.trim();
+            if !trimmed.is_empty() {
+                dmuxai::model_policy::validate_model_for_runner(runner, trimmed)?;
+            }
+        }
+        let resolution = Self::model_resolution_for(&self.model_catalogs, agent, None)?;
+        Ok(resolution.model)
+    }
+
+    /// Single resolver entry point used by both resolution paths (FR-1727).
+    fn model_resolution_for(
+        catalogs: &HashMap<Agent, ModelCatalog>,
+        agent: Agent,
+        explicit: Option<&str>,
+    ) -> Result<dmuxai::model_policy::ModelResolution, String> {
+        let runner = runner_name(agent);
+        let selected = catalogs
+            .get(&agent)
             .and_then(|catalog| catalog.selected.clone());
-        let Some(model) = selected
-            .or_else(|| dmuxai::model_policy::default_model_for_runner(runner).map(str::to_owned))
-        else {
-            return Ok(None);
+        let config_default = match agent {
+            Agent::Custom(index) => {
+                dmuxai::custom_agent::spec_at(index).and_then(|spec| spec.default_model.clone())
+            }
+            _ => None,
         };
-        dmuxai::model_policy::validate_model_for_runner(runner, &model).map(|()| Some(model))
+        let candidates = dmuxai::model_policy::ModelCandidates {
+            explicit,
+            selected: selected.as_deref(),
+            config_default: config_default.as_deref(),
+        };
+        dmuxai::model_policy::ModelResolution::resolve(runner, candidates)
     }
 
     /// [`App::selected_run_model`] as a display/plan label.
@@ -10408,32 +10440,26 @@ impl App {
         agent: Agent,
         planned: &str,
     ) -> Option<String> {
-        if let Some(selected) = catalogs
+        // Cursor's planned model is handled up front (it is not part of the
+        // resolver's candidates); selected still wins.
+        let selected = catalogs
             .get(&agent)
-            .and_then(|catalog| catalog.selected.clone())
-        {
-            if agent == Agent::Cursor {
-                if dmuxai::model_policy::validate_model_for_runner("cursor", &selected).is_ok() {
-                    return Some(selected);
-                }
-                return Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
-            }
-            return Some(selected);
-        }
-        if agent == Agent::Cursor {
-            if dmuxai::model_policy::validate_model_for_runner("cursor", planned).is_ok() {
+            .and_then(|catalog| catalog.selected.clone());
+        let has_selected = selected
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+
+        if agent == Agent::Cursor && !has_selected {
+            let runner = runner_name(agent);
+            if dmuxai::model_policy::validate_model_for_runner(runner, planned).is_ok() {
                 return Some(planned.to_owned());
             }
-            return Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+            // invalid planned falls through to the runner default (composer-2.5)
         }
-        if let Agent::Custom(index) = agent
-            && let Some(spec) = dmuxai::custom_agent::spec_at(index)
-            && let Some(default) = &spec.default_model
-            && dmuxai::model_policy::validate_model_for_runner(&spec.name, default).is_ok()
-        {
-            return Some(default.clone());
-        }
-        None
+
+        let resolution = Self::model_resolution_for(catalogs, agent, None).ok()?;
+        resolution.model
     }
 
     fn apply_runner_and_model(&mut self, runner: &str, model_id: &str) -> Option<Agent> {
@@ -10975,7 +11001,7 @@ impl App {
         if !self.quiet_graph_run {
             let shown_model = self
                 .effective_model_for(agent, &assignment.model_id)
-                .unwrap_or_else(|| "provider default".to_owned());
+                .unwrap_or_else(|| dmuxai::model_policy::PROVIDER_DEFAULT.to_owned());
             self.push_system(format!(
                 "Graph node {} via {} model {}",
                 assignment.node_id, agent, shown_model
@@ -11236,14 +11262,19 @@ impl App {
                             .map(|model| model.label.as_str())
                     })
                     .or(catalog.selected.as_deref())
-                    .unwrap_or("provider default");
+                    .unwrap_or(dmuxai::model_policy::PROVIDER_DEFAULT);
                 let effort = catalog
                     .selected_effort
                     .as_deref()
-                    .unwrap_or("provider default");
+                    .unwrap_or(dmuxai::model_policy::PROVIDER_DEFAULT);
                 (model.to_owned(), effort.to_owned())
             })
-            .unwrap_or_else(|| ("provider default".to_owned(), "provider default".to_owned()));
+            .unwrap_or_else(|| {
+                (
+                    dmuxai::model_policy::PROVIDER_DEFAULT.to_owned(),
+                    dmuxai::model_policy::PROVIDER_DEFAULT.to_owned(),
+                )
+            });
         self.push_system(format!(
             "Codex status\nModel: {model}\nEffort: {effort}\n{}",
             status.strip_prefix("Codex status\n").unwrap_or(&status)
@@ -13148,7 +13179,7 @@ impl App {
 
     fn judge_line_model_for_agent(&self, agent: Agent) -> String {
         self.selected_run_model_label(agent)
-            .unwrap_or_else(|_| "provider default".to_owned())
+            .unwrap_or_else(|_| dmuxai::model_policy::PROVIDER_DEFAULT.to_owned())
     }
 
     fn judging_reason_line_text(&self, pending: &PendingTriage) -> String {
@@ -13301,7 +13332,7 @@ impl App {
         let resolve = |runner: &str, planned: &str| {
             if let Some(agent) = runner_from_str(runner) {
                 self.effective_model_for(agent, planned)
-                    .unwrap_or_else(|| "provider default".to_owned())
+                    .unwrap_or_else(|| dmuxai::model_policy::PROVIDER_DEFAULT.to_owned())
             } else {
                 planned.to_owned()
             }
@@ -13326,7 +13357,7 @@ impl App {
             let runner = runner_name(*agent);
             let model = self
                 .effective_model_for(*agent, planned_model)
-                .unwrap_or_else(|| "provider default".to_owned());
+                .unwrap_or_else(|| dmuxai::model_policy::PROVIDER_DEFAULT.to_owned());
             return Some(Self::append_task_counter(
                 format!("Graph 1/1 · single {role} · {runner} {model} · running"),
                 run_for_counter,
@@ -14021,13 +14052,13 @@ impl App {
                             .unwrap_or(selected)
                     })
                 })
-                .unwrap_or("provider default")
+                .unwrap_or(dmuxai::model_policy::PROVIDER_DEFAULT)
         };
         let effort_name = self
             .model_catalogs
             .get(&selected)
             .and_then(|catalog| catalog.selected_effort.as_deref())
-            .unwrap_or("provider default");
+            .unwrap_or(dmuxai::model_policy::PROVIDER_DEFAULT);
         let notice_name = self.copy_notice.as_deref().unwrap_or("");
 
         let badge_content = match self.run_state(selected) {
@@ -15014,7 +15045,7 @@ fn resolved_assignment_line(
     session.assignment_line_with(|runner, planned| {
         if let Some(agent) = runner_from_str(runner) {
             App::effective_model_for_catalogs(catalogs, agent, planned)
-                .unwrap_or_else(|| "provider default".to_owned())
+                .unwrap_or_else(|| dmuxai::model_policy::PROVIDER_DEFAULT.to_owned())
         } else {
             planned.to_owned()
         }
@@ -15123,7 +15154,7 @@ pub(crate) fn fit_status_segments(segments: &StatusSegments<'_>, width: usize) -
     }
 
     // Candidate 4: Abbreviate key hints ("Enter  Ctrl+C  Esc") and simplify default effort
-    let effort_display = if segments.effort == "provider default" {
+    let effort_display = if segments.effort == dmuxai::model_policy::PROVIDER_DEFAULT {
         "default"
     } else {
         segments.effort
@@ -15866,6 +15897,16 @@ mod tests {
     type SentRequests = Arc<Mutex<Vec<(Agent, AgentRequest)>>>;
     type CancelRequests = Arc<Mutex<Vec<Agent>>>;
 
+    fn install_shared_test_registry() -> Vec<String> {
+        let mut spec = dmuxai::custom_agent::opencode_preset("opencode-step");
+        spec.name = "opencode-step".to_owned();
+        spec.allowed_models = Some("^opencode/.*-free$".to_owned());
+        spec.default_model = Some("opencode/beam-free".to_owned());
+        dmuxai::custom_agent::install_registry(vec![
+            dmuxai::custom_agent::grok_preset("grok"),
+            spec,
+        ])
+    }
     struct RecordingAdapter {
         agent: Agent,
         sent: SentRequests,
@@ -20974,8 +21015,7 @@ mod tests {
     #[test]
     fn cancel_appends_one_cancelled_notice_for_every_runner() {
         // First install wins process-wide; the other test installs the same grok preset.
-        let _ =
-            dmuxai::custom_agent::install_registry(vec![dmuxai::custom_agent::grok_preset("grok")]);
+        let _ = install_shared_test_registry();
         assert!(dmuxai::custom_agent::index_of("grok").is_some());
         let (mut app, sent) = test_app();
         let hub = dmuxai::web::DashboardHub::new(
@@ -24810,8 +24850,7 @@ mod tests {
     // TC-904 / FR-896
     #[test]
     fn selecting_grok_requests_a_model_probe() {
-        let warnings =
-            dmuxai::custom_agent::install_registry(vec![dmuxai::custom_agent::grok_preset("grok")]);
+        let warnings = install_shared_test_registry();
         assert_eq!(
             dmuxai::custom_agent::index_of("grok"),
             Some(0),
@@ -25420,8 +25459,7 @@ mod tests {
         assert!(tiny.ends_with("just now"), "{tiny}");
         assert!(UnicodeWidthStr::width(tiny.as_str()) <= 10, "{tiny}");
 
-        let _ =
-            dmuxai::custom_agent::install_registry(vec![dmuxai::custom_agent::grok_preset("grok")]);
+        let _ = install_shared_test_registry();
         let (mut app, _sent) = test_app();
         app.settings.custom_agents = vec![dmuxai::custom_agent::CustomAgentSpec {
             name: "grok".to_owned(),
@@ -28517,8 +28555,7 @@ mod tests {
     // pinned to Cursor's composer-2.5; it plans and runs on provider default.
     #[test]
     fn tc_1460_grok_follow_up_without_model_uses_provider_default() {
-        let warnings =
-            dmuxai::custom_agent::install_registry(vec![dmuxai::custom_agent::grok_preset("grok")]);
+        let warnings = install_shared_test_registry();
         assert_eq!(
             dmuxai::custom_agent::index_of("grok"),
             Some(0),
@@ -28582,6 +28619,109 @@ mod tests {
             .model
             .clone();
         assert_eq!(model.as_deref(), Some("provider default"));
+    }
+
+    // TC-1740 / FR-1727: custom agent default_model surfaces through selected_run_model
+    #[test]
+    fn tc_1740_custom_agent_default_model_surfaces() {
+        let mut spec = dmuxai::custom_agent::opencode_preset("opencode-step");
+        spec.name = "opencode-step".to_owned();
+        spec.allowed_models = Some("^opencode/.*-free$".to_owned());
+        spec.default_model = Some("opencode/beam-free".to_owned());
+        let _ = install_shared_test_registry();
+        let idx = dmuxai::custom_agent::index_of("opencode-step")
+            .expect("shared test registry has opencode-step");
+        let agent = Agent::Custom(idx);
+        let mut h = plan_gate_test_app();
+        h.app.settings.custom_agents = vec![spec];
+        assert_eq!(
+            h.app.selected_run_model(agent),
+            Ok(Some("opencode/beam-free".to_owned()))
+        );
+        assert_eq!(
+            h.app.selected_run_model_label(agent).as_deref(),
+            Ok("opencode/beam-free")
+        );
+        assert_eq!(
+            h.app.judge_line_model_for_agent(agent),
+            "opencode/beam-free"
+        );
+        h.app.set_turn_runner_pin_from_agent(agent);
+        assert_eq!(
+            h.app.turn_runner_pin,
+            Some(("opencode-step".to_owned(), "opencode/beam-free".to_owned()))
+        );
+    }
+
+    // TC-1741 / FR-1726: disallowed selected model still returns Err
+    #[test]
+    fn tc_1741_disallowed_selected_returns_err() {
+        let (mut app, _) = test_app();
+        app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = Some("gpt-5".to_owned());
+        let err = app.selected_run_model(Agent::Cursor).unwrap_err();
+        assert!(err.contains("gpt-5"), "{err}");
+    }
+
+    // TC-1742 / FR-1726: Cursor resolves to composer-2.5
+    #[test]
+    fn tc_1742_cursor_resolves_composer_2_5() {
+        let (mut app, _) = test_app();
+        app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
+        assert_eq!(
+            app.selected_run_model(Agent::Cursor),
+            Ok(Some("composer-2.5".to_owned()))
+        );
+    }
+
+    // TC-1743 / FR-1727: effective_model_for uses custom default_model
+    #[test]
+    fn tc_1743_effective_model_custom_default() {
+        let mut spec = dmuxai::custom_agent::opencode_preset("opencode-step");
+        spec.name = "opencode-step".to_owned();
+        spec.allowed_models = Some("^opencode/.*-free$".to_owned());
+        spec.default_model = Some("opencode/beam-free".to_owned());
+        let _ = install_shared_test_registry();
+        let idx = dmuxai::custom_agent::index_of("opencode-step")
+            .expect("shared test registry has opencode-step");
+        let agent = Agent::Custom(idx);
+        let (mut app, _) = test_app();
+        app.settings.custom_agents = vec![spec];
+        assert_eq!(
+            app.effective_model_for(agent, "composer-2.5"),
+            Some("opencode/beam-free".to_owned())
+        );
+        app.model_catalogs.get_mut(&agent).unwrap().selected =
+            Some("opencode/glm-5.3-flash-free".to_owned());
+        assert_eq!(
+            app.effective_model_for(agent, "composer-2.5"),
+            Some("opencode/glm-5.3-flash-free".to_owned())
+        );
+    }
+
+    // TC-1744 / FR-1726: Cursor planned model handling
+    #[test]
+    fn tc_1744_cursor_planned_model() {
+        let (mut app, _) = test_app();
+        app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
+        assert_eq!(
+            app.effective_model_for(Agent::Cursor, "composer-2.5"),
+            Some("composer-2.5".to_owned())
+        );
+        assert_eq!(
+            app.effective_model_for(Agent::Cursor, "gpt-5"),
+            Some("composer-2.5".to_owned())
+        );
+    }
+
+    // TC-1745 / FR-1728: provider default constant used for no model
+    #[test]
+    fn tc_1745_provider_default_label() {
+        let (app, _) = test_app();
+        assert_eq!(app.selected_run_model(Agent::Codex), Ok(None));
+        assert_eq!(
+            app.selected_run_model_label(Agent::Codex).as_deref(),
+            Ok(dmuxai::model_policy::PROVIDER_DEFAULT)
+        );
     }
 
     fn session_user_lines(app: &mut App) -> Vec<(String, Option<u64>)> {
