@@ -378,6 +378,11 @@ h1.brand {
 .run-status-done { color: var(--ok); border-color: var(--ok); }
 .run-status-failed { color: var(--err); border-color: var(--err); }
 .run-status-cancelled { color: var(--muted); border-color: var(--line); }
+.run-status-awaiting-approval {
+  color: var(--badge-waiting_gate-text);
+  border-color: var(--badge-waiting_gate-line);
+  background: var(--badge-waiting_gate-bg);
+}
 
 /* FR-981: activity suffix on the running pill. Color is inherited, so the
    same ellipsis works in the light and dark palettes. */

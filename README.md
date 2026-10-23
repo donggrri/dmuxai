@@ -277,6 +277,8 @@ token-authenticated HTTP API:
 ```bash
 TOKEN="<token from .dmuxai/web.json>"
 curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:7420/api/state"
+# Snapshot includes `turn`: { state, conversation_id, graph_id?, since_ms }.
+# Poll `turn.state` — use `awaiting_approval` (not agent `run.state` `done`) when a plan waits for approve/reject.
 ```
 
 With `dmuxai --web` the dashboard's Chat panel does everything the TUI does:
