@@ -1324,6 +1324,20 @@ body.sidebar-resizing .sidebar-resize-handle.is-dragging::after {
   color: var(--accent);
 }
 
+.sidebar-toggle[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.chat-toggle.active, .chat-toggle[aria-pressed="true"] {
+  background: var(--bg-badge);
+}
+
+.chat-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .todos-count {
   display: inline-block;
   min-width: 1.4em;

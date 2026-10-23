@@ -1724,6 +1724,7 @@ function setCenterView(next, opts) {
     }
     if (toggle) {
       toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      toggle.setAttribute('aria-pressed', open ? 'true' : 'false');
       toggle.classList.toggle('active', open);
     }
   });
@@ -1746,6 +1747,7 @@ function setCenterView(next, opts) {
     var back = $(CENTER_VIEWS[prev].toggle);
     if (back) { back.focus(); }
   }
+  syncChatTab();
 }
 
 // docs.js opens the Diff view from chat document cards and closes it for
@@ -1755,6 +1757,34 @@ window.dmuxaiSetCenterView = function (name) { setCenterView(name || null); };
 function toggleCenterView(name) {
   setCenterView(centerView === name ? null : name);
 }
+
+function syncChatTab() {
+  var chat = $('chat-toggle');
+  if (!chat) { return; }
+  var active = !centerView && !(window.dmuxaiMemoryOpen && window.dmuxaiMemoryOpen()) &&
+    !(window.dmuxaiSkillsOpen && window.dmuxaiSkillsOpen());
+  chat.classList.toggle('active', active);
+  chat.setAttribute('aria-pressed', active ? 'true' : 'false');
+}
+
+function showChat(opts) {
+  opts = opts || {};
+  if (window.dmuxaiCloseMemory) { window.dmuxaiCloseMemory(); }
+  if (window.dmuxaiCloseSkills) { window.dmuxaiCloseSkills(); }
+  setCenterView(null, { focus: false });
+  syncChatTab();
+  if (opts.focus !== false) {
+    var input = document.querySelector('#session textarea.session-input');
+    if (input && !input.disabled) {
+      input.focus({ preventScroll: true });
+    } else {
+      var chatBtn = $('chat-toggle');
+      if (chatBtn) { chatBtn.focus(); }
+    }
+  }
+}
+
+window.dmuxaiShowChat = function () { showChat(); };
 
 function graphAwaitingApproval(graph) {
   return !!(graph && graph.phase === 'awaiting_approval' && graph.approval);
@@ -1886,6 +1916,8 @@ function bindCenterViews() {
     var toggle = $(CENTER_VIEWS[name].toggle);
     if (toggle) { toggle.addEventListener('click', function () { toggleCenterView(name); }); }
   });
+  var chatToggle = $('chat-toggle');
+  if (chatToggle) { chatToggle.addEventListener('click', function () { showChat(); }); }
   var closes = document.querySelectorAll('.center-view-close');
   for (var i = 0; i < closes.length; i++) {
     closes[i].addEventListener('click', function () { setCenterView(null); });
@@ -1905,7 +1937,10 @@ function bindCenterViews() {
     if (t && t.closest && t.closest('.sidebar, .sessions-sidebar, .workspace-dialog-backdrop')) { return; }
     setCenterView(null);
   }, true);
+  document.addEventListener('dmuxai:memory-popover', syncChatTab);
+  document.addEventListener('dmuxai:skills-popover', syncChatTab);
   setCenterView(readCenterView(), { persist: false, focus: false });
+  syncChatTab();
 }
 
 function bindGraphControls() {
