@@ -5,6 +5,14 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Added
+
+- Dashboard: run turns in several conversations at once (different agents; the
+  same agent in a second conversation is refused with 409). Background turns keep
+  running when you switch conversations, the Sessions list marks every running
+  conversation, and a background turn that ends no longer wedges the follow-up
+  queue (#124, FR-1620..1625).
+
 ### Removed
 
 - Removed: native Windows support (packaging, launcher, docs). WSL keeps
