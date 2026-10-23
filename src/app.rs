@@ -963,6 +963,7 @@ pub struct HeadlessRequest {
     pub approve_plan: bool,
     pub allow_sensitive: bool,
     pub todo_id: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1384,6 +1385,8 @@ pub struct App {
     pending_turn_policy: Option<TurnPolicy>,
     /// When set, planner nodes are rewritten to this runner and model (FR-1645).
     turn_runner_pin: Option<(String, String)>,
+    /// Headless `--model` accepted for this run (Explicit source), if any.
+    headless_explicit_model: Option<(Agent, String)>,
     /// Explicit graph requests may assign multiple runners (FR-1645).
     allow_multi_runner_graph: bool,
     /// Cursor CLI keeps a chat in ask mode once a read-only turn ran in it, even
@@ -1629,6 +1632,7 @@ impl App {
             switch_ready: None,
             pending_turn_policy: None,
             turn_runner_pin: None,
+            headless_explicit_model: None,
             allow_multi_runner_graph: false,
             cursor_session_maybe_read_only: true,
             chat_markdown_cache: HashMap::new(),
@@ -9023,7 +9027,8 @@ impl App {
         };
         self.last_graph_run = Some(saved);
         if let Some(session) = self.graph_session.as_ref() {
-            self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
+            self.graph_assignment_line =
+                resolved_assignment_line(&self.model_catalogs, Some(&self.settings), session);
         }
         if Self::plan_change_should_emit_revised(&change) {
             self.emit_plan_revised_event(&plan_id, rev);
@@ -9083,7 +9088,8 @@ impl App {
             self.emit_plan_revised_event(&plan_id, rev);
         }
         if let Some(session) = self.graph_session.as_ref() {
-            self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
+            self.graph_assignment_line =
+                resolved_assignment_line(&self.model_catalogs, Some(&self.settings), session);
         }
         // An approved failure replan replaces the held failure (FR-956).
         self.graph_failure_replan = None;
@@ -9505,7 +9511,8 @@ impl App {
                 return;
             };
             let actions = session.on_node_finished(&node_id, success);
-            self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
+            self.graph_assignment_line =
+                resolved_assignment_line(&self.model_catalogs, Some(&self.settings), session);
             let _ = save_run(&self.workspace_root, session.run());
             let run_snapshot = session.run().clone();
             let failed_message = if !success {
@@ -9759,7 +9766,22 @@ impl App {
                 dmuxai::model_policy::validate_model_for_runner(runner, trimmed)?;
             }
         }
-        let resolution = Self::model_resolution_for(&self.model_catalogs, agent, None)?;
+        let explicit = self
+            .headless_explicit_model
+            .as_ref()
+            .filter(|(a, _)| *a == agent)
+            .map(|(_, m)| m.as_str());
+        let config_default = self
+            .settings
+            .runner_models
+            .get(&runner.to_ascii_lowercase())
+            .cloned();
+        let resolution = Self::model_resolution_for(
+            &self.model_catalogs,
+            agent,
+            explicit,
+            config_default.as_deref(),
+        )?;
         Ok(resolution.model)
     }
 
@@ -9768,21 +9790,23 @@ impl App {
         catalogs: &HashMap<Agent, ModelCatalog>,
         agent: Agent,
         explicit: Option<&str>,
+        config_default: Option<&str>,
     ) -> Result<dmuxai::model_policy::ModelResolution, String> {
         let runner = runner_name(agent);
         let selected = catalogs
             .get(&agent)
             .and_then(|catalog| catalog.selected.clone());
-        let config_default = match agent {
+        // [runners.<id>] model wins over a custom agent's default_model (FR-1731).
+        let resolved_config_default = config_default.map(str::to_owned).or_else(|| match agent {
             Agent::Custom(index) => {
                 dmuxai::custom_agent::spec_at(index).and_then(|spec| spec.default_model.clone())
             }
             _ => None,
-        };
+        });
         let candidates = dmuxai::model_policy::ModelCandidates {
             explicit,
             selected: selected.as_deref(),
-            config_default: config_default.as_deref(),
+            config_default: resolved_config_default.as_deref(),
         };
         dmuxai::model_policy::ModelResolution::resolve(runner, candidates)
     }
@@ -10480,7 +10504,12 @@ impl App {
     /// composer-2.5 default only applies to the Cursor runner; other runners
     /// fall back to their provider default (`None`).
     fn effective_model_for(&self, agent: Agent, planned: &str) -> Option<String> {
-        Self::effective_model_for_catalogs(&self.model_catalogs, agent, planned)
+        Self::effective_model_for_catalogs(
+            &self.model_catalogs,
+            Some(&self.settings),
+            agent,
+            planned,
+        )
     }
 
     /// Catalog-only variant of [`App::effective_model_for`] so model
@@ -10488,6 +10517,7 @@ impl App {
     /// run (e.g. when rendering the `Graph assignment:` line).
     fn effective_model_for_catalogs(
         catalogs: &HashMap<Agent, ModelCatalog>,
+        settings: Option<&DmuxSettings>,
         agent: Agent,
         planned: &str,
     ) -> Option<String> {
@@ -10509,7 +10539,17 @@ impl App {
             // invalid planned falls through to the runner default (composer-2.5)
         }
 
-        let resolution = Self::model_resolution_for(catalogs, agent, None).ok()?;
+        let runner = runner_name(agent);
+        let config_default = settings
+            .and_then(|s| s.runner_models.get(&runner.to_ascii_lowercase()).cloned())
+            .or_else(|| match agent {
+                Agent::Custom(index) => {
+                    dmuxai::custom_agent::spec_at(index).and_then(|spec| spec.default_model.clone())
+                }
+                _ => None,
+            });
+        let resolution =
+            Self::model_resolution_for(catalogs, agent, None, config_default.as_deref()).ok()?;
         resolution.model
     }
 
@@ -10638,7 +10678,8 @@ impl App {
                 .count()
                 <= 1;
         let mut session = GraphRunSession::new(run);
-        self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, &session);
+        self.graph_assignment_line =
+            resolved_assignment_line(&self.model_catalogs, Some(&self.settings), &session);
         if !self.quiet_graph_run {
             self.push_system(format!(
                 "Graph {} (orchestrator {}): {}",
@@ -10679,8 +10720,11 @@ impl App {
                         let run = session.run().clone();
                         let _ = save_run(&self.workspace_root, &run);
                         self.last_graph_run = Some(run);
-                        self.graph_assignment_line =
-                            resolved_assignment_line(&self.model_catalogs, session);
+                        self.graph_assignment_line = resolved_assignment_line(
+                            &self.model_catalogs,
+                            Some(&self.settings),
+                            session,
+                        );
                     }
                     let agents: Vec<Agent> = self
                         .graph_agent_nodes
@@ -10730,8 +10774,11 @@ impl App {
                         let run = session.run().clone();
                         let _ = save_run(&self.workspace_root, &run);
                         self.last_graph_run = Some(run);
-                        self.graph_assignment_line =
-                            resolved_assignment_line(&self.model_catalogs, session);
+                        self.graph_assignment_line = resolved_assignment_line(
+                            &self.model_catalogs,
+                            Some(&self.settings),
+                            session,
+                        );
                     }
                     self.clear_graph_defer_state();
                     for (agent, _node_id) in self.graph_agent_nodes.drain() {
@@ -10779,8 +10826,11 @@ impl App {
                         let run = session.run().clone();
                         let _ = save_run(&self.workspace_root, &run);
                         self.last_graph_run = Some(run);
-                        self.graph_assignment_line =
-                            resolved_assignment_line(&self.model_catalogs, session);
+                        self.graph_assignment_line = resolved_assignment_line(
+                            &self.model_catalogs,
+                            Some(&self.settings),
+                            session,
+                        );
                     }
                     self.clear_graph_defer_state();
                     for (agent, _node_id) in self.graph_agent_nodes.drain() {
@@ -10902,7 +10952,8 @@ impl App {
         if let Some(session) = self.graph_session.as_mut() {
             session.revert_node_start(&node_id);
             let _ = save_run(&self.workspace_root, session.run());
-            self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
+            self.graph_assignment_line =
+                resolved_assignment_line(&self.model_catalogs, Some(&self.settings), session);
         }
         // Only drop the mapping when it points at the node being deferred; a
         // different node may still be running on this runner (FR-949).
@@ -11160,7 +11211,8 @@ impl App {
             return;
         };
         let actions = session.acknowledge_gate();
-        self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
+        self.graph_assignment_line =
+            resolved_assignment_line(&self.model_catalogs, Some(&self.settings), session);
         self.dispatch_graph_actions(actions);
     }
 
@@ -11204,7 +11256,8 @@ impl App {
                 node.model_id = model_id.to_owned();
             });
         if updated.is_some() {
-            self.graph_assignment_line = resolved_assignment_line(&self.model_catalogs, session);
+            self.graph_assignment_line =
+                resolved_assignment_line(&self.model_catalogs, Some(&self.settings), session);
             let snapshot = session.run().clone();
             self.push_system(format!("Overrode {node_id} → {runner} {model_id}"));
             let _ = save_run(&self.workspace_root, &snapshot);
@@ -12620,6 +12673,50 @@ impl App {
                     system_prompt: None,
                 };
             }
+        }
+
+        // FR-1730: headless --model validation before any turn starts.
+        if let Some(model_value) = req.model.clone() {
+            let target_agent = self.adapters[self.selected].agent();
+            let runner_id = runner_name(target_agent).to_owned();
+            let config_default = self
+                .settings
+                .runner_models
+                .get(&runner_id.to_ascii_lowercase())
+                .cloned()
+                .or_else(|| match target_agent {
+                    Agent::Custom(index) => dmuxai::custom_agent::spec_at(index)
+                        .and_then(|spec| spec.default_model.clone()),
+                    _ => None,
+                });
+            if let Err(err) = Self::model_resolution_for(
+                &self.model_catalogs,
+                target_agent,
+                Some(&model_value),
+                config_default.as_deref(),
+            ) {
+                return HeadlessOutcome {
+                    ok: false,
+                    exit_code: 5,
+                    conversation_id: self.conversation_id.as_str().to_owned(),
+                    agent: Some(runner_id.clone()),
+                    graph_id: None,
+                    text: String::new(),
+                    messages: Vec::new(),
+                    error: Some(err),
+                    error_kind: Some(AgentErrorKind::Policy.as_str().to_owned()),
+                    todo: None,
+                    triage: None,
+                    plan: None,
+                    system_prompt: None,
+                };
+            }
+            // Accepted: Explicit source. Mirror into the catalog so the turn
+            // path reads it like an F2 selection, and remember it for the
+            // resolver's Explicit branch (triage.model / plan pin).
+            self.headless_explicit_model = Some((target_agent, model_value.clone()));
+            let catalog = self.model_catalogs.entry(target_agent).or_default();
+            catalog.selected = Some(model_value);
         }
 
         if let Some(ref mode_str) = req.mode {
@@ -15123,11 +15220,12 @@ fn adapter_request(
 /// composer-2.5.
 fn resolved_assignment_line(
     catalogs: &HashMap<Agent, ModelCatalog>,
+    settings: Option<&DmuxSettings>,
     session: &GraphRunSession,
 ) -> String {
     session.assignment_line_with(|runner, planned| {
         if let Some(agent) = runner_from_str(runner) {
-            App::effective_model_for_catalogs(catalogs, agent, planned)
+            App::effective_model_for_catalogs(catalogs, settings, agent, planned)
                 .unwrap_or_else(|| dmuxai::model_policy::PROVIDER_DEFAULT.to_owned())
         } else {
             planned.to_owned()
@@ -17293,7 +17391,7 @@ mod tests {
         app.model_catalogs.get_mut(&Agent::Agy).unwrap().selected =
             Some("gemini-3.8-flash-low".to_owned());
         let session = app.graph_session.as_ref().unwrap();
-        let resolved = resolved_assignment_line(&app.model_catalogs, session);
+        let resolved = resolved_assignment_line(&app.model_catalogs, Some(&app.settings), session);
         assert!(resolved.contains("step-1:research→agy:gemini-3.8-flash-low"));
     }
 
@@ -17329,7 +17427,7 @@ mod tests {
         app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected =
             Some("grok-4.7-medium-fast".to_owned());
         let session = app.graph_session.as_ref().unwrap();
-        let resolved = resolved_assignment_line(&app.model_catalogs, session);
+        let resolved = resolved_assignment_line(&app.model_catalogs, Some(&app.settings), session);
         assert!(resolved.contains("step-2:impl→cursor:composer-2.5"));
         assert!(!resolved.contains("grok-4.7-medium-fast"));
     }
@@ -22855,6 +22953,7 @@ mod tests {
             approve_plan: false,
             allow_sensitive: false,
             todo_id: None,
+            model: None,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -22885,6 +22984,7 @@ mod tests {
             approve_plan: false,
             allow_sensitive: false,
             todo_id: None,
+            model: None,
         };
         let outcome = app.run_headless(req, Arc::clone(&cancel)).await;
         assert!(!outcome.ok);
@@ -22901,6 +23001,7 @@ mod tests {
             approve_plan: false,
             allow_sensitive: false,
             todo_id: None,
+            model: None,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -22912,6 +23013,110 @@ mod tests {
                 .unwrap()
                 .contains("runner 'codex' is not in allowed_runners")
         );
+    }
+
+    // TC-1751 / FR-1730: disallowed headless model is policy-rejected before any request
+    #[tokio::test]
+    async fn tc_1751_headless_disallowed_model_policy() {
+        // agy + gemini-4-argon
+        {
+            let (mut app, sent) = test_app();
+            app.selected = adapter_index(Agent::Agy);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let req = HeadlessRequest {
+                prompt: "hello".to_owned(),
+                agent: Some("agy".to_owned()),
+                mode: None,
+                graph: false,
+                approve_plan: false,
+                allow_sensitive: false,
+                todo_id: None,
+                model: Some("gemini-4-argon".to_owned()),
+            };
+            let outcome = app.run_headless(req, cancel).await;
+            assert!(!outcome.ok);
+            assert_eq!(outcome.exit_code, 5);
+            assert_eq!(outcome.error_kind.as_deref(), Some("policy"));
+            assert!(sent.lock().unwrap().is_empty(), "no adapter request");
+        }
+        // cursor + gpt-5
+        {
+            let (mut app, sent) = test_app();
+            app.selected = adapter_index(Agent::Cursor);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let req = HeadlessRequest {
+                prompt: "hello".to_owned(),
+                agent: Some("cursor".to_owned()),
+                mode: None,
+                graph: false,
+                approve_plan: false,
+                allow_sensitive: false,
+                todo_id: None,
+                model: Some("gpt-5".to_owned()),
+            };
+            let outcome = app.run_headless(req, cancel).await;
+            assert!(!outcome.ok);
+            assert_eq!(outcome.exit_code, 5);
+            assert_eq!(outcome.error_kind.as_deref(), Some("policy"));
+            assert!(sent.lock().unwrap().is_empty(), "no adapter request");
+        }
+    }
+
+    // TC-1752 / FR-1730: allowed headless model succeeds and appears in triage.model
+    #[tokio::test]
+    async fn tc_1752_headless_allowed_model_triage() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        app.selected = adapter_index(Agent::Agy);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("Hello from headless agy!".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "Say hello".to_owned(),
+            agent: Some("agy".to_owned()),
+            mode: Some("ask".to_owned()),
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: Some("gemini-3.8-flash-high".to_owned()),
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(outcome.ok);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.agent.as_deref(), Some("agy"));
+        let triage = outcome.triage.expect("triage");
+        assert_eq!(triage.model, "gemini-3.8-flash-high");
     }
 
     // TC-1694 / FR-1682: headless outcome carries error_kind.
@@ -22953,6 +23158,7 @@ mod tests {
             approve_plan: false,
             allow_sensitive: false,
             todo_id: None,
+            model: None,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -22991,6 +23197,7 @@ mod tests {
             approve_plan: false,
             allow_sensitive: false,
             todo_id: None,
+            model: None,
         };
         let outcome = tokio::time::timeout(Duration::from_secs(20), app.run_headless(req, cancel))
             .await
@@ -24675,6 +24882,7 @@ mod tests {
             approve_plan: false,
             allow_sensitive: false,
             todo_id: None,
+            model: None,
         };
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let outcome = app.run_headless(req, cancel).await;
@@ -28930,6 +29138,87 @@ mod tests {
         );
     }
 
+    // TC-1755 / FR-1731: resolver precedence explicit > selected > config > custom default > runner default
+    #[test]
+    fn tc_1755_resolver_precedence_config_model() {
+        let _ = install_shared_test_registry();
+        let idx = dmuxai::custom_agent::index_of("opencode-step")
+            .expect("shared test registry has opencode-step");
+        let agent = Agent::Custom(idx);
+
+        // runner default (Cursor) when nothing else applies
+        let (mut cursor_app, _) = test_app();
+        cursor_app
+            .model_catalogs
+            .get_mut(&Agent::Cursor)
+            .unwrap()
+            .selected = None;
+        cursor_app.settings.runner_models.clear();
+        assert_eq!(
+            cursor_app.selected_run_model(Agent::Cursor),
+            Ok(Some("composer-2.5".to_owned()))
+        );
+
+        let mut spec = dmuxai::custom_agent::opencode_preset("opencode-step");
+        spec.name = "opencode-step".to_owned();
+        spec.allowed_models = Some("^opencode/.*-free$".to_owned());
+        spec.default_model = Some("opencode/beam-free".to_owned());
+
+        let (mut app, _) = test_app();
+        app.settings.custom_agents = vec![spec];
+        app.settings.runner_models.clear();
+        app.model_catalogs.get_mut(&agent).unwrap().selected = None;
+        app.headless_explicit_model = None;
+        assert_eq!(
+            app.selected_run_model(agent),
+            Ok(Some("opencode/beam-free".to_owned()))
+        );
+
+        app.settings.runner_models.insert(
+            "opencode-step".to_owned(),
+            "opencode/config-free".to_owned(),
+        );
+        app.model_catalogs.get_mut(&agent).unwrap().selected = None;
+        app.headless_explicit_model = None;
+        assert_eq!(
+            app.selected_run_model(agent),
+            Ok(Some("opencode/config-free".to_owned()))
+        );
+
+        app.model_catalogs.get_mut(&agent).unwrap().selected =
+            Some("opencode/selected-free".to_owned());
+        app.headless_explicit_model = None;
+        assert_eq!(
+            app.selected_run_model(agent),
+            Ok(Some("opencode/selected-free".to_owned()))
+        );
+
+        app.headless_explicit_model = Some((agent, "opencode/explicit-free".to_owned()));
+        assert_eq!(
+            app.selected_run_model(agent),
+            Ok(Some("opencode/explicit-free".to_owned()))
+        );
+    }
+
+    // TC-1756 / FR-1732: policy unchanged despite config model
+    #[test]
+    fn tc_1756_policy_unchanged() {
+        let (mut app, _) = test_app();
+        app.settings
+            .runner_models
+            .insert("cursor".to_owned(), "gpt-5".to_owned());
+        app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
+        assert_eq!(
+            app.selected_run_model(Agent::Cursor),
+            Ok(Some("composer-2.5".to_owned()))
+        );
+
+        assert!(
+            dmuxai::model_policy::validate_model_for_runner("agy", "gemini-3.8-flash-high").is_ok()
+        );
+        assert!(dmuxai::model_policy::validate_model_for_runner("agy", "gemini-4-argon").is_err());
+    }
+
     fn session_user_lines(app: &mut App) -> Vec<(String, Option<u64>)> {
         app.session_view()
             .transcript
@@ -30529,6 +30818,7 @@ mod tests {
                 }),
                 inject: Some(inject),
                 roles: None,
+                model: None,
             },
         );
     }
@@ -30773,6 +31063,7 @@ mod tests {
                 }),
                 inject: Some(PromptInject::Session),
                 roles: None,
+                model: None,
             },
         );
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -30815,6 +31106,7 @@ mod tests {
             approve_plan: false,
             allow_sensitive: false,
             todo_id: None,
+            model: None,
         };
         let outcome = app.run_headless(req, cancel).await;
         let sp = outcome
