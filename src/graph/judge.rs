@@ -60,6 +60,35 @@ pub enum TriageSource {
 /// words and at most 40 characters (counted per character, not per byte —
 /// e.g. a 3-word Korean greeting stays trivial). The judge turn is skipped
 /// for such prompts.
+/// Prefix for simple question turns (FR-1641).
+pub const QUESTION_ANSWER_HINT: &str =
+    "Answer directly. Do not run tools or explore the workspace unless the answer needs it.";
+
+/// True when the user text is a question (FR-1640).
+pub fn is_question_prompt(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.ends_with('?') || trimmed.ends_with('？') {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    const PREFIXES: &[&str] = &[
+        "what ", "why ", "how ", "which ", "who ", "when ", "where ", "is ", "are ", "can ",
+        "does ", "do ",
+    ];
+    if PREFIXES.iter().any(|prefix| lower.starts_with(prefix)) {
+        return true;
+    }
+    for suffix in ["까", "나요", "니"] {
+        if trimmed.ends_with(suffix) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn is_trivial_prompt(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.contains('\n') || trimmed.starts_with('/') {
@@ -355,5 +384,16 @@ DATA-nonce1>>>>
         assert!(!is_trivial_prompt("line one\nline two"));
         assert!(!is_trivial_prompt("/plan x"));
         assert!(!is_trivial_prompt("please review \n the plan"));
+    }
+
+    // TC-1640 / FR-1640: question detection for read-only agy turns.
+    #[test]
+    fn tc_1640_is_question_prompt() {
+        assert!(is_question_prompt("What is this?"));
+        assert!(is_question_prompt("how does it work"));
+        assert!(is_question_prompt("이거 뭐야?"));
+        assert!(is_question_prompt("괜찮을까"));
+        assert!(!is_question_prompt("fix the typo"));
+        assert!(!is_question_prompt("implement the feature"));
     }
 }

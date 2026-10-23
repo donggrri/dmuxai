@@ -455,6 +455,29 @@ pub fn validate_plan(doc: &PlanDoc, ctx: &PlanContext<'_>) -> Result<GraphPlan, 
     validate_plan_with_limit(doc, ctx, 8)
 }
 
+/// Pins every planned node to one runner and model (FR-1645, FR-1646).
+pub fn pin_graph_plan_runners(
+    plan: &mut GraphPlan,
+    pinned_runner: &str,
+    pinned_model: &str,
+    runner_allowed: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let pinned_runner = pinned_runner.trim().to_ascii_lowercase();
+    let mut notes = Vec::new();
+    for node in &mut plan.nodes {
+        let prior = node.runner.trim().to_ascii_lowercase();
+        if prior != pinned_runner || !runner_allowed(&prior) {
+            notes.push(format!(
+                "step {}: runner {} -> {} (pinned)",
+                node.id, node.runner, pinned_runner
+            ));
+            node.runner = pinned_runner.clone();
+            node.model_id = pinned_model.to_owned();
+        }
+    }
+    notes
+}
+
 /// Same rules as [`validate_plan`] but with an explicit executable-step cap.
 /// Replan revisions use the run's `max_nodes` instead of the initial 8.
 pub(crate) fn validate_plan_with_limit(
@@ -1213,6 +1236,39 @@ mod tests {
         assert_eq!(plan.tasks[1].size, TaskSize::Medium);
         assert_eq!(plan.nodes[0].task.as_deref(), Some("task-1"));
         assert_eq!(plan.nodes[2].task.as_deref(), Some("task-2"));
+    }
+
+    // TC-1646 / FR-1646: disallowed runners are rewritten when pinning.
+    #[test]
+    fn tc_1646_pin_graph_plan_runners_rewrites_disallowed() {
+        let mut plan = GraphPlan {
+            schema: SCHEMA.to_owned(),
+            id: "p".to_owned(),
+            orchestrator_model: ORCHESTRATOR_MODEL.to_owned(),
+            user_prompt: "x".to_owned(),
+            nodes: vec![GraphNode {
+                id: "step-1".to_owned(),
+                role: NodeRole::Implement,
+                job: "j".to_owned(),
+                runner: "cursor".to_owned(),
+                model_id: ORCHESTRATOR_MODEL.to_owned(),
+                skill: None,
+                requires_gate: false,
+                status: GraphNodeStatus::Pending,
+                attempt: 0,
+                task: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+            }],
+            edges: vec![],
+            limits: default_limits(),
+            tasks: vec![],
+        };
+        let notes = pin_graph_plan_runners(&mut plan, "agy", "provider default", &|runner| {
+            runner == "agy"
+        });
+        assert_eq!(plan.nodes[0].runner, "agy");
+        assert!(!notes.is_empty());
     }
 
     // TC-943 / FR-939
