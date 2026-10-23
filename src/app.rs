@@ -1007,6 +1007,110 @@ pub struct HeadlessOutcome {
     pub system_prompt: Option<HeadlessSystemPrompt>,
 }
 
+#[allow(dead_code)]
+impl HeadlessOutcome {
+    pub fn failure(
+        exit_code: i32,
+        conversation_id: impl Into<String>,
+        agent: Option<String>,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            ok: false,
+            exit_code,
+            conversation_id: conversation_id.into(),
+            agent,
+            graph_id: None,
+            text: String::new(),
+            messages: Vec::new(),
+            error: Some(error.into()),
+            error_kind: None,
+            todo: None,
+            triage: None,
+            plan: None,
+            system_prompt: None,
+        }
+    }
+
+    pub fn success(
+        conversation_id: impl Into<String>,
+        agent: Option<String>,
+        text: impl Into<String>,
+        messages: Vec<HeadlessMessage>,
+    ) -> Self {
+        Self {
+            ok: true,
+            exit_code: dmuxai::agent_api::exit::OK,
+            conversation_id: conversation_id.into(),
+            agent,
+            graph_id: None,
+            text: text.into(),
+            messages,
+            error: None,
+            error_kind: None,
+            todo: None,
+            triage: None,
+            plan: None,
+            system_prompt: None,
+        }
+    }
+
+    pub fn with_error_kind(mut self, kind: impl Into<String>) -> Self {
+        self.error_kind = Some(kind.into());
+        self
+    }
+
+    pub fn with_graph_id(mut self, graph_id: Option<String>) -> Self {
+        self.graph_id = graph_id;
+        self
+    }
+
+    pub fn with_text(mut self, text: impl Into<String>) -> Self {
+        self.text = text.into();
+        self
+    }
+
+    pub fn with_messages(mut self, messages: Vec<HeadlessMessage>) -> Self {
+        self.messages = messages;
+        self
+    }
+
+    pub fn with_todo(mut self, todo: Option<Todo>) -> Self {
+        self.todo = todo;
+        self
+    }
+
+    pub fn with_triage(mut self, triage: Option<Triage>) -> Self {
+        self.triage = triage;
+        self
+    }
+
+    pub fn with_plan(mut self, plan: Option<HeadlessPlan>) -> Self {
+        self.plan = plan;
+        self
+    }
+
+    pub fn with_system_prompt(mut self, system_prompt: Option<HeadlessSystemPrompt>) -> Self {
+        self.system_prompt = system_prompt;
+        self
+    }
+
+    pub fn with_agent(mut self, agent: Option<String>) -> Self {
+        self.agent = agent;
+        self
+    }
+
+    pub fn with_ok(mut self, ok: bool) -> Self {
+        self.ok = ok;
+        self
+    }
+
+    pub fn with_exit_code(mut self, exit_code: i32) -> Self {
+        self.exit_code = exit_code;
+        self
+    }
+}
+
 enum HeadlessIdleAction {
     Done,
     ContinueAfterApprove,
@@ -12461,21 +12565,17 @@ impl App {
             .map(|session| session.run().plan.id.clone())
             .or_else(|| self.last_graph_run.as_ref().map(|run| run.plan.id.clone()));
         let (triage, plan) = self.headless_plan_snapshot();
-        HeadlessOutcome {
-            ok: false,
-            exit_code: dmuxai::agent_api::exit::APPROVAL_REQUIRED,
-            conversation_id: conversation_id.to_owned(),
+        HeadlessOutcome::failure(
+            dmuxai::agent_api::exit::APPROVAL_REQUIRED,
+            conversation_id.to_owned(),
             agent,
-            graph_id,
-            text,
-            messages: Vec::new(),
-            error: Some(note.to_owned()),
-            error_kind: None,
-            todo: None,
-            triage,
-            plan,
-            system_prompt: self.system_prompt_applied.clone(),
-        }
+            note.to_owned(),
+        )
+        .with_graph_id(graph_id)
+        .with_text(text)
+        .with_triage(triage)
+        .with_plan(plan)
+        .with_system_prompt(self.system_prompt_applied.clone())
     }
 
     fn headless_submit_prompt(&mut self, req: &HeadlessRequest) {
@@ -12550,21 +12650,15 @@ impl App {
             if req.approve_plan && !approved_plan {
                 if let Err(error) = self.approve_awaiting_plan(DecisionBy::Cli) {
                     let message = Self::plan_decision_notice(error);
-                    return HeadlessIdleAction::Exit(Box::new(HeadlessOutcome {
-                        ok: false,
-                        exit_code: 1,
-                        conversation_id: conversation_id.to_owned(),
-                        agent: agent_label,
-                        graph_id: self.last_graph_run.as_ref().map(|run| run.plan.id.clone()),
-                        text: String::new(),
-                        messages: Vec::new(),
-                        error: Some(message),
-                        error_kind: None,
-                        todo: None,
-                        triage: None,
-                        plan: None,
-                        system_prompt: None,
-                    }));
+                    return HeadlessIdleAction::Exit(Box::new(
+                        HeadlessOutcome::failure(
+                            dmuxai::agent_api::exit::FAILED,
+                            conversation_id.to_owned(),
+                            agent_label,
+                            message,
+                        )
+                        .with_graph_id(self.last_graph_run.as_ref().map(|run| run.plan.id.clone())),
+                    ));
                 }
                 return HeadlessIdleAction::ContinueAfterApprove;
             }
@@ -12601,21 +12695,12 @@ impl App {
                 .iter()
                 .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean);
             let Some(adapter) = adapter else {
-                return HeadlessOutcome {
-                    ok: false,
-                    exit_code: 3,
-                    conversation_id: self.conversation_id.as_str().to_owned(),
-                    agent: Some(agent_str.clone()),
-                    graph_id: None,
-                    text: String::new(),
-                    messages: Vec::new(),
-                    error: Some(format!("unknown agent '{agent_str}'")),
-                    error_kind: None,
-                    todo: None,
-                    triage: None,
-                    plan: None,
-                    system_prompt: None,
-                };
+                return HeadlessOutcome::failure(
+                    dmuxai::agent_api::exit::NOT_FOUND,
+                    self.conversation_id.as_str().to_owned(),
+                    Some(agent_str.clone()),
+                    format!("unknown agent '{agent_str}'"),
+                );
             };
             let target_agent = adapter.agent();
             let runner_id = runner_name(target_agent);
@@ -12625,21 +12710,13 @@ impl App {
                         .iter()
                         .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim())))
             {
-                return HeadlessOutcome {
-                    ok: false,
-                    exit_code: 5,
-                    conversation_id: self.conversation_id.as_str().to_owned(),
-                    agent: Some(runner_id.to_owned()),
-                    graph_id: None,
-                    text: String::new(),
-                    messages: Vec::new(),
-                    error: Some(format!("runner '{runner_id}' is not in allowed_runners")),
-                    error_kind: Some(AgentErrorKind::Policy.as_str().to_owned()),
-                    todo: None,
-                    triage: None,
-                    plan: None,
-                    system_prompt: None,
-                };
+                return HeadlessOutcome::failure(
+                    dmuxai::agent_api::exit::FORBIDDEN,
+                    self.conversation_id.as_str().to_owned(),
+                    Some(runner_id.to_owned()),
+                    format!("runner '{runner_id}' is not in allowed_runners"),
+                )
+                .with_error_kind(AgentErrorKind::Policy.as_str().to_owned());
             }
             self.selected = adapter_index(target_agent);
         } else if let Some(default) = self.settings.routing_default_agent.as_deref()
@@ -12657,21 +12734,13 @@ impl App {
                         .iter()
                         .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim())))
             {
-                return HeadlessOutcome {
-                    ok: false,
-                    exit_code: 5,
-                    conversation_id: self.conversation_id.as_str().to_owned(),
-                    agent: Some(runner_id.to_owned()),
-                    graph_id: None,
-                    text: String::new(),
-                    messages: Vec::new(),
-                    error: Some(format!("runner '{runner_id}' is not in allowed_runners")),
-                    error_kind: Some(AgentErrorKind::Policy.as_str().to_owned()),
-                    todo: None,
-                    triage: None,
-                    plan: None,
-                    system_prompt: None,
-                };
+                return HeadlessOutcome::failure(
+                    dmuxai::agent_api::exit::FORBIDDEN,
+                    self.conversation_id.as_str().to_owned(),
+                    Some(runner_id.to_owned()),
+                    format!("runner '{runner_id}' is not in allowed_runners"),
+                )
+                .with_error_kind(AgentErrorKind::Policy.as_str().to_owned());
             }
         }
 
@@ -12695,21 +12764,13 @@ impl App {
                 Some(&model_value),
                 config_default.as_deref(),
             ) {
-                return HeadlessOutcome {
-                    ok: false,
-                    exit_code: 5,
-                    conversation_id: self.conversation_id.as_str().to_owned(),
-                    agent: Some(runner_id.clone()),
-                    graph_id: None,
-                    text: String::new(),
-                    messages: Vec::new(),
-                    error: Some(err),
-                    error_kind: Some(AgentErrorKind::Policy.as_str().to_owned()),
-                    todo: None,
-                    triage: None,
-                    plan: None,
-                    system_prompt: None,
-                };
+                return HeadlessOutcome::failure(
+                    dmuxai::agent_api::exit::FORBIDDEN,
+                    self.conversation_id.as_str().to_owned(),
+                    Some(runner_id.clone()),
+                    err,
+                )
+                .with_error_kind(AgentErrorKind::Policy.as_str().to_owned());
             }
             // Accepted: Explicit source. Mirror into the catalog so the turn
             // path reads it like an F2 selection, and remember it for the
@@ -12723,21 +12784,12 @@ impl App {
             match crate::agent::turn_policy_from_legacy_mode(mode_str) {
                 Ok(policy) => self.pending_turn_policy = Some(policy),
                 Err(message) => {
-                    return HeadlessOutcome {
-                        ok: false,
-                        exit_code: dmuxai::agent_api::exit::USAGE,
-                        conversation_id: self.conversation_id.as_str().to_owned(),
-                        agent: req.agent.clone(),
-                        graph_id: None,
-                        text: String::new(),
-                        messages: Vec::new(),
-                        error: Some(message),
-                        error_kind: None,
-                        todo: None,
-                        triage: None,
-                        plan: None,
-                        system_prompt: None,
-                    };
+                    return HeadlessOutcome::failure(
+                        dmuxai::agent_api::exit::USAGE,
+                        self.conversation_id.as_str().to_owned(),
+                        req.agent.clone(),
+                        message,
+                    );
                 }
             }
         }
@@ -12811,36 +12863,32 @@ impl App {
                     };
                     if let Err(err) = self.run_todo(todo_id, mode) {
                         let (exit_code, msg) = match err {
-                            RunTodoError::NotFound => (3, "to-do not found".to_owned()),
-                            RunTodoError::UnknownAgent(agent) => {
-                                (3, format!("unknown agent '{agent}'"))
-                            }
-                            RunTodoError::AlreadyRunning => {
-                                (4, "to-do is already running".to_owned())
-                            }
-                            RunTodoError::Busy(msg) => (4, msg),
-                            RunTodoError::Forbidden(msg) => (5, msg),
-                            RunTodoError::Missing(msg) => (3, msg),
-                            RunTodoError::Invalid(msg) => (2, msg),
-                            RunTodoError::Internal(msg) => (6, msg),
-                        };
-                        return HeadlessOutcome {
-                            ok: false,
-                            exit_code,
-                            conversation_id: self.conversation_id.as_str().to_owned(),
-                            agent: Some(
-                                runner_name(self.adapters[self.selected].agent()).to_owned(),
+                            RunTodoError::NotFound => (
+                                dmuxai::agent_api::exit::NOT_FOUND,
+                                "to-do not found".to_owned(),
                             ),
-                            graph_id: None,
-                            text: String::new(),
-                            messages: Vec::new(),
-                            error: Some(msg),
-                            error_kind: None,
-                            todo: None,
-                            triage: None,
-                            plan: None,
-                            system_prompt: None,
+                            RunTodoError::UnknownAgent(agent) => (
+                                dmuxai::agent_api::exit::NOT_FOUND,
+                                format!("unknown agent '{agent}'"),
+                            ),
+                            RunTodoError::AlreadyRunning => (
+                                dmuxai::agent_api::exit::CONFLICT,
+                                "to-do is already running".to_owned(),
+                            ),
+                            RunTodoError::Busy(msg) => (dmuxai::agent_api::exit::CONFLICT, msg),
+                            RunTodoError::Forbidden(msg) => {
+                                (dmuxai::agent_api::exit::FORBIDDEN, msg)
+                            }
+                            RunTodoError::Missing(msg) => (dmuxai::agent_api::exit::NOT_FOUND, msg),
+                            RunTodoError::Invalid(msg) => (dmuxai::agent_api::exit::USAGE, msg),
+                            RunTodoError::Internal(msg) => (dmuxai::agent_api::exit::INTERNAL, msg),
                         };
+                        return HeadlessOutcome::failure(
+                            exit_code,
+                            self.conversation_id.as_str().to_owned(),
+                            Some(runner_name(self.adapters[self.selected].agent()).to_owned()),
+                            msg,
+                        );
                     }
                 } else {
                     self.headless_submit_prompt(&req);
@@ -13058,19 +13106,19 @@ impl App {
         let (ok, exit_code, error, error_kind) = if cancelled || graph_cancelled {
             (
                 false,
-                130,
+                dmuxai::agent_api::exit::CANCELLED,
                 last_system_error.or_else(|| Some("cancelled".to_owned())),
                 Some(AgentErrorKind::Cancelled.as_str().to_owned()),
             )
         } else if had_agent_error || graph_failed {
             (
                 false,
-                1,
+                dmuxai::agent_api::exit::FAILED,
                 last_system_error.or_else(|| Some("run failed".to_owned())),
                 last_error_kind,
             )
         } else {
-            (true, 0, None, None)
+            (true, dmuxai::agent_api::exit::OK, None, None)
         };
 
         let (triage, plan) = self.headless_plan_snapshot();
@@ -23012,6 +23060,57 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("runner 'codex' is not in allowed_runners")
+        );
+    }
+
+    // TC-1761 / FR-1761: HeadlessOutcome::failure builder defaults
+    #[test]
+    fn tc_1761_headless_outcome_failure_builder_defaults() {
+        let outcome = HeadlessOutcome::failure(
+            dmuxai::agent_api::exit::NOT_FOUND,
+            "conv-1",
+            Some("codex".to_owned()),
+            "boom",
+        );
+        assert!(!outcome.ok);
+        assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::NOT_FOUND);
+        assert_eq!(outcome.conversation_id, "conv-1");
+        assert_eq!(outcome.agent.as_deref(), Some("codex"));
+        assert_eq!(outcome.error.as_deref(), Some("boom"));
+        assert!(outcome.graph_id.is_none());
+        assert!(outcome.text.is_empty());
+        assert!(outcome.messages.is_empty());
+        assert!(outcome.error_kind.is_none());
+        assert!(outcome.todo.is_none());
+        assert!(outcome.triage.is_none());
+        assert!(outcome.plan.is_none());
+        assert!(outcome.system_prompt.is_none());
+
+        let actual = serde_json::to_value(&outcome).unwrap();
+        let expected = serde_json::json!({
+            "ok": false,
+            "exit_code": dmuxai::agent_api::exit::NOT_FOUND,
+            "conversation_id": "conv-1",
+            "agent": "codex",
+            "graph_id": null,
+            "text": "",
+            "messages": [],
+            "error": "boom",
+            "todo": null,
+        });
+        assert_eq!(actual, expected);
+    }
+
+    // TC-1763 / FR-1763: headless-style dashboard hub reports SnapshotSource::App
+    #[test]
+    fn tc_1763_headless_dashboard_source_is_app() {
+        let hub =
+            dmuxai::web::DashboardHub::new(dmuxai::web::SnapshotSource::App, "/test".to_owned());
+        let snap = hub.snapshot();
+        assert_eq!(snap.source, dmuxai::web::SnapshotSource::App);
+        assert_eq!(
+            serde_json::to_value(snap.source).unwrap(),
+            serde_json::json!("app")
         );
     }
 

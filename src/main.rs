@@ -922,7 +922,7 @@ async fn attach_web_dashboard(
     };
 
     let sink = cli::build_event_sink(workspace_root, settings);
-    let hub = DashboardHub::new(SnapshotSource::Tui, workspace).with_events(sink);
+    let hub = DashboardHub::new(SnapshotSource::App, workspace).with_events(sink);
     hub.set_jira_base_url(settings.todo_jira_base_url.clone());
     let config = ServerConfig {
         bind: options.bind,

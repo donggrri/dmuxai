@@ -582,7 +582,7 @@ async fn run_headless(
     let first_seq = sink.log().last_seq() + 1;
     let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
         .unwrap_or_else(|_| workspace_root.display().to_string());
-    let hub = dmuxai::web::DashboardHub::new(dmuxai::web::SnapshotSource::Tui, workspace)
+    let hub = dmuxai::web::DashboardHub::new(dmuxai::web::SnapshotSource::App, workspace)
         .with_events(sink.clone());
 
     let mut app =

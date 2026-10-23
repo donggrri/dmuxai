@@ -131,6 +131,9 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | FR-1822 | Must | Given the same feature in headless vs dashboard mode | Then headless uses CLI flags for gates/approval, has no workspace switch or live prompt API, and persists conversations to the same per-repo DB; `serve` is view-only and never runs agents | dashboard uses `/graph continue` and `POST /api/prompt` | TC-1822 |
 | FR-1823 | Must | Given an agent error mid-turn | Then the run exits 1 with the last system error or `run failed` | cancellation exits 130 instead | TC-1823 |
 | FR-1824 | Must | Given `--read-only` | Then the turn runs under the read-only turn policy | internal flag; not listed in `--help` | TC-1824 |
+| FR-1761 | Must | Given headless early-return paths in `App::run_headless`, `headless_idle_action`, `headless_outcome_exit_7` | Then failures are built via `HeadlessOutcome::failure(...)` with magic exit codes replaced by `dmuxai::agent_api::exit::*` constants; JSON output stays byte-for-byte identical | no logic or field value changes | TC-1761 |
+| FR-1762 | Must | Given the `SnapshotSource` enum | Then a new `App` variant serializes as `"app"` and round-trips; it behaves like `Tui` (live, writable), not view-only like `Files` | — | TC-1762 |
+| FR-1763 | Must | Given a headless `dmuxai run` or `dmuxai --web` dashboard hub | Then the snapshot `source` is `"app"` | real interactive TUI keeps `tui`; `serve` keeps `files` | TC-1763 |
 
 ### Code-vs-spec mismatches
 
@@ -178,6 +181,9 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | TC-1822 | FR-1822 | integration | headless vs `--web` | compare gates/persistence | documented behavior holds | planned — no automated test yet (Stream B) |
 | TC-1823 | FR-1823 | unit (app) | scripted agent error | run headless | exit 1 | `src/app.rs` `headless_run_reports_agent_error` |
 | TC-1824 | FR-1824 | unit (app) | `--read-only` | run headless | read-only policy | planned — no automated test yet (Stream B) |
+| TC-1761 | FR-1761 | unit (app) | `test_app()` | construct `HeadlessOutcome::failure(...)` | `ok=false`, given exit code, error text, all other optionals `None`; serialized JSON matches the old literal keys | `src/app.rs` `tc_1761_headless_outcome_failure_builder_defaults` |
+| TC-1762 | FR-1762 | unit | `SnapshotSource::App` | serde round-trip | `"app"` | `src/web/snapshot.rs` `tc_1762_snapshot_source_app_serializes_as_app` |
+| TC-1763 | FR-1763 | unit | `DashboardHub::new(SnapshotSource::App, ...)` | `hub.snapshot()` | source is `App` and serializes `"app"` | `src/app.rs` `tc_1763_headless_dashboard_source_is_app` |
 
 ## 6. Data, integration, and safety contracts
 
