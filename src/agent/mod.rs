@@ -472,6 +472,7 @@ mod legacy_mode_tests {
 mod typed_error_tests {
     use super::{AgentError, AgentErrorKind};
 
+    // TC-1687 / FR-1678: stable snake_case kind strings.
     #[test]
     fn agent_error_kind_strings_and_display() {
         let cases = [
@@ -492,6 +493,7 @@ mod typed_error_tests {
         }
     }
 
+    // TC-1688 / FR-1678: AgentError fields and Display text.
     #[test]
     fn agent_error_constructors_and_display() {
         let err = AgentError::provider("connection failed");

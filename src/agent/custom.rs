@@ -900,6 +900,7 @@ mod tests {
         assert_eq!(text.trim(), "stdin:hi --model x");
     }
 
+    // TC-1689 / FR-1679: runner conditions map to kinds.
     #[tokio::test]
     async fn failures_are_detected() {
         let (empty, _) = run(spec("empty", ""), None).await;
@@ -949,6 +950,7 @@ mod tests {
         assert!(!std::path::Path::new(path).exists());
     }
 
+    // TC-1690 / FR-1679: total timeout maps to Timeout.
     #[tokio::test]
     async fn timeout_kills_the_process_group() {
         let spec = spec("sleep", "timeout_secs = 1");
@@ -1659,6 +1661,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
         worker.await.unwrap();
     }
 
+    // TC-1692 / FR-1679: cancel maps to Cancelled without NUL sentinels.
     #[tokio::test]
     async fn acp_cancel_emits_cancelled_event_without_sentinel() {
         // FR-1416: ACP cancel turns return AgentError with kind Cancelled,

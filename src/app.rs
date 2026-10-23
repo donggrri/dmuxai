@@ -22677,6 +22677,7 @@ mod tests {
         );
     }
 
+    // TC-1694 / FR-1682: headless outcome carries error_kind.
     // TC-761 / FR-761: an agent error yields ok=false and exit 1.
     #[tokio::test]
     async fn headless_run_reports_agent_error() {
@@ -30127,6 +30128,7 @@ mod speaker_style_tests {
 mod graph_stop_notice_tests {
     use super::*;
 
+    // TC-1693 / FR-1679: graph stop notice propagates agent error text.
     // TC-1421 / FR-1416: a cancelled step is reported as cancelled, not failed.
     #[test]
     fn tc_1421_cancelled_graph_step_not_reported_as_failed() {

@@ -1390,6 +1390,7 @@ mod tests {
         run_turn(&request, None, &cwd, &event_tx).await
     }
 
+    // TC-1691 / FR-1679: idle watchdog maps to Idle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
     async fn agy_idle_timeout_kills_silent_child() {

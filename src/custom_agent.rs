@@ -2164,6 +2164,7 @@ image_arg = []
         assert!(!line(r#"{"type":"tool_call_update"}"#).text_break);
     }
 
+    // TC-1696 / FR-1683: preset drift guard for opencode error_path.
     // Preset drift guard: docs/agents/presets.toml opencode error_path == built-in.
     #[test]
     fn presets_opencode_error_path_matches_builtin() {
@@ -2184,6 +2185,7 @@ image_arg = []
         assert_eq!(preset.error_path, built.error_path);
     }
 
+    // TC-1697 / FR-1683: list pointer surfaces provider message.
     #[test]
     fn opencode_error_jsonl_surfaces_provider_message() {
         let spec = opencode_preset("opencode");
@@ -2195,6 +2197,7 @@ image_arg = []
         );
     }
 
+    // TC-1698 / FR-1683: single pointer still works.
     #[test]
     fn single_string_error_path_still_works() {
         let toml_str = r#"
@@ -2208,6 +2211,7 @@ error_path = "/error/message"
         assert_eq!(parsed.error.as_deref(), Some("boom"));
     }
 
+    // TC-1699 / FR-1683: compact JSON fallback.
     #[test]
     fn error_object_without_message_surfaces_compact_json() {
         let spec = opencode_preset("opencode");
