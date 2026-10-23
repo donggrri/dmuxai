@@ -95,6 +95,163 @@ pub fn default_model_for_runner(runner: &str) -> Option<&'static str> {
     }
 }
 
+/// Origin of a resolved model selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSource {
+    Explicit,
+    Selected,
+    ConfigDefault,
+    RunnerDefault,
+    ProviderDefault,
+}
+
+impl ModelSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ModelSource::Explicit => "explicit",
+            ModelSource::Selected => "selected",
+            ModelSource::ConfigDefault => "config_default",
+            ModelSource::RunnerDefault => "runner_default",
+            ModelSource::ProviderDefault => "provider_default",
+        }
+    }
+}
+
+/// Candidate model strings gathered from the various sources.
+pub struct ModelCandidates<'a> {
+    pub explicit: Option<&'a str>,
+    pub selected: Option<&'a str>,
+    pub config_default: Option<&'a str>,
+}
+
+/// Result of resolving a single runner's effective model.
+pub struct ModelResolution {
+    pub model: Option<String>,
+    pub source: ModelSource,
+}
+
+impl ModelResolution {
+    pub fn label(&self) -> String {
+        self.model
+            .clone()
+            .unwrap_or_else(|| PROVIDER_DEFAULT.to_owned())
+    }
+
+    pub fn resolve(runner: &str, candidates: ModelCandidates) -> Result<Self, String> {
+        // 1. explicit
+        if let Some(raw) = candidates.explicit {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                match validate_model_for_runner(runner, trimmed) {
+                    Ok(()) => {
+                        let model = if trimmed.eq_ignore_ascii_case(PROVIDER_DEFAULT) {
+                            None
+                        } else {
+                            Some(trimmed.to_owned())
+                        };
+                        return Ok(ModelResolution {
+                            model,
+                            source: ModelSource::Explicit,
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        // 2. selected (ModelCatalog.selected)
+        if let Some(raw) = candidates.selected {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && validate_model_for_runner(runner, trimmed).is_ok() {
+                let model = if trimmed.eq_ignore_ascii_case(PROVIDER_DEFAULT) {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                };
+                return Ok(ModelResolution {
+                    model,
+                    source: ModelSource::Selected,
+                });
+            }
+        }
+
+        // 3. config_default (custom default_model or [runners.<id>] model)
+        if let Some(raw) = candidates.config_default {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && validate_model_for_runner(runner, trimmed).is_ok() {
+                let model = if trimmed.eq_ignore_ascii_case(PROVIDER_DEFAULT) {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                };
+                return Ok(ModelResolution {
+                    model,
+                    source: ModelSource::ConfigDefault,
+                });
+            }
+        }
+
+        // 4. runner default
+        if let Some(m) = default_model_for_runner(runner) {
+            return Ok(ModelResolution {
+                model: Some(m.to_owned()),
+                source: ModelSource::RunnerDefault,
+            });
+        }
+
+        // 5. provider default
+        Ok(ModelResolution {
+            model: None,
+            source: ModelSource::ProviderDefault,
+        })
+    }
+}
+
+/// Result of checking a resolved model against a runner's model catalog.
+#[derive(Debug)]
+pub enum CatalogCheck {
+    NoCatalog,
+    Listed,
+    NotListed { hint: String },
+}
+
+pub fn check_catalog(
+    model: Option<&str>,
+    catalog: Option<&[String]>,
+    catalog_command: Option<&str>,
+) -> CatalogCheck {
+    let cat = match catalog {
+        Some(c) if !c.is_empty() => c,
+        _ => return CatalogCheck::NoCatalog,
+    };
+    let m = match model {
+        Some(raw) => {
+            let t = raw.trim();
+            if t.is_empty() {
+                return CatalogCheck::NoCatalog;
+            }
+            t
+        }
+        None => return CatalogCheck::NoCatalog,
+    };
+    for item in cat {
+        if item.trim() == m {
+            return CatalogCheck::Listed;
+        }
+    }
+    let hint = match catalog_command {
+        Some(cmd) => format!(
+            "model {} is not offered by '{}'; pick another model",
+            m, cmd
+        ),
+        None => format!(
+            "model {} is not offered by the runner's model list; pick another model",
+            m
+        ),
+    };
+    CatalogCheck::NotListed { hint }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +348,235 @@ mod tests {
         let cursor = default_model_for_runner("cursor").unwrap();
         assert!(!cursor.contains("fast"));
         assert!(validate_model_for_runner("cursor", cursor).is_ok());
+    }
+
+    // TC-1734 / FR-1725: precedence explicit > selected > config > runner > provider
+    #[test]
+    fn tc_1734_precedence_chain() {
+        let cands = ModelCandidates {
+            explicit: Some("opencode/beam-free"),
+            selected: Some("opencode/glm-5.3-flash-free"),
+            config_default: Some("opencode/step-5-preview-free"),
+        };
+        let r = ModelResolution::resolve("opencode", cands).unwrap();
+        assert_eq!(r.source, ModelSource::Explicit);
+        assert_eq!(r.model.as_deref(), Some("opencode/beam-free"));
+
+        let cands = ModelCandidates {
+            explicit: None,
+            selected: Some("opencode/glm-5.3-flash-free"),
+            config_default: Some("opencode/beam-free"),
+        };
+        let r = ModelResolution::resolve("opencode", cands).unwrap();
+        assert_eq!(r.source, ModelSource::Selected);
+        assert_eq!(r.model.as_deref(), Some("opencode/glm-5.3-flash-free"));
+
+        let cands = ModelCandidates {
+            explicit: None,
+            selected: None,
+            config_default: Some("opencode/beam-free"),
+        };
+        let r = ModelResolution::resolve("opencode", cands).unwrap();
+        assert_eq!(r.source, ModelSource::ConfigDefault);
+        assert_eq!(r.model.as_deref(), Some("opencode/beam-free"));
+
+        let r = ModelResolution::resolve(
+            "cursor",
+            ModelCandidates {
+                explicit: None,
+                selected: None,
+                config_default: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(r.source, ModelSource::RunnerDefault);
+        assert_eq!(r.model.as_deref(), Some("composer-2.5"));
+
+        let r = ModelResolution::resolve(
+            "agy",
+            ModelCandidates {
+                explicit: None,
+                selected: None,
+                config_default: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(r.source, ModelSource::ProviderDefault);
+        assert_eq!(r.model, None);
+    }
+
+    // TC-1735 / FR-1726: cursor fall-through and explicit error
+    #[test]
+    fn tc_1735_cursor_fallthrough_and_explicit_error() {
+        let r = ModelResolution::resolve(
+            "cursor",
+            ModelCandidates {
+                explicit: None,
+                selected: Some("claude-x"),
+                config_default: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(r.source, ModelSource::RunnerDefault);
+        assert_eq!(r.model.as_deref(), Some("composer-2.5"));
+
+        let r = ModelResolution::resolve(
+            "cursor",
+            ModelCandidates {
+                explicit: None,
+                selected: None,
+                config_default: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(r.source, ModelSource::RunnerDefault);
+        assert_eq!(r.model.as_deref(), Some("composer-2.5"));
+
+        assert!(
+            ModelResolution::resolve(
+                "cursor",
+                ModelCandidates {
+                    explicit: Some("gpt-5"),
+                    selected: None,
+                    config_default: None,
+                }
+            )
+            .is_err()
+        );
+    }
+
+    // TC-1736 / FR-1732: agy flash-only and fast block
+    #[test]
+    fn tc_1736_agy_flash_and_fast_block() {
+        let r = ModelResolution::resolve(
+            "agy",
+            ModelCandidates {
+                explicit: Some("gemini-3.8-flash-high"),
+                selected: None,
+                config_default: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(r.source, ModelSource::Explicit);
+        assert_eq!(r.model.as_deref(), Some("gemini-3.8-flash-high"));
+
+        assert!(
+            ModelResolution::resolve(
+                "agy",
+                ModelCandidates {
+                    explicit: Some("gemini-4-argon"),
+                    selected: None,
+                    config_default: None,
+                }
+            )
+            .is_err()
+        );
+
+        let runners = ["cursor", "agy", "opencode", "grok", "codex"];
+        for runner in runners {
+            assert!(
+                ModelResolution::resolve(
+                    runner,
+                    ModelCandidates {
+                        explicit: Some("something-fast-here"),
+                        selected: None,
+                        config_default: None,
+                    }
+                )
+                .is_err(),
+                "{runner}"
+            );
+        }
+    }
+
+    // TC-1737 / FR-1725: config default and provider default label
+    #[test]
+    fn tc_1737_config_default_and_provider_label() {
+        let r = ModelResolution::resolve(
+            "opencode",
+            ModelCandidates {
+                explicit: None,
+                selected: None,
+                config_default: Some("opencode/beam-free"),
+            },
+        )
+        .unwrap();
+        assert_eq!(r.source, ModelSource::ConfigDefault);
+        assert_eq!(r.model.as_deref(), Some("opencode/beam-free"));
+
+        let r = ModelResolution::resolve(
+            "agy",
+            ModelCandidates {
+                explicit: None,
+                selected: None,
+                config_default: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(r.source, ModelSource::ProviderDefault);
+        assert_eq!(r.model, None);
+        assert_eq!(r.label(), PROVIDER_DEFAULT);
+    }
+
+    // TC-1738 / FR-1729: catalog check no-catalog and listed
+    #[test]
+    fn tc_1738_catalog_no_catalog_and_listed() {
+        assert!(matches!(
+            check_catalog(None, None, None),
+            CatalogCheck::NoCatalog
+        ));
+        assert!(matches!(
+            check_catalog(Some("m"), None, None),
+            CatalogCheck::NoCatalog
+        ));
+        assert!(matches!(
+            check_catalog(Some("m"), Some(&[]), None),
+            CatalogCheck::NoCatalog
+        ));
+        assert!(matches!(
+            check_catalog(None, Some(&["a".to_string()]), None),
+            CatalogCheck::NoCatalog
+        ));
+
+        let cat = vec![
+            "opencode/beam-free".to_string(),
+            "opencode/glm-5.3-flash-free".to_string(),
+        ];
+        match check_catalog(
+            Some("opencode/beam-free"),
+            Some(&cat),
+            Some("opencode models"),
+        ) {
+            CatalogCheck::Listed => {}
+            other => panic!("expected Listed, got {:?}", other),
+        }
+    }
+
+    // TC-1739 / FR-1729: catalog check not-listed hint exact text
+    #[test]
+    fn tc_1739_catalog_not_listed_hint() {
+        let cat = vec!["opencode/beam-free".to_string()];
+        match check_catalog(
+            Some("opencode/step-5-preview-free"),
+            Some(&cat),
+            Some("opencode models"),
+        ) {
+            CatalogCheck::NotListed { hint } => {
+                assert_eq!(
+                    hint,
+                    "model opencode/step-5-preview-free is not offered by 'opencode models'; pick another model"
+                );
+            }
+            other => panic!("expected NotListed, got {:?}", other),
+        }
+        match check_catalog(Some("opencode/step-5-preview-free"), Some(&cat), None) {
+            CatalogCheck::NotListed { hint } => {
+                assert_eq!(
+                    hint,
+                    "model opencode/step-5-preview-free is not offered by the runner's model list; pick another model"
+                );
+            }
+            other => panic!("expected NotListed, got {:?}", other),
+        }
     }
 }
