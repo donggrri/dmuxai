@@ -111,8 +111,9 @@ pub fn prepare_repo_db(workspace_root: &Path) -> io::Result<(PathBuf, Option<Str
     Ok((db_path, Some(notice)))
 }
 
-#[cfg(test)]
-pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+/// Global test environment lock serializing tests that mutate process environment variables.
+#[doc(hidden)]
+pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     ENV_LOCK
         .lock()

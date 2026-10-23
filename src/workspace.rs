@@ -285,6 +285,47 @@ where
     Ok((chosen, rest))
 }
 
+/// Strips `--config PATH` / `--config=PATH` (before `--`) from `args`.
+/// Returns `(last_config_arg, remaining_args)`.
+pub fn extract_config_flag<I, S>(args: I) -> Result<(Option<String>, Vec<String>), String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let raw: Vec<String> = args.into_iter().map(|s| s.as_ref().to_owned()).collect();
+    let mut chosen: Option<String> = None;
+    let mut rest: Vec<String> = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    let mut past_double_dash = false;
+    while index < raw.len() {
+        let arg = &raw[index];
+        if past_double_dash {
+            rest.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        match arg.as_str() {
+            "--" => {
+                past_double_dash = true;
+                rest.push(arg.clone());
+            }
+            "--config" => {
+                index += 1;
+                match raw.get(index) {
+                    Some(val) => chosen = Some(val.clone()),
+                    None => return Err(String::new()),
+                }
+            }
+            s if s.starts_with("--config=") => {
+                chosen = Some(s["--config=".len()..].to_owned());
+            }
+            _ => rest.push(arg.clone()),
+        }
+        index += 1;
+    }
+    Ok((chosen, rest))
+}
+
 /// Builds the argument list (excluding `argv[0]`) for re-executing `dmuxai` on
 /// a workspace switch (FR-874): strips any prior `-C` / `--workspace-dir`
 /// flags, prepends `-C <canonical_workspace>`, and replaces `--port 0` with the
@@ -304,6 +345,8 @@ pub fn build_reexec_args(
                 .collect(),
         )
     });
+    let (_, stripped) =
+        extract_config_flag(stripped.clone()).unwrap_or_else(|_| (None, stripped.clone()));
     let mut out = vec![
         "-C".to_owned(),
         canonical_workspace.to_string_lossy().into_owned(),

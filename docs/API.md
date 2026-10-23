@@ -19,6 +19,13 @@ Subcommands are recognized as the first argument and never start the TUI.
 `--help`/`--version` print to stdout and exit `0`; unknown subcommands or flags
 print usage to stderr and exit `2`.
 
+### Global options
+
+The following flags can be used before or after subcommands, or with the interactive TUI:
+
+- `--config PATH`: Path to a `dmuxai.toml` user config file. Overrides `DMUXAI_CONFIG` and default XDG/HOME config paths. Exits with status `2` if the file does not exist.
+- `-C DIR`, `--workspace-dir DIR`: Run in `DIR` instead of the current directory.
+
 | Command | Flags | stdout |
 | --- | --- | --- |
 | `dmuxai run <prompt\|->` | `--agent ID`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--json` | Final agent text, or one JSON object with `--json` |
@@ -392,9 +399,13 @@ command = ["tee", "-a", "events.log"]
 
 ## 6. Configuration (`dmuxai.toml`)
 
-User config (`$XDG_CONFIG_HOME/dmuxai/dmuxai.toml` or `~/.config/dmuxai/dmuxai.toml`)
-loads first; workspace `dmuxai.toml` overrides per key. See `dmuxai init` for a
-commented starter file.
+User config loads first; workspace `dmuxai.toml` overrides per key. The user config file is located using the following precedence:
+1. `--config PATH` CLI flag
+2. `DMUXAI_CONFIG` environment variable
+3. `$XDG_CONFIG_HOME/dmuxai/dmuxai.toml`
+4. `~/.config/dmuxai/dmuxai.toml` (via `HOME`)
+
+An explicit config path passed via `--config` or `DMUXAI_CONFIG` that does not exist exits with status `2` (`config file not found: <path>`). Specifying a config file directly avoids changing `XDG_CONFIG_HOME`, keeping credential files intact. See `dmuxai init` for a commented starter file.
 
 ### `[graph]`
 
@@ -406,3 +417,31 @@ commented starter file.
 [graph]
 tasks_file = true
 ```
+
+## 7. Environment variables and child process policy
+
+### Environment variables
+
+| Variable | Meaning |
+| --- | --- |
+| `DMUXAI_CONFIG` | Path to the user configuration file (`dmuxai.toml`). Overridden by `--config PATH`. |
+| `DMUXAI_WORKSPACE` | Canonical workspace directory (defaults to current directory or `-C`). |
+| `DMUXAI_STATE_DIR` | Custom root directory for DmuxAI state databases and conversations. |
+| `DMUXAI_WEB_TOKEN` | Bearer token for the web dashboard (32–128 characters of `[A-Za-z0-9_-]`). |
+| `DMUXAI_MCP_CONFIG` | Internal path to a per-run MCP configuration JSON file. |
+| `DMUXAI_*_BIN` | Explicit executable paths for runner CLIs (`DMUXAI_CURSOR_BIN`, `DMUXAI_AGY_BIN`, `DMUXAI_CODEX_BIN`, `DMUXAI_OPENCODE_BIN`, `DMUXAI_GROK_BIN`). |
+| `DMUXAI_FORCE_COLOR` | Force color output even when `NO_COLOR` is set. |
+| `DMUXAI_REDUCED_MOTION` | Disable motion animations in the TUI. |
+
+### Child process environment policy
+
+Every child process spawned by DmuxAI (including agents, runner CLIs, custom commands, MCP servers, and notify webhooks/commands) has DmuxAI-internal variables stripped from its environment to prevent unintended privilege escalation or leaking parent settings:
+
+- **Removed from child environments:**
+  - `DMUXAI_WEB_TOKEN`: Secret dashboard API token (never leaked to agent processes).
+  - `DMUXAI_MCP_CONFIG`: Internal per-run MCP configuration path (built-in runners never pass MCP via env; custom runners set this per-run only after policy application).
+  - `DMUXAI_CONFIG`: Config file path (child tools or nested DmuxAI instances use standard workspace/default configuration isolation).
+- **Preserved in child environments:**
+  - `XDG_*` (such as `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`) and `HOME` are **always kept untouched**, preserving child access to git, GitHub CLI (`gh`), ssh keys, and system tool configurations.
+  - Other `DMUXAI_*` variables (`DMUXAI_STATE_DIR`, `DMUXAI_WORKSPACE`, runner binary paths, `DMUXAI_REDUCED_MOTION`, `DMUXAI_FORCE_COLOR`) are kept so child processes or subcommands can resolve workspace state and user preferences.
+

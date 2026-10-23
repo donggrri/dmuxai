@@ -19,6 +19,7 @@ pub mod model_policy;
 pub mod notify;
 pub mod process;
 pub mod runner_protocol;
+pub mod runtime_env;
 pub mod settings;
 pub mod skills;
 pub mod stage_skills;

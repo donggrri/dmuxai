@@ -468,6 +468,18 @@ dmuxai init --workspace    # ./dmuxai.toml, for this project only
 `dmuxai init` refuses to overwrite an existing file unless you add `--force`.
 It prints the path it wrote and the runners it found on `PATH`.
 
+### Configuration path and precedence
+
+DmuxAI locates user configuration using the following precedence:
+1. `--config <path>` command-line flag
+2. `DMUXAI_CONFIG` environment variable
+3. `$XDG_CONFIG_HOME/dmuxai/dmuxai.toml`
+4. `~/.config/dmuxai/dmuxai.toml` (via `HOME`)
+
+An explicit config path passed via `--config` or `DMUXAI_CONFIG` that does not exist exits immediately with status `2` (`config file not found: <path>`).
+
+Because `--config` and `DMUXAI_CONFIG` select the config file directly, pointing DmuxAI at a separate configuration no longer requires `XDG_CONFIG_HOME` isolation (which previously broke tool credentials such as `gh` or `git` in agent subprocesses). Workspace `dmuxai.toml` still overrides user configuration per key.
+
 ## Linux / WSL release binary
 
 Each release also has a prebuilt, statically linked (musl)

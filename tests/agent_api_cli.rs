@@ -462,3 +462,199 @@ fn init_writes_starter_config() {
     assert_eq!(workspace.status.code(), Some(0));
     assert!(sandbox.workspace.join("dmuxai.toml").is_file());
 }
+
+// TC-1675 / FR-1675: --config and DMUXAI_CONFIG select the config file.
+#[cfg(unix)]
+#[test]
+fn tc_1675_config_flag_and_env_select_config_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let flag_cfg = root.join("flag.toml");
+    let env_cfg = root.join("env.toml");
+    std::fs::write(
+        &flag_cfg,
+        r#"[[agents.custom]]
+name = "fakeflag"
+command = ["sh", "-c", "cat >/dev/null; echo ok"]
+prompt_via = "stdin"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &env_cfg,
+        r#"[[agents.custom]]
+name = "fakeenv"
+command = ["sh", "-c", "cat >/dev/null; echo ok"]
+prompt_via = "stdin"
+"#,
+    )
+    .unwrap();
+
+    // Each sub-case uses a fresh sandbox (workspace and state dir).
+    // Reusing state across configs that define different agents triggers a known bug
+    // (#145: restoring conversation referencing a no-longer-configured custom agent panics).
+
+    // Sub-case 1: --config flag selects the file (XDG_CONFIG_HOME stays empty).
+    let sandbox_flag = Sandbox::bare();
+    let out = sandbox_flag.run_in_env(
+        &[
+            "--config",
+            flag_cfg.to_str().unwrap(),
+            "run",
+            "--agent",
+            "fakeflag",
+            "--json",
+            "hi",
+        ],
+        None,
+        &[("DMUXAI_CONFIG", std::ffi::OsString::new())],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let json = stdout_json(&out);
+    assert_eq!(json["agent"], "fakeflag");
+    assert!(json["text"].as_str().unwrap().contains("ok"));
+
+    // Sub-case 2: DMUXAI_CONFIG env var alone selects the file.
+    let sandbox_env = Sandbox::bare();
+    let out = sandbox_env.run_in_env(
+        &["run", "--agent", "fakeenv", "--json", "hi"],
+        None,
+        &[("DMUXAI_CONFIG", env_cfg.clone().into_os_string())],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let json = stdout_json(&out);
+    assert_eq!(json["agent"], "fakeenv");
+    assert!(json["text"].as_str().unwrap().contains("ok"));
+
+    // Sub-case 3: --config wins over DMUXAI_CONFIG when both are set.
+    let sandbox_both = Sandbox::bare();
+    let out = sandbox_both.run_in_env(
+        &[
+            "--config",
+            flag_cfg.to_str().unwrap(),
+            "run",
+            "--agent",
+            "fakeflag",
+            "--json",
+            "hi",
+        ],
+        None,
+        &[("DMUXAI_CONFIG", env_cfg.into_os_string())],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let json = stdout_json(&out);
+    assert_eq!(json["agent"], "fakeflag");
+}
+
+// TC-1676 / FR-1676: missing config file exits 2.
+#[cfg(unix)]
+#[test]
+fn tc_1676_missing_config_file_exits_2() {
+    let sandbox = Sandbox::bare();
+
+    let out = sandbox.run_in_env(
+        &["--config", "/nonexistent/x.toml", "status"],
+        None,
+        &[("DMUXAI_CONFIG", std::ffi::OsString::new())],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("config file not found"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = sandbox.run_in_env(
+        &["status"],
+        None,
+        &[(
+            "DMUXAI_CONFIG",
+            std::ffi::OsString::from("/nonexistent/x.toml"),
+        )],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("config file not found"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// TC-1677 / FR-1677: child env policy snapshot.
+#[cfg(unix)]
+#[test]
+fn tc_1677_child_env_policy_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cfg = root.join("env.toml");
+    std::fs::write(
+        &cfg,
+        r#"[[agents.custom]]
+name = "envprobe"
+command = ["sh", "-c", "env"]
+"#,
+    )
+    .unwrap();
+    let xdg = root.join("xdg");
+    let home = root.join("home");
+    std::fs::create_dir_all(&xdg).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+
+    let sandbox = Sandbox::bare();
+    let out = sandbox.run_in_env(
+        &[
+            "--config",
+            cfg.to_str().unwrap(),
+            "run",
+            "--agent",
+            "envprobe",
+            "--json",
+            "hi",
+        ],
+        None,
+        &[
+            ("DMUXAI_CONFIG", std::ffi::OsString::new()),
+            ("DMUXAI_WEB_TOKEN", std::ffi::OsString::from("secret-x")),
+            (
+                "DMUXAI_MCP_CONFIG",
+                std::ffi::OsString::from("/tmp/leak.json"),
+            ),
+            ("XDG_CONFIG_HOME", xdg.clone().into_os_string()),
+            ("HOME", home.clone().into_os_string()),
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = stdout_json(&out);
+    let text = json["text"].as_str().unwrap();
+    assert!(!text.contains("DMUXAI_WEB_TOKEN"), "{text}");
+    assert!(!text.contains("DMUXAI_MCP_CONFIG"), "{text}");
+    assert!(!text.contains("DMUXAI_CONFIG"), "{text}");
+    assert!(
+        text.contains(&format!("XDG_CONFIG_HOME={}", xdg.display())),
+        "{text}"
+    );
+    assert!(text.contains(&format!("HOME={}", home.display())), "{text}");
+}

@@ -9,7 +9,11 @@ use crate::mcp::config::ToolNames;
 use crate::mcp::{McpServerSpec, ServerKind};
 use crate::notify::NotifySettings;
 use crate::runner_protocol::RunnerProtocol;
+use crate::runtime_env::RuntimeEnv;
 use crate::theme::{Theme, ThemeToml};
+
+#[doc(hidden)]
+pub use crate::state_path::test_env_lock;
 
 /// Web dashboard theme settings loaded from `[web]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,28 +265,62 @@ struct RoutingToml {
 
 impl DmuxSettings {
     pub fn load(workspace: &Path) -> Self {
-        Self::load_with_user_config(workspace, default_user_config_path().as_deref())
+        Self::load_with_env(workspace, &RuntimeEnv::from_process())
+    }
+
+    pub fn load_with_env(workspace: &Path, env: &RuntimeEnv) -> Self {
+        let user_config_path = default_user_config_path_from(env);
+        let exe = std::env::current_exe().ok();
+        Self::load_with_runners_and_env(
+            workspace,
+            user_config_path.as_deref(),
+            exe.as_deref(),
+            find_opencode_bin_from(env),
+            find_grok_bin_from(env),
+            env,
+        )
     }
 
     pub fn load_with_user_config(workspace: &Path, user_config_path: Option<&Path>) -> Self {
+        Self::load_with_user_config_and_env(
+            workspace,
+            user_config_path,
+            &RuntimeEnv::from_process(),
+        )
+    }
+
+    pub fn load_with_user_config_and_env(
+        workspace: &Path,
+        user_config_path: Option<&Path>,
+        env: &RuntimeEnv,
+    ) -> Self {
         let exe = std::env::current_exe().ok();
-        Self::load_with_exe(workspace, user_config_path, exe.as_deref())
+        Self::load_with_runners_and_env(
+            workspace,
+            user_config_path,
+            exe.as_deref(),
+            find_opencode_bin_from(env),
+            find_grok_bin_from(env),
+            env,
+        )
     }
 
     /// Like [`Self::load_with_user_config`] with the DmuxAI executable injected
     /// for the built-in `dmuxai-memory` entry (FR-733), so tests are deterministic.
     /// The opencode and grok executables are looked up in the environment.
+    #[allow(dead_code)]
     pub(crate) fn load_with_exe(
         workspace: &Path,
         user_config_path: Option<&Path>,
         exe: Option<&Path>,
     ) -> Self {
-        Self::load_with_runners(
+        Self::load_with_runners_and_env(
             workspace,
             user_config_path,
             exe,
             find_opencode_bin(),
             find_grok_bin(),
+            &RuntimeEnv::from_process(),
         )
     }
 
@@ -299,17 +337,53 @@ impl DmuxSettings {
         exe: Option<&Path>,
         opencode_bin: Option<PathBuf>,
     ) -> Self {
-        Self::load_with_runners(workspace, user_config_path, exe, opencode_bin, None)
+        Self::load_with_opencode_and_env(
+            workspace,
+            user_config_path,
+            exe,
+            opencode_bin,
+            &RuntimeEnv::from_process(),
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn load_with_opencode_and_env(
+        workspace: &Path,
+        user_config_path: Option<&Path>,
+        exe: Option<&Path>,
+        opencode_bin: Option<PathBuf>,
+        env: &RuntimeEnv,
+    ) -> Self {
+        Self::load_with_runners_and_env(workspace, user_config_path, exe, opencode_bin, None, env)
     }
 
     /// Loads settings with both runner executables injected (`None` = not
     /// installed), so preset registration is deterministic in tests (FR-810, FR-890).
+    #[allow(dead_code)]
     pub(crate) fn load_with_runners(
         workspace: &Path,
         user_config_path: Option<&Path>,
         exe: Option<&Path>,
         opencode_bin: Option<PathBuf>,
         grok_bin: Option<PathBuf>,
+    ) -> Self {
+        Self::load_with_runners_and_env(
+            workspace,
+            user_config_path,
+            exe,
+            opencode_bin,
+            grok_bin,
+            &RuntimeEnv::from_process(),
+        )
+    }
+
+    pub(crate) fn load_with_runners_and_env(
+        workspace: &Path,
+        user_config_path: Option<&Path>,
+        exe: Option<&Path>,
+        opencode_bin: Option<PathBuf>,
+        grok_bin: Option<PathBuf>,
+        env: &RuntimeEnv,
     ) -> Self {
         let mut settings = Self::default();
 
@@ -364,7 +438,9 @@ impl DmuxSettings {
         let names_grok = agents()
             .flat_map(|agents| agents.custom.iter().flatten())
             .any(|spec| spec.name.eq_ignore_ascii_case("grok"));
-        let explicit_opencode = std::env::var_os("DMUXAI_OPENCODE_BIN")
+        let explicit_opencode = env
+            .opencode_bin
+            .clone()
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
         let opencode_preset_bin = if settings.builtin_opencode && !names_opencode {
@@ -432,9 +508,19 @@ impl DmuxSettings {
                 .push(format!("[theme.agents] unknown agent id '{id}' ignored"));
         }
 
-        settings.resolve_memory(workspace);
+        settings.resolve_memory(workspace, env);
         settings.add_builtin_memory_server(workspace, exe);
-        if env_flag("DMUXAI_REDUCED_MOTION") {
+        if env
+            .reduced_motion
+            .as_ref()
+            .map(|v| {
+                matches!(
+                    v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+        {
             settings.reduced_motion = true;
             settings.theme.reduced_motion = true;
         }
@@ -455,7 +541,7 @@ impl DmuxSettings {
     }
 
     /// FR-720: turn the merged `[memory]` keys into a [`MemoryConfig`].
-    fn resolve_memory(&mut self, workspace: &Path) {
+    fn resolve_memory(&mut self, workspace: &Path, env: &RuntimeEnv) {
         let raw = std::mem::take(&mut self.memory_raw);
         let Some(vault) = raw
             .vault
@@ -467,7 +553,7 @@ impl DmuxSettings {
             return;
         };
         // A relative vault is relative to the workspace, not the process cwd.
-        let vault_path = expand_home(vault);
+        let vault_path = expand_home_from(vault, env);
         let vault_path = if vault_path.is_relative() {
             workspace.join(vault_path)
         } else {
@@ -824,21 +910,23 @@ pub fn load_user_workspace_settings_from(user_config_path: Option<&Path>) -> Wor
 
 /// Expand a leading `~/` (or `~\\`) with `HOME` / `USERPROFILE`.
 pub fn expand_home(path: &str) -> PathBuf {
+    expand_home_from(path, &RuntimeEnv::from_process())
+}
+
+/// Expand a leading `~/` (or `~\`) using the provided environment.
+pub fn expand_home_from(path: &str, env: &RuntimeEnv) -> PathBuf {
     let rest = path
         .strip_prefix("~/")
         .or_else(|| path.strip_prefix("~\\"))
-        .or_else(|| (path == "~").then_some(""));
-    if let Some(rest) = rest {
-        let home = std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()));
-        if let Some(home) = home {
-            let mut p = PathBuf::from(home);
-            if !rest.is_empty() {
-                p.push(rest);
-            }
-            return p;
+        .or_else(|| if path == "~" { Some("") } else { None });
+    if let Some(rest) = rest
+        && let Some(home) = env.home_dir()
+    {
+        let mut p = home;
+        if !rest.is_empty() {
+            p.push(rest);
         }
+        return p;
     }
     PathBuf::from(path)
 }
@@ -892,41 +980,84 @@ fn normalize_jira_base_url(value: &str) -> Result<String, String> {
 /// is authoritative when set: it must name an existing file. Otherwise the first
 /// `opencode` file on `PATH` is used.
 pub fn find_opencode_bin() -> Option<PathBuf> {
-    find_opencode_bin_from(
-        std::env::var_os("DMUXAI_OPENCODE_BIN").filter(|value| !value.is_empty()),
-        std::env::var_os("PATH"),
-        home_dir(),
-    )
+    find_opencode_bin_from(&RuntimeEnv::from_process())
 }
 
-/// Lookup used by [`find_opencode_bin`]. `explicit` is authoritative when set.
-fn find_opencode_bin_from(
-    explicit: Option<std::ffi::OsString>,
-    path_var: Option<std::ffi::OsString>,
-    home: Option<PathBuf>,
-) -> Option<PathBuf> {
-    if let Some(raw) = explicit {
+/// Lookup used by [`find_opencode_bin`]. `env.opencode_bin` is authoritative when set.
+pub fn find_opencode_bin_from(env: &RuntimeEnv) -> Option<PathBuf> {
+    if let Some(raw) = &env.opencode_bin {
         let path = PathBuf::from(raw);
         return path.is_file().then_some(path);
     }
-    if let Some(found) = find_on_path_in("opencode", path_var.as_deref()) {
+    if let Some(found) = find_on_path_in("opencode", env.path.as_deref()) {
         return Some(found);
     }
-    home.map(|h| h.join(".opencode").join("bin").join("opencode"))
+    env.home_dir()
+        .map(|h| h.join(".opencode").join("bin").join("opencode"))
         .filter(|p| p.is_file())
 }
 
 /// When `DMUXAI_OPENCODE_BIN` is set but does not name an existing file, returns
 /// a user-facing message (SPEC-acp-runners FR-1326).
 pub fn opencode_bin_explicit_missing_message() -> Option<String> {
-    opencode_bin_explicit_missing_message_from(
-        std::env::var_os("DMUXAI_OPENCODE_BIN").filter(|value| !value.is_empty()),
-    )
+    opencode_bin_explicit_missing_message_from(RuntimeEnv::from_process())
 }
 
-fn opencode_bin_explicit_missing_message_from(
-    explicit: Option<std::ffi::OsString>,
+/// Argument accepted by [`opencode_bin_explicit_missing_message_from`].
+pub enum OpencodeMissingArg {
+    Env(Box<RuntimeEnv>),
+    Explicit(Option<std::ffi::OsString>),
+}
+
+impl From<&RuntimeEnv> for OpencodeMissingArg {
+    fn from(env: &RuntimeEnv) -> Self {
+        Self::Env(Box::new(env.clone()))
+    }
+}
+
+impl From<RuntimeEnv> for OpencodeMissingArg {
+    fn from(env: RuntimeEnv) -> Self {
+        Self::Env(Box::new(env))
+    }
+}
+
+impl From<Option<std::ffi::OsString>> for OpencodeMissingArg {
+    fn from(value: Option<std::ffi::OsString>) -> Self {
+        Self::Explicit(value)
+    }
+}
+
+impl From<std::ffi::OsString> for OpencodeMissingArg {
+    fn from(value: std::ffi::OsString) -> Self {
+        Self::Explicit(Some(value))
+    }
+}
+
+impl From<&std::ffi::OsString> for OpencodeMissingArg {
+    fn from(value: &std::ffi::OsString) -> Self {
+        Self::Explicit(Some(value.clone()))
+    }
+}
+
+impl From<Option<PathBuf>> for OpencodeMissingArg {
+    fn from(value: Option<PathBuf>) -> Self {
+        Self::Explicit(value.map(|p| p.into_os_string()))
+    }
+}
+
+impl From<PathBuf> for OpencodeMissingArg {
+    fn from(value: PathBuf) -> Self {
+        Self::Explicit(Some(value.into_os_string()))
+    }
+}
+
+pub fn opencode_bin_explicit_missing_message_from(
+    arg: impl Into<OpencodeMissingArg>,
 ) -> Option<String> {
+    let explicit = match arg.into() {
+        OpencodeMissingArg::Env(env) => env.opencode_bin.clone(),
+        OpencodeMissingArg::Explicit(value) => value,
+    };
     let raw = explicit?;
     let path = PathBuf::from(raw);
     if path.is_file() {
@@ -942,40 +1073,32 @@ fn opencode_bin_explicit_missing_message_from(
 /// `DMUXAI_GROK_BIN` is authoritative and does not fall through. Otherwise the
 /// first `grok` on `PATH`, then `~/.grok/bin/grok` when that file is executable.
 pub fn find_grok_bin() -> Option<PathBuf> {
-    let explicit = std::env::var_os("DMUXAI_GROK_BIN").filter(|value| !value.is_empty());
-    find_grok_bin_from(explicit, std::env::var_os("PATH"), home_dir())
+    find_grok_bin_from(&RuntimeEnv::from_process())
 }
 
-/// Lookup used by [`find_grok_bin`]. `grok_bin` `Some` is authoritative even
-/// when the path is missing. `path_var` and `home` are injected so tests do not
-/// mutate the process environment.
-fn find_grok_bin_from(
-    grok_bin: Option<std::ffi::OsString>,
-    path_var: Option<std::ffi::OsString>,
-    home: Option<PathBuf>,
-) -> Option<PathBuf> {
-    if let Some(raw) = grok_bin {
+/// Lookup used by [`find_grok_bin`]. `env.grok_bin` `Some` is authoritative even
+/// when the path is missing.
+pub fn find_grok_bin_from(env: &RuntimeEnv) -> Option<PathBuf> {
+    if let Some(raw) = &env.grok_bin {
         let path = PathBuf::from(raw);
         return path.is_file().then_some(path);
     }
-    if let Some(found) = find_on_path_in("grok", path_var.as_deref()) {
+    if let Some(found) = find_on_path_in("grok", env.path.as_deref()) {
         return Some(found);
     }
-    let home = home?;
+    let home = env.home_dir()?;
     let candidate = home.join(".grok").join("bin").join("grok");
     is_executable_file(&candidate).then_some(candidate)
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .or_else(|| std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()))
-        .map(PathBuf::from)
+/// Searches `PATH` from `env` for the first file called `name`. No shell is involved.
+pub fn find_on_path_from(name: &str, env: &RuntimeEnv) -> Option<PathBuf> {
+    find_on_path_in(name, env.path.as_deref())
 }
 
 /// Searches `PATH` for the first file called `name`. No shell is involved.
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
-    find_on_path_in(name, std::env::var_os("PATH").as_deref())
+    find_on_path_from(name, &RuntimeEnv::from_process())
 }
 
 fn find_on_path_in(name: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
@@ -1000,28 +1123,24 @@ fn is_executable_file(path: &Path) -> bool {
     meta.is_file() && meta.permissions().mode() & 0o111 != 0
 }
 
-fn env_flag(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => false,
-    }
+pub fn default_user_config_path() -> Option<PathBuf> {
+    default_user_config_path_from(&RuntimeEnv::from_process())
 }
 
-pub fn default_user_config_path() -> Option<PathBuf> {
-    if let Some(base) = std::env::var_os("XDG_CONFIG_HOME") {
-        let base_path = PathBuf::from(base);
-        if !base_path.as_os_str().is_empty() {
-            return Some(base_path.join("dmuxai").join("dmuxai.toml"));
-        }
+pub fn default_user_config_path_from(env: &RuntimeEnv) -> Option<PathBuf> {
+    if let Some(config) = &env.config_path {
+        return Some(config.clone());
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let home_path = PathBuf::from(home);
-        if !home_path.as_os_str().is_empty() {
-            return Some(home_path.join(".config").join("dmuxai").join("dmuxai.toml"));
-        }
+    if let Some(base) = &env.xdg_config_home
+        && !base.as_os_str().is_empty()
+    {
+        return Some(base.join("dmuxai").join("dmuxai.toml"));
+    }
+    let home = env.home_dir();
+    if let Some(home_path) = home
+        && !home_path.as_os_str().is_empty()
+    {
+        return Some(home_path.join(".config").join("dmuxai").join("dmuxai.toml"));
     }
     None
 }
@@ -2135,10 +2254,11 @@ mod builtin_memory_mcp_tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        assert_eq!(
-            find_opencode_bin_from(None, None, Some(home.path().to_path_buf())),
-            Some(exe)
-        );
+        let env = crate::runtime_env::RuntimeEnv {
+            home: Some(home.path().to_path_buf()),
+            ..crate::runtime_env::RuntimeEnv::default()
+        };
+        assert_eq!(find_opencode_bin_from(&env), Some(exe));
     }
 
     // FR-1326: explicit DMUXAI_OPENCODE_BIN missing file → clear message.
@@ -2159,9 +2279,6 @@ mod builtin_opencode_tests {
     use super::*;
     use crate::custom_agent::opencode_preset;
 
-    // Serializes tests that set DMUXAI_REDUCED_MOTION.
-    static REDUCED_MOTION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Fake opencode executable: a plain file is enough for the PATH check.
     fn fake_opencode(dir: &Path) -> PathBuf {
         let path = dir.join("opencode");
@@ -2179,9 +2296,13 @@ mod builtin_opencode_tests {
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let user = dir.path().join("user.toml");
+        let env = RuntimeEnv::default();
+        let load = |bin: Option<PathBuf>| {
+            DmuxSettings::load_with_opencode_and_env(&ws, Some(&user), None, bin, &env)
+        };
 
         // Installed, no config: the preset is registered from the template.
-        let settings = DmuxSettings::load_with_opencode(&ws, Some(&user), None, Some(bin.clone()));
+        let settings = load(Some(bin.clone()));
         assert_eq!(
             settings.custom_agents.len(),
             1,
@@ -2210,7 +2331,7 @@ mod builtin_opencode_tests {
         );
 
         // Not installed: no preset and no error.
-        let missing = DmuxSettings::load_with_opencode(&ws, Some(&user), None, None);
+        let missing = load(None);
         assert!(missing.custom_agents.is_empty());
         assert!(missing.config_warnings.is_empty());
 
@@ -2220,7 +2341,7 @@ mod builtin_opencode_tests {
             "[[agents.custom]]\nname = \"opencode\"\ncommand = [\"my-opencode\"]\n",
         )
         .unwrap();
-        let user_wins = DmuxSettings::load_with_opencode(&ws, Some(&user), None, Some(bin.clone()));
+        let user_wins = load(Some(bin.clone()));
         assert_eq!(user_wins.custom_agents.len(), 1);
         assert!(!user_wins.custom_agents[0].builtin);
         assert_eq!(user_wins.custom_agents[0].command, vec!["my-opencode"]);
@@ -2232,7 +2353,7 @@ mod builtin_opencode_tests {
             "[agents]\nbuiltin_opencode = false\n",
         )
         .unwrap();
-        let disabled = DmuxSettings::load_with_opencode(&ws, Some(&user), None, Some(bin.clone()));
+        let disabled = load(Some(bin.clone()));
         assert!(!disabled.builtin_opencode);
         assert!(disabled.custom_agents.is_empty());
 
@@ -2247,7 +2368,7 @@ mod builtin_opencode_tests {
             "[agents]\nbuiltin_opencode = true\n",
         )
         .unwrap();
-        let kept = DmuxSettings::load_with_opencode(&ws, Some(&user), None, Some(bin.clone()));
+        let kept = load(Some(bin.clone()));
         let names: Vec<&str> = kept.custom_agents.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["pi", "opencode"]);
 
@@ -2258,7 +2379,7 @@ mod builtin_opencode_tests {
             "[graph]\nallowed_runners = [\"opencode\", \"cursor\"]\n",
         )
         .unwrap();
-        let listed = DmuxSettings::load_with_opencode(&ws, Some(&user), None, Some(bin.clone()));
+        let listed = load(Some(bin.clone()));
         assert_eq!(
             listed.graph_allowed_runners,
             Some(vec!["opencode".to_owned(), "cursor".to_owned()])
@@ -2270,7 +2391,7 @@ mod builtin_opencode_tests {
         );
 
         // Without the preset, the same list is reported as unknown.
-        let unknown = DmuxSettings::load_with_opencode(&ws, Some(&user), None, None);
+        let unknown = load(None);
         assert!(
             unknown
                 .config_warnings
@@ -2293,7 +2414,14 @@ mod builtin_opencode_tests {
             "[[agents.custom]]\nname = \"pi\"\ncommand = [\"pi\"]\n",
         )
         .unwrap();
-        let settings = DmuxSettings::load_with_opencode(dir.path(), Some(&user), None, Some(bin));
+        let env = RuntimeEnv::default();
+        let settings = DmuxSettings::load_with_opencode_and_env(
+            dir.path(),
+            Some(&user),
+            None,
+            Some(bin),
+            &env,
+        );
         assert!(!settings.graph_runner_allowed("opencode"));
         assert!(settings.graph_runner_allowed("pi"));
         assert!(settings.graph_runner_allowed("cursor"));
@@ -2308,11 +2436,10 @@ mod builtin_opencode_tests {
     // defaults, with or without the opencode example, and names every section.
     #[test]
     fn starter_config_parses() {
-        let _guard = REDUCED_MOTION_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dmuxai.toml");
+        let env = RuntimeEnv::default();
         for opencode in [false, true] {
             for grok in [false, true] {
                 let text = crate::init::starter_config(opencode, grok);
@@ -2329,8 +2456,13 @@ mod builtin_opencode_tests {
                 }
                 std::fs::write(&path, &text).unwrap();
                 // No opencode executable here: the example stays a comment.
-                let settings =
-                    DmuxSettings::load_with_opencode(dir.path(), Some(&path), None, None);
+                let settings = DmuxSettings::load_with_opencode_and_env(
+                    dir.path(),
+                    Some(&path),
+                    None,
+                    None,
+                    &env,
+                );
                 assert_eq!(
                     settings,
                     DmuxSettings::default(),
@@ -2354,9 +2486,7 @@ mod builtin_opencode_tests {
         // 2. dmuxai.toml with [theme] reduced_motion = false
         std::fs::write(&config_path, "[theme]\nreduced_motion = false\n").unwrap();
         let settings = {
-            let _guard = REDUCED_MOTION_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = test_env_lock();
             DmuxSettings::load_with_opencode(dir.path(), None, None, None)
         };
         assert!(!settings.reduced_motion);
@@ -2365,10 +2495,8 @@ mod builtin_opencode_tests {
         // 3. Environment variable DMUXAI_REDUCED_MOTION=1 overrides config.
         // Hold the env lock so no other test sees the variable in flux.
         let settings_env = {
-            let _guard = REDUCED_MOTION_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // SAFETY: REDUCED_MOTION_ENV_LOCK serializes every test that
+            let _guard = test_env_lock();
+            // SAFETY: test_env_lock() serializes every test that
             // touches DMUXAI_REDUCED_MOTION.
             unsafe { std::env::set_var("DMUXAI_REDUCED_MOTION", "1") };
             let loaded = DmuxSettings::load_with_opencode(dir.path(), None, None, None);
@@ -2424,32 +2552,42 @@ mod builtin_grok_tests {
         let home_only = Some(home.clone());
 
         // PATH beats the home install.
-        let from_path = find_grok_bin_from(None, path_var.clone(), home_only.clone()).unwrap();
+        let env_path = crate::runtime_env::RuntimeEnv {
+            path: path_var.clone(),
+            home: home_only.clone(),
+            ..crate::runtime_env::RuntimeEnv::default()
+        };
+        let from_path = find_grok_bin_from(&env_path).unwrap();
         assert_eq!(from_path, path_bin);
 
         // Home is used when PATH misses.
-        let from_home = find_grok_bin_from(None, None, home_only.clone()).unwrap();
+        let env_home = crate::runtime_env::RuntimeEnv {
+            path: None,
+            home: home_only.clone(),
+            ..crate::runtime_env::RuntimeEnv::default()
+        };
+        let from_home = find_grok_bin_from(&env_home).unwrap();
         assert_eq!(from_home, home_bin);
 
         // An explicit path wins over PATH and home.
-        let from_explicit = find_grok_bin_from(
-            Some(explicit.as_os_str().to_owned()),
-            path_var.clone(),
-            home_only.clone(),
-        )
-        .unwrap();
+        let env_explicit = crate::runtime_env::RuntimeEnv {
+            grok_bin: Some(explicit.as_os_str().to_owned()),
+            path: path_var.clone(),
+            home: home_only.clone(),
+            ..crate::runtime_env::RuntimeEnv::default()
+        };
+        let from_explicit = find_grok_bin_from(&env_explicit).unwrap();
         assert_eq!(from_explicit, explicit);
 
         // A missing DMUXAI_GROK_BIN does not fall through.
         let missing = dir.path().join("missing-grok");
-        assert!(
-            find_grok_bin_from(
-                Some(missing.as_os_str().to_owned()),
-                path_var.clone(),
-                home_only
-            )
-            .is_none()
-        );
+        let env_missing = crate::runtime_env::RuntimeEnv {
+            grok_bin: Some(missing.as_os_str().to_owned()),
+            path: path_var.clone(),
+            home: home_only.clone(),
+            ..crate::runtime_env::RuntimeEnv::default()
+        };
+        assert!(find_grok_bin_from(&env_missing).is_none());
 
         #[cfg(unix)]
         {
@@ -2458,11 +2596,16 @@ mod builtin_grok_tests {
             let quiet = quiet_home.join(".grok").join("bin").join("grok");
             touch(&quiet);
             std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o644)).unwrap();
-            assert!(find_grok_bin_from(None, None, Some(quiet_home)).is_none());
+            let env_quiet = crate::runtime_env::RuntimeEnv {
+                home: Some(quiet_home),
+                ..crate::runtime_env::RuntimeEnv::default()
+            };
+            assert!(find_grok_bin_from(&env_quiet).is_none());
         }
 
+        let env = RuntimeEnv::default();
         let load = |bin: Option<PathBuf>| {
-            DmuxSettings::load_with_runners(&ws, Some(&user), None, None, bin)
+            DmuxSettings::load_with_runners_and_env(&ws, Some(&user), None, None, bin, &env)
         };
 
         let settings = load(Some(path_bin.clone()));
@@ -2532,12 +2675,13 @@ mod builtin_grok_tests {
         )
         .unwrap();
         std::fs::write(ws.join("dmuxai.toml"), "[agents]\nbuiltin_grok = true\n").unwrap();
-        let kept = DmuxSettings::load_with_runners(
+        let kept = DmuxSettings::load_with_runners_and_env(
             &ws,
             Some(&user),
             None,
             Some(opencode_bin.clone()),
             Some(path_bin.clone()),
+            &env,
         );
         let names: Vec<&str> = kept
             .custom_agents
@@ -2593,5 +2737,85 @@ mod builtin_grok_tests {
             "{:?}",
             unknown.config_warnings
         );
+    }
+
+    // TC-1673: presets use bin overrides from RuntimeEnv, and an explicit
+    // RuntimeEnv without overrides ignores process bin environment variables.
+    #[test]
+    fn tc_1673_presets_ignore_process_bin_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let fake_opencode = dir.path().join("fake-opencode");
+        let fake_grok = dir.path().join("fake-grok");
+        std::fs::write(&fake_opencode, "#!/bin/sh\n").unwrap();
+        std::fs::write(&fake_grok, "#!/bin/sh\n").unwrap();
+
+        // 1. RuntimeEnv with opencode/grok bin overrides -> presets use those paths.
+        let env_with_overrides = RuntimeEnv {
+            opencode_bin: Some(fake_opencode.as_os_str().to_owned()),
+            grok_bin: Some(fake_grok.as_os_str().to_owned()),
+            ..RuntimeEnv::default()
+        };
+        let settings = DmuxSettings::load_with_env(&ws, &env_with_overrides);
+        let opencode_spec = settings
+            .custom_agents
+            .iter()
+            .find(|s| s.builtin && s.name == "opencode")
+            .expect("builtin opencode preset registered");
+        assert_eq!(opencode_spec.command[0], fake_opencode.to_string_lossy());
+
+        let grok_spec = settings
+            .custom_agents
+            .iter()
+            .find(|s| s.builtin && s.name == "grok")
+            .expect("builtin grok preset registered");
+        assert_eq!(grok_spec.command[0], fake_grok.to_string_lossy());
+
+        // 2. An explicit RuntimeEnv without overrides ignores real process env variables.
+        let _lock = crate::state_path::test_env_lock();
+        unsafe {
+            std::env::set_var("DMUXAI_OPENCODE_BIN", "/bogus/nonexistent/opencode");
+            std::env::set_var("DMUXAI_GROK_BIN", "/bogus/nonexistent/grok");
+        }
+        let env_clean = RuntimeEnv::default();
+        let settings_clean = DmuxSettings::load_with_env(&ws, &env_clean);
+        unsafe {
+            std::env::remove_var("DMUXAI_OPENCODE_BIN");
+            std::env::remove_var("DMUXAI_GROK_BIN");
+        }
+        assert!(
+            settings_clean
+                .custom_agents
+                .iter()
+                .all(|s| s.name != "opencode"),
+            "clean RuntimeEnv must ignore DMUXAI_OPENCODE_BIN from process env"
+        );
+        assert!(
+            settings_clean
+                .custom_agents
+                .iter()
+                .all(|s| s.name != "grok"),
+            "clean RuntimeEnv must ignore DMUXAI_GROK_BIN from process env"
+        );
+    }
+
+    // TC-1674: a single shared test env lock is used across crates and modules.
+    #[test]
+    fn tc_1674_single_shared_test_env_lock() {
+        let guard = crate::state_path::test_env_lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let locked = crate::settings::test_env_lock();
+            tx.send(()).unwrap();
+            drop(locked);
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(guard);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok());
     }
 }

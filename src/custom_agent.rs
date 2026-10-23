@@ -9,6 +9,8 @@ use std::time::Duration;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::runtime_env::RuntimeEnv;
+
 /// Upper bound for the built-in preset's `models_command` (SPEC-first-run FR-813).
 pub const BUILTIN_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -648,6 +650,8 @@ pub fn build_custom_command(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    crate::process::apply_child_env_policy_tokio(&mut command);
+
     if let Some(mcp_path) = &ctx.mcp_config {
         command.env("DMUXAI_MCP_CONFIG", mcp_path);
     } else {
@@ -661,8 +665,6 @@ pub fn build_custom_command(
     }
     #[cfg(unix)]
     command.process_group(0);
-
-    crate::process::strip_dashboard_env(command.as_std_mut());
 
     Ok(command)
 }
@@ -923,7 +925,7 @@ async fn run_models_output(
         .current_dir(cwd)
         .stdin(Stdio::null())
         .kill_on_drop(true);
-    crate::process::strip_dashboard_env(command.as_std_mut());
+    crate::process::apply_child_env_policy_tokio(&mut command);
     // Test fixtures set GROK_FAKE_* on the preset. Production grok env is empty.
     // Opencode keeps its models command free of OPENCODE_CONFIG substitution.
     if is_builtin_grok(spec) {
@@ -1008,14 +1010,15 @@ async fn list_grok_model_ids(
 /// `allowed_models` match is an error that names the policy and how to override
 /// it. The built-in grok preset uses the login and `^grok-` messages instead.
 /// Other agents keep the plain listing.
-pub async fn list_model_ids(
+pub async fn list_model_ids_with_env(
     spec: &CustomAgentSpec,
     cwd: &Path,
     timeout: Option<Duration>,
+    env: &RuntimeEnv,
 ) -> Result<Vec<String>, String> {
     if spec.builtin
         && spec.name.eq_ignore_ascii_case("opencode")
-        && let Some(message) = crate::settings::opencode_bin_explicit_missing_message()
+        && let Some(message) = crate::settings::opencode_bin_explicit_missing_message_from(env)
     {
         return Err(message);
     }
@@ -1040,6 +1043,14 @@ pub async fn list_model_ids(
             }
         }
     }
+}
+
+pub async fn list_model_ids(
+    spec: &CustomAgentSpec,
+    cwd: &Path,
+    timeout: Option<Duration>,
+) -> Result<Vec<String>, String> {
+    list_model_ids_with_env(spec, cwd, timeout, &RuntimeEnv::from_process()).await
 }
 
 #[cfg(test)]
@@ -1726,6 +1737,7 @@ image_arg = []
     #[cfg(unix)]
     #[tokio::test]
     async fn preset_without_allowed_models_explains_policy() {
+        let env = RuntimeEnv::default();
         let cwd = std::env::temp_dir();
         let timeout = Some(Duration::from_millis(300));
         let with_script = |script: &str| {
@@ -1742,27 +1754,34 @@ image_arg = []
             assert!(error.contains("dmuxai init"), "{error}");
         };
 
-        let err = list_model_ids(&with_script("printf 'opencode/paid\\n'"), &cwd, timeout)
-            .await
-            .unwrap_err();
+        let err = list_model_ids_with_env(
+            &with_script("printf 'opencode/paid\\n'"),
+            &cwd,
+            timeout,
+            &env,
+        )
+        .await
+        .unwrap_err();
         assert_policy(&err);
 
-        let err = list_model_ids(&with_script("echo boom >&2; exit 1"), &cwd, timeout)
-            .await
-            .unwrap_err();
+        let err =
+            list_model_ids_with_env(&with_script("echo boom >&2; exit 1"), &cwd, timeout, &env)
+                .await
+                .unwrap_err();
         assert_policy(&err);
         assert!(err.contains("boom"), "{err}");
 
-        let err = list_model_ids(&with_script("sleep 5"), &cwd, timeout)
+        let err = list_model_ids_with_env(&with_script("sleep 5"), &cwd, timeout, &env)
             .await
             .unwrap_err();
         assert_policy(&err);
         assert!(err.contains("timed out"), "{err}");
 
-        let ids = list_model_ids(
+        let ids = list_model_ids_with_env(
             &with_script("printf 'opencode/a-free\\nopencode/b\\nother/c-free\\n'"),
             &cwd,
             timeout,
+            &env,
         )
         .await;
         assert_eq!(ids, Ok(vec!["opencode/a-free".to_owned()]));
@@ -1771,7 +1790,9 @@ image_arg = []
     // TC-1663 / FR-1663
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn tc_1663_custom_child_clears_inherited_mcp_env() {
+        let _guard = crate::state_path::test_env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let workspace = std::fs::canonicalize(tmp.path()).unwrap();
         let spec = CustomAgentSpec {
@@ -1799,6 +1820,50 @@ image_arg = []
         }
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "env=");
+    }
+
+    #[test]
+    fn custom_child_applies_policy_and_respects_order_guarantees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let mut spec = CustomAgentSpec {
+            name: "policy-test".to_owned(),
+            command: vec!["echo".to_owned()],
+            ..Default::default()
+        };
+        spec.env
+            .insert("DMUXAI_CONFIG".to_owned(), "agent-override.toml".to_owned());
+        spec.env
+            .insert("CUSTOM_VAR".to_owned(), "custom-val".to_owned());
+
+        let mut ctx = SubstitutionContext::new(
+            "test",
+            workspace.to_string_lossy().into_owned(),
+            "ask",
+            "deny",
+        );
+        ctx.mcp_config = Some("/path/to/mcp.json".to_owned());
+
+        let cmd = build_custom_command(&spec, &ctx, workspace).unwrap();
+        let env_map: std::collections::HashMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_str().unwrap(), v.map(|v| v.to_str().unwrap())))
+            .collect();
+
+        // DMUXAI_WEB_TOKEN was stripped by policy
+        assert_eq!(env_map.get("DMUXAI_WEB_TOKEN"), Some(&None));
+        // DMUXAI_MCP_CONFIG was set after policy via ctx.mcp_config
+        assert_eq!(
+            env_map.get("DMUXAI_MCP_CONFIG"),
+            Some(&Some("/path/to/mcp.json"))
+        );
+        // spec.env was applied last, so its override won
+        assert_eq!(
+            env_map.get("DMUXAI_CONFIG"),
+            Some(&Some("agent-override.toml"))
+        );
+        assert_eq!(env_map.get("CUSTOM_VAR"), Some(&Some("custom-val")));
     }
 
     // TC-877 (FR-875)
