@@ -30,6 +30,9 @@ see FR-1623).
 | FR-1623 | Must | At most one running turn per (conversation, agent). A second prompt into the same conversation while that conversation has a run keeps the existing follow-up behaviour (queued on a writable dashboard, `409 busy` on a read-only one). A prompt for agent X while X runs in a *different* conversation is refused with `409` and the message `agent 'X' is running in another conversation (<title>); wait or pick another agent`. |
 | FR-1624 | Must | Each Sessions sidebar entry has `running: true` exactly while that conversation has a running turn; the sidebar spinner follows it. `session.run_active` reflects only the displayed conversation. |
 | FR-1625 | Must | When a background turn ends (completed, cancelled, error) its agent becomes idle and the run state is cleared, so later prompts in any conversation are not queued forever. Follow-ups queued for a conversation start once that conversation has no run, at the latest when it is displayed again. |
+| FR-1666 | Must | When the user opens a conversation whose graph turn is still running in the background while another conversation owns the process-wide live `graph_session`, the dashboard snapshot for the opened conversation must still describe that run as live (active phase and running step), not as cancelled or stopped. |
+| FR-1667 | Must | When that background graph turn ends while the user is viewing its conversation, the dashboard graph snapshot (and chat graph card derived from it) must move to the terminal phase without reloading the conversation. |
+| FR-1668 | Must | When another conversation's graph turn has already finished and cleared the process-wide `graph_session`, reopening a conversation whose graph turn is still running in this process must still show that run as live (not cancelled), using `active_turns` rather than `graph_session` presence. |
 
 ## 5. Acceptance scenarios and test design
 | TC | Covers | Test |
@@ -41,3 +44,6 @@ see FR-1623).
 | TC-1624 | FR-1624 | Automated: `sessions_running_flag_per_conversation`. Manual: A and B both running → both entries show the spinner; each clears when its turn ends. Screenshot. |
 | TC-1625 | FR-1625 | Automated: `background_turn_end_clears_run_state`. Manual: after A finishes in the background, a new prompt in B is `queued: false`. |
 | TC-1626 | FR-1620..1625 | Manual matrix in one dashboard process: grok A + cursor (composer-2.5) B, cursor A + agy (gemini-3.8-flash) B, agy A + grok B. Expected: each pair runs concurrently and both results are correct. |
+| TC-1666 | FR-1666 | Automated: `tc_1666_background_graph_snapshot_stays_live_when_switching_back`. Manual: grok turn in A, cursor turn in B, reopen A while both run. Expected: chat graph row shows running (spinner), not `Run stopped`. |
+| TC-1667 | FR-1667 | Automated: `tc_1667_background_graph_snapshot_updates_when_turn_ends`. Manual: same setup; stay on A until grok finishes. Expected: card shows completed/stopped correctly without reload. |
+| TC-1668 | FR-1668 | Automated: `tc_1668_background_graph_stays_live_after_other_graph_ends`. Manual: long grok turn in A, short cursor turn in B; wait until B finishes (`graph_session` cleared), reopen A while grok still runs. Expected: running graph card, not `Run stopped`. |
