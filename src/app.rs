@@ -5553,7 +5553,65 @@ impl App {
             });
         if let Some(run) = latest {
             self.graph_history_run_id = Some(run.plan.id.clone());
-            self.last_graph_run = Some(Self::graph_history_display(run));
+            let display = if self.preserve_live_graph_history_run(&run) {
+                run
+            } else {
+                Self::graph_history_display(run)
+            };
+            self.last_graph_run = Some(display);
+        }
+    }
+
+    fn graph_run_looks_in_progress_on_disk(phase: GraphRunPhase) -> bool {
+        matches!(
+            phase,
+            GraphRunPhase::Active
+                | GraphRunPhase::WaitingGate
+                | GraphRunPhase::Triage
+                | GraphRunPhase::Planning
+        )
+    }
+
+    /// FR-1666 / FR-1668: a graph turn is live when this process still has an
+    /// `active_turns` entry for that conversation with a graph node. Disk-only
+    /// in-progress runs (no matching active turn) are crash-safe history.
+    fn conversation_has_live_graph_turn(&self, conversation_id: &str) -> bool {
+        self.active_turns.values().any(|turn| {
+            turn.conversation_id.as_str() == conversation_id && turn.graph_node_id.is_some()
+        })
+    }
+
+    fn preserve_live_graph_history_run(&self, run: &GraphRun) -> bool {
+        Self::graph_run_looks_in_progress_on_disk(run.phase)
+            && self.conversation_has_live_graph_turn(run.conversation_id.as_str())
+    }
+
+    /// FR-1666 / FR-1667: keep the displayed conversation's graph snapshot in
+    /// sync with its background run while another conversation owns the session.
+    fn sync_displayed_conversation_background_graph_run(&mut self) {
+        let conversation_id = self.conversation_id.as_str();
+        if self
+            .graph_session
+            .as_ref()
+            .is_some_and(|session| session.run().conversation_id == conversation_id)
+        {
+            return;
+        }
+        if !self.conversation_has_live_graph_turn(conversation_id) {
+            return;
+        }
+        let run = GraphStore::new(&self.workspace_root)
+            .list_runs()
+            .into_iter()
+            .filter(|run| run.conversation_id == conversation_id)
+            .filter(|run| Self::graph_run_looks_in_progress_on_disk(run.phase))
+            .max_by(|left, right| {
+                left.turn_index
+                    .cmp(&right.turn_index)
+                    .then_with(|| left.plan.id.cmp(&right.plan.id))
+            });
+        if let Some(run) = run {
+            self.last_graph_run = Some(run);
         }
     }
 
@@ -9916,6 +9974,10 @@ impl App {
                     .nodes
                     .iter()
                     .any(|node| node.id == node_id)
+                    && (finished_conversation
+                        .as_ref()
+                        .is_some_and(|id| session.run().conversation_id == id.as_str())
+                        || !background_graph_turn)
             }) {
                 self.intercept_graph_node_finished(agent, node_id, success, &output_text);
             } else if let Some(conversation_id) = finished_conversation.as_ref() {
@@ -9929,15 +9991,15 @@ impl App {
             }
         } else if let Some(node_id) = graph_node_id
             && let Some(conversation_id) = finished_conversation.as_ref()
-            && (background_graph_turn
-                || !self.graph_session.as_ref().is_some_and(|session| {
-                    session
+            && !self.graph_session.as_ref().is_some_and(|session| {
+                session.run().conversation_id == conversation_id.as_str()
+                    && session
                         .run()
                         .plan
                         .nodes
                         .iter()
                         .any(|node| node.id == node_id)
-                }))
+            })
         {
             self.complete_background_graph_node(
                 agent,
@@ -11627,6 +11689,8 @@ impl App {
             .map(|session| session.run().clone())
         {
             self.last_graph_run = Some(run);
+        } else {
+            self.sync_displayed_conversation_background_graph_run();
         }
 
         let (conversation_run_total, conversation_runs) = self.conversation_runs_for_snapshot();
@@ -16874,6 +16938,14 @@ mod tests {
         (h, hub)
     }
 
+    /// FR-1222: simulate restart — no in-process graph session or turns.
+    fn clear_in_process_graph_liveness(app: &mut App) {
+        app.graph_session = None;
+        app.active_turns.clear();
+        app.graph_agent_nodes.clear();
+        app.busy_agents.clear();
+    }
+
     // TC-1214 / SPEC-dashboard-fullwidth FR-1222: A -> B -> A restores each
     // conversation's own latest run; B never shows A's.
     #[test]
@@ -16882,7 +16954,7 @@ mod tests {
         let a = h.app.conversation_id.clone();
         h.app.input = "/direct first".to_owned();
         h.app.submit_prompt();
-        h.app.graph_session = None;
+        clear_in_process_graph_liveness(&mut h.app);
         let ws = h.app.workspace_root.clone();
         for run in [
             history_run("run-a1", a.as_str(), 1, "first", GraphRunPhase::Completed),
@@ -16930,7 +17002,7 @@ mod tests {
         let a = h.app.conversation_id.clone();
         h.app.input = "/direct first".to_owned();
         h.app.submit_prompt();
-        h.app.graph_session = None;
+        clear_in_process_graph_liveness(&mut h.app);
         let ws = h.app.workspace_root.clone();
         let mid = history_run("run-mid", a.as_str(), 5, "mid", GraphRunPhase::Active);
         dmuxai::graph::save_run(&ws, &mid).expect("save mid");
@@ -16970,7 +17042,7 @@ mod tests {
         let a = h.app.conversation_id.clone();
         h.app.input = "/direct first".to_owned();
         h.app.submit_prompt();
-        h.app.graph_session = None;
+        clear_in_process_graph_liveness(&mut h.app);
         let ws = h.app.workspace_root.clone();
         dmuxai::graph::save_run(
             &ws,
@@ -28464,6 +28536,119 @@ mod tests {
         assert!(a_row.running);
         assert!(b_row.running);
         assert!(h.app.session_view().run_active);
+    }
+
+    // TC-1666 / FR-1666: reopening a conversation must not mark its background
+    // graph run as cancelled when another conversation owns `graph_session`.
+    #[test]
+    fn tc_1666_background_graph_snapshot_stays_live_when_switching_back() {
+        let mut h = plan_gate_test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            h.app.workspace_root.to_string_lossy().into_owned(),
+        );
+        h.app.attach_dashboard(hub.clone());
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "run in A");
+        h.app.create_conversation(Some("conversation B".to_owned()));
+        submit_direct_agent(&mut h.app, "cursor", "run in B");
+        assert_ne!(
+            h.app
+                .graph_session
+                .as_ref()
+                .expect("live graph session")
+                .run()
+                .conversation_id,
+            a.as_str()
+        );
+        h.app.select_conversation(a);
+        h.app.publish_dashboard();
+        let graph = hub
+            .snapshot()
+            .graph
+            .expect("graph snapshot for conversation A");
+        assert_eq!(graph.phase, GraphRunPhase::Active);
+        assert_eq!(
+            graph.nodes[0].status,
+            dmuxai::graph::GraphNodeStatus::Running
+        );
+    }
+
+    // TC-1668 / FR-1668: reopening A stays live when B's graph finished and
+    // cleared `graph_session` while A's turn is still in `active_turns`.
+    #[test]
+    fn tc_1668_background_graph_stays_live_after_other_graph_ends() {
+        let mut h = plan_gate_test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            h.app.workspace_root.to_string_lossy().into_owned(),
+        );
+        h.app.attach_dashboard(hub.clone());
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "run in A");
+        h.app.create_conversation(Some("conversation B".to_owned()));
+        submit_direct_agent(&mut h.app, "cursor", "run in B");
+        let (cursor_agent, cursor_request) = h.sent.lock().unwrap()[1].clone();
+        assert!(h.app.apply_agent_output(triage_output(
+            cursor_agent,
+            &cursor_request,
+            AgentEvent::Completed,
+        )));
+        assert!(
+            h.app.graph_session.is_none(),
+            "B's graph run ended; no process-wide session"
+        );
+        assert!(
+            h.app
+                .active_turns
+                .values()
+                .any(|turn| turn.conversation_id == a && turn.graph_node_id.is_some()),
+            "A's graph turn still running"
+        );
+        h.app.select_conversation(a);
+        h.app.publish_dashboard();
+        let graph = hub
+            .snapshot()
+            .graph
+            .expect("graph snapshot for conversation A");
+        assert_eq!(graph.phase, GraphRunPhase::Active);
+        assert_eq!(
+            graph.nodes[0].status,
+            dmuxai::graph::GraphNodeStatus::Running
+        );
+    }
+
+    // TC-1667 / FR-1667: the dashboard graph snapshot updates when the background
+    // turn ends, without reloading the conversation.
+    #[test]
+    fn tc_1667_background_graph_snapshot_updates_when_turn_ends() {
+        let mut h = plan_gate_test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            h.app.workspace_root.to_string_lossy().into_owned(),
+        );
+        h.app.attach_dashboard(hub.clone());
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "run in A");
+        let (codex_agent, codex_request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("conversation B".to_owned()));
+        submit_direct_agent(&mut h.app, "cursor", "run in B");
+        h.app.select_conversation(a);
+        assert!(h.app.apply_agent_output(triage_output(
+            codex_agent,
+            &codex_request,
+            AgentEvent::Completed,
+        )));
+        h.app.publish_dashboard();
+        let graph = hub
+            .snapshot()
+            .graph
+            .expect("graph snapshot after A finished");
+        assert_eq!(graph.phase, GraphRunPhase::Completed);
+        assert_eq!(
+            graph.nodes[0].status,
+            dmuxai::graph::GraphNodeStatus::Completed
+        );
     }
 
     // TC-1625 / FR-1625: a background turn ending clears process-wide queue gating.
