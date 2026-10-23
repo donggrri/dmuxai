@@ -82,6 +82,8 @@ observable behavior. Do not commit unless the user explicitly requests it.
   cargo clippy --all-targets --all-features -- -D warnings
   ```
 
+Before a PR run `scripts/gate.sh` (add `--browser` for UI changes).
+
 - Run live-provider tests only when the relevant CLI is installed, authenticated,
   and the task calls for it. Record the exact command and result separately from
   deterministic tests.

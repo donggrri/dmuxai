@@ -441,3 +441,78 @@ fn tc_1804_tc_link_check_reports_orphans_both_ways() {
 
     let _ = fs::remove_dir_all(&temp_root);
 }
+
+#[test]
+fn tc_1805_gate_script_help_and_linux_guard() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new("bash")
+        .arg("scripts/gate.sh")
+        .arg("--help")
+        .current_dir(root)
+        .output()
+        .expect("bash must be available to run scripts/gate.sh --help");
+    assert!(
+        output.status.success(),
+        "gate.sh --help failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for opt in ["--isolated", "--browser", "--quick", "--keep-going"] {
+        assert!(
+            combined.contains(opt),
+            "help text must mention {opt}:\n{combined}"
+        );
+    }
+}
+
+#[test]
+fn tc_1806_gate_script_isolated_mode_unsets_dmuxai_vars() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let isolated = Command::new("bash")
+        .arg("scripts/gate.sh")
+        .arg("--print-env")
+        .env("DMUXAI_OPENCODE_BIN", "/nonexistent")
+        .current_dir(root)
+        .output()
+        .expect("bash must be available to run scripts/gate.sh --print-env");
+    assert!(
+        isolated.status.success(),
+        "isolated --print-env failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        isolated.status.code(),
+        String::from_utf8_lossy(&isolated.stdout),
+        String::from_utf8_lossy(&isolated.stderr)
+    );
+    let isolated_out = String::from_utf8_lossy(&isolated.stdout);
+    assert!(
+        !isolated_out.contains("DMUXAI_OPENCODE_BIN"),
+        "isolated --print-env must not list DMUXAI_OPENCODE_BIN:\n{isolated_out}"
+    );
+
+    let non_isolated = Command::new("bash")
+        .arg("scripts/gate.sh")
+        .arg("--no-isolated")
+        .arg("--print-env")
+        .env("DMUXAI_OPENCODE_BIN", "/nonexistent")
+        .current_dir(root)
+        .output()
+        .expect("bash must be available to run scripts/gate.sh --print-env");
+    assert!(
+        non_isolated.status.success(),
+        "non-isolated --print-env failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        non_isolated.status.code(),
+        String::from_utf8_lossy(&non_isolated.stdout),
+        String::from_utf8_lossy(&non_isolated.stderr)
+    );
+    let non_isolated_out = String::from_utf8_lossy(&non_isolated.stdout);
+    assert!(
+        non_isolated_out.contains("DMUXAI_OPENCODE_BIN"),
+        "non-isolated --print-env must list DMUXAI_OPENCODE_BIN:\n{non_isolated_out}"
+    );
+}
