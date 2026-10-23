@@ -1169,6 +1169,36 @@ env = { FAKE_CFG = "{temp_config}" }
         (result, events)
     }
 
+    // TC-1724 / FR-1721: e2e agy success line finishes without AgentEvent::Error.
+    #[tokio::test]
+    async fn tc_1724_e2e_agy_success_line_finishes_without_error() {
+        let toml = r#"
+name = "agy-e2e"
+command = ["sh", "-c", "echo '{\"event\":\"result\",\"conversation_id\":\"c1\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"done\",\"error\":null}}'"]
+output = "jsonl"
+text_path = "/result/response"
+text_when = { path = "/event", equals = "result" }
+error_path = "/result/error"
+"#;
+        let spec: &'static CustomAgentSpec = Box::leak(Box::new(toml::from_str(toml).unwrap()));
+        let notice_shown = AtomicBool::new(false);
+        let (result, events) = run_turn_capture_events(spec, &[], &notice_shown).await;
+        assert_eq!(result, Ok(()), "events: {:?}", events);
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "must not emit AgentEvent::Error: {:?}",
+            events
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TextDelta(delta) => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("done"), "text: {text}");
+    }
+
     #[tokio::test]
     async fn mcp_merge_unsupported_json_emits_notice_once_per_session() {
         use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
