@@ -569,7 +569,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         tokio::select! {
             _ = interval.tick() => {
                 let graph = source.poll();
-                hub.publish(Vec::new(), graph);
+                hub.publish(Vec::new(), graph, None);
             }
             _ = tokio::signal::ctrl_c() => break,
         }

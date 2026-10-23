@@ -156,6 +156,9 @@ enum SlashAction {
 const PLAN_AWAITING_APPROVAL_MSG: &str =
     "A plan is awaiting approval: approve, edit or reject it first";
 
+/// FR-1652: session transcript line once planning finishes at the approval gate.
+pub const PLAN_WAITING_APPROVAL_TRANSCRIPT: &str = "Plan waiting for approval — approve or reject in the dashboard (or POST the graph approve command)";
+
 const HEADLESS_APPROVAL_NOTE: &str = "approval required (headless)";
 const HEADLESS_GATE_NOTE: &str = "sensitive step needs /graph continue (headless)";
 
@@ -1594,6 +1597,134 @@ impl App {
         Ok(app)
     }
 
+    fn conversation_graph_run(&self) -> Option<&GraphRun> {
+        if let Some(session) = self.graph_session.as_ref()
+            && session.run().conversation_id == self.conversation_id.as_str()
+        {
+            return Some(session.run());
+        }
+        self.last_graph_run
+            .as_ref()
+            .filter(|run| run.conversation_id == self.conversation_id.as_str())
+    }
+
+    fn agent_matches_plan_runner(&self, agent: Agent, run: &GraphRun) -> bool {
+        let id = self.agent_runner_name(agent);
+        run.triage
+            .as_ref()
+            .is_some_and(|triage| triage.runner == id)
+    }
+
+    fn run_state_view_for_dashboard(&self, agent: Agent) -> dmuxai::web::RunStateView {
+        let view = self.run_state(agent).to_view();
+        let awaiting = self
+            .conversation_graph_run()
+            .filter(|run| dmuxai::web::graph_awaits_plan_approval(run))
+            .is_some_and(|run| self.agent_matches_plan_runner(agent, run));
+        dmuxai::web::adjust_run_state_for_plan_approval(view, awaiting)
+    }
+
+    /// FR-1650: top-level `turn` on dashboard snapshots.
+    fn dashboard_turn(&self) -> dmuxai::web::TurnView {
+        let conversation_id = self.conversation_id.as_str().to_owned();
+        if let Some(run) = self.conversation_graph_run() {
+            if dmuxai::web::graph_awaits_plan_approval(run) {
+                return dmuxai::web::TurnView {
+                    state: "awaiting_approval".to_owned(),
+                    conversation_id,
+                    graph_id: Some(run.plan.id.clone()),
+                    since_ms: run
+                        .plan_fixed_ms
+                        .or(run.orchestrate_started_ms)
+                        .unwrap_or_else(unix_ms_now),
+                };
+            }
+            if run.phase == GraphRunPhase::WaitingGate {
+                return dmuxai::web::TurnView {
+                    state: "needs_input".to_owned(),
+                    conversation_id,
+                    graph_id: Some(run.plan.id.clone()),
+                    since_ms: run.orchestrate_started_ms.unwrap_or_else(unix_ms_now),
+                };
+            }
+        }
+        if self.followup_run_active() {
+            let since_ms = self
+                .run_states
+                .values()
+                .filter_map(|state| match state {
+                    RunState::Running { started_at_ms, .. } => Some(*started_at_ms),
+                    _ => None,
+                })
+                .min()
+                .unwrap_or_else(unix_ms_now);
+            return dmuxai::web::TurnView {
+                state: "running".to_owned(),
+                conversation_id,
+                graph_id: self.conversation_graph_run().map(|run| run.plan.id.clone()),
+                since_ms,
+            };
+        }
+        if let Some(ended) = self.most_recent_terminal_run_view() {
+            return ended;
+        }
+        dmuxai::web::TurnView {
+            state: "idle".to_owned(),
+            conversation_id,
+            graph_id: None,
+            since_ms: 0,
+        }
+    }
+
+    fn most_recent_terminal_run_view(&self) -> Option<dmuxai::web::TurnView> {
+        let conversation_id = self.conversation_id.as_str().to_owned();
+        let mut best: Option<(u64, dmuxai::web::TurnView)> = None;
+        for adapter in &self.adapters {
+            let agent = adapter.agent();
+            let state = self.run_state(agent);
+            let (state_name, ended_at_ms) = match state {
+                RunState::Done {
+                    ended_at_ms,
+                    started_at_ms,
+                    ..
+                } => ("done", ended_at_ms.max(started_at_ms.unwrap_or(0))),
+                RunState::Failed {
+                    ended_at_ms,
+                    started_at_ms,
+                    ..
+                } => ("failed", ended_at_ms.max(started_at_ms.unwrap_or(0))),
+                RunState::Cancelled {
+                    ended_at_ms,
+                    started_at_ms,
+                    ..
+                } => ("failed", ended_at_ms.max(started_at_ms.unwrap_or(0))),
+                _ => continue,
+            };
+            let since_ms = ended_at_ms;
+            if best.as_ref().is_none_or(|(at, _)| since_ms >= *at) {
+                best = Some((
+                    since_ms,
+                    dmuxai::web::TurnView {
+                        state: state_name.to_owned(),
+                        conversation_id: conversation_id.clone(),
+                        graph_id: self.conversation_graph_run().map(|run| run.plan.id.clone()),
+                        since_ms,
+                    },
+                ));
+            }
+        }
+        best.map(|(_, view)| view)
+    }
+
+    fn push_plan_waiting_approval_transcript_line(&mut self) {
+        if self.messages.iter().rev().any(|message| {
+            message.role == Role::System && message.content == PLAN_WAITING_APPROVAL_TRANSCRIPT
+        }) {
+            return;
+        }
+        self.push_system(PLAN_WAITING_APPROVAL_TRANSCRIPT.to_owned());
+    }
+
     pub fn run_state(&self, agent: Agent) -> RunState {
         if let Some(state) = self.run_states.get(&agent) {
             state.clone()
@@ -2607,7 +2738,7 @@ impl App {
                             dmuxai::model_policy::validate_model_for_runner(&id, model).is_ok()
                         }),
                     id,
-                    run: Some(self.run_state(agent).to_view()),
+                    run: Some(self.run_state_view_for_dashboard(agent)),
                 }
             })
             .collect();
@@ -5570,6 +5701,7 @@ impl App {
         self.push_system(format!(
             "Plan edit failed: {cause}; previous revision kept."
         ));
+        self.push_plan_waiting_approval_transcript_line();
     }
 
     /// FR-943: approve, edit, or reject the awaiting plan (serialized via the app loop).
@@ -6562,6 +6694,7 @@ impl App {
         let plan_id = run.plan.id.clone();
         self.commit_pending_graph_todo(&plan_id, &mut run);
         self.last_graph_run = Some(run);
+        self.push_plan_waiting_approval_transcript_line();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7044,6 +7177,7 @@ impl App {
         }
         self.remember_judge_reason_triage(run.triage.as_ref());
         self.last_graph_run = Some(run);
+        self.push_plan_waiting_approval_transcript_line();
     }
 
     fn finish_validated_plan_edit(
@@ -7125,6 +7259,7 @@ impl App {
             }
         };
         self.record_plan_change(change);
+        self.push_plan_waiting_approval_transcript_line();
     }
 
     /// Retires the plan turn id and cancels the adapter turn (overflow and
@@ -8492,6 +8627,7 @@ impl App {
         };
         self.last_graph_run = Some(saved);
         self.push_replan_needs_approval_notice(pending.rev);
+        self.push_plan_waiting_approval_transcript_line();
         self.resume_graph_after_replan();
     }
 
@@ -11173,7 +11309,7 @@ impl App {
                         .get(&agent)
                         .and_then(|catalog| catalog.selected.clone()),
                     color: dmuxai::theme::color_hex(color),
-                    run: Some(self.run_state(agent).to_view()),
+                    run: Some(self.run_state_view_for_dashboard(agent)),
                     // Cleared when the turn ends and the activity record is removed.
                     activity: self
                         .activities
@@ -11244,7 +11380,7 @@ impl App {
             }
         }
 
-        hub.publish(agents, graph);
+        hub.publish(agents, graph, Some(self.dashboard_turn()));
         // Only `dmuxai --web` (which has a command channel) exposes the chat
         // session; headless runs and plain TUI sessions skip the work.
         if self.dashboard_commands.is_some() {
@@ -25505,6 +25641,69 @@ mod tests {
             .collect();
         assert!(names.contains(&"/plan"));
         assert!(names.contains(&"/direct"));
+    }
+
+    // TC-1650 / FR-1650: dashboard turn state while a plan waits for approval.
+    #[test]
+    fn tc_1650_dashboard_turn_awaiting_approval() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval(&mut h);
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            h.app.engine.workspace_key().to_owned(),
+        );
+        h.app.attach_dashboard(hub.clone());
+        let turn = hub.snapshot().turn.expect("turn on snapshot");
+        assert_eq!(turn.state, "awaiting_approval");
+        assert_eq!(turn.conversation_id, h.app.conversation_id.as_str());
+        assert!(turn.graph_id.is_some());
+    }
+
+    // TC-1651 / FR-1651: planner run state is awaiting_approval, not done.
+    #[test]
+    fn tc_1651_agent_run_awaiting_approval_not_done() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval(&mut h);
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            h.app.engine.workspace_key().to_owned(),
+        );
+        h.app.attach_dashboard(hub.clone());
+        let snapshot = hub.snapshot();
+        let codex = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.id == "codex")
+            .expect("codex agent");
+        assert_eq!(
+            codex.run.as_ref().map(|run| run.state.as_str()),
+            Some("awaiting_approval")
+        );
+    }
+
+    // TC-1652 / FR-1652: transcript ends with plan-waiting system line.
+    #[test]
+    fn tc_1652_transcript_plan_waiting_line() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval(&mut h);
+        assert!(h.app.messages.iter().any(
+            |message| message.role == Role::System && message.content.contains("Planning with")
+        ));
+        assert!(
+            h.app
+                .messages
+                .iter()
+                .any(|message| message.role == Role::System
+                    && message.content == PLAN_WAITING_APPROVAL_TRANSCRIPT)
+        );
+        let last_system = h
+            .app
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::System)
+            .map(|message| message.content.as_str());
+        assert_eq!(last_system, Some(PLAN_WAITING_APPROVAL_TRANSCRIPT));
     }
 
     // TC-946 / FR-942: awaiting approval blocks new sends, not other slash commands.

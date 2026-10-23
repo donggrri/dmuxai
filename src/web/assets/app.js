@@ -3832,7 +3832,8 @@ function bindImportForm() {
 }
 
 function isRunStateTerminal(state) {
-  return state === 'done' || state === 'failed' || state === 'cancelled' || state === 'idle';
+  return state === 'done' || state === 'failed' || state === 'cancelled' || state === 'idle'
+    || state === 'awaiting_approval';
 }
 
 function getRunningAgents(snapshot) {
@@ -3868,6 +3869,16 @@ var lastRunStatusKey = null;
 function updateRunStatus(snap, nowMs) {
   var pill = $('run-status');
   if (!pill) { return; }
+  var turn = snap && snap.turn;
+  if (turn && turn.state === 'awaiting_approval') {
+    var statusKey = 'awaiting_approval';
+    if (lastRunStatusKey !== statusKey) {
+      lastRunStatusKey = statusKey;
+      pill.className = 'run-status run-status-awaiting-approval';
+      pill.textContent = 'Waiting for approval';
+    }
+    return;
+  }
   var runningAgents = getRunningAgents(snap);
 
   if (runningAgents.length > 0) {

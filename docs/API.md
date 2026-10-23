@@ -205,6 +205,21 @@ Busy agents refuse mode/model/effort changes (409); runners outside
 snapshots also carry `session` (conversation, per-agent pickers, transcript
 tail, recent conversations, slash commands).
 
+Each snapshot includes a top-level `turn` object (FR-1650) for polling clients:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `state` | string | `idle`, `running`, `awaiting_approval`, `needs_input`, `done`, or `failed` |
+| `conversation_id` | string | Active conversation |
+| `graph_id` | string\|null | Graph run id when a graph turn is in progress or awaiting approval |
+| `since_ms` | int | Unix ms when this turn state began (0 when idle) |
+
+`awaiting_approval` means a plan or sensitive replan revision waits for
+`/graph approve` (dashboard or `POST /api/command`). `needs_input` means a
+sensitive step gate (`waiting_gate`) needs `/graph continue`. While
+`awaiting_approval`, the planning runner's `agents[].run.state` is also
+`awaiting_approval`, not `done`.
+
 `POST /api/prompt` submits the text exactly like pressing Enter in the TUI
 (slash commands included). `attachments` lists up to 10 names returned by
 `POST /api/attachments`; the images join the next turn like `/image` or a

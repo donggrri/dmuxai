@@ -853,6 +853,7 @@ mod tests {
             todos,
             jira_base_url: None,
             session: None,
+            turn: None,
         }
     }
 

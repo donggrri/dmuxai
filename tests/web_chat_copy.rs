@@ -98,7 +98,7 @@ async fn copy_button_copies_raw_markdown_in_headless_chrome() {
     }
 
     let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_owned());
-    hub.publish(Vec::new(), None);
+    hub.publish(Vec::new(), None, None);
     hub.set_session(Some(session("first snapshot")));
     let config = ServerConfig {
         bind: "127.0.0.1".parse().unwrap(),

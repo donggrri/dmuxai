@@ -1008,6 +1008,16 @@ mod tests {
         assert!(APP_CSS.contains(".run-status-activity"));
     }
 
+    // TC-1653 / FR-1653: header shows Waiting for approval with theme-safe styles.
+    #[test]
+    fn tc_1653_waiting_for_approval_status_assets() {
+        assert!(APP_CSS.contains(".run-status-awaiting-approval"));
+        assert!(APP_CSS.contains("--badge-waiting_gate-text"));
+        assert!(APP_JS.contains("turn.state === 'awaiting_approval'"));
+        assert!(APP_JS.contains("Waiting for approval"));
+        assert!(SESSION_JS.contains("awaiting_approval"));
+    }
+
     // TC-850: prompt_centering_assets (SPEC-centered-prompt FR-850, UX-850)
     #[test]
     fn prompt_centering_assets() {

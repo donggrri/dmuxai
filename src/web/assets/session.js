@@ -1098,6 +1098,9 @@
         : 0;
       return fmtElapsed(ms) || 'running';
     }
+    if (run.state === 'awaiting_approval') {
+      return 'waiting for approval';
+    }
     if (run.state === 'done') {
       var dur = typeof run.duration_ms === 'number' ? fmtElapsed(run.duration_ms) : '';
       return dur ? ('✓ ' + dur) : '✓';
