@@ -1457,6 +1457,8 @@ pub struct App {
     pending_prompt_application: Option<(String, String, dmuxai::agent_prompt::Delivery)>,
     /// Most recently applied system prompt (headless reporting).
     system_prompt_applied: Option<HeadlessSystemPrompt>,
+    /// Stored triage record for direct headless runs without a graph (FR-1764, FR-1766).
+    headless_triage: Option<Triage>,
     /// Hint for todo runs so try_submit_to_agent maps them to Worker.
     submitting_todo_run: bool,
     pub(crate) mcp_servers: Vec<ResolvedMcpServer>,
@@ -1613,6 +1615,7 @@ impl App {
             prompt_injected: HashMap::new(),
             pending_prompt_application: None,
             system_prompt_applied: None,
+            headless_triage: None,
             submitting_todo_run: false,
             exit: false,
             headless: false,
@@ -6874,20 +6877,7 @@ impl App {
         self.start_graph_run_record(run);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn build_one_node_run(
-        &self,
-        prompt: &str,
-        agent: Agent,
-        route: Route,
-        reason: String,
-        source: TriageSource,
-        cause: Option<FallbackCause>,
-        override_kind: Option<OverrideKind>,
-        run_id: String,
-        judge_calls: u32,
-        elapsed_ms: u64,
-    ) -> Result<GraphRun, String> {
+    fn resolve_one_node_model(&self, agent: Agent, prompt: &str) -> Result<String, String> {
         let runner = runner_name(agent).to_owned();
         if let Some(selected) = self
             .model_catalogs
@@ -6920,6 +6910,51 @@ impl App {
             .unwrap_or_else(|| {
                 model_hint.unwrap_or_else(|| dmuxai::model_policy::default_model().to_owned())
             });
+        Ok(model)
+    }
+
+    fn build_direct_triage(&self, agent: Agent, prompt: &str) -> Result<Triage, String> {
+        let runner = runner_name(agent).to_owned();
+        let model = self.resolve_one_node_model(agent, prompt)?;
+        Ok(Triage {
+            route: Route::Simple,
+            reason: "override".to_owned(),
+            source: TriageSource::Override,
+            cause: None,
+            override_kind: Some(OverrideKind::Agent),
+            runner,
+            model,
+            elapsed_ms: 0,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_one_node_run(
+        &self,
+        prompt: &str,
+        agent: Agent,
+        route: Route,
+        reason: String,
+        source: TriageSource,
+        cause: Option<FallbackCause>,
+        override_kind: Option<OverrideKind>,
+        run_id: String,
+        judge_calls: u32,
+        elapsed_ms: u64,
+    ) -> Result<GraphRun, String> {
+        let runner = runner_name(agent).to_owned();
+        let model = self.resolve_one_node_model(agent, prompt)?;
+        let model_hint = self.selected_run_model(agent).ok().flatten();
+        let built = match fallback_plan(prompt, &runner, model_hint.as_deref(), "direct") {
+            Ok(built) => built,
+            Err(_) if model_hint.is_none() => dmuxai::graph::one_node_plan_on(
+                prompt,
+                &runner,
+                dmuxai::model_policy::PROVIDER_DEFAULT,
+                "direct",
+            ),
+            Err(error) => return Err(error),
+        };
         let mut plan = built.plan;
         plan.id = run_id;
         plan.orchestrator_model = model.clone();
@@ -12428,9 +12463,9 @@ impl App {
     fn headless_plan_snapshot(&self) -> (Option<Triage>, Option<HeadlessPlan>) {
         let run = self.last_graph_run.as_ref();
         let Some(run) = run else {
-            return (None, None);
+            return (self.headless_triage.clone(), None);
         };
-        let triage = run.triage.clone();
+        let triage = run.triage.clone().or_else(|| self.headless_triage.clone());
         let plan = run.approval.as_ref().and_then(|approval| {
             approval.revisions.last().map(|revision| HeadlessPlan {
                 steps: revision.steps.clone(),
@@ -12578,32 +12613,47 @@ impl App {
         .with_system_prompt(self.system_prompt_applied.clone())
     }
 
-    fn headless_submit_prompt(&mut self, req: &HeadlessRequest) {
+    fn headless_submit_prompt(&mut self, req: &HeadlessRequest) -> Result<(), RunTodoError> {
         if req.prompt.trim_start().starts_with('/')
             && !req.prompt.trim_start().starts_with("//")
             && !first_token_is_path(req.prompt.trim_start())
         {
             self.input = req.prompt.clone();
             self.submit_prompt();
-            return;
+            return Ok(());
+        }
+        if req.agent.is_some() && !req.graph {
+            let agent = self.adapters[self.selected].agent();
+            self.begin_user_prompt_turn();
+            self.allow_multi_runner_graph = false;
+            self.set_turn_runner_pin_from_agent(agent);
+            if let Some((runner, model)) = self
+                .headless_triage
+                .as_ref()
+                .map(|t| (t.runner.clone(), t.model.clone()))
+            {
+                let _ = self.apply_runner_and_model(&runner, &model);
+            }
+            self.try_submit_to_agent(agent, req.prompt.clone(), false, true)?;
+            return Ok(());
         }
         if self.pending_turn_policy == Some(TurnPolicy::ReadOnly) {
             let agent = self.adapters[self.selected].agent();
             self.allow_multi_runner_graph = false;
             self.set_turn_runner_pin_from_agent(agent);
             self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::Agent);
-            return;
+            return Ok(());
         }
         if req.agent.is_some() {
             let agent = self.adapters[self.selected].agent();
             self.allow_multi_runner_graph = false;
             self.set_turn_runner_pin_from_agent(agent);
             self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::Agent);
-            return;
+            return Ok(());
         }
         let agent = self.adapters[self.selected].agent();
         if self.refuse_plan_gate_prompt(req.prompt.clone()) {
-            return;
+            return Ok(());
         }
         self.begin_user_prompt_turn();
         if self
@@ -12613,9 +12663,10 @@ impl App {
             .is_some_and(|runners| runners.is_empty())
         {
             self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::NoAllowedRunners);
-            return;
+            return Ok(());
         }
         self.start_judge_turn(agent, req.prompt.clone());
+        Ok(())
     }
 
     fn headless_idle_action(
@@ -12804,6 +12855,48 @@ impl App {
         };
         self.create_conversation(Some(headless_title));
         let headless_conversation_id = self.conversation_id.as_str().to_owned();
+        self.last_graph_run = None;
+        self.graph_session = None;
+        self.headless_triage = None;
+
+        let is_sync_slash = req.todo_id.is_none()
+            && req.prompt.trim_start().starts_with('/')
+            && !req.prompt.trim_start().starts_with("//")
+            && !first_token_is_path(req.prompt.trim_start());
+
+        let is_direct_headless =
+            req.agent.is_some() && !req.graph && req.todo_id.is_none() && !is_sync_slash;
+
+        if is_direct_headless {
+            let target_agent = self.adapters[self.selected].agent();
+            match self.build_direct_triage(target_agent, &req.prompt) {
+                Ok(triage) => {
+                    self.headless_triage = Some(triage);
+                }
+                Err(error) => {
+                    return HeadlessOutcome::failure(
+                        dmuxai::agent_api::exit::FAILED,
+                        headless_conversation_id,
+                        Some(runner_name(target_agent).to_owned()),
+                        error,
+                    );
+                }
+            }
+
+            if dmuxai::graph::sensitive_keyword_match(&req.prompt)
+                && !req.allow_sensitive
+                && !req.approve_plan
+            {
+                return HeadlessOutcome::failure(
+                    dmuxai::agent_api::exit::APPROVAL_REQUIRED,
+                    headless_conversation_id,
+                    Some(runner_name(target_agent).to_owned()),
+                    HEADLESS_GATE_NOTE.to_owned(),
+                )
+                .with_triage(self.headless_triage.clone())
+                .with_system_prompt(self.system_prompt_applied.clone());
+            }
+        }
 
         // FR-1729: pre-load a custom agent's model catalog once so the
         // catalog check can run in the turn path (interactive catalogs are
@@ -12849,7 +12942,7 @@ impl App {
         let mut had_agent_error = false;
         let mut last_error_kind: Option<String> = None;
         let mut last_graph_id: Option<String> = None;
-        let mut cancelled;
+        let mut cancelled = false;
 
         loop {
             if !prompt_submitted {
@@ -12890,16 +12983,23 @@ impl App {
                             msg,
                         );
                     }
-                } else {
-                    self.headless_submit_prompt(&req);
+                } else if let Err(err) = self.headless_submit_prompt(&req)
+                    && !matches!(
+                        &err,
+                        RunTodoError::Busy(msg) if msg.contains("requires conversation summary")
+                    )
+                {
+                    had_agent_error = true;
+                    if last_error_kind.is_none() {
+                        last_error_kind = Some(match &err {
+                            RunTodoError::Busy(_) => "busy".to_owned(),
+                            _ => "internal".to_owned(),
+                        });
+                    }
+                    break;
                 }
                 prompt_submitted = true;
             }
-
-            let is_sync_slash = req.todo_id.is_none()
-                && req.prompt.trim_start().starts_with('/')
-                && !req.prompt.trim_start().starts_with("//")
-                && !first_token_is_path(req.prompt.trim_start());
 
             let mut turn_started = req.todo_id.is_some()
                 || is_sync_slash
@@ -23426,6 +23526,288 @@ mod tests {
                 .and_then(|record| record.message.as_deref())
                 == Some("boom")
         );
+    }
+
+    // TC-1764 / FR-1764: headless run with explicit agent runs directly without a graph.
+    #[tokio::test]
+    async fn tc_1764_headless_explicit_agent_runs_without_graph() {
+        use dmuxai::events::{EventLog, EventSink, events_path, read_since};
+        use dmuxai::web::SnapshotSource;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::open(dir.path(), dir.path().display().to_string());
+        let sink = EventSink::new(log, Duration::ZERO, None);
+        let hub =
+            dmuxai::web::DashboardHub::new(SnapshotSource::App, dir.path().display().to_string())
+                .with_events(sink);
+
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        app.attach_dashboard(hub);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("direct reply".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "Say hello".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(outcome.ok);
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.text.contains("direct reply"));
+        assert!(outcome.graph_id.is_none());
+        assert!(app.last_graph_run.is_none());
+        assert!(app.graph_session.is_none());
+
+        let all_events = read_since(&events_path(dir.path()), 0, None);
+        assert!(
+            all_events.iter().any(|record| record.kind == "agent"),
+            "expected agent lifecycle events, got: {all_events:?}"
+        );
+        assert!(
+            !all_events
+                .iter()
+                .any(|record| record.kind == "graph" || record.kind == "node"),
+            "direct run must not emit graph or node events, got: {all_events:?}"
+        );
+    }
+
+    // TC-1765 / FR-1765: explicit agent error is reported once directly without graph failure notices.
+    #[tokio::test]
+    async fn tc_1765_headless_explicit_agent_error_reported_once() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Error(AgentError::provider(
+                                "underlying provider timeout",
+                            )),
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "Fail please".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.exit_code, 1);
+        let err = outcome.error.expect("error must be reported");
+        assert!(
+            err.contains("underlying provider timeout"),
+            "expected agent error text, got: {err}"
+        );
+        for msg in &outcome.messages {
+            assert!(
+                !msg.content.contains("Graph failed"),
+                "unexpected 'Graph failed' in message: {msg:?}"
+            );
+            assert!(
+                !msg.content.contains("graph node"),
+                "unexpected 'graph node' in message: {msg:?}"
+            );
+        }
+        for msg in &app.messages {
+            assert!(
+                !msg.content.contains("Graph failed"),
+                "unexpected 'Graph failed' in app message: {msg:?}"
+            );
+            assert!(
+                !msg.content.contains("graph node"),
+                "unexpected 'graph node' in app message: {msg:?}"
+            );
+        }
+    }
+
+    // TC-1766 / FR-1766: explicit agent headless run keeps triage with route simple, source override.
+    #[tokio::test]
+    async fn tc_1766_headless_explicit_agent_keeps_override_triage() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("done".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "Inspect code".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(outcome.ok);
+        let triage = outcome.triage.expect("triage must be present");
+        assert_eq!(triage.route, dmuxai::graph::Route::Simple);
+        assert_eq!(triage.reason, "override");
+        assert_eq!(triage.source, dmuxai::graph::TriageSource::Override);
+        assert_eq!(triage.runner, "codex");
+        assert!(!triage.model.is_empty());
+        assert!(outcome.plan.is_none());
+    }
+
+    // TC-1767 / FR-1767: direct sensitive prompt exits 7 without flag; runs with approve_plan.
+    #[tokio::test]
+    async fn tc_1767_headless_direct_sensitive_prompt_needs_flag() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // 1. Without allow_sensitive or approve_plan -> exit 7 and no turn started.
+        let req_gated = HeadlessRequest {
+            prompt: "deploy the migration to production".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req_gated, Arc::clone(&cancel)).await;
+        assert_eq!(outcome.exit_code, 7);
+        assert!(!outcome.ok);
+        assert_eq!(outcome.error.as_deref(), Some(HEADLESS_GATE_NOTE));
+        assert_eq!(sent.lock().unwrap().len(), 0, "no turn should have started");
+
+        // 2. With approve_plan: true -> turn runs.
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("deployment executed".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req_approved = HeadlessRequest {
+            prompt: "deploy the migration to production".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: true,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome2 = app.run_headless(req_approved, cancel).await;
+        assert_eq!(outcome2.exit_code, 0);
+        assert!(outcome2.ok);
+        assert!(outcome2.text.contains("deployment executed"));
+        assert_eq!(sent.lock().unwrap().len(), 1);
     }
 
     #[test]

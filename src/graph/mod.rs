@@ -20,7 +20,7 @@ pub use plan_doc::{
     graph_plan_from_revision_steps, one_node_plan_on, parse_plan, pin_graph_plan_runners,
     plan_json_for_edit, validate_plan,
 };
-pub use planner::heuristic_route;
+pub use planner::{heuristic_route, sensitive_keyword_match};
 pub use policy::{
     ORCHESTRATOR_MODEL, assign_runner, default_limits, is_runner_allowed, model_for_role,
     validate_model_id,
