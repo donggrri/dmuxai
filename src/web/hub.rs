@@ -6,7 +6,8 @@ use crate::events::{EventDraft, EventSink};
 use crate::graph::GraphNodeStatus;
 use crate::todo::Todo;
 use crate::web::snapshot::{
-    AgentView, DashboardSnapshot, GraphView, SNAPSHOT_SCHEMA, SessionView, SnapshotSource, UiTheme,
+    AgentView, DashboardSnapshot, GraphView, SNAPSHOT_SCHEMA, SessionView, SnapshotSource,
+    TurnView, UiTheme,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -50,6 +51,7 @@ impl DashboardHub {
             todos: Vec::new(),
             jira_base_url: None,
             session: None,
+            turn: None,
         };
 
         let (tx, _) = watch::channel(initial_snapshot.clone());
@@ -74,15 +76,26 @@ impl DashboardHub {
         self.state.lock().unwrap().switch_config.clone()
     }
 
-    pub fn publish(&self, agents: Vec<AgentView>, graph: Option<GraphView>) {
+    pub fn publish(
+        &self,
+        agents: Vec<AgentView>,
+        graph: Option<GraphView>,
+        turn: Option<TurnView>,
+    ) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        self.publish_at(agents, graph, now_ms);
+        self.publish_at(agents, graph, turn, now_ms);
     }
 
-    pub fn publish_at(&self, agents: Vec<AgentView>, mut graph: Option<GraphView>, now_ms: u64) {
+    pub fn publish_at(
+        &self,
+        agents: Vec<AgentView>,
+        mut graph: Option<GraphView>,
+        turn: Option<TurnView>,
+        now_ms: u64,
+    ) {
         let changed_snapshot = {
             let mut state = self.state.lock().unwrap();
 
@@ -149,12 +162,15 @@ impl DashboardHub {
                 }
             }
 
-            let content_changed = state.snapshot.agents != agents || state.snapshot.graph != graph;
+            let content_changed = state.snapshot.agents != agents
+                || state.snapshot.graph != graph
+                || state.snapshot.turn != turn;
             if content_changed {
                 state.snapshot.revision += 1;
                 state.snapshot.generated_at_ms = now_ms;
                 state.snapshot.agents = agents;
                 state.snapshot.graph = graph;
+                state.snapshot.turn = turn;
                 let _ = self.watch_tx.send_replace(state.snapshot.clone());
                 Some(state.snapshot.clone())
             } else {
@@ -397,7 +413,7 @@ mod tests {
 
         // 1. Publish running @ 1000
         let graph1 = make_test_graph("run-1", GraphNodeStatus::Running);
-        hub.publish_at(Vec::new(), Some(graph1), 1000);
+        hub.publish_at(Vec::new(), Some(graph1), None, 1000);
 
         let snap1 = hub.snapshot();
         assert_eq!(snap1.revision, 1);
@@ -408,7 +424,7 @@ mod tests {
 
         // 2. Publish completed @ 4000
         let graph1_done = make_test_graph("run-1", GraphNodeStatus::Completed);
-        hub.publish_at(Vec::new(), Some(graph1_done.clone()), 4000);
+        hub.publish_at(Vec::new(), Some(graph1_done.clone()), None, 4000);
 
         let snap2 = hub.snapshot();
         assert_eq!(snap2.revision, 2);
@@ -418,15 +434,15 @@ mod tests {
         assert_eq!(node2.elapsed_ms, Some(3000));
 
         // 3. Publish identical twice (at 5000 and 6000)
-        hub.publish_at(Vec::new(), Some(graph1_done.clone()), 5000);
+        hub.publish_at(Vec::new(), Some(graph1_done.clone()), None, 5000);
         assert_eq!(hub.snapshot().revision, 2);
 
-        hub.publish_at(Vec::new(), Some(graph1_done), 6000);
+        hub.publish_at(Vec::new(), Some(graph1_done), None, 6000);
         assert_eq!(hub.snapshot().revision, 2);
 
         // 4. Publish new graph id (run-2)
         let graph2 = make_test_graph("run-2", GraphNodeStatus::Running);
-        hub.publish_at(Vec::new(), Some(graph2), 7000);
+        hub.publish_at(Vec::new(), Some(graph2), None, 7000);
 
         let snap3 = hub.snapshot();
         assert_eq!(snap3.revision, 3);
@@ -440,7 +456,7 @@ mod tests {
         // running(attempt 0) @ 8000 -> ready(attempt 1) @ 9000 -> running(attempt 1) @ 10000
         let graph_retry_run0 =
             make_test_graph_with_attempt("run-retry", GraphNodeStatus::Running, 0);
-        hub.publish_at(Vec::new(), Some(graph_retry_run0), 8000);
+        hub.publish_at(Vec::new(), Some(graph_retry_run0), None, 8000);
         let snap_retry0 = hub.snapshot();
         let node_retry0 = &snap_retry0.graph.as_ref().unwrap().nodes[0];
         assert_eq!(node_retry0.started_at_ms, Some(8000));
@@ -448,7 +464,7 @@ mod tests {
 
         let graph_retry_ready1 =
             make_test_graph_with_attempt("run-retry", GraphNodeStatus::Ready, 1);
-        hub.publish_at(Vec::new(), Some(graph_retry_ready1), 9000);
+        hub.publish_at(Vec::new(), Some(graph_retry_ready1), None, 9000);
         let snap_ready1 = hub.snapshot();
         let node_ready1 = &snap_ready1.graph.as_ref().unwrap().nodes[0];
         assert_eq!(node_ready1.started_at_ms, None);
@@ -456,7 +472,7 @@ mod tests {
 
         let graph_retry_run1 =
             make_test_graph_with_attempt("run-retry", GraphNodeStatus::Running, 1);
-        hub.publish_at(Vec::new(), Some(graph_retry_run1), 10000);
+        hub.publish_at(Vec::new(), Some(graph_retry_run1), None, 10000);
         let snap_retry1 = hub.snapshot();
         let node_retry1 = &snap_retry1.graph.as_ref().unwrap().nodes[0];
         assert_eq!(node_retry1.started_at_ms, Some(10000));
@@ -470,16 +486,19 @@ mod tests {
         hub.publish_at(
             Vec::new(),
             Some(make_test_graph("run-1", GraphNodeStatus::Running)),
+            None,
             1000,
         );
         hub.publish_at(
             Vec::new(),
             Some(make_test_graph("run-1", GraphNodeStatus::Completed)),
+            None,
             4000,
         );
         hub.publish_at(
             Vec::new(),
             Some(make_test_graph("run-1", GraphNodeStatus::Running)),
+            None,
             5000,
         );
         let snap = hub.snapshot();
@@ -492,7 +511,7 @@ mod tests {
         let mut g = make_test_graph("run-1", GraphNodeStatus::Completed);
         g.nodes[0].started_at_ms = Some(1500);
         g.nodes[0].finished_at_ms = Some(6500);
-        hub.publish_at(Vec::new(), Some(g), 7000);
+        hub.publish_at(Vec::new(), Some(g), None, 7000);
         let snap = hub.snapshot();
         let node = &snap.graph.as_ref().unwrap().nodes[0];
         assert_eq!(node.started_at_ms, Some(1500));
@@ -537,6 +556,7 @@ mod tests {
                     activity: None,
                 },
             ],
+            None,
             None,
         );
 
@@ -594,6 +614,7 @@ mod tests {
         hub.publish_at(
             Vec::new(),
             Some(make_test_graph("g1", GraphNodeStatus::Ready)),
+            None,
             1000,
         );
         assert_eq!(log.last_seq(), 0, "baseline publish emits no event");
@@ -602,6 +623,7 @@ mod tests {
         hub.publish_at(
             Vec::new(),
             Some(make_test_graph("g1", GraphNodeStatus::Ready)),
+            None,
             2000,
         );
         assert_eq!(log.last_seq(), 0);
@@ -610,6 +632,7 @@ mod tests {
         hub.publish_at(
             Vec::new(),
             Some(make_test_graph("g1", GraphNodeStatus::Running)),
+            None,
             3000,
         );
 

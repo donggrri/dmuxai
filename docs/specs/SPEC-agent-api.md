@@ -107,6 +107,11 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | NFR-761 | Must | Given tests for notify | Then they use a local mock HTTP listener and no network | — | TC-772 |
 | NFR-762 | Must | Given the headless CLI and MCP `run` | Then they respect `[graph] allowed_runners` exactly like dashboard to-do runs (FR-542) | — | TC-762 |
 | UX-760 | Should | Given README | Then a "Calling dmuxai from an agent" section shows the CLI, HTTP and MCP entry points and the event schema | — | Manual review (docs) |
+| FR-1650 | Must | Given a running `dmuxai --web` dashboard and `GET /api/state` (or an SSE `snapshot` frame) | Then the payload includes a top-level `turn` object: `{ "state", "conversation_id", "graph_id"?, "since_ms" }` where `state` is one of `idle`, `running`, `awaiting_approval`, `needs_input`, `done`, `failed`. `awaiting_approval` when the active conversation's graph is in phase `awaiting_approval` or holds a `pending_replan_plan` awaiting decision; `needs_input` when the graph is in `waiting_gate` (sensitive step gate); otherwise `state` reflects the active agent turn (running) or the most recent terminal agent run | Absent graph and no active turn → `idle` with the current `conversation_id` | TC-1650 |
+| FR-1651 | Must | Given `awaiting_approval` for the active conversation's graph | Then the planning runner's `agents[].run.state` (and the matching `session.agents[].run.state`) is `awaiting_approval`, not `done`, until the plan is approved, edited, or rejected | Other agents keep their own run states | TC-1651 |
+| FR-1652 | Must | Given a plan turn completes into `awaiting_approval` | Then the session transcript gains a system line `Plan waiting for approval — approve or reject in the dashboard (or POST the graph approve command)` after the `Planning with …` line, so the transcript tail is never only `Planning with …` once planning finished | Replan revisions that already pushed a notice still include this line when the gate opens | TC-1652 |
+| FR-1653 | Must | Given `turn.state` is `awaiting_approval` on a dashboard with the chat session | Then the header run-status pill shows `Waiting for approval` with readable contrast in light and dark themes | View-only `serve` uses the same pill when a stored run awaits approval | TC-1653 |
+| FR-1654 | Should | Given `docs/API.md` and README Agent API section | Then the `turn` object and `awaiting_approval` / `needs_input` states are documented on `GET /api/state` | — | TC-1654 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -128,6 +133,11 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | TC-773 | FR-771 | integration (unix) | command `cat > file` | deliver one event | file contains the event JSON | `src/notify.rs` `command_hook_receives_event_on_stdin` |
 | TC-774 | FR-773 | unit | temp workspace | write/remove discovery; env token valid/invalid | file content and mode; invalid env ignored | `src/web/discovery.rs` `discovery_file_and_token_env` |
 | TC-775 | FR-768 | unit | App with a hub event sink and a scripted agent | start a turn, stream output, complete it | `started` then `completed` agent events with runner and conversation; the CLI run reports their seq range | `src/app.rs` `app_emits_agent_lifecycle_events` |
+| TC-1650 | FR-1650 | integration | `dmuxai --web` hub with a graph run in `awaiting_approval` | `GET /api/state` or hub snapshot after `publish_dashboard` | `turn.state` is `awaiting_approval` with `graph_id` set | `src/web/server.rs` `tc_1650_state_includes_turn_awaiting_approval`; `src/app.rs` `tc_1650_dashboard_turn_awaiting_approval` |
+| TC-1651 | FR-1651 | unit (app) | Plan gate harness at `awaiting_approval` with planner run `done` | `publish_dashboard` | Planner agent `run.state` is `awaiting_approval` | `src/app.rs` `tc_1651_agent_run_awaiting_approval_not_done` |
+| TC-1652 | FR-1652 | unit (app) | Complete a valid plan turn | Inspect `session_view` transcript | Last system line is the plan-waiting message after `Planning with …` | `src/app.rs` `tc_1652_transcript_plan_waiting_line` |
+| TC-1653 | FR-1653 | unit (assets) | `app.css` and `app.js` | Static review | `.run-status-awaiting-approval` exists; `updateRunStatus` handles `turn.state === 'awaiting_approval'` | `src/web/assets.rs` `tc_1653_waiting_for_approval_status_assets` |
+| TC-1654 | FR-1654 | manual | `docs/API.md`, README | Read-through | `turn` documented on `/api/state` | Manual review |
 
 ## 6. Data, integration, and safety contracts
 

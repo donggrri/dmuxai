@@ -81,33 +81,126 @@ fn heuristic_roles(prompt: &str) -> Vec<NodeRole> {
     roles
 }
 
-/// FR-944: whether `text` matches a sensitive keyword. Pure, no role filter;
-/// a plan step is gated by its job or by the user prompt regardless of role.
+/// FR-944 / FR-1662: whether `text` matches a sensitive keyword. Pure, no role
+/// filter; quoted and fenced regions are ignored; matches whole words only.
 pub fn sensitive_keyword_match(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    contains_any(
-        &lower,
-        &[
-            "merge",
-            "database",
-            " db",
-            "auth",
-            "login",
-            "credential",
-            "migration",
-            "deploy",
-            "production",
-        ],
-    )
+    let masked = mask_ignored_regions(text);
+    let lower = masked.to_ascii_lowercase();
+    const KEYWORDS: &[&str] = &[
+        "merge",
+        "database",
+        "db",
+        "auth",
+        "login",
+        "credential",
+        "migration",
+        "deploy",
+        "production",
+    ];
+    KEYWORDS
+        .iter()
+        .any(|word| contains_whole_word(&lower, word))
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+/// Replaces closed fenced, backtick and double-quoted regions with a space.
+/// An unterminated delimiter masks nothing, so a stray quote can never hide a
+/// sensitive keyword (the gate fails closed).
+fn mask_ignored_regions(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let end = if chars[i..].starts_with(&['`', '`', '`']) {
+            find_close(&chars, i + 3, &['`', '`', '`'], false).map(|j| j + 3)
+        } else if chars[i] == '`' {
+            find_close(&chars, i + 1, &['`'], false).map(|j| j + 1)
+        } else if chars[i] == '"' {
+            find_close(&chars, i + 1, &['"'], true).map(|j| j + 1)
+        } else {
+            None
+        };
+        match end {
+            Some(end) => {
+                out.push(' ');
+                i = end;
+            }
+            None => {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn find_close(
+    chars: &[char],
+    from: usize,
+    close: &[char],
+    backslash_escapes: bool,
+) -> Option<usize> {
+    let mut i = from;
+    while i < chars.len() {
+        if backslash_escapes && chars[i] == '\\' && i + 1 < chars.len() {
+            i += 2;
+            continue;
+        }
+        if chars[i..].starts_with(close) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn contains_whole_word(haystack: &str, word: &str) -> bool {
+    let mut start = 0usize;
+    while let Some(rel) = haystack[start..].find(word) {
+        let at = start + rel;
+        let before_ok = haystack[..at]
+            .chars()
+            .last()
+            .is_none_or(|c| !is_word_char(c));
+        let after = at + word.len();
+        let after_ok = haystack[after..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_word_char(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        start = at + 1;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // TC-1662 / FR-1662
+    #[test]
+    fn tc_1662_sensitive_keyword_match() {
+        assert!(sensitive_keyword_match("please login now"));
+        assert!(sensitive_keyword_match("deploy to staging"));
+        assert!(!sensitive_keyword_match("list all authors"));
+        assert!(!sensitive_keyword_match("enable dbg output"));
+        assert!(!sensitive_keyword_match("use `login` helper"));
+        assert!(!sensitive_keyword_match(r#"say "production""#));
+        assert!(!sensitive_keyword_match("```\nlogin\n```"));
+        assert!(sensitive_keyword_match("touch the db schema"));
+        // An unterminated quote must not hide a keyword.
+        assert!(sensitive_keyword_match("cut a 5\" pipe then deploy"));
+        assert!(sensitive_keyword_match("use `unclosed and login"));
+    }
 
     // TC-936 / FR-934, FR-936: the fallback heuristic is pure and returns
     // simple when at most one executable role is inferred (FR-937); it never

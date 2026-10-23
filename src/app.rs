@@ -59,15 +59,15 @@ use dmuxai::{
         GraphStore, MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind, PanelLineKind,
         PlanChange, PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode,
         PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls, PlannerIo,
-        PlannerIoKind, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage, TriageSource,
-        apply_replan, approval_panel_lines_with_skills, budget_allows, build_judge_prompt,
-        build_plan_prompt, build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary,
-        cap_revision_raw, diff_plan_steps, diff_plan_tasks, fallback_plan,
-        graph_plan_from_revision_steps, heuristic_route, is_trivial_prompt, judge_line_text,
-        judging_line_text, next_plan_change_rev, parse_plan, parse_replan, parse_replan_marker,
-        parse_verdict, plan_json_for_edit, replan_allowed, replan_revision_steps,
-        revision_needs_approval, save_run, strip_replan_marker, task_counter_text, validate_plan,
-        write_tasks_file_if_enabled,
+        PlannerIoKind, QUESTION_ANSWER_HINT, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage,
+        TriageSource, apply_replan, approval_panel_lines_with_skills, budget_allows,
+        build_judge_prompt, build_plan_prompt, build_replan_prompt, cap_plan_response_excerpt,
+        cap_replan_step_summary, cap_revision_raw, diff_plan_steps, diff_plan_tasks, fallback_plan,
+        graph_plan_from_revision_steps, heuristic_route, is_question_prompt, is_trivial_prompt,
+        judge_line_text, judging_line_text, next_plan_change_rev, parse_plan, parse_replan,
+        parse_replan_marker, parse_verdict, pin_graph_plan_runners, plan_json_for_edit,
+        replan_allowed, replan_revision_steps, revision_needs_approval, save_run,
+        strip_replan_marker, task_counter_text, validate_plan, write_tasks_file_if_enabled,
     },
     mcp::config::ResolvedMcpServer,
     mcp::registry::McpRegistry,
@@ -155,6 +155,9 @@ enum SlashAction {
 /// FR-942: refusal when a plan waits for approval before new sends.
 const PLAN_AWAITING_APPROVAL_MSG: &str =
     "A plan is awaiting approval: approve, edit or reject it first";
+
+/// FR-1652: session transcript line once planning finishes at the approval gate.
+pub const PLAN_WAITING_APPROVAL_TRANSCRIPT: &str = "Plan waiting for approval — approve or reject in the dashboard (or POST the graph approve command)";
 
 const HEADLESS_APPROVAL_NOTE: &str = "approval required (headless)";
 const HEADLESS_GATE_NOTE: &str = "sensitive step needs /graph continue (headless)";
@@ -948,6 +951,7 @@ pub struct HeadlessRequest {
     pub mode: Option<String>,
     pub graph: bool,
     pub approve_plan: bool,
+    pub allow_sensitive: bool,
     pub todo_id: Option<String>,
 }
 
@@ -1341,6 +1345,10 @@ pub struct App {
     pub(crate) switch_ready: Option<PathBuf>,
     /// Next user/agent turn policy from dashboard `mode` or headless `mode` (cleared on send).
     pending_turn_policy: Option<TurnPolicy>,
+    /// When set, planner nodes are rewritten to this runner and model (FR-1645).
+    turn_runner_pin: Option<(String, String)>,
+    /// Explicit graph requests may assign multiple runners (FR-1645).
+    allow_multi_runner_graph: bool,
     /// Cursor CLI keeps a chat in ask mode once a read-only turn ran in it, even
     /// when a later turn passes `--force`. True when the stored Cursor session may
     /// be such a chat (also at startup, when it is unknown).
@@ -1576,6 +1584,8 @@ impl App {
             switch_pending: None,
             switch_ready: None,
             pending_turn_policy: None,
+            turn_runner_pin: None,
+            allow_multi_runner_graph: false,
             cursor_session_maybe_read_only: true,
             chat_markdown_cache: HashMap::new(),
         };
@@ -1585,6 +1595,134 @@ impl App {
         app.restore_snapshot(snapshot);
         app.restore_graph_runs_on_startup();
         Ok(app)
+    }
+
+    fn conversation_graph_run(&self) -> Option<&GraphRun> {
+        if let Some(session) = self.graph_session.as_ref()
+            && session.run().conversation_id == self.conversation_id.as_str()
+        {
+            return Some(session.run());
+        }
+        self.last_graph_run
+            .as_ref()
+            .filter(|run| run.conversation_id == self.conversation_id.as_str())
+    }
+
+    fn agent_matches_plan_runner(&self, agent: Agent, run: &GraphRun) -> bool {
+        let id = self.agent_runner_name(agent);
+        run.triage
+            .as_ref()
+            .is_some_and(|triage| triage.runner == id)
+    }
+
+    fn run_state_view_for_dashboard(&self, agent: Agent) -> dmuxai::web::RunStateView {
+        let view = self.run_state(agent).to_view();
+        let awaiting = self
+            .conversation_graph_run()
+            .filter(|run| dmuxai::web::graph_awaits_plan_approval(run))
+            .is_some_and(|run| self.agent_matches_plan_runner(agent, run));
+        dmuxai::web::adjust_run_state_for_plan_approval(view, awaiting)
+    }
+
+    /// FR-1650: top-level `turn` on dashboard snapshots.
+    fn dashboard_turn(&self) -> dmuxai::web::TurnView {
+        let conversation_id = self.conversation_id.as_str().to_owned();
+        if let Some(run) = self.conversation_graph_run() {
+            if dmuxai::web::graph_awaits_plan_approval(run) {
+                return dmuxai::web::TurnView {
+                    state: "awaiting_approval".to_owned(),
+                    conversation_id,
+                    graph_id: Some(run.plan.id.clone()),
+                    since_ms: run
+                        .plan_fixed_ms
+                        .or(run.orchestrate_started_ms)
+                        .unwrap_or_else(unix_ms_now),
+                };
+            }
+            if run.phase == GraphRunPhase::WaitingGate {
+                return dmuxai::web::TurnView {
+                    state: "needs_input".to_owned(),
+                    conversation_id,
+                    graph_id: Some(run.plan.id.clone()),
+                    since_ms: run.orchestrate_started_ms.unwrap_or_else(unix_ms_now),
+                };
+            }
+        }
+        if self.followup_run_active() {
+            let since_ms = self
+                .run_states
+                .values()
+                .filter_map(|state| match state {
+                    RunState::Running { started_at_ms, .. } => Some(*started_at_ms),
+                    _ => None,
+                })
+                .min()
+                .unwrap_or_else(unix_ms_now);
+            return dmuxai::web::TurnView {
+                state: "running".to_owned(),
+                conversation_id,
+                graph_id: self.conversation_graph_run().map(|run| run.plan.id.clone()),
+                since_ms,
+            };
+        }
+        if let Some(ended) = self.most_recent_terminal_run_view() {
+            return ended;
+        }
+        dmuxai::web::TurnView {
+            state: "idle".to_owned(),
+            conversation_id,
+            graph_id: None,
+            since_ms: 0,
+        }
+    }
+
+    fn most_recent_terminal_run_view(&self) -> Option<dmuxai::web::TurnView> {
+        let conversation_id = self.conversation_id.as_str().to_owned();
+        let mut best: Option<(u64, dmuxai::web::TurnView)> = None;
+        for adapter in &self.adapters {
+            let agent = adapter.agent();
+            let state = self.run_state(agent);
+            let (state_name, ended_at_ms) = match state {
+                RunState::Done {
+                    ended_at_ms,
+                    started_at_ms,
+                    ..
+                } => ("done", ended_at_ms.max(started_at_ms.unwrap_or(0))),
+                RunState::Failed {
+                    ended_at_ms,
+                    started_at_ms,
+                    ..
+                } => ("failed", ended_at_ms.max(started_at_ms.unwrap_or(0))),
+                RunState::Cancelled {
+                    ended_at_ms,
+                    started_at_ms,
+                    ..
+                } => ("failed", ended_at_ms.max(started_at_ms.unwrap_or(0))),
+                _ => continue,
+            };
+            let since_ms = ended_at_ms;
+            if best.as_ref().is_none_or(|(at, _)| since_ms >= *at) {
+                best = Some((
+                    since_ms,
+                    dmuxai::web::TurnView {
+                        state: state_name.to_owned(),
+                        conversation_id: conversation_id.clone(),
+                        graph_id: self.conversation_graph_run().map(|run| run.plan.id.clone()),
+                        since_ms,
+                    },
+                ));
+            }
+        }
+        best.map(|(_, view)| view)
+    }
+
+    fn push_plan_waiting_approval_transcript_line(&mut self) {
+        if self.messages.iter().rev().any(|message| {
+            message.role == Role::System && message.content == PLAN_WAITING_APPROVAL_TRANSCRIPT
+        }) {
+            return;
+        }
+        self.push_system(PLAN_WAITING_APPROVAL_TRANSCRIPT.to_owned());
     }
 
     pub fn run_state(&self, agent: Agent) -> RunState {
@@ -1996,6 +2134,15 @@ impl App {
 
         // A follow-up sent while a run is active waits in the queue and starts
         // on its own once the run ends (see `flush_followup_queue`).
+        if let Some(active) = self.active_turns.get(&target_agent)
+            && active.conversation_id.as_str() != self.conversation_id.as_str()
+        {
+            let title = self.conversation_title_for(active.conversation_id.as_str());
+            return Err(RunTodoError::Busy(format!(
+                "agent '{runner_id}' is running in another conversation ({title}); wait or pick another agent"
+            )));
+        }
+
         if allow_queue && queued_id.is_none() && !display_is_slash && self.followup_should_queue() {
             if let Some(mode_str) = mode.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
                 crate::agent::turn_policy_from_legacy_mode(mode_str)
@@ -2054,6 +2201,8 @@ impl App {
             }
         }
         let messages_before = self.messages.len();
+        self.allow_multi_runner_graph = false;
+        self.set_turn_runner_pin_from_agent(target_agent);
         let tui_draft = mem::replace(&mut self.input, text);
         self.submit_prompt();
         self.input = tui_draft;
@@ -2072,22 +2221,85 @@ impl App {
         })
     }
 
-    /// A run or turn is active, so a new dashboard prompt would be refused
-    /// as busy. A plan waiting for approval is not active (its gate decides).
+    /// Whether `conversation_id` has a run that blocks new prompts there (FR-1620).
+    fn conversation_run_active(&self, conversation_id: &str) -> bool {
+        if self
+            .active_turns
+            .values()
+            .any(|active| active.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .pending_triage
+            .as_ref()
+            .is_some_and(|pending| pending.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .pending_plan
+            .as_ref()
+            .is_some_and(|pending| pending.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .pending_summary
+            .as_ref()
+            .is_some_and(|pending| pending.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .graph_session
+            .as_ref()
+            .is_some_and(|session| session.run().conversation_id == conversation_id)
+        {
+            return true;
+        }
+        if self
+            .deferred_turns
+            .iter()
+            .any(|turn| turn.conversation_id.as_str() == conversation_id)
+        {
+            return true;
+        }
+        if conversation_id != self.conversation_id.as_str() {
+            return false;
+        }
+        self.busy_agents
+            .iter()
+            .any(|agent| !self.active_turns.contains_key(agent))
+    }
+
+    fn conversation_title_for(&self, conversation_id: &str) -> String {
+        if self.conversation_id.as_str() == conversation_id {
+            return self.conversation_title.clone();
+        }
+        self.engine
+            .list()
+            .ok()
+            .and_then(|cards| {
+                cards
+                    .iter()
+                    .find(|card| card.id.as_str() == conversation_id)
+                    .map(|card| card.title.clone())
+            })
+            .unwrap_or_else(|| conversation_id.to_owned())
+    }
+
+    /// A run or turn is active in the displayed conversation, so a new
+    /// dashboard prompt would be refused as busy or queued. A plan waiting for
+    /// approval is not active (its gate decides).
     fn followup_run_active(&self) -> bool {
-        !self.busy_agents.is_empty()
-            || !self.active_turns.is_empty()
-            || self.pending_triage.is_some()
-            || self.pending_plan.is_some()
-            || self.pending_summary.is_some()
-            || self.graph_session.is_some()
-            || !self.deferred_turns.is_empty()
+        self.conversation_run_active(self.conversation_id.as_str())
     }
 
     /// Queue a new follow-up when a run is active, or when earlier follow-ups
     /// of this conversation still wait (keeps their order).
     fn followup_should_queue(&self) -> bool {
-        self.followup_run_active()
+        self.conversation_run_active(self.conversation_id.as_str())
             || self
                 .followup_queue
                 .iter()
@@ -2137,7 +2349,7 @@ impl App {
     fn flush_followup_queue(&mut self) -> bool {
         if self.followup_queue.is_empty()
             || self.switch_pending.is_some()
-            || self.followup_run_active()
+            || self.conversation_run_active(self.conversation_id.as_str())
             || self
                 .last_graph_run
                 .as_ref()
@@ -2302,6 +2514,69 @@ impl App {
         }
     }
 
+    fn first_allowed_runner_id(&self) -> Option<String> {
+        match &self.settings.graph_allowed_runners {
+            None => self.registered_runner_names().into_iter().next(),
+            Some(allowed) if allowed.is_empty() => None,
+            Some(allowed) => allowed.first().map(|r| r.trim().to_ascii_lowercase()),
+        }
+    }
+
+    fn set_turn_runner_pin_from_agent(&mut self, agent: Agent) {
+        let runner = runner_name(agent).to_owned();
+        let model = self
+            .selected_run_model_label(agent)
+            .unwrap_or_else(|_| "provider default".to_owned());
+        self.turn_runner_pin = Some((runner, model));
+    }
+
+    fn clear_turn_runner_pin(&mut self) {
+        self.turn_runner_pin = None;
+        self.allow_multi_runner_graph = false;
+    }
+
+    fn apply_runner_pin_to_plan(&mut self, plan: &mut dmuxai::graph::GraphPlan) {
+        if self.allow_multi_runner_graph {
+            return;
+        }
+        let Some((runner, model)) = self.turn_runner_pin.clone() else {
+            return;
+        };
+        let notes = pin_graph_plan_runners(plan, &runner, &model, &|candidate| {
+            self.runner_is_allowed(candidate)
+        });
+        for note in notes {
+            self.push_system(format!("Plan: {note}"));
+        }
+    }
+
+    fn restore_conversation_runner(&mut self, agent: Agent) {
+        let runner = runner_name(agent);
+        if self.runner_is_allowed(runner) {
+            self.selected = adapter_index(agent);
+            return;
+        }
+        let Some(replacement) = self.first_allowed_runner_id() else {
+            return;
+        };
+        if let Some(rep_agent) = runner_from_str(&replacement) {
+            self.selected = adapter_index(rep_agent);
+            self.push_system(format!(
+                "Runner '{runner}' is not in allowed_runners; using '{replacement}'"
+            ));
+        }
+    }
+
+    fn simple_question_turn_active(&self, prompt: &str) -> bool {
+        if !is_question_prompt(prompt) {
+            return false;
+        }
+        self.graph_session
+            .as_ref()
+            .and_then(|session| session.run().triage.as_ref())
+            .is_some_and(|triage| triage.route == Route::Simple)
+    }
+
     /// Maps a dashboard agent id to an adapter; `None` means the selected agent.
     fn resolve_dashboard_agent(&self, agent: Option<&str>) -> Result<Agent, RunTodoError> {
         let Some(raw) = agent.map(str::trim).filter(|raw| !raw.is_empty()) else {
@@ -2355,15 +2630,16 @@ impl App {
                         Vec::with_capacity(cards.len().min(SESSION_CONVERSATIONS_MAX));
                     let mut rest = Vec::with_capacity(cards.len());
                     for card in cards {
+                        let id = card.id.as_str().to_owned();
                         let entry = SessionConversation {
-                            id: card.id.as_str().to_owned(),
+                            id: id.clone(),
                             title: card.title,
                             updated_at_ms: card.updated_at_ms.max(0) as u64,
                             last_agent: card
                                 .last_agent
                                 .map(|agent| self.agent_key_display_name(agent)),
                             turn_count: card.turn_count,
-                            running: card.running,
+                            running: card.running || self.conversation_run_active(&id),
                         };
                         if entry.id == conversation_id && ordered.is_empty() {
                             ordered.push(entry);
@@ -2535,7 +2811,7 @@ impl App {
                             dmuxai::model_policy::validate_model_for_runner(&id, model).is_ok()
                         }),
                     id,
-                    run: Some(self.run_state(agent).to_view()),
+                    run: Some(self.run_state_view_for_dashboard(agent)),
                 }
             })
             .collect();
@@ -2983,6 +3259,20 @@ impl App {
                 self.on_agent_lifecycle_event(output.agent, &output.event);
 
                 let Some(event) = stored_event(&output.event) else {
+                    // FR-1621: live-only rows (activity, tool progress, status) of
+                    // a turn running in another conversation are not stored, so
+                    // they must not leak into the displayed transcript.
+                    let background = conversation_id.as_str() != self.conversation_id.as_str();
+                    if background
+                        && matches!(
+                            output.event,
+                            AgentEvent::Activity(_)
+                                | AgentEvent::ToolProgress { .. }
+                                | AgentEvent::Status(_)
+                        )
+                    {
+                        return true;
+                    }
                     self.apply_agent_event(output.agent, output.event);
                     return true;
                 };
@@ -3991,6 +4281,14 @@ impl App {
                 return;
             }
             self.begin_user_prompt_turn();
+            if self.pending_turn_policy == Some(TurnPolicy::ReadOnly) {
+                self.allow_multi_runner_graph = false;
+                self.set_turn_runner_pin_from_agent(agent);
+                self.submit_direct_run(prompt, agent, OverrideKind::Agent);
+                return;
+            }
+            self.allow_multi_runner_graph = false;
+            self.set_turn_runner_pin_from_agent(agent);
             if self
                 .settings
                 .graph_allowed_runners
@@ -4183,8 +4481,15 @@ impl App {
             self.clear_pending_turn_policy();
             return Err(RunTodoError::Internal(message.to_owned()));
         }
-        let policy = self.pending_turn_policy.unwrap_or(TurnPolicy::Agent);
+        let simple_question = self.simple_question_turn_active(&prompt);
+        let mut policy = self.pending_turn_policy.unwrap_or(TurnPolicy::Agent);
+        if simple_question && agent == Agent::Agy && policy == TurnPolicy::Agent {
+            policy = TurnPolicy::ReadOnly;
+        }
         let mut request = request;
+        if simple_question && !request.prompt.starts_with(QUESTION_ANSWER_HINT) {
+            request.prompt = format!("{}\n\n{}", QUESTION_ANSWER_HINT, request.prompt);
+        }
         if agent == Agent::Cursor {
             if policy == TurnPolicy::Agent && self.cursor_session_maybe_read_only {
                 // Start a fresh Cursor chat; the transcript is replayed as context.
@@ -4501,13 +4806,19 @@ impl App {
     }
 
     fn restore_snapshot(&mut self, snapshot: ConversationSnapshot) {
+        let restored_runner = snapshot.turns.last().map(|turn| agent_from_key(turn.agent));
         self.conversation_id = snapshot.id;
         self.conversation_title = snapshot.title;
         self.session_conversations = None;
         self.chat_markdown_cache.clear();
         self.clear_pending_turn_policy();
+        self.clear_turn_runner_pin();
         self.cursor_session_maybe_read_only = true;
         for adapter in &self.adapters {
+            let agent = adapter.agent();
+            if self.active_turns.contains_key(&agent) {
+                continue;
+            }
             let _ = adapter.reset();
         }
         // Switching conversations clears the dashboard's retained graph so the
@@ -4515,7 +4826,10 @@ impl App {
         self.last_graph_run = None;
         self.graph_approval_stale = None;
         self.graph_node_details.clear();
-        self.graph_agent_nodes.clear();
+        // Keep graph node mappings for runners still mid-turn (possibly in another
+        // conversation) so graph completion still runs when they finish (FR-1625).
+        self.graph_agent_nodes
+            .retain(|agent, _| self.active_turns.contains_key(agent));
         self.clear_graph_defer_state();
         self.messages.clear();
         self.turn_user_message.clear();
@@ -4549,6 +4863,9 @@ impl App {
                 restored_welcome_message(&runners),
             ));
         }
+        if let Some(agent) = restored_runner {
+            self.restore_conversation_runner(agent);
+        }
         self.chat_scroll = 0;
         self.message_link_cache.clear();
         self.clear_chat_selection();
@@ -4565,6 +4882,7 @@ impl App {
             self.submit_to_agent(deferred.agent, deferred.prompt, true);
         }
         self.restore_graph_runs_on_startup();
+        self.flush_followup_queue();
         self.publish_dashboard();
     }
 
@@ -5478,6 +5796,7 @@ impl App {
         self.push_system(format!(
             "Plan edit failed: {cause}; previous revision kept."
         ));
+        self.push_plan_waiting_approval_transcript_line();
     }
 
     /// FR-943: approve, edit, or reject the awaiting plan (serialized via the app loop).
@@ -6086,6 +6405,8 @@ impl App {
             return;
         }
         self.begin_user_prompt_turn();
+        self.allow_multi_runner_graph = false;
+        self.set_turn_runner_pin_from_agent(agent);
         let run_id = Uuid::new_v4().to_string();
         self.begin_planning(
             prompt,
@@ -6124,6 +6445,8 @@ impl App {
             return;
         }
         self.begin_user_prompt_turn();
+        self.allow_multi_runner_graph = false;
+        self.set_turn_runner_pin_from_agent(agent);
         let run_id = Uuid::new_v4().to_string();
         self.start_one_node_run(
             prompt,
@@ -6404,6 +6727,7 @@ impl App {
             .unwrap_or_else(|| model_hint.unwrap_or_default());
         let run_id_for_io = run_id.clone();
         let mut plan = built.plan;
+        self.apply_runner_pin_to_plan(&mut plan);
         plan.id = run_id;
         plan.orchestrator_model = model.clone();
         plan.limits = self.graph_limits();
@@ -6465,6 +6789,7 @@ impl App {
         let plan_id = run.plan.id.clone();
         self.commit_pending_graph_todo(&plan_id, &mut run);
         self.last_graph_run = Some(run);
+        self.push_plan_waiting_approval_transcript_line();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6897,6 +7222,7 @@ impl App {
         doc: &PlanDoc,
         mut graph_plan: GraphPlan,
     ) {
+        self.apply_runner_pin_to_plan(&mut graph_plan);
         graph_plan.id = pending.run_id.clone();
         graph_plan.orchestrator_model = pending.model.clone();
         graph_plan.limits = self.graph_limits();
@@ -6946,6 +7272,7 @@ impl App {
         }
         self.remember_judge_reason_triage(run.triage.as_ref());
         self.last_graph_run = Some(run);
+        self.push_plan_waiting_approval_transcript_line();
     }
 
     fn finish_validated_plan_edit(
@@ -6954,6 +7281,7 @@ impl App {
         doc: &PlanDoc,
         mut graph_plan: GraphPlan,
     ) {
+        self.apply_runner_pin_to_plan(&mut graph_plan);
         graph_plan.id = pending.run_id.clone();
         graph_plan.orchestrator_model = pending.model.clone();
         graph_plan.limits = self.graph_limits();
@@ -7026,6 +7354,7 @@ impl App {
             }
         };
         self.record_plan_change(change);
+        self.push_plan_waiting_approval_transcript_line();
     }
 
     /// Retires the plan turn id and cancels the adapter turn (overflow and
@@ -8393,6 +8722,7 @@ impl App {
         };
         self.last_graph_run = Some(saved);
         self.push_replan_needs_approval_notice(pending.rev);
+        self.push_plan_waiting_approval_transcript_line();
         self.resume_graph_after_replan();
     }
 
@@ -8716,6 +9046,158 @@ impl App {
             return;
         }
         self.replan_summaries.push((node_id.to_owned(), capped));
+    }
+
+    fn active_stored_graph_run_for_node(
+        workspace: &std::path::Path,
+        conversation_id: &str,
+        node_id: &str,
+    ) -> Option<GraphRun> {
+        GraphStore::new(workspace)
+            .list_runs()
+            .into_iter()
+            .filter(|run| {
+                run.conversation_id == conversation_id
+                    && run.phase == GraphRunPhase::Active
+                    && run.plan.nodes.iter().any(|node| node.id == node_id)
+            })
+            .max_by(|left, right| {
+                left.turn_index
+                    .cmp(&right.turn_index)
+                    .then_with(|| left.plan.id.cmp(&right.plan.id))
+            })
+    }
+
+    fn clear_background_graph_leftovers(
+        &mut self,
+        agent: Agent,
+        conversation_id: &str,
+        run: &GraphRun,
+    ) {
+        self.graph_agent_nodes.remove(&agent);
+        self.quiet_graph_run = false;
+        if self
+            .graph_session
+            .as_ref()
+            .is_some_and(|session| session.run().conversation_id == conversation_id)
+        {
+            self.graph_session = None;
+            self.graph_assignment_line.clear();
+            self.busy_retry_user_message.clear();
+            self.clear_graph_defer_state();
+        }
+        if self.conversation_id.as_str() == conversation_id {
+            self.last_graph_run = Some(run.clone());
+        }
+        if self
+            .graph_todo
+            .as_ref()
+            .is_some_and(|(plan_id, _)| plan_id == &run.plan.id)
+            && let Some((_plan_id, todo_id)) = self.graph_todo.take()
+            && let Some(store) = self.todo_store.clone()
+        {
+            let success = run.phase == GraphRunPhase::Completed;
+            let todo_error = if success {
+                None
+            } else if run.phase == GraphRunPhase::Cancelled {
+                Some("cancelled".to_owned())
+            } else {
+                Some("graph run failed".to_owned())
+            };
+            if let Err(err) = store.finish_run(&todo_id, success, todo_error) {
+                self.push_system(format!("Failed to finish to-do run: {err}"));
+            }
+            self.publish_todos();
+        }
+        self.session_conversations = None;
+    }
+
+    fn complete_background_graph_node(
+        &mut self,
+        agent: Agent,
+        conversation_id: &str,
+        node_id: String,
+        success: bool,
+        error: Option<&str>,
+    ) {
+        if !success && error == Some("cancelled") {
+            let session_is_target = self
+                .graph_session
+                .as_ref()
+                .is_some_and(|session| session.run().conversation_id == conversation_id);
+            let run = if session_is_target {
+                let session = self.graph_session.as_mut().expect("graph session");
+                session.finalize_failure();
+                session.run_mut().phase = GraphRunPhase::Cancelled;
+                let run = session.run().clone();
+                let _ = save_run(&self.workspace_root, &run);
+                run
+            } else if let Some(mut run) = Self::active_stored_graph_run_for_node(
+                &self.workspace_root,
+                conversation_id,
+                &node_id,
+            ) {
+                run.phase = GraphRunPhase::Cancelled;
+                let _ = save_run(&self.workspace_root, &run);
+                run
+            } else {
+                return;
+            };
+            self.clear_background_graph_leftovers(agent, conversation_id, &run);
+            return;
+        }
+
+        let session_is_target = self
+            .graph_session
+            .as_ref()
+            .is_some_and(|session| session.run().conversation_id == conversation_id);
+
+        let (actions, run_snapshot) = if session_is_target {
+            let session = self.graph_session.as_mut().expect("graph session");
+            let actions = session.on_node_finished(&node_id, success);
+            let snapshot = session.run().clone();
+            let _ = save_run(&self.workspace_root, session.run());
+            (actions, snapshot)
+        } else if let Some(run) =
+            Self::active_stored_graph_run_for_node(&self.workspace_root, conversation_id, &node_id)
+        {
+            let mut session = GraphRunSession::new(run);
+            let actions = session.on_node_finished(&node_id, success);
+            let snapshot = session.run().clone();
+            let _ = save_run(&self.workspace_root, &snapshot);
+            (actions, snapshot)
+        } else {
+            return;
+        };
+
+        self.sync_tasks_file_for_run(&run_snapshot);
+        let completed = actions
+            .iter()
+            .any(|action| matches!(action, GraphAction::Completed));
+        let failed_message = actions.iter().find_map(|action| match action {
+            GraphAction::Failed(message) => Some(message.clone()),
+            _ => None,
+        });
+        if completed {
+            self.clear_background_graph_leftovers(agent, conversation_id, &run_snapshot);
+        } else if let Some(message) = failed_message {
+            if session_is_target {
+                if let Some(session) = self.graph_session.as_mut() {
+                    session.finalize_failure();
+                    if message.starts_with(GRAPH_CANCELLED_PREFIX) {
+                        session.run_mut().phase = GraphRunPhase::Cancelled;
+                    }
+                    let run = session.run().clone();
+                    let _ = save_run(&self.workspace_root, &run);
+                    self.clear_background_graph_leftovers(agent, conversation_id, &run);
+                }
+            } else {
+                let mut run = run_snapshot;
+                run.phase = GraphRunPhase::Failed;
+                let _ = save_run(&self.workspace_root, &run);
+                self.clear_background_graph_leftovers(agent, conversation_id, &run);
+            }
+        }
     }
 
     fn intercept_graph_node_finished(
@@ -9344,6 +9826,9 @@ impl App {
             .last_agent_output_index(agent)
             .map(|index| format!("{}:{index}", self.conversation_id.as_str()));
         let active_turn = self.active_turns.remove(&agent);
+        let finished_conversation = active_turn
+            .as_ref()
+            .map(|active| active.conversation_id.clone());
         self.streaming_messages.remove(&agent);
         self.tool_messages.remove(&agent);
         let graph_node_id = active_turn
@@ -9361,13 +9846,14 @@ impl App {
             let started_ms = active.started_ms;
             let workspace_scan = active.workspace_scan.clone();
             let output_for_docs = output_text.clone();
+            let graph_node_id_for_docs = graph_node_id.clone();
             std::thread::spawn(move || {
                 record_turn_doc_changes(
                     log,
                     turn_id,
                     agent_id,
                     graph_id,
-                    graph_node_id,
+                    graph_node_id_for_docs,
                     started_ms,
                     workspace_scan,
                     &workspace_root,
@@ -9390,8 +9876,21 @@ impl App {
             }
             self.publish_todos();
         }
+        let background_graph_turn = finished_conversation
+            .as_ref()
+            .is_some_and(|id| id.as_str() != self.conversation_id.as_str());
         if let Some(node_id) = self.graph_agent_nodes.remove(&agent) {
-            if !success
+            if background_graph_turn {
+                if let Some(conversation_id) = finished_conversation.as_ref() {
+                    self.complete_background_graph_node(
+                        agent,
+                        conversation_id.as_str(),
+                        node_id,
+                        success,
+                        error.as_deref(),
+                    );
+                }
+            } else if !success
                 && error.as_deref().is_some_and(is_adapter_turn_busy_rejection)
                 && let Some(session) = self.graph_session.as_mut()
                 && let Some(assignment) = session.assignment_for_node(&node_id)
@@ -9403,19 +9902,56 @@ impl App {
                     self.busy_retry_user_message.insert(agent, index);
                 }
                 return;
-            }
-            if !success && error.as_deref() == Some("cancelled") {
+            } else if !success && error.as_deref() == Some("cancelled") {
                 // FR-1416: a cancelled step (user cancel or denied ACP permission)
                 // stops the graph as cancelled, without retry or failure replan.
                 self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
                     "{GRAPH_CANCELLED_PREFIX}step {node_id} was cancelled"
                 ))]);
                 return;
+            } else if self.graph_session.as_ref().is_some_and(|session| {
+                session
+                    .run()
+                    .plan
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == node_id)
+            }) {
+                self.intercept_graph_node_finished(agent, node_id, success, &output_text);
+            } else if let Some(conversation_id) = finished_conversation.as_ref() {
+                self.complete_background_graph_node(
+                    agent,
+                    conversation_id.as_str(),
+                    node_id,
+                    success,
+                    error.as_deref(),
+                );
             }
-            self.intercept_graph_node_finished(agent, node_id, success, &output_text);
+        } else if let Some(node_id) = graph_node_id
+            && let Some(conversation_id) = finished_conversation.as_ref()
+            && (background_graph_turn
+                || !self.graph_session.as_ref().is_some_and(|session| {
+                    session
+                        .run()
+                        .plan
+                        .nodes
+                        .iter()
+                        .any(|node| node.id == node_id)
+                }))
+        {
+            self.complete_background_graph_node(
+                agent,
+                conversation_id.as_str(),
+                node_id,
+                success,
+                error.as_deref(),
+            );
         }
         self.flush_deferred_graph_starts();
         self.try_flush_queued_replan();
+        if finished_conversation.as_ref() == Some(&self.conversation_id) {
+            self.flush_followup_queue();
+        }
     }
 
     /// The model a planned step should actually use on `agent`.
@@ -9657,6 +10193,7 @@ impl App {
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
                     self.clear_pending_turn_policy();
+                    self.clear_turn_runner_pin();
                     if let Some((_plan_id, todo_id)) = self.graph_todo.take()
                         && let Some(store) = self.todo_store.clone()
                     {
@@ -11073,7 +11610,7 @@ impl App {
                         .get(&agent)
                         .and_then(|catalog| catalog.selected.clone()),
                     color: dmuxai::theme::color_hex(color),
-                    run: Some(self.run_state(agent).to_view()),
+                    run: Some(self.run_state_view_for_dashboard(agent)),
                     // Cleared when the turn ends and the activity record is removed.
                     activity: self
                         .activities
@@ -11144,7 +11681,7 @@ impl App {
             }
         }
 
-        hub.publish(agents, graph);
+        hub.publish(agents, graph, Some(self.dashboard_turn()));
         // Only `dmuxai --web` (which has a command channel) exposes the chat
         // session; headless runs and plain TUI sessions skip the work.
         if self.dashboard_commands.is_some() {
@@ -11322,8 +11859,17 @@ impl App {
             self.submit_prompt();
             return;
         }
+        if self.pending_turn_policy == Some(TurnPolicy::ReadOnly) {
+            let agent = self.adapters[self.selected].agent();
+            self.allow_multi_runner_graph = false;
+            self.set_turn_runner_pin_from_agent(agent);
+            self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::Agent);
+            return;
+        }
         if req.agent.is_some() {
             let agent = self.adapters[self.selected].agent();
+            self.allow_multi_runner_graph = false;
+            self.set_turn_runner_pin_from_agent(agent);
             self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::Agent);
             return;
         }
@@ -11353,6 +11899,10 @@ impl App {
     ) -> HeadlessIdleAction {
         let phase = self.headless_active_run_phase();
         if phase == GraphRunPhase::WaitingGate {
+            if req.allow_sensitive || (req.agent.is_some() && req.approve_plan) {
+                self.continue_graph_gate();
+                return HeadlessIdleAction::ContinueAfterApprove;
+            }
             self.headless_record_waiting_gate_note(HEADLESS_GATE_NOTE);
             let text = self
                 .messages
@@ -11924,6 +12474,8 @@ impl App {
                     return Err(RunTodoError::Forbidden("no allowed runners".to_owned()));
                 }
 
+                self.allow_multi_runner_graph = true;
+                self.turn_runner_pin = None;
                 let agent = self.adapters[self.selected].agent();
                 if self.busy_agents.contains(&agent) {
                     return Err(RunTodoError::Busy(format!(
@@ -21659,6 +22211,7 @@ mod tests {
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            allow_sensitive: false,
             todo_id: None,
         };
         let outcome = app.run_headless(req, cancel).await;
@@ -21688,6 +22241,7 @@ mod tests {
             mode: None,
             graph: false,
             approve_plan: false,
+            allow_sensitive: false,
             todo_id: None,
         };
         let outcome = app.run_headless(req, Arc::clone(&cancel)).await;
@@ -21703,6 +22257,7 @@ mod tests {
             mode: None,
             graph: false,
             approve_plan: false,
+            allow_sensitive: false,
             todo_id: None,
         };
         let outcome = app.run_headless(req, cancel).await;
@@ -21753,6 +22308,7 @@ mod tests {
             mode: None,
             graph: false,
             approve_plan: false,
+            allow_sensitive: false,
             todo_id: None,
         };
         let outcome = app.run_headless(req, cancel).await;
@@ -21789,6 +22345,7 @@ mod tests {
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            allow_sensitive: false,
             todo_id: None,
         };
         let outcome = tokio::time::timeout(Duration::from_secs(20), app.run_headless(req, cancel))
@@ -23472,6 +24029,7 @@ mod tests {
             mode: None,
             graph: false,
             approve_plan: false,
+            allow_sensitive: false,
             todo_id: None,
         };
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -24561,6 +25119,135 @@ mod tests {
         assert!(harness.app.graph_session.is_none());
     }
 
+    // TC-1640 / FR-1640, TC-1641 / FR-1641: simple question on agy is read-only with a hint.
+    #[test]
+    fn tc_1640_1641_agy_simple_question_is_read_only_with_hint() {
+        let mut harness = plan_gate_test_app();
+        harness.app.selected = adapter_index(Agent::Agy);
+        harness.app.input = "Why?".to_owned();
+        harness.app.submit_prompt();
+        let sent = harness.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1.policy, TurnPolicy::ReadOnly);
+        assert!(sent[0].1.prompt.contains(QUESTION_ANSWER_HINT));
+    }
+
+    // TC-1642 / FR-1642: non-question implement turns stay in agent mode.
+    #[test]
+    fn tc_1642_non_question_implement_unchanged() {
+        let mut harness = plan_gate_test_app();
+        harness.app.selected = adapter_index(Agent::Agy);
+        harness.app.input = "fix typo".to_owned();
+        harness.app.submit_prompt();
+        let sent = harness.sent.lock().unwrap();
+        assert_eq!(sent[0].1.policy, TurnPolicy::Agent);
+        assert!(!sent[0].1.prompt.contains(QUESTION_ANSWER_HINT));
+    }
+
+    // TC-1643 / FR-1643: resume clamps disallowed saved runner to allowed list.
+    #[test]
+    fn tc_1643_resume_honours_allowed_runners() {
+        let mut harness = plan_gate_test_app();
+        harness.app.skip_judge_for_tests = true;
+        harness.app.selected = adapter_index(Agent::Cursor);
+        harness.app.input = "hello".to_owned();
+        harness.app.submit_prompt();
+        let conv = harness.app.conversation_id.clone();
+        harness.app.create_conversation(Some("other".to_owned()));
+        harness.app.settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
+        harness.app.selected = adapter_index(Agent::Agy);
+        harness.app.resume_conversation(conv.as_str());
+        assert_eq!(harness.app.selected, adapter_index(Agent::Agy));
+        assert!(harness.app.messages.iter().any(|message| {
+            message
+                .content
+                .contains("Runner 'cursor' is not in allowed_runners; using 'agy'")
+        }));
+    }
+
+    // TC-1647 / FR-1647: startup-style open uses the same runner clamp as resume.
+    #[test]
+    fn tc_1647_startup_restore_honours_allowed_runners() {
+        let mut harness = plan_gate_test_app();
+        harness.app.skip_judge_for_tests = true;
+        harness.app.selected = adapter_index(Agent::Cursor);
+        harness.app.input = "hello".to_owned();
+        harness.app.submit_prompt();
+        let conv = harness.app.conversation_id.as_str().to_owned();
+        harness.app.create_conversation(Some("other".to_owned()));
+        harness.app.settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
+        harness.app.open_conversation_on_startup(&conv);
+        assert_eq!(harness.app.selected, adapter_index(Agent::Agy));
+    }
+
+    // TC-1648 / FR-1648: dashboard load conversation clamps runner.
+    #[test]
+    fn tc_1648_dashboard_load_honours_allowed_runners() {
+        let mut harness = plan_gate_test_app();
+        harness.app.skip_judge_for_tests = true;
+        harness.app.selected = adapter_index(Agent::Cursor);
+        harness.app.input = "hello".to_owned();
+        harness.app.submit_prompt();
+        let conv = harness.app.conversation_id.as_str().to_owned();
+        harness
+            .app
+            .handle_session_command(SessionCommand::NewConversation {
+                title: Some("other".to_owned()),
+            })
+            .unwrap();
+        harness.app.settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
+        harness
+            .app
+            .handle_session_command(SessionCommand::LoadConversation { id: conv })
+            .unwrap();
+        assert_eq!(harness.app.selected, adapter_index(Agent::Agy));
+    }
+
+    // TC-1644 / FR-1644: ask/plan mode never enters triage.
+    #[test]
+    fn tc_1644_ask_mode_skips_judge() {
+        let mut harness = plan_gate_test_app();
+        harness.app.pending_turn_policy = Some(TurnPolicy::ReadOnly);
+        harness.app.input = "Explain the build steps?".to_owned();
+        harness.app.submit_prompt();
+        let sent = harness.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(!sent[0].1.turn_id.as_str().starts_with("judge-"));
+        assert!(harness.app.pending_triage.is_none());
+    }
+
+    // TC-1645 / FR-1645: pinned runner rewrites planner nodes.
+    #[test]
+    fn tc_1645_pins_planned_runners() {
+        let mut harness = plan_gate_test_app();
+        harness.app.set_turn_runner_pin_from_agent(Agent::Codex);
+        let mut plan = dmuxai::graph::GraphPlan {
+            schema: "cursor-agent-graph/v1".to_owned(),
+            id: "plan".to_owned(),
+            orchestrator_model: "composer-2.5".to_owned(),
+            user_prompt: "work".to_owned(),
+            limits: dmuxai::graph::default_limits(),
+            nodes: vec![dmuxai::graph::GraphNode {
+                id: "step-1".to_owned(),
+                role: dmuxai::graph::NodeRole::Implement,
+                job: "work".to_owned(),
+                runner: "cursor".to_owned(),
+                model_id: "composer-2.5".to_owned(),
+                requires_gate: false,
+                status: dmuxai::graph::GraphNodeStatus::Pending,
+                attempt: 0,
+                task: None,
+                skill: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+            }],
+            edges: vec![],
+            tasks: vec![],
+        };
+        harness.app.apply_runner_pin_to_plan(&mut plan);
+        assert_eq!(plan.nodes[0].runner, "codex");
+    }
+
     // TC-931 / FR-930: an empty allowed_runners list notices and sends directly.
     #[test]
     fn plan_gate_empty_allowed_runners_sends_direct() {
@@ -25255,6 +25942,69 @@ mod tests {
             .collect();
         assert!(names.contains(&"/plan"));
         assert!(names.contains(&"/direct"));
+    }
+
+    // TC-1650 / FR-1650: dashboard turn state while a plan waits for approval.
+    #[test]
+    fn tc_1650_dashboard_turn_awaiting_approval() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval(&mut h);
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            h.app.engine.workspace_key().to_owned(),
+        );
+        h.app.attach_dashboard(hub.clone());
+        let turn = hub.snapshot().turn.expect("turn on snapshot");
+        assert_eq!(turn.state, "awaiting_approval");
+        assert_eq!(turn.conversation_id, h.app.conversation_id.as_str());
+        assert!(turn.graph_id.is_some());
+    }
+
+    // TC-1651 / FR-1651: planner run state is awaiting_approval, not done.
+    #[test]
+    fn tc_1651_agent_run_awaiting_approval_not_done() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval(&mut h);
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            h.app.engine.workspace_key().to_owned(),
+        );
+        h.app.attach_dashboard(hub.clone());
+        let snapshot = hub.snapshot();
+        let codex = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.id == "codex")
+            .expect("codex agent");
+        assert_eq!(
+            codex.run.as_ref().map(|run| run.state.as_str()),
+            Some("awaiting_approval")
+        );
+    }
+
+    // TC-1652 / FR-1652: transcript ends with plan-waiting system line.
+    #[test]
+    fn tc_1652_transcript_plan_waiting_line() {
+        let mut h = plan_gate_test_app();
+        reach_awaiting_approval(&mut h);
+        assert!(h.app.messages.iter().any(
+            |message| message.role == Role::System && message.content.contains("Planning with")
+        ));
+        assert!(
+            h.app
+                .messages
+                .iter()
+                .any(|message| message.role == Role::System
+                    && message.content == PLAN_WAITING_APPROVAL_TRANSCRIPT)
+        );
+        let last_system = h
+            .app
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::System)
+            .map(|message| message.content.as_str());
+        assert_eq!(last_system, Some(PLAN_WAITING_APPROVAL_TRANSCRIPT));
     }
 
     // TC-946 / FR-942: awaiting approval blocks new sends, not other slash commands.
@@ -27589,6 +28339,207 @@ mod tests {
         assert_eq!(sent_prompts(&h).len(), 1);
         assert!(queued_lines(&mut h.app).is_empty());
         assert_eq!(h.app.followup_queue.len(), 1);
+    }
+
+    fn submit_direct_agent(app: &mut App, agent: &str, text: &str) -> PromptAccepted {
+        app.handle_dashboard_submit_prompt(
+            text.to_owned(),
+            Some(agent.to_owned()),
+            None,
+            Some("direct".to_owned()),
+            Vec::new(),
+        )
+        .expect("accepted")
+    }
+
+    // TC-1620 / FR-1620: another agent in another conversation starts immediately.
+    #[test]
+    fn concurrent_send_other_conversation_other_agent_starts() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        let first = submit_direct_agent(&mut h.app, "codex", "task in A");
+        assert!(!first.queued);
+        assert!(h.app.conversation_run_active(a.as_str()));
+        h.app.create_conversation(Some("conversation B".to_owned()));
+        assert_ne!(h.app.conversation_id, a);
+        assert!(!h.app.session_view().run_active);
+        let second = submit_direct_agent(&mut h.app, "cursor", "task in B");
+        assert!(!second.queued);
+        assert_eq!(h.sent.lock().unwrap().len(), 2);
+        assert_eq!(h.sent.lock().unwrap()[1].0, Agent::Cursor);
+    }
+
+    // TC-1621 / FR-1621: switching away does not drop a background turn.
+    #[test]
+    fn switch_conversation_keeps_background_turn() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "background work");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::TextDelta("done".to_owned())
+        )));
+        assert!(
+            !h.app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("done"))
+        );
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request, AgentEvent::Completed))
+        );
+        h.app.select_conversation(a);
+        assert!(
+            h.app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("done"))
+        );
+    }
+
+    // TC-1621 / FR-1621: live-only activity rows of a background turn never
+    // appear in the displayed conversation.
+    #[test]
+    fn background_activity_does_not_leak_into_displayed_conversation() {
+        let mut h = plan_gate_test_app();
+        submit_direct_agent(&mut h.app, "codex", "background work");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        let before = h.app.messages.len();
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::ToolProgress {
+                item_id: "t1".to_owned(),
+                summary: "execute sleep 12; echo LEAKCHECK".to_owned(),
+                state: "completed".to_owned(),
+            }
+        )));
+        assert_eq!(h.app.messages.len(), before);
+        assert!(
+            !h.app
+                .messages
+                .iter()
+                .any(|message| message.content.contains("LEAKCHECK"))
+        );
+    }
+
+    // TC-1623 / FR-1623: same agent cannot run in two conversations at once.
+    #[test]
+    fn same_agent_other_conversation_refused() {
+        let mut h = plan_gate_test_app();
+        submit_direct_agent(&mut h.app, "codex", "first in A");
+        h.app.create_conversation(Some("conversation B".to_owned()));
+        let refused = h.app.submit_dashboard_prompt(
+            "second in B".to_owned(),
+            Some("codex".to_owned()),
+            None,
+            Some("direct".to_owned()),
+            Vec::new(),
+            true,
+            None,
+        );
+        assert!(
+            matches!(refused, Err(RunTodoError::Busy(message)) if message.contains("another conversation"))
+        );
+        assert_eq!(h.sent.lock().unwrap().len(), 1);
+    }
+
+    // TC-1624 / FR-1624: Sessions list marks each running conversation.
+    #[test]
+    fn sessions_running_flag_per_conversation() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.as_str().to_owned();
+        submit_direct_agent(&mut h.app, "codex", "run A");
+        h.app.create_conversation(Some("B".to_owned()));
+        let b = h.app.conversation_id.as_str().to_owned();
+        submit_direct_agent(&mut h.app, "cursor", "run B");
+        let conversations = h.app.session_view().conversations;
+        let a_row = conversations.iter().find(|c| c.id == a).expect("A listed");
+        let b_row = conversations.iter().find(|c| c.id == b).expect("B listed");
+        assert!(a_row.running);
+        assert!(b_row.running);
+        assert!(h.app.session_view().run_active);
+    }
+
+    // TC-1625 / FR-1625: a background turn ending clears process-wide queue gating.
+    #[test]
+    fn background_turn_end_clears_run_state() {
+        let mut h = plan_gate_test_app();
+        submit_direct_agent(&mut h.app, "codex", "background");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request, AgentEvent::Completed))
+        );
+        assert!(!h.app.session_view().run_active);
+        let next = submit_direct_agent(&mut h.app, "cursor", "after background done");
+        assert!(!next.queued);
+    }
+
+    // TC-1625: background graph turn completion clears run gating for all conversations.
+    #[test]
+    fn background_graph_turn_end_clears_run_state() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "background graph");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        let b = h.app.conversation_id.clone();
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request, AgentEvent::Completed))
+        );
+        assert!(!h.app.conversation_run_active(a.as_str()));
+        assert!(!h.app.conversation_run_active(b.as_str()));
+        assert!(!h.app.session_view().run_active);
+        let store = GraphStore::new(&h.app.workspace_root);
+        assert!(
+            !store
+                .list_runs()
+                .iter()
+                .any(|run| run.conversation_id == a.as_str() && run.phase == GraphRunPhase::Active)
+        );
+        let next = submit_direct_agent(&mut h.app, "cursor", "after background graph done");
+        assert!(!next.queued);
+    }
+
+    // TC-1626: concurrent graph runs in two conversations both complete cleanly.
+    #[test]
+    fn two_conversations_graph_runs_complete_independently() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "run A");
+        let (codex_agent, codex_req) = h.sent.lock().unwrap()[0].clone();
+        h.app.create_conversation(Some("B".to_owned()));
+        let _b = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "cursor", "run B");
+        let (cursor_agent, cursor_req) = h.sent.lock().unwrap()[1].clone();
+        h.app.select_conversation(a.clone());
+        assert!(h.app.apply_agent_output(triage_output(
+            cursor_agent,
+            &cursor_req,
+            AgentEvent::Completed
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            codex_agent,
+            &codex_req,
+            AgentEvent::Completed
+        )));
+        let store = GraphStore::new(&h.app.workspace_root);
+        assert!(
+            !store
+                .list_runs()
+                .iter()
+                .any(|run| run.phase == GraphRunPhase::Active)
+        );
+        let conversations = h.app.session_view().conversations;
+        assert!(conversations.iter().all(|card| !card.running));
     }
 
     fn start_approved_three_step_run(h: &mut PlanGateHarness) -> String {

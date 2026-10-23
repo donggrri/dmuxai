@@ -31,8 +31,9 @@ pub use snapshot::{
     SESSION_MESSAGE_MAX_BYTES, SESSION_TRANSCRIPT_MAX_BYTES, SESSION_TRANSCRIPT_MAX_MESSAGES,
     SESSION_TRUNCATED_MARKER, SNAPSHOT_SCHEMA, SessionAgent, SessionCommandInfo,
     SessionConversation, SessionMessage, SessionModel, SessionView, SessionWorkspaceGroup,
-    SnapshotSource, TurnBandView, TurnStepView, UiTheme, cap_session_message,
-    cap_session_transcript, snapshot_from_run, snapshot_from_run_with_conversation,
+    SnapshotSource, TurnBandView, TurnStepView, TurnView, UiTheme,
+    adjust_run_state_for_plan_approval, cap_session_message, cap_session_transcript,
+    graph_awaits_plan_approval, snapshot_from_run, snapshot_from_run_with_conversation,
     truncate_with_ellipsis,
 };
 
