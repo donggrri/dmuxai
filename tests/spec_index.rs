@@ -13,6 +13,11 @@
 //   with the committed allowlist -> `tc_1800_check_spec_all_passes_with_allowlist`.
 // FR-1801 / TC-1801: --all reports stale and unknown allowlist entries as failures
 //   -> `tc_1801_check_spec_all_flags_stale_and_unknown_allowlist`.
+// FR-1803 / TC-1803: `python3 scripts/check-tc-links.py` exits 0 on this repo
+//   with the committed allowlist -> `tc_1803_tc_links_have_tests_or_allowlist`.
+// FR-1804 / TC-1804: check-tc-links.py reports orphans both ways (unlinked specs,
+//   undefined tests, stale allowlist entries, undefined allowlist entries)
+//   -> `tc_1804_tc_link_check_reports_orphans_both_ways`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -320,4 +325,119 @@ fn tc_1801_check_spec_all_flags_stale_and_unknown_allowlist() {
 
     let _ = fs::remove_dir_all(&specs_dir);
     let _ = fs::remove_file(&allowlist);
+}
+
+#[test]
+fn tc_1803_tc_links_have_tests_or_allowlist() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new("python3")
+        .arg("scripts/check-tc-links.py")
+        .current_dir(root)
+        .output()
+        .expect("python3 must be available to run scripts/check-tc-links.py");
+    assert!(
+        output.status.success(),
+        "check-tc-links.py failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn tc_1804_tc_link_check_reports_orphans_both_ways() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temp_root = std::env::temp_dir().join(format!(
+        "dmuxai-tc-link-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(temp_root.join("docs/specs")).expect("create temp docs/specs");
+    fs::create_dir_all(temp_root.join("src")).expect("create temp src");
+    fs::create_dir_all(temp_root.join("scripts")).expect("create temp scripts");
+
+    fs::write(
+        temp_root.join("docs/specs/SPEC-x.md"),
+        "Status: Draft\n\n## 4. Requirements\n\n\
+         | ID | Priority | P | R | F | Evidence |\n|---|---|---|---|---|---|\n\
+         | FR-1 | Must | p | r | f | TC-1 |\n\
+         | FR-2 | Must | p | r | f | TC-2 |\n\n\
+         ## 5. Acceptance scenarios and test design\n\n\
+         | TC-1 | FR-1 | unit | s | a | o | loc |\n\
+         | TC-2 | FR-2 | unit | s | a | o | loc |\n",
+    )
+    .expect("write SPEC-x.md");
+
+    fs::write(
+        temp_root.join("src/a.rs"),
+        "#[test]\nfn tc_1_ok() {}\n\n#[test]\nfn tc_9_bad() {}\n",
+    )
+    .expect("write src/a.rs");
+
+    let allowlist = temp_root.join("scripts/tc-link-allowlist.txt");
+    fs::write(&allowlist, "TC-1 manual\nTC-3 planned\n").expect("write allowlist");
+
+    let script = root.join("scripts/check-tc-links.py");
+    let bad_output = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--allowlist")
+        .arg(&allowlist)
+        .output()
+        .expect("python3 must run scripts/check-tc-links.py");
+    assert_eq!(
+        bad_output.status.code(),
+        Some(1),
+        "bad fixture should exit 1\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&bad_output.stdout),
+        String::from_utf8_lossy(&bad_output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bad_output.stdout),
+        String::from_utf8_lossy(&bad_output.stderr)
+    );
+    assert!(
+        combined.contains("TC-2") && combined.to_lowercase().contains("orphan"),
+        "output must name TC-2 (orphan):\n{combined}"
+    );
+    assert!(
+        combined.contains("TC-9") && combined.contains("undefined"),
+        "output must name TC-9 (undefined test):\n{combined}"
+    );
+    assert!(
+        combined.contains("TC-1") && combined.to_lowercase().contains("stale"),
+        "output must name TC-1 (stale):\n{combined}"
+    );
+    assert!(
+        combined.contains("TC-3") && combined.contains("undefined"),
+        "output must name TC-3 (undefined allowlist):\n{combined}"
+    );
+
+    // Clean fixture: TC-1 has test tc_1_ok; TC-2 is allowlisted; no undefined test or allowlist.
+    fs::write(temp_root.join("src/a.rs"), "#[test]\nfn tc_1_ok() {}\n")
+        .expect("write clean src/a.rs");
+    fs::write(&allowlist, "TC-2 manual\n").expect("write clean allowlist");
+
+    let good_output = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--allowlist")
+        .arg(&allowlist)
+        .output()
+        .expect("python3 must run scripts/check-tc-links.py");
+    assert!(
+        good_output.status.success(),
+        "clean fixture should exit 0, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        good_output.status.code(),
+        String::from_utf8_lossy(&good_output.stdout),
+        String::from_utf8_lossy(&good_output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&temp_root);
 }
