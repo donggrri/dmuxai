@@ -62,54 +62,168 @@ pub struct RunOptions {
     pub allow_sensitive: bool,
     pub json: bool,
     pub model: Option<String>,
+    pub progress: bool,
 }
 
 /// First arguments that select an agent-facing subcommand.
 pub const SUBCOMMANDS: [&str; 6] = ["run", "todo", "status", "events", "mcp", "init"];
 
-fn value<'a>(args: &'a [String], index: &mut usize, flag: &str) -> Result<&'a str, String> {
-    *index += 1;
-    args.get(*index)
-        .map(String::as_str)
-        .filter(|value| !value.starts_with("--"))
-        .ok_or_else(|| format!("{flag} needs a value"))
+/// Table-driven flag specification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlagSpec {
+    pub names: &'static [&'static str],
+    pub takes_value: bool,
+    /// Hidden flags are accepted but not listed in help.
+    pub hidden: bool,
 }
+
+/// Parsed flags for a subcommand.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParsedFlags {
+    pub flags: std::collections::BTreeMap<String, Option<String>>,
+    pub positionals: Vec<String>,
+}
+
+/// Generic table-driven flag parser.
+pub fn parse_flags(
+    args: &[String],
+    specs: &[FlagSpec],
+    allow_positional: bool,
+) -> Result<ParsedFlags, String> {
+    let mut parsed = ParsedFlags::default();
+    let mut index = 0;
+    let mut rest_is_positional = false;
+    while index < args.len() {
+        let arg = args[index].clone();
+        if rest_is_positional {
+            if !allow_positional {
+                return Err(format!("unexpected argument '{arg}'"));
+            }
+            parsed.positionals.push(arg);
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            rest_is_positional = true;
+            index += 1;
+            continue;
+        }
+        let matched = specs.iter().find(|spec| spec.names.contains(&arg.as_str()));
+        if let Some(spec) = matched {
+            if spec.takes_value {
+                index += 1;
+                let value = args.get(index).map(String::as_str);
+                match value {
+                    Some(value) if !value.starts_with("--") => {
+                        for name in spec.names {
+                            parsed
+                                .flags
+                                .insert((*name).to_owned(), Some(value.to_owned()));
+                        }
+                    }
+                    _ => {
+                        return Err(format!("{arg} needs a value"));
+                    }
+                }
+            } else {
+                for name in spec.names {
+                    parsed.flags.insert((*name).to_owned(), None);
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if arg.starts_with("--") {
+            return Err(format!("unexpected argument '{arg}'"));
+        }
+        if !allow_positional {
+            return Err(format!("unexpected argument '{arg}'"));
+        }
+        parsed.positionals.push(arg);
+        index += 1;
+    }
+    Ok(parsed)
+}
+
+const RUN_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--agent"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--mode"],
+        takes_value: true,
+        hidden: true,
+    },
+    FlagSpec {
+        names: &["--graph"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--read-only"],
+        takes_value: false,
+        hidden: true,
+    },
+    FlagSpec {
+        names: &["--approve-plan"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--allow-sensitive"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--json"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--model"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--progress"],
+        takes_value: false,
+        hidden: false,
+    },
+];
 
 /// Parses run-style flags; positional words become the prompt.
 fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, String> {
-    let mut options = RunOptions::default();
-    let mut words: Vec<String> = Vec::new();
-    let mut index = 0;
-    let mut rest_is_prompt = false;
-    while index < args.len() {
-        let arg = args[index].as_str();
-        if rest_is_prompt {
-            words.push(arg.to_owned());
-        } else {
-            match arg {
-                "--" => rest_is_prompt = true,
-                "--agent" => options.agent = Some(value(args, &mut index, "--agent")?.to_owned()),
-                "--mode" => {
-                    let _ = value(args, &mut index, "--mode")?;
-                    return Err(
-                        "--mode was removed; DmuxAI runs a single agent mode (write-capable). Omit --mode."
-                            .to_owned(),
-                    );
-                }
-                "--graph" => options.graph = true,
-                "--read-only" => options.read_only = true,
-                "--approve-plan" => options.approve_plan = true,
-                "--allow-sensitive" => options.allow_sensitive = true,
-                "--json" => options.json = true,
-                "--model" => options.model = Some(value(args, &mut index, "--model")?.to_owned()),
-                flag if flag.starts_with("--") => {
-                    return Err(format!("unexpected argument '{flag}'"));
-                }
-                word => words.push(word.to_owned()),
-            }
-        }
-        index += 1;
+    let parsed = parse_flags(args, RUN_FLAGS, allow_prompt)?;
+    if parsed.flags.contains_key("--mode") {
+        return Err(
+            "--mode was removed; DmuxAI runs a single agent mode (write-capable). Omit --mode."
+                .to_owned(),
+        );
     }
+    if !allow_prompt
+        && !parsed.positionals.is_empty()
+        && let Some(word) = parsed.positionals.first()
+    {
+        return Err(format!("unexpected argument '{word}'"));
+    }
+    let options = RunOptions {
+        prompt: if allow_prompt {
+            parsed.positionals.join(" ")
+        } else {
+            String::new()
+        },
+        agent: parsed.flags.get("--agent").cloned().flatten(),
+        mode: None,
+        read_only: parsed.flags.contains_key("--read-only"),
+        graph: parsed.flags.contains_key("--graph"),
+        approve_plan: parsed.flags.contains_key("--approve-plan"),
+        allow_sensitive: parsed.flags.contains_key("--allow-sensitive"),
+        json: parsed.flags.contains_key("--json"),
+        model: parsed.flags.get("--model").cloned().flatten(),
+        progress: parsed.flags.contains_key("--progress"),
+    };
     if options.graph && options.agent.is_some() {
         return Err("use either --agent or --graph, not both".to_owned());
     }
@@ -118,11 +232,6 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
     }
     if options.model.is_some() && options.agent.is_none() {
         return Err("--model needs --agent".to_owned());
-    }
-    if allow_prompt {
-        options.prompt = words.join(" ");
-    } else if let Some(word) = words.first() {
-        return Err(format!("unexpected argument '{word}'"));
     }
     Ok(options)
 }
@@ -149,43 +258,52 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
             let rest = &rest[1..];
             match sub.as_str() {
                 "add" => {
-                    let mut title = Vec::new();
-                    let mut body = String::new();
-                    let mut json = false;
-                    let mut index = 0;
-                    while index < rest.len() {
-                        match rest[index].as_str() {
-                            "--body" => body = value(rest, &mut index, "--body")?.to_owned(),
-                            "--json" => json = true,
-                            flag if flag.starts_with("--") => {
-                                return Err(format!("unexpected argument '{flag}'"));
-                            }
-                            word => title.push(word.to_owned()),
-                        }
-                        index += 1;
-                    }
-                    let title = title.join(" ");
+                    const TODO_ADD_FLAGS: &[FlagSpec] = &[
+                        FlagSpec {
+                            names: &["--body"],
+                            takes_value: true,
+                            hidden: false,
+                        },
+                        FlagSpec {
+                            names: &["--json"],
+                            takes_value: false,
+                            hidden: false,
+                        },
+                    ];
+                    let parsed = parse_flags(rest, TODO_ADD_FLAGS, true)?;
+                    let title = parsed.positionals.join(" ");
+                    let body = parsed
+                        .flags
+                        .get("--body")
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_default();
+                    let json = parsed.flags.contains_key("--json");
                     if title.trim().is_empty() {
                         return Err("todo add needs a title".to_owned());
                     }
                     Ok(AgentCommand::TodoAdd { title, body, json })
                 }
                 "list" => {
+                    const TODO_LIST_FLAGS: &[FlagSpec] = &[
+                        FlagSpec {
+                            names: &["--status"],
+                            takes_value: true,
+                            hidden: false,
+                        },
+                        FlagSpec {
+                            names: &["--json"],
+                            takes_value: false,
+                            hidden: false,
+                        },
+                    ];
+                    let parsed = parse_flags(rest, TODO_LIST_FLAGS, false)?;
                     let mut status = None;
-                    let mut json = false;
-                    let mut index = 0;
-                    while index < rest.len() {
-                        match rest[index].as_str() {
-                            "--status" => {
-                                let raw = value(rest, &mut index, "--status")?;
-                                agent_api::parse_todo_status(raw).map_err(|e| e.message)?;
-                                status = Some(raw.to_ascii_lowercase());
-                            }
-                            "--json" => json = true,
-                            other => return Err(format!("unexpected argument '{other}'")),
-                        }
-                        index += 1;
+                    if let Some(raw) = parsed.flags.get("--status").cloned().flatten() {
+                        agent_api::parse_todo_status(&raw).map_err(|e| e.message)?;
+                        status = Some(raw.to_ascii_lowercase());
                     }
+                    let json = parsed.flags.contains_key("--json");
                     Ok(AgentCommand::TodoList { status, json })
                 }
                 "run" => {
@@ -201,39 +319,59 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
                 other => Err(format!("unknown todo subcommand '{other}'")),
             }
         }
-        "status" => match rest {
-            [] => Ok(AgentCommand::Status { json: false }),
-            [flag] if flag == "--json" => Ok(AgentCommand::Status { json: true }),
-            [other, ..] => Err(format!("unexpected argument '{other}'")),
-        },
+        "status" => {
+            const STATUS_FLAGS: &[FlagSpec] = &[FlagSpec {
+                names: &["--json"],
+                takes_value: false,
+                hidden: false,
+            }];
+            let parsed = parse_flags(rest, STATUS_FLAGS, false)?;
+            Ok(AgentCommand::Status {
+                json: parsed.flags.contains_key("--json"),
+            })
+        }
         "events" => {
+            const EVENTS_FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--since"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--limit"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--follow", "-f"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, EVENTS_FLAGS, false)?;
             let mut since = 0;
-            let mut limit = None;
-            let mut follow = false;
-            let mut json = false;
-            let mut index = 0;
-            while index < rest.len() {
-                match rest[index].as_str() {
-                    "--since" => {
-                        since = value(rest, &mut index, "--since")?
-                            .parse()
-                            .map_err(|_| "--since must be a number".to_owned())?;
-                    }
-                    "--limit" => {
-                        let parsed: usize = value(rest, &mut index, "--limit")?
-                            .parse()
-                            .map_err(|_| "--limit must be a number".to_owned())?;
-                        if parsed == 0 {
-                            return Err("--limit must be at least 1".to_owned());
-                        }
-                        limit = Some(parsed);
-                    }
-                    "--follow" | "-f" => follow = true,
-                    "--json" => json = true,
-                    other => return Err(format!("unexpected argument '{other}'")),
-                }
-                index += 1;
+            if let Some(raw) = parsed.flags.get("--since").cloned().flatten() {
+                since = raw
+                    .parse()
+                    .map_err(|_| "--since must be a number".to_owned())?;
             }
+            let mut limit = None;
+            if let Some(raw) = parsed.flags.get("--limit").cloned().flatten() {
+                let parsed_limit: usize = raw
+                    .parse()
+                    .map_err(|_| "--limit must be a number".to_owned())?;
+                if parsed_limit == 0 {
+                    return Err("--limit must be at least 1".to_owned());
+                }
+                limit = Some(parsed_limit);
+            }
+            let follow = parsed.flags.contains_key("--follow") || parsed.flags.contains_key("-f");
+            let json = parsed.flags.contains_key("--json");
             Ok(AgentCommand::Events {
                 since,
                 limit,
@@ -241,21 +379,28 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
                 json,
             })
         }
-        "mcp" => match rest {
-            [] => Ok(AgentCommand::Mcp),
-            [other, ..] => Err(format!("unexpected argument '{other}'")),
-        },
+        "mcp" => {
+            parse_flags(rest, &[], false)?;
+            Ok(AgentCommand::Mcp)
+        }
         "init" => {
-            let mut workspace = false;
-            let mut force = false;
-            for arg in rest {
-                match arg.as_str() {
-                    "--workspace" => workspace = true,
-                    "--force" => force = true,
-                    other => return Err(format!("unexpected argument '{other}'")),
-                }
-            }
-            Ok(AgentCommand::Init { workspace, force })
+            const INIT_FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--workspace"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--force"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, INIT_FLAGS, false)?;
+            Ok(AgentCommand::Init {
+                workspace: parsed.flags.contains_key("--workspace"),
+                force: parsed.flags.contains_key("--force"),
+            })
         }
         other => Err(format!("unknown subcommand '{other}'")),
     }
@@ -789,6 +934,7 @@ mod tests {
                 allow_sensitive: false,
                 json: true,
                 model: None,
+                progress: false,
             }))
         );
         assert!(parse(&args(&["run", "x", "--mode", "ask"])).is_err());
@@ -957,6 +1103,7 @@ mod tests {
                 allow_sensitive: false,
                 json: true,
                 model: Some("gemini-3.8-flash-high".into()),
+                progress: false,
             }))
         );
         assert!(parse(&args(&["run", "x", "--agent", "agy", "--model"])).is_err());
@@ -999,5 +1146,132 @@ mod tests {
             serde_json::to_value(snap.source).unwrap(),
             serde_json::json!("app")
         );
+    }
+
+    // TC-1769: table-driven parser handles run flags and --progress.
+    #[test]
+    fn tc_1769_flag_table_parses_run_flags_and_progress() {
+        assert_eq!(
+            parse(&args(&[
+                "run",
+                "x",
+                "--agent",
+                "a",
+                "--model",
+                "m",
+                "--progress",
+                "--json"
+            ])),
+            Ok(AgentCommand::Run(RunOptions {
+                prompt: "x".into(),
+                agent: Some("a".into()),
+                mode: None,
+                read_only: false,
+                graph: false,
+                approve_plan: false,
+                allow_sensitive: false,
+                json: true,
+                model: Some("m".into()),
+                progress: true,
+            }))
+        );
+        assert_eq!(
+            parse(&args(&["todo", "run", "abc", "--agent", "a", "--progress"])),
+            Ok(AgentCommand::TodoRun {
+                id: "abc".into(),
+                run: RunOptions {
+                    agent: Some("a".into()),
+                    progress: true,
+                    ..RunOptions::default()
+                }
+            })
+        );
+        match parse(&args(&["todo", "run", "abc", "--agent", "a"])) {
+            Ok(AgentCommand::TodoRun { run, .. }) => assert!(!run.progress),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // TC-1770: error messages unchanged by table-driven parser.
+    #[test]
+    fn tc_1770_flag_table_errors_unchanged() {
+        assert_eq!(
+            parse(&args(&["run", "x", "--nope"])),
+            Err("unexpected argument '--nope'".to_owned())
+        );
+        assert_eq!(
+            parse(&args(&["run", "x", "--agent"])),
+            Err("--agent needs a value".to_owned())
+        );
+        assert_eq!(
+            parse(&args(&["run", "x", "--agent", "--json"])),
+            Err("--agent needs a value".to_owned())
+        );
+        assert_eq!(
+            parse(&args(&["run", "x", "--mode", "ask"])),
+            Err(
+                "--mode was removed; DmuxAI runs a single agent mode (write-capable). Omit --mode."
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            parse(&args(&["run", "x", "--agent", "a", "--graph"])),
+            Err("use either --agent or --graph, not both".to_owned())
+        );
+        assert_eq!(
+            parse(&args(&["run", "x", "--graph", "--model", "m"])),
+            Err("--model cannot be used with --graph".to_owned())
+        );
+        assert_eq!(
+            parse(&args(&["run", "x", "--model", "m"])),
+            Err("--model needs --agent".to_owned())
+        );
+        assert_eq!(
+            parse(&args(&["run", "--json"])),
+            Err("run needs a prompt (use - to read it from stdin)".to_owned())
+        );
+        assert_eq!(
+            parse(&args(&["todo", "add", "--json"])),
+            Err("todo add needs a title".to_owned())
+        );
+        assert_eq!(
+            parse(&args(&["events", "--since", "x"])),
+            Err("--since must be a number".to_owned())
+        );
+        assert_eq!(
+            parse(&args(&["events", "--limit", "0"])),
+            Err("--limit must be at least 1".to_owned())
+        );
+        assert_eq!(
+            parse(&args(&["run", "--graph", "--", "--literal prompt"])),
+            Ok(AgentCommand::Run(RunOptions {
+                prompt: "--literal prompt".into(),
+                graph: true,
+                ..RunOptions::default()
+            }))
+        );
+    }
+
+    // TC-1771: help lists --progress, not --read-only; hidden flags.
+    #[test]
+    fn tc_1771_help_lists_progress_not_read_only() {
+        let usage = crate::USAGE;
+        assert!(usage.contains("--progress"));
+        assert!(!usage.contains("--read-only"));
+        let run_line = usage
+            .lines()
+            .find(|l| l.trim_start().starts_with("dmuxai run "))
+            .expect("dmuxai run line");
+        let normalized = run_line.replace(['[', ']', '(', ')'], " ");
+        let tokens: Vec<&str> = normalized.split_whitespace().collect();
+        for spec in RUN_FLAGS {
+            let name = spec.names[0];
+            let present = tokens.contains(&name);
+            if spec.hidden {
+                assert!(!present, "hidden flag {name} should not appear in run line");
+            } else {
+                assert!(present, "non-hidden flag {name} should appear in run line");
+            }
+        }
     }
 }

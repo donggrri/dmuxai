@@ -27,11 +27,11 @@ Nothing here changes how the TUI behaves for a human user.
 
 ### In scope
 
-- `dmuxai run <prompt|-> [--agent ID] [--approve-plan] [--allow-sensitive] [--graph] [--json]`.
+- `dmuxai run <prompt|-> [--agent ID] [--model M] [--approve-plan] [--allow-sensitive] [--graph] [--progress] [--json]`.
   `--mode` is not accepted (removed; see [SPEC-acp-runners](SPEC-acp-runners.md) FR-1318 / TC-1492).
 - `dmuxai todo add <title> [--body TEXT] [--json]`,
   `dmuxai todo list [--status open|running|done] [--json]`,
-  `dmuxai todo run <id> [--agent ID | --graph] [--json]` (same `--mode` rejection as `run`).
+  `dmuxai todo run <id> [--agent ID | --graph] [--model M] [--progress] [--json]` (same `--mode` rejection as `run`).
 - Internal flags (accepted by the parser but not listed in `dmuxai --help`): `--read-only` on
   `run` / `todo run` runs the prompt's turn with the read-only turn policy; the MCP `run`
   tool passes it for legacy `mode` `ask`/`plan` (FR-767).
@@ -141,6 +141,9 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | FR-1766 | Must | Given an explicit `--agent` headless direct run | Then the JSON output retains `triage` with `route: simple`, `reason: "override"`, `source: override`, `runner`, and the resolved `model`, while `plan` is absent | explicit `--model` overrides the runner model default in triage | TC-1766 |
 | FR-1767 | Must | Given an explicit `--agent` headless direct run with a prompt matching a sensitive keyword | Then without `--allow-sensitive` or `--approve-plan`, no turn starts and headless exits 7 (`APPROVAL_REQUIRED`) with the sensitive gate note; with `--approve-plan` or `--allow-sensitive`, the direct turn runs | keeps the sensitive gate rule without constructing a graph | TC-1767 |
 | FR-1768 | Must | Given an explicit `--agent` headless CLI run | Then `.dmuxai/events.jsonl` records only `agent` lifecycle events and no `graph` or `node` events | `graph_id` remains null in JSON output | TC-1768 |
+| FR-1769 | Must | Given `dmuxai run` / `todo run` flags parsed by the table-driven parser | Then `--agent`, `--model`, `--graph`, `--read-only`, `--approve-plan`, `--allow-sensitive`, `--json`, and `--progress` are recognized and `RunOptions.progress` is true iff `--progress` is present | unknown flags, missing values, and `--` handling keep their existing messages | TC-1769 |
+| FR-1770 | Must | Given the table-driven flag parser | Then every existing error message (`unexpected argument`, `<flag> needs a value`, removed `--mode`, agent/graph conflict, model rules, empty prompt, `todo add` title, numeric limits, etc.) is still produced for the same input | boundary cases in TC-1770 | TC-1770 |
+| FR-1771 | Must | Given `dmuxai --help` | Then the usage text contains `--progress` and does not contain `--read-only` | help exits 0 | TC-1771 |
 | FR-1778 | Must | Given an explicit `--agent` headless direct run | Then when `settings.stage_skills.chat` is true the prompt sent to the agent is prefixed with the implement stage skill prefix, and when it is false the prompt is sent unchanged | single 1-node chat turns apply chat stage skills only when enabled | TC-1778 |
 
 ### Code-vs-spec mismatches
@@ -197,6 +200,9 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | TC-1766 | FR-1766 | unit (app) | scripted agent | `run_headless` with explicit agent | `outcome.triage` has route simple, reason override, source override, runner, resolved model, and plan is None | `src/app.rs` `tc_1766_headless_explicit_agent_keeps_override_triage` |
 | TC-1767 | FR-1767 | unit (app) | scripted agent, sensitive prompt | `run_headless` with explicit agent without flags, then with `approve_plan` | exit 7 and no turn started; with `approve_plan` turn runs to exit 0 | `src/app.rs` `tc_1767_headless_direct_sensitive_prompt_needs_flag` |
 | TC-1768 | FR-1768 | integration (CLI unix) | fake agent sandbox | `dmuxai run hi --agent fake --json` | exit 0, `graph_id` null, events contain `agent` events and no `graph`/`node` events | `tests/agent_api_cli.rs` `tc_1768_cli_run_agent_emits_no_graph_events` |
+| TC-1769 | FR-1769 | unit | `src/cli.rs` tests | parse `run x --agent a --model m --progress --json` and `todo run abc --agent a --progress` | `RunOptions.progress` true; absent false | `src/cli.rs` `tc_1769_flag_table_parses_run_flags_and_progress` |
+| TC-1770 | FR-1770 | unit | `src/cli.rs` tests | invalid inputs | exact error messages unchanged | `src/cli.rs` `tc_1770_flag_table_errors_unchanged` |
+| TC-1771 | FR-1771 | unit | `src/cli.rs` tests / `dmuxai --help` | help text | contains `--progress`, not `--read-only` | `src/cli.rs` `tc_1771_help_lists_progress_not_read_only` |
 | TC-1778 | FR-1778 | unit (app) | scripted agent with stage skill configured | `run_headless` with explicit agent, chat enabled then disabled | prompt received contains the skill prefix when chat is enabled and equals the user prompt when disabled | `src/app.rs` `tc_1778_headless_direct_applies_chat_stage_skills` |
 
 ## 6. Data, integration, and safety contracts
