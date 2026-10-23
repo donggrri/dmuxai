@@ -15,7 +15,7 @@ The Graph view draws a run as a "subway map": columns by dependency depth, with 
 
 It replaces the subway drawing inside the existing Graph view. The data (`NodeView` with `runner`, `started_at_ms`, `finished_at_ms`, `deps`) is already in the snapshot, so the server API does not change. The List/Graph toggle, the click-for-detail panel, live SSE updates and view-only `serve` keep working.
 
-## 2. Requirements
+## 4. Requirements
 
 | ID | Priority | Requirement | Tests |
 | --- | --- | --- | --- |
@@ -48,10 +48,10 @@ It replaces the subway drawing inside the existing Graph view. The data (`NodeVi
 - **Live updates.** Running cards update their elapsed time every tick. The whole timeline is rebuilt every 5s (never while the pointer is down), so the now line and the tails move, and keyboard focus is kept across rebuilds.
 - **Screenshots.** Light and dark screenshots come from the demo-run fixture (`swim-shot.sh` in the maintainer flow, committed under `docs/images/`), not from the Rust e2e test.
 
-## 3. Tests
+## 5. Acceptance scenarios and test design
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |
 | TC-880 | FR-880, FR-881, FR-883 | unit (asset) | app.js, app.css | Swimlane renderer functions (lanes, axis ticks, now line, running tail, sub-row stacking) exist; the subway station code is gone; the detail panel is an overlay | `src/web/assets.rs` `graph_swimlane_assets` |
 | TC-881 | FR-882, FR-884, UX-880 | unit (node-free JS check via headless Chrome) | demo graph JSON | `graphEstimate()` gives the expected estimated starts and durations; the arrow router returns a non-loop-back path when the gap is < 24px; contrast computed from the light theme variables: pending ≥ 3:1, text ≥ 4.5:1; the tick step for a 14h run gives ≤ 10 ticks; a dependency-less pending node starts at now; a node after a running dependency starts at that dependency's estimated end; a node after a failed dependency is marked `blocked` | `tests/web_graph_view.rs` `graph_swimlane_math_in_headless_chrome` |
-| TC-882 | FR-880..FR-885, UX-880, UX-881 | e2e (ignored, headless Chrome) | `dmuxai serve` with the demo run (8 nodes, 4 runners, one running, one failed, three pending) | 4 lanes; cards in their lanes in time order; now line present; the running card has a tail; pending cards show "est. start"; no arrow path passes back over its source card (cross-lane and same-lane short gaps included); clicking a card opens the drawer and the svg width is unchanged; after Fit at 900px wide every text element is ≥ 11px; light and dark screenshots captured | `tests/web_graph_view.rs` `graph_swimlane_renders_in_headless_chrome` |
+| TC-882 | FR-880, FR-881, FR-882, FR-883, FR-884, FR-885, UX-880, UX-881 | e2e (ignored, headless Chrome) | `dmuxai serve` with the demo run (8 nodes, 4 runners, one running, one failed, three pending) | 4 lanes; cards in their lanes in time order; now line present; the running card has a tail; pending cards show "est. start"; no arrow path passes back over its source card (cross-lane and same-lane short gaps included); clicking a card opens the drawer and the svg width is unchanged; after Fit at 900px wide every text element is ≥ 11px; light and dark screenshots captured | `tests/web_graph_view.rs` `graph_swimlane_renders_in_headless_chrome` |

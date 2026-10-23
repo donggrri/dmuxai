@@ -23,6 +23,13 @@ Baseline: `main` (`1b9861a`)
 | FR-1460 | Must | A turn on runner R with no explicitly selected model | The model is R's own default: `composer-2.5` (non-fast) for Cursor; `provider default` (no `--model`, no select) for every other runner | Never falls back to another runner's model and never to a fast model | TC-1460, TC-1461 |
 | FR-1461 | Must | The 1-node fallback plan for runner R with no valid hint | The node model is R's default per FR-1460 instead of an error | A disallowed explicit selection is still rejected | TC-1462 |
 | FR-1462 | Must | `--web`/`serve` with an explicit `--port N` already in use | The dashboard binds a free port and reports a warning naming N and the real URL | Non-AddrInUse bind errors still fail as before | TC-1463 |
+| FR-1843 | Must | `--web` or `serve` with an explicit `--port N` already in use | The dashboard binds a free port and reports a warning naming N and the real URL | non-AddrInUse bind errors still fail | TC-1843 |
+| FR-1844 | Must | Headless `dmuxai run`/`serve` vs `--web` for the dashboard port | Headless commands never start a dashboard or bind a port; only `--web`/`serve` do, with the fallback above | port 0 means OS-assigned | TC-1844 |
+
+### Code-vs-spec mismatches
+
+| ID | Spec says | Code does (file:function) | Proposed resolution |
+| --- | --- | --- | --- |
 
 ## 5. Acceptance scenarios and test design
 
@@ -35,6 +42,8 @@ Baseline: `main` (`1b9861a`)
 | TC-1485 | FR-1460 | Manual: TUI on a grok conversation with no model picked; type a follow-up and press Enter. Pass: grok replies; no "composer-2.5 is not allowed for grok" |
 | TC-1486 | FR-1460 | Manual: same follow-up sent from the web dashboard (`POST /api/prompt` with `agent=grok` or the composer). Pass: grok reply appears in the dashboard chat |
 | TC-1487 | FR-1462 | Manual: hold port N with another `--web`; start `dmuxai --web --port N`. Pass: warning names N and the new port; the new URL loads and shows "live" |
+| TC-1843 | FR-1843 | `cargo test tc_1463_explicit_port_in_use_falls_back_with_warning` |
+| TC-1844 | FR-1844 | planned — no automated test yet (Stream B) |
 
 ## Root causes
 

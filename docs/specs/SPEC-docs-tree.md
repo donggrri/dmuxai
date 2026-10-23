@@ -15,7 +15,7 @@ Decision:
 - Preview and edit keep using the existing `/api/docs/file`, `/api/docs/render` and view-ticket routes.
 - Confinement (`docs::confine`), `IGNORED_DIRS`, the symlink rules and the caps are unchanged and reused.
 
-## 2. Requirements
+## 4. Requirements
 
 | ID | Priority | Requirement | Tests |
 | --- | --- | --- | --- |
@@ -25,7 +25,7 @@ Decision:
 | FR-833 | Should | This SPEC owns the right sidebar shell: a shared region with tabs, Files first. SPEC-todo-sidebar FR-842 adds the To-dos tab to it. Expanded folders and the sidebar's open/closed state persist in `localStorage` per workspace. A header button `Files` toggles the sidebar on its Files tab | TC-833 |
 | UX-830 | Must | The tree is keyboard accessible (`role="tree"`/`treeitem`, `aria-expanded`, Up/Down/Left/Right/Enter) and readable at narrow widths: below 900px the sidebar becomes an overlay drawer | TC-833, TC-834 |
 
-## 3. Tests
+## 5. Acceptance scenarios and test design
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |

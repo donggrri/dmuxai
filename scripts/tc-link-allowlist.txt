@@ -156,3 +156,77 @@ TC-1622 manual
 TC-1654 manual
 TC-1665 manual
 TC-1807 manual
+TC-1810 covered by headless_run_returns_agent_text (no TC ref in code yet)
+TC-1811 covered by todo_cli_add_list_run (no TC ref in code yet)
+TC-1812 covered by status_json_has_contract_keys (no TC ref in code yet)
+TC-1813 covered by headless_run_json_success_and_failure (no TC ref in code yet)
+TC-1814 covered by headless_run_rejects_unknown_and_disallowed_agent (no TC ref in code yet)
+TC-1815 planned — no automated test yet
+TC-1816 covered by parse_cli_agent_api_subcommands (no TC ref in code yet)
+TC-1817 covered by parse_cli_agent_api_subcommands (no TC ref in code yet)
+TC-1818 covered by run_complex_needs_approve_plan (no TC ref in code yet)
+TC-1819 planned — no automated test yet
+TC-1820 planned — no automated test yet
+TC-1821 covered by parse_cli_agent_api_subcommands (no TC ref in code yet)
+TC-1822 planned — no automated test yet
+TC-1823 covered by headless_run_reports_agent_error (no TC ref in code yet)
+TC-1824 planned — no automated test yet
+TC-1825 covered by tc_1660_headless_agent_approve_confirms_sensitive_gate (no TC ref in code yet)
+TC-1826 covered by tc_1661_allow_sensitive_bypasses_headless_gate (no TC ref in code yet)
+TC-1827 planned — no automated test yet
+TC-1828 covered by run_complex_needs_approve_plan (no TC ref in code yet)
+TC-1829 covered by run_complex_needs_approve_plan (no TC ref in code yet)
+TC-1830 covered by plan_decision_command_contract (no TC ref in code yet)
+TC-1831 covered by todo_graph_run_waits_for_plan_approval (no TC ref in code yet)
+TC-1832 covered by workspace_dir_flag_sets_workspace (no TC ref in code yet)
+TC-1833 covered by workspace_switch_guards (no TC ref in code yet)
+TC-1834 planned — no automated test yet
+TC-1835 covered by user_config_merged_and_overridden_by_workspace (no TC ref in code yet)
+TC-1836 planned — no automated test yet
+TC-1837 covered by state_dir_env_overrides_base (no TC ref in code yet)
+TC-1838 covered by repo_key_is_stable_fnv1a (no TC ref in code yet)
+TC-1839 covered by legacy_db_is_copied_once_and_left_in_place (no TC ref in code yet)
+TC-1840 covered by event_log_seq_is_monotonic_across_handles (no TC ref in code yet)
+TC-1841 covered by multiple_live_instances_start_in_separate_conversations (no TC ref in code yet)
+TC-1842 covered by busy_agent_is_rejected_across_runtime_sessions (no TC ref in code yet)
+TC-1843 covered by tc_1463_explicit_port_in_use_falls_back_with_warning (no TC ref in code yet)
+TC-1844 planned — no automated test yet
+TC-1845 covered by test_build_argv_prompt_injection_prevented (no TC ref in code yet)
+TC-1846 covered by runner_cwd_is_workspace (no TC ref in code yet)
+TC-1847 covered by test_build_argv_empty_image_arg_appends_to_prompt (no TC ref in code yet)
+TC-1848 covered by test_parse_jsonl_opencode_sample (no TC ref in code yet)
+TC-1849 covered by test_failure_reason (no TC ref in code yet)
+TC-1850 covered by timeout_message_mentions_config_for_user_agent (no TC ref in code yet)
+TC-1851 covered by opencode_config_gets_mcp_key (no TC ref in code yet)
+TC-1852 covered by fast_models_are_rejected_for_every_runner (no TC ref in code yet)
+TC-1853 covered by tc_1461_default_model_for_runner_is_per_runner (no TC ref in code yet)
+TC-1854 covered by fast_models_are_rejected_for_every_runner (no TC ref in code yet)
+TC-1855 covered by agy_idle_timeout_env_parsing (no TC ref in code yet)
+TC-1856 covered by agy_idle_timeout_kills_silent_child (no TC ref in code yet)
+TC-1857 covered by agy_bare_model_resolves_to_medium (no TC ref in code yet)
+TC-1858 covered by builtin_opencode_preset_registration (no TC ref in code yet)
+TC-1859 planned — no automated test yet
+TC-1860 covered by permission_denial_is_detected_in_stderr (no TC ref in code yet)
+TC-1861 covered by finish_accepts_forced_kill_after_result_in_agent_mode (no TC ref in code yet)
+TC-1862 legacy: no test reference yet
+TC-1863 covered by tc_1420_permission_denied_ends_cancelled (no TC ref in code yet)
+TC-1864 covered by grok_acp_argv_puts_model_before_stdio (no TC ref in code yet)
+TC-1865 covered by grok_auth_is_models_stdout_only (no TC ref in code yet)
+TC-1866 covered by cursor_argv_always_contains_composer_2_5_by_default (no TC ref in code yet)
+TC-1867 covered by codex_argv_includes_mcp_config_overrides (no TC ref in code yet)
+TC-1880 planned — no automated test yet
+TC-1881 covered by validate_rejects_fast_and_non_composer_models (no TC ref in code yet)
+TC-1882 covered by validate_model_id (no TC ref in code yet)
+TC-1883 planned — no automated test yet
+TC-1884 manual
+TC-1885 covered by gate_pauses_until_continue (no TC ref in code yet)
+TC-1886 planned — no automated test yet
+TC-1887 covered by store_round_trip (no TC ref in code yet)
+TC-1888 covered by discover_skills_finds_agent_graph_engineering (no TC ref in code yet)
+TC-1889 covered by legacy_ask_and_plan_are_read_only (no TC ref in code yet)
+TC-1890 covered by image_slash_command_attaches_supported_file (no TC ref in code yet)
+TC-1891 covered by rejects_oversized_images (no TC ref in code yet)
+TC-1892 covered by submit_prompt_forwards_image_paths_to_adapter (no TC ref in code yet)
+TC-1893 covered by prompt_with_image_references (no TC ref in code yet)
+TC-1894 covered by cursor_passes_image_paths_to_cli (no TC ref in code yet)
+TC-1895 manual

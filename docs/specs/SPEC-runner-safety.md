@@ -21,6 +21,8 @@ Agy implement turns used full edit permissions on simple questions (#112). `/res
 | FR-1646 | Must | A planned node names another runner or a disallowed runner while pinned | Rewrite to the pinned runner; log a plan note | — | TC-1646 |
 | FR-1647 | Must | App startup restores the latest conversation | FR-1643 applies to the restored runner | — | TC-1647 |
 | FR-1648 | Must | Dashboard opens a conversation | FR-1643 applies | — | TC-1648 |
+| FR-1858 | Must | A required runner executable is missing upon turn invocation or startup registration (`src/settings.rs`, `src/agent/custom.rs`) | Missing binary on send fails immediately with `<label>: failed to start <program>: <error>`. Missing executable at startup silently omits the built-in preset (`opencode`, `grok`) without error | User custom entries with missing binaries still register but fail on spawn | TC-1858 |
+| FR-1859 | Must | Active turn is cancelled via UI or API across any runner (`src/agent/cursor.rs`, `src/agent/agy.rs`, `src/agent/custom.rs`, `src/agent/acp/client.rs`) | The adapter aborts execution, terminates the child process group, and emits `AgentEvent::Cancelled` | ACP runners send `session/cancel` with 1500ms grace before kill; no orphan processes remain | TC-1859 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -35,3 +37,5 @@ Agy implement turns used full edit permissions on simple questions (#112). `/res
 | TC-1646 | FR-1646 | `cargo test tc_1646_pin_graph_plan_runners_rewrites_disallowed` |
 | TC-1647 | FR-1647 | `cargo test tc_1647_startup_restore_honours_allowed_runners` |
 | TC-1648 | FR-1648 | `cargo test tc_1648_dashboard_load_honours_allowed_runners` |
+| TC-1858 | FR-1858 | `cargo test builtin_opencode_preset_registration` |
+| TC-1859 | FR-1859 | planned — no automated test yet (Stream B) |

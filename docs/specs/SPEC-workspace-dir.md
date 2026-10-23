@@ -16,7 +16,7 @@ Decision:
 
 Re-exec is simpler and safer than re-wiring the live App, which holds about 40 workspace-bound handles (DB, event sink, docs, to-dos, MCP, warm cursor process).
 
-## 2. Requirements
+## 4. Requirements
 
 | ID | Priority | Requirement | Tests |
 | --- | --- | --- | --- |
@@ -27,6 +27,17 @@ Re-exec is simpler and safer than re-wiring the live App, which holds about 40 w
 | FR-874 | Must | `POST /api/workspace/switch {path}` validates the path. It answers 409 while any turn or graph run is in flight, and 403 in view-only mode. Otherwise it sets a switch-pending flag **atomically with the busy check** (under the same App lock); from then on new turns, graph runs and to-do runs are refused with 409 "workspace switch in progress". It records the path in the recent list, answers 202 and then, on Unix, re-executes the current binary with the original arguments minus any `-C DIR`, `--workspace-dir DIR` or `--workspace-dir=DIR`, plus `-C <canonical path>`, and the same port, bind and `DMUXAI_WEB_TOKEN`, after a clean shutdown (warm processes reaped, session heartbeat closed). Before tearing anything down it runs a preflight (`current_exe()` resolves and is executable, the target still validates). If the preflight fails, nothing has been shut down: it clears the switch-pending flag and publishes the error as a dashboard notice. If `exec` itself fails after the clean shutdown (it returns only on error), the process prints the error and the exact restart command (`dmuxai … -C <path>`) to stderr and exits with code 1. It never keeps serving a half-shut-down workspace. On non-Unix it answers 501. The dashboard shows "switching…", reconnects and reloads the snapshot | TC-875, TC-876 |
 | FR-875 | Must | Every runner turn (built-in and custom agents, graph nodes, headless `run`) uses the active workspace as its process working directory and as `{workspace}`. No code path may fall back to the process cwd once the workspace is resolved | TC-877 |
 | NFR-870 | Must | The workspace API returns directory names only, never file names or file contents, and only inside the browse roots. It never follows a path or symlink into the deny list, and never logs or returns the dashboard token. Errors name the reason (`not a directory`, `not writable`, `denied: credential directory`) without listing directory contents | TC-873 |
+| FR-1832 | Must | `-C`/`--workspace-dir DIR` with a nonexistent or non-directory DIR: `src/main.rs` `main` parses the flag via `workspace::extract_workspace_dir_flag` and validates with `workspace::validate_workspace_dir`; on failure it prints `error: -C {raw}: {reason}` (or `error: -C {raw}: invalid path` when the flag has no value) to stderr and exits with code 2. Reasons include `does not exist` and `not a directory` | TC-1832 |
+| FR-1833 | Must | Dashboard workspace switch is refused in view-only `serve` mode: `POST /api/workspace/switch` returns HTTP 403 (`view-only: start dmuxai --web`) (src/web/server.rs `post_workspace_switch`); directory browsing is likewise refused | TC-1833 |
+| FR-1834 | Must | User config path resolution: `default_user_config_path` (src/settings.rs) returns `$XDG_CONFIG_HOME/dmuxai/dmuxai.toml` when `XDG_CONFIG_HOME` is set and non-empty, otherwise `$HOME/.config/dmuxai/dmuxai.toml`; returns `None` when neither is set or non-empty. `--config`/`DMUXAI_CONFIG` are specified in SPEC-env-config-isolation (in flight) | TC-1834 |
+| FR-1835 | Must | User file vs workspace `dmuxai.toml` precedence per key, and merge vs replace for lists: both files are loaded user-first then workspace (src/settings.rs `load_with_runners`/`apply_toml`); most keys apply per-key only when present (workspace overrides, absent key preserves user value); `[[agents.custom]]` (`custom_agents`) is replaced wholesale when the workspace file contains that section, while a workspace `[agents]` without `custom` keeps the user list; MCP servers merge by name (later replaces, `enabled = false` removes) | TC-1835 |
+| FR-1836 | Must | Malformed TOML in either file: a parse failure in the user config pushes a `user config {path} ignored: {error}` warning and skips it; a failure in workspace `dmuxai.toml` pushes `dmuxai.toml ignored: {error}`; settings continue with defaults (src/settings.rs `load_with_runners`) | TC-1836 |
+
+### Code-vs-spec mismatches
+
+| ID | Spec says | Code does (file:function) | Proposed resolution |
+| --- | --- | --- | --- |
+| OQ-1813 | §1 says the workspace cannot be picked from the CLI with a flag, from config, or from the dashboard | `src/main.rs` `main` supports `-C`/`--workspace-dir`; `src/settings.rs` `load`/`default_user_config_path` reads `[workspace] dir` from the user config; `src/web/server.rs` `post_workspace_switch` re-executes on switch | Update the §1 sentence to describe the implemented `-C`/config/dashboard capabilities; keep code as-is |
 
 ### Design notes
 
@@ -44,7 +55,7 @@ Re-exec is simpler and safer than re-wiring the live App, which holds about 40 w
 - `POST /api/workspace/validate` stays available in view-only mode, and works for paths outside the browse roots, as FR-872 specifies. It needs the dashboard token, returns only ok or a reason (never directory contents), and uses the same write probe as the CLI.
 - The header path button shows a `▾` caret, so you can tell it opens the dialog.
 
-## 3. Tests
+## 5. Acceptance scenarios and test design
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |
@@ -56,3 +67,8 @@ Re-exec is simpler and safer than re-wiring the live App, which holds about 40 w
 | TC-875 | FR-874 | integration | router with a fake busy turn | `switch` answers 409 while busy, 202 when idle (the re-exec hook is a test double), 403 view-only, and 501 on non-Unix (cfg-gated); after a 202 a new prompt gets 409; a failing preflight clears the flag and raises a notice; a failing exec double exits with code 1 and prints the restart command; the re-exec argv has exactly one `-C` (also when the original used `--workspace-dir=DIR`) | `src/web/server.rs` `workspace_switch_guards` |
 | TC-876 | FR-874 | e2e (ignored, Unix) | `dmuxai --web` (pty) with a fixed token | After `switch` to a second temp dir, the same URL serves a snapshot whose `workspace` is the new path within 15s | `tests/web_workspace_dir.rs` `workspace_switch_reexecs_serve` |
 | TC-877 | FR-875 | unit | custom agent with `command = ["pwd"]`-style probe, graph node runner | The spawned process cwd and `{workspace}` both equal the resolved workspace, not the test process cwd | `src/custom_agent.rs` `runner_cwd_is_workspace` |
+| TC-1832 | FR-1832 | integration (CLI) | built binary | `dmuxai -C /nonexistent status` | exit 2, one line on stderr | `tests/cli.rs` `workspace_dir_flag_sets_workspace` |
+| TC-1833 | FR-1833 | integration | router | view-only switch | 403 in serve | `src/web/server.rs` `workspace_switch_guards` |
+| TC-1834 | FR-1834 | unit | env | default_user_config_path | XDG vs HOME resolution | planned — no automated test yet (Stream B) |
+| TC-1835 | FR-1835 | unit | two config files | load settings | merge/replace behavior | `src/settings.rs` `user_config_merged_and_overridden_by_workspace` |
+| TC-1836 | FR-1836 | unit | malformed TOML | load settings | warning and defaults | planned — no automated test yet (Stream B) |

@@ -14,7 +14,7 @@ Decision:
 2. Add `dmuxai init`. It writes a commented starter config listing the runners it detected.
 3. Document first-run setup and the release tarball layout in the README.
 
-## 2. Requirements
+## 4. Requirements
 
 | ID | Priority | Requirement | Tests |
 | --- | --- | --- | --- |
@@ -27,7 +27,7 @@ Decision:
 | FR-816 | Must | README install steps match the release archive layout: `dmuxai-linux-x86_64.tar.gz` extracts to `dmuxai-linux-x86_64/{dmuxai,README.md,CHANGELOG.md}`. The archive keeps its top directory (it holds README and CHANGELOG; a flat archive would scatter files into the cwd). The README shows `mkdir -p ~/.local/bin`, the install command, a one-line `tar --strip-components=1` alternative and a `PATH` note | TC-815 |
 | FR-983 | Must | The TUI welcome message (first system line of a new session, also the first dashboard transcript line) names the runners from the loaded runner registry, in picker order: the built-in codex, cursor and agy plus every registered custom runner including the built-in opencode and grok presets, for example `Runners: codex, cursor, agy, opencode, grok.` It no longer hardcodes "Codex, Cursor, and AGY". The rest of the help text (/agent, /mode, /image, /effort, /status, /quit, F2, Ctrl+C) is kept. A runner that is not registered is not named | TC-816 |
 
-## 3. Tests
+## 5. Acceptance scenarios and test design
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |

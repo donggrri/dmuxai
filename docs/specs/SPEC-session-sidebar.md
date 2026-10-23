@@ -10,7 +10,7 @@ Today the conversation list sits in a small box to the right of the transcript i
 
 Decision: move the list into a collapsible **left sidebar**, like ChatGPT's. It shows every conversation in the workspace (the current one first, then by last update) with its title, last agent, relative time and a running spinner. Clicking a row switches to it; a `New` button starts a new conversation. It reuses the existing `load_conversation` and `new_conversation` session commands. The snapshot's conversation entries gain the fields the list needs. The TUI already has the equivalent (F3 picker), so it only gets the same agent, time and running marks.
 
-## 2. Requirements
+## 4. Requirements
 
 | ID | Priority | Requirement | Tests |
 | --- | --- | --- | --- |
@@ -40,14 +40,14 @@ Decision: move the list into a collapsible **left sidebar**, like ChatGPT's. It 
 - The picker width (FR-865) is `clamp(90% of the terminal, 60, 160)`, capped by the widest row and by the terminal width. Row fitting is a pure function (`fit_picker_row`) so the give-way order is unit tested without a terminal; the time and running mark come last in that order because they are what the picker is for (FR-864). Only when the space inside the border is narrower than the current mark, `●` and the time (12 columns for `just now`, so a terminal under 16 columns) does ratatui clip the row.
 - A sidebar toggle made before the first snapshot names the workspace is held and saved under the real workspace key, never under a placeholder key.
 
-## 3. Tests
+## 5. Acceptance scenarios and test design
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |
 | TC-860 | FR-860 | unit | `SessionConversation` serde | New fields serialize as `last_agent`, `turn_count` and `running`; old snapshots without them still deserialize (defaults) | `src/web/snapshot.rs` `session_conversation_fields_roundtrip` |
 | TC-861 | FR-860 | unit | conversation engine with two conversations and one in-flight turn | The listed card for that conversation has `running = true` and its `last_agent`; the list is capped, keeps the active conversation first and orders the rest by `updated_at` descending | `src/app.rs` `session_conversations_report_running_and_agent` |
-| TC-862 | FR-861..FR-863, UX-860 | unit (asset) | index.html, JS and CSS assets | `#sessions-sidebar` nav with `aria-label`, toggle with `aria-controls`/`aria-expanded`, `New` button, filter, spinner class, reduced-motion rule; the old `.session-conversations` box is gone | `src/web/assets.rs` `session_sidebar_assets` |
-| TC-863 | FR-861..FR-863, UX-860 | e2e (ignored, headless Chrome) | `dmuxai --web` on a workspace with two stored conversations | The sidebar lists both with agent and time, active first; clicking the other row makes it active (`aria-current`); `New` adds a row; collapse persists across reload; screenshot captured | `tests/web_session_sidebar.rs` `session_sidebar_renders_in_headless_chrome` |
+| TC-862 | FR-861, FR-862, FR-863, UX-860 | unit (asset) | index.html, JS and CSS assets | `#sessions-sidebar` nav with `aria-label`, toggle with `aria-controls`/`aria-expanded`, `New` button, filter, spinner class, reduced-motion rule; the old `.session-conversations` box is gone | `src/web/assets.rs` `session_sidebar_assets` |
+| TC-863 | FR-861, FR-862, FR-863, UX-860 | e2e (ignored, headless Chrome) | `dmuxai --web` on a workspace with two stored conversations | The sidebar lists both with agent and time, active first; clicking the other row makes it active (`aria-current`); `New` adds a row; collapse persists across reload; screenshot captured | `tests/web_session_sidebar.rs` `session_sidebar_renders_in_headless_chrome` |
 | TC-864 | FR-864 | unit (TUI render) | App with two conversations, one running | The picker rows contain the agent name, relative time and the running mark | `src/app.rs` `conversation_picker_shows_agent_time_running` |
 | TC-865 | FR-865 | unit (TUI render) | App with a short and a long-titled running conversation, rendered at 80x24, 120x40 and 200x50 | The picker box, found by its `┌ Conversations` corner cell in the buffer, is exactly 72, 108 and 141 columns wide (141 = widest row + 4, under the 160 cap); every row, running or not and selected or not, shows the agent and relative time inside the right border; the running row keeps its `[id]` and turn count at every size; the long title is shortened with `…` at 80 and 120, and no row has `…` at 200 | `src/app.rs` `conversation_picker_scales_with_terminal_width` |
 | TC-866 | FR-865 | unit | `conversation_picker_width` at the clamp borders | 50→50, 59→59, 60→60, 61→60, 67→60, 68→61, 160→144, 178→160, 179→160, 200→160 with ample content; a narrow natural width is raised to 60 but never past the terminal | `src/app.rs` `conversation_picker_width_borders` |

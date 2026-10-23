@@ -116,6 +116,27 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | FR-1652 | Must | Given a plan turn completes into `awaiting_approval` | Then the session transcript gains a system line `Plan waiting for approval — approve or reject in the dashboard (or POST the graph approve command)` after the `Planning with …` line, so the transcript tail is never only `Planning with …` once planning finished | Replan revisions that already pushed a notice still include this line when the gate opens | TC-1652 |
 | FR-1653 | Must | Given `turn.state` is `awaiting_approval` on a dashboard with the chat session | Then the header run-status pill shows `Waiting for approval` with readable contrast in light and dark themes | View-only `serve` uses the same pill when a stored run awaits approval | TC-1653 |
 | FR-1654 | Should | Given `docs/API.md` and README Agent API section | Then the `turn` object and `awaiting_approval` / `needs_input` states are documented on `GET /api/state` | — | TC-1654 |
+| FR-1810 | Must | Given a headless `dmuxai run` process exits | Then the exit code is one of 0 success, 1 agent error or failed/cancelled graph, 2 usage, 3 unknown agent, 4 busy/conflict, 5 runner not in `allowed_runners`, 6 internal error, 7 plan approval or sensitive gate, 130 cancelled | A graph stopped by a cancelled step exits 130 (FR-1416) | TC-1810 |
+| FR-1811 | Must | Given `dmuxai todo run <id>` | Then it uses the same exit codes as FR-1810, plus 3 for a missing to-do, 4 for an already running to-do, and 2 for an empty `todo add` title | `todo add`/`list` exit 2 on usage errors | TC-1811 |
+| FR-1812 | Must | Given `dmuxai status` or `dmuxai events` | Then `status` prints its JSON and exits 0 even when stores are unreadable (warnings recorded); `events` prints available events and exits 0 when the log is missing | malformed event lines are skipped; unreadable workspace → 2 | TC-1812 |
+| FR-1813 | Must | Given `--json` on `run` / `todo run` | Then stdout contains exactly one JSON object with `ok`, `exit_code`, `conversation_id`, `agent`, `graph_id`, `text`, `messages`, `error`, `todo`, `triage`, `plan`, and `events` (`{first_seq,last_seq}` or nulls) | error runs use the same object with `ok: false` | TC-1813 |
+| FR-1814 | Must | Given `--agent ID` naming an unknown runner | Then the run exits 3 with `error: "unknown agent 'ID'"` and no turn starts | matching is case-insensitive after trim | TC-1814 |
+| FR-1815 | Must | Given an empty prompt or empty stdin for `run -` | Then parsing or reading stdin fails with exit 2 and a one-line message | whitespace-only prompts are empty | TC-1815 |
+| FR-1816 | Must | Given an unknown flag or subcommand | Then usage is printed to stderr and the process exits 2 | `--mode` is also exit 2 with a removed-mode message | TC-1816 |
+| FR-1817 | Must | Given a flag that requires a value but has none or a flag-like value | Then parsing fails with exit 2 and `<flag> needs a value` | `value()` never consumes another flag | TC-1817 |
+| FR-1818 | Must | Given a graph run reaches `AwaitingApproval` without `--approve-plan` | Then headless exits 7 with the plan text and cancels the run | `--approve-plan` is required for complex plans | TC-1818 |
+| FR-1819 | Must | Given a sensitive gate (`WaitingGate`) without `--allow-sensitive` (or `--agent` + `--approve-plan`) | Then headless exits 7 | `--allow-sensitive` auto-confirms every gate | TC-1819 |
+| FR-1820 | Must | Given the selected runner's binary cannot be spawned | Then the turn emits an agent error and the run exits 1 | the error names `failed to start <program>` | TC-1820 |
+| FR-1821 | Must | Given `--graph` on `dmuxai run` | Then the flag is accepted and the run follows the normal judge path (no-op for legacy scripts) | `--graph` with `--agent` is rejected at parse time | TC-1821 |
+| FR-1822 | Must | Given the same feature in headless vs dashboard mode | Then headless uses CLI flags for gates/approval, has no workspace switch or live prompt API, and persists conversations to the same per-repo DB; `serve` is view-only and never runs agents | dashboard uses `/graph continue` and `POST /api/prompt` | TC-1822 |
+| FR-1823 | Must | Given an agent error mid-turn | Then the run exits 1 with the last system error or `run failed` | cancellation exits 130 instead | TC-1823 |
+| FR-1824 | Must | Given `--read-only` | Then the turn runs under the read-only turn policy | internal flag; not listed in `--help` | TC-1824 |
+
+### Code-vs-spec mismatches
+
+| ID | Spec says | Code does (file:function) | Proposed resolution |
+| --- | --- | --- | --- |
+| OQ-1810 | `dmuxai run --graph` is a no-op for legacy scripts | `src/cli.rs` `run_headless` passes `graph` into `HeadlessRequest` and `todo run --graph` uses `RunMode::Graph` | Clarify that `--graph` is a no-op only for `run`; `todo run --graph` selects graph mode |
 
 ## 5. Acceptance scenarios and test design
 
@@ -142,6 +163,21 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | TC-1652 | FR-1652 | unit (app) | Complete a valid plan turn | Inspect `session_view` transcript | Last system line is the plan-waiting message after `Planning with …` | `src/app.rs` `tc_1652_transcript_plan_waiting_line` |
 | TC-1653 | FR-1653 | unit (assets) | `app.css` and `app.js` | Static review | `.run-status-awaiting-approval` exists; `updateRunStatus` handles `turn.state === 'awaiting_approval'` | `src/web/assets.rs` `tc_1653_waiting_for_approval_status_assets` |
 | TC-1654 | FR-1654 | manual | `docs/API.md`, README | Read-through | `turn` documented on `/api/state` | Manual review |
+| TC-1810 | FR-1810 | unit (app) | scripted agent success/error/cancel | run headless | exit codes 0/1/130 and 3/5/6 boundaries | `src/app.rs` `headless_run_returns_agent_text`, `headless_run_reports_agent_error`, `headless_run_cancel_exits_130`, `headless_run_rejects_unknown_and_disallowed_agent` |
+| TC-1811 | FR-1811 | integration (CLI) | temp workspace + fake agent | `todo add/run/list` | exit codes for missing/running/busy to-dos | `tests/agent_api_cli.rs` `todo_cli_add_list_run` |
+| TC-1812 | FR-1812 | integration | temp workspace | `status --json`, `events --since` | exit 0 on missing log; malformed lines skipped | `tests/agent_api_cli.rs` `status_json_has_contract_keys`, `events_cli_since_json` |
+| TC-1813 | FR-1813 | integration | fake agent | `dmuxai run ... --json` | one JSON object with all documented fields | `tests/agent_api_cli.rs` `headless_run_json_success_and_failure` |
+| TC-1814 | FR-1814 | unit (app) | `test_app()` | unknown agent request | exit 3, JSON error | `src/app.rs` `headless_run_rejects_unknown_and_disallowed_agent` |
+| TC-1815 | FR-1815 | unit | parse/read_prompt | empty prompt/stdin | exit 2 | planned — no automated test yet (Stream B) |
+| TC-1816 | FR-1816 | unit | parse | unknown flag/subcommand | exit 2 | `src/cli.rs` `parse_cli_agent_api_subcommands` |
+| TC-1817 | FR-1817 | unit | parse | flag missing value | exit 2 | `src/cli.rs` `parse_cli_agent_api_subcommands` |
+| TC-1818 | FR-1818 | integration (CLI) | fake agent plan | `dmuxai run ...` without `--approve-plan` | exit 7 with plan JSON | `tests/cli.rs` `run_complex_needs_approve_plan` |
+| TC-1819 | FR-1819 | unit (app) | scripted agent sensitive keyword | headless run | exit 7 without flag | planned — no automated test yet (Stream B) |
+| TC-1820 | FR-1820 | unit | custom agent missing binary | run turn | agent error, exit 1 | planned — no automated test yet (Stream B) |
+| TC-1821 | FR-1821 | unit | parse | `--graph` flag | accepted | `src/cli.rs` `parse_cli_agent_api_subcommands` |
+| TC-1822 | FR-1822 | integration | headless vs `--web` | compare gates/persistence | documented behavior holds | planned — no automated test yet (Stream B) |
+| TC-1823 | FR-1823 | unit (app) | scripted agent error | run headless | exit 1 | `src/app.rs` `headless_run_reports_agent_error` |
+| TC-1824 | FR-1824 | unit (app) | `--read-only` | run headless | read-only policy | planned — no automated test yet (Stream B) |
 
 ## 6. Data, integration, and safety contracts
 

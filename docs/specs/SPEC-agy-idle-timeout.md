@@ -2,30 +2,36 @@
 
 Status: Implemented · Dogfood: #8
 
-## Decision summary
+## 1. Decision summary
 Long AGY Implement turns could start a background command, such as `cargo build &`, and then wait on it with no output, hanging for 5+ minutes. dmuxai now (1) tells AGY in Implement mode to run commands in the foreground with a bounded time, and (2) aborts the turn when AGY produces no stdout event for an idle timeout. The child process is killed and a clear error is shown.
 
-## Scope
+## 2. Scope
+
 In scope: AGY adapter (`src/agent/agy.rs`). Out of scope: the other providers, which already stream continuously.
 
-## Terms / state
+## 3. Terms and state model
+
 - Idle timeout: the time since the last stdout line from the AGY child. Default 300 s. Override with the `DMUXAI_AGY_IDLE_TIMEOUT_SECS` environment variable (integer seconds; 0 disables it).
 
-## Requirements
+## 4. Requirements
 | ID | Pri | Requirement |
 |---|---|---|
 | FR-440 | Must | If no stdout line arrives for the idle timeout, the AGY child is killed and the turn fails with an error that contains `no events for <N>s` and mentions background commands. |
 | FR-441 | Must | Each stdout line resets the idle timer. |
 | FR-442 | Must | `DMUXAI_AGY_IDLE_TIMEOUT_SECS` overrides the default. `0` disables the timeout. Invalid values fall back to the default. |
 | FR-443 | Should | The Implement prompt tells AGY not to start background or detached processes and to run commands in the foreground with a timeout. |
+| FR-1855 | Must | `parse_idle_timeout_secs` in `src/agent/agy.rs` parses `DMUXAI_AGY_IDLE_TIMEOUT_SECS`: None yields default 300s (`AGY_IDLE_TIMEOUT_DEFAULT_SECS`); trimmed "0" disables the timeout (None); positive integer strings parse to `Some(secs)`; non-numeric or negative values fall back to 300s. |
+| FR-1856 | Must | When the idle deadline fires in `stream_child` (`src/agent/agy.rs`), the child process is killed and the turn fails with: `"AGY produced no events for <N>s; it may be waiting on a background command. Run commands in the foreground with a bounded timeout."`. |
 
-## Acceptance
+## 5. Acceptance scenarios and test design
 | TC | Covers | Test |
 |---|---|---|
 | TC-440 | FR-440 | `agy_idle_timeout_kills_silent_child` (fake AGY script that prints one init event, then sleeps) |
 | TC-441 | FR-441 | `agy_idle_timer_resets_on_each_event` |
 | TC-442 | FR-442 | `agy_idle_timeout_env_parsing` |
 | TC-443 | FR-443 | `implement_prompt_forbids_background_commands` |
+| TC-1855 | FR-1855 | `src/agent/agy.rs` `agy_idle_timeout_env_parsing` |
+| TC-1856 | FR-1856 | `src/agent/agy.rs` `agy_idle_timeout_kills_silent_child` |
 
-## Exit criteria
+## 6. Exit criteria
 TCs pass in CI. Dogfood #8 is closed.

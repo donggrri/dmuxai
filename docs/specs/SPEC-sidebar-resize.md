@@ -12,7 +12,7 @@ Decision: each docked sidebar gets a drag handle on its inner edge (the right ed
 
 The graph node detail pane (`#graph-detail`) is part of the Graph panel, not a docked sidebar, and is out of scope.
 
-## 2. Requirements
+## 4. Requirements
 
 | ID | Priority | Requirement | Tests |
 | --- | --- | --- | --- |
@@ -46,7 +46,7 @@ The graph node detail pane (`#graph-detail`) is part of the Graph panel, not a d
 - Each handle is 8px and sits fully outside the inner edge (`right: -8px` on the left sidebar, `left: -8px` on the right), so it does not cover the list scrollbar.
 - Above 900px, an open sidebar sets its dock variable to `var(--left-sidebar-width)` or `var(--right-sidebar-width)`. The defaults stay 320px.
 
-## 3. Tests
+## 5. Acceptance scenarios and test design
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |

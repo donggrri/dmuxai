@@ -63,7 +63,7 @@ still compiles.
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-510 | FR-510–FR-514 | unit | Repository checkout | Read `AGENTS.md` | Section lists `submit_prompt`, `test_app`, and extended helpers | `tests/agent_test_helpers.rs` |
+| TC-510 | FR-510, FR-511, FR-512, FR-513, FR-514 | unit | Repository checkout | Read `AGENTS.md` | Section lists `submit_prompt`, `test_app`, and extended helpers | `tests/agent_test_helpers.rs` |
 | TC-511 | FR-511, FR-516 | unit | `test_app()`, `app.input` set | `app.handle_enter()` | Same adapter send count as `submit_prompt()` | `src/app.rs` |
 | TC-512 | FR-515 | unit | Repository checkout | Read `src/app.rs` test module doc | Mentions `submit_prompt` and `test_app` | `tests/agent_test_helpers.rs` |
 | TC-513 | FR-519 | unit | All `SPEC-*.md` files | `cargo test every_spec_has_status_line` | This SPEC has `Status:` in first 10 lines | `tests/spec_index.rs` |

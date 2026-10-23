@@ -59,13 +59,13 @@ Follow-up states: `queued` -> `started` (terminal) or `queued` -> `removed`
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-1230 | FR-1230..1232 | unit | Direct turn running | Send two follow-ups, finish turns | Queued in order, not sent or in messages; start one by one | `followup_during_run_is_queued_and_runs_in_order` |
+| TC-1230 | FR-1230, FR-1231, FR-1232 | unit | Direct turn running | Send two follow-ups, finish turns | Queued in order, not sent or in messages; start one by one | `followup_during_run_is_queued_and_runs_in_order` |
 | TC-1231 | FR-1233 | unit | Three queued | Remove one, edit one | Edited text runs, removed never does; late edit refused | `queued_followup_can_be_removed_or_edited_before_it_starts` |
 | TC-1232 | FR-1234 | unit | One queued | Cancel the run | Queue kept, next starts after the cancel | `stop_keeps_the_followup_queue` |
 | TC-1233 | FR-1235 | unit | Run active | Submit without queue permission | Busy, nothing queued | `followup_without_queue_permission_is_refused_as_busy`, `dashboard_slash_commands_via_prompt` |
 | TC-1234 | FR-1232 | unit | Queued item of another conversation | Run ends | It does not start | `queued_followup_stays_with_its_conversation` |
 | TC-1235 | FR-1235 | integration | Router with and without `web_attached` | POST prompt, queue_remove, queue_edit | allow_queue follows web_attached; 403 view-only | `view_only_dashboard_cannot_queue_followups` |
-| TC-1236 | FR-1230..1234, UX-1236 | headless browser | Real server and assets, fake app | Send during run, x, Edit, Stop | Badges, order, remove, edit, Stop keeps queue | `cargo test --test web_followup_queue -- --ignored` |
+| TC-1236 | FR-1230, FR-1231, FR-1232, FR-1233, FR-1234, UX-1236 | headless browser | Real server and assets, fake app | Send during run, x, Edit, Stop | Badges, order, remove, edit, Stop keeps queue | `cargo test --test web_followup_queue -- --ignored` |
 
 ## 6. Data, integration, and safety contracts
 

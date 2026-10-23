@@ -77,7 +77,7 @@ Per-task override: `/plan --skills grill-me,-implement:tdd,review:local-review <
 | UX-1501 | The plan approval card shows the skills of each step and lets the user remove or add them before approving. |
 | NFR-1500 | Skill text is treated as untrusted prompt content. It never changes runner permissions, the model policy, the allowed runners or the sandbox. |
 
-## 5. Per-runner delivery
+## 6. Per-runner delivery
 
 | Runner | Native skill dir (FR-1504, opt-in) | Default (inject) | Notes |
 |---|---|---|---|
@@ -87,7 +87,7 @@ Per-task override: `/plan --skills grill-me,-implement:tdd,review:local-review <
 | opencode headless | `.dmuxai/run-skills/<run>/.agents/skills/<id>` + pointer | yes | |
 | codex | `.dmuxai/run-skills/<run>/.agents/skills/<id>` + pointer | yes | |
 
-## 6. Tests
+## 5. Acceptance scenarios and test design
 
 | ID | Test |
 |---|---|
