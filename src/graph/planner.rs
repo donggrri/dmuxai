@@ -198,6 +198,9 @@ mod tests {
         assert!(sensitive_keyword_match("touch the db schema"));
     }
 
+    // TC-936 / FR-934, FR-936: the fallback heuristic is pure and returns
+    // simple when at most one executable role is inferred (FR-937); it never
+    // builds a plan (FR-948).
     #[test]
     fn heuristic_route_handles_korean_and_english() {
         assert_eq!(heuristic_route("README 오타 고쳐줘"), Route::Simple);
