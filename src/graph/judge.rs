@@ -55,11 +55,6 @@ pub enum TriageSource {
     Override,
 }
 
-/// True for a prompt that is trivially simple (FR-1613): non-empty after
-/// trimming, one line, not a slash command, at most 3 whitespace-separated
-/// words and at most 40 characters (counted per character, not per byte —
-/// e.g. a 3-word Korean greeting stays trivial). The judge turn is skipped
-/// for such prompts.
 /// Prefix for simple question turns (FR-1641).
 pub const QUESTION_ANSWER_HINT: &str =
     "Answer directly. Do not run tools or explore the workspace unless the answer needs it.";
@@ -75,8 +70,7 @@ pub fn is_question_prompt(text: &str) -> bool {
     }
     let lower = trimmed.to_ascii_lowercase();
     const PREFIXES: &[&str] = &[
-        "what ", "why ", "how ", "which ", "who ", "when ", "where ", "is ", "are ", "can ",
-        "does ", "do ",
+        "what ", "why ", "how ", "which ", "who ", "when ", "where ", "is ", "are ", "does ",
     ];
     if PREFIXES.iter().any(|prefix| lower.starts_with(prefix)) {
         return true;
@@ -89,6 +83,11 @@ pub fn is_question_prompt(text: &str) -> bool {
     false
 }
 
+/// True for a prompt that is trivially simple (FR-1613): non-empty after
+/// trimming, one line, not a slash command, at most 3 whitespace-separated
+/// words and at most 40 characters (counted per character, not per byte —
+/// e.g. a 3-word Korean greeting stays trivial). The judge turn is skipped
+/// for such prompts.
 pub fn is_trivial_prompt(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.contains('\n') || trimmed.starts_with('/') {

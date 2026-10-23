@@ -23,7 +23,3 @@ Every parallel worktree appended a row to the hand-maintained SPEC table in `doc
 
 ## Exit criteria
 TCs pass in CI. Dogfood #14 is downgraded from friction to resolved.
-
-## Feature specs (generated index)
-
-See `bash scripts/spec-index.sh` for the full table. Runner safety: [SPEC-runner-safety.md](SPEC-runner-safety.md) (FR-1640..1648, TC-1640..1648).
