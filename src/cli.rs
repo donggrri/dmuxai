@@ -13,6 +13,7 @@ use dmuxai::agent_api::{self, ApiError, exit};
 use dmuxai::events::{EventLog, EventSink};
 use dmuxai::mcp_server::{McpBackend, RunArgs};
 use dmuxai::settings::DmuxSettings;
+use dmuxai::web::DashboardHub;
 
 use crate::app::{App, HeadlessOutcome, HeadlessRequest};
 
@@ -556,6 +557,10 @@ async fn run_and_report(
     }
 }
 
+fn headless_dashboard_hub(workspace: String, sink: Arc<EventSink>) -> DashboardHub {
+    dmuxai::web::DashboardHub::new(dmuxai::web::SnapshotSource::App, workspace).with_events(sink)
+}
+
 async fn run_headless(
     workspace_root: &Path,
     options: &RunOptions,
@@ -582,8 +587,7 @@ async fn run_headless(
     let first_seq = sink.log().last_seq() + 1;
     let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
         .unwrap_or_else(|_| workspace_root.display().to_string());
-    let hub = dmuxai::web::DashboardHub::new(dmuxai::web::SnapshotSource::App, workspace)
-        .with_events(sink.clone());
+    let hub = headless_dashboard_hub(workspace, sink.clone());
 
     let mut app =
         App::new(engine, workspace_root.to_path_buf(), settings).map_err(|e| internal(&e))?;
@@ -976,6 +980,24 @@ mod tests {
                     ..RunOptions::default()
                 }
             })
+        );
+    }
+
+    // TC-1763 / FR-1763: headless-style dashboard hub reports SnapshotSource::App
+    #[test]
+    fn tc_1763_headless_dashboard_source_is_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = dmuxai::events::EventSink::new(
+            dmuxai::events::EventLog::open(dir.path(), "/test".to_owned()),
+            std::time::Duration::from_secs(60),
+            None,
+        );
+        let hub = headless_dashboard_hub("/test".to_owned(), sink);
+        let snap = hub.snapshot();
+        assert_eq!(snap.source, dmuxai::web::SnapshotSource::App);
+        assert_eq!(
+            serde_json::to_value(snap.source).unwrap(),
+            serde_json::json!("app")
         );
     }
 }

@@ -141,6 +141,7 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | FR-1766 | Must | Given an explicit `--agent` headless direct run | Then the JSON output retains `triage` with `route: simple`, `reason: "override"`, `source: override`, `runner`, and the resolved `model`, while `plan` is absent | explicit `--model` overrides the runner model default in triage | TC-1766 |
 | FR-1767 | Must | Given an explicit `--agent` headless direct run with a prompt matching a sensitive keyword | Then without `--allow-sensitive` or `--approve-plan`, no turn starts and headless exits 7 (`APPROVAL_REQUIRED`) with the sensitive gate note; with `--approve-plan` or `--allow-sensitive`, the direct turn runs | keeps the sensitive gate rule without constructing a graph | TC-1767 |
 | FR-1768 | Must | Given an explicit `--agent` headless CLI run | Then `.dmuxai/events.jsonl` records only `agent` lifecycle events and no `graph` or `node` events | `graph_id` remains null in JSON output | TC-1768 |
+| FR-1778 | Must | Given an explicit `--agent` headless direct run | Then when `settings.stage_skills.chat` is true the prompt sent to the agent is prefixed with the implement stage skill prefix, and when it is false the prompt is sent unchanged | single 1-node chat turns apply chat stage skills only when enabled | TC-1778 |
 
 ### Code-vs-spec mismatches
 
@@ -190,12 +191,13 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | TC-1824 | FR-1824 | unit (app) | `--read-only` | run headless | read-only policy | planned — no automated test yet (Stream B) |
 | TC-1761 | FR-1761 | unit (app) | `test_app()` | construct `HeadlessOutcome::failure(...)` | `ok=false`, given exit code, error text, all other optionals `None`; serialized JSON matches the old literal keys | `src/app.rs` `tc_1761_headless_outcome_failure_builder_defaults` |
 | TC-1762 | FR-1762 | unit | `SnapshotSource::App` | serde round-trip | `"app"` | `src/web/snapshot.rs` `tc_1762_snapshot_source_app_serializes_as_app` |
-| TC-1763 | FR-1763 | unit | `DashboardHub::new(SnapshotSource::App, ...)` | `hub.snapshot()` | source is `App` and serializes `"app"` | `src/app.rs` `tc_1763_headless_dashboard_source_is_app` |
+| TC-1763 | FR-1763 | unit | `DashboardHub::new(SnapshotSource::App, ...)` | `hub.snapshot()` | source is `App` and serializes `"app"` | `src/cli.rs` `tc_1763_headless_dashboard_source_is_app` |
 | TC-1764 | FR-1764 | unit (app) | scripted agent with hub event sink | `run_headless` with explicit agent | exit 0, text returned, `graph_id` None, `last_graph_run` None, event log has `agent` events but no `graph`/`node` events | `src/app.rs` `tc_1764_headless_explicit_agent_runs_without_graph` |
 | TC-1765 | FR-1765 | unit (app) | scripted agent returning error | `run_headless` with explicit agent | exit 1, `ok: false`, agent error reported once, no message contains "Graph failed" or "graph node" | `src/app.rs` `tc_1765_headless_explicit_agent_error_reported_once` |
 | TC-1766 | FR-1766 | unit (app) | scripted agent | `run_headless` with explicit agent | `outcome.triage` has route simple, reason override, source override, runner, resolved model, and plan is None | `src/app.rs` `tc_1766_headless_explicit_agent_keeps_override_triage` |
 | TC-1767 | FR-1767 | unit (app) | scripted agent, sensitive prompt | `run_headless` with explicit agent without flags, then with `approve_plan` | exit 7 and no turn started; with `approve_plan` turn runs to exit 0 | `src/app.rs` `tc_1767_headless_direct_sensitive_prompt_needs_flag` |
 | TC-1768 | FR-1768 | integration (CLI unix) | fake agent sandbox | `dmuxai run hi --agent fake --json` | exit 0, `graph_id` null, events contain `agent` events and no `graph`/`node` events | `tests/agent_api_cli.rs` `tc_1768_cli_run_agent_emits_no_graph_events` |
+| TC-1778 | FR-1778 | unit (app) | scripted agent with stage skill configured | `run_headless` with explicit agent, chat enabled then disabled | prompt received contains the skill prefix when chat is enabled and equals the user prompt when disabled | `src/app.rs` `tc_1778_headless_direct_applies_chat_stage_skills` |
 
 ## 6. Data, integration, and safety contracts
 

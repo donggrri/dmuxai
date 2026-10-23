@@ -1007,7 +1007,6 @@ pub struct HeadlessOutcome {
     pub system_prompt: Option<HeadlessSystemPrompt>,
 }
 
-#[allow(dead_code)]
 impl HeadlessOutcome {
     pub fn failure(
         exit_code: i32,
@@ -1032,29 +1031,6 @@ impl HeadlessOutcome {
         }
     }
 
-    pub fn success(
-        conversation_id: impl Into<String>,
-        agent: Option<String>,
-        text: impl Into<String>,
-        messages: Vec<HeadlessMessage>,
-    ) -> Self {
-        Self {
-            ok: true,
-            exit_code: dmuxai::agent_api::exit::OK,
-            conversation_id: conversation_id.into(),
-            agent,
-            graph_id: None,
-            text: text.into(),
-            messages,
-            error: None,
-            error_kind: None,
-            todo: None,
-            triage: None,
-            plan: None,
-            system_prompt: None,
-        }
-    }
-
     pub fn with_error_kind(mut self, kind: impl Into<String>) -> Self {
         self.error_kind = Some(kind.into());
         self
@@ -1070,16 +1046,6 @@ impl HeadlessOutcome {
         self
     }
 
-    pub fn with_messages(mut self, messages: Vec<HeadlessMessage>) -> Self {
-        self.messages = messages;
-        self
-    }
-
-    pub fn with_todo(mut self, todo: Option<Todo>) -> Self {
-        self.todo = todo;
-        self
-    }
-
     pub fn with_triage(mut self, triage: Option<Triage>) -> Self {
         self.triage = triage;
         self
@@ -1092,21 +1058,6 @@ impl HeadlessOutcome {
 
     pub fn with_system_prompt(mut self, system_prompt: Option<HeadlessSystemPrompt>) -> Self {
         self.system_prompt = system_prompt;
-        self
-    }
-
-    pub fn with_agent(mut self, agent: Option<String>) -> Self {
-        self.agent = agent;
-        self
-    }
-
-    pub fn with_ok(mut self, ok: bool) -> Self {
-        self.ok = ok;
-        self
-    }
-
-    pub fn with_exit_code(mut self, exit_code: i32) -> Self {
-        self.exit_code = exit_code;
         self
     }
 }
@@ -12634,7 +12585,18 @@ impl App {
             {
                 let _ = self.apply_runner_and_model(&runner, &model);
             }
-            self.try_submit_to_agent(agent, req.prompt.clone(), false, true)?;
+            let prompt = if self.settings.stage_skills.chat {
+                let prefix = self.stage_skill_prefix(
+                    &NodeRole::Implement.to_string(),
+                    runner_name(agent),
+                    None,
+                    None,
+                );
+                format!("{prefix}{}", req.prompt.clone())
+            } else {
+                req.prompt.clone()
+            };
+            self.try_submit_to_agent(agent, prompt, false, true)?;
             return Ok(());
         }
         if self.pending_turn_policy == Some(TurnPolicy::ReadOnly) {
@@ -23201,19 +23163,6 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    // TC-1763 / FR-1763: headless-style dashboard hub reports SnapshotSource::App
-    #[test]
-    fn tc_1763_headless_dashboard_source_is_app() {
-        let hub =
-            dmuxai::web::DashboardHub::new(dmuxai::web::SnapshotSource::App, "/test".to_owned());
-        let snap = hub.snapshot();
-        assert_eq!(snap.source, dmuxai::web::SnapshotSource::App);
-        assert_eq!(
-            serde_json::to_value(snap.source).unwrap(),
-            serde_json::json!("app")
-        );
-    }
-
     // TC-1751 / FR-1730: disallowed headless model is policy-rejected before any request
     #[tokio::test]
     async fn tc_1751_headless_disallowed_model_policy() {
@@ -23606,6 +23555,124 @@ mod tests {
                 .any(|record| record.kind == "graph" || record.kind == "node"),
             "direct run must not emit graph or node events, got: {all_events:?}"
         );
+    }
+
+    // TC-1778 / FR-1778: headless direct path applies chat stage skills only when enabled.
+    #[tokio::test]
+    async fn tc_1778_headless_direct_applies_chat_stage_skills() {
+        for chat_enabled in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let skill_dir = dir.path().join("skills").join("review-list");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: review-list\ndescription: Review checklist\n---\nREVIEW-BODY check error handling.\n",
+            )
+            .unwrap();
+            let toml = if chat_enabled {
+                "[stages.implement]\nskills = [\"./skills/review-list\"]\n[skills]\nchat = true\n"
+            } else {
+                "[stages.implement]\nskills = [\"./skills/review-list\"]\n"
+            };
+            std::fs::write(dir.path().join("dmuxai.toml"), toml).unwrap();
+
+            let settings = DmuxSettings::load_with_user_config(dir.path(), None);
+            let workspace = dir.path().to_path_buf();
+            let engine =
+                ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let cancelled = Arc::new(Mutex::new(Vec::new()));
+            let adapters = Agent::all()
+                .into_iter()
+                .map(|agent| {
+                    Box::new(RecordingAdapter {
+                        agent,
+                        sent: Arc::clone(&sent),
+                        cancelled: Arc::clone(&cancelled),
+                        fail_send: false,
+                        unsupported_modes: Vec::new(),
+                    }) as Box<dyn AgentAdapter>
+                })
+                .collect();
+            let (event_tx, event_rx) = event_channel();
+            let mut app = App::with_runtime(
+                adapters,
+                event_rx,
+                Vec::new(),
+                engine,
+                workspace,
+                settings,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            app.selected = adapter_index(Agent::Codex);
+            app.skip_judge_for_tests = true;
+
+            let cancel = Arc::new(AtomicBool::new(false));
+            let sent_clone = Arc::clone(&sent);
+            tokio::spawn(async move {
+                for _ in 0..100 {
+                    let maybe_req = {
+                        let lock = sent_clone.lock().unwrap();
+                        lock.first().cloned()
+                    };
+                    if let Some((agent, req)) = maybe_req {
+                        let conv_id = req.conversation_id.clone();
+                        let turn_id = req.turn_id.clone();
+                        let _ = event_tx
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conv_id.clone()),
+                                turn_id: Some(turn_id.clone()),
+                                event: AgentEvent::TextDelta("direct reply".to_owned()),
+                            })
+                            .await;
+                        let _ = event_tx
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conv_id),
+                                turn_id: Some(turn_id),
+                                event: AgentEvent::Completed,
+                            })
+                            .await;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+
+            let req = HeadlessRequest {
+                prompt: "Say hello".to_owned(),
+                agent: Some("codex".to_owned()),
+                mode: None,
+                graph: false,
+                approve_plan: false,
+                allow_sensitive: false,
+                todo_id: None,
+                model: None,
+            };
+            let outcome = app.run_headless(req, cancel).await;
+            assert!(outcome.ok, "chat_enabled={chat_enabled}");
+
+            let requests = sent.lock().unwrap();
+            let prompt = requests
+                .iter()
+                .map(|(_, r)| r.prompt.clone())
+                .next()
+                .expect("sent request");
+            if chat_enabled {
+                assert!(
+                    prompt.contains("REVIEW-BODY"),
+                    "chat enabled: expected skill prefix, got: {prompt}"
+                );
+            } else {
+                assert_eq!(
+                    prompt, "Say hello",
+                    "chat disabled: prompt must be unchanged"
+                );
+            }
+        }
     }
 
     // TC-1765 / FR-1765: explicit agent error is reported once directly without graph failure notices.
