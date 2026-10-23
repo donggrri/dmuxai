@@ -305,7 +305,7 @@ async fn deliver_command(
         return;
     };
     let mut cmd = tokio::process::Command::new(program);
-    crate::process::strip_dashboard_env(cmd.as_std_mut());
+    crate::process::apply_child_env_policy_tokio(&mut cmd);
     cmd.args(&command[1..])
         .current_dir(workspace_root)
         .stdin(Stdio::piped())

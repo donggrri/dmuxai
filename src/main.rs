@@ -79,7 +79,7 @@ DmuxAI - One terminal. Multiple AI coding agents.
 
 Usage:
   dmuxai [--help|--version]
-  dmuxai [-C DIR | --workspace-dir DIR] [subcommand...]
+  dmuxai [-C DIR | --workspace-dir DIR] [--config PATH] [subcommand...]
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
@@ -96,6 +96,7 @@ Options:
   -h, --help             Print this help message and exit
   -V, --version          Print version information and exit
   -C, --workspace-dir DIR  Run in DIR instead of the current directory
+  --config PATH          Use PATH as the dmuxai.toml config file
   serve            Run the local dashboard server without the TUI
   --web            Run the local dashboard with agents (no TUI)
   --port N         Dashboard port (default 7420)
@@ -303,6 +304,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 std::process::exit(2);
             }
         };
+    let (config_flag, remaining_args) = match dmuxai::workspace::extract_config_flag(remaining_args)
+    {
+        Ok(res) => res,
+        Err(_) => {
+            eprintln!("error: --config needs a value");
+            std::process::exit(2);
+        }
+    };
     if let Some(raw_path) = workspace_flag {
         match dmuxai::workspace::validate_workspace_dir(Path::new(&raw_path)) {
             Ok(canonical) => {
@@ -316,6 +325,25 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("error: -C {raw_path}: {reason}");
                 std::process::exit(2);
             }
+        }
+    }
+
+    let config_path = config_flag.clone().or_else(|| {
+        std::env::var("DMUXAI_CONFIG")
+            .ok()
+            .filter(|v| !v.is_empty())
+    });
+    if let Some(raw_path) = &config_path
+        && !std::path::Path::new(raw_path).exists()
+    {
+        eprintln!("config file not found: {raw_path}");
+        std::process::exit(2);
+    }
+    if let Some(raw_path) = config_flag {
+        // SAFETY: called at the very start of main before the tokio runtime
+        // or any background threads are spawned.
+        unsafe {
+            std::env::set_var("DMUXAI_CONFIG", &raw_path);
         }
     }
 

@@ -1778,6 +1778,7 @@ pub(crate) mod tests {
     pub(crate) static TEST_CURSOR_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn cursor_mcp_notice_once_per_session() {
         // TC-578, INT-561: Cursor runner with an existing user .cursor/mcp.json; two turns.
         // The "not propagated" notice is emitted once per session; the user file is untouched.
@@ -1787,6 +1788,7 @@ pub(crate) mod tests {
 
         #[cfg(unix)]
         let _guard = TEST_CURSOR_MUTEX.lock().await;
+        let _env_guard = dmuxai::state_path::test_env_lock();
 
         let temp = tempfile::tempdir().unwrap();
         let cursor_dir = temp.path().join(".cursor");
@@ -1900,6 +1902,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     pub(crate) struct FakeCursorFixture {
         pub(crate) _guard: tokio::sync::MutexGuard<'static, ()>,
+        pub(crate) _env_guard: std::sync::MutexGuard<'static, ()>,
         pub(crate) _dir: tempfile::TempDir,
         pub(crate) log_path: PathBuf,
         pub(crate) exit_once_marker: PathBuf,
@@ -1917,6 +1920,7 @@ pub(crate) mod tests {
         pub(crate) async fn new() -> Self {
             use std::os::unix::fs::PermissionsExt;
             let guard = TEST_CURSOR_MUTEX.lock().await;
+            let env_guard = dmuxai::state_path::test_env_lock();
             let dir = tempfile::tempdir().expect("tempdir");
             let log_path = dir.path().join("fake_cursor.log");
             let exit_once_marker = dir.path().join("exit_once.marker");
@@ -1953,6 +1957,7 @@ pub(crate) mod tests {
             }
             Self {
                 _guard: guard,
+                _env_guard: env_guard,
                 _dir: dir,
                 log_path,
                 exit_once_marker,
@@ -2186,9 +2191,11 @@ pub(crate) mod tests {
     // refused with "already running a turn".
     #[tokio::test]
     #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
     async fn send_right_after_result_is_queued_not_refused() {
         use std::os::unix::fs::PermissionsExt;
         let _guard = TEST_CURSOR_MUTEX.lock().await;
+        let _env_guard = dmuxai::state_path::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("linger.log");
         let script_path = dir.path().join("cursor-agent");
@@ -2343,8 +2350,10 @@ pub(crate) mod tests {
     // its whole group is gone, and the prompt queued behind it then runs.
     #[tokio::test]
     #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
     async fn lingering_cli_is_stopped_after_grace_and_queued_prompt_runs() {
         let _guard = TEST_CURSOR_MUTEX.lock().await;
+        let _env_guard = dmuxai::state_path::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let (script_path, log_path) = lingering_cursor_script(dir.path(), 60);
         // SAFETY: TEST_CURSOR_MUTEX is held for the whole test.
@@ -2411,8 +2420,10 @@ pub(crate) mod tests {
     // stops that CLI's whole group and drops the queued prompt (Cancelled).
     #[tokio::test]
     #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
     async fn cancel_while_queued_kills_lingering_cli_and_drops_prompt() {
         let _guard = TEST_CURSOR_MUTEX.lock().await;
+        let _env_guard = dmuxai::state_path::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let (script_path, log_path) = lingering_cursor_script(dir.path(), 60);
         // SAFETY: TEST_CURSOR_MUTEX is held for the whole test.
@@ -2475,8 +2486,10 @@ pub(crate) mod tests {
     // Cancelled for it instead of dropping it silently.
     #[tokio::test]
     #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
     async fn adapter_close_while_queued_reports_cancelled() {
         let _guard = TEST_CURSOR_MUTEX.lock().await;
+        let _env_guard = dmuxai::state_path::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let (script_path, log_path) = lingering_cursor_script(dir.path(), 60);
         // SAFETY: TEST_CURSOR_MUTEX is held for the whole test.
@@ -2889,11 +2902,14 @@ pub(crate) mod tests {
         use crate::agent::{ConversationId, TurnId};
 
         /// Holds the shared cursor test lock and clears the fake env on drop.
-        struct FakeEnvGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
+        struct FakeEnvGuard(
+            #[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>,
+            #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+        );
 
         impl Drop for FakeEnvGuard {
             fn drop(&mut self) {
-                // SAFETY: still holding TEST_CURSOR_MUTEX.
+                // SAFETY: still holding TEST_CURSOR_MUTEX and test_env_lock.
                 unsafe {
                     for key in FAKE_VARS {
                         std::env::remove_var(key);
@@ -2904,7 +2920,10 @@ pub(crate) mod tests {
         }
 
         async fn lock_env() -> FakeEnvGuard {
-            FakeEnvGuard(TEST_CURSOR_MUTEX.lock().await)
+            FakeEnvGuard(
+                TEST_CURSOR_MUTEX.lock().await,
+                dmuxai::state_path::test_env_lock(),
+            )
         }
         static BUILD: std::sync::Once = std::sync::Once::new();
 

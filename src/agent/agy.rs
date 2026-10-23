@@ -942,19 +942,23 @@ mod tests {
     }
 
     // TC-1010 / FR-1010: the shared headless builder (used by every runner,
-    // judge and planner turn) removes the dashboard token without any extra call.
+    // judge and planner turn) removes the dashboard token and internal env vars without any extra call.
     #[test]
     fn agent_child_env_drops_web_token() {
-        fn token_removed(command: &tokio::process::Command) -> bool {
+        fn env_removed(command: &tokio::process::Command, var: &str) -> bool {
             command
                 .as_std()
                 .get_envs()
-                .any(|(key, value)| key == "DMUXAI_WEB_TOKEN" && value.is_none())
+                .any(|(key, value)| key == var && value.is_none())
         }
         let command = dmuxai::process::headless_command(std::path::PathBuf::from("agy"));
-        assert!(token_removed(&command), "headless_command");
+        for var in dmuxai::process::INTERNAL_ENV_VARS {
+            assert!(env_removed(&command, var), "headless_command: {var}");
+        }
         let command = dmuxai::process::cursor_command().expect("cursor_command");
-        assert!(token_removed(&command), "cursor_command");
+        for var in dmuxai::process::INTERNAL_ENV_VARS {
+            assert!(env_removed(&command, var), "cursor_command: {var}");
+        }
     }
 
     #[test]
@@ -1317,11 +1321,13 @@ mod tests {
     static AGY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
     async fn with_agy_spawn_env<F>(program: &Path, idle_secs: &str, work: F) -> F::Output
     where
         F: std::future::Future,
     {
         let _guard = AGY_ENV_LOCK.lock().await;
+        let _env_guard = dmuxai::state_path::test_env_lock();
         let saved_bin = std::env::var(AGY_BINARY_OVERRIDE).ok();
         let saved_idle = std::env::var(AGY_IDLE_TIMEOUT_ENV).ok();
         unsafe {

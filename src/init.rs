@@ -2,7 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::settings::{default_user_config_path, find_grok_bin, find_on_path, find_opencode_bin};
+use crate::runtime_env::RuntimeEnv;
+use crate::settings::{
+    default_user_config_path_from, find_grok_bin_from, find_on_path_from, find_opencode_bin_from,
+};
 
 /// Starter config. Every setting is commented out, so the file parses to
 /// `DmuxSettings::default()` (SPEC-first-run TC-814).
@@ -130,15 +133,33 @@ pub fn starter_config(opencode_detected: bool, grok_detected: bool) -> String {
     text
 }
 
+/// The starter config text constructed using runners detected from `env`.
+pub fn starter_config_with_env(env: &RuntimeEnv) -> String {
+    let detected = detected_runners_with_env(env);
+    let opencode = detected.contains(&"opencode");
+    let grok = detected.contains(&"grok");
+    starter_config(opencode, grok)
+}
+
 /// Where `dmuxai init` writes: `<workspace>/dmuxai.toml` with `--workspace`,
-/// otherwise the user config file.
-pub fn target_path(workspace: bool, workspace_root: &Path) -> Result<PathBuf, String> {
+/// otherwise the user config file determined from `env`.
+pub fn target_path_with_env(
+    workspace: bool,
+    workspace_root: &Path,
+    env: &RuntimeEnv,
+) -> Result<PathBuf, String> {
     if workspace {
         return Ok(workspace_root.join("dmuxai.toml"));
     }
-    default_user_config_path().ok_or_else(|| {
+    default_user_config_path_from(env).ok_or_else(|| {
         "cannot find the user config directory: set HOME or XDG_CONFIG_HOME".to_owned()
     })
+}
+
+/// Where `dmuxai init` writes: `<workspace>/dmuxai.toml` with `--workspace`,
+/// otherwise the user config file.
+pub fn target_path(workspace: bool, workspace_root: &Path) -> Result<PathBuf, String> {
+    target_path_with_env(workspace, workspace_root, &RuntimeEnv::from_process())
 }
 
 /// Writes the starter config to `path`, creating parent directories. An existing
@@ -163,17 +184,22 @@ pub fn write_starter_config(
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
-/// Runners whose executables are found on `PATH` (opencode honours
-/// `DMUXAI_OPENCODE_BIN`; grok honours `DMUXAI_GROK_BIN` and `~/.grok/bin`).
-pub fn detected_runners() -> Vec<&'static str> {
+/// Runners whose executables are found using `env`.
+pub fn detected_runners_with_env(env: &RuntimeEnv) -> Vec<&'static str> {
     RUNNER_BINARIES
         .into_iter()
         .filter(|name| match *name {
-            "opencode" => find_opencode_bin().is_some(),
-            "grok" => find_grok_bin().is_some(),
-            _ => find_on_path(name).is_some(),
+            "opencode" => find_opencode_bin_from(env).is_some(),
+            "grok" => find_grok_bin_from(env).is_some(),
+            _ => find_on_path_from(name, env).is_some(),
         })
         .collect()
+}
+
+/// Runners whose executables are found on `PATH` (opencode honours
+/// `DMUXAI_OPENCODE_BIN`; grok honours `DMUXAI_GROK_BIN` and `~/.grok/bin`).
+pub fn detected_runners() -> Vec<&'static str> {
+    detected_runners_with_env(&RuntimeEnv::from_process())
 }
 
 #[cfg(test)]
@@ -233,12 +259,14 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("dmuxai.toml");
             std::fs::write(&path, text).unwrap();
-            let settings = crate::settings::DmuxSettings::load_with_runners(
+            let env = RuntimeEnv::default();
+            let settings = crate::settings::DmuxSettings::load_with_runners_and_env(
                 dir.path(),
                 Some(&path),
                 None,
                 None,
                 None,
+                &env,
             );
             assert_eq!(settings, crate::settings::DmuxSettings::default());
         }

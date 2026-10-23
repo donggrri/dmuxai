@@ -147,7 +147,7 @@ impl McpClient {
             Transport::Stdio { command, args, env } => {
                 let mut cmd = tokio::process::Command::new(command);
                 cmd.args(args);
-                crate::process::strip_dashboard_env(cmd.as_std_mut());
+                crate::process::apply_child_env_policy_tokio(&mut cmd);
                 for (k, v) in env {
                     cmd.env(k, v);
                 }

@@ -15678,6 +15678,7 @@ mod tests {
 
     fn pin_test_state_dir() {
         TEST_STATE_DIR.get_or_init(|| {
+            let _guard = dmuxai::state_path::test_env_lock();
             let dir = tempfile::tempdir().expect("test state tempdir");
             let state = dir.path().join("dmuxai");
             std::fs::create_dir_all(&state).expect("dmuxai state dir");

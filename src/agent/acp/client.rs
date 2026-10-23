@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
 use crate::agent::{Agent, AgentEvent, AgentOutput, OutputContext, TurnPolicy};
-use dmuxai::process::strip_dashboard_env;
+use dmuxai::process::apply_child_env_policy;
 
 use super::debug::acp_trace;
 use super::permissions::{PermissionContext, choose_permission_option, permission_option_denies};
@@ -116,7 +116,7 @@ pub async fn run_acp_turn(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.kill_on_drop(true);
-    strip_dashboard_env(command.as_std_mut());
+    apply_child_env_policy(command.as_std_mut());
 
     #[cfg(unix)]
     {
