@@ -101,7 +101,12 @@ pub struct DmuxSettings {
     /// True when any configured `[[mcp.servers]]` entry (enabled or disabled)
     /// is named `dmuxai-memory`; suppresses the built-in entry (FR-733).
     memory_server_configured: bool,
+    /// Per-runner system prompt configs keyed by normalized runner ID (or "default") (PR-2.5).
+    pub runner_prompts: BTreeMap<String, crate::agent_prompt::RunnerPromptConfig>,
 }
+
+/// Convenience alias for [`DmuxSettings`].
+pub type Settings = DmuxSettings;
 
 /// Name of the built-in shared MCP entry added when `[memory]` is set (FR-733).
 pub const BUILTIN_MEMORY_SERVER_NAME: &str = "dmuxai-memory";
@@ -160,6 +165,8 @@ struct DmuxToml {
     skills: Option<crate::stage_skills::SkillsToml>,
     /// Legacy execution modes table (removed); presence triggers a warning.
     modes: Option<LegacyModesToml>,
+    /// `[runners.<id>]` prompt configuration (PR-2.5).
+    runners: Option<std::collections::BTreeMap<String, crate::agent_prompt::RunnerPromptToml>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -388,6 +395,7 @@ impl DmuxSettings {
         let mut settings = Self::default();
 
         let mut configs: Vec<DmuxToml> = Vec::new();
+        let mut user_runners = None;
         if let Some(user_path) = user_config_path
             && let Ok(contents) = std::fs::read_to_string(user_path)
         {
@@ -395,6 +403,25 @@ impl DmuxSettings {
                 Ok(mut parsed) => {
                     if let Some(ws) = parsed.workspace.take() {
                         settings.workspace = ws;
+                    }
+                    if let Some(runners) = parsed.runners.take() {
+                        let base_dir = match user_path.parent() {
+                            Some(p) if !p.as_os_str().is_empty() => p,
+                            _ => Path::new("."),
+                        };
+                        let mut parsed_map = BTreeMap::new();
+                        for (id, raw) in runners {
+                            let norm_id = id.trim().to_ascii_lowercase();
+                            let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
+                                &norm_id,
+                                &raw,
+                                "user",
+                                base_dir,
+                                &mut settings.config_warnings,
+                            );
+                            parsed_map.insert(norm_id, cfg);
+                        }
+                        user_runners = Some(parsed_map);
                     }
                     configs.push(parsed);
                 }
@@ -406,9 +433,27 @@ impl DmuxSettings {
         }
 
         let config_path = workspace.join("dmuxai.toml");
+        let mut workspace_runners = None;
         if let Ok(contents) = std::fs::read_to_string(&config_path) {
             match toml::from_str::<DmuxToml>(&contents) {
-                Ok(parsed) => configs.push(parsed),
+                Ok(mut parsed) => {
+                    if let Some(runners) = parsed.runners.take() {
+                        let mut parsed_map = BTreeMap::new();
+                        for (id, raw) in runners {
+                            let norm_id = id.trim().to_ascii_lowercase();
+                            let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
+                                &norm_id,
+                                &raw,
+                                "workspace",
+                                workspace,
+                                &mut settings.config_warnings,
+                            );
+                            parsed_map.insert(norm_id, cfg);
+                        }
+                        workspace_runners = Some(parsed_map);
+                    }
+                    configs.push(parsed);
+                }
                 Err(error) => {
                     settings
                         .config_warnings
@@ -416,6 +461,9 @@ impl DmuxSettings {
                 }
             }
         }
+
+        settings.runner_prompts =
+            crate::agent_prompt::merge_runner_prompts(user_runners, workspace_runners);
 
         // FR-810/FR-811 and FR-890/FR-891: a built-in preset is registered only
         // when its flag is not false, no config names that agent, and the
@@ -850,6 +898,15 @@ impl DmuxSettings {
                 .any(|spec| spec.builtin && spec.name.eq_ignore_ascii_case(runner)),
         }
     }
+
+    /// Pure resolver for a runner's system prompt (PR-2.5).
+    pub fn resolve_agent_prompt(
+        &self,
+        runner: &str,
+        role: crate::agent_prompt::PromptRole,
+    ) -> Option<crate::agent_prompt::ResolvedPrompt> {
+        crate::agent_prompt::resolve(self, runner, role)
+    }
 }
 
 impl Default for DmuxSettings {
@@ -885,6 +942,7 @@ impl Default for DmuxSettings {
             memory: None,
             memory_raw: MemoryToml::default(),
             memory_server_configured: false,
+            runner_prompts: BTreeMap::new(),
         }
     }
 }
@@ -2817,5 +2875,430 @@ mod builtin_grok_tests {
         );
         drop(guard);
         assert!(rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod agent_prompt_tests {
+    use super::*;
+    use crate::agent_prompt::{PromptInject, PromptRole, resolve};
+
+    #[test]
+    fn agent_prompt_inline_text() {
+        let ws = tempfile::tempdir().unwrap();
+        let config = r#"
+[runners.default]
+system_prompt = "You are a helpful coding assistant."
+"#;
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+        let resolved = resolve(&settings, "codex", PromptRole::Chat).expect("prompt resolved");
+        assert_eq!(resolved.text, "You are a helpful coding assistant.");
+        assert_eq!(resolved.source, "workspace:[runners.default]");
+        assert_eq!(resolved.inject, PromptInject::Session);
+    }
+
+    #[test]
+    fn agent_prompt_file_text() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("prompt.txt"), "Instructions from file.").unwrap();
+        let config = r#"
+[runners.codex]
+system_prompt_file = "prompt.txt"
+"#;
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+        let resolved = resolve(&settings, "codex", PromptRole::Chat).expect("prompt resolved");
+        assert_eq!(resolved.text, "Instructions from file.");
+        assert_eq!(resolved.source, "workspace:[runners.codex] (prompt.txt)");
+    }
+
+    #[test]
+    fn agent_prompt_relative_path_resolved_against_config_file_dir() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = user_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        std::fs::write(
+            prompts_dir.join("user_prompt.txt"),
+            "User prompt from relative file.",
+        )
+        .unwrap();
+
+        let user_toml = user_dir.path().join("user.toml");
+        std::fs::write(
+            &user_toml,
+            r#"
+[runners.default]
+system_prompt_file = "prompts/user_prompt.txt"
+"#,
+        )
+        .unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), Some(&user_toml));
+        let resolved =
+            resolve(&settings, "cursor", PromptRole::Chat).expect("prompt resolved from user file");
+        assert_eq!(resolved.text, "User prompt from relative file.");
+        assert_eq!(
+            resolved.source,
+            "user:[runners.default] (prompts/user_prompt.txt)"
+        );
+    }
+
+    #[test]
+    fn agent_prompt_absolute_path_allowed() {
+        let ws = tempfile::tempdir().unwrap();
+        let prompt_dir = tempfile::tempdir().unwrap();
+        let abs_file = prompt_dir.path().join("abs_prompt.txt");
+        std::fs::write(&abs_file, "Absolute prompt text.").unwrap();
+
+        let config = format!(
+            r#"
+[runners.default]
+system_prompt_file = "{}"
+"#,
+            abs_file.to_string_lossy()
+        );
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+        let resolved = resolve(&settings, "codex", PromptRole::Chat).expect("resolved");
+        assert_eq!(resolved.text, "Absolute prompt text.");
+        assert!(resolved.source.starts_with("workspace:[runners.default] ("));
+    }
+
+    #[test]
+    fn agent_prompt_both_set_warns_and_ignored() {
+        let ws = tempfile::tempdir().unwrap();
+        let config = r#"
+[runners.default]
+system_prompt = "Inline prompt"
+system_prompt_file = "some_file.txt"
+"#;
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[runners.default]")
+                    && w.contains("both system_prompt and system_prompt_file")
+                    && w.contains("prompt ignored")),
+            "expected both configured warning, got {:?}",
+            settings.config_warnings
+        );
+        assert!(resolve(&settings, "cursor", PromptRole::Chat).is_none());
+    }
+
+    #[test]
+    fn agent_prompt_greater_than_32kib_warns_and_ignored() {
+        let ws = tempfile::tempdir().unwrap();
+        let too_large = "x".repeat(32_769);
+        let config = format!(
+            r#"
+[runners.default]
+system_prompt = "{too_large}"
+"#
+        );
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[runners.default]")
+                    && w.contains("exceeds 32 KiB (32768 bytes)")
+                    && w.contains("prompt ignored")),
+            "expected >32 KiB warning, got {:?}",
+            settings.config_warnings
+        );
+        assert!(resolve(&settings, "cursor", PromptRole::Chat).is_none());
+
+        // Exactly 32 KiB (32768 bytes) is accepted
+        let ws_exact = tempfile::tempdir().unwrap();
+        let exact_32kib = "y".repeat(32_768);
+        let config_exact = format!(
+            r#"
+[runners.default]
+system_prompt = "{exact_32kib}"
+"#
+        );
+        std::fs::write(ws_exact.path().join("dmuxai.toml"), config_exact).unwrap();
+        let settings_exact = DmuxSettings::load_with_user_config(ws_exact.path(), None);
+        assert!(
+            !settings_exact
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("exceeds 32 KiB")),
+            "unexpected 32 KiB warning"
+        );
+        let resolved = resolve(&settings_exact, "cursor", PromptRole::Chat)
+            .expect("exact 32 KiB prompt accepted");
+        assert_eq!(resolved.text.len(), 32_768);
+    }
+
+    #[test]
+    fn agent_prompt_unreadable_file_warns_and_ignored() {
+        let ws = tempfile::tempdir().unwrap();
+        let config = r#"
+[runners.default]
+system_prompt_file = "missing_prompt_file.txt"
+"#;
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[runners.default]")
+                    && w.contains("failed to read system_prompt_file")
+                    && w.contains("prompt ignored")),
+            "expected file read warning, got {:?}",
+            settings.config_warnings
+        );
+        assert!(resolve(&settings, "cursor", PromptRole::Chat).is_none());
+    }
+
+    #[test]
+    fn agent_prompt_workspace_overrides_user() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let user_toml = user_dir.path().join("user.toml");
+        std::fs::write(
+            &user_toml,
+            r#"
+[runners.default]
+system_prompt = "User prompt"
+prompt_inject = "always"
+"#,
+        )
+        .unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            r#"
+[runners.default]
+system_prompt = "Workspace prompt"
+"#,
+        )
+        .unwrap();
+
+        let settings = DmuxSettings::load_with_user_config(ws.path(), Some(&user_toml));
+        let resolved = resolve(&settings, "cursor", PromptRole::Chat).expect("resolved");
+        assert_eq!(resolved.text, "Workspace prompt");
+        assert_eq!(resolved.source, "workspace:[runners.default]");
+        // prompt_inject was not specified in workspace, so it inherited "always" from user config
+        assert_eq!(resolved.inject, PromptInject::Always);
+    }
+
+    #[test]
+    fn agent_prompt_runner_id_overrides_default() {
+        let ws = tempfile::tempdir().unwrap();
+        let config = r#"
+[runners.default]
+system_prompt = "Default prompt"
+prompt_inject = "always"
+
+[runners.codex]
+system_prompt = "Codex prompt"
+"#;
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+
+        // codex gets its own prompt, but inherits prompt_inject = always from default
+        let codex_prompt = resolve(&settings, "codex", PromptRole::Chat).expect("codex prompt");
+        assert_eq!(codex_prompt.text, "Codex prompt");
+        assert_eq!(codex_prompt.source, "workspace:[runners.codex]");
+        assert_eq!(codex_prompt.inject, PromptInject::Always);
+
+        // cursor inherits from default
+        let cursor_prompt = resolve(&settings, "cursor", PromptRole::Chat).expect("cursor prompt");
+        assert_eq!(cursor_prompt.text, "Default prompt");
+        assert_eq!(cursor_prompt.source, "workspace:[runners.default]");
+        assert_eq!(cursor_prompt.inject, PromptInject::Always);
+    }
+
+    #[test]
+    fn agent_prompt_default_inject_session() {
+        let ws = tempfile::tempdir().unwrap();
+        let config = r#"
+[runners.default]
+system_prompt = "Test prompt"
+"#;
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+        let resolved = resolve(&settings, "codex", PromptRole::Chat).expect("resolved");
+        assert_eq!(resolved.inject, PromptInject::Session);
+    }
+
+    #[test]
+    fn agent_prompt_always_parsed() {
+        let ws = tempfile::tempdir().unwrap();
+        let config = r#"
+[runners.default]
+system_prompt = "Test prompt"
+prompt_inject = "always"
+"#;
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+        let resolved = resolve(&settings, "codex", PromptRole::Chat).expect("resolved");
+        assert_eq!(resolved.inject, PromptInject::Always);
+    }
+
+    #[test]
+    fn agent_prompt_unknown_inject_warns() {
+        let ws = tempfile::tempdir().unwrap();
+        let config = r#"
+[runners.default]
+system_prompt = "Test prompt"
+prompt_inject = "immediately"
+"#;
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[runners.default]")
+                    && w.contains("unknown prompt_inject 'immediately'")
+                    && w.contains("using default 'session'")),
+            "expected unknown prompt_inject warning, got {:?}",
+            settings.config_warnings
+        );
+        let resolved = resolve(&settings, "codex", PromptRole::Chat).expect("resolved");
+        assert_eq!(resolved.inject, PromptInject::Session);
+    }
+
+    #[test]
+    fn agent_prompt_default_roles() {
+        let ws = tempfile::tempdir().unwrap();
+        let config = r#"
+[runners.default]
+system_prompt = "Default roles prompt"
+"#;
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+
+        assert!(resolve(&settings, "cursor", PromptRole::Chat).is_some());
+        assert!(resolve(&settings, "cursor", PromptRole::Worker).is_some());
+        assert!(resolve(&settings, "cursor", PromptRole::Judge).is_none());
+    }
+
+    #[test]
+    fn agent_prompt_judge_triage_planner_replan_summary_interview_excluded_even_if_listed() {
+        let ws = tempfile::tempdir().unwrap();
+        let config = r#"
+[runners.default]
+system_prompt = "Test prompt"
+prompt_roles = [
+    "chat",
+    "worker",
+    "judge",
+    "triage",
+    "planner",
+    "replan",
+    "summary",
+    "interview",
+    "unknown_role"
+]
+"#;
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+
+        for excluded in &[
+            "judge",
+            "triage",
+            "planner",
+            "replan",
+            "summary",
+            "interview",
+        ] {
+            assert!(
+                settings
+                    .config_warnings
+                    .iter()
+                    .any(|w| w.contains("[runners.default]")
+                        && w.contains(&format!(
+                            "role '{excluded}' in prompt_roles cannot receive system prompts"
+                        ))),
+                "expected warning for role {excluded}, got {:?}",
+                settings.config_warnings
+            );
+        }
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[runners.default]")
+                    && w.contains("unknown role 'unknown_role' in prompt_roles ignored")),
+            "expected warning for unknown_role, got {:?}",
+            settings.config_warnings
+        );
+
+        // Chat and Worker succeed
+        assert!(resolve(&settings, "cursor", PromptRole::Chat).is_some());
+        assert!(resolve(&settings, "cursor", PromptRole::Worker).is_some());
+
+        // All excluded roles return None unconditionally
+        assert!(resolve(&settings, "cursor", PromptRole::Judge).is_none());
+        assert!(resolve(&settings, "cursor", PromptRole::Triage).is_none());
+        assert!(resolve(&settings, "cursor", PromptRole::Planner).is_none());
+        assert!(resolve(&settings, "cursor", PromptRole::Replan).is_none());
+        assert!(resolve(&settings, "cursor", PromptRole::Summary).is_none());
+        assert!(resolve(&settings, "cursor", PromptRole::Interview).is_none());
+    }
+
+    #[test]
+    fn agent_prompt_runner_case_insensitive() {
+        let ws = tempfile::tempdir().unwrap();
+        let config = r#"
+[runners.CoDeX]
+system_prompt = "Case-insensitive codex prompt"
+"#;
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+
+        let r1 = resolve(&settings, "codex", PromptRole::Chat).expect("codex resolved");
+        let r2 = resolve(&settings, "CODEX", PromptRole::Chat).expect("CODEX resolved");
+        let r3 = resolve(&settings, "  CoDeX  ", PromptRole::Chat).expect("padded resolved");
+        assert_eq!(r1.text, "Case-insensitive codex prompt");
+        assert_eq!(r2.text, "Case-insensitive codex prompt");
+        assert_eq!(r3.text, "Case-insensitive codex prompt");
+    }
+
+    #[test]
+    fn agent_prompt_workspace_runner_overrides_user_default() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let user_toml = user_dir.path().join("user.toml");
+        std::fs::write(
+            &user_toml,
+            r#"
+[runners.default]
+system_prompt = "User default"
+"#,
+        )
+        .unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            r#"
+[runners.codex]
+system_prompt = "Workspace codex"
+"#,
+        )
+        .unwrap();
+
+        let settings = DmuxSettings::load_with_user_config(ws.path(), Some(&user_toml));
+        let codex_prompt = resolve(&settings, "codex", PromptRole::Chat).expect("codex");
+        assert_eq!(codex_prompt.text, "Workspace codex");
+        assert_eq!(codex_prompt.source, "workspace:[runners.codex]");
+
+        let cursor_prompt = resolve(&settings, "cursor", PromptRole::Chat).expect("cursor");
+        assert_eq!(cursor_prompt.text, "User default");
+        assert_eq!(cursor_prompt.source, "user:[runners.default]");
     }
 }
