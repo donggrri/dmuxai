@@ -35,6 +35,7 @@
   <button id="graph-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="graph" aria-controls="graph" aria-expanded="false" aria-pressed="false" title="Show the graph run and plan (Esc closes)" aria-label="Graph">Graph <span id="graph-indicator" class="view-indicator" aria-hidden="true" hidden></span></button>
   <button id="memory-toggle" type="button" class="btn sidebar-toggle memory-top-btn" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="memory-popover" title="Memory vault status">Memory <span id="memory-badge" class="memory-badge" aria-hidden="true">Off</span></button>
   <button id="skills-toggle" type="button" class="btn sidebar-toggle memory-top-btn" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="skills-popover" title="Stage skills">Skills</button>
+  <button id="agent-prompts-toggle" type="button" class="btn sidebar-toggle memory-top-btn" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="agent-prompts-popover" title="System prompts">System prompts</button>
   <nav id="status" class="status" aria-label="dashboard status">
     <span id="run-status" class="run-status run-status-idle" role="status" aria-live="polite">Idle</span>
     <span class="stat"><span class="stat-k">workspace</span><button id="workspace-button" type="button" class="btn stat-v workspace-button" aria-haspopup="dialog" title="">&ndash;</button></span>
@@ -125,6 +126,7 @@
 
   <div id="memory-popover" class="memory-popover" role="dialog" aria-label="Memory" hidden></div>
 <div id="skills-popover" class="memory-popover skills-popover" role="dialog" aria-label="Stage skills" tabindex="-1" hidden></div>
+<div id="system-prompts" class="system-prompts-panel agent-prompts-panel"><div id="agent-prompts-popover" class="memory-popover agent-prompts-popover" role="dialog" aria-label="System prompts" tabindex="-1" hidden></div></div>
 </main>
 <nav id="sessions-sidebar" class="sessions-sidebar" aria-label="Sessions" data-parity="conversations" inert>
   <div class="sidebar-header sessions-header">
@@ -254,6 +256,7 @@
 </div>
 <script src="/assets/memory.js" defer></script>
 <script src="/assets/skills.js" defer></script>
+<script src="/assets/agent-prompts.js" defer></script>
 <script src="/assets/session.js" defer></script>
 <script src="/assets/workspace.js" defer></script>
 <script src="/assets/sidebar-resize.js" defer></script>

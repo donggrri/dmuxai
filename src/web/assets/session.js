@@ -1926,7 +1926,8 @@
       seen[m.id] = true;
       var node = messageNodes[m.id];
       if (!node) {
-        node = el('li', 'msg msg-' + m.role);
+        var promptChip = (m.role === 'system' && String(m.content || '').indexOf('system prompt applied') === 0);
+        node = el('li', promptChip ? 'msg-activity agent-prompt-chip' : ('msg msg-' + m.role));
         node.setAttribute('data-msg-id', m.id);
         node.dmuxWho = el('span', 'msg-who');
         node.dmuxText = el('div', 'msg-text');

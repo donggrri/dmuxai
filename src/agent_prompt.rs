@@ -375,6 +375,63 @@ pub fn resolve(settings: &Settings, runner: &str, role: PromptRole) -> Option<Re
     })
 }
 
+/// Edits `[runners.<runner>]` in a dmuxai.toml text, keeping the rest of the file.
+/// `system_prompt`: None => leave unchanged; Some(None) => remove; Some(Some(t)) => set.
+/// `prompt_inject`: same convention.
+pub fn set_runner_prompt_in_toml(
+    text: &str,
+    runner: &str,
+    system_prompt: Option<Option<&str>>,
+    prompt_inject: Option<Option<&str>>,
+) -> Result<String, String> {
+    let mut doc: toml::Value = if text.trim().is_empty() {
+        toml::Value::Table(Default::default())
+    } else {
+        toml::from_str(text).map_err(|err| err.to_string())?
+    };
+    let root = doc
+        .as_table_mut()
+        .ok_or("dmuxai.toml root is not a table")?;
+    let runners = root
+        .entry("runners")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or("[runners] is not a table")?;
+    let entry = runners
+        .entry(runner.to_owned())
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or("runner entry is not a table")?;
+
+    if let Some(sp) = system_prompt {
+        match sp {
+            Some(value) => {
+                entry.insert(
+                    "system_prompt".to_owned(),
+                    toml::Value::String(value.to_owned()),
+                );
+            }
+            None => {
+                entry.remove("system_prompt");
+            }
+        }
+    }
+    if let Some(pi) = prompt_inject {
+        match pi {
+            Some(value) => {
+                entry.insert(
+                    "prompt_inject".to_owned(),
+                    toml::Value::String(value.to_owned()),
+                );
+            }
+            None => {
+                entry.remove("prompt_inject");
+            }
+        }
+    }
+    toml::to_string(&doc).map_err(|err| err.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
