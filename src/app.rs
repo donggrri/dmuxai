@@ -92,18 +92,9 @@ use crate::agent::{
     event_channel, is_adapter_turn_busy_rejection, spawn_agy_adapter, spawn_codex_adapter,
     spawn_cursor_adapter, spawn_custom_adapter,
 };
+use crate::graph_defer::{DeferPoll, GRAPH_DEFER_RETRY_INTERVAL, GraphDeferQueue};
 use crate::internal_turn::{self, InternalTurn, TurnBuffer};
 use crate::todo_link::{TodoFinish, TodoLinks};
-
-/// Minimum wait between graph defer retries (FR-976); zero in unit tests.
-const GRAPH_DEFER_RETRY_INTERVAL: Duration = if cfg!(test) {
-    Duration::ZERO
-} else {
-    Duration::from_secs(1)
-};
-
-/// FR-976: if the adapter never frees, fail like a stuck node (same cap as judge hard stop).
-const GRAPH_DEFER_MAX_WAIT: Duration = Duration::from_secs(270);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GraphNodeDispatch {
@@ -1410,9 +1401,7 @@ pub struct App {
     /// Graph node id currently driven by each agent turn (parallel-safe, FR-702).
     graph_agent_nodes: HashMap<Agent, String>,
     /// Ready nodes waiting for a runner whose adapter is still busy (FR-976).
-    graph_deferred_starts: HashMap<Agent, VecDeque<NodeAssignment>>,
-    graph_defer_retry_after: HashMap<String, Instant>,
-    graph_defer_since: HashMap<String, Instant>,
+    graph_defer: GraphDeferQueue,
     graph_node_details: HashMap<String, NodeDetailTracker>,
     single_graph_plan: Option<(NodeRole, Agent, String)>,
     /// FR-937: a 1-node run hides the graph progress lines so the transcript
@@ -1709,9 +1698,7 @@ impl App {
             graph_session: None,
             graph_assignment_line: String::new(),
             graph_agent_nodes: HashMap::new(),
-            graph_deferred_starts: HashMap::new(),
-            graph_defer_retry_after: HashMap::new(),
-            graph_defer_since: HashMap::new(),
+            graph_defer: GraphDeferQueue::new(),
             graph_node_details: HashMap::new(),
             single_graph_plan: None,
             quiet_graph_run: false,
@@ -11023,9 +11010,7 @@ impl App {
     }
 
     fn clear_graph_defer_state(&mut self) {
-        self.graph_deferred_starts.clear();
-        self.graph_defer_retry_after.clear();
-        self.graph_defer_since.clear();
+        self.graph_defer.clear();
         // No step is retried any more; a later busy refusal is a real error.
         self.busy_retry_user_message.clear();
     }
@@ -11035,16 +11020,11 @@ impl App {
     fn busy_retry_pending(&self, agent: Agent) -> bool {
         self.graph_session.is_some()
             && self.busy_retry_user_message.contains_key(&agent)
-            && self
-                .graph_deferred_starts
-                .get(&agent)
-                .is_some_and(|queue| !queue.is_empty())
+            && self.graph_defer.has_queued(agent)
     }
 
     fn remove_deferred_assignment_for_node(&mut self, node_id: &str) {
-        for queue in self.graph_deferred_starts.values_mut() {
-            queue.retain(|assignment| assignment.node_id != node_id);
-        }
+        self.graph_defer.remove_node(node_id);
         if let Some(session) = self.graph_session.as_mut() {
             session.clear_node_deferred(node_id);
         }
@@ -11052,11 +11032,7 @@ impl App {
 
     fn defer_graph_node_start(&mut self, agent: Agent, assignment: NodeAssignment) {
         let node_id = assignment.node_id.clone();
-        self.graph_defer_since
-            .entry(node_id.clone())
-            .or_insert_with(Instant::now);
-        self.graph_defer_retry_after
-            .insert(node_id.clone(), Instant::now() + GRAPH_DEFER_RETRY_INTERVAL);
+        self.graph_defer.defer(agent, assignment, Instant::now());
         if let Some(session) = self.graph_session.as_mut() {
             session.revert_node_start(&node_id);
             let _ = save_run(&self.workspace_root, session.run());
@@ -11068,64 +11044,39 @@ impl App {
         if self.graph_agent_nodes.get(&agent) == Some(&node_id) {
             self.graph_agent_nodes.remove(&agent);
         }
-        let queue = self.graph_deferred_starts.entry(agent).or_default();
-        if !queue.iter().any(|pending| pending.node_id == node_id) {
-            queue.push_back(assignment);
-        }
     }
 
     fn flush_deferred_graph_starts(&mut self) -> bool {
-        if self.graph_session.is_none() || self.graph_deferred_starts.is_empty() {
+        if self.graph_session.is_none() || self.graph_defer.is_empty() {
             return false;
         }
-        let agents: Vec<Agent> = self.graph_deferred_starts.keys().copied().collect();
+        let agents = self.graph_defer.agents();
         let mut dispatched = false;
         let now = Instant::now();
         for agent in agents {
             if self.busy_agents.contains(&agent) {
                 // FR-976: waiting behind a real turn is not a rejection; the
                 // timeout only counts adapter refusals after the runner frees.
-                if let Some(queue) = self.graph_deferred_starts.get(&agent) {
-                    for pending in queue {
-                        self.graph_defer_since.insert(pending.node_id.clone(), now);
+                self.graph_defer.mark_waiting_behind_busy(agent, now);
+                continue;
+            }
+            match self.graph_defer.poll(agent, now) {
+                DeferPoll::Empty | DeferPoll::NotYet => {}
+                DeferPoll::TimedOut(assignment) => {
+                    self.remove_deferred_assignment_for_node(&assignment.node_id);
+                    self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
+                        "graph node {} timed out waiting for runner {}",
+                        assignment.node_id, agent
+                    ))]);
+                }
+                DeferPoll::Ready(assignment) => {
+                    if matches!(
+                        self.start_graph_node(assignment),
+                        Ok(GraphNodeDispatch::Started)
+                    ) {
+                        dispatched = true;
                     }
                 }
-                continue;
-            }
-            let Some(queue) = self.graph_deferred_starts.get_mut(&agent) else {
-                continue;
-            };
-            let Some(assignment) = queue.front().cloned() else {
-                continue;
-            };
-            if self
-                .graph_defer_retry_after
-                .get(&assignment.node_id)
-                .is_some_and(|retry_after| now < *retry_after)
-            {
-                continue;
-            }
-            if self
-                .graph_defer_since
-                .get(&assignment.node_id)
-                .is_some_and(|since| now.saturating_duration_since(*since) >= GRAPH_DEFER_MAX_WAIT)
-            {
-                queue.pop_front();
-                self.graph_defer_since.remove(&assignment.node_id);
-                self.graph_defer_retry_after.remove(&assignment.node_id);
-                self.remove_deferred_assignment_for_node(&assignment.node_id);
-                self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
-                    "graph node {} timed out waiting for runner {}",
-                    assignment.node_id, agent
-                ))]);
-                continue;
-            }
-            queue.pop_front();
-            if matches!(
-                self.start_graph_node(assignment),
-                Ok(GraphNodeDispatch::Started)
-            ) {
-                dispatched = true;
             }
         }
         dispatched
@@ -11271,8 +11222,7 @@ impl App {
                 assignment.node_id
             ));
         }
-        self.graph_defer_since.remove(&assignment.node_id);
-        self.graph_defer_retry_after.remove(&assignment.node_id);
+        self.graph_defer.node_started(&assignment.node_id);
         Ok(GraphNodeDispatch::Started)
     }
 
@@ -17069,8 +17019,8 @@ mod tests {
         assert_eq!(step_2.status, dmuxai::graph::GraphNodeStatus::Ready);
         assert_eq!(step_2.attempt, 0);
         assert_eq!(
-            app.graph_deferred_starts
-                .get(&Agent::Cursor)
+            app.graph_defer
+                .queued_for_test(Agent::Cursor)
                 .map(|queue| queue.len())
                 .unwrap_or(0),
             1
@@ -17327,8 +17277,8 @@ mod tests {
         app.defer_graph_node_start(Agent::Cursor, second);
 
         let queue = app
-            .graph_deferred_starts
-            .get(&Agent::Cursor)
+            .graph_defer
+            .queued_for_test(Agent::Cursor)
             .expect("cursor queue");
         assert_eq!(queue.len(), 2);
         assert_eq!(queue[0].node_id, "step-a");
@@ -21224,8 +21174,8 @@ mod tests {
             )
         );
         assert!(
-            app.graph_deferred_starts
-                .get(&first.0)
+            app.graph_defer
+                .queued_for_test(first.0)
                 .is_none_or(|queue| queue.is_empty()),
             "not queued for a retry"
         );
@@ -21302,8 +21252,8 @@ mod tests {
         assert!(!app.busy_agents.contains(&Agent::Codex));
         assert!(!app.active_turns.contains_key(&Agent::Codex));
         let deferred = app
-            .graph_deferred_starts
-            .get(&Agent::Codex)
+            .graph_defer
+            .queued_for_test(Agent::Codex)
             .map(|queue| queue.len())
             .unwrap_or(0);
         let last = app.messages.last().unwrap();
@@ -32227,9 +32177,9 @@ mod tests {
         let old = Instant::now()
             .checked_sub(Duration::from_secs(400))
             .unwrap_or_else(Instant::now);
-        app.graph_defer_since.insert("step-2".to_owned(), old);
-        app.graph_defer_retry_after
-            .insert("step-2".to_owned(), Instant::now());
+        app.graph_defer.set_since_for_test("step-2", old);
+        app.graph_defer
+            .set_retry_after_for_test("step-2", Instant::now());
         assert!(app.busy_agents.contains(&Agent::Cursor));
         assert!(!app.flush_deferred_graph_starts());
         let step_b = app
