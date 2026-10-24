@@ -17,7 +17,7 @@ use dmuxai::attachments::prompt_with_image_references;
 
 use super::{
     AdapterError, Agent, AgentAdapter, AgentError, AgentEvent, AgentOutput, AgentRequest,
-    ConversationId, ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy,
+    ConversationId, ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy, map_send_error,
 };
 use dmuxai::process::{headless_command, resolve_program};
 
@@ -79,13 +79,6 @@ impl AgentAdapter for CodexAdapter {
         self.command_tx
             .try_send(CodexCommand::RequestStatus)
             .map_err(map_send_error)
-    }
-}
-
-fn map_send_error(error: mpsc::error::TrySendError<CodexCommand>) -> AdapterError {
-    match error {
-        mpsc::error::TrySendError::Full(_) => AdapterError::CommandQueueFull,
-        mpsc::error::TrySendError::Closed(_) => AdapterError::RuntimeStopped,
     }
 }
 
@@ -1289,14 +1282,7 @@ async fn send_event(
     context: Option<&OutputContext>,
     event: AgentEvent,
 ) {
-    let _ = event_tx
-        .send(AgentOutput {
-            agent: Agent::Codex,
-            conversation_id: context.map(|context| context.conversation_id.clone()),
-            turn_id: context.map(|context| context.turn_id.clone()),
-            event,
-        })
-        .await;
+    super::emit(event_tx, Agent::Codex, context, event).await;
 }
 
 async fn read_stdout(stdout: ChildStdout, raw_tx: mpsc::Sender<RawMessage>) {

@@ -37,10 +37,7 @@ impl CustomAdapter {
     fn push(&self, command: CustomCommand) -> Result<(), AdapterError> {
         self.command_tx
             .try_send(command)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => AdapterError::CommandQueueFull,
-                mpsc::error::TrySendError::Closed(_) => AdapterError::RuntimeStopped,
-            })
+            .map_err(super::map_send_error)
     }
 }
 
@@ -773,14 +770,7 @@ async fn send(
     context: Option<&OutputContext>,
     event: AgentEvent,
 ) {
-    let _ = event_tx
-        .send(AgentOutput {
-            agent,
-            conversation_id: context.map(|c| c.conversation_id.clone()),
-            turn_id: context.map(|c| c.turn_id.clone()),
-            event,
-        })
-        .await;
+    super::emit(event_tx, agent, context, event).await;
 }
 
 // The fake agent is a POSIX shell script; keep test-only on unix.

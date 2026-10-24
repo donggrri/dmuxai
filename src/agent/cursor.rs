@@ -12,7 +12,7 @@ use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 use super::{
     AdapterError, Agent, AgentAdapter, AgentError, AgentEvent, AgentOutput, AgentRequest,
     ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy, implement_outcome::ImplementTurnTracker,
-    prompt_with_image_tokens,
+    map_send_error, prompt_with_image_tokens,
 };
 use dmuxai::process::cursor_command;
 use dmuxai::runner_protocol::RunnerProtocol;
@@ -160,13 +160,6 @@ impl AgentAdapter for CursorAdapter {
         self.command_tx
             .try_send(CursorCommand::Tick)
             .map_err(map_send_error)
-    }
-}
-
-fn map_send_error(error: mpsc::error::TrySendError<CursorCommand>) -> AdapterError {
-    match error {
-        mpsc::error::TrySendError::Full(_) => AdapterError::CommandQueueFull,
-        mpsc::error::TrySendError::Closed(_) => AdapterError::RuntimeStopped,
     }
 }
 
@@ -1325,14 +1318,7 @@ async fn send_event(
     context: Option<&OutputContext>,
     event: AgentEvent,
 ) {
-    let _ = event_tx
-        .send(AgentOutput {
-            agent: Agent::Cursor,
-            conversation_id: context.map(|context| context.conversation_id.clone()),
-            turn_id: context.map(|context| context.turn_id.clone()),
-            event,
-        })
-        .await;
+    super::emit(event_tx, Agent::Cursor, context, event).await;
 }
 
 #[cfg(test)]

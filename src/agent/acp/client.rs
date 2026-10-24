@@ -870,14 +870,7 @@ async fn send_event(
     context: &OutputContext,
     event: AgentEvent,
 ) {
-    let _ = event_tx
-        .send(AgentOutput {
-            agent,
-            conversation_id: Some(context.conversation_id.clone()),
-            turn_id: Some(context.turn_id.clone()),
-            event,
-        })
-        .await;
+    crate::agent::emit(event_tx, agent, Some(context), event).await;
 }
 
 fn format_acp_exit(status: std::process::ExitStatus, diagnostic: &str) -> String {

@@ -13,7 +13,7 @@ use super::{
     implement_outcome::{
         ImplementTurnTracker, is_plan_only_implement_outcome, is_plan_review_response,
     },
-    prompt_with_image_tokens,
+    map_send_error, prompt_with_image_tokens,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -149,13 +149,6 @@ impl AgentAdapter for AgyAdapter {
         self.command_tx
             .try_send(AgyCommand::SelectModel(model))
             .map_err(map_send_error)
-    }
-}
-
-fn map_send_error(error: mpsc::error::TrySendError<AgyCommand>) -> AdapterError {
-    match error {
-        mpsc::error::TrySendError::Full(_) => AdapterError::CommandQueueFull,
-        mpsc::error::TrySendError::Closed(_) => AdapterError::RuntimeStopped,
     }
 }
 
@@ -837,14 +830,7 @@ async fn send_event(
     context: Option<&OutputContext>,
     event: AgentEvent,
 ) {
-    let _ = event_tx
-        .send(AgentOutput {
-            agent: Agent::Agy,
-            conversation_id: context.map(|context| context.conversation_id.clone()),
-            turn_id: context.map(|context| context.turn_id.clone()),
-            event,
-        })
-        .await;
+    super::emit(event_tx, Agent::Agy, context, event).await;
 }
 
 #[cfg(test)]
