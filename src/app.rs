@@ -11312,6 +11312,7 @@ impl App {
         self.graph_node_details.remove(&assignment.node_id);
         self.graph_agent_nodes
             .insert(agent, assignment.node_id.clone());
+        let raw_prompt = assignment.prompt.clone();
         let mut prompt = assignment.prompt;
         if let Some(run_id) = self
             .graph_session
@@ -11327,9 +11328,9 @@ impl App {
             );
             prompt = format!("{prefix}{prompt}");
         }
-        // Display text for this node turn is the prompt before the WRITE_STEP_NOTE
-        // and skill_prompt_prefix injections below.
-        self.pending_display_text = Some(prompt.clone());
+        // Display text for this node turn is the raw node prompt before any
+        // injected prefix (stage skill, WRITE_STEP_NOTE, skill_prompt_prefix).
+        self.pending_display_text = Some(raw_prompt);
         // Read-only turns earlier in the conversation (planning interview, explore
         // nodes) can leave replies such as "I'm in ask mode" in the context; a
         // write step must not mimic them.
@@ -30963,6 +30964,51 @@ mod tests {
         h2.app.input = "build a multi-step feature".to_owned();
         h2.app.submit_prompt();
         assert_eq!(h2.app.conversation_title, "build a multi-step feature");
+    }
+
+    // TC-1911 / FR-1911: graph node display text excludes injected prefixes.
+    #[test]
+    fn tc_1911_graph_node_display_text_excludes_injected_prefixes() {
+        let mut h =
+            stage_skill_harness("[stages.implement]\nskills = [\"./skills/review-list\"]\n");
+        reach_awaiting_approval(&mut h);
+        let run = h.app.last_graph_run.clone().unwrap();
+        h.app
+            .decide_plan(
+                PlanDecisionKind::Approve,
+                run.plan.id.clone(),
+                1,
+                DecisionBy::Tui,
+            )
+            .unwrap();
+        let nodes = graph_node_requests(&h.sent);
+        assert!(!nodes.is_empty(), "graph node dispatched");
+        assert!(
+            nodes.iter().any(|r| r.prompt.contains("REVIEW-BODY")),
+            "stage skill prefix injected into node prompt"
+        );
+        let conv_id = h.app.conversation_id.clone();
+        let snap = h
+            .app
+            .engine
+            .select(ConversationSelection::Existing(conv_id))
+            .unwrap();
+        let user_msg = snap
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::User)
+            .unwrap();
+        assert!(
+            user_msg.text.contains("REVIEW-BODY"),
+            "stored text keeps injected prefix"
+        );
+        assert_eq!(user_msg.display_text.as_deref(), Some("ship"));
+        assert!(
+            h.app
+                .messages
+                .iter()
+                .any(|m| { matches!(m.role, Role::User) && m.content == "ship" })
+        );
     }
 
     // TC-1912 / FR-1912: pending_display_text never leaks to a later turn.
