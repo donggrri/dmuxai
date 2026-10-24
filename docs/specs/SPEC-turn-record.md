@@ -59,6 +59,9 @@ PR-6 introduces the turn record: decoupling visible turn text (`display_text`) f
 | FR-1905 | Must | Given an active turn ID and an `ActivityItem` | `record_activity(turn_id, item)` executes an immediate transaction to load existing rows, call `merge_activity`, and upsert the row at the returned ordinal with kind, summary, state, and payload_json | If `turn_id` is unknown, returns `ConversationError::InvalidOutput` and writes nothing | TC-1905 |
 | FR-1906 | Must | Given activity recording with many items or long content | A new item beyond `MAX_ACTIVITIES_PER_TURN` (400) is ignored without error while existing row updates still apply; Thinking `text` and Tool `detail` are bounded to `MAX_ACTIVITY_TEXT_CHARS` (16,000) characters safely; summary is bounded to 200 characters | Payload JSON and summary truncate at character boundaries; turn activity count does not exceed 400 | TC-1906 |
 | FR-1907 | Must | Given a conversation snapshot load or turn deletion | `ConversationSnapshot.activities` returns all turn activities ordered by turn seq then ordinal; malformed payload JSON rows are skipped; deleting a turn cascades and deletes all associated activities | Engine load does not fail on corrupted activity JSON; activities clean up automatically on turn deletion | TC-1907 |
+| FR-1910 | Must | Given a skill interview turn | The full injected prompt is stored as `messages.text`, while the `[planning interview n/m] ...` label is stored as `display_text`; the live user message shows the label; after `restore_snapshot` the user message still shows the label, not the injected prompt | Display text survives reload; no leak of injected prompt into visible transcript | TC-1910 |
+| FR-1911 | Must | Given a skill-/graph-/stage-prefixed prompt or a `/plan` or graph run start | The conversation title is the user's task text and never starts with an injected prefix such as "The user attached these skills" or `WRITE_STEP_NOTE`; `set_title_if_untitled` is called before any node turn starts | Title remains 'New conversation' only when no task text is available | TC-1911 |
+| FR-1912 | Must | Given `pending_display_text` set and then a busy or refused submit | `pending_display_text` is consumed at the top of `try_submit_to_agent` and never leaks; the next normal turn's user message and stored row use its own prompt | No display text leaks across turns or early returns | TC-1912 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -72,6 +75,9 @@ PR-6 introduces the turn record: decoupling visible turn text (`display_text`) f
 | TC-1905 | FR-1905 | unit | Conversation with an active turn | Call `record_activity` with tool running, ok, and thinking deltas | Rows upserted and survive engine reopen; unknown turn ID returns error | `tests/conversation.rs` `tc_1905_record_activity_merges_and_upserts_durable_rows` |
 | TC-1906 | FR-1906 | unit | Active turn with long text and 400+ activities | Record 401 distinct items, long text, long detail | Cap at 400 ignores new items but allows existing updates; text and detail bounded to 16,000 chars; summary bounded to 200 chars | `tests/conversation.rs` `tc_1906_record_activity_enforces_bounds_and_caps` |
 | TC-1907 | FR-1907 | unit | Turns with activities and malformed activity row | Load snapshot and delete turn | Snapshot activities ordered by turn seq then ordinal; malformed JSON skipped; turn deletion cascades activities | `tests/conversation.rs` `tc_1907_conversation_snapshot_activities_ordered_and_cascade` |
+| TC-1910 | FR-1910 | integration | Skill interview turn with injected prompt | Submit interview turn, switch away and back (or reload) | Stored `messages.text` is the full injected prompt, `display_text` is the interview label; live and restored user message show the label | `src/app.rs` tests `tc_1910_*` |
+| TC-1911 | FR-1911 | integration | Graph or `/plan` run starting from user task text | Start run and inspect title | Conversation title equals the user task text and does not start with injected prefixes | `src/app.rs` tests `tc_1911_*` |
+| TC-1912 | FR-1912 | unit | `pending_display_text` set followed by busy/refused submit | Submit while busy, then normal submit | Next turn's user message and stored row use its own prompt with no leaked display text | `src/app.rs` tests `tc_1912_*` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -89,10 +95,11 @@ PR-6 introduces the turn record: decoupling visible turn text (`display_text`) f
 | 2 | `set_title_if_untitled` | `src/conversation.rs` | FR-1903 | `tc_1903` |
 | 3 | Activity serde and `merge_activity` | `src/activity.rs` | FR-1904 | `tc_1904` |
 | 4 | Durable activities and snapshot projection | `src/conversation.rs` | FR-1905, FR-1906, FR-1907 | `tc_1905`, `tc_1906`, `tc_1907` |
+| 5 | App display text and pending_display_text | `src/app.rs` | FR-1910, FR-1911, FR-1912 | `tc_1910`, `tc_1911`, `tc_1912` |
 
 ## 8. Review and test exit criteria
 
-- [x] All Must requirements (FR-1900..FR-1907) map to passing test evidence (TC-1900..TC-1907).
+- [x] All Must requirements (FR-1900..FR-1912) map to passing test evidence (TC-1900..TC-1912).
 - [x] The diff has been reviewed against scope and non-goals.
 - [x] Required Rust checks pass: format, test, and clippy with `-D warnings`.
 - [x] `scripts/check-spec.py` passes and `tests/spec_index.rs` verifies spec indexing.

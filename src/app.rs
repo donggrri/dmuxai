@@ -731,6 +731,7 @@ struct DeferredTurn {
     conversation_id: StoredConversationId,
     agent: Agent,
     prompt: String,
+    display_text: Option<String>,
 }
 
 struct PendingSummary {
@@ -1412,6 +1413,8 @@ pub struct App {
     headless_triage: Option<Triage>,
     /// Hint for todo runs so try_submit_to_agent maps them to Worker.
     submitting_todo_run: bool,
+    /// Display text for the next turn, consumed in try_submit_to_agent.
+    pending_display_text: Option<String>,
     pub(crate) mcp_servers: Vec<ResolvedMcpServer>,
     mcp_registry: Arc<McpRegistry>,
     agy_mcp_notice_shown: bool,
@@ -1577,6 +1580,7 @@ impl App {
             system_prompt_applied: None,
             headless_triage: None,
             submitting_todo_run: false,
+            pending_display_text: None,
             exit: false,
             headless: false,
             selected: adapter_index(Agent::default()),
@@ -4609,6 +4613,15 @@ impl App {
         self.pending_turn_policy = None;
     }
 
+    fn set_title_if_untitled_local(&mut self, text: &str) {
+        if self.engine.set_title_if_untitled(text).unwrap_or(false)
+            && let Ok(cards) = self.engine.list()
+            && let Some(card) = cards.into_iter().find(|c| c.id == self.conversation_id)
+        {
+            self.conversation_title = card.title;
+        }
+    }
+
     fn try_submit_to_agent(
         &mut self,
         agent: Agent,
@@ -4620,6 +4633,8 @@ impl App {
         // early return (busy, deferred, summary-in-progress, ...).
         let submitting_todo_run = self.submitting_todo_run;
         self.submitting_todo_run = false;
+        // Consume pending display text up front so it never leaks to a later turn.
+        let pending_display_text = self.pending_display_text.take();
         if self.busy_agents.contains(&agent) {
             if restore_input_on_failure {
                 self.input = prompt;
@@ -4709,7 +4724,7 @@ impl App {
             agent: agent_key(agent),
             model_id,
             prompt: prompt.clone(),
-            display_text: None,
+            display_text: pending_display_text.clone(),
         });
         let request = match outcome {
             Ok(BeginTurnOutcome::Ready(request)) => request,
@@ -4721,6 +4736,7 @@ impl App {
                             conversation_id: self.conversation_id.clone(),
                             agent,
                             prompt,
+                            display_text: pending_display_text.clone(),
                         }),
                         None,
                     );
@@ -4863,7 +4879,11 @@ impl App {
         } else {
             self.adapters[adapter_index].send(adapter_request)
         };
-        let mut user_message = Message::new(Role::User, prompt.clone());
+        let shown_text = pending_display_text
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| prompt.clone());
+        let mut user_message = Message::new(Role::User, shown_text.clone());
         let attachments_dir = dmuxai::attachments::attachments_dir(&self.workspace_root);
         user_message.images = image_paths_for_message
             .iter()
@@ -5290,6 +5310,7 @@ impl App {
             .position(|turn| turn.conversation_id == self.conversation_id)
         {
             let deferred = self.deferred_turns.remove(index);
+            self.pending_display_text = deferred.display_text.clone();
             self.submit_to_agent(deferred.agent, deferred.prompt, true);
         }
         self.restore_graph_runs_on_startup();
@@ -5493,6 +5514,7 @@ impl App {
                         }
                         if let Some(deferred) = pending.deferred {
                             if deferred.conversation_id == self.conversation_id {
+                                self.pending_display_text = deferred.display_text.clone();
                                 self.submit_to_agent(deferred.agent, deferred.prompt, true);
                             } else {
                                 self.deferred_turns.push(deferred);
@@ -5568,6 +5590,7 @@ impl App {
     /// FR-932: the judge turn is an internal read-only turn. Its text is
     /// buffered, never shown, and the user's mode is restored on every ending.
     fn start_judge_turn(&mut self, agent: Agent, prompt: String) {
+        self.set_title_if_untitled_local(&prompt);
         if self.refuse_plan_gate_prompt(prompt.clone()) {
             return;
         }
@@ -6875,6 +6898,7 @@ impl App {
             ));
             return;
         }
+        self.set_title_if_untitled_local(&prompt);
         self.begin_user_prompt_turn();
         self.allow_multi_runner_graph = false;
         self.set_turn_runner_pin_from_agent(agent);
@@ -6915,6 +6939,7 @@ impl App {
             ));
             return;
         }
+        self.set_title_if_untitled_local(&prompt);
         self.begin_user_prompt_turn();
         self.allow_multi_runner_graph = false;
         self.set_turn_runner_pin_from_agent(agent);
@@ -11302,6 +11327,9 @@ impl App {
             );
             prompt = format!("{prefix}{prompt}");
         }
+        // Display text for this node turn is the prompt before the WRITE_STEP_NOTE
+        // and skill_prompt_prefix injections below.
+        self.pending_display_text = Some(prompt.clone());
         // Read-only turns earlier in the conversation (planning interview, explore
         // nodes) can leave replies such as "I'm in ask mode" in the context; a
         // write step must not mimic them.
@@ -11930,7 +11958,7 @@ impl App {
             interview.round, interview.max_rounds
         );
         self.pending_turn_policy = Some(TurnPolicy::ReadOnly);
-        let before = self.messages.len();
+        self.pending_display_text = Some(label.clone());
         if self.try_submit_to_agent(agent, text, false, true).is_err() {
             self.push_system("The planning interview could not start; planning without it.");
             self.skill_interview_finish = Some(String::new());
@@ -11939,11 +11967,6 @@ impl App {
         // The read-only policy belongs to this interview turn only; later graph
         // nodes of the same conversation must run with their own policy.
         self.clear_pending_turn_policy();
-        for message in self.messages.iter_mut().skip(before) {
-            if message.role == Role::User {
-                message.content = label.clone();
-            }
-        }
     }
 
     fn answer_skill_interview(&mut self, answer: String) {
@@ -12738,6 +12761,7 @@ impl App {
                     None,
                     None,
                 );
+                self.pending_display_text = Some(req.prompt.clone());
                 format!("{prefix}{}", req.prompt.clone())
             } else {
                 req.prompt.clone()
@@ -15695,7 +15719,7 @@ fn message_from_transcript(message: &TranscriptMessage) -> Message {
         MessageRole::User => Role::User,
         MessageRole::Assistant => Role::Agent(agent_from_key(message.agent)),
     };
-    Message::new(role, message.text.clone())
+    Message::new(role, message.shown_text().to_owned())
 }
 
 fn terminal_snapshot_notice(turn: &TurnSnapshot) -> Option<String> {
@@ -30883,6 +30907,100 @@ mod tests {
             );
             h.app.select_conversation(b.clone());
         }
+    }
+
+    // TC-1910 / FR-1910: interview turn stores full injected prompt as text and
+    // the label as display text; restored user message shows the label.
+    #[test]
+    fn tc_1910_interview_turn_stores_display_text_and_restores_label() {
+        let mut h = stage_skill_harness("[stages.planner]\nskills = [\"grill-me\"]\n");
+        h.app.input = "/plan build a login page".to_owned();
+        h.app.submit_prompt();
+        assert!(h.app.messages.iter().any(|m| {
+            matches!(m.role, Role::User)
+                && m.content == "[planning interview 1/5] build a login page"
+        }));
+        let conv_id = h.app.conversation_id.clone();
+        let snap = h
+            .app
+            .engine
+            .select(ConversationSelection::Existing(conv_id))
+            .unwrap();
+        let user_msg = snap
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::User)
+            .unwrap();
+        assert!(user_msg.text.contains("GRILL-BODY"));
+        assert_eq!(
+            user_msg.display_text.as_deref(),
+            Some("[planning interview 1/5] build a login page")
+        );
+        let first = h.app.conversation_id.clone();
+        h.app.create_conversation(Some("foreground".to_owned()));
+        h.app.select_conversation(first);
+        assert!(h.app.messages.iter().any(|m| {
+            matches!(m.role, Role::User)
+                && m.content == "[planning interview 1/5] build a login page"
+        }));
+    }
+
+    // TC-1911 / FR-1911: graph or /plan title is the user task, never an injected prefix.
+    #[test]
+    fn tc_1911_graph_or_plan_title_is_task_text() {
+        let mut h = stage_skill_harness("[stages.planner]\nskills = [\"grill-me\"]\n");
+        h.app.input = "/plan build a login page".to_owned();
+        h.app.submit_prompt();
+        assert_eq!(h.app.conversation_title, "build a login page");
+        assert!(
+            !h.app
+                .conversation_title
+                .starts_with("The user attached these skills")
+        );
+        assert!(!h.app.conversation_title.starts_with("WRITE_STEP_NOTE"));
+
+        let mut h2 = plan_gate_test_app();
+        h2.app.input = "build a multi-step feature".to_owned();
+        h2.app.submit_prompt();
+        assert_eq!(h2.app.conversation_title, "build a multi-step feature");
+    }
+
+    // TC-1912 / FR-1912: pending_display_text never leaks to a later turn.
+    #[test]
+    fn tc_1912_pending_display_text_does_not_leak() {
+        let mut h = plan_gate_test_app();
+        h.app
+            .submit_to_agent(Agent::Codex, "first".to_owned(), false);
+        h.app.pending_display_text = Some("LEAKLABEL".to_owned());
+        let err = h
+            .app
+            .try_submit_to_agent(Agent::Codex, "second".to_owned(), false, true);
+        assert!(err.is_err());
+        assert!(h.app.pending_display_text.is_none());
+
+        let req = h.sent.lock().unwrap()[0].1.clone();
+        h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &req,
+            AgentEvent::TextDelta("done".to_owned()),
+        ));
+        h.app
+            .apply_agent_output(triage_output(Agent::Codex, &req, AgentEvent::Completed));
+
+        h.app.input = "third".to_owned();
+        h.app.submit_prompt();
+        assert!(
+            h.app
+                .messages
+                .iter()
+                .any(|m| { matches!(m.role, Role::User) && m.content == "third" })
+        );
+        assert!(
+            !h.app
+                .messages
+                .iter()
+                .any(|m| { matches!(m.role, Role::User) && m.content == "LEAKLABEL" })
+        );
     }
 
     // TC-1623 / FR-1623: same agent cannot run in two conversations at once.
