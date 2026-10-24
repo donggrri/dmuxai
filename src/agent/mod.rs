@@ -143,6 +143,7 @@ pub enum AgentErrorKind {
     ProcessExit,
     Timeout,
     Idle,
+    Stalled,
     Cancelled,
     Policy,
 }
@@ -155,6 +156,7 @@ impl AgentErrorKind {
             Self::ProcessExit => "process_exit",
             Self::Timeout => "timeout",
             Self::Idle => "idle",
+            Self::Stalled => "stalled",
             Self::Cancelled => "cancelled",
             Self::Policy => "policy",
         }
@@ -203,6 +205,10 @@ impl AgentError {
 
     pub fn idle(message: impl Into<String>) -> Self {
         Self::new(AgentErrorKind::Idle, message)
+    }
+
+    pub fn stalled(message: impl Into<String>) -> Self {
+        Self::new(AgentErrorKind::Stalled, message)
     }
 
     pub fn cancelled(message: impl Into<String>) -> Self {
@@ -507,6 +513,7 @@ mod typed_error_tests {
             (AgentErrorKind::ProcessExit, "process_exit"),
             (AgentErrorKind::Timeout, "timeout"),
             (AgentErrorKind::Idle, "idle"),
+            (AgentErrorKind::Stalled, "stalled"),
             (AgentErrorKind::Cancelled, "cancelled"),
             (AgentErrorKind::Policy, "policy"),
         ];
@@ -548,6 +555,10 @@ mod typed_error_tests {
         let err = AgentError::idle("silent child killed");
         assert_eq!(err.kind(), AgentErrorKind::Idle);
         assert_eq!(err.to_string(), "silent child killed");
+
+        let err = AgentError::stalled("child stalled");
+        assert_eq!(err.kind(), AgentErrorKind::Stalled);
+        assert_eq!(err.to_string(), "child stalled");
 
         let err = AgentError::cancelled("turn was cancelled");
         assert_eq!(err.kind(), AgentErrorKind::Cancelled);

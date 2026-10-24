@@ -559,17 +559,47 @@ async fn run_turn(
         .then(|| dmuxai::grok_activity::GrokToolTracker::new(cwd));
     let mut done = false;
     let mut checked_first_nonempty_stdout = false;
+    let stall_policy = settings
+        .runner_fallback
+        .stall_policy_for(&spec.name.to_ascii_lowercase());
+    let mut stall_detector = stall_policy
+        .map(|p| dmuxai::runner_fallback::StallDetector::new(p, std::time::Instant::now()));
+    let stall_keepalive_re = spec
+        .stall_keepalive
+        .as_deref()
+        .and_then(|p| regex::Regex::new(p).ok());
 
     let status = loop {
-        let event = match supervised.next_line().await {
-            Ok(event) => event,
-            Err(e) => {
-                let _ = supervised.stop().await;
-                return Err(AgentError::process_exit(e.to_string()));
+        let event = if stall_detector.is_some() {
+            match supervised.next_line_with_tick(Duration::from_secs(1)).await {
+                Ok(event) => event,
+                Err(e) => {
+                    let _ = supervised.stop().await;
+                    return Err(AgentError::process_exit(e.to_string()));
+                }
+            }
+        } else {
+            match supervised.next_line().await {
+                Ok(event) => event,
+                Err(e) => {
+                    let _ = supervised.stop().await;
+                    return Err(AgentError::process_exit(e.to_string()));
+                }
             }
         };
 
         match event {
+            dmuxai::process::supervisor::LineEvent::Tick => {
+                if let Some(detector) = &stall_detector
+                    && let Some(reason) = detector.check(std::time::Instant::now())
+                {
+                    let _ = supervised.stop().await;
+                    return Err(AgentError::stalled(format!(
+                        "{} stalled: {reason}",
+                        spec.label()
+                    )));
+                }
+            }
             dmuxai::process::supervisor::LineEvent::Idle(d) => {
                 let _ = supervised.stop().await;
                 return Err(AgentError::idle(
@@ -585,6 +615,40 @@ async fn run_turn(
                 break supervised.finish(DONE_EXIT_GRACE).await;
             }
             dmuxai::process::supervisor::LineEvent::Line(line) => {
+                if let Some(detector) = &mut stall_detector {
+                    let now = std::time::Instant::now();
+                    if dmuxai::runner_fallback::is_api_retry_line(&line) {
+                        detector.observe_api_retry(now);
+                    } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                        && v.pointer("/step_update/step_type")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("tool")
+                    {
+                        let state = v
+                            .pointer("/step_update/state")
+                            .and_then(serde_json::Value::as_str);
+                        if state == Some("ACTIVE") {
+                            detector.observe_tool_started(now);
+                        } else {
+                            detector.observe_tool_finished(now);
+                        }
+                    } else if stall_keepalive_re
+                        .as_ref()
+                        .is_some_and(|re| re.is_match(&line))
+                    {
+                        detector.observe_keepalive();
+                    } else if !line.trim().is_empty() {
+                        detector.observe_progress(now);
+                    }
+
+                    if let Some(reason) = detector.check(now) {
+                        let _ = supervised.stop().await;
+                        return Err(AgentError::stalled(format!(
+                            "{} stalled: {reason}",
+                            spec.label()
+                        )));
+                    }
+                }
                 if !checked_first_nonempty_stdout && !line.trim().is_empty() {
                     checked_first_nonempty_stdout = true;
                     if effective_output == CustomAgentOutput::Text
@@ -659,6 +723,36 @@ async fn run_turn(
     if let Some(reason) =
         failure_reason(spec, exit_ok, &reply, &stderr_text, jsonl_error.as_deref())
     {
+        let is_policy = spec
+            .failure_stderr
+            .as_deref()
+            .and_then(|p| regex::Regex::new(p).ok())
+            .is_some_and(|re| re.is_match(&stderr_text));
+
+        let err_candidate = jsonl_error
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| stderr_text.trim());
+
+        if !is_policy
+            && !reply.trim().is_empty()
+            && dmuxai::runner_fallback::is_transient_provider_error(err_candidate)
+        {
+            let truncated: String = err_candidate.chars().take(200).collect();
+            let label = spec.label();
+            send(
+                event_tx,
+                agent,
+                Some(context),
+                AgentEvent::Notice(format!(
+                    "{label} reported a provider error after its final result ({truncated}); the result was kept (#151)."
+                )),
+            )
+            .await;
+            return Ok(());
+        }
+
         let message = format!("{} failed: {reason}", spec.label());
         let err = if jsonl_error
             .as_deref()
@@ -666,12 +760,7 @@ async fn run_turn(
             .is_some_and(|s| !s.is_empty())
         {
             AgentError::provider(message)
-        } else if spec
-            .failure_stderr
-            .as_deref()
-            .and_then(|p| regex::Regex::new(p).ok())
-            .is_some_and(|re| re.is_match(&stderr_text))
-        {
+        } else if is_policy {
             AgentError::policy(message)
         } else if !exit_ok {
             AgentError::process_exit(message)
@@ -1968,5 +2057,193 @@ system_prompt_arg = ["--system", "{system_prompt}"]
                 }
             }
         }
+    }
+
+    async fn run_custom_turn_in_dir(
+        spec: &CustomAgentSpec,
+        cwd: &Path,
+    ) -> (Result<(), AgentError>, Vec<AgentEvent>) {
+        let (tx, mut rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: ConversationId::new("c"),
+            turn_id: TurnId::new("t"),
+            prompt: "hi".to_owned(),
+            resume_session: None,
+            image_paths: Vec::new(),
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+        let context = OutputContext::from(&request);
+        let pgid = std::sync::atomic::AtomicU32::new(0);
+        let notice_shown = AtomicBool::new(false);
+        let mcp = RunnerMcp::for_runner(&[], &spec.name);
+        let result = run_turn(
+            Agent::Custom(0),
+            spec,
+            &request,
+            None,
+            TurnPolicy::Agent,
+            cwd,
+            &tx,
+            &context,
+            &pgid,
+            &mcp,
+            &notice_shown,
+            None,
+        )
+        .await;
+        let mut events = Vec::new();
+        while let Ok(out) = rx.try_recv() {
+            events.push(out.event);
+        }
+        (result, events)
+    }
+
+    // TC-2112 / FR-2112: final text followed by transient error is treated as warning (#151).
+    #[tokio::test]
+    async fn tc_2112_custom_final_text_then_transient_error_is_warning() {
+        let ws = tempfile::tempdir().unwrap();
+        let toml = r#"
+name = "tc_2112"
+command = ["sh", "-c", "printf '{\"event\":\"result\",\"result\":{\"response\":\"done\"}}\n'; printf '{\"result\":{\"error\":\"API error (attempt 1): INTERNAL (code 500)\"}}\n'; exit 1"]
+output = "jsonl"
+text_path = "/result/response"
+error_path = ["/result/error"]
+"#;
+        let spec: &'static CustomAgentSpec = Box::leak(Box::new(toml::from_str(toml).unwrap()));
+        let (result, events) = run_custom_turn_in_dir(spec, ws.path()).await;
+
+        assert_eq!(result, Ok(()));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TextDelta(t) if t == "done")),
+            "expected TextDelta('done') in events: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(msg) if msg.contains("#151"))),
+            "expected Notice containing '#151' in events: {events:?}"
+        );
+    }
+
+    // TC-2112 / FR-2112: non-transient error still fails.
+    #[tokio::test]
+    async fn tc_2112_custom_non_transient_error_still_fails() {
+        let ws = tempfile::tempdir().unwrap();
+        let toml = r#"
+name = "tc_2112_fail"
+command = ["sh", "-c", "printf '{\"event\":\"result\",\"result\":{\"response\":\"done\"}}\n'; printf '{\"result\":{\"error\":\"invalid argument passed\"}}\n'; exit 1"]
+output = "jsonl"
+text_path = "/result/response"
+error_path = ["/result/error"]
+"#;
+        let spec: &'static CustomAgentSpec = Box::leak(Box::new(toml::from_str(toml).unwrap()));
+        let (result, _events) = run_custom_turn_in_dir(spec, ws.path()).await;
+
+        assert!(result.is_err(), "non-transient error must fail: {result:?}");
+    }
+
+    // TC-2116 / FR-2116: agent with keepalive lines stalls when no progress is made.
+    #[tokio::test]
+    async fn tc_2116_custom_stall_with_keepalive_output() {
+        let _env_guard = dmuxai::state_path::test_env_lock();
+        let xdg_dir = tempfile::tempdir().unwrap();
+        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            "[runners.fake_stall]\nfallback = [\"opencode\"]\nstall_timeout_secs = 1\n",
+        )
+        .unwrap();
+
+        let pidfile = ws.path().join("child.pid");
+        let toml = format!(
+            r#"
+name = "fake_stall"
+command = ["sh", "-c", "echo $$ > '{}'; while true; do echo 'ping keepalive'; sleep 0.2; done"]
+stall_keepalive = "^ping keepalive"
+"#,
+            pidfile.display()
+        );
+        let spec: &'static CustomAgentSpec = Box::leak(Box::new(toml::from_str(&toml).unwrap()));
+
+        let turn_res = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_custom_turn_in_dir(spec, ws.path()),
+        )
+        .await;
+
+        unsafe {
+            match saved_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        let (result, _events) = turn_res.expect("turn should time out and stall within 5s");
+        let err = result.expect_err("expected Stalled error");
+        assert_eq!(err.kind, AgentErrorKind::Stalled);
+        assert!(
+            err.message
+                .contains("fake_stall stalled: no model progress for 1s")
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            let child_pid = read_pid(&pidfile).await;
+            assert_gone(child_pid).await;
+        }
+    }
+
+    // TC-2116 / FR-2116: consecutive api retry lines trigger stall.
+    #[tokio::test]
+    async fn tc_2116_custom_api_retry_lines_stall() {
+        let _env_guard = dmuxai::state_path::test_env_lock();
+        let xdg_dir = tempfile::tempdir().unwrap();
+        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            "[runners.fake_retry]\nfallback = [\"opencode\"]\nstall_api_retries = 3\n",
+        )
+        .unwrap();
+
+        let toml = r#"
+name = "fake_retry"
+command = ["sh", "-c", "echo 'API error (attempt 1): request failed'; echo 'API error (attempt 2): request failed'; echo 'API error (attempt 3): request failed'; sleep 30"]
+"#;
+        let spec: &'static CustomAgentSpec = Box::leak(Box::new(toml::from_str(toml).unwrap()));
+
+        let turn_res = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_custom_turn_in_dir(spec, ws.path()),
+        )
+        .await;
+
+        unsafe {
+            match saved_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        let (result, _events) = turn_res.expect("turn should stall quickly on 3 retries");
+        let err = result.expect_err("expected Stalled error");
+        assert_eq!(err.kind, AgentErrorKind::Stalled);
+        assert!(
+            err.message
+                .contains("3 consecutive provider API retries without progress")
+        );
     }
 }

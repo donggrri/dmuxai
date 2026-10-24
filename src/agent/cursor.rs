@@ -976,6 +976,7 @@ async fn stream_child(
             }
             dmuxai::process::supervisor::LineEvent::Idle(_) => {}
             dmuxai::process::supervisor::LineEvent::Timeout(_) => {}
+            dmuxai::process::supervisor::LineEvent::Tick => {}
         }
     }
 }
