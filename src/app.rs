@@ -1747,6 +1747,7 @@ impl App {
             last_tool_progress_state: HashMap::new(),
             last_output_heartbeat_at: HashMap::new(),
         };
+        app.selected = app.initial_runner_index(None);
         let runners = app.registered_runner_names();
         app.messages
             .push(Message::new(Role::System, welcome_message(&runners)));
@@ -2700,19 +2701,59 @@ impl App {
         }
     }
 
+    fn initial_runner_index(&self, preferred: Option<Agent>) -> usize {
+        let available_slot = |agent: Agent| -> Option<usize> {
+            let slot = adapter_slot(agent)?;
+            (slot < self.adapters.len() && self.runner_is_allowed(runner_name(agent)))
+                .then_some(slot)
+        };
+        if let Some(agent) = preferred
+            && let Some(slot) = available_slot(agent)
+        {
+            return slot;
+        }
+        if let Some(agent) = self
+            .settings
+            .routing_default_agent
+            .as_deref()
+            .and_then(runner_from_str)
+            && let Some(slot) = available_slot(agent)
+        {
+            return slot;
+        }
+        if let Some(agent) = self
+            .first_allowed_runner_id()
+            .as_deref()
+            .and_then(runner_from_str)
+            && let Some(slot) = available_slot(agent)
+        {
+            return slot;
+        }
+        adapter_slot(Agent::default())
+            .filter(|slot| *slot < self.adapters.len())
+            .unwrap_or(0)
+    }
+
     fn restore_conversation_runner(&mut self, agent: Agent) {
         let runner = runner_name(agent);
-        if self.runner_is_allowed(runner) {
+        let registered = adapter_slot(agent).is_some_and(|slot| slot < self.adapters.len());
+        if registered && self.runner_is_allowed(runner) {
             self.selected = adapter_index(agent);
             return;
         }
-        let Some(replacement) = self.first_allowed_runner_id() else {
+        let replacement_index = self.initial_runner_index(Some(agent));
+        let replacement = self.agent_runner_name(self.adapters[replacement_index].agent());
+        self.selected = replacement_index;
+        if replacement.eq_ignore_ascii_case(runner) {
             return;
-        };
-        if let Some(rep_agent) = runner_from_str(&replacement) {
-            self.selected = adapter_index(rep_agent);
+        }
+        if registered {
             self.push_system(format!(
                 "Runner '{runner}' is not in allowed_runners; using '{replacement}'"
+            ));
+        } else {
+            self.push_system(format!(
+                "Runner '{runner}' is no longer configured; using '{replacement}'"
             ));
         }
     }
@@ -5653,8 +5694,10 @@ impl App {
                             .insert(stored_turn_id.clone(), index);
                         self.messages.push(message_from_transcript(message));
                         if message.state == MessageState::Streaming {
-                            self.streaming_messages
-                                .insert(agent_from_key(message.agent), index);
+                            let agent = agent_from_key(message.agent);
+                            if adapter_slot(agent).is_some() {
+                                self.streaming_messages.insert(agent, index);
+                            }
                         }
                     }
                 }
@@ -5777,6 +5820,16 @@ impl App {
             return;
         }
         let agent = agent_from_key(job.agent());
+        let Some(slot) = adapter_slot(agent).filter(|slot| *slot < self.adapters.len()) else {
+            if let Some(deferred) = deferred {
+                self.restore_deferred_input(deferred);
+            }
+            self.push_system(format!(
+                "Runner '{}' is no longer configured; cannot start summary.",
+                self.agent_runner_name(agent)
+            ));
+            return;
+        };
         let prompt = summary_prompt(&job, focus.as_deref());
         let turn_id = TurnId::new(format!("summary-{}", self.next_internal_turn_id));
         self.next_internal_turn_id += 1;
@@ -5790,7 +5843,7 @@ impl App {
             require_file_edits: false,
             system_prompt: None,
         };
-        match self.adapters[adapter_index(agent)].send(request) {
+        match self.adapters[slot].send(request) {
             Ok(()) => {
                 self.busy_agents.insert(agent);
                 self.run_states.insert(
@@ -13037,10 +13090,23 @@ impl App {
                 .with_error_kind(AgentErrorKind::Policy.as_str().to_owned());
             }
             self.selected = adapter_index(target_agent);
-        } else if let Some(default) = self.settings.routing_default_agent.as_deref()
-            && let Some(agent) = runner_from_str(default)
-        {
-            self.selected = adapter_index(agent);
+        } else {
+            let preferred = self
+                .settings
+                .routing_default_agent
+                .as_deref()
+                .and_then(runner_from_str);
+            self.selected = match preferred {
+                Some(agent)
+                    if adapter_slot(agent).is_some_and(|slot| slot < self.adapters.len())
+                        && !self.runner_is_allowed(runner_name(agent)) =>
+                {
+                    // Keep the configured default selected so the allowed_runners
+                    // policy check below still refuses it (FR-781).
+                    adapter_index(agent)
+                }
+                other => self.initial_runner_index(other),
+            };
         }
 
         if req.agent.is_none() {
@@ -15609,11 +15675,16 @@ fn agent_from_key(agent: AgentKey) -> Agent {
     }
 }
 
-fn adapter_index(agent: Agent) -> usize {
+fn adapter_slot(agent: Agent) -> Option<usize> {
     Agent::all()
         .iter()
         .position(|candidate| *candidate == agent)
-        .expect("agent belongs to Agent::all()")
+}
+
+fn adapter_index(agent: Agent) -> usize {
+    adapter_slot(agent)
+        .or_else(|| adapter_slot(Agent::default()))
+        .unwrap_or(0)
 }
 
 /// FR-950: the `cause` label stored in the fallback note and revision errors.
@@ -26411,7 +26482,11 @@ mod tests {
         }
     }
 
-    fn app_with_runner_agents(agents: Vec<Agent>, settings: DmuxSettings) -> App {
+    fn startup_app_with_engine(
+        engine: ConversationEngine,
+        agents: Vec<Agent>,
+        settings: DmuxSettings,
+    ) -> App {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
         let adapters = agents
@@ -26429,23 +26504,92 @@ mod tests {
             .collect();
         let (event_tx, event_rx) = event_channel();
         drop(event_tx);
-        let workspace = std::env::current_dir().unwrap();
-        let engine =
-            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
-        let mut app = App::with_runtime(
+        App::with_runtime(
             adapters,
             event_rx,
             Vec::new(),
             engine,
-            workspace,
+            std::env::current_dir().unwrap_or_default(),
             settings,
             Vec::new(),
             Vec::new(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn app_with_runner_agents(agents: Vec<Agent>, settings: DmuxSettings) -> App {
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let mut app = startup_app_with_engine(engine, agents, settings);
         app.selected = adapter_index(Agent::Codex);
         app.skip_judge_for_tests = true;
         app
+    }
+
+    fn startup_app_with_settings(agents: Vec<Agent>, settings: DmuxSettings) -> App {
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        startup_app_with_engine(engine, agents, settings)
+    }
+
+    // #145: a stored conversation whose last turn names a removed custom agent
+    // must restore onto a registered runner instead of panicking.
+    #[test]
+    fn startup_restore_of_unregistered_runner_does_not_panic() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine =
+            ConversationEngine::open(&dir.path().join("conversations.sqlite3"), dir.path())
+                .unwrap();
+        engine
+            .select(ConversationSelection::New {
+                title: Some("Legacy".to_owned()),
+            })
+            .unwrap();
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Custom(u8::MAX),
+                model_id: None,
+                prompt: "old turn".to_owned(),
+                display_text: None,
+            })
+            .unwrap();
+        let app = startup_app_with_engine(engine, Agent::BUILTIN.to_vec(), DmuxSettings::default());
+        assert!(app.selected < app.adapters.len());
+        assert_eq!(adapter_slot(Agent::Custom(u8::MAX)), None);
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| { message.content.contains("is no longer configured; using") })
+        );
+    }
+
+    // #171: a fresh session must start on an allowed runner even when the
+    // implicit default (Cursor) is excluded by allowed_runners.
+    #[test]
+    fn startup_new_session_honours_allowed_runners() {
+        pin_test_state_dir();
+        let mut settings = DmuxSettings::default();
+        settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
+        let app = startup_app_with_settings(Agent::BUILTIN.to_vec(), settings);
+        assert_eq!(app.adapters[app.selected].agent(), Agent::Agy);
+    }
+
+    // #171: routing_default_agent selects the startup runner.
+    #[test]
+    fn startup_new_session_honours_routing_default() {
+        pin_test_state_dir();
+        let mut settings = DmuxSettings::default();
+        settings.routing_default_agent = Some("agy".to_owned());
+        let app = startup_app_with_settings(Agent::BUILTIN.to_vec(), settings);
+        assert_eq!(app.adapters[app.selected].agent(), Agent::Agy);
+    }
+
+    #[test]
+    fn adapter_slot_rejects_unknown_custom_agent() {
+        assert_eq!(adapter_slot(Agent::Custom(u8::MAX)), None);
     }
 
     // TC-816 (FR-983): the welcome line names adapters in picker order.
