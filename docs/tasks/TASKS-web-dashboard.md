@@ -36,7 +36,7 @@ Spec: [SPEC-web-dashboard.md](../specs/SPEC-web-dashboard.md)
 | Done | Owner | Task | Requirement IDs | Test command |
 | --- | --- | --- | --- | --- |
 | [x] | opencode deepseek | `[[mcp.servers]]` config, merge, env-ref resolution, redaction | INT-560 | `cargo test --lib mcp_config_merges_user_and_repo_by_name` |
-| [x] | opencode deepseek | Per-runner propagation helpers (opencode, Codex, custom, Cursor guard, AGY notice) | INT-561 | `cargo test --lib mcp::propagate` |
+| [x] | opencode deepseek | Per-runner propagation helpers (opencode, Codex, custom, Cursor guard, AGY notice) (superseded 2026-10-24 by TASKS-mcp-propagation-removal) | INT-561 | `cargo test --lib mcp::propagate` |
 | [x] | opencode glm | Deterministic mock MCP server (stdio + streamable HTTP) and `__mock-mcp` fixtures | NFR-560 | `cargo test --lib mcp::mock` |
 | [x] | AGY | MCP client (stdio + streamable HTTP), adapter hooks, `__mock-mcp`, wiring | INT-562, INT-563 | `cargo test --test mcp_client` |
 | [x] | AGY | Client hardening: no redirects, process groups, bounded writes, streamed SSE, no secrets in Codex argv, once-per-session Cursor notice | NFR-561 | `cargo test --test mcp_client`; `cargo test --bin dmuxai codex_mcp_secrets_not_in_argv` |

@@ -194,10 +194,6 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-web-dashboard | INT-560 | TC-560 | `mcp_config_merges_user_and_repo_by_name` | unit | ✅ | web dashboard slice C (MCP) |
 | M8,M2 | SPEC-web-dashboard | INT-562 | TC-561 | `mcp_client_stdio_and_http_against_mock` | integration | ✅ | web dashboard slice C (MCP) |
 | M8,M2 | SPEC-web-dashboard | FR-561 | TC-562 | `import_creates_todos_from_mock_jira_and_confluence` | integration | ✅ | web dashboard slice C (MCP) |
-| M8,M2 | SPEC-web-dashboard | INT-561 | TC-563 | `opencode_config_gets_mcp_key` | unit | ✅ | web dashboard slice C (MCP) |
-| M8,M2 | SPEC-web-dashboard | INT-561 | TC-564 | `codex_overrides_encode_mcp_servers` | unit | ✅ | web dashboard slice C (MCP) |
-| M8,M2 | SPEC-web-dashboard | INT-561 | TC-565 | `custom_agent_mcp_json_shape` | unit | ✅ | web dashboard slice C (MCP) |
-| M8,M2 | SPEC-web-dashboard | INT-561 | TC-566 | `cursor_guard_writes_only_when_absent_and_agy_notice` | unit | ✅ | web dashboard slice C (MCP) |
 | M8,M2 | SPEC-web-dashboard | FR-562 | TC-567 | `mcp_servers_route_redacts_secrets` | integration | ✅ | web dashboard slice C (MCP) |
 | M8,M2 | SPEC-web-dashboard | UX-560 | TC-568 | `static_page_has_import_panel` | integration | ✅ | web dashboard slice C (MCP) |
 | M8,M2 | SPEC-web-dashboard | INT-563 | TC-569 | `serve_imports_from_mock_mcp_end_to_end` | e2e | ✅ | web dashboard slice C (MCP) |
@@ -208,8 +204,6 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-web-dashboard | NFR-561 | TC-574 | `mcp_client_refuses_redirects` | integration | ✅ | web dashboard slice C (MCP) |
 | M8,M2 | SPEC-web-dashboard | NFR-561 | TC-575 | `mcp_client_kills_stdio_process_group` | integration (unix) | ✅ | web dashboard slice C (MCP) |
 | M8,M2 | SPEC-web-dashboard | NFR-561 | TC-576 | `mcp_client_bounds_writes_and_streams_sse` | integration | ✅ | web dashboard slice C (MCP) |
-| M8,M2 | SPEC-web-dashboard | NFR-561 | TC-577 | `codex_mcp_secrets_not_in_argv` | unit | ✅ | web dashboard slice C (MCP) |
-| M8,M2 | SPEC-web-dashboard | INT-561 | TC-578 | `cursor_mcp_notice_once_per_session` | unit | ✅ | web dashboard slice C (MCP) |
 | M8,M2 | SPEC-web-dashboard | FR-564 | TC-579 | `serve_snapshot_has_jira_base_url_at_startup` | integration | ✅ | web dashboard slice C (MCP) |
 | M8,M2 | SPEC-graph-view | FR-700 | TC-700 | `layout_assigns_layers_and_stable_order` | unit | ✅ | graph view slice H |
 | M8,M2 | SPEC-graph-view | FR-700 | TC-701 | `layout_is_cycle_safe_and_handles_empty` | unit | ✅ | graph view slice H |
@@ -255,9 +249,6 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-obsidian-memory | INT-729 | TC-729 | `mcp_memory_serves_tools_against_a_vault`, `mcp_memory_reports_disabled_memory`, `mcp_memory_rejects_*`, `mcp_memory_null_id_notification_is_silent`, `mcp_memory_oversized_line_is_parse_error_and_serving_continues` | integration | ✅ | Obsidian memory (slice E) |
 | M8,M2 | SPEC-obsidian-memory | FR-730 | TC-730 | `search_*` | unit | ✅ | Obsidian memory (slice E) |
 | M8,M2 | SPEC-obsidian-memory | UX-728 | TC-731 | `memory_panel_assets_present` | unit + manual | ✅ | Obsidian memory (slice E) |
-| M8,M2 | SPEC-obsidian-memory | FR-733 | TC-733 | `builtin_memory_mcp_server_*` | unit | ✅ | shared memory MCP entry |
-| M8,M2 | SPEC-obsidian-memory | FR-733 | TC-734 | `builtin_memory_server_*` (propagate, registry) | unit | ✅ | shared memory MCP entry |
-| M8,M2 | SPEC-obsidian-memory | FR-733 | TC-735 | `builtin_memory_server_connects_via_shared_list` | integration | ✅ | shared memory MCP entry |
 | M8,M2 | SPEC-docs-preview | FR-740 | TC-740 | `rejects_traversal_and_absolute_paths` | unit | ✅ | docs preview (PR F) |
 | M8,M2 | SPEC-docs-preview | FR-740 | TC-741 | `rejects_symlink_escape` (unix) | unit | ✅ | docs preview (PR F) |
 | M8,M2 | SPEC-docs-preview | FR-741 | TC-742 | `list_skips_ignored_dirs_and_truncates` | unit | ✅ | docs preview (PR F) |
@@ -366,6 +357,12 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8 | SPEC-model-policy | FR-912 | TC-912 | `dmuxai_graph_yaml_keeps_grok_disallow_and_explains_why` | integration | ✅ | v0.2.2 |
 | M8 | SPEC-graph-swimlane | FR-881,FR-884 | TC-884 | `graph_swimlane_one_head_per_target_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.2 |
 | M8 | SPEC-graph-swimlane | FR-884 | TC-885 | `graph_swimlane_direct_arrow_avoids_cards_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.2 |
+| M8 | SPEC-mcp-propagation-removal | FR-2080 | TC-2080 | `tc_2080_acp_session_params_send_empty_mcp_servers`, `tc_2080_cursor_acp_session_new_has_empty_mcp_servers` | unit + integration | ✅ | ACP session params send empty mcpServers |
+| M8 | SPEC-mcp-propagation-removal | FR-2081 | TC-2081 | `tc_2081_legacy_mcp_runners_key_loads_with_one_warning` | unit | ✅ | legacy runners key ignored with one warning |
+| M8 | SPEC-mcp-propagation-removal | FR-2082 | TC-2082 | `tc_2082_custom_mcp_config_placeholder_dropped_with_warning` | unit | ✅ | custom {mcp_config} placeholder dropped with warning |
+| M8 | SPEC-mcp-propagation-removal | FR-2083 | TC-2083 | `tc_2083_memory_on_adds_no_builtin_mcp_entry` | unit | ✅ | no builtin dmuxai-memory entry added |
+| M8 | SPEC-mcp-propagation-removal | FR-2084 | TC-2084 | `tc_2084_no_runner_gets_mcp_args_or_files` | integration | ✅ | no runner gets MCP args, env, or files |
+| M8 | SPEC-mcp-propagation-removal | FR-2085 | TC-2085 | `tc_2085_no_propagation_code_left` | unit | ✅ | source scan confirms no propagation code |
 
 ### 1.1 주의할 ⚠️ 항목
 

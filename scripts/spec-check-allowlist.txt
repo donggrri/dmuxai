@@ -1,2 +1,3 @@
 # Spec check allowlist. This list must only shrink.
 # A docs PR (branch docs/spec-behavior-gaps) is fixing these specs.
+SPEC-mcp-injection.md # Removed (superseded by SPEC-mcp-propagation-removal, 2026-10-24)
