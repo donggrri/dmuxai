@@ -54,6 +54,7 @@ Refactor R-1 (Part A) extracts a generic merge engine `dmuxai::activity::merge_a
 | --- | --- | --- | --- | --- | --- |
 | FR-1950 | Must | Given an incoming `ActivityItem` (Tool or Thinking) and a sequence of elements containing activity items | Single activity merge rule: App message list, offscreen buffer, dashboard and durable storage all use `activity::merge_activity_in`/`merge_activity`; behavior unchanged; a Tool replaces the most recent Running tool with the same name (or pushes if none exists); a Thinking merges into the most recent live thinking (`finished_ms: None`) (updating `finished_ms`, updating `started_ms` if 0, and appending text) or pushes if none exists | Non-activity elements in the collection are skipped by the search; indices returned reflect the exact updated or appended position | TC-1950 |
 | FR-1951 | Must | Given an identical sequence of `ActivityItem` items applied to an App message list and a plain `Vec<ActivityItem>` | App merge equals engine merge for the same sequence; the sequence of `Role::Activity` items in `messages` equals the plain vector in order and content | Non-activity messages (user, agent, system) interleaved in `messages` do not alter the merge outcome or order of activity items | TC-1951 |
+| FR-1955 | Must | Given production plan validation, local task edits, revision-to-graph conversion, replan prompt building, or replan apply in `src/app.rs` | All five sites obtain their `PlanContext` from the single `App::with_plan_context` builder; the model filter lives in `App::plan_effective_model`; behavior is unchanged | No other `PlanContext` literal remains in non-test `src/app.rs` code; test adapters in `src/graph/*` are unchanged | TC-1955 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -61,6 +62,7 @@ Refactor R-1 (Part A) extracts a generic merge engine `dmuxai::activity::merge_a
 | --- | --- | --- | --- | --- | --- | --- |
 | TC-1950 | FR-1950 | unit | A `Vec` of an enum/struct with non-activity elements interleaved | Call `merge_activity_in` for Tool running, Tool completed (replace across non-activity rows), Tool push when none running, Thinking live, Thinking delta/finish (merge across non-activity rows), and Thinking push after finished | Tool replaces latest running tool of same name across non-activity rows or pushes; Thinking merges into live thinking across non-activity rows or pushes after finished; returned indices are correct | `src/activity.rs` `tc_1950_merge_activity_in_skips_non_activity_rows` |
 | TC-1951 | FR-1951 | unit | An identical sequence of `ActivityItem` items (running tools, completed replacements, multiple tools, thinking start/deltas/finish/new) | Apply the sequence to an App message list via `merge_activity_item` and to a plain `Vec<ActivityItem>` via `merge_activity` | The `Role::Activity` items extracted from `messages` equal the plain vector in order and content exactly | `src/app.rs` `tc_1951_app_activity_merge_matches_engine_rule` |
+| TC-1955 | FR-1955 | unit | A test `App` built like other app tests | Call `with_plan_context("task", |ctx| ...)` and compare each field against `App` policy helpers | `user_prompt == "task"`; `available_runners == app.registered_runner_names()`; `runner_allowed` matches `app.runner_is_allowed` for every registered runner and `"nonexistent"`; `effective_model` matches `app.plan_effective_model`; `validate_model("codex", m)` equals `dmuxai::model_policy::validate_model_for_runner("codex", m)` for a valid and an invalid model | `src/app.rs` `tc_1955_plan_context_builder_uses_app_policy` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -76,6 +78,7 @@ Refactor R-1 (Part A) extracts a generic merge engine `dmuxai::activity::merge_a
 | 2 | Replace duplicate merge in `App` with `merge_activity_in` delegation | `src/app.rs` | FR-1950 | `cargo check` |
 | 3 | Add unit test `tc_1950_merge_activity_in_skips_non_activity_rows` | `src/activity.rs` | FR-1950 | `tc_1950_merge_activity_in_skips_non_activity_rows` |
 | 4 | Add parity test `tc_1951_app_activity_merge_matches_engine_rule` | `src/app.rs` | FR-1951 | `tc_1951_app_activity_merge_matches_engine_rule` |
+| 5 | Extract single `App::with_plan_context` builder and `App::plan_effective_model`; replace five `PlanContext` assemblies | `src/app.rs` | FR-1955 | `tc_1955_plan_context_builder_uses_app_policy` |
 
 ## 8. Review and test exit criteria
 

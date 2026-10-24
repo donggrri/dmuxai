@@ -6503,25 +6503,11 @@ impl App {
                     .ok_or(PlanDecisionError::NotAwaitingApproval)?;
                 let tasks = run.plan.tasks.clone();
                 let user_prompt = run.plan.user_prompt.clone();
-                let available = self.registered_runner_names();
-                let ctx = PlanContext {
-                    user_prompt: &user_prompt,
-                    available_runners: &available,
-                    runner_allowed: &|runner: &str| self.runner_is_allowed(runner),
-                    effective_model: &|runner: &str| {
-                        runner_from_str(runner).and_then(|agent| {
-                            self.effective_model_for(agent, "").filter(|model| {
-                                dmuxai::model_policy::validate_model_for_runner(runner, model)
-                                    .is_ok()
-                            })
-                        })
-                    },
-                    validate_model: &dmuxai::model_policy::validate_model_for_runner,
-                };
                 let max_steps = self.graph_limits().max_nodes.max(1);
-                let (steps, tasks) = local
-                    .apply(&revision_steps, &tasks, &ctx, max_steps)
-                    .map_err(PlanDecisionError::TaskEditRefused)?;
+                let result = self.with_plan_context(&user_prompt, |ctx| {
+                    local.apply(&revision_steps, &tasks, ctx, max_steps)
+                });
+                let (steps, tasks) = result.map_err(PlanDecisionError::TaskEditRefused)?;
                 self.push_local_task_revision(steps, tasks)?;
             }
         }
@@ -6698,30 +6684,18 @@ impl App {
             )
         };
         let limits = self.graph_limits();
-        let available = self.registered_runner_names();
-        let ctx = PlanContext {
-            user_prompt: &user_prompt,
-            available_runners: &available,
-            runner_allowed: &|runner: &str| self.runner_is_allowed(runner),
-            effective_model: &|runner: &str| {
-                runner_from_str(runner).and_then(|agent| {
-                    self.effective_model_for(agent, "").filter(|model| {
-                        dmuxai::model_policy::validate_model_for_runner(runner, model).is_ok()
-                    })
-                })
-            },
-            validate_model: &dmuxai::model_policy::validate_model_for_runner,
-        };
-        let mut graph_plan = graph_plan_from_revision_steps(
-            &plan_id,
-            &user_prompt,
-            &triage.model,
-            &tasks,
-            &steps,
-            limits,
-            &ctx,
-        )
-        .map_err(|errors| {
+        let result = self.with_plan_context(&user_prompt, |ctx| {
+            graph_plan_from_revision_steps(
+                &plan_id,
+                &user_prompt,
+                &triage.model,
+                &tasks,
+                &steps,
+                limits,
+                ctx,
+            )
+        });
+        let mut graph_plan = result.map_err(|errors| {
             PlanDecisionError::InvalidRevisionPlan(
                 errors
                     .iter()
@@ -8029,24 +8003,9 @@ impl App {
                 self.end_run_state(pending.agent, true, false);
                 match parse_plan(&pending.buffer) {
                     Ok(doc) => {
-                        let available = self.registered_runner_names();
-                        let ctx = PlanContext {
-                            user_prompt: &pending.prompt,
-                            available_runners: &available,
-                            runner_allowed: &|runner: &str| self.runner_is_allowed(runner),
-                            effective_model: &|runner: &str| {
-                                runner_from_str(runner).and_then(|agent| {
-                                    self.effective_model_for(agent, "").filter(|model| {
-                                        dmuxai::model_policy::validate_model_for_runner(
-                                            runner, model,
-                                        )
-                                        .is_ok()
-                                    })
-                                })
-                            },
-                            validate_model: &dmuxai::model_policy::validate_model_for_runner,
-                        };
-                        match validate_plan(&doc, &ctx) {
+                        let result =
+                            self.with_plan_context(&pending.prompt, |ctx| validate_plan(&doc, ctx));
+                        match result {
                             Ok(graph_plan) => {
                                 self.record_pending_plan_io(&pending, true);
                                 if pending.edit_previous_json.is_some() {
@@ -8556,22 +8515,10 @@ impl App {
         }
         let user_prompt = run.plan.user_prompt.clone();
         let summaries = self.replan_summaries.clone();
-        let available = self.registered_runner_names();
-        let ctx = PlanContext {
-            user_prompt: &user_prompt,
-            available_runners: &available,
-            runner_allowed: &|runner: &str| self.runner_is_allowed(runner),
-            effective_model: &|runner: &str| {
-                runner_from_str(runner).and_then(|agent| {
-                    self.effective_model_for(agent, "").filter(|model| {
-                        dmuxai::model_policy::validate_model_for_runner(runner, model).is_ok()
-                    })
-                })
-            },
-            validate_model: &dmuxai::model_policy::validate_model_for_runner,
-        };
         let nonce = Uuid::new_v4().simple().to_string();
-        let prompt = match build_replan_prompt(&run, trigger, &reason, &summaries, &ctx, &nonce) {
+        let prompt = match self.with_plan_context(&user_prompt, |ctx| {
+            build_replan_prompt(&run, trigger, &reason, &summaries, ctx, &nonce)
+        }) {
             Ok(prompt) => prompt,
             Err(_) => {
                 let message = self.push_replan_skipped(
@@ -9519,24 +9466,9 @@ impl App {
                             return true;
                         };
                         let user_prompt = run.plan.user_prompt.clone();
-                        let available = self.registered_runner_names();
-                        let ctx = PlanContext {
-                            user_prompt: &user_prompt,
-                            available_runners: &available,
-                            runner_allowed: &|runner: &str| self.runner_is_allowed(runner),
-                            effective_model: &|runner: &str| {
-                                runner_from_str(runner).and_then(|agent| {
-                                    self.effective_model_for(agent, "").filter(|model| {
-                                        dmuxai::model_policy::validate_model_for_runner(
-                                            runner, model,
-                                        )
-                                        .is_ok()
-                                    })
-                                })
-                            },
-                            validate_model: &dmuxai::model_policy::validate_model_for_runner,
-                        };
-                        match apply_replan(&run, &doc, &ctx) {
+                        let result = self
+                            .with_plan_context(&user_prompt, |ctx| apply_replan(&run, &doc, ctx));
+                        match result {
                             Ok((plan, change)) => {
                                 let old = run.plan;
                                 if revision_needs_approval(&old, &plan, &change) {
@@ -12308,6 +12240,26 @@ impl App {
             .iter()
             .map(|adapter| self.agent_runner_name(adapter.agent()))
             .collect()
+    }
+
+    fn plan_effective_model(&self, runner: &str) -> Option<String> {
+        runner_from_str(runner).and_then(|agent| {
+            self.effective_model_for(agent, "").filter(|model| {
+                dmuxai::model_policy::validate_model_for_runner(runner, model).is_ok()
+            })
+        })
+    }
+
+    fn with_plan_context<R>(&self, user_prompt: &str, f: impl FnOnce(&PlanContext<'_>) -> R) -> R {
+        let available = self.registered_runner_names();
+        let ctx = PlanContext {
+            user_prompt,
+            available_runners: &available,
+            runner_allowed: &|runner: &str| self.runner_is_allowed(runner),
+            effective_model: &|runner: &str| self.plan_effective_model(runner),
+            validate_model: &dmuxai::model_policy::validate_model_for_runner,
+        };
+        f(&ctx)
     }
 
     pub(crate) fn agent_runner_name(&self, agent: Agent) -> String {
@@ -32708,6 +32660,46 @@ mod tests {
         assert!(json.contains("\"hash\""));
         assert!(json.contains("\"delivery\""));
         assert!(!json.contains("INSTR"));
+    }
+
+    #[test]
+    fn tc_1955_plan_context_builder_uses_app_policy() {
+        let (app, _sent) = test_app();
+        let runners = app.registered_runner_names();
+        let allowed_expected: Vec<(String, bool)> = runners
+            .iter()
+            .map(|r| (r.clone(), app.runner_is_allowed(r)))
+            .collect();
+        let nonexistent_allowed = app.runner_is_allowed("nonexistent");
+        let effective_expected: Vec<(String, Option<String>)> = runners
+            .iter()
+            .map(|r| (r.clone(), app.plan_effective_model(r)))
+            .collect();
+        let valid_model = "composer-2.5";
+        let invalid_model = "gpt-4";
+        let valid_expected = dmuxai::model_policy::validate_model_for_runner("codex", valid_model);
+        let invalid_expected =
+            dmuxai::model_policy::validate_model_for_runner("codex", invalid_model);
+
+        app.with_plan_context("task", |ctx| {
+            assert_eq!(ctx.user_prompt, "task");
+            assert_eq!(ctx.available_runners, runners.as_slice());
+            for (r, exp) in &allowed_expected {
+                assert_eq!((ctx.runner_allowed)(r), *exp);
+            }
+            assert_eq!((ctx.runner_allowed)("nonexistent"), nonexistent_allowed);
+            for (r, exp) in &effective_expected {
+                assert_eq!((ctx.effective_model)(r), exp.clone());
+            }
+            assert_eq!(
+                (ctx.validate_model)("codex", valid_model),
+                valid_expected.clone()
+            );
+            assert_eq!(
+                (ctx.validate_model)("codex", invalid_model),
+                invalid_expected.clone()
+            );
+        });
     }
 }
 
