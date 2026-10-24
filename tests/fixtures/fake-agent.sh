@@ -54,6 +54,12 @@ case "$behavior" in
   text)   echo "hello $last" ;;
   stdin)  read -r line; echo "stdin:$line" ;;
   empty)  : ;;
+  writefile)
+    # Edit the workspace without printing a final message (FR-2125).
+    if [ -n "$FAKE_AGENT_OUT" ]; then
+      printf 'changed\n' > "$FAKE_AGENT_OUT"
+    fi
+    ;;
   denied) echo "Error: permission denied for bash" >&2; echo "partial" ;;
   fail)   echo "boom" >&2; exit 3 ;;
   error)  printf '{"type":"error","error":{"message":"model not found"}}\n' ;;

@@ -136,6 +136,22 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
+- **Custom agents that edit files but send no final message no longer fail
+  (#146, FR-2125).** An agent turn that exits 0 with no reply, no JSONL error
+  and no `failure_stderr` match used to be reported as "empty reply text". In
+  an Implement (edit-allowed) turn, DmuxAI now compares `git status --porcelain`
+  before and after the run: when the workspace changed, the turn completes with
+  the notice "<label> finished without a final message; workspace files
+  changed" instead of an error. An empty reply without a workspace change, and
+  every read-only turn, still fail.
+
+- **A model-catalog warning no longer turns unrelated failures into a runner
+  handover (FR-2126).** The "model <m> is not offered by ..." hint is still
+  attached to a failed turn, but the error kind becomes `model_unavailable` only
+  when the error message itself reports an unknown or unavailable model. Other
+  provider or process failures keep their kind and are no longer handed to the
+  next runner in the fallback chain.
+
 - **AGY keeps results after a recovered provider error (#151).** A transient
   provider error reported after AGY's final answer step no longer fails the
   turn; the result is kept with a Notice. Same behaviour for custom agents

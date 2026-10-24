@@ -902,16 +902,39 @@ pub fn append_reply_text(reply: &mut String, text: &str, break_pending: &mut boo
     chunk
 }
 
-/// Determines whether a turn failed and returns an error reason if so.
-pub fn failure_reason(
+/// The failure signal of a finished turn, in the order the checks run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FailureSignal {
+    JsonlError(String),
+    StderrPattern(String),
+    NonZeroExit(String),
+    EmptyReply,
+}
+
+impl FailureSignal {
+    /// The user-facing reason for this failure signal.
+    fn reason(&self) -> String {
+        match self {
+            Self::JsonlError(message)
+            | Self::StderrPattern(message)
+            | Self::NonZeroExit(message) => message.clone(),
+            Self::EmptyReply => "empty reply text".to_string(),
+        }
+    }
+}
+
+/// Detects the first failure signal of a finished turn, in the order the
+/// checks run: JSONL error, `failure_stderr` match, non-zero exit, empty
+/// reply.
+fn failure_signal(
     spec: &CustomAgentSpec,
     exit_ok: bool,
     reply_text: &str,
     stderr: &str,
     jsonl_error: Option<&str>,
-) -> Option<String> {
+) -> Option<FailureSignal> {
     if let Some(err) = jsonl_error.map(str::trim).filter(|s| !s.is_empty()) {
-        return Some(err.to_string());
+        return Some(FailureSignal::JsonlError(err.to_string()));
     }
 
     if let Some(pattern) = &spec.failure_stderr
@@ -919,16 +942,16 @@ pub fn failure_reason(
         && re.is_match(stderr)
     {
         let trimmed = stderr.trim();
-        return Some(if trimmed.is_empty() {
+        return Some(FailureSignal::StderrPattern(if trimmed.is_empty() {
             "matched failure_stderr pattern".to_string()
         } else {
             trimmed.to_string()
-        });
+        }));
     }
 
     if !exit_ok {
         let trimmed = stderr.trim();
-        return Some(if trimmed.is_empty() {
+        return Some(FailureSignal::NonZeroExit(if trimmed.is_empty() {
             let program = spec
                 .command
                 .first()
@@ -943,14 +966,60 @@ pub fn failure_reason(
             )
         } else {
             trimmed.to_string()
-        });
+        }));
     }
 
     if reply_text.trim().is_empty() {
-        return Some("empty reply text".to_string());
+        return Some(FailureSignal::EmptyReply);
     }
 
     None
+}
+
+/// Determines whether a turn failed and returns an error reason if so.
+pub fn failure_reason(
+    spec: &CustomAgentSpec,
+    exit_ok: bool,
+    reply_text: &str,
+    stderr: &str,
+    jsonl_error: Option<&str>,
+) -> Option<String> {
+    failure_signal(spec, exit_ok, reply_text, stderr, jsonl_error).map(|signal| signal.reason())
+}
+
+/// The outcome of a finished custom-agent turn (FR-2125).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnOutcome {
+    /// The turn produced a reply and no error indicator.
+    Success,
+    /// The turn exited successfully without a final message, but the workspace
+    /// changed during an edit-allowed turn (FR-2125).
+    SuccessWithoutReply,
+    /// The turn failed with the given reason.
+    Failed(String),
+}
+
+/// Classifies a finished turn.
+///
+/// The failure checks run in the same order as [`failure_reason`]: a JSONL
+/// error wins, then a `failure_stderr` match, then a non-zero exit, then an
+/// empty reply. The one difference is the empty reply: when the turn exited
+/// successfully, reported no error, and the workspace changed while it ran
+/// (edit-allowed turn), the turn is a success without a final message
+/// (FR-2125). An empty reply without a workspace change stays a failure.
+pub fn classify_turn_outcome(
+    spec: &CustomAgentSpec,
+    exit_ok: bool,
+    reply_text: &str,
+    stderr: &str,
+    jsonl_error: Option<&str>,
+    workspace_changed: bool,
+) -> TurnOutcome {
+    match failure_signal(spec, exit_ok, reply_text, stderr, jsonl_error) {
+        None => TurnOutcome::Success,
+        Some(FailureSignal::EmptyReply) if workspace_changed => TurnOutcome::SuccessWithoutReply,
+        Some(signal) => TurnOutcome::Failed(signal.reason()),
+    }
 }
 
 /// Process-wide registry of configured custom agents, installed once at startup.
@@ -1867,6 +1936,55 @@ image_arg = []
         // 6. Success
         let r6 = failure_reason(&spec, true, "Everything succeeded!", "", None);
         assert_eq!(r6, None);
+    }
+
+    // TC-2125 / FR-2125: empty reply is only a success when the workspace
+    // changed during an edit-allowed turn; every other failure signal wins.
+    #[test]
+    fn tc_2125_classify_turn_outcome_table() {
+        let spec: CustomAgentSpec = toml::from_str(OPENCODE_TOML).unwrap();
+
+        // Empty reply + workspace change -> success without a final message.
+        assert_eq!(
+            classify_turn_outcome(&spec, true, "   \n  ", "", None, true),
+            TurnOutcome::SuccessWithoutReply
+        );
+
+        // Empty reply without a workspace change -> failure.
+        assert_eq!(
+            classify_turn_outcome(&spec, true, "   \n  ", "", None, false),
+            TurnOutcome::Failed("empty reply text".to_string())
+        );
+
+        // A JSONL error wins over the workspace change.
+        assert_eq!(
+            classify_turn_outcome(&spec, true, "", "", Some("model not found"), true),
+            TurnOutcome::Failed("model not found".to_string())
+        );
+
+        // A non-zero exit wins over the workspace change.
+        let exit_failure = classify_turn_outcome(&spec, false, "", "boom\n", None, true);
+        assert_eq!(exit_failure, TurnOutcome::Failed("boom".to_string()));
+
+        // A failure_stderr match wins over the workspace change.
+        let stderr_failure = classify_turn_outcome(
+            &spec,
+            true,
+            "",
+            "Error: Permission Denied to execute bash",
+            None,
+            true,
+        );
+        assert_eq!(
+            stderr_failure,
+            TurnOutcome::Failed("Error: Permission Denied to execute bash".to_string())
+        );
+
+        // A reply with text is a plain success.
+        assert_eq!(
+            classify_turn_outcome(&spec, true, "done", "", None, false),
+            TurnOutcome::Success
+        );
     }
 
     #[test]
