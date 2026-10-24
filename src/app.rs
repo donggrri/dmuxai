@@ -93,6 +93,7 @@ use crate::agent::{
     spawn_cursor_adapter, spawn_custom_adapter,
 };
 use crate::internal_turn::{self, InternalTurn, TurnBuffer};
+use crate::todo_link::{TodoFinish, TodoLinks};
 
 /// Minimum wait between graph defer retries (FR-976); zero in unit tests.
 const GRAPH_DEFER_RETRY_INTERVAL: Duration = if cfg!(test) {
@@ -1442,14 +1443,8 @@ pub struct App {
     /// keyed by node id only, so they are not applied to it.
     graph_history_run_id: Option<String>,
     pub(crate) dirty: bool,
-    todo_store: Option<Arc<TodoStore>>,
+    todos: TodoLinks,
     dashboard_commands: Option<mpsc::Receiver<DashboardCommand>>,
-    todo_turns: HashMap<(Agent, StoredTurnId), String>,
-    graph_todo: Option<(String, String)>,
-    /// FR-947: to-do id while judge/planning runs before `GraphRun` exists.
-    pending_todo_graph: Option<String>,
-    /// FR-947: preallocated run id for `mark_running` and judge triage.
-    pending_todo_run_id: Option<String>,
     pub(crate) color_enabled: bool,
     cached_agent_colors: HashMap<Agent, Color>,
     cached_theme: Option<Theme>,
@@ -1465,8 +1460,6 @@ pub struct App {
     system_prompt_applied: Option<HeadlessSystemPrompt>,
     /// Stored triage record for direct headless runs without a graph (FR-1764, FR-1766).
     headless_triage: Option<Triage>,
-    /// Hint for todo runs so try_submit_to_agent maps them to Worker.
-    submitting_todo_run: bool,
     /// Display text for the next turn, consumed in try_submit_to_agent.
     pending_display_text: Option<String>,
     /// Turn ids that already emitted a notice on failure to save durable activity (FR-1920).
@@ -1640,7 +1633,6 @@ impl App {
             pending_prompt_application: None,
             system_prompt_applied: None,
             headless_triage: None,
-            submitting_todo_run: false,
             pending_display_text: None,
             activity_save_failed_turns: HashSet::new(),
             exit: false,
@@ -1736,12 +1728,8 @@ impl App {
             graph_approval_stale: None,
             graph_history_run_id: None,
             dirty: false,
-            todo_store: None,
+            todos: TodoLinks::default(),
             dashboard_commands: None,
-            todo_turns: HashMap::new(),
-            graph_todo: None,
-            pending_todo_graph: None,
-            pending_todo_run_id: None,
             color_enabled,
             cached_agent_colors: HashMap::new(),
             cached_theme: None,
@@ -2130,19 +2118,11 @@ impl App {
         self.active_turns.clear();
         self.streaming_messages.clear();
 
-        if let Some(store) = self.todo_store.clone() {
-            let mut ids_to_finish: HashSet<String> =
-                self.todo_turns.drain().map(|(_, id)| id).collect();
-            if let Some((_plan_id, todo_id)) = self.graph_todo.take() {
-                ids_to_finish.insert(todo_id);
-            }
-            let changed = !ids_to_finish.is_empty();
-            for todo_id in ids_to_finish {
-                if let Err(err) =
-                    store.finish_run(&todo_id, false, Some("dmuxai exited".to_owned()))
-                {
-                    self.push_system(format!("Failed to finish to-do run on shutdown: {err}"));
-                }
+        if self.todos.store().is_some() {
+            let changed = !self.todos.turns.is_empty() || self.todos.graph.is_some();
+            let errors = self.todos.finish_all("dmuxai exited".to_owned());
+            for err in errors {
+                self.push_system(format!("Failed to finish to-do run on shutdown: {err}"));
             }
             if changed {
                 self.publish_todos();
@@ -3439,7 +3419,8 @@ impl App {
             .map(|a| a.conversation_id.as_str().to_owned())
             .or_else(|| Some(self.conversation_id.as_str().to_owned()));
         let todo = active.as_ref().and_then(|a| {
-            self.todo_turns
+            self.todos
+                .turns
                 .get(&(output.agent, a.turn_id.clone()))
                 .cloned()
         });
@@ -4705,8 +4686,7 @@ impl App {
     ) -> Result<StoredTurnId, RunTodoError> {
         // Consume the todo-run hint up front so it can never leak across an
         // early return (busy, deferred, summary-in-progress, ...).
-        let submitting_todo_run = self.submitting_todo_run;
-        self.submitting_todo_run = false;
+        let submitting_run = self.todos.take_submitting_run();
         // Consume pending display text up front so it never leaks to a later turn.
         let pending_display_text = self.pending_display_text.take();
         if self.busy_agents.contains(&agent) {
@@ -4864,14 +4844,13 @@ impl App {
         let injected_memory = self.inject_memory(agent, &mut adapter_request);
 
         // Determine the prompt role for this turn.
-        let prompt_role =
-            if self.active_graph_node_for_agent(agent).is_some() || submitting_todo_run {
-                dmuxai::agent_prompt::PromptRole::Worker
-            } else if self.skill_interview.is_some() {
-                dmuxai::agent_prompt::PromptRole::Interview
-            } else {
-                dmuxai::agent_prompt::PromptRole::Chat
-            };
+        let prompt_role = if self.active_graph_node_for_agent(agent).is_some() || submitting_run {
+            dmuxai::agent_prompt::PromptRole::Worker
+        } else if self.skill_interview.is_some() {
+            dmuxai::agent_prompt::PromptRole::Interview
+        } else {
+            dmuxai::agent_prompt::PromptRole::Chat
+        };
         let runner = runner_name(agent);
         let custom_spec = match agent {
             Agent::Custom(idx) => dmuxai::custom_agent::spec_at(idx),
@@ -5154,7 +5133,16 @@ impl App {
                 }
             }
             // FR-947: a cancelled plan of a to-do run sends the to-do back to open.
-            self.finish_linked_graph_todo(false, Some("cancelled by user".to_owned()));
+            let last_run_todo = self
+                .last_graph_run
+                .as_ref()
+                .and_then(|run| run.todo_id.clone());
+            let finish = self.todos.finish_linked(
+                false,
+                Some("cancelled by user".to_owned()),
+                last_run_todo,
+            );
+            self.report_todo_finish(finish);
             self.push_system(format!("{plan_agent} turn cancelled."));
             return;
         }
@@ -5203,7 +5191,16 @@ impl App {
             }
             self.last_graph_run = Some(run);
             // FR-947: a to-do whose judge turn is cancelled goes back to open.
-            self.finish_linked_graph_todo(false, Some("cancelled by user".to_owned()));
+            let last_run_todo = self
+                .last_graph_run
+                .as_ref()
+                .and_then(|run| run.todo_id.clone());
+            let finish = self.todos.finish_linked(
+                false,
+                Some("cancelled by user".to_owned()),
+                last_run_todo,
+            );
+            self.report_todo_finish(finish);
             self.push_system(format!("{agent} turn cancelled."));
             return;
         }
@@ -5687,7 +5684,8 @@ impl App {
         // does not take this fast path and still starts a judge turn.
         if is_trivial_prompt(&prompt) && heuristic_route(&prompt) == Route::Simple {
             let run_id = self
-                .pending_todo_run_id
+                .todos
+                .pending_run_id
                 .take()
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
             self.start_one_node_run(
@@ -5729,7 +5727,8 @@ impl App {
             system_prompt: None,
         };
         let run_id = self
-            .pending_todo_run_id
+            .todos
+            .pending_run_id
             .take()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         match self.adapters[index].send(request) {
@@ -6854,7 +6853,14 @@ impl App {
         }
         self.graph_approval_stale = None;
         self.push_system("Plan rejected.".to_owned());
-        self.finish_linked_graph_todo(false, Some("plan rejected".to_owned()));
+        let last_run_todo = self
+            .last_graph_run
+            .as_ref()
+            .and_then(|run| run.todo_id.clone());
+        let finish =
+            self.todos
+                .finish_linked(false, Some("plan rejected".to_owned()), last_run_todo);
+        self.report_todo_finish(finish);
         Ok(())
     }
 
@@ -7377,7 +7383,7 @@ impl App {
         }
         self.remember_judge_reason_triage(run.triage.as_ref());
         let plan_id = run.plan.id.clone();
-        self.commit_pending_graph_todo(&plan_id, &mut run);
+        self.todos.commit_pending_graph(&plan_id, &mut run);
         self.last_graph_run = Some(run);
         self.push_plan_waiting_approval_transcript_line();
     }
@@ -7615,7 +7621,7 @@ impl App {
             }
             self.remember_judge_reason_triage(planning_run.triage.as_ref());
             let plan_id = planning_run.plan.id.clone();
-            self.commit_pending_graph_todo(&plan_id, &mut planning_run);
+            self.todos.commit_pending_graph(&plan_id, &mut planning_run);
             self.last_graph_run = Some(planning_run);
         }
         self.push_system(format!("Planning with {runner} {model}…"));
@@ -9600,26 +9606,18 @@ impl App {
         if self.conversation_id.as_str() == conversation_id {
             self.last_graph_run = Some(run.clone());
         }
-        if self
-            .graph_todo
-            .as_ref()
-            .is_some_and(|(plan_id, _)| plan_id == &run.plan.id)
-            && let Some((_plan_id, todo_id)) = self.graph_todo.take()
-            && let Some(store) = self.todo_store.clone()
-        {
-            let success = run.phase == GraphRunPhase::Completed;
-            let todo_error = if success {
-                None
-            } else if run.phase == GraphRunPhase::Cancelled {
-                Some("cancelled".to_owned())
-            } else {
-                Some("graph run failed".to_owned())
-            };
-            if let Err(err) = store.finish_run(&todo_id, success, todo_error) {
-                self.push_system(format!("Failed to finish to-do run: {err}"));
-            }
-            self.publish_todos();
-        }
+        let success = run.phase == GraphRunPhase::Completed;
+        let todo_error = if success {
+            None
+        } else if run.phase == GraphRunPhase::Cancelled {
+            Some("cancelled".to_owned())
+        } else {
+            Some("graph run failed".to_owned())
+        };
+        let finish = self
+            .todos
+            .finish_graph_for_plan(&run.plan.id, success, todo_error);
+        self.report_todo_finish(finish);
         self.session_conversations = None;
     }
 
@@ -9801,12 +9799,7 @@ impl App {
             .conversation_run_count(self.conversation_id.as_str()) as u32
             + 1;
         // A to-do link: still pending (judge stage) or already bound to this plan id.
-        let todo_id = self.pending_todo_graph.clone().or_else(|| {
-            self.graph_todo
-                .as_ref()
-                .filter(|(plan_id, _)| plan_id == &plan.id)
-                .map(|(_, todo_id)| todo_id.clone())
-        });
+        let todo_id = self.todos.todo_for_new_run(&plan.id);
         GraphRun {
             plan,
             conversation_id: self.conversation_id.as_str().to_owned(),
@@ -9827,46 +9820,6 @@ impl App {
             pending_replan_plan: None,
             planner_io: Vec::new(),
             todo_id,
-        }
-    }
-
-    fn commit_pending_graph_todo(&mut self, plan_id: &str, run: &mut GraphRun) {
-        // The pending link is consumed by the first run it reaches, so a later
-        // plain prompt never inherits a finished to-do.
-        let pending = self.pending_todo_graph.take();
-        self.pending_todo_run_id = None;
-        if run.todo_id.is_none() {
-            run.todo_id = pending;
-        }
-        if self.graph_todo.is_none()
-            && let Some(todo_id) = run.todo_id.clone()
-        {
-            self.graph_todo = Some((plan_id.to_owned(), todo_id));
-        }
-    }
-
-    fn finish_linked_graph_todo(&mut self, success: bool, error: Option<String>) {
-        let todo_id = self
-            .graph_todo
-            .as_ref()
-            .map(|(_, id)| id.clone())
-            .or_else(|| self.pending_todo_graph.clone())
-            .or_else(|| {
-                self.last_graph_run
-                    .as_ref()
-                    .and_then(|run| run.todo_id.clone())
-            });
-        let Some(todo_id) = todo_id else {
-            return;
-        };
-        self.graph_todo = None;
-        self.pending_todo_graph = None;
-        self.pending_todo_run_id = None;
-        if let Some(store) = self.todo_store.clone() {
-            if let Err(err) = store.finish_run(&todo_id, success, error) {
-                self.push_system(format!("Failed to finish to-do run: {err}"));
-            }
-            self.publish_todos();
         }
     }
 
@@ -10605,14 +10558,11 @@ impl App {
         {
             self.single_graph_plan = None;
         }
-        if let Some(active) = active_turn
-            && let Some(todo_id) = self.todo_turns.remove(&(agent, active.turn_id))
-            && let Some(store) = self.todo_store.clone()
-        {
-            if let Err(err) = store.finish_run(&todo_id, success, error_string.clone()) {
-                self.push_system(format!("Failed to finish to-do run: {err}"));
-            }
-            self.publish_todos();
+        if let Some(active) = active_turn {
+            let finish =
+                self.todos
+                    .finish_turn(agent, &active.turn_id, success, error_string.clone());
+            self.report_todo_finish(finish);
         }
         let background_graph_turn = finished_conversation
             .as_ref()
@@ -10851,7 +10801,7 @@ impl App {
 
     fn start_graph_run_record(&mut self, mut run: GraphRun) {
         let plan_id = run.plan.id.clone();
-        self.commit_pending_graph_todo(&plan_id, &mut run);
+        self.todos.commit_pending_graph(&plan_id, &mut run);
         if self
             .tasks_file_last_snapshot
             .as_ref()
@@ -10959,14 +10909,8 @@ impl App {
                     self.single_graph_plan = None;
                     self.clear_pending_turn_policy();
                     self.clear_turn_runner_pin();
-                    if let Some((_plan_id, todo_id)) = self.graph_todo.take()
-                        && let Some(store) = self.todo_store.clone()
-                    {
-                        if let Err(err) = store.finish_run(&todo_id, true, None) {
-                            self.push_system(format!("Failed to finish to-do run: {err}"));
-                        }
-                        self.publish_todos();
-                    }
+                    let finish = self.todos.finish_graph(true, None);
+                    self.report_todo_finish(finish);
                     break;
                 }
                 GraphAction::Cancelled(detail) => {
@@ -11008,16 +10952,10 @@ impl App {
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
                     self.clear_pending_turn_policy();
-                    if let Some((_plan_id, todo_id)) = self.graph_todo.take()
-                        && let Some(store) = self.todo_store.clone()
-                    {
-                        if let Err(err) =
-                            store.finish_run(&todo_id, false, Some(format!("cancelled: {detail}")))
-                        {
-                            self.push_system(format!("Failed to finish to-do run: {err}"));
-                        }
-                        self.publish_todos();
-                    }
+                    let finish = self
+                        .todos
+                        .finish_graph(false, Some(format!("cancelled: {detail}")));
+                    self.report_todo_finish(finish);
                     break;
                 }
                 GraphAction::Failed(message) => {
@@ -11060,14 +10998,8 @@ impl App {
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
                     self.clear_pending_turn_policy();
-                    if let Some((_plan_id, todo_id)) = self.graph_todo.take()
-                        && let Some(store) = self.todo_store.clone()
-                    {
-                        if let Err(err) = store.finish_run(&todo_id, false, Some(message)) {
-                            self.push_system(format!("Failed to finish to-do run: {err}"));
-                        }
-                        self.publish_todos();
-                    }
+                    let finish = self.todos.finish_graph(false, Some(message.clone()));
+                    self.report_todo_finish(finish);
                     break;
                 }
             }
@@ -12306,7 +12238,8 @@ impl App {
             lifecycle.last_to_state.clone()
         };
         let todo = self
-            .todo_turns
+            .todos
+            .turns
             .get(&(agent, active.turn_id.clone()))
             .cloned();
         let node = self.graph_agent_nodes.get(&agent).cloned();
@@ -12543,7 +12476,7 @@ impl App {
 
     /// Attaches the to-do store without reconciling stale runs or attaching a command channel.
     pub fn attach_todo_store(&mut self, store: Arc<TodoStore>) {
-        self.todo_store = Some(store);
+        self.todos.attach_store(store);
     }
 
     fn headless_plan_snapshot(&self) -> (Option<Triage>, Option<HeadlessPlan>) {
@@ -12612,7 +12545,14 @@ impl App {
             self.push_system(format!("Could not save the cancelled plan: {error}"));
         }
         self.graph_approval_stale = None;
-        self.finish_linked_graph_todo(false, Some(note.to_owned()));
+        let last_run_todo = self
+            .last_graph_run
+            .as_ref()
+            .and_then(|run| run.todo_id.clone());
+        let finish = self
+            .todos
+            .finish_linked(false, Some(note.to_owned()), last_run_todo);
+        self.report_todo_finish(finish);
     }
 
     fn headless_active_run_phase(&self) -> GraphRunPhase {
@@ -13268,7 +13208,7 @@ impl App {
         let text = agent_texts.join("\n\n");
 
         let todo = if let Some(ref todo_id) = req.todo_id {
-            if let Some(store) = self.todo_store.as_ref() {
+            if let Some(store) = self.todos.store() {
                 if cancelled
                     && let Ok(current_todo) = store.get(todo_id)
                     && current_todo.status == TodoStatus::Running
@@ -13358,16 +13298,30 @@ impl App {
                 }
             }
         }
-        self.todo_store = Some(store);
+        self.todos.attach_store(store);
         self.dashboard_commands = Some(commands);
         self.publish_todos();
         // The chat session appears with the first snapshot (FR-780).
         self.publish_dashboard();
     }
 
+    fn report_todo_finish(&mut self, finish: TodoFinish) {
+        let failed = match &finish {
+            TodoFinish::Failed(err) => {
+                self.push_system(format!("Failed to finish to-do run: {err}"));
+                true
+            }
+            TodoFinish::Finished => true,
+            TodoFinish::NotLinked => false,
+        };
+        if failed && self.todos.store().is_some() {
+            self.publish_todos();
+        }
+    }
+
     /// Publishes the current to-do list to the dashboard hub, if attached (FR-542).
     fn publish_todos(&mut self) {
-        let (Some(hub), Some(store)) = (&self.dashboard, &self.todo_store) else {
+        let (Some(hub), Some(store)) = (&self.dashboard, self.todos.store()) else {
             return;
         };
         match store.list() {
@@ -13387,7 +13341,7 @@ impl App {
                 "workspace switch in progress".to_owned(),
             ));
         }
-        let Some(store) = self.todo_store.clone() else {
+        let Some(store) = self.todos.store().cloned() else {
             return Err(RunTodoError::Internal(
                 "to-do store not attached".to_owned(),
             ));
@@ -13458,13 +13412,12 @@ impl App {
                 }
 
                 let run_ref = Uuid::new_v4().to_string();
-                self.pending_todo_graph = Some(todo_id.to_owned());
-                self.pending_todo_run_id = Some(run_ref.clone());
+                self.todos
+                    .begin_pending_graph(todo_id.to_owned(), run_ref.clone());
                 let updated = store
                     .mark_running(todo_id, "graph", &run_ref)
                     .map_err(|err| {
-                        self.pending_todo_graph = None;
-                        self.pending_todo_run_id = None;
+                        self.todos.clear_pending_graph();
                         self.push_system(format!("Failed to mark to-do running: {err}"));
                         RunTodoError::Internal(err.to_string())
                     })?;
@@ -13531,10 +13484,10 @@ impl App {
         }
 
         self.begin_user_prompt_turn();
-        self.submitting_todo_run = true;
+        self.todos.set_submitting_run(true);
         let turn_id = self.try_submit_to_agent(target_agent, prompt, false, false)?;
-        self.todo_turns
-            .insert((target_agent, turn_id), todo_id.to_owned());
+        self.todos
+            .link_turn(target_agent, turn_id, todo_id.to_owned());
         let updated = store
             .mark_running(todo_id, "agent", runner_id)
             .map_err(|err| {
@@ -18785,8 +18738,8 @@ mod tests {
         assert!(h.app.graph_session.is_none());
         assert_eq!(store.get(&todo.id).unwrap().status, TodoStatus::Done);
         // The to-do link is consumed by its run: nothing leaks into later prompts.
-        assert!(h.app.pending_todo_graph.is_none());
-        assert!(h.app.pending_todo_run_id.is_none());
+        assert!(h.app.todos.pending_graph.is_none());
+        assert!(h.app.todos.pending_run_id.is_none());
 
         // Cancelling the judge turn of a to-do run sends the to-do back to open.
         let todo_cancel = store
@@ -18804,7 +18757,7 @@ mod tests {
         assert!(h.app.pending_triage.is_some());
         h.app.cancel_selected();
         assert_eq!(store.get(&todo_cancel.id).unwrap().status, TodoStatus::Open);
-        assert!(h.app.pending_todo_graph.is_none());
+        assert!(h.app.todos.pending_graph.is_none());
         assert_eq!(
             store.get(&todo.id).unwrap().status,
             TodoStatus::Done,
@@ -19226,7 +19179,7 @@ mod tests {
 
         let plan_id = "test-abort-run";
         store.mark_running(&todo.id, "graph", plan_id).unwrap();
-        app.graph_todo = Some((plan_id.to_owned(), todo.id.clone()));
+        app.todos.graph = Some((plan_id.to_owned(), todo.id.clone()));
 
         let plan = dmuxai::graph::GraphPlan {
             schema: "cursor-agent-graph/v1".to_owned(),
