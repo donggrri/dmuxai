@@ -94,6 +94,7 @@ Notes:
 | `triage` | object\|null | Judge/fallback/override verdict (`source`: `judge`, `fallback`, or `override`) when a graph run started |
 | `plan` | object\|null | `{steps, tasks}` when a plan was produced (including exit 7 awaiting approval) |
 | `events` | object | `first_seq`/`last_seq` written for this run; both `null` when the run wrote no events |
+| `fallbacks` | array | Optional list of handovers: `{from_runner, from_model, reason, detail, to_runner, to_model}` (`to_*` null when the chain is exhausted); omitted when empty |
 
 Failures with `--json` print `{ "ok": false, "exit_code": <n>, "error": "<message>" }`.
 
@@ -351,7 +352,7 @@ restarts at 1.
 | `ts` | string | RFC 3339 UTC with milliseconds |
 | `ts_ms` | int | Epoch milliseconds |
 | `workspace` | string | Workspace label |
-| `kind` | string | `agent`, `node`, `graph` or `todo` |
+| `kind` | string | `agent`, `node`, `graph`, `todo` or `fallback` |
 | `task` | string\|null | Graph run id |
 | `todo` | string\|null | To-do id |
 | `node` | string\|null | Graph node id |
@@ -372,6 +373,7 @@ Readers must ignore unknown fields; malformed lines are skipped.
 | `node` | `pending`, `ready`, `running`, `waiting_gate`, `completed`, `failed`, `skipped` |
 | `graph` | `active`, `waiting_gate`, `completed`, `failed` |
 | `todo` | `started` (→ running), `completed` (→ done), `failed` (running → open with an error), `open` (any other change to open) |
+| `fallback` | `<runner>` (handing the turn to that runner) or `exhausted` (chain exhausted) |
 
 Ordering guarantees:
 
@@ -456,6 +458,9 @@ Per-runner system prompts. User config sets defaults; workspace `dmuxai.toml` ov
 | `prompt_inject` | `session` | `session` (inject on fresh session or hash change) or `always` (every turn). |
 | `prompt_roles` | `["chat", "worker"]` | Roles that may receive the prompt; `judge`/`triage`/`planner`/`replan`/`summary`/`interview` never do. |
 | `model` | — | Per-runner model profile (`[runners.<id>] model = "..."`); validated with `validate_model_for_runner` (built-in) / `allowed_models` (custom). Invalid values are dropped with a config warning. `[runners.default] model` is ignored with a warning. |
+| `fallback` | — | Ordered chain of `"<runner>"` or `"<runner>:<model>"` targets tried when the runner fails for provider reasons or stalls; empty array disables the default chain for that runner; missing/empty means old behaviour. Invalid targets are dropped with a config warning. |
+| `stall_timeout_secs` | `240` | No-progress seconds that trigger a stall when the runner has a non-empty chain; `0` disables. |
+| `stall_api_retries` | `3` | Consecutive `API error (attempt N)` retry lines that trigger a stall; `0` disables. |
 
 ```toml
 [runners.default]

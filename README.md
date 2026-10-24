@@ -571,6 +571,40 @@ The database is stored at
 set, or `~/.local/state/dmuxai/conversations.sqlite3` otherwise. Conversations
 are scoped by the canonical current workspace path.
 
+## Runner fallback
+
+A runner can hand a failed turn to the next runner/model in an ordered chain:
+
+```toml
+[runners.agy-flash]
+fallback = ["agy-flash:gemini-3.8-flash-low", "opencode-step"]
+stall_timeout_secs = 240   # 0 disables the no-progress timer
+stall_api_retries = 3      # 0 disables
+```
+
+`[runners.<id>]` and `[runners.default]` accept `fallback = ["<runner>", "<runner>:<model>", ...]`
+(runner ids like `agy`, `cursor`, `codex`, `opencode`, `grok`, or a custom agent name; model optional;
+another model of the same runner is allowed). An empty `fallback = []` disables the default chain
+for that runner; missing/empty means old behaviour. Workspace `dmuxai.toml` replaces the user entry
+per runner id. Invalid targets (unknown runner, disallowed model, duplicates) are dropped with a
+config warning.
+
+Fallback triggers: `stalled`; `model_unavailable` (quota/unavailable); provider/process-exit errors
+whose message looks like quota/429/rate limit, auth expired/401/403/not logged in, transient
+provider/network errors, or a runner that could not start. It never triggers on user cancel,
+permission denied, total timeout, plain idle, or normal task failures (tests failing, empty reply,
+plan-only, refusal).
+
+Stall detection runs inside the agy and custom command adapters only when the runner has a
+non-empty chain: no model progress for `stall_timeout_secs` (keepalive lines do not count; the
+timer pauses while a tool runs), or `stall_api_retries` consecutive `API error (attempt N)`
+retry lines. Custom agents may set `stall_keepalive = "<regex>"` for keepalive-only stdout lines.
+ACP runners (codex/cursor/grok acp) have no stall detection.
+
+One pass through the original runner's chain per user turn; exhausted chains fail normally with a
+"fallback chain exhausted" line. Internal turns (planner, judge, triage, replan, summary) do not
+fall back.
+
 ## Safety and platform behavior
 
 Every user turn runs in **agent mode** (former Implement-equivalent CLI flags).
@@ -579,7 +613,7 @@ are not selectable from the UI.
 
 | Turn | Codex | Cursor (legacy) | Cursor (ACP, Linux) | AGY |
 | --- | --- | --- | --- | --- |
-| User (agent) | workspace-write sandbox | `--force --sandbox enabled` | `cursor-agent acp …` | `--mode accept-edits --sandbox` |
+| User (agent) | workspace-write sandbox | `--force --sandbox enabled` | `cursor-agent acp …` | `--mode accept-edits` |
 | Internal read-only | read-only sandbox | `--mode ask` | ACP with read-only policy | `--mode plan --sandbox` |
 
 Agent turns may modify project files inside the provider workspace/sandbox.

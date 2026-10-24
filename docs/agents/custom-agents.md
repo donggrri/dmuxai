@@ -30,6 +30,7 @@ text_break_when = { path = "/type", equals = "tool_call" }   # optional: next te
 resume_arg = ["--session", "{session_id}"]   # appended when resuming
 timeout_secs = 1800
 idle_timeout_secs = 300               # optional: seconds without stdout before failing (default 300, 0 disables)
+stall_keepalive = "^ping keepalive"   # optional regex: stdout lines matching are keepalives only (used with runner fallback)
 failure_stderr = "(?i)permission denied|rejected permission"
 temp_config_template = '{"permission":{"edit":"{edit}","bash":"{edit}","webfetch":"allow"}}'
 env = { OPENCODE_CONFIG = "{temp_config}" }
@@ -62,6 +63,9 @@ DmuxAI emits a one-time notice suggesting `output = "jsonl"` and `text_path`.
 
 Failure (shown as an error turn): spawn error, non-zero exit, timeout, empty reply text,
 a jsonl `error_path` hit, or stderr matching `failure_stderr`.
+If a transient provider error arrives after the final text (same line or the previous
+non-empty line), the turn completes with a Notice "...(#151)" instead of failing, so a
+runner-fallback chain can still take over on mid-turn errors.
 Process: own process group; Ctrl+C kills the whole group. The temp config is deleted after the turn.
 
 Presets: see `docs/agents/presets.toml` (opencode tested; hermes tested; pi untested).
