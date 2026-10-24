@@ -9,7 +9,7 @@ Related: #123, #162; PR-5
 
 ## 1. Decision summary
 
-Runner process management is unified into a shared process supervisor module (`src/process/supervisor.rs`, lib crate `dmuxai::process::supervisor`). The supervisor centralizes child process spawning in isolated process groups, idle and total timeout watchdogs, non-blocking stderr tail capture, graceful shutdown escalation (`SIGTERM` -> grace period -> `SIGKILL`), and grandchild cleanup after turn completion. This closes #123 (custom agent hang without output) and #162 (SIGTERM/SIGHUP leaving orphaned runner processes editing the workspace) by ensuring one robust supervisor controls the lifecycle and group signaling of runner processes.
+Runner process management is unified into a shared process supervisor module (`src/process/supervisor.rs`, lib crate `dmuxai::process::supervisor`). The supervisor centralizes child process spawning in isolated process groups, idle and total timeout watchdogs, non-blocking stderr tail capture, graceful shutdown escalation (`SIGTERM` -> grace period -> `SIGKILL`), and grandchild cleanup after turn completion. PR-5 also adds SIGTERM/SIGHUP handling for `dmuxai run`, ports the custom runner with `idle_timeout_secs` (default 300; 0 disables), and registers agy, cursor (legacy), and ACP runner groups for `killpg`-based termination. This closes #123 (custom agent hang without output) and #162 (SIGTERM/SIGHUP leaving orphaned runner processes editing the workspace) by ensuring one robust supervisor controls the lifecycle and group signaling of runner processes.
 
 ## 2. Scope
 
@@ -21,10 +21,13 @@ Runner process management is unified into a shared process supervisor module (`s
 - `Supervised` child handle with line-by-line stdout streaming (`next_line`), idle and total duration watchdogs (`LineEvent::Idle`, `LineEvent::Timeout`), and non-blocking stderr tail ring buffer (`stderr_tail`).
 - Two-phase graceful termination (`stop`), grandchild reaping after leader exit (`finish`), and safe drop termination (`Drop for Supervised`).
 - Diagnostic error messages (`idle_error_message`, `timeout_error_message`).
+- Signal handling in `dmuxai run`: SIGTERM/SIGHUP set the cancel flag, emit `cancelled`, exit 130, and reap the runner group.
+- Custom runner port: supervisor idle/total watchdogs with `idle_timeout_secs` (default 300; 0 disables).
+- agy, cursor (legacy), and ACP runners: own process group, `live_groups()` registration via `GroupGuard`, termination via `libc::killpg`.
 
 ### Out of scope / non-goals
 
-- Porting specific runners (`custom`, `agy`, `cursor`, `acp`) to the supervisor; agy, cursor, and acp are addressed in subsequent parts of PR-5.
+- agy keeps its own `tokio::process::Child` and its existing idle watchdog (`DMUXAI_AGY_IDLE_TIMEOUT_SECS`, SPEC-agy-idle-timeout) instead of `Supervised::next_line`; Cursor stays on the headless legacy stream-json protocol (no ACP default change); the ACP JSON-RPC layer is unchanged; non-runner helpers (`src/mcp/client.rs`, `src/docs/office.rs`, `src/web/server.rs`) still shell out to `kill` and are not part of this PR.
 
 ### Assumptions and open questions
 
