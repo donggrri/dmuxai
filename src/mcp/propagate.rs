@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
@@ -250,69 +249,6 @@ fn custom_entry(server: &ResolvedMcpServer) -> Value {
     Value::Object(object)
 }
 
-/// Remove-on-drop guard for a project `.cursor/mcp.json` DmuxAI wrote itself.
-#[derive(Debug)]
-pub struct CursorMcpGuard {
-    file: PathBuf,
-    dir: PathBuf,
-    created_dir: bool,
-}
-
-impl Drop for CursorMcpGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.file);
-        if self.created_dir {
-            let empty = std::fs::read_dir(&self.dir)
-                .map(|mut entries| entries.next().is_none())
-                .unwrap_or(false);
-            if empty {
-                let _ = std::fs::remove_dir(&self.dir);
-            }
-        }
-    }
-}
-
-/// Writes `<workspace>/.cursor/mcp.json` only when it does not already exist.
-/// Returns `Ok(None)` when the user owns the file (the caller emits a notice).
-/// On unix the file is created with mode 0600. The returned guard removes the
-/// file, and the `.cursor` directory when DmuxAI created it and it is empty.
-pub fn cursor_mcp_guard(
-    workspace: &Path,
-    servers: &[ResolvedMcpServer],
-) -> std::io::Result<Option<CursorMcpGuard>> {
-    let dir = workspace.join(".cursor");
-    let file = dir.join("mcp.json");
-    if file.exists() {
-        return Ok(None);
-    }
-    let created_dir = if dir.exists() {
-        false
-    } else {
-        std::fs::create_dir_all(&dir)?;
-        true
-    };
-    let contents = custom_mcp_json(servers);
-
-    // `create_new(true)` on every platform so a file that appears after the
-    // `exists()` check is never truncated/overwritten (fail closed).
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    use std::io::Write as _;
-    let mut handle = options.open(&file)?;
-    handle.write_all(contents.as_bytes())?;
-
-    Ok(Some(CursorMcpGuard {
-        file,
-        dir,
-        created_dir,
-    }))
-}
-
 /// A notice listing the equivalent `agy mcp add` commands. AGY only has a
 /// user-level store, so DmuxAI never runs these (OQ-523). Flags come before
 /// `<name>` (the CLI rejects flags after it), `--header` uses the required
@@ -538,7 +474,6 @@ mod tests {
         // TC-566, INT-561: Cursor project file is written only when absent and
         // removed on drop; AGY notice lists commands with $VAR placeholders and
         // no secret values.
-        let workspace = tempfile::tempdir().unwrap();
         let servers = vec![
             stdio(
                 "demo",
@@ -552,40 +487,6 @@ mod tests {
                 &[("Authorization", "demo-token")],
             ),
         ];
-
-        let guard = cursor_mcp_guard(workspace.path(), &servers).unwrap();
-        let guard = guard.expect("guard written when absent");
-        let cursor_dir = workspace.path().join(".cursor");
-        let file = cursor_dir.join("mcp.json");
-        assert!(file.exists());
-        let written: Value =
-            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-        assert_eq!(written["mcpServers"]["demo"]["command"], "npx");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-        }
-        drop(guard);
-        assert!(!file.exists(), "guard must remove the file");
-        assert!(
-            !cursor_dir.exists(),
-            "guard must remove the created empty dir"
-        );
-
-        // A pre-existing file is never overwritten.
-        std::fs::create_dir_all(&cursor_dir).unwrap();
-        std::fs::write(&file, r#"{"mcpServers":{"user":"owned"}}"#).unwrap();
-        assert!(
-            cursor_mcp_guard(workspace.path(), &servers)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            r#"{"mcpServers":{"user":"owned"}}"#
-        );
 
         // TC-566: the AGY notice uses flags before <name>, the
         // `"Key: $KEY"` header form, `-- <command>`, and no secret/query text.
@@ -605,26 +506,6 @@ mod tests {
         assert!(!notice.contains("demo-query-secret"));
         assert!(!notice.contains("api-key"));
         assert!(agy_mcp_notice(&[]).is_none());
-
-        // Finding 1: the write fails closed rather than truncating a file that
-        // appears between the `exists()` check and the open. A dangling symlink
-        // reports `exists() == false` yet occupies the path.
-        #[cfg(unix)]
-        {
-            let raced = tempfile::tempdir().unwrap();
-            let raced_dir = raced.path().join(".cursor");
-            std::fs::create_dir_all(&raced_dir).unwrap();
-            let raced_file = raced_dir.join("mcp.json");
-            std::os::unix::fs::symlink(raced.path().join("missing-target"), &raced_file).unwrap();
-            assert!(
-                cursor_mcp_guard(raced.path(), &servers).is_err(),
-                "must fail closed instead of overwriting"
-            );
-            assert!(
-                std::fs::symlink_metadata(&raced_file).unwrap().is_symlink(),
-                "the existing symlink is untouched"
-            );
-        }
     }
 }
 

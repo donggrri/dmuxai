@@ -252,4 +252,50 @@ mod tests {
         assert_eq!(empty_mcp.agy_notice(), agy_mcp_notice(&[]));
         assert_eq!(empty_mcp.cursor_legacy_notice(), None);
     }
+
+    #[test]
+    fn tc_1984_no_applies_to_outside_mcp() {
+        use std::fs;
+        use std::path::Path;
+
+        fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, out);
+                    } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = manifest.join("src");
+        let mcp = src.join("mcp");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+
+        let mut offenders = Vec::new();
+        for file in files {
+            if file.starts_with(&mcp) {
+                continue;
+            }
+            if let Ok(content) = fs::read_to_string(&file)
+                && content.contains(".applies_to(")
+            {
+                offenders.push(
+                    file.strip_prefix(manifest)
+                        .unwrap_or(&file)
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "applies_to calls found outside src/mcp/: {offenders:?}"
+        );
+    }
 }

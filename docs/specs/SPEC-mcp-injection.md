@@ -49,6 +49,9 @@ PR-7 establishes `RunnerMcp` as the single injection contract across all runners
 | --- | --- | --- | --- | --- | --- |
 | FR-1980 | Must | Given a resolved MCP server list and a target runner name | `RunnerMcp::for_runner(all, runner)` filters servers by runner applicability exactly once using case/whitespace-insensitive matching (None applies to all) | Returns empty `RunnerMcp` when no servers match | TC-1980 |
 | FR-1981 | Must | Given a `RunnerMcp` instance | Adapter methods (`opencode_config`, `codex_overrides`, `custom_json`, `acp_servers`, `agy_notice`) produce outputs byte-for-byte identical to existing `propagate.rs` builders | Empty servers yield empty overrides/arrays or None notices matching builder behavior | TC-1981 |
+| FR-1982 | Must | Given a Cursor legacy turn with applicable MCP servers | DmuxAI no longer writes `<workspace>/.cursor/mcp.json`; the legacy notice is emitted exactly once per adapter session; prewarm runs regardless of MCP servers | No `.cursor/` directory is created; empty server lists emit no notice | TC-1982 |
+| FR-1983 | Must | Given a Cursor ACP turn with applicable MCP servers | MCP servers are passed in `session/new` via `mcpServers` (using `RunnerMcp::acp_servers()`) | Missing/empty servers still send an empty `mcpServers` array | TC-1983 |
+| FR-1984 | Must | Given the repository source tree | No `.applies_to(` call remains outside `src/mcp/` | A unit test fails the build if any such call is introduced | TC-1984 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -56,6 +59,9 @@ PR-7 establishes `RunnerMcp` as the single injection contract across all runners
 | --- | --- | --- | --- | --- | --- | --- |
 | TC-1980 | FR-1980 | unit | Resolved MCP servers with various runner lists (None, single runner, multiple runners with whitespace/case variations, disjoint runners) | Call `RunnerMcp::for_runner` | Contains exactly the matching servers, preserves runner name, reports `is_empty()` accurately | `src/mcp/inject.rs` `tc_1980_for_runner_filters_once` |
 | TC-1981 | FR-1981 | unit | Configured MCP servers (stdio with args/env, http with headers) and base config documents | Call each `RunnerMcp` adapter method and corresponding `propagate.rs` builder | Adapter method outputs equal previous builder outputs byte-for-byte, including empty server lists | `src/mcp/inject.rs` `tc_1981_adapter_outputs_equal_propagate_builders` |
+| TC-1982 | FR-1982 | integration | Fake Cursor binary, legacy protocol, workspace with applicable MCP servers | Run two turns | No `.cursor/` directory is created; the legacy notice is emitted exactly once across both turns | `src/agent/cursor.rs` `tc_1982_cursor_legacy_leaves_no_cursor_dir_and_notice_once` |
+| TC-1983 | FR-1983 | integration | Fake ACP agent with `FAKE_ACP_MCP_CAPTURE`, Cursor ACP protocol, applicable MCP servers | Run one ACP turn | Captured `mcpServers` contains the applicable server | `src/agent/cursor.rs` `tc_1983_cursor_acp_sends_mcp_servers` |
+| TC-1984 | FR-1984 | unit | Repository `src/**/*.rs` excluding `src/mcp/` | Scan source text for `.applies_to(` | No occurrences found | `src/mcp/inject.rs` `tc_1984_no_applies_to_outside_mcp` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -63,6 +69,7 @@ PR-7 establishes `RunnerMcp` as the single injection contract across all runners
 | --- | --- | --- | --- |
 | Injection seam | `RunnerMcp` is the exclusive channel delivering MCP servers to runner adapters | Unchanged payload generation maintains full runner compatibility | TC-1980, TC-1981 |
 | Secret isolation | Secrets continue passing solely through per-run files or child environment, never via command arguments | Preserves existing security and sanitization invariants | TC-1981 |
+| Cursor legacy injection | **Behavior change:** Cursor legacy turns no longer write `<workspace>/.cursor/mcp.json`; workspace stays clean | Cursor legacy loses automatic MCP propagation; users add servers to `~/.cursor/mcp.json` or switch to `protocol = "acp"` | TC-1982 |
 
 ## 7. Implementation plan
 

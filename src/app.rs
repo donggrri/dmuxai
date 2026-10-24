@@ -1512,7 +1512,7 @@ impl App {
                     event_tx.clone(),
                     workspace_root.clone(),
                     cursor_config.clone(),
-                    mcp_servers.clone(),
+                    RunnerMcp::for_runner(&mcp_servers, "cursor"),
                 ),
                 Agent::Agy => spawn_agy_adapter(event_tx.clone(), workspace_root.clone()),
                 Agent::Custom(index) => {
