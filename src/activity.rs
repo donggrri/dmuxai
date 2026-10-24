@@ -160,34 +160,44 @@ impl ActivityItem {
     }
 }
 
-/// Merges an incoming activity item into an existing sequence.
+/// Merges an incoming activity item into an existing collection of items of type `T`.
 ///
-/// Follows the presentation rules of `App::merge_activity_item`:
-/// - A `Tool` replaces the most recent `Running` tool with the same `name`, else is pushed.
+/// Searches from the end for the matching element using `view` (elements where `view` returns `None`
+/// are skipped):
+/// - A `Tool` replaces the most recent `Running` tool with the same `name`, else is pushed via `wrap(item)`.
 /// - A `Thinking` merges into the most recent `Thinking` whose `finished_ms` is `None`
 ///   (setting `finished_ms` if incoming has it, setting `started_ms` if existing is 0 and
-///   incoming is non-zero, and appending incoming text), else is pushed.
+///   incoming is non-zero, and appending incoming text), else is pushed via `wrap(item)`.
 ///
 /// Returns the index in `items` that was updated or pushed.
-pub fn merge_activity(items: &mut Vec<ActivityItem>, item: ActivityItem) -> usize {
+pub fn merge_activity_in<T>(
+    items: &mut Vec<T>,
+    item: ActivityItem,
+    mut view: impl FnMut(&mut T) -> Option<&mut ActivityItem>,
+    wrap: impl FnOnce(ActivityItem) -> T,
+) -> usize {
     match item {
         ActivityItem::Tool { ref name, .. } => {
-            let found = items.iter().rposition(|existing| {
-                matches!(
-                    existing,
-                    ActivityItem::Tool {
+            let found = items
+                .iter_mut()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, el)| match view(el) {
+                    Some(ActivityItem::Tool {
                         name: existing_name,
                         status: ToolStatus::Running,
                         ..
-                    } if existing_name == name
-                )
-            });
+                    }) if existing_name == name => Some(idx),
+                    _ => None,
+                });
 
             if let Some(index) = found {
-                items[index] = item;
+                if let Some(target) = view(&mut items[index]) {
+                    *target = item;
+                }
                 index
             } else {
-                items.push(item);
+                items.push(wrap(item));
                 items.len() - 1
             }
         }
@@ -196,22 +206,23 @@ pub fn merge_activity(items: &mut Vec<ActivityItem>, item: ActivityItem) -> usiz
             started_ms: incoming_started,
             finished_ms: incoming_finished,
         } => {
-            let found = items.iter().rposition(|existing| {
-                matches!(
-                    existing,
-                    ActivityItem::Thinking {
-                        finished_ms: None,
-                        ..
-                    }
-                )
-            });
+            let found = items
+                .iter_mut()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, el)| match view(el) {
+                    Some(ActivityItem::Thinking {
+                        finished_ms: None, ..
+                    }) => Some(idx),
+                    _ => None,
+                });
 
             if let Some(index) = found {
-                if let ActivityItem::Thinking {
+                if let Some(ActivityItem::Thinking {
                     text: existing_text,
                     started_ms: existing_started,
                     finished_ms: existing_finished,
-                } = &mut items[index]
+                }) = view(&mut items[index])
                 {
                     if incoming_finished.is_some() {
                         *existing_finished = incoming_finished;
@@ -225,15 +236,28 @@ pub fn merge_activity(items: &mut Vec<ActivityItem>, item: ActivityItem) -> usiz
                 }
                 index
             } else {
-                items.push(ActivityItem::Thinking {
+                items.push(wrap(ActivityItem::Thinking {
                     text: incoming_text,
                     started_ms: incoming_started,
                     finished_ms: incoming_finished,
-                });
+                }));
                 items.len() - 1
             }
         }
     }
+}
+
+/// Merges an incoming activity item into an existing sequence.
+///
+/// Single source of the merge rule used by App, the dashboard and durable storage:
+/// - A `Tool` replaces the most recent `Running` tool with the same `name`, else is pushed.
+/// - A `Thinking` merges into the most recent `Thinking` whose `finished_ms` is `None`
+///   (setting `finished_ms` if incoming has it, setting `started_ms` if existing is 0 and
+///   incoming is non-zero, and appending incoming text), else is pushed.
+///
+/// Returns the index in `items` that was updated or pushed.
+pub fn merge_activity(items: &mut Vec<ActivityItem>, item: ActivityItem) -> usize {
+    merge_activity_in(items, item, |existing| Some(existing), |item| item)
 }
 
 /// Default line limit when expanding tool details or thought transcripts.
@@ -1168,5 +1192,180 @@ mod tests {
         assert_eq!(idx4, 4);
         assert_eq!(items.len(), 5);
         assert_eq!(items[4], new_thinking);
+    }
+
+    // TC-1950 / FR-1950: merge_activity_in skips non-activity rows and correctly replaces/merges.
+    #[test]
+    fn tc_1950_merge_activity_in_skips_non_activity_rows() {
+        #[derive(Debug, PartialEq, Clone)]
+        enum Row {
+            Comment(String),
+            Activity(ActivityItem),
+        }
+
+        let mut rows = vec![Row::Comment("first comment".to_string())];
+
+        let tool_running = ActivityItem::Tool {
+            name: "read_file".to_string(),
+            target: "src/main.rs".to_string(),
+            status: ToolStatus::Running,
+            duration_ms: None,
+            detail: String::new(),
+        };
+
+        // Push new tool (Running). Index should be 1 (after the comment at 0)
+        let idx0 = merge_activity_in(
+            &mut rows,
+            tool_running.clone(),
+            |r| match r {
+                Row::Activity(a) => Some(a),
+                _ => None,
+            },
+            Row::Activity,
+        );
+        assert_eq!(idx0, 1);
+        assert_eq!(rows.len(), 2);
+
+        // Add an interleaved non-activity element
+        rows.push(Row::Comment("interleaved comment".to_string()));
+        assert_eq!(rows.len(), 3);
+
+        // Replace tool across non-activity row:
+        let tool_completed = ActivityItem::Tool {
+            name: "read_file".to_string(),
+            target: "src/main.rs".to_string(),
+            status: ToolStatus::Ok,
+            duration_ms: Some(120),
+            detail: "done".to_string(),
+        };
+        let idx_replace = merge_activity_in(
+            &mut rows,
+            tool_completed.clone(),
+            |r| match r {
+                Row::Activity(a) => Some(a),
+                _ => None,
+            },
+            Row::Activity,
+        );
+        assert_eq!(idx_replace, 1);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1], Row::Activity(tool_completed));
+
+        // Push tool when none running (index 3)
+        let tool_another = ActivityItem::Tool {
+            name: "read_file".to_string(),
+            target: "src/lib.rs".to_string(),
+            status: ToolStatus::Running,
+            duration_ms: None,
+            detail: String::new(),
+        };
+        let idx_push = merge_activity_in(
+            &mut rows,
+            tool_another.clone(),
+            |r| match r {
+                Row::Activity(a) => Some(a),
+                _ => None,
+            },
+            Row::Activity,
+        );
+        assert_eq!(idx_push, 3);
+        assert_eq!(rows.len(), 4);
+
+        // Add another non-activity row
+        rows.push(Row::Comment("another comment".to_string())); // index 4
+        assert_eq!(rows.len(), 5);
+
+        // Thinking: push live thinking (index 5)
+        let thinking_live = ActivityItem::Thinking {
+            text: "Thinking part 1".to_string(),
+            started_ms: 1000,
+            finished_ms: None,
+        };
+        let idx_think = merge_activity_in(
+            &mut rows,
+            thinking_live,
+            |r| match r {
+                Row::Activity(a) => Some(a),
+                _ => None,
+            },
+            Row::Activity,
+        );
+        assert_eq!(idx_think, 5);
+        assert_eq!(rows.len(), 6);
+
+        // Add non-activity row
+        rows.push(Row::Comment("thought comment".to_string())); // index 6
+        assert_eq!(rows.len(), 7);
+
+        // Merge thinking into live thinking across non-activity rows (updating index 5)
+        let thinking_delta = ActivityItem::Thinking {
+            text: ", part 2".to_string(),
+            started_ms: 0,
+            finished_ms: None,
+        };
+        let idx_think_delta = merge_activity_in(
+            &mut rows,
+            thinking_delta,
+            |r| match r {
+                Row::Activity(a) => Some(a),
+                _ => None,
+            },
+            Row::Activity,
+        );
+        assert_eq!(idx_think_delta, 5);
+        assert_eq!(rows.len(), 7);
+
+        // Finish thinking across non-activity rows (updating index 5)
+        let thinking_finish = ActivityItem::Thinking {
+            text: " (finished)".to_string(),
+            started_ms: 0,
+            finished_ms: Some(2500),
+        };
+        let idx_think_finish = merge_activity_in(
+            &mut rows,
+            thinking_finish,
+            |r| match r {
+                Row::Activity(a) => Some(a),
+                _ => None,
+            },
+            Row::Activity,
+        );
+        assert_eq!(idx_think_finish, 5);
+        assert_eq!(rows.len(), 7);
+        if let Row::Activity(ActivityItem::Thinking {
+            text,
+            started_ms,
+            finished_ms,
+        }) = &rows[5]
+        {
+            assert_eq!(text, "Thinking part 1, part 2 (finished)");
+            assert_eq!(*started_ms, 1000);
+            assert_eq!(*finished_ms, Some(2500));
+        } else {
+            panic!("expected thinking at index 5");
+        }
+
+        // Add non-activity row
+        rows.push(Row::Comment("after finished comment".to_string())); // index 7
+        assert_eq!(rows.len(), 8);
+
+        // Push new thinking after finished across non-activity rows (index 8)
+        let new_thinking = ActivityItem::Thinking {
+            text: "Fresh thought".to_string(),
+            started_ms: 3000,
+            finished_ms: None,
+        };
+        let idx_new_think = merge_activity_in(
+            &mut rows,
+            new_thinking.clone(),
+            |r| match r {
+                Row::Activity(a) => Some(a),
+                _ => None,
+            },
+            Row::Activity,
+        );
+        assert_eq!(idx_new_think, 8);
+        assert_eq!(rows.len(), 9);
+        assert_eq!(rows[8], Row::Activity(new_thinking));
     }
 }
