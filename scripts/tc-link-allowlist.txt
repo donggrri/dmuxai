@@ -155,7 +155,6 @@ TC-1614 manual
 TC-1622 manual
 TC-1654 manual
 TC-1665 manual
-TC-1807 manual
 TC-1810 covered by headless_run_returns_agent_text (no TC ref in code yet)
 TC-1811 covered by todo_cli_add_list_run (no TC ref in code yet)
 TC-1812 covered by status_json_has_contract_keys (no TC ref in code yet)

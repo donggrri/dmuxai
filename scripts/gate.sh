@@ -18,6 +18,7 @@ browser=0
 quick=0
 keep_going=0
 print_env=0
+print_browser_cmd=0
 help=0
 
 for arg in "$@"; do
@@ -28,6 +29,7 @@ for arg in "$@"; do
         --quick) quick=1 ;;
         --keep-going) keep_going=1 ;;
         --print-env) print_env=1 ;;
+        --print-browser-cmd) print_browser_cmd=1 ;;
         -h|--help) help=1 ;;
         *)
             echo "gate.sh: unknown option: $arg" >&2
@@ -43,33 +45,90 @@ Usage: scripts/gate.sh [options]
 Run the local DmuxAI quality gate.
 
 Options:
-  --isolated        Run every step with all DMUXAI_* variables unset (default).
-  --no-isolated     Do not unset DMUXAI_* variables.
+  --isolated        Run every step with DMUXAI_* variables unset and a fresh
+                    empty XDG_CONFIG_HOME temp dir (default).
+  --no-isolated     Leave the environment untouched.
   --browser         After the normal steps, run ignored browser tests.
   --quick           Skip clippy and run only the spec_index test.
   --keep-going      Run all steps and summarize failures at the end.
   -h, --help        Show this help and exit.
 
 Hidden/debug:
-  --print-env       Print the env var names passed to steps and exit.
+  --print-env          Print the env var names passed to steps and exit.
+  --print-browser-cmd  Print the browser test cargo command and exit.
 USAGE
     exit 0
 fi
 
-if (( print_env )); then
-    if (( isolated )); then
-        compgen -e | grep -v '^DMUXAI_' | sort -u
+# Build the browser test command from every tests/web_*.rs integration target.
+browser_test_args=()
+for test_file in tests/web_*.rs; do
+    [[ -e "$test_file" ]] || continue
+    stem="${test_file##*/}"
+    stem="${stem%.rs}"
+    browser_test_args+=(--test "$stem")
+done
+
+browser_cmd=(cargo test --all-features)
+if (( ${#browser_test_args[@]} > 0 )); then
+    browser_cmd+=("${browser_test_args[@]}")
+fi
+browser_cmd+=(-- --ignored)
+browser_label="${browser_cmd[*]}"
+
+if (( print_browser_cmd )); then
+    if (( ${#browser_test_args[@]} == 0 )); then
+        echo "gate.sh: no tests/web_*.rs targets found" >&2
     else
-        compgen -e | sort -u
+        echo "$browser_label"
     fi
     exit 0
 fi
 
-# Build env(1) arguments that unset every DMUXAI_* variable.
-env_unset_args=()
+# In isolated mode, point XDG_CONFIG_HOME at a fresh empty directory so tests
+# never read the developer's DmuxAI config. HOME is intentionally left alone.
+isolated_xdg=""
+browser_log=""
+cleanup() {
+    if [[ -n "$isolated_xdg" && -d "$isolated_xdg" ]]; then
+        rm -rf "$isolated_xdg"
+    fi
+    if [[ -n "$browser_log" && -f "$browser_log" ]]; then
+        rm -f "$browser_log"
+    fi
+}
+trap cleanup EXIT
+
+if (( isolated )); then
+    isolated_xdg=$(mktemp -d)
+    echo "isolated: XDG_CONFIG_HOME=$isolated_xdg"
+fi
+
+if (( print_env )); then
+    if (( isolated )); then
+        compgen -e | grep -v '^DMUXAI_' | grep -v '^XDG_CONFIG_HOME$' | sort -u
+        echo "XDG_CONFIG_HOME=$isolated_xdg"
+    else
+        while IFS= read -r var; do
+            if [[ "$var" == "XDG_CONFIG_HOME" ]]; then
+                echo "XDG_CONFIG_HOME=${XDG_CONFIG_HOME}"
+            else
+                echo "$var"
+            fi
+        done < <(compgen -e | sort -u)
+    fi
+    exit 0
+fi
+
+# Build env(1) arguments that unset every DMUXAI_* variable and, in isolated
+# mode, set XDG_CONFIG_HOME to the gate-owned temp dir.
+env_args=()
 for var in "${dmuxai_vars[@]}"; do
-    env_unset_args+=(-u "$var")
+    env_args+=(-u "$var")
 done
+if (( isolated )); then
+    env_args+=(XDG_CONFIG_HOME="$isolated_xdg")
+fi
 
 if (( isolated )) && (( ${#dmuxai_vars[@]} > 0 )); then
     echo "isolated: unsetting DMUXAI_* vars:"
@@ -86,7 +145,7 @@ run_step() {
     start=$(date +%s%N)
     set +e
     if (( isolated )); then
-        env "${env_unset_args[@]}" "$@"
+        env "${env_args[@]}" "$@"
     else
         "$@"
     fi
@@ -95,6 +154,47 @@ run_step() {
     end=$(date +%s%N)
     elapsed=$(awk "BEGIN { printf \"%.3f\", ($end - $start) / 1000000000 }")
     echo "    (${elapsed}s)"
+    return "$rc"
+}
+
+sum_result_field() {
+    local field="$1"
+    awk -v field="$field" '
+        /test result:/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == field ";") {
+                    print $(i - 1)
+                    break
+                }
+            }
+        }
+    ' "$browser_log" | awk '{ total += $1 } END { print total + 0 }'
+}
+
+run_browser_step() {
+    local start end elapsed rc passed_total failed_total
+    browser_log=$(mktemp)
+    echo "==> $browser_label"
+    start=$(date +%s%N)
+    set +e
+    if (( isolated )); then
+        env "${env_args[@]}" "${browser_cmd[@]}" 2>&1 | tee "$browser_log"
+    else
+        "${browser_cmd[@]}" 2>&1 | tee "$browser_log"
+    fi
+    rc=${PIPESTATUS[0]}
+    set -e
+    end=$(date +%s%N)
+    elapsed=$(awk "BEGIN { printf \"%.3f\", ($end - $start) / 1000000000 }")
+    echo "    (${elapsed}s)"
+    passed_total=$(sum_result_field passed)
+    failed_total=$(sum_result_field failed)
+    rm -f "$browser_log"
+    browser_log=""
+    if (( rc == 0 && passed_total == 0 && failed_total == 0 )); then
+        echo "GATE: browser step ran zero tests (no matching tests/web_*.rs targets?)" >&2
+        return 1
+    fi
     return "$rc"
 }
 
@@ -169,8 +269,15 @@ fi
 # Optional browser tests.
 if (( browser )); then
     if command -v google-chrome >/dev/null 2>&1 || command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null 2>&1; then
-        browser_label="cargo test --all-features -- --ignored web_"
-        if ! run_step "$browser_label" cargo test --all-features -- --ignored web_; then
+        if (( ${#browser_test_args[@]} == 0 )); then
+            browser_label="browser tests: no tests/web_*.rs targets"
+            echo "==> $browser_label" >&2
+            record_failure "$browser_label"
+            if (( ! keep_going )); then
+                echo "GATE: FAIL at $browser_label"
+                exit 1
+            fi
+        elif ! run_browser_step; then
             record_failure "$browser_label"
             if (( ! keep_going )); then
                 echo "GATE: FAIL at $browser_label"

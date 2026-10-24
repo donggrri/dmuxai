@@ -475,10 +475,12 @@ fn tc_1805_gate_script_help_and_linux_guard() {
 fn tc_1806_gate_script_isolated_mode_unsets_dmuxai_vars() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
 
+    let caller_xdg = "/caller/config-should-not-leak";
     let isolated = Command::new("bash")
         .arg("scripts/gate.sh")
         .arg("--print-env")
         .env("DMUXAI_OPENCODE_BIN", "/nonexistent")
+        .env("XDG_CONFIG_HOME", caller_xdg)
         .current_dir(root)
         .output()
         .expect("bash must be available to run scripts/gate.sh --print-env");
@@ -494,12 +496,21 @@ fn tc_1806_gate_script_isolated_mode_unsets_dmuxai_vars() {
         !isolated_out.contains("DMUXAI_OPENCODE_BIN"),
         "isolated --print-env must not list DMUXAI_OPENCODE_BIN:\n{isolated_out}"
     );
+    assert!(
+        isolated_out.contains("XDG_CONFIG_HOME="),
+        "isolated --print-env must list the gate-owned XDG_CONFIG_HOME:\n{isolated_out}"
+    );
+    assert!(
+        !isolated_out.contains(caller_xdg),
+        "isolated --print-env must not use the caller's XDG_CONFIG_HOME:\n{isolated_out}"
+    );
 
     let non_isolated = Command::new("bash")
         .arg("scripts/gate.sh")
         .arg("--no-isolated")
         .arg("--print-env")
         .env("DMUXAI_OPENCODE_BIN", "/nonexistent")
+        .env("XDG_CONFIG_HOME", caller_xdg)
         .current_dir(root)
         .output()
         .expect("bash must be available to run scripts/gate.sh --print-env");
@@ -514,5 +525,40 @@ fn tc_1806_gate_script_isolated_mode_unsets_dmuxai_vars() {
     assert!(
         non_isolated_out.contains("DMUXAI_OPENCODE_BIN"),
         "non-isolated --print-env must list DMUXAI_OPENCODE_BIN:\n{non_isolated_out}"
+    );
+    assert!(
+        non_isolated_out.contains(&format!("XDG_CONFIG_HOME={caller_xdg}")),
+        "non-isolated --print-env must keep the caller's XDG_CONFIG_HOME:\n{non_isolated_out}"
+    );
+}
+
+#[test]
+fn tc_1807_gate_script_browser_command_uses_web_targets() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new("bash")
+        .arg("scripts/gate.sh")
+        .arg("--print-browser-cmd")
+        .current_dir(root)
+        .output()
+        .expect("bash must be available to run scripts/gate.sh --print-browser-cmd");
+    assert!(
+        output.status.success(),
+        "gate.sh --print-browser-cmd failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cmd = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        cmd.contains("cargo test --all-features"),
+        "browser command must be a cargo test invocation:\n{cmd}"
+    );
+    assert!(
+        cmd.contains("--test web_followup_queue"),
+        "browser command must use tests/web_*.rs integration targets:\n{cmd}"
+    );
+    assert!(
+        cmd.contains("--ignored"),
+        "browser command must run ignored tests:\n{cmd}"
     );
 }
