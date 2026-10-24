@@ -223,7 +223,7 @@ static UNAVAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 pub fn is_transient_provider_error(message: &str) -> bool {
     static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)api error \(attempt \d+\)|request failed|stream idle timeout|connection (timed out|reset|refused|closed)|(request|read|connect|connection|operation) timed out|(status|code|http)[ :=(]*5\d\d|\b5\d\d (internal|bad gateway|service unavailable|gateway timeout)|internal \(code|\binternal\b.*\berror\b|service unavailable|\bunavailable\b|overloaded|bad gateway|gateway timeout|deadline exceeded|broken pipe|eof while|network (error|is unreachable)").unwrap()
+        Regex::new(r"(?i)api error \(attempt \d+\)|request failed|stream idle timeout|stream was interrupted|connection (timed out|reset|refused|closed)|(request|read|connect|connection|operation) timed out|(status|code|http)[ :=(]*5\d\d|\b5\d\d (internal|bad gateway|service unavailable|gateway timeout)|internal \(code|\binternal\b.*\berror\b|service unavailable|\bunavailable\b|overloaded|bad gateway|gateway timeout|deadline exceeded|broken pipe|eof while|network (error|is unreachable)").unwrap()
     });
     RE.is_match(message)
 }
@@ -610,6 +610,13 @@ mod tests {
         );
         assert_eq!(
             classify_failure("provider", "status: 500"),
+            Some(FallbackReason::Provider)
+        );
+        assert_eq!(
+            classify_failure(
+                "provider",
+                "agy flash failed: The stream was interrupted. Please continue the task you were working on."
+            ),
             Some(FallbackReason::Provider)
         );
     }

@@ -16,7 +16,7 @@ All notable changes to dmuxai are listed here. Versions follow
 - **Runner fallback (SPEC-runner-fallback).** A runner can hand a failed turn to
   the next runner/model in an ordered `[runners.<id>]`/`[runners.default]`
   `fallback` chain on provider errors or stalls, with `stall_timeout_secs` and
-  `stall_api_retries` (PR-10 part 1/4).
+  `stall_api_retries`. Stalled runners (no model progress or repeated API retries) are stopped and handed over too.
 
 ### Removed
 

@@ -3678,6 +3678,7 @@ impl App {
         let from_runner_str = runner_name(agent).to_owned();
         let from_model = self.selected_run_model(agent).ok().flatten();
         let had_chain = active.fallback_chain.is_some();
+        let mut had_settings_chain = false;
 
         let mut chain = match active.fallback_chain {
             Some(chain) => chain,
@@ -3689,6 +3690,7 @@ impl App {
                 if targets.is_empty() {
                     return false;
                 }
+                had_settings_chain = true;
                 dmuxai::runner_fallback::FallbackChain::new(targets)
             }
         };
@@ -3748,7 +3750,7 @@ impl App {
         });
 
         if next_target.is_none() {
-            if had_chain {
+            if had_chain || had_settings_chain {
                 let exhausted = dmuxai::runner_fallback::FallbackRecord {
                     from_runner: from_runner_str.clone(),
                     from_model: from_model.clone(),
@@ -33300,6 +33302,46 @@ mod tests {
         assert_eq!(arr[0]["from_runner"], "agy");
         assert_eq!(arr[0]["to_runner"], "codex");
         assert_eq!(arr[0]["reason"], "provider");
+    }
+
+    // FR-2119 / TC-2119
+    #[test]
+    fn tc_2119_no_usable_target_records_exhausted() {
+        let (mut app, sent) = test_app();
+        let mut fallback = dmuxai::runner_fallback::FallbackSettings::default();
+        fallback.runners.insert(
+            "agy".to_owned(),
+            dmuxai::runner_fallback::RunnerFallbackConfig {
+                chain: vec![dmuxai::runner_fallback::FallbackTarget {
+                    runner: "nosuch".to_owned(),
+                    model: None,
+                }],
+                stall_timeout_secs: 240,
+                stall_api_retries: 3,
+            },
+        );
+        app.settings.runner_fallback = fallback;
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "no usable target".to_owned();
+        app.submit_prompt();
+
+        let req = sent.lock().unwrap()[0].1.clone();
+        let _ = app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("API error: 503 service unavailable")),
+        });
+
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(!app.busy_agents.contains(&Agent::Agy));
+        assert_eq!(app.fallback_history.len(), 1);
+        assert_eq!(app.fallback_history[0].to_runner, None);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("fallback chain exhausted"))
+        );
     }
 }
 
