@@ -43,3 +43,7 @@ filetime = "0.2.27"
 tempfile = "3.27.0"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+

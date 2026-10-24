@@ -2,6 +2,8 @@ use std::{io, path::PathBuf};
 
 use tokio::process::Command;
 
+pub mod supervisor;
+
 /// DmuxAI-internal environment variables that must be removed from every
 /// agent or runner child process.
 ///
