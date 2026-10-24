@@ -4709,6 +4709,7 @@ impl App {
             agent: agent_key(agent),
             model_id,
             prompt: prompt.clone(),
+            display_text: None,
         });
         let request = match outcome {
             Ok(BeginTurnOutcome::Ready(request)) => request,
