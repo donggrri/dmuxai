@@ -291,7 +291,6 @@ async fn runtime_loop(
 ) {
     let protocol = config.protocol;
     let idle_limit = std::time::Duration::from_secs(config.prewarm_idle_secs);
-    let mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer> = mcp.servers().to_vec();
     let can_prewarm = config.prewarm && protocol == RunnerProtocol::Legacy;
     let cursor_notice_emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut active: Option<ActiveTurn> = None;
@@ -375,7 +374,7 @@ async fn runtime_loop(
                             cwd.clone(),
                             event_tx.clone(),
                             protocol,
-                            mcp_servers.clone(),
+                            mcp.clone(),
                             cursor_notice_emitted.clone(),
                             true,
                             reset_epoch,
@@ -450,7 +449,7 @@ async fn runtime_loop(
                             cwd.clone(),
                             event_tx.clone(),
                             protocol,
-                            mcp_servers.clone(),
+                            mcp.clone(),
                             cursor_notice_emitted.clone(),
                             false,
                             reset_epoch,
@@ -650,7 +649,7 @@ fn spawn_turn(
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
     protocol: RunnerProtocol,
-    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
+    mcp: dmuxai::mcp::RunnerMcp,
     cursor_notice_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     is_graph: bool,
     reset_epoch: u64,
@@ -674,7 +673,7 @@ fn spawn_turn(
             &cwd,
             &event_tx,
             protocol,
-            &mcp_servers,
+            &mcp,
             &cursor_notice_emitted,
             &turn_terminal_seen,
             &turn_pgid,
@@ -769,7 +768,7 @@ pub(crate) async fn run_turn(
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     protocol: RunnerProtocol,
-    mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
+    mcp: dmuxai::mcp::RunnerMcp,
     cursor_notice_emitted: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<String>, AgentError> {
     run_turn_with_child(
@@ -780,7 +779,7 @@ pub(crate) async fn run_turn(
         cwd,
         event_tx,
         protocol,
-        mcp_servers,
+        &mcp,
         cursor_notice_emitted,
         &std::sync::atomic::AtomicBool::new(false),
         &std::sync::atomic::AtomicU32::new(0),
@@ -798,7 +797,7 @@ async fn run_turn_with_child(
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     protocol: RunnerProtocol,
-    mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
+    mcp: &dmuxai::mcp::RunnerMcp,
     cursor_notice_emitted: &std::sync::atomic::AtomicBool,
     terminal_seen: &std::sync::atomic::AtomicBool,
     pgid: &std::sync::atomic::AtomicU32,
@@ -806,13 +805,11 @@ async fn run_turn_with_child(
 ) -> Result<Option<String>, AgentError> {
     let context = OutputContext::from(request);
     if protocol != RunnerProtocol::Acp
-        && !mcp_servers.is_empty()
+        && !mcp.is_empty()
         && !cursor_notice_emitted.swap(true, std::sync::atomic::Ordering::Relaxed)
+        && let Some(notice) = mcp.cursor_legacy_notice()
     {
-        let mcp = dmuxai::mcp::RunnerMcp::for_runner(mcp_servers, "cursor");
-        if let Some(notice) = mcp.cursor_legacy_notice() {
-            send_event(event_tx, Some(&context), AgentEvent::Notice(notice)).await;
-        }
+        send_event(event_tx, Some(&context), AgentEvent::Notice(notice)).await;
     }
 
     if protocol == RunnerProtocol::Acp {
@@ -852,7 +849,7 @@ async fn run_turn_with_child(
             selected_model.clone(),
             None,
             None,
-            dmuxai::mcp::inject::RunnerMcp::for_runner(mcp_servers, "cursor").acp_servers(),
+            mcp.acp_servers(),
         )
         .await
         .map(|outcome| outcome.session_id)
@@ -2137,7 +2134,7 @@ pub(crate) mod tests {
                 &cwd,
                 &event_tx,
                 RunnerProtocol::Legacy,
-                &[],
+                dmuxai::mcp::RunnerMcp::for_runner(&[], "cursor"),
                 &std::sync::atomic::AtomicBool::new(false),
             )
             .await
@@ -2237,7 +2234,7 @@ pub(crate) mod tests {
             temp.path(),
             &event_tx,
             RunnerProtocol::Legacy,
-            std::slice::from_ref(&server),
+            dmuxai::mcp::RunnerMcp::for_runner(std::slice::from_ref(&server), "cursor"),
             &notice_shown,
         )
         .await;
@@ -2275,7 +2272,7 @@ pub(crate) mod tests {
             temp.path(),
             &event_tx,
             RunnerProtocol::Legacy,
-            std::slice::from_ref(&server),
+            dmuxai::mcp::RunnerMcp::for_runner(std::slice::from_ref(&server), "cursor"),
             &notice_shown,
         )
         .await;
@@ -2352,7 +2349,7 @@ pub(crate) mod tests {
             workspace.path(),
             &event_tx,
             RunnerProtocol::Legacy,
-            std::slice::from_ref(&server),
+            dmuxai::mcp::RunnerMcp::for_runner(std::slice::from_ref(&server), "cursor"),
             &notice_shown,
         )
         .await;
@@ -2385,7 +2382,7 @@ pub(crate) mod tests {
             workspace.path(),
             &event_tx,
             RunnerProtocol::Legacy,
-            std::slice::from_ref(&server),
+            dmuxai::mcp::RunnerMcp::for_runner(std::slice::from_ref(&server), "cursor"),
             &notice_shown,
         )
         .await;
@@ -3555,7 +3552,7 @@ pub(crate) mod tests {
                 workspace,
                 &event_tx,
                 RunnerProtocol::Acp,
-                mcp_servers,
+                dmuxai::mcp::RunnerMcp::for_runner(mcp_servers, "cursor"),
                 &notice,
             )
             .await;
@@ -3919,7 +3916,7 @@ pub(crate) mod tests {
             &cwd,
             &event_tx,
             RunnerProtocol::Legacy,
-            &[],
+            dmuxai::mcp::RunnerMcp::for_runner(&[], "cursor"),
             &notice,
         )
         .await;
