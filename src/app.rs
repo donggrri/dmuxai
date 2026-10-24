@@ -3561,11 +3561,11 @@ impl App {
                     return false;
                 }
 
-                if let AgentEvent::Error(ref err) = output.event {
-                    if self.try_runner_fallback(output.agent, err) {
-                        self.last_output_handed_over = true;
-                        return true;
-                    }
+                if let AgentEvent::Error(ref err) = output.event
+                    && self.try_runner_fallback(output.agent, err)
+                {
+                    self.last_output_handed_over = true;
+                    return true;
                 }
 
                 if let Some(hub) = &self.dashboard {
@@ -3889,18 +3889,17 @@ impl App {
             if let Some(node_id) = self.graph_agent_nodes.remove(&current_node_agent) {
                 self.graph_agent_nodes.insert(new_agent, node_id.clone());
                 current_node_agent = new_agent;
-                if let Some(session) = self.graph_session.as_mut() {
-                    if let Some(node) = session
+                if let Some(session) = self.graph_session.as_mut()
+                    && let Some(node) = session
                         .run_mut()
                         .plan
                         .nodes
                         .iter_mut()
                         .find(|n| n.id == node_id)
-                    {
-                        node.runner = target.runner.clone();
-                        if let Some(m) = &target.model {
-                            node.model_id = m.clone();
-                        }
+                {
+                    node.runner = target.runner.clone();
+                    if let Some(m) = &target.model {
+                        node.model_id = m.clone();
                     }
                 }
             }

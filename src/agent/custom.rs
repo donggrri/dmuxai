@@ -716,14 +716,14 @@ async fn run_turn(
                         if parsed.text_break {
                             break_pending = true;
                         }
-                        if let Some(error) = parsed.error {
-                            if !error.trim().is_empty() {
-                                if jsonl_error.is_none() || line_produced_text {
-                                    jsonl_error_eligible =
-                                        line_produced_text || last_stdout_produced_text;
-                                }
-                                jsonl_error = Some(error);
+                        if let Some(error) = parsed.error
+                            && !error.trim().is_empty()
+                        {
+                            if jsonl_error.is_none() || line_produced_text {
+                                jsonl_error_eligible =
+                                    line_produced_text || last_stdout_produced_text;
                             }
+                            jsonl_error = Some(error);
                         }
                         if parsed.done {
                             done = true;
@@ -842,6 +842,29 @@ async fn send(
 mod tests {
     use super::*;
     use crate::agent::{ConversationId, TurnId};
+
+    static CUSTOM_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[allow(clippy::await_holding_lock)]
+    async fn with_custom_env<F>(xdg_dir: &std::path::Path, work: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        let _tokio_guard = CUSTOM_ENV_LOCK.lock().await;
+        let _env_guard = dmuxai::state_path::test_env_lock();
+        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", xdg_dir);
+        }
+        let result = work.await;
+        unsafe {
+            match saved_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        result
+    }
 
     fn fixture() -> String {
         format!(
@@ -2202,13 +2225,7 @@ error_path = ["/result/error"]
     // TC-2116 / FR-2116: agent with keepalive lines stalls when no progress is made.
     #[tokio::test]
     async fn tc_2116_custom_stall_with_keepalive_output() {
-        let _env_guard = dmuxai::state_path::test_env_lock();
         let xdg_dir = tempfile::tempdir().unwrap();
-        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
-        }
-
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(
             ws.path().join("dmuxai.toml"),
@@ -2227,18 +2244,14 @@ stall_keepalive = "^ping keepalive"
         );
         let spec: &'static CustomAgentSpec = Box::leak(Box::new(toml::from_str(&toml).unwrap()));
 
-        let turn_res = tokio::time::timeout(
-            Duration::from_secs(5),
-            run_custom_turn_in_dir(spec, ws.path()),
-        )
+        let turn_res = with_custom_env(xdg_dir.path(), async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                run_custom_turn_in_dir(spec, ws.path()),
+            )
+            .await
+        })
         .await;
-
-        unsafe {
-            match saved_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
 
         let (result, _events) = turn_res.expect("turn should time out and stall within 5s");
         let err = result.expect_err("expected Stalled error");
@@ -2258,13 +2271,7 @@ stall_keepalive = "^ping keepalive"
     // TC-2116 / FR-2116: consecutive api retry lines trigger stall.
     #[tokio::test]
     async fn tc_2116_custom_api_retry_lines_stall() {
-        let _env_guard = dmuxai::state_path::test_env_lock();
         let xdg_dir = tempfile::tempdir().unwrap();
-        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
-        }
-
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(
             ws.path().join("dmuxai.toml"),
@@ -2278,18 +2285,14 @@ command = ["sh", "-c", "echo 'API error (attempt 1): request failed'; echo 'API 
 "#;
         let spec: &'static CustomAgentSpec = Box::leak(Box::new(toml::from_str(toml).unwrap()));
 
-        let turn_res = tokio::time::timeout(
-            Duration::from_secs(5),
-            run_custom_turn_in_dir(spec, ws.path()),
-        )
+        let turn_res = with_custom_env(xdg_dir.path(), async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                run_custom_turn_in_dir(spec, ws.path()),
+            )
+            .await
+        })
         .await;
-
-        unsafe {
-            match saved_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
 
         let (result, _events) = turn_res.expect("turn should stall quickly on 3 retries");
         let err = result.expect_err("expected Stalled error");
