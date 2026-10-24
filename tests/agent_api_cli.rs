@@ -210,6 +210,94 @@ fn headless_run_respects_allowed_runners() {
     assert_eq!(usage.status.code(), Some(2));
 }
 
+// TC-1768 / FR-1768: explicit --agent CLI run emits only agent events, no graph or node events.
+#[cfg(unix)]
+#[test]
+fn tc_1768_cli_run_agent_emits_no_graph_events() {
+    let sandbox = Sandbox::new(&fake_agent_config("jsonl", None));
+    let output = sandbox.run(&["run", "hi", "--agent", "fake", "--json"]);
+    let json = stdout_json(&output);
+    assert_eq!(output.status.code(), Some(0), "{json}");
+    assert!(
+        json["graph_id"].is_null(),
+        "graph_id must be null for direct agent run, got: {json}"
+    );
+    assert_eq!(json["ok"], true);
+
+    let events_output = sandbox.run(&["events", "--json"]);
+    assert_eq!(events_output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&events_output.stdout);
+    let mut saw_agent_event = false;
+    for line in stdout.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            let kind = v["kind"].as_str().unwrap_or_default();
+            assert_ne!(kind, "graph", "unexpected graph event: {line}");
+            assert_ne!(kind, "node", "unexpected node event: {line}");
+            if kind == "agent" {
+                saw_agent_event = true;
+            }
+        }
+    }
+    assert!(
+        saw_agent_event,
+        "expected at least one agent event in: {stdout}"
+    );
+}
+
+// TC-1777 / FR-1777: dmuxai run hi --agent fake --json --progress -> stderr has
+// at least a started and a completed progress JSON line, stdout is exactly one
+// JSON object; without --progress stderr has no progress lines.
+#[cfg(unix)]
+#[test]
+fn tc_1777_cli_progress_lines_before_final_json() {
+    let sandbox = Sandbox::new(&fake_agent_config("jsonl", None));
+    let output = sandbox.run(&["run", "hi", "--agent", "fake", "--json", "--progress"]);
+    assert_eq!(output.status.code(), Some(0));
+
+    // stdout is exactly one JSON object
+    let json = stdout_json(&output);
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["agent"], "fake");
+
+    // stderr has at least started and completed progress lines
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut saw_started = false;
+    let mut saw_completed = false;
+    for line in stderr.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+            && v["type"] == "progress"
+        {
+            if v["kind"] == "started" {
+                saw_started = true;
+            }
+            if v["kind"] == "completed" {
+                saw_completed = true;
+            }
+        }
+    }
+    assert!(
+        saw_started,
+        "expected started progress line in stderr: {stderr}"
+    );
+    assert!(
+        saw_completed,
+        "expected completed progress line in stderr: {stderr}"
+    );
+
+    // Without --progress stderr has no progress lines
+    let plain_output = sandbox.run(&["run", "hi", "--agent", "fake", "--json"]);
+    assert_eq!(plain_output.status.code(), Some(0));
+    let plain_stderr = String::from_utf8_lossy(&plain_output.stderr);
+    for line in plain_stderr.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            assert_ne!(
+                v["type"], "progress",
+                "unexpected progress line without --progress: {line}"
+            );
+        }
+    }
+}
+
 // TC-763 / FR-762: todo add, list and run without a TUI.
 // The fixture is a POSIX shell script (same as src/agent/custom.rs tests).
 #[cfg(unix)]

@@ -27,11 +27,11 @@ Nothing here changes how the TUI behaves for a human user.
 
 ### In scope
 
-- `dmuxai run <prompt|-> [--agent ID] [--approve-plan] [--allow-sensitive] [--graph] [--json]`.
+- `dmuxai run <prompt|-> [--agent ID] [--model M] [--approve-plan] [--allow-sensitive] [--graph] [--progress] [--json]`.
   `--mode` is not accepted (removed; see [SPEC-acp-runners](SPEC-acp-runners.md) FR-1318 / TC-1492).
 - `dmuxai todo add <title> [--body TEXT] [--json]`,
   `dmuxai todo list [--status open|running|done] [--json]`,
-  `dmuxai todo run <id> [--agent ID | --graph] [--json]` (same `--mode` rejection as `run`).
+  `dmuxai todo run <id> [--agent ID | --graph] [--model M] [--progress] [--json]` (same `--mode` rejection as `run`).
 - Internal flags (accepted by the parser but not listed in `dmuxai --help`): `--read-only` on
   `run` / `todo run` runs the prompt's turn with the read-only turn policy; the MCP `run`
   tool passes it for legacy `mode` `ask`/`plan` (FR-767).
@@ -76,9 +76,12 @@ Event `to_state` vocabulary (`kind` in parentheses):
 | kind | Transitions emitted |
 | --- | --- |
 | `agent` | `pending` (request accepted), `started`, `running` (phase change, `message` = phase), `completed`, `error`, `cancelled`, `stalled` |
+| `activity` | runner activity and progress heartbeats: `tool` (ToolProgress state change), `file_edit` (file-edit Activity item), `output` (text delta heartbeat at most once every 30s) |
 | `node` | graph node status changes: `pending`, `ready`, `running`, `waiting_gate`, `completed`, `failed`, `skipped` |
 | `graph` | graph run phase changes: `active`, `waiting_gate`, `completed`, `failed` |
 | `todo` | `started` (to running), `completed` (to done), `failed` (running to open with an error), `open` (any other change to open) |
+
+A direct `--agent` run (without `--graph`) runs one agent turn directly and emits only `agent` transitions (no `graph` or `node` events).
 
 Event schema (`v` = 1). Unknown fields must be ignored by readers.
 
@@ -89,12 +92,24 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
  "from_state":"ready","to_state":"running","message":null}
 ```
 
+Progress line schema (emitted to STDERR when `--progress` is enabled, one JSON object per line):
+
+```json
+{"type":"progress","ts_ms":1792236153456,"agent":"cursor","kind":"started","summary":"started"}
+```
+
+- `type`: constant `"progress"`
+- `ts_ms`: epoch milliseconds (`u64`)
+- `agent`: runner id string
+- `kind`: one of `started`, `tool`, `activity`, `status`, `notice`, `text`, `completed`, `error`, `cancelled`
+- `summary`: single-line string at most 160 characters (cut with `…` if longer; newlines replaced by spaces)
+
 ## 4. Requirements
 
 | ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
 | --- | --- | --- | --- | --- | --- |
 | FR-760 | Must | Given any `dmuxai` subcommand in §2, when it is parsed | Then `run`, `todo add/list/run`, `status`, `events`, `mcp` are recognized with the user-facing flags in §2; `dmuxai --help` lists those flags for each subcommand (not internal `--read-only`) | Unknown subcommands or flags print usage to stderr and exit 2; `--mode` on `run` / `todo run` is a usage error (exit 2, message that `--mode` was removed); existing `serve`/`--web`/no-arg behavior is unchanged | TC-760, TC-1492 |
-| FR-761 | Must | Given `dmuxai run <prompt>` without a TTY | Then the prompt is submitted once (to `--agent`, else the configured default agent; `--graph` is accepted as a no-op for legacy scripts; `--read-only` runs with read-only turn policy; `--approve-plan` auto-approves a plan gate), the process waits for the turn or graph to finish, prints the final agent text (or one JSON object with `--json`) and exits | Exit 0 on success, 1 on agent error or failed graph, 130 on cancel/Ctrl+C (child turns are cancelled first), 3 unknown agent, 5 runner not in `allowed_runners`, 6 internal error; `--mode` → exit 2 (FR-1318) | TC-761, TC-762, TC-1492 |
+| FR-761 | Must | Given `dmuxai run <prompt>` without a TTY | Then the prompt is submitted once (to `--agent` directly without building a graph, else the configured default agent via the judge path; `--graph` is accepted as a no-op for legacy scripts; `--read-only` runs with read-only turn policy; `--approve-plan` auto-approves a plan gate), the process waits for the turn or graph to finish, prints the final agent text (or one JSON object with `--json`) and exits | Exit 0 on success, 1 on agent error or failed graph, 130 on cancel/Ctrl+C (child turns are cancelled first), 3 unknown agent, 5 runner not in `allowed_runners`, 6 internal error; `--mode` → exit 2 (FR-1318) | TC-761, TC-762, TC-1492 |
 | FR-762 | Must | Given `dmuxai todo add/list/run` | Then add creates a manual to-do and prints it, list prints to-dos (filtered by `--status`), run marks the to-do running, runs it like FR-761 and finishes it as done (success) or open with `last_error` (failure) | Missing to-do → exit 3; already running → exit 4; empty title → exit 2 | TC-763 |
 | FR-763 | Must | Given `dmuxai status --json` | Then one JSON object with `workspace`, `version`, `agents` (id, label, allowed), `allowed_runners`, `graph_enabled`, `todos` counts, `last_graph` (id, phase, counts or null), `events` (`path`, `last_seq`) and `dashboard` (discovery data or null) | Unreadable stores are reported as `null` fields plus a `warnings` array, exit 0 | TC-764 |
 | FR-764 | Must | Given `dmuxai events [--since N] [--limit N] [--follow] [--json]` | Then events with `seq > N` are printed oldest first, one JSON object per line with `--json`; `--follow` keeps printing new events until interrupted | Missing log → no output, exit 0; malformed lines are skipped | TC-765 |
@@ -119,7 +134,7 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | FR-1810 | Must | Given a headless `dmuxai run` process exits | Then the exit code is one of 0 success, 1 agent error or failed/cancelled graph, 2 usage, 3 unknown agent, 4 busy/conflict, 5 runner not in `allowed_runners`, 6 internal error, 7 plan approval or sensitive gate, 130 cancelled | A graph stopped by a cancelled step exits 130 (FR-1416) | TC-1810 |
 | FR-1811 | Must | Given `dmuxai todo run <id>` | Then it uses the same exit codes as FR-1810, plus 3 for a missing to-do, 4 for an already running to-do, and 2 for an empty `todo add` title | `todo add`/`list` exit 2 on usage errors | TC-1811 |
 | FR-1812 | Must | Given `dmuxai status` or `dmuxai events` | Then `status` prints its JSON and exits 0 even when stores are unreadable (warnings recorded); `events` prints available events and exits 0 when the log is missing | malformed event lines are skipped; unreadable workspace → 2 | TC-1812 |
-| FR-1813 | Must | Given `--json` on `run` / `todo run` | Then stdout contains exactly one JSON object with `ok`, `exit_code`, `conversation_id`, `agent`, `graph_id`, `text`, `messages`, `error`, `todo`, `triage`, `plan`, and `events` (`{first_seq,last_seq}` or nulls) | error runs use the same object with `ok: false` | TC-1813 |
+| FR-1813 | Must | Given `--json` on `run` / `todo run` | Then stdout contains exactly one JSON object with `ok`, `exit_code`, `conversation_id`, `agent`, `graph_id` (`null` for direct `--agent` runs without `--graph`), `text`, `messages`, `error`, `todo`, `triage`, `plan`, and `events` (`{first_seq,last_seq}` or nulls) | error runs use the same object with `ok: false` | TC-1813 |
 | FR-1814 | Must | Given `--agent ID` naming an unknown runner | Then the run exits 3 with `error: "unknown agent 'ID'"` and no turn starts | matching is case-insensitive after trim | TC-1814 |
 | FR-1815 | Must | Given an empty prompt or empty stdin for `run -` | Then parsing or reading stdin fails with exit 2 and a one-line message | whitespace-only prompts are empty | TC-1815 |
 | FR-1816 | Must | Given an unknown flag or subcommand | Then usage is printed to stderr and the process exits 2 | `--mode` is also exit 2 with a removed-mode message | TC-1816 |
@@ -131,6 +146,24 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | FR-1822 | Must | Given the same feature in headless vs dashboard mode | Then headless uses CLI flags for gates/approval, has no workspace switch or live prompt API, and persists conversations to the same per-repo DB; `serve` is view-only and never runs agents | dashboard uses `/graph continue` and `POST /api/prompt` | TC-1822 |
 | FR-1823 | Must | Given an agent error mid-turn | Then the run exits 1 with the last system error or `run failed` | cancellation exits 130 instead | TC-1823 |
 | FR-1824 | Must | Given `--read-only` | Then the turn runs under the read-only turn policy | internal flag; not listed in `--help` | TC-1824 |
+| FR-1761 | Must | Given headless early-return paths in `App::run_headless`, `headless_idle_action`, `headless_outcome_exit_7` | Then failures are built via `HeadlessOutcome::failure(...)` with magic exit codes replaced by `dmuxai::agent_api::exit::*` constants; JSON output stays byte-for-byte identical | no logic or field value changes | TC-1761 |
+| FR-1762 | Must | Given the `SnapshotSource` enum | Then a new `App` variant serializes as `"app"` and round-trips; it behaves like `Tui` (live, writable), not view-only like `Files` | — | TC-1762 |
+| FR-1763 | Must | Given a headless `dmuxai run` or `dmuxai --web` dashboard hub | Then the snapshot `source` is `"app"` | real interactive TUI keeps `tui`; `serve` keeps `files` | TC-1763 |
+| FR-1764 | Must | Given a headless `dmuxai run` with explicit `--agent` and without `--graph` | Then the turn runs directly on the agent without creating a graph or graph session, `graph_id` is null, and on success the process exits 0 with the agent text | no `graph` or `node` events or run files are created | TC-1764 |
+| FR-1765 | Must | Given an explicit `--agent` headless direct run where the agent fails | Then the process exits 1 with `ok: false` and the error is reported once directly from the agent | no "Graph failed" or "graph node" messages or events appear in output | TC-1765 |
+| FR-1766 | Must | Given an explicit `--agent` headless direct run | Then the JSON output retains `triage` with `route: simple`, `reason: "override"`, `source: override`, `runner`, and the resolved `model`, while `plan` is absent | explicit `--model` overrides the runner model default in triage | TC-1766 |
+| FR-1767 | Must | Given an explicit `--agent` headless direct run with a prompt matching a sensitive keyword | Then without `--allow-sensitive` or `--approve-plan`, no turn starts and headless exits 7 (`APPROVAL_REQUIRED`) with the sensitive gate note; with `--approve-plan` or `--allow-sensitive`, the direct turn runs | keeps the sensitive gate rule without constructing a graph | TC-1767 |
+| FR-1768 | Must | Given an explicit `--agent` headless CLI run | Then `.dmuxai/events.jsonl` records only `agent` lifecycle events and no `graph` or `node` events | `graph_id` remains null in JSON output | TC-1768 |
+| FR-1769 | Must | Given `dmuxai run` / `todo run` flags parsed by the table-driven parser | Then `--agent`, `--model`, `--graph`, `--read-only`, `--approve-plan`, `--allow-sensitive`, `--json`, and `--progress` are recognized and `RunOptions.progress` is true iff `--progress` is present | unknown flags, missing values, and `--` handling keep their existing messages | TC-1769 |
+| FR-1770 | Must | Given the table-driven flag parser | Then every existing error message (`unexpected argument`, `<flag> needs a value`, removed `--mode`, agent/graph conflict, model rules, empty prompt, `todo add` title, numeric limits, etc.) is still produced for the same input | boundary cases in TC-1770 | TC-1770 |
+| FR-1771 | Must | Given `dmuxai --help` | Then the usage text contains `--progress` and does not contain `--read-only` | help exits 0 | TC-1771 |
+| FR-1772 | Must | Given an `AgentEvent` mapped to a progress line | Then the line shape matches `{"type":"progress","ts_ms":<u64>,"agent":"<runner id>","kind":"<kind>","summary":"<text>"}` and summary is single-line, at most 160 characters cut with `…` | multiline summaries replace newlines with spaces; non-progress events return None | TC-1772 |
+| FR-1773 | Must | Given streaming `TextDelta` events for an agent | Then at most one `text` line per agent is emitted every 2 seconds (summary = last 160 chars received since previous text line, newlines replaced with spaces), and pending text is flushed before `completed`, `error`, or `cancelled` | empty delta text does not emit an extra line | TC-1773 |
+| FR-1774 | Must | Given a headless run with `--progress` | Then live progress lines are written to stderr in order as events occur, while stdout carries only the final output; without `--progress` stderr receives no progress lines | errors and cancellations still flush pending progress lines | TC-1774 |
+| FR-1775 | Must | Given an active turn in a process with an event hub | Then activity events (`kind: "activity"`) are emitted to the event log: `tool` on `ToolProgress` state changes, `file_edit` on file-edit `ActivityItem`s, and an `output` heartbeat at most once every 30 seconds for `TextDelta` | unchanged tool state and frequent text deltas do not emit duplicate activity events | TC-1775 |
+| FR-1776 | Must | Given `dmuxai status --json` | Then each `agents[].run` in `running` state includes `last_output_at_ms` equal to the latest `agent` or `activity` event `ts_ms` for that runner since the run started (equal to `started_at_ms` when no output yet) | stalled and pending transitions do not reset `last_output_at_ms`; terminal states preserve it | TC-1776 |
+| FR-1777 | Must | Given `dmuxai run <prompt> --agent ID --json --progress` | Then stderr contains at least a `started` and a `completed` progress JSON line while stdout is exactly one JSON object; without `--progress` stderr contains no progress lines | exit code and JSON contract match non-progress runs | TC-1777 |
+| FR-1778 | Must | Given an explicit `--agent` headless direct run | Then when `settings.stage_skills.chat` is true the prompt sent to the agent is prefixed with the implement stage skill prefix, and when it is false the prompt is sent unchanged | single 1-node chat turns apply chat stage skills only when enabled | TC-1778 |
 
 ### Code-vs-spec mismatches
 
@@ -178,6 +211,24 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | TC-1822 | FR-1822 | integration | headless vs `--web` | compare gates/persistence | documented behavior holds | planned — no automated test yet (Stream B) |
 | TC-1823 | FR-1823 | unit (app) | scripted agent error | run headless | exit 1 | `src/app.rs` `headless_run_reports_agent_error` |
 | TC-1824 | FR-1824 | unit (app) | `--read-only` | run headless | read-only policy | planned — no automated test yet (Stream B) |
+| TC-1761 | FR-1761 | unit (app) | `test_app()` | construct `HeadlessOutcome::failure(...)` | `ok=false`, given exit code, error text, all other optionals `None`; serialized JSON matches the old literal keys | `src/app.rs` `tc_1761_headless_outcome_failure_builder_defaults` |
+| TC-1762 | FR-1762 | unit | `SnapshotSource::App` | serde round-trip | `"app"` | `src/web/snapshot.rs` `tc_1762_snapshot_source_app_serializes_as_app` |
+| TC-1763 | FR-1763 | unit | `DashboardHub::new(SnapshotSource::App, ...)` | `hub.snapshot()` | source is `App` and serializes `"app"` | `src/cli.rs` `tc_1763_headless_dashboard_source_is_app` |
+| TC-1764 | FR-1764 | unit (app) | scripted agent with hub event sink | `run_headless` with explicit agent | exit 0, text returned, `graph_id` None, `last_graph_run` None, event log has `agent` events but no `graph`/`node` events | `src/app.rs` `tc_1764_headless_explicit_agent_runs_without_graph` |
+| TC-1765 | FR-1765 | unit (app) | scripted agent returning error | `run_headless` with explicit agent | exit 1, `ok: false`, agent error reported once, no message contains "Graph failed" or "graph node" | `src/app.rs` `tc_1765_headless_explicit_agent_error_reported_once` |
+| TC-1766 | FR-1766 | unit (app) | scripted agent | `run_headless` with explicit agent | `outcome.triage` has route simple, reason override, source override, runner, resolved model, and plan is None | `src/app.rs` `tc_1766_headless_explicit_agent_keeps_override_triage` |
+| TC-1767 | FR-1767 | unit (app) | scripted agent, sensitive prompt | `run_headless` with explicit agent without flags, then with `approve_plan` | exit 7 and no turn started; with `approve_plan` turn runs to exit 0 | `src/app.rs` `tc_1767_headless_direct_sensitive_prompt_needs_flag` |
+| TC-1768 | FR-1768 | integration (CLI unix) | fake agent sandbox | `dmuxai run hi --agent fake --json` | exit 0, `graph_id` null, events contain `agent` events and no `graph`/`node` events | `tests/agent_api_cli.rs` `tc_1768_cli_run_agent_emits_no_graph_events` |
+| TC-1769 | FR-1769 | unit | `src/cli.rs` tests | parse `run x --agent a --model m --progress --json` and `todo run abc --agent a --progress` | `RunOptions.progress` true; absent false | `src/cli.rs` `tc_1769_flag_table_parses_run_flags_and_progress` |
+| TC-1770 | FR-1770 | unit | `src/cli.rs` tests | invalid inputs | exact error messages unchanged | `src/cli.rs` `tc_1770_flag_table_errors_unchanged` |
+| TC-1771 | FR-1771 | unit | `src/cli.rs` tests / `dmuxai --help` | help text | contains `--progress`, not `--read-only` | `src/cli.rs` `tc_1771_help_lists_progress_not_read_only` |
+| TC-1772 | FR-1772 | unit | `src/progress.rs` | format each `AgentEvent` kind | shape has documented JSON keys; multiline/long summaries become one line ≤160 chars cut with `…` | `src/progress.rs` `tc_1772_progress_line_shape_and_cut` |
+| TC-1773 | FR-1773 | unit | `src/progress.rs` | observe multiple `TextDelta`s within 2 s, then complete | coalesced into one text line; pending text flushed before completed | `src/progress.rs` `tc_1773_progress_text_coalesced_every_2s` |
+| TC-1774 | FR-1774 | unit (app) | scripted agent with progress sink installed, then without sink | run headless | sink receives `started`, `text`, `completed` in order; without sink nothing produced | `src/app.rs` `tc_1774_headless_progress_sink_receives_lines` |
+| TC-1775 | FR-1775 | unit (app) | App with hub event sink | tool progress, file edit, 50 text deltas in short time | `activity` events logged for tool and file_edit; at most one `output` heartbeat logged | `src/app.rs` `tc_1775_activity_events_logged_and_throttled` |
+| TC-1776 | FR-1776 | unit (agent_api) | `events.jsonl` with started + activity | `status_json` | running run has `last_output_at_ms` equal to activity ts | `src/agent_api.rs` `tc_1776_status_json_last_output_at` |
+| TC-1777 | FR-1777 | integration (CLI) | fake agent sandbox | `dmuxai run hi --agent fake --json --progress` and without `--progress` | stderr has `started` and `completed` progress JSON lines, stdout is exactly one JSON object; without `--progress` stderr has no progress lines | `tests/agent_api_cli.rs` `tc_1777_cli_progress_lines_before_final_json` |
+| TC-1778 | FR-1778 | unit (app) | scripted agent with stage skill configured | `run_headless` with explicit agent, chat enabled then disabled | prompt received contains the skill prefix when chat is enabled and equals the user prompt when disabled | `src/app.rs` `tc_1778_headless_direct_applies_chat_stage_skills` |
 
 ## 6. Data, integration, and safety contracts
 

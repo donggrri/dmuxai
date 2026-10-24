@@ -1,6 +1,7 @@
 mod agent;
 mod app;
 mod cli;
+mod progress;
 
 use std::{
     error::Error,
@@ -74,7 +75,7 @@ struct MemoryOptions {
     project: Option<String>,
 }
 
-const USAGE: &str = "\
+pub const USAGE: &str = "\
 DmuxAI - One terminal. Multiple AI coding agents.
 
 Usage:
@@ -83,10 +84,10 @@ Usage:
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
-  dmuxai run <prompt|-> [--agent ID] [--model M] [--approve-plan] [--allow-sensitive] [--graph] [--json]
+  dmuxai run <prompt|-> [--agent ID] [--model M] [--approve-plan] [--allow-sensitive] [--graph] [--progress] [--json]
   dmuxai todo add <title> [--body TEXT] [--json]
   dmuxai todo list [--status open|running|done] [--json]
-  dmuxai todo run <id> [--agent ID | --graph] [--model M] [--json]
+  dmuxai todo run <id> [--agent ID | --graph] [--model M] [--progress] [--json]
   dmuxai status [--json]
   dmuxai events [--since N] [--limit N] [--follow] [--json]
   dmuxai mcp
@@ -118,6 +119,7 @@ Options:
   init             Write a commented starter dmuxai.toml to the user config
                    (or the workspace with --workspace); --force overwrites
   --json           Print machine-readable JSON on stdout
+  --progress       Stream one JSON line per agent activity to stderr while the run works
 
 Configuration:
   dmuxai.toml      Optional configuration file in the workspace root or parent directories
@@ -922,7 +924,7 @@ async fn attach_web_dashboard(
     };
 
     let sink = cli::build_event_sink(workspace_root, settings);
-    let hub = DashboardHub::new(SnapshotSource::Tui, workspace).with_events(sink);
+    let hub = DashboardHub::new(SnapshotSource::App, workspace).with_events(sink);
     hub.set_jira_base_url(settings.todo_jira_base_url.clone());
     let config = ServerConfig {
         bind: options.bind,

@@ -118,15 +118,16 @@ dmuxai status --json
 dmuxai run "summarize this repo" --agent agy --json
 dmuxai run "ship the feature" --json
 dmuxai run "ship the feature" --json --approve-plan
+dmuxai run "ship the feature" --json --progress   # live progress JSON lines on stderr
 dmuxai run "plan the migration" --graph --json
 dmuxai todo add "Write docs" --body "API.md first" --json
 dmuxai todo list --status open --json
-dmuxai todo run 3f2a1c9e --agent agy --json
+dmuxai todo run 3f2a1c9e --agent agy --json --progress
 dmuxai events --since 0 --limit 50 --json
 dmuxai events --follow --json
 ```
 
-`status --json` keys: `workspace`, `version`, `agents` (`{id, label, allowed}`),
+`status --json` keys: `workspace`, `version`, `agents` (`{id, label, allowed, run}` where running runs include `started_at_ms` and `last_output_at_ms`),
 `allowed_runners`, `graph_enabled`, `todos` (`{open, running, done}` or `null`),
 `last_graph` (`{id, phase, counts}` or `null`), `events` (`{path, last_seq}`),
 `dashboard` (`{base_url, port, pid, token_file}` or `null`) and `warnings` (array).
@@ -346,6 +347,7 @@ Readers must ignore unknown fields; malformed lines are skipped.
 | `kind` | `to_state` values emitted |
 | --- | --- |
 | `agent` | `pending`, `started`, `running`, `completed`, `error`, `cancelled`, `stalled` |
+| `activity` | `tool`, `file_edit`, `output` (runner activity and progress heartbeats) |
 | `node` | `pending`, `ready`, `running`, `waiting_gate`, `completed`, `failed`, `skipped` |
 | `graph` | `active`, `waiting_gate`, `completed`, `failed` |
 | `todo` | `started` (→ running), `completed` (→ done), `failed` (running → open with an error), `open` (any other change to open) |

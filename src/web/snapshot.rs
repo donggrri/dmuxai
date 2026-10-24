@@ -24,6 +24,9 @@ const SNAPSHOT_NODE_JOB_LIMIT: usize = 200;
 pub enum SnapshotSource {
     Tui,
     Files,
+    /// A DmuxAI process without a terminal UI (headless `dmuxai run` or
+    /// `dmuxai --web`).
+    App,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1883,5 +1886,15 @@ mod tests {
         assert_eq!(adjusted.ended_at_ms, None);
         let unchanged = adjust_run_state_for_plan_approval(done, false);
         assert_eq!(unchanged.state, "done");
+    }
+
+    // TC-1762 / FR-1762: SnapshotSource::App serializes as "app"
+    #[test]
+    fn tc_1762_snapshot_source_app_serializes_as_app() {
+        let source = SnapshotSource::App;
+        let json = serde_json::to_string(&source).unwrap();
+        assert_eq!(json, "\"app\"");
+        let round: SnapshotSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(round, SnapshotSource::App);
     }
 }

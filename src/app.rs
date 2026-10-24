@@ -1007,6 +1007,61 @@ pub struct HeadlessOutcome {
     pub system_prompt: Option<HeadlessSystemPrompt>,
 }
 
+impl HeadlessOutcome {
+    pub fn failure(
+        exit_code: i32,
+        conversation_id: impl Into<String>,
+        agent: Option<String>,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            ok: false,
+            exit_code,
+            conversation_id: conversation_id.into(),
+            agent,
+            graph_id: None,
+            text: String::new(),
+            messages: Vec::new(),
+            error: Some(error.into()),
+            error_kind: None,
+            todo: None,
+            triage: None,
+            plan: None,
+            system_prompt: None,
+        }
+    }
+
+    pub fn with_error_kind(mut self, kind: impl Into<String>) -> Self {
+        self.error_kind = Some(kind.into());
+        self
+    }
+
+    pub fn with_graph_id(mut self, graph_id: Option<String>) -> Self {
+        self.graph_id = graph_id;
+        self
+    }
+
+    pub fn with_text(mut self, text: impl Into<String>) -> Self {
+        self.text = text.into();
+        self
+    }
+
+    pub fn with_triage(mut self, triage: Option<Triage>) -> Self {
+        self.triage = triage;
+        self
+    }
+
+    pub fn with_plan(mut self, plan: Option<HeadlessPlan>) -> Self {
+        self.plan = plan;
+        self
+    }
+
+    pub fn with_system_prompt(mut self, system_prompt: Option<HeadlessSystemPrompt>) -> Self {
+        self.system_prompt = system_prompt;
+        self
+    }
+}
+
 enum HeadlessIdleAction {
     Done,
     ContinueAfterApprove,
@@ -1353,6 +1408,8 @@ pub struct App {
     pending_prompt_application: Option<(String, String, dmuxai::agent_prompt::Delivery)>,
     /// Most recently applied system prompt (headless reporting).
     system_prompt_applied: Option<HeadlessSystemPrompt>,
+    /// Stored triage record for direct headless runs without a graph (FR-1764, FR-1766).
+    headless_triage: Option<Triage>,
     /// Hint for todo runs so try_submit_to_agent maps them to Worker.
     submitting_todo_run: bool,
     pub(crate) mcp_servers: Vec<ResolvedMcpServer>,
@@ -1395,9 +1452,18 @@ pub struct App {
     cursor_session_maybe_read_only: bool,
     /// Cached assistant HTML keyed by transcript message id (`conversation:index`).
     chat_markdown_cache: HashMap<String, (u64, String)>,
+    pub(crate) progress_tracker: crate::progress::ProgressTracker,
+    pub(crate) progress_sink: Option<ProgressSink>,
+    last_tool_progress_state: HashMap<(Agent, String), String>,
+    last_output_heartbeat_at: HashMap<Agent, Instant>,
 }
 
+pub type ProgressSink = Box<dyn FnMut(&str) + Send>;
+
 impl App {
+    pub fn set_progress_sink(&mut self, sink: ProgressSink) {
+        self.progress_sink = Some(sink);
+    }
     pub fn new(
         engine: ConversationEngine,
         workspace_root: PathBuf,
@@ -1509,6 +1575,7 @@ impl App {
             prompt_injected: HashMap::new(),
             pending_prompt_application: None,
             system_prompt_applied: None,
+            headless_triage: None,
             submitting_todo_run: false,
             exit: false,
             headless: false,
@@ -1636,6 +1703,10 @@ impl App {
             allow_multi_runner_graph: false,
             cursor_session_maybe_read_only: true,
             chat_markdown_cache: HashMap::new(),
+            progress_tracker: crate::progress::ProgressTracker::new(),
+            progress_sink: None,
+            last_tool_progress_state: HashMap::new(),
+            last_output_heartbeat_at: HashMap::new(),
         };
         let runners = app.registered_runner_names();
         app.messages
@@ -3252,6 +3323,8 @@ impl App {
         let mut outcome = DrainEventsOutcome::default();
         while let Ok(mut output) = self.event_rx.try_recv() {
             self.attach_model_catalog_hint(&mut output);
+            self.feed_progress_sink(&output);
+            self.maybe_emit_activity_event(&output);
             if let AgentEvent::Error(ref err) = output.event {
                 outcome.errored = true;
                 outcome.error_kind = Some(err.kind.as_str().to_owned());
@@ -3267,6 +3340,136 @@ impl App {
             }
         }
         outcome
+    }
+
+    fn feed_progress_sink(&mut self, output: &AgentOutput) {
+        if self.progress_sink.is_none() {
+            return;
+        }
+        let runner = self.agent_runner_name(output.agent);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
+        let lines = self
+            .progress_tracker
+            .observe(&runner, &output.event, now_ms);
+        if let Some(ref mut sink) = self.progress_sink {
+            for line in lines {
+                let json = line.to_json();
+                sink(&json);
+            }
+        }
+    }
+
+    fn maybe_emit_activity_event(&mut self, output: &AgentOutput) {
+        let Some(hub) = self.dashboard.clone() else {
+            return;
+        };
+        let runner = self.agent_runner_name(output.agent);
+        let active = self.active_turns.get(&output.agent).cloned();
+        let task = active
+            .as_ref()
+            .map(|a| a.conversation_id.as_str().to_owned())
+            .or_else(|| Some(self.conversation_id.as_str().to_owned()));
+        let todo = active.as_ref().and_then(|a| {
+            self.todo_turns
+                .get(&(output.agent, a.turn_id.clone()))
+                .cloned()
+        });
+        let node = self.graph_agent_nodes.get(&output.agent).cloned();
+        let model = self
+            .model_catalogs
+            .get(&output.agent)
+            .and_then(|catalog| catalog.selected.clone());
+
+        match &output.event {
+            AgentEvent::ToolProgress {
+                item_id,
+                summary,
+                state,
+            } => {
+                let key = (output.agent, item_id.clone());
+                let duplicate = self.last_tool_progress_state.get(&key) == Some(state);
+                if duplicate {
+                    return;
+                }
+                self.last_tool_progress_state.insert(key, state.clone());
+                let msg = crate::progress::sanitize_summary(
+                    &format!("{state} {summary}"),
+                    crate::progress::MAX_SUMMARY_CHARS,
+                );
+                hub.emit_event(dmuxai::events::EventDraft {
+                    kind: "activity".to_owned(),
+                    task,
+                    todo,
+                    node,
+                    runner: Some(runner),
+                    model,
+                    from_state: None,
+                    to_state: "tool".to_owned(),
+                    message: Some(msg),
+                    error_kind: None,
+                });
+            }
+            AgentEvent::Activity(item) => {
+                if crate::progress::is_file_edit_activity(item) {
+                    let msg = crate::progress::sanitize_summary(
+                        &crate::progress::activity_item_summary(item),
+                        crate::progress::MAX_SUMMARY_CHARS,
+                    );
+                    hub.emit_event(dmuxai::events::EventDraft {
+                        kind: "activity".to_owned(),
+                        task,
+                        todo,
+                        node,
+                        runner: Some(runner),
+                        model,
+                        from_state: None,
+                        to_state: "file_edit".to_owned(),
+                        message: Some(msg),
+                        error_kind: None,
+                    });
+                }
+            }
+            AgentEvent::TextDelta(text) => {
+                let now = std::time::Instant::now();
+                let should_heartbeat = match self.last_output_heartbeat_at.get(&output.agent) {
+                    None => true,
+                    Some(last) => now.duration_since(*last) >= std::time::Duration::from_secs(30),
+                };
+                if should_heartbeat {
+                    self.last_output_heartbeat_at.insert(output.agent, now);
+                    let msg = crate::progress::sanitize_text_summary(
+                        text,
+                        crate::progress::MAX_SUMMARY_CHARS,
+                    );
+                    hub.emit_event(dmuxai::events::EventDraft {
+                        kind: "activity".to_owned(),
+                        task,
+                        todo,
+                        node,
+                        runner: Some(runner),
+                        model,
+                        from_state: None,
+                        to_state: "output".to_owned(),
+                        message: Some(msg),
+                        error_kind: None,
+                    });
+                }
+            }
+            AgentEvent::Started => {
+                self.last_tool_progress_state
+                    .retain(|(agent, _), _| *agent != output.agent);
+                self.last_output_heartbeat_at.remove(&output.agent);
+            }
+            AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_) => {
+                self.last_tool_progress_state
+                    .retain(|(agent, _), _| *agent != output.agent);
+                self.last_output_heartbeat_at.remove(&output.agent);
+            }
+            _ => {}
+        }
     }
 
     fn attach_model_catalog_hint(&self, output: &mut AgentOutput) {
@@ -6770,20 +6973,7 @@ impl App {
         self.start_graph_run_record(run);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn build_one_node_run(
-        &self,
-        prompt: &str,
-        agent: Agent,
-        route: Route,
-        reason: String,
-        source: TriageSource,
-        cause: Option<FallbackCause>,
-        override_kind: Option<OverrideKind>,
-        run_id: String,
-        judge_calls: u32,
-        elapsed_ms: u64,
-    ) -> Result<GraphRun, String> {
+    fn resolve_one_node_model(&self, agent: Agent, prompt: &str) -> Result<String, String> {
         let runner = runner_name(agent).to_owned();
         if let Some(selected) = self
             .model_catalogs
@@ -6816,6 +7006,51 @@ impl App {
             .unwrap_or_else(|| {
                 model_hint.unwrap_or_else(|| dmuxai::model_policy::default_model().to_owned())
             });
+        Ok(model)
+    }
+
+    fn build_direct_triage(&self, agent: Agent, prompt: &str) -> Result<Triage, String> {
+        let runner = runner_name(agent).to_owned();
+        let model = self.resolve_one_node_model(agent, prompt)?;
+        Ok(Triage {
+            route: Route::Simple,
+            reason: "override".to_owned(),
+            source: TriageSource::Override,
+            cause: None,
+            override_kind: Some(OverrideKind::Agent),
+            runner,
+            model,
+            elapsed_ms: 0,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_one_node_run(
+        &self,
+        prompt: &str,
+        agent: Agent,
+        route: Route,
+        reason: String,
+        source: TriageSource,
+        cause: Option<FallbackCause>,
+        override_kind: Option<OverrideKind>,
+        run_id: String,
+        judge_calls: u32,
+        elapsed_ms: u64,
+    ) -> Result<GraphRun, String> {
+        let runner = runner_name(agent).to_owned();
+        let model = self.resolve_one_node_model(agent, prompt)?;
+        let model_hint = self.selected_run_model(agent).ok().flatten();
+        let built = match fallback_plan(prompt, &runner, model_hint.as_deref(), "direct") {
+            Ok(built) => built,
+            Err(_) if model_hint.is_none() => dmuxai::graph::one_node_plan_on(
+                prompt,
+                &runner,
+                dmuxai::model_policy::PROVIDER_DEFAULT,
+                "direct",
+            ),
+            Err(error) => return Err(error),
+        };
         let mut plan = built.plan;
         plan.id = run_id;
         plan.orchestrator_model = model.clone();
@@ -12324,9 +12559,9 @@ impl App {
     fn headless_plan_snapshot(&self) -> (Option<Triage>, Option<HeadlessPlan>) {
         let run = self.last_graph_run.as_ref();
         let Some(run) = run else {
-            return (None, None);
+            return (self.headless_triage.clone(), None);
         };
-        let triage = run.triage.clone();
+        let triage = run.triage.clone().or_else(|| self.headless_triage.clone());
         let plan = run.approval.as_ref().and_then(|approval| {
             approval.revisions.last().map(|revision| HeadlessPlan {
                 steps: revision.steps.clone(),
@@ -12461,49 +12696,71 @@ impl App {
             .map(|session| session.run().plan.id.clone())
             .or_else(|| self.last_graph_run.as_ref().map(|run| run.plan.id.clone()));
         let (triage, plan) = self.headless_plan_snapshot();
-        HeadlessOutcome {
-            ok: false,
-            exit_code: dmuxai::agent_api::exit::APPROVAL_REQUIRED,
-            conversation_id: conversation_id.to_owned(),
+        HeadlessOutcome::failure(
+            dmuxai::agent_api::exit::APPROVAL_REQUIRED,
+            conversation_id.to_owned(),
             agent,
-            graph_id,
-            text,
-            messages: Vec::new(),
-            error: Some(note.to_owned()),
-            error_kind: None,
-            todo: None,
-            triage,
-            plan,
-            system_prompt: self.system_prompt_applied.clone(),
-        }
+            note.to_owned(),
+        )
+        .with_graph_id(graph_id)
+        .with_text(text)
+        .with_triage(triage)
+        .with_plan(plan)
+        .with_system_prompt(self.system_prompt_applied.clone())
     }
 
-    fn headless_submit_prompt(&mut self, req: &HeadlessRequest) {
+    fn headless_submit_prompt(&mut self, req: &HeadlessRequest) -> Result<(), RunTodoError> {
         if req.prompt.trim_start().starts_with('/')
             && !req.prompt.trim_start().starts_with("//")
             && !first_token_is_path(req.prompt.trim_start())
         {
             self.input = req.prompt.clone();
             self.submit_prompt();
-            return;
+            return Ok(());
+        }
+        if req.agent.is_some() && !req.graph {
+            let agent = self.adapters[self.selected].agent();
+            self.begin_user_prompt_turn();
+            self.allow_multi_runner_graph = false;
+            self.set_turn_runner_pin_from_agent(agent);
+            if let Some((runner, model)) = self
+                .headless_triage
+                .as_ref()
+                .map(|t| (t.runner.clone(), t.model.clone()))
+            {
+                let _ = self.apply_runner_and_model(&runner, &model);
+            }
+            let prompt = if self.settings.stage_skills.chat {
+                let prefix = self.stage_skill_prefix(
+                    &NodeRole::Implement.to_string(),
+                    runner_name(agent),
+                    None,
+                    None,
+                );
+                format!("{prefix}{}", req.prompt.clone())
+            } else {
+                req.prompt.clone()
+            };
+            self.try_submit_to_agent(agent, prompt, false, true)?;
+            return Ok(());
         }
         if self.pending_turn_policy == Some(TurnPolicy::ReadOnly) {
             let agent = self.adapters[self.selected].agent();
             self.allow_multi_runner_graph = false;
             self.set_turn_runner_pin_from_agent(agent);
             self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::Agent);
-            return;
+            return Ok(());
         }
         if req.agent.is_some() {
             let agent = self.adapters[self.selected].agent();
             self.allow_multi_runner_graph = false;
             self.set_turn_runner_pin_from_agent(agent);
             self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::Agent);
-            return;
+            return Ok(());
         }
         let agent = self.adapters[self.selected].agent();
         if self.refuse_plan_gate_prompt(req.prompt.clone()) {
-            return;
+            return Ok(());
         }
         self.begin_user_prompt_turn();
         if self
@@ -12513,9 +12770,10 @@ impl App {
             .is_some_and(|runners| runners.is_empty())
         {
             self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::NoAllowedRunners);
-            return;
+            return Ok(());
         }
         self.start_judge_turn(agent, req.prompt.clone());
+        Ok(())
     }
 
     fn headless_idle_action(
@@ -12550,21 +12808,15 @@ impl App {
             if req.approve_plan && !approved_plan {
                 if let Err(error) = self.approve_awaiting_plan(DecisionBy::Cli) {
                     let message = Self::plan_decision_notice(error);
-                    return HeadlessIdleAction::Exit(Box::new(HeadlessOutcome {
-                        ok: false,
-                        exit_code: 1,
-                        conversation_id: conversation_id.to_owned(),
-                        agent: agent_label,
-                        graph_id: self.last_graph_run.as_ref().map(|run| run.plan.id.clone()),
-                        text: String::new(),
-                        messages: Vec::new(),
-                        error: Some(message),
-                        error_kind: None,
-                        todo: None,
-                        triage: None,
-                        plan: None,
-                        system_prompt: None,
-                    }));
+                    return HeadlessIdleAction::Exit(Box::new(
+                        HeadlessOutcome::failure(
+                            dmuxai::agent_api::exit::FAILED,
+                            conversation_id.to_owned(),
+                            agent_label,
+                            message,
+                        )
+                        .with_graph_id(self.last_graph_run.as_ref().map(|run| run.plan.id.clone())),
+                    ));
                 }
                 return HeadlessIdleAction::ContinueAfterApprove;
             }
@@ -12601,21 +12853,12 @@ impl App {
                 .iter()
                 .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean);
             let Some(adapter) = adapter else {
-                return HeadlessOutcome {
-                    ok: false,
-                    exit_code: 3,
-                    conversation_id: self.conversation_id.as_str().to_owned(),
-                    agent: Some(agent_str.clone()),
-                    graph_id: None,
-                    text: String::new(),
-                    messages: Vec::new(),
-                    error: Some(format!("unknown agent '{agent_str}'")),
-                    error_kind: None,
-                    todo: None,
-                    triage: None,
-                    plan: None,
-                    system_prompt: None,
-                };
+                return HeadlessOutcome::failure(
+                    dmuxai::agent_api::exit::NOT_FOUND,
+                    self.conversation_id.as_str().to_owned(),
+                    Some(agent_str.clone()),
+                    format!("unknown agent '{agent_str}'"),
+                );
             };
             let target_agent = adapter.agent();
             let runner_id = runner_name(target_agent);
@@ -12625,21 +12868,13 @@ impl App {
                         .iter()
                         .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim())))
             {
-                return HeadlessOutcome {
-                    ok: false,
-                    exit_code: 5,
-                    conversation_id: self.conversation_id.as_str().to_owned(),
-                    agent: Some(runner_id.to_owned()),
-                    graph_id: None,
-                    text: String::new(),
-                    messages: Vec::new(),
-                    error: Some(format!("runner '{runner_id}' is not in allowed_runners")),
-                    error_kind: Some(AgentErrorKind::Policy.as_str().to_owned()),
-                    todo: None,
-                    triage: None,
-                    plan: None,
-                    system_prompt: None,
-                };
+                return HeadlessOutcome::failure(
+                    dmuxai::agent_api::exit::FORBIDDEN,
+                    self.conversation_id.as_str().to_owned(),
+                    Some(runner_id.to_owned()),
+                    format!("runner '{runner_id}' is not in allowed_runners"),
+                )
+                .with_error_kind(AgentErrorKind::Policy.as_str().to_owned());
             }
             self.selected = adapter_index(target_agent);
         } else if let Some(default) = self.settings.routing_default_agent.as_deref()
@@ -12657,21 +12892,13 @@ impl App {
                         .iter()
                         .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim())))
             {
-                return HeadlessOutcome {
-                    ok: false,
-                    exit_code: 5,
-                    conversation_id: self.conversation_id.as_str().to_owned(),
-                    agent: Some(runner_id.to_owned()),
-                    graph_id: None,
-                    text: String::new(),
-                    messages: Vec::new(),
-                    error: Some(format!("runner '{runner_id}' is not in allowed_runners")),
-                    error_kind: Some(AgentErrorKind::Policy.as_str().to_owned()),
-                    todo: None,
-                    triage: None,
-                    plan: None,
-                    system_prompt: None,
-                };
+                return HeadlessOutcome::failure(
+                    dmuxai::agent_api::exit::FORBIDDEN,
+                    self.conversation_id.as_str().to_owned(),
+                    Some(runner_id.to_owned()),
+                    format!("runner '{runner_id}' is not in allowed_runners"),
+                )
+                .with_error_kind(AgentErrorKind::Policy.as_str().to_owned());
             }
         }
 
@@ -12695,21 +12922,13 @@ impl App {
                 Some(&model_value),
                 config_default.as_deref(),
             ) {
-                return HeadlessOutcome {
-                    ok: false,
-                    exit_code: 5,
-                    conversation_id: self.conversation_id.as_str().to_owned(),
-                    agent: Some(runner_id.clone()),
-                    graph_id: None,
-                    text: String::new(),
-                    messages: Vec::new(),
-                    error: Some(err),
-                    error_kind: Some(AgentErrorKind::Policy.as_str().to_owned()),
-                    todo: None,
-                    triage: None,
-                    plan: None,
-                    system_prompt: None,
-                };
+                return HeadlessOutcome::failure(
+                    dmuxai::agent_api::exit::FORBIDDEN,
+                    self.conversation_id.as_str().to_owned(),
+                    Some(runner_id.clone()),
+                    err,
+                )
+                .with_error_kind(AgentErrorKind::Policy.as_str().to_owned());
             }
             // Accepted: Explicit source. Mirror into the catalog so the turn
             // path reads it like an F2 selection, and remember it for the
@@ -12723,21 +12942,12 @@ impl App {
             match crate::agent::turn_policy_from_legacy_mode(mode_str) {
                 Ok(policy) => self.pending_turn_policy = Some(policy),
                 Err(message) => {
-                    return HeadlessOutcome {
-                        ok: false,
-                        exit_code: dmuxai::agent_api::exit::USAGE,
-                        conversation_id: self.conversation_id.as_str().to_owned(),
-                        agent: req.agent.clone(),
-                        graph_id: None,
-                        text: String::new(),
-                        messages: Vec::new(),
-                        error: Some(message),
-                        error_kind: None,
-                        todo: None,
-                        triage: None,
-                        plan: None,
-                        system_prompt: None,
-                    };
+                    return HeadlessOutcome::failure(
+                        dmuxai::agent_api::exit::USAGE,
+                        self.conversation_id.as_str().to_owned(),
+                        req.agent.clone(),
+                        message,
+                    );
                 }
             }
         }
@@ -12752,6 +12962,48 @@ impl App {
         };
         self.create_conversation(Some(headless_title));
         let headless_conversation_id = self.conversation_id.as_str().to_owned();
+        self.last_graph_run = None;
+        self.graph_session = None;
+        self.headless_triage = None;
+
+        let is_sync_slash = req.todo_id.is_none()
+            && req.prompt.trim_start().starts_with('/')
+            && !req.prompt.trim_start().starts_with("//")
+            && !first_token_is_path(req.prompt.trim_start());
+
+        let is_direct_headless =
+            req.agent.is_some() && !req.graph && req.todo_id.is_none() && !is_sync_slash;
+
+        if is_direct_headless {
+            let target_agent = self.adapters[self.selected].agent();
+            match self.build_direct_triage(target_agent, &req.prompt) {
+                Ok(triage) => {
+                    self.headless_triage = Some(triage);
+                }
+                Err(error) => {
+                    return HeadlessOutcome::failure(
+                        dmuxai::agent_api::exit::FAILED,
+                        headless_conversation_id,
+                        Some(runner_name(target_agent).to_owned()),
+                        error,
+                    );
+                }
+            }
+
+            if dmuxai::graph::sensitive_keyword_match(&req.prompt)
+                && !req.allow_sensitive
+                && !req.approve_plan
+            {
+                return HeadlessOutcome::failure(
+                    dmuxai::agent_api::exit::APPROVAL_REQUIRED,
+                    headless_conversation_id,
+                    Some(runner_name(target_agent).to_owned()),
+                    HEADLESS_GATE_NOTE.to_owned(),
+                )
+                .with_triage(self.headless_triage.clone())
+                .with_system_prompt(self.system_prompt_applied.clone());
+            }
+        }
 
         // FR-1729: pre-load a custom agent's model catalog once so the
         // catalog check can run in the turn path (interactive catalogs are
@@ -12797,7 +13049,7 @@ impl App {
         let mut had_agent_error = false;
         let mut last_error_kind: Option<String> = None;
         let mut last_graph_id: Option<String> = None;
-        let mut cancelled;
+        let mut cancelled = false;
 
         loop {
             if !prompt_submitted {
@@ -12811,47 +13063,50 @@ impl App {
                     };
                     if let Err(err) = self.run_todo(todo_id, mode) {
                         let (exit_code, msg) = match err {
-                            RunTodoError::NotFound => (3, "to-do not found".to_owned()),
-                            RunTodoError::UnknownAgent(agent) => {
-                                (3, format!("unknown agent '{agent}'"))
-                            }
-                            RunTodoError::AlreadyRunning => {
-                                (4, "to-do is already running".to_owned())
-                            }
-                            RunTodoError::Busy(msg) => (4, msg),
-                            RunTodoError::Forbidden(msg) => (5, msg),
-                            RunTodoError::Missing(msg) => (3, msg),
-                            RunTodoError::Invalid(msg) => (2, msg),
-                            RunTodoError::Internal(msg) => (6, msg),
-                        };
-                        return HeadlessOutcome {
-                            ok: false,
-                            exit_code,
-                            conversation_id: self.conversation_id.as_str().to_owned(),
-                            agent: Some(
-                                runner_name(self.adapters[self.selected].agent()).to_owned(),
+                            RunTodoError::NotFound => (
+                                dmuxai::agent_api::exit::NOT_FOUND,
+                                "to-do not found".to_owned(),
                             ),
-                            graph_id: None,
-                            text: String::new(),
-                            messages: Vec::new(),
-                            error: Some(msg),
-                            error_kind: None,
-                            todo: None,
-                            triage: None,
-                            plan: None,
-                            system_prompt: None,
+                            RunTodoError::UnknownAgent(agent) => (
+                                dmuxai::agent_api::exit::NOT_FOUND,
+                                format!("unknown agent '{agent}'"),
+                            ),
+                            RunTodoError::AlreadyRunning => (
+                                dmuxai::agent_api::exit::CONFLICT,
+                                "to-do is already running".to_owned(),
+                            ),
+                            RunTodoError::Busy(msg) => (dmuxai::agent_api::exit::CONFLICT, msg),
+                            RunTodoError::Forbidden(msg) => {
+                                (dmuxai::agent_api::exit::FORBIDDEN, msg)
+                            }
+                            RunTodoError::Missing(msg) => (dmuxai::agent_api::exit::NOT_FOUND, msg),
+                            RunTodoError::Invalid(msg) => (dmuxai::agent_api::exit::USAGE, msg),
+                            RunTodoError::Internal(msg) => (dmuxai::agent_api::exit::INTERNAL, msg),
                         };
+                        return HeadlessOutcome::failure(
+                            exit_code,
+                            self.conversation_id.as_str().to_owned(),
+                            Some(runner_name(self.adapters[self.selected].agent()).to_owned()),
+                            msg,
+                        );
                     }
-                } else {
-                    self.headless_submit_prompt(&req);
+                } else if let Err(err) = self.headless_submit_prompt(&req)
+                    && !matches!(
+                        &err,
+                        RunTodoError::Busy(msg) if msg.contains("requires conversation summary")
+                    )
+                {
+                    had_agent_error = true;
+                    if last_error_kind.is_none() {
+                        last_error_kind = Some(match &err {
+                            RunTodoError::Busy(_) => "busy".to_owned(),
+                            _ => "internal".to_owned(),
+                        });
+                    }
+                    break;
                 }
                 prompt_submitted = true;
             }
-
-            let is_sync_slash = req.todo_id.is_none()
-                && req.prompt.trim_start().starts_with('/')
-                && !req.prompt.trim_start().starts_with("//")
-                && !first_token_is_path(req.prompt.trim_start());
 
             let mut turn_started = req.todo_id.is_some()
                 || is_sync_slash
@@ -13058,19 +13313,19 @@ impl App {
         let (ok, exit_code, error, error_kind) = if cancelled || graph_cancelled {
             (
                 false,
-                130,
+                dmuxai::agent_api::exit::CANCELLED,
                 last_system_error.or_else(|| Some("cancelled".to_owned())),
                 Some(AgentErrorKind::Cancelled.as_str().to_owned()),
             )
         } else if had_agent_error || graph_failed {
             (
                 false,
-                1,
+                dmuxai::agent_api::exit::FAILED,
                 last_system_error.or_else(|| Some("run failed".to_owned())),
                 last_error_kind,
             )
         } else {
-            (true, 0, None, None)
+            (true, dmuxai::agent_api::exit::OK, None, None)
         };
 
         let (triage, plan) = self.headless_plan_snapshot();
@@ -23015,6 +23270,44 @@ mod tests {
         );
     }
 
+    // TC-1761 / FR-1761: HeadlessOutcome::failure builder defaults
+    #[test]
+    fn tc_1761_headless_outcome_failure_builder_defaults() {
+        let outcome = HeadlessOutcome::failure(
+            dmuxai::agent_api::exit::NOT_FOUND,
+            "conv-1",
+            Some("codex".to_owned()),
+            "boom",
+        );
+        assert!(!outcome.ok);
+        assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::NOT_FOUND);
+        assert_eq!(outcome.conversation_id, "conv-1");
+        assert_eq!(outcome.agent.as_deref(), Some("codex"));
+        assert_eq!(outcome.error.as_deref(), Some("boom"));
+        assert!(outcome.graph_id.is_none());
+        assert!(outcome.text.is_empty());
+        assert!(outcome.messages.is_empty());
+        assert!(outcome.error_kind.is_none());
+        assert!(outcome.todo.is_none());
+        assert!(outcome.triage.is_none());
+        assert!(outcome.plan.is_none());
+        assert!(outcome.system_prompt.is_none());
+
+        let actual = serde_json::to_value(&outcome).unwrap();
+        let expected = serde_json::json!({
+            "ok": false,
+            "exit_code": dmuxai::agent_api::exit::NOT_FOUND,
+            "conversation_id": "conv-1",
+            "agent": "codex",
+            "graph_id": null,
+            "text": "",
+            "messages": [],
+            "error": "boom",
+            "todo": null,
+        });
+        assert_eq!(actual, expected);
+    }
+
     // TC-1751 / FR-1730: disallowed headless model is policy-rejected before any request
     #[tokio::test]
     async fn tc_1751_headless_disallowed_model_policy() {
@@ -23327,6 +23620,668 @@ mod tests {
                 .and_then(|record| record.message.as_deref())
                 == Some("boom")
         );
+    }
+
+    // TC-1764 / FR-1764: headless run with explicit agent runs directly without a graph.
+    #[tokio::test]
+    async fn tc_1764_headless_explicit_agent_runs_without_graph() {
+        use dmuxai::events::{EventLog, EventSink, events_path, read_since};
+        use dmuxai::web::SnapshotSource;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::open(dir.path(), dir.path().display().to_string());
+        let sink = EventSink::new(log, Duration::ZERO, None);
+        let hub =
+            dmuxai::web::DashboardHub::new(SnapshotSource::App, dir.path().display().to_string())
+                .with_events(sink);
+
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        app.attach_dashboard(hub);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("direct reply".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "Say hello".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(outcome.ok);
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.text.contains("direct reply"));
+        assert!(outcome.graph_id.is_none());
+        assert!(app.last_graph_run.is_none());
+        assert!(app.graph_session.is_none());
+
+        let all_events = read_since(&events_path(dir.path()), 0, None);
+        assert!(
+            all_events.iter().any(|record| record.kind == "agent"),
+            "expected agent lifecycle events, got: {all_events:?}"
+        );
+        assert!(
+            !all_events
+                .iter()
+                .any(|record| record.kind == "graph" || record.kind == "node"),
+            "direct run must not emit graph or node events, got: {all_events:?}"
+        );
+    }
+
+    // TC-1778 / FR-1778: headless direct path applies chat stage skills only when enabled.
+    #[tokio::test]
+    async fn tc_1778_headless_direct_applies_chat_stage_skills() {
+        for chat_enabled in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let skill_dir = dir.path().join("skills").join("review-list");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: review-list\ndescription: Review checklist\n---\nREVIEW-BODY check error handling.\n",
+            )
+            .unwrap();
+            let toml = if chat_enabled {
+                "[stages.implement]\nskills = [\"./skills/review-list\"]\n[skills]\nchat = true\n"
+            } else {
+                "[stages.implement]\nskills = [\"./skills/review-list\"]\n"
+            };
+            std::fs::write(dir.path().join("dmuxai.toml"), toml).unwrap();
+
+            let settings = DmuxSettings::load_with_user_config(dir.path(), None);
+            let workspace = dir.path().to_path_buf();
+            let engine =
+                ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let cancelled = Arc::new(Mutex::new(Vec::new()));
+            let adapters = Agent::all()
+                .into_iter()
+                .map(|agent| {
+                    Box::new(RecordingAdapter {
+                        agent,
+                        sent: Arc::clone(&sent),
+                        cancelled: Arc::clone(&cancelled),
+                        fail_send: false,
+                        unsupported_modes: Vec::new(),
+                    }) as Box<dyn AgentAdapter>
+                })
+                .collect();
+            let (event_tx, event_rx) = event_channel();
+            let mut app = App::with_runtime(
+                adapters,
+                event_rx,
+                Vec::new(),
+                engine,
+                workspace,
+                settings,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            app.selected = adapter_index(Agent::Codex);
+            app.skip_judge_for_tests = true;
+
+            let cancel = Arc::new(AtomicBool::new(false));
+            let sent_clone = Arc::clone(&sent);
+            tokio::spawn(async move {
+                for _ in 0..100 {
+                    let maybe_req = {
+                        let lock = sent_clone.lock().unwrap();
+                        lock.first().cloned()
+                    };
+                    if let Some((agent, req)) = maybe_req {
+                        let conv_id = req.conversation_id.clone();
+                        let turn_id = req.turn_id.clone();
+                        let _ = event_tx
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conv_id.clone()),
+                                turn_id: Some(turn_id.clone()),
+                                event: AgentEvent::TextDelta("direct reply".to_owned()),
+                            })
+                            .await;
+                        let _ = event_tx
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conv_id),
+                                turn_id: Some(turn_id),
+                                event: AgentEvent::Completed,
+                            })
+                            .await;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+
+            let req = HeadlessRequest {
+                prompt: "Say hello".to_owned(),
+                agent: Some("codex".to_owned()),
+                mode: None,
+                graph: false,
+                approve_plan: false,
+                allow_sensitive: false,
+                todo_id: None,
+                model: None,
+            };
+            let outcome = app.run_headless(req, cancel).await;
+            assert!(outcome.ok, "chat_enabled={chat_enabled}");
+
+            let requests = sent.lock().unwrap();
+            let prompt = requests
+                .iter()
+                .map(|(_, r)| r.prompt.clone())
+                .next()
+                .expect("sent request");
+            if chat_enabled {
+                assert!(
+                    prompt.contains("REVIEW-BODY"),
+                    "chat enabled: expected skill prefix, got: {prompt}"
+                );
+            } else {
+                assert_eq!(
+                    prompt, "Say hello",
+                    "chat disabled: prompt must be unchanged"
+                );
+            }
+        }
+    }
+
+    // TC-1774 / FR-1774: with a progress sink installed, a headless run that streams
+    // text then completes produces started, text, completed lines in order;
+    // without a sink nothing is produced.
+    #[tokio::test]
+    async fn tc_1774_headless_progress_sink_receives_lines() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let received = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let received_clone = Arc::clone(&received);
+        app.set_progress_sink(Box::new(move |line: &str| {
+            received_clone.lock().unwrap().push(line.to_owned());
+        }));
+
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::Started,
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("streaming answer".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "test prompt".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert_eq!(outcome.exit_code, 0);
+
+        let lines = received.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected started, text, completed: {lines:?}"
+        );
+        let val0: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        let val1: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        let val2: serde_json::Value = serde_json::from_str(&lines[2]).unwrap();
+        assert_eq!(val0["kind"], "started");
+        assert_eq!(val1["kind"], "text");
+        assert_eq!(val1["summary"], "streaming answer");
+        assert_eq!(val2["kind"], "completed");
+
+        // Without a sink installed, nothing is produced
+        let (mut app_no_sink, sent2, event_tx2) = test_app_with_event_sender();
+        let cancel2 = Arc::new(AtomicBool::new(false));
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent2.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx2
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::Started,
+                        })
+                        .await;
+                    let _ = event_tx2
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("streaming answer".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx2
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let req2 = HeadlessRequest {
+            prompt: "test prompt 2".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome2 = app_no_sink.run_headless(req2, cancel2).await;
+        assert_eq!(outcome2.exit_code, 0);
+        assert!(app_no_sink.progress_sink.is_none());
+    }
+
+    // TC-1775 / FR-1775: a tool progress and a file edit produce activity events;
+    // 50 text deltas in a short time produce at most one output heartbeat.
+    #[test]
+    fn tc_1775_activity_events_logged_and_throttled() {
+        use dmuxai::events::{EventLog, EventSink, read_since};
+        use dmuxai::web::SnapshotSource;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::open(dir.path(), dir.path().display().to_string());
+        let sink = EventSink::new(log, Duration::ZERO, None);
+        let hub =
+            dmuxai::web::DashboardHub::new(SnapshotSource::Tui, dir.path().display().to_string())
+                .with_events(sink);
+
+        let (mut app, _sent) = test_app();
+        app.attach_dashboard(hub);
+
+        let conv_id = app.conversation_id.clone();
+        let turn_id = TurnId::new("turn-1");
+
+        // 1. ToolProgress event produces activity event with to_state = "tool"
+        let tool_out = AgentOutput {
+            agent: Agent::Cursor,
+            conversation_id: Some(ConversationId::new(conv_id.as_str())),
+            turn_id: Some(turn_id.clone()),
+            event: AgentEvent::ToolProgress {
+                item_id: "tool-1".to_owned(),
+                summary: "cargo check".to_owned(),
+                state: "running".to_owned(),
+            },
+        };
+        app.maybe_emit_activity_event(&tool_out);
+
+        // Repeated same state does not emit duplicate
+        app.maybe_emit_activity_event(&tool_out);
+
+        // 2. File edit Activity item produces activity event with to_state = "file_edit"
+        let file_edit_out = AgentOutput {
+            agent: Agent::Cursor,
+            conversation_id: Some(ConversationId::new(conv_id.as_str())),
+            turn_id: Some(turn_id.clone()),
+            event: AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "edit".to_owned(),
+                target: "src/main.rs".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        };
+        app.maybe_emit_activity_event(&file_edit_out);
+
+        // Non-file-edit activity (e.g. run) does NOT produce file_edit event
+        let non_edit_out = AgentOutput {
+            agent: Agent::Cursor,
+            conversation_id: Some(ConversationId::new(conv_id.as_str())),
+            turn_id: Some(turn_id.clone()),
+            event: AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "run".to_owned(),
+                target: "cargo test".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        };
+        app.maybe_emit_activity_event(&non_edit_out);
+
+        // 3. 50 text deltas in a short time produce at most one output heartbeat
+        for i in 0..50 {
+            let delta_out = AgentOutput {
+                agent: Agent::Cursor,
+                conversation_id: Some(ConversationId::new(conv_id.as_str())),
+                turn_id: Some(turn_id.clone()),
+                event: AgentEvent::TextDelta(format!("delta {i} ")),
+            };
+            app.maybe_emit_activity_event(&delta_out);
+        }
+
+        let events_path = dmuxai::events::events_path(dir.path());
+        let events = read_since(&events_path, 0, None);
+
+        let activity_events: Vec<_> = events.iter().filter(|e| e.kind == "activity").collect();
+        let tool_events: Vec<_> = activity_events
+            .iter()
+            .filter(|e| e.to_state == "tool")
+            .collect();
+        let edit_events: Vec<_> = activity_events
+            .iter()
+            .filter(|e| e.to_state == "file_edit")
+            .collect();
+        let output_events: Vec<_> = activity_events
+            .iter()
+            .filter(|e| e.to_state == "output")
+            .collect();
+
+        assert_eq!(
+            tool_events.len(),
+            1,
+            "expected 1 tool activity event: {activity_events:?}"
+        );
+        assert_eq!(
+            edit_events.len(),
+            1,
+            "expected 1 file_edit activity event: {activity_events:?}"
+        );
+        assert_eq!(
+            output_events.len(),
+            1,
+            "expected exactly 1 output heartbeat for 50 text deltas: {activity_events:?}"
+        );
+        assert!(
+            tool_events[0]
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("cargo check")
+        );
+        assert!(
+            edit_events[0]
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("src/main.rs")
+        );
+    }
+
+    // TC-1765 / FR-1765: explicit agent error is reported once directly without graph failure notices.
+    #[tokio::test]
+    async fn tc_1765_headless_explicit_agent_error_reported_once() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Error(AgentError::provider(
+                                "underlying provider timeout",
+                            )),
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "Fail please".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.exit_code, 1);
+        let err = outcome.error.expect("error must be reported");
+        assert!(
+            err.contains("underlying provider timeout"),
+            "expected agent error text, got: {err}"
+        );
+        for msg in &outcome.messages {
+            assert!(
+                !msg.content.contains("Graph failed"),
+                "unexpected 'Graph failed' in message: {msg:?}"
+            );
+            assert!(
+                !msg.content.contains("graph node"),
+                "unexpected 'graph node' in message: {msg:?}"
+            );
+        }
+        for msg in &app.messages {
+            assert!(
+                !msg.content.contains("Graph failed"),
+                "unexpected 'Graph failed' in app message: {msg:?}"
+            );
+            assert!(
+                !msg.content.contains("graph node"),
+                "unexpected 'graph node' in app message: {msg:?}"
+            );
+        }
+    }
+
+    // TC-1766 / FR-1766: explicit agent headless run keeps triage with route simple, source override.
+    #[tokio::test]
+    async fn tc_1766_headless_explicit_agent_keeps_override_triage() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("done".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "Inspect code".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(outcome.ok);
+        let triage = outcome.triage.expect("triage must be present");
+        assert_eq!(triage.route, dmuxai::graph::Route::Simple);
+        assert_eq!(triage.reason, "override");
+        assert_eq!(triage.source, dmuxai::graph::TriageSource::Override);
+        assert_eq!(triage.runner, "codex");
+        assert!(!triage.model.is_empty());
+        assert!(outcome.plan.is_none());
+    }
+
+    // TC-1767 / FR-1767: direct sensitive prompt exits 7 without flag; runs with approve_plan.
+    #[tokio::test]
+    async fn tc_1767_headless_direct_sensitive_prompt_needs_flag() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // 1. Without allow_sensitive or approve_plan -> exit 7 and no turn started.
+        let req_gated = HeadlessRequest {
+            prompt: "deploy the migration to production".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req_gated, Arc::clone(&cancel)).await;
+        assert_eq!(outcome.exit_code, 7);
+        assert!(!outcome.ok);
+        assert_eq!(outcome.error.as_deref(), Some(HEADLESS_GATE_NOTE));
+        assert_eq!(sent.lock().unwrap().len(), 0, "no turn should have started");
+
+        // 2. With approve_plan: true -> turn runs.
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("deployment executed".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req_approved = HeadlessRequest {
+            prompt: "deploy the migration to production".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: true,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome2 = app.run_headless(req_approved, cancel).await;
+        assert_eq!(outcome2.exit_code, 0);
+        assert!(outcome2.ok);
+        assert!(outcome2.text.contains("deployment executed"));
+        assert_eq!(sent.lock().unwrap().len(), 1);
     }
 
     #[test]

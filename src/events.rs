@@ -763,14 +763,18 @@ impl EventSink {
     }
 
     fn feed_stall(&self, record: &EventRecord) {
-        if record.kind != "agent" {
-            return;
-        }
         let Some(runner) = record.runner.as_deref() else {
             return;
         };
         let now = Instant::now();
         let mut stall = self.stall.lock().unwrap_or_else(|p| p.into_inner());
+        if record.kind == "activity" {
+            stall.activity(runner, now);
+            return;
+        }
+        if record.kind != "agent" {
+            return;
+        }
         match record.to_state.as_str() {
             "pending" | "started" => stall.busy(runner, record.model.clone(), now),
             "running" => stall.activity(runner, now),
