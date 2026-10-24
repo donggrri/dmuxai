@@ -93,6 +93,9 @@ use crate::agent::{
     spawn_cursor_adapter, spawn_custom_adapter,
 };
 use crate::graph_defer::{DeferPoll, GRAPH_DEFER_RETRY_INTERVAL, GraphDeferQueue};
+#[cfg(test)]
+use crate::input_command::first_token_is_path;
+use crate::input_command::{self, InputKind, is_slash_command};
 use crate::internal_turn::{self, InternalTurn, TurnBuffer};
 use crate::todo_link::{TodoFinish, TodoLinks};
 
@@ -4323,16 +4326,28 @@ impl App {
         self.pending_images.paths()
     }
 
-    pub fn submit_prompt(&mut self) {
+    fn submit_precheck(&mut self, text: &str) -> bool {
         if self.switch_pending.is_some() {
             self.push_system("Workspace switch in progress.".to_owned());
-            return;
+            return false;
         }
-        if self.input.trim().is_empty() {
+        if text.trim().is_empty() {
+            return false;
+        }
+        true
+    }
+
+    pub fn submit_prompt(&mut self) {
+        let prompt = mem::take(&mut self.input);
+        if !self.submit_precheck(&prompt) {
+            self.input = prompt;
             return;
         }
 
-        let mut prompt = mem::take(&mut self.input);
+        self.submit_text(prompt);
+    }
+
+    fn submit_text(&mut self, mut prompt: String) {
         if prompt.ends_with('\n') || prompt.ends_with('\r') {
             prompt.truncate(prompt.trim_end_matches(['\r', '\n']).len());
         }
@@ -4348,21 +4363,19 @@ impl App {
             return;
         }
 
-        let is_escaped = prompt.starts_with("//");
-        if is_escaped {
-            if self.plan_gate_blocks_send() {
-                self.refuse_plan_gate_prompt(prompt);
-                return;
+        match input_command::classify(&prompt) {
+            InputKind::Escaped(unescaped) => {
+                if self.plan_gate_blocks_send() {
+                    self.refuse_plan_gate_prompt(prompt);
+                    return;
+                }
+                prompt = unescaped.to_owned();
             }
-            prompt = prompt[1..].to_owned();
-        } else if prompt.starts_with('/') && !first_token_is_path(&prompt) {
-            let cmd = prompt.split_whitespace().next().unwrap_or(&prompt);
-            match cmd {
+            InputKind::Slash { cmd, rest } => match cmd {
                 "/agent" => {
-                    let arg = prompt.strip_prefix("/agent").unwrap().trim();
-                    if arg.is_empty() {
+                    if rest.is_empty() {
                         self.execute_slash_action(SlashAction::Agent);
-                    } else if let Some(agent) = runner_from_str(arg) {
+                    } else if let Some(agent) = runner_from_str(rest) {
                         self.selected = adapter_index(agent);
                         let _ = self.adapters[self.selected].prewarm();
                         self.messages.push(Message::new(
@@ -4371,7 +4384,7 @@ impl App {
                         ));
                     } else {
                         self.push_system(format!(
-                            "Unknown agent: {arg}. Use /agent to pick from available agents."
+                            "Unknown agent: {rest}. Use /agent to pick from available agents."
                         ));
                     }
                     return;
@@ -4381,7 +4394,6 @@ impl App {
                     return;
                 }
                 "/summarize" | "/compact" => {
-                    let rest = prompt.strip_prefix(cmd).unwrap_or("").trim();
                     let focus = (!rest.is_empty()).then(|| rest.to_owned());
                     self.start_explicit_summary(focus);
                     return;
@@ -4399,11 +4411,7 @@ impl App {
                     return;
                 }
                 "/new" => {
-                    let title = prompt
-                        .strip_prefix("/new")
-                        .map(str::trim)
-                        .filter(|title| !title.is_empty())
-                        .map(str::to_owned);
+                    let title = (!rest.is_empty()).then(|| rest.to_owned());
                     self.create_conversation(title);
                     return;
                 }
@@ -4412,7 +4420,6 @@ impl App {
                     return;
                 }
                 "/resume" => {
-                    let rest = prompt.strip_prefix("/resume").unwrap().trim();
                     if rest.is_empty() {
                         self.push_system("Usage: /resume <conversation-id>");
                     } else {
@@ -4421,7 +4428,6 @@ impl App {
                     return;
                 }
                 "/share" => {
-                    let rest = prompt.strip_prefix("/share").unwrap().trim();
                     if rest.is_empty() {
                         self.push_system("Usage: /share <codex|cursor|agy>");
                     } else {
@@ -4430,7 +4436,6 @@ impl App {
                     return;
                 }
                 "/image" => {
-                    let rest = prompt.strip_prefix("/image").unwrap().trim();
                     if rest.is_empty() {
                         self.push_system("Usage: /image <path>");
                     } else {
@@ -4443,56 +4448,47 @@ impl App {
                     return;
                 }
                 "/remember" => {
-                    let rest = prompt.strip_prefix("/remember").unwrap().trim().to_owned();
-                    self.remember_command(&rest);
+                    self.remember_command(rest);
                     return;
                 }
                 "/memory" => {
-                    let rest = prompt.strip_prefix("/memory").unwrap().trim().to_owned();
-                    self.memory_command(&rest);
+                    self.memory_command(rest);
                     return;
                 }
                 "/skills" => {
-                    let rest = prompt.strip_prefix("/skills").unwrap().trim().to_owned();
-                    self.skills_command(&rest);
+                    self.skills_command(rest);
                     return;
                 }
                 "/plan" => {
-                    let raw = prompt.strip_prefix("/plan").unwrap_or("").trim().to_owned();
-                    let (overrides, rest) = stage_skills::parse_skill_overrides(&raw);
-                    if !rest.is_empty() && self.skill_preflight_blocks(&overrides) {
+                    let (overrides, plan_rest) = stage_skills::parse_skill_overrides(rest);
+                    if !plan_rest.is_empty() && self.skill_preflight_blocks(&overrides) {
                         self.input = prompt;
                         return;
                     }
                     self.pending_skill_overrides = overrides;
-                    if rest.is_empty() {
+                    if plan_rest.is_empty() {
                         self.push_system("Usage: /plan <prompt>");
                     } else if self.refuse_plan_gate_prompt(prompt) {
                         return;
                     } else {
                         let agent = self.adapters[self.selected].agent();
-                        self.submit_plan_run(rest, agent);
+                        self.submit_plan_run(plan_rest, agent);
                     }
                     return;
                 }
                 "/direct" => {
-                    let rest = prompt
-                        .strip_prefix("/direct")
-                        .unwrap_or("")
-                        .trim()
-                        .to_owned();
-                    if rest.is_empty() {
+                    let direct_prompt = rest.to_owned();
+                    if direct_prompt.is_empty() {
                         self.push_system("Usage: /direct <prompt>");
                     } else if self.refuse_plan_gate_prompt(prompt) {
                         return;
                     } else {
                         let agent = self.adapters[self.selected].agent();
-                        self.submit_direct_run(rest, agent, OverrideKind::Direct);
+                        self.submit_direct_run(direct_prompt, agent, OverrideKind::Direct);
                     }
                     return;
                 }
                 "/graph" => {
-                    let rest = prompt.strip_prefix("/graph").unwrap().trim();
                     if rest.is_empty() {
                         self.show_graph_status();
                     } else if rest == "continue" {
@@ -4579,7 +4575,8 @@ impl App {
                     self.input = prompt;
                     return;
                 }
-            }
+            },
+            InputKind::Plain => {}
         }
 
         if !prompt.trim_start().starts_with('/') {
@@ -12549,12 +12546,10 @@ impl App {
     }
 
     fn headless_submit_prompt(&mut self, req: &HeadlessRequest) -> Result<(), RunTodoError> {
-        if req.prompt.trim_start().starts_with('/')
-            && !req.prompt.trim_start().starts_with("//")
-            && !first_token_is_path(req.prompt.trim_start())
-        {
-            self.input = req.prompt.clone();
-            self.submit_prompt();
+        if is_slash_command(&req.prompt) {
+            if self.submit_precheck(&req.prompt) {
+                self.submit_text(req.prompt.clone());
+            }
             return Ok(());
         }
         if req.agent.is_some() && !req.graph {
@@ -12806,10 +12801,7 @@ impl App {
         self.graph_session = None;
         self.headless_triage = None;
 
-        let is_sync_slash = req.todo_id.is_none()
-            && req.prompt.trim_start().starts_with('/')
-            && !req.prompt.trim_start().starts_with("//")
-            && !first_token_is_path(req.prompt.trim_start());
+        let is_sync_slash = req.todo_id.is_none() && is_slash_command(&req.prompt);
 
         let is_direct_headless =
             req.agent.is_some() && !req.graph && req.todo_id.is_none() && !is_sync_slash;
@@ -15368,13 +15360,6 @@ fn runner_from_str(runner: &str) -> Option<Agent> {
         "codex" => Some(Agent::Codex),
         other => dmuxai::custom_agent::index_of(other).map(Agent::Custom),
     }
-}
-
-/// `/home/u/shot.png describe this` is a path, not a slash command: the
-/// first token has a second `/` or names an existing file.
-fn first_token_is_path(prompt: &str) -> bool {
-    let token = prompt.split_whitespace().next().unwrap_or("");
-    token[1..].contains('/') || Path::new(token).exists()
 }
 
 fn prompt_should_attach_only(prompt: &str) -> bool {
@@ -27224,6 +27209,29 @@ mod tests {
         assert!(app.retired_internal_turns.contains("turn-retire-no-cancel"));
         // Adapter cancel was not called for Cursor
         assert_eq!(&*cancelled.lock().unwrap(), &[Agent::Codex]);
+    }
+
+    // TC-2062 / FR-2062: headless slash command does not touch TUI input buffer.
+    #[test]
+    fn tc_2062_headless_slash_does_not_touch_tui_input() {
+        let (mut app, _sent) = test_app();
+        app.input = "draft text in tui".to_owned();
+
+        let req = HeadlessRequest {
+            prompt: "/agent cursor".to_owned(),
+            agent: None,
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+
+        let result = app.headless_submit_prompt(&req);
+        assert!(result.is_ok());
+        assert_eq!(app.input, "draft text in tui");
+        assert_eq!(app.adapters[app.selected].agent(), Agent::Cursor);
     }
 
     // TC-937 / FR-935: silence past 90 s falls back; recent events keep it alive.
