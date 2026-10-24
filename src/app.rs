@@ -93,8 +93,8 @@ use crate::agent::{
     spawn_cursor_adapter, spawn_custom_adapter,
 };
 use crate::graph_defer::{DeferPoll, GRAPH_DEFER_RETRY_INTERVAL, GraphDeferQueue};
-#[allow(unused_imports)]
-pub(crate) use crate::input_command::first_token_is_path;
+#[cfg(test)]
+use crate::input_command::first_token_is_path;
 use crate::input_command::{self, InputKind, is_slash_command};
 use crate::internal_turn::{self, InternalTurn, TurnBuffer};
 use crate::todo_link::{TodoFinish, TodoLinks};
