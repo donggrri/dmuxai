@@ -60,4 +60,35 @@ case "$behavior" in
   env)    echo "cfg=$FAKE_CFG content=$(cat "$FAKE_CFG")" ;;
   sleep)  sleep 30; echo late ;;
   judge|plan|judge-simple) dispatch_judge_or_plan "$last" ;;
+  pidsleep)
+    printf '%s\n' "$$" > "$FAKE_AGENT_PIDFILE"
+    sleep 60 &
+    printf '%s\n' "$!" >> "$FAKE_AGENT_PIDFILE"
+    printf '{"type":"text","part":{"text":"working"}}\n'
+    wait
+    ;;
+  idle_sleep)
+    if [ -n "$FAKE_AGENT_PIDFILE" ]; then
+      printf '%s\n' "$$" > "$FAKE_AGENT_PIDFILE"
+    fi
+    sleep 30
+    ;;
+  trickle)
+    for i in 1 2 3 4 5 6; do
+      printf '{"type":"text","part":{"text":"line%s\\n"}}\n' "$i"
+      sleep 0.4
+    done
+    ;;
+  delayed)
+    sleep 2
+    printf '{"type":"text","part":{"text":"delayed text\\n"}}\n'
+    ;;
+  orphan_stdout)
+    sleep 60 &
+    if [ -n "$FAKE_AGENT_PIDFILE" ]; then
+      printf '%s\n' "$!" > "$FAKE_AGENT_PIDFILE"
+    fi
+    printf '{"type":"text","part":{"text":"orphan ok\\n"}}\n'
+    exit 0
+    ;;
 esac

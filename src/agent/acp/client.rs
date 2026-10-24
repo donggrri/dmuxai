@@ -120,12 +120,16 @@ pub async fn run_acp_turn(
 
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
-        command.as_std_mut().process_group(0);
+        dmuxai::process::supervisor::configure_child(
+            &mut command,
+            &dmuxai::process::supervisor::ChildOptions::default(),
+        );
     }
 
     let mut child = command.spawn()?;
     let child_pid = child.id();
+    #[cfg(unix)]
+    let _acp_group_guard = child_pid.map(dmuxai::process::supervisor::GroupGuard::register);
     let stdin = child
         .stdin
         .take()
@@ -892,27 +896,23 @@ async fn wait_child(child: &mut tokio::process::Child, _pid: Option<u32>) {
 
 #[cfg(unix)]
 async fn terminate_group(pgid: u32) {
-    let _ = signal_group(pgid, "-TERM");
+    if !dmuxai::process::supervisor::signal_group(
+        pgid,
+        dmuxai::process::supervisor::GroupSignal::Term,
+    ) {
+        return;
+    }
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
-        if !signal_group(pgid, "-0") {
+        if !dmuxai::process::supervisor::group_alive(pgid) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let _ = signal_group(pgid, "-KILL");
-}
-
-#[cfg(unix)]
-fn signal_group(pgid: u32, signal: &str) -> bool {
-    std::process::Command::new("kill")
-        .args([signal, "--", &format!("-{pgid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let _ = dmuxai::process::supervisor::signal_group(
+        pgid,
+        dmuxai::process::supervisor::GroupSignal::Kill,
+    );
 }
 
 pub fn new_cancel_flag() -> Arc<AtomicBool> {

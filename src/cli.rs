@@ -756,9 +756,19 @@ async fn run_headless(
 
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_signal = cancel.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let finished_signal = finished.clone();
     let signal_task = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            cancel_signal.store(true, Ordering::SeqCst);
+        wait_for_stop_signal().await;
+        cancel_signal.store(true, Ordering::SeqCst);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+            _ = wait_for_stop_signal() => {}
+        }
+        if !finished_signal.load(Ordering::SeqCst) {
+            dmuxai::process::supervisor::stop_all_live_groups(Duration::from_secs(2));
+            eprintln!("error: stopped after signal");
+            std::process::exit(130);
         }
     });
     let mode = if options.read_only {
@@ -778,6 +788,7 @@ async fn run_headless(
     };
     let outcome = app.run_headless(request, cancel).await;
     app.shutdown().await;
+    finished.store(true, Ordering::SeqCst);
     signal_task.abort();
     let last_seq = sink.log().last_seq();
     Ok((outcome, first_seq, last_seq))
@@ -918,6 +929,25 @@ impl McpBackend for CliMcpBackend {
         let events = dmuxai::events::read_since(&path, since, Some(limit.unwrap_or(200)));
         let last_seq = events.last().map(|e| e.seq).unwrap_or(since);
         Ok(json!({ "events": events, "last_seq": last_seq }))
+    }
+}
+
+/// Waits for any of Ctrl+C, SIGTERM or SIGHUP (Unix); Ctrl+C only elsewhere.
+async fn wait_for_stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+            _ = sighup.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

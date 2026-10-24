@@ -477,6 +477,10 @@ async fn run_single_agy_process(
     let program = resolve_program(AGY_BINARY_OVERRIDE, "agy");
     let mut command = headless_command(program);
     configure_command_for_resume(&mut command, request, selected_model, mode, resume_session);
+    dmuxai::process::supervisor::configure_child(
+        &mut command,
+        &dmuxai::process::supervisor::ChildOptions::default(),
+    );
     command
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -487,6 +491,8 @@ async fn run_single_agy_process(
     let mut child = command
         .spawn()
         .map_err(|error| AgentError::process_exit(format!("could not start AGY: {error}")))?;
+    let pgid = child.id().unwrap_or(0);
+    let _group_guard = dmuxai::process::supervisor::GroupGuard::register(pgid);
     let mut stdin = child
         .stdin
         .take()
@@ -516,7 +522,7 @@ async fn run_single_agy_process(
         .map_err(|error| AgentError::provider(error.to_string()))?;
     drop(stdin);
 
-    stream_child(&mut child, stdout, stderr, event_tx, context, mode).await
+    stream_child(&mut child, pgid, stdout, stderr, event_tx, context, mode).await
 }
 
 fn configure_command_for_resume(
@@ -590,6 +596,7 @@ fn configure_command(
 
 async fn stream_child(
     child: &mut tokio::process::Child,
+    pgid: u32,
     stdout: ChildStdout,
     stderr: ChildStderr,
     event_tx: &mpsc::Sender<AgentOutput>,
@@ -649,7 +656,13 @@ async fn stream_child(
                 exit_status = Some(status.map_err(|e| AgentError::process_exit(e.to_string()))?);
             }
             _ = tokio::time::sleep_until(idle_deadline_at), if idle_deadline.is_some() => {
-                child.kill().await.ok();
+                dmuxai::process::supervisor::signal_group(pgid, dmuxai::process::supervisor::GroupSignal::Term);
+                let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+                if dmuxai::process::supervisor::group_alive(pgid) {
+                    dmuxai::process::supervisor::signal_group(pgid, dmuxai::process::supervisor::GroupSignal::Kill);
+                }
+                let _ = child.start_kill();
+                let _ = child.wait().await;
                 return Err(AgentError::idle(format!(
                     "AGY produced no events for {}s; it may be waiting on a background command. Run commands in the foreground with a bounded timeout.",
                     idle_secs.unwrap_or(AGY_IDLE_TIMEOUT_DEFAULT_SECS)
@@ -663,8 +676,16 @@ async fn stream_child(
                 // when no idle timeout is configured.
                 if exit_status.is_none() {
                     killed_after_result = true;
-                    child.kill().await.ok();
-                    exit_status = Some(child.wait().await.map_err(|e| AgentError::process_exit(e.to_string()))?);
+                    dmuxai::process::supervisor::signal_group(pgid, dmuxai::process::supervisor::GroupSignal::Term);
+                    let wait_res = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+                    match wait_res {
+                        Ok(Ok(st)) => exit_status = Some(st),
+                        _ => {
+                            dmuxai::process::supervisor::signal_group(pgid, dmuxai::process::supervisor::GroupSignal::Kill);
+                            let _ = child.start_kill();
+                            exit_status = Some(child.wait().await.map_err(|e| AgentError::process_exit(e.to_string()))?);
+                        }
+                    }
                 }
                 stdout_open = false;
                 stderr_open = false;
@@ -1451,13 +1472,11 @@ mod tests {
         assert!(!pid.is_empty());
         let dead = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if std::process::Command::new("kill")
-                    .arg("-0")
-                    .arg(&pid)
-                    .status()
-                    .map(|status| !status.success())
-                    .unwrap_or(true)
-                {
+                let pid_n: i32 = pid.parse().unwrap_or(0);
+                // SAFETY: kill with signal 0 probes process existence.
+                let gone = unsafe { libc::kill(pid_n, 0) != 0 }
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                if gone {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1860,5 +1879,81 @@ mod tests {
             outcome.is_ok(),
             "the turn returns conversation id; the denial is the terminal event"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_1799_runner_groups_registered_while_running() {
+        let (dir, fake) = write_fake_agy(|tmp| {
+            format!(
+                "#!/bin/sh\necho $$ > {}\nsleep 600\n",
+                tmp.join("agy.pid").display()
+            )
+        });
+        let pid_path = dir.path().join("agy.pid");
+
+        let _ = with_agy_spawn_env(&fake, "60", async {
+            let turn = tokio::spawn(async { run_fake_agy_turn(TurnPolicy::Agent, false).await });
+
+            let mut pid = None;
+            for _ in 0..100 {
+                if let Ok(content) = std::fs::read_to_string(&pid_path)
+                    && let Ok(p) = content.trim().parse::<u32>()
+                {
+                    pid = Some(p);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let pid = pid.expect("fake AGY should have written its PID");
+
+            let mut registered = false;
+            for _ in 0..100 {
+                if dmuxai::process::supervisor::live_groups().contains(&pid) {
+                    registered = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                registered,
+                "fake AGY pgid should be registered while running"
+            );
+
+            turn.abort();
+            let _ = turn.await;
+
+            let unregistered = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if !dmuxai::process::supervisor::live_groups().contains(&pid) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .is_ok();
+            assert!(
+                unregistered,
+                "fake AGY pgid should unregister after turn ends"
+            );
+
+            let dead = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let pid_i = pid as i32;
+                    // SAFETY: kill with signal 0 probes process existence.
+                    if unsafe { libc::kill(pid_i, 0) != 0 }
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .is_ok();
+            assert!(dead, "fake AGY process should be gone after turn ends");
+        })
+        .await;
     }
 }

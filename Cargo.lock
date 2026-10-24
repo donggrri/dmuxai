@@ -540,6 +540,7 @@ dependencies = [
  "filetime",
  "http-body-util",
  "image",
+ "libc",
  "linkify",
  "pulldown-cmark",
  "ratatui",

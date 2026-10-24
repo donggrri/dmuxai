@@ -17,6 +17,9 @@ pub const BUILTIN_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default per-turn timeout when `timeout_secs` is not set (FR-339).
 pub const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
+/// Default idle watchdog timeout when `idle_timeout_secs` is not set (FR-1796).
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+
 /// How the prompt is delivered to the runner process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -106,6 +109,9 @@ pub struct CustomAgentSpec {
     pub resume_arg: Vec<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Seconds without any stdout line before the turn fails with an Idle error; default 300; 0 disables.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
     #[serde(default)]
     pub failure_stderr: Option<String>,
     #[serde(default)]
@@ -165,6 +171,7 @@ pub fn opencode_preset(program: &str) -> CustomAgentSpec {
         session_id_path: Some("/sessionID".to_owned()),
         resume_arg: words(&["--session", "{session_id}"]),
         timeout_secs: Some(DEFAULT_TIMEOUT_SECS),
+        idle_timeout_secs: Some(DEFAULT_IDLE_TIMEOUT_SECS),
         failure_stderr: Some("(?i)permission denied|rejected permission".to_owned()),
         temp_config_template: Some(
             r#"{"permission":{"edit":"{edit}","bash":"{edit}","webfetch":"allow"}}"#.to_owned(),
@@ -214,6 +221,7 @@ pub fn grok_preset(program: &str) -> CustomAgentSpec {
         session_id_path: Some("/sessionId".to_owned()),
         resume_arg: words(&["-r", "{session_id}"]),
         timeout_secs: Some(DEFAULT_TIMEOUT_SECS),
+        idle_timeout_secs: Some(DEFAULT_IDLE_TIMEOUT_SECS),
         // FR-913: a background task that finishes during the turn queues an
         // auto-wake prompt that grok 1.0.62 never runs in headless mode, so the
         // process idles forever after its reply. Auto-wake off avoids it.
@@ -348,6 +356,16 @@ impl CustomAgentSpec {
     /// Returns the timeout in seconds, defaulting to [`DEFAULT_TIMEOUT_SECS`].
     pub fn timeout_secs(&self) -> u64 {
         self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)
+    }
+
+    /// Returns the idle timeout in seconds, returning `None` if disabled (`0`),
+    /// or `Some(300)` when unset ([`DEFAULT_IDLE_TIMEOUT_SECS`]).
+    pub fn idle_timeout_secs(&self) -> Option<u64> {
+        match self.idle_timeout_secs {
+            None => Some(DEFAULT_IDLE_TIMEOUT_SECS),
+            Some(0) => None,
+            Some(secs) => Some(secs),
+        }
     }
 
     /// Returns whether any of `text_path`, `text_when`, `error_path`, `session_id_path`,
@@ -1250,6 +1268,24 @@ implement = []
             DEFAULT_TIMEOUT_SECS
         );
         assert_eq!(grok_preset("grok").timeout_secs(), DEFAULT_TIMEOUT_SECS);
+    }
+
+    // TC-1796 (FR-1796)
+    #[test]
+    fn tc_1796_idle_timeout_secs_defaults() {
+        let unset: CustomAgentSpec = toml::from_str("name = \"a\"\ncommand = [\"a\"]").unwrap();
+        assert_eq!(unset.idle_timeout_secs, None);
+        assert_eq!(unset.idle_timeout_secs(), Some(300));
+
+        let zero: CustomAgentSpec =
+            toml::from_str("name = \"a\"\ncommand = [\"a\"]\nidle_timeout_secs = 0").unwrap();
+        assert_eq!(zero.idle_timeout_secs, Some(0));
+        assert_eq!(zero.idle_timeout_secs(), None);
+
+        let explicit: CustomAgentSpec =
+            toml::from_str("name = \"a\"\ncommand = [\"a\"]\nidle_timeout_secs = 45").unwrap();
+        assert_eq!(explicit.idle_timeout_secs, Some(45));
+        assert_eq!(explicit.idle_timeout_secs(), Some(45));
     }
 
     #[test]
