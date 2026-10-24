@@ -31,7 +31,7 @@ This part (Part A) provides:
 
 - Cursor legacy runner migration onto `Supervised` and warm process adoption (`adopt`) is deferred to Part B (planned FR-1965).
 - ACP client migration to shared `terminate_group` and stderr formatting is deferred to Part C (planned FR-1966).
-- MCP stdio client and Office conversion shell `kill` elimination is deferred to Part D (planned FR-1967..FR-1968).
+- MCP stdio client and Office conversion shell `kill` elimination is complete in Part D (FR-1967..FR-1968).
 - Windows non-unix supervisor support remains non-goal.
 
 ### Assumptions and open questions
@@ -59,6 +59,8 @@ This part (Part A) provides:
 | FR-1964 | Must | Given an AGY agent turn execution | The child process is supervised with `supervisor::spawn`, configures idle timeout from `agy_idle_timeout_secs()` (300 s default; 0 disables) and 500 ms term grace; streams stdout via `next_line()`, and reaps the child/grandchild group upon result completion (`wait_exit` + `finish(0)` or `stop`), idle (`stop`), or EOF (`finish(3s)`) | Stderr diagnostic formatting uses `tail_lines(..., 8)`; idle timeout returns standard `AgentError::idle` text; group is registered in `live_groups()` during execution | TC-1964 |
 | FR-1965 | Must | Given a Cursor legacy agent turn execution (fresh or warm-adopted child) | Fresh turn children are spawned with `supervisor::spawn`, matching warm children are wrapped with `supervisor::adopt` at turn start, and `stream_child` loops over `next_line()` with terminal-result grace (`wait_exit(TERMINAL_EXIT_GRACE)`), forced stop on timeout, and `tail_lines(..., 8)` diagnostics | Cursor's private `terminate_group`, `push_stderr`, and stderr ring are deleted; warm-process idle expiry/reaping behavior remains unchanged; group is registered in `live_groups()` during the turn | TC-1965 |
 | FR-1966 | Must | Given an ACP client turn execution | The ACP client uses the shared `supervisor::terminate_group(pgid, 500ms)` for group termination and formats its stderr diagnostic with `tail_lines`-compatible output (last 8 non-empty lines joined with `" | "`) | No private `terminate_group` copy remains in `src/agent/acp/client.rs`; full `adopt` of ACP remains out of scope | TC-1966 |
+| FR-1967 | Must | Given an MCP stdio client connection | The child process is built with `crate::process::supervisor::configure_child` (own process group, `kill_on_drop`, and Linux `PR_SET_PDEATHSIG`), and killed with `signal_group(pgid, GroupSignal::Kill)` plus `start_kill`; no `std::process::Command::new("kill")` subprocess is used | MCP stdio servers now also receive `PR_SET_PDEATHSIG` on Linux (behavior change); process group is killed on drop, timeout, and error paths | TC-1967 |
+| FR-1968 | Must | Given an Office (LibreOffice) conversion that times out or fails | `kill_tree` sends `signal_group(child.id(), GroupSignal::Kill)` under `cfg(unix)` instead of a shell `kill` subprocess, then `child.kill()` and `child.wait()`; the whole process group (including `soffice.bin` forked by the wrapper) is killed | No `std::process::Command::new("kill")` subprocess remains in `src/docs/office.rs`; `process_group(0)` is retained | TC-1968 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -71,6 +73,8 @@ This part (Part A) provides:
 | TC-1964 | FR-1964 | integration (unix) | Fake AGY turn running in own process group | Run turn, verify live group tracking, idle timeout, and result grace | `live_groups()` contains AGY pgid during turn and unregisters after completion; existing idle kill and result grace tests continue to pass | `src/agent/agy.rs` `tc_1964_agy_uses_supervisor_and_registers_group` |
 | TC-1965 | FR-1965 | integration (unix) | Fake Cursor legacy turn and warm-adopted turn | Run both turns and inspect live group registration | Both turns complete; `live_groups()` contains the cursor pgid during each turn; fake Cursor binary only, no real Cursor CLI | `src/agent/cursor.rs` `tc_1965_cursor_legacy_uses_supervisor_and_registers_group` |
 | TC-1966 | FR-1966 | integration (unix) | Fake ACP agent turn | Run turn and verify process cleanup | ACP turn completes and no fake ACP agent process outlives the turn via shared `terminate_group` | `src/agent/cursor.rs` `tc_1966_acp_client_uses_shared_terminate_group` |
+| TC-1967 | FR-1967 | integration (unix) | MCP stdio server script that spawns a sleeping grandchild | Connect then drop (or time out) the client | The sleeping grandchild is gone within 2 s; no shell `kill` subprocess is used | `tests/mcp_client.rs` `tc_1967_mcp_stdio_drop_kills_grandchild_group` |
+| TC-1968 | FR-1968 | unit (unix) | `sh -c 'sleep 30 & sleep 30'` spawned in its own process group | Call `kill_tree` on the leader | Both sleeping processes are gone; no shell `kill` subprocess is used | `src/docs/office.rs` `tc_1968_office_kill_tree_kills_process_group` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -78,7 +82,7 @@ This part (Part A) provides:
 | --- | --- | --- | --- |
 | Process group lifecycle | Children adopted via `adopt` are registered in `live_groups()` and cleaned up on stop or drop | Backward compatible; preserves live-group registry semantics | TC-1960 |
 | Termination escalation | `terminate_group` unifies `SIGTERM` delivery, 25 ms polling, and `SIGKILL` escalation | Replaces duplicated private copies in runner modules | TC-1961 |
-| Output streaming | Line streaming, idle watchdogs, and stderr tail capture unified under `Supervised` | Same error messages and behavior as existing AGY implementation | TC-1964 |
+| Output streaming | Line streaming, idle watchdogs, and stderr tail capture unified under `Supervised` | Same error messages and behavior as existing AGY implementation | TC-1964 || MCP stdio PDEATHSIG | MCP stdio servers are now spawned with `configure_child`, gaining `PR_SET_PDEATHSIG` on Linux | Behavior change: previously MCP used `process_group(0)` + `kill_on_drop` without parent-death signal; now matches other supervised children | TC-1967 |
 
 ## 7. Implementation plan
 
@@ -88,7 +92,7 @@ This part (Part A) provides:
 | 2 | AGY runner migration onto supervisor | `src/agent/agy.rs` | FR-1964 | `tc_1964`, existing agy tests |
 | 3 | Cursor legacy migration onto supervisor | `src/agent/cursor.rs` | FR-1965 | `tc_1965`, existing cursor tests |
 | 4 | ACP client shared terminate_group adoption | `src/agent/acp/client.rs` | FR-1966 | `tc_1966`, existing acp tests |
-| 5 | (planned) MCP client & Office conversion cleanup of shell kill | `src/mcp/client.rs`, `src/docs/office.rs` | FR-1967, FR-1968 (planned) | Part D verification |
+| 5 | MCP client & Office conversion cleanup of shell kill | `src/mcp/client.rs`, `src/docs/office.rs` | FR-1967, FR-1968 | TC-1967, TC-1968 |
 
 ## 8. Review and test exit criteria
 
