@@ -101,6 +101,9 @@ pub struct DmuxSettings {
     /// Per-runner model profile from `[runners.<id>] model` (FR-1731), keys
     /// lowercased runner ids. `[runners.default] model` is ignored with a warning.
     pub runner_models: BTreeMap<String, String>,
+    /// Runner fallback chains and stall policy from `[runners.<id>]`
+    /// `fallback`/`stall_*` (SPEC-runner-fallback, FR-2101).
+    pub runner_fallback: crate::runner_fallback::FallbackSettings,
 }
 
 /// Convenience alias for [`DmuxSettings`].
@@ -357,6 +360,9 @@ impl DmuxSettings {
 
         let mut configs: Vec<DmuxToml> = Vec::new();
         let mut user_runners = None;
+        let mut user_fallback_tables: Option<
+            BTreeMap<String, crate::runner_fallback::RunnerFallbackToml>,
+        > = None;
         if let Some(user_path) = user_config_path
             && let Ok(contents) = std::fs::read_to_string(user_path)
         {
@@ -371,6 +377,7 @@ impl DmuxSettings {
                             _ => Path::new("."),
                         };
                         let mut parsed_map = BTreeMap::new();
+                        let mut fallback_map = BTreeMap::new();
                         for (id, raw) in runners {
                             let norm_id = id.trim().to_ascii_lowercase();
                             let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
@@ -380,9 +387,18 @@ impl DmuxSettings {
                                 base_dir,
                                 &mut settings.config_warnings,
                             );
-                            parsed_map.insert(norm_id, cfg);
+                            parsed_map.insert(norm_id.clone(), cfg);
+                            fallback_map.insert(
+                                norm_id,
+                                crate::runner_fallback::RunnerFallbackToml {
+                                    fallback: raw.fallback.clone(),
+                                    stall_timeout_secs: raw.stall_timeout_secs,
+                                    stall_api_retries: raw.stall_api_retries,
+                                },
+                            );
                         }
                         user_runners = Some(parsed_map);
+                        user_fallback_tables = Some(fallback_map);
                     }
                     configs.push(parsed);
                 }
@@ -395,11 +411,15 @@ impl DmuxSettings {
 
         let config_path = workspace.join("dmuxai.toml");
         let mut workspace_runners = None;
+        let mut workspace_fallback_tables: Option<
+            BTreeMap<String, crate::runner_fallback::RunnerFallbackToml>,
+        > = None;
         if let Ok(contents) = std::fs::read_to_string(&config_path) {
             match toml::from_str::<DmuxToml>(&contents) {
                 Ok(mut parsed) => {
                     if let Some(runners) = parsed.runners.take() {
                         let mut parsed_map = BTreeMap::new();
+                        let mut fallback_map = BTreeMap::new();
                         for (id, raw) in runners {
                             let norm_id = id.trim().to_ascii_lowercase();
                             let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
@@ -409,9 +429,18 @@ impl DmuxSettings {
                                 workspace,
                                 &mut settings.config_warnings,
                             );
-                            parsed_map.insert(norm_id, cfg);
+                            parsed_map.insert(norm_id.clone(), cfg);
+                            fallback_map.insert(
+                                norm_id,
+                                crate::runner_fallback::RunnerFallbackToml {
+                                    fallback: raw.fallback.clone(),
+                                    stall_timeout_secs: raw.stall_timeout_secs,
+                                    stall_api_retries: raw.stall_api_retries,
+                                },
+                            );
                         }
                         workspace_runners = Some(parsed_map);
+                        workspace_fallback_tables = Some(fallback_map);
                     }
                     configs.push(parsed);
                 }
@@ -501,6 +530,48 @@ impl DmuxSettings {
             settings
                 .custom_agents
                 .push(crate::custom_agent::grok_preset(&program.to_string_lossy()));
+        }
+
+        // SPEC-runner-fallback (FR-2101): build fallback settings now that
+        // custom agents are known, so the validate closure can resolve them.
+        {
+            let custom_agents = &settings.custom_agents;
+            let validate = |target: &crate::runner_fallback::FallbackTarget| -> Result<(), String> {
+                let runner = target.runner.as_str();
+                let is_builtin = matches!(runner, "cursor" | "agy" | "codex" | "opencode" | "grok");
+                let custom_spec = custom_agents
+                    .iter()
+                    .find(|spec| spec.name.eq_ignore_ascii_case(runner));
+                if is_builtin {
+                    if let Some(model) = &target.model {
+                        crate::model_policy::validate_model_for_runner(runner, model)
+                    } else {
+                        Ok(())
+                    }
+                } else if let Some(spec) = custom_spec {
+                    if let Some(model) = &target.model {
+                        crate::custom_agent::validate_custom_model(spec, model)
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Err(format!("unknown runner '{}'", runner))
+                }
+            };
+            let user_tables = user_fallback_tables.unwrap_or_default();
+            let ws_tables = workspace_fallback_tables.unwrap_or_default();
+            let user_settings = crate::runner_fallback::FallbackSettings::from_tables(
+                &user_tables,
+                &validate,
+                &mut settings.config_warnings,
+            );
+            let ws_settings = crate::runner_fallback::FallbackSettings::from_tables(
+                &ws_tables,
+                &validate,
+                &mut settings.config_warnings,
+            );
+            settings.runner_fallback =
+                crate::runner_fallback::FallbackSettings::merge(user_settings, ws_settings);
         }
 
         // FR-1731: validate per-runner model profiles now that custom agents
@@ -973,6 +1044,7 @@ impl Default for DmuxSettings {
             memory_raw: MemoryToml::default(),
             runner_prompts: BTreeMap::new(),
             runner_models: BTreeMap::new(),
+            runner_fallback: Default::default(),
         }
     }
 }
@@ -3299,6 +3371,95 @@ model = "opencode/beam-free"
                 .config_warnings
                 .iter()
                 .any(|w| w.contains("unknown runner"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod runner_fallback_settings_tests {
+    use super::*;
+
+    // tc_2101 (settings): parse fallback tables from user + workspace configs.
+    #[test]
+    fn tc_2101_settings_parse_fallback_tables() {
+        let ws = tempfile::tempdir().unwrap();
+        let user_dir = tempfile::tempdir().unwrap();
+        let user_toml = user_dir.path().join("user.toml");
+        std::fs::write(&user_toml, "[runners.default]\nfallback = [\"codex\"]\n").unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            "[runners.agy]\nfallback = [\"agy:gemini-3.8-flash-low\", \"codex\"]\nstall_timeout_secs = 120\n",
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), Some(&user_toml));
+
+        let chain = settings
+            .runner_fallback
+            .chain_for("agy", Some("gemini-3.8-flash-high"));
+        assert_eq!(
+            chain,
+            vec![
+                crate::runner_fallback::FallbackTarget {
+                    runner: "agy".to_owned(),
+                    model: Some("gemini-3.8-flash-low".to_owned()),
+                },
+                crate::runner_fallback::FallbackTarget {
+                    runner: "codex".to_owned(),
+                    model: None,
+                },
+            ]
+        );
+
+        let cfg = settings.runner_fallback.config_for("agy").unwrap();
+        assert_eq!(cfg.stall_timeout_secs, 120);
+        assert_eq!(cfg.stall_api_retries, 3);
+
+        let chain2 = settings.runner_fallback.chain_for("cursor", None);
+        assert_eq!(
+            chain2,
+            vec![crate::runner_fallback::FallbackTarget {
+                runner: "codex".to_owned(),
+                model: None,
+            }]
+        );
+    }
+
+    // tc_2102 (settings): disallowed model and unknown runner are ignored.
+    #[test]
+    fn tc_2102_settings_fallback_rejects_disallowed_model() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            "[runners.agy]\nfallback = [\"agy:claude-opus\", \"nosuchrunner\", \"codex\"]\n",
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+
+        let chain = settings.runner_fallback.chain_for("agy", None);
+        assert_eq!(
+            chain,
+            vec![crate::runner_fallback::FallbackTarget {
+                runner: "codex".to_owned(),
+                model: None,
+            }]
+        );
+
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("fallback 'agy:claude-opus' ignored")),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w
+                    .contains("fallback 'nosuchrunner' ignored: unknown runner 'nosuchrunner'")),
+            "warnings: {:?}",
+            settings.config_warnings
         );
     }
 }

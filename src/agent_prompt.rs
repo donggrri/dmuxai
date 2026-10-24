@@ -108,6 +108,9 @@ pub struct RunnerPromptToml {
     pub prompt_inject: Option<String>,
     pub prompt_roles: Option<Vec<String>>,
     pub model: Option<String>,
+    pub fallback: Option<Vec<String>>,
+    pub stall_timeout_secs: Option<u64>,
+    pub stall_api_retries: Option<u32>,
 }
 
 /// Delivery mechanism for the system prompt.
