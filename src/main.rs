@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod cli;
 mod graph_defer;
+mod input_command;
 mod internal_turn;
 mod progress;
 mod todo_link;
