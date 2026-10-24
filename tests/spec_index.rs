@@ -94,6 +94,24 @@ fn format_id_ranges(ranges: &BTreeMap<String, (u32, u32)>) -> String {
         .join(", ")
 }
 
+/// Run `scripts/gate.sh` with the given arguments and return its stdout.
+fn print_gate_cmd(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("bash")
+        .arg("scripts/gate.sh")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("bash must be available to run scripts/gate.sh");
+    assert!(
+        output.status.success(),
+        "gate.sh {args:?} failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
 #[test]
 fn every_spec_has_status_line() {
     for path in spec_paths() {
@@ -469,6 +487,22 @@ fn tc_1805_gate_script_help_and_linux_guard() {
             "help text must mention {opt}:\n{combined}"
         );
     }
+
+    // The test command must keep running the remaining test targets after one
+    // target fails (issue #198).
+    let full_cmd = print_gate_cmd(root, &["--print-test-cmd"]);
+    assert_eq!(
+        full_cmd.trim(),
+        "cargo test --all-features --no-fail-fast",
+        "full test command must use --no-fail-fast:\n{full_cmd}"
+    );
+
+    let quick_cmd = print_gate_cmd(root, &["--print-test-cmd", "--quick"]);
+    assert_eq!(
+        quick_cmd.trim(),
+        "cargo test --all-features --no-fail-fast --test spec_index",
+        "quick test command must use --no-fail-fast:\n{quick_cmd}"
+    );
 }
 
 #[test]
@@ -554,11 +588,19 @@ fn tc_1807_gate_script_browser_command_uses_web_targets() {
         "browser command must be a cargo test invocation:\n{cmd}"
     );
     assert!(
+        cmd.contains("--no-fail-fast"),
+        "browser command must keep running the remaining web targets after one fails:\n{cmd}"
+    );
+    assert!(
         cmd.contains("--test web_followup_queue"),
         "browser command must use tests/web_*.rs integration targets:\n{cmd}"
     );
     assert!(
         cmd.contains("--ignored"),
         "browser command must run ignored tests:\n{cmd}"
+    );
+    assert!(
+        cmd.find("--no-fail-fast") < cmd.find(" -- "),
+        "--no-fail-fast must be passed to cargo, before the test-arg separator:\n{cmd}"
     );
 }
