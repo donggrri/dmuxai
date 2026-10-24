@@ -8,7 +8,7 @@ Related: MISSION §2, TEST-PLAN §2.4
 
 ## 1. Decision summary
 
-Any agent CLI with a headless command (opencode, Hermes, pi, ...) can be connected by declaring `[[agents.custom]]` in `dmuxai.toml`. DmuxAI expands a command template, runs it without a shell in its own process group, parses text or JSONL output, applies failure rules, and exposes the agent in `/agent`, F2 and graph nodes.
+Any agent CLI with a headless command (opencode, Hermes, pi, ...) can be connected by declaring `[[agents.custom]]` in `dmuxai.toml`. DmuxAI expands a command template, runs it without a shell in its own process group, parses text or JSONL output, applies failure rules, and exposes the agent in `/agent`, F2 and graph nodes. Note: child process spawning, idle-output watchdogs, and timeout supervision now live in SPEC-process-supervisor.
 
 ## 2. Scope
 

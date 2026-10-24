@@ -11,11 +11,7 @@ use dmuxai::custom_agent::{
     failure_reason, grok_no_allowed_model_message, is_builtin_grok, list_model_ids,
     parse_jsonl_line, policy_message, select_grok_model, spec_at, substitute, timeout_parts,
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    sync::mpsc,
-    task::JoinHandle,
-};
+use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 
 use super::{
     AdapterError, Agent, AgentAdapter, AgentError, AgentErrorKind, AgentEvent, AgentOutput,
@@ -579,19 +575,29 @@ async fn run_turn(
     let program = argv
         .first()
         .ok_or_else(|| AgentError::process_exit(format!("{}: empty command", spec.label())))?;
-    let mut command = dmuxai::custom_agent::build_custom_command(spec, &ctx, cwd)
+    let command = dmuxai::custom_agent::build_custom_command(spec, &ctx, cwd)
         .map_err(AgentError::process_exit)?;
 
-    let mut child = command.spawn().map_err(|error| {
-        AgentError::process_exit(format!(
-            "{}: failed to start {program}: {error}",
-            spec.label()
-        ))
-    })?;
-    if let Some(id) = child.id() {
-        pgid.store(id, std::sync::atomic::Ordering::SeqCst);
-    }
-    if let Some(mut stdin) = child.stdin.take() {
+    let supervisor_config = dmuxai::process::supervisor::SupervisorConfig {
+        label: spec.label().to_owned(),
+        idle_timeout: spec.idle_timeout_secs().map(Duration::from_secs),
+        total_timeout: Some(Duration::from_secs(spec.timeout_secs())),
+        stderr_tail_bytes: STDERR_LIMIT,
+        term_grace: TERM_GRACE,
+        stderr_drain_grace: STDERR_DRAIN_GRACE,
+        ..Default::default()
+    };
+
+    let mut supervised =
+        dmuxai::process::supervisor::spawn(command, supervisor_config).map_err(|error| {
+            AgentError::process_exit(format!(
+                "{}: failed to start {program}: {error}",
+                spec.label()
+            ))
+        })?;
+    pgid.store(supervised.pgid(), std::sync::atomic::Ordering::SeqCst);
+
+    if let Some(mut stdin) = supervised.take_stdin() {
         let mut prompt = ctx.prompt.clone();
         for image in &ctx.images {
             prompt.push_str(&format!(" @{image}"));
@@ -602,24 +608,6 @@ async fn run_turn(
             .map_err(|error| AgentError::process_exit(format!("stdin: {error}")))?;
         drop(stdin);
     }
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AgentError::process_exit("stdout not piped"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AgentError::process_exit("stderr not piped"))?;
-    let stderr_task = tokio::spawn(async move {
-        let mut buffer = Vec::new();
-        let _ = (&mut stderr)
-            .take(STDERR_LIMIT as u64)
-            .read_to_end(&mut buffer)
-            .await;
-        let mut sink = Vec::new();
-        let _ = stderr.read_to_end(&mut sink).await;
-        String::from_utf8_lossy(&buffer).into_owned()
-    });
 
     let effective_output = spec.effective_output();
     let mut reply = String::new();
@@ -629,96 +617,103 @@ async fn run_turn(
     let mut grok_tools = dmuxai::custom_agent::is_builtin_grok(spec)
         .then(|| dmuxai::grok_activity::GrokToolTracker::new(cwd));
     let mut done = false;
-    let mut lines = BufReader::new(stdout).lines();
-    let pgid_value = || pgid.load(std::sync::atomic::Ordering::SeqCst);
-    let read = async {
-        let mut checked_first_nonempty_stdout = false;
-        while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
-            if !checked_first_nonempty_stdout && !line.trim().is_empty() {
-                checked_first_nonempty_stdout = true;
-                if effective_output == CustomAgentOutput::Text
-                    && serde_json::from_str::<serde_json::Value>(line.trim())
-                        .ok()
-                        .is_some_and(|v| v.is_object())
-                {
-                    send(
-                        event_tx,
-                        agent,
-                        Some(context),
-                        AgentEvent::Notice(
-                            "output looks like JSONL; set output = \"jsonl\" and text_path in dmuxai.toml (docs/agents/custom-agents.md)"
-                                .to_string(),
-                        ),
-                    )
-                    .await;
-                }
+    let mut checked_first_nonempty_stdout = false;
+
+    let status = loop {
+        let event = match supervised.next_line().await {
+            Ok(event) => event,
+            Err(e) => {
+                let _ = supervised.stop().await;
+                return Err(AgentError::process_exit(e.to_string()));
             }
-            match effective_output {
-                CustomAgentOutput::Text => {
-                    let chunk = format!("{line}\n");
-                    reply.push_str(&chunk);
-                    send(event_tx, agent, Some(context), AgentEvent::TextDelta(chunk)).await;
-                }
-                CustomAgentOutput::Jsonl => {
-                    if let Some(tracker) = grok_tools.as_mut()
-                        && let Some(item) = tracker.observe(&line)
+        };
+
+        match event {
+            dmuxai::process::supervisor::LineEvent::Idle(d) => {
+                let _ = supervised.stop().await;
+                return Err(AgentError::idle(
+                    dmuxai::process::supervisor::idle_error_message(spec.label(), d.as_secs()),
+                ));
+            }
+            dmuxai::process::supervisor::LineEvent::Timeout(_) => {
+                let _ = supervised.stop().await;
+                let (msg, hint) = timeout_parts(spec);
+                return Err(AgentError::timeout(msg).with_hint(hint));
+            }
+            dmuxai::process::supervisor::LineEvent::Eof => {
+                break supervised.finish(DONE_EXIT_GRACE).await;
+            }
+            dmuxai::process::supervisor::LineEvent::Line(line) => {
+                if !checked_first_nonempty_stdout && !line.trim().is_empty() {
+                    checked_first_nonempty_stdout = true;
+                    if effective_output == CustomAgentOutput::Text
+                        && serde_json::from_str::<serde_json::Value>(line.trim())
+                            .ok()
+                            .is_some_and(|v| v.is_object())
                     {
-                        send(event_tx, agent, Some(context), AgentEvent::Activity(item)).await;
-                    }
-                    let parsed = parse_jsonl_line(spec, &line);
-                    if let Some(session) = parsed.session_id
-                        && bound_session.as_deref() != Some(session.as_str())
-                    {
-                        bound_session = Some(session.clone());
                         send(
                             event_tx,
                             agent,
                             Some(context),
-                            AgentEvent::ProviderSessionBound(session),
+                            AgentEvent::Notice(
+                                "output looks like JSONL; set output = \"jsonl\" and text_path in dmuxai.toml (docs/agents/custom-agents.md)"
+                                    .to_string(),
+                            ),
                         )
                         .await;
                     }
-                    if let Some(text) = parsed.text {
-                        let chunk = dmuxai::custom_agent::append_reply_text(
-                            &mut reply,
-                            &text,
-                            &mut break_pending,
-                        );
+                }
+                match effective_output {
+                    CustomAgentOutput::Text => {
+                        let chunk = format!("{line}\n");
+                        reply.push_str(&chunk);
                         send(event_tx, agent, Some(context), AgentEvent::TextDelta(chunk)).await;
                     }
-                    if parsed.text_break {
-                        break_pending = true;
-                    }
-                    if let Some(error) = parsed.error {
-                        jsonl_error = Some(error);
-                    }
-                    if parsed.done {
-                        // FR-914: the provider said the turn is over. Do not wait
-                        // for EOF: a leftover child can hold stdout open.
-                        done = true;
-                        break;
+                    CustomAgentOutput::Jsonl => {
+                        if let Some(tracker) = grok_tools.as_mut()
+                            && let Some(item) = tracker.observe(&line)
+                        {
+                            send(event_tx, agent, Some(context), AgentEvent::Activity(item)).await;
+                        }
+                        let parsed = parse_jsonl_line(spec, &line);
+                        if let Some(session) = parsed.session_id
+                            && bound_session.as_deref() != Some(session.as_str())
+                        {
+                            bound_session = Some(session.clone());
+                            send(
+                                event_tx,
+                                agent,
+                                Some(context),
+                                AgentEvent::ProviderSessionBound(session),
+                            )
+                            .await;
+                        }
+                        if let Some(text) = parsed.text {
+                            let chunk = dmuxai::custom_agent::append_reply_text(
+                                &mut reply,
+                                &text,
+                                &mut break_pending,
+                            );
+                            send(event_tx, agent, Some(context), AgentEvent::TextDelta(chunk))
+                                .await;
+                        }
+                        if parsed.text_break {
+                            break_pending = true;
+                        }
+                        if let Some(error) = parsed.error {
+                            jsonl_error = Some(error);
+                        }
+                        if parsed.done {
+                            done = true;
+                            break supervised.finish(DONE_EXIT_GRACE).await;
+                        }
                     }
                 }
             }
         }
-        if done {
-            return Ok(finish_after_done(&mut child, pgid_value()).await);
-        }
-        child.wait().await.map_err(|e| e.to_string())
     };
-    let status = tokio::time::timeout(Duration::from_secs(spec.timeout_secs()), read)
-        .await
-        .map_err(|_| {
-            kill_group(pgid.load(std::sync::atomic::Ordering::SeqCst));
-            let (msg, hint) = timeout_parts(spec);
-            AgentError::timeout(msg).with_hint(hint)
-        })?
-        .map_err(AgentError::process_exit)?;
-    // A leftover child that inherited stderr must not block the turn either.
-    let stderr_text = match tokio::time::timeout(STDERR_DRAIN_GRACE, stderr_task).await {
-        Ok(joined) => joined.unwrap_or_default(),
-        Err(_) => String::new(),
-    };
+
+    let stderr_text = supervised.stderr_tail().await;
     let exit_ok = done || status.success();
     if let Some(reason) =
         failure_reason(spec, exit_ok, &reply, &stderr_text, jsonl_error.as_deref())
@@ -747,60 +742,12 @@ async fn run_turn(
     Ok(())
 }
 
-/// How long the process may take to exit on its own after its `done_when` line.
+/// How long the process may take to exit on its own after its `done_when` line or EOF.
 const DONE_EXIT_GRACE: Duration = Duration::from_secs(3);
 /// How long SIGTERM gets before SIGKILL when stopping a finished turn's group.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 /// How long stderr may stay open after the process exited.
 const STDERR_DRAIN_GRACE: Duration = Duration::from_secs(2);
-
-/// After the `done_when` line (FR-914): wait briefly for a normal exit, then
-/// stop the whole process group (TERM, then KILL) so neither the runner nor a
-/// child it left behind keeps the turn open. The turn's success does not
-/// depend on how the process ended, because the provider already finished it.
-async fn finish_after_done(
-    child: &mut tokio::process::Child,
-    pgid: u32,
-) -> std::process::ExitStatus {
-    let status = match tokio::time::timeout(DONE_EXIT_GRACE, child.wait()).await {
-        Ok(Ok(status)) => Some(status),
-        _ => None,
-    };
-    // Reap leftovers in the group even after a clean exit of the leader.
-    kill_group(pgid);
-    if let Some(status) = status {
-        return status;
-    }
-    match tokio::time::timeout(TERM_GRACE, child.wait()).await {
-        Ok(Ok(status)) => status,
-        _ => {
-            kill_group_with(pgid, "-KILL");
-            // The group signal is Unix-only; this also stops the leader elsewhere.
-            let _ = child.start_kill();
-            child.wait().await.unwrap_or_else(|_| exit_status_ok())
-        }
-    }
-}
-
-fn exit_status_ok() -> std::process::ExitStatus {
-    use std::os::unix::process::ExitStatusExt;
-    std::process::ExitStatus::from_raw(0)
-}
-
-fn kill_group(pgid: u32) {
-    kill_group_with(pgid, "-TERM");
-}
-
-fn kill_group_with(pgid: u32, signal: &str) {
-    if pgid > 0 {
-        let _ = std::process::Command::new("kill")
-            .args([signal, "--", &format!("-{pgid}")])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-}
 
 async fn stop_turn(agent: Agent, turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
     if let Some(turn) = turn {
@@ -808,7 +755,11 @@ async fn stop_turn(agent: Agent, turn: Option<ActiveTurn>, event_tx: &mpsc::Send
             cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = tokio::time::timeout(std::time::Duration::from_millis(1600), turn.handle).await;
         } else {
-            kill_group(turn.pgid.load(std::sync::atomic::Ordering::SeqCst));
+            let pgid = turn.pgid.load(std::sync::atomic::Ordering::SeqCst);
+            dmuxai::process::supervisor::signal_group(
+                pgid,
+                dmuxai::process::supervisor::GroupSignal::Term,
+            );
             turn.handle.abort();
             let _ = turn.handle.await;
         }
@@ -1047,6 +998,110 @@ mod tests {
         assert!(err_str.contains("name = \"fake\""));
         assert!(err_str.contains("partial edits"));
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    // TC-1794 (FR-1794): silent custom agent fails idle naming agent and idle_timeout_secs
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tc_1794_silent_custom_agent_fails_idle_naming_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        let extra = format!(
+            "label = \"my-silent-agent\"\nidle_timeout_secs = 1\ntimeout_secs = 60\nenv = {{ FAKE_AGENT_PIDFILE = \"{}\" }}",
+            pidfile.to_str().expect("utf8 path")
+        );
+        let spec = spec("idle_sleep", &extra);
+        let started = std::time::Instant::now();
+        let (result, _) = run(spec, None).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "took too long: {elapsed:?}"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, AgentErrorKind::Idle);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my-silent-agent"),
+            "error message must name agent label: {msg}"
+        );
+        assert!(
+            msg.contains("idle_timeout_secs"),
+            "error message must name idle_timeout_secs: {msg}"
+        );
+        assert!(
+            msg.contains("1s") || msg.contains("1"),
+            "error message must contain idle timeout seconds: {msg}"
+        );
+        let child_pid = read_pid(&pidfile).await;
+        assert_gone(child_pid).await;
+    }
+
+    // TC-1795 (FR-1795): each stdout line resets the idle timer
+    #[tokio::test]
+    async fn tc_1795_idle_timer_resets_on_each_line() {
+        let extra = "idle_timeout_secs = 1\ntimeout_secs = 60\noutput = \"jsonl\"\ntext_path = \"/part/text\"";
+        let spec = spec("trickle", extra);
+        let started = std::time::Instant::now();
+        let (result, text) = run(spec, None).await;
+        let elapsed = started.elapsed();
+        assert_eq!(result, Ok(()));
+        assert!(
+            elapsed > Duration::from_millis(1500),
+            "trickle should take over 1.5s: {elapsed:?}"
+        );
+        for i in 1..=6 {
+            assert!(
+                text.contains(&format!("line{i}")),
+                "text should contain line{i}: {text}"
+            );
+        }
+    }
+
+    // TC-1796 (FR-1796): idle_timeout_secs = 0 disables the watchdog
+    #[tokio::test]
+    async fn tc_1796_idle_timeout_zero_disables_watchdog() {
+        let extra = "idle_timeout_secs = 0\ntimeout_secs = 60\noutput = \"jsonl\"\ntext_path = \"/part/text\"";
+        let spec = spec("delayed", extra);
+        let started = std::time::Instant::now();
+        let (result, text) = run(spec, None).await;
+        let elapsed = started.elapsed();
+        assert_eq!(result, Ok(()));
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "delayed should take at least 2s: {elapsed:?}"
+        );
+        assert!(
+            text.contains("delayed text"),
+            "text should contain delayed text: {text}"
+        );
+    }
+
+    // TC-1797 (FR-1797): grandchild holding stdout does not block turn completion
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tc_1797_grandchild_holding_stdout_still_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let extra = format!(
+            "env = {{ FAKE_AGENT_PIDFILE = \"{}\" }}\noutput = \"jsonl\"\ntext_path = \"/part/text\"",
+            pidfile.to_str().expect("utf8 path")
+        );
+        let spec = spec("orphan_stdout", &extra);
+        let started = std::time::Instant::now();
+        let (result, text) = run(spec, None).await;
+        let elapsed = started.elapsed();
+        assert_eq!(result, Ok(()));
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "turn must finish within 10s: {elapsed:?}"
+        );
+        assert!(
+            text.contains("orphan ok"),
+            "text must contain orphan ok: {text}"
+        );
+        let grandchild_pid = read_pid(&pidfile).await;
+        assert_gone(grandchild_pid).await;
     }
 
     #[tokio::test]

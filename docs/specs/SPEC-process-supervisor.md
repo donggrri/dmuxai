@@ -24,8 +24,8 @@ Runner process management is unified into a shared process supervisor module (`s
 
 ### Out of scope / non-goals
 
-- Porting specific runners (`custom`, `agy`, `cursor`, `acp`) to the supervisor; these are addressed in subsequent parts of PR-5.
-- Reserved IDs note: FR-1794..1799 and TC-1794..1799 are reserved for runner ports in subsequent PR-5 parts and are not defined here.
+- Porting specific runners (`custom`, `agy`, `cursor`, `acp`) to the supervisor; agy, cursor, and acp are addressed in subsequent parts of PR-5.
+- Reserved IDs note: FR-1798..1799 and TC-1798..1799 are reserved for runner ports in subsequent PR-5 parts and are not defined here.
 
 ### Assumptions and open questions
 
@@ -61,6 +61,10 @@ Runner process management is unified into a shared process supervisor module (`s
 | FR-1791 | Must | Given `dmuxai run` exits after a stop signal | The runner process group is gone (leader and descendants reaped) | `kill -0` fails for both leader and grandchild PIDs | TC-1791 |
 | FR-1792 | Must | Given a stop signal after which the run has not finished within 10 s | `stop_all_live_groups` is called and the process exits 130 with `error: stopped after signal`; a second signal does so immediately | Grace period is 10 s; no hang | TC-1792 |
 | FR-1793 | Must | Given `CursorAdapterConfig::default()` | Its `protocol` equals `DmuxSettings::default().cursor_protocol` (`Legacy`) | Matches settings default; no ACP default | TC-1793 |
+| FR-1794 | Must | Given a custom agent configured with `idle_timeout_secs` (default 300) that produces no stdout for that duration | The turn fails with `AgentErrorKind::Idle` naming the agent label/name and `idle_timeout_secs` in the error message; the child process group is terminated and reaped | If output arrives within `idle_timeout_secs`, no error occurs | TC-1794 |
+| FR-1795 | Must | Given a running custom agent emitting stdout lines | Each stdout line resets the idle timer; streaming continues without `Idle` timeout as long as the interval between lines is under `idle_timeout_secs` | An idle interval exceeding `idle_timeout_secs` triggers the watchdog | TC-1795 |
+| FR-1796 | Must | Given a custom agent with `idle_timeout_secs` unset or explicitly set to 0 | Unset defaults to 300 seconds; explicit 0 disables the idle watchdog completely | Disabled watchdog allows turns with long pauses between stdout lines | TC-1796 |
+| FR-1797 | Must | Given a custom agent turn without `done_when` where the leader process exits 0 while a detached grandchild holds stdout open | The turn does not block waiting for EOF; it completes within 10 s with the text and reaps the grandchild process group | Grandchild PID is gone after turn finishes | TC-1797 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -81,6 +85,10 @@ Runner process management is unified into a shared process supervisor module (`s
 | TC-1791 | FR-1790, FR-1791 | integration (unix) | `pidsleep` fake agent | Send SIGHUP to `dmuxai run` | Exit code 130, JSON `exit_code` 130, cancelled event, both PIDs gone | `tests/agent_api_cli.rs` `tc_1791_sighup_cancels_headless_run_and_reaps_runner` |
 | TC-1792 | FR-1792 | manual / code review | `dmuxai run` with a hung runner | Wait 10 s after signal or send second signal | `stop_all_live_groups` invoked and process exits 130 | manual / covered by code review |
 | TC-1793 | FR-1793 | unit | Default config and settings | Assert equality | `CursorAdapterConfig::default().protocol == DmuxSettings::default().cursor_protocol` | `src/agent/cursor.rs` `tc_1793_cursor_adapter_default_protocol_matches_settings` |
+| TC-1794 | FR-1794 | integration (unix) | Silent fake custom agent sleeping 30 s with `idle_timeout_secs = 1`, `timeout_secs = 60` | Run turn | Turn ends within 10 s with `AgentErrorKind::Idle` naming the agent and `idle_timeout_secs`, child process group is gone | `src/agent/custom.rs` `tc_1794_silent_custom_agent_fails_idle_naming_agent` |
+| TC-1795 | FR-1795 | integration (unix) | Fake custom agent printing one JSONL line every 400 ms for ~2.5 s then exiting 0, `idle_timeout_secs = 1` | Run turn | Turn succeeds, all text received without `Idle` timeout | `src/agent/custom.rs` `tc_1795_idle_timer_resets_on_each_line` |
+| TC-1796 | FR-1796 | unit / integration | Fake custom agent with `idle_timeout_secs = 0` silent for 2 s then printing text line; and spec parsing tests | Run turn and parse specs | Turn succeeds with text; parsing gives unset -> `Some(300)`, 0 -> `None`, 45 -> `Some(45)` | `src/agent/custom.rs` `tc_1796_idle_timeout_zero_disables_watchdog`, `src/custom_agent.rs` `tc_1796_idle_timeout_secs_defaults` |
+| TC-1797 | FR-1797 | integration (unix) | Fake custom agent starting `sleep 60 &` (inheriting stdout), writing PID to file, printing text line and exiting 0 without `done_when` | Run turn | Turn finishes within 10 s with the text, grandchild PID is gone | `src/agent/custom.rs` `tc_1797_grandchild_holding_stdout_still_finishes` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -97,10 +105,11 @@ Runner process management is unified into a shared process supervisor module (`s
 | 1 | Unix dependency and process supervisor API | `Cargo.toml`, `src/process/mod.rs`, `src/process/supervisor.rs` | FR-1779, FR-1780, FR-1789 | `tc_1779`, `tc_1780`, `tc_1789` |
 | 2 | Output streaming, watchdogs, and stderr tail | `src/process/supervisor.rs` | FR-1781, FR-1782, FR-1783, FR-1784, FR-1786 | `tc_1781`, `tc_1782`, `tc_1783`, `tc_1784`, `tc_1786` |
 | 3 | Group termination, cleanup, and drop safety | `src/process/supervisor.rs` | FR-1785, FR-1787, FR-1788 | `tc_1785`, `tc_1787`, `tc_1788` |
+| 4 | Custom agent runner port and idle watchdog | `src/custom_agent.rs`, `src/agent/custom.rs`, `docs/agents/custom-agents.md`, `src/init.rs` | FR-1794, FR-1795, FR-1796, FR-1797 | `tc_1794`, `tc_1795`, `tc_1796`, `tc_1797` |
 
 ## 8. Review and test exit criteria
 
-- [x] All Must requirements (FR-1779..FR-1789) map to passing test evidence (TC-1779..TC-1789).
+- [x] All Must requirements (FR-1779..FR-1797) map to passing test evidence (TC-1779..TC-1797).
 - [x] The diff has been reviewed against scope and non-goals.
 - [x] Required Rust checks pass: format, test, and clippy with `-D warnings`.
 - [x] `scripts/check-spec.py` passes and `tests/spec_index.rs` verifies spec indexing.

@@ -29,6 +29,7 @@ done_when = { path = "/type", equals = "end" }        # optional: this line ends
 text_break_when = { path = "/type", equals = "tool_call" }   # optional: next text starts a new paragraph
 resume_arg = ["--session", "{session_id}"]   # appended when resuming
 timeout_secs = 1800
+idle_timeout_secs = 300               # optional: seconds without stdout before failing (default 300, 0 disables)
 failure_stderr = "(?i)permission denied|rejected permission"
 temp_config_template = '{"permission":{"edit":"{edit}","bash":"{edit}","webfetch":"allow"}}'
 env = { OPENCODE_CONFIG = "{temp_config}" }
@@ -51,6 +52,7 @@ prompt text can never inject arguments. An argument whose placeholder has no val
 when that flag starts with `-`.
 
 The default `timeout_secs` is 1800 (30 minutes); long implement turns often need a larger value.
+The default `idle_timeout_secs` is 300 (5 minutes; `0` disables it). If a runner produces no stdout line for `idle_timeout_secs`, the turn fails with an `Idle` error naming the agent and suggesting a check of the provider (for example a usage limit), prompting to raise `idle_timeout_secs` or disable it with `0`.
 
 When `output` is omitted but any JSONL path field (`text_path`, `text_when`, and the like) is set,
 DmuxAI treats the agent as `output = "jsonl"`. If you set `output = "text"` explicitly while

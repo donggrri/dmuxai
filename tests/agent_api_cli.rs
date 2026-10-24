@@ -766,7 +766,7 @@ command = ["sh", "-c", "env"]
 
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
+    let alive = std::process::Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
         .stdin(std::process::Stdio::null())
@@ -774,7 +774,17 @@ fn pid_alive(pid: u32) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !alive {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(content) = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        && content.lines().any(|l| l.starts_with("State:\tZ"))
+    {
+        return false;
+    }
+    true
 }
 
 #[cfg(unix)]

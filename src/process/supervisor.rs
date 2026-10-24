@@ -242,6 +242,7 @@ pub struct Supervised {
     config: SupervisorConfig,
     spawn_time: std::time::Instant,
     last_activity: std::time::Instant,
+    leader_exit_status: Option<std::process::ExitStatus>,
     reaped_status: Option<std::process::ExitStatus>,
 }
 
@@ -284,6 +285,16 @@ impl Supervised {
             return Ok(LineEvent::Idle(dur));
         }
 
+        if self.leader_exit_status.is_none()
+            && let Ok(Some(st)) = self.child.try_wait()
+        {
+            self.leader_exit_status = Some(st);
+        }
+
+        if self.leader_exit_status.is_some() && !self.has_unread_stdout() {
+            return Ok(LineEvent::Eof);
+        }
+
         let total_fut = self
             .config
             .total_timeout
@@ -302,6 +313,19 @@ impl Supervised {
                     res = self.reader.read_line(&mut self.line_buf) => {
                         self.handle_line_read(res)
                     }
+                    child_res = self.child.wait() => {
+                        let st = match child_res {
+                            Ok(s) => s,
+                            Err(_) => exit_status_from_raw(0),
+                        };
+                        self.leader_exit_status = Some(st);
+                        if self.has_unread_stdout() {
+                            let res = self.reader.read_line(&mut self.line_buf).await;
+                            self.handle_line_read(res)
+                        } else {
+                            Ok(LineEvent::Eof)
+                        }
+                    }
                 }
             }
             (Some(total_sleep), None) => {
@@ -310,6 +334,19 @@ impl Supervised {
                     _ = total_sleep => Ok(LineEvent::Timeout(self.config.total_timeout.unwrap())),
                     res = self.reader.read_line(&mut self.line_buf) => {
                         self.handle_line_read(res)
+                    }
+                    child_res = self.child.wait() => {
+                        let st = match child_res {
+                            Ok(s) => s,
+                            Err(_) => exit_status_from_raw(0),
+                        };
+                        self.leader_exit_status = Some(st);
+                        if self.has_unread_stdout() {
+                            let res = self.reader.read_line(&mut self.line_buf).await;
+                            self.handle_line_read(res)
+                        } else {
+                            Ok(LineEvent::Eof)
+                        }
                     }
                 }
             }
@@ -320,12 +357,57 @@ impl Supervised {
                     res = self.reader.read_line(&mut self.line_buf) => {
                         self.handle_line_read(res)
                     }
+                    child_res = self.child.wait() => {
+                        let st = match child_res {
+                            Ok(s) => s,
+                            Err(_) => exit_status_from_raw(0),
+                        };
+                        self.leader_exit_status = Some(st);
+                        if self.has_unread_stdout() {
+                            let res = self.reader.read_line(&mut self.line_buf).await;
+                            self.handle_line_read(res)
+                        } else {
+                            Ok(LineEvent::Eof)
+                        }
+                    }
                 }
             }
             (None, None) => {
-                let res = self.reader.read_line(&mut self.line_buf).await;
-                self.handle_line_read(res)
+                tokio::select! {
+                    biased;
+                    res = self.reader.read_line(&mut self.line_buf) => {
+                        self.handle_line_read(res)
+                    }
+                    child_res = self.child.wait() => {
+                        let st = match child_res {
+                            Ok(s) => s,
+                            Err(_) => exit_status_from_raw(0),
+                        };
+                        self.leader_exit_status = Some(st);
+                        if self.has_unread_stdout() {
+                            let res = self.reader.read_line(&mut self.line_buf).await;
+                            self.handle_line_read(res)
+                        } else {
+                            Ok(LineEvent::Eof)
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    fn has_unread_stdout(&self) -> bool {
+        if !self.reader.buffer().is_empty() {
+            return true;
+        }
+        use std::os::unix::io::AsRawFd;
+        let fd = self.reader.get_ref().as_raw_fd();
+        let mut bytes: libc::c_int = 0;
+        // SAFETY: FIONREAD is a standard POSIX query on pipes returning readable byte count.
+        if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut bytes) } == 0 {
+            bytes > 0
+        } else {
+            false
         }
     }
 
@@ -355,15 +437,19 @@ impl Supervised {
 
         signal_group(self.pgid, GroupSignal::Term);
 
-        let wait_res = tokio::time::timeout(self.config.term_grace, self.child.wait()).await;
-        let status = match wait_res {
-            Ok(Ok(st)) => st,
-            _ => {
-                signal_group(self.pgid, GroupSignal::Kill);
-                let _ = self.child.start_kill();
-                match self.child.wait().await {
-                    Ok(st) => st,
-                    Err(_) => exit_status_from_raw(0),
+        let status = if let Some(st) = self.leader_exit_status {
+            st
+        } else {
+            let wait_res = tokio::time::timeout(self.config.term_grace, self.child.wait()).await;
+            match wait_res {
+                Ok(Ok(st)) => st,
+                _ => {
+                    signal_group(self.pgid, GroupSignal::Kill);
+                    let _ = self.child.start_kill();
+                    match self.child.wait().await {
+                        Ok(st) => st,
+                        Err(_) => exit_status_from_raw(0),
+                    }
                 }
             }
         };
@@ -380,9 +466,13 @@ impl Supervised {
             return status;
         }
 
-        let leader_status = match tokio::time::timeout(exit_grace, self.child.wait()).await {
-            Ok(Ok(st)) => Some(st),
-            _ => None,
+        let leader_status = if let Some(st) = self.leader_exit_status {
+            Some(st)
+        } else {
+            match tokio::time::timeout(exit_grace, self.child.wait()).await {
+                Ok(Ok(st)) => Some(st),
+                _ => None,
+            }
         };
 
         signal_group(self.pgid, GroupSignal::Term);
@@ -511,6 +601,7 @@ pub fn spawn(
         config,
         spawn_time: now,
         last_activity: now,
+        leader_exit_status: None,
         reaped_status: None,
     })
 }

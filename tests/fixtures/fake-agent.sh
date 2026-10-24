@@ -67,4 +67,28 @@ case "$behavior" in
     printf '{"type":"text","part":{"text":"working"}}\n'
     wait
     ;;
+  idle_sleep)
+    if [ -n "$FAKE_AGENT_PIDFILE" ]; then
+      printf '%s\n' "$$" > "$FAKE_AGENT_PIDFILE"
+    fi
+    sleep 30
+    ;;
+  trickle)
+    for i in 1 2 3 4 5 6; do
+      printf '{"type":"text","part":{"text":"line%s\\n"}}\n' "$i"
+      sleep 0.4
+    done
+    ;;
+  delayed)
+    sleep 2
+    printf '{"type":"text","part":{"text":"delayed text\\n"}}\n'
+    ;;
+  orphan_stdout)
+    sleep 60 &
+    if [ -n "$FAKE_AGENT_PIDFILE" ]; then
+      printf '%s\n' "$!" > "$FAKE_AGENT_PIDFILE"
+    fi
+    printf '{"type":"text","part":{"text":"orphan ok\\n"}}\n'
+    exit 0
+    ;;
 esac
