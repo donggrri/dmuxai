@@ -18,6 +18,16 @@ All notable changes to dmuxai are listed here. Versions follow
   `fallback` chain on provider errors or stalls, with `stall_timeout_secs` and
   `stall_api_retries`. Stalled runners (no model progress or repeated API retries) are stopped and handed over too.
 
+### Fixed
+
+- **A second `dmuxai run` in a busy workspace no longer fails with "database is
+  locked" (FR-2120, #167).** Opening the conversation database waits for the
+  other process (bounded backoff of about 20 s), takes no write transaction
+  while the schema is current, and skips the WAL switch on a database that is
+  already in WAL mode. A database that stays locked ends the headless run with
+  exit code 4 (conflict) and a message that asks the caller to retry, instead
+  of exit code 6.
+
 ### Removed
 
 - **Removed: MCP propagation to runners (SPEC-mcp-propagation-removal).** DmuxAI

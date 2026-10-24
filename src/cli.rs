@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use dmuxai::agent_api::{self, ApiError, exit};
+use dmuxai::conversation::{ConversationEngine, ConversationError};
 use dmuxai::events::{EventLog, EventSink};
 use dmuxai::mcp_server::{McpBackend, RunArgs};
 use dmuxai::settings::DmuxSettings;
@@ -713,6 +714,16 @@ fn headless_dashboard_hub(workspace: String, sink: Arc<EventSink>) -> DashboardH
     dmuxai::web::DashboardHub::new(dmuxai::web::SnapshotSource::App, workspace).with_events(sink)
 }
 
+/// Maps a conversation-database open failure to a headless exit code
+/// (FR-2120). A database another process still holds is a conflict (4);
+/// everything else stays an internal error (6).
+fn conversation_open_error(error: &ConversationError) -> ApiError {
+    match error {
+        ConversationError::Busy(message) => ApiError::new(exit::CONFLICT, message.clone()),
+        other => ApiError::new(exit::INTERNAL, other.to_string()),
+    }
+}
+
 async fn run_headless(
     workspace_root: &Path,
     options: &RunOptions,
@@ -730,8 +741,8 @@ async fn run_headless(
     if let Some(notice) = notice {
         eprintln!("warning: {notice}");
     }
-    let engine = dmuxai::conversation::ConversationEngine::open(&db_path, workspace_root)
-        .map_err(|e| internal(&e))?;
+    let engine = ConversationEngine::open(&db_path, workspace_root)
+        .map_err(|error| conversation_open_error(&error))?;
     for warning in dmuxai::custom_agent::install_registry(settings.custom_agents.clone()) {
         eprintln!("warning: {warning}");
     }
@@ -741,8 +752,8 @@ async fn run_headless(
         .unwrap_or_else(|_| workspace_root.display().to_string());
     let hub = headless_dashboard_hub(workspace, sink.clone());
 
-    let mut app =
-        App::new(engine, workspace_root.to_path_buf(), settings).map_err(|e| internal(&e))?;
+    let mut app = App::new(engine, workspace_root.to_path_buf(), settings)
+        .map_err(|error| conversation_open_error(&error))?;
     app.attach_dashboard(hub);
     if options.progress {
         app.set_progress_sink(Box::new(|line: &str| {
@@ -1317,5 +1328,25 @@ mod tests {
                 assert!(present, "non-hidden flag {name} should appear in run line");
             }
         }
+    }
+
+    // TC-2120: a busy conversation database is a conflict (4), not an
+    // internal error (6).
+    #[test]
+    fn tc_2120_busy_conversation_open_maps_to_exit_4() {
+        let busy = ConversationError::Busy(
+            "another dmuxai process is using this workspace's conversation database \
+             (database is locked); retry when it finishes"
+                .to_owned(),
+        );
+        let error = conversation_open_error(&busy);
+        assert_eq!(error.code, exit::CONFLICT);
+        assert_eq!(error.code, 4);
+        assert!(error.message.contains("retry"));
+
+        let other =
+            conversation_open_error(&ConversationError::Sqlite(rusqlite::Error::InvalidQuery));
+        assert_eq!(other.code, exit::INTERNAL);
+        assert_eq!(other.code, 6);
     }
 }
