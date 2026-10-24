@@ -676,3 +676,102 @@ async fn mcp_client_bounds_writes_and_streams_sse() {
 
     server_task.abort();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn tc_1967_mcp_stdio_drop_kills_grandchild_group() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn is_pid_alive(pid: i32) -> bool {
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            let state = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next());
+            return !matches!(state, Some("Z") | Some("X"));
+        }
+        if std::path::Path::new("/proc/self/stat").exists() {
+            return false;
+        }
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("grandchild.pid");
+    let launcher = temp.path().join("launcher.sh");
+
+    let script = format!(
+        r#"#!/bin/sh
+sleep 60 &
+echo $! > "{pid_file}"
+while IFS= read -r line; do
+  case "$line" in
+    *initialize*)
+      echo '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"mock","version":"1"}}}}}}'
+      ;;
+    *notifications/initialized*)
+      ;;
+  esac
+done
+"#,
+        pid_file = pid_file.display()
+    );
+    fs::write(&launcher, script).unwrap();
+    let mut perms = fs::metadata(&launcher).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&launcher, perms).unwrap();
+
+    let server = ResolvedMcpServer {
+        name: "group-stdio-tc1967".to_owned(),
+        kind: ServerKind::Generic,
+        transport: Transport::Stdio {
+            command: "/bin/sh".to_owned(),
+            args: vec![launcher.to_str().unwrap().to_owned()],
+            env: BTreeMap::new(),
+        },
+        runners: None,
+        tools: ToolNames::default(),
+    };
+
+    let client = McpClient::connect(&server, Duration::from_secs(5))
+        .await
+        .expect("connect to launcher");
+
+    let start = std::time::Instant::now();
+    let mut pid: Option<i32> = None;
+    while start.elapsed() < Duration::from_secs(2) {
+        if let Some(p) = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|c| c.trim().parse::<i32>().ok())
+        {
+            pid = Some(p);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let pid = pid.expect("grandchild PID was not written");
+    assert!(
+        is_pid_alive(pid),
+        "grandchild should be running before drop"
+    );
+
+    drop(client);
+
+    let drop_start = std::time::Instant::now();
+    let mut gone = false;
+    while drop_start.elapsed() < Duration::from_secs(2) {
+        if !is_pid_alive(pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "grandchild {pid} was not killed within 2s after drop");
+}

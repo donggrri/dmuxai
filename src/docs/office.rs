@@ -85,11 +85,16 @@ fn is_pdf_file(path: &Path) -> bool {
 
 /// Kills the conversion process and its whole process group.
 fn kill_tree(child: &mut std::process::Child) {
-    let _ = std::process::Command::new("kill")
-        .args(["-KILL", "--", &format!("-{}", child.id())])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        if pid != 0 {
+            let _ = crate::process::supervisor::signal_group(
+                pid,
+                crate::process::supervisor::GroupSignal::Kill,
+            );
+        }
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -320,4 +325,46 @@ pub fn convert_to_pdf(
     drop(cleanup);
 
     OfficePreview::Pdf(cached_pdf)
+}
+
+#[cfg(all(test, unix))]
+mod tc_1968_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    #[test]
+    fn tc_1968_office_kill_tree_kills_process_group() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30 & sleep 30"]);
+        cmd.process_group(0);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+
+        let mut child = cmd.spawn().expect("spawn sh group");
+        let pgid = child.id();
+
+        // Give the two sleeps a moment to start in the group.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(
+            crate::process::supervisor::group_alive(pgid),
+            "process group should be alive before kill_tree"
+        );
+
+        kill_tree(&mut child);
+
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(3) {
+            if !crate::process::supervisor::group_alive(pgid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !crate::process::supervisor::group_alive(pgid),
+            "process group should be dead after kill_tree"
+        );
+    }
 }

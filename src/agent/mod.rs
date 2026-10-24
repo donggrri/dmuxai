@@ -323,6 +323,29 @@ impl From<&AgentRequest> for OutputContext {
     }
 }
 
+pub(crate) fn map_send_error<T>(error: tokio::sync::mpsc::error::TrySendError<T>) -> AdapterError {
+    match error {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => AdapterError::CommandQueueFull,
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => AdapterError::RuntimeStopped,
+    }
+}
+
+pub(crate) async fn emit(
+    event_tx: &mpsc::Sender<AgentOutput>,
+    agent: Agent,
+    context: Option<&OutputContext>,
+    event: AgentEvent,
+) {
+    let _ = event_tx
+        .send(AgentOutput {
+            agent,
+            conversation_id: context.map(|c| c.conversation_id.clone()),
+            turn_id: context.map(|c| c.turn_id.clone()),
+            event,
+        })
+        .await;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     pub id: String,
@@ -533,5 +556,49 @@ mod typed_error_tests {
         let err = AgentError::policy("permission denied");
         assert_eq!(err.kind(), AgentErrorKind::Policy);
         assert_eq!(err.to_string(), "permission denied");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TC-1970 / FR-1970: map_send_error maps Full to CommandQueueFull and Closed to RuntimeStopped.
+    #[test]
+    fn tc_1970_map_send_error_maps_full_and_closed() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
+        tx.try_send(()).unwrap();
+        let err_full = tx.try_send(()).unwrap_err();
+        assert_eq!(map_send_error(err_full), AdapterError::CommandQueueFull);
+
+        let (tx_closed, rx_closed) = tokio::sync::mpsc::channel::<()>(1);
+        drop(rx_closed);
+        let err_closed = tx_closed.try_send(()).unwrap_err();
+        assert_eq!(map_send_error(err_closed), AdapterError::RuntimeStopped);
+    }
+
+    // TC-1971 / FR-1971: emit tags agent, conversation_id, turn_id, and event.
+    #[tokio::test]
+    async fn tc_1971_emit_tags_agent_conversation_and_turn() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let context = OutputContext {
+            conversation_id: ConversationId::new("conv-1"),
+            turn_id: TurnId::new("turn-1"),
+        };
+
+        emit(&tx, Agent::Cursor, Some(&context), AgentEvent::Started).await;
+        emit(&tx, Agent::Agy, None, AgentEvent::Completed).await;
+
+        let first = rx.recv().await.expect("first output");
+        assert_eq!(first.agent, Agent::Cursor);
+        assert_eq!(first.conversation_id, Some(ConversationId::new("conv-1")));
+        assert_eq!(first.turn_id, Some(TurnId::new("turn-1")));
+        assert!(matches!(first.event, AgentEvent::Started));
+
+        let second = rx.recv().await.expect("second output");
+        assert_eq!(second.agent, Agent::Agy);
+        assert_eq!(second.conversation_id, None);
+        assert_eq!(second.turn_id, None);
+        assert!(matches!(second.event, AgentEvent::Completed));
     }
 }

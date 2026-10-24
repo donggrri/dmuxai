@@ -307,13 +307,11 @@ pub async fn run_acp_turn(
     reader.abort();
     stderr_reader.abort();
     let status = child.wait().await?;
-    let diagnostic = stderr_tail
-        .lock()
-        .unwrap()
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" | ");
+    let diagnostic = {
+        let lines = stderr_tail.lock().unwrap();
+        let joined = lines.iter().cloned().collect::<Vec<_>>().join("\n");
+        dmuxai::process::supervisor::tail_lines(&joined, STDERR_TAIL)
+    };
 
     let prompt_result = turn_result;
 
@@ -406,7 +404,7 @@ async fn shutdown_acp_child(child: &mut tokio::process::Child, child_pid: Option
     let _ = child.start_kill();
     #[cfg(unix)]
     if let Some(pid) = child_pid {
-        terminate_group(pid).await;
+        dmuxai::process::supervisor::terminate_group(pid, Duration::from_millis(500)).await;
     }
 }
 
@@ -872,14 +870,7 @@ async fn send_event(
     context: &OutputContext,
     event: AgentEvent,
 ) {
-    let _ = event_tx
-        .send(AgentOutput {
-            agent,
-            conversation_id: Some(context.conversation_id.clone()),
-            turn_id: Some(context.turn_id.clone()),
-            event,
-        })
-        .await;
+    crate::agent::emit(event_tx, agent, Some(context), event).await;
 }
 
 fn format_acp_exit(status: std::process::ExitStatus, diagnostic: &str) -> String {
@@ -892,27 +883,6 @@ fn format_acp_exit(status: std::process::ExitStatus, diagnostic: &str) -> String
 
 async fn wait_child(child: &mut tokio::process::Child, _pid: Option<u32>) {
     let _ = child.wait().await;
-}
-
-#[cfg(unix)]
-async fn terminate_group(pgid: u32) {
-    if !dmuxai::process::supervisor::signal_group(
-        pgid,
-        dmuxai::process::supervisor::GroupSignal::Term,
-    ) {
-        return;
-    }
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    while std::time::Instant::now() < deadline {
-        if !dmuxai::process::supervisor::group_alive(pgid) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let _ = dmuxai::process::supervisor::signal_group(
-        pgid,
-        dmuxai::process::supervisor::GroupSignal::Kill,
-    );
 }
 
 pub fn new_cancel_flag() -> Arc<AtomicBool> {

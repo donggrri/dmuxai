@@ -89,6 +89,16 @@ pub fn timeout_error_message(label: &str, secs: u64) -> String {
     format!("{label} timed out after {secs}s")
 }
 
+/// Returns the last `max_lines` non-empty lines of a stderr tail string, joined with `" | "`.
+pub fn tail_lines(tail: &str, max_lines: usize) -> String {
+    if max_lines == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = tail.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join(" | ")
+}
+
 #[cfg(unix)]
 static LIVE_GROUPS: std::sync::Mutex<std::collections::BTreeSet<u32>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
@@ -205,6 +215,26 @@ pub fn group_alive(pgid: u32) -> bool {
     }
     // SAFETY: killpg with signal 0 probes for any live process in the group.
     unsafe { libc::killpg(pgid as i32, 0) == 0 }
+}
+
+/// Signals a process group with `SIGTERM`, waits up to `grace` polling every 25 ms
+/// until no process remains in the group, then escalates with `SIGKILL`.
+///
+/// Returns immediately without waiting if `signal_group(pgid, GroupSignal::Term)`
+/// returns `false` (e.g. invalid `pgid`, own process group, or group already gone).
+#[cfg(unix)]
+pub async fn terminate_group(pgid: u32, grace: Duration) {
+    if !signal_group(pgid, GroupSignal::Term) {
+        return;
+    }
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if !group_alive(pgid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = signal_group(pgid, GroupSignal::Kill);
 }
 
 /// Guard that keeps a runner's process group registered in the live-group registry
@@ -463,6 +493,27 @@ impl Supervised {
         Ok(LineEvent::Line(line))
     }
 
+    /// Waits up to `timeout` for the leader process to exit on its own without sending signals.
+    ///
+    /// Records the status in `leader_exit_status` upon exit so that subsequent calls to
+    /// [`stop`](Self::stop) or [`finish`](Self::finish) reuse it without waiting.
+    /// Returns `None` if the child does not exit before `timeout` elapses.
+    pub async fn wait_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        if let Some(status) = self.reaped_status {
+            return Some(status);
+        }
+        if let Some(status) = self.leader_exit_status {
+            return Some(status);
+        }
+        match tokio::time::timeout(timeout, self.child.wait()).await {
+            Ok(Ok(st)) => {
+                self.leader_exit_status = Some(st);
+                Some(st)
+            }
+            _ => None,
+        }
+    }
+
     /// Stops the child process group: sends `SIGTERM` to the group, waits up to `term_grace`
     /// for the child leader, then escalates with `SIGKILL` to the group and kills the leader,
     /// then reaps. Idempotent.
@@ -597,18 +648,17 @@ impl Drop for Supervised {
     }
 }
 
-/// Spawns a supervised child process with isolated process group, piped stdout/stderr,
-/// and background stderr draining.
+/// Wraps an already-spawned child process into a [`Supervised`] handle.
+///
+/// The child must have been configured with [`configure_child`] and spawned with
+/// piped `stdout` and `stderr` handles. Registers the process group in the
+/// live-group registry, starts the non-blocking stderr drain task, and initializes
+/// watchdog timers.
 #[cfg(unix)]
-pub fn spawn(
-    mut cmd: tokio::process::Command,
+pub fn adopt(
+    mut child: tokio::process::Child,
     config: SupervisorConfig,
 ) -> std::io::Result<Supervised> {
-    configure_child(&mut cmd, &config.child_options);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    let mut child = cmd.spawn()?;
     let pid = child
         .id()
         .ok_or_else(|| std::io::Error::other("spawned child did not return a pid"))?;
@@ -672,6 +722,21 @@ pub fn spawn(
         leader_exit_status: None,
         reaped_status: None,
     })
+}
+
+/// Spawns a supervised child process with isolated process group, piped stdout/stderr,
+/// and background stderr draining.
+#[cfg(unix)]
+pub fn spawn(
+    mut cmd: tokio::process::Command,
+    config: SupervisorConfig,
+) -> std::io::Result<Supervised> {
+    configure_child(&mut cmd, &config.child_options);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let child = cmd.spawn()?;
+    adopt(child, config)
 }
 
 #[cfg(unix)]
@@ -1095,6 +1160,114 @@ mod tests {
         assert_eq!(
             timeout_error_message("opencode", 300),
             "opencode timed out after 300s"
+        );
+    }
+
+    #[tokio::test]
+    async fn tc_1960_adopt_spawns_child_yields_lines_and_stop_kills_group() {
+        // TC-1960 / FR-1960: adopt wraps a child spawned with configure_child and piped stdio;
+        // yields Line("a"), registers pgid in live_groups(), and stop() kills the group and unregisters.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "echo a; sleep 30"]);
+        configure_child(&mut cmd, &ChildOptions::default());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let child = cmd.spawn().expect("spawn child");
+        let config = SupervisorConfig::new("tc_1960");
+        let mut supervised = adopt(child, config).expect("adopt child");
+        let pgid = supervised.pgid();
+
+        assert!(
+            live_groups().contains(&pgid),
+            "live_groups should contain pgid while alive"
+        );
+
+        let event = supervised.next_line().await.expect("read line");
+        assert_eq!(event, LineEvent::Line("a".to_string()));
+
+        let _status = supervised.stop().await;
+
+        assert!(
+            !live_groups().contains(&pgid),
+            "live_groups should not contain pgid after stop"
+        );
+        assert!(
+            wait_pid_gone(pgid, Duration::from_secs(3)).await,
+            "process group should be dead after stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn tc_1961_terminate_group_escalates_to_kill_and_handles_dead_group() {
+        // TC-1961 / FR-1961: terminate_group returns quickly for a dead group,
+        // and for a group with a child that traps TERM, escalates to SIGKILL after grace.
+        let start = std::time::Instant::now();
+        terminate_group(999_999, Duration::from_millis(500)).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "dead group returns quickly"
+        );
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "trap '' TERM; sleep 30"]);
+        configure_child(&mut cmd, &ChildOptions::default());
+        let child = cmd.spawn().expect("spawn stubborn child");
+        let pgid = child.id().expect("pid");
+
+        assert!(group_alive(pgid), "stubborn child group should be alive");
+
+        terminate_group(pgid, Duration::from_millis(300)).await;
+
+        assert!(
+            wait_pid_gone(pgid, Duration::from_secs(3)).await,
+            "stubborn child should be dead after terminate_group escalation"
+        );
+    }
+
+    #[tokio::test]
+    async fn tc_1962_wait_exit_waits_without_signals_and_records_status() {
+        // TC-1962 / FR-1962: wait_exit returns Some for an exiting child, None for one that sleeps,
+        // does not send signals, and records leader_exit_status for later reuse.
+        let mut cmd_exit = tokio::process::Command::new("sh");
+        cmd_exit.args(["-c", "exit 0"]);
+        let mut sup_exit =
+            spawn(cmd_exit, SupervisorConfig::new("tc_1962_exit")).expect("spawn exit");
+        let status = sup_exit
+            .wait_exit(Duration::from_secs(3))
+            .await
+            .expect("should return Some status");
+        assert!(status.success());
+        let stop_status = sup_exit.stop().await;
+        assert_eq!(stop_status, status);
+
+        let mut cmd_sleep = tokio::process::Command::new("sh");
+        cmd_sleep.args(["-c", "sleep 30"]);
+        let mut sup_sleep =
+            spawn(cmd_sleep, SupervisorConfig::new("tc_1962_sleep")).expect("spawn sleep");
+        let pgid = sup_sleep.pgid();
+        let res = sup_sleep.wait_exit(Duration::from_millis(100)).await;
+        assert!(res.is_none(), "should time out and return None");
+        assert!(
+            group_alive(pgid),
+            "child should not have been signaled by wait_exit"
+        );
+        sup_sleep.stop().await;
+    }
+
+    #[test]
+    fn tc_1963_tail_lines_formats_last_non_empty_lines() {
+        // TC-1963 / FR-1963: tail_lines formats the last max_lines non-empty lines joined with " | ".
+        assert_eq!(tail_lines("", 5), "");
+        assert_eq!(tail_lines("   \n\n\r\n", 5), "");
+        assert_eq!(tail_lines("line1\nline2\nline3", 0), "");
+
+        let sample = "line 1\n\nline 2\n  \nline 3\nline 4\nline 5\n";
+        assert_eq!(tail_lines(sample, 2), "line 4 | line 5");
+        assert_eq!(tail_lines(sample, 3), "line 3 | line 4 | line 5");
+        assert_eq!(
+            tail_lines(sample, 10),
+            "line 1 | line 2 | line 3 | line 4 | line 5"
         );
     }
 }

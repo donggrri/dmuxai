@@ -84,12 +84,10 @@ impl StdioClient {
     fn kill(&mut self) {
         #[cfg(unix)]
         if self.pgid > 0 {
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", "--", &format!("-{}", self.pgid)])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            let _ = crate::process::supervisor::signal_group(
+                self.pgid,
+                crate::process::supervisor::GroupSignal::Kill,
+            );
         }
         let _ = self.child.start_kill();
     }
@@ -153,11 +151,16 @@ impl McpClient {
                 }
                 cmd.stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .kill_on_drop(true);
+                    .stderr(Stdio::piped());
 
                 #[cfg(unix)]
-                cmd.process_group(0);
+                crate::process::supervisor::configure_child(
+                    &mut cmd,
+                    &crate::process::supervisor::ChildOptions::default(),
+                );
+
+                #[cfg(not(unix))]
+                cmd.kill_on_drop(true);
 
                 let mut child = cmd.spawn().map_err(|e| {
                     McpError::new(&server.name, format!("failed to spawn '{command}': {e}"))

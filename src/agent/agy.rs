@@ -1,18 +1,11 @@
 use std::{
-    collections::VecDeque,
     io,
     path::{Path, PathBuf},
     process::Stdio,
 };
 
 use serde_json::{Value, json};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{ChildStderr, ChildStdout},
-    sync::mpsc,
-    task::JoinHandle,
-    time::{Duration, Instant},
-};
+use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle, time::Duration};
 
 use super::{
     AdapterError, Agent, AgentAdapter, AgentError, AgentEvent, AgentOutput, AgentRequest,
@@ -20,7 +13,7 @@ use super::{
     implement_outcome::{
         ImplementTurnTracker, is_plan_only_implement_outcome, is_plan_review_response,
     },
-    prompt_with_image_tokens,
+    map_send_error, prompt_with_image_tokens,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,6 +26,7 @@ const AGY_MODEL_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 const AGY_IDLE_TIMEOUT_ENV: &str = "DMUXAI_AGY_IDLE_TIMEOUT_SECS";
 const AGY_IDLE_TIMEOUT_DEFAULT_SECS: u64 = 300;
 const AGY_RESULT_GRACE_SECS: u64 = 3;
+const AGY_RESULT_GRACE: Duration = Duration::from_secs(AGY_RESULT_GRACE_SECS);
 const AGY_PLAN_ONLY_MAX_ATTEMPTS: usize = 2;
 
 /// Resolves the idle timeout from `DMUXAI_AGY_IDLE_TIMEOUT_SECS`.
@@ -155,13 +149,6 @@ impl AgentAdapter for AgyAdapter {
         self.command_tx
             .try_send(AgyCommand::SelectModel(model))
             .map_err(map_send_error)
-    }
-}
-
-fn map_send_error(error: mpsc::error::TrySendError<AgyCommand>) -> AdapterError {
-    match error {
-        mpsc::error::TrySendError::Full(_) => AdapterError::CommandQueueFull,
-        mpsc::error::TrySendError::Closed(_) => AdapterError::RuntimeStopped,
     }
 }
 
@@ -477,34 +464,21 @@ async fn run_single_agy_process(
     let program = resolve_program(AGY_BINARY_OVERRIDE, "agy");
     let mut command = headless_command(program);
     configure_command_for_resume(&mut command, request, selected_model, mode, resume_session);
-    dmuxai::process::supervisor::configure_child(
-        &mut command,
-        &dmuxai::process::supervisor::ChildOptions::default(),
-    );
-    command
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    command.current_dir(cwd);
+    command.stdin(Stdio::piped());
 
-    let mut child = command
-        .spawn()
+    let mut config = dmuxai::process::supervisor::SupervisorConfig::new("AGY");
+    config.idle_timeout = agy_idle_timeout_secs().map(Duration::from_secs);
+    config.total_timeout = None;
+    config.term_grace = Duration::from_millis(500);
+    config.stderr_tail_bytes = 64 * 1024;
+
+    let mut supervised = dmuxai::process::supervisor::spawn(command, config)
         .map_err(|error| AgentError::process_exit(format!("could not start AGY: {error}")))?;
-    let pgid = child.id().unwrap_or(0);
-    let _group_guard = dmuxai::process::supervisor::GroupGuard::register(pgid);
-    let mut stdin = child
-        .stdin
-        .take()
+
+    let mut stdin = supervised
+        .take_stdin()
         .ok_or_else(|| AgentError::process_exit("AGY stdin was not piped"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AgentError::process_exit("AGY stdout was not piped"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AgentError::process_exit("AGY stderr was not piped"))?;
 
     let mut input = serde_json::to_vec(&json!({
         "event": "user",
@@ -522,7 +496,7 @@ async fn run_single_agy_process(
         .map_err(|error| AgentError::provider(error.to_string()))?;
     drop(stdin);
 
-    stream_child(&mut child, pgid, stdout, stderr, event_tx, context, mode).await
+    stream_child(&mut supervised, event_tx, context, mode).await
 }
 
 fn configure_command_for_resume(
@@ -595,106 +569,66 @@ fn configure_command(
 }
 
 async fn stream_child(
-    child: &mut tokio::process::Child,
-    pgid: u32,
-    stdout: ChildStdout,
-    stderr: ChildStderr,
+    supervised: &mut dmuxai::process::supervisor::Supervised,
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
     mode: TurnPolicy,
 ) -> Result<SingleAgyOutcome, AgentError> {
-    let mut stdout_lines = BufReader::new(stdout).lines();
-    let mut stderr_lines = BufReader::new(stderr).lines();
-    let mut stderr_history = VecDeque::with_capacity(STDERR_HISTORY_CAPACITY);
-    let mut stdout_open = true;
-    let mut stderr_open = true;
-    let mut exit_status = None;
-    let mut killed_after_result = false;
     let mut state = AgyStreamState::default();
     let mut implement_tracker = ImplementTurnTracker::new(mode);
+    let mut killed_after_result = false;
 
-    let idle_secs = agy_idle_timeout_secs();
-    let mut idle_deadline = idle_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
-    let mut result_grace_deadline: Option<Instant> = None;
-
-    while stdout_open || stderr_open || exit_status.is_none() {
-        let idle_deadline_at = idle_deadline.unwrap_or_else(Instant::now);
-        let grace_deadline_at = result_grace_deadline.unwrap_or_else(Instant::now);
-        tokio::select! {
-            line = stdout_lines.next_line(), if stdout_open => {
-                match line.map_err(|e| AgentError::process_exit(e.to_string()))? {
-                    Some(line) => {
-                        if let Some(secs) = idle_secs {
-                            idle_deadline = Some(Instant::now() + Duration::from_secs(secs));
+    let status = loop {
+        match supervised
+            .next_line()
+            .await
+            .map_err(|e| AgentError::process_exit(e.to_string()))?
+        {
+            dmuxai::process::supervisor::LineEvent::Line(line) => {
+                let message: Value = serde_json::from_str(&line).map_err(|error| {
+                    AgentError::provider(format!("invalid AGY NDJSON: {error}"))
+                })?;
+                implement_tracker.observe_agy_message(&message);
+                for event in normalize_event(&message, mode, &mut state) {
+                    send_event(event_tx, Some(context), event).await;
+                }
+                if state.result_received {
+                    let st = match supervised.wait_exit(AGY_RESULT_GRACE).await {
+                        Some(st) => {
+                            supervised.finish(Duration::ZERO).await;
+                            st
                         }
-                        let message: Value = serde_json::from_str(&line).map_err(|error| {
-                            AgentError::provider(format!("invalid AGY NDJSON: {error}"))
-                        })?;
-                        implement_tracker.observe_agy_message(&message);
-                        for event in normalize_event(&message, mode, &mut state) {
-                            send_event(event_tx, Some(context), event).await;
+                        None => {
+                            killed_after_result = true;
+                            supervised.stop().await
                         }
-                        if state.result_received {
-                            stdout_open = false;
-                            if result_grace_deadline.is_none() {
-                                result_grace_deadline = Some(
-                                    Instant::now() + Duration::from_secs(AGY_RESULT_GRACE_SECS),
-                                );
-                            }
-                        }
-                    }
-                    None => stdout_open = false,
+                    };
+                    break st;
                 }
             }
-            line = stderr_lines.next_line(), if stderr_open => {
-                match line.map_err(|e| AgentError::process_exit(e.to_string()))? {
-                    Some(line) => push_stderr(&mut stderr_history, line),
-                    None => stderr_open = false,
-                }
-            }
-            status = child.wait(), if exit_status.is_none() => {
-                exit_status = Some(status.map_err(|e| AgentError::process_exit(e.to_string()))?);
-            }
-            _ = tokio::time::sleep_until(idle_deadline_at), if idle_deadline.is_some() => {
-                dmuxai::process::supervisor::signal_group(pgid, dmuxai::process::supervisor::GroupSignal::Term);
-                let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
-                if dmuxai::process::supervisor::group_alive(pgid) {
-                    dmuxai::process::supervisor::signal_group(pgid, dmuxai::process::supervisor::GroupSignal::Kill);
-                }
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+            dmuxai::process::supervisor::LineEvent::Idle(_d) => {
+                supervised.stop().await;
+                let idle_secs = agy_idle_timeout_secs();
                 return Err(AgentError::idle(format!(
                     "AGY produced no events for {}s; it may be waiting on a background command. Run commands in the foreground with a bounded timeout.",
                     idle_secs.unwrap_or(AGY_IDLE_TIMEOUT_DEFAULT_SECS)
                 )));
             }
-            _ = tokio::time::sleep_until(grace_deadline_at), if result_grace_deadline.is_some() => {
-                // The result line arrived but the loop is still open. Either the
-                // child is lingering (kill and reap it) or it already exited
-                // while a grandchild keeps the stderr pipe open (just stop
-                // draining). Closing both pipes guarantees termination even
-                // when no idle timeout is configured.
-                if exit_status.is_none() {
-                    killed_after_result = true;
-                    dmuxai::process::supervisor::signal_group(pgid, dmuxai::process::supervisor::GroupSignal::Term);
-                    let wait_res = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
-                    match wait_res {
-                        Ok(Ok(st)) => exit_status = Some(st),
-                        _ => {
-                            dmuxai::process::supervisor::signal_group(pgid, dmuxai::process::supervisor::GroupSignal::Kill);
-                            let _ = child.start_kill();
-                            exit_status = Some(child.wait().await.map_err(|e| AgentError::process_exit(e.to_string()))?);
-                        }
-                    }
-                }
-                stdout_open = false;
-                stderr_open = false;
+            dmuxai::process::supervisor::LineEvent::Timeout(_d) => {
+                let st = supervised.stop().await;
+                break st;
+            }
+            dmuxai::process::supervisor::LineEvent::Eof => {
+                let st = supervised.finish(AGY_RESULT_GRACE).await;
+                break st;
             }
         }
-    }
+    };
 
-    let status = exit_status.expect("child.wait runs before the loop can finish");
-    let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
+    let diagnostic = dmuxai::process::supervisor::tail_lines(
+        &supervised.stderr_tail().await,
+        STDERR_HISTORY_CAPACITY,
+    );
     let protocol_completed = state.pending_terminal.is_some();
     let require_writes = false;
     let writes_observed = implement_tracker.writes_observed();
@@ -891,32 +825,18 @@ fn parse_model_list(output: &str) -> Vec<ModelInfo> {
         .collect()
 }
 
-fn push_stderr(history: &mut VecDeque<String>, line: String) {
-    if history.len() == STDERR_HISTORY_CAPACITY {
-        history.pop_front();
-    }
-    history.push_back(line);
-}
-
 async fn send_event(
     event_tx: &mpsc::Sender<AgentOutput>,
     context: Option<&OutputContext>,
     event: AgentEvent,
 ) {
-    let _ = event_tx
-        .send(AgentOutput {
-            agent: Agent::Agy,
-            conversation_id: context.map(|context| context.conversation_id.clone()),
-            turn_id: context.map(|context| context.turn_id.clone()),
-            event,
-        })
-        .await;
+    super::emit(event_tx, Agent::Agy, context, event).await;
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{Duration, Instant, timeout};
 
     use super::super::AgentErrorKind;
     use super::*;
@@ -1953,6 +1873,72 @@ mod tests {
             .await
             .is_ok();
             assert!(dead, "fake AGY process should be gone after turn ends");
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_1964_agy_uses_supervisor_and_registers_group() {
+        // TC-1964 / FR-1964: AGY runner uses the process supervisor.
+        // Existing tests verify idle timeout (agy_idle_timeout_kills_silent_child,
+        // agy_idle_timer_resets_on_each_event), result grace kill (agy_result_grace_kills_lingering_child_after_result,
+        // agy_implement_grace_kill_after_success_result_completes), and grandchild cleanup
+        // (agy_grace_closes_when_grandchild_holds_stderr_after_exit).
+        // This test verifies live_groups registration during turn execution and cleanup.
+        let (dir, fake) = write_fake_agy(|tmp| {
+            format!(
+                "#!/bin/sh\necho $$ > {}\nsleep 600\n",
+                tmp.join("agy_tc1964.pid").display()
+            )
+        });
+        let pid_path = dir.path().join("agy_tc1964.pid");
+
+        let _ = with_agy_spawn_env(&fake, "60", async {
+            let turn = tokio::spawn(async { run_fake_agy_turn(TurnPolicy::Agent, false).await });
+
+            let mut pid = None;
+            for _ in 0..100 {
+                if let Ok(content) = std::fs::read_to_string(&pid_path)
+                    && let Ok(p) = content.trim().parse::<u32>()
+                {
+                    pid = Some(p);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let pid = pid.expect("fake AGY should write its PID");
+
+            let mut registered = false;
+            for _ in 0..100 {
+                if dmuxai::process::supervisor::live_groups().contains(&pid) {
+                    registered = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                registered,
+                "fake AGY pgid should be registered in live_groups() while running"
+            );
+
+            turn.abort();
+            let _ = turn.await;
+
+            let unregistered = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if !dmuxai::process::supervisor::live_groups().contains(&pid) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .is_ok();
+            assert!(
+                unregistered,
+                "fake AGY pgid should unregister from live_groups() after turn ends"
+            );
         })
         .await;
     }

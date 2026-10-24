@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     ffi::OsString,
     io,
     path::{Path, PathBuf},
@@ -8,17 +7,12 @@ use std::{
 };
 
 use serde_json::Value;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{ChildStderr, ChildStdout},
-    sync::mpsc,
-    task::JoinHandle,
-};
+use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 
 use super::{
     AdapterError, Agent, AgentAdapter, AgentError, AgentEvent, AgentOutput, AgentRequest,
     ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy, implement_outcome::ImplementTurnTracker,
-    prompt_with_image_tokens,
+    map_send_error, prompt_with_image_tokens,
 };
 use dmuxai::process::cursor_command;
 use dmuxai::runner_protocol::RunnerProtocol;
@@ -169,13 +163,6 @@ impl AgentAdapter for CursorAdapter {
     }
 }
 
-fn map_send_error(error: mpsc::error::TrySendError<CursorCommand>) -> AdapterError {
-    match error {
-        mpsc::error::TrySendError::Full(_) => AdapterError::CommandQueueFull,
-        mpsc::error::TrySendError::Closed(_) => AdapterError::RuntimeStopped,
-    }
-}
-
 pub fn spawn_cursor_adapter(
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
@@ -227,29 +214,6 @@ impl Drop for WarmProcess {
             let _ = child.start_kill();
         }
     }
-}
-
-/// SIGTERM the group, wait up to 500 ms for it to go away, then SIGKILL
-/// whatever is left (descendants that ignore SIGTERM included).
-#[cfg(unix)]
-async fn terminate_group(pgid: u32) {
-    if !dmuxai::process::supervisor::signal_group(
-        pgid,
-        dmuxai::process::supervisor::GroupSignal::Term,
-    ) {
-        return; // group already gone
-    }
-    let deadline = Instant::now() + std::time::Duration::from_millis(500);
-    while Instant::now() < deadline {
-        if !dmuxai::process::supervisor::group_alive(pgid) {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    let _ = dmuxai::process::supervisor::signal_group(
-        pgid,
-        dmuxai::process::supervisor::GroupSignal::Kill,
-    );
 }
 
 async fn reap_warm_process(mut warm: WarmProcess) {
@@ -458,6 +422,11 @@ async fn runtime_loop(
                                             && warm.cwd == cwd
                                             && warm.env_bin == turn_env_bin;
                                         if matches {
+                                            // Drop the warm process group guard before adopting the
+                                            // child into a Supervised handle so the registry entry
+                                            // is not removed while it is alive.
+                                            #[cfg(unix)]
+                                            let _ = warm.group_guard.take();
                                             Some(child)
                                         } else {
                                             warm.child = Some(child);
@@ -774,7 +743,11 @@ async fn kill_turn(turn: Option<ActiveTurn>) {
         {
             let pgid = turn.pgid.load(std::sync::atomic::Ordering::SeqCst);
             if pgid > 0 {
-                terminate_group(pgid).await;
+                dmuxai::process::supervisor::terminate_group(
+                    pgid,
+                    std::time::Duration::from_millis(500),
+                )
+                .await;
             }
         }
         turn.handle.abort();
@@ -909,8 +882,11 @@ async fn run_turn_with_child(
         .map_err(|e| AgentError::provider(e.to_string()));
     }
 
-    let mut child = match warm_child {
-        Some(child) => child,
+    let mut config = dmuxai::process::supervisor::SupervisorConfig::new("Cursor");
+    config.term_grace = std::time::Duration::from_millis(500);
+    let mut supervised = match warm_child {
+        Some(child) => dmuxai::process::supervisor::adopt(child, config)
+            .map_err(|e| AgentError::process_exit(format!("could not adopt Cursor: {e}")))?,
         None => {
             let mut command = cursor_command()
                 .map_err(|e| AgentError::process_exit(format!("could not start Cursor: {e}")))?;
@@ -921,42 +897,21 @@ async fn run_turn_with_child(
                 mode,
                 cwd,
             );
-            dmuxai::process::supervisor::configure_child(
-                &mut command,
-                &dmuxai::process::supervisor::ChildOptions::default(),
-            );
             command
                 .current_dir(cwd)
                 .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
                 .kill_on_drop(true);
-            command
-                .spawn()
+            dmuxai::process::supervisor::spawn(command, config)
                 .map_err(|e| AgentError::process_exit(format!("could not start Cursor: {e}")))?
         }
     };
-    if let Some(id) = child.id() {
+    if let Some(id) = supervised.pid() {
         pgid.store(id, std::sync::atomic::Ordering::SeqCst);
     }
-    // Register the turn's group for its lifetime.
-    #[cfg(unix)]
-    let _cursor_group_guard = child
-        .id()
-        .map(dmuxai::process::supervisor::GroupGuard::register);
 
-    let mut stdin = child
-        .stdin
-        .take()
+    let mut stdin = supervised
+        .take_stdin()
         .ok_or_else(|| AgentError::process_exit("Cursor stdin was not piped"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AgentError::process_exit("Cursor stdout was not piped"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AgentError::process_exit("Cursor stderr was not piped"))?;
 
     let context = OutputContext::from(request);
     send_event(event_tx, Some(&context), AgentEvent::Started).await;
@@ -975,16 +930,7 @@ async fn run_turn_with_child(
         .map_err(|e| AgentError::provider(e.to_string()))?;
     drop(stdin);
 
-    stream_child(
-        &mut child,
-        stdout,
-        stderr,
-        event_tx,
-        &context,
-        mode,
-        terminal_seen,
-    )
-    .await
+    stream_child(&mut supervised, event_tx, &context, mode, terminal_seen).await
 }
 
 fn configure_command(
@@ -1025,97 +971,81 @@ fn configure_command(
 }
 
 async fn stream_child(
-    child: &mut tokio::process::Child,
-    stdout: ChildStdout,
-    stderr: ChildStderr,
+    supervised: &mut dmuxai::process::supervisor::Supervised,
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
     mode: TurnPolicy,
     terminal_seen: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<String>, AgentError> {
-    let mut stdout_lines = BufReader::new(stdout).lines();
-    let mut stderr_lines = BufReader::new(stderr).lines();
-    let mut stderr_history = VecDeque::with_capacity(STDERR_HISTORY_CAPACITY);
-    let mut stdout_open = true;
-    let mut stderr_open = true;
-    let mut exit_status = None;
     let mut state = CursorStreamState::default();
     let mut implement_tracker = ImplementTurnTracker::new(mode);
-    // The CLI's process group (it is the group leader); kept for after reaping.
-    #[cfg_attr(not(unix), allow(unused_variables))]
-    let pgid = child.id();
-    // Set when the terminal `result` line arrives: past it the process gets
-    // TERMINAL_EXIT_GRACE to exit and close its pipes, then it is stopped.
-    let mut exit_deadline: Option<tokio::time::Instant> = None;
+    let pgid = supervised.pgid();
     let mut forced_after_result = false;
 
-    while stdout_open || stderr_open || exit_status.is_none() {
-        let deadline = exit_deadline
-            .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
-        tokio::select! {
-            line = stdout_lines.next_line(), if stdout_open => {
-                match line.map_err(|e| AgentError::process_exit(e.to_string()))? {
-                    Some(line) => {
-                        implement_tracker.observe_provider_line(&line);
-                        let message: Value = serde_json::from_str(&line).map_err(|error| {
-                            AgentError::provider(format!("invalid Cursor NDJSON: {error}"))
-                        })?;
-                        // Mark the turn terminal before its `Completed` reaches the
-                        // app, so a follow-up prompt is queued, not refused.
-                        let events = normalize_event(&message, &mut state);
-                        if state.terminal {
-                            terminal_seen.store(true, std::sync::atomic::Ordering::SeqCst);
-                            exit_deadline.get_or_insert_with(|| {
-                                tokio::time::Instant::now() + TERMINAL_EXIT_GRACE
-                            });
+    loop {
+        match supervised
+            .next_line()
+            .await
+            .map_err(|e| AgentError::process_exit(e.to_string()))?
+        {
+            dmuxai::process::supervisor::LineEvent::Line(line) => {
+                implement_tracker.observe_provider_line(&line);
+                let message: Value = serde_json::from_str(&line).map_err(|error| {
+                    AgentError::provider(format!("invalid Cursor NDJSON: {error}"))
+                })?;
+                let events = normalize_event(&message, &mut state);
+                if state.terminal {
+                    terminal_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                for event in events {
+                    send_event(event_tx, Some(context), event).await;
+                }
+                if state.terminal {
+                    let status = match supervised.wait_exit(TERMINAL_EXIT_GRACE).await {
+                        Some(st) => st,
+                        None => {
+                            forced_after_result = true;
+                            supervised.stop().await
                         }
-                        for event in events {
-                            send_event(event_tx, Some(context), event).await;
-                        }
+                    };
+                    if !forced_after_result {
+                        let _ = dmuxai::process::supervisor::signal_group(
+                            pgid,
+                            dmuxai::process::supervisor::GroupSignal::Kill,
+                        );
                     }
-                    None => stdout_open = false,
+                    return finish_cursor_turn(
+                        supervised,
+                        status,
+                        &state,
+                        implement_tracker,
+                        forced_after_result,
+                    )
+                    .await;
                 }
             }
-            line = stderr_lines.next_line(), if stderr_open => {
-                match line.map_err(|e| AgentError::process_exit(e.to_string()))? {
-                    Some(line) => push_stderr(&mut stderr_history, line),
-                    None => stderr_open = false,
-                }
+            dmuxai::process::supervisor::LineEvent::Eof => {
+                let status = supervised.finish(TERMINAL_EXIT_GRACE).await;
+                return finish_cursor_turn(supervised, status, &state, implement_tracker, false)
+                    .await;
             }
-            status = child.wait(), if exit_status.is_none() => {
-                exit_status = Some(status.map_err(|e| AgentError::process_exit(e.to_string()))?);
-            }
-            _ = tokio::time::sleep_until(deadline), if exit_deadline.is_some() => {
-                // Still running (or a child holds its pipes) after the grace
-                // period: stop the whole group and finish the turn.
-                #[cfg(unix)]
-                if let Some(pgid) = pgid {
-                    terminate_group(pgid).await;
-                }
-                if exit_status.is_none() {
-                    let _ = child.start_kill();
-                    exit_status = Some(child.wait().await.map_err(|e| AgentError::process_exit(e.to_string()))?);
-                }
-                forced_after_result = true;
-                break;
-            }
+            dmuxai::process::supervisor::LineEvent::Idle(_) => {}
+            dmuxai::process::supervisor::LineEvent::Timeout(_) => {}
         }
     }
-    // A finished turn leaves nothing behind: reap any child of the CLI that
-    // detached its pipes (no-op when the group is already gone).
-    #[cfg(unix)]
-    if state.terminal
-        && !forced_after_result
-        && let Some(pgid) = pgid
-    {
-        let _ = dmuxai::process::supervisor::signal_group(
-            pgid,
-            dmuxai::process::supervisor::GroupSignal::Kill,
-        );
-    }
+}
 
-    let status = exit_status.expect("child.wait runs before the loop can finish");
-    let diagnostic = stderr_history.into_iter().collect::<Vec<_>>().join(" | ");
+async fn finish_cursor_turn(
+    supervised: &mut dmuxai::process::supervisor::Supervised,
+    status: std::process::ExitStatus,
+    state: &CursorStreamState,
+    implement_tracker: ImplementTurnTracker,
+    forced_after_result: bool,
+) -> Result<Option<String>, AgentError> {
+    let diagnostic = dmuxai::process::supervisor::tail_lines(
+        &supervised.stderr_tail().await,
+        STDERR_HISTORY_CAPACITY,
+    );
     implement_tracker.finish(
         &status,
         &diagnostic,
@@ -1136,7 +1066,7 @@ async fn stream_child(
         };
         return Err(err);
     }
-    Ok(state.session_id)
+    Ok(state.session_id.clone())
 }
 
 #[derive(Default)]
@@ -1383,31 +1313,19 @@ fn parse_model_list(output: &str) -> (Vec<ModelInfo>, Option<String>) {
     (models, selected)
 }
 
-fn push_stderr(history: &mut VecDeque<String>, line: String) {
-    if history.len() == STDERR_HISTORY_CAPACITY {
-        history.pop_front();
-    }
-    history.push_back(line);
-}
-
 async fn send_event(
     event_tx: &mpsc::Sender<AgentOutput>,
     context: Option<&OutputContext>,
     event: AgentEvent,
 ) {
-    let _ = event_tx
-        .send(AgentOutput {
-            agent: Agent::Cursor,
-            conversation_id: context.map(|context| context.conversation_id.clone()),
-            turn_id: context.map(|context| context.turn_id.clone()),
-            event,
-        })
-        .await;
+    super::emit(event_tx, Agent::Cursor, context, event).await;
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use serde_json::json;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tokio::time::{Duration, timeout};
 
     use super::super::AgentErrorKind;
@@ -2427,7 +2345,6 @@ pub(crate) mod tests {
     #[cfg(unix)]
     impl FakeCursorFixture {
         pub(crate) async fn new() -> Self {
-            use std::os::unix::fs::PermissionsExt;
             let guard = TEST_CURSOR_MUTEX.lock().await;
             let env_guard = dmuxai::state_path::test_env_lock();
             let dir = tempfile::tempdir().expect("tempdir");
@@ -2698,7 +2615,6 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[allow(clippy::await_holding_lock)]
     async fn send_right_after_result_is_queued_not_refused() {
-        use std::os::unix::fs::PermissionsExt;
         let _guard = TEST_CURSOR_MUTEX.lock().await;
         let _env_guard = dmuxai::state_path::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
@@ -2778,7 +2694,6 @@ pub(crate) mod tests {
     /// exit right after their result. Logs `PROMPT`, `LEADER` and `CHILD`.
     #[cfg(unix)]
     fn lingering_cursor_script(dir: &Path, linger_secs: u32) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let log_path = dir.join("linger.log");
         let marker = dir.join("first-run-done");
         let script_path = dir.join("cursor-agent");
@@ -3173,7 +3088,6 @@ pub(crate) mod tests {
     // TC-807 / FR-807: reaping a warm process kills its whole process group,
     // including a grandchild that ignores SIGTERM.
     async fn reaping_warm_process_kills_term_ignoring_grandchild() {
-        use std::os::unix::fs::PermissionsExt;
         let fixture = FakeCursorFixture::new().await;
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("grandchild.pid");
@@ -3646,6 +3560,224 @@ pub(crate) mod tests {
             );
             assert_eq!(read_only_mode_call("both").await, "session/set_mode ask");
             assert_eq!(read_only_mode_call("none").await, "");
+        }
+
+        // TC-1966 / FR-1966: ACP client uses the shared supervisor::terminate_group;
+        // no lingering fake ACP agent process remains after the turn.
+        #[tokio::test]
+        async fn tc_1966_acp_client_uses_shared_terminate_group() {
+            let _guard = lock_env().await;
+            set_fake_env(&[]);
+            let workspace = tempfile::tempdir().unwrap();
+            let (result, events) = drive(TurnPolicy::Agent, None, workspace.path()).await;
+            result.expect("acp turn");
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::Completed)));
+
+            let mut alive = live_fake_acp_agent_count();
+            for _ in 0..50 {
+                if alive == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                alive = live_fake_acp_agent_count();
+            }
+            assert_eq!(alive, 0, "fake-acp-agent process should not outlive turn");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    async fn tc_1965_cursor_legacy_uses_supervisor_and_registers_group() {
+        let _guard = TEST_CURSOR_MUTEX.lock().await;
+        let _env_guard = dmuxai::state_path::test_env_lock();
+
+        // Basic turn with a lingering CLI so the group stays alive while checked.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let (script_path, log_path) = lingering_cursor_script(dir.path(), 60);
+            unsafe {
+                std::env::set_var("DMUXAI_CURSOR_BIN", &script_path);
+            }
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let config = CursorAdapterConfig {
+                protocol: RunnerProtocol::Legacy,
+                prewarm: false,
+                prewarm_idle_secs: 300,
+            };
+            let workspace = tempfile::tempdir().unwrap();
+            let (adapter, worker) =
+                spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config, Vec::new());
+            adapter.send(linger_request("turn-1", "first")).unwrap();
+
+            // Wait for the leader pid to be logged.
+            let mut leader_pid = None;
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) && leader_pid.is_none() {
+                let pids = logged_pids(&log_path, "LEADER ");
+                if !pids.is_empty() {
+                    leader_pid = Some(pids[0]);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let leader_pid = leader_pid.expect("leader pid should be logged");
+
+            let mut registered = false;
+            for _ in 0..100 {
+                if dmuxai::process::supervisor::live_groups().contains(&leader_pid) {
+                    registered = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(registered, "cursor group should be registered during turn");
+
+            // Wait for turn completion (grace stops the lingering group).
+            let sent_at = Instant::now();
+            let mut completed = false;
+            while sent_at.elapsed() < TERMINAL_EXIT_GRACE + Duration::from_secs(5) && !completed {
+                if let Ok(Some(output)) = timeout(Duration::from_millis(200), event_rx.recv()).await
+                    && matches!(output.event, AgentEvent::Completed)
+                {
+                    completed = true;
+                }
+            }
+            assert!(completed, "turn should complete");
+            drop(adapter);
+            let _ = worker.await;
+            unsafe {
+                std::env::remove_var("DMUXAI_CURSOR_BIN");
+            }
+        }
+
+        // Warm-adopted turn.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let (script_path, log_path) = lingering_cursor_script(dir.path(), 60);
+            unsafe {
+                std::env::set_var("DMUXAI_CURSOR_BIN", &script_path);
+            }
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let config = CursorAdapterConfig {
+                protocol: RunnerProtocol::Legacy,
+                prewarm: true,
+                prewarm_idle_secs: 300,
+            };
+            let workspace = tempfile::tempdir().unwrap();
+            let (adapter, worker) =
+                spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config, Vec::new());
+
+            adapter.prewarm().unwrap();
+            // Wait for warm spawn.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            adapter.send(linger_request("turn-1", "first")).unwrap();
+
+            let mut leader_pid = None;
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) && leader_pid.is_none() {
+                let pids = logged_pids(&log_path, "LEADER ");
+                if !pids.is_empty() {
+                    leader_pid = Some(pids[0]);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let leader_pid = leader_pid.expect("leader pid should be logged");
+
+            let mut registered = false;
+            for _ in 0..100 {
+                if dmuxai::process::supervisor::live_groups().contains(&leader_pid) {
+                    registered = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                registered,
+                "warm-adopted cursor group should be registered during turn"
+            );
+
+            let sent_at = Instant::now();
+            let mut completed = false;
+            while sent_at.elapsed() < TERMINAL_EXIT_GRACE + Duration::from_secs(5) && !completed {
+                if let Ok(Some(output)) = timeout(Duration::from_millis(200), event_rx.recv()).await
+                    && matches!(output.event, AgentEvent::Completed)
+                {
+                    completed = true;
+                }
+            }
+            assert!(completed, "turn should complete");
+            drop(adapter);
+            let _ = worker.await;
+            unsafe {
+                std::env::remove_var("DMUXAI_CURSOR_BIN");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    async fn tc_1965_cursor_eof_before_exit_is_not_killed() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicBool;
+
+        let _guard = TEST_CURSOR_MUTEX.lock().await;
+        let _env_guard = dmuxai::state_path::test_env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("cursor-agent");
+        let script = "#!/bin/sh\nread -r line\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"OK\",\"session_id\":\"sess-1\"}'\nexec 1>&-\nsleep 0.3\n";
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        unsafe {
+            std::env::set_var("DMUXAI_CURSOR_BIN", &script_path);
+        }
+
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conv-eof"),
+            turn_id: super::super::TurnId::new("turn-eof"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let cwd = dir.path().to_path_buf();
+        let notice = AtomicBool::new(false);
+
+        let result = run_turn(
+            &request,
+            None,
+            TurnPolicy::Agent,
+            &cwd,
+            &event_tx,
+            RunnerProtocol::Legacy,
+            &[],
+            &notice,
+        )
+        .await;
+
+        assert!(result.is_ok(), "turn should succeed: {result:?}");
+
+        let mut events = Vec::new();
+        while let Ok(out) = event_rx.try_recv() {
+            events.push(out.event);
+        }
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "no error event expected: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Completed)),
+            "completed event expected: {events:?}"
+        );
+
+        unsafe {
+            std::env::remove_var("DMUXAI_CURSOR_BIN");
         }
     }
 }
