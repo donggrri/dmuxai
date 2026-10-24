@@ -18,7 +18,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 2;
+use crate::activity::{ActivityItem, ToolStatus, collapsed_line, merge_activity};
+
+const SCHEMA_VERSION: i64 = 3;
+pub const MAX_ACTIVITIES_PER_TURN: usize = 400;
+pub const MAX_ACTIVITY_TEXT_CHARS: usize = 16_000;
 const MAX_CONTEXT_CHARS: usize = 32_000;
 const RECENT_TAIL_CHARS: usize = 12_000;
 const MAX_SUMMARY_CHARS: usize = MAX_CONTEXT_CHARS - RECENT_TAIL_CHARS;
@@ -253,6 +257,40 @@ fn ensure_runtime_session_schema(connection: &mut Connection) -> Result<(), Conv
         )?;
     }
 
+    transaction.commit()?;
+    Ok(())
+}
+
+/// v3: add optional display_text to messages and create activities table.
+fn migrate_to_v3(connection: &mut Connection) -> Result<(), ConversationError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let has_display_text_column = {
+        let mut statement = transaction.prepare("PRAGMA table_info(messages)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .any(|name| name == "display_text")
+    };
+    if !has_display_text_column {
+        transaction.execute_batch("ALTER TABLE messages ADD COLUMN display_text TEXT;")?;
+    }
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS activities (
+            turn_id         TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+            ordinal         INTEGER NOT NULL CHECK (ordinal >= 0),
+            kind            TEXT NOT NULL CHECK (kind IN ('tool', 'thinking')),
+            summary         TEXT NOT NULL DEFAULT '',
+            state           TEXT NOT NULL CHECK (state IN ('running', 'ok', 'failed', 'live', 'done')),
+            payload_json    TEXT NOT NULL,
+            created_at_ms   INTEGER NOT NULL,
+            updated_at_ms   INTEGER NOT NULL,
+            PRIMARY KEY (turn_id, ordinal)
+        );
+        PRAGMA user_version = 3;
+        "#,
+    )?;
     transaction.commit()?;
     Ok(())
 }
@@ -565,7 +603,21 @@ pub struct TranscriptMessage {
     pub agent: AgentKey,
     pub role: MessageRole,
     pub text: String,
+    pub display_text: Option<String>,
     pub state: MessageState,
+}
+
+impl TranscriptMessage {
+    pub fn shown_text(&self) -> &str {
+        self.display_text.as_deref().unwrap_or(&self.text)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnActivity {
+    pub turn_id: TurnId,
+    pub ordinal: i64,
+    pub item: ActivityItem,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -575,6 +627,7 @@ pub struct ConversationSnapshot {
     pub turns: Vec<TurnSnapshot>,
     pub messages: Vec<TranscriptMessage>,
     pub bindings: Vec<ProviderBinding>,
+    pub activities: Vec<TurnActivity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -598,6 +651,7 @@ pub struct BeginTurn {
     pub agent: AgentKey,
     pub model_id: Option<String>,
     pub prompt: String,
+    pub display_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -790,6 +844,9 @@ impl ConversationEngine {
         if version < 2 {
             migrate_to_v2(&mut connection)?;
         }
+        if version < 3 {
+            migrate_to_v3(&mut connection)?;
+        }
         let session_id = Uuid::new_v4().to_string();
         let now = now_ms()?;
         connection.execute(
@@ -943,6 +1000,29 @@ impl ConversationEngine {
         self.load_snapshot(&conversation_id)
     }
 
+    pub fn set_title_if_untitled(&mut self, text: &str) -> Result<bool, ConversationError> {
+        let conversation_id = self
+            .active_conversation
+            .as_ref()
+            .ok_or(ConversationError::NoActiveConversation)?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(false);
+        }
+        let title = title_from_prompt(trimmed);
+        if title == "New conversation" {
+            return Ok(false);
+        }
+        let now = now_ms()?;
+        let rows = self.connection.execute(
+            "UPDATE conversations
+                SET title = ?2, updated_at_ms = ?3
+              WHERE id = ?1 AND title = 'New conversation'",
+            params![conversation_id.as_str(), title, now],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn begin_turn(&mut self, input: BeginTurn) -> Result<BeginTurnOutcome, ConversationError> {
         let conversation_id = self
             .active_conversation
@@ -986,11 +1066,17 @@ impl ConversationEngine {
                 self.session_id,
             ],
         )?;
+        let display_text = input
+            .display_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty() && *text != input.prompt.as_str());
+        let title_prompt = display_text.unwrap_or(input.prompt.as_str());
         transaction.execute(
             "INSERT INTO messages
-                (id, turn_id, ordinal, role, text, state, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, 0, 'user', ?3, 'complete', ?4, ?4)",
-            params![message_id, turn_id.as_str(), input.prompt, now],
+                (id, turn_id, ordinal, role, text, display_text, state, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, 0, 'user', ?3, ?4, 'complete', ?5, ?5)",
+            params![message_id, turn_id.as_str(), input.prompt, display_text, now],
         )?;
         transaction.execute(
             "UPDATE conversations
@@ -999,7 +1085,7 @@ impl ConversationEngine {
               WHERE id = ?1",
             params![
                 conversation_id.as_str(),
-                title_from_prompt(&input.prompt),
+                title_from_prompt(title_prompt),
                 now
             ],
         )?;
@@ -1465,7 +1551,7 @@ impl ConversationEngine {
 
         let mut message_statement = self.connection.prepare(
             "SELECT m.id, m.turn_id, t.seq, t.requested_agent,
-                    m.role, m.text, m.state
+                    m.role, m.text, m.state, m.display_text
                FROM messages m
                JOIN turns t ON t.id = m.turn_id
               WHERE t.conversation_id = ?1
@@ -1473,13 +1559,20 @@ impl ConversationEngine {
         )?;
         let messages = message_statement
             .query_map([conversation_id.as_str()], |row| {
+                let role = MessageRole::from_db(&row.get::<_, String>(4)?)?;
+                let display_text: Option<String> = if role == MessageRole::Assistant {
+                    None
+                } else {
+                    row.get(7)?
+                };
                 Ok(TranscriptMessage {
                     id: row.get(0)?,
                     turn_id: TurnId::new(row.get::<_, String>(1)?),
                     turn_seq: row.get(2)?,
                     agent: AgentKey::from_db(&row.get::<_, String>(3)?)?,
-                    role: MessageRole::from_db(&row.get::<_, String>(4)?)?,
+                    role,
                     text: row.get(5)?,
+                    display_text,
                     state: MessageState::from_db(&row.get::<_, String>(6)?)?,
                 })
             })?
@@ -1502,13 +1595,139 @@ impl ConversationEngine {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
+        let mut activity_statement = self.connection.prepare(
+            "SELECT a.turn_id, a.ordinal, a.payload_json
+               FROM activities a
+               JOIN turns t ON t.id = a.turn_id
+              WHERE t.conversation_id = ?1
+              ORDER BY t.seq, a.ordinal",
+        )?;
+        let mut activities = Vec::new();
+        let mut rows = activity_statement.query([conversation_id.as_str()])?;
+        while let Some(row) = rows.next()? {
+            let turn_id = TurnId::new(row.get::<_, String>(0)?);
+            let ordinal: i64 = row.get(1)?;
+            let payload_json: String = row.get(2)?;
+            if let Ok(item) = serde_json::from_str::<ActivityItem>(&payload_json) {
+                activities.push(TurnActivity {
+                    turn_id,
+                    ordinal,
+                    item,
+                });
+            }
+        }
+
         Ok(ConversationSnapshot {
             id: conversation_id.clone(),
             title,
             turns,
             messages,
             bindings,
+            activities,
         })
+    }
+
+    pub fn record_activity(
+        &mut self,
+        turn_id: &TurnId,
+        item: ActivityItem,
+    ) -> Result<(), ConversationError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let turn_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM turns WHERE id = ?1)",
+            [turn_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if !turn_exists {
+            return Err(ConversationError::InvalidOutput(format!(
+                "unknown turn {turn_id}"
+            )));
+        }
+
+        let mut items = Vec::new();
+        {
+            let mut statement = transaction.prepare(
+                "SELECT ordinal, payload_json FROM activities WHERE turn_id = ?1 ORDER BY ordinal",
+            )?;
+            let mut rows = statement.query([turn_id.as_str()])?;
+            while let Some(row) = rows.next()? {
+                let payload_json: String = row.get(1)?;
+                if let Ok(deserialized) = serde_json::from_str::<ActivityItem>(&payload_json) {
+                    items.push(deserialized);
+                }
+            }
+        }
+
+        let idx = merge_activity(&mut items, item);
+        if idx >= MAX_ACTIVITIES_PER_TURN {
+            return Ok(());
+        }
+
+        let target_item = &mut items[idx];
+        match target_item {
+            ActivityItem::Tool { detail, .. } => {
+                if detail.chars().count() > MAX_ACTIVITY_TEXT_CHARS {
+                    let bounded = truncate_chars(detail, MAX_ACTIVITY_TEXT_CHARS);
+                    *detail = bounded.to_owned();
+                }
+            }
+            ActivityItem::Thinking { text, .. } => {
+                if text.chars().count() > MAX_ACTIVITY_TEXT_CHARS {
+                    let bounded = truncate_chars(text, MAX_ACTIVITY_TEXT_CHARS);
+                    *text = bounded.to_owned();
+                }
+            }
+        }
+
+        let kind = match target_item {
+            ActivityItem::Tool { .. } => "tool",
+            ActivityItem::Thinking { .. } => "thinking",
+        };
+        let state = match target_item {
+            ActivityItem::Tool { status, .. } => match status {
+                ToolStatus::Running => "running",
+                ToolStatus::Ok => "ok",
+                ToolStatus::Failed => "failed",
+            },
+            ActivityItem::Thinking { finished_ms, .. } => {
+                if finished_ms.is_none() {
+                    "live"
+                } else {
+                    "done"
+                }
+            }
+        };
+        let summary_raw = collapsed_line(target_item);
+        let summary = truncate_chars(&summary_raw, 200);
+        let payload_json = serde_json::to_string(target_item)?;
+        let now = now_ms()?;
+
+        transaction.execute(
+            "INSERT INTO activities
+                (turn_id, ordinal, kind, summary, state, payload_json, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(turn_id, ordinal) DO UPDATE SET
+                 kind = excluded.kind,
+                 summary = excluded.summary,
+                 state = excluded.state,
+                 payload_json = excluded.payload_json,
+                 updated_at_ms = excluded.updated_at_ms",
+            params![
+                turn_id.as_str(),
+                idx as i64,
+                kind,
+                summary,
+                state,
+                payload_json,
+                now,
+            ],
+        )?;
+
+        transaction.commit()?;
+        Ok(())
     }
 }
 
@@ -1851,6 +2070,13 @@ fn normalize_workspace(path: &Path) -> Result<String, ConversationError> {
     crate::workspace::normalize_workspace_path(path).map_err(ConversationError::from)
 }
 
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
 fn title_from_prompt(prompt: &str) -> String {
     let title = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = title.chars();
@@ -2002,7 +2228,7 @@ mod schema_v2_tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         connection
             .execute(
                 "INSERT INTO turns (id, conversation_id, seq, requested_agent, status, created_at_ms)

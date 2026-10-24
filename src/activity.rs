@@ -124,7 +124,8 @@ impl Default for UiSettings {
 }
 
 /// Execution status of a tool call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolStatus {
     Running,
     Ok,
@@ -132,7 +133,8 @@ pub enum ToolStatus {
 }
 
 /// Ephemeral activity item representing a tool invocation or model thinking stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActivityItem {
     Tool {
         name: String,
@@ -155,6 +157,82 @@ impl ActivityItem {
 
     pub fn is_thinking(&self) -> bool {
         matches!(self, Self::Thinking { .. })
+    }
+}
+
+/// Merges an incoming activity item into an existing sequence.
+///
+/// Follows the presentation rules of `App::merge_activity_item`:
+/// - A `Tool` replaces the most recent `Running` tool with the same `name`, else is pushed.
+/// - A `Thinking` merges into the most recent `Thinking` whose `finished_ms` is `None`
+///   (setting `finished_ms` if incoming has it, setting `started_ms` if existing is 0 and
+///   incoming is non-zero, and appending incoming text), else is pushed.
+///
+/// Returns the index in `items` that was updated or pushed.
+pub fn merge_activity(items: &mut Vec<ActivityItem>, item: ActivityItem) -> usize {
+    match item {
+        ActivityItem::Tool { ref name, .. } => {
+            let found = items.iter().rposition(|existing| {
+                matches!(
+                    existing,
+                    ActivityItem::Tool {
+                        name: existing_name,
+                        status: ToolStatus::Running,
+                        ..
+                    } if existing_name == name
+                )
+            });
+
+            if let Some(index) = found {
+                items[index] = item;
+                index
+            } else {
+                items.push(item);
+                items.len() - 1
+            }
+        }
+        ActivityItem::Thinking {
+            text: incoming_text,
+            started_ms: incoming_started,
+            finished_ms: incoming_finished,
+        } => {
+            let found = items.iter().rposition(|existing| {
+                matches!(
+                    existing,
+                    ActivityItem::Thinking {
+                        finished_ms: None,
+                        ..
+                    }
+                )
+            });
+
+            if let Some(index) = found {
+                if let ActivityItem::Thinking {
+                    text: existing_text,
+                    started_ms: existing_started,
+                    finished_ms: existing_finished,
+                } = &mut items[index]
+                {
+                    if incoming_finished.is_some() {
+                        *existing_finished = incoming_finished;
+                    }
+                    if *existing_started == 0 && incoming_started != 0 {
+                        *existing_started = incoming_started;
+                    }
+                    if !incoming_text.is_empty() {
+                        existing_text.push_str(&incoming_text);
+                    }
+                }
+                index
+            } else {
+                items.push(ActivityItem::Thinking {
+                    text: incoming_text,
+                    started_ms: incoming_started,
+                    finished_ms: incoming_finished,
+                });
+                items.len() - 1
+            }
+        }
     }
 }
 
@@ -943,5 +1021,152 @@ mod tests {
         from_agy_step_tool_fixtures();
         from_agy_step_thinking_fixtures();
         from_agy_step_unknown_events_return_none();
+    }
+
+    // TC-1904 / FR-1904: ActivityItem and ToolStatus serde round-trips and merge_activity rules.
+    #[test]
+    fn tc_1904_activity_item_serde_and_merge_rules() {
+        // 1. Serde round-trips
+        let tool_running = ActivityItem::Tool {
+            name: "read_file".to_string(),
+            target: "src/main.rs".to_string(),
+            status: ToolStatus::Running,
+            duration_ms: None,
+            detail: "reading file".to_string(),
+        };
+        let tool_json = serde_json::to_string(&tool_running).expect("serialize tool");
+        assert!(tool_json.contains(r#""type":"tool""#));
+        assert!(tool_json.contains(r#""status":"running""#));
+        let tool_de: ActivityItem = serde_json::from_str(&tool_json).expect("deserialize tool");
+        assert_eq!(tool_running, tool_de);
+
+        let thinking_live = ActivityItem::Thinking {
+            text: "Initial thought".to_string(),
+            started_ms: 1000,
+            finished_ms: None,
+        };
+        let thinking_json = serde_json::to_string(&thinking_live).expect("serialize thinking");
+        assert!(thinking_json.contains(r#""type":"thinking""#));
+        let thinking_de: ActivityItem =
+            serde_json::from_str(&thinking_json).expect("deserialize thinking");
+        assert_eq!(thinking_live, thinking_de);
+
+        // Tool status variants
+        for (status, expected_str) in [
+            (ToolStatus::Running, "\"running\""),
+            (ToolStatus::Ok, "\"ok\""),
+            (ToolStatus::Failed, "\"failed\""),
+        ] {
+            let json = serde_json::to_string(&status).expect("serialize status");
+            assert_eq!(json, expected_str);
+            let de: ToolStatus = serde_json::from_str(&json).expect("deserialize status");
+            assert_eq!(de, status);
+        }
+
+        // 2. merge_activity rules
+        let mut items = Vec::new();
+
+        // Push new tool (Running)
+        let idx0 = merge_activity(&mut items, tool_running.clone());
+        assert_eq!(idx0, 0);
+        assert_eq!(items.len(), 1);
+
+        // Push another distinct tool (Running)
+        let tool_exec = ActivityItem::Tool {
+            name: "run_command".to_string(),
+            target: "cargo test".to_string(),
+            status: ToolStatus::Running,
+            duration_ms: None,
+            detail: "testing".to_string(),
+        };
+        let idx1 = merge_activity(&mut items, tool_exec);
+        assert_eq!(idx1, 1);
+        assert_eq!(items.len(), 2);
+
+        // Tool replacement: incoming completed tool replaces the most recent running tool with same name
+        let tool_completed = ActivityItem::Tool {
+            name: "read_file".to_string(),
+            target: "src/main.rs".to_string(),
+            status: ToolStatus::Ok,
+            duration_ms: Some(150),
+            detail: "read 50 lines".to_string(),
+        };
+        let idx_replace = merge_activity(&mut items, tool_completed.clone());
+        assert_eq!(idx_replace, 0);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], tool_completed);
+
+        // A new tool with same name after completion is pushed (no running tool to replace)
+        let tool_read_again = ActivityItem::Tool {
+            name: "read_file".to_string(),
+            target: "src/lib.rs".to_string(),
+            status: ToolStatus::Running,
+            duration_ms: None,
+            detail: "reading lib".to_string(),
+        };
+        let idx2 = merge_activity(&mut items, tool_read_again);
+        assert_eq!(idx2, 2);
+        assert_eq!(items.len(), 3);
+
+        // Thinking merging:
+        // Push initial live thinking
+        let idx3 = merge_activity(&mut items, thinking_live);
+        assert_eq!(idx3, 3);
+        assert_eq!(items.len(), 4);
+
+        // Incoming thinking delta: merges into live thinking (finished_ms == None)
+        let thinking_delta = ActivityItem::Thinking {
+            text: "... more thoughts".to_string(),
+            started_ms: 0,
+            finished_ms: None,
+        };
+        let idx_delta = merge_activity(&mut items, thinking_delta);
+        assert_eq!(idx_delta, 3);
+        assert_eq!(items.len(), 4);
+        if let ActivityItem::Thinking {
+            text,
+            started_ms,
+            finished_ms,
+        } = &items[3]
+        {
+            assert_eq!(text, "Initial thought... more thoughts");
+            assert_eq!(*started_ms, 1000);
+            assert_eq!(*finished_ms, None);
+        } else {
+            panic!("expected thinking at index 3");
+        }
+
+        // Incoming thinking completion: updates finished_ms and appends remaining text
+        let thinking_finish = ActivityItem::Thinking {
+            text: " (done)".to_string(),
+            started_ms: 0,
+            finished_ms: Some(2500),
+        };
+        let idx_finish = merge_activity(&mut items, thinking_finish);
+        assert_eq!(idx_finish, 3);
+        assert_eq!(items.len(), 4);
+        if let ActivityItem::Thinking {
+            text,
+            started_ms,
+            finished_ms,
+        } = &items[3]
+        {
+            assert_eq!(text, "Initial thought... more thoughts (done)");
+            assert_eq!(*started_ms, 1000);
+            assert_eq!(*finished_ms, Some(2500));
+        } else {
+            panic!("expected thinking at index 3");
+        }
+
+        // New thinking after completion is pushed (no unfinished thinking)
+        let new_thinking = ActivityItem::Thinking {
+            text: "Second reasoning phase".to_string(),
+            started_ms: 3000,
+            finished_ms: None,
+        };
+        let idx4 = merge_activity(&mut items, new_thinking.clone());
+        assert_eq!(idx4, 4);
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[4], new_thinking);
     }
 }
