@@ -559,6 +559,8 @@ async fn run_turn(
         .then(|| dmuxai::grok_activity::GrokToolTracker::new(cwd));
     let mut done = false;
     let mut checked_first_nonempty_stdout = false;
+    let mut last_stdout_produced_text = false;
+    let mut jsonl_error_eligible = false;
     let stall_policy = settings
         .runner_fallback
         .stall_policy_for(&spec.name.to_ascii_lowercase());
@@ -615,6 +617,9 @@ async fn run_turn(
                 break supervised.finish(DONE_EXIT_GRACE).await;
             }
             dmuxai::process::supervisor::LineEvent::Line(line) => {
+                let is_non_empty = !line.trim().is_empty();
+                let mut line_produced_text = false;
+
                 if let Some(detector) = &mut stall_detector {
                     let now = std::time::Instant::now();
                     if dmuxai::runner_fallback::is_api_retry_line(&line) {
@@ -671,6 +676,9 @@ async fn run_turn(
                 match effective_output {
                     CustomAgentOutput::Text => {
                         let chunk = format!("{line}\n");
+                        if is_non_empty {
+                            line_produced_text = true;
+                        }
                         reply.push_str(&chunk);
                         send(event_tx, agent, Some(context), AgentEvent::TextDelta(chunk)).await;
                     }
@@ -694,6 +702,9 @@ async fn run_turn(
                             .await;
                         }
                         if let Some(text) = parsed.text {
+                            if !text.is_empty() {
+                                line_produced_text = true;
+                            }
                             let chunk = dmuxai::custom_agent::append_reply_text(
                                 &mut reply,
                                 &text,
@@ -706,13 +717,22 @@ async fn run_turn(
                             break_pending = true;
                         }
                         if let Some(error) = parsed.error {
-                            jsonl_error = Some(error);
+                            if !error.trim().is_empty() {
+                                if jsonl_error.is_none() || line_produced_text {
+                                    jsonl_error_eligible =
+                                        line_produced_text || last_stdout_produced_text;
+                                }
+                                jsonl_error = Some(error);
+                            }
                         }
                         if parsed.done {
                             done = true;
                             break supervised.finish(DONE_EXIT_GRACE).await;
                         }
                     }
+                }
+                if is_non_empty {
+                    last_stdout_produced_text = line_produced_text;
                 }
             }
         }
@@ -735,8 +755,19 @@ async fn run_turn(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| stderr_text.trim());
 
+        let error_at_final = if jsonl_error
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+        {
+            jsonl_error_eligible
+        } else {
+            last_stdout_produced_text
+        };
+
         if !is_policy
             && !reply.trim().is_empty()
+            && error_at_final
             && dmuxai::runner_fallback::is_transient_provider_error(err_candidate)
         {
             let truncated: String = err_candidate.chars().take(200).collect();
@@ -2076,8 +2107,6 @@ system_prompt_arg = ["--system", "{system_prompt}"]
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
-        let notice_shown = AtomicBool::new(false);
-        let mcp = RunnerMcp::for_runner(&[], &spec.name);
         let result = run_turn(
             Agent::Custom(0),
             spec,
@@ -2088,8 +2117,6 @@ system_prompt_arg = ["--system", "{system_prompt}"]
             &tx,
             &context,
             &pgid,
-            &mcp,
-            &notice_shown,
             None,
         )
         .await;
@@ -2144,6 +2171,32 @@ error_path = ["/result/error"]
         let (result, _events) = run_custom_turn_in_dir(spec, ws.path()).await;
 
         assert!(result.is_err(), "non-transient error must fail: {result:?}");
+    }
+
+    // TC-2112 / FR-2112: mid-turn transient error still fails when not after final answer.
+    #[tokio::test]
+    async fn tc_2112_custom_mid_turn_transient_error_still_fails() {
+        let ws = tempfile::tempdir().unwrap();
+        let toml = r#"
+name = "tc_2112_mid_turn"
+command = ["sh", "-c", "printf '{\"event\":\"result\",\"result\":{\"response\":\"starting\"}}\n'; printf '{\"type\":\"tool_use\"}\n'; printf '{\"result\":{\"error\":\"API error (attempt 2): request failed\"}}\n'; exit 1"]
+output = "jsonl"
+text_path = "/result/response"
+error_path = ["/result/error"]
+"#;
+        let spec: &'static CustomAgentSpec = Box::leak(Box::new(toml::from_str(toml).unwrap()));
+        let (result, events) = run_custom_turn_in_dir(spec, ws.path()).await;
+
+        assert!(
+            matches!(result, Err(ref err) if err.kind() == crate::agent::AgentErrorKind::Provider),
+            "expected Err provider, got: {result:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(msg) if msg.contains("#151"))),
+            "must not emit Notice with '#151': {events:?}"
+        );
     }
 
     // TC-2116 / FR-2116: agent with keepalive lines stalls when no progress is made.

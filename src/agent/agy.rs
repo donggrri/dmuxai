@@ -611,20 +611,17 @@ async fn stream_child(
                         let step_state = message
                             .pointer("/step_update/state")
                             .and_then(Value::as_str);
-                        if step_type == Some("agent_response")
+                        if step_type == Some("tool") {
+                            if step_state == Some("ACTIVE") {
+                                detector.observe_tool_started(now);
+                            } else {
+                                detector.observe_tool_finished(now);
+                            }
+                        } else if step_type == Some("agent_response")
                             || step_type == Some("thinking")
                             || step_state == Some("DONE")
                         {
                             detector.observe_progress(now);
-                        } else if step_type == Some("tool") && step_state == Some("ACTIVE") {
-                            detector.observe_tool_started(now);
-                        } else if step_type == Some("tool")
-                            && matches!(
-                                step_state,
-                                Some("DONE" | "ERROR" | "CANCELED" | "CANCELLED")
-                            )
-                        {
-                            detector.observe_tool_finished(now);
                         } else {
                             detector.observe_keepalive();
                         }
@@ -679,29 +676,15 @@ async fn stream_child(
     };
 
     let writes_observed = implement_tracker.writes_observed();
-    if let Some(AgentEvent::Error(err)) = &state.pending_terminal {
-        if writes_observed && dmuxai::runner_fallback::is_transient_provider_error(&err.message) {
-            let truncated: String = err.message.chars().take(200).collect();
-            send_event(
-                event_tx,
-                Some(context),
-                AgentEvent::Notice(format!(
-                    "AGY reported a provider error after finishing its work ({truncated}); the result was kept (#151)."
-                )),
-            )
-            .await;
-            state.pending_terminal = Some(AgentEvent::Completed);
-            state.recovered_transient_error = true;
-        }
-    }
-
     let diagnostic = dmuxai::process::supervisor::tail_lines(
         &supervised.stderr_tail().await,
         STDERR_HISTORY_CAPACITY,
     );
     let protocol_completed = state.pending_terminal.is_some();
     let require_writes = false;
-    let exit_forced_after_result = killed_after_result || state.recovered_transient_error;
+    let exit_forced_after_result = killed_after_result
+        || state.recovered_transient_error
+        || matches!(state.pending_terminal, Some(AgentEvent::Error(_)));
     if let Err(reason) = implement_tracker.finish(
         &status,
         &diagnostic,
@@ -753,6 +736,8 @@ struct AgyStreamState {
     pending_terminal: Option<AgentEvent>,
     response_text: String,
     recovered_transient_error: bool,
+    last_step_type: Option<String>,
+    last_step_state: Option<String>,
 }
 
 fn denied_actions_summary(message: &Value) -> Option<String> {
@@ -786,6 +771,17 @@ fn normalize_event(
     {
         state.conversation_id = Some(conversation_id.to_owned());
         events.push(AgentEvent::ProviderSessionBound(conversation_id.to_owned()));
+    }
+
+    if message.get("event").and_then(Value::as_str) == Some("step_update") {
+        state.last_step_type = message
+            .pointer("/step_update/step_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        state.last_step_state = message
+            .pointer("/step_update/state")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
     }
 
     match message.get("event").and_then(Value::as_str) {
@@ -856,8 +852,14 @@ fn normalize_event(
                         .pointer("/result/error")
                         .and_then(Value::as_str)
                         .unwrap_or("AGY turn failed");
-                    let has_text = state.emitted_text || !state.response_text.trim().is_empty();
-                    if has_text && dmuxai::runner_fallback::is_transient_provider_error(err_msg) {
+                    let final_answer_done = state.last_step_type.as_deref()
+                        == Some("agent_response")
+                        && state.last_step_state.as_deref() == Some("DONE");
+                    let has_nonempty_text = !state.response_text.trim().is_empty();
+                    if final_answer_done
+                        && has_nonempty_text
+                        && dmuxai::runner_fallback::is_transient_provider_error(err_msg)
+                    {
                         let truncated: String = err_msg.chars().take(200).collect();
                         events.push(AgentEvent::Notice(format!(
                             "AGY reported a provider error after finishing its work ({truncated}); the result was kept (#151)."
@@ -2094,6 +2096,7 @@ mod tests {
                 "event": "step_update",
                 "step_update": {
                     "step_type": "agent_response",
+                    "state": "DONE",
                     "text_delta": "done work"
                 }
             });
@@ -2159,6 +2162,7 @@ mod tests {
                 "event": "step_update",
                 "step_update": {
                     "step_type": "agent_response",
+                    "state": "DONE",
                     "text_delta": "done work"
                 }
             });
@@ -2205,6 +2209,84 @@ mod tests {
         assert!(
             !events.iter().any(|e| matches!(e, AgentEvent::Completed)),
             "must not emit Completed: {events:?}"
+        );
+    }
+
+    // TC-2111 / FR-2111: mid-turn transient API error still fails (runner fallback can take over).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2111_agy_mid_turn_api_error_still_fails() {
+        let (_dir, fake) = write_fake_agy(|_| {
+            let start = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "text_delta": "I'll start"
+                }
+            });
+            let tool_act = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "ACTIVE"
+                }
+            });
+            let tool_done = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "DONE"
+                }
+            });
+            let err = json!({
+                "event": "result",
+                "result": {
+                    "status": "ERROR",
+                    "error": "API error (attempt 3): request failed: connection timed out"
+                }
+            });
+            format!(
+                "#!/bin/sh\ncat > /dev/null\ncat << 'EOF'\n{}\n{}\n{}\n{}\nEOF\nexit 1\n",
+                start, tool_act, tool_done, err
+            )
+        });
+
+        let ws = tempfile::tempdir().expect("ws tempdir");
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("fake-conversation"),
+            turn_id: super::super::TurnId::new("fake-turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+
+        let outcome = with_agy_spawn_env(&fake, "0", async {
+            run_turn(&request, None, ws.path(), &event_tx).await
+        })
+        .await;
+
+        let mut events = Vec::new();
+        while let Ok(out) = event_rx.try_recv() {
+            events.push(out.event);
+        }
+
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Error(err) if err.kind() == crate::agent::AgentErrorKind::Provider)),
+            "expected Error event with kind Provider in events: {events:?}, outcome={outcome:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Completed)),
+            "must not emit Completed: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(msg) if msg.contains("#151"))),
+            "must not emit #151 Notice: {events:?}"
         );
     }
 
@@ -2292,6 +2374,78 @@ mod tests {
             events.push(out.event);
         }
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Completed)));
+    }
+
+    // TC-2117 / FR-2117: stall detector fires after a tool finishes if no progress occurs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2117_agy_stall_fires_after_tool_finished() {
+        let ws = tempfile::tempdir().expect("ws tempdir");
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            "[runners.agy]\nfallback = [\"opencode\"]\nstall_timeout_secs = 1\n",
+        )
+        .expect("write dmuxai.toml");
+
+        let (_dir, fake) = write_fake_agy(|_| {
+            let tool_act = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "ACTIVE"
+                }
+            });
+            let tool_done = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "DONE"
+                }
+            });
+            format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\nsleep 30\nexit 0\n",
+                tool_act, tool_done
+            )
+        });
+
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("fake-conversation"),
+            turn_id: super::super::TurnId::new("fake-turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+
+        let outcome = with_agy_spawn_env(&fake, "0", async {
+            let xdg_dir = tempfile::tempdir().expect("xdg tempdir");
+            let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+            }
+            let res = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_turn(&request, None, ws.path(), &event_tx),
+            )
+            .await
+            .expect("must complete within 5s");
+            unsafe {
+                match saved_xdg {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            res
+        })
+        .await;
+
+        assert!(
+            matches!(outcome, Err(ref err) if err.kind() == crate::agent::AgentErrorKind::Stalled),
+            "expected Stalled error within 5s, got: {outcome:?}"
+        );
     }
 
     // TC-2117 / FR-2117: no stall detector without fallback chain.
