@@ -16,12 +16,12 @@ pub(crate) enum TodoFinish {
 
 #[derive(Default)]
 pub(crate) struct TodoLinks {
-    pub(crate) store: Option<Arc<TodoStore>>,
-    pub(crate) turns: HashMap<(Agent, StoredTurnId), String>,
-    pub(crate) graph: Option<(String, String)>,
-    pub(crate) pending_graph: Option<String>,
-    pub(crate) pending_run_id: Option<String>,
-    pub(crate) submitting_run: bool,
+    store: Option<Arc<TodoStore>>,
+    turns: HashMap<(Agent, StoredTurnId), String>,
+    graph: Option<(String, String)>,
+    pending_graph: Option<String>,
+    pending_run_id: Option<String>,
+    submitting_run: bool,
 }
 
 impl TodoLinks {
@@ -31,6 +31,39 @@ impl TodoLinks {
 
     pub(crate) fn store(&self) -> Option<&Arc<TodoStore>> {
         self.store.as_ref()
+    }
+
+    pub(crate) fn turn_todo(&self, agent: Agent, turn_id: &StoredTurnId) -> Option<String> {
+        self.turns.get(&(agent, turn_id.clone())).cloned()
+    }
+
+    pub(crate) fn take_pending_run_id(&mut self) -> Option<String> {
+        self.pending_run_id.take()
+    }
+
+    pub(crate) fn has_links(&self) -> bool {
+        !self.turns.is_empty() || self.graph.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_graph(&mut self, plan_id: impl Into<String>, todo_id: impl Into<String>) {
+        self.graph = Some((plan_id.into(), todo_id.into()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_graph(&self) -> bool {
+        self.pending_graph.is_some()
+    }
+
+    fn finish_id(&self, todo_id: &str, success: bool, error: Option<String>) -> TodoFinish {
+        if let Some(store) = &self.store {
+            match store.finish_run(todo_id, success, error) {
+                Ok(_) => TodoFinish::Finished,
+                Err(err) => TodoFinish::Failed(err.to_string()),
+            }
+        } else {
+            TodoFinish::Finished
+        }
     }
 
     pub(crate) fn link_turn(
@@ -52,14 +85,7 @@ impl TodoLinks {
         let Some(todo_id) = self.turns.remove(&(agent, turn_id.clone())) else {
             return TodoFinish::NotLinked;
         };
-        if let Some(store) = &self.store {
-            match store.finish_run(&todo_id, success, error) {
-                Ok(_) => TodoFinish::Finished,
-                Err(err) => TodoFinish::Failed(err.to_string()),
-            }
-        } else {
-            TodoFinish::Finished
-        }
+        self.finish_id(&todo_id, success, error)
     }
 
     pub(crate) fn begin_pending_graph(
@@ -71,18 +97,17 @@ impl TodoLinks {
         self.pending_run_id = Some(run_ref.into());
     }
 
-    #[allow(dead_code)]
     pub(crate) fn clear_pending_graph(&mut self) {
         self.pending_graph = None;
         self.pending_run_id = None;
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn pending_run_id(&self) -> Option<&str> {
         self.pending_run_id.as_deref()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn pending_graph(&self) -> Option<&str> {
         self.pending_graph.as_deref()
     }
@@ -126,28 +151,14 @@ impl TodoLinks {
             return TodoFinish::NotLinked;
         };
         self.graph = None;
-        if let Some(store) = &self.store {
-            match store.finish_run(&todo_id, success, error) {
-                Ok(_) => TodoFinish::Finished,
-                Err(err) => TodoFinish::Failed(err.to_string()),
-            }
-        } else {
-            TodoFinish::Finished
-        }
+        self.finish_id(&todo_id, success, error)
     }
 
     pub(crate) fn finish_graph(&mut self, success: bool, error: Option<String>) -> TodoFinish {
         let Some((_plan_id, todo_id)) = self.graph.take() else {
             return TodoFinish::NotLinked;
         };
-        if let Some(store) = &self.store {
-            match store.finish_run(&todo_id, success, error) {
-                Ok(_) => TodoFinish::Finished,
-                Err(err) => TodoFinish::Failed(err.to_string()),
-            }
-        } else {
-            TodoFinish::Finished
-        }
+        self.finish_id(&todo_id, success, error)
     }
 
     pub(crate) fn finish_linked(
@@ -168,14 +179,7 @@ impl TodoLinks {
         self.graph = None;
         self.pending_graph = None;
         self.pending_run_id = None;
-        if let Some(store) = &self.store {
-            match store.finish_run(&todo_id, success, error) {
-                Ok(_) => TodoFinish::Finished,
-                Err(err) => TodoFinish::Failed(err.to_string()),
-            }
-        } else {
-            TodoFinish::Finished
-        }
+        self.finish_id(&todo_id, success, error)
     }
 
     pub(crate) fn finish_all(&mut self, reason: impl Into<String>) -> Vec<String> {
@@ -219,9 +223,10 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    fn make_store() -> Arc<TodoStore> {
+    fn make_store() -> (tempfile::TempDir, Arc<TodoStore>) {
         let dir = tempdir().unwrap();
-        Arc::new(TodoStore::open(&dir.path().join("todos.db")).unwrap())
+        let store = Arc::new(TodoStore::open(&dir.path().join("todos.db")).unwrap());
+        (dir, store)
     }
 
     fn create_todo(store: &Arc<TodoStore>) -> String {
@@ -239,7 +244,7 @@ mod tests {
     // TC-2020
     #[test]
     fn tc_2020_todo_links_turn_finish() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let mut links = TodoLinks::default();
         links.attach_store(store.clone());
         let todo_id = create_todo(&store);
@@ -258,7 +263,7 @@ mod tests {
     // TC-2021
     #[test]
     fn tc_2021_pending_graph_commit_and_new_run_link() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let mut links = TodoLinks::default();
         links.attach_store(store.clone());
         let todo_id = create_todo(&store);
@@ -306,7 +311,7 @@ mod tests {
     // TC-2022
     #[test]
     fn tc_2022_finish_linked_resolution_order() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let mut links = TodoLinks::default();
         links.attach_store(store.clone());
         let graph_todo = create_todo(&store);
@@ -350,7 +355,7 @@ mod tests {
     // TC-2023
     #[test]
     fn tc_2023_finish_all_on_shutdown() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let mut links = TodoLinks::default();
         links.attach_store(store.clone());
         let t1 = create_todo(&store);

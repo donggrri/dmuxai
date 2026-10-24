@@ -18,6 +18,8 @@ To-do run links in `src/app.rs` are consolidated into a dedicated `src/todo_link
 - `TodoLinks` owning store, turn links, graph link, pending graph link, pending run id, and submitting flag.
 - Methods for linking and finishing turns, pending graph commit, graph and linked finishing, shutdown drain, and submitting flag access.
 - `App::report_todo_finish` shared reporting helper.
+- `App::finish_linked_graph_todo` shared helper for the three graph-linked finishing sites.
+- `TodoLinks` accessors `turn_todo`, `take_pending_run_id`, and `has_links` (fields are private).
 
 ### Out of scope / non-goals
 

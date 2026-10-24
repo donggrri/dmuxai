@@ -2119,7 +2119,7 @@ impl App {
         self.streaming_messages.clear();
 
         if self.todos.store().is_some() {
-            let changed = !self.todos.turns.is_empty() || self.todos.graph.is_some();
+            let changed = self.todos.has_links();
             let errors = self.todos.finish_all("dmuxai exited".to_owned());
             for err in errors {
                 self.push_system(format!("Failed to finish to-do run on shutdown: {err}"));
@@ -3418,12 +3418,9 @@ impl App {
             .as_ref()
             .map(|a| a.conversation_id.as_str().to_owned())
             .or_else(|| Some(self.conversation_id.as_str().to_owned()));
-        let todo = active.as_ref().and_then(|a| {
-            self.todos
-                .turns
-                .get(&(output.agent, a.turn_id.clone()))
-                .cloned()
-        });
+        let todo = active
+            .as_ref()
+            .and_then(|a| self.todos.turn_todo(output.agent, &a.turn_id));
         let node = self.graph_agent_nodes.get(&output.agent).cloned();
         let model = self
             .model_catalogs
@@ -5133,16 +5130,7 @@ impl App {
                 }
             }
             // FR-947: a cancelled plan of a to-do run sends the to-do back to open.
-            let last_run_todo = self
-                .last_graph_run
-                .as_ref()
-                .and_then(|run| run.todo_id.clone());
-            let finish = self.todos.finish_linked(
-                false,
-                Some("cancelled by user".to_owned()),
-                last_run_todo,
-            );
-            self.report_todo_finish(finish);
+            self.finish_linked_graph_todo(false, Some("cancelled by user".to_owned()));
             self.push_system(format!("{plan_agent} turn cancelled."));
             return;
         }
@@ -5191,16 +5179,7 @@ impl App {
             }
             self.last_graph_run = Some(run);
             // FR-947: a to-do whose judge turn is cancelled goes back to open.
-            let last_run_todo = self
-                .last_graph_run
-                .as_ref()
-                .and_then(|run| run.todo_id.clone());
-            let finish = self.todos.finish_linked(
-                false,
-                Some("cancelled by user".to_owned()),
-                last_run_todo,
-            );
-            self.report_todo_finish(finish);
+            self.finish_linked_graph_todo(false, Some("cancelled by user".to_owned()));
             self.push_system(format!("{agent} turn cancelled."));
             return;
         }
@@ -5685,8 +5664,7 @@ impl App {
         if is_trivial_prompt(&prompt) && heuristic_route(&prompt) == Route::Simple {
             let run_id = self
                 .todos
-                .pending_run_id
-                .take()
+                .take_pending_run_id()
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
             self.start_one_node_run(
                 prompt,
@@ -5728,8 +5706,7 @@ impl App {
         };
         let run_id = self
             .todos
-            .pending_run_id
-            .take()
+            .take_pending_run_id()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         match self.adapters[index].send(request) {
             Ok(()) => {
@@ -6853,14 +6830,7 @@ impl App {
         }
         self.graph_approval_stale = None;
         self.push_system("Plan rejected.".to_owned());
-        let last_run_todo = self
-            .last_graph_run
-            .as_ref()
-            .and_then(|run| run.todo_id.clone());
-        let finish =
-            self.todos
-                .finish_linked(false, Some("plan rejected".to_owned()), last_run_todo);
-        self.report_todo_finish(finish);
+        self.finish_linked_graph_todo(false, Some("plan rejected".to_owned()));
         Ok(())
     }
 
@@ -12237,11 +12207,7 @@ impl App {
         } else {
             lifecycle.last_to_state.clone()
         };
-        let todo = self
-            .todos
-            .turns
-            .get(&(agent, active.turn_id.clone()))
-            .cloned();
+        let todo = self.todos.turn_todo(agent, &active.turn_id);
         let node = self.graph_agent_nodes.get(&agent).cloned();
         let model = self
             .model_catalogs
@@ -12545,14 +12511,7 @@ impl App {
             self.push_system(format!("Could not save the cancelled plan: {error}"));
         }
         self.graph_approval_stale = None;
-        let last_run_todo = self
-            .last_graph_run
-            .as_ref()
-            .and_then(|run| run.todo_id.clone());
-        let finish = self
-            .todos
-            .finish_linked(false, Some(note.to_owned()), last_run_todo);
-        self.report_todo_finish(finish);
+        self.finish_linked_graph_todo(false, Some(note.to_owned()));
     }
 
     fn headless_active_run_phase(&self) -> GraphRunPhase {
@@ -13317,6 +13276,15 @@ impl App {
         if failed && self.todos.store().is_some() {
             self.publish_todos();
         }
+    }
+
+    fn finish_linked_graph_todo(&mut self, success: bool, error: Option<String>) {
+        let last_run_todo = self
+            .last_graph_run
+            .as_ref()
+            .and_then(|run| run.todo_id.clone());
+        let finish = self.todos.finish_linked(success, error, last_run_todo);
+        self.report_todo_finish(finish);
     }
 
     /// Publishes the current to-do list to the dashboard hub, if attached (FR-542).
@@ -18738,8 +18706,8 @@ mod tests {
         assert!(h.app.graph_session.is_none());
         assert_eq!(store.get(&todo.id).unwrap().status, TodoStatus::Done);
         // The to-do link is consumed by its run: nothing leaks into later prompts.
-        assert!(h.app.todos.pending_graph.is_none());
-        assert!(h.app.todos.pending_run_id.is_none());
+        assert!(!h.app.todos.has_pending_graph());
+        assert!(h.app.todos.take_pending_run_id().is_none());
 
         // Cancelling the judge turn of a to-do run sends the to-do back to open.
         let todo_cancel = store
@@ -18757,7 +18725,7 @@ mod tests {
         assert!(h.app.pending_triage.is_some());
         h.app.cancel_selected();
         assert_eq!(store.get(&todo_cancel.id).unwrap().status, TodoStatus::Open);
-        assert!(h.app.todos.pending_graph.is_none());
+        assert!(!h.app.todos.has_pending_graph());
         assert_eq!(
             store.get(&todo.id).unwrap().status,
             TodoStatus::Done,
@@ -19179,7 +19147,7 @@ mod tests {
 
         let plan_id = "test-abort-run";
         store.mark_running(&todo.id, "graph", plan_id).unwrap();
-        app.todos.graph = Some((plan_id.to_owned(), todo.id.clone()));
+        app.todos.set_graph(plan_id.to_owned(), todo.id.clone());
 
         let plan = dmuxai::graph::GraphPlan {
             schema: "cursor-agent-graph/v1".to_owned(),
