@@ -1415,6 +1415,8 @@ pub struct App {
     submitting_todo_run: bool,
     /// Display text for the next turn, consumed in try_submit_to_agent.
     pending_display_text: Option<String>,
+    /// Turn ids that already emitted a notice on failure to save durable activity (FR-1920).
+    activity_save_failed_turns: HashSet<String>,
     pub(crate) mcp_servers: Vec<ResolvedMcpServer>,
     mcp_registry: Arc<McpRegistry>,
     agy_mcp_notice_shown: bool,
@@ -1581,6 +1583,7 @@ impl App {
             headless_triage: None,
             submitting_todo_run: false,
             pending_display_text: None,
+            activity_save_failed_turns: HashSet::new(),
             exit: false,
             headless: false,
             selected: adapter_index(Agent::default()),
@@ -3535,6 +3538,18 @@ impl App {
                 self.observe_activity(output.agent, &output.event, Instant::now());
                 self.on_agent_lifecycle_event(output.agent, &output.event);
 
+                if let AgentEvent::Activity(item) = &output.event
+                    && let Err(error) = self
+                        .engine
+                        .record_activity(&StoredTurnId::new(turn_id.as_str()), item.clone())
+                    && self.activity_save_failed_turns.insert(turn_id.to_string())
+                {
+                    self.show_conversation_notice(
+                        &StoredConversationId::new(conversation_id.as_str()),
+                        format!("Could not save turn activity: {error}"),
+                    );
+                }
+
                 let Some(event) = stored_event(&output.event) else {
                     let background = conversation_id.as_str() != self.conversation_id.as_str();
                     if background
@@ -5253,8 +5268,25 @@ impl App {
                 .collect(),
         );
         let mut offscreen_anchors = OffscreenActivityAnchors::default();
+        let mut activities_by_turn: HashMap<StoredTurnId, Vec<dmuxai::activity::ActivityItem>> =
+            HashMap::new();
+        let mut stored_activity_turns: HashSet<StoredTurnId> = HashSet::new();
+        for activity in snapshot.activities {
+            stored_activity_turns.insert(activity.turn_id.clone());
+            activities_by_turn
+                .entry(activity.turn_id)
+                .or_default()
+                .push(activity.item);
+        }
         for turn in &snapshot.turns {
             let stored_turn_id = StoredTurnId::new(turn.id.as_str());
+            let mut turn_activities = activities_by_turn
+                .remove(&stored_turn_id)
+                .unwrap_or_default();
+            let has_assistant = snapshot.messages.iter().any(|message| {
+                message.turn_id == turn.id && message.role == MessageRole::Assistant
+            });
+
             for message in snapshot
                 .messages
                 .iter()
@@ -5267,8 +5299,16 @@ impl App {
                         offscreen_anchors
                             .after_user
                             .insert(stored_turn_id.clone(), index);
+                        if !has_assistant {
+                            for item in turn_activities.drain(..) {
+                                self.messages.push(Message::new(Role::Activity(item), ""));
+                            }
+                        }
                     }
                     MessageRole::Assistant => {
+                        for item in turn_activities.drain(..) {
+                            self.messages.push(Message::new(Role::Activity(item), ""));
+                        }
                         let index = self.messages.len();
                         offscreen_anchors
                             .before_assistant
@@ -5280,6 +5320,9 @@ impl App {
                         }
                     }
                 }
+            }
+            for item in turn_activities.drain(..) {
+                self.messages.push(Message::new(Role::Activity(item), ""));
             }
             if let Some(notice) = terminal_snapshot_notice(turn) {
                 self.messages.push(Message::new(Role::System, notice));
@@ -5293,7 +5336,11 @@ impl App {
             ));
         }
         let opened_conversation = self.conversation_id.clone();
-        self.inject_offscreen_activity_for_conversation(&opened_conversation, &offscreen_anchors);
+        self.inject_offscreen_activity_for_conversation(
+            &opened_conversation,
+            &offscreen_anchors,
+            &stored_activity_turns,
+        );
         if let Some(agent) = restored_runner {
             self.restore_conversation_runner(agent);
         }
@@ -10456,7 +10503,25 @@ impl App {
         &mut self,
         conversation_id: &StoredConversationId,
         anchors: &OffscreenActivityAnchors,
+        turns_with_stored_activity: &HashSet<StoredTurnId>,
     ) {
+        if let Some(retained) = self.retained_offscreen_activity.get_mut(conversation_id) {
+            for turn_id in turns_with_stored_activity {
+                if let Some(activity) = retained.get_mut(turn_id) {
+                    activity.retain(|message| !matches!(message.role, Role::Activity(_)));
+                }
+            }
+            retained.retain(|_, activity| !activity.is_empty());
+        }
+        for turn in self.active_turns.values_mut() {
+            if turn.conversation_id.as_str() == conversation_id.as_str()
+                && turns_with_stored_activity.contains(&turn.turn_id)
+            {
+                turn.offscreen_activity
+                    .retain(|message| !matches!(message.role, Role::Activity(_)));
+            }
+        }
+
         let mut by_turn = self
             .retained_offscreen_activity
             .get(conversation_id)
@@ -10472,31 +10537,33 @@ impl App {
                     .extend(turn.offscreen_activity.iter().cloned());
             }
         }
-        if by_turn.is_empty() {
-            return;
-        }
-        let mut entries: Vec<(StoredTurnId, Vec<Message>)> = by_turn.into_iter().collect();
-        entries.sort_by_key(|(turn_id, _)| {
-            if let Some(index) = anchors.before_assistant.get(turn_id) {
-                *index
-            } else if let Some(index) = anchors.after_user.get(turn_id) {
-                index + 1
-            } else {
-                usize::MAX
+        by_turn.retain(|_, activity| !activity.is_empty());
+
+        if !by_turn.is_empty() {
+            let mut entries: Vec<(StoredTurnId, Vec<Message>)> = by_turn.into_iter().collect();
+            entries.sort_by_key(|(turn_id, _)| {
+                if let Some(index) = anchors.before_assistant.get(turn_id) {
+                    *index
+                } else if let Some(index) = anchors.after_user.get(turn_id) {
+                    index + 1
+                } else {
+                    usize::MAX
+                }
+            });
+            for (turn_id, activity) in entries.into_iter().rev() {
+                let insert_at = if let Some(index) = anchors.before_assistant.get(&turn_id) {
+                    *index
+                } else if let Some(index) = anchors.after_user.get(&turn_id) {
+                    index + 1
+                } else {
+                    self.messages.len()
+                };
+                for (offset, message) in activity.into_iter().enumerate() {
+                    self.messages.insert(insert_at + offset, message);
+                }
             }
-        });
-        for (turn_id, activity) in entries.into_iter().rev() {
-            let insert_at = if let Some(index) = anchors.before_assistant.get(&turn_id) {
-                *index
-            } else if let Some(index) = anchors.after_user.get(&turn_id) {
-                index + 1
-            } else {
-                self.messages.len()
-            };
-            for (offset, message) in activity.into_iter().enumerate() {
-                self.messages.insert(insert_at + offset, message);
-            }
         }
+
         for (agent, turn) in self.active_turns.iter_mut() {
             if turn.conversation_id.as_str() == conversation_id.as_str() {
                 turn.offscreen_activity.clear();
@@ -31046,6 +31113,375 @@ mod tests {
                 .messages
                 .iter()
                 .any(|m| { matches!(m.role, Role::User) && m.content == "LEAKLABEL" })
+        );
+    }
+
+    // TC-1920 / FR-1920: foreground turn activity persists in SQLite and survives reload.
+    #[test]
+    fn tc_1920_foreground_activity_persists_and_restores_before_assistant() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("test.db");
+        let engine = ConversationEngine::open(&db_path, temp.path()).unwrap();
+        let (mut app, sent) = test_app_with_engine(engine);
+
+        app.input = "foreground work".to_owned();
+        app.submit_prompt();
+        let (agent, request) = sent.lock().unwrap()[0].clone();
+
+        // 1. Tool running -> Tool ok
+        assert!(app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "search".to_owned(),
+                target: "grep something".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        )));
+        assert!(app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "search".to_owned(),
+                target: "grep something".to_owned(),
+                status: dmuxai::activity::ToolStatus::Ok,
+                duration_ms: Some(40),
+                detail: "3 matches".to_owned(),
+            }),
+        )));
+
+        // 2. Thinking live -> Thinking finished
+        assert!(app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Thinking {
+                text: "pondering".to_owned(),
+                started_ms: 10,
+                finished_ms: None,
+            }),
+        )));
+        assert!(app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Thinking {
+                text: " solution".to_owned(),
+                started_ms: 0,
+                finished_ms: Some(50),
+            }),
+        )));
+
+        // 3. Text delta -> Completed
+        assert!(app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::TextDelta("final answer".to_owned()),
+        )));
+        assert!(app.apply_agent_output(triage_output(agent, &request, AgentEvent::Completed,)));
+
+        // Verify SQLite snapshot has the merged rows
+        let snap = app
+            .engine
+            .select(ConversationSelection::Existing(app.conversation_id.clone()))
+            .unwrap();
+        assert_eq!(snap.activities.len(), 2);
+        match &snap.activities[0].item {
+            dmuxai::activity::ActivityItem::Tool {
+                name,
+                status,
+                duration_ms,
+                ..
+            } => {
+                assert_eq!(name, "search");
+                assert_eq!(*status, dmuxai::activity::ToolStatus::Ok);
+                assert_eq!(*duration_ms, Some(40));
+            }
+            _ => panic!("expected tool item"),
+        }
+        match &snap.activities[1].item {
+            dmuxai::activity::ActivityItem::Thinking {
+                text,
+                started_ms,
+                finished_ms,
+            } => {
+                assert_eq!(text, "pondering solution");
+                assert_eq!(*started_ms, 10);
+                assert_eq!(*finished_ms, Some(50));
+            }
+            _ => panic!("expected thinking item"),
+        }
+
+        // Drop current app and reopen engine in a new App to verify reload restoration
+        drop(app);
+        let reopened_engine = ConversationEngine::open(&db_path, temp.path()).unwrap();
+        let (reopened_app, _) = test_app_with_engine(reopened_engine);
+
+        assert_activity_between_user_and_reply(
+            &reopened_app,
+            "foreground work",
+            "search",
+            "final answer",
+        );
+        assert_activity_between_user_and_reply(
+            &reopened_app,
+            "foreground work",
+            "thought for",
+            "final answer",
+        );
+        assert_eq!(
+            reopened_app
+                .messages
+                .iter()
+                .filter(|m| {
+                    matches!(
+                        &m.role,
+                        Role::Activity(dmuxai::activity::ActivityItem::Thinking { text, .. })
+                            if text.contains("pondering solution")
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            reopened_app
+                .messages
+                .iter()
+                .filter(|m| matches!(&m.role, Role::Activity(_)))
+                .count(),
+            2
+        );
+    }
+
+    // TC-1920 / FR-1920: activity persistence error emits conversation notice at most once per turn.
+    #[test]
+    fn tc_1920_activity_save_error_shows_notice_once_per_turn() {
+        let mut h = plan_gate_test_app();
+        submit_direct_agent(&mut h.app, "codex", "test prompt");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+
+        // Mutate the active turn's turn_id to an unknown ID so record_activity returns error
+        if let Some(active) = h.app.active_turns.get_mut(&agent) {
+            active.turn_id = StoredTurnId::new("nonexistent-turn-id");
+        }
+        let fake_request = AgentRequest {
+            turn_id: TurnId::new("nonexistent-turn-id"),
+            ..request
+        };
+
+        // First activity event fails to persist and shows notice
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &fake_request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "test_tool".to_owned(),
+                target: "target 1".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        )));
+        let notice_count_1 = h
+            .app
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("Could not save turn activity"))
+            .count();
+        assert_eq!(notice_count_1, 1);
+
+        // Second activity event fails to persist but does NOT repeat the notice
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &fake_request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "test_tool".to_owned(),
+                target: "target 2".to_owned(),
+                status: dmuxai::activity::ToolStatus::Ok,
+                duration_ms: Some(10),
+                detail: String::new(),
+            }),
+        )));
+        let notice_count_2 = h
+            .app
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("Could not save turn activity"))
+            .count();
+        assert_eq!(notice_count_2, 1);
+    }
+
+    // TC-1921 / FR-1921: background turn activity persists, restores without duplicates, and merges live events.
+    #[test]
+    fn tc_1921_background_activity_persists_restores_without_duplicates_and_merges_live() {
+        let mut h = plan_gate_test_app();
+        let a = h.app.conversation_id.clone();
+        submit_direct_agent(&mut h.app, "codex", "background work");
+        let (agent, request) = h.sent.lock().unwrap()[0].clone();
+
+        // Switch to a different foreground conversation
+        h.app.create_conversation(Some("foreground".to_owned()));
+        let b = h.app.conversation_id.clone();
+
+        // Codex emits activity in background conversation A
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "compile".to_owned(),
+                target: "cargo build".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "compile".to_owned(),
+                target: "cargo build".to_owned(),
+                status: dmuxai::activity::ToolStatus::Ok,
+                duration_ms: Some(120),
+                detail: String::new(),
+            }),
+        )));
+
+        // Persisted in engine snapshot for conversation A while still in background
+        let snap = h
+            .app
+            .engine
+            .select(ConversationSelection::Existing(a.clone()))
+            .unwrap();
+        assert_eq!(snap.activities.len(), 1);
+        assert!(dmuxai::activity::collapsed_line(&snap.activities[0].item).contains("cargo build"));
+
+        // Switch back to conversation A while the turn is STILL RUNNING
+        h.app.select_conversation(a.clone());
+
+        // Stored activity is restored exactly once; no duplicate from retained/offscreen buffers
+        assert!(transcript_has_activity_line(&h.app, "cargo build"));
+        assert_eq!(
+            h.app
+                .messages
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        &message.role,
+                        Role::Activity(item)
+                            if dmuxai::activity::collapsed_line(item).contains("cargo build")
+                    )
+                })
+                .count(),
+            1
+        );
+
+        // Turn is now in foreground and still active: later live events arrive
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "test".to_owned(),
+                target: "cargo test".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "test".to_owned(),
+                target: "cargo test".to_owned(),
+                status: dmuxai::activity::ToolStatus::Ok,
+                duration_ms: Some(50),
+                detail: String::new(),
+            }),
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Thinking {
+                text: "verifying results".to_owned(),
+                started_ms: 10,
+                finished_ms: Some(25),
+            }),
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            agent,
+            &request,
+            AgentEvent::TextDelta("work completed".to_owned()),
+        )));
+        assert!(
+            h.app
+                .apply_agent_output(triage_output(agent, &request, AgentEvent::Completed,))
+        );
+
+        // Verify transcript layout: User prompt < Activities < Assistant reply
+        assert_activity_between_user_and_reply(
+            &h.app,
+            "background work",
+            "cargo build",
+            "work completed",
+        );
+        assert_activity_between_user_and_reply(
+            &h.app,
+            "background work",
+            "cargo test",
+            "work completed",
+        );
+        assert_activity_between_user_and_reply(
+            &h.app,
+            "background work",
+            "thought for",
+            "work completed",
+        );
+
+        // Verify no duplicates across repeated conversation switches
+        h.app.select_conversation(b);
+        h.app.select_conversation(a.clone());
+
+        assert_eq!(
+            h.app
+                .messages
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        &message.role,
+                        Role::Activity(item)
+                            if dmuxai::activity::collapsed_line(item).contains("cargo build")
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            h.app
+                .messages
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        &message.role,
+                        Role::Activity(item)
+                            if dmuxai::activity::collapsed_line(item).contains("cargo test")
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            h.app
+                .messages
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        &message.role,
+                        Role::Activity(dmuxai::activity::ActivityItem::Thinking { text, .. })
+                            if text.contains("verifying results")
+                    )
+                })
+                .count(),
+            1
         );
     }
 
