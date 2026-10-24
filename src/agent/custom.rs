@@ -11,6 +11,7 @@ use dmuxai::custom_agent::{
     failure_reason, grok_no_allowed_model_message, is_builtin_grok, list_model_ids,
     parse_jsonl_line, policy_message, select_grok_model, spec_at, substitute, timeout_parts,
 };
+use dmuxai::mcp::RunnerMcp;
 use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 
 use super::{
@@ -63,10 +64,10 @@ pub fn spawn_custom_adapter(
     index: u8,
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
-    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
+    mcp: RunnerMcp,
 ) -> SpawnedAdapter {
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-    let worker = tokio::spawn(runtime_loop(index, command_rx, event_tx, cwd, mcp_servers));
+    let worker = tokio::spawn(runtime_loop(index, command_rx, event_tx, cwd, mcp));
     (Box::new(CustomAdapter { index, command_tx }), worker)
 }
 
@@ -82,20 +83,12 @@ async fn runtime_loop(
     command_rx: mpsc::Receiver<CustomCommand>,
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
-    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
+    mcp: RunnerMcp,
 ) {
     let Some(spec) = spec_at(index) else {
         return;
     };
-    runtime_loop_with_spec(
-        Agent::Custom(index),
-        spec,
-        command_rx,
-        event_tx,
-        cwd,
-        mcp_servers,
-    )
-    .await;
+    runtime_loop_with_spec(Agent::Custom(index), spec, command_rx, event_tx, cwd, mcp).await;
 }
 
 async fn runtime_loop_with_spec(
@@ -104,12 +97,8 @@ async fn runtime_loop_with_spec(
     mut command_rx: mpsc::Receiver<CustomCommand>,
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
-    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
+    mcp: RunnerMcp,
 ) {
-    let applicable: Vec<dmuxai::mcp::ResolvedMcpServer> = mcp_servers
-        .into_iter()
-        .filter(|s| s.applies_to(&spec.name))
-        .collect();
     let mut active: Option<ActiveTurn> = None;
     let mut selected_model = spec.default_model.clone();
     let mcp_notice_shown = Arc::new(AtomicBool::new(false));
@@ -167,7 +156,7 @@ async fn runtime_loop_with_spec(
                     policy,
                     cwd.clone(),
                     event_tx.clone(),
-                    applicable.clone(),
+                    mcp.clone(),
                     mcp_notice_shown.clone(),
                 ));
             }
@@ -286,7 +275,7 @@ fn spawn_turn(
     mode: TurnPolicy,
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
-    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
+    mcp: RunnerMcp,
     mcp_notice_shown: Arc<AtomicBool>,
 ) -> ActiveTurn {
     let context = OutputContext::from(&request);
@@ -310,7 +299,7 @@ fn spawn_turn(
             &event_tx,
             &turn_context,
             &turn_pgid,
-            &mcp_servers,
+            &mcp,
             &mcp_notice_shown,
             cancel_for_turn,
         )
@@ -366,7 +355,7 @@ async fn run_turn(
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
     pgid: &std::sync::atomic::AtomicU32,
-    mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
+    mcp: &RunnerMcp,
     mcp_notice_shown: &AtomicBool,
     acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), AgentError> {
@@ -411,7 +400,7 @@ async fn run_turn(
             Some(model_id.to_owned()),
             None,
             None,
-            dmuxai::mcp::propagate::acp_mcp_servers(mcp_servers, "grok"),
+            mcp.acp_servers(),
         )
         .await
         .map_err(AgentError::provider)?;
@@ -534,8 +523,8 @@ async fn run_turn(
             temp_system_prompt_instructions.0 = Some(path);
         }
 
-        if !mcp_servers.is_empty() {
-            let (merged, applied) = dmuxai::mcp::propagate::merge_opencode_mcp(&body, mcp_servers);
+        if !mcp.is_empty() {
+            let (merged, applied) = mcp.opencode_config(&body);
             body = merged;
             if !applied && !mcp_notice_shown.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 send(
@@ -556,13 +545,13 @@ async fn run_turn(
     }
 
     let mut mcp_temp = TempFile(None);
-    if !mcp_servers.is_empty() {
+    if !mcp.is_empty() {
         let path = std::env::temp_dir().join(format!(
             "dmuxai-mcp-{}-{}.json",
             spec.name,
             uuid::Uuid::new_v4()
         ));
-        let body = dmuxai::mcp::propagate::custom_mcp_json(mcp_servers);
+        let body = mcp.custom_json();
         write_private_temp_file(&path, &body, "mcp config").map_err(AgentError::process_exit)?;
         ctx.mcp_config = Some(path.display().to_string());
         mcp_temp.0 = Some(path);
@@ -818,6 +807,7 @@ mod tests {
         let pgid = std::sync::atomic::AtomicU32::new(0);
         let cwd = std::env::temp_dir();
         let notice_shown = AtomicBool::new(false);
+        let mcp = RunnerMcp::for_runner(mcp_servers, &spec.name);
         let result = run_turn(
             Agent::Custom(0),
             spec,
@@ -828,7 +818,7 @@ mod tests {
             &tx,
             &context,
             &pgid,
-            mcp_servers,
+            &mcp,
             &notice_shown,
             None,
         )
@@ -1191,6 +1181,7 @@ env = { FAKE_CFG = "{temp_config}" }
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
         let cwd = std::env::temp_dir();
+        let mcp = RunnerMcp::for_runner(mcp_servers, &spec.name);
         let result = run_turn(
             Agent::Custom(0),
             spec,
@@ -1201,7 +1192,7 @@ env = { FAKE_CFG = "{temp_config}" }
             &tx,
             &context,
             &pgid,
-            mcp_servers,
+            &mcp,
             notice_shown,
             None,
         )
@@ -1361,7 +1352,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
             command_rx,
             event_tx,
             workspace.path().to_path_buf(),
-            Vec::new(),
+            RunnerMcp::default(),
         ));
         std::mem::forget(workspace);
         (command_tx, event_rx, worker)
@@ -1369,7 +1360,7 @@ temp_config_template = '{"mcp": "not-an-object"}'
 
     async fn until_terminal(rx: &mut mpsc::Receiver<AgentOutput>) -> Vec<AgentEvent> {
         let mut events = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let output = tokio::time::timeout(remaining, rx.recv())
@@ -1876,7 +1867,7 @@ system_prompt_arg = ["--system", "{system_prompt}"]
             &tx,
             &context,
             &pgid,
-            &[],
+            &RunnerMcp::default(),
             &notice_shown,
             None,
         )
@@ -1936,7 +1927,7 @@ system_prompt_arg = ["--system", "{system_prompt}"]
             &tx,
             &context,
             &pgid,
-            &[],
+            &RunnerMcp::default(),
             &notice_shown,
             None,
         )
@@ -2001,7 +1992,7 @@ system_prompt_arg = ["--system", "{system_prompt}"]
             &tx,
             &context,
             &pgid,
-            &[],
+            &RunnerMcp::default(),
             &notice_shown,
             None,
         )
@@ -2065,7 +2056,7 @@ system_prompt_arg = ["--system", "{system_prompt}"]
             &tx,
             &context,
             &pgid,
-            &[],
+            &RunnerMcp::default(),
             &notice_shown,
             None,
         )

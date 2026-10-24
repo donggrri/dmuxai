@@ -14,6 +14,7 @@ use tokio::{
 };
 
 use dmuxai::attachments::prompt_with_image_references;
+use dmuxai::mcp::RunnerMcp;
 
 use super::{
     AdapterError, Agent, AgentAdapter, AgentError, AgentEvent, AgentOutput, AgentRequest,
@@ -85,10 +86,10 @@ impl AgentAdapter for CodexAdapter {
 pub fn spawn_codex_adapter(
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
-    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
+    mcp: RunnerMcp,
 ) -> SpawnedAdapter {
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-    let worker = tokio::spawn(runtime_loop(command_rx, event_tx, cwd, mcp_servers));
+    let worker = tokio::spawn(runtime_loop(command_rx, event_tx, cwd, mcp));
 
     (Box::new(CodexAdapter { command_tx }), worker)
 }
@@ -97,24 +98,19 @@ pub fn spawn_codex_adapter(
 pub(crate) fn build_codex_app_server_args(
     servers: &[dmuxai::mcp::ResolvedMcpServer],
 ) -> Vec<String> {
-    let (args, _, _) = build_codex_app_server_args_and_env(servers);
+    let mcp = RunnerMcp::for_runner(servers, "codex");
+    let (args, _, _) = build_codex_app_server_args_and_env(&mcp);
     args
 }
 
 pub(crate) fn build_codex_app_server_args_and_env(
-    servers: &[dmuxai::mcp::ResolvedMcpServer],
+    mcp: &RunnerMcp,
 ) -> (
     Vec<String>,
     std::collections::BTreeMap<String, String>,
     Vec<String>,
 ) {
-    let applicable: Vec<dmuxai::mcp::ResolvedMcpServer> = servers
-        .iter()
-        .filter(|s| s.applies_to("codex"))
-        .cloned()
-        .collect();
-    let (mut args, env, notices) =
-        dmuxai::mcp::propagate::codex_config_overrides_and_env(&applicable);
+    let (mut args, env, notices) = mcp.codex_overrides();
     args.push("app-server".to_owned());
     args.push("--stdio".to_owned());
     (args, env, notices)
@@ -148,11 +144,11 @@ impl CodexClient {
     async fn start(
         cwd: &Path,
         event_tx: &mpsc::Sender<AgentOutput>,
-        mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
+        mcp: &RunnerMcp,
     ) -> io::Result<Self> {
         let program = resolve_program(CODEX_BINARY_OVERRIDE, "codex");
         let mut command = headless_command(program);
-        let (args, env, notices) = build_codex_app_server_args_and_env(mcp_servers);
+        let (args, env, notices) = build_codex_app_server_args_and_env(mcp);
         for notice in notices {
             send_event(event_tx, None, AgentEvent::Notice(notice)).await;
         }
@@ -555,10 +551,10 @@ async fn connect_for_request(
     selected_effort: Option<&str>,
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
-    mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
+    mcp: &RunnerMcp,
 ) -> Option<CodexClient> {
     let context = OutputContext::from(request);
-    match CodexClient::start(cwd, event_tx, mcp_servers).await {
+    match CodexClient::start(cwd, event_tx, mcp).await {
         Ok(mut started) => {
             if let Err(error) = begin_request(
                 &mut started,
@@ -601,7 +597,7 @@ async fn runtime_loop(
     mut command_rx: mpsc::Receiver<CodexCommand>,
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
-    mcp_servers: Vec<dmuxai::mcp::ResolvedMcpServer>,
+    mcp: RunnerMcp,
 ) {
     let mut client: Option<CodexClient> = None;
     let mut selected_model: Option<String> = None;
@@ -618,7 +614,7 @@ async fn runtime_loop(
                         selected_effort.as_deref(),
                         &cwd,
                         &event_tx,
-                        &mcp_servers,
+                        &mcp,
                     )
                     .await;
                 }
@@ -632,7 +628,7 @@ async fn runtime_loop(
                     send_event(&event_tx, None, AgentEvent::EffortSelected(effort)).await;
                 }
                 Some(CodexCommand::ListModels) => {
-                    match CodexClient::start(&cwd, &event_tx, &mcp_servers).await {
+                    match CodexClient::start(&cwd, &event_tx, &mcp).await {
                         Ok(mut started) => match started.list_models(&event_tx).await {
                             Ok((models, default_model)) => {
                                 model_catalog = models.clone();
@@ -685,7 +681,7 @@ async fn runtime_loop(
                     }
                 }
                 Some(CodexCommand::RequestStatus) => {
-                    match CodexClient::start(&cwd, &event_tx, &mcp_servers).await {
+                    match CodexClient::start(&cwd, &event_tx, &mcp).await {
                         Ok(mut started) => {
                             let status = started.status(&event_tx).await;
                             send_event(&event_tx, None, AgentEvent::Status(status)).await;
@@ -893,7 +889,7 @@ async fn runtime_loop(
                 selected_effort.as_deref(),
                 &cwd,
                 &event_tx,
-                &mcp_servers,
+                &mcp,
             )
             .await;
         }
@@ -1716,7 +1712,7 @@ mod tests {
     async fn real_codex_app_server_handshake() {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let cwd = std::env::current_dir().unwrap();
-        let client = CodexClient::start(&cwd, &event_tx, &[])
+        let client = CodexClient::start(&cwd, &event_tx, &RunnerMcp::default())
             .await
             .expect("the installed Codex app-server should complete its handshake");
 
@@ -1732,7 +1728,7 @@ mod tests {
     async fn real_codex_turn_streams_to_completion() {
         let (event_tx, mut event_rx) = mpsc::channel(128);
         let cwd = std::env::current_dir().unwrap();
-        let mut client = CodexClient::start(&cwd, &event_tx, &[])
+        let mut client = CodexClient::start(&cwd, &event_tx, &RunnerMcp::default())
             .await
             .expect("the installed Codex app-server should complete its handshake");
         let request = request("Reply with exactly CODEX_OK. Do not use tools or modify files.");
@@ -1789,7 +1785,7 @@ mod tests {
     async fn real_codex_turn_can_be_interrupted() {
         let (event_tx, mut event_rx) = mpsc::channel(128);
         let cwd = std::env::current_dir().unwrap();
-        let mut client = CodexClient::start(&cwd, &event_tx, &[])
+        let mut client = CodexClient::start(&cwd, &event_tx, &RunnerMcp::default())
             .await
             .expect("the installed Codex app-server should complete its handshake");
         let request = request(
@@ -1957,7 +1953,8 @@ mod tests {
         };
 
         let servers = vec![stdio_server, http_server];
-        let (args, child_env, notices) = build_codex_app_server_args_and_env(&servers);
+        let mcp = RunnerMcp::for_runner(&servers, "codex");
+        let (args, child_env, notices) = build_codex_app_server_args_and_env(&mcp);
 
         assert!(notices.is_empty(), "expected no notices for valid servers");
 

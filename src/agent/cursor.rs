@@ -875,7 +875,7 @@ async fn run_turn_with_child(
             selected_model.clone(),
             None,
             None,
-            dmuxai::mcp::propagate::acp_mcp_servers(mcp_servers, "cursor"),
+            dmuxai::mcp::inject::RunnerMcp::for_runner(mcp_servers, "cursor").acp_servers(),
         )
         .await
         .map(|outcome| outcome.session_id)

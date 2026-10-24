@@ -4,9 +4,11 @@
 
 pub mod client;
 pub mod config;
+pub mod inject;
 #[doc(hidden)]
 pub mod mock;
 pub mod propagate;
 pub mod registry;
 
 pub use config::{McpServerSpec, ResolvedMcpServer, ServerKind, Transport, resolve_servers};
+pub use inject::RunnerMcp;
