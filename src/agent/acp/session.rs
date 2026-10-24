@@ -31,47 +31,24 @@ pub fn parse_agent_capabilities(init_result: &Value) -> AgentCapabilities {
     }
 }
 
-fn mcp_array(mcp_servers: &Value) -> Value {
-    if mcp_servers.is_array() {
-        mcp_servers.clone()
-    } else {
-        json!([])
-    }
-}
-
-/// Drop HTTP/SSE MCP entries unless `initialize` advertised `mcpCapabilities.http`.
-pub fn filter_mcp_for_agent(mcp_servers: &Value, init_result: &Value) -> Value {
-    let http = init_result
-        .pointer("/agentCapabilities/mcpCapabilities/http")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let items = mcp_servers.as_array().cloned().unwrap_or_default();
-    Value::Array(
-        items
-            .into_iter()
-            .filter(|server| http || server.get("type").is_none())
-            .collect(),
-    )
-}
-
-/// `session/new` params with the runner's MCP servers (FR-1414).
-pub fn session_new_params(cwd: &Path, mcp_servers: &Value) -> Value {
+/// `session/new` params with an empty `mcpServers` array (FR-2080).
+pub fn session_new_params(cwd: &Path) -> Value {
     json!({
         "cwd": cwd.to_string_lossy(),
-        "mcpServers": mcp_array(mcp_servers)
+        "mcpServers": []
     })
 }
 
-pub fn session_load_params(session_id: &str, cwd: &Path, mcp_servers: &Value) -> Value {
+pub fn session_load_params(session_id: &str, cwd: &Path) -> Value {
     json!({
         "sessionId": session_id,
         "cwd": cwd.to_string_lossy(),
-        "mcpServers": mcp_array(mcp_servers)
+        "mcpServers": []
     })
 }
 
-pub fn session_resume_params(session_id: &str, cwd: &Path, mcp_servers: &Value) -> Value {
-    session_load_params(session_id, cwd, mcp_servers)
+pub fn session_resume_params(session_id: &str, cwd: &Path) -> Value {
+    session_load_params(session_id, cwd)
 }
 
 /// Fast variants: `*-fast`, `*-build-fast`, or a `fast=true` bracket parameter (FR-1411).
@@ -337,7 +314,7 @@ mod tests {
     // TC-1323 / FR-1316: session/load params include cwd and mcpServers.
     #[test]
     fn session_load_params_schema() {
-        let params = session_load_params("sid-1", Path::new("/proj"), &json!([]));
+        let params = session_load_params("sid-1", Path::new("/proj"));
         assert_eq!(params["sessionId"], "sid-1");
         assert_eq!(params["cwd"], "/proj");
         assert_eq!(params["mcpServers"], json!([]));
@@ -399,16 +376,22 @@ mod tests {
         assert!(read_only_mode_request(&grok, "s").is_none());
     }
 
-    // TC-1418 / FR-1414: mcpServers passed through.
+    // TC-2080 / FR-2080: session params always carry empty mcpServers.
     #[test]
-    fn tc_1418_session_new_params_carry_mcp_servers() {
-        let servers = json!([{"name": "mem", "command": "/bin/mem", "args": [], "env": []}]);
-        let params = session_new_params(Path::new("/proj"), &servers);
-        assert_eq!(params["mcpServers"], servers);
-        assert_eq!(
-            session_new_params(Path::new("/p"), &Value::Null)["mcpServers"],
-            json!([])
-        );
+    fn tc_2080_acp_session_params_send_empty_mcp_servers() {
+        let p_new = session_new_params(Path::new("/proj"));
+        assert_eq!(p_new["mcpServers"], json!([]));
+        assert_eq!(p_new["cwd"], "/proj");
+
+        let p_load = session_load_params("sid-1", Path::new("/proj"));
+        assert_eq!(p_load["mcpServers"], json!([]));
+        assert_eq!(p_load["sessionId"], "sid-1");
+        assert_eq!(p_load["cwd"], "/proj");
+
+        let p_resume = session_resume_params("sid-2", Path::new("/proj"));
+        assert_eq!(p_resume["mcpServers"], json!([]));
+        assert_eq!(p_resume["sessionId"], "sid-2");
+        assert_eq!(p_resume["cwd"], "/proj");
     }
 
     #[test]
@@ -417,28 +400,6 @@ mod tests {
         assert_eq!(
             extract_reported_model(&payload).as_deref(),
             Some("grok-4.7")
-        );
-    }
-
-    #[test]
-    fn http_mcp_servers_need_agent_capability() {
-        let servers =
-            json!([{"name": "a", "command": "x"}, {"type": "http", "name": "b", "url": "u"}]);
-        let none = json!({"agentCapabilities": {}});
-        assert_eq!(
-            filter_mcp_for_agent(&servers, &none)
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        let http = json!({"agentCapabilities": {"mcpCapabilities": {"http": true}}});
-        assert_eq!(
-            filter_mcp_for_agent(&servers, &http)
-                .as_array()
-                .unwrap()
-                .len(),
-            2
         );
     }
 }

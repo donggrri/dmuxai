@@ -197,7 +197,6 @@ TC-1847 covered by test_build_argv_empty_image_arg_appends_to_prompt (no TC ref 
 TC-1848 covered by test_parse_jsonl_opencode_sample (no TC ref in code yet)
 TC-1849 covered by test_failure_reason (no TC ref in code yet)
 TC-1850 covered by timeout_message_mentions_config_for_user_agent (no TC ref in code yet)
-TC-1851 covered by opencode_config_gets_mcp_key (no TC ref in code yet)
 TC-1852 covered by fast_models_are_rejected_for_every_runner (no TC ref in code yet)
 TC-1853 covered by tc_1461_default_model_for_runner_is_per_runner (no TC ref in code yet)
 TC-1854 covered by fast_models_are_rejected_for_every_runner (no TC ref in code yet)
@@ -213,7 +212,6 @@ TC-1863 covered by tc_1420_permission_denied_ends_cancelled (no TC ref in code y
 TC-1864 covered by grok_acp_argv_puts_model_before_stdio (no TC ref in code yet)
 TC-1865 covered by grok_auth_is_models_stdout_only (no TC ref in code yet)
 TC-1866 covered by cursor_argv_always_contains_composer_2_5_by_default (no TC ref in code yet)
-TC-1867 covered by codex_argv_includes_mcp_config_overrides (no TC ref in code yet)
 TC-1880 planned — no automated test yet
 TC-1881 covered by validate_rejects_fast_and_non_composer_models (no TC ref in code yet)
 TC-1882 covered by validate_model_id (no TC ref in code yet)

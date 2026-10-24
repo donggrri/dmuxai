@@ -20,7 +20,6 @@ async fn mcp_client_stdio_and_http_against_mock() {
             args: vec!["__mock-mcp".to_owned()],
             env: BTreeMap::new(),
         },
-        runners: None,
         tools: ToolNames::default(),
     };
 
@@ -69,7 +68,6 @@ async fn mcp_client_stdio_and_http_against_mock() {
             args: vec![],
             env: BTreeMap::new(),
         },
-        runners: None,
         tools: ToolNames::default(),
     };
     let crash_err = McpClient::connect(&crash_server, Duration::from_secs(2))
@@ -92,7 +90,6 @@ async fn mcp_client_stdio_and_http_against_mock() {
             // (a 1ns timeout raced the fast mock on Windows CI).
             env: BTreeMap::from([("DMUXAI_MOCK_MCP_SILENT".to_owned(), "1".to_owned())]),
         },
-        runners: None,
         tools: ToolNames::default(),
     };
     let timeout_err = McpClient::connect(&timeout_server, Duration::from_millis(300))
@@ -125,7 +122,6 @@ async fn mcp_client_stdio_and_http_against_mock() {
             url: base_url.clone(),
             headers: BTreeMap::new(),
         },
-        runners: None,
         tools: ToolNames::default(),
     };
 
@@ -165,7 +161,6 @@ async fn mcp_client_stdio_and_http_against_mock() {
             url: base_url,
             headers: sse_headers,
         },
-        runners: None,
         tools: ToolNames::default(),
     };
 
@@ -190,7 +185,6 @@ async fn mcp_client_stdio_and_http_against_mock() {
             url: "http://127.0.0.1:1/mcp".to_owned(),
             headers: BTreeMap::new(),
         },
-        runners: None,
         tools: ToolNames::default(),
     };
     let bad_err = McpClient::connect(&bad_http_server, Duration::from_secs(1))
@@ -225,7 +219,6 @@ async fn mcp_client_smoke_server_everything() {
             ],
             env: BTreeMap::new(),
         },
-        runners: None,
         tools: ToolNames::default(),
     };
 
@@ -301,7 +294,6 @@ async fn mcp_client_refuses_redirects() {
             url: format!("http://{redirect_addr}/mcp"),
             headers,
         },
-        runners: None,
         tools: ToolNames::default(),
     };
 
@@ -399,7 +391,6 @@ done
             args: vec![launcher_a.to_str().unwrap().to_owned()],
             env: BTreeMap::new(),
         },
-        runners: None,
         tools: ToolNames::default(),
     };
 
@@ -494,7 +485,6 @@ done
             args: vec![launcher_b.to_str().unwrap().to_owned()],
             env: BTreeMap::new(),
         },
-        runners: None,
         tools: ToolNames::default(),
     };
 
@@ -558,7 +548,6 @@ async fn mcp_client_bounds_writes_and_streams_sse() {
             args: stdio_args,
             env: BTreeMap::new(),
         },
-        runners: None,
         tools: ToolNames::default(),
     };
 
@@ -640,7 +629,6 @@ async fn mcp_client_bounds_writes_and_streams_sse() {
             url: format!("http://{addr}/mcp"),
             headers: BTreeMap::new(),
         },
-        runners: None,
         tools: ToolNames::default(),
     };
 
@@ -736,7 +724,6 @@ done
             args: vec![launcher.to_str().unwrap().to_owned()],
             env: BTreeMap::new(),
         },
-        runners: None,
         tools: ToolNames::default(),
     };
 

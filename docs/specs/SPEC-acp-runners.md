@@ -98,7 +98,7 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | FR-1411 | Must | Cursor `protocol = "acp"`, agent-reported model is a fast variant (`-fast` or `fast=true`). | Turn is refused with an error naming the reported model before any `session/prompt` is sent; child reaped. | No silent fallback to another model. | TC-1411, TC-1412 |
 | FR-1412 | Must | Built-in grok, ACP. | Root options (`--permission-mode`, `-m`, `--reasoning-effort`) precede `agent stdio`; read-only turns add `--permission-mode plan`. Default protocol `acp`; `legacy` keeps streaming-json. | — | TC-1413, TC-1414 |
 | FR-1413 | Must | Read-only internal turn. | Mode is applied via `session/set_mode` when `modes` is advertised, else `session/set_config_option` (`configId` with category `mode`) when advertised; if neither, the turn still runs but every write/exec/edit permission is denied (read_only_fail_closed is on for every ACP runner). | Never runs writable without the client-side deny. | TC-1415, TC-1416, TC-1417 |
-| FR-1414 | Must | Any ACP `session/new`/`load`/`resume`. | `mcpServers` carries the runner's configured MCP servers (stdio entries from dmuxai MCP settings) instead of a hardcoded empty list. | Empty list when none configured. | TC-1418 |
+| FR-1414 | Removed | Any ACP `session/new`/`load`/`resume`. | **Removed** (2026-10-24): superseded by SPEC-mcp-propagation-removal FR-2080. | — | TC-2080 |
 | FR-1415 | Must | Requested model not in the allowed list for an ACP runner. | Turn fails with an error naming the model; `--model` is never dropped silently. | — | TC-1419 |
 | FR-1416 | Must | Permission denied by policy or user cancel during an ACP turn. | Turn ends as `Cancelled` (stop reason `cancelled`) with a notice naming the denied tool; graph/task UI shows cancelled, not "Graph failed". | Agent crash still ends in `Error`. | TC-1420, TC-1421 |
 | FR-1417 | Must | ACP `execute` tool call. | Activity row shows the command (`rawInput.command` or title), not the cwd. | — | TC-1422 |
@@ -120,7 +120,6 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | TC-1415 | FR-1413 | unit | `modes` advertised | `read_only_mode_request` | `session/set_mode` | `src/agent/acp/session.rs` |
 | TC-1416 | FR-1413 | unit | `configOptions` mode only | `read_only_mode_request` | `session/set_config_option` | `src/agent/acp/session.rs` |
 | TC-1417 | FR-1413 | unit | No mode support | Permission policy read-only | Edit denied | `src/agent/acp/permissions.rs` |
-| TC-1418 | FR-1414 | unit | MCP settings with stdio server | `session_new_params` | `mcpServers` populated | `src/agent/acp/session.rs` |
 | TC-1419 | FR-1415 | unit | Disallowed model | `acp_model_arg` | Err | `src/agent/acp_runner.rs` |
 | TC-1420 | FR-1416 | integration | Fake agent denies outside-workspace permission | Cursor ACP turn | `Cancelled` + notice, no `Error` | `src/agent/cursor.rs` |
 | TC-1421 | FR-1416 | unit | Cancelled graph step | `graph_stop_notice` | "Graph cancelled" | `src/app.rs` |

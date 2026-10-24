@@ -190,6 +190,10 @@ clean exit. Read it instead of parsing logs.
 | PATCH | `/api/todos/{id}` | `{title?, body?, status?}` | `200` `Todo` | 400, 401, 403, 404, 415, 503 |
 | DELETE | `/api/todos/{id}` | — | `204` | 401, 403, 404, 503 |
 | POST | `/api/todos/{id}/run` | `{mode: "agent"\|"graph", agent?}` | `202` `Todo` | 400, 401, 403, 404, 409, 500, 503, 504 |
+| GET | `/api/mcp/servers` | — | `200` `{servers, warnings}` | 401, 403, 503 |
+| POST | `/api/import` | `{server, query}` | `200` `{imported, updated}` | 400, 401, 403, 404, 502, 503 |
+
+`GET /api/mcp/servers` lists configured `[[mcp.servers]]` entries for the dashboard. Each entry returns `name`, `kind` (`"generic"` | `"jira"` | `"confluence"`), `transport` (`"stdio"` | `"http"`), `enabled`, and optional `warnings`. Secret headers/env values and the legacy `runners` field are not returned. DmuxAI does not pass MCP servers to agents; `[[mcp.servers]]` is only used by the dashboard (the server list and Jira/Confluence import). The `runners` key in `[[mcp.servers]]` and `{mcp_config}` in custom agent specs are deprecated and ignored with a warning.
 
 Status meanings:
 
@@ -306,6 +310,23 @@ Most clients wrap it, for example:
 
 ```json
 { "mcpServers": { "dmuxai": { "command": "dmuxai", "args": ["mcp"], "cwd": "<repo>" } } }
+```
+
+### Memory MCP server
+
+`dmuxai mcp-memory` is a stdio MCP server exposing Obsidian memory tools (`memory_get_context`, `memory_search`, `memory_propose`). DmuxAI does not pass MCP servers to agents; every agent configures MCP tools directly in its own native configuration.
+
+Client configuration (generic):
+
+```json
+{
+  "mcpServers": {
+    "dmuxai-memory": {
+      "command": "dmuxai",
+      "args": ["mcp-memory", "--workspace", "<repo>"]
+    }
+  }
+}
 ```
 
 ## 4. Events
@@ -461,7 +482,7 @@ provider default (no `--model`).
 | `DMUXAI_WORKSPACE` | Canonical workspace directory (defaults to current directory or `-C`). |
 | `DMUXAI_STATE_DIR` | Custom root directory for DmuxAI state databases and conversations. |
 | `DMUXAI_WEB_TOKEN` | Bearer token for the web dashboard (32–128 characters of `[A-Za-z0-9_-]`). |
-| `DMUXAI_MCP_CONFIG` | Internal path to a per-run MCP configuration JSON file. |
+| `DMUXAI_MCP_CONFIG` | Legacy MCP configuration path (deprecated; scrubbed from child environments). |
 | `DMUXAI_*_BIN` | Explicit executable paths for runner CLIs (`DMUXAI_CURSOR_BIN`, `DMUXAI_AGY_BIN`, `DMUXAI_CODEX_BIN`, `DMUXAI_OPENCODE_BIN`, `DMUXAI_GROK_BIN`). |
 | `DMUXAI_FORCE_COLOR` | Force color output even when `NO_COLOR` is set. |
 | `DMUXAI_REDUCED_MOTION` | Disable motion animations in the TUI. |
@@ -472,7 +493,7 @@ Every child process spawned by DmuxAI (including agents, runner CLIs, custom com
 
 - **Removed from child environments:**
   - `DMUXAI_WEB_TOKEN`: Secret dashboard API token (never leaked to agent processes).
-  - `DMUXAI_MCP_CONFIG`: Internal per-run MCP configuration path (built-in runners never pass MCP via env; custom runners set this per-run only after policy application).
+  - `DMUXAI_MCP_CONFIG`: Legacy MCP configuration path (always scrubbed; DmuxAI no longer propagates MCP configs to runners).
   - `DMUXAI_CONFIG`: Config file path (child tools or nested DmuxAI instances use standard workspace/default configuration isolation).
 - **Preserved in child environments:**
   - `XDG_*` (such as `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`) and `HOME` are **always kept untouched**, preserving child access to git, GitHub CLI (`gh`), ssh keys, and system tool configurations.

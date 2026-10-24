@@ -167,7 +167,6 @@ pub fn spawn_cursor_adapter(
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
     config: impl Into<CursorAdapterConfig>,
-    mcp: dmuxai::mcp::RunnerMcp,
 ) -> SpawnedAdapter {
     let config = config.into();
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
@@ -177,7 +176,6 @@ pub fn spawn_cursor_adapter(
         event_tx,
         cwd,
         config,
-        mcp,
         reset_requests.clone(),
     ));
     (
@@ -286,13 +284,11 @@ async fn runtime_loop(
     event_tx: mpsc::Sender<AgentOutput>,
     cwd: PathBuf,
     config: CursorAdapterConfig,
-    mcp: dmuxai::mcp::RunnerMcp,
     reset_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let protocol = config.protocol;
     let idle_limit = std::time::Duration::from_secs(config.prewarm_idle_secs);
     let can_prewarm = config.prewarm && protocol == RunnerProtocol::Legacy;
-    let cursor_notice_emitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut active: Option<ActiveTurn> = None;
     let mut selected_model: Option<String> = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
     let mut latest_session_id: Option<String> = None;
@@ -374,8 +370,6 @@ async fn runtime_loop(
                             cwd.clone(),
                             event_tx.clone(),
                             protocol,
-                            mcp.clone(),
-                            cursor_notice_emitted.clone(),
                             true,
                             reset_epoch,
                         ));
@@ -449,8 +443,6 @@ async fn runtime_loop(
                             cwd.clone(),
                             event_tx.clone(),
                             protocol,
-                            mcp.clone(),
-                            cursor_notice_emitted.clone(),
                             false,
                             reset_epoch,
                         ));
@@ -649,8 +641,6 @@ fn spawn_turn(
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
     protocol: RunnerProtocol,
-    mcp: dmuxai::mcp::RunnerMcp,
-    cursor_notice_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     is_graph: bool,
     reset_epoch: u64,
 ) -> ActiveTurn {
@@ -673,8 +663,6 @@ fn spawn_turn(
             &cwd,
             &event_tx,
             protocol,
-            &mcp,
-            &cursor_notice_emitted,
             &turn_terminal_seen,
             &turn_pgid,
             cancel_for_turn,
@@ -760,7 +748,6 @@ async fn cancel_queued(queued: &mut Option<CursorCommand>, event_tx: &mpsc::Send
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_turn(
     request: &AgentRequest,
     selected_model: Option<String>,
@@ -768,8 +755,6 @@ pub(crate) async fn run_turn(
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     protocol: RunnerProtocol,
-    mcp: dmuxai::mcp::RunnerMcp,
-    cursor_notice_emitted: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<String>, AgentError> {
     run_turn_with_child(
         request,
@@ -779,8 +764,6 @@ pub(crate) async fn run_turn(
         cwd,
         event_tx,
         protocol,
-        &mcp,
-        cursor_notice_emitted,
         &std::sync::atomic::AtomicBool::new(false),
         &std::sync::atomic::AtomicU32::new(0),
         None,
@@ -797,21 +780,10 @@ async fn run_turn_with_child(
     cwd: &Path,
     event_tx: &mpsc::Sender<AgentOutput>,
     protocol: RunnerProtocol,
-    mcp: &dmuxai::mcp::RunnerMcp,
-    cursor_notice_emitted: &std::sync::atomic::AtomicBool,
     terminal_seen: &std::sync::atomic::AtomicBool,
     pgid: &std::sync::atomic::AtomicU32,
     acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Option<String>, AgentError> {
-    let context = OutputContext::from(request);
-    if protocol != RunnerProtocol::Acp
-        && !mcp.is_empty()
-        && !cursor_notice_emitted.swap(true, std::sync::atomic::Ordering::Relaxed)
-        && let Some(notice) = mcp.cursor_legacy_notice()
-    {
-        send_event(event_tx, Some(&context), AgentEvent::Notice(notice)).await;
-    }
-
     if protocol == RunnerProtocol::Acp {
         if let Some(mut child) = warm_child {
             let _ = child.start_kill();
@@ -849,7 +821,6 @@ async fn run_turn_with_child(
             selected_model.clone(),
             None,
             None,
-            mcp.acp_servers(),
         )
         .await
         .map(|outcome| outcome.session_id)
@@ -2134,8 +2105,6 @@ pub(crate) mod tests {
                 &cwd,
                 &event_tx,
                 RunnerProtocol::Legacy,
-                dmuxai::mcp::RunnerMcp::for_runner(&[], "cursor"),
-                &std::sync::atomic::AtomicBool::new(false),
             )
             .await
         });
@@ -2175,237 +2144,6 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     pub(crate) static TEST_CURSOR_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn cursor_mcp_notice_once_per_session() {
-        // TC-578, INT-561: Cursor runner with an existing user .cursor/mcp.json; two turns.
-        // The "not propagated" notice is emitted once per session; the user file is untouched.
-        use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
-        use std::collections::BTreeMap;
-        use std::sync::atomic::AtomicBool;
-
-        #[cfg(unix)]
-        let _guard = TEST_CURSOR_MUTEX.lock().await;
-        let _env_guard = dmuxai::state_path::test_env_lock();
-
-        let temp = tempfile::tempdir().unwrap();
-        let cursor_dir = temp.path().join(".cursor");
-        std::fs::create_dir_all(&cursor_dir).unwrap();
-        let user_file = cursor_dir.join("mcp.json");
-        std::fs::write(&user_file, r#"{"user": "pre-existing"}"#).unwrap();
-
-        let server = ResolvedMcpServer {
-            name: "test-server".to_owned(),
-            kind: ServerKind::Generic,
-            transport: Transport::Stdio {
-                command: "echo".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-            },
-            runners: None,
-            tools: ToolNames::default(),
-        };
-
-        let (event_tx, mut event_rx) = mpsc::channel(32);
-        let notice_shown = AtomicBool::new(false);
-
-        let req1 = AgentRequest {
-            conversation_id: super::super::ConversationId::new("conv-1"),
-            turn_id: super::super::TurnId::new("turn-1"),
-            prompt: "prompt 1".to_owned(),
-            resume_session: None,
-            image_paths: vec![],
-            policy: TurnPolicy::Agent,
-            require_file_edits: false,
-            system_prompt: None,
-        };
-
-        // Override cursor binary so the test does not spawn a live external cursor-agent CLI
-        unsafe {
-            std::env::set_var("DMUXAI_CURSOR_BIN", "nonexistent-cursor-bin");
-        }
-
-        // Turn 1
-        let _ = run_turn(
-            &req1,
-            None,
-            TurnPolicy::ReadOnly,
-            temp.path(),
-            &event_tx,
-            RunnerProtocol::Legacy,
-            dmuxai::mcp::RunnerMcp::for_runner(std::slice::from_ref(&server), "cursor"),
-            &notice_shown,
-        )
-        .await;
-
-        let mut turn1_notices = Vec::new();
-        while let Ok(output) = event_rx.try_recv() {
-            if let AgentEvent::Notice(msg) = output.event
-                && msg.contains("MCP servers are not propagated to Cursor in legacy mode")
-            {
-                turn1_notices.push(msg);
-            }
-        }
-        assert_eq!(
-            turn1_notices.len(),
-            1,
-            "turn 1 should emit exactly one notice"
-        );
-
-        let req2 = AgentRequest {
-            conversation_id: super::super::ConversationId::new("conv-1"),
-            turn_id: super::super::TurnId::new("turn-2"),
-            prompt: "prompt 2".to_owned(),
-            resume_session: None,
-            image_paths: vec![],
-            policy: TurnPolicy::Agent,
-            require_file_edits: false,
-            system_prompt: None,
-        };
-
-        // Turn 2
-        let _ = run_turn(
-            &req2,
-            None,
-            TurnPolicy::ReadOnly,
-            temp.path(),
-            &event_tx,
-            RunnerProtocol::Legacy,
-            dmuxai::mcp::RunnerMcp::for_runner(std::slice::from_ref(&server), "cursor"),
-            &notice_shown,
-        )
-        .await;
-
-        unsafe {
-            std::env::remove_var("DMUXAI_CURSOR_BIN");
-        }
-
-        let mut turn2_notices = Vec::new();
-        while let Ok(output) = event_rx.try_recv() {
-            if let AgentEvent::Notice(msg) = output.event
-                && msg.contains("MCP servers are not propagated to Cursor in legacy mode")
-            {
-                turn2_notices.push(msg);
-            }
-        }
-        assert_eq!(
-            turn2_notices.len(),
-            0,
-            "turn 2 must not emit the notice again (once per session)"
-        );
-
-        // User file remains untouched
-        let content = std::fs::read_to_string(&user_file).unwrap();
-        assert_eq!(content, r#"{"user": "pre-existing"}"#);
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    #[allow(clippy::await_holding_lock)]
-    async fn tc_1982_cursor_legacy_leaves_no_cursor_dir_and_notice_once() {
-        use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
-        use std::collections::BTreeMap;
-        use std::sync::atomic::AtomicBool;
-
-        let _guard = TEST_CURSOR_MUTEX.lock().await;
-        let _env_guard = dmuxai::state_path::test_env_lock();
-
-        let workspace = tempfile::tempdir().unwrap();
-        let server = ResolvedMcpServer {
-            name: "tc1982-server".to_owned(),
-            kind: ServerKind::Generic,
-            transport: Transport::Stdio {
-                command: "echo".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-            },
-            runners: Some(vec!["cursor".to_owned()]),
-            tools: ToolNames::default(),
-        };
-
-        unsafe {
-            std::env::set_var("DMUXAI_CURSOR_BIN", "nonexistent-cursor-bin");
-        }
-
-        let (event_tx, mut event_rx) = mpsc::channel(32);
-        let notice_shown = AtomicBool::new(false);
-
-        let req1 = AgentRequest {
-            conversation_id: super::super::ConversationId::new("conv-1"),
-            turn_id: super::super::TurnId::new("turn-1"),
-            prompt: "prompt 1".to_owned(),
-            resume_session: None,
-            image_paths: vec![],
-            policy: TurnPolicy::Agent,
-            require_file_edits: false,
-            system_prompt: None,
-        };
-
-        let _ = run_turn(
-            &req1,
-            None,
-            TurnPolicy::ReadOnly,
-            workspace.path(),
-            &event_tx,
-            RunnerProtocol::Legacy,
-            dmuxai::mcp::RunnerMcp::for_runner(std::slice::from_ref(&server), "cursor"),
-            &notice_shown,
-        )
-        .await;
-
-        let mut turn1_notices = Vec::new();
-        while let Ok(output) = event_rx.try_recv() {
-            if let AgentEvent::Notice(msg) = output.event
-                && msg.contains("MCP servers are not propagated to Cursor in legacy mode")
-            {
-                turn1_notices.push(msg);
-            }
-        }
-        assert_eq!(turn1_notices.len(), 1, "turn 1 emits one legacy notice");
-
-        let req2 = AgentRequest {
-            conversation_id: super::super::ConversationId::new("conv-1"),
-            turn_id: super::super::TurnId::new("turn-2"),
-            prompt: "prompt 2".to_owned(),
-            resume_session: None,
-            image_paths: vec![],
-            policy: TurnPolicy::Agent,
-            require_file_edits: false,
-            system_prompt: None,
-        };
-
-        let _ = run_turn(
-            &req2,
-            None,
-            TurnPolicy::ReadOnly,
-            workspace.path(),
-            &event_tx,
-            RunnerProtocol::Legacy,
-            dmuxai::mcp::RunnerMcp::for_runner(std::slice::from_ref(&server), "cursor"),
-            &notice_shown,
-        )
-        .await;
-
-        let mut turn2_notices = Vec::new();
-        while let Ok(output) = event_rx.try_recv() {
-            if let AgentEvent::Notice(msg) = output.event
-                && msg.contains("MCP servers are not propagated to Cursor in legacy mode")
-            {
-                turn2_notices.push(msg);
-            }
-        }
-        assert_eq!(turn2_notices.len(), 0, "turn 2 emits no second notice");
-
-        assert!(
-            !workspace.path().join(".cursor").exists(),
-            "no .cursor dir created"
-        );
-
-        unsafe {
-            std::env::remove_var("DMUXAI_CURSOR_BIN");
-        }
-    }
 
     #[cfg(unix)]
     pub(crate) struct FakeCursorFixture {
@@ -2600,12 +2338,8 @@ pub(crate) mod tests {
             prewarm_idle_secs: 300,
         };
         let workspace = tempfile::tempdir().unwrap();
-        let (adapter, worker) = spawn_cursor_adapter(
-            event_tx,
-            workspace.path().to_path_buf(),
-            config,
-            dmuxai::mcp::RunnerMcp::default(),
-        );
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
 
         // Turn 1
         let req1 = AgentRequest {
@@ -2728,12 +2462,8 @@ pub(crate) mod tests {
             prewarm_idle_secs: 300,
         };
         let workspace = tempfile::tempdir().unwrap();
-        let (adapter, worker) = spawn_cursor_adapter(
-            event_tx,
-            workspace.path().to_path_buf(),
-            config,
-            dmuxai::mcp::RunnerMcp::default(),
-        );
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
         let request = |turn: &str, prompt: &str| AgentRequest {
             conversation_id: super::super::ConversationId::new("conv-1"),
             turn_id: super::super::TurnId::new(turn),
@@ -2878,12 +2608,8 @@ pub(crate) mod tests {
             prewarm_idle_secs: 300,
         };
         let workspace = tempfile::tempdir().unwrap();
-        let (adapter, worker) = spawn_cursor_adapter(
-            event_tx,
-            workspace.path().to_path_buf(),
-            config,
-            dmuxai::mcp::RunnerMcp::default(),
-        );
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
         adapter.send(linger_request("turn-1", "first")).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
         let sent_at = Instant::now();
@@ -2952,12 +2678,8 @@ pub(crate) mod tests {
             prewarm_idle_secs: 300,
         };
         let workspace = tempfile::tempdir().unwrap();
-        let (adapter, worker) = spawn_cursor_adapter(
-            event_tx,
-            workspace.path().to_path_buf(),
-            config,
-            dmuxai::mcp::RunnerMcp::default(),
-        );
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
         adapter.send(linger_request("turn-1", "first")).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
         adapter.send(linger_request("turn-2", "second")).unwrap();
@@ -3022,12 +2744,8 @@ pub(crate) mod tests {
             prewarm_idle_secs: 300,
         };
         let workspace = tempfile::tempdir().unwrap();
-        let (adapter, worker) = spawn_cursor_adapter(
-            event_tx,
-            workspace.path().to_path_buf(),
-            config,
-            dmuxai::mcp::RunnerMcp::default(),
-        );
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
         adapter.send(linger_request("turn-1", "first")).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
         adapter.send(linger_request("turn-2", "second")).unwrap();
@@ -3054,58 +2772,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    // Prewarm now runs regardless of applicable MCP servers, and no .cursor dir is created.
-    async fn prewarm_runs_when_mcp_servers_apply() {
-        use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
-        use std::collections::BTreeMap;
-
-        let fixture = FakeCursorFixture::new().await;
-        let (event_tx, _) = mpsc::channel(64);
-        let config = CursorAdapterConfig {
-            protocol: RunnerProtocol::Legacy,
-            prewarm: true,
-            prewarm_idle_secs: 300,
-        };
-        let workspace = tempfile::tempdir().unwrap();
-
-        let server = ResolvedMcpServer {
-            name: "test-server".to_owned(),
-            kind: ServerKind::Generic,
-            transport: Transport::Stdio {
-                command: "echo".to_owned(),
-                args: vec![],
-                env: BTreeMap::new(),
-            },
-            runners: Some(vec!["cursor".to_owned()]),
-            tools: ToolNames::default(),
-        };
-
-        let (adapter, worker) = spawn_cursor_adapter(
-            event_tx,
-            workspace.path().to_path_buf(),
-            config,
-            dmuxai::mcp::RunnerMcp::for_runner(std::slice::from_ref(&server), "cursor"),
-        );
-
-        // Prewarm runs even when MCP servers apply to Cursor.
-        adapter.prewarm().unwrap();
-        let spawns = fixture.wait_for_spawns(1, Duration::from_secs(3)).await;
-        assert_eq!(
-            spawns.len(),
-            1,
-            "prewarm must run when MCP servers apply to Cursor"
-        );
-        assert!(
-            !workspace.path().join(".cursor").exists(),
-            "no .cursor directory may be created by prewarm"
-        );
-
-        drop(adapter);
-        let _ = worker.await;
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
     // TC-806 / FR-806, FR-807: Changing the mode or model before the prompt discards the warm process,
     // and its pid no longer exists afterwards; a fresh one is spawned; /new discards it the same way.
     async fn prewarm_discarded_on_arg_change() {
@@ -3117,12 +2783,8 @@ pub(crate) mod tests {
             prewarm_idle_secs: 300,
         };
         let workspace = tempfile::tempdir().unwrap();
-        let (adapter, worker) = spawn_cursor_adapter(
-            event_tx,
-            workspace.path().to_path_buf(),
-            config,
-            dmuxai::mcp::RunnerMcp::default(),
-        );
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
 
         // 1. Initial prewarm
         adapter.prewarm().unwrap();
@@ -3259,7 +2921,6 @@ pub(crate) mod tests {
             event_tx.clone(),
             workspace.path().to_path_buf(),
             disabled_config,
-            dmuxai::mcp::RunnerMcp::default(),
         );
         disabled_adapter.prewarm().unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3300,7 +2961,6 @@ pub(crate) mod tests {
             event_tx.clone(),
             workspace.path().to_path_buf(),
             enabled_config,
-            dmuxai::mcp::RunnerMcp::default(),
         );
         enabled_adapter.prewarm().unwrap();
         let spawns = fixture.wait_for_spawns(2, Duration::from_secs(3)).await;
@@ -3382,12 +3042,8 @@ pub(crate) mod tests {
         // Create the exit-once marker file so the warm process exits immediately on spawn
         std::fs::write(&fixture.exit_once_marker, b"exit").unwrap();
 
-        let (adapter, worker) = spawn_cursor_adapter(
-            event_tx,
-            workspace.path().to_path_buf(),
-            config,
-            dmuxai::mcp::RunnerMcp::default(),
-        );
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
         adapter.prewarm().unwrap();
 
         let spawns = fixture.wait_for_spawns(1, WAIT).await;
@@ -3541,10 +3197,8 @@ pub(crate) mod tests {
             policy: TurnPolicy,
             model: Option<&str>,
             workspace: &Path,
-            mcp_servers: &[dmuxai::mcp::ResolvedMcpServer],
         ) -> (Result<Option<String>, AgentError>, Vec<AgentEvent>) {
             let (event_tx, mut event_rx) = mpsc::channel(256);
-            let notice = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let result = run_turn(
                 &request(policy),
                 model.map(str::to_owned),
@@ -3552,8 +3206,6 @@ pub(crate) mod tests {
                 workspace,
                 &event_tx,
                 RunnerProtocol::Acp,
-                dmuxai::mcp::RunnerMcp::for_runner(mcp_servers, "cursor"),
-                &notice,
             )
             .await;
             drop(event_tx);
@@ -3589,7 +3241,7 @@ pub(crate) mod tests {
             let _guard = lock_env().await;
             set_fake_env(&[]);
             let workspace = tempfile::tempdir().unwrap();
-            let (result, events) = drive(TurnPolicy::Agent, None, workspace.path(), &[]).await;
+            let (result, events) = drive(TurnPolicy::Agent, None, workspace.path()).await;
             result.expect("acp turn");
             let text: String = events
                 .iter()
@@ -3602,37 +3254,27 @@ pub(crate) mod tests {
             assert!(text.contains("ACP_OK"), "{text}");
         }
 
-        // TC-1983 / FR-1983: Cursor ACP turn still sends mcpServers in session/new.
+        // TC-2080 / FR-2080: Cursor ACP session/new passes empty mcpServers even when mcp servers configured.
         #[tokio::test]
-        async fn tc_1983_cursor_acp_sends_mcp_servers() {
+        async fn tc_2080_cursor_acp_session_new_has_empty_mcp_servers() {
             let _guard = lock_env().await;
-            use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
-            use std::collections::BTreeMap;
 
             let capture = tempfile::NamedTempFile::new().unwrap();
             std::fs::remove_file(capture.path()).ok();
 
-            let server = ResolvedMcpServer {
-                name: "tc1983-server".to_owned(),
-                kind: ServerKind::Generic,
-                transport: Transport::Stdio {
-                    command: "echo".to_owned(),
-                    args: vec![],
-                    env: BTreeMap::new(),
-                },
-                runners: Some(vec!["cursor".to_owned()]),
-                tools: ToolNames::default(),
-            };
-
             set_fake_env(&[("FAKE_ACP_MCP_CAPTURE", capture.path().as_os_str())]);
             let workspace = tempfile::tempdir().unwrap();
-            let (result, events) =
-                drive(TurnPolicy::Agent, None, workspace.path(), &[server]).await;
+            std::fs::write(
+                workspace.path().join("dmuxai.toml"),
+                "[[mcp.servers]]\nname = \"tc2080-server\"\ncommand = \"echo\"\n",
+            )
+            .unwrap();
+            let (result, events) = drive(TurnPolicy::Agent, None, workspace.path()).await;
             result.expect("acp turn");
             assert!(events.iter().any(|e| matches!(e, AgentEvent::Completed)));
 
             let captured = std::fs::read_to_string(capture.path()).expect("mcp capture written");
-            assert!(captured.contains("tc1983-server"), "captured: {captured}");
+            assert_eq!(captured.trim(), "[]", "captured: {captured}");
         }
 
         // TC-1412, TC-1329 / FR-1411, FR-1327: fast-only session refused before any
@@ -3647,13 +3289,8 @@ pub(crate) mod tests {
                 ("FAKE_ACP_PROMPT_CAPTURE", capture.path().as_os_str()),
             ]);
             let workspace = tempfile::tempdir().unwrap();
-            let (result, _events) = drive(
-                TurnPolicy::Agent,
-                Some("composer-2.5"),
-                workspace.path(),
-                &[],
-            )
-            .await;
+            let (result, _events) =
+                drive(TurnPolicy::Agent, Some("composer-2.5"), workspace.path()).await;
             let err = result.unwrap_err();
             assert!(err.to_string().contains("fast"), "{err}");
             assert!(!capture.path().exists(), "no session/prompt may be sent");
@@ -3674,7 +3311,7 @@ pub(crate) mod tests {
             let _guard = lock_env().await;
             set_fake_env(&[("FAKE_ACP_PERMISSION_OUTSIDE", "1".as_ref())]);
             let workspace = tempfile::tempdir().unwrap();
-            let (result, events) = drive(TurnPolicy::Agent, None, workspace.path(), &[]).await;
+            let (result, events) = drive(TurnPolicy::Agent, None, workspace.path()).await;
             result.expect("denied turn is not an error");
             assert!(events.iter().any(|e| matches!(e, AgentEvent::Cancelled)));
             assert!(
@@ -3696,7 +3333,7 @@ pub(crate) mod tests {
                 ("FAKE_ACP_MODE_CAPTURE", capture.path().as_os_str()),
             ]);
             let workspace = tempfile::tempdir().unwrap();
-            let (result, _) = drive(TurnPolicy::ReadOnly, None, workspace.path(), &[]).await;
+            let (result, _) = drive(TurnPolicy::ReadOnly, None, workspace.path()).await;
             result.expect("read-only turn");
             std::fs::read_to_string(capture.path()).unwrap_or_default()
         }
@@ -3721,7 +3358,7 @@ pub(crate) mod tests {
             let _guard = lock_env().await;
             set_fake_env(&[]);
             let workspace = tempfile::tempdir().unwrap();
-            let (result, events) = drive(TurnPolicy::Agent, None, workspace.path(), &[]).await;
+            let (result, events) = drive(TurnPolicy::Agent, None, workspace.path()).await;
             result.expect("acp turn");
             assert!(events.iter().any(|e| matches!(e, AgentEvent::Completed)));
 
@@ -3758,12 +3395,8 @@ pub(crate) mod tests {
                 prewarm_idle_secs: 300,
             };
             let workspace = tempfile::tempdir().unwrap();
-            let (adapter, worker) = spawn_cursor_adapter(
-                event_tx,
-                workspace.path().to_path_buf(),
-                config,
-                dmuxai::mcp::RunnerMcp::default(),
-            );
+            let (adapter, worker) =
+                spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
             adapter.send(linger_request("turn-1", "first")).unwrap();
 
             // Wait for the leader pid to be logged.
@@ -3820,12 +3453,8 @@ pub(crate) mod tests {
                 prewarm_idle_secs: 300,
             };
             let workspace = tempfile::tempdir().unwrap();
-            let (adapter, worker) = spawn_cursor_adapter(
-                event_tx,
-                workspace.path().to_path_buf(),
-                config,
-                dmuxai::mcp::RunnerMcp::default(),
-            );
+            let (adapter, worker) =
+                spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
 
             adapter.prewarm().unwrap();
             // Wait for warm spawn.
@@ -3880,7 +3509,6 @@ pub(crate) mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn tc_1965_cursor_eof_before_exit_is_not_killed() {
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::AtomicBool;
 
         let _guard = TEST_CURSOR_MUTEX.lock().await;
         let _env_guard = dmuxai::state_path::test_env_lock();
@@ -3907,7 +3535,6 @@ pub(crate) mod tests {
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = dir.path().to_path_buf();
-        let notice = AtomicBool::new(false);
 
         let result = run_turn(
             &request,
@@ -3916,8 +3543,6 @@ pub(crate) mod tests {
             &cwd,
             &event_tx,
             RunnerProtocol::Legacy,
-            dmuxai::mcp::RunnerMcp::for_runner(&[], "cursor"),
-            &notice,
         )
         .await;
 

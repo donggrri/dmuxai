@@ -40,8 +40,7 @@ propose entries; agents can never write memory without human approval.
   vault git commit from `memory.mjs`.
 - Editing or deleting existing entries (users do that in Obsidian).
 - An Obsidian plugin, vault sync, or embeddings/semantic search.
-- Automatic registration of the memory MCP server before slice C was
-  merged (now done by FR-733; see OQ-721).
+- Automatic registration of the memory MCP server (removed 2026-10-24, superseded by SPEC-mcp-propagation-removal FR-2083; users configure `dmuxai mcp-memory` in agent configs).
 - An MCP tool that writes memory without approval.
 
 ### Assumptions and open questions
@@ -49,7 +48,7 @@ propose entries; agents can never write memory without human approval.
 | ID | Assumption or question | Owner | Needed by |
 | --- | --- | --- | --- |
 | OQ-720 | Dates use UTC (`YYYY-MM-DD`), the same as `memory.mjs` (`toISOString`). | Dongjin | Review |
-| OQ-721 | Until slice C merges, registration is a documented `[[mcp.servers]]` entry (`command = "dmuxai"`, `args = ["mcp-memory"]`); automatic registration when `[memory]` is set is a follow-up. **Resolved:** slice C merged; FR-733 adds the entry automatically. | Dongjin | Release |
+| OQ-721 | Automatic registration superseded (Dongjin decision 2026-10-24): users configure `dmuxai mcp-memory --workspace <dir>` in each agent's own MCP config. | Dongjin | Release |
 | OQ-722 | `/remember` and the dashboard Save are human actions and save directly; only agent proposals (MCP) go through the approval queue. | Dongjin | Review |
 | OQ-723 | Budgets count Unicode scalar values (`chars()`), not UTF-16 units as `memory.mjs` does; the `…(N omitted)` marker is appended after the 900-char budget exactly like `fitEntries`. | Dongjin | Review |
 
@@ -82,8 +81,8 @@ Both are terminal; deciding a non-pending proposal is an error.
 | INT-729 | Must | Given `dmuxai mcp-memory [--workspace DIR] [--vault P] [--dir D] [--project N]` | A newline-delimited JSON-RPC 2.0 MCP server on stdio: `initialize` (protocol `2024-11-05`, `serverInfo.name = "dmuxai-memory"`, `capabilities.tools`), `tools/list`, `tools/call`, `ping`; tools `memory_get_context {project?}`, `memory_search {query, limit?}`, `memory_propose {text, target?}`; results are `{content:[{type:"text",text}], isError}` | Unknown method -> error `-32601`; a request without a string `method` -> `-32600`; malformed JSON, invalid UTF-8 or a line over 4 MiB -> error `-32700` and the server keeps serving; notifications get no response; memory disabled or a rejected proposal -> `isError: true` with the reason; stdout carries only protocol messages; EOF exits 0 | TC-729 |
 | FR-730 | Must | Given `memory_search {query, limit}` | Returns entries containing every whitespace-separated query term (case-insensitive) as `<target>: <entry>` lines in the fixed order `human.md`, `projects/*`, `decisions/*`, `gotchas/*` (files by name, newest entry first within a file), at most `limit` (default 20) | Empty query -> `isError`; a `limit` that is not an integer in 1..=100 -> `isError`; no hits -> `no matches` | TC-730 |
 | NFR-731 | Must | Given any save, approve or proposal | Writes stay inside the memory root (targets are validated by pattern, never joined from raw input); the queue is written to a temp file and renamed; tests use a temporary vault only; docs use generic paths such as `~/Obsidian/Vault` | A symlinked root is allowed (Obsidian setups), but no target can contain `/`, `\`, `..` beyond the fixed layout | TC-723, TC-725 |
-| INT-732 | Should | Given slice C's shared `[[mcp.servers]]` | The README documents the automatic `dmuxai-memory` entry (FR-733) and how to override or disable it | Without slice C the subcommand still works standalone | Manual: README section |
-| FR-733 | Must | Given `[memory]` resolves to a valid config (FR-720) after the user and workspace `dmuxai.toml` are merged | Settings add a built-in shared MCP server `dmuxai-memory` to the merged `[[mcp.servers]]` list: stdio, `command` = the running DmuxAI executable (absolute path), `args = ["mcp-memory", "--workspace", <workspace root>]`, `kind = "generic"`, no `runners` filter, no env and no secrets; the vault path is never placed in argv (the subcommand reads `[memory]` from the workspace). It is appended after user/repo entries, so every runner, the dashboard registry and `/api/mcp/servers` see it like any other shared server | Memory disabled or invalid -> no entry. A user or repo entry named `dmuxai-memory` replaces the built-in one; `enabled = false` on that name removes it and it is not re-added. The executable path cannot be resolved -> one config warning and no entry | TC-733, TC-734, TC-735 |
+| INT-732 | Removed | Given slice C's shared `[[mcp.servers]]` | **Removed** (2026-10-24): superseded by SPEC-mcp-propagation-removal FR-2083. | — | TC-2083 |
+| FR-733 | Removed | Given `[memory]` resolves to a valid config (FR-720) after the user and workspace `dmuxai.toml` are merged | **Removed** (2026-10-24): superseded by SPEC-mcp-propagation-removal FR-2083. | — | TC-2083 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -101,9 +100,6 @@ Both are terminal; deciding a non-pending proposal is an error.
 | TC-729 | INT-729 | integration | built binary, temp vault | spawn `dmuxai mcp-memory --vault …`, send JSON-RPC lines | initialize, tools/list names, each tool result, `-32601`, `-32700`, disabled server `isError` | `tests/memory_mcp.rs` `mcp_memory_serves_tools_against_a_vault`, `mcp_memory_reports_disabled_memory`, `mcp_memory_rejects_*`, `mcp_memory_null_id_notification_is_silent`, `mcp_memory_oversized_line_is_parse_error_and_serving_continues` |
 | TC-730 | FR-730 | unit | temp root | search terms, limit, empty | hits, limit, error | `src/memory.rs` `search_*` |
 | TC-731 | UX-728 | unit + manual | embedded assets | read index/app assets | Memory panel ids and API paths exist; screenshot via headless Chromium recorded in the review | `src/web/assets.rs` `memory_panel_assets_present` |
-| TC-733 | FR-733 | unit | temp vault + user/workspace toml; injected executable path | load settings | memory on -> exactly one `dmuxai-memory` stdio entry with the exe and `["mcp-memory","--workspace",<root>]`, last in the list, vault path not in args; memory off -> absent; repo entry with that name replaces it; `enabled = false` removes it; unresolvable exe -> warning, absent | `src/settings.rs` `builtin_memory_mcp_server_*` |
-| TC-734 | FR-733, INT-561 | unit | settings with memory on | resolve servers, build opencode / custom-agent MCP config, registry view | `dmuxai-memory` appears as an opencode `local` entry and in the custom `mcpServers` JSON and `/api/mcp/servers` view with no secrets | `src/mcp/propagate.rs` / `src/mcp/registry.rs` `builtin_memory_server_*` |
-| TC-735 | FR-733, INT-729 | integration | built binary; temp workspace whose `dmuxai.toml` sets `[memory] vault` to a temp vault | resolve the built-in entry with the built binary as exe, connect `McpClient`, `tools/list`, call `memory_get_context` | tools `memory_get_context`, `memory_search`, `memory_propose` listed; context call succeeds | `tests/memory_mcp.rs` `builtin_memory_server_connects_via_shared_list` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -124,7 +120,7 @@ Both are terminal; deciding a non-pending proposal is an error.
 | 4 | Web API and Memory panel | `src/web/server.rs`, `src/web/assets/*` | FR-727, UX-728 | TC-728, TC-731 |
 | 5 | MCP stdio server | `src/memory_mcp.rs`, `src/main.rs` | INT-729, FR-730 | TC-729 |
 | 6 | README section | `README.md` | INT-732 | Manual |
-| 7 | Built-in shared `dmuxai-memory` MCP entry | `src/settings.rs`, `tests/memory_mcp.rs`, `README.md` | FR-733, INT-732 | TC-733..TC-735 |
+| 7 | Built-in shared `dmuxai-memory` MCP entry (superseded by SPEC-mcp-propagation-removal) | `src/settings.rs` | FR-733, INT-732 | TC-2083 |
 
 ## 8. Review and test exit criteria
 

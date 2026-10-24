@@ -15,6 +15,21 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Removed
 
+- **Removed: MCP propagation to runners (SPEC-mcp-propagation-removal).** DmuxAI
+  no longer passes its `[[mcp.servers]]` list to any runner (Codex
+  `-c mcp_servers.*` overrides, OpenCode `mcp` key in temp configs, custom agent
+  per-run JSON and `{mcp_config}`, Cursor legacy notice and `.cursor/mcp.json`
+  guard, AGY notice, and Cursor/Grok ACP `mcpServers` parameter). Every agent CLI
+  configures MCP tools directly in its own native configuration. `[[mcp.servers]]`
+  in `dmuxai.toml` is retained exclusively for the web dashboard (`GET /api/mcp/servers`
+  and Jira/Confluence to-do import via `POST /api/import`). The automatic built-in
+  `dmuxai-memory` MCP entry when `[memory]` is enabled is removed; users add
+  `dmuxai mcp-memory --workspace <dir>` to their agent's own MCP config.
+- **Deprecated:** `[[mcp.servers]] runners` allow-list is deprecated and ignored
+  with a single warning per settings load (never a parse error). Custom agent
+  `{mcp_config}` placeholder is deprecated and ignored with one warning per agent
+  (the placeholder and preceding flag are dropped; `DMUXAI_MCP_CONFIG` remains
+  scrubbed from child environments).
 - Removed: native Windows support (packaging, launcher, docs). WSL keeps
   working. Revertable in one commit.
 

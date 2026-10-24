@@ -182,30 +182,22 @@ and it is only re-sent on a resumed session when it changed.
   then `/memory approve <id>` or `/memory reject <id>`, or use the
   Approve/Reject buttons in the dashboard.
 - **MCP:** `dmuxai mcp-memory` is a stdio MCP server with `memory_search`,
-  `memory_get_context` and `memory_propose`. When `[memory]` is set, DmuxAI adds
-  it to the shared MCP list automatically as `dmuxai-memory` (command = the
-  running DmuxAI executable, args `mcp-memory --workspace <repo>`), so every
-  runner, the dashboard and `/api/mcp/servers` see it. The entry holds no vault
-  path or secrets; the subcommand reads `[memory]` from the workspace.
+  `memory_get_context` and `memory_propose`. DmuxAI does not pass MCP servers to
+  agents. To use memory tools in an agent, register `dmuxai mcp-memory` in that
+  agent's own MCP configuration:
 
-  To override it, add an entry with the same name. To disable it, add
-  `enabled = false` under that name (it is not re-added). A configured entry
-  with that name suppresses the automatic one even if it is invalid; the
-  config warning explains why.
-
-  ```toml
-  # Replace the automatic entry with your own command
-  [[mcp.servers]]
-  name = "dmuxai-memory"
-  command = "/opt/dmuxai/bin/dmuxai"
-  args = ["mcp-memory", "--workspace", "/path/to/repo"]
-
-  # Or turn it off
-  [[mcp.servers]]
-  name = "dmuxai-memory"
-  enabled = false
+  ```json
+  {
+    "mcpServers": {
+      "dmuxai-memory": {
+        "command": "dmuxai",
+        "args": ["mcp-memory", "--workspace", "/path/to/repo"]
+      }
+    }
+  }
   ```
 
+  The subcommand reads `[memory]` settings from the specified workspace directory.
   Standalone use: `dmuxai mcp-memory --workspace DIR`, or override with
   `--vault PATH --dir DIR --project NAME`.
 
@@ -316,15 +308,20 @@ allowed_runners = ["agy", "opencode-glm"]   # restrict which runners graph nodes
 More fields and ready-made presets: [docs/agents/custom-agents.md](docs/agents/custom-agents.md),
 [docs/agents/presets.toml](docs/agents/presets.toml).
 
-## Shared MCP servers (all agents)
+## MCP servers (dashboard and imports)
 
-Define MCP servers once under `[[mcp.servers]]` in `~/.config/dmuxai/dmuxai.toml`
-(user). A repo `dmuxai.toml` overrides an entry with the same `name`, and
-`enabled = false` removes it from the merged list. DmuxAI hands every runner the
-merged list per run in that CLI's own native form — it never edits user-owned
-agent config files. Secrets are env var names only (`{ env = "VAR" }`); values
-are never stored, logged, or shown by the dashboard, and a missing env var
-disables that server with a warning.
+Define MCP servers under `[[mcp.servers]]` in `~/.config/dmuxai/dmuxai.toml`
+(user) or workspace `dmuxai.toml`. A repo `dmuxai.toml` overrides an entry with the same `name`, and
+`enabled = false` removes it from the merged list.
+
+DmuxAI does not pass MCP servers to agents; every agent configures MCP tools in its
+own native configuration. `[[mcp.servers]]` is used only by the web dashboard:
+- Displaying the configured MCP server list (`GET /api/mcp/servers`).
+- Importing Jira issues or Confluence pages into to-dos (`POST /api/import`) when configured with `kind = "jira"` or `kind = "confluence"`.
+
+The `runners` allow-list key in `[[mcp.servers]]` and the `{mcp_config}` placeholder in custom agent commands are deprecated and ignored with a warning.
+
+Secrets are env var names only (`{ env = "VAR" }`); values are never stored, logged, or shown by the dashboard, and a missing env var disables that server with a warning.
 
 ```toml
 [[mcp.servers]]
@@ -339,28 +336,7 @@ kind = "jira"                        # this is the remote Atlassian MCP over
 headers = { Authorization = { env = "ATLASSIAN_MCP_AUTH" } }   # streamable HTTP
 ```
 
-Optional per entry: `kind = "generic" | "jira" | "confluence"` and a `runners`
-allow-list (absent = every runner):
-
-```toml
-runners = ["codex", "opencode-glm"]
-```
-
-How each runner receives the servers (all per run, nothing persisted into
-agent-owned config):
-
-| Runner | How DmuxAI passes MCP servers |
-| --- | --- |
-| opencode | merged into the per-run `OPENCODE_CONFIG` temp file under `mcp` (`type: local` / `remote`) |
-| Codex | per-run `-c mcp_servers.<name>.command/args` (or `.url`) overrides; secret values go into the Codex child's environment and are referenced by name (`env_vars`, `env_http_headers`), never placed in argv |
-| Custom agents | a per-run `{"mcpServers":{...}}` JSON file via the `{mcp_config}` placeholder + `DMUXAI_MCP_CONFIG` env var, removed after the turn |
-| Cursor | writes `.cursor/mcp.json` for the run only if that file does not exist and removes it after the turn; if it exists, one notice instead |
-| AGY | DmuxAI only prints the equivalent `agy mcp add` commands; AGY's user-level config is never modified |
-
-The dashboard's own MCP client uses the same list: with a `kind = "jira"` or
-`"confluence"` server configured, the to-do board shows an Import form that
-pulls issues or pages into to-dos (read-only; re-importing updates instead of
-duplicating). Details and the runner matrix:
+With a `kind = "jira"` or `"confluence"` server configured, the to-do board shows an Import form that pulls issues or pages into to-dos (read-only; re-importing updates instead of duplicating). Details:
 [SPEC-web-dashboard](docs/specs/SPEC-web-dashboard.md).
 
 The MCP client never follows HTTP redirects (so auth headers cannot leak to
@@ -846,7 +822,7 @@ similar to move-capturing owning C++ values in a task lambda.
 - `src/events.rs`, `src/notify.rs`: `.dmuxai/events.jsonl` state-change log, webhooks and command hooks
 - `src/graph/`: agent-graph planning and orchestration
 - `src/todo.rs`: persistent per-repo to-dos
-- `src/mcp/`: shared `[[mcp.servers]]` config, per-runner propagation, MCP client and registry
+- `src/mcp/`: `[[mcp.servers]]` config, dashboard MCP client and registry
 - `src/memory.rs`, `src/memory_mcp.rs`: Obsidian memory and the `dmuxai mcp-memory` server
 - `src/theme.rs`: TUI and dashboard colors
 - `src/web/`: local dashboard (`serve`/`--web`): auth, snapshot hub, HTTP/SSE routes, graph layout, parity matrix, embedded assets

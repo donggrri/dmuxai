@@ -30,7 +30,6 @@ pub async fn run_agent_acp_turn(
     requested_model: Option<String>,
     session_config_model: Option<&str>,
     reasoning_effort: Option<&str>,
-    mcp_servers: serde_json::Value,
 ) -> Result<AcpTurnResult, String> {
     let context = OutputContext::from(request);
     let prompt = prompt_with_image_tokens(&request.prompt, &request.image_paths);
@@ -42,7 +41,6 @@ pub async fn run_agent_acp_turn(
         session_config_model: session_config_model.map(str::to_owned),
         reasoning_effort: reasoning_effort.map(str::to_owned),
         cancel,
-        mcp_servers,
     };
     let outcome = run_acp_turn(
         program,
