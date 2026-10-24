@@ -19,6 +19,7 @@ quick=0
 keep_going=0
 print_env=0
 print_browser_cmd=0
+print_test_cmd=0
 help=0
 
 for arg in "$@"; do
@@ -30,6 +31,7 @@ for arg in "$@"; do
         --keep-going) keep_going=1 ;;
         --print-env) print_env=1 ;;
         --print-browser-cmd) print_browser_cmd=1 ;;
+        --print-test-cmd) print_test_cmd=1 ;;
         -h|--help) help=1 ;;
         *)
             echo "gate.sh: unknown option: $arg" >&2
@@ -56,6 +58,7 @@ Options:
 Hidden/debug:
   --print-env          Print the env var names passed to steps and exit.
   --print-browser-cmd  Print the browser test cargo command and exit.
+  --print-test-cmd     Print the test cargo command and exit.
 USAGE
     exit 0
 fi
@@ -69,7 +72,7 @@ for test_file in tests/web_*.rs; do
     browser_test_args+=(--test "$stem")
 done
 
-browser_cmd=(cargo test --all-features)
+browser_cmd=(cargo test --all-features --no-fail-fast)
 if (( ${#browser_test_args[@]} > 0 )); then
     browser_cmd+=("${browser_test_args[@]}")
 fi
@@ -82,6 +85,21 @@ if (( print_browser_cmd )); then
     else
         echo "$browser_label"
     fi
+    exit 0
+fi
+
+# Determine step list. --no-fail-fast keeps every test target running after an
+# earlier target fails, so one flaky target cannot hide the remaining results.
+if (( quick )); then
+    test_label="cargo test --all-features --no-fail-fast --test spec_index"
+    test_cmd=(cargo test --all-features --no-fail-fast --test spec_index)
+else
+    test_label="cargo test --all-features --no-fail-fast"
+    test_cmd=(cargo test --all-features --no-fail-fast)
+fi
+
+if (( print_test_cmd )); then
+    echo "$test_label"
     exit 0
 fi
 
@@ -208,15 +226,6 @@ record_failure() {
         first_failed="$label"
     fi
 }
-
-# Determine step list.
-if (( quick )); then
-    test_label="cargo test --all-features --test spec_index"
-    test_cmd=(cargo test --all-features --test spec_index)
-else
-    test_label="cargo test --all-features"
-    test_cmd=(cargo test --all-features)
-fi
 
 # Step 1
 if ! run_step "cargo fmt --all -- --check" cargo fmt --all -- --check; then
