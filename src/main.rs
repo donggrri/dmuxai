@@ -3,6 +3,7 @@ mod app;
 mod cli;
 mod internal_turn;
 mod progress;
+mod todo_link;
 
 use std::{
     error::Error,
