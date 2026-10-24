@@ -57,6 +57,8 @@ This part (Part A) provides:
 | FR-1962 | Must | Given a `Supervised` handle and a `timeout` duration | `wait_exit(timeout)` waits up to `timeout` for the child leader to exit without sending signals, stores the status in `leader_exit_status`, and returns `Some(status)` | Returns `None` on timeout without signaling the process group, preserving the ability for subsequent `stop` or `finish` calls to reap | TC-1962 |
 | FR-1963 | Must | Given a stderr tail string and a `max_lines` limit | `tail_lines(tail, max_lines)` returns the last `max_lines` non-empty lines joined with `" | "` | Returns an empty string if `max_lines` is 0 or if the input contains no non-empty lines | TC-1963 |
 | FR-1964 | Must | Given an AGY agent turn execution | The child process is supervised with `supervisor::spawn`, configures idle timeout from `agy_idle_timeout_secs()` (300 s default; 0 disables) and 500 ms term grace; streams stdout via `next_line()`, and reaps the child/grandchild group upon result completion (`wait_exit` + `finish(0)` or `stop`), idle (`stop`), or EOF (`finish(3s)`) | Stderr diagnostic formatting uses `tail_lines(..., 8)`; idle timeout returns standard `AgentError::idle` text; group is registered in `live_groups()` during execution | TC-1964 |
+| FR-1965 | Must | Given a Cursor legacy agent turn execution (fresh or warm-adopted child) | Fresh turn children are spawned with `supervisor::spawn`, matching warm children are wrapped with `supervisor::adopt` at turn start, and `stream_child` loops over `next_line()` with terminal-result grace (`wait_exit(TERMINAL_EXIT_GRACE)`), forced stop on timeout, and `tail_lines(..., 8)` diagnostics | Cursor's private `terminate_group`, `push_stderr`, and stderr ring are deleted; warm-process idle expiry/reaping behavior remains unchanged; group is registered in `live_groups()` during the turn | TC-1965 |
+| FR-1966 | Must | Given an ACP client turn execution | The ACP client uses the shared `supervisor::terminate_group(pgid, 500ms)` for group termination and formats its stderr diagnostic with `tail_lines`-compatible output (last 8 non-empty lines joined with `" | "`) | No private `terminate_group` copy remains in `src/agent/acp/client.rs`; full `adopt` of ACP remains out of scope | TC-1966 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -67,6 +69,8 @@ This part (Part A) provides:
 | TC-1962 | FR-1962 | unit (unix) | One child that exits promptly with code 0 and one child sleeping 30 s | Call `wait_exit` on both | Returns `Some(status)` with code 0 for exiting child and `None` on timeout for sleeping child without sending signals | `src/process/supervisor.rs` `tc_1962_wait_exit_waits_without_signals_and_records_status` |
 | TC-1963 | FR-1963 | unit | Various stderr strings with empty lines, trailing newlines, and varying line counts | Call `tail_lines(tail, max_lines)` | Yields last `max_lines` non-empty lines joined with `" | "`; handles 0 max_lines, empty string, and whitespace-only lines | `src/process/supervisor.rs` `tc_1963_tail_lines_formats_last_non_empty_lines` |
 | TC-1964 | FR-1964 | integration (unix) | Fake AGY turn running in own process group | Run turn, verify live group tracking, idle timeout, and result grace | `live_groups()` contains AGY pgid during turn and unregisters after completion; existing idle kill and result grace tests continue to pass | `src/agent/agy.rs` `tc_1964_agy_uses_supervisor_and_registers_group` |
+| TC-1965 | FR-1965 | integration (unix) | Fake Cursor legacy turn and warm-adopted turn | Run both turns and inspect live group registration | Both turns complete; `live_groups()` contains the cursor pgid during each turn; fake Cursor binary only, no real Cursor CLI | `src/agent/cursor.rs` `tc_1965_cursor_legacy_uses_supervisor_and_registers_group` |
+| TC-1966 | FR-1966 | integration (unix) | Fake ACP agent turn | Run turn and verify process cleanup | ACP turn completes and no fake ACP agent process outlives the turn via shared `terminate_group` | `src/agent/cursor.rs` `tc_1966_acp_client_uses_shared_terminate_group` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -82,8 +86,8 @@ This part (Part A) provides:
 | --- | --- | --- | --- | --- |
 | 1 | Supervisor API additions (adopt, terminate_group, wait_exit, tail_lines) | `src/process/supervisor.rs` | FR-1960, FR-1961, FR-1962, FR-1963 | `tc_1960`, `tc_1961`, `tc_1962`, `tc_1963` |
 | 2 | AGY runner migration onto supervisor | `src/agent/agy.rs` | FR-1964 | `tc_1964`, existing agy tests |
-| 3 | (planned) Cursor legacy migration onto supervisor | `src/agent/cursor.rs` | FR-1965 (planned) | Part B verification |
-| 4 | (planned) ACP client terminate_group adoption | `src/agent/acp/client.rs` | FR-1966 (planned) | Part C verification |
+| 3 | Cursor legacy migration onto supervisor | `src/agent/cursor.rs` | FR-1965 | `tc_1965`, existing cursor tests |
+| 4 | ACP client shared terminate_group adoption | `src/agent/acp/client.rs` | FR-1966 | `tc_1966`, existing acp tests |
 | 5 | (planned) MCP client & Office conversion cleanup of shell kill | `src/mcp/client.rs`, `src/docs/office.rs` | FR-1967, FR-1968 (planned) | Part D verification |
 
 ## 8. Review and test exit criteria
