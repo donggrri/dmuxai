@@ -209,6 +209,9 @@ struct WarmProcess {
     env_bin: Option<OsString>,
     child: Option<tokio::process::Child>,
     spawned_at: Instant,
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    group_guard: Option<dmuxai::process::supervisor::GroupGuard>,
 }
 
 impl Drop for WarmProcess {
@@ -216,57 +219,54 @@ impl Drop for WarmProcess {
         if let Some(mut child) = self.child.take() {
             #[cfg(unix)]
             if let Some(id) = child.id() {
-                let _ = std::process::Command::new("kill")
-                    .args(["-KILL", "--", &format!("-{id}")])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                let _ = dmuxai::process::supervisor::signal_group(
+                    id,
+                    dmuxai::process::supervisor::GroupSignal::Kill,
+                );
             }
             let _ = child.start_kill();
         }
     }
 }
 
-/// Sends `signal` (e.g. `-TERM`) to the whole process group `pgid` (Unix).
-#[cfg(unix)]
-async fn signal_group(pgid: u32, signal: &str) -> bool {
-    tokio::process::Command::new("kill")
-        .args([signal, "--", &format!("-{pgid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|status| status.success())
-}
-
 /// SIGTERM the group, wait up to 500 ms for it to go away, then SIGKILL
 /// whatever is left (descendants that ignore SIGTERM included).
 #[cfg(unix)]
 async fn terminate_group(pgid: u32) {
-    if !signal_group(pgid, "-TERM").await {
+    if !dmuxai::process::supervisor::signal_group(
+        pgid,
+        dmuxai::process::supervisor::GroupSignal::Term,
+    ) {
         return; // group already gone
     }
     let deadline = Instant::now() + std::time::Duration::from_millis(500);
     while Instant::now() < deadline {
-        if !signal_group(pgid, "-0").await {
+        if !dmuxai::process::supervisor::group_alive(pgid) {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    let _ = signal_group(pgid, "-KILL").await;
+    let _ = dmuxai::process::supervisor::signal_group(
+        pgid,
+        dmuxai::process::supervisor::GroupSignal::Kill,
+    );
 }
 
 async fn reap_warm_process(mut warm: WarmProcess) {
     if let Some(mut child) = warm.child.take() {
         #[cfg(unix)]
         if let Some(id) = child.id() {
-            let _ = signal_group(id, "-TERM").await;
+            let _ = dmuxai::process::supervisor::signal_group(
+                id,
+                dmuxai::process::supervisor::GroupSignal::Term,
+            );
             let _ = tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await;
             // Always clean up the rest of the group, even if the leader exited
             // in time: children may ignore SIGTERM.
-            let _ = signal_group(id, "-KILL").await;
+            let _ = dmuxai::process::supervisor::signal_group(
+                id,
+                dmuxai::process::supervisor::GroupSignal::Kill,
+            );
         }
         let _ = child.start_kill();
         let _ = child.wait().await;
@@ -288,8 +288,10 @@ fn spawn_warm_process(
         .map(|s| s.to_os_string())
         .collect::<Vec<_>>();
     let env_bin = std::env::var_os("DMUXAI_CURSOR_BIN");
-    #[cfg(unix)]
-    command.process_group(0);
+    dmuxai::process::supervisor::configure_child(
+        &mut command,
+        &dmuxai::process::supervisor::ChildOptions::default(),
+    );
     command
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -297,6 +299,12 @@ fn spawn_warm_process(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let child = command.spawn()?;
+    #[cfg(unix)]
+    let group_guard = child
+        .id()
+        .map(dmuxai::process::supervisor::GroupGuard::register);
+    #[cfg(not(unix))]
+    let group_guard = None;
     Ok(WarmProcess {
         program,
         argv,
@@ -304,6 +312,8 @@ fn spawn_warm_process(
         env_bin,
         child: Some(child),
         spawned_at: Instant::now(),
+        #[cfg(unix)]
+        group_guard,
     })
 }
 
@@ -911,16 +921,16 @@ async fn run_turn_with_child(
                 mode,
                 cwd,
             );
+            dmuxai::process::supervisor::configure_child(
+                &mut command,
+                &dmuxai::process::supervisor::ChildOptions::default(),
+            );
             command
                 .current_dir(cwd)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
-            // Own process group, so a lingering CLI and its children can be
-            // stopped together (cancel, or after the terminal result).
-            #[cfg(unix)]
-            command.process_group(0);
             command
                 .spawn()
                 .map_err(|e| AgentError::process_exit(format!("could not start Cursor: {e}")))?
@@ -929,6 +939,11 @@ async fn run_turn_with_child(
     if let Some(id) = child.id() {
         pgid.store(id, std::sync::atomic::Ordering::SeqCst);
     }
+    // Register the turn's group for its lifetime.
+    #[cfg(unix)]
+    let _cursor_group_guard = child
+        .id()
+        .map(dmuxai::process::supervisor::GroupGuard::register);
 
     let mut stdin = child
         .stdin
@@ -1093,7 +1108,10 @@ async fn stream_child(
         && !forced_after_result
         && let Some(pgid) = pgid
     {
-        let _ = signal_group(pgid, "-KILL").await;
+        let _ = dmuxai::process::supervisor::signal_group(
+            pgid,
+            dmuxai::process::supervisor::GroupSignal::Kill,
+        );
     }
 
     let status = exit_status.expect("child.wait runs before the loop can finish");
@@ -2527,14 +2545,8 @@ pub(crate) mod tests {
                 }
                 true
             } else {
-                std::process::Command::new("kill")
-                    .arg("-0")
-                    .arg(pid.to_string())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
+                // SAFETY: kill with signal 0 probes process existence.
+                unsafe { libc::kill(pid as i32, 0) == 0 }
             }
         }
 

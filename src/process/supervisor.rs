@@ -192,6 +192,42 @@ pub fn signal_group(pgid: u32, signal: GroupSignal) -> bool {
     res == 0
 }
 
+/// Returns `true` if any process in the process group `pgid` is still alive.
+#[cfg(unix)]
+pub fn group_alive(pgid: u32) -> bool {
+    if pgid <= 1 || pgid > i32::MAX as u32 {
+        return false;
+    }
+    // SAFETY: getpgrp returns caller process group.
+    let own_pgid = unsafe { libc::getpgrp() };
+    if pgid as i32 == own_pgid {
+        return false;
+    }
+    // SAFETY: killpg with signal 0 probes for any live process in the group.
+    unsafe { libc::killpg(pgid as i32, 0) == 0 }
+}
+
+/// Guard that keeps a runner's process group registered in the live-group registry
+/// for as long as it is alive. Runners that keep their own `tokio::process::Child`
+/// (agy, cursor legacy, ACP) register on spawn and unregister on drop.
+#[cfg(unix)]
+pub struct GroupGuard(u32);
+
+#[cfg(unix)]
+impl GroupGuard {
+    pub fn register(pgid: u32) -> Self {
+        register_group(pgid);
+        Self(pgid)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        unregister_group(self.0);
+    }
+}
+
 /// Configures a Tokio process command for supervised execution:
 /// puts the child into its own process group (`process_group(0)`, so child pgid == child pid),
 /// sets `kill_on_drop(true)`, and on Linux when `opts.parent_death_signal` is enabled,
@@ -454,6 +490,22 @@ impl Supervised {
             }
         };
 
+        // Leader reaped: if a grandchild ignored SIGTERM, escalate to SIGKILL.
+        if group_alive(self.pgid) {
+            let start = std::time::Instant::now();
+            let poll = Duration::from_millis(20);
+            while start.elapsed() < self.config.term_grace && group_alive(self.pgid) {
+                tokio::time::sleep(
+                    poll.min(self.config.term_grace.saturating_sub(start.elapsed())),
+                )
+                .await;
+            }
+            if group_alive(self.pgid) {
+                signal_group(self.pgid, GroupSignal::Kill);
+                let _ = self.child.start_kill();
+            }
+        }
+
         unregister_group(self.pgid);
         self.reaped_status = Some(status);
         status
@@ -492,6 +544,22 @@ impl Supervised {
                 }
             }
         };
+
+        // Leader reaped: if a grandchild ignored SIGTERM, wait up to term_grace then SIGKILL.
+        if group_alive(self.pgid) {
+            let start = std::time::Instant::now();
+            let poll = Duration::from_millis(20);
+            while start.elapsed() < self.config.term_grace && group_alive(self.pgid) {
+                tokio::time::sleep(
+                    poll.min(self.config.term_grace.saturating_sub(start.elapsed())),
+                )
+                .await;
+            }
+            if group_alive(self.pgid) {
+                signal_group(self.pgid, GroupSignal::Kill);
+                let _ = self.child.start_kill();
+            }
+        }
 
         unregister_group(self.pgid);
         self.reaped_status = Some(status);
@@ -942,6 +1010,80 @@ mod tests {
             other => panic!("expected Line, got {:?}", other),
         }
         sup_false.stop().await;
+    }
+
+    #[tokio::test]
+    async fn tc_1798_group_alive_and_guard_registry() {
+        use std::process::Stdio;
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let opts = ChildOptions::default();
+        configure_child(&mut cmd, &opts);
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        let mut child = cmd.spawn().expect("spawn");
+        let pid = child.id().expect("pid");
+        let pgid = pid;
+
+        assert!(group_alive(pgid));
+
+        {
+            let _guard = GroupGuard::register(pgid);
+            assert!(live_groups().contains(&pgid));
+        }
+        assert!(!live_groups().contains(&pgid));
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        assert!(!group_alive(pgid));
+    }
+
+    #[tokio::test]
+    async fn tc_1798_finish_kills_grandchild_ignoring_term() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pid_file = tmp.path().join("child.pid");
+        let pid_path_str = pid_file.to_str().expect("valid path");
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!("sh -c \"trap '' TERM; sleep 60\" & echo $! > '{pid_path_str}'; echo done"),
+        ]);
+        let config = SupervisorConfig::new("tc_1798_finish");
+        let mut supervised = spawn(cmd, config).expect("spawn succeeds");
+
+        match supervised.next_line().await.expect("read done") {
+            LineEvent::Line(l) => assert_eq!(l, "done"),
+            other => panic!("expected Line(done), got {:?}", other),
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut grandchild_pid = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(content) = std::fs::read_to_string(&pid_file) {
+                let trimmed = content.trim();
+                if let Ok(pid) = trimmed.parse::<u32>() {
+                    grandchild_pid = Some(pid);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let grandchild_pid = grandchild_pid.expect("grandchild pid file was not written in time");
+
+        let start = std::time::Instant::now();
+        let _status = supervised.finish(Duration::from_millis(500)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "finish took too long: {elapsed:?}"
+        );
+
+        assert!(
+            wait_pid_gone(grandchild_pid, Duration::from_secs(5)).await,
+            "grandchild pid {grandchild_pid} should be gone"
+        );
     }
 
     #[test]

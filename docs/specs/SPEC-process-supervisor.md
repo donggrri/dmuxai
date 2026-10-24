@@ -25,7 +25,6 @@ Runner process management is unified into a shared process supervisor module (`s
 ### Out of scope / non-goals
 
 - Porting specific runners (`custom`, `agy`, `cursor`, `acp`) to the supervisor; agy, cursor, and acp are addressed in subsequent parts of PR-5.
-- Reserved IDs note: FR-1798..1799 and TC-1798..1799 are reserved for runner ports in subsequent PR-5 parts and are not defined here.
 
 ### Assumptions and open questions
 
@@ -65,6 +64,8 @@ Runner process management is unified into a shared process supervisor module (`s
 | FR-1795 | Must | Given a running custom agent emitting stdout lines | Each stdout line resets the idle timer; streaming continues without `Idle` timeout as long as the interval between lines is under `idle_timeout_secs` | An idle interval exceeding `idle_timeout_secs` triggers the watchdog | TC-1795 |
 | FR-1796 | Must | Given a custom agent with `idle_timeout_secs` unset or explicitly set to 0 | Unset defaults to 300 seconds; explicit 0 disables the idle watchdog completely | Disabled watchdog allows turns with long pauses between stdout lines | TC-1796 |
 | FR-1797 | Must | Given a custom agent turn without `done_when` where the leader process exits 0 while a detached grandchild holds stdout open | The turn does not block waiting for EOF; it completes within 10 s with the text and reaps the grandchild process group | Grandchild PID is gone after turn finishes | TC-1797 |
+| FR-1798 | Must | Given a runner that keeps its own `tokio::process::Child` (agy, cursor legacy, ACP) | `group_alive(pgid)` reports whether any process in the group is alive (false for 0, 1, and the caller's own group); `GroupGuard::register(pgid)` adds the group to the live-group registry for the life of the turn and unregisters on drop | Group stays registered only while the runner is running | TC-1798 |
+| FR-1799 | Must | Given agy, cursor legacy, and ACP child processes | They run in their own process group, are registered in `live_groups()` while running, and are stopped with `libc::killpg` via `signal_group`; no `Command::new("kill")` shell-outs remain in `src/agent` or `src/process` | Kill path is idempotent and leaves no orphaned descendants | TC-1799 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -89,6 +90,8 @@ Runner process management is unified into a shared process supervisor module (`s
 | TC-1795 | FR-1795 | integration (unix) | Fake custom agent printing one JSONL line every 400 ms for ~2.5 s then exiting 0, `idle_timeout_secs = 1` | Run turn | Turn succeeds, all text received without `Idle` timeout | `src/agent/custom.rs` `tc_1795_idle_timer_resets_on_each_line` |
 | TC-1796 | FR-1796 | unit / integration | Fake custom agent with `idle_timeout_secs = 0` silent for 2 s then printing text line; and spec parsing tests | Run turn and parse specs | Turn succeeds with text; parsing gives unset -> `Some(300)`, 0 -> `None`, 45 -> `Some(45)` | `src/agent/custom.rs` `tc_1796_idle_timeout_zero_disables_watchdog`, `src/custom_agent.rs` `tc_1796_idle_timeout_secs_defaults` |
 | TC-1797 | FR-1797 | integration (unix) | Fake custom agent starting `sleep 60 &` (inheriting stdout), writing PID to file, printing text line and exiting 0 without `done_when` | Run turn | Turn finishes within 10 s with the text, grandchild PID is gone | `src/agent/custom.rs` `tc_1797_grandchild_holding_stdout_still_finishes` |
+| TC-1798 | FR-1798 | unit (unix) | Running child in its own group; grandchild ignoring SIGTERM | `group_alive`/`GroupGuard` registry; `finish` reaps ignoring grandchild | Guard registers/unregisters; group_alive true while running and false after stop; finish kills grandchild within 5 s | `src/process/supervisor.rs` `tc_1798_group_alive_and_guard_registry`, `tc_1798_finish_kills_grandchild_ignoring_term` |
+| TC-1799 | FR-1799 | integration (unix) | Fake agy turn running | Run turn | While running pgid is in `live_groups()`; after turn ends/cancelled it is not and process is gone | `src/agent/agy.rs` `tc_1799_runner_groups_registered_while_running` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -109,7 +112,7 @@ Runner process management is unified into a shared process supervisor module (`s
 
 ## 8. Review and test exit criteria
 
-- [x] All Must requirements (FR-1779..FR-1797) map to passing test evidence (TC-1779..TC-1797).
+- [x] All Must requirements (FR-1779..FR-1799) map to passing test evidence (TC-1779..TC-1799).
 - [x] The diff has been reviewed against scope and non-goals.
 - [x] Required Rust checks pass: format, test, and clippy with `-D warnings`.
 - [x] `scripts/check-spec.py` passes and `tests/spec_index.rs` verifies spec indexing.
