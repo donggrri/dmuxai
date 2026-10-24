@@ -214,13 +214,14 @@ Details: [SPEC-obsidian-memory](docs/specs/SPEC-obsidian-memory.md).
 ## Calling dmuxai from an agent
 
 DmuxAI is usable without the terminal, from the repo it runs in. `--json` keeps
-stdout machine-readable and sends diagnostics to stderr:
+stdout machine-readable and sends diagnostics to stderr; `--progress` streams live
+progress JSON lines to stderr while a turn runs:
 
 ```bash
-dmuxai status --json                                  # agents, to-dos, last graph, last event seq
-dmuxai run "summarize this repo" --agent agy --json   # one-shot; add --graph for the planner
+dmuxai status --json                                  # agents (with last_output_at_ms), to-dos, last graph, last event seq
+dmuxai run "summarize this repo" --agent agy --json   # one-shot; add --progress for live progress, --graph for the planner
 dmuxai todo add "Write docs" --body "API.md first"
-dmuxai events --follow --json                         # tail .dmuxai/events.jsonl
+dmuxai events --follow --json                         # tail .dmuxai/events.jsonl (agent, activity, node, graph, todo)
 ```
 
 MCP over stdio exposes the same operations as tools; most clients take a

@@ -1452,9 +1452,18 @@ pub struct App {
     cursor_session_maybe_read_only: bool,
     /// Cached assistant HTML keyed by transcript message id (`conversation:index`).
     chat_markdown_cache: HashMap<String, (u64, String)>,
+    pub(crate) progress_tracker: crate::progress::ProgressTracker,
+    pub(crate) progress_sink: Option<ProgressSink>,
+    last_tool_progress_state: HashMap<(Agent, String), String>,
+    last_output_heartbeat_at: HashMap<Agent, Instant>,
 }
 
+pub type ProgressSink = Box<dyn FnMut(&str) + Send>;
+
 impl App {
+    pub fn set_progress_sink(&mut self, sink: ProgressSink) {
+        self.progress_sink = Some(sink);
+    }
     pub fn new(
         engine: ConversationEngine,
         workspace_root: PathBuf,
@@ -1694,6 +1703,10 @@ impl App {
             allow_multi_runner_graph: false,
             cursor_session_maybe_read_only: true,
             chat_markdown_cache: HashMap::new(),
+            progress_tracker: crate::progress::ProgressTracker::new(),
+            progress_sink: None,
+            last_tool_progress_state: HashMap::new(),
+            last_output_heartbeat_at: HashMap::new(),
         };
         let runners = app.registered_runner_names();
         app.messages
@@ -3310,6 +3323,8 @@ impl App {
         let mut outcome = DrainEventsOutcome::default();
         while let Ok(mut output) = self.event_rx.try_recv() {
             self.attach_model_catalog_hint(&mut output);
+            self.feed_progress_sink(&output);
+            self.maybe_emit_activity_event(&output);
             if let AgentEvent::Error(ref err) = output.event {
                 outcome.errored = true;
                 outcome.error_kind = Some(err.kind.as_str().to_owned());
@@ -3325,6 +3340,136 @@ impl App {
             }
         }
         outcome
+    }
+
+    fn feed_progress_sink(&mut self, output: &AgentOutput) {
+        if self.progress_sink.is_none() {
+            return;
+        }
+        let runner = self.agent_runner_name(output.agent);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
+        let lines = self
+            .progress_tracker
+            .observe(&runner, &output.event, now_ms);
+        if let Some(ref mut sink) = self.progress_sink {
+            for line in lines {
+                let json = line.to_json();
+                sink(&json);
+            }
+        }
+    }
+
+    fn maybe_emit_activity_event(&mut self, output: &AgentOutput) {
+        let Some(hub) = self.dashboard.clone() else {
+            return;
+        };
+        let runner = self.agent_runner_name(output.agent);
+        let active = self.active_turns.get(&output.agent).cloned();
+        let task = active
+            .as_ref()
+            .map(|a| a.conversation_id.as_str().to_owned())
+            .or_else(|| Some(self.conversation_id.as_str().to_owned()));
+        let todo = active.as_ref().and_then(|a| {
+            self.todo_turns
+                .get(&(output.agent, a.turn_id.clone()))
+                .cloned()
+        });
+        let node = self.graph_agent_nodes.get(&output.agent).cloned();
+        let model = self
+            .model_catalogs
+            .get(&output.agent)
+            .and_then(|catalog| catalog.selected.clone());
+
+        match &output.event {
+            AgentEvent::ToolProgress {
+                item_id,
+                summary,
+                state,
+            } => {
+                let key = (output.agent, item_id.clone());
+                let duplicate = self.last_tool_progress_state.get(&key) == Some(state);
+                if duplicate {
+                    return;
+                }
+                self.last_tool_progress_state.insert(key, state.clone());
+                let msg = crate::progress::sanitize_summary(
+                    &format!("{state} {summary}"),
+                    crate::progress::MAX_SUMMARY_CHARS,
+                );
+                hub.emit_event(dmuxai::events::EventDraft {
+                    kind: "activity".to_owned(),
+                    task,
+                    todo,
+                    node,
+                    runner: Some(runner),
+                    model,
+                    from_state: None,
+                    to_state: "tool".to_owned(),
+                    message: Some(msg),
+                    error_kind: None,
+                });
+            }
+            AgentEvent::Activity(item) => {
+                if crate::progress::is_file_edit_activity(item) {
+                    let msg = crate::progress::sanitize_summary(
+                        &crate::progress::activity_item_summary(item),
+                        crate::progress::MAX_SUMMARY_CHARS,
+                    );
+                    hub.emit_event(dmuxai::events::EventDraft {
+                        kind: "activity".to_owned(),
+                        task,
+                        todo,
+                        node,
+                        runner: Some(runner),
+                        model,
+                        from_state: None,
+                        to_state: "file_edit".to_owned(),
+                        message: Some(msg),
+                        error_kind: None,
+                    });
+                }
+            }
+            AgentEvent::TextDelta(text) => {
+                let now = std::time::Instant::now();
+                let should_heartbeat = match self.last_output_heartbeat_at.get(&output.agent) {
+                    None => true,
+                    Some(last) => now.duration_since(*last) >= std::time::Duration::from_secs(30),
+                };
+                if should_heartbeat {
+                    self.last_output_heartbeat_at.insert(output.agent, now);
+                    let msg = crate::progress::sanitize_text_summary(
+                        text,
+                        crate::progress::MAX_SUMMARY_CHARS,
+                    );
+                    hub.emit_event(dmuxai::events::EventDraft {
+                        kind: "activity".to_owned(),
+                        task,
+                        todo,
+                        node,
+                        runner: Some(runner),
+                        model,
+                        from_state: None,
+                        to_state: "output".to_owned(),
+                        message: Some(msg),
+                        error_kind: None,
+                    });
+                }
+            }
+            AgentEvent::Started => {
+                self.last_tool_progress_state
+                    .retain(|(agent, _), _| *agent != output.agent);
+                self.last_output_heartbeat_at.remove(&output.agent);
+            }
+            AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_) => {
+                self.last_tool_progress_state
+                    .retain(|(agent, _), _| *agent != output.agent);
+                self.last_output_heartbeat_at.remove(&output.agent);
+            }
+            _ => {}
+        }
     }
 
     fn attach_model_catalog_hint(&self, output: &mut AgentOutput) {
@@ -23673,6 +23818,268 @@ mod tests {
                 );
             }
         }
+    }
+
+    // TC-1774 / FR-1774: with a progress sink installed, a headless run that streams
+    // text then completes produces started, text, completed lines in order;
+    // without a sink nothing is produced.
+    #[tokio::test]
+    async fn tc_1774_headless_progress_sink_receives_lines() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let received = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let received_clone = Arc::clone(&received);
+        app.set_progress_sink(Box::new(move |line: &str| {
+            received_clone.lock().unwrap().push(line.to_owned());
+        }));
+
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::Started,
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("streaming answer".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "test prompt".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert_eq!(outcome.exit_code, 0);
+
+        let lines = received.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected started, text, completed: {lines:?}"
+        );
+        let val0: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        let val1: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        let val2: serde_json::Value = serde_json::from_str(&lines[2]).unwrap();
+        assert_eq!(val0["kind"], "started");
+        assert_eq!(val1["kind"], "text");
+        assert_eq!(val1["summary"], "streaming answer");
+        assert_eq!(val2["kind"], "completed");
+
+        // Without a sink installed, nothing is produced
+        let (mut app_no_sink, sent2, event_tx2) = test_app_with_event_sender();
+        let cancel2 = Arc::new(AtomicBool::new(false));
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent2.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx2
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::Started,
+                        })
+                        .await;
+                    let _ = event_tx2
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("streaming answer".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx2
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let req2 = HeadlessRequest {
+            prompt: "test prompt 2".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome2 = app_no_sink.run_headless(req2, cancel2).await;
+        assert_eq!(outcome2.exit_code, 0);
+        assert!(app_no_sink.progress_sink.is_none());
+    }
+
+    // TC-1775 / FR-1775: a tool progress and a file edit produce activity events;
+    // 50 text deltas in a short time produce at most one output heartbeat.
+    #[test]
+    fn tc_1775_activity_events_logged_and_throttled() {
+        use dmuxai::events::{EventLog, EventSink, read_since};
+        use dmuxai::web::SnapshotSource;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::open(dir.path(), dir.path().display().to_string());
+        let sink = EventSink::new(log, Duration::ZERO, None);
+        let hub =
+            dmuxai::web::DashboardHub::new(SnapshotSource::Tui, dir.path().display().to_string())
+                .with_events(sink);
+
+        let (mut app, _sent) = test_app();
+        app.attach_dashboard(hub);
+
+        let conv_id = app.conversation_id.clone();
+        let turn_id = TurnId::new("turn-1");
+
+        // 1. ToolProgress event produces activity event with to_state = "tool"
+        let tool_out = AgentOutput {
+            agent: Agent::Cursor,
+            conversation_id: Some(ConversationId::new(conv_id.as_str())),
+            turn_id: Some(turn_id.clone()),
+            event: AgentEvent::ToolProgress {
+                item_id: "tool-1".to_owned(),
+                summary: "cargo check".to_owned(),
+                state: "running".to_owned(),
+            },
+        };
+        app.maybe_emit_activity_event(&tool_out);
+
+        // Repeated same state does not emit duplicate
+        app.maybe_emit_activity_event(&tool_out);
+
+        // 2. File edit Activity item produces activity event with to_state = "file_edit"
+        let file_edit_out = AgentOutput {
+            agent: Agent::Cursor,
+            conversation_id: Some(ConversationId::new(conv_id.as_str())),
+            turn_id: Some(turn_id.clone()),
+            event: AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "edit".to_owned(),
+                target: "src/main.rs".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        };
+        app.maybe_emit_activity_event(&file_edit_out);
+
+        // Non-file-edit activity (e.g. run) does NOT produce file_edit event
+        let non_edit_out = AgentOutput {
+            agent: Agent::Cursor,
+            conversation_id: Some(ConversationId::new(conv_id.as_str())),
+            turn_id: Some(turn_id.clone()),
+            event: AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "run".to_owned(),
+                target: "cargo test".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        };
+        app.maybe_emit_activity_event(&non_edit_out);
+
+        // 3. 50 text deltas in a short time produce at most one output heartbeat
+        for i in 0..50 {
+            let delta_out = AgentOutput {
+                agent: Agent::Cursor,
+                conversation_id: Some(ConversationId::new(conv_id.as_str())),
+                turn_id: Some(turn_id.clone()),
+                event: AgentEvent::TextDelta(format!("delta {i} ")),
+            };
+            app.maybe_emit_activity_event(&delta_out);
+        }
+
+        let events_path = dmuxai::events::events_path(dir.path());
+        let events = read_since(&events_path, 0, None);
+
+        let activity_events: Vec<_> = events.iter().filter(|e| e.kind == "activity").collect();
+        let tool_events: Vec<_> = activity_events
+            .iter()
+            .filter(|e| e.to_state == "tool")
+            .collect();
+        let edit_events: Vec<_> = activity_events
+            .iter()
+            .filter(|e| e.to_state == "file_edit")
+            .collect();
+        let output_events: Vec<_> = activity_events
+            .iter()
+            .filter(|e| e.to_state == "output")
+            .collect();
+
+        assert_eq!(
+            tool_events.len(),
+            1,
+            "expected 1 tool activity event: {activity_events:?}"
+        );
+        assert_eq!(
+            edit_events.len(),
+            1,
+            "expected 1 file_edit activity event: {activity_events:?}"
+        );
+        assert_eq!(
+            output_events.len(),
+            1,
+            "expected exactly 1 output heartbeat for 50 text deltas: {activity_events:?}"
+        );
+        assert!(
+            tool_events[0]
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("cargo check")
+        );
+        assert!(
+            edit_events[0]
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("src/main.rs")
+        );
     }
 
     // TC-1765 / FR-1765: explicit agent error is reported once directly without graph failure notices.

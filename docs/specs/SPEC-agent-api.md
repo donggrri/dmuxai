@@ -76,6 +76,7 @@ Event `to_state` vocabulary (`kind` in parentheses):
 | kind | Transitions emitted |
 | --- | --- |
 | `agent` | `pending` (request accepted), `started`, `running` (phase change, `message` = phase), `completed`, `error`, `cancelled`, `stalled` |
+| `activity` | runner activity and progress heartbeats: `tool` (ToolProgress state change), `file_edit` (file-edit Activity item), `output` (text delta heartbeat at most once every 30s) |
 | `node` | graph node status changes: `pending`, `ready`, `running`, `waiting_gate`, `completed`, `failed`, `skipped` |
 | `graph` | graph run phase changes: `active`, `waiting_gate`, `completed`, `failed` |
 | `todo` | `started` (to running), `completed` (to done), `failed` (running to open with an error), `open` (any other change to open) |
@@ -90,6 +91,18 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
  "node":"implement-1","runner":"agy","model":"gemini-3.8-flash-high",
  "from_state":"ready","to_state":"running","message":null}
 ```
+
+Progress line schema (emitted to STDERR when `--progress` is enabled, one JSON object per line):
+
+```json
+{"type":"progress","ts_ms":1792236153456,"agent":"cursor","kind":"started","summary":"started"}
+```
+
+- `type`: constant `"progress"`
+- `ts_ms`: epoch milliseconds (`u64`)
+- `agent`: runner id string
+- `kind`: one of `started`, `tool`, `activity`, `status`, `notice`, `text`, `completed`, `error`, `cancelled`
+- `summary`: single-line string at most 160 characters (cut with `…` if longer; newlines replaced by spaces)
 
 ## 4. Requirements
 
@@ -144,6 +157,12 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | FR-1769 | Must | Given `dmuxai run` / `todo run` flags parsed by the table-driven parser | Then `--agent`, `--model`, `--graph`, `--read-only`, `--approve-plan`, `--allow-sensitive`, `--json`, and `--progress` are recognized and `RunOptions.progress` is true iff `--progress` is present | unknown flags, missing values, and `--` handling keep their existing messages | TC-1769 |
 | FR-1770 | Must | Given the table-driven flag parser | Then every existing error message (`unexpected argument`, `<flag> needs a value`, removed `--mode`, agent/graph conflict, model rules, empty prompt, `todo add` title, numeric limits, etc.) is still produced for the same input | boundary cases in TC-1770 | TC-1770 |
 | FR-1771 | Must | Given `dmuxai --help` | Then the usage text contains `--progress` and does not contain `--read-only` | help exits 0 | TC-1771 |
+| FR-1772 | Must | Given an `AgentEvent` mapped to a progress line | Then the line shape matches `{"type":"progress","ts_ms":<u64>,"agent":"<runner id>","kind":"<kind>","summary":"<text>"}` and summary is single-line, at most 160 characters cut with `…` | multiline summaries replace newlines with spaces; non-progress events return None | TC-1772 |
+| FR-1773 | Must | Given streaming `TextDelta` events for an agent | Then at most one `text` line per agent is emitted every 2 seconds (summary = last 160 chars received since previous text line, newlines replaced with spaces), and pending text is flushed before `completed`, `error`, or `cancelled` | empty delta text does not emit an extra line | TC-1773 |
+| FR-1774 | Must | Given a headless run with `--progress` | Then live progress lines are written to stderr in order as events occur, while stdout carries only the final output; without `--progress` stderr receives no progress lines | errors and cancellations still flush pending progress lines | TC-1774 |
+| FR-1775 | Must | Given an active turn in a process with an event hub | Then activity events (`kind: "activity"`) are emitted to the event log: `tool` on `ToolProgress` state changes, `file_edit` on file-edit `ActivityItem`s, and an `output` heartbeat at most once every 30 seconds for `TextDelta` | unchanged tool state and frequent text deltas do not emit duplicate activity events | TC-1775 |
+| FR-1776 | Must | Given `dmuxai status --json` | Then each `agents[].run` in `running` state includes `last_output_at_ms` equal to the latest `agent` or `activity` event `ts_ms` for that runner since the run started (equal to `started_at_ms` when no output yet) | stalled and pending transitions do not reset `last_output_at_ms`; terminal states preserve it | TC-1776 |
+| FR-1777 | Must | Given `dmuxai run <prompt> --agent ID --json --progress` | Then stderr contains at least a `started` and a `completed` progress JSON line while stdout is exactly one JSON object; without `--progress` stderr contains no progress lines | exit code and JSON contract match non-progress runs | TC-1777 |
 | FR-1778 | Must | Given an explicit `--agent` headless direct run | Then when `settings.stage_skills.chat` is true the prompt sent to the agent is prefixed with the implement stage skill prefix, and when it is false the prompt is sent unchanged | single 1-node chat turns apply chat stage skills only when enabled | TC-1778 |
 
 ### Code-vs-spec mismatches
@@ -203,6 +222,12 @@ Event schema (`v` = 1). Unknown fields must be ignored by readers.
 | TC-1769 | FR-1769 | unit | `src/cli.rs` tests | parse `run x --agent a --model m --progress --json` and `todo run abc --agent a --progress` | `RunOptions.progress` true; absent false | `src/cli.rs` `tc_1769_flag_table_parses_run_flags_and_progress` |
 | TC-1770 | FR-1770 | unit | `src/cli.rs` tests | invalid inputs | exact error messages unchanged | `src/cli.rs` `tc_1770_flag_table_errors_unchanged` |
 | TC-1771 | FR-1771 | unit | `src/cli.rs` tests / `dmuxai --help` | help text | contains `--progress`, not `--read-only` | `src/cli.rs` `tc_1771_help_lists_progress_not_read_only` |
+| TC-1772 | FR-1772 | unit | `src/progress.rs` | format each `AgentEvent` kind | shape has documented JSON keys; multiline/long summaries become one line ≤160 chars cut with `…` | `src/progress.rs` `tc_1772_progress_line_shape_and_cut` |
+| TC-1773 | FR-1773 | unit | `src/progress.rs` | observe multiple `TextDelta`s within 2 s, then complete | coalesced into one text line; pending text flushed before completed | `src/progress.rs` `tc_1773_progress_text_coalesced_every_2s` |
+| TC-1774 | FR-1774 | unit (app) | scripted agent with progress sink installed, then without sink | run headless | sink receives `started`, `text`, `completed` in order; without sink nothing produced | `src/app.rs` `tc_1774_headless_progress_sink_receives_lines` |
+| TC-1775 | FR-1775 | unit (app) | App with hub event sink | tool progress, file edit, 50 text deltas in short time | `activity` events logged for tool and file_edit; at most one `output` heartbeat logged | `src/app.rs` `tc_1775_activity_events_logged_and_throttled` |
+| TC-1776 | FR-1776 | unit (agent_api) | `events.jsonl` with started + activity | `status_json` | running run has `last_output_at_ms` equal to activity ts | `src/agent_api.rs` `tc_1776_status_json_last_output_at` |
+| TC-1777 | FR-1777 | integration (CLI) | fake agent sandbox | `dmuxai run hi --agent fake --json --progress` and without `--progress` | stderr has `started` and `completed` progress JSON lines, stdout is exactly one JSON object; without `--progress` stderr has no progress lines | `tests/agent_api_cli.rs` `tc_1777_cli_progress_lines_before_final_json` |
 | TC-1778 | FR-1778 | unit (app) | scripted agent with stage skill configured | `run_headless` with explicit agent, chat enabled then disabled | prompt received contains the skill prefix when chat is enabled and equals the user prompt when disabled | `src/app.rs` `tc_1778_headless_direct_applies_chat_stage_skills` |
 
 ## 6. Data, integration, and safety contracts

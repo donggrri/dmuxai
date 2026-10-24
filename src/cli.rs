@@ -601,16 +601,23 @@ fn format_event_line(event: &dmuxai::events::EventRecord) -> String {
     .flatten()
     .collect::<Vec<_>>()
     .join(" ");
-    let from = event.from_state.as_deref().unwrap_or("-");
     let message = event
         .message
         .as_deref()
         .map(|m| format!(" — {m}"))
         .unwrap_or_default();
-    format!(
-        "#{} {} {} {} {} -> {}{}",
-        event.seq, event.ts, event.kind, subject, from, event.to_state, message
-    )
+    if event.kind == "activity" {
+        format!(
+            "#{} {} {} {} {}{}",
+            event.seq, event.ts, event.kind, subject, event.to_state, message
+        )
+    } else {
+        let from = event.from_state.as_deref().unwrap_or("-");
+        format!(
+            "#{} {} {} {} {} -> {}{}",
+            event.seq, event.ts, event.kind, subject, from, event.to_state, message
+        )
+    }
 }
 
 async fn print_events(root: &Path, since: u64, limit: Option<usize>, follow: bool, json: bool) {
@@ -737,6 +744,11 @@ async fn run_headless(
     let mut app =
         App::new(engine, workspace_root.to_path_buf(), settings).map_err(|e| internal(&e))?;
     app.attach_dashboard(hub);
+    if options.progress {
+        app.set_progress_sink(Box::new(|line: &str| {
+            eprintln!("{line}");
+        }));
+    }
     if todo_id.is_some() {
         let store = agent_api::open_todo_store(workspace_root)?;
         app.attach_todo_store(Arc::new(store));

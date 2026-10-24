@@ -137,9 +137,19 @@ pub fn status_json(workspace_root: &Path) -> Value {
     if let Ok(records) = std::fs::read_to_string(&events_path) {
         for line in records.lines() {
             if let Ok(rec) = serde_json::from_str::<crate::events::EventRecord>(line)
-                && rec.kind == "agent"
                 && let Some(runner) = rec.runner
             {
+                if rec.kind == "activity" {
+                    if let Some(prev) = last_agent_run.get_mut(&runner)
+                        && prev.get("state").and_then(|s| s.as_str()) == Some("running")
+                    {
+                        prev["last_output_at_ms"] = json!(rec.ts_ms);
+                    }
+                    continue;
+                }
+                if rec.kind != "agent" {
+                    continue;
+                }
                 let state = match rec.to_state.as_str() {
                     "started" | "running" | "pending" | "stalled" => "running",
                     "completed" => "done",
@@ -148,38 +158,43 @@ pub fn status_json(workspace_root: &Path) -> Value {
                     _ => "idle",
                 };
                 let mut run_val = json!({ "state": state });
+                let prev_run = last_agent_run.get(&runner);
+                let prev_running = prev_run
+                    .filter(|prev| prev.get("state").and_then(|s| s.as_str()) == Some("running"));
                 if state == "running" {
-                    let prev_start = last_agent_run
-                        .get(&runner)
-                        .filter(|prev| {
-                            prev.get("state").and_then(|s| s.as_str()) == Some("running")
-                        })
-                        .and_then(|prev| prev.get("started_at_ms").cloned());
-                    run_val["started_at_ms"] = prev_start.unwrap_or_else(|| json!(rec.ts_ms));
+                    let prev_start =
+                        prev_running.and_then(|prev| prev.get("started_at_ms").cloned());
+                    let started_at = prev_start.unwrap_or_else(|| json!(rec.ts_ms));
+                    run_val["started_at_ms"] = started_at.clone();
+
+                    let prev_output =
+                        prev_running.and_then(|prev| prev.get("last_output_at_ms").cloned());
+                    let last_output = match rec.to_state.as_str() {
+                        "stalled" | "pending" => prev_output.unwrap_or(started_at),
+                        _ => json!(rec.ts_ms),
+                    };
+                    run_val["last_output_at_ms"] = last_output;
                 } else if state != "idle" {
                     // done / failed / cancelled carry ended_at and, when the
                     // run's start is known, its duration (FR-820).
                     run_val["ended_at_ms"] = json!(rec.ts_ms);
-                    if let Some(start) = last_agent_run
-                        .get(&runner)
-                        .filter(|prev| {
-                            prev.get("state").and_then(|s| s.as_str()) == Some("running")
-                        })
+                    if let Some(start) = prev_running
                         .and_then(|prev| prev.get("started_at_ms"))
                         .and_then(|v| v.as_u64())
                     {
                         run_val["started_at_ms"] = json!(start);
                         run_val["duration_ms"] = json!(rec.ts_ms.saturating_sub(start));
                     }
+                    if let Some(last_output) =
+                        prev_running.and_then(|prev| prev.get("last_output_at_ms").cloned())
+                    {
+                        run_val["last_output_at_ms"] = last_output;
+                    }
                 }
                 if let Some(node) = rec.node {
                     run_val["node"] = json!(node);
-                } else if let Some(prev_node) = last_agent_run
-                    .get(&runner)
-                    // Only the same (still running) run keeps its node; a new
-                    // run without a node must not inherit the previous one.
-                    .filter(|prev| prev.get("state").and_then(|s| s.as_str()) == Some("running"))
-                    .and_then(|prev| prev.get("node").cloned())
+                } else if let Some(prev_node) =
+                    prev_running.and_then(|prev| prev.get("node").cloned())
                 {
                     run_val["node"] = prev_node;
                 }
@@ -407,5 +422,83 @@ mod tests {
         assert_eq!(run["state"], "running");
         assert_eq!(run["started_at_ms"].as_u64(), Some(20000));
         assert!(run.get("node").is_none(), "new run inherited node: {run}");
+    }
+
+    // TC-1776 / FR-1776: events.jsonl with started + activity -> running run has
+    // last_output_at_ms equal to the activity ts.
+    #[test]
+    fn tc_1776_status_json_last_output_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let dmux_dir = dir.path().join(".dmuxai");
+        std::fs::create_dir_all(&dmux_dir).unwrap();
+        let events_file = dmux_dir.join("events.jsonl");
+
+        let rec_start = crate::events::EventRecord {
+            v: 1,
+            seq: 1,
+            ts: "2026-10-24T00:00:00Z".to_string(),
+            ts_ms: 1000,
+            workspace: dir.path().display().to_string(),
+            kind: "agent".to_string(),
+            task: None,
+            todo: None,
+            node: None,
+            runner: Some("cursor".to_string()),
+            model: None,
+            from_state: Some("idle".to_string()),
+            to_state: "started".to_string(),
+            message: None,
+            error_kind: None,
+        };
+        let rec_act = crate::events::EventRecord {
+            v: 1,
+            seq: 2,
+            ts: "2026-10-24T00:00:05Z".to_string(),
+            ts_ms: 6000,
+            workspace: dir.path().display().to_string(),
+            kind: "activity".to_string(),
+            task: None,
+            todo: None,
+            node: None,
+            runner: Some("cursor".to_string()),
+            model: None,
+            from_state: None,
+            to_state: "tool".to_string(),
+            message: Some("running cargo test".to_string()),
+            error_kind: None,
+        };
+
+        // When only started has arrived, last_output_at_ms equals started_at_ms
+        std::fs::write(
+            &events_file,
+            format!("{}\n", serde_json::to_string(&rec_start).unwrap()),
+        )
+        .unwrap();
+        let val1 = status_json(dir.path());
+        let agents1 = val1["agents"].as_array().unwrap();
+        let cursor1 = agents1
+            .iter()
+            .find(|a| a["id"] == "cursor")
+            .expect("cursor agent found");
+        let run1 = &cursor1["run"];
+        assert_eq!(run1["state"], "running");
+        assert_eq!(run1["started_at_ms"], 1000);
+        assert_eq!(run1["last_output_at_ms"], 1000);
+
+        // When activity arrives, last_output_at_ms updates to the activity timestamp
+        let mut content = std::fs::read_to_string(&events_file).unwrap();
+        content.push_str(&format!("{}\n", serde_json::to_string(&rec_act).unwrap()));
+        std::fs::write(&events_file, &content).unwrap();
+
+        let val2 = status_json(dir.path());
+        let agents2 = val2["agents"].as_array().unwrap();
+        let cursor2 = agents2
+            .iter()
+            .find(|a| a["id"] == "cursor")
+            .expect("cursor agent found");
+        let run2 = &cursor2["run"];
+        assert_eq!(run2["state"], "running");
+        assert_eq!(run2["started_at_ms"], 1000);
+        assert_eq!(run2["last_output_at_ms"], 6000);
     }
 }

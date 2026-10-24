@@ -1,6 +1,7 @@
 mod agent;
 mod app;
 mod cli;
+mod progress;
 
 use std::{
     error::Error,
