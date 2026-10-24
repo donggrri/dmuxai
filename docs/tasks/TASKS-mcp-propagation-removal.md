@@ -22,7 +22,7 @@ Owner: agy-flash (gemini-3.8-flash-high)
 | Done | Owner | Task | Requirement IDs | Test command |
 | --- | --- | --- | --- | --- |
 | [x] | agy-flash (gemini-3.8-flash-high) | Author SPEC-mcp-propagation-removal.md with FR-2080..FR-2085 and TC-2080..TC-2085 | FR-2080..FR-2085 | `python3 scripts/check-spec.py docs/specs/SPEC-mcp-propagation-removal.md` |
-| [x] | agy-flash (gemini-3.8-flash-high) | Mark superseded specs and requirements (SPEC-mcp-injection, SPEC-web-dashboard, SPEC-obsidian-memory, SPEC-acp-runners, SPEC-custom-agent-provider, SPEC-codex-sandbox-policy) | all | `python3 scripts/check-spec.py --all` |
+| [x] | agy-flash (gemini-3.8-flash-high) | Mark superseded specs and requirements (remove deleted SPEC-mcp-injection, SPEC-web-dashboard, SPEC-obsidian-memory, SPEC-acp-runners, SPEC-custom-agent-provider, SPEC-codex-sandbox-policy) | all | `python3 scripts/check-spec.py --all` |
 | [x] | agy-flash (gemini-3.8-flash-high) | Update TEST-PLAN.md: remove deleted TC rows, add TC-2080..TC-2085 rows | all | `python3 scripts/check-tc-links.py` |
 | [x] | agy-flash (gemini-3.8-flash-high) | Update tc-link and spec-check allowlists | all | `python3 scripts/check-tc-links.py`, `python3 scripts/check-spec.py --all` |
 | [x] | agy-flash (gemini-3.8-flash-high) | Update README.md, docs/API.md, and CHANGELOG.md | all | manual review, `cargo test --test spec_index` |

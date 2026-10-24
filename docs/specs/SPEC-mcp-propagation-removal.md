@@ -5,7 +5,7 @@ Status: Implemented
 Owner: dmuxai
 Created: 2026-10-24
 Baseline: main
-Related: Dongjin decision 2026-10-24, supersedes SPEC-mcp-injection, SPEC-web-dashboard INT-561/INT-563 propagation, SPEC-obsidian-memory FR-733
+Related: Dongjin decision 2026-10-24, supersedes SPEC-mcp-injection (deleted 2026-10-24), SPEC-web-dashboard INT-561/INT-563 propagation, SPEC-obsidian-memory FR-733
 
 ## 1. Decision summary
 
@@ -18,6 +18,8 @@ Following Dongjin's decision on 2026-10-24, Model Context Protocol (MCP) server 
 
 ### Old config behavior
 
+#### Previous behavior
+
 Previously, DmuxAI attempted to centralize MCP definitions under `[[mcp.servers]]` and propagate them across diverse runner adapters:
 - OpenCode: injected MCP entries into a per-run `OPENCODE_CONFIG` temporary JSON file.
 - Codex: injected `-c mcp_servers.<name>.*` command-line overrides and child environment variables (`DMUXAI_MCP_<SERVER>_<HEADER>`).
@@ -27,6 +29,16 @@ Previously, DmuxAI attempted to centralize MCP definitions under `[[mcp.servers]
 - Obsidian memory: automatically injected a built-in `dmuxai-memory` MCP server into `[[mcp.servers]]` when `[memory]` was configured.
 
 This ad-hoc propagation caused complex runner coupling, fragile escaping, and configuration conflicts. Under the new architecture, runners configure their own tools natively, and DmuxAI remains focused on orchestration.
+
+#### Existing config behavior after this change
+
+When loading an existing `dmuxai.toml` file created prior to this change:
+- **Zero parse or deserialization errors:** Existing configurations always load successfully; legacy or deprecated fields never cause a parse error or failure to launch.
+- **`[[mcp.servers]] runners`:** The `runners` allow-list key is accepted and ignored, emitting exactly one deprecation warning across all loaded configuration files per settings load (`runners is deprecated and ignored`).
+- **`{mcp_config}` in custom agents:** If a custom agent command includes `{mcp_config}`, the placeholder is unset, dropping both the argument and its preceding flag (e.g. `--mcp`), emitting exactly one deprecation warning per custom agent. The child process environment remains scrubbed of `DMUXAI_MCP_CONFIG`.
+- **`dmuxai-memory` entry:** An entry named `dmuxai-memory` in `[[mcp.servers]]` is treated as an ordinary user-defined entry. DmuxAI no longer auto-adds or injects any built-in `dmuxai-memory` entry into `mcp_servers` when `[memory]` is enabled.
+- **Dashboard registry and imports:** Generic `[[mcp.servers]]` entries are only listed in the web dashboard registry (`GET /api/mcp/servers`). Entries configured with `kind = "jira"` or `kind = "confluence"` still power issue and document import for to-dos (`POST /api/import`).
+- **Agent isolation:** Agents keep using only their own native MCP configuration (e.g. `~/.cursor/mcp.json`, OpenCode native settings, Claude Desktop configs). DmuxAI never passes any MCP configuration, CLI flags, environment variables, or temporary files to runner processes.
 
 ## 2. Scope
 
@@ -94,15 +106,15 @@ This ad-hoc propagation caused complex runner coupling, fragile escaping, and co
 
 ### Removed requirements
 
-The following requirements from earlier specifications are superseded and removed by this decision:
+The following requirements from earlier specifications (including FR-1980..FR-1984 / TC-1980..TC-1984 from SPEC-mcp-injection, deleted 2026-10-24) are superseded and removed by this decision:
 
 | Superseded requirement | Former scope | Replacement | Reason |
 | --- | --- | --- | --- |
-| [FR-1980](SPEC-mcp-injection.md) | `RunnerMcp::for_runner` applicability filtering | FR-2081, FR-2085 | Runners configure MCP natively; filtering logic removed |
-| [FR-1981](SPEC-mcp-injection.md) | `RunnerMcp` runner-specific payload builders | FR-2084, FR-2085 | Adapters no longer build MCP arguments or payloads |
-| [FR-1982](SPEC-mcp-injection.md) | Cursor legacy `.cursor/mcp.json` guard and notice | FR-2084, FR-2085 | Cursor legacy turns never receive or write MCP configs |
-| [FR-1983](SPEC-mcp-injection.md) | Cursor ACP session `mcpServers` parameter injection | FR-2080 | ACP sessions always send empty `mcpServers: []` |
-| [FR-1984](SPEC-mcp-injection.md) | Enforce no `.applies_to(` calls outside `src/mcp/` | FR-2085 | All propagation and applicability checking removed |
+| FR-1980 / TC-1980 (was SPEC-mcp-injection, deleted 2026-10-24) | `RunnerMcp::for_runner` applicability filtering | FR-2081, FR-2085 | Runners configure MCP natively; filtering logic removed |
+| FR-1981 / TC-1981 (was SPEC-mcp-injection, deleted 2026-10-24) | `RunnerMcp` runner-specific payload builders | FR-2084, FR-2085 | Adapters no longer build MCP arguments or payloads |
+| FR-1982 / TC-1982 (was SPEC-mcp-injection, deleted 2026-10-24) | Cursor legacy `.cursor/mcp.json` guard and notice | FR-2084, FR-2085 | Cursor legacy turns never receive or write MCP configs |
+| FR-1983 / TC-1983 (was SPEC-mcp-injection, deleted 2026-10-24) | Cursor ACP session `mcpServers` parameter injection | FR-2080 | ACP sessions always send empty `mcpServers: []` |
+| FR-1984 / TC-1984 (was SPEC-mcp-injection, deleted 2026-10-24) | Enforce no `.applies_to(` calls outside `src/mcp/` | FR-2085 | All propagation and applicability checking removed |
 | [INT-561](SPEC-web-dashboard.md) | Native MCP propagation to runners (OpenCode, Codex, custom, Cursor, AGY) | FR-2084 | DmuxAI no longer propagates MCP servers to runners |
 | [INT-563](SPEC-web-dashboard.md) | Adapter spawn-time MCP propagation delivery | FR-2084 | Runner adapters receive no MCP configuration |
 | [NFR-561](SPEC-web-dashboard.md) (propagation portion) | Codex child env and secret keys in runner argv | FR-2084 | Codex app-server receives no MCP overrides |
