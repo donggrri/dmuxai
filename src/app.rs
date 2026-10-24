@@ -70,6 +70,7 @@ use dmuxai::{
         strip_replan_marker, task_counter_text, validate_plan, write_tasks_file_if_enabled,
     },
     mcp::config::ResolvedMcpServer,
+    mcp::inject::RunnerMcp,
     mcp::registry::McpRegistry,
     settings::DmuxSettings,
     skills::{discover_skills, skill_prompt_prefix},
@@ -1505,21 +1506,26 @@ impl App {
                 Agent::Codex => spawn_codex_adapter(
                     event_tx.clone(),
                     workspace_root.clone(),
-                    mcp_servers.clone(),
+                    RunnerMcp::for_runner(&mcp_servers, "codex"),
                 ),
                 Agent::Cursor => spawn_cursor_adapter(
                     event_tx.clone(),
                     workspace_root.clone(),
                     cursor_config.clone(),
-                    mcp_servers.clone(),
+                    RunnerMcp::for_runner(&mcp_servers, "cursor"),
                 ),
                 Agent::Agy => spawn_agy_adapter(event_tx.clone(), workspace_root.clone()),
-                Agent::Custom(index) => spawn_custom_adapter(
-                    index,
-                    event_tx.clone(),
-                    workspace_root.clone(),
-                    mcp_servers.clone(),
-                ),
+                Agent::Custom(index) => {
+                    let runner_name = dmuxai::custom_agent::spec_at(index)
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("");
+                    spawn_custom_adapter(
+                        index,
+                        event_tx.clone(),
+                        workspace_root.clone(),
+                        RunnerMcp::for_runner(&mcp_servers, runner_name),
+                    )
+                }
             };
             adapters.push(adapter);
             workers.push(worker);
@@ -4718,13 +4724,8 @@ impl App {
         }
 
         if agent == Agent::Agy && !self.agy_mcp_notice_shown {
-            let applicable: Vec<ResolvedMcpServer> = self
-                .mcp_servers
-                .iter()
-                .filter(|s| s.applies_to("agy"))
-                .cloned()
-                .collect();
-            if let Some(notice) = dmuxai::mcp::propagate::agy_mcp_notice(&applicable) {
+            let mcp = RunnerMcp::for_runner(&self.mcp_servers, "agy");
+            if let Some(notice) = mcp.agy_notice() {
                 self.push_system(notice);
             }
             self.agy_mcp_notice_shown = true;
