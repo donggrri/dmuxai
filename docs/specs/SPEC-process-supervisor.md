@@ -4,7 +4,7 @@ Status: Implemented
 
 Owner: dmuxai
 Created: 2026-10-24
-Baseline: `4841710`
+Baseline: `93b1fe6`
 Related: #123, #162; PR-5
 
 ## 1. Decision summary
@@ -25,8 +25,7 @@ Runner process management is unified into a shared process supervisor module (`s
 ### Out of scope / non-goals
 
 - Porting specific runners (`custom`, `agy`, `cursor`, `acp`) to the supervisor; these are addressed in subsequent parts of PR-5.
-- Implementing SIGTERM/SIGHUP signal handling in `dmuxai run` CLI (`src/cli.rs`); addressed in a later part of PR-5.
-- Reserved IDs note: FR-1790..1799 and TC-1790..1799 are reserved for runner ports and `dmuxai run` signal handling in subsequent PR-5 parts and are not defined here.
+- Reserved IDs note: FR-1794..1799 and TC-1794..1799 are reserved for runner ports in subsequent PR-5 parts and are not defined here.
 
 ### Assumptions and open questions
 
@@ -58,6 +57,10 @@ Runner process management is unified into a shared process supervisor module (`s
 | FR-1787 | Must | Given an uncooperative child ignoring `SIGTERM` | `stop()` sends `SIGTERM`, waits up to `term_grace` for the leader, then escalates by sending `SIGKILL` to the group and killing the leader, successfully reaping it | Idempotent on repeated calls | TC-1787 |
 | FR-1788 | Must | Given an active `Supervised` handle that is dropped before being reaped | `Drop` sends `SIGTERM` then `SIGKILL` to the group, kills the leader, and unregisters the group from `live_groups()` | Does not hang on drop | TC-1788 |
 | FR-1789 | Must | Given `ChildOptions` with `parent_death_signal` set to `true` or `false` on Linux | Child processes spawn and execute normally under either setting | In pre_exec, exits with code 1 if parent death signal cannot be configured or parent died | TC-1789 |
+| FR-1790 | Must | Given `dmuxai run ... --json` is running and receives SIGTERM or SIGHUP | The cancel flag is set like Ctrl+C, producing a `cancelled` event and final JSON with exit code 130 | Same path as Ctrl+C; no orphaned runner edits remain | TC-1790 |
+| FR-1791 | Must | Given `dmuxai run` exits after a stop signal | The runner process group is gone (leader and descendants reaped) | `kill -0` fails for both leader and grandchild PIDs | TC-1791 |
+| FR-1792 | Must | Given a stop signal after which the run has not finished within 10 s | `stop_all_live_groups` is called and the process exits 130 with `error: stopped after signal`; a second signal does so immediately | Grace period is 10 s; no hang | TC-1792 |
+| FR-1793 | Must | Given `CursorAdapterConfig::default()` | Its `protocol` equals `DmuxSettings::default().cursor_protocol` (`Legacy`) | Matches settings default; no ACP default | TC-1793 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -74,6 +77,10 @@ Runner process management is unified into a shared process supervisor module (`s
 | TC-1787 | FR-1787 | unit | Child ignoring SIGTERM with 300 ms term_grace | Call `stop()` | Returns within 5 s after escalating to SIGKILL and child pid disappears | `src/process/supervisor.rs` `tc_1787_stop_escalates_to_kill` |
 | TC-1788 | FR-1788 | unit | Running supervised child | Drop `Supervised` handle | Pid disappears within 3 s and group is removed from `live_groups()` | `src/process/supervisor.rs` `tc_1788_drop_kills_group` |
 | TC-1789 | FR-1789 | unit | Children spawned with parent_death_signal true and false | Spawn, read output, and stop | Both start, output lines, and stop normally | `src/process/supervisor.rs` `tc_1789_child_options_parent_death_signal_spawns` |
+| TC-1790 | FR-1790, FR-1791 | integration (unix) | `pidsleep` fake agent | Send SIGTERM to `dmuxai run` | Exit code 130, JSON `exit_code` 130, cancelled event, both PIDs gone | `tests/agent_api_cli.rs` `tc_1790_sigterm_cancels_headless_run_and_reaps_runner` |
+| TC-1791 | FR-1790, FR-1791 | integration (unix) | `pidsleep` fake agent | Send SIGHUP to `dmuxai run` | Exit code 130, JSON `exit_code` 130, cancelled event, both PIDs gone | `tests/agent_api_cli.rs` `tc_1791_sighup_cancels_headless_run_and_reaps_runner` |
+| TC-1792 | FR-1792 | manual / code review | `dmuxai run` with a hung runner | Wait 10 s after signal or send second signal | `stop_all_live_groups` invoked and process exits 130 | manual / covered by code review |
+| TC-1793 | FR-1793 | unit | Default config and settings | Assert equality | `CursorAdapterConfig::default().protocol == DmuxSettings::default().cursor_protocol` | `src/agent/cursor.rs` `tc_1793_cursor_adapter_default_protocol_matches_settings` |
 
 ## 6. Data, integration, and safety contracts
 

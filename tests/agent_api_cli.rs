@@ -48,18 +48,8 @@ impl Sandbox {
     /// Runs the binary with `env` overrides (for example a custom `PATH`).
     fn run_in_env(&self, args: &[&str], stdin: Option<&str>, env: &[(&str, OsString)]) -> Output {
         use std::io::Write;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
-            .args(args)
-            .current_dir(&self.workspace)
-            .env("DMUXAI_WORKSPACE", &self.workspace)
-            .env("DMUXAI_STATE_DIR", self.root.join("state"))
-            .env("XDG_CONFIG_HOME", self.root.join("cfg"))
-            .env("APPDATA", self.root.join("cfg"))
-            .env("HOME", self.root.join("home"))
-            .env_remove("DMUXAI_WEB_TOKEN")
-            .env_remove("DMUXAI_OPENCODE_BIN")
-            .env_remove("DMUXAI_GROK_BIN")
-            .envs(env.iter().map(|(key, value)| (*key, value.clone())))
+        let mut child = self
+            .command(args, env)
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -74,6 +64,33 @@ impl Sandbox {
             pipe.write_all(text.as_bytes()).unwrap();
         }
         child.wait_with_output().expect("wait for dmuxai")
+    }
+
+    /// Common Command setup shared by `run_in_env` and `spawn_in_env`.
+    fn command(&self, args: &[&str], env: &[(&str, OsString)]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_dmuxai"));
+        cmd.args(args)
+            .current_dir(&self.workspace)
+            .env("DMUXAI_WORKSPACE", &self.workspace)
+            .env("DMUXAI_STATE_DIR", self.root.join("state"))
+            .env("XDG_CONFIG_HOME", self.root.join("cfg"))
+            .env("APPDATA", self.root.join("cfg"))
+            .env("HOME", self.root.join("home"))
+            .env_remove("DMUXAI_WEB_TOKEN")
+            .env_remove("DMUXAI_OPENCODE_BIN")
+            .env_remove("DMUXAI_GROK_BIN");
+        cmd.envs(env.iter().map(|(key, value)| (*key, value.clone())));
+        cmd
+    }
+
+    /// Spawns the binary with environment overrides, returning the child process.
+    fn spawn_in_env(&self, args: &[&str], env: &[(&str, OsString)]) -> std::process::Child {
+        self.command(args, env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("execute dmuxai")
     }
 }
 
@@ -745,4 +762,119 @@ command = ["sh", "-c", "env"]
         "{text}"
     );
     assert!(text.contains(&format!("HOME={}", home.display())), "{text}");
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn assert_stop_signal_cancels_run(signal: &str) {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let sandbox = Sandbox::new(&fake_agent_config("pidsleep", None));
+    let pidfile = sandbox.root.join("pids.txt");
+    let env_refs: Vec<(&str, OsString)> =
+        vec![("FAKE_AGENT_PIDFILE", pidfile.as_os_str().to_os_string())];
+    let mut child = sandbox.spawn_in_env(&["run", "hello", "--agent", "fake", "--json"], &env_refs);
+    let stdout_pipe = child.stdout.take().unwrap();
+    let dmuxai_pid = child.id();
+
+    // Poll until pidfile has 2 pids.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut pids: Vec<u32> = Vec::new();
+    while Instant::now() < deadline {
+        if let Ok(content) = std::fs::read_to_string(&pidfile) {
+            let parsed: Vec<u32> = content
+                .lines()
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+                .collect();
+            if parsed.len() >= 2 {
+                pids = parsed;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(pids.len() >= 2, "pidfile did not contain 2 pids: {pids:?}");
+
+    // Send signal.
+    let _ = std::process::Command::new("kill")
+        .arg(signal)
+        .arg(dmuxai_pid.to_string())
+        .status();
+
+    // Wait with 30s deadline.
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if start.elapsed() < Duration::from_secs(30) => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("dmuxai did not exit within 30s");
+            }
+            Err(e) => panic!("wait error: {e}"),
+        }
+    };
+    assert_eq!(status.code(), Some(130));
+
+    // Read stdout.
+    let mut buf = String::new();
+    let mut stdout_pipe = stdout_pipe;
+    let _ = stdout_pipe.read_to_string(&mut buf);
+    let json: Value = serde_json::from_str(buf.trim())
+        .unwrap_or_else(|e| panic!("stdout not one JSON object ({e}): {buf}"));
+    assert_eq!(json["exit_code"], 130);
+
+    // events.jsonl contains cancelled.
+    let events_path = sandbox.workspace.join(".dmuxai").join("events.jsonl");
+    let mut saw_cancelled = false;
+    if let Ok(content) = std::fs::read_to_string(&events_path) {
+        for line in content.lines() {
+            if let Ok(v) = serde_json::from_str::<Value>(line)
+                && (v["to_state"] == "cancelled" || v["kind"] == "cancelled")
+            {
+                saw_cancelled = true;
+            }
+        }
+    }
+    assert!(saw_cancelled, "no cancelled event in events.jsonl");
+
+    // Both pids gone within 5s.
+    for pid in pids {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !pid_alive(pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!pid_alive(pid), "pid {pid} still alive");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn tc_1790_sigterm_cancels_headless_run_and_reaps_runner() {
+    assert_stop_signal_cancels_run("-TERM");
+}
+
+#[cfg(unix)]
+#[test]
+fn tc_1791_sighup_cancels_headless_run_and_reaps_runner() {
+    assert_stop_signal_cancels_run("-HUP");
 }

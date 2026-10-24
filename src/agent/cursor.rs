@@ -60,7 +60,7 @@ impl Default for CursorAdapterConfig {
         Self {
             prewarm: false,
             prewarm_idle_secs: 300,
-            protocol: RunnerProtocol::Acp,
+            protocol: RunnerProtocol::Legacy,
         }
     }
 }
@@ -1394,6 +1394,16 @@ pub(crate) mod tests {
 
     use super::super::AgentErrorKind;
     use super::*;
+
+    #[test]
+    fn tc_1793_cursor_adapter_default_protocol_matches_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = DmuxSettings::load_with_user_config(dir.path(), None);
+        assert_eq!(
+            CursorAdapterConfig::default().protocol,
+            settings.cursor_protocol
+        );
+    }
 
     #[test]
     fn parses_cursor_models_and_default() {

@@ -230,3 +230,4 @@ TC-1892 covered by submit_prompt_forwards_image_paths_to_adapter (no TC ref in c
 TC-1893 covered by prompt_with_image_references (no TC ref in code yet)
 TC-1894 covered by cursor_passes_image_paths_to_cli (no TC ref in code yet)
 TC-1895 manual
+TC-1792 manual
