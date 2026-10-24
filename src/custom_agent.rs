@@ -115,6 +115,8 @@ pub struct CustomAgentSpec {
     #[serde(default)]
     pub failure_stderr: Option<String>,
     #[serde(default)]
+    pub stall_keepalive: Option<String>,
+    #[serde(default)]
     pub temp_config_template: Option<String>,
     #[serde(default)]
     pub system_prompt_arg: Vec<String>,
@@ -459,6 +461,15 @@ impl CustomAgentSpec {
             Regex::new(pattern).map_err(|e| {
                 format!(
                     "custom agent '{}' invalid failure_stderr regex: {e}",
+                    self.name
+                )
+            })?;
+        }
+
+        if let Some(pattern) = &self.stall_keepalive {
+            Regex::new(pattern).map_err(|e| {
+                format!(
+                    "custom agent '{}' invalid stall_keepalive regex: {e}",
                     self.name
                 )
             })?;
@@ -1414,6 +1425,12 @@ text_path = "/part/text"
         assert!(spec.validate().is_err());
 
         spec.failure_stderr = Some("(?i)error".to_string());
+        assert!(spec.validate().is_ok());
+
+        spec.stall_keepalive = Some("(?invalid".to_string());
+        assert!(spec.validate().is_err());
+
+        spec.stall_keepalive = Some("keepalive:.*".to_string());
         assert!(spec.validate().is_ok());
     }
 

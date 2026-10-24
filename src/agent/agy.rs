@@ -496,7 +496,10 @@ async fn run_single_agy_process(
         .map_err(|error| AgentError::provider(error.to_string()))?;
     drop(stdin);
 
-    stream_child(&mut supervised, event_tx, context, mode).await
+    let settings = dmuxai::settings::DmuxSettings::load(cwd);
+    let stall_policy = settings.runner_fallback.stall_policy_for("agy");
+
+    stream_child(&mut supervised, event_tx, context, mode, stall_policy).await
 }
 
 fn configure_command_for_resume(
@@ -522,12 +525,14 @@ async fn emit_terminal_event(
 }
 
 fn agy_prompt(policy: TurnPolicy, prompt: &str, require_file_edits: bool) -> String {
+    const EFFICIENCY_RULES: &str = "Work efficiently: do not keep a task list (no manage_task); read whole functions or 200+ lines at once; batch searches into one rg call; run only fast checks (e.g. `cargo check`) and the tests you added or changed, and leave formatters, linters and the full test suite to the caller.\n\n";
+
     match policy {
         TurnPolicy::ReadOnly => prompt.to_owned(),
         TurnPolicy::Agent if require_file_edits => format!(
-            "Apply edits directly to files in the workspace. Do not produce plans, plan artifacts, or ask for review before editing. Run every command in the foreground with a bounded timeout. Do not start background or detached processes.\n\n{prompt}"
+            "Apply edits directly to files in the workspace. Do not produce plans, plan artifacts, or ask for review before editing. Run every command in the foreground with a bounded timeout. Do not start background or detached processes.\n\n{EFFICIENCY_RULES}{prompt}"
         ),
-        TurnPolicy::Agent => prompt.to_owned(),
+        TurnPolicy::Agent => format!("{EFFICIENCY_RULES}{prompt}"),
     }
 }
 
@@ -554,13 +559,9 @@ fn configure_command(
         }
         TurnPolicy::Agent => {
             // Headless AGY auto-denies tools it cannot prompt for (e.g. run_command),
-            // which silently produced empty Implement turns. The sandbox still applies.
-            command.args([
-                "--mode",
-                "accept-edits",
-                "--sandbox",
-                "--dangerously-skip-permissions",
-            ]);
+            // which silently produced empty Implement turns. The sandbox made `cargo fmt`/`cargo test`
+            // fail with "Read-only file system", so omit --sandbox for Agent turns.
+            command.args(["--mode", "accept-edits", "--dangerously-skip-permissions"]);
         }
     }
     if let Some(model) = selected_model {
@@ -573,18 +574,67 @@ async fn stream_child(
     event_tx: &mpsc::Sender<AgentOutput>,
     context: &OutputContext,
     mode: TurnPolicy,
+    stall_policy: Option<dmuxai::runner_fallback::StallPolicy>,
 ) -> Result<SingleAgyOutcome, AgentError> {
     let mut state = AgyStreamState::default();
     let mut implement_tracker = ImplementTurnTracker::new(mode);
     let mut killed_after_result = false;
+    let mut stall_detector = stall_policy
+        .map(|p| dmuxai::runner_fallback::StallDetector::new(p, std::time::Instant::now()));
 
     let status = loop {
-        match supervised
-            .next_line()
-            .await
-            .map_err(|e| AgentError::process_exit(e.to_string()))?
-        {
+        let event = if stall_detector.is_some() {
+            supervised.next_line_with_tick(Duration::from_secs(1)).await
+        } else {
+            supervised.next_line().await
+        }
+        .map_err(|e| AgentError::process_exit(e.to_string()))?;
+
+        match event {
+            dmuxai::process::supervisor::LineEvent::Tick => {
+                if let Some(detector) = &stall_detector
+                    && let Some(reason) = detector.check(std::time::Instant::now())
+                {
+                    supervised.stop().await;
+                    return Err(AgentError::stalled(format!("AGY stalled: {reason}")));
+                }
+            }
             dmuxai::process::supervisor::LineEvent::Line(line) => {
+                if let Some(detector) = &mut stall_detector {
+                    let now = std::time::Instant::now();
+                    if dmuxai::runner_fallback::is_api_retry_line(&line) {
+                        detector.observe_api_retry(now);
+                    } else if let Ok(message) = serde_json::from_str::<Value>(&line) {
+                        let step_type = message
+                            .pointer("/step_update/step_type")
+                            .and_then(Value::as_str);
+                        let step_state = message
+                            .pointer("/step_update/state")
+                            .and_then(Value::as_str);
+                        if step_type == Some("tool") {
+                            if step_state == Some("ACTIVE") {
+                                detector.observe_tool_started(now);
+                            } else {
+                                detector.observe_tool_finished(now);
+                            }
+                        } else if step_type == Some("agent_response")
+                            || step_type == Some("thinking")
+                            || step_state == Some("DONE")
+                        {
+                            detector.observe_progress(now);
+                        } else {
+                            detector.observe_keepalive();
+                        }
+                    } else {
+                        detector.observe_keepalive();
+                    }
+
+                    if let Some(reason) = detector.check(now) {
+                        supervised.stop().await;
+                        return Err(AgentError::stalled(format!("AGY stalled: {reason}")));
+                    }
+                }
+
                 let message: Value = serde_json::from_str(&line).map_err(|error| {
                     AgentError::provider(format!("invalid AGY NDJSON: {error}"))
                 })?;
@@ -625,19 +675,22 @@ async fn stream_child(
         }
     };
 
+    let writes_observed = implement_tracker.writes_observed();
     let diagnostic = dmuxai::process::supervisor::tail_lines(
         &supervised.stderr_tail().await,
         STDERR_HISTORY_CAPACITY,
     );
     let protocol_completed = state.pending_terminal.is_some();
     let require_writes = false;
-    let writes_observed = implement_tracker.writes_observed();
+    let exit_forced_after_result = killed_after_result
+        || state.recovered_transient_error
+        || matches!(state.pending_terminal, Some(AgentEvent::Error(_)));
     if let Err(reason) = implement_tracker.finish(
         &status,
         &diagnostic,
         protocol_completed,
         require_writes,
-        killed_after_result,
+        exit_forced_after_result,
     ) {
         return Ok(SingleAgyOutcome {
             conversation_id: state.conversation_id,
@@ -682,6 +735,9 @@ struct AgyStreamState {
     result_received: bool,
     pending_terminal: Option<AgentEvent>,
     response_text: String,
+    recovered_transient_error: bool,
+    last_step_type: Option<String>,
+    last_step_state: Option<String>,
 }
 
 fn denied_actions_summary(message: &Value) -> Option<String> {
@@ -715,6 +771,17 @@ fn normalize_event(
     {
         state.conversation_id = Some(conversation_id.to_owned());
         events.push(AgentEvent::ProviderSessionBound(conversation_id.to_owned()));
+    }
+
+    if message.get("event").and_then(Value::as_str) == Some("step_update") {
+        state.last_step_type = message
+            .pointer("/step_update/step_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        state.last_step_state = message
+            .pointer("/step_update/state")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
     }
 
     match message.get("event").and_then(Value::as_str) {
@@ -781,12 +848,28 @@ fn normalize_event(
                     state.pending_terminal = Some(AgentEvent::Cancelled);
                 }
                 _ => {
-                    state.pending_terminal = Some(AgentEvent::Error(AgentError::provider(
-                        message
-                            .pointer("/result/error")
-                            .and_then(Value::as_str)
-                            .unwrap_or("AGY turn failed"),
-                    )));
+                    let err_msg = message
+                        .pointer("/result/error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("AGY turn failed");
+                    let final_answer_done = state.last_step_type.as_deref()
+                        == Some("agent_response")
+                        && state.last_step_state.as_deref() == Some("DONE");
+                    let has_nonempty_text = !state.response_text.trim().is_empty();
+                    if final_answer_done
+                        && has_nonempty_text
+                        && dmuxai::runner_fallback::is_transient_provider_error(err_msg)
+                    {
+                        let truncated: String = err_msg.chars().take(200).collect();
+                        events.push(AgentEvent::Notice(format!(
+                            "AGY reported a provider error after finishing its work ({truncated}); the result was kept (#151)."
+                        )));
+                        state.pending_terminal = Some(AgentEvent::Completed);
+                        state.recovered_transient_error = true;
+                    } else {
+                        state.pending_terminal =
+                            Some(AgentEvent::Error(AgentError::provider(err_msg)));
+                    }
                 }
             }
         }
@@ -991,6 +1074,7 @@ mod tests {
 
         let read_only = args_for(TurnPolicy::ReadOnly);
         assert!(read_only.windows(2).any(|args| args == ["--mode", "plan"]));
+        assert!(read_only.iter().any(|arg| arg == "--sandbox"));
         assert_eq!(agy_prompt(TurnPolicy::ReadOnly, "hello", false), "hello");
         let implement = args_for(TurnPolicy::Agent);
         assert!(
@@ -998,9 +1082,10 @@ mod tests {
                 .windows(2)
                 .any(|args| args == ["--mode", "accept-edits"])
         );
-        assert!(implement.iter().any(|arg| arg == "--sandbox"));
+        assert!(!implement.iter().any(|arg| arg == "--sandbox"));
         assert!(agy_prompt(TurnPolicy::Agent, "hello", true).ends_with("\n\nhello"));
-        assert_eq!(agy_prompt(TurnPolicy::Agent, "hello", false), "hello");
+        assert!(agy_prompt(TurnPolicy::Agent, "hello", false).ends_with("\n\nhello"));
+        assert!(agy_prompt(TurnPolicy::Agent, "hello", false).contains("manage_task"));
     }
 
     #[test]
@@ -1941,5 +2026,490 @@ mod tests {
             );
         })
         .await;
+    }
+
+    // TC-2113 / FR-2113: Agent mode does not pass --sandbox; ReadOnly retains --sandbox.
+    #[test]
+    fn tc_2113_agy_agent_mode_has_no_sandbox() {
+        let mut command = tokio::process::Command::new("agy");
+        configure_command(&mut command, None, TurnPolicy::Agent);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2).any(|w| w == ["--mode", "accept-edits"]),
+            "expected --mode accept-edits: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--dangerously-skip-permissions"),
+            "expected --dangerously-skip-permissions: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--sandbox"),
+            "Agent mode must NOT have --sandbox: {args:?}"
+        );
+
+        let mut ro_cmd = tokio::process::Command::new("agy");
+        configure_command(&mut ro_cmd, None, TurnPolicy::ReadOnly);
+        let ro_args = ro_cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            ro_args.iter().any(|arg| arg == "--sandbox"),
+            "ReadOnly mode must retain --sandbox: {ro_args:?}"
+        );
+    }
+
+    // TC-2114 / FR-2114: Agent prompt has efficiency rules.
+    #[test]
+    fn tc_2114_agy_agent_prompt_has_efficiency_rules() {
+        let agent_prompt = agy_prompt(TurnPolicy::Agent, "do work", false);
+        assert!(
+            agent_prompt.contains("Work efficiently: do not keep a task list (no manage_task);"),
+            "expected efficiency rules: {agent_prompt}"
+        );
+        assert!(agent_prompt.ends_with("\n\ndo work"));
+
+        let agent_edits_prompt = agy_prompt(TurnPolicy::Agent, "do work", true);
+        assert!(agent_edits_prompt.starts_with("Apply edits directly"));
+        assert!(
+            agent_edits_prompt
+                .contains("Work efficiently: do not keep a task list (no manage_task);")
+        );
+        assert!(agent_edits_prompt.ends_with("\n\ndo work"));
+
+        let ro_prompt = agy_prompt(TurnPolicy::ReadOnly, "do work", false);
+        assert_eq!(ro_prompt, "do work");
+    }
+
+    // TC-2111 / FR-2111: recovered API error keeps result (#151).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2111_agy_recovered_api_error_keeps_result() {
+        let (_dir, fake) = write_fake_agy(|_| {
+            let chunk = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "state": "DONE",
+                    "text_delta": "done work"
+                }
+            });
+            let err = json!({
+                "event": "result",
+                "result": {
+                    "status": "ERROR",
+                    "error": "API error (attempt 1): INTERNAL (code 500)"
+                }
+            });
+            format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\nexit 1\n",
+                chunk, err
+            )
+        });
+
+        let ws = tempfile::tempdir().expect("ws tempdir");
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("fake-conversation"),
+            turn_id: super::super::TurnId::new("fake-turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+
+        let outcome = with_agy_spawn_env(&fake, "0", async {
+            run_turn(&request, None, ws.path(), &event_tx).await
+        })
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "turn should complete despite transient error: {outcome:?}"
+        );
+
+        let mut events = Vec::new();
+        while let Ok(out) = event_rx.try_recv() {
+            events.push(out.event);
+        }
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(msg) if msg.contains("#151"))),
+            "expected notice with #151 in events: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Completed)),
+            "expected completed terminal event in events: {events:?}"
+        );
+    }
+
+    // TC-2111 / FR-2111: non-transient error still fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2111_agy_non_transient_error_still_fails() {
+        let (_dir, fake) = write_fake_agy(|_| {
+            let chunk = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "state": "DONE",
+                    "text_delta": "done work"
+                }
+            });
+            let err = json!({
+                "event": "result",
+                "result": {
+                    "status": "ERROR",
+                    "error": "invalid parameter supplied"
+                }
+            });
+            format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\nexit 1\n",
+                chunk, err
+            )
+        });
+
+        let ws = tempfile::tempdir().expect("ws tempdir");
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("fake-conversation"),
+            turn_id: super::super::TurnId::new("fake-turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+
+        let outcome = with_agy_spawn_env(&fake, "0", async {
+            run_turn(&request, None, ws.path(), &event_tx).await
+        })
+        .await;
+
+        let mut events = Vec::new();
+        while let Ok(out) = event_rx.try_recv() {
+            events.push(out.event);
+        }
+
+        assert!(
+            outcome.is_err() || events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "expected error for non-transient error: outcome={outcome:?}, events={events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Completed)),
+            "must not emit Completed: {events:?}"
+        );
+    }
+
+    // TC-2111 / FR-2111: mid-turn transient API error still fails (runner fallback can take over).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2111_agy_mid_turn_api_error_still_fails() {
+        let (_dir, fake) = write_fake_agy(|_| {
+            let start = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "text_delta": "I'll start"
+                }
+            });
+            let tool_act = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "ACTIVE"
+                }
+            });
+            let tool_done = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "DONE"
+                }
+            });
+            let err = json!({
+                "event": "result",
+                "result": {
+                    "status": "ERROR",
+                    "error": "API error (attempt 3): request failed: connection timed out"
+                }
+            });
+            format!(
+                "#!/bin/sh\ncat > /dev/null\ncat << 'EOF'\n{}\n{}\n{}\n{}\nEOF\nexit 1\n",
+                start, tool_act, tool_done, err
+            )
+        });
+
+        let ws = tempfile::tempdir().expect("ws tempdir");
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("fake-conversation"),
+            turn_id: super::super::TurnId::new("fake-turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+
+        let outcome = with_agy_spawn_env(&fake, "0", async {
+            run_turn(&request, None, ws.path(), &event_tx).await
+        })
+        .await;
+
+        let mut events = Vec::new();
+        while let Ok(out) = event_rx.try_recv() {
+            events.push(out.event);
+        }
+
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Error(err) if err.kind() == crate::agent::AgentErrorKind::Provider)),
+            "expected Error event with kind Provider in events: {events:?}, outcome={outcome:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Completed)),
+            "must not emit Completed: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(msg) if msg.contains("#151"))),
+            "must not emit #151 Notice: {events:?}"
+        );
+    }
+
+    // TC-2117 / FR-2117: running tool pauses stall detection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2117_agy_running_tool_pauses_stall() {
+        let ws = tempfile::tempdir().expect("ws tempdir");
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            "[runners.agy]\nfallback = [\"opencode\"]\nstall_timeout_secs = 1\n",
+        )
+        .expect("write dmuxai.toml");
+
+        let (_dir, fake) = write_fake_agy(|_| {
+            let tool_act = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "ACTIVE"
+                }
+            });
+            let tool_done = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "DONE"
+                }
+            });
+            let text = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "text_delta": "tool result"
+                }
+            });
+            let res = json!({
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": "tool result"
+                }
+            });
+            format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{}'\nsleep 2.5\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\nexit 0\n",
+                tool_act, tool_done, text, res
+            )
+        });
+
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("fake-conversation"),
+            turn_id: super::super::TurnId::new("fake-turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+
+        let outcome = with_agy_spawn_env(&fake, "0", async {
+            let xdg_dir = tempfile::tempdir().expect("xdg tempdir");
+            let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+            }
+            let res = run_turn(&request, None, ws.path(), &event_tx).await;
+            unsafe {
+                match saved_xdg {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            res
+        })
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "turn should complete without stalling: {outcome:?}"
+        );
+        let mut events = Vec::new();
+        while let Ok(out) = event_rx.try_recv() {
+            events.push(out.event);
+        }
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Completed)));
+    }
+
+    // TC-2117 / FR-2117: stall detector fires after a tool finishes if no progress occurs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2117_agy_stall_fires_after_tool_finished() {
+        let ws = tempfile::tempdir().expect("ws tempdir");
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            "[runners.agy]\nfallback = [\"opencode\"]\nstall_timeout_secs = 1\n",
+        )
+        .expect("write dmuxai.toml");
+
+        let (_dir, fake) = write_fake_agy(|_| {
+            let tool_act = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "ACTIVE"
+                }
+            });
+            let tool_done = json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "state": "DONE"
+                }
+            });
+            format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'\nsleep 30\nexit 0\n",
+                tool_act, tool_done
+            )
+        });
+
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("fake-conversation"),
+            turn_id: super::super::TurnId::new("fake-turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+
+        let outcome = with_agy_spawn_env(&fake, "0", async {
+            let xdg_dir = tempfile::tempdir().expect("xdg tempdir");
+            let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+            }
+            let res = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_turn(&request, None, ws.path(), &event_tx),
+            )
+            .await
+            .expect("must complete within 5s");
+            unsafe {
+                match saved_xdg {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            res
+        })
+        .await;
+
+        assert!(
+            matches!(outcome, Err(ref err) if err.kind() == crate::agent::AgentErrorKind::Stalled),
+            "expected Stalled error within 5s, got: {outcome:?}"
+        );
+    }
+
+    // TC-2117 / FR-2117: no stall detector without fallback chain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2117_no_stall_without_fallback_chain() {
+        let ws = tempfile::tempdir().expect("ws tempdir");
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            "[runners.agy]\nstall_timeout_secs = 1\n",
+        )
+        .expect("write dmuxai.toml");
+
+        let (_dir, fake) = write_fake_agy(|_| {
+            let res = json!({
+                "event": "result",
+                "result": {
+                    "status": "SUCCESS",
+                    "response": "finally done"
+                }
+            });
+            format!(
+                "#!/bin/sh\ncat > /dev/null\nsleep 2\nprintf '%s\\n' '{}'\nexit 0\n",
+                res
+            )
+        });
+
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("fake-conversation"),
+            turn_id: super::super::TurnId::new("fake-turn"),
+            prompt: "hello".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+
+        let outcome = with_agy_spawn_env(&fake, "0", async {
+            let xdg_dir = tempfile::tempdir().expect("xdg tempdir");
+            let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+            }
+            let res = run_turn(&request, None, ws.path(), &event_tx).await;
+            unsafe {
+                match saved_xdg {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            res
+        })
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "turn without fallback chain should not stall: {outcome:?}"
+        );
+        let mut events = Vec::new();
+        while let Ok(out) = event_rx.try_recv() {
+            events.push(out.event);
+        }
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Completed)));
     }
 }

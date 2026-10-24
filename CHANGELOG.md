@@ -13,6 +13,11 @@ All notable changes to dmuxai are listed here. Versions follow
   conversation, and a background turn that ends no longer wedges the follow-up
   queue (#124, FR-1620..1625).
 
+- **Runner fallback (SPEC-runner-fallback).** A runner can hand a failed turn to
+  the next runner/model in an ordered `[runners.<id>]`/`[runners.default]`
+  `fallback` chain on provider errors or stalls, with `stall_timeout_secs` and
+  `stall_api_retries`. Stalled runners (no model progress or repeated API retries) are stopped and handed over too.
+
 ### Removed
 
 - **Removed: MCP propagation to runners (SPEC-mcp-propagation-removal).** DmuxAI
@@ -121,6 +126,13 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
+- **AGY keeps results after a recovered provider error (#151).** A transient
+  provider error reported after AGY's final answer step no longer fails the
+  turn; the result is kept with a Notice. Same behaviour for custom agents
+  when the error arrives right after the final text. Mid-turn errors still fail.
+- **AGY agent turns no longer pass `--sandbox`** (it made `cargo fmt`/`cargo test`
+  fail with "Read-only file system"); read-only turns keep `--mode plan --sandbox`.
+  AGY agent turns also get a short "Work efficiently" rule block.
 - **Approving a fallback plan works again (FR-941, FR-950, TC-1011).** The
   1-node fallback revision (heuristic complex route, invalid plan twice, plan
   turn error/timeout, busy agent) stored its step without the implicit

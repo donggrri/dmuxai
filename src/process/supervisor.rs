@@ -75,6 +75,7 @@ pub enum LineEvent {
     Eof,
     Idle(Duration),
     Timeout(Duration),
+    Tick,
 }
 
 /// Formats the standard idle watchdog error message.
@@ -301,7 +302,7 @@ pub struct Supervised {
     child: tokio::process::Child,
     pgid: u32,
     reader: tokio::io::BufReader<tokio::process::ChildStdout>,
-    line_buf: String,
+    line_buf: Vec<u8>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     stderr_abort: tokio::task::AbortHandle,
     stderr_tail_buf: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
@@ -335,8 +336,25 @@ impl Supervised {
     /// or since the last line. Each line resets the idle timer.
     /// Yields `LineEvent::Timeout` if the child's total lifetime exceeds `total_timeout`.
     pub async fn next_line(&mut self) -> std::io::Result<LineEvent> {
-        use tokio::io::AsyncBufReadExt;
+        self.next_line_internal(None).await
+    }
 
+    /// Reads the next stdout line, watchdog event, or tick event.
+    ///
+    /// Behaves exactly like `next_line` but yields `LineEvent::Tick` if no line, exit,
+    /// or timeout event occurs within `tick`. Partially read line bytes are preserved
+    /// across ticks without loss.
+    pub async fn next_line_with_tick(
+        &mut self,
+        tick: std::time::Duration,
+    ) -> std::io::Result<LineEvent> {
+        self.next_line_internal(Some(tick)).await
+    }
+
+    async fn next_line_internal(
+        &mut self,
+        tick: Option<std::time::Duration>,
+    ) -> std::io::Result<LineEvent> {
         let now = std::time::Instant::now();
 
         if let Some(dur) = self.config.total_timeout
@@ -361,108 +379,61 @@ impl Supervised {
             return Ok(LineEvent::Eof);
         }
 
-        let total_fut = self
-            .config
-            .total_timeout
-            .map(|dur| tokio::time::sleep_until((self.spawn_time + dur).into()));
-        let idle_fut = self
-            .config
-            .idle_timeout
-            .map(|dur| tokio::time::sleep_until((self.last_activity + dur).into()));
+        let total_sleep = async {
+            match self.config.total_timeout {
+                Some(dur) => {
+                    tokio::time::sleep_until((self.spawn_time + dur).into()).await;
+                    dur
+                }
+                None => std::future::pending().await,
+            }
+        };
+        let idle_sleep = async {
+            match self.config.idle_timeout {
+                Some(dur) => {
+                    tokio::time::sleep_until((self.last_activity + dur).into()).await;
+                    dur
+                }
+                None => std::future::pending().await,
+            }
+        };
+        let tick_sleep = async {
+            match tick {
+                Some(dur) => {
+                    tokio::time::sleep(dur).await;
+                }
+                None => std::future::pending().await,
+            }
+        };
 
-        match (total_fut, idle_fut) {
-            (Some(total_sleep), Some(idle_sleep)) => {
-                tokio::select! {
-                    biased;
-                    _ = total_sleep => Ok(LineEvent::Timeout(self.config.total_timeout.unwrap())),
-                    _ = idle_sleep => Ok(LineEvent::Idle(self.config.idle_timeout.unwrap())),
-                    res = self.reader.read_line(&mut self.line_buf) => {
-                        self.handle_line_read(res)
-                    }
-                    child_res = self.child.wait() => {
-                        let st = match child_res {
-                            Ok(s) => s,
-                            Err(_) => exit_status_from_raw(0),
-                        };
-                        self.leader_exit_status = Some(st);
-                        if self.has_unread_stdout() {
-                            let res = self.reader.read_line(&mut self.line_buf).await;
-                            self.handle_line_read(res)
-                        } else {
-                            Ok(LineEvent::Eof)
-                        }
-                    }
+        tokio::select! {
+            biased;
+            dur = total_sleep => Ok(LineEvent::Timeout(dur)),
+            dur = idle_sleep => Ok(LineEvent::Idle(dur)),
+            res = read_one_line(&mut self.reader, &mut self.line_buf) => {
+                self.handle_line_read(res)
+            }
+            child_res = self.child.wait() => {
+                let st = match child_res {
+                    Ok(s) => s,
+                    Err(_) => exit_status_from_raw(0),
+                };
+                self.leader_exit_status = Some(st);
+                if self.has_unread_stdout() {
+                    let res = read_one_line(&mut self.reader, &mut self.line_buf).await;
+                    self.handle_line_read(res)
+                } else {
+                    Ok(LineEvent::Eof)
                 }
             }
-            (Some(total_sleep), None) => {
-                tokio::select! {
-                    biased;
-                    _ = total_sleep => Ok(LineEvent::Timeout(self.config.total_timeout.unwrap())),
-                    res = self.reader.read_line(&mut self.line_buf) => {
-                        self.handle_line_read(res)
-                    }
-                    child_res = self.child.wait() => {
-                        let st = match child_res {
-                            Ok(s) => s,
-                            Err(_) => exit_status_from_raw(0),
-                        };
-                        self.leader_exit_status = Some(st);
-                        if self.has_unread_stdout() {
-                            let res = self.reader.read_line(&mut self.line_buf).await;
-                            self.handle_line_read(res)
-                        } else {
-                            Ok(LineEvent::Eof)
-                        }
-                    }
-                }
-            }
-            (None, Some(idle_sleep)) => {
-                tokio::select! {
-                    biased;
-                    _ = idle_sleep => Ok(LineEvent::Idle(self.config.idle_timeout.unwrap())),
-                    res = self.reader.read_line(&mut self.line_buf) => {
-                        self.handle_line_read(res)
-                    }
-                    child_res = self.child.wait() => {
-                        let st = match child_res {
-                            Ok(s) => s,
-                            Err(_) => exit_status_from_raw(0),
-                        };
-                        self.leader_exit_status = Some(st);
-                        if self.has_unread_stdout() {
-                            let res = self.reader.read_line(&mut self.line_buf).await;
-                            self.handle_line_read(res)
-                        } else {
-                            Ok(LineEvent::Eof)
-                        }
-                    }
-                }
-            }
-            (None, None) => {
-                tokio::select! {
-                    biased;
-                    res = self.reader.read_line(&mut self.line_buf) => {
-                        self.handle_line_read(res)
-                    }
-                    child_res = self.child.wait() => {
-                        let st = match child_res {
-                            Ok(s) => s,
-                            Err(_) => exit_status_from_raw(0),
-                        };
-                        self.leader_exit_status = Some(st);
-                        if self.has_unread_stdout() {
-                            let res = self.reader.read_line(&mut self.line_buf).await;
-                            self.handle_line_read(res)
-                        } else {
-                            Ok(LineEvent::Eof)
-                        }
-                    }
-                }
-            }
+            _ = tick_sleep => Ok(LineEvent::Tick),
         }
     }
 
     fn has_unread_stdout(&self) -> bool {
+        if !self.line_buf.is_empty() {
+            return true;
+        }
         if !self.reader.buffer().is_empty() {
             return true;
         }
@@ -479,16 +450,17 @@ impl Supervised {
 
     fn handle_line_read(&mut self, res: std::io::Result<usize>) -> std::io::Result<LineEvent> {
         let n = res?;
-        if n == 0 {
+        if n == 0 && self.line_buf.is_empty() {
             return Ok(LineEvent::Eof);
         }
-        if self.line_buf.ends_with('\n') {
+        if self.line_buf.ends_with(b"\n") {
             self.line_buf.pop();
-            if self.line_buf.ends_with('\r') {
+            if self.line_buf.ends_with(b"\r") {
                 self.line_buf.pop();
             }
         }
-        let line = std::mem::take(&mut self.line_buf);
+        let bytes = std::mem::take(&mut self.line_buf);
+        let line = String::from_utf8_lossy(&bytes).into_owned();
         self.last_activity = std::time::Instant::now();
         Ok(LineEvent::Line(line))
     }
@@ -648,6 +620,28 @@ impl Drop for Supervised {
     }
 }
 
+async fn read_one_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    use tokio::io::AsyncBufReadExt;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(buf.len());
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&available[..=pos]);
+            reader.consume(pos + 1);
+            return Ok(buf.len());
+        } else {
+            let len = available.len();
+            buf.extend_from_slice(available);
+            reader.consume(len);
+        }
+    }
+}
+
 /// Wraps an already-spawned child process into a [`Supervised`] handle.
 ///
 /// The child must have been configured with [`configure_child`] and spawned with
@@ -712,7 +706,7 @@ pub fn adopt(
         child,
         pgid,
         reader: tokio::io::BufReader::new(stdout),
-        line_buf: String::new(),
+        line_buf: Vec::new(),
         stderr_task: Some(stderr_task),
         stderr_abort,
         stderr_tail_buf,
@@ -918,6 +912,7 @@ mod tests {
                 }
                 LineEvent::Idle(_) => panic!("unexpected Idle event"),
                 LineEvent::Eof => panic!("unexpected Eof"),
+                LineEvent::Tick => panic!("unexpected Tick event"),
             }
         }
         assert!(got_timeout, "expected LineEvent::Timeout");
@@ -1269,5 +1264,42 @@ mod tests {
             tail_lines(sample, 10),
             "line 1 | line 2 | line 3 | line 4 | line 5"
         );
+    }
+
+    // TC-2115 / FR-2115: next_line_with_tick yields Tick without losing partial line bytes.
+    #[tokio::test]
+    async fn tc_2115_next_line_with_tick_keeps_partial_line() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "printf 'par'; sleep 0.3; printf 'tial\n'"]);
+        let config = SupervisorConfig::new("tc_2115");
+        let mut supervised = spawn(cmd, config).expect("spawn succeeds");
+
+        let mut tick_count = 0;
+        let mut line_received = None;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match supervised
+                .next_line_with_tick(Duration::from_millis(50))
+                .await
+                .expect("read event")
+            {
+                LineEvent::Tick => {
+                    tick_count += 1;
+                }
+                LineEvent::Line(line) => {
+                    line_received = Some(line);
+                    break;
+                }
+                other => panic!("unexpected event: {:?}", other),
+            }
+        }
+
+        assert!(
+            tick_count > 0,
+            "expected at least one Tick, got {tick_count}"
+        );
+        assert_eq!(line_received.as_deref(), Some("partial"));
+        supervised.stop().await;
     }
 }

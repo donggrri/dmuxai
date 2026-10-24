@@ -420,6 +420,10 @@ struct ActiveTurn {
     offscreen_activity: Vec<Message>,
     /// Catalog-check hint remembered for this turn (FR-1729).
     model_catalog_hint: Option<String>,
+    fallback_prompt: String,
+    fallback_display_text: Option<String>,
+    fallback_policy: Option<TurnPolicy>,
+    fallback_chain: Option<dmuxai::runner_fallback::FallbackChain>,
 }
 
 /// Where to re-insert retained offscreen activity after `restore_snapshot`.
@@ -1054,6 +1058,8 @@ pub struct HeadlessOutcome {
     pub plan: Option<HeadlessPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<HeadlessSystemPrompt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<dmuxai::runner_fallback::FallbackRecord>,
 }
 
 impl HeadlessOutcome {
@@ -1077,6 +1083,7 @@ impl HeadlessOutcome {
             triage: None,
             plan: None,
             system_prompt: None,
+            fallbacks: Vec::new(),
         }
     }
 
@@ -1346,6 +1353,9 @@ pub struct App {
     /// Internal judge (and similar) turn ids whose adapter output must be dropped.
     retired_internal_turns: HashSet<String>,
     active_turns: HashMap<Agent, ActiveTurn>,
+    pub fallback_history: Vec<dmuxai::runner_fallback::FallbackRecord>,
+    pending_fallback_chain: Option<dmuxai::runner_fallback::FallbackChain>,
+    last_output_handed_over: bool,
     /// Activity rows for turns started in this process (FR-1669); keyed by turn id so
     /// multi-turn transcripts keep each turn's rows between its user prompt and reply.
     retained_offscreen_activity: HashMap<StoredConversationId, HashMap<StoredTurnId, Vec<Message>>>,
@@ -1633,6 +1643,9 @@ impl App {
             next_internal_turn_id: 1,
             retired_internal_turns: HashSet::new(),
             active_turns: HashMap::new(),
+            fallback_history: Vec::new(),
+            pending_fallback_chain: None,
+            last_output_handed_over: false,
             retained_offscreen_activity: HashMap::new(),
             conversation_turn_ids: HashMap::new(),
             pending_summary: None,
@@ -3343,18 +3356,26 @@ impl App {
             self.attach_model_catalog_hint(&mut output);
             self.feed_progress_sink(&output);
             self.maybe_emit_activity_event(&output);
-            if let AgentEvent::Error(ref err) = output.event {
-                outcome.errored = true;
-                outcome.error_kind = Some(err.kind.as_str().to_owned());
-            }
+            let is_error = matches!(output.event, AgentEvent::Error(_));
+            let error_kind_opt = match &output.event {
+                AgentEvent::Error(err) => Some(err.kind.as_str().to_owned()),
+                _ => None,
+            };
             let terminal = matches!(
                 output.event,
                 AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_)
             );
+            self.last_output_handed_over = false;
             let changed = self.apply_agent_output(output);
             outcome.changed |= changed;
-            if terminal && changed {
-                outcome.completed = true;
+            if !self.last_output_handed_over {
+                if is_error {
+                    outcome.errored = true;
+                    outcome.error_kind = error_kind_opt;
+                }
+                if terminal && changed {
+                    outcome.completed = true;
+                }
             }
         }
         outcome
@@ -3540,6 +3561,13 @@ impl App {
                     return false;
                 }
 
+                if let AgentEvent::Error(ref err) = output.event
+                    && self.try_runner_fallback(output.agent, err)
+                {
+                    self.last_output_handed_over = true;
+                    return true;
+                }
+
                 if let Some(hub) = &self.dashboard {
                     hub.note_runner_activity(&self.agent_runner_name(output.agent));
                 }
@@ -3635,6 +3663,321 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    fn try_runner_fallback(&mut self, agent: Agent, err: &AgentError) -> bool {
+        let Some(reason) =
+            dmuxai::runner_fallback::classify_failure(err.kind.as_str(), &err.message)
+        else {
+            return false;
+        };
+        let Some(active) = self.active_turns.get(&agent).cloned() else {
+            return false;
+        };
+
+        let from_runner_str = runner_name(agent).to_owned();
+        let from_model = self.selected_run_model(agent).ok().flatten();
+        let had_chain = active.fallback_chain.is_some();
+        let mut had_settings_chain = false;
+
+        let mut chain = match active.fallback_chain {
+            Some(chain) => chain,
+            None => {
+                let targets = self
+                    .settings
+                    .runner_fallback
+                    .chain_for(&from_runner_str, from_model.as_deref());
+                if targets.is_empty() {
+                    return false;
+                }
+                had_settings_chain = true;
+                dmuxai::runner_fallback::FallbackChain::new(targets)
+            }
+        };
+
+        let is_usable = |t: &dmuxai::runner_fallback::FallbackTarget,
+                         adapters: &[Box<dyn AgentAdapter>],
+                         busy_agents: &HashSet<Agent>,
+                         allowed_fn: &dyn Fn(&str) -> bool,
+                         catalogs: &HashMap<Agent, ModelCatalog>,
+                         settings: &DmuxSettings|
+         -> bool {
+            let Some(cand_agent) = runner_from_str(&t.runner) else {
+                return false;
+            };
+            if !adapters.iter().any(|a| a.agent() == cand_agent) {
+                return false;
+            }
+            if busy_agents.contains(&cand_agent) && cand_agent != agent {
+                return false;
+            }
+            if !allowed_fn(&t.runner) {
+                return false;
+            }
+            let config_default = settings
+                .runner_models
+                .get(&t.runner.to_ascii_lowercase())
+                .cloned();
+            if Self::model_resolution_for(
+                catalogs,
+                cand_agent,
+                t.model.as_deref(),
+                config_default.as_deref(),
+            )
+            .is_err()
+            {
+                return false;
+            }
+            true
+        };
+
+        let old_conv_id = active.conversation_id.clone();
+        let old_turn_id = active.turn_id.clone();
+        let from_label = match &from_model {
+            Some(m) => format!("{} {}", from_runner_str, m),
+            None => from_runner_str.clone(),
+        };
+
+        let mut next_target = chain.next_target(|t| {
+            is_usable(
+                t,
+                &self.adapters,
+                &self.busy_agents,
+                &|r| self.runner_is_allowed(r),
+                &self.model_catalogs,
+                &self.settings,
+            )
+        });
+
+        if next_target.is_none() {
+            if had_chain || had_settings_chain {
+                let exhausted = dmuxai::runner_fallback::FallbackRecord {
+                    from_runner: from_runner_str.clone(),
+                    from_model: from_model.clone(),
+                    reason: reason.as_str().to_owned(),
+                    detail: err.to_string(),
+                    to_runner: None,
+                    to_model: None,
+                };
+                self.fallback_history.push(exhausted.clone());
+                let summary = exhausted.summary();
+                self.push_system(summary.clone());
+                if let Some(hub) = &self.dashboard {
+                    let task = Some(active.conversation_id.as_str().to_owned());
+                    let todo = self.todos.turn_todo(agent, &active.turn_id);
+                    let node = self.graph_agent_nodes.get(&agent).cloned();
+                    hub.emit_event(dmuxai::events::EventDraft {
+                        kind: "fallback".to_owned(),
+                        task,
+                        todo,
+                        node,
+                        runner: Some(from_runner_str),
+                        model: from_model,
+                        from_state: Some(runner_name(agent).to_owned()),
+                        to_state: "exhausted".to_owned(),
+                        message: Some(summary),
+                        error_kind: Some(err.kind.as_str().to_owned()),
+                    });
+                }
+            }
+            return false;
+        }
+
+        let mut retired_old_turn = false;
+        let mut current_node_agent = agent;
+
+        while let Some(target) = next_target {
+            let to_runner = target.runner.clone();
+            let to_model = target.model.clone();
+            let record = dmuxai::runner_fallback::FallbackRecord {
+                from_runner: from_runner_str.clone(),
+                from_model: from_model.clone(),
+                reason: reason.as_str().to_owned(),
+                detail: err.to_string(),
+                to_runner: Some(to_runner.clone()),
+                to_model: to_model.clone(),
+            };
+            chain.record(record.clone());
+            self.fallback_history.push(record.clone());
+            let summary = record.summary();
+            self.push_system(summary.clone());
+            if let Some(hub) = &self.dashboard {
+                let task = Some(active.conversation_id.as_str().to_owned());
+                let todo = self.todos.turn_todo(agent, &active.turn_id);
+                let node = self.graph_agent_nodes.get(&current_node_agent).cloned();
+                hub.emit_event(dmuxai::events::EventDraft {
+                    kind: "fallback".to_owned(),
+                    task,
+                    todo,
+                    node,
+                    runner: Some(from_runner_str.clone()),
+                    model: from_model.clone(),
+                    from_state: Some(from_runner_str.clone()),
+                    to_state: to_runner.clone(),
+                    message: Some(summary.clone()),
+                    error_kind: Some(err.kind.as_str().to_owned()),
+                });
+            }
+
+            if !retired_old_turn {
+                let notice_output = TurnOutput {
+                    conversation_id: old_conv_id.clone(),
+                    turn_id: old_turn_id.clone(),
+                    agent: agent_key(agent),
+                    event: TurnEvent::Notice(summary),
+                };
+                let failed_output = TurnOutput {
+                    conversation_id: old_conv_id.clone(),
+                    turn_id: old_turn_id.clone(),
+                    agent: agent_key(agent),
+                    event: TurnEvent::Failed {
+                        message: format!("handed over to {target}: {err}"),
+                        invalidates_binding: true,
+                    },
+                };
+                let _ = self
+                    .engine
+                    .record_turn_outputs(&[notice_output, failed_output]);
+                self.retired_internal_turns
+                    .insert(old_turn_id.as_str().to_owned());
+
+                if self
+                    .activities
+                    .get(&agent)
+                    .is_some_and(|activity| activity.kind == ActivityKind::Turn)
+                {
+                    let message = Some(Self::truncate_agent_lifecycle_message(err.to_string()));
+                    self.emit_agent_lifecycle(
+                        agent,
+                        "error",
+                        message,
+                        Some(err.kind.as_str().to_owned()),
+                    );
+                }
+                self.agent_lifecycle.remove(&agent);
+                self.busy_agents.remove(&agent);
+                self.session_conversations = None;
+                if let Ok(mut starts) = self.busy_fallback_starts.lock() {
+                    starts.remove(&agent);
+                }
+                self.activities.remove(&agent);
+                self.end_run_state(agent, false, false);
+                let output_text = self.last_agent_output_text(agent);
+                self.note_skill_interview_turn_end(
+                    agent,
+                    false,
+                    Some(&err.to_string()),
+                    &output_text,
+                );
+                let removed_active = self.active_turns.remove(&agent);
+                if let Some(active) = removed_active.as_ref()
+                    && active.conversation_id.as_str() != self.conversation_id.as_str()
+                    && !active.offscreen_activity.is_empty()
+                {
+                    self.merge_retained_offscreen_activity(
+                        &active.conversation_id,
+                        active.turn_id.clone(),
+                        active.offscreen_activity.clone(),
+                    );
+                }
+                self.streaming_messages.remove(&agent);
+                self.tool_messages.remove(&agent);
+                retired_old_turn = true;
+            }
+
+            let new_agent = runner_from_str(&target.runner).expect("target runner was validated");
+            if let Some(node_id) = self.graph_agent_nodes.remove(&current_node_agent) {
+                self.graph_agent_nodes.insert(new_agent, node_id.clone());
+                current_node_agent = new_agent;
+                if let Some(session) = self.graph_session.as_mut()
+                    && let Some(node) = session
+                        .run_mut()
+                        .plan
+                        .nodes
+                        .iter_mut()
+                        .find(|n| n.id == node_id)
+                {
+                    node.runner = target.runner.clone();
+                    if let Some(m) = &target.model {
+                        node.model_id = m.clone();
+                    }
+                }
+            }
+
+            let _ =
+                self.apply_runner_and_model(&target.runner, target.model.as_deref().unwrap_or(""));
+            if let Some(m) = &target.model {
+                let idx = adapter_index(new_agent);
+                let _ = self.adapters[idx].select_model(m.clone());
+                if let Some(catalog) = self.model_catalogs.get_mut(&new_agent) {
+                    catalog.selected = Some(m.clone());
+                }
+            }
+
+            self.pending_display_text = active.fallback_display_text.clone();
+            self.pending_turn_policy = active.fallback_policy;
+            self.pending_fallback_chain = Some(chain.clone());
+
+            let preface =
+                dmuxai::runner_fallback::handover_preface(&from_label, reason, &err.to_string());
+            let new_prompt = format!("{}{}", preface, active.fallback_prompt);
+            let submit_res = self.try_submit_to_agent(new_agent, new_prompt, false, false);
+            match submit_res {
+                Ok(new_turn_id) => {
+                    self.todos
+                        .relink_turn((agent, &old_turn_id), (new_agent, new_turn_id));
+                    return true;
+                }
+                Err(_) => {
+                    next_target = chain.next_target(|t| {
+                        is_usable(
+                            t,
+                            &self.adapters,
+                            &self.busy_agents,
+                            &|r| self.runner_is_allowed(r),
+                            &self.model_catalogs,
+                            &self.settings,
+                        )
+                    });
+                }
+            }
+        }
+
+        // All targets in chain failed to start
+        let exhausted = dmuxai::runner_fallback::FallbackRecord {
+            from_runner: from_runner_str.clone(),
+            from_model: from_model.clone(),
+            reason: reason.as_str().to_owned(),
+            detail: err.to_string(),
+            to_runner: None,
+            to_model: None,
+        };
+        chain.record(exhausted.clone());
+        self.fallback_history.push(exhausted.clone());
+        let summary = exhausted.summary();
+        self.push_system(summary.clone());
+        if let Some(hub) = &self.dashboard {
+            hub.emit_event(dmuxai::events::EventDraft {
+                kind: "fallback".to_owned(),
+                task: Some(active.conversation_id.as_str().to_owned()),
+                todo: self.todos.turn_todo(agent, &old_turn_id),
+                node: self.graph_agent_nodes.get(&current_node_agent).cloned(),
+                runner: Some(from_runner_str),
+                model: from_model,
+                from_state: Some(runner_name(agent).to_owned()),
+                to_state: "exhausted".to_owned(),
+                message: Some(summary),
+                error_kind: Some(err.kind.as_str().to_owned()),
+            });
+        }
+        let finish = self
+            .todos
+            .finish_turn(agent, &old_turn_id, false, Some(err.to_string()));
+        self.report_todo_finish(finish);
+        if let Some(node_id) = self.graph_agent_nodes.remove(&current_node_agent) {
+            self.intercept_graph_node_finished(agent, node_id, false, "", Some(&err.to_string()));
+        }
+        false
     }
 
     fn handle_paste(&mut self, text: String) {
@@ -4652,6 +4995,9 @@ impl App {
         let submitting_run = self.todos.take_submitting_run();
         // Consume pending display text up front so it never leaks to a later turn.
         let pending_display_text = self.pending_display_text.take();
+        let fallback_policy = self.pending_turn_policy;
+        let fallback_prompt = prompt.clone();
+        let fallback_display_text = pending_display_text.clone();
         if self.busy_agents.contains(&agent) {
             if restore_input_on_failure {
                 self.input = prompt;
@@ -4962,6 +5308,10 @@ impl App {
                         graph_node_id: self.active_graph_node_for_agent(agent),
                         offscreen_activity: Vec::new(),
                         model_catalog_hint: catalog_hint,
+                        fallback_prompt,
+                        fallback_display_text,
+                        fallback_policy,
+                        fallback_chain: self.pending_fallback_chain.take(),
                     },
                 );
                 self.conversation_turn_ids
@@ -12655,6 +13005,7 @@ impl App {
         req: HeadlessRequest,
         cancel: Arc<AtomicBool>,
     ) -> HeadlessOutcome {
+        let start_fallbacks_len = self.fallback_history.len();
         if let Some(ref agent_str) = req.agent {
             let runner_clean = agent_str.trim().to_ascii_lowercase();
             let adapter = self
@@ -13149,6 +13500,7 @@ impl App {
             triage,
             plan,
             system_prompt: self.system_prompt_applied.clone(),
+            fallbacks: self.fallback_history[start_fallbacks_len..].to_vec(),
         }
     }
 
@@ -16153,6 +16505,7 @@ mod tests {
 
     type SentRequests = Arc<Mutex<Vec<(Agent, AgentRequest)>>>;
     type CancelRequests = Arc<Mutex<Vec<Agent>>>;
+    type SelectedModels = Arc<Mutex<Vec<(Agent, String)>>>;
 
     fn install_shared_test_registry() -> Vec<String> {
         let mut spec = dmuxai::custom_agent::opencode_preset("opencode-step");
@@ -16170,6 +16523,7 @@ mod tests {
         cancelled: CancelRequests,
         fail_send: bool,
         unsupported_modes: Vec<TurnPolicy>,
+        selected_models: SelectedModels,
     }
 
     impl AgentAdapter for RecordingAdapter {
@@ -16197,7 +16551,11 @@ mod tests {
             Ok(())
         }
 
-        fn select_model(&self, _model: String) -> Result<(), AdapterError> {
+        fn select_model(&self, model: String) -> Result<(), AdapterError> {
+            self.selected_models
+                .lock()
+                .unwrap()
+                .push((self.agent, model));
             Ok(())
         }
 
@@ -16247,8 +16605,18 @@ mod tests {
         engine: ConversationEngine,
         failing_agent: Option<Agent>,
     ) -> (App, SentRequests, CancelRequests) {
+        let (app, sent, cancelled, _) =
+            test_app_runtime_with_selected_models(engine, failing_agent);
+        (app, sent, cancelled)
+    }
+
+    fn test_app_runtime_with_selected_models(
+        engine: ConversationEngine,
+        failing_agent: Option<Agent>,
+    ) -> (App, SentRequests, CancelRequests, SelectedModels) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let selected_models = Arc::new(Mutex::new(Vec::new()));
         let adapters = Agent::all()
             .into_iter()
             .map(|agent| {
@@ -16258,6 +16626,7 @@ mod tests {
                     cancelled: Arc::clone(&cancelled),
                     fail_send: failing_agent == Some(agent),
                     unsupported_modes: Vec::new(),
+                    selected_models: Arc::clone(&selected_models),
                 }) as Box<dyn AgentAdapter>
             })
             .collect();
@@ -16279,7 +16648,16 @@ mod tests {
         app.selected = adapter_index(Agent::Codex);
         app.color_enabled = true;
         app.skip_judge_for_tests = true;
-        (app, sent, cancelled)
+        (app, sent, cancelled, selected_models)
+    }
+
+    fn test_app_with_selected_models() -> (App, SentRequests, SelectedModels) {
+        pin_test_state_dir();
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (app, sent, _, selected_models) = test_app_runtime_with_selected_models(engine, None);
+        (app, sent, selected_models)
     }
 
     fn test_app_with_event_sender() -> (App, SentRequests, mpsc::Sender<AgentOutput>) {
@@ -16288,6 +16666,7 @@ mod tests {
             ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let selected_models = Arc::new(Mutex::new(Vec::new()));
         let adapters = Agent::all()
             .into_iter()
             .map(|agent| {
@@ -16297,6 +16676,7 @@ mod tests {
                     cancelled: Arc::clone(&cancelled),
                     fail_send: false,
                     unsupported_modes: Vec::new(),
+                    selected_models: Arc::clone(&selected_models),
                 }) as Box<dyn AgentAdapter>
             })
             .collect();
@@ -16342,6 +16722,7 @@ mod tests {
             ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let selected_models = Arc::new(Mutex::new(Vec::new()));
         let adapters = Agent::all()
             .into_iter()
             .map(|agent| {
@@ -16355,6 +16736,7 @@ mod tests {
                         .filter(|(candidate, _)| *candidate == agent)
                         .map(|(_, mode)| *mode)
                         .collect(),
+                    selected_models: Arc::clone(&selected_models),
                 }) as Box<dyn AgentAdapter>
             })
             .collect();
@@ -21257,6 +21639,10 @@ mod tests {
                 graph_node_id: None,
                 offscreen_activity: Vec::new(),
                 model_catalog_hint: None,
+                fallback_prompt: String::new(),
+                fallback_display_text: None,
+                fallback_policy: None,
+                fallback_chain: None,
             },
         );
 
@@ -22705,6 +23091,10 @@ mod tests {
                 graph_node_id: None,
                 offscreen_activity: Vec::new(),
                 model_catalog_hint: None,
+                fallback_prompt: String::new(),
+                fallback_display_text: None,
+                fallback_policy: None,
+                fallback_chain: None,
             },
         );
         app.busy_agents.insert(Agent::Cursor);
@@ -22753,6 +23143,10 @@ mod tests {
                 graph_node_id: None,
                 offscreen_activity: Vec::new(),
                 model_catalog_hint: None,
+                fallback_prompt: String::new(),
+                fallback_display_text: None,
+                fallback_policy: None,
+                fallback_chain: None,
             },
         );
         app.activities.insert(
@@ -23511,6 +23905,7 @@ mod tests {
                         cancelled: Arc::clone(&cancelled),
                         fail_send: false,
                         unsupported_modes: Vec::new(),
+                        selected_models: Arc::new(Mutex::new(Vec::new())),
                     }) as Box<dyn AgentAdapter>
                 })
                 .collect();
@@ -25768,6 +26163,7 @@ mod tests {
                 cancelled,
                 fail_send: false,
                 unsupported_modes: Vec::new(),
+                selected_models: Arc::new(Mutex::new(Vec::new())),
             }));
         }
         app.messages.clear();
@@ -26027,6 +26423,7 @@ mod tests {
                     cancelled: Arc::clone(&cancelled),
                     fail_send: false,
                     unsupported_modes: Vec::new(),
+                    selected_models: Arc::new(Mutex::new(Vec::new())),
                 }) as Box<dyn AgentAdapter>
             })
             .collect();
@@ -32527,6 +32924,423 @@ mod tests {
                 invalid_expected.clone()
             );
         });
+    }
+
+    fn agy_to_codex_fallback_settings() -> dmuxai::runner_fallback::FallbackSettings {
+        let mut fallback = dmuxai::runner_fallback::FallbackSettings::default();
+        fallback.runners.insert(
+            "agy".to_owned(),
+            dmuxai::runner_fallback::RunnerFallbackConfig {
+                chain: vec![dmuxai::runner_fallback::FallbackTarget {
+                    runner: "codex".to_owned(),
+                    model: None,
+                }],
+                stall_timeout_secs: 240,
+                stall_api_retries: 3,
+            },
+        );
+        fallback
+    }
+
+    // FR-2118 / TC-2118
+    #[test]
+    fn tc_2118_provider_error_hands_turn_to_next_runner() {
+        let (mut app, sent) = test_app();
+        app.settings.runner_fallback = agy_to_codex_fallback_settings();
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "analyze the codebase".to_owned();
+        app.submit_prompt();
+
+        let old_turn_id = app.active_turns.get(&Agent::Agy).unwrap().turn_id.clone();
+        assert!(app.busy_agents.contains(&Agent::Agy));
+        assert_eq!(sent.lock().unwrap().len(), 1);
+
+        let (agent, req) = sent.lock().unwrap()[0].clone();
+        assert_eq!(agent, Agent::Agy);
+
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider(
+                "API error (attempt 3): request failed: read tcp: connection timed out",
+            )),
+        }));
+
+        // codex adapter got a request whose prompt starts with "[DmuxAI runner fallback]" and contains original prompt
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let (c_agent, c_req) = &requests[1];
+        assert_eq!(*c_agent, Agent::Codex);
+        assert!(c_req.prompt.starts_with("[DmuxAI runner fallback]"));
+        assert!(c_req.prompt.contains("analyze the codebase"));
+
+        // agy not busy, codex busy and owns the active turn
+        assert!(!app.busy_agents.contains(&Agent::Agy));
+        assert!(app.busy_agents.contains(&Agent::Codex));
+        assert!(app.active_turns.contains_key(&Agent::Codex));
+        assert!(!app.active_turns.contains_key(&Agent::Agy));
+
+        // a system message with "runner fallback: agy" exists
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| matches!(m.role, Role::System)
+                    && m.content.contains("runner fallback: agy"))
+        );
+
+        // old turn stored Notice + Failed
+        let snapshot = app
+            .engine
+            .select(ConversationSelection::Existing(app.conversation_id.clone()))
+            .expect("conversation snapshot");
+        let old_turn = snapshot
+            .turns
+            .iter()
+            .find(|t| t.id.as_str() == old_turn_id.as_str())
+            .expect("old turn snapshot");
+        assert_eq!(old_turn.status, dmuxai::conversation::TurnStatus::Failed);
+    }
+
+    // FR-2118 / TC-2118
+    #[test]
+    fn tc_2118_stall_error_hands_over() {
+        let (mut app, sent) = test_app();
+        app.settings.runner_fallback = agy_to_codex_fallback_settings();
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "stall test prompt".to_owned();
+        app.submit_prompt();
+
+        let (agent, req) = sent.lock().unwrap()[0].clone();
+        assert_eq!(agent, Agent::Agy);
+
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::new(
+                AgentErrorKind::Stalled,
+                "no model progress for 240s",
+            )),
+        }));
+
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].0, Agent::Codex);
+        assert!(requests[1].1.prompt.contains("stall test prompt"));
+        assert!(app.busy_agents.contains(&Agent::Codex));
+    }
+
+    // FR-2118 / TC-2118
+    #[test]
+    fn tc_2118_normal_failure_does_not_fall_back() {
+        let (mut app, sent) = test_app();
+        app.settings.runner_fallback = agy_to_codex_fallback_settings();
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "run tests".to_owned();
+        app.submit_prompt();
+
+        let (agent, req) = sent.lock().unwrap()[0].clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("tests failed: 2 failures")),
+        }));
+
+        // No request to codex, turn fails as before
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(!app.busy_agents.contains(&Agent::Agy));
+        assert!(!app.busy_agents.contains(&Agent::Codex));
+        assert!(app.fallback_history.is_empty());
+    }
+
+    // FR-2118 / TC-2118
+    #[test]
+    fn tc_2118_cancel_does_not_fall_back() {
+        let (mut app, sent) = test_app();
+        app.settings.runner_fallback = agy_to_codex_fallback_settings();
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "cancel me".to_owned();
+        app.submit_prompt();
+
+        let (agent, req) = sent.lock().unwrap()[0].clone();
+        // AgentEvent::Cancelled
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Cancelled,
+        }));
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(app.fallback_history.is_empty());
+
+        // Also test Error cancelled
+        app.input = "cancel me 2".to_owned();
+        app.submit_prompt();
+        let req2 = sent.lock().unwrap()[1].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(req2.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req2.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::cancelled("cancelled")),
+        }));
+        assert_eq!(sent.lock().unwrap().len(), 2);
+        assert!(app.fallback_history.is_empty());
+    }
+
+    // FR-2118 / TC-2118
+    #[test]
+    fn tc_2118_drain_does_not_mark_handed_over_error() {
+        let (mut app, sent, tx) = test_app_with_event_sender();
+        app.settings.runner_fallback = agy_to_codex_fallback_settings();
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "drain test".to_owned();
+        app.submit_prompt();
+
+        let (agent, req) = sent.lock().unwrap()[0].clone();
+        tx.try_send(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider(
+                "API error (attempt 1): request failed: read tcp: connection timed out",
+            )),
+        })
+        .unwrap();
+
+        let outcome = app.drain_agent_events();
+        assert!(outcome.changed);
+        assert!(
+            !outcome.errored,
+            "handed over error must not set outcome.errored"
+        );
+        assert!(
+            !outcome.completed,
+            "handed over error must not set outcome.completed"
+        );
+        assert_eq!(outcome.error_kind, None);
+    }
+
+    // FR-2119 / TC-2119
+    #[test]
+    fn tc_2119_chain_single_pass() {
+        let (mut app, sent) = test_app();
+        app.settings.runner_fallback = agy_to_codex_fallback_settings();
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "single pass test".to_owned();
+        app.submit_prompt();
+
+        let req1 = sent.lock().unwrap()[0].1.clone();
+        // Agy fails with provider error -> hands over to codex
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(req1.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req1.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("API error: 503 service unavailable")),
+        }));
+        assert_eq!(sent.lock().unwrap().len(), 2);
+
+        let req2 = sent.lock().unwrap()[1].1.clone();
+        // Codex also fails with provider error -> no further send, turn fails
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(ConversationId::new(req2.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req2.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("API error: 500 internal error")),
+        }));
+
+        // No further send
+        assert_eq!(sent.lock().unwrap().len(), 2);
+        assert!(!app.busy_agents.contains(&Agent::Codex));
+
+        // fallback_history has 2 records, second has to_runner None
+        assert_eq!(app.fallback_history.len(), 2);
+        assert_eq!(app.fallback_history[0].from_runner, "agy");
+        assert_eq!(app.fallback_history[0].to_runner.as_deref(), Some("codex"));
+        assert_eq!(app.fallback_history[1].from_runner, "codex");
+        assert_eq!(app.fallback_history[1].to_runner, None);
+    }
+
+    // FR-2119 / TC-2119
+    #[test]
+    fn tc_2119_same_runner_model_fallback() {
+        let (mut app, sent, selected_models) = test_app_with_selected_models();
+        let mut fallback = dmuxai::runner_fallback::FallbackSettings::default();
+        fallback.runners.insert(
+            "agy".to_owned(),
+            dmuxai::runner_fallback::RunnerFallbackConfig {
+                chain: vec![dmuxai::runner_fallback::FallbackTarget {
+                    runner: "agy".to_owned(),
+                    model: Some("gemini-3.8-flash-low".to_owned()),
+                }],
+                stall_timeout_secs: 240,
+                stall_api_retries: 3,
+            },
+        );
+        app.settings.runner_fallback = fallback;
+        app.model_catalogs.get_mut(&Agent::Agy).unwrap().selected =
+            Some("gemini-3.8-flash-high".to_owned());
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "same runner test".to_owned();
+        app.submit_prompt();
+
+        let req = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("connection timed out")),
+        }));
+
+        // agy adapter received select_model("gemini-3.8-flash-low") and a second send
+        let models = selected_models.lock().unwrap();
+        assert!(
+            models
+                .iter()
+                .any(|(agent, model)| *agent == Agent::Agy && model == "gemini-3.8-flash-low")
+        );
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].0, Agent::Agy);
+    }
+
+    // FR-2119 / TC-2119
+    #[test]
+    fn tc_2119_graph_node_rebinds_to_fallback_runner() {
+        let (mut app, sent) = test_app();
+        app.settings.runner_fallback = agy_to_codex_fallback_settings();
+        app.selected = adapter_index(Agent::Agy);
+        app.quiet_graph_run = false;
+
+        let plan = dmuxai::graph::GraphPlan {
+            schema: "dmuxai.graph/v1".to_owned(),
+            id: "tc-2119-graph".to_owned(),
+            orchestrator_model: "composer-2.5".to_owned(),
+            user_prompt: "graph fallback".to_owned(),
+            tasks: Vec::new(),
+            nodes: vec![dmuxai::graph::GraphNode {
+                id: "step-1".to_owned(),
+                role: NodeRole::Implement,
+                job: "job on agy".to_owned(),
+                runner: "agy".to_owned(),
+                model_id: "".to_owned(),
+                skill: None,
+                requires_gate: false,
+                status: dmuxai::graph::GraphNodeStatus::Pending,
+                attempt: 0,
+                task: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+            }],
+            edges: Vec::new(),
+            limits: dmuxai::graph::default_limits(),
+        };
+        app.start_graph_run(plan);
+
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        let (agent, req) = sent.lock().unwrap()[0].clone();
+        assert_eq!(agent, Agent::Agy);
+
+        // Fail agy step with provider error -> hands over to codex
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("HTTP 503 service unavailable")),
+        }));
+
+        assert_eq!(sent.lock().unwrap().len(), 2);
+        let (c_agent, c_req) = sent.lock().unwrap()[1].clone();
+        assert_eq!(c_agent, Agent::Codex);
+        assert_eq!(
+            app.graph_agent_nodes.get(&Agent::Codex).map(|s| s.as_str()),
+            Some("step-1")
+        );
+
+        // Completing the codex turn completes that node
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(ConversationId::new(c_req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(c_req.turn_id.as_str())),
+            event: AgentEvent::Completed,
+        }));
+
+        // Graph session finished / completed
+        assert!(app.graph_session.is_none());
+        let run = app.last_graph_run.as_ref().expect("completed graph run");
+        assert_eq!(run.phase, GraphRunPhase::Completed);
+    }
+
+    // FR-2119 / TC-2119
+    #[test]
+    fn tc_2119_headless_outcome_serializes_fallbacks() {
+        let mut outcome = HeadlessOutcome::failure(1, "conv-1", Some("agy".to_owned()), "err");
+        let json_empty = serde_json::to_value(&outcome).unwrap();
+        assert!(
+            json_empty.get("fallbacks").is_none(),
+            "empty fallbacks must be skipped in JSON serialization"
+        );
+
+        outcome
+            .fallbacks
+            .push(dmuxai::runner_fallback::FallbackRecord {
+                from_runner: "agy".to_owned(),
+                from_model: None,
+                reason: "provider".to_owned(),
+                detail: "timeout".to_owned(),
+                to_runner: Some("codex".to_owned()),
+                to_model: None,
+            });
+        let json_with_fallbacks = serde_json::to_value(&outcome).unwrap();
+        let arr = json_with_fallbacks
+            .get("fallbacks")
+            .and_then(|v| v.as_array())
+            .expect("fallbacks array must be serialized when non-empty");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["from_runner"], "agy");
+        assert_eq!(arr[0]["to_runner"], "codex");
+        assert_eq!(arr[0]["reason"], "provider");
+    }
+
+    // FR-2119 / TC-2119
+    #[test]
+    fn tc_2119_no_usable_target_records_exhausted() {
+        let (mut app, sent) = test_app();
+        let mut fallback = dmuxai::runner_fallback::FallbackSettings::default();
+        fallback.runners.insert(
+            "agy".to_owned(),
+            dmuxai::runner_fallback::RunnerFallbackConfig {
+                chain: vec![dmuxai::runner_fallback::FallbackTarget {
+                    runner: "nosuch".to_owned(),
+                    model: None,
+                }],
+                stall_timeout_secs: 240,
+                stall_api_retries: 3,
+            },
+        );
+        app.settings.runner_fallback = fallback;
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "no usable target".to_owned();
+        app.submit_prompt();
+
+        let req = sent.lock().unwrap()[0].1.clone();
+        let _ = app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("API error: 503 service unavailable")),
+        });
+
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(!app.busy_agents.contains(&Agent::Agy));
+        assert_eq!(app.fallback_history.len(), 1);
+        assert_eq!(app.fallback_history[0].to_runner, None);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("fallback chain exhausted"))
+        );
     }
 }
 

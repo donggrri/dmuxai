@@ -1097,6 +1097,7 @@ mod tests {
             triage: None,
             plan: None,
             system_prompt: None,
+            fallbacks: Vec::new(),
         };
         let json = outcome_json(&outcome, 1, 2);
         assert_eq!(json["error"], "boom");
@@ -1116,6 +1117,7 @@ mod tests {
             triage: None,
             plan: None,
             system_prompt: None,
+            fallbacks: Vec::new(),
         };
         let json = outcome_json(&outcome, 0, 0);
         assert!(json["error"].is_null());

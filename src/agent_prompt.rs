@@ -108,6 +108,9 @@ pub struct RunnerPromptToml {
     pub prompt_inject: Option<String>,
     pub prompt_roles: Option<Vec<String>>,
     pub model: Option<String>,
+    pub fallback: Option<Vec<String>>,
+    pub stall_timeout_secs: Option<u64>,
+    pub stall_api_retries: Option<u32>,
 }
 
 /// Delivery mechanism for the system prompt.
@@ -492,6 +495,7 @@ mod tests {
             timeout_secs: None,
             idle_timeout_secs: None,
             failure_stderr: None,
+            stall_keepalive: None,
             temp_config_template: None,
             system_prompt_arg: vec![],
             env: BTreeMap::new(),
@@ -654,6 +658,7 @@ mod tests {
             timeout_secs: None,
             idle_timeout_secs: None,
             failure_stderr: None,
+            stall_keepalive: None,
             temp_config_template: None,
             system_prompt_arg: vec!["--system".to_owned(), "{system_prompt}".to_owned()],
             env: BTreeMap::new(),
