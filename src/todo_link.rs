@@ -75,6 +75,12 @@ impl TodoLinks {
         self.turns.insert((agent, turn_id), todo_id.into());
     }
 
+    pub(crate) fn relink_turn(&mut self, from: (Agent, &StoredTurnId), to: (Agent, StoredTurnId)) {
+        if let Some(todo_id) = self.turns.remove(&(from.0, from.1.clone())) {
+            self.turns.insert((to.0, to.1), todo_id);
+        }
+    }
+
     pub(crate) fn finish_turn(
         &mut self,
         agent: Agent,
