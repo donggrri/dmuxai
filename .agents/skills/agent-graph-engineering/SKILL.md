@@ -74,7 +74,7 @@ Design multi-agent workflows as **directed graphs**: agents are nodes, context a
 
 - **When:** One operation applied to N items, then aggregated.
 - **Key:** Chunker produces a uniform list. Workers are identical logic with different inputs. Reducer combines into a single artifact.
-- **Cursor:** Build the item list in the parent (code or a planner subagent). Spawn N Task calls in batches of 3–5 (`graph-worker` or `composer-2.5` roles). Collect outputs, then run the reducer.
+- **Cursor:** Build the item list in the parent (code or a planner subagent). Spawn N Task calls in batches of 3–5 (e.g. `graph-worker` roles). Collect outputs, then run the reducer.
 
 ### 5. Hierarchical Delegation — Manager-Worker
 
@@ -100,15 +100,9 @@ Design multi-agent workflows as **directed graphs**: agents are nodes, context a
    - **`task_cloud`** — Task with `environment: "cloud"` for isolated VMs, separate branches, or heavy CI-style work (Cloud Agents / IDE when enabled).
    - **`self`** — Cheap steps done in the parent context without delegation.
 
-## Model assignment (example subagents)
+## Model choice
 
-Use **only `composer-2.5`** for every graph node and subagent in this repository (see `MISSION.md`). Do not default to or invoke haiku, grok, sonnet, gpt, gemini, or any `*-fast` model.
-
-| Role bucket | Model | Example agents |
-| --- | --- | --- |
-| All roles (research, implement, orchestrate, review, route, draft) | `composer-2.5` | `graph-*` under `.cursor/agents/` |
-
-Omit `model` on custom agents to inherit the parent model when appropriate.
+This skill is model-agnostic. Use whatever model your runner is configured with; omit `model` on custom agents to inherit the parent model, or set it per role only if your project requires that.
 
 ## Edge Contract Template
 
@@ -181,7 +175,7 @@ Before declaring a graph workflow complete:
 
 - `.agents/skills/agent-graph-engineering/templates/graph.yaml` — Graph definition template
 - `.agents/skills/agent-graph-engineering/templates/edge-contract.md` — Edge contract format
-- `.cursor/agents/graph-*.md` — Example role subagents with model assignments
+- `.cursor/agents/graph-*.md` — Example role subagents
 
 ## Attribution
 
