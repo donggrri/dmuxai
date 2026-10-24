@@ -10337,67 +10337,19 @@ impl App {
         Self::merge_activity_item(&mut self.messages, item);
     }
 
-    fn merge_activity_item(messages: &mut Vec<Message>, item: dmuxai::activity::ActivityItem) {
-        match item {
-            dmuxai::activity::ActivityItem::Tool { ref name, .. } => {
-                let found = messages.iter_mut().rev().find_map(|msg| {
-                    if let Role::Activity(dmuxai::activity::ActivityItem::Tool {
-                        name: existing_name,
-                        status: dmuxai::activity::ToolStatus::Running,
-                        ..
-                    }) = &mut msg.role
-                        && existing_name == name
-                    {
-                        return Some(msg);
-                    }
-                    None
-                });
-
-                if let Some(msg) = found {
-                    msg.role = Role::Activity(item);
-                } else {
-                    messages.push(Message::new(Role::Activity(item), ""));
-                }
-            }
-            dmuxai::activity::ActivityItem::Thinking {
-                text: incoming_text,
-                started_ms: incoming_started,
-                finished_ms: incoming_finished,
-            } => {
-                let found = messages.iter_mut().rev().find_map(|msg| {
-                    if let Role::Activity(dmuxai::activity::ActivityItem::Thinking {
-                        text: existing_text,
-                        started_ms: existing_started,
-                        finished_ms: existing_finished,
-                    }) = &mut msg.role
-                        && existing_finished.is_none()
-                    {
-                        if incoming_finished.is_some() {
-                            *existing_finished = incoming_finished;
-                        }
-                        if *existing_started == 0 && incoming_started != 0 {
-                            *existing_started = incoming_started;
-                        }
-                        if !incoming_text.is_empty() {
-                            existing_text.push_str(&incoming_text);
-                        }
-                        return Some(());
-                    }
-                    None
-                });
-
-                if found.is_none() {
-                    messages.push(Message::new(
-                        Role::Activity(dmuxai::activity::ActivityItem::Thinking {
-                            text: incoming_text,
-                            started_ms: incoming_started,
-                            finished_ms: incoming_finished,
-                        }),
-                        "",
-                    ));
-                }
-            }
-        }
+    fn merge_activity_item(
+        messages: &mut Vec<Message>,
+        item: dmuxai::activity::ActivityItem,
+    ) -> usize {
+        dmuxai::activity::merge_activity_in(
+            messages,
+            item,
+            |msg| match &mut msg.role {
+                Role::Activity(activity) => Some(activity),
+                _ => None,
+            },
+            |item| Message::new(Role::Activity(item), ""),
+        )
     }
 
     fn buffer_offscreen_live_event(&mut self, agent: Agent, event: AgentEvent) {
@@ -31483,6 +31435,85 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    // TC-1951 / FR-1951: App activity merge matches engine rule for the same sequence.
+    #[test]
+    fn tc_1951_app_activity_merge_matches_engine_rule() {
+        let sequence = vec![
+            dmuxai::activity::ActivityItem::Tool {
+                name: "read_file".to_string(),
+                target: "src/main.rs".to_string(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            },
+            dmuxai::activity::ActivityItem::Tool {
+                name: "run_command".to_string(),
+                target: "cargo check".to_string(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            },
+            dmuxai::activity::ActivityItem::Tool {
+                name: "read_file".to_string(),
+                target: "src/main.rs".to_string(),
+                status: dmuxai::activity::ToolStatus::Ok,
+                duration_ms: Some(150),
+                detail: "ok".to_string(),
+            },
+            dmuxai::activity::ActivityItem::Tool {
+                name: "read_file".to_string(),
+                target: "src/lib.rs".to_string(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            },
+            dmuxai::activity::ActivityItem::Thinking {
+                text: "Step 1 reasoning".to_string(),
+                started_ms: 1000,
+                finished_ms: None,
+            },
+            dmuxai::activity::ActivityItem::Thinking {
+                text: " -> Step 2".to_string(),
+                started_ms: 0,
+                finished_ms: None,
+            },
+            dmuxai::activity::ActivityItem::Thinking {
+                text: " -> conclusion".to_string(),
+                started_ms: 0,
+                finished_ms: Some(2500),
+            },
+            dmuxai::activity::ActivityItem::Thinking {
+                text: "Next turn reasoning".to_string(),
+                started_ms: 3000,
+                finished_ms: None,
+            },
+        ];
+
+        let mut plain_vec = Vec::new();
+        for item in sequence.clone() {
+            dmuxai::activity::merge_activity(&mut plain_vec, item);
+        }
+
+        let mut messages = vec![
+            Message::new(Role::User, "initial user prompt"),
+            Message::new(Role::Agent(Agent::Codex), "working..."),
+        ];
+
+        for item in sequence {
+            App::merge_activity_item(&mut messages, item);
+        }
+
+        let app_activities: Vec<dmuxai::activity::ActivityItem> = messages
+            .into_iter()
+            .filter_map(|msg| match msg.role {
+                Role::Activity(act) => Some(act),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(app_activities, plain_vec);
     }
 
     // TC-1623 / FR-1623: same agent cannot run in two conversations at once.
