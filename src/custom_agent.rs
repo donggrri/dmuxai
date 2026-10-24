@@ -379,6 +379,21 @@ impl CustomAgentSpec {
             || self.text_break_when.is_some()
     }
 
+    /// Whether any field references `{mcp_config}`, which was deprecated when
+    /// MCP propagation was removed (FR-2082).
+    pub fn uses_deprecated_mcp_config(&self) -> bool {
+        self.command.iter().any(|arg| arg.contains("{mcp_config}"))
+            || self
+                .resume_arg
+                .iter()
+                .any(|arg| arg.contains("{mcp_config}"))
+            || self
+                .temp_config_template
+                .as_deref()
+                .is_some_and(|tmpl| tmpl.contains("{mcp_config}"))
+            || self.env.values().any(|val| val.contains("{mcp_config}"))
+    }
+
     /// Returns the effective output format, inferring Jsonl when JSONL path fields
     /// are set but output is not explicitly set to Jsonl.
     ///
@@ -462,7 +477,6 @@ pub struct SubstitutionContext {
     pub images: Vec<String>,
     pub session_id: Option<String>,
     pub temp_config: Option<String>,
-    pub mcp_config: Option<String>,
     pub mode: &'static str,
     pub edit: &'static str,
     pub system_prompt: Option<String>,
@@ -483,7 +497,6 @@ impl SubstitutionContext {
             images: Vec::new(),
             session_id: None,
             temp_config: None,
-            mcp_config: None,
             mode,
             edit,
             system_prompt: None,
@@ -518,7 +531,7 @@ fn substitute_internal(
             "image" => Some(image?),
             "session_id" => Some(ctx.session_id.as_deref()?),
             "temp_config" => Some(ctx.temp_config.as_deref()?),
-            "mcp_config" => Some(ctx.mcp_config.as_deref()?),
+            "mcp_config" => return None,
             "system_prompt" => Some(ctx.system_prompt.as_deref().unwrap_or("")),
             "system_prompt_file" => Some(ctx.system_prompt_file.as_deref().unwrap_or("")),
             "mode" => Some(ctx.mode),
@@ -711,11 +724,7 @@ pub fn build_custom_command(
 
     crate::process::apply_child_env_policy_tokio(&mut command);
 
-    if let Some(mcp_path) = &ctx.mcp_config {
-        command.env("DMUXAI_MCP_CONFIG", mcp_path);
-    } else {
-        command.env_remove("DMUXAI_MCP_CONFIG");
-    }
+    command.env_remove("DMUXAI_MCP_CONFIG");
 
     for (key, value) in &spec.env {
         if let Some(value) = substitute(value, ctx) {
@@ -945,6 +954,12 @@ pub fn install_registry(specs: Vec<CustomAgentSpec>) -> Vec<String> {
         if let Err(error) = spec.validate() {
             warnings.push(error);
             continue;
+        }
+        if spec.uses_deprecated_mcp_config() {
+            warnings.push(format!(
+                "agents.custom \"{}\": {{mcp_config}} is deprecated and ignored; DmuxAI no longer passes MCP servers to agents (configure MCP in the agent itself)",
+                spec.name
+            ));
         }
         if matches!(spec.name.as_str(), "cursor" | "agy" | "codex")
             || accepted.iter().any(|other| other.name == spec.name)
@@ -1411,7 +1426,6 @@ text_path = "/part/text"
             images: vec!["/tmp/shot.png".to_string()],
             session_id: Some("sess-99".to_string()),
             temp_config: Some("/tmp/config.json".to_string()),
-            mcp_config: Some("/tmp/mcp.json".to_string()),
             mode: "implement",
             edit: "allow",
             system_prompt: None,
@@ -1440,10 +1454,6 @@ text_path = "/part/text"
             Some("CONF=/tmp/config.json")
         );
         assert_eq!(
-            substitute("MCP={mcp_config}", &ctx).as_deref(),
-            Some("MCP=/tmp/mcp.json")
-        );
-        assert_eq!(
             substitute("mode={mode},edit={edit}", &ctx).as_deref(),
             Some("mode=implement,edit=allow")
         );
@@ -1458,7 +1468,6 @@ text_path = "/part/text"
             images: Vec::new(),
             session_id: None,
             temp_config: None,
-            mcp_config: None,
             mode: "ask",
             edit: "deny",
             system_prompt: None,
@@ -1487,7 +1496,6 @@ text_path = "/part/text"
             images: Vec::new(),
             session_id: None,
             temp_config: None,
-            mcp_config: None,
             mode: "ask",
             edit: "deny",
             system_prompt: None,
@@ -1521,7 +1529,6 @@ text_path = "/part/text"
             images: Vec::new(),
             session_id: None,
             temp_config: None,
-            mcp_config: None,
             mode: "ask",
             edit: "deny",
             system_prompt: None,
@@ -1691,7 +1698,6 @@ prompt_via = "stdin"
             images: Vec::new(),
             session_id: None,
             temp_config: None,
-            mcp_config: None,
             mode: "ask",
             edit: "deny",
             system_prompt: None,
@@ -1724,7 +1730,6 @@ implement = ["--mode", "implement"]
             images: vec!["img1.png".to_string(), "img2.png".to_string()],
             session_id: Some("sess-123".to_string()),
             temp_config: None,
-            mcp_config: None,
             mode: "implement",
             edit: "allow",
             system_prompt: None,
@@ -1764,7 +1769,6 @@ image_arg = []
             images: vec!["a.png".to_string(), "b.png".to_string()],
             session_id: None,
             temp_config: None,
-            mcp_config: None,
             mode: "ask",
             edit: "deny",
             system_prompt: None,
@@ -1985,13 +1989,12 @@ image_arg = []
         spec.env
             .insert("CUSTOM_VAR".to_owned(), "custom-val".to_owned());
 
-        let mut ctx = SubstitutionContext::new(
+        let ctx = SubstitutionContext::new(
             "test",
             workspace.to_string_lossy().into_owned(),
             "ask",
             "deny",
         );
-        ctx.mcp_config = Some("/path/to/mcp.json".to_owned());
 
         let cmd = build_custom_command(&spec, &ctx, workspace).unwrap();
         let env_map: std::collections::HashMap<_, _> = cmd
@@ -2002,17 +2005,57 @@ image_arg = []
 
         // DMUXAI_WEB_TOKEN was stripped by policy
         assert_eq!(env_map.get("DMUXAI_WEB_TOKEN"), Some(&None));
-        // DMUXAI_MCP_CONFIG was set after policy via ctx.mcp_config
-        assert_eq!(
-            env_map.get("DMUXAI_MCP_CONFIG"),
-            Some(&Some("/path/to/mcp.json"))
-        );
+        // DMUXAI_MCP_CONFIG was stripped unconditionally
+        assert_eq!(env_map.get("DMUXAI_MCP_CONFIG"), Some(&None));
         // spec.env was applied last, so its override won
         assert_eq!(
             env_map.get("DMUXAI_CONFIG"),
             Some(&Some("agent-override.toml"))
         );
         assert_eq!(env_map.get("CUSTOM_VAR"), Some(&Some("custom-val")));
+    }
+
+    // TC-2082 / FR-2082: custom agent {mcp_config} placeholder dropped with one warning.
+    #[test]
+    fn tc_2082_custom_mcp_config_placeholder_dropped_with_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("dmuxai.toml"),
+            r#"
+[[agents.custom]]
+name = "mcp-agent"
+command = ["x", "--mcp", "{mcp_config}", "{prompt}"]
+"#,
+        )
+        .unwrap();
+
+        let settings = crate::settings::DmuxSettings::load(tmp.path());
+        let warnings: Vec<&String> = settings
+            .config_warnings
+            .iter()
+            .filter(|w| w.contains("{mcp_config} is deprecated and ignored"))
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        assert_eq!(
+            warnings[0],
+            "agents.custom \"mcp-agent\": {mcp_config} is deprecated and ignored; DmuxAI no longer passes MCP servers to agents (configure MCP in the agent itself)"
+        );
+
+        let spec = settings
+            .custom_agents
+            .iter()
+            .find(|s| s.name == "mcp-agent")
+            .unwrap();
+        let ctx = SubstitutionContext::new("my prompt", "/ws", "ask", "deny");
+        let argv = build_argv(spec, &ctx);
+        assert_eq!(argv, vec!["x", "my prompt"]);
+        assert!(!argv.contains(&"--mcp".to_string()));
+        assert!(!argv.iter().any(|arg| arg.contains("{mcp_config}")));
     }
 
     // TC-877 (FR-875)

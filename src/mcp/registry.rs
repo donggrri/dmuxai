@@ -54,8 +54,6 @@ pub struct McpServerView {
     pub transport: &'static str,
     pub enabled: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub runners: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
 
@@ -150,7 +148,6 @@ impl McpRegistry {
                     Transport::Http { .. } => "http",
                 },
                 enabled: true,
-                runners: server.runners.clone().unwrap_or_default(),
                 warnings: self.warnings_for(&server.name),
             })
             .collect();
@@ -415,7 +412,6 @@ mod tests {
                     .into_iter()
                     .collect(),
             },
-            runners: None,
             tools: crate::mcp::config::ToolNames::default(),
         }
     }
@@ -432,7 +428,6 @@ mod tests {
                     .into_iter()
                     .collect(),
             },
-            runners: Some(vec!["codex".to_owned()]),
             tools: crate::mcp::config::ToolNames::default(),
         };
         let registry = McpRegistry::new(vec![stdio("demo", ServerKind::Generic), http], Vec::new());
@@ -441,7 +436,6 @@ mod tests {
         assert_eq!(view.servers[0].transport, "stdio");
         assert_eq!(view.servers[1].transport, "http");
         assert_eq!(view.servers[1].kind, "jira");
-        assert_eq!(view.servers[1].runners, vec!["codex".to_owned()]);
         let json = serde_json::to_string(&view).unwrap();
         assert!(!json.contains("demo-token"));
         assert!(!json.contains("demo-header"));
@@ -501,46 +495,5 @@ mod tests {
             truncated: false,
         };
         assert!(!serde_json::to_string(&whole).unwrap().contains("truncated"));
-    }
-}
-
-#[cfg(test)]
-mod builtin_memory_tests {
-    use super::*;
-    use crate::settings::{BUILTIN_MEMORY_SERVER_NAME, DmuxSettings};
-
-    // TC-734 (FR-733, INT-561): the `/api/mcp/servers` view lists the built-in
-    // entry as a generic stdio server, and the view carries no command, args,
-    // vault path or executable path.
-    #[test]
-    fn builtin_memory_server_in_registry_view() {
-        let ws = tempfile::tempdir().unwrap();
-        let vault = tempfile::tempdir().unwrap();
-        let v = vault.path().display().to_string().replace('\\', "/");
-        std::fs::write(
-            ws.path().join("dmuxai.toml"),
-            format!("[memory]\nvault = \"{v}\"\n"),
-        )
-        .unwrap();
-        let exe = std::env::temp_dir().join("dmuxai-bin").join("dmuxai");
-        let s = DmuxSettings::load_with_exe(ws.path(), None, Some(&exe));
-
-        let view = McpRegistry::from_specs(&s.mcp_servers, |_| None).servers_view();
-        let entry = view
-            .servers
-            .iter()
-            .find(|server| server.name == BUILTIN_MEMORY_SERVER_NAME)
-            .expect("built-in entry in view");
-        assert_eq!(entry.transport, "stdio");
-        assert_eq!(entry.kind, "generic");
-        assert!(entry.enabled);
-        assert!(entry.runners.is_empty());
-
-        let text = serde_json::to_string(&view).unwrap();
-        let vault_json = Value::String(vault.path().display().to_string()).to_string();
-        let exe_json = Value::String(exe.display().to_string()).to_string();
-        assert!(!text.contains(&vault_json[1..vault_json.len() - 1]));
-        assert!(!text.contains(&exe_json[1..exe_json.len() - 1]));
-        assert!(!text.contains("mcp-memory"));
     }
 }

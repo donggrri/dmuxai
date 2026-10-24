@@ -59,8 +59,6 @@ pub struct AcpTurnConfig {
     #[allow(dead_code)]
     pub reasoning_effort: Option<String>,
     pub cancel: Arc<AtomicBool>,
-    /// ACP `mcpServers` array passed on session/new|load|resume (FR-1414).
-    pub mcp_servers: Value,
 }
 
 pub struct AcpRunOutcome {
@@ -449,8 +447,6 @@ async fn open_session(
     )
     .await?;
     let caps = parse_agent_capabilities(&init);
-    // GLM review: only send HTTP MCP servers when the agent advertises them.
-    let mcp_servers = super::session::filter_mcp_for_agent(&config.mcp_servers, &init);
     let mut resume_warnings: Vec<String> = Vec::new();
 
     if let Some(id) = resume_session.filter(|s| !s.is_empty()) {
@@ -460,7 +456,7 @@ async fn open_session(
                 line_rx,
                 state,
                 "session/load",
-                session_load_params(id, cwd, &mcp_servers),
+                session_load_params(id, cwd),
                 &config.cancel,
             )
             .await
@@ -496,7 +492,7 @@ async fn open_session(
                 line_rx,
                 state,
                 "session/resume",
-                session_resume_params(id, cwd, &mcp_servers),
+                session_resume_params(id, cwd),
                 &config.cancel,
             )
             .await
@@ -533,7 +529,7 @@ async fn open_session(
         line_rx,
         state,
         "session/new",
-        session_new_params(cwd, &mcp_servers),
+        session_new_params(cwd),
         &config.cancel,
     )
     .await?;

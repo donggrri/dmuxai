@@ -97,6 +97,19 @@ impl Default for ToolNames {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) struct LegacyRunnersPresent;
+
+impl<'de> Deserialize<'de> for LegacyRunnersPresent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(LegacyRunnersPresent)
+    }
+}
+
 /// One `[[mcp.servers]]` entry as written in user or repo TOML before merging.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct McpServerSpec {
@@ -113,9 +126,8 @@ pub struct McpServerSpec {
     pub headers: BTreeMap<String, SecretValue>,
     #[serde(default)]
     pub kind: ServerKind,
-    /// Optional allow-list of runner ids; absent means every runner.
-    #[serde(default)]
-    pub runners: Option<Vec<String>>,
+    #[serde(default, rename = "runners")]
+    pub(crate) legacy_runners: Option<LegacyRunnersPresent>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -177,7 +189,6 @@ impl fmt::Debug for McpServerSpec {
             .field("url", &self.url.as_deref().map(redact_url))
             .field("headers", &headers)
             .field("kind", &self.kind)
-            .field("runners", &self.runners)
             .field("enabled", &self.enabled)
             .field("tools", &self.tools)
             .finish()
@@ -208,22 +219,7 @@ pub struct ResolvedMcpServer {
     pub name: String,
     pub kind: ServerKind,
     pub transport: Transport,
-    /// Optional allow-list of runner ids; absent means every runner.
-    pub runners: Option<Vec<String>>,
     pub tools: ToolNames,
-}
-
-impl ResolvedMcpServer {
-    /// Whether this server applies to `runner_id` (case-insensitive, trimmed).
-    pub fn applies_to(&self, runner_id: &str) -> bool {
-        let runner = runner_id.trim();
-        match &self.runners {
-            None => true,
-            Some(allowed) => allowed
-                .iter()
-                .any(|entry| entry.trim().eq_ignore_ascii_case(runner)),
-        }
-    }
 }
 
 impl fmt::Debug for ResolvedMcpServer {
@@ -232,7 +228,6 @@ impl fmt::Debug for ResolvedMcpServer {
             .field("name", &self.name)
             .field("kind", &self.kind)
             .field("transport", &self.transport)
-            .field("runners", &self.runners)
             .field("tools", &self.tools)
             .finish()
     }
@@ -359,7 +354,6 @@ pub fn resolve_servers(
             name: spec.name.clone(),
             kind: spec.kind,
             transport,
-            runners: spec.runners.clone(),
             tools: spec.tools.clone(),
         });
     }
@@ -490,9 +484,6 @@ enabled = false
             }
             other => panic!("expected stdio transport, got {other:?}"),
         }
-        assert!(demo.applies_to("CODEX"));
-        assert!(demo.applies_to("opencode"));
-        assert!(!demo.applies_to("cursor"));
 
         assert!(
             resolved.iter().all(|server| server.name != "needs-env"),
@@ -529,7 +520,7 @@ enabled = false
                 url: None,
                 headers: BTreeMap::new(),
                 kind: ServerKind::Generic,
-                runners: None,
+                legacy_runners: None,
                 enabled: true,
                 tools: ToolNames::default(),
             },
@@ -543,7 +534,7 @@ enabled = false
                 ),
                 headers: BTreeMap::new(),
                 kind: ServerKind::Jira,
-                runners: None,
+                legacy_runners: None,
                 enabled: true,
                 tools: ToolNames::default(),
             },
@@ -577,5 +568,56 @@ enabled = false
 
         assert_eq!(redact_url("https://h/mcp?token=x#y"), "https://h/mcp");
         assert_eq!(redact_url("https://h/mcp"), "https://h/mcp");
+    }
+
+    // TC-2085 / FR-2085: source scan of src/**/*.rs asserting no propagation code remains.
+    #[test]
+    fn tc_2085_no_propagation_code_left() {
+        use std::path::{Path, PathBuf};
+
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src_dir = manifest_dir.join("src");
+        let patterns = [
+            format!("Runner{}", "Mcp"),
+            format!("mcp::{}", "propagate"),
+            format!("mcp::{}", "inject"),
+            format!("applies_{}(", "to"),
+            format!(".cursor/{}", "mcp.json"),
+        ];
+
+        let mut offenders = Vec::new();
+        fn scan_dir(
+            dir: &Path,
+            patterns: &[String],
+            offenders: &mut Vec<(PathBuf, usize, String)>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    scan_dir(&path, patterns, offenders);
+                } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    let content = std::fs::read_to_string(&path).unwrap();
+                    for (line_no, line) in content.lines().enumerate() {
+                        if line.contains("tc_2085_no_propagation_code_left")
+                            || line.contains("patterns = [")
+                        {
+                            continue;
+                        }
+                        for pattern in patterns {
+                            if line.contains(pattern) {
+                                offenders.push((path.clone(), line_no + 1, line.trim().to_owned()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        scan_dir(&src_dir, &patterns, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "propagation code found in src/: {offenders:#?}"
+        );
     }
 }

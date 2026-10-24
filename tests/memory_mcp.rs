@@ -1,13 +1,10 @@
 //! TC-729 (INT-729) / TC-730 (FR-730): `dmuxai mcp-memory` stdio MCP server.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use dmuxai::mcp::client::McpClient;
-use dmuxai::mcp::resolve_servers;
 use serde_json::{Value, json};
 
 /// Kills and reaps the child on every exit path, including panics.
@@ -523,47 +520,4 @@ fn mcp_memory_oversized_line_is_parse_error_and_serving_continues() {
     assert!(responses[0]["id"].is_null());
     assert_eq!(responses[1]["id"], 2);
     assert_eq!(responses[1]["result"], json!({}));
-}
-
-// TC-735 (FR-733, INT-729): the built-in shared entry, built with the real
-// binary as the executable, connects through McpClient and serves the tools.
-#[tokio::test]
-async fn builtin_memory_server_connects_via_shared_list() {
-    let ws = tempfile::tempdir().unwrap();
-    let vault = tempfile::tempdir().unwrap();
-    let v = vault.path().display().to_string().replace('\\', "/");
-    std::fs::write(
-        ws.path().join("dmuxai.toml"),
-        format!("[memory]\nvault = \"{v}\"\n"),
-    )
-    .expect("write dmuxai.toml");
-
-    let exe = Path::new(env!("CARGO_BIN_EXE_dmuxai"));
-    let mut spec = dmuxai::settings::builtin_memory_mcp_server(Some(exe), ws.path())
-        .expect("built-in entry for the built binary");
-    // Isolate the child's user config (HOME, XDG_CONFIG_HOME, USERPROFILE) so a
-    // developer's ~/.config/dmuxai/dmuxai.toml cannot change the result.
-    let empty_home = tempfile::tempdir().unwrap();
-    let home =
-        dmuxai::mcp::config::SecretValue::Literal(empty_home.path().to_string_lossy().into_owned());
-    for key in ["HOME", "XDG_CONFIG_HOME", "USERPROFILE"] {
-        spec.env.insert(key.to_owned(), home.clone());
-    }
-    let (resolved, warnings) = resolve_servers(&[spec], |_| None);
-    assert!(warnings.is_empty(), "{warnings:?}");
-    assert_eq!(resolved.len(), 1);
-
-    let client = McpClient::connect(&resolved[0], Duration::from_secs(20))
-        .await
-        .expect("connect to built-in dmuxai-memory");
-    let tools = client.list_tools().await.expect("tools/list");
-    let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
-    for expected in ["memory_get_context", "memory_search", "memory_propose"] {
-        assert!(names.contains(&expected), "missing {expected}: {names:?}");
-    }
-    let result = client
-        .call_tool("memory_get_context", json!({}))
-        .await
-        .expect("memory_get_context call");
-    assert_ne!(result.get("isError"), Some(&Value::Bool(true)), "{result}");
 }

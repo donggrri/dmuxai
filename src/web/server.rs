@@ -4615,7 +4615,6 @@ mod tests {
                     .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
                     .collect(),
             },
-            runners: None,
             tools: ToolNames::default(),
         }
     }
@@ -4636,7 +4635,6 @@ mod tests {
                     .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
                     .collect(),
             },
-            runners: None,
             tools: ToolNames::default(),
         }
     }
@@ -4725,7 +4723,6 @@ mod tests {
                 url: url.clone(),
                 headers: std::collections::BTreeMap::new(),
             },
-            runners: None,
             tools: ToolNames {
                 search: "jira_search".to_owned(),
                 get: "jira_get".to_owned(),
@@ -4738,7 +4735,6 @@ mod tests {
                 url,
                 headers: std::collections::BTreeMap::new(),
             },
-            runners: None,
             tools: ToolNames {
                 search: "confluence_search".to_owned(),
                 get: "confluence_get".to_owned(),
@@ -4954,7 +4950,6 @@ mod tests {
                 url: format!("http://{addr}/mcp"),
                 headers: std::collections::BTreeMap::new(),
             },
-            runners: None,
             tools: ToolNames {
                 search: "jira_search".to_owned(),
                 get: "jira_get".to_owned(),
