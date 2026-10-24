@@ -92,6 +92,7 @@ use crate::agent::{
     event_channel, is_adapter_turn_busy_rejection, spawn_agy_adapter, spawn_codex_adapter,
     spawn_cursor_adapter, spawn_custom_adapter,
 };
+use crate::internal_turn::{self, InternalTurn, TurnBuffer};
 
 /// Minimum wait between graph defer retries (FR-976); zero in unit tests.
 const GRAPH_DEFER_RETRY_INTERVAL: Duration = if cfg!(test) {
@@ -130,7 +131,7 @@ const DEFAULT_INPUT_HEIGHT: u16 = 3;
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MIN_MAIN_HEIGHT: u16 = 5;
 const STATUS_HEIGHT: u16 = 1;
-const MAX_SUMMARY_BUFFER_CHARS: usize = 80_000;
+const MAX_SUMMARY_BUFFER_CHARS: usize = internal_turn::MAX_INTERNAL_TURN_BUFFER_CHARS;
 
 #[derive(Clone, Copy)]
 enum SlashAction {
@@ -740,9 +741,22 @@ struct PendingSummary {
     conversation_id: StoredConversationId,
     turn_id: TurnId,
     agent: Agent,
-    buffer: String,
-    buffer_chars: usize,
+    buffer: TurnBuffer,
     deferred: Option<DeferredTurn>,
+}
+
+impl InternalTurn for PendingSummary {
+    fn agent(&self) -> Agent {
+        self.agent
+    }
+
+    fn conversation_id(&self) -> &str {
+        self.conversation_id.as_str()
+    }
+
+    fn turn_id(&self) -> &str {
+        self.turn_id.as_str()
+    }
 }
 
 /// FR-932: an internal read-only judge turn. Its streamed text is buffered and
@@ -755,13 +769,26 @@ struct PendingTriage {
     conversation_id: StoredConversationId,
     turn_id: StoredTurnId,
     adapter_prompt: String,
-    buffer: String,
-    buffer_chars: usize,
+    buffer: TurnBuffer,
     started: Instant,
     last_event: Instant,
     prompt: String,
     run_id: String,
     judge_calls: u32,
+}
+
+impl InternalTurn for PendingTriage {
+    fn agent(&self) -> Agent {
+        self.agent
+    }
+
+    fn conversation_id(&self) -> &str {
+        self.conversation_id.as_str()
+    }
+
+    fn turn_id(&self) -> &str {
+        self.turn_id.as_str()
+    }
 }
 
 /// FR-938: internal read-only plan (and repair) turn. Text is buffered, never
@@ -773,8 +800,7 @@ struct PendingPlan {
     conversation_id: StoredConversationId,
     turn_id: StoredTurnId,
     adapter_prompt: String,
-    buffer: String,
-    buffer_chars: usize,
+    buffer: TurnBuffer,
     started: Instant,
     last_event: Instant,
     prompt: String,
@@ -796,6 +822,20 @@ struct PendingPlan {
     override_kind: Option<OverrideKind>,
     /// True once the adapter accepted the plan/repair/edit turn.
     adapter_sent: bool,
+}
+
+impl InternalTurn for PendingPlan {
+    fn agent(&self) -> Agent {
+        self.agent
+    }
+
+    fn conversation_id(&self) -> &str {
+        self.conversation_id.as_str()
+    }
+
+    fn turn_id(&self) -> &str {
+        self.turn_id.as_str()
+    }
 }
 
 /// SPEC-stage-skills FR-1512: a planning interview run by a question skill
@@ -827,8 +867,7 @@ struct PendingReplan {
     defer_origin: Option<Instant>,
     conversation_id: StoredConversationId,
     turn_id: StoredTurnId,
-    buffer: String,
-    buffer_chars: usize,
+    buffer: TurnBuffer,
     started: Instant,
     last_event: Instant,
     prompt: String,
@@ -842,6 +881,20 @@ struct PendingReplan {
     #[allow(dead_code)]
     summaries: Vec<(String, String)>,
     adapter_sent: bool,
+}
+
+impl InternalTurn for PendingReplan {
+    fn agent(&self) -> Agent {
+        self.agent
+    }
+
+    fn conversation_id(&self) -> &str {
+        self.conversation_id.as_str()
+    }
+
+    fn turn_id(&self) -> &str {
+        self.turn_id.as_str()
+    }
 }
 
 enum DeferredInternalTurn {
@@ -5077,7 +5130,7 @@ impl App {
             let Some(pending) = self.pending_plan.take() else {
                 return;
             };
-            self.retire_plan_turn_id(&pending);
+            self.retire_internal_turn(pending.agent, pending.turn_id.as_str(), false);
             self.busy_agents.remove(&plan_agent);
             self.activities.remove(&plan_agent);
             self.end_run_state(plan_agent, false, true);
@@ -5473,8 +5526,7 @@ impl App {
                     conversation_id: self.conversation_id.clone(),
                     turn_id,
                     agent,
-                    buffer: String::new(),
-                    buffer_chars: 0,
+                    buffer: TurnBuffer::new(),
                     deferred,
                 });
                 self.push_system(format!(
@@ -5491,17 +5543,7 @@ impl App {
     }
 
     fn output_belongs_to_summary(&self, output: &AgentOutput) -> bool {
-        self.pending_summary.as_ref().is_some_and(|pending| {
-            pending.agent == output.agent
-                && output
-                    .conversation_id
-                    .as_ref()
-                    .is_some_and(|id| id.as_str() == pending.conversation_id.as_str())
-                && output
-                    .turn_id
-                    .as_ref()
-                    .is_some_and(|id| id.as_str() == pending.turn_id.as_str())
-        })
+        internal_turn::output_belongs(self.pending_summary.as_ref(), output)
     }
 
     fn apply_summary_output(&mut self, output: AgentOutput) -> bool {
@@ -5512,9 +5554,10 @@ impl App {
             }
             AgentEvent::TextDelta(delta) => {
                 let delta_chars = delta.chars().count();
-                let exceeds_limit = self.pending_summary.as_ref().is_some_and(|pending| {
-                    pending.buffer_chars.saturating_add(delta_chars) > MAX_SUMMARY_BUFFER_CHARS
-                });
+                let exceeds_limit = self
+                    .pending_summary
+                    .as_ref()
+                    .is_some_and(|pending| pending.buffer.would_overflow(delta_chars));
                 if exceeds_limit {
                     let Some(pending) = self.pending_summary.take() else {
                         return false;
@@ -5533,8 +5576,7 @@ impl App {
                         ),
                     );
                 } else if let Some(pending) = self.pending_summary.as_mut() {
-                    pending.buffer_chars += delta_chars;
-                    pending.buffer.push_str(&delta);
+                    pending.buffer.push(&delta);
                 }
                 true
             }
@@ -5546,7 +5588,7 @@ impl App {
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, true, false);
                 let visible = pending.conversation_id == self.conversation_id;
-                match parse_summary_document(&pending.buffer)
+                match parse_summary_document(pending.buffer.as_str())
                     .map_err(|error| error.to_string())
                     .and_then(|document| {
                         self.engine
@@ -5615,24 +5657,20 @@ impl App {
         }
     }
 
-    fn retire_internal_judge_turn(&mut self, pending: &PendingTriage) {
-        self.retired_internal_turns
-            .insert(pending.turn_id.as_str().to_owned());
-        let _ = self.adapters[adapter_index(pending.agent)].cancel();
+    pub(crate) fn retire_internal_turn(
+        &mut self,
+        agent: Agent,
+        turn_id: &str,
+        cancel_adapter: bool,
+    ) {
+        self.retired_internal_turns.insert(turn_id.to_owned());
+        if cancel_adapter {
+            let _ = self.adapters[adapter_index(agent)].cancel();
+        }
     }
 
     fn output_belongs_to_triage(&self, output: &AgentOutput) -> bool {
-        self.pending_triage.as_ref().is_some_and(|pending| {
-            pending.agent == output.agent
-                && output
-                    .conversation_id
-                    .as_ref()
-                    .is_some_and(|id| id.as_str() == pending.conversation_id.as_str())
-                && output
-                    .turn_id
-                    .as_ref()
-                    .is_some_and(|id| id.as_str() == pending.turn_id.as_str())
-        })
+        internal_turn::output_belongs(self.pending_triage.as_ref(), output)
     }
 
     /// FR-932: the judge turn is an internal read-only turn. Its text is
@@ -5715,8 +5753,7 @@ impl App {
                     conversation_id: self.conversation_id.clone(),
                     turn_id: StoredTurnId::new(turn_id.as_str()),
                     adapter_prompt,
-                    buffer: String::new(),
-                    buffer_chars: 0,
+                    buffer: TurnBuffer::new(),
                     started: now,
                     last_event: now,
                     prompt,
@@ -5747,14 +5784,15 @@ impl App {
             }
             AgentEvent::TextDelta(delta) => {
                 let delta_chars = delta.chars().count();
-                let exceeds_limit = self.pending_triage.as_ref().is_some_and(|pending| {
-                    pending.buffer_chars.saturating_add(delta_chars) > MAX_SUMMARY_BUFFER_CHARS
-                });
+                let exceeds_limit = self
+                    .pending_triage
+                    .as_ref()
+                    .is_some_and(|pending| pending.buffer.would_overflow(delta_chars));
                 if exceeds_limit {
                     let Some(pending) = self.pending_triage.take() else {
                         return false;
                     };
-                    self.retire_internal_judge_turn(&pending);
+                    self.retire_internal_turn(pending.agent, pending.turn_id.as_str(), true);
                     self.busy_agents.remove(&pending.agent);
                     self.activities.remove(&pending.agent);
                     self.end_run_state(pending.agent, false, false);
@@ -5769,8 +5807,7 @@ impl App {
                         elapsed_ms,
                     );
                 } else if let Some(pending) = self.pending_triage.as_mut() {
-                    pending.buffer_chars += delta_chars;
-                    pending.buffer.push_str(&delta);
+                    pending.buffer.push(&delta);
                 }
                 true
             }
@@ -5782,7 +5819,7 @@ impl App {
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, true, false);
                 let elapsed_ms = pending.started.elapsed().as_millis() as u64;
-                let verdict_result = parse_verdict(&pending.buffer);
+                let verdict_result = parse_verdict(pending.buffer.as_str());
                 self.record_pending_triage_io(&pending, verdict_result.is_ok());
                 match verdict_result {
                     Ok(verdict) => match verdict.route {
@@ -7634,8 +7671,7 @@ impl App {
                     conversation_id: self.conversation_id.clone(),
                     turn_id: StoredTurnId::new(turn_id.as_str()),
                     adapter_prompt,
-                    buffer: String::new(),
-                    buffer_chars: 0,
+                    buffer: TurnBuffer::new(),
                     started: now,
                     last_event: now,
                     prompt,
@@ -7667,8 +7703,7 @@ impl App {
                         conversation_id: self.conversation_id.clone(),
                         turn_id: StoredTurnId::new(turn_id.as_str()),
                         adapter_prompt: adapter_prompt.clone(),
-                        buffer: String::new(),
-                        buffer_chars: 0,
+                        buffer: TurnBuffer::new(),
                         started: Instant::now(),
                         last_event: Instant::now(),
                         prompt,
@@ -7911,33 +7946,8 @@ impl App {
         self.push_plan_waiting_approval_transcript_line();
     }
 
-    /// Retires the plan turn id and cancels the adapter turn (overflow and
-    /// timeout paths, where the turn may still be running).
-    fn retire_internal_plan_turn(&mut self, pending: &PendingPlan) {
-        self.retire_plan_turn_id(pending);
-        let _ = self.adapters[adapter_index(pending.agent)].cancel();
-    }
-
-    /// Retires the plan turn id only: the turn already ended (Completed,
-    /// Error, Cancelled) or was cancelled by the caller, so a repair turn sent
-    /// right after must not be cancelled.
-    fn retire_plan_turn_id(&mut self, pending: &PendingPlan) {
-        self.retired_internal_turns
-            .insert(pending.turn_id.as_str().to_owned());
-    }
-
     fn output_belongs_to_plan(&self, output: &AgentOutput) -> bool {
-        self.pending_plan.as_ref().is_some_and(|pending| {
-            pending.agent == output.agent
-                && output
-                    .conversation_id
-                    .as_ref()
-                    .is_some_and(|id| id.as_str() == pending.conversation_id.as_str())
-                && output
-                    .turn_id
-                    .as_ref()
-                    .is_some_and(|id| id.as_str() == pending.turn_id.as_str())
-        })
+        internal_turn::output_belongs(self.pending_plan.as_ref(), output)
     }
 
     fn apply_plan_output(&mut self, output: AgentOutput) -> bool {
@@ -7951,14 +7961,15 @@ impl App {
             }
             AgentEvent::TextDelta(delta) => {
                 let delta_chars = delta.chars().count();
-                let exceeds_limit = self.pending_plan.as_ref().is_some_and(|pending| {
-                    pending.buffer_chars.saturating_add(delta_chars) > MAX_SUMMARY_BUFFER_CHARS
-                });
+                let exceeds_limit = self
+                    .pending_plan
+                    .as_ref()
+                    .is_some_and(|pending| pending.buffer.would_overflow(delta_chars));
                 if exceeds_limit {
                     let Some(pending) = self.pending_plan.take() else {
                         return false;
                     };
-                    self.retire_internal_plan_turn(&pending);
+                    self.retire_internal_turn(pending.agent, pending.turn_id.as_str(), true);
                     self.busy_agents.remove(&pending.agent);
                     self.activities.remove(&pending.agent);
                     self.end_run_state(pending.agent, false, false);
@@ -7989,8 +8000,7 @@ impl App {
                         );
                     }
                 } else if let Some(pending) = self.pending_plan.as_mut() {
-                    pending.buffer_chars += delta_chars;
-                    pending.buffer.push_str(&delta);
+                    pending.buffer.push(&delta);
                 }
                 true
             }
@@ -7998,11 +8008,11 @@ impl App {
                 let Some(pending) = self.pending_plan.take() else {
                     return false;
                 };
-                self.retire_plan_turn_id(&pending);
+                self.retire_internal_turn(pending.agent, pending.turn_id.as_str(), false);
                 self.busy_agents.remove(&pending.agent);
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, true, false);
-                match parse_plan(&pending.buffer) {
+                match parse_plan(pending.buffer.as_str()) {
                     Ok(doc) => {
                         let result =
                             self.with_plan_context(&pending.prompt, |ctx| validate_plan(&doc, ctx));
@@ -8049,7 +8059,7 @@ impl App {
                                         "plan invalid twice",
                                     );
                                 } else {
-                                    let raw = cap_revision_raw(&pending.buffer);
+                                    let raw = cap_revision_raw(pending.buffer.as_str());
                                     let error_lines: Vec<String> =
                                         errors.iter().map(|err| err.to_string()).collect();
                                     self.park_fallback_plan(
@@ -8111,7 +8121,7 @@ impl App {
                                 "plan invalid twice",
                             );
                         } else {
-                            let raw = cap_revision_raw(&pending.buffer);
+                            let raw = cap_revision_raw(pending.buffer.as_str());
                             let error_lines: Vec<String> =
                                 errors.iter().map(|err| err.to_string()).collect();
                             self.park_fallback_plan(
@@ -8151,7 +8161,7 @@ impl App {
                     self.defer_internal_turn(DeferredInternalTurn::Plan(pending));
                     return true;
                 }
-                self.retire_plan_turn_id(&pending);
+                self.retire_internal_turn(pending.agent, pending.turn_id.as_str(), false);
                 self.busy_agents.remove(&pending.agent);
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, false, false);
@@ -8209,7 +8219,7 @@ impl App {
         let Some(pending) = self.pending_plan.take() else {
             return;
         };
-        self.retire_internal_plan_turn(&pending);
+        self.retire_internal_turn(pending.agent, pending.turn_id.as_str(), true);
         self.busy_agents.remove(&pending.agent);
         self.activities.remove(&pending.agent);
         self.end_run_state(pending.agent, false, false);
@@ -8646,8 +8656,7 @@ impl App {
                     agent,
                     conversation_id: self.conversation_id.clone(),
                     turn_id: StoredTurnId::new(turn_id.as_str()),
-                    buffer: String::new(),
-                    buffer_chars: 0,
+                    buffer: TurnBuffer::new(),
                     started: now,
                     last_event: now,
                     prompt: replan_prompt,
@@ -8670,28 +8679,7 @@ impl App {
     }
 
     fn output_belongs_to_replan(&self, output: &AgentOutput) -> bool {
-        self.pending_replan.as_ref().is_some_and(|pending| {
-            pending.agent == output.agent
-                && output
-                    .conversation_id
-                    .as_ref()
-                    .is_some_and(|id| id.as_str() == pending.conversation_id.as_str())
-                && output
-                    .turn_id
-                    .as_ref()
-                    .is_some_and(|id| id.as_str() == pending.turn_id.as_str())
-        })
-    }
-
-    fn retire_internal_replan_turn(&mut self, pending: &PendingReplan) {
-        self.retired_internal_turns
-            .insert(pending.turn_id.as_str().to_owned());
-        let _ = self.adapters[adapter_index(pending.agent)].cancel();
-    }
-
-    fn retire_replan_turn_id(&mut self, pending: &PendingReplan) {
-        self.retired_internal_turns
-            .insert(pending.turn_id.as_str().to_owned());
+        internal_turn::output_belongs(self.pending_replan.as_ref(), output)
     }
 
     fn finalize_pending_replan_change(
@@ -8701,7 +8689,7 @@ impl App {
         change.rev = pending.rev;
         change.trigger = Some(Self::plan_change_trigger(pending.trigger));
         change.prompt_chars = Some(pending.prompt.chars().count());
-        change.response_chars = Some(pending.buffer.chars().count());
+        change.response_chars = Some(pending.buffer.chars());
         change.after_node = pending.failure_node_id.clone();
         if change.decided_by.is_none() {
             change.decided_by = pending.decided_by;
@@ -9127,7 +9115,7 @@ impl App {
     fn finish_replan_rejected(&mut self, pending: PendingReplan, message: String, resume: bool) {
         self.record_pending_replan_io(&pending, false);
         let rev = pending.rev;
-        let excerpt = cap_plan_response_excerpt(&pending.buffer);
+        let excerpt = cap_plan_response_excerpt(pending.buffer.as_str());
         let change = Self::finalize_pending_replan_change(
             &pending,
             PlanChange {
@@ -9173,7 +9161,7 @@ impl App {
                 reason: reason.clone(),
                 trigger: Some(Self::plan_change_trigger(pending.trigger)),
                 prompt_chars: Some(pending.prompt.chars().count()),
-                response_chars: Some(pending.buffer.chars().count()),
+                response_chars: Some(pending.buffer.chars()),
                 added: Vec::new(),
                 changed: Vec::new(),
                 removed: Vec::new(),
@@ -9423,21 +9411,21 @@ impl App {
             }
             AgentEvent::TextDelta(delta) => {
                 let delta_chars = delta.chars().count();
-                let exceeds_limit = self.pending_replan.as_ref().is_some_and(|pending| {
-                    pending.buffer_chars.saturating_add(delta_chars) > MAX_SUMMARY_BUFFER_CHARS
-                });
+                let exceeds_limit = self
+                    .pending_replan
+                    .as_ref()
+                    .is_some_and(|pending| pending.buffer.would_overflow(delta_chars));
                 if exceeds_limit {
                     let Some(pending) = self.pending_replan.take() else {
                         return false;
                     };
-                    self.retire_internal_replan_turn(&pending);
+                    self.retire_internal_turn(pending.agent, pending.turn_id.as_str(), true);
                     self.busy_agents.remove(&pending.agent);
                     self.activities.remove(&pending.agent);
                     self.end_run_state(pending.agent, false, false);
                     self.finish_replan_rejected(pending, "buffer overflow".to_owned(), true);
                 } else if let Some(pending) = self.pending_replan.as_mut() {
-                    pending.buffer_chars += delta_chars;
-                    pending.buffer.push_str(&delta);
+                    pending.buffer.push(&delta);
                 }
                 true
             }
@@ -9445,11 +9433,11 @@ impl App {
                 let Some(pending) = self.pending_replan.take() else {
                     return false;
                 };
-                self.retire_replan_turn_id(&pending);
+                self.retire_internal_turn(pending.agent, pending.turn_id.as_str(), false);
                 self.busy_agents.remove(&pending.agent);
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, true, false);
-                match parse_replan(&pending.buffer) {
+                match parse_replan(pending.buffer.as_str()) {
                     Ok(ReplanDoc::Keep { reason }) => {
                         self.finish_replan_kept(pending, reason);
                     }
@@ -9508,7 +9496,7 @@ impl App {
                     self.defer_internal_turn(DeferredInternalTurn::Replan(pending));
                     return true;
                 }
-                self.retire_replan_turn_id(&pending);
+                self.retire_internal_turn(pending.agent, pending.turn_id.as_str(), false);
                 self.busy_agents.remove(&pending.agent);
                 self.activities.remove(&pending.agent);
                 self.end_run_state(pending.agent, false, false);
@@ -9541,7 +9529,7 @@ impl App {
         let Some(pending) = self.pending_replan.take() else {
             return;
         };
-        self.retire_internal_replan_turn(&pending);
+        self.retire_internal_turn(pending.agent, pending.turn_id.as_str(), true);
         self.busy_agents.remove(&pending.agent);
         self.activities.remove(&pending.agent);
         self.end_run_state(pending.agent, false, false);
@@ -9955,7 +9943,7 @@ impl App {
         let entry = Self::make_planner_io(
             PlannerIoKind::Judge,
             &pending.adapter_prompt,
-            &pending.buffer,
+            pending.buffer.as_str(),
             ok,
         );
         self.push_planner_io(&pending.run_id, entry);
@@ -9966,7 +9954,8 @@ impl App {
             return;
         }
         let kind = Self::pending_plan_io_kind(pending);
-        let entry = Self::make_planner_io(kind, &pending.adapter_prompt, &pending.buffer, ok);
+        let entry =
+            Self::make_planner_io(kind, &pending.adapter_prompt, pending.buffer.as_str(), ok);
         self.push_planner_io(&pending.run_id, entry);
     }
 
@@ -9974,8 +9963,12 @@ impl App {
         if !pending.adapter_sent {
             return;
         }
-        let entry =
-            Self::make_planner_io(PlannerIoKind::Replan, &pending.prompt, &pending.buffer, ok);
+        let entry = Self::make_planner_io(
+            PlannerIoKind::Replan,
+            &pending.prompt,
+            pending.buffer.as_str(),
+            ok,
+        );
         self.push_planner_io(&pending.run_id, entry);
     }
 
@@ -10071,7 +10064,7 @@ impl App {
         let Some(pending) = self.pending_triage.take() else {
             return;
         };
-        self.retire_internal_judge_turn(&pending);
+        self.retire_internal_turn(pending.agent, pending.turn_id.as_str(), true);
         self.busy_agents.remove(&pending.agent);
         self.activities.remove(&pending.agent);
         self.end_run_state(pending.agent, false, false);
@@ -10817,7 +10810,7 @@ impl App {
 
     fn cancel_active_replan_turn(&mut self) {
         if let Some(pending) = self.pending_replan.take() {
-            self.retire_internal_replan_turn(&pending);
+            self.retire_internal_turn(pending.agent, pending.turn_id.as_str(), true);
             self.busy_agents.remove(&pending.agent);
             self.activities.remove(&pending.agent);
             self.end_run_state(pending.agent, false, false);
@@ -19721,8 +19714,7 @@ mod tests {
             conversation_id: conversation_id.clone(),
             turn_id: StoredTurnId::new("judge-1"),
             adapter_prompt: String::new(),
-            buffer: String::new(),
-            buffer_chars: 0,
+            buffer: TurnBuffer::new(),
             started: start,
             last_event: start,
             prompt: "hello".to_owned(),
@@ -27302,7 +27294,13 @@ mod tests {
         harness.app.input = "please review this overflow path".to_owned();
         harness.app.submit_prompt();
         let judge = harness.sent.lock().unwrap()[0].1.clone();
-        harness.app.pending_triage.as_mut().unwrap().buffer_chars = MAX_SUMMARY_BUFFER_CHARS;
+        harness
+            .app
+            .pending_triage
+            .as_mut()
+            .unwrap()
+            .buffer
+            .set_chars_for_test(MAX_SUMMARY_BUFFER_CHARS);
         // The user prompt deliberately contains "overflow", so the judge delta
         // must be matched (and asserted absent) by a distinct leaked-text marker.
         assert!(harness.app.apply_agent_output(triage_output(
@@ -27335,6 +27333,26 @@ mod tests {
             &judge,
             AgentEvent::Cancelled
         )));
+    }
+
+    // TC-2002 / FR-2002: retire_internal_turn records turn id and conditionally cancels adapter.
+    #[test]
+    fn tc_2002_retire_internal_turn_records_and_optionally_cancels() {
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (mut app, _sent, cancelled) = test_app_runtime(engine, None);
+
+        // Turn retirement with cancel_adapter = true
+        app.retire_internal_turn(Agent::Codex, "turn-retire-cancel", true);
+        assert!(app.retired_internal_turns.contains("turn-retire-cancel"));
+        assert_eq!(&*cancelled.lock().unwrap(), &[Agent::Codex]);
+
+        // Turn retirement with cancel_adapter = false
+        app.retire_internal_turn(Agent::Cursor, "turn-retire-no-cancel", false);
+        assert!(app.retired_internal_turns.contains("turn-retire-no-cancel"));
+        // Adapter cancel was not called for Cursor
+        assert_eq!(&*cancelled.lock().unwrap(), &[Agent::Codex]);
     }
 
     // TC-937 / FR-935: silence past 90 s falls back; recent events keep it alive.
