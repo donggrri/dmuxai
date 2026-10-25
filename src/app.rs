@@ -1362,6 +1362,11 @@ fn conversation_save_exit_code(error: &ConversationError) -> i32 {
     }
 }
 
+/// Busy timeout of the shutdown session close once the save budget of the turn
+/// is spent (FR-2140). The database is likely still locked, so waiting the
+/// default 5 s connection timeout would only delay the exit.
+const SHORT_CLOSE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+
 pub struct App {
     exit: bool,
     /// FR-1470: no terminal; skip key/mouse polling (dashboard-only process).
@@ -2180,7 +2185,16 @@ impl App {
             }
         }
 
-        let _ = self.engine.close_session();
+        let close = if self.conversation_save_budget_spent() {
+            // FR-2140: the save budget of the turn is already spent, so the
+            // database is likely still locked; try the close once with a short
+            // timeout instead of waiting the default connection timeout.
+            self.engine
+                .close_session_with_timeout(SHORT_CLOSE_BUSY_TIMEOUT)
+        } else {
+            self.engine.close_session()
+        };
+        let _ = close;
     }
 
     fn drain_dashboard_commands(&mut self) -> bool {
@@ -3660,6 +3674,20 @@ impl App {
             .copied()
             .unwrap_or_default();
         budget.saturating_sub(waited)
+    }
+
+    /// Whether the busy-retry budget of the turn is already spent (FR-2140).
+    ///
+    /// A recorded save failure means the turn waited out its budget against a
+    /// locked database. The waited time of a turn is reset when the turn ends,
+    /// so the recorded failure is the durable signal shutdown uses to avoid
+    /// waiting the default connection timeout on the same lock.
+    fn conversation_save_budget_spent(&self) -> bool {
+        !self.turn_save_failures.is_empty()
+            || self
+                .conversation_save_waited
+                .values()
+                .any(|waited| *waited >= self.conversation_save_budget)
     }
 
     /// Saves one turn output, retrying a busy database with a bounded backoff
@@ -13951,7 +13979,7 @@ impl App {
                     "Could not save {} reply: {}",
                     failure.agent, failure.detail
                 )),
-                last_error_kind,
+                dmuxai::agent_api::error_kind_for_exit(failure.exit_code).map(str::to_owned),
             )
         } else {
             (true, dmuxai::agent_api::exit::OK, None, None)
@@ -24199,6 +24227,8 @@ mod tests {
         assert!(!outcome.ok, "a lost reply must fail the run");
         assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::CONFLICT);
         assert_eq!(outcome.exit_code, 4);
+        // FR-2140: the busy save failure carries the "conflict" error kind.
+        assert_eq!(outcome.error_kind.as_deref(), Some("conflict"));
         let error = outcome.error.as_deref().unwrap_or_default();
         assert!(
             error.contains("Could not save") && error.contains("reply"),
@@ -24210,6 +24240,47 @@ mod tests {
             "the in-memory reply must survive the failed save, got {:?}",
             outcome.text
         );
+    }
+
+    // TC-2140 / FR-2140: after a spent save budget, shutdown closes the session
+    // once with a short busy timeout instead of waiting the default 5 s twice
+    // (shutdown and then Drop).
+    #[tokio::test]
+    async fn tc_2140_shutdown_after_a_spent_budget_closes_once() {
+        let (_temp, _workspace, db, mut app, sent, event_tx) = locked_db_app();
+        app.conversation_save_budget = Duration::from_millis(300);
+        let lock = Arc::new(DbLock::new(db.clone()));
+        reply_after_lock(sent, event_tx, Arc::clone(&lock), "done-slow");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let req = HeadlessRequest {
+            prompt: "Say hello".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: Some("ask".to_owned()),
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(!outcome.ok);
+        assert!(
+            !app.turn_save_failures.is_empty(),
+            "the failed save must be recorded for shutdown"
+        );
+
+        let started = Instant::now();
+        app.shutdown().await;
+        let elapsed = started.elapsed();
+        // The short close timeout is 250 ms; a retried 5 s close would blow
+        // well past this bound.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "shutdown waited for the locked database: {elapsed:?}"
+        );
+
+        lock.release();
     }
 
     // TC-2142 / FR-2140: the failed save keeps the system note in the
@@ -24313,6 +24384,8 @@ mod tests {
         assert!(!outcome.ok);
         assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::INTERNAL);
         assert_eq!(outcome.exit_code, 6);
+        // FR-2140: a non-busy database error carries the "internal" error kind.
+        assert_eq!(outcome.error_kind.as_deref(), Some("internal"));
         assert!(outcome.text.contains("done-slow"));
     }
 
@@ -24327,6 +24400,19 @@ mod tests {
         assert_eq!(
             conversation_save_exit_code(&ConversationError::Sqlite(rusqlite::Error::InvalidQuery)),
             dmuxai::agent_api::exit::INTERNAL
+        );
+        // FR-2140: the exit code also carries the matching error kind.
+        assert_eq!(
+            dmuxai::agent_api::error_kind_for_exit(dmuxai::agent_api::exit::CONFLICT),
+            Some("conflict")
+        );
+        assert_eq!(
+            dmuxai::agent_api::error_kind_for_exit(dmuxai::agent_api::exit::INTERNAL),
+            Some("internal")
+        );
+        assert_eq!(
+            dmuxai::agent_api::error_kind_for_exit(dmuxai::agent_api::exit::USAGE),
+            None
         );
     }
 

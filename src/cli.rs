@@ -1348,10 +1348,13 @@ mod tests {
         assert_eq!(error.code, exit::CONFLICT);
         assert_eq!(error.code, 4);
         assert!(error.message.contains("retry"));
+        // FR-2140: the busy open carries the "conflict" error kind in JSON.
+        assert_eq!(error.to_json()["error_kind"], "conflict");
 
         let other =
             conversation_open_error(&ConversationError::Sqlite(rusqlite::Error::InvalidQuery));
         assert_eq!(other.code, exit::INTERNAL);
         assert_eq!(other.code, 6);
+        assert_eq!(other.to_json()["error_kind"], "internal");
     }
 }

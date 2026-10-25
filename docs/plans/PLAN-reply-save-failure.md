@@ -43,6 +43,13 @@ Spec: [SPEC-agent-api.md](../specs/SPEC-agent-api.md) (FR-2140)
 7. Document the behaviour: FR-2140 and TC-2140..TC-2144 in
    `docs/specs/SPEC-agent-api.md`, the exit-code table in `docs/API.md`, and a
    `Fixed` entry in `CHANGELOG.md`. (FR-2140)
+8. Follow-up from QA (#203): mark the session closed after the first close
+   attempt so `Drop` never retries a busy close, and once the save budget of
+   the turn is spent close the session once with a short (250 ms) busy timeout,
+   so a headless run does not wait the default 5 s connection timeout twice.
+   Report `error_kind` `conflict` for exit 4 and `internal` for exit 6 (the
+   failed reply save and the locked open of #196). (FR-2140, TC-2140, TC-2141,
+   TC-2143, TC-2144)
 
 ## Risks and mitigations
 

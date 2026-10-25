@@ -16,7 +16,10 @@ Issue: [#203](https://github.com/dmuxai/dmuxai/issues/203)
 | App | A failed save is recorded and mapped in the headless outcome: `ok: false`, exit 4 (busy) or 6 (other), error "Could not save &lt;agent&gt; reply: …" | `src/app.rs` `conversation_save_exit_code`, `run_headless` |
 | App | The "Could not save &lt;agent&gt; output" notice is shown once per turn (a locked database would repeat it for every event) | `src/app.rs` `apply_agent_output` |
 | App | The cancel record is saved with the same retry | `src/app.rs` `cancel_selected` |
-| Docs | FR-2140 and TC-2140..TC-2144, the exit-code table, the changelog | `docs/specs/SPEC-agent-api.md`, `docs/API.md`, `CHANGELOG.md` |
+| Conversation engine | `close_session` marks the session closed after the first attempt whether it succeeded or not, so `Drop` never retries a busy close; new `close_session_with_timeout` lets shutdown try once with a short busy timeout | `src/conversation.rs` `close_session`, `close_session_with_timeout` |
+| App | Once the save budget of the turn is spent, `shutdown` closes the session with a 250 ms busy timeout, so a headless run does not wait the default 5 s connection timeout twice | `src/app.rs` `conversation_save_budget_spent`, `SHORT_CLOSE_BUSY_TIMEOUT`, `shutdown` |
+| App / API | A failed reply save and a busy open report `error_kind` `conflict` (exit 4) or `internal` (exit 6); `ApiError::to_json` and the headless outcome use `agent_api::error_kind_for_exit` | `src/agent_api.rs` `error_kind_for_exit`, `ApiError::to_json`; `src/app.rs` `run_headless` |
+| Docs | FR-2140 and TC-2140..TC-2144, the exit-code table, `error_kind`, the changelog | `docs/specs/SPEC-agent-api.md`, `docs/API.md`, `CHANGELOG.md` |
 
 ## Spec compliance
 
@@ -27,6 +30,8 @@ Issue: [#203](https://github.com/dmuxai/dmuxai/issues/203)
 | FR-2140 (the answer is never lost) | the failed save applies the event to the visible transcript; the headless `text` and the `messages` keep the reply | `src/app.rs` `tc_2141_…`, `tc_2142_failed_save_keeps_the_system_note_and_the_reply` (TC-2142) |
 | FR-2140 (the TUI keeps the notice and does not crash) | the notice is unchanged, shown once per turn; no new panic path | `src/app.rs` `tc_2142_…` |
 | FR-2140 (the retry never blocks longer than the budget) | one attempt waits at most 250 ms, the budget bounds the waiting of a turn (about 20 s, the order of the open phase), a spent budget only probes the database without waiting, and a save that follows a successful one gets the whole budget again | `src/conversation.rs` `SAVE_ATTEMPT_BUSY_TIMEOUT`, `SAVE_RETRY_BUDGET`; `src/app.rs` `conversation_save_budget_left` (TC-2140) |
+| FR-2140 (exit 4/6 carry an error kind) | `error_kind_for_exit` maps exit 4 to `conflict` and exit 6 to `internal`; the headless outcome and `ApiError::to_json` include it, including the locked open of #196 | `src/app.rs` `tc_2141_…` (TC-2141), `tc_2143_non_busy_database_error_maps_to_the_internal_exit_code` (TC-2143), `tc_2144_busy_database_error_maps_to_the_conflict_exit_code` (TC-2144); `src/cli.rs` `tc_2120_busy_conversation_open_maps_to_exit_4` |
+| FR-2140 (shutdown does not wait the default timeout twice) | the session is marked closed after the first attempt and shutdown closes once with a 250 ms busy timeout once the save budget is spent | `src/conversation.rs` `tc_2140_a_busy_close_is_attempted_once_and_does_not_wait_twice`; `src/app.rs` `tc_2140_shutdown_after_a_spent_budget_closes_once` (TC-2140) |
 
 Non-goals kept: the activity-save path (`record_activity`) keeps its own
 once-per-turn notice and is not retried; it stores auxiliary rows, not the
@@ -42,6 +47,8 @@ the exit codes of unrelated failures.
 | The turn outcome changes | The internal turn outcome is unchanged (the agent did answer); only the headless outcome reports the failure, so the graph and the dashboard keep their previous behaviour |
 | The reply is applied twice | The failed-save branch returns before the success path, so an event is applied at most once |
 | The transcript floods with notices | The notice is shown once per turn (`turn_save_failed_turns`) |
+| A busy close is retried and delays the exit | The session is marked closed after the first attempt, so `Drop` never retries; shutdown uses a 250 ms busy timeout once the save budget is spent |
+| Adding `error_kind` changes unrelated failure JSON | `error_kind_for_exit` returns `null` for every exit code other than 4 and 6, so usage/not-found/failed output keeps its shape plus a `null` field |
 
 ## Test evidence
 
@@ -50,10 +57,12 @@ the exit codes of unrelated failures.
 | `cargo fmt --all --check` | pass |
 | `cargo clippy --all-targets --all-features -- -D warnings` | pass |
 | `cargo test --all-targets --no-fail-fast` | pass, except the pre-existing `web::server::tests::agent_prompt_api_get_lists_runners_unset_by_default` failure (fails on the unmodified checkout too) |
-| `cargo test --lib tc_2140` | 3 passed |
-| `cargo test --bin dmuxai tc_214` | 6 passed |
+| `cargo test --lib tc_2140` | 4 passed |
+| `cargo test --bin dmuxai tc_214` | 7 passed |
+| `cargo test --lib conversation::` | 9 passed |
+| `cargo test --bin dmuxai tc_2120` | 1 passed |
 | `python3 scripts/check-spec.py --all` | 80 specs, 80 pass |
-| `python3 scripts/check-tc-links.py` | 873 defined, 221 strong, 0 orphan, 0 undefined-test, 0 stale |
+| `python3 scripts/check-tc-links.py` | 880 defined, 228 strong, 0 orphan, 0 undefined-test, 0 stale |
 
 Manual end-to-end check with the built binary (`target/debug/dmuxai run "Say
 hello" --agent slow --json`), a custom agent that prints `delayed-text` after

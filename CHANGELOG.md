@@ -54,7 +54,11 @@ All notable changes to dmuxai are listed here. Versions follow
   errors) and an error that says the reply could not be saved, instead of
   reporting `ok: true` with an empty `text`. The answer itself is never lost:
   it stays in the JSON `text`, in the transcript, and next to the "Could not
-  save <agent> output" system note.
+  save <agent> output" system note. The JSON now reports `error_kind`
+  `conflict` for exit 4 and `internal` for exit 6 (also for the locked open of
+  #196), and once the retry budget is spent the process closes its session with
+  a short busy timeout, so a headless run exits without waiting the default
+  connection timeout a second time.
 
 - **A second `dmuxai run` in a busy workspace no longer fails with "database is
   locked" (FR-2120, #167).** Opening the conversation database waits for the

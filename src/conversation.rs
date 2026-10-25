@@ -995,6 +995,26 @@ fn save_attempts() -> usize {
     SAVE_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+// Number of session-close attempts made on the current thread (FR-2140,
+// test-only). A thread-local keeps the count stable while other tests create
+// and drop their own engines in parallel.
+#[cfg(test)]
+thread_local! {
+    static CLOSE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one session-close attempt (FR-2140, test-only).
+#[cfg(test)]
+fn count_close_attempt() {
+    CLOSE_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+}
+
+/// Session-close attempts made on the current thread (FR-2140, test-only).
+#[cfg(test)]
+fn close_attempts() -> usize {
+    CLOSE_ATTEMPTS.with(std::cell::Cell::get)
+}
+
 /// One open attempt: pragmas, migrations and the runtime-session insert.
 fn open_once(
     db_path: &Path,
@@ -1099,10 +1119,18 @@ impl ConversationEngine {
 
     /// Marks this process closed so a later startup may recover any turn it
     /// left unfinished. Drop calls this best-effort as a final fallback.
+    ///
+    /// The session is marked closed after this first attempt whether it
+    /// succeeded or not (FR-2140): a close that failed against a locked
+    /// database must not make Drop wait the connection busy timeout a second
+    /// time.
     pub fn close_session(&mut self) -> Result<(), ConversationError> {
         if self.session_closed {
             return Ok(());
         }
+        self.session_closed = true;
+        #[cfg(test)]
+        count_close_attempt();
         let now = now_ms()?;
         self.connection.execute(
             "UPDATE runtime_sessions
@@ -1110,8 +1138,24 @@ impl ConversationEngine {
               WHERE id = ?1 AND status = 'active'",
             params![self.session_id, now],
         )?;
-        self.session_closed = true;
         Ok(())
+    }
+
+    /// Closes the session once with a short busy timeout (FR-2140).
+    ///
+    /// Shutdown uses this when the busy-retry budget of the turn is already
+    /// spent: the database is likely still locked, so waiting the default
+    /// connection busy timeout would only delay the exit. The session is still
+    /// marked closed after this one attempt.
+    pub fn close_session_with_timeout(
+        &mut self,
+        busy_timeout: Duration,
+    ) -> Result<(), ConversationError> {
+        if self.session_closed {
+            return Ok(());
+        }
+        self.connection.busy_timeout(busy_timeout)?;
+        self.close_session()
     }
 
     pub fn list(&self) -> Result<Vec<ConversationCard>, ConversationError> {
@@ -2746,5 +2790,50 @@ mod busy_save_tests {
             )
             .unwrap();
         assert_eq!(text, "the reply");
+    }
+
+    /// FR-2140: after the save budget is spent the session is closed with a
+    /// short busy timeout, and a close that fails against the locked database
+    /// is never attempted again (Drop must not wait a second time).
+    #[test]
+    fn tc_2140_a_busy_close_is_attempted_once_and_does_not_wait_twice() {
+        let (_temp, workspace, db) = temp_workspace();
+        let mut engine = ConversationEngine::open(&db, &workspace).unwrap();
+
+        let blocker = Connection::open(&db).unwrap();
+        blocker.busy_timeout(Duration::from_secs(1)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let attempts_before = close_attempts();
+        let error = engine
+            .close_session_with_timeout(Duration::from_millis(100))
+            .expect_err("a locked database must fail the close");
+        assert!(
+            is_busy_error(&error),
+            "expected a busy close error, got {error:?}"
+        );
+        assert_eq!(
+            close_attempts() - attempts_before,
+            1,
+            "the close must be attempted exactly once"
+        );
+
+        // The first attempt already marked the session closed: the fallback
+        // close returns immediately instead of waiting the default timeout.
+        let started = Instant::now();
+        engine
+            .close_session()
+            .expect("a session marked closed must close without touching the database");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "the fallback close must not wait for the lock"
+        );
+        assert_eq!(
+            close_attempts() - attempts_before,
+            1,
+            "the fallback close must not make a second attempt"
+        );
+
+        blocker.execute_batch("ROLLBACK").unwrap();
     }
 }
