@@ -8,7 +8,7 @@ use std::{
     error::Error,
     fmt, fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{
@@ -28,6 +28,23 @@ const RECENT_TAIL_CHARS: usize = 12_000;
 const MAX_SUMMARY_CHARS: usize = MAX_CONTEXT_CHARS - RECENT_TAIL_CHARS;
 const SUMMARY_PROMPT_VERSION: &str = "conversation-summary-v1";
 const SESSION_LEASE_MS: i64 = 30_000;
+
+/// Total time the open phase waits for a concurrent DmuxAI process to release
+/// the conversation database before it reports the database as busy (FR-2120).
+const OPEN_RETRY_BUDGET: Duration = Duration::from_secs(20);
+/// First backoff step between two open attempts (FR-2120).
+const OPEN_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
+/// Longest backoff step between two open attempts (FR-2120).
+const OPEN_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+/// Busy timeout of a single open attempt (FR-2120). The retry loop owns the
+/// waiting, so one attempt must not block for long.
+const OPEN_ATTEMPT_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+/// Busy timeout of the connection once the database is open.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Message shown when the conversation database stays locked for the whole
+/// retry budget (FR-2120).
+const BUSY_MESSAGE: &str = "another dmuxai process is using this workspace's conversation \
+                            database (database is locked); retry when it finishes";
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS runtime_sessions (
@@ -208,11 +225,73 @@ fn migrate_to_v2(connection: &mut Connection) -> Result<(), ConversationError> {
     result
 }
 
+/// Reports whether an object (table or index) exists in `sqlite_master`.
+fn sqlite_object_kind(
+    connection: &Connection,
+    name: &str,
+) -> Result<Option<String>, ConversationError> {
+    let kind: Option<String> = connection
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(kind)
+}
+
+/// Reports whether a table has the given column.
+fn table_has_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, ConversationError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns.iter().any(|name| name == column))
+}
+
+/// Read-only check for the runtime-session objects (FR-2120).
+///
+/// When everything is already in place the caller can skip the write
+/// transaction, so opening a current database never blocks a concurrent
+/// DmuxAI process.
+fn runtime_session_schema_is_current(connection: &Connection) -> Result<bool, ConversationError> {
+    if sqlite_object_kind(connection, "runtime_sessions")?.as_deref() != Some("table") {
+        return Ok(false);
+    }
+    if sqlite_object_kind(connection, "runtime_sessions_by_workspace_status")?.as_deref()
+        != Some("index")
+    {
+        return Ok(false);
+    }
+    if sqlite_object_kind(connection, "turns")?.as_deref() == Some("table") {
+        if !table_has_column(connection, "turns", "owner_session_id")? {
+            return Ok(false);
+        }
+        if sqlite_object_kind(connection, "turns_by_owner_status")?.as_deref() != Some("index") {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Installs the runtime-session objects for databases created by the original
 /// v1 migration. The extension intentionally does not bump `user_version`:
 /// older binaries can ignore the additive table and nullable column during a
 /// rollback. Every change is committed together or not at all.
+///
+/// The schema is inspected read-only first (FR-2120): a database that already
+/// has every object needs no write transaction, so a concurrent process is not
+/// blocked. Only a database that is missing something takes the immediate
+/// transaction, where the `IF NOT EXISTS` clauses and the column re-check keep
+/// a racing process harmless.
 fn ensure_runtime_session_schema(connection: &mut Connection) -> Result<(), ConversationError> {
+    if runtime_session_schema_is_current(connection)? {
+        return Ok(());
+    }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
         r#"
@@ -300,6 +379,9 @@ pub enum ConversationError {
     Sqlite(rusqlite::Error),
     Io(std::io::Error),
     Json(serde_json::Error),
+    /// The conversation database stayed locked for the whole retry budget
+    /// (FR-2120). The message is actionable for the caller.
+    Busy(String),
     NoActiveConversation,
     ConversationNotFound(ConversationId),
     AgentBusy(AgentKey),
@@ -322,6 +404,7 @@ impl fmt::Display for ConversationError {
             Self::Sqlite(error) => write!(formatter, "conversation database error: {error}"),
             Self::Io(error) => write!(formatter, "conversation I/O error: {error}"),
             Self::Json(error) => write!(formatter, "invalid conversation JSON: {error}"),
+            Self::Busy(message) => formatter.write_str(message),
             Self::NoActiveConversation => formatter.write_str("no conversation is active"),
             Self::ConversationNotFound(id) => write!(formatter, "conversation {id} was not found"),
             Self::AgentBusy(agent) => write!(formatter, "{agent} already has an active turn"),
@@ -373,6 +456,26 @@ impl From<std::io::Error> for ConversationError {
 impl From<serde_json::Error> for ConversationError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
+    }
+}
+
+/// True for SQLite's "database is locked" and "database table is locked"
+/// errors (FR-2120).
+fn is_busy(error: &rusqlite::Error) -> bool {
+    match error {
+        rusqlite::Error::SqliteFailure(inner, _) => matches!(
+            inner.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        ),
+        _ => false,
+    }
+}
+
+/// True when a conversation error is a busy database (FR-2120).
+fn is_busy_error(error: &ConversationError) -> bool {
+    match error {
+        ConversationError::Sqlite(inner) => is_busy(inner),
+        _ => false,
     }
 }
 
@@ -810,59 +913,111 @@ pub struct ConversationEngine {
     active_conversation: Option<ConversationId>,
 }
 
+/// Opens the conversation database, waiting for a concurrent DmuxAI process to
+/// release it (FR-2120).
+///
+/// The open phase is retried while the database reports SQLITE_BUSY or
+/// SQLITE_LOCKED, with a bounded backoff. When the database stays locked for
+/// the whole budget the error is `ConversationError::Busy`.
+fn open_with_retry(
+    db_path: &Path,
+    workspace_root: &Path,
+    budget: Duration,
+) -> Result<ConversationEngine, ConversationError> {
+    if let Some(parent) = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let workspace_root = normalize_workspace(workspace_root)?;
+
+    let started = Instant::now();
+    let mut delay = OPEN_RETRY_INITIAL_DELAY;
+    loop {
+        match open_once(db_path, &workspace_root) {
+            Ok(engine) => return Ok(engine),
+            Err(error) => {
+                if !is_busy_error(&error) {
+                    return Err(error);
+                }
+                if started.elapsed().saturating_add(delay) >= budget {
+                    return Err(ConversationError::Busy(BUSY_MESSAGE.to_owned()));
+                }
+                std::thread::sleep(delay + retry_jitter(delay));
+                delay = (delay * 2).min(OPEN_RETRY_MAX_DELAY);
+            }
+        }
+    }
+}
+
+/// Small random padding so two processes do not retry in lockstep.
+fn retry_jitter(delay: Duration) -> Duration {
+    let bytes = Uuid::new_v4().into_bytes();
+    let fraction = u32::from(bytes[0]) % 5;
+    delay / 4 * fraction
+}
+
+/// One open attempt: pragmas, migrations and the runtime-session insert.
+fn open_once(
+    db_path: &Path,
+    workspace_root: &str,
+) -> Result<ConversationEngine, ConversationError> {
+    let mut connection = Connection::open(db_path)?;
+    connection.busy_timeout(OPEN_ATTEMPT_BUSY_TIMEOUT)?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    // Switching the journal mode needs a brief exclusive lock, and SQLite does
+    // not run the busy handler for it: a database that is already in WAL mode
+    // is left alone (FR-2120).
+    let journal_mode: String =
+        connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+    }
+    connection.pragma_update(None, "synchronous", "NORMAL")?;
+
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(ConversationError::UnsupportedSchema {
+            version,
+            db_path: db_path.to_path_buf(),
+        });
+    }
+    if version < 1 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATION_1)?;
+        transaction.commit()?;
+    }
+
+    ensure_runtime_session_schema(&mut connection)?;
+    if version < 2 {
+        migrate_to_v2(&mut connection)?;
+    }
+    if version < 3 {
+        migrate_to_v3(&mut connection)?;
+    }
+    let session_id = Uuid::new_v4().to_string();
+    let now = now_ms()?;
+    connection.execute(
+        "INSERT INTO runtime_sessions
+            (id, workspace_root, status, created_at_ms, last_seen_at_ms)
+         VALUES (?1, ?2, 'active', ?3, ?3)",
+        params![session_id, workspace_root, now],
+    )?;
+    connection.busy_timeout(BUSY_TIMEOUT)?;
+
+    Ok(ConversationEngine {
+        connection,
+        session_id,
+        session_closed: false,
+        workspace_root: workspace_root.to_owned(),
+        active_conversation: None,
+    })
+}
+
 impl ConversationEngine {
     pub fn open(db_path: &Path, workspace_root: &Path) -> Result<Self, ConversationError> {
-        if let Some(parent) = db_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
-
-        let workspace_root = normalize_workspace(workspace_root)?;
-        let mut connection = Connection::open(db_path)?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "synchronous", "NORMAL")?;
-
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > SCHEMA_VERSION {
-            return Err(ConversationError::UnsupportedSchema {
-                version,
-                db_path: db_path.to_path_buf(),
-            });
-        }
-        if version < 1 {
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(MIGRATION_1)?;
-            transaction.commit()?;
-        }
-
-        ensure_runtime_session_schema(&mut connection)?;
-        if version < 2 {
-            migrate_to_v2(&mut connection)?;
-        }
-        if version < 3 {
-            migrate_to_v3(&mut connection)?;
-        }
-        let session_id = Uuid::new_v4().to_string();
-        let now = now_ms()?;
-        connection.execute(
-            "INSERT INTO runtime_sessions
-                (id, workspace_root, status, created_at_ms, last_seen_at_ms)
-             VALUES (?1, ?2, 'active', ?3, ?3)",
-            params![session_id, workspace_root, now],
-        )?;
-
-        Ok(Self {
-            connection,
-            session_id,
-            session_closed: false,
-            workspace_root,
-            active_conversation: None,
-        })
+        open_with_retry(db_path, workspace_root, OPEN_RETRY_BUDGET)
     }
 
     /// Returns whether another non-expired DmuxAI process is using this
@@ -2252,5 +2407,128 @@ mod schema_v2_tests {
         assert_eq!(index_count, 1);
         // Re-opening a v2 database is a no-op.
         drop(ConversationEngine::open(&db, &workspace).unwrap());
+    }
+}
+
+/// SPEC-agent-api FR-2120: opening the conversation database must not take a
+/// write lock when the schema is current, must retry a busy database, and must
+/// report a still-busy database as a conflict instead of an internal error.
+#[cfg(test)]
+mod busy_open_tests {
+    use super::*;
+
+    fn temp_workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let db = temp.path().join("conversations.sqlite3");
+        (temp, workspace, db)
+    }
+
+    /// Opens a database that already carries the current schema.
+    fn current_schema_db(workspace: &Path, db: &Path) {
+        drop(ConversationEngine::open(db, workspace).unwrap());
+    }
+
+    #[test]
+    fn tc_2120_open_of_current_schema_takes_no_write_lock() {
+        let (_temp, workspace, db) = temp_workspace();
+        current_schema_db(&workspace, &db);
+
+        // A second process holds the write lock of the same file.
+        let blocker = Connection::open(&db).unwrap();
+        blocker.busy_timeout(Duration::from_secs(1)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        // The runtime-session schema is current, so the open phase checks it
+        // read-only and needs no write transaction.
+        let reader = Connection::open(&db).unwrap();
+        assert!(
+            runtime_session_schema_is_current(&reader).unwrap(),
+            "the runtime-session schema must be recognized as current"
+        );
+        drop(reader);
+
+        // The remaining write is the runtime-session insert, which is the only
+        // statement that needs the lock.
+        let error = match open_with_retry(&db, &workspace, Duration::from_millis(400)) {
+            Ok(_) => panic!("the open must not succeed while another process holds the lock"),
+            Err(error) => error,
+        };
+        let ConversationError::Busy(message) = error else {
+            panic!("expected a busy conversation database, got {error:?}");
+        };
+        assert!(
+            message.contains("database is locked") && message.contains("retry"),
+            "the busy message must be actionable, got {message}"
+        );
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn tc_2120_open_succeeds_once_the_lock_is_released() {
+        let (_temp, workspace, db) = temp_workspace();
+        current_schema_db(&workspace, &db);
+
+        // Another process holds the write lock and releases it shortly after.
+        let blocker = Connection::open(&db).unwrap();
+        blocker.busy_timeout(Duration::from_secs(1)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            blocker.execute_batch("COMMIT").unwrap();
+        });
+
+        let engine = open_with_retry(&db, &workspace, Duration::from_secs(10))
+            .expect("the open must succeed once the lock is released");
+        assert!(!engine.session_id.is_empty());
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn tc_2120_is_busy_matches_busy_and_locked_codes() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy,
+                extended_code: 5,
+            },
+            None,
+        );
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseLocked,
+                extended_code: 6,
+            },
+            None,
+        );
+        assert!(is_busy(&busy));
+        assert!(is_busy(&locked));
+        assert!(!is_busy(&rusqlite::Error::InvalidQuery));
+        assert!(!is_busy(&rusqlite::Error::QueryReturnedNoRows));
+    }
+
+    #[test]
+    fn tc_2120_a_locked_database_produces_a_busy_sqlite_error() {
+        let (_temp, workspace, db) = temp_workspace();
+        current_schema_db(&workspace, &db);
+
+        let blocker = Connection::open(&db).unwrap();
+        blocker.busy_timeout(Duration::from_secs(1)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let writer = Connection::open(&db).unwrap();
+        writer.busy_timeout(Duration::from_millis(50)).unwrap();
+        let error = writer
+            .execute(
+                "INSERT INTO runtime_sessions
+                    (id, workspace_root, status, created_at_ms, last_seen_at_ms)
+                 VALUES ('other', '/ws', 'active', 1, 1)",
+                [],
+            )
+            .unwrap_err();
+        assert!(is_busy(&error), "expected a busy sqlite error, got {error}");
+
+        blocker.execute_batch("ROLLBACK").unwrap();
     }
 }
