@@ -1974,7 +1974,7 @@ pub(crate) mod tests {
             system_prompt: None,
         };
 
-        for disallowed in ["composer-2.5-fast", "claude-3-5-sonnet-fast", "gpt-5", ""] {
+        for disallowed in ["composer-2.5-fast", "claude-3-5-sonnet-fast", ""] {
             let mut command = tokio::process::Command::new("cursor-agent");
             configure_command(
                 &mut command,
@@ -2001,6 +2001,49 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    // TC-2182 / FR-2182
+    fn tc_2182_cursor_defaults_to_composer_and_preserves_selected_grok() {
+        let cwd = Path::new("workspace");
+        let mut default_cmd = tokio::process::Command::new("cursor-agent");
+        configure_command(&mut default_cmd, None, None, TurnPolicy::ReadOnly, cwd);
+        let default_args = default_cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            default_args
+                .windows(2)
+                .any(|args| args == ["--model", "composer-2.5"]),
+            "cursor with no model should default to composer-2.5: {default_args:?}"
+        );
+
+        let mut grok_cmd = tokio::process::Command::new("cursor-agent");
+        configure_command(
+            &mut grok_cmd,
+            None,
+            Some("grok-4.7"),
+            TurnPolicy::ReadOnly,
+            cwd,
+        );
+        let grok_args = grok_cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            grok_args
+                .windows(2)
+                .any(|args| args == ["--model", "grok-4.7"]),
+            "cursor with selected grok-4.7 should reach argv as --model grok-4.7: {grok_args:?}"
+        );
+        assert!(
+            !grok_args.iter().any(|arg| arg == "composer-2.5"),
+            "grok-4.7 should not be replaced with composer-2.5: {grok_args:?}"
+        );
     }
 
     #[test]
