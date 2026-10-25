@@ -420,10 +420,33 @@ struct ActiveTurn {
     offscreen_activity: Vec<Message>,
     /// Catalog-check hint remembered for this turn (FR-1729).
     model_catalog_hint: Option<String>,
-    fallback_prompt: String,
+    /// The prompt the user sent, without any runner-fallback preface
+    /// (SPEC-runner-fallback FR-2131). A handover hop adds its own preface in
+    /// front of this text instead of stacking on the previous hop's.
+    fallback_original_prompt: String,
     fallback_display_text: Option<String>,
     fallback_policy: Option<TurnPolicy>,
     fallback_chain: Option<dmuxai::runner_fallback::FallbackChain>,
+}
+
+/// Handover state for the turn that takes over a failed runner
+/// (SPEC-runner-fallback FR-2130, TC-2130/TC-2131).
+#[derive(Clone)]
+struct PendingFallback {
+    /// The chain the taking-over turn continues with.
+    chain: dmuxai::runner_fallback::FallbackChain,
+    /// The user's original prompt, without any handover preface.
+    original_prompt: String,
+}
+
+/// The graph node mapping of a fallback target, kept so a target that fails
+/// to start can be restored (SPEC-runner-fallback FR-2132, TC-2132).
+struct GraphNodeRemap {
+    node_id: String,
+    from_agent: Agent,
+    to_agent: Agent,
+    previous_runner: String,
+    previous_model_id: String,
 }
 
 /// Where to re-insert retained offscreen activity after `restore_snapshot`.
@@ -1354,7 +1377,10 @@ pub struct App {
     retired_internal_turns: HashSet<String>,
     active_turns: HashMap<Agent, ActiveTurn>,
     pub fallback_history: Vec<dmuxai::runner_fallback::FallbackRecord>,
-    pending_fallback_chain: Option<dmuxai::runner_fallback::FallbackChain>,
+    /// Handover state for the next submitted turn (SPEC-runner-fallback
+    /// FR-2118, TC-2130). Consumed by the submit path so it can never leak into a
+    /// later turn.
+    pending_fallback: Option<PendingFallback>,
     last_output_handed_over: bool,
     /// Activity rows for turns started in this process (FR-1669); keyed by turn id so
     /// multi-turn transcripts keep each turn's rows between its user prompt and reply.
@@ -1644,7 +1670,7 @@ impl App {
             retired_internal_turns: HashSet::new(),
             active_turns: HashMap::new(),
             fallback_history: Vec::new(),
-            pending_fallback_chain: None,
+            pending_fallback: None,
             last_output_handed_over: false,
             retained_offscreen_activity: HashMap::new(),
             conversation_turn_ids: HashMap::new(),
@@ -3659,7 +3685,13 @@ impl App {
                     agent: agent_key(output.agent),
                     event,
                 };
-                if let Err(error) = self.engine.record_turn_outputs(&[stored_output]) {
+                // A failed turn that was already recorded (the runner already
+                // reported the error) must not be recorded twice: the engine
+                // rejects a second failure for the same turn.
+                let already_recorded = self.retired_internal_turns.contains(turn_id.as_str());
+                if !already_recorded
+                    && let Err(error) = self.engine.record_turn_outputs(&[stored_output])
+                {
                     let terminal = matches!(
                         output.event,
                         AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_)
@@ -3715,7 +3747,17 @@ impl App {
         }
     }
 
+    /// Hands a failed turn to the next usable runner in the fallback chain
+    /// (SPEC-runner-fallback FR-2118, FR-2130..FR-2133).
+    ///
+    /// The handover is only recorded once the target turn actually started: a
+    /// target whose runner/model cannot be applied is skipped, and a target
+    /// that fails to start leaves the original error to the normal error path
+    /// (FR-2130..FR-2133).
     fn try_runner_fallback(&mut self, agent: Agent, err: &AgentError) -> bool {
+        // FR-2130 / TC-2130: a pending handover from an earlier attempt must never leak
+        // into this one.
+        self.pending_fallback = None;
         let Some(reason) =
             dmuxai::runner_fallback::classify_failure(err.kind.as_str(), &err.message)
         else {
@@ -3724,6 +3766,17 @@ impl App {
         let Some(active) = self.active_turns.get(&agent).cloned() else {
             return false;
         };
+
+        // The original user text of this turn. Every hop adds its own preface
+        // in front of it; the preface never stacks on the previous hop's
+        // FR-2131 / TC-2131.
+        let original_prompt = active.fallback_original_prompt.clone();
+        // The transcript shows the original user text, never the handover
+        // preface (FR-2131 / TC-2131).
+        let original_display_text = active
+            .fallback_display_text
+            .clone()
+            .unwrap_or_else(|| original_prompt.clone());
 
         let from_runner_str = runner_name(agent).to_owned();
         let from_model = self.selected_run_model(agent).ok().flatten();
@@ -3833,152 +3886,113 @@ impl App {
             return false;
         }
 
-        let mut retired_old_turn = false;
-        let mut current_node_agent = agent;
+        let selected_before = self.selected;
+        let display_text_before = self.pending_display_text.clone();
+        let policy_before = self.pending_turn_policy;
 
         while let Some(target) = next_target {
             let to_runner = target.runner.clone();
             let to_model = target.model.clone();
-            let record = dmuxai::runner_fallback::FallbackRecord {
-                from_runner: from_runner_str.clone(),
-                from_model: from_model.clone(),
-                reason: reason.as_str().to_owned(),
-                detail: err.to_string(),
-                to_runner: Some(to_runner.clone()),
-                to_model: to_model.clone(),
-            };
-            chain.record(record.clone());
-            self.fallback_history.push(record.clone());
-            let summary = record.summary();
-            self.push_system(summary.clone());
-            if let Some(hub) = &self.dashboard {
-                let task = Some(active.conversation_id.as_str().to_owned());
-                let todo = self.todos.turn_todo(agent, &active.turn_id);
-                let node = self.graph_agent_nodes.get(&current_node_agent).cloned();
-                hub.emit_event(dmuxai::events::EventDraft {
-                    kind: "fallback".to_owned(),
-                    task,
-                    todo,
-                    node,
-                    runner: Some(from_runner_str.clone()),
-                    model: from_model.clone(),
-                    from_state: Some(from_runner_str.clone()),
-                    to_state: to_runner.clone(),
-                    message: Some(summary.clone()),
-                    error_kind: Some(err.kind.as_str().to_owned()),
-                });
-            }
-
-            if !retired_old_turn {
-                let notice_output = TurnOutput {
-                    conversation_id: old_conv_id.clone(),
-                    turn_id: old_turn_id.clone(),
-                    agent: agent_key(agent),
-                    event: TurnEvent::Notice(summary),
-                };
-                let failed_output = TurnOutput {
-                    conversation_id: old_conv_id.clone(),
-                    turn_id: old_turn_id.clone(),
-                    agent: agent_key(agent),
-                    event: TurnEvent::Failed {
-                        message: format!("handed over to {target}: {err}"),
-                        invalidates_binding: true,
-                    },
-                };
-                let _ = self
-                    .engine
-                    .record_turn_outputs(&[notice_output, failed_output]);
-                self.retired_internal_turns
-                    .insert(old_turn_id.as_str().to_owned());
-
-                if self
-                    .activities
-                    .get(&agent)
-                    .is_some_and(|activity| activity.kind == ActivityKind::Turn)
-                {
-                    let message = Some(Self::truncate_agent_lifecycle_message(err.to_string()));
-                    self.emit_agent_lifecycle(
-                        agent,
-                        "error",
-                        message,
-                        Some(err.kind.as_str().to_owned()),
-                    );
-                }
-                self.agent_lifecycle.remove(&agent);
-                self.busy_agents.remove(&agent);
-                self.session_conversations = None;
-                if let Ok(mut starts) = self.busy_fallback_starts.lock() {
-                    starts.remove(&agent);
-                }
-                self.activities.remove(&agent);
-                self.end_run_state(agent, false, false);
-                let output_text = self.last_agent_output_text(agent);
-                self.note_skill_interview_turn_end(
-                    agent,
-                    false,
-                    Some(&err.to_string()),
-                    &output_text,
-                );
-                let removed_active = self.active_turns.remove(&agent);
-                if let Some(active) = removed_active.as_ref()
-                    && active.conversation_id.as_str() != self.conversation_id.as_str()
-                    && !active.offscreen_activity.is_empty()
-                {
-                    self.merge_retained_offscreen_activity(
-                        &active.conversation_id,
-                        active.turn_id.clone(),
-                        active.offscreen_activity.clone(),
-                    );
-                }
-                self.streaming_messages.remove(&agent);
-                self.tool_messages.remove(&agent);
-                retired_old_turn = true;
-            }
-
             let new_agent = runner_from_str(&target.runner).expect("target runner was validated");
-            if let Some(node_id) = self.graph_agent_nodes.remove(&current_node_agent) {
-                self.graph_agent_nodes.insert(new_agent, node_id.clone());
-                current_node_agent = new_agent;
-                if let Some(session) = self.graph_session.as_mut()
-                    && let Some(node) = session
-                        .run_mut()
-                        .plan
-                        .nodes
-                        .iter_mut()
-                        .find(|n| n.id == node_id)
-                {
-                    node.runner = target.runner.clone();
-                    if let Some(m) = &target.model {
-                        node.model_id = m.clone();
-                    }
-                }
+
+            // FR-2133 / TC-2133: a target whose runner or model cannot be applied is
+            // unusable; skip it instead of submitting with the wrong model.
+            if !self.apply_fallback_target(new_agent, &target) {
+                self.selected = selected_before;
+                next_target = chain.next_target(|t| {
+                    is_usable(
+                        t,
+                        &self.adapters,
+                        &self.busy_agents,
+                        &|r| self.runner_is_allowed(r),
+                        &self.model_catalogs,
+                        &self.settings,
+                    )
+                });
+                continue;
             }
 
-            let _ =
-                self.apply_runner_and_model(&target.runner, target.model.as_deref().unwrap_or(""));
-            if let Some(m) = &target.model {
-                let idx = adapter_index(new_agent);
-                let _ = self.adapters[idx].select_model(m.clone());
-                if let Some(catalog) = self.model_catalogs.get_mut(&new_agent) {
-                    catalog.selected = Some(m.clone());
-                }
-            }
-
-            self.pending_display_text = active.fallback_display_text.clone();
-            self.pending_turn_policy = active.fallback_policy;
-            self.pending_fallback_chain = Some(chain.clone());
+            // The graph node follows the target runner while it runs; the
+            // mapping is restored when the target does not start.
+            let remap = self.remap_graph_node_for_fallback(agent, new_agent, &target);
 
             let preface =
                 dmuxai::runner_fallback::handover_preface(&from_label, reason, &err.to_string());
-            let new_prompt = format!("{}{}", preface, active.fallback_prompt);
+            let new_prompt = format!("{}{}", preface, original_prompt);
+
+            self.pending_display_text = Some(original_display_text.clone());
+            self.pending_turn_policy = active.fallback_policy;
+            self.pending_fallback = Some(PendingFallback {
+                chain: chain.clone(),
+                original_prompt: original_prompt.clone(),
+            });
+
+            // The failed runner must not block the target: the chain may hand
+            // the turn to the same runner with another model.
+            self.busy_agents.remove(&agent);
+            let removed_active = self.active_turns.remove(&agent);
+            // The conversation engine refuses a second turn for the same runner
+            // while the failed turn is still running, so a same-runner handover
+            // has to finish the failed turn before the new one starts.
+            let same_runner = new_agent == agent;
+            if same_runner {
+                self.record_failed_turn(&old_conv_id, &old_turn_id, agent, &err.to_string());
+                self.retired_internal_turns
+                    .insert(old_turn_id.as_str().to_owned());
+            }
+
             let submit_res = self.try_submit_to_agent(new_agent, new_prompt, false, false);
             match submit_res {
                 Ok(new_turn_id) => {
+                    // FR-2132 / TC-2132: the handover is only recorded now that the
+                    // target turn started.
+                    let record = dmuxai::runner_fallback::FallbackRecord {
+                        from_runner: from_runner_str.clone(),
+                        from_model: from_model.clone(),
+                        reason: reason.as_str().to_owned(),
+                        detail: err.to_string(),
+                        to_runner: Some(to_runner.clone()),
+                        to_model: to_model.clone(),
+                    };
+                    chain.record(record.clone());
+                    // The target turn continues this chain: its copy must carry
+                    // the record of this hop too.
+                    if let Some(new_active) = self.active_turns.get_mut(&new_agent)
+                        && let Some(new_chain) = new_active.fallback_chain.as_mut()
+                    {
+                        new_chain.record(record.clone());
+                    }
+                    self.finish_runner_handover(
+                        agent,
+                        err,
+                        record,
+                        &target,
+                        &old_conv_id,
+                        &old_turn_id,
+                        removed_active,
+                        same_runner,
+                    );
                     self.todos
                         .relink_turn((agent, &old_turn_id), (new_agent, new_turn_id));
+                    // The handover's pending policy must not leak into the next
+                    // turn (FR-2130 / TC-2130).
+                    if self.pending_turn_policy == active.fallback_policy {
+                        self.pending_turn_policy = policy_before;
+                    }
                     return true;
                 }
                 Err(_) => {
+                    // The target did not start: restore the state and try the
+                    // next target (FR-2132 / TC-2132).
+                    if let Some(old) = removed_active {
+                        self.active_turns.insert(agent, old);
+                    }
+                    self.busy_agents.insert(agent);
+                    self.selected = selected_before;
+                    self.restore_graph_node_for_fallback(remap);
+                    self.pending_display_text = display_text_before.clone();
+                    self.pending_turn_policy = policy_before;
+                    self.pending_fallback = None;
                     next_target = chain.next_target(|t| {
                         is_usable(
                             t,
@@ -3993,7 +4007,8 @@ impl App {
             }
         }
 
-        // All targets in chain failed to start
+        // Every target failed to start: the original error goes to the normal
+        // error path exactly once (FR-2132 / TC-2132).
         let exhausted = dmuxai::runner_fallback::FallbackRecord {
             from_runner: from_runner_str.clone(),
             from_model: from_model.clone(),
@@ -4011,7 +4026,7 @@ impl App {
                 kind: "fallback".to_owned(),
                 task: Some(active.conversation_id.as_str().to_owned()),
                 todo: self.todos.turn_todo(agent, &old_turn_id),
-                node: self.graph_agent_nodes.get(&current_node_agent).cloned(),
+                node: self.graph_agent_nodes.get(&agent).cloned(),
                 runner: Some(from_runner_str),
                 model: from_model,
                 from_state: Some(runner_name(agent).to_owned()),
@@ -4020,14 +4035,228 @@ impl App {
                 error_kind: Some(err.kind.as_str().to_owned()),
             });
         }
-        let finish = self
-            .todos
-            .finish_turn(agent, &old_turn_id, false, Some(err.to_string()));
-        self.report_todo_finish(finish);
-        if let Some(node_id) = self.graph_agent_nodes.remove(&current_node_agent) {
-            self.intercept_graph_node_finished(agent, node_id, false, "", Some(&err.to_string()));
-        }
         false
+    }
+
+    /// Applies the fallback target's runner and model (FR-2133 / TC-2133).
+    ///
+    /// Returns `false` when the target cannot be applied, so the caller can
+    /// skip it instead of submitting with the wrong model.
+    fn apply_fallback_target(
+        &mut self,
+        new_agent: Agent,
+        target: &dmuxai::runner_fallback::FallbackTarget,
+    ) -> bool {
+        if self
+            .apply_runner_and_model(&target.runner, target.model.as_deref().unwrap_or(""))
+            .is_none()
+        {
+            self.push_system(format!(
+                "runner fallback: runner '{}' is unavailable; skipping this fallback target",
+                target.runner
+            ));
+            return false;
+        }
+        if let Some(model) = &target.model {
+            let index = adapter_index(new_agent);
+            if let Err(error) = self.adapters[index].select_model(model.clone()) {
+                self.push_system(format!(
+                    "runner fallback: could not apply model '{model}' to '{}' ({error}); skipping this fallback target",
+                    target.runner
+                ));
+                return false;
+            }
+            if let Some(catalog) = self.model_catalogs.get_mut(&new_agent) {
+                catalog.selected = Some(model.clone());
+            }
+        }
+        true
+    }
+
+    /// Points the graph node at the fallback runner (FR-2132 / TC-2132).
+    ///
+    /// Returns the previous mapping so a target that fails to start can be
+    /// restored.
+    fn remap_graph_node_for_fallback(
+        &mut self,
+        from_agent: Agent,
+        to_agent: Agent,
+        target: &dmuxai::runner_fallback::FallbackTarget,
+    ) -> Option<GraphNodeRemap> {
+        let node_id = self.graph_agent_nodes.remove(&from_agent)?;
+        let previous = self
+            .graph_session
+            .as_mut()
+            .and_then(|session| {
+                session
+                    .run_mut()
+                    .plan
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.id == node_id)
+                    .map(|node| (node.runner.clone(), node.model_id.clone()))
+            })
+            .unwrap_or_default();
+        self.graph_agent_nodes.insert(to_agent, node_id.clone());
+        if let Some(session) = self.graph_session.as_mut()
+            && let Some(node) = session
+                .run_mut()
+                .plan
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == node_id)
+        {
+            node.runner = target.runner.clone();
+            if let Some(model) = &target.model {
+                node.model_id = model.clone();
+            }
+        }
+        Some(GraphNodeRemap {
+            node_id,
+            from_agent,
+            to_agent,
+            previous_runner: previous.0,
+            previous_model_id: previous.1,
+        })
+    }
+
+    /// Restores the graph node mapping of a fallback target that did not start
+    /// (FR-2132 / TC-2132).
+    fn restore_graph_node_for_fallback(&mut self, remap: Option<GraphNodeRemap>) {
+        let Some(remap) = remap else {
+            return;
+        };
+        self.graph_agent_nodes.remove(&remap.to_agent);
+        self.graph_agent_nodes
+            .insert(remap.from_agent, remap.node_id.clone());
+        if let Some(session) = self.graph_session.as_mut()
+            && let Some(node) = session
+                .run_mut()
+                .plan
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == remap.node_id)
+        {
+            node.runner = remap.previous_runner.clone();
+            node.model_id = remap.previous_model_id.clone();
+        }
+    }
+
+    /// Records the failure of a turn that could not be handed over (FR-2132,
+    /// TC-2132).
+    fn record_failed_turn(
+        &mut self,
+        conversation_id: &StoredConversationId,
+        turn_id: &StoredTurnId,
+        agent: Agent,
+        message: &str,
+    ) {
+        let failed_output = TurnOutput {
+            conversation_id: conversation_id.clone(),
+            turn_id: turn_id.clone(),
+            agent: agent_key(agent),
+            event: TurnEvent::Failed {
+                message: message.to_owned(),
+                invalidates_binding: true,
+            },
+        };
+        let _ = self.engine.record_turn_outputs(&[failed_output]);
+    }
+
+    /// Records the handover of a failed turn and retires the failed turn
+    /// (FR-2132, TC-2132).
+    #[allow(clippy::too_many_arguments)]
+    fn finish_runner_handover(
+        &mut self,
+        agent: Agent,
+        err: &AgentError,
+        record: dmuxai::runner_fallback::FallbackRecord,
+        target: &dmuxai::runner_fallback::FallbackTarget,
+        old_conv_id: &StoredConversationId,
+        old_turn_id: &StoredTurnId,
+        removed_active: Option<ActiveTurn>,
+        failed_already_recorded: bool,
+    ) {
+        self.fallback_history.push(record.clone());
+        let summary = record.summary();
+        self.push_system(summary.clone());
+        // The graph node follows the target runner now, so take the id from the
+        // failed turn instead of the (already remapped) mapping.
+        let node_id = removed_active
+            .as_ref()
+            .and_then(|active| active.graph_node_id.clone());
+        if let Some(hub) = &self.dashboard {
+            let task = Some(old_conv_id.as_str().to_owned());
+            let todo = self.todos.turn_todo(agent, old_turn_id);
+            let node = node_id
+                .clone()
+                .or_else(|| self.graph_agent_nodes.get(&agent).cloned());
+            hub.emit_event(dmuxai::events::EventDraft {
+                kind: "fallback".to_owned(),
+                task,
+                todo,
+                node,
+                runner: Some(record.from_runner.clone()),
+                model: record.from_model.clone(),
+                from_state: Some(record.from_runner.clone()),
+                to_state: record.to_runner.clone().unwrap_or_default(),
+                message: Some(summary.clone()),
+                error_kind: Some(err.kind.as_str().to_owned()),
+            });
+        }
+
+        let notice_output = TurnOutput {
+            conversation_id: old_conv_id.clone(),
+            turn_id: old_turn_id.clone(),
+            agent: agent_key(agent),
+            event: TurnEvent::Notice(summary),
+        };
+        let mut outputs = vec![notice_output];
+        if !failed_already_recorded {
+            outputs.push(TurnOutput {
+                conversation_id: old_conv_id.clone(),
+                turn_id: old_turn_id.clone(),
+                agent: agent_key(agent),
+                event: TurnEvent::Failed {
+                    message: format!("handed over to {target}: {err}"),
+                    invalidates_binding: true,
+                },
+            });
+        }
+        let _ = self.engine.record_turn_outputs(&outputs);
+        self.retired_internal_turns
+            .insert(old_turn_id.as_str().to_owned());
+
+        if self
+            .activities
+            .get(&agent)
+            .is_some_and(|activity| activity.kind == ActivityKind::Turn)
+        {
+            let message = Some(Self::truncate_agent_lifecycle_message(err.to_string()));
+            self.emit_agent_lifecycle(agent, "error", message, Some(err.kind.as_str().to_owned()));
+        }
+        self.agent_lifecycle.remove(&agent);
+        self.busy_agents.remove(&agent);
+        self.session_conversations = None;
+        if let Ok(mut starts) = self.busy_fallback_starts.lock() {
+            starts.remove(&agent);
+        }
+        self.activities.remove(&agent);
+        self.end_run_state(agent, false, false);
+        let output_text = self.last_agent_output_text(agent);
+        self.note_skill_interview_turn_end(agent, false, Some(&err.to_string()), &output_text);
+        if let Some(active) = removed_active.as_ref()
+            && active.conversation_id.as_str() != self.conversation_id.as_str()
+            && !active.offscreen_activity.is_empty()
+        {
+            self.merge_retained_offscreen_activity(
+                &active.conversation_id,
+                active.turn_id.clone(),
+                active.offscreen_activity.clone(),
+            );
+        }
+        self.streaming_messages.remove(&agent);
+        self.tool_messages.remove(&agent);
     }
 
     fn handle_paste(&mut self, text: String) {
@@ -5046,7 +5275,15 @@ impl App {
         // Consume pending display text up front so it never leaks to a later turn.
         let pending_display_text = self.pending_display_text.take();
         let fallback_policy = self.pending_turn_policy;
-        let fallback_prompt = prompt.clone();
+        // Consume the pending fallback state up front so a stale chain can
+        // never leak into a later turn (FR-2130 / TC-2130).
+        let pending_fallback = self.pending_fallback.take();
+        // The prompt the user sent, without any runner-fallback preface; a
+        // handover hop keeps the original text (FR-2131 / TC-2131).
+        let fallback_original_prompt = pending_fallback
+            .as_ref()
+            .map(|fallback| fallback.original_prompt.clone())
+            .unwrap_or_else(|| prompt.clone());
         let fallback_display_text = pending_display_text.clone();
         if self.busy_agents.contains(&agent) {
             if restore_input_on_failure {
@@ -5358,10 +5595,10 @@ impl App {
                         graph_node_id: self.active_graph_node_for_agent(agent),
                         offscreen_activity: Vec::new(),
                         model_catalog_hint: catalog_hint,
-                        fallback_prompt,
+                        fallback_original_prompt,
                         fallback_display_text,
                         fallback_policy,
-                        fallback_chain: self.pending_fallback_chain.take(),
+                        fallback_chain: pending_fallback.map(|fallback| fallback.chain),
                     },
                 );
                 self.conversation_turn_ids
@@ -13061,6 +13298,64 @@ impl App {
         HeadlessIdleAction::Done
     }
 
+    /// Maps the transcript messages of this run to the headless message shape
+    /// (SPEC-agent-api FR-761).
+    fn mapped_headless_messages(&self, start_msg_count: usize) -> Vec<HeadlessMessage> {
+        let mut mapped_messages = Vec::new();
+        for msg in &self.messages[start_msg_count..] {
+            if msg.local_only {
+                continue;
+            }
+            match &msg.role {
+                Role::User => mapped_messages.push(HeadlessMessage {
+                    role: "user".to_owned(),
+                    agent: None,
+                    content: msg.content.clone(),
+                }),
+                Role::Agent(agent) => mapped_messages.push(HeadlessMessage {
+                    role: "agent".to_owned(),
+                    agent: Some(runner_name(*agent).to_owned()),
+                    content: msg.content.clone(),
+                }),
+                Role::System => mapped_messages.push(HeadlessMessage {
+                    role: "system".to_owned(),
+                    agent: None,
+                    content: msg.content.clone(),
+                }),
+                Role::Activity(_) => {}
+            }
+        }
+        mapped_messages
+    }
+
+    /// The answer text of a headless run.
+    ///
+    /// After a handover only the messages of the final runner are the answer:
+    /// the failed runner's partial output stays in `messages` but must not leak
+    /// into `text` (SPEC-runner-fallback FR-2134, TC-2134).
+    fn headless_answer_text(
+        mapped_messages: &[HeadlessMessage],
+        fallback_records: &[dmuxai::runner_fallback::FallbackRecord],
+    ) -> String {
+        let final_runner = fallback_records
+            .iter()
+            .rev()
+            .find_map(|record| record.to_runner.clone());
+        let agent_texts: Vec<&str> = mapped_messages
+            .iter()
+            .filter(|m| m.role == "agent")
+            .filter(|m| match final_runner.as_deref() {
+                Some(runner) => m
+                    .agent
+                    .as_deref()
+                    .is_some_and(|agent| agent.eq_ignore_ascii_case(runner)),
+                None => true,
+            })
+            .map(|m| m.content.as_str())
+            .collect();
+        agent_texts.join("\n\n")
+    }
+
     /// Runs a prompt or to-do headlessly without terminal I/O (SPEC-agent-api FR-761, FR-762).
     pub async fn run_headless(
         &mut self,
@@ -13476,37 +13771,11 @@ impl App {
             }
         }
 
-        let mut mapped_messages = Vec::new();
-        for msg in &self.messages[start_msg_count..] {
-            if msg.local_only {
-                continue;
-            }
-            match &msg.role {
-                Role::User => mapped_messages.push(HeadlessMessage {
-                    role: "user".to_owned(),
-                    agent: None,
-                    content: msg.content.clone(),
-                }),
-                Role::Agent(agent) => mapped_messages.push(HeadlessMessage {
-                    role: "agent".to_owned(),
-                    agent: Some(runner_name(*agent).to_owned()),
-                    content: msg.content.clone(),
-                }),
-                Role::System => mapped_messages.push(HeadlessMessage {
-                    role: "system".to_owned(),
-                    agent: None,
-                    content: msg.content.clone(),
-                }),
-                Role::Activity(_) => {}
-            }
-        }
-
-        let agent_texts: Vec<&str> = mapped_messages
-            .iter()
-            .filter(|m| m.role == "agent")
-            .map(|m| m.content.as_str())
-            .collect();
-        let text = agent_texts.join("\n\n");
+        let mapped_messages = self.mapped_headless_messages(start_msg_count);
+        let text = Self::headless_answer_text(
+            &mapped_messages,
+            &self.fallback_history[start_fallbacks_len..],
+        );
 
         let todo = if let Some(ref todo_id) = req.todo_id {
             if let Some(store) = self.todos.store() {
@@ -16602,6 +16871,7 @@ mod tests {
         sent: SentRequests,
         cancelled: CancelRequests,
         fail_send: bool,
+        fail_select_model: bool,
         unsupported_modes: Vec<TurnPolicy>,
         selected_models: SelectedModels,
     }
@@ -16632,6 +16902,9 @@ mod tests {
         }
 
         fn select_model(&self, model: String) -> Result<(), AdapterError> {
+            if self.fail_select_model {
+                return Err(AdapterError::Unsupported);
+            }
             self.selected_models
                 .lock()
                 .unwrap()
@@ -16694,6 +16967,25 @@ mod tests {
         engine: ConversationEngine,
         failing_agent: Option<Agent>,
     ) -> (App, SentRequests, CancelRequests, SelectedModels) {
+        test_app_with_adapter_failures(engine, failing_agent, None)
+    }
+
+    /// A recording-adapter app whose adapter refuses `select_model` for
+    /// `failing_select_model` (SPEC-runner-fallback FR-2118, TC-2133).
+    fn test_app_with_select_model_failure(agent: Agent) -> (App, SentRequests) {
+        pin_test_state_dir();
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (app, sent, _, _) = test_app_with_adapter_failures(engine, None, Some(agent));
+        (app, sent)
+    }
+
+    fn test_app_with_adapter_failures(
+        engine: ConversationEngine,
+        failing_agent: Option<Agent>,
+        failing_select_model: Option<Agent>,
+    ) -> (App, SentRequests, CancelRequests, SelectedModels) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
         let selected_models = Arc::new(Mutex::new(Vec::new()));
@@ -16705,6 +16997,7 @@ mod tests {
                     sent: Arc::clone(&sent),
                     cancelled: Arc::clone(&cancelled),
                     fail_send: failing_agent == Some(agent),
+                    fail_select_model: failing_select_model == Some(agent),
                     unsupported_modes: Vec::new(),
                     selected_models: Arc::clone(&selected_models),
                 }) as Box<dyn AgentAdapter>
@@ -16755,6 +17048,7 @@ mod tests {
                     sent: Arc::clone(&sent),
                     cancelled: Arc::clone(&cancelled),
                     fail_send: false,
+                    fail_select_model: false,
                     unsupported_modes: Vec::new(),
                     selected_models: Arc::clone(&selected_models),
                 }) as Box<dyn AgentAdapter>
@@ -16807,6 +17101,7 @@ mod tests {
             .into_iter()
             .map(|agent| {
                 Box::new(RecordingAdapter {
+                    fail_select_model: false,
                     agent,
                     sent: Arc::clone(&sent),
                     cancelled: Arc::clone(&cancelled),
@@ -21719,7 +22014,7 @@ mod tests {
                 graph_node_id: None,
                 offscreen_activity: Vec::new(),
                 model_catalog_hint: None,
-                fallback_prompt: String::new(),
+                fallback_original_prompt: String::new(),
                 fallback_display_text: None,
                 fallback_policy: None,
                 fallback_chain: None,
@@ -23171,7 +23466,7 @@ mod tests {
                 graph_node_id: None,
                 offscreen_activity: Vec::new(),
                 model_catalog_hint: None,
-                fallback_prompt: String::new(),
+                fallback_original_prompt: String::new(),
                 fallback_display_text: None,
                 fallback_policy: None,
                 fallback_chain: None,
@@ -23223,7 +23518,7 @@ mod tests {
                 graph_node_id: None,
                 offscreen_activity: Vec::new(),
                 model_catalog_hint: None,
-                fallback_prompt: String::new(),
+                fallback_original_prompt: String::new(),
                 fallback_display_text: None,
                 fallback_policy: None,
                 fallback_chain: None,
@@ -23980,6 +24275,7 @@ mod tests {
                 .into_iter()
                 .map(|agent| {
                     Box::new(RecordingAdapter {
+                        fail_select_model: false,
                         agent,
                         sent: Arc::clone(&sent),
                         cancelled: Arc::clone(&cancelled),
@@ -26238,6 +26534,7 @@ mod tests {
         {
             let cancelled = Arc::new(Mutex::new(Vec::new()));
             app.adapters.push(Box::new(RecordingAdapter {
+                fail_select_model: false,
                 agent: Agent::Custom(0),
                 sent,
                 cancelled,
@@ -26502,6 +26799,7 @@ mod tests {
             .into_iter()
             .map(|agent| {
                 Box::new(RecordingAdapter {
+                    fail_select_model: false,
                     agent,
                     sent: Arc::clone(&sent),
                     cancelled: Arc::clone(&cancelled),
@@ -33119,12 +33417,12 @@ mod tests {
         fallback.runners.insert(
             "agy".to_owned(),
             dmuxai::runner_fallback::RunnerFallbackConfig {
-                chain: vec![dmuxai::runner_fallback::FallbackTarget {
+                chain: Some(vec![dmuxai::runner_fallback::FallbackTarget {
                     runner: "codex".to_owned(),
                     model: None,
-                }],
-                stall_timeout_secs: 240,
-                stall_api_retries: 3,
+                }]),
+                stall_timeout_secs: Some(240),
+                stall_api_retries: Some(3),
             },
         );
         fallback
@@ -33358,12 +33656,12 @@ mod tests {
         fallback.runners.insert(
             "agy".to_owned(),
             dmuxai::runner_fallback::RunnerFallbackConfig {
-                chain: vec![dmuxai::runner_fallback::FallbackTarget {
+                chain: Some(vec![dmuxai::runner_fallback::FallbackTarget {
                     runner: "agy".to_owned(),
                     model: Some("gemini-3.8-flash-low".to_owned()),
-                }],
-                stall_timeout_secs: 240,
-                stall_api_retries: 3,
+                }]),
+                stall_timeout_secs: Some(240),
+                stall_api_retries: Some(3),
             },
         );
         app.settings.runner_fallback = fallback;
@@ -33499,12 +33797,12 @@ mod tests {
         fallback.runners.insert(
             "agy".to_owned(),
             dmuxai::runner_fallback::RunnerFallbackConfig {
-                chain: vec![dmuxai::runner_fallback::FallbackTarget {
+                chain: Some(vec![dmuxai::runner_fallback::FallbackTarget {
                     runner: "nosuch".to_owned(),
                     model: None,
-                }],
-                stall_timeout_secs: 240,
-                stall_api_retries: 3,
+                }]),
+                stall_timeout_secs: Some(240),
+                stall_api_retries: Some(3),
             },
         );
         app.settings.runner_fallback = fallback;
@@ -33528,6 +33826,289 @@ mod tests {
             app.messages
                 .iter()
                 .any(|m| m.content.contains("fallback chain exhausted"))
+        );
+    }
+
+    /// A fallback chain for `agy` with the given targets (`"runner"` or
+    /// `"runner:model"`).
+    fn agy_fallback_chain(targets: &[&str]) -> dmuxai::runner_fallback::FallbackSettings {
+        let mut fallback = dmuxai::runner_fallback::FallbackSettings::default();
+        fallback.runners.insert(
+            "agy".to_owned(),
+            dmuxai::runner_fallback::RunnerFallbackConfig {
+                chain: Some(
+                    targets
+                        .iter()
+                        .map(|raw| {
+                            dmuxai::runner_fallback::FallbackTarget::parse(raw)
+                                .expect("valid fallback target")
+                        })
+                        .collect(),
+                ),
+                stall_timeout_secs: Some(240),
+                stall_api_retries: Some(3),
+            },
+        );
+        fallback
+    }
+
+    /// The provider error that `classify_failure` treats as a trigger.
+    fn provider_trigger_error() -> AgentError {
+        AgentError::provider("API error: 503 service unavailable")
+    }
+
+    // FR-2130 / TC-2130: an exhausted handover leaves no pending state behind,
+    // so the next user turn starts without a stale fallback chain.
+    #[test]
+    fn tc_2130_exhausted_handover_leaves_no_pending_chain() {
+        pin_test_state_dir();
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        // The target runner cannot start, so the chain is exhausted.
+        let (mut app, sent) = test_app_with_engine_and_failure(engine, Some(Agent::Codex));
+        app.settings.runner_fallback = agy_fallback_chain(&["codex"]);
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "first turn".to_owned();
+        app.submit_prompt();
+
+        let req = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(provider_trigger_error()),
+        }));
+
+        // The target never started: the chain is exhausted.
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert_eq!(app.fallback_history.len(), 1);
+        assert_eq!(app.fallback_history[0].to_runner, None);
+
+        // Nothing of the handover is pending any more.
+        assert!(app.pending_fallback.is_none());
+        assert!(app.pending_display_text.is_none());
+
+        // The next turn starts without a stale chain.
+        app.input = "second turn".to_owned();
+        app.submit_prompt();
+        let active = app
+            .active_turns
+            .get(&Agent::Agy)
+            .expect("the new agy turn is active");
+        assert!(active.fallback_chain.is_none());
+        assert_eq!(active.fallback_original_prompt, "second turn");
+    }
+
+    // FR-2131 / TC-2131: every hop sends exactly one preface in front of the
+    // original user prompt, and the transcript never shows the preface.
+    #[test]
+    fn tc_2131_two_hops_keep_one_preface_and_the_original_prompt() {
+        let (mut app, sent) = test_app();
+        app.settings.runner_fallback = agy_fallback_chain(&["codex", "cursor"]);
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "analyze the codebase".to_owned();
+        app.submit_prompt();
+
+        let req1 = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(req1.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req1.turn_id.as_str())),
+            event: AgentEvent::Error(provider_trigger_error()),
+        }));
+
+        let req2 = sent.lock().unwrap()[1].1.clone();
+        assert_eq!(sent.lock().unwrap()[1].0, Agent::Codex);
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(ConversationId::new(req2.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req2.turn_id.as_str())),
+            event: AgentEvent::Error(provider_trigger_error()),
+        }));
+
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        // First hop: one preface, then the original prompt.
+        assert_eq!(
+            requests[1]
+                .1
+                .prompt
+                .matches("[DmuxAI runner fallback]")
+                .count(),
+            1
+        );
+        assert!(requests[1].1.prompt.ends_with("analyze the codebase"));
+        // Second hop: one preface again, not the previous hop's preface too.
+        assert_eq!(requests[2].0, Agent::Cursor);
+        assert_eq!(
+            requests[2]
+                .1
+                .prompt
+                .matches("[DmuxAI runner fallback]")
+                .count(),
+            1
+        );
+        assert!(requests[2].1.prompt.ends_with("analyze the codebase"));
+        drop(requests);
+
+        // The transcript shows the original user text, never a preface.
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("[DmuxAI runner fallback]")),
+            "the handover preface must not become a transcript message"
+        );
+        let user_messages: Vec<&str> = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::User))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            user_messages
+                .iter()
+                .all(|text| *text == "analyze the codebase"),
+            "unexpected user messages: {user_messages:?}"
+        );
+    }
+
+    // FR-2132 / TC-2132: when every target fails to start, the original error
+    // is recorded once and the turn is finished once.
+    #[test]
+    fn tc_2132_all_targets_failing_records_the_original_error_once() {
+        pin_test_state_dir();
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (mut app, sent) = test_app_with_engine_and_failure(engine, Some(Agent::Codex));
+        app.settings.runner_fallback = agy_fallback_chain(&["codex"]);
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "exhausted chain".to_owned();
+        app.submit_prompt();
+
+        let agy_turn_id = app
+            .active_turns
+            .get(&Agent::Agy)
+            .expect("the agy turn is active")
+            .turn_id
+            .clone();
+        let req = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(provider_trigger_error()),
+        }));
+
+        // The failed turn is reported exactly once.
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|m| m.content.contains("AGY error:"))
+                .count(),
+            1
+        );
+        // The engine never rejected a second write for the same turn.
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("Could not save")),
+            "the failure must be recorded once: {:?}",
+            app.messages
+        );
+        // No handover happened, only the exhausted chain is recorded.
+        assert_eq!(app.fallback_history.len(), 1);
+        assert_eq!(app.fallback_history[0].to_runner, None);
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("handed over to")),
+            "a failed handover must not be recorded as a handover"
+        );
+
+        let snapshot = app
+            .engine
+            .select(ConversationSelection::Existing(app.conversation_id.clone()))
+            .expect("conversation snapshot");
+        let turn = snapshot
+            .turns
+            .iter()
+            .find(|t| t.id.as_str() == agy_turn_id.as_str())
+            .expect("the agy turn is stored");
+        assert_eq!(turn.status, dmuxai::conversation::TurnStatus::Failed);
+        assert!(
+            turn.error_text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("503 service unavailable"),
+            "unexpected error text: {:?}",
+            turn.error_text
+        );
+    }
+
+    // FR-2133 / TC-2133: a target whose model cannot be applied is skipped
+    // instead of running with the wrong model.
+    #[test]
+    fn tc_2133_target_with_unusable_model_is_skipped() {
+        let (mut app, sent) = test_app_with_select_model_failure(Agent::Codex);
+        app.settings.runner_fallback = agy_fallback_chain(&["codex:composer-2.5"]);
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "unusable model".to_owned();
+        app.submit_prompt();
+
+        let req = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Agy,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(provider_trigger_error()),
+        }));
+
+        // The skipped target never ran.
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        // The reason is reported to the user.
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("skipping this fallback target")),
+            "unexpected messages: {:?}",
+            app.messages
+        );
+        // The chain is exhausted; the original error stands.
+        assert_eq!(app.fallback_history.len(), 1);
+        assert_eq!(app.fallback_history[0].to_runner, None);
+    }
+
+    // FR-2134 / TC-2134: after a handover the headless text is the final
+    // runner's message only; the failed runner's output stays in `messages`.
+    #[test]
+    fn tc_2134_headless_text_uses_the_final_runner_only() {
+        let mapped = vec![
+            HeadlessMessage {
+                role: "agent".to_owned(),
+                agent: Some("first".to_owned()),
+                content: "partial output of the failed runner".to_owned(),
+            },
+            HeadlessMessage {
+                role: "agent".to_owned(),
+                agent: Some("second".to_owned()),
+                content: "final answer".to_owned(),
+            },
+        ];
+        let records = vec![dmuxai::runner_fallback::FallbackRecord {
+            from_runner: "first".to_owned(),
+            from_model: None,
+            reason: "quota".to_owned(),
+            detail: "429 rate limit exceeded".to_owned(),
+            to_runner: Some("second".to_owned()),
+            to_model: None,
+        }];
+        assert_eq!(App::headless_answer_text(&mapped, &records), "final answer");
+        // Without a handover every agent message belongs to the answer.
+        assert_eq!(
+            App::headless_answer_text(&mapped, &[]),
+            "partial output of the failed runner\n\nfinal answer"
         );
     }
 }

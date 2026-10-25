@@ -15,6 +15,11 @@ pick_runner() {
   printf '%s\n' "$1" | awk '/^- / { line = $0; sub(/^- /, "", line); sub(/:.*/, "", line); print line; exit }'
 }
 
+# Escapes a text for a JSON string value (newlines become \n).
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | awk 'BEGIN { ORS = "" } { if (NR > 1) printf "\\n"; print }'
+}
+
 emit_plan_json() {
   runner=$(pick_runner "$1")
   if [ -z "$runner" ]; then
@@ -50,7 +55,7 @@ dispatch_judge_or_plan() {
 }
 
 case "$behavior" in
-  jsonl)  printf '{"type":"step_start","sessionID":"ses_1"}\n{"type":"text","sessionID":"ses_1","part":{"text":"echo:%s"}}\n' "$last" ;;
+  jsonl)  printf '{"type":"step_start","sessionID":"ses_1"}\n{"type":"text","sessionID":"ses_1","part":{"text":"echo:%s"}}\n' "$(json_escape "$last")" ;;
   text)   echo "hello $last" ;;
   stdin)  read -r line; echo "stdin:$line" ;;
   empty)  : ;;
@@ -63,6 +68,11 @@ case "$behavior" in
   denied) echo "Error: permission denied for bash" >&2; echo "partial" ;;
   fail)   echo "boom" >&2; exit 3 ;;
   error)  printf '{"type":"error","error":{"message":"model not found"}}\n' ;;
+  rate-limit)
+    # Partial output, then a provider error that triggers a runner fallback.
+    printf '{"type":"text","sessionID":"ses_1","part":{"text":"partial from the failed runner\\n"}}\n'
+    printf '{"type":"error","error":{"message":"429 rate limit exceeded"}}\n'
+    ;;
   env)    echo "cfg=$FAKE_CFG content=$(cat "$FAKE_CFG")" ;;
   sleep)  sleep 30; echo late ;;
   judge|plan|judge-simple) dispatch_judge_or_plan "$last" ;;

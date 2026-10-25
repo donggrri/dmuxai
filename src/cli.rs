@@ -659,7 +659,7 @@ async fn print_events(root: &Path, since: u64, limit: Option<usize>, follow: boo
 }
 
 fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Value {
-    json!({
+    let mut value = json!({
         "ok": outcome.ok,
         "exit_code": outcome.exit_code,
         "conversation_id": outcome.conversation_id,
@@ -679,7 +679,12 @@ fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Val
         } else {
             json!({ "first_seq": null, "last_seq": null })
         },
-    })
+    });
+    // FR-2119: the runner fallbacks of this run, omitted when there were none.
+    if !outcome.fallbacks.is_empty() {
+        value["fallbacks"] = json!(outcome.fallbacks);
+    }
+    value
 }
 
 /// Headless `run` / `todo run` (FR-761, FR-762).
