@@ -221,6 +221,38 @@ static UNAVAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
+/// Error messages that report an unknown or unavailable model (FR-2126).
+static MODEL_UNAVAILABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?ix)
+        \b(?:
+              model \s+ (?: \S+ \s+ )? (?: does \s+ not \s+ exist
+                                     | is \s+ not \s+ available
+                                     | not \s+ available
+                                     | is \s+ not \s+ supported
+                                     | not \s+ supported
+                                     | is \s+ unknown
+                                     | is \s+ invalid
+                                     | not \s+ found
+                                     | is \s+ not \s+ a \s+ valid \s+ model )
+            | model \s+ not \s+ found
+            | not \s+ a \s+ valid \s+ model
+            | (?: unknown | invalid | unavailable | unsupported | unrecognized | unrecognised )
+              \s+ model
+        )\b",
+    )
+    .unwrap()
+});
+
+/// True when the message reports an unknown or unavailable model.
+///
+/// Used to decide whether a failure may be reclassified as
+/// `model_unavailable` (FR-2126). It is deliberately narrow: unrelated
+/// provider or process failures must not trigger a runner handover.
+pub fn is_model_unavailable_message(message: &str) -> bool {
+    MODEL_UNAVAILABLE_RE.is_match(message)
+}
+
 pub fn is_transient_provider_error(message: &str) -> bool {
     static RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)api error \(attempt \d+\)|request failed|stream idle timeout|stream was interrupted|connection (timed out|reset|refused|closed)|(request|read|connect|connection|operation) timed out|(status|code|http)[ :=(]*5\d\d|\b5\d\d (internal|bad gateway|service unavailable|gateway timeout)|internal \(code|\binternal\b.*\berror\b|service unavailable|\bunavailable\b|overloaded|bad gateway|gateway timeout|deadline exceeded|broken pipe|eof while|network (error|is unreachable)").unwrap()
@@ -776,6 +808,38 @@ mod tests {
             p,
             "[DmuxAI runner fallback] The previous agent (agy-flash) was interrupted (stall: no model progress for 240s) and may have left partial edits in the workspace. Check `git status` and `git diff` first, keep correct partial work, and continue the task instead of restarting it.\n\n"
         );
+    }
+
+    // TC-2128 / FR-2126: only messages that report an unknown or unavailable
+    // model may reclassify a failure as model_unavailable.
+    #[test]
+    fn tc_2128_model_unavailable_message_matcher() {
+        assert!(is_model_unavailable_message("model not found"));
+        assert!(is_model_unavailable_message("unknown model"));
+        assert!(is_model_unavailable_message("invalid model"));
+        assert!(is_model_unavailable_message("not a valid model"));
+        assert!(is_model_unavailable_message("model gpt-9 does not exist"));
+        assert!(is_model_unavailable_message("model gpt-9 is not available"));
+        assert!(is_model_unavailable_message(
+            "model opencode/beam-free not supported"
+        ));
+        assert!(is_model_unavailable_message(
+            "opencode failed: model opencode/beam-free does not exist"
+        ));
+
+        assert!(!is_model_unavailable_message("boom"));
+        assert!(!is_model_unavailable_message("tests failed: 3 failures"));
+        assert!(!is_model_unavailable_message(
+            "request failed: connection timed out"
+        ));
+        assert!(!is_model_unavailable_message("429 Too Many Requests"));
+        assert!(!is_model_unavailable_message("permission denied"));
+        assert!(!is_model_unavailable_message(
+            "the model returned an invalid response"
+        ));
+        assert!(!is_model_unavailable_message(
+            "model output was not accepted by the tool"
+        ));
     }
 
     #[test]

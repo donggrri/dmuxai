@@ -3550,6 +3550,11 @@ impl App {
         }
     }
 
+    /// FR-1729 / FR-2126: attach the catalog hint to a failed turn. The error
+    /// kind is only rewritten to `ModelUnavailable` when the error message
+    /// itself reports an unknown or unavailable model; unrelated provider or
+    /// process failures keep their kind so they do not trigger a runner
+    /// handover (SPEC-runner-fallback).
     fn attach_model_catalog_hint(&self, output: &mut AgentOutput) {
         if let AgentEvent::Error(err) = &mut output.event
             && let Some(hint) = self
@@ -3557,13 +3562,17 @@ impl App {
                 .get(&output.agent)
                 .and_then(|turn| turn.model_catalog_hint.clone())
         {
+            let model_unavailable =
+                dmuxai::runner_fallback::is_model_unavailable_message(&err.message);
             if err.hint.is_none() {
                 err.hint = Some(hint);
             }
-            if matches!(
-                err.kind,
-                AgentErrorKind::Provider | AgentErrorKind::ProcessExit
-            ) {
+            if model_unavailable
+                && matches!(
+                    err.kind,
+                    AgentErrorKind::Provider | AgentErrorKind::ProcessExit
+                )
+            {
                 err.kind = AgentErrorKind::ModelUnavailable;
             }
         }
@@ -30413,8 +30422,43 @@ mod tests {
             agent: a,
             conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
             turn_id: Some(TurnId::new(req.turn_id.as_str())),
-            event: AgentEvent::Error(AgentError::provider("boom")),
+            event: AgentEvent::Error(AgentError::provider("model not found")),
         }));
+        let msgs: Vec<String> = app.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("model not found") && m.contains("is not offered")),
+            "{msgs:?}"
+        );
+    }
+
+    // TC-2129 / FR-2126: a generic provider failure keeps its kind when the
+    // turn had a catalog warning; only the hint is attached.
+    #[test]
+    fn tc_2129_generic_provider_error_keeps_provider_kind_with_hint() {
+        let _ = install_shared_test_registry();
+        let idx = dmuxai::custom_agent::index_of("opencode-step")
+            .expect("shared test registry has opencode-step");
+        let agent = Agent::Custom(idx);
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        app.model_catalogs.get_mut(&agent).unwrap().models = vec![ModelInfo::new(
+            "opencode/other-free".to_owned(),
+            "opencode/other-free".to_owned(),
+        )];
+        app.selected = adapter_index(agent);
+        let _ = app.try_submit_to_agent(agent, "hello".into(), false, true);
+        let (a, req) = sent.lock().unwrap()[0].clone();
+        event_tx
+            .try_send(AgentOutput {
+                agent: a,
+                conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+                turn_id: Some(TurnId::new(req.turn_id.as_str())),
+                event: AgentEvent::Error(AgentError::provider("request failed: boom")),
+            })
+            .unwrap();
+        let outcome = app.drain_agent_events();
+        assert!(outcome.errored);
+        assert_eq!(outcome.error_kind.as_deref(), Some("provider"));
         let msgs: Vec<String> = app.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
             msgs.iter()
@@ -30443,7 +30487,7 @@ mod tests {
                 agent: a,
                 conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
                 turn_id: Some(TurnId::new(req.turn_id.as_str())),
-                event: AgentEvent::Error(AgentError::provider("boom")),
+                event: AgentEvent::Error(AgentError::provider("model not found")),
             })
             .unwrap();
         let outcome = app.drain_agent_events();

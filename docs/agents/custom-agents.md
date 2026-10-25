@@ -63,6 +63,13 @@ DmuxAI emits a one-time notice suggesting `output = "jsonl"` and `text_path`.
 
 Failure (shown as an error turn): spawn error, non-zero exit, timeout, empty reply text,
 a jsonl `error_path` hit, or stderr matching `failure_stderr`.
+Empty reply text is a failure *unless* the workspace changed while the turn ran: in an
+Implement (edit-allowed) turn that exits 0 with no reply and no error, DmuxAI compares
+`git status --porcelain` before and after the run and, when the workspace changed, finishes
+the turn with the notice `<label> finished without a final message; workspace files changed`
+instead of an error. The comparison needs `git` and a workspace inside a git repository;
+without them an empty reply stays a failure. Ask/Plan (read-only) turns always fail on an
+empty reply.
 If a transient provider error arrives after the final text (same line or the previous
 non-empty line), the turn completes with a Notice "...(#151)" instead of failing, so a
 runner-fallback chain can still take over on mid-turn errors.

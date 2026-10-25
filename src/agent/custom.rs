@@ -7,8 +7,8 @@ use std::{
 
 use dmuxai::custom_agent::{
     BUILTIN_MODELS_TIMEOUT, CustomAgentOutput, CustomAgentSpec, SubstitutionContext, build_argv,
-    failure_reason, grok_no_allowed_model_message, is_builtin_grok, list_model_ids,
-    parse_jsonl_line, policy_message, select_grok_model, spec_at, substitute, timeout_parts,
+    grok_no_allowed_model_message, is_builtin_grok, list_model_ids, parse_jsonl_line,
+    policy_message, select_grok_model, spec_at, substitute, timeout_parts,
 };
 use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 
@@ -529,6 +529,16 @@ async fn run_turn(
         ..Default::default()
     };
 
+    // FR-2125: an edit-allowed turn that leaves the workspace changed is
+    // evidence of work, so an empty final reply is not a failure. Sample the
+    // workspace before the child starts.
+    let edit_allowed = request.policy == TurnPolicy::Agent;
+    let fingerprint_before = if edit_allowed {
+        workspace_fingerprint(cwd).await
+    } else {
+        None
+    };
+
     let mut supervised =
         dmuxai::process::supervisor::spawn(command, supervisor_config).map_err(|error| {
             AgentError::process_exit(format!(
@@ -740,9 +750,39 @@ async fn run_turn(
 
     let stderr_text = supervised.stderr_tail().await;
     let exit_ok = done || status.success();
-    if let Some(reason) =
-        failure_reason(spec, exit_ok, &reply, &stderr_text, jsonl_error.as_deref())
-    {
+    // FR-2125: sample the workspace again after the child exited.
+    let fingerprint_after = if edit_allowed {
+        workspace_fingerprint(cwd).await
+    } else {
+        None
+    };
+    let workspace_changed = matches!(
+        (fingerprint_before.as_deref(), fingerprint_after.as_deref()),
+        (Some(before), Some(after)) if before != after
+    );
+    let outcome = dmuxai::custom_agent::classify_turn_outcome(
+        spec,
+        exit_ok,
+        &reply,
+        &stderr_text,
+        jsonl_error.as_deref(),
+        workspace_changed,
+    );
+    if let dmuxai::custom_agent::TurnOutcome::SuccessWithoutReply = outcome {
+        // FR-2125: the runner did the work but sent no final message.
+        send(
+            event_tx,
+            agent,
+            Some(context),
+            AgentEvent::Notice(format!(
+                "{} finished without a final message; workspace files changed",
+                spec.label()
+            )),
+        )
+        .await;
+        return Ok(());
+    }
+    if let dmuxai::custom_agent::TurnOutcome::Failed(reason) = outcome {
         let is_policy = spec
             .failure_stderr
             .as_deref()
@@ -801,6 +841,33 @@ async fn run_turn(
         return Err(err);
     }
     Ok(())
+}
+
+/// How long the workspace fingerprint command may run before it is abandoned.
+const WORKSPACE_FINGERPRINT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cheap fingerprint of the workspace state: the raw `git status` porcelain
+/// output. Returns `None` when git is missing, the workspace is not a
+/// repository, or the command does not finish in time (FR-2125).
+///
+/// DmuxAI's own temp config and system-prompt files are written to the system
+/// temp directory, outside the workspace, so they never appear in the
+/// fingerprint.
+async fn workspace_fingerprint(cwd: &Path) -> Option<String> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(WORKSPACE_FINGERPRINT_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// How long the process may take to exit on its own after its `done_when` line or EOF.
@@ -1171,6 +1238,13 @@ mod tests {
     async fn run_turn_capture_events(
         spec: &CustomAgentSpec,
     ) -> (Result<(), AgentError>, Vec<AgentEvent>) {
+        run_turn_capture_events_in(spec, std::env::temp_dir()).await
+    }
+
+    async fn run_turn_capture_events_in(
+        spec: &CustomAgentSpec,
+        cwd: PathBuf,
+    ) -> (Result<(), AgentError>, Vec<AgentEvent>) {
         let (tx, mut rx) = mpsc::channel(64);
         let request = AgentRequest {
             conversation_id: ConversationId::new("c"),
@@ -1184,7 +1258,6 @@ mod tests {
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
-        let cwd = std::env::temp_dir();
         let result = run_turn(
             Agent::Custom(0),
             spec,
@@ -1204,6 +1277,86 @@ mod tests {
             events.push(output.event);
         }
         (result, events)
+    }
+
+    /// Creates an empty git repository in a temp dir (FR-2125). Returns `None`
+    /// when git is not installed.
+    fn init_git_repo() -> Option<tempfile::TempDir> {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match status {
+            Ok(status) if status.success() => Some(dir),
+            _ => None,
+        }
+    }
+
+    // TC-2126 / FR-2125: an agent that edits the workspace but sends no final
+    // message completes with a notice instead of failing on "empty reply text".
+    #[tokio::test]
+    async fn tc_2126_empty_reply_with_workspace_change_succeeds() {
+        let Some(repo) = init_git_repo() else {
+            eprintln!("git not available; skipping");
+            return;
+        };
+        let out = repo.path().join("created.txt");
+        let extra = format!(
+            "label = \"silent-editor\"\nenv = {{ FAKE_AGENT_OUT = \"{}\" }}",
+            out.to_str().expect("utf8 path")
+        );
+        let spec = spec("writefile", &extra);
+        let (result, events) = run_turn_capture_events_in(spec, repo.path().to_path_buf()).await;
+        assert_eq!(result, Ok(()), "events: {events:?}");
+        assert!(out.exists(), "fake agent must have written the file");
+        let notices: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(message) => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(
+                |message| message.contains("finished without a final message")
+                    && message.contains("workspace files changed")
+            ),
+            "notices: {notices:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error(_))),
+            "must not emit AgentEvent::Error: {events:?}"
+        );
+    }
+
+    // TC-2127 / FR-2125: without a workspace change the empty reply stays a
+    // failure.
+    #[tokio::test]
+    async fn tc_2127_empty_reply_without_workspace_change_fails() {
+        let Some(repo) = init_git_repo() else {
+            eprintln!("git not available; skipping");
+            return;
+        };
+        let spec = spec("empty", "label = \"silent-agent\"");
+        let (result, events) = run_turn_capture_events_in(spec, repo.path().to_path_buf()).await;
+        let error = result.expect_err("empty reply without changes must fail");
+        assert!(
+            error.to_string().contains("empty reply text"),
+            "error: {error}"
+        );
+        assert_eq!(error.kind, AgentErrorKind::Provider);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Notice(message) if message.contains("finished without a final message")
+            )),
+            "must not emit the workspace-change notice: {events:?}"
+        );
     }
 
     // TC-1724 / FR-1721: e2e agy success line finishes without AgentEvent::Error.
