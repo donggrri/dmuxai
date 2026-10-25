@@ -5445,7 +5445,20 @@ impl App {
             _ => None,
         };
         let delivery = dmuxai::agent_prompt::delivery(runner, custom_spec);
-        let resolved_prompt = self.settings.resolve_agent_prompt(runner, prompt_role);
+        // The effective model is needed before the prompt: built-ins are chosen
+        // per model, so a model switch mid-conversation re-injects (FR-2152).
+        let resolved_model = self
+            .selected_run_model(agent)
+            .ok()
+            .flatten()
+            .or_else(|| custom_spec.and_then(|spec| spec.default_model.clone()))
+            .or_else(|| dmuxai::model_policy::default_model_for_runner(runner).map(str::to_owned));
+        let resolved_prompt = self.settings.resolve_agent_prompt_for(
+            runner,
+            resolved_model.as_deref(),
+            prompt_role,
+            policy == TurnPolicy::Agent,
+        );
 
         let mut injected_prompt_hash: Option<String> = None;
         if let Some(resolved) = resolved_prompt {
@@ -5482,8 +5495,8 @@ impl App {
             }
         }
 
-        // FR-1729: catalog check before the turn is sent.
-        let resolved_model = self.selected_run_model(agent).ok().flatten();
+        // FR-1729: catalog check before the turn is sent. `resolved_model` was
+        // computed above so per-model prompts use the same effective model.
         let catalog_ids: Vec<String> = self
             .model_catalogs
             .get(&agent)
@@ -16934,6 +16947,16 @@ mod tests {
         });
     }
 
+    fn disable_builtin_prompts(app: &mut App) {
+        app.settings.runner_prompts.insert(
+            "default".to_owned(),
+            dmuxai::agent_prompt::RunnerPromptConfig {
+                builtin_prompt: Some(false),
+                ..Default::default()
+            },
+        );
+    }
+
     fn test_app() -> (App, SentRequests) {
         pin_test_state_dir();
         let workspace = std::env::current_dir().unwrap();
@@ -17850,6 +17873,7 @@ mod tests {
     #[test]
     fn busy_retry_reuses_own_message_with_parallel_steps() {
         let (mut app, sent, _tx) = test_app_with_event_sender();
+        disable_builtin_prompts(&mut app);
         app.selected = adapter_index(Agent::Cursor);
         app.quiet_graph_run = false;
         app.start_graph_run(parallel_cursor_codex_plan("dup-parallel"));
@@ -20594,6 +20618,7 @@ mod tests {
     // TC-413 / FR-410, FR-412: Slash-prefixed prompt to Cursor still pins composer-2.5.
     fn slash_prefixed_prompt_to_cursor_still_pins_composer_2_5() {
         let (mut app, sent) = test_app();
+        disable_builtin_prompts(&mut app);
         app.selected = adapter_index(Agent::Cursor);
         app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
 
@@ -20666,6 +20691,7 @@ mod tests {
     #[test]
     fn submitting_routes_to_the_selected_agent() {
         let (mut app, sent) = test_app();
+        disable_builtin_prompts(&mut app);
         app.selected = adapter_index(Agent::Cursor);
         app.input = "Explain ownership".to_owned();
 
@@ -23107,6 +23133,7 @@ mod tests {
 
     fn memory_test_app(dir: &std::path::Path) -> (App, SentRequests) {
         let (mut app, sent) = test_app();
+        disable_builtin_prompts(&mut app);
         app.memory = Some(dmuxai::memory::MemoryHandle {
             store: dmuxai::memory::MemoryStore::new(dir.to_path_buf()),
             project: "demo".to_owned(),
@@ -24928,6 +24955,7 @@ mod tests {
             DmuxSettings::default(),
         )
         .unwrap();
+        disable_builtin_prompts(&mut app);
         app.selected = adapter_index(Agent::Cursor);
         app.skip_judge_for_tests = true;
 
@@ -33069,6 +33097,8 @@ mod tests {
                 inject: Some(inject),
                 roles: None,
                 model: None,
+                models: None,
+                builtin_prompt: None,
             },
         );
     }
@@ -33314,6 +33344,8 @@ mod tests {
                 inject: Some(PromptInject::Session),
                 roles: None,
                 model: None,
+                models: None,
+                builtin_prompt: None,
             },
         );
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -33371,6 +33403,53 @@ mod tests {
         assert!(json.contains("\"hash\""));
         assert!(json.contains("\"delivery\""));
         assert!(!json.contains("INSTR"));
+    }
+
+    // TC-2157 / FR-2152, FR-2155: app turns prepend the built-in prompt for
+    // Cursor's composer-2.5 and for an AGY-family model on a custom runner.
+    #[test]
+    fn tc_2157_app_builtin_prompts_by_model_and_runner() {
+        let (mut app, sent) = test_app();
+        app.selected = adapter_index(Agent::Cursor);
+        app.input = "hello".to_owned();
+        app.submit_prompt();
+        {
+            let reqs = sent.lock().unwrap();
+            let prompt = &reqs[0].1.prompt;
+            assert!(prompt.starts_with("<agent-instructions>"));
+            assert!(prompt.contains("You are an expert software engineer"));
+            assert!(prompt.contains("Do not narrate progress"));
+        }
+
+        let (mut app, sent) = test_app();
+        app.model_catalogs.entry(Agent::Agy).or_default().selected =
+            Some("gemini-3.8-flash-low".to_owned());
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "hello".to_owned();
+        app.submit_prompt();
+        {
+            let reqs = sent.lock().unwrap();
+            let prompt = &reqs[0].1.prompt;
+            assert!(prompt.starts_with("<agent-instructions>"));
+            assert!(prompt.contains("You are a senior software engineer working autonomously"));
+            assert!(prompt.contains("no manage_task"));
+        }
+
+        let (mut app, sent) = test_app();
+        app.model_catalogs
+            .entry(Agent::Cursor)
+            .or_default()
+            .selected = Some("grok-4.7".to_owned());
+        app.selected = adapter_index(Agent::Cursor);
+        app.input = "hello".to_owned();
+        app.submit_prompt();
+        {
+            let reqs = sent.lock().unwrap();
+            let prompt = &reqs[0].1.prompt;
+            assert!(prompt.starts_with("<agent-instructions>"));
+            assert!(prompt.contains("running headless in Cursor's agent"));
+            assert!(prompt.contains("## Stop conditions"));
+        }
     }
 
     #[test]

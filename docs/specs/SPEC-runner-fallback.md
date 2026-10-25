@@ -9,7 +9,7 @@ Related: #151, PR-10
 
 ## 1. Decision summary
 
-When a runner fails for provider reasons (quota, auth, transient network error, a runner that could not start) or stalls, DmuxAI may hand the same turn to the next runner/model in an ordered per-runner chain configured under `[runners.<id>]` / `[runners.default]`. A failed turn is recorded with a Notice and Failed state, a `fallback` event is emitted, and the next target receives the original prompt with a preface telling it to check `git status` and `git diff` first. Empty or missing chains preserve the old behaviour. Stall detection runs inside the agy and custom command adapters only when a chain exists. AGY also keeps results after a transient provider error reported after the final answer step (#151), no longer passes `--sandbox` on agent turns, and adds a short efficiency rule block to its agent prompt.
+When a runner fails for provider reasons (quota, auth, transient network error, a runner that could not start) or stalls, DmuxAI may hand the same turn to the next runner/model in an ordered per-runner chain configured under `[runners.<id>]` / `[runners.default]`. A failed turn is recorded with a Notice and Failed state, a `fallback` event is emitted, and the next target receives the original prompt with a preface telling it to check `git status` and `git diff` first. Empty or missing chains preserve the old behaviour. Stall detection runs inside the agy and custom command adapters only when a chain exists. AGY also keeps results after a transient provider error reported after the final answer step (#151), no longer passes `--sandbox` on agent turns, and receives its efficiency rules from the built-in AGY/Gemini prompt (SPEC-agent-system-prompt FR-2156) rather than from `agy_prompt`.
 
 ## 2. Scope
 
@@ -20,7 +20,7 @@ When a runner fails for provider reasons (quota, auth, transient network error, 
 - Stall detection in agy and custom command adapters.
 - Handover across chat turns, graph worker nodes, and headless `dmuxai run` turns.
 - Headless `run --json` `fallbacks` array.
-- AGY #151 recovery, `--sandbox` removal on agent turns, efficiency rules.
+- AGY #151 recovery, `--sandbox` removal on agent turns, and efficiency rules delivered by the built-in AGY prompt.
 - Custom agent #151 recovery and `stall_keepalive`.
 
 ### Out of scope / non-goals
@@ -66,7 +66,7 @@ When a runner fails for provider reasons (quota, auth, transient network error, 
 | FR-2111 | Must | Given an AGY turn ending in a transient provider error after the final answer step | Complete with a Notice "...the result was kept (#151)" instead of failing; mid-turn or non-transient errors still fail | Result kept | TC-2111 |
 | FR-2112 | Must | Given a custom agent turn with a transient provider error after final text | Complete with a Notice "...(#151)"; mid-turn or non-transient errors still fail | Warning only at final | TC-2112 |
 | FR-2113 | Must | Given an AGY agent turn | Do not pass `--sandbox`; read-only turns keep `--mode plan --sandbox` | Agent turns can run cargo fmt/test | TC-2113 |
-| FR-2114 | Must | Given an AGY agent turn | Include the "Work efficiently" rule block (no manage_task, read 200+ lines at once, batch rg, run only cargo check and changed tests; leave fmt/clippy/full suite to caller) | Prompt contains rules | TC-2114 |
+| FR-2114 | Must | Given an AGY agent turn | Receive the "Work efficiently" rules (no manage_task, read 200+ lines at once, batch rg, run only cargo check and changed tests; leave fmt/clippy/full suite to caller) from the built-in AGY/Gemini prompt; `agy_prompt` keeps only its edit/retry preface and does not duplicate them | Built-in AGY prompt contains the rules; `agy_prompt` does not | TC-2114 |
 | FR-2115 | Must | Given stall timers running | Supervisor `next_line_with_tick` keeps partial lines across ticks | No lost output | TC-2115 |
 | FR-2116 | Must | Given a custom agent with `stall_keepalive` | Lines matching the regex are keepalives only; stall triggers on no progress or API retry lines | Keepalive does not reset timer | TC-2116 |
 | FR-2117 | Must | Given an AGY turn with a tool running | Stall timer pauses while the tool is ACTIVE and fires after it finishes; no stall detection without a chain | Tool pause observed | TC-2117 |
@@ -96,7 +96,7 @@ When a runner fails for provider reasons (quota, auth, transient network error, 
 | TC-2111 | FR-2111 | integration | AGY fixture NDJSON with final answer then transient error | Run turn | Completes with #151 Notice; mid/non-transient errors fail | `src/agent/agy.rs` `tc_2111_agy_recovered_api_error_keeps_result`, `tc_2111_agy_non_transient_error_still_fails`, `tc_2111_agy_mid_turn_api_error_still_fails` |
 | TC-2112 | FR-2112 | integration | Custom agent output with final text then transient error | Run turn | Completes with #151 Notice; mid/non-transient errors fail | `src/agent/custom.rs` `tc_2112_custom_final_text_then_transient_error_is_warning`, `tc_2112_custom_non_transient_error_still_fails`, `tc_2112_custom_mid_turn_transient_error_still_fails` |
 | TC-2113 | FR-2113 | unit | AGY command config | configure_command for Agent/ReadOnly | Agent has no --sandbox; ReadOnly keeps it | `src/agent/agy.rs` `tc_2113_agy_agent_mode_has_no_sandbox` |
-| TC-2114 | FR-2114 | unit | AGY prompt builder | Build agent prompt | Contains efficiency rules | `src/agent/agy.rs` `tc_2114_agy_agent_prompt_has_efficiency_rules` |
+| TC-2114 | FR-2114 | unit | AGY prompt builder and built-in prompt | Build agent prompt and inspect built-in | Built-in AGY prompt contains the efficiency rules; `agy_prompt` no longer duplicates them | `src/agent/agy.rs` `tc_2114_agy_agent_prompt_has_efficiency_rules` |
 | TC-2115 | FR-2115 | unit | Partial line across ticks | next_line_with_tick | Partial line preserved | `src/process/supervisor.rs` `tc_2115_next_line_with_tick_keeps_partial_line` |
 | TC-2116 | FR-2116 | integration | Custom agent with keepalive regex and retry lines | Run turn | Stall fires as specified | `src/agent/custom.rs` `tc_2116_custom_stall_with_keepalive_output`, `tc_2116_custom_api_retry_lines_stall` |
 | TC-2117 | FR-2117 | integration | AGY turn with tool running and no chain | Run turn | Tool pauses stall; no detection without chain | `src/agent/agy.rs` `tc_2117_agy_running_tool_pauses_stall`, `tc_2117_agy_stall_fires_after_tool_finished`, `tc_2117_no_stall_without_fallback_chain` |
@@ -119,7 +119,7 @@ When a runner fails for provider reasons (quota, auth, transient network error, 
 | Stall detection | Only agy/custom command adapters, only with chain | ACP runners unaffected | TC-2106, TC-2107, TC-2116, TC-2117 |
 | Events | New `kind: "fallback"` event with to_state runner or exhausted | Readers ignore unknown kinds | TC-2118 |
 | Headless JSON | Optional `fallbacks` array; `text` is the final runner's text only | Omitted when empty; ok/exit_code final | TC-2119, TC-2134, TC-2136 |
-| AGY | No `--sandbox` on agent turns; efficiency rules; #151 recovery | Read-only turns unchanged | TC-2111, TC-2113, TC-2114 |
+| AGY | No `--sandbox` on agent turns; efficiency rules from the built-in AGY prompt; #151 recovery | Read-only turns unchanged | TC-2111, TC-2113, TC-2114 |
 | Custom | #151 recovery; `stall_keepalive` | Mid-turn errors still fail | TC-2112, TC-2116 |
 
 ## 7. Implementation plan

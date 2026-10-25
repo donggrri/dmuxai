@@ -447,9 +447,9 @@ An explicit config path passed via `--config` or `DMUXAI_CONFIG` that does not e
 tasks_file = true
 ```
 
-### `[runners.default]` / `[runners.<id>]`
+### `[runners.default]` / `[runners.<id>]` / `[runners.<id>.models."<model>"]`
 
-Per-runner system prompts. User config sets defaults; workspace `dmuxai.toml` overrides per key.
+Per-runner and per-model system prompts. User config sets defaults; workspace `dmuxai.toml` overrides per key.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -457,13 +457,29 @@ Per-runner system prompts. User config sets defaults; workspace `dmuxai.toml` ov
 | `system_prompt_file` | — | Path to a prompt file, relative to the config file that sets it unless absolute. |
 | `prompt_inject` | `session` | `session` (inject on fresh session or hash change) or `always` (every turn). |
 | `prompt_roles` | `["chat", "worker"]` | Roles that may receive the prompt; `judge`/`triage`/`planner`/`replan`/`summary`/`interview` never do. |
+| `builtin_prompt` | `true` | Whether the built-in prompt may be used for this runner (or for runners without their own value under `[runners.default]`). `false` disables built-ins; a runner value beats the default value. |
+| `models` | — | Per-model prompt tables keyed by model id (`[runners.<id>.models."<model>"]`). Not allowed under `[runners.default]` (warns and is ignored). |
 | `model` | — | Per-runner model profile (`[runners.<id>] model = "..."`); validated with `validate_model_for_runner` (built-in) / `allowed_models` (custom). Invalid values are dropped with a config warning. `[runners.default] model` is ignored with a warning. |
 | `fallback` | — | Ordered chain of `"<runner>"` or `"<runner>:<model>"` targets tried when the runner fails for provider reasons or stalls; empty array disables the default chain for that runner; missing/empty means old behaviour. Invalid targets are dropped with a config warning. |
 | `stall_timeout_secs` | `240` | No-progress seconds that trigger a stall when the runner has a non-empty chain; `0` disables. |
 | `stall_api_retries` | `3` | Consecutive `API error (attempt N)` retry lines that trigger a stall; `0` disables. |
 
+`[runners.<id>.models."<model>"]` accepts `system_prompt`, `system_prompt_file`, and `prompt_inject` with the same validation, 32 KiB cap, relative-path rules, and warnings as the runner table. Model ids match case-insensitively after trimming. An explicitly empty/whitespace prompt at the model or runner level means "no prompt" and stops resolution; it does not fall through to built-ins or `[runners.default]`.
+
+Resolution order for a turn's prompt (first match wins; built-ins only on write turns):
+
+1. `[runners.<runner>.models."<model>"]`
+2. `[runners.<runner>]`
+3. Built-in by model (`gemini-*` → AGY/Gemini Flash, `composer-2.5` → Cursor, runner `cursor` + `grok-4.7*` → Cursor Grok)
+4. Built-in by runner (`agy` → AGY/Gemini Flash, `cursor` → Cursor, `grok` → Grok Build)
+5. `[runners.default]`
+6. None
+
+Built-in source labels are `builtin:model:gemini`, `builtin:model:composer-2.5`, `builtin:model:cursor:grok-4.7`, `builtin:runner:agy`, `builtin:runner:cursor`, and `builtin:runner:grok`. `prompt_inject` resolves model entry > runner table > default > `session`; built-ins use the runner/default value. Switching model changes the prompt hash and re-injects on the `session` cadence.
+
 ```toml
 [runners.default]
+builtin_prompt = true
 system_prompt = "Follow these rules."
 prompt_inject = "session"
 prompt_roles = ["chat", "worker"]
@@ -471,11 +487,18 @@ prompt_roles = ["chat", "worker"]
 [runners.codex]
 system_prompt_file = "prompts/codex.md"
 
+[runners.cursor]
+builtin_prompt = false
+
+[runners.cursor.models."composer-2.5"]
+system_prompt_file = "prompts/composer.md"
+prompt_inject = "session"
+```
+
 Precedence for a turn's effective model: explicit (`--model` / explicit request) >
 selected (F2 picker / `ModelCatalog.selected`) > `[runners.<id>] model` >
 custom agent `default_model` > runner default (Cursor → `composer-2.5`) >
 provider default (no `--model`).
-```
 
 ## 7. Environment variables and child process policy
 

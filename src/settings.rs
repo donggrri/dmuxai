@@ -1008,6 +1008,18 @@ impl DmuxSettings {
     ) -> Option<crate::agent_prompt::ResolvedPrompt> {
         crate::agent_prompt::resolve(self, runner, role)
     }
+
+    /// Pure resolver for a turn's system prompt with per-model and built-in
+    /// prompt support (SPEC-agent-system-prompt FR-2150..FR-2155).
+    pub fn resolve_agent_prompt_for(
+        &self,
+        runner: &str,
+        model: Option<&str>,
+        role: crate::agent_prompt::PromptRole,
+        write_turn: bool,
+    ) -> Option<crate::agent_prompt::ResolvedPrompt> {
+        crate::agent_prompt::resolve_for(self, runner, model, role, write_turn)
+    }
 }
 
 impl Default for DmuxSettings {
@@ -2818,7 +2830,7 @@ mod builtin_grok_tests {
 #[cfg(test)]
 mod agent_prompt_tests {
     use super::*;
-    use crate::agent_prompt::{PromptInject, PromptRole, resolve};
+    use crate::agent_prompt::{PromptInject, PromptRole, resolve, resolve_for};
 
     // TC-1707 (FR-1700): inline text
     #[test]
@@ -3372,6 +3384,279 @@ model = "opencode/beam-free"
                 .iter()
                 .any(|w| w.contains("unknown runner"))
         );
+    }
+
+    // TC-2150 / FR-2150: parse per-model prompts and reject the default table.
+    #[test]
+    fn tc_2150_settings_parse_model_prompts_and_default_warns() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("model.txt"), "Model file prompt").unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            r#"
+[runners.cursor]
+system_prompt = "Runner prompt"
+prompt_inject = "always"
+
+[runners.cursor.models."Composer-2.5"]
+system_prompt_file = "model.txt"
+prompt_inject = "session"
+
+[runners.cursor.models."inline-model"]
+system_prompt = "Inline model prompt"
+
+[runners.default.models."composer-2.5"]
+system_prompt = "ignored"
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+
+        let cursor = settings.runner_prompts.get("cursor").expect("cursor table");
+        let model = cursor
+            .models
+            .as_ref()
+            .and_then(|models| models.get("composer-2.5"))
+            .expect("case-insensitive model entry");
+        let prompt = model.prompt.as_ref().expect("model prompt");
+        assert_eq!(prompt.text, "Model file prompt");
+        assert_eq!(
+            prompt.source,
+            "workspace:[runners.cursor.models.\"Composer-2.5\"] (model.txt)"
+        );
+        assert_eq!(model.inject, Some(PromptInject::Session));
+
+        let inline = cursor
+            .models
+            .as_ref()
+            .and_then(|models| models.get("inline-model"))
+            .and_then(|model| model.prompt.as_ref())
+            .expect("inline model prompt");
+        assert_eq!(inline.text, "Inline model prompt");
+        assert_eq!(
+            inline.source,
+            "workspace:[runners.cursor.models.\"inline-model\"]"
+        );
+
+        let default = settings
+            .runner_prompts
+            .get("default")
+            .expect("default table exists");
+        assert!(
+            default.models.is_none(),
+            "[runners.default.models] must be ignored"
+        );
+        assert!(
+            settings.config_warnings.iter().any(|w| {
+                w.contains("[runners.default.models]")
+                    && w.contains("not allowed under [runners.default]")
+                    && w.contains("ignored")
+            }),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        assert!(
+            !settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("unknown") && w.contains("models")),
+            "models key must not trigger an unknown-key warning: {:?}",
+            settings.config_warnings
+        );
+
+        let resolved = resolve_for(
+            &settings,
+            "cursor",
+            Some("composer-2.5"),
+            PromptRole::Chat,
+            true,
+        )
+        .expect("model prompt resolved");
+        assert_eq!(resolved.text, "Model file prompt");
+    }
+
+    // TC-2159 / FR-2150: model prompt tables share runner validation rules.
+    #[test]
+    fn tc_2159_settings_model_prompt_validation_warns() {
+        let ws = tempfile::tempdir().unwrap();
+        let too_large = "x".repeat(32_769);
+        let config = format!(
+            r#"
+[runners.cursor.models."composer-2.5"]
+system_prompt = "inline"
+system_prompt_file = "missing.txt"
+
+[runners.cursor.models."big"]
+system_prompt = "{too_large}"
+
+[runners.cursor.models."bad-inject"]
+system_prompt = "ok"
+prompt_inject = "immediately"
+"#
+        );
+        std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+
+        assert!(settings.config_warnings.iter().any(|w| {
+            w.contains("[runners.cursor.models.\"composer-2.5\"]")
+                && w.contains("both system_prompt and system_prompt_file")
+        }));
+        assert!(settings.config_warnings.iter().any(|w| {
+            w.contains("[runners.cursor.models.\"big\"]")
+                && w.contains("exceeds 32 KiB (32768 bytes)")
+        }));
+        assert!(settings.config_warnings.iter().any(|w| {
+            w.contains("[runners.cursor.models.\"bad-inject\"]")
+                && w.contains("unknown prompt_inject 'immediately'")
+        }));
+    }
+
+    // TC-2151 / FR-2150, FR-2151: workspace overrides user per model key;
+    // builtin_prompt merges per key too.
+    #[test]
+    fn tc_2151_settings_model_prompt_workspace_overrides_user() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let user_toml = user_dir.path().join("user.toml");
+        std::fs::write(
+            &user_toml,
+            r#"
+[runners.cursor]
+builtin_prompt = false
+
+[runners.default]
+builtin_prompt = false
+
+[runners.cursor.models."composer-2.5"]
+system_prompt = "user model"
+prompt_inject = "always"
+
+[runners.cursor.models."user-only"]
+system_prompt = "user only model"
+"#,
+        )
+        .unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            r#"
+[runners.cursor]
+builtin_prompt = true
+
+[runners.cursor.models."composer-2.5"]
+system_prompt = "workspace model"
+"#,
+        )
+        .unwrap();
+
+        let settings = DmuxSettings::load_with_user_config(ws.path(), Some(&user_toml));
+        let cursor = settings.runner_prompts.get("cursor").expect("cursor table");
+        assert_eq!(cursor.builtin_prompt, Some(true));
+
+        let models = cursor.models.as_ref().expect("models");
+        let composer = models.get("composer-2.5").expect("composer entry");
+        let prompt = composer.prompt.as_ref().expect("composer prompt");
+        assert_eq!(prompt.text, "workspace model");
+        assert_eq!(
+            prompt.source,
+            "workspace:[runners.cursor.models.\"composer-2.5\"]"
+        );
+        // The workspace entry did not set prompt_inject, so the user value stays.
+        assert_eq!(composer.inject, Some(PromptInject::Always));
+
+        let user_only = models.get("user-only").expect("user-only entry");
+        assert_eq!(
+            user_only.prompt.as_ref().map(|p| p.text.as_str()),
+            Some("user only model")
+        );
+
+        // A runner table's builtin_prompt beats the default table's value, so
+        // cursor still resolves its built-in while agy (unset) does not.
+        assert_eq!(
+            settings
+                .runner_prompts
+                .get("default")
+                .and_then(|c| c.builtin_prompt),
+            Some(false)
+        );
+        let cursor_builtin = resolve_for(
+            &settings,
+            "cursor",
+            Some("unknown-model"),
+            PromptRole::Chat,
+            true,
+        )
+        .expect("cursor builtin");
+        assert_eq!(cursor_builtin.source, "builtin:runner:cursor");
+        assert!(
+            resolve_for(
+                &settings,
+                "agy",
+                Some("gemini-3.8-flash-low"),
+                PromptRole::Chat,
+                true,
+            )
+            .is_none()
+        );
+    }
+
+    // TC-2158 / FR-2152: an explicitly empty prompt at the model or runner
+    // level means "no prompt" and stops resolution.
+    #[test]
+    fn tc_2158_explicit_empty_prompt_stops_resolution() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("dmuxai.toml"),
+            r#"
+[runners.default]
+system_prompt = "default prompt"
+
+[runners.cursor]
+system_prompt = "runner prompt"
+
+[runners.cursor.models."composer-2.5"]
+system_prompt = "   "
+
+[runners.agy]
+system_prompt = ""
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+
+        // The blank model entry stops before the runner prompt and built-in.
+        assert!(
+            resolve_for(
+                &settings,
+                "cursor",
+                Some("composer-2.5"),
+                PromptRole::Chat,
+                true,
+            )
+            .is_none()
+        );
+
+        // The blank runner prompt stops before the default and built-in.
+        assert!(
+            resolve_for(
+                &settings,
+                "agy",
+                Some("gemini-3.8-flash-low"),
+                PromptRole::Chat,
+                true,
+            )
+            .is_none()
+        );
+
+        // The non-blank runner prompt still wins over the default.
+        let resolved = resolve_for(&settings, "cursor", Some("other"), PromptRole::Chat, true)
+            .expect("runner prompt");
+        assert_eq!(resolved.text, "runner prompt");
+
+        // An unset runner still falls through to the default prompt.
+        let resolved =
+            resolve_for(&settings, "codex", None, PromptRole::Chat, true).expect("default prompt");
+        assert_eq!(resolved.text, "default prompt");
     }
 }
 
