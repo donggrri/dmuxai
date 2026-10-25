@@ -30,9 +30,9 @@ pub fn validate_model_id(model_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Runner-aware validation: Cursor stays composer-2.5 only; AGY may use
+/// Runner-aware validation: Cursor accepts any non-fast model id; AGY may use
 /// `gemini-*-flash-*` models (the dogfooding runner); opencode may use `*-free`;
-/// grok may use `grok-*` ids that do not contain `fast` (FR-910, FR-911).
+/// grok and cursor may use `grok-*` ids that do not contain `fast` (FR-910, FR-911, FR-2180..2182).
 pub fn validate_model_for_runner(runner: &str, model_id: &str) -> Result<(), String> {
     let trimmed = model_id.trim();
     if trimmed.to_ascii_lowercase().contains("fast") {
@@ -51,19 +51,26 @@ pub fn validate_model_for_runner(runner: &str, model_id: &str) -> Result<(), Str
         };
     }
     if crate::custom_agent::is_grok_model_id(trimmed) {
-        return if runner_key == "grok" {
+        return if runner_key == "grok" || runner_key == "cursor" {
             Ok(())
         } else {
             Err(format!(
-                "model {trimmed} is not allowed for {runner_key}; only the grok runner accepts grok models"
+                "model {trimmed} is not allowed for {runner_key}; only grok and cursor runners accept grok models"
             ))
         };
     }
     let lower = trimmed.to_ascii_lowercase();
     match runner_key.as_str() {
+        "cursor" => {
+            if trimmed.is_empty() {
+                Err("model id must not be empty".to_owned())
+            } else {
+                Ok(())
+            }
+        }
         "agy" if lower.starts_with("gemini-") && lower.contains("-flash") => Ok(()),
         "opencode" if lower.starts_with("opencode/") && lower.ends_with("-free") => Ok(()),
-        "cursor" | "agy" | "codex" => validate_model_id(model_id),
+        "agy" | "codex" => validate_model_id(model_id),
         "grok" => Err(format!(
             "model {trimmed} is not allowed for grok; only grok-* models without fast are permitted"
         )),
@@ -280,9 +287,9 @@ mod tests {
         assert!(validate_model_for_runner("agy", "gemini-3.8-flash-medium").is_ok());
         assert!(validate_model_for_runner("agy", "composer-2.5").is_ok());
         assert!(validate_model_for_runner("agy", "gemini-4-pro").is_err());
-        assert!(validate_model_for_runner("cursor", "gemini-3.8-flash-medium").is_err());
+        assert!(validate_model_for_runner("cursor", "gemini-3.8-flash-medium").is_ok());
         assert!(validate_model_for_runner("opencode", "opencode/glm-5.3-flash-free").is_ok());
-        assert!(validate_model_for_runner("cursor", "opencode/glm-5.3-flash-free").is_err());
+        assert!(validate_model_for_runner("cursor", "opencode/glm-5.3-flash-free").is_ok());
     }
 
     // TC-910 / FR-910
@@ -316,7 +323,9 @@ mod tests {
         for id in ["grok-4.7", "grok-4.6", "Grok-4.7"] {
             assert!(validate_model_for_runner("grok", id).is_ok(), "{id}");
             assert!(validate_model_for_runner("GROK", id).is_ok(), "{id}");
-            for runner in ["cursor", "agy", "codex", "opencode"] {
+            assert!(validate_model_for_runner("cursor", id).is_ok(), "{id}");
+            assert!(validate_model_for_runner("CURSOR", id).is_ok(), "{id}");
+            for runner in ["agy", "codex", "opencode"] {
                 assert!(
                     validate_model_for_runner(runner, id).is_err(),
                     "{runner} {id}"
@@ -324,7 +333,7 @@ mod tests {
             }
         }
         assert!(validate_model_for_runner("cursor", "composer-2.5").is_ok());
-        assert!(validate_model_for_runner("cursor", "grok-4.7").is_err());
+        assert!(validate_model_for_runner("cursor", "grok-4.7").is_ok());
         assert!(validate_model_for_runner("grok", "composer-2.5").is_err());
         assert!(validate_model_for_runner("grok", "grok").is_err());
         assert!(validate_model_for_runner("grok", "opencode/glm-5.3-flash-free").is_err());
@@ -334,6 +343,43 @@ mod tests {
         // or custom runner never accepts them (no global registry mutation).
         assert!(validate_model_for_runner("zz-grok-policy", "grok-4.7").is_err());
         assert!(validate_model_for_runner("grok", "composer-2.5").is_err());
+    }
+
+    // TC-2180 / FR-2180
+    #[test]
+    fn tc_2180_cursor_accepts_non_fast_models() {
+        for id in [
+            "grok-4.7",
+            "grok-4.7-high",
+            "grok-4.7-low",
+            "grok-4.7-medium",
+            "grok-4.7-xhigh",
+            "claude-sonnet-5-5-high",
+            "composer-2.5",
+            "gpt-5",
+        ] {
+            assert!(validate_model_for_runner("cursor", id).is_ok(), "{id}");
+            assert!(validate_model_for_runner("CURSOR", id).is_ok(), "{id}");
+        }
+    }
+
+    // TC-2181 / FR-2181
+    #[test]
+    fn tc_2181_cursor_and_grok_reject_fast_models() {
+        for runner in ["cursor", "grok"] {
+            for id in [
+                "grok-4.7-build-fast",
+                "composer-2.5-fast",
+                "FAST-model",
+                "claude-fast-high",
+            ] {
+                let err = validate_model_for_runner(runner, id).unwrap_err();
+                assert!(
+                    err.contains("fast models are blocked by policy"),
+                    "{runner} {id}: {err}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -412,7 +458,7 @@ mod tests {
             "cursor",
             ModelCandidates {
                 explicit: None,
-                selected: Some("claude-x"),
+                selected: Some("claude-x-fast"),
                 config_default: None,
             },
         )
@@ -436,7 +482,7 @@ mod tests {
             ModelResolution::resolve(
                 "cursor",
                 ModelCandidates {
-                    explicit: Some("gpt-5"),
+                    explicit: Some("gpt-5-fast"),
                     selected: None,
                     config_default: None,
                 }

@@ -1356,10 +1356,10 @@ mod tests {
                 false,
             ),
             (
-                r#"{"steps":[{"id":"a","role":"implement","job":"one","runner":"cursor","model":"gpt-5","depends_on":[]}]}"#
+                r#"{"steps":[{"id":"a","role":"implement","job":"one","runner":"agy","model":"gemini-4-pro","depends_on":[]}]}"#
                     .to_owned(),
                 "a",
-                policy("gpt-5"),
+                crate::model_policy::validate_model_for_runner("agy", "gemini-4-pro").unwrap_err(),
                 false,
             ),
             (

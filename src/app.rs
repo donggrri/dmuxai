@@ -23876,7 +23876,7 @@ mod tests {
             assert_eq!(outcome.error_kind.as_deref(), Some("policy"));
             assert!(sent.lock().unwrap().is_empty(), "no adapter request");
         }
-        // cursor + gpt-5
+        // cursor + composer-2.5-fast
         {
             let (mut app, sent) = test_app();
             app.selected = adapter_index(Agent::Cursor);
@@ -23889,7 +23889,7 @@ mod tests {
                 approve_plan: false,
                 allow_sensitive: false,
                 todo_id: None,
-                model: Some("gpt-5".to_owned()),
+                model: Some("composer-2.5-fast".to_owned()),
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(!outcome.ok);
@@ -25561,13 +25561,13 @@ mod tests {
         app.model_catalogs.insert(
             Agent::Cursor,
             ModelCatalog {
-                models: vec![ModelInfo::new("other-model", "Other")],
+                models: vec![ModelInfo::new("other-model-fast", "Other")],
                 ..ModelCatalog::default()
             },
         );
         app.handle_session_command(SessionCommand::SelectModel {
             agent: Some("cursor".to_owned()),
-            model: "other-model".to_owned(),
+            model: "other-model-fast".to_owned(),
         })
         .unwrap();
         assert_eq!(
@@ -30578,9 +30578,10 @@ mod tests {
     #[test]
     fn tc_1741_disallowed_selected_returns_err() {
         let (mut app, _) = test_app();
-        app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = Some("gpt-5".to_owned());
+        app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected =
+            Some("composer-2.5-fast".to_owned());
         let err = app.selected_run_model(Agent::Cursor).unwrap_err();
-        assert!(err.contains("gpt-5"), "{err}");
+        assert!(err.contains("fast models are blocked by policy"), "{err}");
     }
 
     // TC-1742 / FR-1725: Cursor resolves to composer-2.5
@@ -30629,7 +30630,7 @@ mod tests {
             Some("composer-2.5".to_owned())
         );
         assert_eq!(
-            app.effective_model_for(Agent::Cursor, "gpt-5"),
+            app.effective_model_for(Agent::Cursor, "composer-2.5-fast"),
             Some("composer-2.5".to_owned())
         );
     }
@@ -30868,7 +30869,7 @@ mod tests {
         let (mut app, _) = test_app();
         app.settings
             .runner_models
-            .insert("cursor".to_owned(), "gpt-5".to_owned());
+            .insert("cursor".to_owned(), "composer-2.5-fast".to_owned());
         app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
         assert_eq!(
             app.selected_run_model(Agent::Cursor),

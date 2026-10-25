@@ -5,6 +5,14 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Changed
+
+- **Cursor runner accepts any non-fast model (FR-2180..2182).** Lifted the built-in
+  Cursor runner model block so it accepts non-fast model IDs including `grok-*`
+  and `claude-sonnet-5-5-*` IDs; user configuration, custom agent `allowed_models`,
+  or model catalogs dictate what is offered. Default model when unset remains `composer-2.5`,
+  and models containing `fast` remain blocked across all runners.
+
 ### Added
 
 - Dashboard: run turns in several conversations at once (different agents; the
