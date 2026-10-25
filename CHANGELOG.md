@@ -15,6 +15,17 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Added
 
+- **Per-model system prompts and built-in prompts (SPEC-agent-system-prompt
+  FR-2150..FR-2156, FR-2160..FR-2162).** Configure prompts per model with
+  `[runners.<id>.models."<model>"]` (`system_prompt`, `system_prompt_file`,
+  `prompt_inject`), set `builtin_prompt = false` to disable built-ins, and
+  resolve prompts in order: model entry > runner table > built-in by model >
+  built-in by runner > `[runners.default]` > none. Built-in prompts cover
+  AGY/Gemini Flash, Cursor `composer-2.5`, runner-scoped Cursor `grok-4.7`, and
+  Grok Build (`grok` runner), apply only on write turns, and
+  re-inject when a model switch changes the prompt hash. The AGY efficiency
+  rules now come from the built-in prompt instead of `agy_prompt`.
+
 - Dashboard: run turns in several conversations at once (different agents; the
   same agent in a second conversation is refused with 409). Background turns keep
   running when you switch conversations, the Sessions list marks every running

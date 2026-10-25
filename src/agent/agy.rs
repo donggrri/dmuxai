@@ -525,14 +525,12 @@ async fn emit_terminal_event(
 }
 
 fn agy_prompt(policy: TurnPolicy, prompt: &str, require_file_edits: bool) -> String {
-    const EFFICIENCY_RULES: &str = "Work efficiently: do not keep a task list (no manage_task); read whole functions or 200+ lines at once; batch searches into one rg call; run only fast checks (e.g. `cargo check`) and the tests you added or changed, and leave formatters, linters and the full test suite to the caller.\n\n";
-
     match policy {
         TurnPolicy::ReadOnly => prompt.to_owned(),
         TurnPolicy::Agent if require_file_edits => format!(
-            "Apply edits directly to files in the workspace. Do not produce plans, plan artifacts, or ask for review before editing. Run every command in the foreground with a bounded timeout. Do not start background or detached processes.\n\n{EFFICIENCY_RULES}{prompt}"
+            "Apply edits directly to files in the workspace. Do not produce plans, plan artifacts, or ask for review before editing. Run every command in the foreground with a bounded timeout. Do not start background or detached processes.\n\n{prompt}"
         ),
-        TurnPolicy::Agent => format!("{EFFICIENCY_RULES}{prompt}"),
+        TurnPolicy::Agent => prompt.to_owned(),
     }
 }
 
@@ -1084,8 +1082,7 @@ mod tests {
         );
         assert!(!implement.iter().any(|arg| arg == "--sandbox"));
         assert!(agy_prompt(TurnPolicy::Agent, "hello", true).ends_with("\n\nhello"));
-        assert!(agy_prompt(TurnPolicy::Agent, "hello", false).ends_with("\n\nhello"));
-        assert!(agy_prompt(TurnPolicy::Agent, "hello", false).contains("manage_task"));
+        assert_eq!(agy_prompt(TurnPolicy::Agent, "hello", false), "hello");
     }
 
     #[test]
@@ -2065,22 +2062,25 @@ mod tests {
         );
     }
 
-    // TC-2114 / FR-2114: Agent prompt has efficiency rules.
+    // TC-2114 / FR-2114: efficiency rules are delivered by the built-in AGY prompt.
     #[test]
     fn tc_2114_agy_agent_prompt_has_efficiency_rules() {
-        let agent_prompt = agy_prompt(TurnPolicy::Agent, "do work", false);
+        use dmuxai::agent_prompt::BUILTIN_AGY_PROMPT;
+
         assert!(
-            agent_prompt.contains("Work efficiently: do not keep a task list (no manage_task);"),
-            "expected efficiency rules: {agent_prompt}"
+            BUILTIN_AGY_PROMPT.contains("(no manage_task)"),
+            "built-in AGY prompt must contain the efficiency rules"
         );
-        assert!(agent_prompt.ends_with("\n\ndo work"));
+        let agent_prompt = agy_prompt(TurnPolicy::Agent, "do work", false);
+        assert_eq!(agent_prompt, "do work");
+        assert!(
+            !agent_prompt.contains("Work efficiently:"),
+            "agy_prompt must not duplicate the built-in efficiency rules: {agent_prompt}"
+        );
 
         let agent_edits_prompt = agy_prompt(TurnPolicy::Agent, "do work", true);
         assert!(agent_edits_prompt.starts_with("Apply edits directly"));
-        assert!(
-            agent_edits_prompt
-                .contains("Work efficiently: do not keep a task list (no manage_task);")
-        );
+        assert!(!agent_edits_prompt.contains("Work efficiently:"));
         assert!(agent_edits_prompt.ends_with("\n\ndo work"));
 
         let ro_prompt = agy_prompt(TurnPolicy::ReadOnly, "do work", false);
