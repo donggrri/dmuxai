@@ -20,6 +20,12 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
+- **Grok CLI v1.0.62 model listing recognized as authenticated (#207, FR-2170).**
+  `grok_models_authenticated` now accepts `grok models` output from newer grok CLI
+  versions that print only the model list without `"logged in"`, recognizing
+  exit code 0 with at least one parseable `grok-` model id while retaining
+  compatibility with the older `"logged in"` banner.
+
 - **A second `dmuxai run` in a busy workspace no longer fails with "database is
   locked" (FR-2120, #167).** Opening the conversation database waits for the
   other process (bounded backoff of about 20 s), takes no write transaction
