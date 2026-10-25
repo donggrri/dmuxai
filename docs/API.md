@@ -87,7 +87,7 @@ Notes:
 | `conversation_id` | string | Durable conversation id |
 | `agent` | string\|null | Runner that answered (null for graph runs) |
 | `graph_id` | string\|null | Graph run id (null for single-agent runs) |
-| `text` | string | Final agent text |
+| `text` | string | Final agent text (still returned when the reply could not be saved, see exit code 4) |
 | `messages` | array | `{ role, agent, content }` per message |
 | `error` | string\|null | Failure detail when `ok` is false |
 | `todo` | object\|null | To-do after a `todo run` |
@@ -106,11 +106,17 @@ Failures with `--json` print `{ "ok": false, "exit_code": <n>, "error": "<messag
 | 1 | Turn failed or graph failed |
 | 2 | Usage error (unknown flag/subcommand, empty title/prompt) |
 | 3 | Not found (to-do id, unknown agent) |
-| 4 | Busy / conflict (already running) |
+| 4 | Busy / conflict (already running; the workspace conversation database is locked by another process — while it is opened and while a reply is saved) |
 | 5 | Runner not in `[graph] allowed_runners` |
 | 6 | Internal error |
 | 7 | Plan approval or sensitive gate required (headless); `--approve-plan` for plans; `--allow-sensitive` or `--agent` + `--approve-plan` for sensitive gates |
 | 130 | Cancelled (Ctrl+C) |
+
+A locked workspace conversation database is retried with a bounded backoff
+(about 20 s of waiting per turn; after that the database is only probed, so a
+lock that is released later still receives the reply). When the reply still
+cannot be saved, the run ends with exit code 4, `error` says the reply could
+not be saved, and `text` still holds the answer the agent produced.
 
 ### Examples
 

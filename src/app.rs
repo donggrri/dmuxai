@@ -1341,6 +1341,27 @@ fn normalize_workspace_path(target: &str, workspace_root: &Path) -> Option<Strin
     }
 }
 
+/// A conversation save of a turn that failed after the busy retry budget
+/// (FR-2140). The headless run reports it as a failed turn.
+#[derive(Debug, Clone)]
+struct TurnSaveFailure {
+    agent: Agent,
+    /// Headless exit code: 4 for a busy database, 6 for every other error.
+    exit_code: i32,
+    /// The failure detail (for example "database is locked").
+    detail: String,
+}
+
+/// The headless exit code of a failed conversation save (FR-2140): a database
+/// another process still holds is a conflict (4), every other database error
+/// stays an internal error (6).
+fn conversation_save_exit_code(error: &ConversationError) -> i32 {
+    match error {
+        ConversationError::Busy(_) => dmuxai::agent_api::exit::CONFLICT,
+        _ => dmuxai::agent_api::exit::INTERNAL,
+    }
+}
+
 pub struct App {
     exit: bool,
     /// FR-1470: no terminal; skip key/mouse polling (dashboard-only process).
@@ -1491,6 +1512,20 @@ pub struct App {
     pending_display_text: Option<String>,
     /// Turn ids that already emitted a notice on failure to save durable activity (FR-1920).
     activity_save_failed_turns: HashSet<String>,
+    /// Total busy-retry budget for the conversation saves of one turn
+    /// (FR-2140). It matches the order of the open-phase budget.
+    conversation_save_budget: Duration,
+    /// Time the conversation saves of a turn already spent waiting for a busy
+    /// conversation database, per agent (FR-2140). Only the waiting of a save
+    /// that failed counts, so a long turn is not punished by its own runtime
+    /// and a save that follows a successful one gets the whole budget again.
+    conversation_save_waited: HashMap<Agent, Duration>,
+    /// Conversation saves that failed after the retry budget (FR-2140).
+    turn_save_failures: Vec<TurnSaveFailure>,
+    /// Turn ids that already showed the "Could not save <agent> output" notice
+    /// (FR-2140). A locked database would otherwise repeat the same notice for
+    /// every event of the turn.
+    turn_save_failed_turns: HashSet<String>,
     mcp_registry: Arc<McpRegistry>,
     agent_lifecycle: HashMap<Agent, AgentLifecycleState>,
     /// Recent conversations for the dashboard session, refreshed at most every
@@ -1647,6 +1682,10 @@ impl App {
             headless_triage: None,
             pending_display_text: None,
             activity_save_failed_turns: HashSet::new(),
+            conversation_save_budget: dmuxai::conversation::SAVE_RETRY_BUDGET,
+            conversation_save_waited: HashMap::new(),
+            turn_save_failures: Vec::new(),
+            turn_save_failed_turns: HashSet::new(),
             exit: false,
             headless: false,
             selected: adapter_index(Agent::default()),
@@ -3604,6 +3643,46 @@ impl App {
         }
     }
 
+    /// The busy-retry budget left for the conversation saves of `agent`
+    /// (FR-2140).
+    ///
+    /// Only the waiting of a save that failed against a busy database counts
+    /// against the budget: a save that follows a successful one gets the whole
+    /// budget again, so a long turn is not punished by the time it already ran.
+    /// A turn that really waited for a locked database only gets what is left
+    /// of the budget, so a locked database cannot block the save path once per
+    /// event.
+    fn conversation_save_budget_left(&mut self, agent: Agent) -> Duration {
+        let budget = self.conversation_save_budget;
+        let waited = self
+            .conversation_save_waited
+            .get(&agent)
+            .copied()
+            .unwrap_or_default();
+        budget.saturating_sub(waited)
+    }
+
+    /// Saves one turn output, retrying a busy database with a bounded backoff
+    /// (FR-2140).
+    fn record_turn_output_with_retry(
+        &mut self,
+        agent: Agent,
+        output: &TurnOutput,
+    ) -> Result<(), ConversationError> {
+        let budget = self.conversation_save_budget_left(agent);
+        let started = Instant::now();
+        let saved = self
+            .engine
+            .record_turn_outputs_with_retry(std::slice::from_ref(output), budget);
+        if matches!(&saved, Err(ConversationError::Busy(_))) {
+            // The wait for a locked database counts against the budget of the
+            // turn: the save path must not block once per event.
+            let waited = self.conversation_save_waited.entry(agent).or_default();
+            *waited += started.elapsed();
+        }
+        saved.map(|_| ())
+    }
+
     fn apply_agent_output(&mut self, mut output: AgentOutput) -> bool {
         self.attach_model_catalog_hint(&mut output);
         if output
@@ -3690,13 +3769,20 @@ impl App {
                 // rejects a second failure for the same turn.
                 let already_recorded = self.retired_internal_turns.contains(turn_id.as_str());
                 if !already_recorded
-                    && let Err(error) = self.engine.record_turn_outputs(&[stored_output])
+                    && let Err(error) =
+                        self.record_turn_output_with_retry(output.agent, &stored_output)
                 {
+                    let visible = conversation_id.as_str() == self.conversation_id.as_str();
                     let terminal = matches!(
                         output.event,
                         AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_)
                     );
-                    if terminal {
+                    if visible {
+                        // FR-2140: the reply text stays in the transcript even
+                        // when the database refused to store it, so a locked
+                        // conversation database never loses the answer.
+                        self.apply_agent_event(output.agent, output.event);
+                    } else if terminal {
                         let success = matches!(output.event, AgentEvent::Completed);
                         let error = match &output.event {
                             AgentEvent::Error(err) => Some(err.clone()),
@@ -3705,10 +3791,19 @@ impl App {
                         };
                         self.finish_turn_outcome_with_error(output.agent, success, error);
                     }
-                    self.show_conversation_notice(
-                        &StoredConversationId::new(conversation_id.as_str()),
-                        format!("Could not save {} output: {error}", output.agent),
-                    );
+                    // FR-2140: the notice is shown once per turn; a locked
+                    // database would repeat it for every event.
+                    if self.turn_save_failed_turns.insert(turn_id.to_string()) {
+                        self.turn_save_failures.push(TurnSaveFailure {
+                            agent: output.agent,
+                            exit_code: conversation_save_exit_code(&error),
+                            detail: error.to_string(),
+                        });
+                        self.show_conversation_notice(
+                            &StoredConversationId::new(conversation_id.as_str()),
+                            format!("Could not save {} output: {error}", output.agent),
+                        );
+                    }
                     return true;
                 }
 
@@ -5614,6 +5709,11 @@ impl App {
                         fallback_chain: pending_fallback.map(|fallback| fallback.chain),
                     },
                 );
+                // FR-2140: the next turn starts with a fresh busy-retry budget
+                // and no longer carries the previous turn's save failures.
+                self.conversation_save_waited.remove(&agent);
+                self.turn_save_failures
+                    .retain(|failure| failure.agent != agent);
                 self.conversation_turn_ids
                     .entry(stored_conversation_id.clone())
                     .or_default()
@@ -5803,7 +5903,7 @@ impl App {
                     agent: agent_key(agent),
                     event: TurnEvent::Cancelled,
                 };
-                if let Err(error) = self.engine.record_turn_outputs(&[stored_output]) {
+                if let Err(error) = self.record_turn_output_with_retry(agent, &stored_output) {
                     self.show_conversation_notice(
                         &active.conversation_id,
                         format!("Could not save {agent} output: {error}"),
@@ -11097,6 +11197,9 @@ impl App {
             .last_agent_output_index(agent)
             .map(|index| format!("{}:{index}", self.conversation_id.as_str()));
         let active_turn = self.active_turns.remove(&agent);
+        // FR-2140: the turn is over, so the next one starts with a fresh
+        // busy-retry budget for its conversation saves.
+        self.conversation_save_waited.remove(&agent);
         if let Some(active) = active_turn.as_ref()
             && active.conversation_id.as_str() != self.conversation_id.as_str()
             && !active.offscreen_activity.is_empty()
@@ -13836,6 +13939,18 @@ impl App {
                 false,
                 dmuxai::agent_api::exit::FAILED,
                 last_system_error.or_else(|| Some("run failed".to_owned())),
+                last_error_kind,
+            )
+        } else if let Some(failure) = self.turn_save_failures.last() {
+            // FR-2140: the agent answered but its reply could not be stored,
+            // so the turn failed even though the text is still returned.
+            (
+                false,
+                failure.exit_code,
+                Some(format!(
+                    "Could not save {} reply: {}",
+                    failure.agent, failure.detail
+                )),
                 last_error_kind,
             )
         } else {
@@ -17060,6 +17175,13 @@ mod tests {
         let workspace = std::env::current_dir().unwrap();
         let engine =
             ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        test_app_with_engine_and_event_sender(engine, workspace)
+    }
+
+    fn test_app_with_engine_and_event_sender(
+        engine: ConversationEngine,
+        workspace: std::path::PathBuf,
+    ) -> (App, SentRequests, mpsc::Sender<AgentOutput>) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let cancelled = Arc::new(Mutex::new(Vec::new()));
         let selected_models = Arc::new(Mutex::new(Vec::new()));
@@ -23792,6 +23914,419 @@ mod tests {
                 .messages
                 .iter()
                 .any(|m| m.role == "agent" && m.content.contains("Hello from headless codex!"))
+        );
+    }
+
+    /// FR-2140: a second SQLite connection that holds the write lock of the
+    /// conversation database while a turn runs.
+    struct DbLock {
+        take_now: Arc<AtomicBool>,
+        ready: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        holder: Mutex<Option<std::thread::JoinHandle<()>>>,
+    }
+
+    impl DbLock {
+        /// Arms a lock that is taken when [`DbLock::take`] is called.
+        fn new(db_path: PathBuf) -> Self {
+            let take_now = Arc::new(AtomicBool::new(false));
+            let ready = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(AtomicBool::new(false));
+            let holder = {
+                let take_now = Arc::clone(&take_now);
+                let ready = Arc::clone(&ready);
+                let release = Arc::clone(&release);
+                std::thread::spawn(move || {
+                    while !take_now.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    let connection = rusqlite::Connection::open(&db_path).unwrap();
+                    connection.busy_timeout(Duration::from_secs(5)).unwrap();
+                    connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+                    ready.store(true, Ordering::SeqCst);
+                    while !release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    let _ = connection.execute_batch("ROLLBACK");
+                })
+            };
+            Self {
+                take_now,
+                ready,
+                release,
+                holder: Mutex::new(Some(holder)),
+            }
+        }
+
+        /// Takes the write lock and waits until it is held.
+        fn take(&self) {
+            self.take_now.store(true, Ordering::SeqCst);
+            while !self.ready.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// Releases the write lock and waits for the holder to finish.
+        fn release(&self) {
+            self.release.store(true, Ordering::SeqCst);
+            if let Some(holder) = self.holder.lock().unwrap().take() {
+                let _ = holder.join();
+            }
+        }
+    }
+
+    /// FR-2140: a conversation database on disk plus an app that uses it.
+    fn locked_db_app() -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        App,
+        SentRequests,
+        mpsc::Sender<AgentOutput>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let db = temp.path().join("conversations.sqlite3");
+        let engine = ConversationEngine::open(&db, &workspace).unwrap();
+        let (app, sent, event_tx) =
+            test_app_with_engine_and_event_sender(engine, workspace.clone());
+        (temp, workspace, db, app, sent, event_tx)
+    }
+
+    /// FR-2140: answers the headless request once the write lock is held.
+    fn reply_after_lock(
+        sent: SentRequests,
+        event_tx: mpsc::Sender<AgentOutput>,
+        lock: Arc<DbLock>,
+        reply: &'static str,
+    ) {
+        tokio::spawn(async move {
+            let mut request = None;
+            for _ in 0..2_000 {
+                request = sent.lock().unwrap().first().cloned();
+                if request.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let Some((agent, request)) = request else {
+                return;
+            };
+            lock.take();
+            let _ = event_tx
+                .send(AgentOutput {
+                    agent,
+                    conversation_id: Some(request.conversation_id.clone()),
+                    turn_id: Some(request.turn_id.clone()),
+                    event: AgentEvent::TextDelta(reply.to_owned()),
+                })
+                .await;
+            let _ = event_tx
+                .send(AgentOutput {
+                    agent,
+                    conversation_id: Some(request.conversation_id),
+                    turn_id: Some(request.turn_id),
+                    event: AgentEvent::Completed,
+                })
+                .await;
+        });
+    }
+
+    /// FR-2140: the assistant messages stored in the conversation database.
+    fn stored_assistant_texts(db: &Path) -> Vec<String> {
+        let connection = rusqlite::Connection::open(db).unwrap();
+        let mut statement = connection
+            .prepare("SELECT text FROM messages WHERE role = 'assistant' ORDER BY ordinal")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    // TC-2140 / FR-2140: a conversation database that is locked for a short
+    // time is retried and the reply is persisted.
+    #[tokio::test]
+    async fn tc_2140_short_database_lock_is_retried_and_the_reply_is_persisted() {
+        let (_temp, _workspace, db, mut app, sent, event_tx) = locked_db_app();
+        app.conversation_save_budget = Duration::from_secs(5);
+        let lock = Arc::new(DbLock::new(db.clone()));
+
+        // The lock is released inside the retry budget.
+        let releaser = {
+            let lock = Arc::clone(&lock);
+            std::thread::spawn(move || {
+                lock.take();
+                std::thread::sleep(Duration::from_millis(400));
+                lock.release();
+            })
+        };
+        reply_after_lock(sent, event_tx, Arc::clone(&lock), "done-slow");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let req = HeadlessRequest {
+            prompt: "Say hello".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: Some("ask".to_owned()),
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        releaser.join().unwrap();
+
+        assert!(outcome.ok, "the run must succeed: {outcome:?}");
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.text.contains("done-slow"));
+        assert!(
+            stored_assistant_texts(&db)
+                .iter()
+                .any(|text| text.contains("done-slow")),
+            "the retried save must persist the reply"
+        );
+    }
+
+    // TC-2140 / FR-2140: a spent busy-retry budget must not skip the
+    // database. The save recovers as soon as the lock is released, so the rest
+    // of the reply is stored.
+    #[tokio::test]
+    async fn tc_2140_a_spent_budget_stores_the_rest_of_the_reply_after_the_lock_is_released() {
+        let (_temp, _workspace, db, mut app, sent, event_tx) = locked_db_app();
+        app.conversation_save_budget = Duration::from_millis(300);
+        let lock = Arc::new(DbLock::new(db.clone()));
+
+        tokio::spawn(async move {
+            let mut request = None;
+            for _ in 0..2_000 {
+                request = sent.lock().unwrap().first().cloned();
+                if request.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let Some((agent, request)) = request else {
+                return;
+            };
+            lock.take();
+            let _ = event_tx
+                .send(AgentOutput {
+                    agent,
+                    conversation_id: Some(request.conversation_id.clone()),
+                    turn_id: Some(request.turn_id.clone()),
+                    event: AgentEvent::TextDelta("lost-while-locked".to_owned()),
+                })
+                .await;
+            // The lock outlives the retry budget of the first save.
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            lock.release();
+            let _ = event_tx
+                .send(AgentOutput {
+                    agent,
+                    conversation_id: Some(request.conversation_id.clone()),
+                    turn_id: Some(request.turn_id.clone()),
+                    event: AgentEvent::TextDelta("saved-after-release".to_owned()),
+                })
+                .await;
+            let _ = event_tx
+                .send(AgentOutput {
+                    agent,
+                    conversation_id: Some(request.conversation_id),
+                    turn_id: Some(request.turn_id),
+                    event: AgentEvent::Completed,
+                })
+                .await;
+        });
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let req = HeadlessRequest {
+            prompt: "Say hello".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: Some("ask".to_owned()),
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+
+        // The save that failed is still reported.
+        assert!(!outcome.ok, "a lost save must fail the run");
+        assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::CONFLICT);
+        // The in-memory reply keeps both parts.
+        assert!(outcome.text.contains("lost-while-locked"));
+        assert!(outcome.text.contains("saved-after-release"));
+
+        let stored = stored_assistant_texts(&db);
+        assert!(
+            stored
+                .iter()
+                .any(|text| text.contains("saved-after-release")),
+            "the save after the spent budget must store the reply: {stored:?}"
+        );
+        assert!(
+            !stored.iter().any(|text| text.contains("lost-while-locked")),
+            "the reply that could not be saved stays out of the database: {stored:?}"
+        );
+    }
+
+    // TC-2141 / FR-2140: a conversation database that stays locked fails the
+    // headless run with exit 4 (conflict) and keeps the reply text.
+    #[tokio::test]
+    async fn tc_2141_locked_database_fails_the_run_with_exit_4_and_keeps_the_text() {
+        let (_temp, _workspace, db, mut app, sent, event_tx) = locked_db_app();
+        app.conversation_save_budget = Duration::from_millis(300);
+        let lock = Arc::new(DbLock::new(db.clone()));
+        reply_after_lock(sent, event_tx, Arc::clone(&lock), "done-slow");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let req = HeadlessRequest {
+            prompt: "Say hello".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: Some("ask".to_owned()),
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        lock.release();
+
+        assert!(!outcome.ok, "a lost reply must fail the run");
+        assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::CONFLICT);
+        assert_eq!(outcome.exit_code, 4);
+        let error = outcome.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("Could not save") && error.contains("reply"),
+            "the error must say the reply could not be saved, got {error}"
+        );
+        // FR-2140: the reply text is never lost.
+        assert!(
+            outcome.text.contains("done-slow"),
+            "the in-memory reply must survive the failed save, got {:?}",
+            outcome.text
+        );
+    }
+
+    // TC-2142 / FR-2140: the failed save keeps the system note in the
+    // transcript next to the reply.
+    #[tokio::test]
+    async fn tc_2142_failed_save_keeps_the_system_note_and_the_reply() {
+        let (_temp, _workspace, db, mut app, sent, event_tx) = locked_db_app();
+        app.conversation_save_budget = Duration::from_millis(300);
+        let lock = Arc::new(DbLock::new(db.clone()));
+        reply_after_lock(sent, event_tx, Arc::clone(&lock), "done-slow");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let req = HeadlessRequest {
+            prompt: "Say hello".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: Some("ask".to_owned()),
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        lock.release();
+
+        let notices = outcome
+            .messages
+            .iter()
+            .filter(|m| m.role == "system" && m.content.contains("Could not save"))
+            .count();
+        assert_eq!(
+            notices, 1,
+            "the system note is shown once per turn: {:?}",
+            outcome.messages
+        );
+        assert!(
+            outcome
+                .messages
+                .iter()
+                .any(|m| m.role == "agent" && m.content.contains("done-slow")),
+            "the reply must stay in the transcript: {:?}",
+            outcome.messages
+        );
+    }
+
+    // TC-2143 / FR-2140: a database error that is not a busy database maps to
+    // the internal exit code, not to the conflict exit code.
+    #[tokio::test]
+    async fn tc_2143_non_busy_database_error_maps_to_the_internal_exit_code() {
+        let (_temp, _workspace, db, mut app, sent, event_tx) = locked_db_app();
+        app.conversation_save_budget = Duration::from_millis(300);
+
+        // Send the events once the request is recorded, and break the schema
+        // so the save fails with an error that is not a busy database.
+        let db_for_task = db.clone();
+        tokio::spawn(async move {
+            let mut request = None;
+            for _ in 0..2_000 {
+                request = sent.lock().unwrap().first().cloned();
+                if request.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let Some((agent, request)) = request else {
+                return;
+            };
+            let connection = rusqlite::Connection::open(&db_for_task).unwrap();
+            connection.execute_batch("DROP TABLE turns").unwrap();
+            let _ = event_tx
+                .send(AgentOutput {
+                    agent,
+                    conversation_id: Some(request.conversation_id.clone()),
+                    turn_id: Some(request.turn_id.clone()),
+                    event: AgentEvent::TextDelta("done-slow".to_owned()),
+                })
+                .await;
+            let _ = event_tx
+                .send(AgentOutput {
+                    agent,
+                    conversation_id: Some(request.conversation_id),
+                    turn_id: Some(request.turn_id),
+                    event: AgentEvent::Completed,
+                })
+                .await;
+        });
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let req = HeadlessRequest {
+            prompt: "Say hello".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: Some("ask".to_owned()),
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+
+        assert!(!outcome.ok);
+        assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::INTERNAL);
+        assert_eq!(outcome.exit_code, 6);
+        assert!(outcome.text.contains("done-slow"));
+    }
+
+    // TC-2144 / FR-2140: the busy-retry mapping keeps a locked database a
+    // conflict and every other database error an internal error.
+    #[test]
+    fn tc_2144_busy_database_error_maps_to_the_conflict_exit_code() {
+        assert_eq!(
+            conversation_save_exit_code(&ConversationError::Busy("locked".to_owned())),
+            dmuxai::agent_api::exit::CONFLICT
+        );
+        assert_eq!(
+            conversation_save_exit_code(&ConversationError::Sqlite(rusqlite::Error::InvalidQuery)),
+            dmuxai::agent_api::exit::INTERNAL
         );
     }
 
