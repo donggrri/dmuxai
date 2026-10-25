@@ -208,6 +208,74 @@ fn headless_run_json_success_and_failure() {
     );
 }
 
+/// Two custom fake agents in one workspace config: `first` fails with a
+/// provider error that triggers the runner fallback, `second` answers.
+/// `[runners.first]` names the handover target.
+fn fallback_agent_config() -> String {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-agent.sh");
+    let fixture = fixture.display().to_string().replace('\\', "/");
+    format!(
+        r#"[graph]
+enabled = false
+[[agents.custom]]
+name = "first"
+command = ["sh", "{fixture}", "rate-limit", "{{prompt}}"]
+prompt_via = "arg"
+output = "jsonl"
+text_path = "/part/text"
+text_when = {{ path = "/type", equals = "text" }}
+error_path = "/error/message"
+timeout_secs = 30
+[[agents.custom]]
+name = "second"
+command = ["sh", "{fixture}", "jsonl", "{{prompt}}"]
+prompt_via = "arg"
+output = "jsonl"
+text_path = "/part/text"
+text_when = {{ path = "/type", equals = "text" }}
+error_path = "/error/message"
+timeout_secs = 30
+[runners.first]
+fallback = ["second"]
+"#,
+        fixture = fixture,
+    )
+}
+
+// TC-2136 / FR-2119, FR-2134: a headless run whose runner fails with a
+// provider error hands the turn to the next runner of the chain. The JSON
+// output has one fallback record, and the text is the second runner's answer
+// only (the failed runner's partial output stays in `messages`).
+#[cfg(unix)]
+#[test]
+fn tc_2136_cli_fallback_handover_uses_the_second_agent() {
+    let sandbox = Sandbox::new(&fallback_agent_config());
+    let output = sandbox.run(&["run", "hi", "--agent", "first", "--json"]);
+    let json = stdout_json(&output);
+    assert_eq!(output.status.code(), Some(0), "{json}");
+    assert_eq!(json["ok"], true, "{json}");
+
+    let fallbacks = json["fallbacks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("fallbacks array missing: {json}"));
+    assert_eq!(fallbacks.len(), 1, "{json}");
+    assert_eq!(fallbacks[0]["from_runner"], "first", "{json}");
+    assert_eq!(fallbacks[0]["to_runner"], "second", "{json}");
+
+    let text = json["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("echo:"),
+        "the answer must come from the second runner: {json}"
+    );
+    assert!(
+        !text.contains("partial from the failed runner"),
+        "the failed runner's partial output must not be the answer: {json}"
+    );
+}
+
 // TC-762 / FR-761, NFR-762: allowed_runners is enforced and unknown agents
 // are reported with their own exit codes.
 #[test]

@@ -3411,8 +3411,8 @@ mod runner_fallback_settings_tests {
         );
 
         let cfg = settings.runner_fallback.config_for("agy").unwrap();
-        assert_eq!(cfg.stall_timeout_secs, 120);
-        assert_eq!(cfg.stall_api_retries, 3);
+        assert_eq!(cfg.stall_timeout_secs, Some(120));
+        assert_eq!(cfg.effective_stall_api_retries(), 3);
 
         let chain2 = settings.runner_fallback.chain_for("cursor", None);
         assert_eq!(

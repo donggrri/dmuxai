@@ -49,11 +49,38 @@ impl fmt::Display for FallbackTarget {
 pub const DEFAULT_STALL_TIMEOUT_SECS: u64 = 240;
 pub const DEFAULT_STALL_API_RETRIES: u32 = 3;
 
+/// Per-runner fallback configuration (FR-2101).
+///
+/// Every field is optional so a table can set only the keys it cares about.
+/// A field the workspace table does not set keeps the user value when the
+/// user and workspace settings are merged (FR-2101, TC-2135).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerFallbackConfig {
-    pub chain: Vec<FallbackTarget>,
-    pub stall_timeout_secs: u64,
-    pub stall_api_retries: u32,
+    /// The configured chain. `Some(vec![])` disables the chain for the runner,
+    /// `None` means the table did not set a chain at all.
+    pub chain: Option<Vec<FallbackTarget>>,
+    /// The configured stall timeout; `None` means the table did not set one.
+    pub stall_timeout_secs: Option<u64>,
+    /// The configured API retry budget; `None` means the table did not set one.
+    pub stall_api_retries: Option<u32>,
+}
+
+impl RunnerFallbackConfig {
+    /// The configured chain (empty when the table set none).
+    pub fn chain(&self) -> &[FallbackTarget] {
+        self.chain.as_deref().unwrap_or(&[])
+    }
+
+    /// The effective stall timeout (the configured value or the default).
+    pub fn effective_stall_timeout_secs(&self) -> u64 {
+        self.stall_timeout_secs
+            .unwrap_or(DEFAULT_STALL_TIMEOUT_SECS)
+    }
+
+    /// The effective API retry budget (the configured value or the default).
+    pub fn effective_stall_api_retries(&self) -> u32 {
+        self.stall_api_retries.unwrap_or(DEFAULT_STALL_API_RETRIES)
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
@@ -108,11 +135,12 @@ impl FallbackSettings {
                 }
             }
             let cfg = RunnerFallbackConfig {
-                chain,
-                stall_timeout_secs: toml
-                    .stall_timeout_secs
-                    .unwrap_or(DEFAULT_STALL_TIMEOUT_SECS),
-                stall_api_retries: toml.stall_api_retries.unwrap_or(DEFAULT_STALL_API_RETRIES),
+                // `None` marks "this table set no chain" so a workspace table
+                // that only tunes the stall timers keeps the user chain
+                // (FR-2101, TC-2135).
+                chain: toml.fallback.as_ref().map(|_| chain),
+                stall_timeout_secs: toml.stall_timeout_secs,
+                stall_api_retries: toml.stall_api_retries,
             };
             if id == "default" {
                 settings.default = Some(cfg);
@@ -123,15 +151,41 @@ impl FallbackSettings {
         settings
     }
 
+    /// Merges the workspace settings into the user settings field-wise: a
+    /// field the workspace table does not set keeps the user value
+    /// (FR-2101, TC-2135).
     pub fn merge(user: Self, workspace: Self) -> Self {
         let mut result = user;
-        if workspace.default.is_some() {
-            result.default = workspace.default;
+        if let Some(workspace) = workspace.default {
+            result.default = Some(Self::merge_config(result.default.as_ref(), &workspace));
         }
-        for (k, v) in workspace.runners {
-            result.runners.insert(k, v);
+        for (id, workspace) in workspace.runners {
+            let merged = match result.runners.get(&id) {
+                Some(user) => Self::merge_config(Some(user), &workspace),
+                None => workspace,
+            };
+            result.runners.insert(id, merged);
         }
         result
+    }
+
+    /// Field-wise merge of one runner entry (FR-2101, TC-2135).
+    fn merge_config(
+        user: Option<&RunnerFallbackConfig>,
+        workspace: &RunnerFallbackConfig,
+    ) -> RunnerFallbackConfig {
+        RunnerFallbackConfig {
+            chain: workspace
+                .chain
+                .clone()
+                .or_else(|| user.and_then(|cfg| cfg.chain.clone())),
+            stall_timeout_secs: workspace
+                .stall_timeout_secs
+                .or_else(|| user.and_then(|cfg| cfg.stall_timeout_secs)),
+            stall_api_retries: workspace
+                .stall_api_retries
+                .or_else(|| user.and_then(|cfg| cfg.stall_api_retries)),
+        }
     }
 
     pub fn config_for(&self, runner: &str) -> Option<&RunnerFallbackConfig> {
@@ -148,7 +202,7 @@ impl FallbackSettings {
         };
         let runner_lc = runner.trim().to_ascii_lowercase();
         let cur = current_model.map(str::to_owned);
-        cfg.chain
+        cfg.chain()
             .iter()
             .filter(|t| {
                 if !t.runner.eq_ignore_ascii_case(&runner_lc) {
@@ -168,15 +222,15 @@ impl FallbackSettings {
             return None;
         }
         let cfg = self.config_for(runner)?;
-        let timeout = if cfg.stall_timeout_secs == 0 {
+        let timeout = if cfg.effective_stall_timeout_secs() == 0 {
             None
         } else {
-            Some(Duration::from_secs(cfg.stall_timeout_secs))
+            Some(Duration::from_secs(cfg.effective_stall_timeout_secs()))
         };
-        let retries = if cfg.stall_api_retries == 0 {
+        let retries = if cfg.effective_stall_api_retries() == 0 {
             None
         } else {
-            Some(cfg.stall_api_retries)
+            Some(cfg.effective_stall_api_retries())
         };
         if timeout.is_none() && retries.is_none() {
             return None;
@@ -509,10 +563,10 @@ mod tests {
         let mut w = Vec::new();
         let s = FallbackSettings::from_tables(&tables, &validate, &mut w);
         // agy empty chain disables default
-        assert!(s.config_for("agy").unwrap().chain.is_empty());
+        assert!(s.config_for("agy").unwrap().chain().is_empty());
         assert_eq!(s.chain_for("agy", None).len(), 0);
         // default has chain
-        assert_eq!(s.config_for("cursor").unwrap().chain.len(), 1);
+        assert_eq!(s.config_for("cursor").unwrap().chain().len(), 1);
         // merge
         let mut ut = BTreeMap::new();
         ut.insert(
@@ -536,7 +590,10 @@ mod tests {
         let workspace = FallbackSettings::from_tables(&wt, &validate, &mut Vec::new());
         let merged = FallbackSettings::merge(user, workspace);
         assert!(merged.runners.contains_key("agy"));
-        assert_eq!(merged.runners.get("agy").unwrap().stall_timeout_secs, 120);
+        assert_eq!(
+            merged.runners.get("agy").unwrap().stall_timeout_secs,
+            Some(120)
+        );
     }
 
     #[test]
@@ -563,7 +620,7 @@ mod tests {
         };
         let mut w = Vec::new();
         let s = FallbackSettings::from_tables(&tables, &validate, &mut w);
-        let chain = &s.runners.get("agy").unwrap().chain;
+        let chain = s.runners.get("agy").unwrap().chain();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].runner, "opencode");
         assert!(w.iter().any(
@@ -868,5 +925,79 @@ mod tests {
             r2.summary(),
             "runner fallback: agy-flash (gemini-3.8-flash-high) failed (stall: no model progress for 240s); fallback chain exhausted"
         );
+    }
+
+    // FR-2101 / TC-2135: the user and workspace tables of one runner are
+    // merged field-wise; a field the workspace table does not set keeps the
+    // user value.
+    #[test]
+    fn tc_2135_merge_keeps_user_fields_absent_from_workspace_table() {
+        let mut user_tables = BTreeMap::new();
+        user_tables.insert(
+            "agy".to_string(),
+            RunnerFallbackToml {
+                fallback: Some(vec!["opencode".into()]),
+                stall_timeout_secs: None,
+                stall_api_retries: Some(5),
+            },
+        );
+        let mut workspace_tables = BTreeMap::new();
+        // The workspace table only tunes the stall timer: it must not drop the
+        // user's chain.
+        workspace_tables.insert(
+            "agy".to_string(),
+            RunnerFallbackToml {
+                fallback: None,
+                stall_timeout_secs: Some(120),
+                stall_api_retries: None,
+            },
+        );
+        let validate = |_: &FallbackTarget| Ok(());
+        let mut warnings = Vec::new();
+        let user = FallbackSettings::from_tables(&user_tables, &validate, &mut warnings);
+        let workspace = FallbackSettings::from_tables(&workspace_tables, &validate, &mut warnings);
+        let merged = FallbackSettings::merge(user, workspace);
+
+        let cfg = merged.runners.get("agy").expect("agy entry");
+        assert_eq!(cfg.chain().len(), 1);
+        assert_eq!(cfg.chain()[0].runner, "opencode");
+        assert_eq!(cfg.stall_timeout_secs, Some(120));
+        assert_eq!(cfg.stall_api_retries, Some(5));
+        assert_eq!(cfg.effective_stall_timeout_secs(), 120);
+        assert_eq!(cfg.effective_stall_api_retries(), 5);
+        assert_eq!(merged.chain_for("agy", None).len(), 1);
+    }
+
+    // FR-2101 / TC-2135: an explicit workspace chain still replaces the user
+    // chain, and an empty chain still disables the default chain.
+    #[test]
+    fn tc_2135_merge_workspace_chain_replaces_user_chain() {
+        let mut user_tables = BTreeMap::new();
+        user_tables.insert(
+            "agy".to_string(),
+            RunnerFallbackToml {
+                fallback: Some(vec!["opencode".into()]),
+                stall_timeout_secs: None,
+                stall_api_retries: None,
+            },
+        );
+        let mut workspace_tables = BTreeMap::new();
+        workspace_tables.insert(
+            "agy".to_string(),
+            RunnerFallbackToml {
+                fallback: Some(vec![]),
+                stall_timeout_secs: None,
+                stall_api_retries: None,
+            },
+        );
+        let validate = |_: &FallbackTarget| Ok(());
+        let mut warnings = Vec::new();
+        let user = FallbackSettings::from_tables(&user_tables, &validate, &mut warnings);
+        let workspace = FallbackSettings::from_tables(&workspace_tables, &validate, &mut warnings);
+        let merged = FallbackSettings::merge(user, workspace);
+
+        let cfg = merged.runners.get("agy").expect("agy entry");
+        assert!(cfg.chain().is_empty());
+        assert!(merged.chain_for("agy", None).is_empty());
     }
 }
