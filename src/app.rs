@@ -25561,13 +25561,13 @@ mod tests {
         app.model_catalogs.insert(
             Agent::Cursor,
             ModelCatalog {
-                models: vec![ModelInfo::new("other-model", "Other")],
+                models: vec![ModelInfo::new("other-model-fast", "Other")],
                 ..ModelCatalog::default()
             },
         );
         app.handle_session_command(SessionCommand::SelectModel {
             agent: Some("cursor".to_owned()),
-            model: "other-model".to_owned(),
+            model: "other-model-fast".to_owned(),
         })
         .unwrap();
         assert_eq!(
@@ -30869,7 +30869,7 @@ mod tests {
         let (mut app, _) = test_app();
         app.settings
             .runner_models
-            .insert("cursor".to_owned(), "gpt-5".to_owned());
+            .insert("cursor".to_owned(), "composer-2.5-fast".to_owned());
         app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
         assert_eq!(
             app.selected_run_model(Agent::Cursor),
