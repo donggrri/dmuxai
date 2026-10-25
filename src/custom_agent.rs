@@ -265,24 +265,31 @@ pub fn is_grok_model_id(model_id: &str) -> bool {
     pattern.is_match(model_id.trim())
 }
 
+fn extract_grok_candidate_token(line: &str) -> Option<&str> {
+    let mut token = line.trim();
+    if token.is_empty() {
+        return None;
+    }
+    if token.starts_with('*') || token.starts_with('-') {
+        token = token[1..].trim_start();
+    }
+    if let Some(stripped) = token.strip_suffix("(default)") {
+        token = stripped.trim_end();
+    }
+    if token.split_whitespace().nth(1).is_some() {
+        return None;
+    }
+    Some(token)
+}
+
 /// Parse `grok models` stdout into allowed ids (FR-895). Order is kept.
 /// `fast` ids and lines that are not a single grok token are dropped.
 pub fn parse_grok_model_ids(stdout: &str) -> Vec<String> {
     let mut ids = Vec::new();
     for line in stdout.lines() {
-        let mut token = line.trim();
-        if token.is_empty() {
+        let Some(token) = extract_grok_candidate_token(line) else {
             continue;
-        }
-        if token.starts_with('*') || token.starts_with('-') {
-            token = token[1..].trim_start();
-        }
-        if let Some(stripped) = token.strip_suffix("(default)") {
-            token = stripped.trim_end();
-        }
-        if token.split_whitespace().nth(1).is_some() {
-            continue;
-        }
+        };
         if !is_grok_model_id(token) || token.to_ascii_lowercase().contains("fast") {
             continue;
         }
@@ -305,10 +312,19 @@ pub fn select_grok_model(ids: &[String], current: Option<&str>) -> Option<String
     ids.first().cloned()
 }
 
-/// Authenticated iff the models command exited 0 and stdout contains `logged in`
-/// (ASCII case-insensitive). Takes no path (NFR-890, A-3).
+/// Authenticated iff the models command exited 0 and either stdout contains `logged in`
+/// (ASCII case-insensitive) or stdout contains at least one parseable `grok-` model id
+/// (including fast ids) (FR-896, FR-2170). Takes no path (NFR-890, A-3).
 pub fn grok_models_authenticated(stdout: &str, exit_ok: bool) -> bool {
-    exit_ok && stdout.to_ascii_lowercase().contains("logged in")
+    if !exit_ok {
+        return false;
+    }
+    if stdout.to_ascii_lowercase().contains("logged in") {
+        return true;
+    }
+    stdout
+        .lines()
+        .any(|line| extract_grok_candidate_token(line).is_some_and(is_grok_model_id))
 }
 
 /// Shown when `grok models` is missing, fails, times out, or is not logged in (FR-896).
@@ -2378,11 +2394,67 @@ command = ["x", "--mcp", "{mcp_config}", "{prompt}"]
         ));
         assert!(!grok_models_authenticated(
             "Available models:\n* grok-4.7 (default)\n",
-            true
+            false
         ));
         let login = grok_login_message();
         assert!(login.contains("grok login"), "{login}");
         assert_ne!(login, grok_no_allowed_model_message());
+    }
+
+    // TC-2170 / FR-2170: v1.0.62 listing with exit 0 is authenticated
+    #[test]
+    fn tc_2170_grok_v1_0_62_models_listing_authenticated() {
+        let stdout = "\
+Available models:
+  * grok-4.7 (default)
+  - grok-4.7-build-fast
+  - grok-4.6
+  - grok-4.5
+";
+        assert!(grok_models_authenticated(stdout, true));
+    }
+
+    // TC-2171 / FR-2170: "logged in" old format is authenticated
+    #[test]
+    fn tc_2171_grok_logged_in_old_format_authenticated() {
+        assert!(grok_models_authenticated(
+            "You are logged in with grok.com.\n",
+            true
+        ));
+        assert!(grok_models_authenticated(
+            "You are logged in with grok.com.\nAvailable models:\n  * grok-4.7 (default)\n",
+            true
+        ));
+    }
+
+    // TC-2172 / FR-2170: exit nonzero, empty list, or list without grok- ids is not authenticated
+    #[test]
+    fn tc_2172_grok_models_unauthenticated_failures() {
+        let v1_0_62_stdout = "\
+Available models:
+  * grok-4.7 (default)
+  - grok-4.7-build-fast
+  - grok-4.6
+  - grok-4.5
+";
+        // Exit nonzero
+        assert!(!grok_models_authenticated(v1_0_62_stdout, false));
+        assert!(!grok_models_authenticated(
+            "You are logged in with grok.com.\n",
+            false
+        ));
+
+        // Empty list / output
+        assert!(!grok_models_authenticated("", true));
+        assert!(!grok_models_authenticated("   \n\n  ", true));
+
+        // List without grok- ids
+        let no_grok_ids = "\
+Available models:
+  * other-model (default)
+  - some-other-model
+";
+        assert!(!grok_models_authenticated(no_grok_ids, true));
     }
 
     // TC-899 / FR-898

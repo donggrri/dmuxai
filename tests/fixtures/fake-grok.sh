@@ -31,9 +31,8 @@ if [ "${1:-}" = "models" ]; then
     0)
       cat <<'EOF'
 Available models:
-  * grok-4.7 (default)
-  - grok-4.6
-  - grok-4.7-build-fast
+  * other-4.7 (default)
+  - other-4.6
 EOF
       exit 0
       ;;
