@@ -73,6 +73,7 @@ Notes:
     { "role": "agent", "agent": "agy", "content": "The repo is a Rust TUI client…" }
   ],
   "error": null,
+  "error_kind": null,
   "todo": null,
   "triage": { "route": "simple", "source": "judge", "reason": "…", "runner": "agy", "model": "…", "elapsed_ms": 42 },
   "plan": null,
@@ -87,16 +88,17 @@ Notes:
 | `conversation_id` | string | Durable conversation id |
 | `agent` | string\|null | Runner that answered (null for graph runs) |
 | `graph_id` | string\|null | Graph run id (null for single-agent runs) |
-| `text` | string | Final agent text |
+| `text` | string | Final agent text (still returned when the reply could not be saved, see exit code 4) |
 | `messages` | array | `{ role, agent, content }` per message |
 | `error` | string\|null | Failure detail when `ok` is false |
+| `error_kind` | string\|null | Stable failure category next to `error`: `provider`, `model_unavailable`, `process_exit`, `timeout`, `idle`, `stalled`, `cancelled`, `policy`, or `conflict` (exit 4) / `internal` (exit 6); `null` when there is no error |
 | `todo` | object\|null | To-do after a `todo run` |
 | `triage` | object\|null | Judge/fallback/override verdict (`source`: `judge`, `fallback`, or `override`) when a graph run started |
 | `plan` | object\|null | `{steps, tasks}` when a plan was produced (including exit 7 awaiting approval) |
 | `events` | object | `first_seq`/`last_seq` written for this run; both `null` when the run wrote no events |
 | `fallbacks` | array | Optional list of handovers: `{from_runner, from_model, reason, detail, to_runner, to_model}` (`to_*` null when the chain is exhausted); omitted when empty |
 
-Failures with `--json` print `{ "ok": false, "exit_code": <n>, "error": "<message>" }`.
+Failures with `--json` print `{ "ok": false, "exit_code": <n>, "error": "<message>", "error_kind": "<kind>|null" }`, where `error_kind` is `conflict` for exit 4 and `internal` for exit 6.
 
 ### Exit codes
 
@@ -106,11 +108,21 @@ Failures with `--json` print `{ "ok": false, "exit_code": <n>, "error": "<messag
 | 1 | Turn failed or graph failed |
 | 2 | Usage error (unknown flag/subcommand, empty title/prompt) |
 | 3 | Not found (to-do id, unknown agent) |
-| 4 | Busy / conflict (already running) |
+| 4 | Busy / conflict (already running; the workspace conversation database is locked by another process — while it is opened and while a reply is saved) |
 | 5 | Runner not in `[graph] allowed_runners` |
-| 6 | Internal error |
+| 6 | Internal error (including a non-busy conversation-database error while saving the agent reply, which exits 6 rather than 4) |
 | 7 | Plan approval or sensitive gate required (headless); `--approve-plan` for plans; `--allow-sensitive` or `--agent` + `--approve-plan` for sensitive gates |
 | 130 | Cancelled (Ctrl+C) |
+
+A locked workspace conversation database is retried with a bounded backoff
+(about 20 s of waiting per turn; after that the database is only probed, so a
+lock that is released later still receives the reply). When the reply still
+cannot be saved, the run ends with exit code 4 (`error_kind` `conflict`), or
+exit 6 (`error_kind` `internal`) for any other database error, `error` says the
+reply could not be saved, and `text` still holds the answer the agent produced.
+After the retry budget is spent the process closes its session with a short
+busy timeout, so shutdown does not wait the default connection timeout again
+when the database is still locked.
 
 ### Examples
 

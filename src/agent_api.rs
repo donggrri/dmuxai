@@ -22,6 +22,19 @@ pub mod exit {
     pub const CANCELLED: i32 = 130;
 }
 
+/// The stable `error_kind` string of a headless exit code (FR-2140).
+///
+/// A busy database (or any other conflict) is reported as `"conflict"`, and an
+/// internal error as `"internal"`, so a machine caller can tell the two apart
+/// without parsing the message. Other exit codes carry no error kind.
+pub fn error_kind_for_exit(code: i32) -> Option<&'static str> {
+    match code {
+        exit::CONFLICT => Some("conflict"),
+        exit::INTERNAL => Some("internal"),
+        _ => None,
+    }
+}
+
 /// An error that carries the exit code it maps to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
@@ -38,7 +51,12 @@ impl ApiError {
     }
 
     pub fn to_json(&self) -> Value {
-        json!({ "ok": false, "exit_code": self.code, "error": self.message })
+        json!({
+            "ok": false,
+            "exit_code": self.code,
+            "error": self.message,
+            "error_kind": error_kind_for_exit(self.code),
+        })
     }
 }
 

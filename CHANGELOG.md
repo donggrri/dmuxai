@@ -44,6 +44,21 @@ All notable changes to dmuxai are listed here. Versions follow
   versions that print only the model list without `"logged in"`, recognizing
   exit code 0 with at least one parseable `grok-` model id while retaining
   compatibility with the older `"logged in"` banner.
+- **A reply that cannot be saved no longer disappears silently (FR-2140,
+  #203).** When the workspace conversation database is locked by another
+  process *during* a turn, saving the agent's reply now waits for the lock with
+  the same bounded backoff the database open uses (about 20 s of waiting per
+  turn; after that the database is only probed, without waiting, so a released
+  lock still receives the reply). If the reply still cannot be saved, the
+  headless run fails with exit code 4 (conflict; exit 6 for other database
+  errors) and an error that says the reply could not be saved, instead of
+  reporting `ok: true` with an empty `text`. The answer itself is never lost:
+  it stays in the JSON `text`, in the transcript, and next to the "Could not
+  save <agent> output" system note. The JSON now reports `error_kind`
+  `conflict` for exit 4 and `internal` for exit 6 (also for the locked open of
+  #196), and once the retry budget is spent the process closes its session with
+  a short busy timeout, so a headless run exits without waiting the default
+  connection timeout a second time.
 
 - **A second `dmuxai run` in a busy workspace no longer fails with "database is
   locked" (FR-2120, #167).** Opening the conversation database waits for the

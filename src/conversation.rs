@@ -41,6 +41,13 @@ const OPEN_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const OPEN_ATTEMPT_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 /// Busy timeout of the connection once the database is open.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total time a save waits for a concurrent DmuxAI process to release the
+/// conversation database before the save is reported as busy (FR-2140). It
+/// matches the order of the open-phase budget.
+pub const SAVE_RETRY_BUDGET: Duration = Duration::from_secs(20);
+/// Busy timeout of a single save attempt (FR-2140). The retry loop owns the
+/// waiting, so one attempt must not block for long.
+const SAVE_ATTEMPT_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 /// Message shown when the conversation database stays locked for the whole
 /// retry budget (FR-2120).
 const BUSY_MESSAGE: &str = "another dmuxai process is using this workspace's conversation \
@@ -932,11 +939,24 @@ fn open_with_retry(
     }
     let workspace_root = normalize_workspace(workspace_root)?;
 
+    with_busy_retry(budget, || open_once(db_path, &workspace_root))
+}
+
+/// Runs `attempt` while the conversation database reports SQLITE_BUSY or
+/// SQLITE_LOCKED, with a bounded backoff (FR-2120, FR-2140).
+///
+/// The retry stops when the attempt succeeds, when the error is not a busy
+/// database, or when the budget is exhausted. An exhausted budget is reported
+/// as `ConversationError::Busy` so the caller can map it to a conflict.
+fn with_busy_retry<T>(
+    budget: Duration,
+    mut attempt: impl FnMut() -> Result<T, ConversationError>,
+) -> Result<T, ConversationError> {
     let started = Instant::now();
     let mut delay = OPEN_RETRY_INITIAL_DELAY;
     loop {
-        match open_once(db_path, &workspace_root) {
-            Ok(engine) => return Ok(engine),
+        match attempt() {
+            Ok(value) => return Ok(value),
             Err(error) => {
                 if !is_busy_error(&error) {
                     return Err(error);
@@ -956,6 +976,43 @@ fn retry_jitter(delay: Duration) -> Duration {
     let bytes = Uuid::new_v4().into_bytes();
     let fraction = u32::from(bytes[0]) % 5;
     delay / 4 * fraction
+}
+
+/// Number of save attempts the busy-retry loop made (FR-2140, test-only).
+#[cfg(test)]
+static SAVE_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts one save attempt of the busy-retry loop (FR-2140, test-only).
+#[cfg(test)]
+fn count_save_attempt() {
+    SAVE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Save attempts the busy-retry loop made since the process started
+/// (FR-2140, test-only).
+#[cfg(test)]
+fn save_attempts() -> usize {
+    SAVE_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+// Number of session-close attempts made on the current thread (FR-2140,
+// test-only). A thread-local keeps the count stable while other tests create
+// and drop their own engines in parallel.
+#[cfg(test)]
+thread_local! {
+    static CLOSE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one session-close attempt (FR-2140, test-only).
+#[cfg(test)]
+fn count_close_attempt() {
+    CLOSE_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+}
+
+/// Session-close attempts made on the current thread (FR-2140, test-only).
+#[cfg(test)]
+fn close_attempts() -> usize {
+    CLOSE_ATTEMPTS.with(std::cell::Cell::get)
 }
 
 /// One open attempt: pragmas, migrations and the runtime-session insert.
@@ -1062,10 +1119,18 @@ impl ConversationEngine {
 
     /// Marks this process closed so a later startup may recover any turn it
     /// left unfinished. Drop calls this best-effort as a final fallback.
+    ///
+    /// The session is marked closed after this first attempt whether it
+    /// succeeded or not (FR-2140): a close that failed against a locked
+    /// database must not make Drop wait the connection busy timeout a second
+    /// time.
     pub fn close_session(&mut self) -> Result<(), ConversationError> {
         if self.session_closed {
             return Ok(());
         }
+        self.session_closed = true;
+        #[cfg(test)]
+        count_close_attempt();
         let now = now_ms()?;
         self.connection.execute(
             "UPDATE runtime_sessions
@@ -1073,8 +1138,24 @@ impl ConversationEngine {
               WHERE id = ?1 AND status = 'active'",
             params![self.session_id, now],
         )?;
-        self.session_closed = true;
         Ok(())
+    }
+
+    /// Closes the session once with a short busy timeout (FR-2140).
+    ///
+    /// Shutdown uses this when the busy-retry budget of the turn is already
+    /// spent: the database is likely still locked, so waiting the default
+    /// connection busy timeout would only delay the exit. The session is still
+    /// marked closed after this one attempt.
+    pub fn close_session_with_timeout(
+        &mut self,
+        busy_timeout: Duration,
+    ) -> Result<(), ConversationError> {
+        if self.session_closed {
+            return Ok(());
+        }
+        self.connection.busy_timeout(busy_timeout)?;
+        self.close_session()
     }
 
     pub fn list(&self) -> Result<Vec<ConversationCard>, ConversationError> {
@@ -1343,6 +1424,43 @@ impl ConversationEngine {
         }
         transaction.commit()?;
         Ok(patches)
+    }
+
+    /// Saves turn outputs, retrying while the database is busy (FR-2140).
+    ///
+    /// A reply that is written while another process holds the conversation
+    /// database must not be lost: the save is retried with the same bounded
+    /// backoff the open phase uses. `budget` bounds the total waiting time; a
+    /// database that stays locked is reported as `ConversationError::Busy`.
+    ///
+    /// A spent budget (`Duration::ZERO`) still makes one attempt, and that
+    /// attempt does not wait: the database may have become writable again, and
+    /// the save has to recover instead of skipping the database for the rest of
+    /// the turn.
+    pub fn record_turn_outputs_with_retry(
+        &mut self,
+        outputs: &[TurnOutput],
+        budget: Duration,
+    ) -> Result<Vec<TranscriptPatch>, ConversationError> {
+        if outputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One attempt must not block for the whole connection timeout: the
+        // retry loop owns the waiting. A spent budget only probes the
+        // database, so its attempt must not wait at all.
+        let attempt_timeout = if budget.is_zero() {
+            Duration::ZERO
+        } else {
+            SAVE_ATTEMPT_BUSY_TIMEOUT
+        };
+        self.connection.busy_timeout(attempt_timeout)?;
+        let saved = with_busy_retry(budget, || {
+            #[cfg(test)]
+            count_save_attempt();
+            self.record_turn_outputs(outputs)
+        });
+        self.connection.busy_timeout(BUSY_TIMEOUT)?;
+        saved
     }
 
     pub fn commit_summary(
@@ -2528,6 +2646,193 @@ mod busy_open_tests {
             )
             .unwrap_err();
         assert!(is_busy(&error), "expected a busy sqlite error, got {error}");
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+    }
+}
+
+/// SPEC-agent-api FR-2140: a turn-output save must retry a busy conversation
+/// database, persist the reply once the lock is released, and report a
+/// database that stays locked as a busy error.
+#[cfg(test)]
+mod busy_save_tests {
+    use super::*;
+
+    fn temp_workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let db = temp.path().join("conversations.sqlite3");
+        (temp, workspace, db)
+    }
+
+    /// A conversation with one open turn, ready for turn outputs.
+    fn engine_with_turn(db: &Path, workspace: &Path) -> (ConversationEngine, TurnOutput) {
+        let mut engine = ConversationEngine::open(db, workspace).unwrap();
+        let conversation = engine
+            .select(ConversationSelection::New { title: None })
+            .unwrap();
+        let request = match engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Codex,
+                model_id: None,
+                prompt: "hello".to_owned(),
+                display_text: None,
+            })
+            .unwrap()
+        {
+            BeginTurnOutcome::Ready(request) => request,
+            other => panic!("expected a ready turn, got {other:?}"),
+        };
+        let output = TurnOutput {
+            conversation_id: ConversationId::new(conversation.id.as_str()),
+            turn_id: TurnId::new(request.turn_id.as_str()),
+            agent: AgentKey::Codex,
+            event: TurnEvent::TextDelta("the reply".to_owned()),
+        };
+        (engine, output)
+    }
+
+    #[test]
+    fn tc_2140_busy_save_is_retried_and_persisted_once_the_lock_is_released() {
+        let (_temp, workspace, db) = temp_workspace();
+        let (mut engine, output) = engine_with_turn(&db, &workspace);
+
+        // Another process holds the write lock and releases it shortly after.
+        let blocker = Connection::open(&db).unwrap();
+        blocker.busy_timeout(Duration::from_secs(1)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            blocker.execute_batch("COMMIT").unwrap();
+        });
+
+        let attempts_before = save_attempts();
+        let saved = engine
+            .record_turn_outputs_with_retry(&[output], Duration::from_secs(10))
+            .expect("the save must succeed once the lock is released");
+        let attempts = save_attempts() - attempts_before;
+        assert!(
+            attempts >= 2,
+            "a busy save must be retried, made {attempts} attempts"
+        );
+        assert!(!saved.is_empty());
+        releaser.join().unwrap();
+
+        let connection = Connection::open(&db).unwrap();
+        let text: String = connection
+            .query_row(
+                "SELECT text FROM messages WHERE role = 'assistant'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(text, "the reply");
+    }
+
+    #[test]
+    fn tc_2140_a_locked_database_fails_the_save_with_a_busy_error() {
+        let (_temp, workspace, db) = temp_workspace();
+        let (mut engine, output) = engine_with_turn(&db, &workspace);
+
+        let blocker = Connection::open(&db).unwrap();
+        blocker.busy_timeout(Duration::from_secs(1)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let error = engine
+            .record_turn_outputs_with_retry(&[output], Duration::from_millis(400))
+            .expect_err("the save must fail while the database is locked");
+        let ConversationError::Busy(message) = error else {
+            panic!("expected a busy conversation database, got {error:?}");
+        };
+        assert!(
+            message.contains("database is locked") && message.contains("retry"),
+            "the busy message must be actionable, got {message}"
+        );
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// A spent budget must still reach the database: the lock can be released
+    /// right after the budget ran out, and the save has to recover instead of
+    /// skipping the database for the rest of the turn (FR-2140).
+    #[test]
+    fn tc_2140_a_spent_budget_still_saves_once_the_lock_is_released() {
+        let (_temp, workspace, db) = temp_workspace();
+        let (mut engine, output) = engine_with_turn(&db, &workspace);
+
+        let blocker = Connection::open(&db).unwrap();
+        blocker.busy_timeout(Duration::from_secs(1)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        // The budget is spent: the save reports the busy database.
+        let error = engine
+            .record_turn_outputs_with_retry(std::slice::from_ref(&output), Duration::ZERO)
+            .expect_err("a locked database must fail the save");
+        assert!(
+            matches!(error, ConversationError::Busy(_)),
+            "expected a busy conversation database, got {error:?}"
+        );
+
+        // The lock is released: the next save recovers, even with a spent
+        // budget, and the reply is stored.
+        blocker.execute_batch("ROLLBACK").unwrap();
+        engine
+            .record_turn_outputs_with_retry(&[output], Duration::ZERO)
+            .expect("the save must recover once the database is writable");
+
+        let connection = Connection::open(&db).unwrap();
+        let text: String = connection
+            .query_row(
+                "SELECT text FROM messages WHERE role = 'assistant'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(text, "the reply");
+    }
+
+    /// FR-2140: after the save budget is spent the session is closed with a
+    /// short busy timeout, and a close that fails against the locked database
+    /// is never attempted again (Drop must not wait a second time).
+    #[test]
+    fn tc_2140_a_busy_close_is_attempted_once_and_does_not_wait_twice() {
+        let (_temp, workspace, db) = temp_workspace();
+        let mut engine = ConversationEngine::open(&db, &workspace).unwrap();
+
+        let blocker = Connection::open(&db).unwrap();
+        blocker.busy_timeout(Duration::from_secs(1)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let attempts_before = close_attempts();
+        let error = engine
+            .close_session_with_timeout(Duration::from_millis(100))
+            .expect_err("a locked database must fail the close");
+        assert!(
+            is_busy_error(&error),
+            "expected a busy close error, got {error:?}"
+        );
+        assert_eq!(
+            close_attempts() - attempts_before,
+            1,
+            "the close must be attempted exactly once"
+        );
+
+        // The first attempt already marked the session closed: the fallback
+        // close returns immediately instead of waiting the default timeout.
+        let started = Instant::now();
+        engine
+            .close_session()
+            .expect("a session marked closed must close without touching the database");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "the fallback close must not wait for the lock"
+        );
+        assert_eq!(
+            close_attempts() - attempts_before,
+            1,
+            "the fallback close must not make a second attempt"
+        );
 
         blocker.execute_batch("ROLLBACK").unwrap();
     }
