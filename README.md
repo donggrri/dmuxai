@@ -287,7 +287,8 @@ Full reference: [docs/API.md](docs/API.md) — CLI, HTTP, MCP, events and `[noti
 Built-in runners are Cursor (`cursor-agent`), AGY and Codex. **Any other headless
 agent CLI** (opencode, hermes, pi, Claude Code, ...) is attached with an
 `[[agents.custom]]` block in `dmuxai.toml` (repo) or `~/.config/dmuxai/dmuxai.toml`
-(user) — no Rust code. Custom agents show up in `/agent` and F2, keep conversation
+(user) — no Rust code. In a repo `dmuxai.toml`, custom agents require `dmuxai trust`
+before execution. Custom agents show up in `/agent` and F2, keep conversation
 continuity via their session id, and can run graph nodes:
 
 ```toml
@@ -311,7 +312,7 @@ More fields and ready-made presets: [docs/agents/custom-agents.md](docs/agents/c
 ## MCP servers (dashboard and imports)
 
 Define MCP servers under `[[mcp.servers]]` in `~/.config/dmuxai/dmuxai.toml`
-(user) or workspace `dmuxai.toml`. A repo `dmuxai.toml` overrides an entry with the same `name`, and
+(user) or workspace `dmuxai.toml` (which requires `dmuxai trust`). A repo `dmuxai.toml` overrides an entry with the same `name`, and
 `enabled = false` removes it from the merged list.
 
 DmuxAI does not pass MCP servers to agents; every agent configures MCP tools in its
@@ -455,7 +456,7 @@ DmuxAI locates user configuration using the following precedence:
 
 An explicit config path passed via `--config` or `DMUXAI_CONFIG` that does not exist exits immediately with status `2` (`config file not found: <path>`).
 
-Because `--config` and `DMUXAI_CONFIG` select the config file directly, pointing DmuxAI at a separate configuration no longer requires `XDG_CONFIG_HOME` isolation (which previously broke tool credentials such as `gh` or `git` in agent subprocesses). Workspace `dmuxai.toml` still overrides user configuration per key.
+Because `--config` and `DMUXAI_CONFIG` select the config file directly, pointing DmuxAI at a separate configuration no longer requires `XDG_CONFIG_HOME` isolation (which previously broke tool credentials such as `gh` or `git` in agent subprocesses). Workspace `dmuxai.toml` still overrides user configuration per key, subject to workspace configuration trust (`dmuxai trust`) for restricted execution settings.
 
 ## Linux / WSL release binary
 
@@ -707,7 +708,7 @@ Exception: when `allowed_runners` is unset, every runner may take graph nodes
 except the built-in opencode and grok runners (see [First run](#first-run)).
 List `opencode` or `grok` explicitly to allow that runner.
 
-User-level configuration is read first, and any keys in the workspace `dmuxai.toml` override user configuration per key.
+User-level configuration is read first, and any keys in the workspace `dmuxai.toml` override user configuration per key. Restricted execution keys in a workspace `dmuxai.toml` require trust via `dmuxai trust` (or `DMUXAI_TRUST_WORKSPACE_CONFIG=1`).
 
 ## Custom headless agents
 

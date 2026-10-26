@@ -9,6 +9,9 @@ use crate::notify::NotifySettings;
 use crate::runner_protocol::RunnerProtocol;
 use crate::runtime_env::RuntimeEnv;
 use crate::theme::{Theme, ThemeToml};
+use crate::workspace_trust::{
+    TrustDecision, TrustStore, WorkspaceTrustStatus, content_hash, decide,
+};
 
 #[doc(hidden)]
 pub use crate::state_path::test_env_lock;
@@ -104,6 +107,8 @@ pub struct DmuxSettings {
     /// Runner fallback chains and stall policy from `[runners.<id>]`
     /// `fallback`/`stall_*` (SPEC-runner-fallback, FR-2101).
     pub runner_fallback: crate::runner_fallback::FallbackSettings,
+    /// Trust status of workspace configuration.
+    pub workspace_trust: WorkspaceTrustStatus,
 }
 
 /// Convenience alias for [`DmuxSettings`].
@@ -417,6 +422,33 @@ impl DmuxSettings {
         if let Ok(contents) = std::fs::read_to_string(&config_path) {
             match toml::from_str::<DmuxToml>(&contents) {
                 Ok(mut parsed) => {
+                    let sha256 = content_hash(contents.as_bytes());
+                    let restricted = restricted_workspace_keys(&parsed, workspace, env);
+                    if restricted.is_empty() {
+                        settings.workspace_trust = WorkspaceTrustStatus::NotNeeded;
+                    } else {
+                        let store = TrustStore::load(env);
+                        if let Some(warning) = store.corrupt_warning() {
+                            settings.config_warnings.push(warning.to_owned());
+                        }
+                        match decide(env, workspace, &sha256) {
+                            TrustDecision::Trusted(source) => {
+                                settings.workspace_trust = WorkspaceTrustStatus::Trusted(source);
+                            }
+                            TrustDecision::Untrusted => {
+                                strip_restricted_workspace_keys(&mut parsed, workspace, env);
+                                settings.config_warnings.push(format!(
+                                    "workspace dmuxai.toml is not trusted; ignored: {}. Review it, then run `dmuxai trust` (or set DMUXAI_TRUST_WORKSPACE_CONFIG=1 for one run)",
+                                    restricted.join(", ")
+                                ));
+                                settings.workspace_trust = WorkspaceTrustStatus::Untrusted {
+                                    sha256,
+                                    ignored: restricted.clone(),
+                                };
+                            }
+                        }
+                    }
+
                     if let Some(runners) = parsed.runners.take() {
                         let mut parsed_map = BTreeMap::new();
                         let mut fallback_map = BTreeMap::new();
@@ -1022,6 +1054,231 @@ impl DmuxSettings {
     }
 }
 
+fn path_inside_workspace(path: &Path, workspace: &Path) -> bool {
+    let ws_norm = std::fs::canonicalize(workspace).unwrap_or_else(|_| {
+        if workspace.is_absolute() {
+            workspace.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(workspace)
+        }
+    });
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        ws_norm.join(path)
+    };
+    let cand_norm = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+    cand_norm == ws_norm || cand_norm.starts_with(&ws_norm)
+}
+
+fn prompt_file_outside_workspace(file_rel: &str, workspace: &Path) -> bool {
+    let path = Path::new(file_rel);
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    };
+    !path_inside_workspace(&full, workspace)
+}
+
+fn restricted_workspace_keys(parsed: &DmuxToml, workspace: &Path, env: &RuntimeEnv) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(notify) = &parsed.notify {
+        if notify.command.is_some() {
+            keys.push("notify.command".to_owned());
+        }
+        if notify.webhook_url.is_some() {
+            keys.push("notify.webhook_url".to_owned());
+        }
+        if notify.webhook_secret_env.is_some() {
+            keys.push("notify.webhook_secret_env".to_owned());
+        }
+        if notify.secret_header.is_some() {
+            keys.push("notify.secret_header".to_owned());
+        }
+    }
+    if parsed
+        .agents
+        .as_ref()
+        .and_then(|a| a.custom.as_ref())
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        keys.push("agents.custom".to_owned());
+    }
+    if parsed
+        .mcp
+        .as_ref()
+        .map(|m| !m.servers.is_empty())
+        .unwrap_or(false)
+    {
+        keys.push("mcp.servers".to_owned());
+    }
+    if let Some(skills) = &parsed.skills {
+        for (name, source) in &skills.sources {
+            if source.git.is_some() {
+                keys.push(format!("skills.sources.{name}"));
+                continue;
+            }
+            if let Some(path) = &source.path {
+                let full = if Path::new(path).is_absolute() {
+                    PathBuf::from(path)
+                } else {
+                    workspace.join(path)
+                };
+                if !path_inside_workspace(&full, workspace) {
+                    keys.push(format!("skills.sources.{name}"));
+                }
+            }
+        }
+    }
+    if let Some(memory) = &parsed.memory {
+        if let Some(vault) = &memory.vault {
+            let vault_path = expand_home_from(vault, env);
+            let resolved = if vault_path.is_relative() {
+                workspace.join(vault_path)
+            } else {
+                vault_path
+            };
+            if !path_inside_workspace(&resolved, workspace) {
+                keys.push("memory.vault".to_owned());
+            }
+        }
+        if let Some(dir) = &memory.dir {
+            let p = Path::new(dir);
+            if p.is_absolute() {
+                let resolved = expand_home_from(dir, env);
+                if !path_inside_workspace(&resolved, workspace) {
+                    keys.push("memory.dir".to_owned());
+                }
+            } else if dir.contains("..") {
+                keys.push("memory.dir".to_owned());
+            }
+        }
+    }
+    if parsed
+        .todo
+        .as_ref()
+        .and_then(|t| t.jira_base_url.as_ref())
+        .is_some()
+    {
+        keys.push("todo.jira_base_url".to_owned());
+    }
+    if let Some(runners) = &parsed.runners {
+        for (id, raw) in runners {
+            if let Some(file) = &raw.system_prompt_file
+                && prompt_file_outside_workspace(file, workspace)
+            {
+                keys.push(format!("runners.{id}.system_prompt_file"));
+            }
+            if let Some(models) = &raw.models {
+                for (model, entry) in models {
+                    if let Some(file) = &entry.system_prompt_file
+                        && prompt_file_outside_workspace(file, workspace)
+                    {
+                        keys.push(format!("runners.{id}.models.{model}.system_prompt_file"));
+                    }
+                }
+            }
+        }
+    }
+    keys
+}
+
+fn strip_restricted_workspace_keys(parsed: &mut DmuxToml, workspace: &Path, env: &RuntimeEnv) {
+    if let Some(notify) = &mut parsed.notify {
+        notify.command = None;
+        notify.webhook_url = None;
+        notify.webhook_secret_env = None;
+        notify.secret_header = None;
+    }
+    if let Some(agents) = &mut parsed.agents {
+        agents.custom = None;
+    }
+    parsed.mcp = None;
+    if let Some(skills) = &mut parsed.skills {
+        skills.sources.retain(|_name, source| {
+            if source.git.is_some() {
+                return false;
+            }
+            if let Some(path) = &source.path {
+                let full = if Path::new(path).is_absolute() {
+                    PathBuf::from(path)
+                } else {
+                    workspace.join(path)
+                };
+                if !path_inside_workspace(&full, workspace) {
+                    return false;
+                }
+            }
+            true
+        });
+    }
+    if let Some(memory) = &mut parsed.memory {
+        if let Some(vault) = &memory.vault {
+            let vault_path = expand_home_from(vault, env);
+            let resolved = if vault_path.is_relative() {
+                workspace.join(vault_path)
+            } else {
+                vault_path
+            };
+            if !path_inside_workspace(&resolved, workspace) {
+                memory.vault = None;
+            }
+        }
+        if let Some(dir) = &memory.dir.clone() {
+            let p = Path::new(dir);
+            let outside = if p.is_absolute() {
+                let resolved = expand_home_from(dir, env);
+                !path_inside_workspace(&resolved, workspace)
+            } else {
+                dir.contains("..")
+            };
+            if outside {
+                memory.dir = None;
+            }
+        }
+    }
+    if let Some(todo) = &mut parsed.todo {
+        todo.jira_base_url = None;
+    }
+    if let Some(runners) = &mut parsed.runners {
+        for raw in runners.values_mut() {
+            if let Some(file) = &raw.system_prompt_file
+                && prompt_file_outside_workspace(file, workspace)
+            {
+                raw.system_prompt_file = None;
+            }
+            if let Some(models) = &mut raw.models {
+                for entry in models.values_mut() {
+                    if let Some(file) = &entry.system_prompt_file
+                        && prompt_file_outside_workspace(file, workspace)
+                    {
+                        entry.system_prompt_file = None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Inspect a workspace's `dmuxai.toml` for trust purposes.
+///
+/// Returns `(exists, sha256, restricted_keys)` where `exists` is true when the
+/// file is present and parses, `sha256` is the hash of its raw bytes, and
+/// `restricted_keys` lists the keys that would be stripped if untrusted.
+pub fn inspect_workspace_trust(workspace: &Path, env: &RuntimeEnv) -> (bool, String, Vec<String>) {
+    let config_path = workspace.join("dmuxai.toml");
+    let Ok(contents) = std::fs::read_to_string(&config_path) else {
+        return (false, String::new(), Vec::new());
+    };
+    let Ok(parsed) = toml::from_str::<DmuxToml>(&contents) else {
+        return (true, content_hash(contents.as_bytes()), Vec::new());
+    };
+    let keys = restricted_workspace_keys(&parsed, workspace, env);
+    (true, content_hash(contents.as_bytes()), keys)
+}
+
 impl Default for DmuxSettings {
     fn default() -> Self {
         Self {
@@ -1057,6 +1314,7 @@ impl Default for DmuxSettings {
             runner_prompts: BTreeMap::new(),
             runner_models: BTreeMap::new(),
             runner_fallback: Default::default(),
+            workspace_trust: WorkspaceTrustStatus::NoWorkspaceConfig,
         }
     }
 }
@@ -1469,7 +1727,9 @@ command = ["workspace-only"]
         )
         .unwrap();
 
-        let settings = DmuxSettings::load_with_user_config(&ws_dir, Some(&user_toml));
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws_dir, Some(&user_toml), &env);
 
         // `[theme]` surface colors apply through the nested table.
         assert_eq!(
@@ -1543,7 +1803,9 @@ text_path = "/part/text"
 "#,
         )
         .unwrap();
-        let settings = DmuxSettings::load_with_user_config(&dir, None);
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let settings = DmuxSettings::load_with_user_config_and_env(&dir, None, &env);
         assert!(
             settings.config_warnings.iter().any(|w| {
                 w.contains("[custom agent] warn-agent")
@@ -1868,7 +2130,9 @@ allowed_runners = []
         )
         .unwrap();
 
-        let settings = DmuxSettings::load_with_user_config(&ws_dir, Some(&user_toml));
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws_dir, Some(&user_toml), &env);
         assert_eq!(
             settings.todo_jira_base_url.as_deref(),
             Some("https://example.atlassian.net"),
@@ -1881,7 +2145,9 @@ allowed_runners = []
             "[todo]\njira_base_url = \"javascript:alert(1)\"\n",
         )
         .unwrap();
-        let settings = DmuxSettings::load_with_user_config(&ws_dir, Some(&user_toml));
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws_dir, Some(&user_toml), &env);
         assert_eq!(
             settings.todo_jira_base_url.as_deref(),
             Some("https://user.atlassian.net"),
@@ -2066,7 +2332,9 @@ timeout_secs = 0
         )
         .unwrap();
 
-        let settings = DmuxSettings::load_with_user_config(dir.path(), None);
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let settings = DmuxSettings::load_with_user_config_and_env(dir.path(), None, &env);
         assert_eq!(
             settings.notify.webhook_url.as_deref(),
             Some("ftp://example.invalid/hook")
@@ -2165,7 +2433,9 @@ runners = ["custom-agent"]
         )
         .unwrap();
 
-        let settings = DmuxSettings::load_with_user_config(ws.path(), Some(&user));
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let settings = DmuxSettings::load_with_user_config_and_env(ws.path(), Some(&user), &env);
         let names: Vec<&str> = settings
             .mcp_servers
             .iter()
@@ -2196,7 +2466,16 @@ runners = ["custom-agent"]
         write_memory_ws(ws.path(), vault.path(), "");
 
         let exe = exe();
-        let s = DmuxSettings::load_with_exe(ws.path(), None, Some(&exe));
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let s = DmuxSettings::load_with_runners_and_env(
+            ws.path(),
+            None,
+            Some(&exe),
+            find_opencode_bin(),
+            find_grok_bin(),
+            &env,
+        );
         assert!(s.memory.is_some());
         assert!(
             s.mcp_servers.iter().all(|s| s.name != "dmuxai-memory"),
@@ -2470,11 +2749,11 @@ mod builtin_opencode_tests {
                     None,
                     &env,
                 );
-                assert_eq!(
-                    settings,
-                    DmuxSettings::default(),
-                    "opencode={opencode} grok={grok}"
-                );
+                let expected = DmuxSettings {
+                    workspace_trust: WorkspaceTrustStatus::NotNeeded,
+                    ..DmuxSettings::default()
+                };
+                assert_eq!(settings, expected, "opencode={opencode} grok={grok}");
             }
         }
     }
@@ -2913,7 +3192,9 @@ system_prompt_file = "{}"
             abs_file.to_string_lossy()
         );
         std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
-        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let settings = DmuxSettings::load_with_user_config_and_env(ws.path(), None, &env);
         let resolved = resolve(&settings, "codex", PromptRole::Chat).expect("resolved");
         assert_eq!(resolved.text, "Absolute prompt text.");
         assert!(resolved.source.starts_with("workspace:[runners.default] ("));
@@ -3087,7 +3368,9 @@ system_prompt = "Codex prompt"
 system_prompt = "Test prompt"
 "#;
         std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
-        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let settings = DmuxSettings::load_with_user_config_and_env(ws.path(), None, &env);
         let resolved = resolve(&settings, "codex", PromptRole::Chat).expect("resolved");
         assert_eq!(resolved.inject, PromptInject::Session);
     }
@@ -3102,7 +3385,9 @@ system_prompt = "Test prompt"
 prompt_inject = "always"
 "#;
         std::fs::write(ws.path().join("dmuxai.toml"), config).unwrap();
-        let settings = DmuxSettings::load_with_user_config(ws.path(), None);
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let settings = DmuxSettings::load_with_user_config_and_env(ws.path(), None, &env);
         let resolved = resolve(&settings, "codex", PromptRole::Chat).expect("resolved");
         assert_eq!(resolved.inject, PromptInject::Always);
     }
@@ -3361,7 +3646,9 @@ model = "opencode/beam-free"
 "#,
         )
         .unwrap();
-        let settings2 = DmuxSettings::load_with_user_config(ws2.path(), None);
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let settings2 = DmuxSettings::load_with_user_config_and_env(ws2.path(), None, &env);
         assert_eq!(
             settings2.runner_models.get("oc"),
             Some(&"opencode/beam-free".to_owned())
@@ -3663,6 +3950,7 @@ system_prompt = ""
 #[cfg(test)]
 mod runner_fallback_settings_tests {
     use super::*;
+    use crate::workspace_trust::TrustSource;
 
     // tc_2101 (settings): parse fallback tables from user + workspace configs.
     #[test]
@@ -3744,6 +4032,406 @@ mod runner_fallback_settings_tests {
                 .any(|w| w
                     .contains("fallback 'nosuchrunner' ignored: unknown runner 'nosuchrunner'")),
             "warnings: {:?}",
+            settings.config_warnings
+        );
+    }
+
+    #[test]
+    fn tc_2198_untrusted_notify_keys_stripped_and_warnings_sanitized() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let ws_toml = r#"
+[notify]
+command = ["sh", "-c", "echo malicious"]
+webhook_url = "https://secret-hook.invalid/hook"
+webhook_secret_env = "VERY_SECRET_ENV_VAR"
+secret_header = "X-Super-Secret"
+events = ["run_failed", "run_succeeded"]
+"#;
+        std::fs::write(ws.join("dmuxai.toml"), ws_toml).unwrap();
+
+        let state_dir = dir.path().join("state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            trust_workspace_config: false,
+            ..RuntimeEnv::default()
+        };
+
+        let settings = DmuxSettings::load_with_env(&ws, &env);
+        assert_eq!(settings.notify.command, None);
+        assert_eq!(settings.notify.webhook_url, None);
+        assert_eq!(settings.notify.webhook_secret_env, None);
+        assert_eq!(settings.notify.secret_header, None);
+        // Events are kept!
+        assert_eq!(
+            settings.notify.events.as_deref(),
+            Some(["run_failed".to_owned(), "run_succeeded".to_owned()].as_slice())
+        );
+
+        match &settings.workspace_trust {
+            WorkspaceTrustStatus::Untrusted { sha256: _, ignored } => {
+                assert!(ignored.contains(&"notify.command".to_owned()));
+                assert!(ignored.contains(&"notify.webhook_url".to_owned()));
+                assert!(ignored.contains(&"notify.webhook_secret_env".to_owned()));
+                assert!(ignored.contains(&"notify.secret_header".to_owned()));
+            }
+            other => panic!("expected Untrusted, got {other:?}"),
+        }
+
+        // Exactly one trust warning naming the keys and NOT containing URL or env var name values
+        let trust_warnings: Vec<&String> = settings
+            .config_warnings
+            .iter()
+            .filter(|w| w.contains("workspace dmuxai.toml is not trusted"))
+            .collect();
+        assert_eq!(trust_warnings.len(), 1);
+        let warn = trust_warnings[0];
+        assert!(warn.contains("notify.command"));
+        assert!(warn.contains("notify.webhook_url"));
+        assert!(warn.contains("notify.webhook_secret_env"));
+        assert!(warn.contains("notify.secret_header"));
+        assert!(!warn.contains("https://secret-hook.invalid"));
+        assert!(!warn.contains("VERY_SECRET_ENV_VAR"));
+        assert!(!warn.contains("X-Super-Secret"));
+    }
+
+    #[test]
+    fn tc_2199_untrusted_custom_agents_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let ws_toml = r#"
+[[agents.custom]]
+name = "ws-agent"
+command = ["echo", "test"]
+"#;
+        std::fs::write(ws.join("dmuxai.toml"), ws_toml).unwrap();
+
+        let state_dir = dir.path().join("state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            trust_workspace_config: false,
+            ..RuntimeEnv::default()
+        };
+
+        let settings = DmuxSettings::load_with_env(&ws, &env);
+        assert!(
+            settings.custom_agents.iter().all(|a| a.name != "ws-agent"),
+            "custom agent should be absent"
+        );
+        assert!(matches!(
+            settings.workspace_trust,
+            WorkspaceTrustStatus::Untrusted { .. }
+        ));
+    }
+
+    #[test]
+    fn tc_2200_untrusted_mcp_servers_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let ws_toml = r#"
+[[mcp.servers]]
+name = "ws-mcp"
+command = "echo"
+args = ["mcp"]
+"#;
+        std::fs::write(ws.join("dmuxai.toml"), ws_toml).unwrap();
+
+        let state_dir = dir.path().join("state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            trust_workspace_config: false,
+            ..RuntimeEnv::default()
+        };
+
+        let settings = DmuxSettings::load_with_env(&ws, &env);
+        assert!(
+            settings.mcp_servers.iter().all(|s| s.name != "ws-mcp"),
+            "mcp server should be absent"
+        );
+        assert!(matches!(
+            settings.workspace_trust,
+            WorkspaceTrustStatus::Untrusted { .. }
+        ));
+    }
+
+    #[test]
+    fn tc_2201_untrusted_skills_git_vault_outside_and_jira_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside_vault = dir.path().join("outside_vault");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside_vault).unwrap();
+
+        let ws_toml = format!(
+            r#"
+[skills.sources.remote-git]
+git = "https://github.com/foo/bar.git"
+
+[memory]
+vault = "{}"
+
+[todo]
+jira_base_url = "https://malicious.atlassian.net"
+"#,
+            outside_vault.display()
+        );
+        std::fs::write(ws.join("dmuxai.toml"), ws_toml).unwrap();
+
+        let state_dir = dir.path().join("state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            trust_workspace_config: false,
+            ..RuntimeEnv::default()
+        };
+
+        let settings = DmuxSettings::load_with_env(&ws, &env);
+        assert!(!settings.stage_skills.sources.contains_key("remote-git"));
+        assert_eq!(settings.memory, None);
+        assert_eq!(settings.todo_jira_base_url, None);
+        assert!(matches!(
+            settings.workspace_trust,
+            WorkspaceTrustStatus::Untrusted { .. }
+        ));
+    }
+
+    #[test]
+    fn tc_2202_user_config_path_loads_unchanged_without_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let user_toml = dir.path().join("user.toml");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let user_content = r#"
+[notify]
+command = ["echo", "from-user"]
+webhook_url = "https://user-hook.invalid/hook"
+webhook_secret_env = "USER_SECRET_ENV"
+secret_header = "X-User-Secret"
+events = ["run_failed"]
+
+[[agents.custom]]
+name = "user-agent"
+command = ["echo", "user"]
+
+[[mcp.servers]]
+name = "user-mcp"
+command = "echo"
+args = ["user"]
+"#;
+        std::fs::write(&user_toml, user_content).unwrap();
+
+        let state_dir = dir.path().join("state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            trust_workspace_config: false,
+            ..RuntimeEnv::default()
+        };
+
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user_toml), &env);
+        // Status is NoWorkspaceConfig when workspace has no dmuxai.toml
+        assert_eq!(
+            settings.workspace_trust,
+            WorkspaceTrustStatus::NoWorkspaceConfig
+        );
+        assert_eq!(
+            settings.notify.command,
+            Some(vec!["echo".to_owned(), "from-user".to_owned()])
+        );
+        assert_eq!(
+            settings.notify.webhook_url.as_deref(),
+            Some("https://user-hook.invalid/hook")
+        );
+        assert_eq!(
+            settings.notify.webhook_secret_env.as_deref(),
+            Some("USER_SECRET_ENV")
+        );
+        assert_eq!(
+            settings.notify.secret_header.as_deref(),
+            Some("X-User-Secret")
+        );
+        assert!(
+            settings
+                .custom_agents
+                .iter()
+                .any(|a| a.name == "user-agent")
+        );
+        assert!(settings.mcp_servers.iter().any(|s| s.name == "user-mcp"));
+        assert!(
+            !settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("is not trusted")),
+            "unexpected trust warning in user config: {:?}",
+            settings.config_warnings
+        );
+    }
+
+    #[test]
+    fn tc_2203_trust_record_applied_modify_file_reverts_to_untrusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let config_path = ws.join("dmuxai.toml");
+
+        let content1 = r#"
+[notify]
+command = ["echo", "ws-notify"]
+"#;
+        std::fs::write(&config_path, content1).unwrap();
+        let hash1 = content_hash(content1.as_bytes());
+
+        let state_dir = dir.path().join("state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir.clone()),
+            trust_workspace_config: false,
+            ..RuntimeEnv::default()
+        };
+
+        // Initially untrusted
+        let settings_init = DmuxSettings::load_with_env(&ws, &env);
+        assert!(matches!(
+            settings_init.workspace_trust,
+            WorkspaceTrustStatus::Untrusted { .. }
+        ));
+
+        // Trust exact hash
+        let mut store = TrustStore::load(&env);
+        store.trust(&ws, &hash1);
+        store.save().unwrap();
+
+        // Applied as Trusted(Record)
+        let settings_trusted = DmuxSettings::load_with_env(&ws, &env);
+        assert_eq!(
+            settings_trusted.workspace_trust,
+            WorkspaceTrustStatus::Trusted(TrustSource::Record)
+        );
+        assert_eq!(
+            settings_trusted.notify.command,
+            Some(vec!["echo".to_owned(), "ws-notify".to_owned()])
+        );
+
+        // Modify the file after trusting
+        let content2 = format!("{content1}\n# modified comment\n");
+        std::fs::write(&config_path, &content2).unwrap();
+        let hash2 = content_hash(content2.as_bytes());
+        assert_ne!(hash1, hash2);
+
+        // Untrusted again with the new sha
+        let settings_modified = DmuxSettings::load_with_env(&ws, &env);
+        match settings_modified.workspace_trust {
+            WorkspaceTrustStatus::Untrusted { sha256, .. } => {
+                assert_eq!(sha256, hash2);
+            }
+            other => panic!("expected Untrusted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tc_2204_opt_in_yields_trusted_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            "[notify]\ncommand = [\"echo\", \"optin\"]\n",
+        )
+        .unwrap();
+
+        let state_dir = dir.path().join("state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            trust_workspace_config: true,
+            ..RuntimeEnv::default()
+        };
+
+        let settings = DmuxSettings::load_with_env(&ws, &env);
+        assert_eq!(
+            settings.workspace_trust,
+            WorkspaceTrustStatus::Trusted(TrustSource::OptIn)
+        );
+        assert_eq!(
+            settings.notify.command,
+            Some(vec!["echo".to_owned(), "optin".to_owned()])
+        );
+    }
+
+    #[test]
+    fn tc_2205_harmless_workspace_config_is_not_needed_without_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let ws_toml = r#"
+[ui]
+status_bar = false
+
+[graph]
+max_parallel = 4
+"#;
+        std::fs::write(ws.join("dmuxai.toml"), ws_toml).unwrap();
+
+        let state_dir = dir.path().join("state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            trust_workspace_config: false,
+            ..RuntimeEnv::default()
+        };
+
+        let settings = DmuxSettings::load_with_env(&ws, &env);
+        assert_eq!(settings.workspace_trust, WorkspaceTrustStatus::NotNeeded);
+        assert!(
+            !settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("is not trusted")),
+            "unexpected warning: {:?}",
+            settings.config_warnings
+        );
+    }
+
+    #[test]
+    fn tc_2206_corrupt_store_yields_untrusted_and_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            "[notify]\ncommand = [\"echo\", \"corrupt\"]\n",
+        )
+        .unwrap();
+
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("trusted-workspaces.json"),
+            "INVALID NOT JSON",
+        )
+        .unwrap();
+
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            trust_workspace_config: false,
+            ..RuntimeEnv::default()
+        };
+
+        let settings = DmuxSettings::load_with_env(&ws, &env);
+        assert!(matches!(
+            settings.workspace_trust,
+            WorkspaceTrustStatus::Untrusted { .. }
+        ));
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("is corrupt")),
+            "missing corrupt warning: {:?}",
             settings.config_warnings
         );
     }

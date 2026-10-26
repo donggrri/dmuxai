@@ -16,12 +16,20 @@ pub struct RuntimeEnv {
     pub xdg_config_home: Option<PathBuf>,
     pub home: Option<PathBuf>,
     pub userprofile: Option<PathBuf>,
+    pub dmuxai_state_dir: Option<PathBuf>,
+    pub xdg_state_home: Option<PathBuf>,
+    pub trust_workspace_config: bool,
     pub path: Option<OsString>,
     pub reduced_motion: Option<OsString>,
 }
 
 impl RuntimeEnv {
     pub fn from_process() -> Self {
+        let trust_workspace_config = std::env::var("DMUXAI_TRUST_WORKSPACE_CONFIG")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
         Self {
             opencode_bin: std::env::var_os("DMUXAI_OPENCODE_BIN").filter(|v| !v.is_empty()),
             grok_bin: std::env::var_os("DMUXAI_GROK_BIN").filter(|v| !v.is_empty()),
@@ -40,6 +48,13 @@ impl RuntimeEnv {
             userprofile: std::env::var_os("USERPROFILE")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
+            dmuxai_state_dir: std::env::var_os("DMUXAI_STATE_DIR")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            trust_workspace_config,
             path: std::env::var_os("PATH"),
             reduced_motion: std::env::var_os("DMUXAI_REDUCED_MOTION").filter(|v| !v.is_empty()),
         }

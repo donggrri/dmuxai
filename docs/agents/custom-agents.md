@@ -1,6 +1,7 @@
 # Custom headless agents (`[[agents.custom]]`)
 
 Any agent CLI with a headless (non-interactive) command can be added in `dmuxai.toml`, no Rust code.
+In a workspace `dmuxai.toml`, `[[agents.custom]]` definitions require workspace trust (`dmuxai trust` or `DMUXAI_TRUST_WORKSPACE_CONFIG=1`) to prevent executing untrusted commands. User configuration (`~/.config/dmuxai/dmuxai.toml`) is always trusted.
 It then shows in `/agent` and F2, gets its own chat color, and can be a graph runner via
 `/graph override <node> <name> <model>`.
 

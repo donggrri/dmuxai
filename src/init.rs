@@ -270,7 +270,9 @@ mod tests {
                 None,
                 &env,
             );
-            assert_eq!(settings, crate::settings::DmuxSettings::default());
+            let mut expected = crate::settings::DmuxSettings::default();
+            expected.workspace_trust = crate::workspace_trust::WorkspaceTrustStatus::NotNeeded;
+            assert_eq!(settings, expected);
         }
         assert!(detected.contains("# name = \"grok\""));
         assert!(

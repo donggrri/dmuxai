@@ -2180,7 +2180,9 @@ command = ["x", "--mcp", "{mcp_config}", "{prompt}"]
         )
         .unwrap();
 
-        let settings = crate::settings::DmuxSettings::load(tmp.path());
+        let mut env = crate::runtime_env::RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let settings = crate::settings::DmuxSettings::load_with_env(tmp.path(), &env);
         let warnings: Vec<&String> = settings
             .config_warnings
             .iter()

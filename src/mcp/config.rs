@@ -363,6 +363,7 @@ pub fn resolve_servers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_env::RuntimeEnv;
     use crate::settings::DmuxSettings;
 
     fn write(path: &std::path::Path, contents: &str) {
@@ -438,7 +439,9 @@ enabled = false
 "#,
         );
 
-        let settings = DmuxSettings::load_with_user_config(&ws_dir, Some(&user_toml));
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws_dir, Some(&user_toml), &env);
         let names: Vec<&str> = settings
             .mcp_servers
             .iter()

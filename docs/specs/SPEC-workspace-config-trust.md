@@ -1,0 +1,169 @@
+# SPEC-workspace-config-trust
+
+Status: Implemented
+
+Owner: dmuxai
+Created: 2026-10-26
+Baseline: `55029ac`
+Related: #208
+
+## 1. Decision summary
+
+Workspace-local configuration files (`dmuxai.toml` in the repository root) can declare settings that run external commands, read secret environment variables, clone remote repositories, or establish outbound network connections. DmuxAI activates those restricted keys from a workspace configuration only after the user explicitly trusts that exact file content; the user configuration is unaffected.
+
+Trust records are pinned to the SHA-256 hash of the workspace configuration file and persisted in the user's state directory (`trusted-workspaces.json`). Untrusted workspace configurations have restricted keys stripped during settings loading, with a single summarized warning. User-level configuration remains unchanged and unrestricted. Interactive startup prompts the user to review and trust when run in a TTY, while headless executions never prompt and require either an existing trust record, the `--trust-workspace-config` CLI flag, or the `DMUXAI_TRUST_WORKSPACE_CONFIG=1` environment variable.
+
+## 2. Scope
+
+### In scope
+
+- Content hash calculation (SHA-256 hex digest) of workspace configuration.
+- Trust store persistence in the user's state directory with atomic write and 0600 permissions.
+- Exact restricted keys identification and stripping when untrusted:
+  - `notify.command`
+  - `notify.webhook_url`
+  - `notify.webhook_secret_env`
+  - `notify.secret_header`
+  - `agents.custom`
+  - `mcp.servers`
+  - `skills.sources.<name>` (for git sources or filesystem paths outside workspace root)
+  - `memory.vault` (when outside workspace root)
+  - `memory.dir` (when absolute path outside workspace root or contains path traversal `..`)
+  - `todo.jira_base_url`
+  - `runners.<id>.system_prompt_file` (when outside workspace root)
+  - `runners.<id>.models.<model>.system_prompt_file` (when outside workspace root)
+- Single sanitized warning emitted on untrusted configurations listing only key names.
+- Configuration change invalidation: modifying workspace `dmuxai.toml` changes the content hash, requiring renewed trust.
+- Interactive startup trust prompt in interactive TTY environments for TUI (`dmuxai`) and dashboard (`dmuxai serve`).
+- Dedicated CLI command `dmuxai trust` with `--status`, `--json`, `--revoke`, and `--yes` flags.
+- Headless execution opt-ins: `--trust-workspace-config` flag on `dmuxai run` and `dmuxai todo run`, and `DMUXAI_TRUST_WORKSPACE_CONFIG=1` environment variable (in-memory only; does not write to the trust store).
+- User-level configuration (`~/.config/dmuxai/dmuxai.toml` or `--config PATH`) remains fully unrestricted.
+
+### Out of scope / non-goals
+
+- Altering user-level configuration loading or security boundaries.
+- Prompts or interactive blocking in headless non-TTY mode.
+- Persistent trust based purely on repository directory path without file content hash validation.
+- Network-based trust verification or signing authorities.
+
+## 3. Terms and state model
+
+| Term | Meaning | Not to be confused with |
+| --- | --- | --- |
+| Workspace configuration | The `dmuxai.toml` file located in the target workspace root. | User configuration located in `~/.config/dmuxai/dmuxai.toml` or passed via `--config`. |
+| Trust store | JSON document at `<state_dir>/trusted-workspaces.json` mapping normalized workspace paths to trusted SHA-256 digests and timestamps. | Conversation database or cache directory. |
+| Restricted keys | Configuration keys capable of invoking external processes, reading sensitive environment variables, or sending network requests. | General settings such as UI themes, model selection, or concurrency limits. |
+| One-process opt-in | Explicit trust granted for the active process invocation via `--trust-workspace-config` or `DMUXAI_TRUST_WORKSPACE_CONFIG=1`. | Stored persistent trust written to disk. |
+
+```text
+                        ┌──────────────────────────────┐
+                        │ No workspace dmuxai.toml     │
+                        │ status: no_workspace_config  │
+                        └──────────────────────────────┘
+                                        │
+                         workspace dmuxai.toml exists
+                                        │
+                                        ▼
+                        ┌──────────────────────────────┐
+                        │ Has restricted keys?         │
+                        └──────────────────────────────┘
+                                   │          │
+                              No   │          │ Yes
+                                   ▼          ▼
+┌──────────────────────────────┐       ┌──────────────────────────────┐
+│ status: not_needed           │       │ Check trust store / opt-in   │
+│ All keys loaded              │       └──────────────────────────────┘
+└──────────────────────────────┘                      │
+                        ┌─────────────────────────────┴─────────────────────────────┐
+                        ▼                                                           ▼
+         ┌──────────────────────────────┐                            ┌──────────────────────────────┐
+         │ Hash matches or Opt-In       │                            │ Hash mismatch & No opt-in    │
+         │ status: trusted              │                            │ status: untrusted            │
+         │ (Record or OptIn)            │                            │ Restricted keys stripped     │
+         └──────────────────────────────┘                            │ Single warning emitted       │
+                                                                     └──────────────────────────────┘
+```
+
+## 4. Requirements
+
+| ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
+| --- | --- | --- | --- | --- | --- |
+| FR-2190 | Must | Given arbitrary raw file content bytes | `content_hash` computes the lowercase hexadecimal SHA-256 digest of the raw bytes | Deterministic 64-character hex string | TC-2190 |
+| FR-2191 | Must | Given a `RuntimeEnv` with candidate state directories | `TrustStore::store_path` resolves `trusted-workspaces.json` with precedence: `DMUXAI_STATE_DIR` > `XDG_STATE_HOME/dmuxai` > `HOME/.local/state/dmuxai` | Returns `io::ErrorKind::NotFound` if neither directory is set | TC-2191 |
+| FR-2192 | Must | Given an operational `TrustStore` and valid workspace path and SHA-256 | `store.trust()` records normalized path, lowercase SHA-256, and UNIX timestamp in seconds; `store.save()` writes atomically via temporary file replacement; `TrustStore::load()` re-reads matching entry | File errors return `io::Error` | TC-2192 |
+| FR-2193 | Must | Given a recorded workspace in `TrustStore` | `store.is_trusted(path, sha256)` returns `true` only when normalized path matches and SHA-256 matches exactly | Returns `false` on modified SHA-256 or different path | TC-2193 |
+| FR-2194 | Must | Given a recorded workspace entry in `TrustStore` | `store.revoke(path)` removes entry and returns `true`; subsequent call returns `false` | Nonexistent workspace returns `false` | TC-2194 |
+| FR-2195 | Must | Given an invalid or malformed JSON file at `trusted-workspaces.json` | `TrustStore::load()` returns an empty store with a `corrupt_warning` string, treating all workspaces as untrusted without crashing | Warning surfaces in `DmuxSettings::config_warnings` | TC-2195, TC-2206 |
+| FR-2196 | Must | On Unix platforms, saving `TrustStore` | Written temporary file and destination `trusted-workspaces.json` have file permission mode `0600` | Created directories inherit standard umask | TC-2196 |
+| FR-2197 | Must | Given runtime environment, workspace root, and config hash | `workspace_trust::decide` evaluates: stored record match -> `Trusted(Record)`; `RuntimeEnv::trust_workspace_config` set -> `Trusted(OptIn)` without writing store; otherwise `Untrusted` | Opt-in never writes to disk | TC-2197 |
+| FR-2198 | Must | Given untrusted workspace config with `[notify]` keys | Strip `notify.command`, `notify.webhook_url`, `notify.webhook_secret_env`, and `notify.secret_header`; preserve safe keys like `events`; emit exactly one warning listing stripped keys without exposing URLs or environment variable names | Warning contains key names only | TC-2198 |
+| FR-2199 | Must | Given untrusted workspace config with `[[agents.custom]]` | Strip `agents.custom` entries; record key in untrusted ignored list and emit trust warning | Custom agent definitions are discarded | TC-2199 |
+| FR-2200 | Must | Given untrusted workspace config with `[[mcp.servers]]` | Strip `mcp.servers` entries; record key in untrusted ignored list and emit trust warning | MCP servers are discarded | TC-2200 |
+| FR-2201 | Must | Given untrusted workspace config with remote git skills, external memory paths, external runner system prompt files, or Jira base URL | Strip git skills sources, skills path outside workspace, `memory.vault` outside workspace, `memory.dir` absolute outside workspace or containing `..`, `todo.jira_base_url`, and `runners.*.system_prompt_file` outside workspace | In-workspace relative paths remain allowed | TC-2201 |
+| FR-2202 | Must | Given user-level configuration containing restricted keys | User config loads without restriction; `workspace_trust` status is `NoWorkspaceConfig` when workspace has no `dmuxai.toml`, and no trust warning is generated | User configuration is always trusted | TC-2202 |
+| FR-2203 | Must | Given a workspace trusted by record whose `dmuxai.toml` is modified on disk | Re-evaluating trust detects changed SHA-256 and reverts status to `Untrusted` with the new hash, stripping restricted keys | Trust is invalid as soon as content changes | TC-2203, TC-2211 |
+| FR-2204 | Must | Given workspace config with restricted keys when `trust_workspace_config` opt-in is active | Status evaluates to `Trusted(OptIn)`; all restricted keys are retained without warnings | Trust store on disk is not updated | TC-2204, TC-2208, TC-2209 |
+| FR-2205 | Must | Given workspace `dmuxai.toml` containing only unrestricted keys (e.g., `[ui]`, `[graph]`) | `workspace_trust` status is `NotNeeded`; all keys load without warnings or trust requirement | No trust prompts or warnings generated | TC-2205 |
+| FR-2206 | Must | Given a corrupted trust store file during settings load | Status evaluates to `Untrusted`, restricted keys are stripped, and corruption warning is appended to `config_warnings` | Untrusted safe fallback | TC-2206 |
+| FR-2207 | Must | Given headless command `dmuxai run` against untrusted workspace config | Executes in untrusted mode without interactive prompt; restricted keys stripped; runs with exit code 0 if primary task succeeds | Subprocesses or webhooks are not executed | TC-2207 |
+| FR-2208 | Must | Given headless command executed with `DMUXAI_TRUST_WORKSPACE_CONFIG=1` (or `"true"` / `"yes"`) | One-process opt-in activates; restricted keys are applied during run; trust store is not modified | Unset or `"0"` remains untrusted | TC-2208 |
+| FR-2209 | Must | Given `dmuxai run` or `dmuxai todo run` with `--trust-workspace-config` flag | Enables `RuntimeEnv::trust_workspace_config` for the duration of the command without writing to disk | CLI flag overrides stored trust absence | TC-2209 |
+| FR-2210 | Must | Given CLI subcommand `dmuxai trust` | Supports `--status` (with optional `--json`), `--yes`, and `--revoke`; prints status and restricted keys; interactive prompt asks `[y/N]` when run in a TTY; exits 0 on success, 1 on refusal/non-TTY, 6 on I/O failure | Headless non-TTY without `--yes` exits 1 | TC-2210 |
+| FR-2211 | Must | Given workspace trusted via `dmuxai trust` subsequently edited | `dmuxai trust --status --json` transitions from `trusted` to `untrusted` with updated SHA-256 | Automatic revocation on content change | TC-2211 |
+| FR-2212 | Must | Given trusted workspace when `dmuxai trust --revoke` is executed | Workspace entry removed from store; returns exit 0 and status `revoked`; subsequent `--status` reports `untrusted` | Revocation persists in store | TC-2212 |
+| FR-2213 | Must | CLI help and usage string output | Lists `dmuxai trust [--status] [--json] [--revoke] [--yes]` and `--trust-workspace-config` on `run` and `todo run` | Exactly one usage entry per command variant | TC-2213 |
+| FR-2214 | Must | Given workspace `[notify]` webhook with `webhook_secret_env` | Untrusted run delivers no webhook connection; run with `DMUXAI_TRUST_WORKSPACE_CONFIG=1` connects and sends HTTP POST request; assertion messages avoid exposing secrets | Secret environment variables are shielded | TC-2214 |
+
+## 5. Acceptance scenarios and test design
+
+| Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
+| --- | --- | --- | --- | --- | --- | --- |
+| TC-2190 | FR-2190 | unit | Known byte slice `b"hello world\n"` | Call `content_hash` | Deterministic lowercase hex sha256 string `a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447` | `src/workspace_trust.rs` `tc_2190_content_hash_stable_and_hex` |
+| TC-2191 | FR-2191 | unit | `RuntimeEnv` with `dmuxai_state_dir`, `xdg_state_home`, and `home` | Call `TrustStore::store_path` under each combination | Resolves `trusted-workspaces.json` following strict precedence; errors when all absent | `src/workspace_trust.rs` `tc_2191_store_path_resolution_precedence` |
+| TC-2192 | FR-2192 | unit | Temporary state directory and workspace path | `store.trust()` with hash, `save()`, then `load()` in new store | Saved workspace entry is present, trusted, and has valid timestamp | `src/workspace_trust.rs` `tc_2192_trust_save_load_round_trip` |
+| TC-2193 | FR-2193 | unit | Workspace path trusted with hash A | Query `store.is_trusted()` with hash B or different workspace path | Returns `false` on any hash or path difference | `src/workspace_trust.rs` `tc_2193_is_trusted_false_when_hash_or_path_differs` |
+| TC-2194 | FR-2194 | unit | Trusted workspace in store | Call `store.revoke()` | Returns `true` and clears entry; second call returns `false` | `src/workspace_trust.rs` `tc_2194_revoke` |
+| TC-2195 | FR-2195 | unit | State directory containing non-JSON string in `trusted-workspaces.json` | `TrustStore::load()` | Generates corrupt warning; store is empty; no crash | `src/workspace_trust.rs` `tc_2195_corrupt_json_handling` |
+| TC-2196 | FR-2196 | unit | Unix filesystem environment | `store.trust()` and `store.save()` | Metadata permissions mode of saved `trusted-workspaces.json` is `0600` | `src/workspace_trust.rs` `tc_2196_saved_file_mode_0600` |
+| TC-2197 | FR-2197 | unit | Clean state directory | Evaluate `decide()` initially, with `trust_workspace_config = true`, and with store record | Transitions `Untrusted` -> `Trusted(OptIn)` (file not created) -> `Trusted(Record)` | `src/workspace_trust.rs` `tc_2197_decide_logic` |
+| TC-2198 | FR-2198 | unit | Untrusted workspace config with `[notify]` command, webhook URL, secret env, and header | `DmuxSettings::load_with_env()` | Notify execution keys are cleared; events kept; single sanitized warning generated without secret values | `src/settings.rs` `tc_2198_untrusted_notify_keys_stripped_and_warnings_sanitized` |
+| TC-2199 | FR-2199 | unit | Untrusted workspace config with `[[agents.custom]]` | `DmuxSettings::load_with_env()` | `custom_agents` vector does not contain workspace custom agent; trust status is `Untrusted` | `src/settings.rs` `tc_2199_untrusted_custom_agents_stripped` |
+| TC-2200 | FR-2200 | unit | Untrusted workspace config with `[[mcp.servers]]` | `DmuxSettings::load_with_env()` | `mcp_servers` vector does not contain workspace MCP server; trust status is `Untrusted` | `src/settings.rs` `tc_2200_untrusted_mcp_servers_stripped` |
+| TC-2201 | FR-2201 | unit | Untrusted workspace config with git skill source, outside vault, and Jira URL | `DmuxSettings::load_with_env()` | Git skill source omitted, memory settings cleared, Jira base URL cleared | `src/settings.rs` `tc_2201_untrusted_skills_git_vault_outside_and_jira_stripped` |
+| TC-2202 | FR-2202 | unit | User-level configuration with notify, custom agent, and MCP server | `DmuxSettings::load_with_user_config_and_env()` with no workspace config | User settings load intact; status `NoWorkspaceConfig`; no trust warnings emitted | `src/settings.rs` `tc_2202_user_config_path_loads_unchanged_without_warning` |
+| TC-2203 | FR-2203 | unit | Workspace trusted by hash in store | Load settings, modify workspace `dmuxai.toml` on disk, re-load settings | Status transitions from `Trusted(Record)` to `Untrusted` with the new hash | `src/settings.rs` `tc_2203_trust_record_applied_modify_file_reverts_to_untrusted` |
+| TC-2204 | FR-2204 | unit | Untrusted workspace config with restricted notify command | Load settings with `RuntimeEnv::trust_workspace_config = true` | Status is `Trusted(OptIn)`; notify command is retained intact | `src/settings.rs` `tc_2204_opt_in_yields_trusted_opt_in` |
+| TC-2205 | FR-2205 | unit | Workspace `dmuxai.toml` with only `[ui]` and `[graph]` settings | `DmuxSettings::load_with_env()` | Status is `NotNeeded`; no untrusted warnings emitted | `src/settings.rs` `tc_2205_harmless_workspace_config_is_not_needed_without_warning` |
+| TC-2206 | FR-2206 | unit | Workspace with restricted notify and corrupted `trusted-workspaces.json` on disk | `DmuxSettings::load_with_env()` | Status is `Untrusted`; corrupt store warning surfaced in `config_warnings` | `src/settings.rs` `tc_2206_corrupt_store_yields_untrusted_and_warning` |
+| TC-2207 | FR-2207 | integration | Workspace config with notify command touching marker file | Run `dmuxai run hello --agent user-fake --json` | Exit 0; marker file is not created; config warning emitted on stderr | `tests/workspace_trust.rs` `tc_2207_untrusted_workspace_config` |
+| TC-2208 | FR-2204, FR-2208 | integration | Workspace config with notify command touching marker file | Run with env `DMUXAI_TRUST_WORKSPACE_CONFIG=1` | Exit 0; marker file is created; status command reports `untrusted` (store untouched) | `tests/workspace_trust.rs` `tc_2208_trust_via_env_var` |
+| TC-2209 | FR-2204, FR-2209 | integration | Workspace config with notify command touching marker file | Run with CLI flag `--trust-workspace-config` | Exit 0; marker file is created; status command reports `untrusted` | `tests/workspace_trust.rs` `tc_2209_trust_via_cli_flag` |
+| TC-2210 | FR-2210 | integration | Untrusted workspace config | Execute `trust --status --json`, `trust --yes`, and repeat status | Status transitions from `untrusted` to `trusted`; subsequent run creates marker | `tests/workspace_trust.rs` `tc_2210_trust_cli_command_lifecycle` |
+| TC-2211 | FR-2203, FR-2211 | integration | Workspace config trusted with `trust --yes` | Append comment to `dmuxai.toml` and run `dmuxai run` | Run succeeds without executing notify command; `trust --status --json` reports `untrusted` | `tests/workspace_trust.rs` `tc_2211_modified_config_invalidates_trust` |
+| TC-2212 | FR-2194, FR-2212 | integration | Workspace config trusted with `trust --yes` | Run `dmuxai trust --revoke` | Exit 0; status reports `revoked`; subsequent `--status --json` reports `untrusted` | `tests/workspace_trust.rs` `tc_2212_trust_revoke` |
+| TC-2213 | FR-2213 | unit | Main CLI `USAGE` text constant | Inspect command lists for `todo run` and `trust` | `dmuxai todo run` includes `--trust-workspace-config`; `dmuxai trust` listed with flags | `src/main.rs` `tc_2213_usage_lists_todo_run_and_trust_once` |
+| TC-2214 | FR-2214 | integration | Workspace `[notify]` with webhook URL, secret env, and listening TCP socket | Run without trust, then run with `DMUXAI_TRUST_WORKSPACE_CONFIG=1` | Untrusted run makes no socket connection; trusted run connects and issues HTTP POST | `tests/workspace_trust.rs` `tc_2214_webhook_trust_enforcement` |
+
+## 6. Data, integration, and safety contracts
+
+| Area | Contract / change | Compatibility and rollback | Evidence |
+| --- | --- | --- | --- |
+| State store | `<state_dir>/trusted-workspaces.json` maps workspace paths to `{ sha256, trusted_at }` | Deleting file reverts all workspaces to untrusted | TC-2192, TC-2196 |
+| Configuration | Untrusted workspace `dmuxai.toml` has restricted keys stripped with one summarized warning | Safe defaults; user config unaffected | TC-2198..TC-2202 |
+| CLI commands | Subcommand `dmuxai trust` and flag `--trust-workspace-config` on `run` and `todo run` | Additive CLI surface; scripts opt in via environment variable or flag | TC-2208..2210, TC-2213 |
+| Environment | `DMUXAI_TRUST_WORKSPACE_CONFIG=1` enables one-process trust | Process-scoped; does not mutate disk store | TC-2208, TC-2214 |
+
+## 7. Implementation plan
+
+| Order | Change | Files / modules | Requirement IDs | Verification |
+| --- | --- | --- | --- | --- |
+| 1 | SHA-256 digest and trust store persistence | `src/workspace_trust.rs` | FR-2190..FR-2197 | TC-2190..TC-2197 |
+| 2 | Restricted key inspection and stripping | `src/settings.rs` | FR-2198..FR-2206 | TC-2198..TC-2206 |
+| 3 | CLI trust subcommand and runtime flags | `src/cli.rs`, `src/runtime_env.rs`, `src/main.rs` | FR-2207..FR-2213 | TC-2207..TC-2213 |
+| 4 | Webhook and subprocess trust integration | `tests/workspace_trust.rs` | FR-2214 | TC-2214 |
+| 5 | Specification and documentation registration | `docs/specs/SPEC-workspace-config-trust.md`, `SECURITY.md`, `docs/API.md` | All | `python3 scripts/check-spec.py --all` |
+
+## 8. Review and test exit criteria
+
+- [x] All Must requirements (FR-2190..FR-2214) map to passing automated test evidence (TC-2190..TC-2214).
+- [x] Spec gate checks pass: `python3 scripts/check-spec.py --all` and `python3 scripts/check-tc-links.py`.

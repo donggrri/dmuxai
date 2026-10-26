@@ -28,10 +28,11 @@ The following flags can be used before or after subcommands, or with the interac
 
 | Command | Flags | stdout |
 | --- | --- | --- |
-| `dmuxai run <prompt\|->` | `--agent ID`, `--model M`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--json` | Final agent text, or one JSON object with `--json` |
+| `dmuxai run <prompt\|->` | `--agent ID`, `--model M`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--progress`, `--json`, `--trust-workspace-config` | Final agent text, or one JSON object with `--json` |
 | `dmuxai todo add <title>` | `--body TEXT`, `--json` | The created to-do (TSV or JSON) |
 | `dmuxai todo list` | `--status open\|running\|done`, `--json` | To-dos (TSV lines or a JSON array) |
-| `dmuxai todo run <id>` | `--agent ID \| --graph`, `--model M`, `--json` | Same as `run`; the to-do is marked running then done/open |
+| `dmuxai todo run <id>` | `--agent ID \| --graph`, `--model M`, `--progress`, `--json`, `--trust-workspace-config` | Same as `run`; the to-do is marked running then done/open |
+| `dmuxai trust` | `[--status]`, `[--json]`, `[--revoke]`, `[--yes]` | Trust management for workspace `dmuxai.toml` |
 | `dmuxai status` | `--json` | Workspace status (JSON if `--json`) |
 | `dmuxai events` | `--since N`, `--limit N`, `--follow`/`-f`, `--json` | Events (see §4); `--json` prints one object per line |
 | `dmuxai mcp` | — | stdio MCP server (see §3) |
@@ -53,6 +54,12 @@ Notes:
   `--allow-sensitive`, or `--agent` with `--approve-plan` on a one-step run, to
   confirm sensitive gates headlessly. JSON includes `triage` and, when applicable,
   `plan`.
+- `dmuxai trust` manages workspace configuration trust:
+  - `dmuxai trust`: Interactive prompt in a TTY asking to trust the workspace configuration.
+  - `dmuxai trust --status [--json]`: Reports trust status (`trusted`, `untrusted`, `not_needed`, or `no_workspace_config`), SHA-256 hash, and restricted keys.
+  - `dmuxai trust --yes`: Non-interactively trusts the current workspace configuration.
+  - `dmuxai trust --revoke`: Revokes trust for the workspace configuration.
+  - Headless `run` and `todo run` accept `--trust-workspace-config` (or `DMUXAI_TRUST_WORKSPACE_CONFIG=1`) to trust workspace settings for a single process without modifying the persistent trust store.
 - `--model M` requires `--agent`; it sets the Explicit model source for the run
   (validated with `validate_model_for_runner` / custom `allowed_models`). A disallowed
   model is rejected before any turn starts with exit `5` (usage errors such as a
@@ -411,7 +418,10 @@ Ordering guarantees:
 ## 5. Notifications
 
 Configured under `[notify]` in `dmuxai.toml`. Delivery is best effort and never
-blocks a runner.
+blocks a runner. In a workspace `dmuxai.toml`, executable notification settings
+(`command`, `webhook_url`, `webhook_secret_env`, and `secret_header`) require
+workspace configuration trust (see [specs/SPEC-workspace-config-trust.md](specs/SPEC-workspace-config-trust.md)). Untrusted
+workspace configurations have these keys stripped.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -443,7 +453,9 @@ command = ["tee", "-a", "events.log"]
 
 ## 6. Configuration (`dmuxai.toml`)
 
-User config loads first; workspace `dmuxai.toml` overrides per key. The user config file is located using the following precedence:
+User config loads first; workspace `dmuxai.toml` overrides per key. In a workspace `dmuxai.toml`, settings that run commands (`[[agents.custom]]`, `[notify] command`, external `[[skills.sources]]`), read secret environment variables (`[notify] webhook_secret_env`), or make network connections (`[notify] webhook_url`, git skill sources, `[todo] jira_base_url`) require workspace configuration trust via `dmuxai trust` (see [specs/SPEC-workspace-config-trust.md](specs/SPEC-workspace-config-trust.md)). Untrusted workspace settings are stripped with a warning.
+
+The user config file is located using the following precedence:
 1. `--config PATH` CLI flag
 2. `DMUXAI_CONFIG` environment variable
 3. `$XDG_CONFIG_HOME/dmuxai/dmuxai.toml`
@@ -464,7 +476,7 @@ tasks_file = true
 
 ### `[runners.default]` / `[runners.<id>]` / `[runners.<id>.models."<model>"]`
 
-Per-runner and per-model system prompts. User config sets defaults; workspace `dmuxai.toml` overrides per key.
+Per-runner and per-model system prompts. User config sets defaults; workspace `dmuxai.toml` overrides per key. In a workspace `dmuxai.toml`, `system_prompt_file` paths that resolve outside the workspace root require workspace configuration trust; otherwise they are stripped when untrusted.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -524,6 +536,7 @@ provider default (no `--model`).
 | `DMUXAI_CONFIG` | Path to the user configuration file (`dmuxai.toml`). Overridden by `--config PATH`. |
 | `DMUXAI_WORKSPACE` | Canonical workspace directory (defaults to current directory or `-C`). |
 | `DMUXAI_STATE_DIR` | Custom root directory for DmuxAI state databases and conversations. |
+| `DMUXAI_TRUST_WORKSPACE_CONFIG` | Opt in to trust workspace configuration for the current process (`1`, `true`, or `yes`). Does not write to persistent trust store. |
 | `DMUXAI_WEB_TOKEN` | Bearer token for the web dashboard (32–128 characters of `[A-Za-z0-9_-]`). |
 | `DMUXAI_MCP_CONFIG` | Legacy MCP configuration path (deprecated; scrubbed from child environments). |
 | `DMUXAI_*_BIN` | Explicit executable paths for runner CLIs (`DMUXAI_CURSOR_BIN`, `DMUXAI_AGY_BIN`, `DMUXAI_CODEX_BIN`, `DMUXAI_OPENCODE_BIN`, `DMUXAI_GROK_BIN`). |

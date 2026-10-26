@@ -36,6 +36,7 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Changed
 
+- Workspace `dmuxai.toml` settings that run commands, read secret environment variables, or set outbound URLs now require `dmuxai trust` (pinned to the file hash); headless runs opt in with `DMUXAI_TRUST_WORKSPACE_CONFIG=1`.
 - **Cursor runner accepts any non-fast model (FR-2180..2182).** Lifted the built-in
   Cursor runner model block so it accepts non-fast model IDs including `grok-*`
   and `claude-sonnet-5-5-*` IDs; user configuration, custom agent `allowed_models`,

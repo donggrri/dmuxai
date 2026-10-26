@@ -1411,7 +1411,9 @@ headers = { Authorization = "Bearer secret" }
 "#;
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("dmuxai.toml"), toml_settings).unwrap();
-        let settings = dmuxai::settings::DmuxSettings::load(ws.path());
+        let mut env = dmuxai::runtime_env::RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+        let settings = dmuxai::settings::DmuxSettings::load_with_env(ws.path(), &env);
         assert_eq!(settings.mcp_servers.len(), 2);
 
         // 1. Codex app-server argv has no mcp_servers
