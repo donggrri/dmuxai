@@ -30,6 +30,14 @@ mod tests {
         assert!(SESSION_JS.contains("sessions-group-restricted"));
     }
 
+    // TC-2315 / FR-2314: a page whose folder closed falls back to the first.
+    #[test]
+    fn tc_2315_missing_folder_falls_back_to_first() {
+        assert!(APP_JS.contains("pageWs"));
+        assert!(APP_JS.contains("searchParams.delete('ws')"));
+        assert!(APP_JS.contains("location.replace(url.toString())"));
+    }
+
     // TC-529: static_page_is_embedded_and_hardened
     #[tokio::test]
     async fn static_page_is_embedded_and_hardened() {
