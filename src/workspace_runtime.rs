@@ -15,7 +15,8 @@ use dmuxai::settings::DmuxSettings;
 use dmuxai::todo::TodoStore;
 use dmuxai::web::commands::DashboardCommand;
 use dmuxai::web::directory::{
-    DirectoryError, MAX_WORKSPACES, OpenError, OpenRequest, WorkspaceDirectory, WorkspaceEntry,
+    CloseRequest, DirectoryError, MAX_WORKSPACES, OpenError, OpenRequest, WorkspaceDirectory,
+    WorkspaceEntry,
 };
 use dmuxai::web::{DashboardHub, DashboardServices, SnapshotSource};
 use tokio::sync::mpsc::Receiver;
@@ -179,11 +180,21 @@ pub(crate) async fn run_headless_host(
 ) -> HostOutcome {
     let mut tasks = tokio::task::JoinSet::new();
     let mut stop_flags: HashMap<String, Arc<AtomicBool>> = HashMap::new();
+    let mut closing: HashMap<String, tokio::sync::oneshot::Sender<Result<(), OpenError>>> =
+        HashMap::new();
     let mut next_id = 2u32;
     let mut rx = match ctx.as_ref() {
         Some(ctx) => {
             let (tx, rx) = tokio::sync::mpsc::channel::<OpenRequest>(4);
             ctx.directory.set_opener(tx);
+            Some(rx)
+        }
+        None => None,
+    };
+    let mut close_rx = match ctx.as_ref() {
+        Some(ctx) => {
+            let (tx, rx) = tokio::sync::mpsc::channel::<CloseRequest>(4);
+            ctx.directory.set_closer(tx);
             Some(rx)
         }
         None => None,
@@ -211,12 +222,29 @@ pub(crate) async fn run_headless_host(
         tokio::select! {
             joined = tasks.join_next() => {
                 match joined {
-                    Some(Ok(Ok(item))) => collected.push(item),
-                    Some(Ok(Err(error))) => join_error = Some(error),
-                    Some(Err(error)) => join_error = Some(std::io::Error::other(error)),
-                    None => {}
+                    Some(Ok(Ok((id, mut app, result)))) => {
+                        if let Some(reply) = closing.remove(&id) {
+                            app.shutdown().await;
+                            if let Some(ctx) = ctx.as_ref() {
+                                let _ = ctx.directory.remove(&id);
+                            }
+                            stop_flags.remove(&id);
+                            let _ = reply.send(Ok(()));
+                        } else {
+                            collected.push((id, app, result));
+                            host_ended = true;
+                        }
+                    }
+                    Some(Ok(Err(error))) => {
+                        join_error = Some(error);
+                        host_ended = true;
+                    }
+                    Some(Err(error)) => {
+                        join_error = Some(std::io::Error::other(error));
+                        host_ended = true;
+                    }
+                    None => host_ended = true,
                 }
-                host_ended = true;
             }
             _ = async {
                 match shutdown.as_deref_mut() {
@@ -268,7 +296,42 @@ pub(crate) async fn run_headless_host(
                     }
                 }
             }
+            received_close = async {
+                match close_rx.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending::<Option<CloseRequest>>().await,
+                }
+            } => {
+                match received_close {
+                    Some(CloseRequest { id, reply }) => {
+                        if id == "default" {
+                            let _ = reply.send(Err(OpenError {
+                                status: 409,
+                                message: "the first folder closes with Quit".to_owned(),
+                            }));
+                        } else if let Some(stop) = stop_flags.get(&id) {
+                            closing.insert(id, reply);
+                            stop.store(true, Ordering::Relaxed);
+                        } else {
+                            let _ = reply.send(Err(OpenError {
+                                status: 404,
+                                message: "no such open folder".to_owned(),
+                            }));
+                        }
+                    }
+                    None => {
+                        close_rx = None;
+                    }
+                }
+            }
         }
+    }
+
+    for (_, reply) in closing.drain() {
+        let _ = reply.send(Err(OpenError {
+            status: 503,
+            message: "dmuxai is shutting down".to_owned(),
+        }));
     }
 
     for stop in stop_flags.values() {
