@@ -6,8 +6,9 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRequest, Path, Query, Request, State};
+use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State};
 use axum::http::header::HeaderName;
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -25,6 +26,7 @@ use crate::todo::{NewTodo, TodoError, TodoPatch, TodoSource, TodoStatus};
 use crate::web::DEFAULT_PORT;
 use crate::web::auth::{BindCheck, check_bind, dashboard_url, token_matches};
 use crate::web::commands::{DashboardCommand, RunMode, RunTodoError, SessionCommand};
+use crate::web::directory::{WorkspaceDirectory, WorkspaceEntry};
 use crate::web::hub::DashboardHub;
 
 /// Injectable re-execution hook for `POST /api/workspace/switch` (FR-874, TC-875).
@@ -94,10 +96,22 @@ pub struct ServerConfig {
 
 #[derive(Clone)]
 struct AppState {
-    hub: DashboardHub,
     token: Arc<String>,
     allowed_hosts: Option<Arc<Vec<String>>>,
-    services: DashboardServices,
+    workspaces: Arc<WorkspaceDirectory>,
+}
+
+struct Ws(Arc<WorkspaceEntry>);
+
+impl FromRequestParts<AppState> for Ws {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(
+        _parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Ws(state.workspaces.focused()))
+    }
 }
 
 pub struct DashboardServer {
@@ -156,19 +170,19 @@ fn todo_error_response(error: TodoError) -> Response {
     }
 }
 
-fn todo_store(state: &AppState) -> Option<Arc<crate::todo::TodoStore>> {
-    state.services.todos.clone()
+fn todo_store(ws: &WorkspaceEntry) -> Option<Arc<crate::todo::TodoStore>> {
+    ws.services.todos.clone()
 }
 
-fn refresh_todos(state: &AppState, store: &crate::todo::TodoStore) {
-    state.hub.set_jira_base_url(store.jira_base_url());
+fn refresh_todos(ws: &WorkspaceEntry, store: &crate::todo::TodoStore) {
+    ws.hub.set_jira_base_url(store.jira_base_url());
     if let Ok(todos) = store.list() {
-        state.hub.set_todos(todos);
+        ws.hub.set_todos(todos);
     }
 }
 
-fn memory_handle(state: &AppState) -> Option<MemoryHandle> {
-    state.services.memory.clone()
+fn memory_handle(ws: &WorkspaceEntry) -> Option<MemoryHandle> {
+    ws.services.memory.clone()
 }
 
 fn memory_not_configured() -> Response {
@@ -218,8 +232,8 @@ struct MemoryActionResponse {
 }
 
 /// SPEC-stage-skills UX-1500: stage → skill map of the dashboard workspace.
-async fn get_skills(State(state): State<AppState>) -> Response {
-    let workspace = std::path::PathBuf::from(state.hub.snapshot().workspace);
+async fn get_skills(Ws(ws): Ws) -> Response {
+    let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
     let settings = crate::settings::DmuxSettings::load(&workspace);
     let ctx = crate::stage_skills::SkillContext::new(&workspace);
     let rows = crate::stage_skills::map_rows(&settings.stage_skills, &ctx);
@@ -250,11 +264,8 @@ struct SkillsPostBody {
 }
 
 /// UX-1500: writes `[stages.<stage>] skills` to the workspace dmuxai.toml.
-async fn post_skills(
-    State(state): State<AppState>,
-    ApiJson(body): ApiJson<SkillsPostBody>,
-) -> Response {
-    let workspace = std::path::PathBuf::from(state.hub.snapshot().workspace);
+async fn post_skills(Ws(ws): Ws, ApiJson(body): ApiJson<SkillsPostBody>) -> Response {
+    let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
     let path = workspace.join("dmuxai.toml");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let skills: Vec<String> = body
@@ -265,7 +276,7 @@ async fn post_skills(
         .collect();
     match crate::stage_skills::set_stage_skills_in_toml(&text, &body.stage, &skills) {
         Ok(updated) => match std::fs::write(&path, updated) {
-            Ok(()) => get_skills(State(state)).await,
+            Ok(()) => get_skills(Ws(ws)).await,
             Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
         },
         Err(error) => error_json(StatusCode::BAD_REQUEST, &error),
@@ -278,22 +289,19 @@ struct SkillsApproveBody {
 }
 
 /// FR-1502: one-time approval of a pinned git skill commit from the dashboard.
-async fn post_skills_approve(
-    State(state): State<AppState>,
-    ApiJson(body): ApiJson<SkillsApproveBody>,
-) -> Response {
-    let workspace = std::path::PathBuf::from(state.hub.snapshot().workspace);
+async fn post_skills_approve(Ws(ws): Ws, ApiJson(body): ApiJson<SkillsApproveBody>) -> Response {
+    let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
     let settings = crate::settings::DmuxSettings::load(&workspace);
     let ctx = crate::stage_skills::SkillContext::new(&workspace);
     match crate::stage_skills::Approvals::approve(&ctx, &settings.stage_skills, &body.source) {
-        Ok(_) => get_skills(State(state)).await,
+        Ok(_) => get_skills(Ws(ws)).await,
         Err(error) => error_json(StatusCode::BAD_REQUEST, &error),
     }
 }
 
 /// PR-2.5 part 4: per-agent system prompts dashboard API.
-async fn get_agent_prompts(State(state): State<AppState>) -> Response {
-    let workspace = std::path::PathBuf::from(state.hub.snapshot().workspace);
+async fn get_agent_prompts(Ws(ws): Ws) -> Response {
+    let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
     let settings = crate::settings::DmuxSettings::load(&workspace);
 
     let mut runner_ids: Vec<String> =
@@ -387,11 +395,8 @@ struct AgentPromptsPostBody {
     prompt_inject: Option<Option<String>>,
 }
 
-async fn post_agent_prompts(
-    State(state): State<AppState>,
-    ApiJson(body): ApiJson<AgentPromptsPostBody>,
-) -> Response {
-    let workspace = std::path::PathBuf::from(state.hub.snapshot().workspace);
+async fn post_agent_prompts(Ws(ws): Ws, ApiJson(body): ApiJson<AgentPromptsPostBody>) -> Response {
+    let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
     let settings = crate::settings::DmuxSettings::load(&workspace);
 
     let runner = body.runner.trim().to_ascii_lowercase();
@@ -441,7 +446,7 @@ async fn post_agent_prompts(
 
     match crate::agent_prompt::set_runner_prompt_in_toml(&text, &runner, sp, pi) {
         Ok(updated) => match std::fs::write(&path, updated) {
-            Ok(()) => get_agent_prompts(State(state)).await,
+            Ok(()) => get_agent_prompts(Ws(ws)).await,
             Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
         },
         Err(error) => error_json(StatusCode::BAD_REQUEST, &error),
@@ -480,8 +485,8 @@ async fn get_skills_js() -> impl IntoResponse {
     )
 }
 
-async fn get_memory(State(state): State<AppState>) -> Response {
-    let Some(memory) = memory_handle(&state) else {
+async fn get_memory(Ws(ws): Ws) -> Response {
+    let Some(memory) = memory_handle(&ws) else {
         return json_ok(StatusCode::OK, &serde_json::json!({ "enabled": false }));
     };
     let project = memory.project.clone();
@@ -502,11 +507,8 @@ async fn get_memory(State(state): State<AppState>) -> Response {
     )
 }
 
-async fn post_memory_save(
-    State(state): State<AppState>,
-    ApiJson(body): ApiJson<MemorySaveBody>,
-) -> Response {
-    let Some(memory) = memory_handle(&state) else {
+async fn post_memory_save(Ws(ws): Ws, ApiJson(body): ApiJson<MemorySaveBody>) -> Response {
+    let Some(memory) = memory_handle(&ws) else {
         return memory_not_configured();
     };
     let target = body
@@ -545,11 +547,8 @@ async fn post_memory_save(
     }
 }
 
-async fn post_memory_proposal_approve(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
-    let Some(memory) = memory_handle(&state) else {
+async fn post_memory_proposal_approve(Ws(ws): Ws, Path(id): Path<String>) -> Response {
+    let Some(memory) = memory_handle(&ws) else {
         return memory_not_configured();
     };
     let today = crate::memory::today_utc();
@@ -566,11 +565,8 @@ async fn post_memory_proposal_approve(
     }
 }
 
-async fn post_memory_proposal_reject(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
-    let Some(memory) = memory_handle(&state) else {
+async fn post_memory_proposal_reject(Ws(ws): Ws, Path(id): Path<String>) -> Response {
+    let Some(memory) = memory_handle(&ws) else {
         return memory_not_configured();
     };
     match memory.store.reject(&id) {
@@ -815,8 +811,8 @@ async fn get_favicon_failed() -> impl IntoResponse {
     )
 }
 
-async fn get_state(State(state): State<AppState>) -> Response {
-    let mut snapshot = state.hub.snapshot();
+async fn get_state(Ws(ws): Ws) -> Response {
+    let mut snapshot = ws.hub.snapshot();
     snapshot.sent_at_ms = crate::web::snapshot::now_ms();
     match serde_json::to_string(&snapshot) {
         Ok(json) => (
@@ -873,10 +869,7 @@ fn state_change_sse_event(record: &crate::events::EventRecord) -> Result<Event, 
         .data(data))
 }
 
-async fn get_events_log(
-    State(state): State<AppState>,
-    Query(params): Query<EventsQueryParams>,
-) -> Response {
+async fn get_events_log(Ws(ws): Ws, Query(params): Query<EventsQueryParams>) -> Response {
     let since = match parse_events_since(params.since.as_deref(), 0) {
         Ok(since) => since,
         Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid since"),
@@ -885,7 +878,7 @@ async fn get_events_log(
         Ok(limit) => limit,
         Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid limit"),
     };
-    let Some(path) = state.services.events_path.as_ref() else {
+    let Some(path) = ws.services.events_path.as_ref() else {
         return json_ok(
             StatusCode::OK,
             &serde_json::json!({
@@ -905,10 +898,7 @@ async fn get_events_log(
     )
 }
 
-async fn get_events(
-    State(state): State<AppState>,
-    Query(params): Query<EventsQueryParams>,
-) -> Response {
+async fn get_events(Ws(ws): Ws, Query(params): Query<EventsQueryParams>) -> Response {
     // Validate `since` even when no event log is configured.
     let requested_since = match params.since.as_deref() {
         None | Some("") => None,
@@ -917,7 +907,7 @@ async fn get_events(
             Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid since"),
         },
     };
-    let tail = if let Some(path) = state.services.events_path.clone() {
+    let tail = if let Some(path) = ws.services.events_path.clone() {
         let replay_since = requested_since.unwrap_or_else(|| crate::events::last_event_seq(&path));
         Some((path, replay_since))
     } else {
@@ -925,7 +915,7 @@ async fn get_events(
     };
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
-    let hub = state.hub.clone();
+    let hub = ws.hub.clone();
     let snapshot_tx = tx.clone();
     tokio::spawn(async move {
         let mut watch_stream = WatchStream::new(hub.subscribe());
@@ -1048,8 +1038,8 @@ struct RunTodoBody {
     agent: Option<String>,
 }
 
-async fn list_todos(State(state): State<AppState>) -> Response {
-    let Some(store) = todo_store(&state) else {
+async fn list_todos(Ws(ws): Ws) -> Response {
+    let Some(store) = todo_store(&ws) else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-dos unavailable");
     };
     match store.list() {
@@ -1058,11 +1048,8 @@ async fn list_todos(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn create_todo(
-    State(state): State<AppState>,
-    ApiJson(body): ApiJson<NewTodoBody>,
-) -> Response {
-    let Some(store) = todo_store(&state) else {
+async fn create_todo(Ws(ws): Ws, ApiJson(body): ApiJson<NewTodoBody>) -> Response {
+    let Some(store) = todo_store(&ws) else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-dos unavailable");
     };
     if let Some(response) =
@@ -1078,7 +1065,7 @@ async fn create_todo(
     };
     match store.create_with_link(new, body.external_key, body.link_url) {
         Ok(todo) => {
-            refresh_todos(&state, &store);
+            refresh_todos(&ws, &store);
             json_ok(StatusCode::CREATED, &todo)
         }
         Err(error) => todo_error_response(error),
@@ -1086,11 +1073,11 @@ async fn create_todo(
 }
 
 async fn update_todo(
-    State(state): State<AppState>,
+    Ws(ws): Ws,
     Path(id): Path<String>,
     ApiJson(body): ApiJson<PatchTodoBody>,
 ) -> Response {
-    let Some(store) = todo_store(&state) else {
+    let Some(store) = todo_store(&ws) else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-dos unavailable");
     };
     if let Some(response) =
@@ -1114,20 +1101,20 @@ async fn update_todo(
     };
     match store.update(&id, patch) {
         Ok(todo) => {
-            refresh_todos(&state, &store);
+            refresh_todos(&ws, &store);
             json_ok(StatusCode::OK, &todo)
         }
         Err(error) => todo_error_response(error),
     }
 }
 
-async fn delete_todo(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let Some(store) = todo_store(&state) else {
+async fn delete_todo(Ws(ws): Ws, Path(id): Path<String>) -> Response {
+    let Some(store) = todo_store(&ws) else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-dos unavailable");
     };
     match store.delete(&id) {
         Ok(()) => {
-            refresh_todos(&state, &store);
+            refresh_todos(&ws, &store);
             StatusCode::NO_CONTENT.into_response()
         }
         Err(error) => todo_error_response(error),
@@ -1135,7 +1122,7 @@ async fn delete_todo(State(state): State<AppState>, Path(id): Path<String>) -> R
 }
 
 async fn run_todo(
-    State(state): State<AppState>,
+    Ws(ws): Ws,
     Path(id): Path<String>,
     ApiJson(body): ApiJson<RunTodoBody>,
 ) -> Response {
@@ -1152,11 +1139,11 @@ async fn run_todo(
 
     // `--web` without a store could not be made runnable; report the missing
     // board (503) rather than the `serve` "requires dmuxai --web" hint.
-    if state.services.todos.is_none() && state.services.web_attached {
+    if ws.services.todos.is_none() && ws.services.web_attached {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-do board unavailable");
     }
 
-    let Some(sender) = state.services.commands.clone() else {
+    let Some(sender) = ws.services.commands.clone() else {
         return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
     };
 
@@ -1180,10 +1167,10 @@ async fn run_todo(
         Ok(Ok(Ok(todo))) => todo,
     };
 
-    if let Some(store) = state.services.todos.clone()
+    if let Some(store) = ws.services.todos.clone()
         && let Ok(todos) = store.list()
     {
-        state.hub.set_todos(todos);
+        ws.hub.set_todos(todos);
     }
     json_ok(StatusCode::ACCEPTED, &result)
 }
@@ -1209,10 +1196,7 @@ fn session_command_needs_web_write(command: &SessionCommand) -> bool {
     )
 }
 
-async fn post_prompt(
-    State(state): State<AppState>,
-    ApiJson(body): ApiJson<PromptBody>,
-) -> Response {
+async fn post_prompt(Ws(ws): Ws, ApiJson(body): ApiJson<PromptBody>) -> Response {
     let slash_wins = body.text.starts_with('/') && !body.text.starts_with("//");
     if !slash_wins
         && let Some(route) = body
@@ -1244,12 +1228,12 @@ async fn post_prompt(
     if body.attachments.len() > crate::web::attachments_api::MAX_PROMPT_ATTACHMENTS {
         return error_json(StatusCode::BAD_REQUEST, "too many attachments");
     }
-    if !body.attachments.is_empty() && !state.services.web_attached {
+    if !body.attachments.is_empty() && !ws.services.web_attached {
         return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
     }
     let mut resolved_images: Vec<std::path::PathBuf> = Vec::new();
     if !body.attachments.is_empty() {
-        let workspace = state.hub.snapshot().workspace;
+        let workspace = ws.hub.snapshot().workspace;
         for name in &body.attachments {
             match crate::web::attachments_api::resolve_attachment(
                 std::path::Path::new(&workspace),
@@ -1261,7 +1245,7 @@ async fn post_prompt(
         }
     }
 
-    let Some(sender) = state.services.commands.clone() else {
+    let Some(sender) = ws.services.commands.clone() else {
         return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
     };
 
@@ -1273,7 +1257,7 @@ async fn post_prompt(
             mode: body.mode,
             route: body.route,
             images: resolved_images,
-            allow_queue: state.services.web_attached,
+            allow_queue: ws.services.web_attached,
             reply,
         })
         .await
@@ -1302,11 +1286,11 @@ async fn post_prompt(
     )
 }
 
-async fn post_attachment(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
-    if !state.services.web_attached {
+async fn post_attachment(Ws(ws): Ws, body: axum::body::Bytes) -> Response {
+    if !ws.services.web_attached {
         return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
     }
-    let workspace = state.hub.snapshot().workspace;
+    let workspace = ws.hub.snapshot().workspace;
     if workspace.is_empty() {
         return error_json(StatusCode::CONFLICT, "no workspace");
     }
@@ -1336,8 +1320,8 @@ async fn post_attachment(State(state): State<AppState>, body: axum::body::Bytes)
     }
 }
 
-async fn get_attachment(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let workspace = state.hub.snapshot().workspace;
+async fn get_attachment(Ws(ws): Ws, Path(name): Path<String>) -> Response {
+    let workspace = ws.hub.snapshot().workspace;
     let workspace_path = std::path::Path::new(&workspace);
     let Some(path) = crate::web::attachments_api::resolve_attachment(workspace_path, &name) else {
         return error_json(StatusCode::NOT_FOUND, "attachment not found");
@@ -1367,20 +1351,17 @@ async fn get_attachment(State(state): State<AppState>, Path(name): Path<String>)
 
 /// `POST /api/command`: picker and lifecycle actions (SPEC-dashboard-parity
 /// FR-781). Answers with the updated session.
-async fn post_command(
-    State(state): State<AppState>,
-    ApiJson(command): ApiJson<SessionCommand>,
-) -> Response {
+async fn post_command(Ws(ws): Ws, ApiJson(command): ApiJson<SessionCommand>) -> Response {
     if matches!(&command, SessionCommand::SetMode { .. }) {
         return error_json(
             StatusCode::BAD_REQUEST,
             "mode selection was removed; pass ask, plan, or implement on POST /api/prompt instead",
         );
     }
-    if !state.services.web_attached && session_command_needs_web_write(&command) {
+    if !ws.services.web_attached && session_command_needs_web_write(&command) {
         return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
     }
-    let Some(sender) = state.services.commands.clone() else {
+    let Some(sender) = ws.services.commands.clone() else {
         return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
     };
     let (reply, rx) = oneshot::channel();
@@ -1424,22 +1405,19 @@ struct ImportBody {
 }
 
 /// GET /api/mcp/servers (FR-562): redacted merged server list.
-async fn list_mcp_servers(State(state): State<AppState>) -> Response {
-    let Some(registry) = state.services.mcp.clone() else {
+async fn list_mcp_servers(Ws(ws): Ws) -> Response {
+    let Some(registry) = ws.services.mcp.clone() else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "mcp unavailable");
     };
     json_ok(StatusCode::OK, &registry.servers_view())
 }
 
 /// POST /api/import (FR-561): import Jira/Confluence items as to-dos.
-async fn import_todos(
-    State(state): State<AppState>,
-    ApiJson(body): ApiJson<ImportBody>,
-) -> Response {
-    let Some(registry) = state.services.mcp.clone() else {
+async fn import_todos(Ws(ws): Ws, ApiJson(body): ApiJson<ImportBody>) -> Response {
+    let Some(registry) = ws.services.mcp.clone() else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "mcp unavailable");
     };
-    let Some(store) = todo_store(&state) else {
+    let Some(store) = todo_store(&ws) else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "to-dos unavailable");
     };
     match registry
@@ -1447,7 +1425,7 @@ async fn import_todos(
         .await
     {
         Ok(result) => {
-            refresh_todos(&state, &store);
+            refresh_todos(&ws, &store);
             json_ok(StatusCode::OK, &result)
         }
         Err(error) => import_error_response(error),
@@ -1561,9 +1539,8 @@ async fn security_and_auth_middleware(
     next.run(req).await
 }
 
-fn is_unix_switch_supported(state: &AppState) -> bool {
-    state
-        .hub
+fn is_unix_switch_supported(ws: &WorkspaceEntry) -> bool {
+    ws.hub
         .switch_config()
         .and_then(|c| c.unix_supported)
         .unwrap_or(cfg!(unix))
@@ -1602,14 +1579,14 @@ struct WorkspaceInfoResponse {
     can_switch: bool,
 }
 
-async fn get_workspace(State(state): State<AppState>) -> Response {
-    let current = state.hub.snapshot().workspace;
+async fn get_workspace(Ws(ws): Ws) -> Response {
+    let current = ws.hub.snapshot().workspace;
     let recent = crate::workspace::load_recent_workspaces();
     let browse_roots = crate::workspace::resolve_browse_roots()
         .into_iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
-    let can_switch = state.services.web_attached && is_unix_switch_supported(&state);
+    let can_switch = ws.services.web_attached && is_unix_switch_supported(&ws);
     json_ok(
         StatusCode::OK,
         &WorkspaceInfoResponse {
@@ -1634,11 +1611,8 @@ struct WorkspaceDirsResponse {
     dirs: Vec<String>,
 }
 
-async fn get_workspace_dirs(
-    State(state): State<AppState>,
-    Query(params): Query<WorkspaceDirsQuery>,
-) -> Response {
-    if !state.services.web_attached {
+async fn get_workspace_dirs(Ws(ws): Ws, Query(params): Query<WorkspaceDirsQuery>) -> Response {
+    if !ws.services.web_attached {
         return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
     }
     let roots = crate::workspace::resolve_browse_roots();
@@ -1649,7 +1623,7 @@ async fn get_workspace_dirs(
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .or_else(|| roots.first().map(|p| p.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| state.hub.snapshot().workspace);
+        .unwrap_or_else(|| ws.hub.snapshot().workspace);
 
     if raw_path.as_bytes().contains(&0) || raw_path.len() > 4096 {
         return error_json(StatusCode::BAD_REQUEST, "invalid path");
@@ -1758,11 +1732,8 @@ const OPEN_DISCOVERY_TIMEOUT: Duration = if cfg!(test) {
 /// A live discovery file is reused. Otherwise the current executable is spawned
 /// with `--web -C <path> --port 0` and this handler waits until that process
 /// writes `<path>/.dmuxai/web.json`.
-async fn post_workspace_open(
-    State(state): State<AppState>,
-    ApiJson(body): ApiJson<WorkspacePathBody>,
-) -> Response {
-    if !state.services.web_attached {
+async fn post_workspace_open(Ws(ws): Ws, ApiJson(body): ApiJson<WorkspacePathBody>) -> Response {
+    if !ws.services.web_attached {
         return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
     }
     let canonical = match crate::workspace::validate_workspace_dir(std::path::Path::new(&body.path))
@@ -1776,7 +1747,7 @@ async fn post_workspace_open(
             &serde_json::json!({ "ok": true, "url": url }),
         );
     }
-    let cfg = state.hub.switch_config().unwrap_or_default();
+    let cfg = ws.hub.switch_config().unwrap_or_default();
     let exe = match cfg
         .current_exe
         .clone()
@@ -1838,12 +1809,13 @@ async fn post_workspace_open(
 
 async fn post_workspace_switch(
     State(state): State<AppState>,
+    Ws(ws): Ws,
     ApiJson(body): ApiJson<WorkspacePathBody>,
 ) -> Response {
-    if !state.services.web_attached {
+    if !ws.services.web_attached {
         return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
     }
-    if !is_unix_switch_supported(&state) {
+    if !is_unix_switch_supported(&ws) {
         return error_json(
             StatusCode::NOT_IMPLEMENTED,
             "workspace switch is not supported on this platform",
@@ -1858,9 +1830,13 @@ async fn post_workspace_switch(
     // Run the rest in its own task: once the App has set switch-pending, the
     // flag must be committed or cancelled even if the client disconnects and
     // axum drops this handler future.
-    tokio::spawn(workspace_switch_task(state, canonical))
-        .await
-        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+    tokio::spawn(workspace_switch_task(
+        state.token.clone(),
+        ws.clone(),
+        canonical,
+    ))
+    .await
+    .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
 }
 
 /// How long `POST /api/workspace/switch` waits for the App (shortened in tests).
@@ -1870,8 +1846,12 @@ const SWITCH_REPLY_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(10)
 };
 
-async fn workspace_switch_task(state: AppState, canonical: std::path::PathBuf) -> Response {
-    let Some(sender) = state.services.commands.clone() else {
+async fn workspace_switch_task(
+    token: Arc<String>,
+    ws: Arc<WorkspaceEntry>,
+    canonical: std::path::PathBuf,
+) -> Response {
+    let Some(sender) = ws.services.commands.clone() else {
         return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
     };
     let (reply, rx) = oneshot::channel();
@@ -1905,7 +1885,7 @@ async fn workspace_switch_task(state: AppState, canonical: std::path::PathBuf) -
 
     let _ = crate::workspace::record_recent_workspace(&canonical);
 
-    let cfg = state.hub.switch_config().unwrap_or_default();
+    let cfg = ws.hub.switch_config().unwrap_or_default();
     match preflight_workspace_switch(cfg.current_exe.as_deref(), &canonical) {
         Err(reason) => {
             let notice = format!("Workspace switch failed: {reason}");
@@ -1914,7 +1894,7 @@ async fn workspace_switch_task(state: AppState, canonical: std::path::PathBuf) -
                     notice: notice.clone(),
                 })
                 .await;
-            state.hub.push_notice(notice.clone());
+            ws.hub.push_notice(notice.clone());
             tokio::task::yield_now().await;
             return error_json(StatusCode::INTERNAL_SERVER_ERROR, &notice);
         }
@@ -1922,7 +1902,7 @@ async fn workspace_switch_task(state: AppState, canonical: std::path::PathBuf) -
             let reexec_args =
                 crate::workspace::build_reexec_args(&cfg.orig_args, &canonical, cfg.bound_port);
             if let Some(exec_hook) = cfg.exec_hook {
-                if let Err(err) = exec_hook(&exe, &reexec_args, &state.token) {
+                if let Err(err) = exec_hook(&exe, &reexec_args, &token) {
                     let msg = format_reexec_failure(&exe, &reexec_args, &err);
                     if let Some(on_err) = cfg.on_exec_error {
                         on_err(1, msg);
@@ -1968,11 +1948,11 @@ pub fn build_router_with(
     allowed_hosts: Option<Vec<String>>,
     services: DashboardServices,
 ) -> Router {
+    let workspaces = Arc::new(WorkspaceDirectory::single(hub, services));
     let state = AppState {
-        hub,
         token: Arc::new(token),
         allowed_hosts: allowed_hosts.map(Arc::new),
-        services,
+        workspaces,
     };
 
     Router::new()
@@ -2028,7 +2008,7 @@ pub fn build_router_with(
         .route("/api/attachments/{name}", get(get_attachment))
         .route("/api/prompt", post(post_prompt))
         .route("/api/command", post(post_command))
-        .merge(crate::web::docs_api::router(state.services.docs.clone()))
+        .merge(crate::web::docs_api::router(state.workspaces.clone()))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_and_auth_middleware,

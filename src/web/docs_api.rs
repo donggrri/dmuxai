@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::docs::confine::Workspace;
 use crate::docs::{DocKind, DocsError, MAX_TEXT_BYTES};
+use crate::web::directory::WorkspaceDirectory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketPurpose {
@@ -170,7 +171,13 @@ impl DocsService {
 
 #[derive(Clone)]
 pub struct DocsApiState {
-    pub docs: Option<Arc<DocsService>>,
+    pub workspaces: Arc<WorkspaceDirectory>,
+}
+
+impl DocsApiState {
+    pub fn docs(&self) -> Option<Arc<DocsService>> {
+        self.workspaces.focused().services.docs.clone()
+    }
 }
 
 fn error_json(status: StatusCode, message: &str) -> Response {
@@ -338,7 +345,8 @@ async fn get_docs_css() -> impl IntoResponse {
 }
 
 async fn get_docs(State(state): State<DocsApiState>) -> Response {
-    let Some(service) = &state.docs else {
+    let docs = state.docs();
+    let Some(service) = &docs else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
     };
     let list = crate::docs::list::list_documents(&service.workspace, crate::docs::MAX_LIST_ENTRIES);
@@ -352,7 +360,8 @@ struct TreeQuery {
 }
 
 async fn get_tree(State(state): State<DocsApiState>, Query(query): Query<TreeQuery>) -> Response {
-    let Some(service) = &state.docs else {
+    let docs = state.docs();
+    let Some(service) = &docs else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
     };
     match crate::docs::list::list_children(
@@ -369,7 +378,8 @@ async fn get_file(
     State(state): State<DocsApiState>,
     Query(query): Query<FilePathQuery>,
 ) -> Response {
-    let Some(service) = &state.docs else {
+    let docs = state.docs();
+    let Some(service) = &docs else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
     };
     // Reading, hashing and highlighting are blocking work: keep them off
@@ -392,7 +402,8 @@ async fn put_file(
     State(state): State<DocsApiState>,
     DocsJson(body): DocsJson<SaveFileBody>,
 ) -> Response {
-    let Some(service) = &state.docs else {
+    let docs = state.docs();
+    let Some(service) = &docs else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
     };
 
@@ -445,7 +456,8 @@ async fn get_render(
     State(state): State<DocsApiState>,
     Query(query): Query<RenderPathQuery>,
 ) -> Response {
-    let Some(service) = &state.docs else {
+    let docs = state.docs();
+    let Some(service) = &docs else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
     };
 
@@ -497,7 +509,8 @@ async fn post_view(
     State(state): State<DocsApiState>,
     DocsJson(body): DocsJson<ViewBody>,
 ) -> Response {
-    let Some(service) = &state.docs else {
+    let docs = state.docs();
+    let Some(service) = &docs else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
     };
 
@@ -637,7 +650,8 @@ async fn get_view_ticket(
     State(state): State<DocsApiState>,
     AxumPath(ticket): AxumPath<String>,
 ) -> Response {
-    let Some(service) = &state.docs else {
+    let docs = state.docs();
+    let Some(service) = &docs else {
         return error_json(StatusCode::NOT_FOUND, "not found");
     };
     let path = match service
@@ -705,7 +719,8 @@ async fn get_download_ticket(
     State(state): State<DocsApiState>,
     AxumPath(ticket): AxumPath<String>,
 ) -> Response {
-    let Some(service) = &state.docs else {
+    let docs = state.docs();
+    let Some(service) = &docs else {
         return error_json(StatusCode::NOT_FOUND, "not found");
     };
     let path = match service
@@ -768,7 +783,8 @@ async fn get_open_ticket(
     State(state): State<DocsApiState>,
     AxumPath(ticket): AxumPath<String>,
 ) -> Response {
-    let Some(service) = &state.docs else {
+    let docs = state.docs();
+    let Some(service) = &docs else {
         return plain_not_found();
     };
     let relative = service
@@ -815,7 +831,8 @@ async fn get_changes(
     State(state): State<DocsApiState>,
     Query(query): Query<ChangesQuery>,
 ) -> Response {
-    let Some(service) = &state.docs else {
+    let docs = state.docs();
+    let Some(service) = &docs else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
     };
     if service.read_only {
@@ -874,11 +891,11 @@ fn safe_filename(path: &std::path::Path) -> String {
     }
 }
 
-pub fn router<S>(docs: Option<Arc<DocsService>>) -> Router<S>
+pub fn router<S>(workspaces: Arc<WorkspaceDirectory>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    let state = DocsApiState { docs };
+    let state = DocsApiState { workspaces };
     Router::new()
         .route("/assets/docs.js", get(get_docs_js))
         .route("/assets/docs.css", get(get_docs_css))
