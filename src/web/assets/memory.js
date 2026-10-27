@@ -1,6 +1,7 @@
 'use strict';
 
 (function () {
+  var apiUrl = window.dmuxaiApiUrl || function (p) { return p; };
   var REFRESH_MS = 15000;
   var TOKEN_KEY = 'dmuxai.token';
   var NAME_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/;
@@ -41,7 +42,7 @@
       headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
-    return fetch(path, init).then(function (res) {
+    return fetch(apiUrl(path), init).then(function (res) {
       return res.text().then(function (text) {
         var payload = null;
         if (text) {

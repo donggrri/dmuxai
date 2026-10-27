@@ -5,6 +5,7 @@
 // container and app.js's `dmuxai:snapshot` DOM event (one SSE connection).
 
 (function () {
+  var apiUrl = window.dmuxaiApiUrl || function (p) { return p; };
   var TOKEN_KEY = 'dmuxai.token';
   var PROMPT_ROUTES = [
     { value: 'auto', label: 'Auto' },
@@ -252,7 +253,7 @@
   }
 
   function api(path, body) {
-    return fetch(path, {
+    return fetch(apiUrl(path), {
       method: 'POST',
       headers: {
         Authorization: 'Bearer ' + token,
@@ -356,7 +357,7 @@
   }
 
   function uploadAttachment(item) {
-    fetch('/api/attachments', {
+    fetch(apiUrl('/api/attachments'), {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + token, 'Content-Type': item.file.type },
       cache: 'no-store',
@@ -2065,7 +2066,7 @@
             if (imageUrlCache[name]) {
               img.src = imageUrlCache[name];
             } else {
-              fetch('/api/attachments/' + encodeURIComponent(name), {
+              fetch(apiUrl('/api/attachments/' + encodeURIComponent(name)), {
                 headers: { Authorization: 'Bearer ' + token }
               }).then(function (resp) {
                 if (!resp.ok) { throw new Error('HTTP ' + resp.status); }

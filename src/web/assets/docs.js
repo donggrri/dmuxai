@@ -7,6 +7,7 @@
 // ---------------------------------------------------------------------------
 
 (function () {
+  var apiUrl = window.dmuxaiApiUrl || function (p) { return p; };
   var TOKEN_KEY = 'dmuxai.token';
   var SNAPSHOT_EVENT = 'dmuxai:snapshot';
   var CHANGES_POLL_MS = 10000;
@@ -181,7 +182,7 @@
       headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
-    return fetch(path, init).then(function (res) {
+    return fetch(apiUrl(path), init).then(function (res) {
       if (res.status === 401) {
         // Token rotation rejected this page; stop polling instead of
         // hammering the server with stale credentials.
@@ -1458,7 +1459,7 @@
   function loadServeState() {
     var token = currentToken();
     if (!token) { return; }
-    fetch('/api/state', {
+    fetch(apiUrl('/api/state'), {
       headers: { Authorization: 'Bearer ' + token },
       cache: 'no-store'
     })

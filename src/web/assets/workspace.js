@@ -4,6 +4,7 @@
 // browse-root directory browser, and re-exec switch polling).
 
 (function () {
+  var apiUrl = window.dmuxaiApiUrl || function (p) { return p; };
   var TOKEN_KEY = 'dmuxai.token';
   var ELLIPSIS_MAX = 40;
   var VALIDATE_DEBOUNCE_MS = 120;
@@ -86,7 +87,7 @@
   }
 
   function apiGet(path) {
-    return fetch(path, {
+    return fetch(apiUrl(path), {
       method: 'GET',
       headers: authHeaders()
     }).then(function (res) {
@@ -97,7 +98,7 @@
   }
 
   function apiPost(path, payload) {
-    return fetch(path, {
+    return fetch(apiUrl(path), {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload || {})
