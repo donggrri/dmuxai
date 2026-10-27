@@ -736,37 +736,30 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     } else {
         Some(TerminalSession::start()?)
     };
-    let result = match session.as_mut() {
-        Some(session) => app.run(session.terminal_mut()).await,
+    // FR-1601: SIGINT/SIGTERM also end a headless `--web` run. When a signal
+    // wins, the stop flag ends the run and control continues to the shutdown
+    // path below with an `Ok` result.
+    let (app, result) = match session.as_mut() {
+        Some(session) => {
+            let res = app.run(session.terminal_mut()).await;
+            (Some(app), res)
+        }
         None => {
-            // Renders into a sink; the fixed viewport avoids a terminal size query.
-            let backend = ratatui::backend::CrosstermBackend::new(io::sink());
-            let mut terminal = ratatui::Terminal::with_options(
-                backend,
-                ratatui::TerminalOptions {
-                    viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 120, 40)),
-                },
-            )?;
-            // FR-1601: SIGINT/SIGTERM also end a headless `--web` run. When a
-            // signal wins, the run future is dropped and control continues to
-            // the shutdown path below with an `Ok` result.
-            tokio::select! {
-                result = app.run(&mut terminal) => result,
-                _ = async {
-                    match shutdown.as_mut() {
-                        Some(shutdown) => shutdown.recv().await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => Ok(()),
-            }
+            tokio::task::LocalSet::new()
+                .run_until(workspace_runtime::run_headless_host(app, shutdown.as_mut()))
+                .await
         }
     };
-    let switch_target = app.take_switch_ready();
-    let open_conversation = switch_target
-        .as_deref()
-        .and_then(|target| app.take_switch_open_conversation(target));
-    app.shutdown().await;
-    drop(app);
+    let mut switch_target = None;
+    let mut open_conversation = None;
+    if let Some(mut app) = app {
+        switch_target = app.take_switch_ready();
+        open_conversation = switch_target
+            .as_deref()
+            .and_then(|target| app.take_switch_open_conversation(target));
+        app.shutdown().await;
+        drop(app);
+    }
     drop(session);
     let mut bound_port = None;
     let mut dashboard_tok = None;
@@ -791,13 +784,13 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
 /// Creating the stream registers the OS handler synchronously (see the
 /// regression guard in [`run_tui`]); a failed registration for one signal
 /// never blocks the other.
-struct ShutdownSignals {
+pub(crate) struct ShutdownSignals {
     interrupt: Option<tokio::signal::unix::Signal>,
     sigterm: Option<tokio::signal::unix::Signal>,
 }
 
 impl ShutdownSignals {
-    fn register() -> Self {
+    pub(crate) fn register() -> Self {
         Self {
             interrupt: tokio::signal::unix::signal(SignalKind::interrupt()).ok(),
             sigterm: tokio::signal::unix::signal(SignalKind::terminate()).ok(),
@@ -806,7 +799,7 @@ impl ShutdownSignals {
 
     /// Resolves after SIGINT (Ctrl-C) or SIGTERM; never resolves if neither
     /// stream could be registered.
-    async fn recv(&mut self) {
+    pub(crate) async fn recv(&mut self) {
         let sigterm = async {
             match self.sigterm.as_mut() {
                 Some(sigterm) => {

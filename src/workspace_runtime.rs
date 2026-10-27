@@ -136,3 +136,56 @@ pub(crate) fn attach_web_workspace(
         app.attach_dashboard_services(store, receiver);
     }
 }
+
+/// Runs a headless host for an App.
+///
+/// Hosts one workspace today; a later change hosts several.
+pub(crate) async fn run_headless_host(
+    mut app: App,
+    shutdown: Option<&mut crate::ShutdownSignals>,
+) -> (Option<App>, std::io::Result<()>) {
+    let mut tasks = tokio::task::JoinSet::new();
+    let stop = app.stop_handle();
+
+    tasks.spawn_local(async move {
+        let backend = ratatui::backend::CrosstermBackend::new(std::io::sink());
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 120, 40)),
+            },
+        )?;
+        let result = app.run(&mut terminal).await;
+        Ok::<_, std::io::Error>((app, result))
+    });
+
+    let shutdown_fut = async {
+        match shutdown {
+            Some(s) => s.recv().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+
+    tokio::select! {
+        joined = tasks.join_next() => {
+            match joined {
+                Some(Ok(Ok((app, result)))) => (Some(app), result),
+                Some(Ok(Err(io_err))) => (None, Err(io_err)),
+                Some(Err(join_err)) => (None, Err(std::io::Error::other(join_err))),
+                None => (None, Ok(())),
+            }
+        }
+        _ = shutdown_fut => {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            match tokio::time::timeout(std::time::Duration::from_secs(5), tasks.join_next()).await {
+                Ok(Some(Ok(Ok((app, result))))) => (Some(app), result),
+                Ok(Some(Ok(Err(io_err)))) => (None, Err(io_err)),
+                Ok(Some(Err(join_err))) => (None, Err(std::io::Error::other(join_err))),
+                _ => {
+                    tasks.abort_all();
+                    (None, Ok(()))
+                }
+            }
+        }
+    }
+}
