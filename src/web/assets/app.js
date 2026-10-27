@@ -1,5 +1,11 @@
 'use strict';
 
+// Single place that maps dashboard API paths to URLs; currently identity.
+function apiUrl(path) {
+  return path;
+}
+window.dmuxaiApiUrl = apiUrl;
+
 var TICK_MS = 1000;
 var POLL_INITIAL_MS = 2000;
 var POLL_MAX_MS = 30000;
@@ -3032,7 +3038,7 @@ function todoApi(method, path, body) {
     headers['Content-Type'] = 'application/json';
     init.body = JSON.stringify(body);
   }
-  return fetch(path, init).then(function(res) {
+  return fetch(apiUrl(path), init).then(function(res) {
     if (res.status === 401) {
       var fatal = new Error('unauthorized');
       fatal.fatal = true;
@@ -4210,7 +4216,7 @@ function startSse() {
   sseFailures = 0;
   setConn('connecting', 'connecting');
   try {
-    sse = new EventSource('/api/events?token=' + encodeURIComponent(token));
+    sse = new EventSource(apiUrl('/api/events') + '?token=' + encodeURIComponent(token));
   } catch (err) {
     showMsg('dashboard: SSE unavailable, falling back to polling', true);
     startPolling();
@@ -4270,7 +4276,7 @@ function stopPolling() {
 }
 
 function poll() {
-  fetch('/api/state', {
+  fetch(apiUrl('/api/state'), {
     headers: { Authorization: 'Bearer ' + token },
     cache: 'no-store'
   })

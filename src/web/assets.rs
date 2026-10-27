@@ -1886,4 +1886,69 @@ mod tests {
         assert!(body.contains("!state.validPath"), "{body}");
         assert!(!body.contains("|| !target"), "{body}");
     }
+
+    #[test]
+    fn api_requests_go_through_api_url_helper() {
+        let files = [
+            ("APP_JS", APP_JS),
+            ("DOCS_JS", DOCS_JS),
+            ("MEMORY_JS", MEMORY_JS),
+            ("SKILLS_JS", SKILLS_JS),
+            ("AGENT_PROMPTS_JS", AGENT_PROMPTS_JS),
+            ("SESSION_JS", SESSION_JS),
+            ("WORKSPACE_JS", WORKSPACE_JS),
+            ("SIDEBAR_RESIZE_JS", SIDEBAR_RESIZE_JS),
+        ];
+
+        for (name, content) in files {
+            assert!(
+                !content.contains("fetch('/api"),
+                "{name} contains raw fetch('/api"
+            );
+            assert!(
+                !content.contains("fetch(\"/api"),
+                "{name} contains raw fetch(\"/api"
+            );
+            assert!(
+                !content.contains("fetch(`/api"),
+                "{name} contains raw fetch(`/api"
+            );
+            assert!(
+                !content.contains("EventSource('/api"),
+                "{name} contains raw EventSource('/api"
+            );
+            assert!(
+                !content.contains("EventSource(\"/api"),
+                "{name} contains raw EventSource(\"/api"
+            );
+
+            // Assert every occurrence of fetch( and new EventSource( is immediately followed by apiUrl(
+            // (ignoring occurrences in // comment lines).
+            for line in content.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for (idx, _) in line.match_indices("fetch(") {
+                    let after = &line[idx + "fetch(".len()..];
+                    assert!(
+                        after.starts_with("apiUrl("),
+                        "{name}: fetch( not followed by apiUrl(: {line}"
+                    );
+                }
+                for (idx, _) in line.match_indices("new EventSource(") {
+                    let after = &line[idx + "new EventSource(".len()..];
+                    assert!(
+                        after.starts_with("apiUrl("),
+                        "{name}: new EventSource( not followed by apiUrl(: {line}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            APP_JS.contains("window.dmuxaiApiUrl = apiUrl"),
+            "APP_JS must export window.dmuxaiApiUrl = apiUrl"
+        );
+    }
 }

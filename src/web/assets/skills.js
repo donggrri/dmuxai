@@ -2,6 +2,7 @@
 
 // SPEC-stage-skills UX-1500: stage -> skill map in the dashboard.
 (function () {
+  var apiUrl = window.dmuxaiApiUrl || function (p) { return p; };
   var TOKEN_KEY = 'dmuxai.token';
   var token = (function () {
     var fromQuery = new URLSearchParams(location.search).get('token');
@@ -23,7 +24,7 @@
       headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
-    return fetch(path, init).then(function (res) {
+    return fetch(apiUrl(path), init).then(function (res) {
       return res.json().catch(function () { return null; }).then(function (payload) {
         if (!res.ok) {
           throw new Error(payload && payload.error ? payload.error : 'HTTP ' + res.status);
