@@ -109,6 +109,19 @@
     });
   }
 
+  function apiPostTo(url, payload) {
+    // apiUrl( helper wrapper for fetch(apiUrl(url))
+    return fetch(apiUrl(url), {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload || {})
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (body) {
+        return { status: res.status, ok: res.ok, body: body };
+      });
+    });
+  }
+
   function updateHeaderButton() {
     var btn = $('workspace-button');
     if (!btn) { return; }
@@ -387,6 +400,32 @@
     }, SWITCH_POLL_MS);
   }
 
+  function navigateToFolder(wsId) {
+    var url = new URL(window.location.href);
+    if (!wsId || wsId === 'default') {
+      url.searchParams.delete('ws');
+    } else {
+      url.searchParams.set('ws', wsId);
+    }
+    window.location.assign(url.toString());
+  }
+
+  function handleInProcessSwitch(body, opts) {
+    var p = Promise.resolve();
+    var commandUrl = typeof window.dmuxaiApiUrlFor === 'function'
+      ? window.dmuxaiApiUrlFor(body.id, '/api/command')
+      : apiUrl('/api/command');
+    if (opts && opts.conversation) {
+      p = apiPostTo(commandUrl, { command: 'load_conversation', id: opts.conversation });
+    } else if (opts && opts.newConversation) {
+      p = apiPostTo(commandUrl, { command: 'new_conversation' });
+    }
+    return p.then(function () {
+      navigateToFolder(body.id);
+      return { ok: true, in_process: true, id: body.id };
+    });
+  }
+
   function submitSwitch() {
     if (state.switching || !state.canSwitch || state.viewOnly) { return; }
     var input = $('workspace-path');
@@ -400,6 +439,11 @@
     setReason('Switching\u2026', 'info');
 
     apiPost('/api/workspace/switch', { path: target }).then(function (res) {
+      if (res.status === 200 && res.body && res.body.in_process === true) {
+        setReason('Switched', 'info');
+        handleInProcessSwitch(res.body);
+        return;
+      }
       if (res.status === 202) {
         var canonical = (res.body && res.body.path) ? String(res.body.path) : target;
         setReason('Switching\u2026', 'info');
@@ -459,7 +503,8 @@
   window.dmuxaiWorkspaceCanSwitch = function () {
     return !!state.canSwitch && !state.viewOnly;
   };
-  window.dmuxaiSwitchWorkspace = function (path) {
+  window.dmuxaiSwitchWorkspace = function (path, opts) {
+    // window.dmuxaiSwitchWorkspace = function (path)
     return new Promise(function (resolve) {
       fetchWorkspaceInfo(function () {
         if (!state.canSwitch || state.viewOnly) {
@@ -473,6 +518,10 @@
         var previousCurrent = state.current;
         state.switching = true;
         apiPost('/api/workspace/switch', { path: path }).then(function (res) {
+          if (res.status === 200 && res.body && res.body.in_process === true) {
+            handleInProcessSwitch(res.body, opts).then(resolve);
+            return;
+          }
           if (res.status === 202) {
             var canonical = (res.body && res.body.path) ? String(res.body.path) : path;
             startSwitchPoll(canonical, previousCurrent);
