@@ -274,33 +274,26 @@ struct SkillsPostBody {
 /// UX-1500: writes `[stages.<stage>] skills` to the workspace dmuxai.toml.
 async fn post_skills(Ws(ws): Ws, ApiJson(body): ApiJson<SkillsPostBody>) -> Response {
     let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
-    let path = workspace.join("dmuxai.toml");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
     let skills: Vec<String> = body
         .skills
         .iter()
         .map(|skill| skill.trim().to_owned())
         .filter(|skill| !skill.is_empty())
         .collect();
-    match crate::stage_skills::set_stage_skills_in_toml(&text, &body.stage, &skills) {
-        Ok(updated) => {
-            let env = ws
-                .services
-                .trust_env
-                .clone()
-                .unwrap_or_else(crate::runtime_env::RuntimeEnv::from_process);
-            match crate::workspace_trust::write_workspace_config_refreshing_trust(
-                &env,
-                &workspace,
-                &text,
-                &updated,
-                ws.services.web_attached,
-            ) {
-                Ok(_) => get_skills(Ws(ws)).await,
-                Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-            }
-        }
-        Err(error) => error_json(StatusCode::BAD_REQUEST, &error),
+    let env = ws
+        .services
+        .trust_env
+        .clone()
+        .unwrap_or_else(crate::runtime_env::RuntimeEnv::from_process);
+    match crate::workspace_trust::update_workspace_config_refreshing_trust(
+        &env,
+        &workspace,
+        ws.services.web_attached,
+        |text| crate::stage_skills::set_stage_skills_in_toml(text, &body.stage, &skills),
+    ) {
+        Ok(Ok(_)) => get_skills(Ws(ws)).await,
+        Ok(Err(error)) => error_json(StatusCode::BAD_REQUEST, &error),
+        Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -459,31 +452,23 @@ async fn post_agent_prompts(Ws(ws): Ws, ApiJson(body): ApiJson<AgentPromptsPostB
         );
     }
 
-    let path = workspace.join("dmuxai.toml");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-
     let sp = Some(body.system_prompt.as_deref());
     let pi = body.prompt_inject.as_ref().map(|opt| opt.as_deref());
 
-    match crate::agent_prompt::set_runner_prompt_in_toml(&text, &runner, sp, pi) {
-        Ok(updated) => {
-            let env = ws
-                .services
-                .trust_env
-                .clone()
-                .unwrap_or_else(crate::runtime_env::RuntimeEnv::from_process);
-            match crate::workspace_trust::write_workspace_config_refreshing_trust(
-                &env,
-                &workspace,
-                &text,
-                &updated,
-                ws.services.web_attached,
-            ) {
-                Ok(_) => get_agent_prompts(Ws(ws)).await,
-                Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-            }
-        }
-        Err(error) => error_json(StatusCode::BAD_REQUEST, &error),
+    let env = ws
+        .services
+        .trust_env
+        .clone()
+        .unwrap_or_else(crate::runtime_env::RuntimeEnv::from_process);
+    match crate::workspace_trust::update_workspace_config_refreshing_trust(
+        &env,
+        &workspace,
+        ws.services.web_attached,
+        |text| crate::agent_prompt::set_runner_prompt_in_toml(text, &runner, sp, pi),
+    ) {
+        Ok(Ok(_)) => get_agent_prompts(Ws(ws)).await,
+        Ok(Err(error)) => error_json(StatusCode::BAD_REQUEST, &error),
+        Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -6694,5 +6679,80 @@ mod tests {
         let new_bytes = std::fs::read(workspace.join("dmuxai.toml")).unwrap();
         let new_hash = content_hash(&new_bytes);
         assert!(!TrustStore::load(&env).is_trusted(&workspace, &new_hash));
+    }
+
+    #[tokio::test]
+    async fn tc_2251_concurrent_dashboard_saves_keep_both_sections() {
+        use crate::runtime_env::RuntimeEnv;
+        use crate::workspace_trust::{TrustStore, content_hash};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("proj");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let state = tmp.path().join("state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state),
+            ..Default::default()
+        };
+
+        let initial_bytes = b"[ui]\ntheme = \"dark\"\n";
+        std::fs::write(workspace.join("dmuxai.toml"), initial_bytes).unwrap();
+        let mut s = TrustStore::load(&env);
+        s.trust(&workspace, &content_hash(initial_bytes));
+        s.save().unwrap();
+
+        let token = "dashboard-trust-token-2251";
+        let hub = DashboardHub::new(SnapshotSource::Tui, workspace.to_string_lossy().to_string());
+        let services = DashboardServices {
+            web_attached: true,
+            trust_env: Some(env.clone()),
+            ..Default::default()
+        };
+        let router = build_router_with(hub, token.to_owned(), allowed_localhost(), services);
+
+        for round in 0..10 {
+            let skill = format!("skill-{round}");
+            let prompt = format!("Prompt {round}");
+            let skills_body =
+                serde_json::json!({"stage": "implement", "skills": [skill]}).to_string();
+            let prompt_body = serde_json::json!({
+                "runner": "codex",
+                "system_prompt": prompt,
+                "prompt_inject": "session"
+            })
+            .to_string();
+
+            let (skills_resp, prompt_resp) = tokio::join!(
+                router
+                    .clone()
+                    .oneshot(json_request("POST", "/api/skills", token, &skills_body)),
+                router.clone().oneshot(json_request(
+                    "POST",
+                    "/api/agent-prompts",
+                    token,
+                    &prompt_body
+                ))
+            );
+            assert_eq!(skills_resp.unwrap().status(), StatusCode::OK);
+            assert_eq!(prompt_resp.unwrap().status(), StatusCode::OK);
+
+            let text = std::fs::read_to_string(workspace.join("dmuxai.toml")).unwrap();
+            let doc: toml::Value = toml::from_str(&text).unwrap();
+            assert_eq!(
+                doc["stages"]["implement"]["skills"][0].as_str(),
+                Some(skill.as_str())
+            );
+            assert_eq!(
+                doc["runners"]["codex"]["system_prompt"].as_str(),
+                Some(prompt.as_str())
+            );
+            assert_eq!(
+                doc["runners"]["codex"]["prompt_inject"].as_str(),
+                Some("session")
+            );
+
+            let bytes = std::fs::read(workspace.join("dmuxai.toml")).unwrap();
+            assert!(TrustStore::load(&env).is_trusted(&workspace, &content_hash(&bytes)));
+        }
     }
 }

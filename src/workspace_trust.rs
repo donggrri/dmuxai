@@ -1,8 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -406,6 +407,122 @@ pub enum TrustRefresh {
     StoreSaveFailed(String),
 }
 
+static WORKSPACE_CONFIG_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+static TRUST_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn workspace_config_lock(workspace: &Path) -> Arc<Mutex<()>> {
+    let key = normalize_workspace_path(workspace)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let locks = WORKSPACE_CONFIG_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn trust_store_lock() -> std::sync::MutexGuard<'static, ()> {
+    TRUST_STORE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn atomic_write_config(path: &Path, contents: &str) -> io::Result<()> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temp = parent.join(format!(
+        ".dmuxai.toml.{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            if let Ok(meta) = fs::metadata(path) {
+                options.mode(meta.permissions().mode() & 0o777);
+            }
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Reads `<workspace>/dmuxai.toml`, applies `edit`, writes the result atomically,
+/// and optionally refreshes the persistent trust record while holding a per-workspace lock.
+pub fn update_workspace_config_refreshing_trust<E>(
+    env: &RuntimeEnv,
+    workspace: &Path,
+    allow_refresh: bool,
+    edit: impl FnOnce(&str) -> Result<String, E>,
+) -> Result<Result<TrustRefresh, E>, io::Error> {
+    let lock = workspace_config_lock(workspace);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = workspace.join("dmuxai.toml");
+    let on_disk = read_optional(&path)?;
+    let text = match &on_disk {
+        Some(bytes) => String::from_utf8(bytes.clone())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        None => String::new(),
+    };
+
+    let updated = match edit(&text) {
+        Ok(updated) => updated,
+        Err(error) => return Ok(Err(error)),
+    };
+
+    let mut eligible = None;
+    if allow_refresh && let Some(bytes) = &on_disk {
+        let guard = trust_store_lock();
+        let store = TrustStore::load(env);
+        if store.path().is_some()
+            && store.corrupt_warning().is_none()
+            && store.is_trusted(workspace, &content_hash(bytes))
+        {
+            eligible = Some((guard, store));
+        }
+    }
+
+    atomic_write_config(&path, &updated)?;
+
+    if let Some((_guard, mut store)) = eligible {
+        store.trust(workspace, &content_hash(updated.as_bytes()));
+        match store.save() {
+            Ok(()) => Ok(Ok(TrustRefresh::Refreshed)),
+            Err(e) => Ok(Ok(TrustRefresh::StoreSaveFailed(e.to_string()))),
+        }
+    } else {
+        Ok(Ok(TrustRefresh::NotEligible))
+    }
+}
+
 /// Writes `updated` to `<workspace>/dmuxai.toml` and, when strictly eligible, refreshes the persistent trust record to the new content hash.
 pub fn write_workspace_config_refreshing_trust(
     env: &RuntimeEnv,
@@ -414,30 +531,29 @@ pub fn write_workspace_config_refreshing_trust(
     updated: &str,
     allow_refresh: bool,
 ) -> io::Result<TrustRefresh> {
+    let lock = workspace_config_lock(workspace);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = workspace.join("dmuxai.toml");
-    let on_disk = match fs::read(&path) {
-        Ok(bytes) => Some(bytes),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e),
-    };
+    let on_disk = read_optional(&path)?;
 
-    let mut eligible_store = None;
+    let mut eligible = None;
     if allow_refresh
         && let Some(bytes) = &on_disk
         && content_hash(bytes) == content_hash(based_on.as_bytes())
     {
+        let guard = trust_store_lock();
         let store = TrustStore::load(env);
         if store.path().is_some()
             && store.corrupt_warning().is_none()
             && store.is_trusted(workspace, &content_hash(bytes))
         {
-            eligible_store = Some(store);
+            eligible = Some((guard, store));
         }
     }
 
-    fs::write(&path, updated)?;
+    atomic_write_config(&path, updated)?;
 
-    if let Some(mut store) = eligible_store {
+    if let Some((_guard, mut store)) = eligible {
         store.trust(workspace, &content_hash(updated.as_bytes()));
         match store.save() {
             Ok(()) => Ok(TrustRefresh::Refreshed),
@@ -939,6 +1055,145 @@ mod tests {
 
         let current_bytes = fs::read(store_file).unwrap();
         assert_eq!(recorded_bytes, current_bytes);
+    }
+
+    #[test]
+    fn tc_2248_concurrent_updates_keep_all_sections() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("dmuxai.toml"), "base = true\n").unwrap();
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(dir.path().join("state")),
+            ..RuntimeEnv::default()
+        };
+
+        let ws = Arc::new(ws);
+        let env = Arc::new(env);
+        let barrier = Arc::new(Barrier::new(16));
+        let mut handles = Vec::new();
+        for i in 0..16i64 {
+            let ws = Arc::clone(&ws);
+            let env = Arc::clone(&env);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                update_workspace_config_refreshing_trust(&env, &ws, false, |text| {
+                    std::thread::sleep(Duration::from_millis(5));
+                    let mut table: toml::Table = toml::from_str(text).unwrap();
+                    let mut section = toml::Table::new();
+                    section.insert("value".to_owned(), toml::Value::Integer(i));
+                    table.insert(format!("section_{i}"), toml::Value::Table(section));
+                    Ok::<_, String>(toml::to_string(&table).unwrap())
+                })
+                .unwrap()
+                .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let text = fs::read_to_string(ws.join("dmuxai.toml")).unwrap();
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        for i in 0..16i64 {
+            let section = table
+                .get(&format!("section_{i}"))
+                .unwrap_or_else(|| panic!("missing section_{i}"))
+                .as_table()
+                .unwrap();
+            assert_eq!(section.get("value").unwrap().as_integer(), Some(i));
+        }
+    }
+
+    #[test]
+    fn tc_2249_atomic_write_leaves_no_temp_files() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(dir.path().join("state")),
+            ..RuntimeEnv::default()
+        };
+        let path = ws.join("dmuxai.toml");
+        fs::write(&path, "a = 0\n").unwrap();
+
+        for i in 1..=5 {
+            update_workspace_config_refreshing_trust(&env, &ws, false, |_text| {
+                Ok::<_, String>(format!("a = {i}\n"))
+            })
+            .unwrap()
+            .unwrap();
+        }
+
+        let temp_files: Vec<_> = fs::read_dir(&ws)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(temp_files.is_empty(), "left temp files: {temp_files:?}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a = 5\n");
+
+        let before = fs::read(&path).unwrap();
+        let result: Result<TrustRefresh, String> =
+            update_workspace_config_refreshing_trust(&env, &ws, false, |_text| {
+                Err::<String, _>("edit failed".to_owned())
+            })
+            .unwrap();
+        assert_eq!(result, Err("edit failed".to_owned()));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn tc_2250_concurrent_refresh_keeps_trust() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(dir.path().join("state")),
+            ..RuntimeEnv::default()
+        };
+        let initial = "count = 0\n";
+        fs::write(ws.join("dmuxai.toml"), initial).unwrap();
+        let mut store = TrustStore::load(&env);
+        store.trust(&ws, &content_hash(initial.as_bytes()));
+        store.save().unwrap();
+
+        let ws = Arc::new(ws);
+        let env = Arc::new(env);
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let ws = Arc::clone(&ws);
+            let env = Arc::clone(&env);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                update_workspace_config_refreshing_trust(&env, &ws, true, |text| {
+                    let mut table: toml::Table = toml::from_str(text).unwrap();
+                    let next = table
+                        .get("count")
+                        .and_then(|value| value.as_integer())
+                        .unwrap_or(0)
+                        + 1;
+                    table.insert("count".to_owned(), toml::Value::Integer(next));
+                    Ok::<_, String>(toml::to_string(&table).unwrap())
+                })
+                .unwrap()
+                .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let final_bytes = fs::read(ws.join("dmuxai.toml")).unwrap();
+        assert!(TrustStore::load(&env).is_trusted(&ws, &content_hash(&final_bytes)));
     }
 
     #[test]

@@ -138,6 +138,8 @@ Trust records are pinned to the SHA-256 hash of the workspace configuration file
 | FR-2239 | Must | Given an existing trust state directory | On load and save it must be a real directory owned by the current user; group/world-writable directories are refused with a warning; other permissive modes are tightened to `0700` | State directory permissions enforced | TC-2241, TC-2242 |
 | FR-2240 | Must | Given a memory vault (from user or workspace config) that lexically lies in the workspace | The canonical vault and memory root must stay inside the canonical workspace; otherwise memory is disabled with a warning | Memory root confinement | TC-2245, TC-2246, TC-2247 |
 | FR-2241 | Should | When the startup trust prompt cannot save the record, or the trust store has a warning | An error is printed instead of silently continuing; `dmuxai trust` (including `--status`, with a `warning` JSON field) reports the store warning | Failures are visible | Manual review of `src/main.rs` `load_settings_with_trust_prompt` and `src/cli.rs` `trust_workspace` |
+| FR-2242 | Must | Given two or more dashboard saves of the workspace `dmuxai.toml` at the same time in one process | Each save reads, edits, writes and refreshes trust while holding a per-workspace lock, so no save loses another save's section | Concurrent saves keep every change | TC-2248, TC-2251 |
+| FR-2243 | Must | When the workspace `dmuxai.toml` is written by a dashboard save | The file is written to a temporary file in the same directory, synced and renamed into place; a failed edit or write leaves the file unchanged and no temporary file behind; trust store updates are serialized in the process | No partial files; trust stays current under concurrency | TC-2249, TC-2250 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -201,6 +203,10 @@ Trust records are pinned to the SHA-256 hash of the workspace configuration file
 | TC-2245 | FR-2240 | unit | User vault at an in-workspace symlink to outside | Settings load | Memory disabled with warning | `src/settings.rs` `tc_2245_user_memory_vault_symlink_in_workspace_disabled` |
 | TC-2246 | FR-2240 | unit | User vault at a real in-workspace dir | Settings load | Memory enabled | `src/settings.rs` `tc_2246_workspace_memory_vault_inside_ok` |
 | TC-2247 | FR-2240 | unit | Real in-workspace vault whose `dir` is a symlink to outside | Settings load | Memory disabled | `src/settings.rs` `tc_2247_relative_memory_root_symlink_escape_disabled` |
+| TC-2248 | FR-2242 | unit | Workspace config file | 16 threads update different sections at once | All 16 sections present | `src/workspace_trust.rs` `tc_2248_concurrent_updates_keep_all_sections` |
+| TC-2249 | FR-2243 | unit | Workspace config file | Several updates, then an edit that fails | No `*.tmp` files; last content kept; failed edit leaves the file unchanged | `src/workspace_trust.rs` `tc_2249_atomic_write_leaves_no_temp_files` |
+| TC-2250 | FR-2243 | unit | Trusted workspace | 8 concurrent updates with refresh allowed | Store trusts the final file hash | `src/workspace_trust.rs` `tc_2250_concurrent_refresh_keeps_trust` |
+| TC-2251 | FR-2242 | unit | `--web` router, trusted workspace | `POST /api/skills` and `POST /api/agent-prompts` at the same time, 10 rounds | Both changes present after each round; still trusted | `src/web/server.rs` `tc_2251_concurrent_dashboard_saves_keep_both_sections` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -221,10 +227,11 @@ Trust records are pinned to the SHA-256 hash of the workspace configuration file
 | 3 | CLI trust subcommand and runtime flags | `src/cli.rs`, `src/runtime_env.rs`, `src/main.rs` | FR-2207..FR-2213 | TC-2207..TC-2213 |
 | 4 | Webhook and subprocess trust integration | `tests/workspace_trust.rs` | FR-2214 | TC-2214 |
 | 5 | Dashboard save trust refresh | `src/workspace_trust.rs`, `src/web/server.rs` | FR-2226..FR-2231 | TC-2226..TC-2233 |
+| 5b | Locked, atomic dashboard config saves | `src/workspace_trust.rs`, `src/web/server.rs` | FR-2242, FR-2243 | TC-2248..TC-2251 |
 | 6 | Always-on skill and memory confinement, display escaping, state dir checks | `src/stage_skills.rs`, `src/settings.rs`, `src/workspace_trust.rs`, `src/cli.rs`, `src/main.rs` | FR-2234..FR-2241 | TC-2234..TC-2247 |
 | 7 | Specification and documentation registration | `docs/specs/SPEC-workspace-config-trust.md`, `SECURITY.md`, `docs/API.md` | All | `python3 scripts/check-spec.py --all` |
 
 ## 8. Review and test exit criteria
 
-- [x] All Must requirements (FR-2190..FR-2240) map to passing automated test evidence (TC-2190..TC-2247).
+- [x] All Must requirements (FR-2190..FR-2243) map to passing automated test evidence (TC-2190..TC-2251).
 - [x] Spec gate checks pass: `python3 scripts/check-spec.py --all` and `python3 scripts/check-tc-links.py`.
