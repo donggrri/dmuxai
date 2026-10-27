@@ -124,6 +124,12 @@ Trust records are pinned to the SHA-256 hash of the workspace configuration file
 | FR-2223 | Must | Given untrusted workspace with dotpath skill reference resolving outside the workspace | Skill resolution fails with missing issue indicating outside workspace | Relative dotpath resolution confined to workspace | TC-2223 |
 | FR-2224 | Must | Given restricted workspace settings during interactive approval prompt or `dmuxai trust` | Prints actual restricted values (argv commands, URLs, headers, agent/MCP commands and env key names only, skill sources, memory vault/dir, Jira URL, prompt files) without ever exposing secret environment variable values | Secret values are shielded while presenting full details | TC-2224 |
 | FR-2225 | Must | Child process command construction under child environment policy | `DMUXAI_TRUST_WORKSPACE_CONFIG` and `DMUXAI_CONFIG` are removed in child process environments | Child processes never inherit trust opt-in | TC-2225 |
+| FR-2226 | Must | Given a write-capable dashboard (`dmuxai --web`) saves workspace `dmuxai.toml` (skills or agent prompts) and, immediately before the write, the on-disk file hash equals the persistent trust record for that workspace | After a successful write the trust record is updated to the new file hash | The user's own dashboard save keeps the folder trusted | TC-2226, TC-2230 |
+| FR-2227 | Must | Given a dashboard save in a workspace with no matching persistent trust record | No trust record is created or changed and no store file is written | Saves never grant trust | TC-2227 |
+| FR-2228 | Must | Given trust comes only from the one-process opt-in (`--trust-workspace-config` / `DMUXAI_TRUST_WORKSPACE_CONFIG`) | A dashboard save does not create or upgrade a persistent record | Opt-in stays process-scoped | TC-2228 |
+| FR-2229 | Must | Given the on-disk `dmuxai.toml` differs from the trusted hash (edited outside the dashboard) or from the text the save was based on | No refresh happens; after the save the workspace is untrusted | External edits keep invalidating trust | TC-2229, TC-2231 |
+| FR-2230 | Must | Given a view-only dashboard (`dmuxai serve`) saves workspace `dmuxai.toml` | No trust refresh happens even when a matching record exists | Refresh limited to authenticated write-capable dashboards | TC-2232 |
+| FR-2231 | Must | Given the config write fails | The error is returned and the trust store is not modified | Failed saves never touch trust | TC-2233 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -165,6 +171,14 @@ Trust records are pinned to the SHA-256 hash of the workspace configuration file
 | TC-2223 | FR-2223 | unit | Untrusted workspace with dotpath skill symlinked outside | `crate::stage_skills::resolve` with `confine_to` | Returns `IssueKind::Missing` resolving outside workspace | `src/stage_skills.rs` `tc_2223_untrusted_dotpath_symlink_outside_rejected` |
 | TC-2224 | FR-2224 | unit | Untrusted workspace with commands, webhook, secret env, and custom agents | `restricted_workspace_details` with secret env var set in process | Returns details with command strings and env key names; never contains secret value | `src/settings.rs` `tc_2224_restricted_workspace_details_hides_secret_values` |
 | TC-2225 | FR-2225 | unit | Process command with `DMUXAI_TRUST_WORKSPACE_CONFIG` and `DMUXAI_CONFIG` set | `apply_child_env_policy` | Command environment removes both variables (values are None) | `src/process/mod.rs` `tc_2225_child_env_policy_removes_trust_workspace_config_and_config` |
+| TC-2226 | FR-2226 | unit | Workspace config trusted by record | `write_workspace_config_refreshing_trust` with `allow_refresh = true` and matching `based_on` | Returns `Refreshed`; new hash trusted, old hash not; file updated | `src/workspace_trust.rs` `tc_2226_trusted_save_refreshes_record` |
+| TC-2227 | FR-2227 | unit | Workspace config with no trust record | Same helper | Returns `NotEligible`; file written; store file absent | `src/workspace_trust.rs` `tc_2227_untrusted_save_stays_untrusted` |
+| TC-2228 | FR-2228 | unit | No record, `trust_workspace_config = true` | Same helper | Returns `NotEligible`; store file absent; new hash untrusted without the flag | `src/workspace_trust.rs` `tc_2228_opt_in_flag_does_not_persist_trust` |
+| TC-2229 | FR-2229 | unit | Record for old hash; file edited on disk | Same helper with edited or stale `based_on`, and with `allow_refresh = false` | Returns `NotEligible` in every case; new hash untrusted | `src/workspace_trust.rs` `tc_2229_external_edit_blocks_refresh` |
+| TC-2230 | FR-2226 | unit | `--web` router (`web_attached = true`), trusted workspace | `POST /api/agent-prompts` with valid token | 200; trust record matches the saved file hash | `src/web/server.rs` `tc_2230_dashboard_save_refreshes_trust` |
+| TC-2231 | FR-2229 | unit | `--web` router, trusted workspace, `dmuxai.toml` then edited externally | `POST /api/agent-prompts` | 200; workspace is untrusted for the saved file hash | `src/web/server.rs` `tc_2231_external_edit_then_dashboard_save_stays_untrusted` |
+| TC-2232 | FR-2230 | unit | View-only router (`web_attached = false`), trusted workspace | `POST /api/skills` | No trust refresh; workspace untrusted for the saved file hash | `src/web/server.rs` `tc_2232_view_only_save_does_not_refresh_trust` |
+| TC-2233 | FR-2231 | unit | `dmuxai.toml` path is a directory, workspace trusted | Same helper | Returns `Err`; trust store file unchanged | `src/workspace_trust.rs` `tc_2233_write_failure_leaves_trust_untouched` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -174,6 +188,7 @@ Trust records are pinned to the SHA-256 hash of the workspace configuration file
 | Configuration | Untrusted workspace `dmuxai.toml` has restricted keys stripped with one summarized warning | Safe defaults; user config unaffected | TC-2198..TC-2202 |
 | CLI commands | Subcommand `dmuxai trust` and flag `--trust-workspace-config` on `run` and `todo run` | Additive CLI surface; scripts opt in via environment variable or flag | TC-2208..2210, TC-2213 |
 | Environment | `DMUXAI_TRUST_WORKSPACE_CONFIG=1` enables one-process trust | Process-scoped; does not mutate disk store | TC-2208, TC-2214 |
+| Dashboard save | A write-capable dashboard save refreshes an existing trust record only when the on-disk file still matches it | Never creates trust; view-only and opt-in never refresh | TC-2226..TC-2233 |
 
 ## 7. Implementation plan
 
@@ -183,9 +198,10 @@ Trust records are pinned to the SHA-256 hash of the workspace configuration file
 | 2 | Restricted key inspection and stripping | `src/settings.rs` | FR-2198..FR-2206 | TC-2198..TC-2206 |
 | 3 | CLI trust subcommand and runtime flags | `src/cli.rs`, `src/runtime_env.rs`, `src/main.rs` | FR-2207..FR-2213 | TC-2207..TC-2213 |
 | 4 | Webhook and subprocess trust integration | `tests/workspace_trust.rs` | FR-2214 | TC-2214 |
-| 5 | Specification and documentation registration | `docs/specs/SPEC-workspace-config-trust.md`, `SECURITY.md`, `docs/API.md` | All | `python3 scripts/check-spec.py --all` |
+| 5 | Dashboard save trust refresh | `src/workspace_trust.rs`, `src/web/server.rs` | FR-2226..FR-2231 | TC-2226..TC-2233 |
+| 6 | Specification and documentation registration | `docs/specs/SPEC-workspace-config-trust.md`, `SECURITY.md`, `docs/API.md` | All | `python3 scripts/check-spec.py --all` |
 
 ## 8. Review and test exit criteria
 
-- [x] All Must requirements (FR-2190..FR-2225) map to passing automated test evidence (TC-2190..TC-2225).
+- [x] All Must requirements (FR-2190..FR-2231) map to passing automated test evidence (TC-2190..TC-2233).
 - [x] Spec gate checks pass: `python3 scripts/check-spec.py --all` and `python3 scripts/check-tc-links.py`.

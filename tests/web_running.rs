@@ -329,6 +329,7 @@ async fn running_indicator_renders_in_headless_chrome() {
             web_attached: false,
             memory: None,
             docs: None,
+            trust_env: None,
         },
     };
 

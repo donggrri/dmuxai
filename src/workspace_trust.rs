@@ -321,6 +321,59 @@ pub fn decide(env: &RuntimeEnv, workspace: &Path, sha256: &str) -> TrustDecision
     }
 }
 
+/// Outcome of a dashboard save of the workspace `dmuxai.toml` (FR-2226..FR-2229).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustRefresh {
+    /// Folder was trusted by a persistent record matching the on-disk file right before the write; record now points at the new hash.
+    Refreshed,
+    /// Refresh not attempted (not allowed, no matching record, file changed since the caller read it, store unusable).
+    NotEligible,
+    /// File was written but saving the store failed; trust is left as-is (so the folder is now untrusted).
+    StoreSaveFailed(String),
+}
+
+/// Writes `updated` to `<workspace>/dmuxai.toml` and, when strictly eligible, refreshes the persistent trust record to the new content hash.
+pub fn write_workspace_config_refreshing_trust(
+    env: &RuntimeEnv,
+    workspace: &Path,
+    based_on: &str,
+    updated: &str,
+    allow_refresh: bool,
+) -> io::Result<TrustRefresh> {
+    let path = workspace.join("dmuxai.toml");
+    let on_disk = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+
+    let mut eligible_store = None;
+    if allow_refresh
+        && let Some(bytes) = &on_disk
+        && content_hash(bytes) == content_hash(based_on.as_bytes())
+    {
+        let store = TrustStore::load(env);
+        if store.path().is_some()
+            && store.corrupt_warning().is_none()
+            && store.is_trusted(workspace, &content_hash(bytes))
+        {
+            eligible_store = Some(store);
+        }
+    }
+
+    fs::write(&path, updated)?;
+
+    if let Some(mut store) = eligible_store {
+        store.trust(workspace, &content_hash(updated.as_bytes()));
+        match store.save() {
+            Ok(()) => Ok(TrustRefresh::Refreshed),
+            Err(e) => Ok(TrustRefresh::StoreSaveFailed(e.to_string())),
+        }
+    } else {
+        Ok(TrustRefresh::NotEligible)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,5 +695,175 @@ mod tests {
 
         // Saving should refuse with an error rather than overwrite it
         assert!(store.save().is_err());
+    }
+
+    #[test]
+    fn tc_2226_trusted_save_refreshes_record() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let state_dir = dir.path().join("state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            ..RuntimeEnv::default()
+        };
+
+        let initial = "a = 1\n";
+        fs::write(ws.join("dmuxai.toml"), initial).unwrap();
+        let mut store = TrustStore::load(&env);
+        store.trust(&ws, &content_hash(initial.as_bytes()));
+        store.save().unwrap();
+
+        let updated = "a = 2\n";
+        let res = write_workspace_config_refreshing_trust(&env, &ws, initial, updated, true)
+            .expect("write config");
+        assert_eq!(res, TrustRefresh::Refreshed);
+
+        let reloaded = TrustStore::load(&env);
+        assert!(reloaded.is_trusted(&ws, &content_hash(updated.as_bytes())));
+        assert!(!reloaded.is_trusted(&ws, &content_hash(initial.as_bytes())));
+        assert_eq!(
+            fs::read_to_string(ws.join("dmuxai.toml")).unwrap(),
+            "a = 2\n"
+        );
+    }
+
+    #[test]
+    fn tc_2227_untrusted_save_stays_untrusted() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let state_dir = dir.path().join("state");
+        let store_file = state_dir.join("trusted-workspaces.json");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            ..RuntimeEnv::default()
+        };
+
+        let initial = "a = 1\n";
+        fs::write(ws.join("dmuxai.toml"), initial).unwrap();
+
+        let updated = "a = 2\n";
+        let res = write_workspace_config_refreshing_trust(&env, &ws, initial, updated, true)
+            .expect("write config");
+        assert_eq!(res, TrustRefresh::NotEligible);
+        assert_eq!(
+            fs::read_to_string(ws.join("dmuxai.toml")).unwrap(),
+            "a = 2\n"
+        );
+        assert!(!store_file.exists());
+    }
+
+    #[test]
+    fn tc_2228_opt_in_flag_does_not_persist_trust() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let state_dir = dir.path().join("state");
+        let store_file = state_dir.join("trusted-workspaces.json");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir.clone()),
+            trust_workspace_config: true,
+            ..RuntimeEnv::default()
+        };
+
+        let initial = "a = 1\n";
+        fs::write(ws.join("dmuxai.toml"), initial).unwrap();
+
+        let updated = "a = 2\n";
+        let res = write_workspace_config_refreshing_trust(&env, &ws, initial, updated, true)
+            .expect("write config");
+        assert_eq!(res, TrustRefresh::NotEligible);
+        assert!(!store_file.exists());
+
+        let flag_off_env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            trust_workspace_config: false,
+            ..RuntimeEnv::default()
+        };
+        assert_eq!(
+            decide(&flag_off_env, &ws, &content_hash(updated.as_bytes())),
+            TrustDecision::Untrusted
+        );
+    }
+
+    #[test]
+    fn tc_2229_external_edit_blocks_refresh() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let state_dir = dir.path().join("state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            ..RuntimeEnv::default()
+        };
+
+        let initial = "a = 1\n";
+        let edited = "a = 1\n# edited\n";
+        let updated = "a = 2\n";
+
+        // (i) Trust hash of "a = 1\n", overwrite with edited on disk.
+        // Call with based_on = "a = 1\n# edited\n" -> NotEligible (stored record doesn't match on-disk file).
+        fs::write(ws.join("dmuxai.toml"), edited).unwrap();
+        let mut store = TrustStore::load(&env);
+        store.trust(&ws, &content_hash(initial.as_bytes()));
+        store.save().unwrap();
+
+        let res1 = write_workspace_config_refreshing_trust(&env, &ws, edited, updated, true)
+            .expect("write config");
+        assert_eq!(res1, TrustRefresh::NotEligible);
+        let store1 = TrustStore::load(&env);
+        assert!(!store1.is_trusted(&ws, &content_hash(updated.as_bytes())));
+        assert!(store1.is_trusted(&ws, &content_hash(initial.as_bytes())));
+
+        // (ii) Separately, based_on = "a = 1\n" but disk has the edited text -> NotEligible.
+        fs::write(ws.join("dmuxai.toml"), edited).unwrap();
+        let res2 = write_workspace_config_refreshing_trust(&env, &ws, initial, updated, true)
+            .expect("write config");
+        assert_eq!(res2, TrustRefresh::NotEligible);
+        let store2 = TrustStore::load(&env);
+        assert!(!store2.is_trusted(&ws, &content_hash(updated.as_bytes())));
+        assert!(store2.is_trusted(&ws, &content_hash(initial.as_bytes())));
+
+        // (iii) allow_refresh = false with a matching record -> NotEligible and old record unchanged.
+        fs::write(ws.join("dmuxai.toml"), initial).unwrap();
+        let res3 = write_workspace_config_refreshing_trust(&env, &ws, initial, updated, false)
+            .expect("write config");
+        assert_eq!(res3, TrustRefresh::NotEligible);
+        let store3 = TrustStore::load(&env);
+        assert!(!store3.is_trusted(&ws, &content_hash(updated.as_bytes())));
+        assert!(store3.is_trusted(&ws, &content_hash(initial.as_bytes())));
+        assert_eq!(
+            fs::read_to_string(ws.join("dmuxai.toml")).unwrap(),
+            "a = 2\n"
+        );
+    }
+
+    #[test]
+    fn tc_2233_write_failure_leaves_trust_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("proj");
+        fs::create_dir_all(&ws).unwrap();
+        // create ws/dmuxai.toml as a DIRECTORY so fs::write fails
+        fs::create_dir_all(ws.join("dmuxai.toml")).unwrap();
+
+        let state = tmp.path().join("state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state),
+            ..Default::default()
+        };
+
+        let mut s = TrustStore::load(&env);
+        s.trust(&ws, "x");
+        s.save().unwrap();
+
+        let store_file = s.path().expect("store path");
+        let recorded_bytes = fs::read(store_file).unwrap();
+
+        let res = write_workspace_config_refreshing_trust(&env, &ws, "initial", "updated", true);
+        assert!(res.is_err());
+
+        let current_bytes = fs::read(store_file).unwrap();
+        assert_eq!(recorded_bytes, current_bytes);
     }
 }

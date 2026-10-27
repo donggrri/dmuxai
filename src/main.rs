@@ -587,6 +587,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 memory: memory.clone(),
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
+                trust_env: None,
             }
         }
         Err(error) => {
@@ -600,6 +601,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 // The event log is independent of the to-do database (FR-766).
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
+                trust_env: None,
             }
         }
     };
