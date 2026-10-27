@@ -488,9 +488,30 @@
     ui.share = button('Share', 'share', function () { openShare(); });
     ui.palette = button('Commands (Ctrl+K)', null, function () { openPalette(''); });
     ui.quit = button('Quit', 'quit', function () {
-      if (window.confirm('Quit dmuxai? This stops the TUI and the dashboard.')) {
-        command({ command: 'quit' });
-      }
+      var cachedFolders = (openFolders || []).slice();
+      fetch(apiUrl('/api/workspaces'), {
+        headers: { Authorization: 'Bearer ' + token },
+        cache: 'no-store'
+      }).then(function (resp) {
+        if (!resp.ok) { throw new Error('HTTP ' + resp.status); }
+        return resp.json();
+      }).then(function (data) {
+        var next = (data && Array.isArray(data.workspaces)) ? data.workspaces : cachedFolders;
+        openFolders = next;
+        var running = (openFolders || []).filter(function (f) { return f && f.running; });
+        var text = 'Quit dmuxai? This stops the TUI and the dashboard.';
+        if (running.length) {
+          text = 'Quit dmuxai? Turns are still running in: ' + running.map(function (f) { return f.name; }).join(', ') + '. Quitting stops them.';
+        }
+        if (window.confirm(text)) { command({ command: 'quit' }); }
+      }).catch(function () {
+        var running = cachedFolders.filter(function (f) { return f && f.running; });
+        var text = 'Quit dmuxai? This stops the TUI and the dashboard.';
+        if (running.length) {
+          text = 'Quit dmuxai? Turns are still running in: ' + running.map(function (f) { return f.name; }).join(', ') + '. Quitting stops them.';
+        }
+        if (window.confirm(text)) { command({ command: 'quit' }); }
+      });
     });
     [ui.cancel, ui.newConv, ui.status, ui.details, ui.share, ui.palette, ui.quit].forEach(function (b) {
       actions.appendChild(b);
@@ -2504,6 +2525,66 @@
           });
         })(group);
         gli.appendChild(newBtn);
+        if (isOpen && !viewOnly && folder && folder.id && folder.id !== 'default') {
+          var closeBtn = el('button', 'sessions-group-close', '\u00d7');
+          closeBtn.type = 'button';
+          var closeName = (folder && folder.name) || group.name || path || 'Workspace';
+          var closeId = folder.id;
+          closeBtn.title = 'Close ' + closeName + ' in this dashboard';
+          closeBtn.setAttribute('aria-label', 'Close ' + closeName + ' in this dashboard');
+          (function (id, name) {
+            closeBtn.addEventListener('click', function (e) {
+              e.stopPropagation();
+              fetch(apiUrl('/api/workspaces/' + encodeURIComponent(id) + '/close'), {
+                method: 'POST',
+                headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+                cache: 'no-store',
+                body: JSON.stringify({})
+              }).then(function (resp) {
+                return resp.text().then(function (text) {
+                  var data = null;
+                  try { data = text ? JSON.parse(text) : null; } catch (err) { data = null; }
+                  if (resp.status === 409 && data && data.running) {
+                    if (window.confirm('Turns are running in ' + name + '. Close it and stop them?')) {
+                      return fetch(apiUrl('/api/workspaces/' + encodeURIComponent(id) + '/close'), {
+                        method: 'POST',
+                        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+                        cache: 'no-store',
+                        body: JSON.stringify({ force: true })
+                      }).then(function (resp2) {
+                        return resp2.text().then(function (text2) {
+                          var data2 = null;
+                          try { data2 = text2 ? JSON.parse(text2) : null; } catch (err) { data2 = null; }
+                          if (!resp2.ok) {
+                            throw new Error((data2 && data2.error) ? data2.error : ('HTTP ' + resp2.status));
+                          }
+                          return data2;
+                        });
+                      });
+                    }
+                    return null;
+                  }
+                  if (!resp.ok) {
+                    throw new Error((data && data.error) ? data.error : ('HTTP ' + resp.status));
+                  }
+                  return data;
+                });
+              }).then(function (data) {
+                if (!data) { return; }
+                refreshOpenFolders();
+                notify('Closed ' + name + '.');
+                if (window.dmuxaiWorkspaceId && window.dmuxaiWorkspaceId() === id) {
+                  var u = new URL(window.location.href);
+                  u.searchParams.delete('ws');
+                  window.location.href = u.toString();
+                }
+              }).catch(function (err) {
+                notify(err && err.message ? err.message : String(err), true);
+              });
+            });
+          })(closeId, closeName);
+          gli.appendChild(closeBtn);
+        }
       }
 
       var ul = el('ul', 'sessions-group-list');
