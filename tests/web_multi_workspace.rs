@@ -144,7 +144,7 @@ timeout_secs = 60
     );
     assert!(prompt.starts_with("HTTP/1.1 202"), "{prompt}");
 
-    // FR-2314: the default folder reports a running turn while it is hosted.
+    // FR-2301: the default folder reports a running turn while it is hosted.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let list = http(port, "GET", "/api/workspaces", &token, "");
