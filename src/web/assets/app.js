@@ -4298,6 +4298,8 @@ function stopPolling() {
   }
 }
 
+var missingWsRedirected = false;
+
 function poll() {
   fetch(apiUrl('/api/state'), {
     headers: { Authorization: 'Bearer ' + token },
@@ -4308,6 +4310,15 @@ function poll() {
         var fatal = new Error('unauthorized');
         fatal.fatal = true;
         throw fatal;
+      }
+      if (res.status === 404 && pageWs && !missingWsRedirected) {
+        // The folder in this URL is no longer open: fall back once to the
+        // focused (first) folder instead of polling a dead id forever.
+        missingWsRedirected = true;
+        var url = new URL(location.href);
+        url.searchParams.delete('ws');
+        location.replace(url.toString());
+        return new Promise(function() {});
       }
       if (!res.ok) {
         throw new Error('HTTP ' + res.status);

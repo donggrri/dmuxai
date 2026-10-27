@@ -32,6 +32,9 @@ All notable changes to dmuxai are listed here. Versions follow
   the dashboard whose `dmuxai.toml` needs trust and is not in the workspace
   trust store (`dmuxai trust`) has its command, secret and URL settings
   ignored, and shows a warning and a `restricted` badge.
+- **A tab for a closed folder falls back to the first folder (FR-2314).** If a
+  dashboard tab's `ws` folder is no longer open, the page reloads once on the
+  first folder instead of polling a missing folder.
 
 ### Changed
 
