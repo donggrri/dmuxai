@@ -269,6 +269,277 @@ pub async fn terminate_group(pgid: u32, grace: Duration) {
     let _ = signal_group(pgid, GroupSignal::Kill);
 }
 
+/// Recorded process entry in a process tree snapshot.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessEntry {
+    pub pid: u32,
+    pub pgid: u32,
+    pub start_time: u64,
+}
+
+/// Snapshot of a process tree rooted at `root_pgid`.
+#[cfg(unix)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TreeSnapshot {
+    pub root_pgid: u32,
+    pub processes: Vec<ProcessEntry>,
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn read_proc_stat(pid: u32) -> Option<(u32, u32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rparen = stat.rfind(')')?;
+    let rest = &stat[rparen + 1..];
+    let mut fields = rest.split_whitespace();
+    // field 3: state
+    let _state = fields.next()?;
+    // field 4: ppid
+    let ppid: u32 = fields.next()?.parse().ok()?;
+    // field 5: pgid
+    let pgid: u32 = fields.next()?.parse().ok()?;
+    // fields 6..=21: 16 items
+    for _ in 6..=21 {
+        fields.next()?;
+    }
+    // field 22: starttime
+    let start_time: u64 = fields.next()?.parse().ok()?;
+    Some((ppid, pgid, start_time))
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn process_start_time(pid: u32) -> Option<u64> {
+    read_proc_stat(pid).map(|(_, _, start_time)| start_time)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Walks `/proc` once and collects every live process that is a descendant
+/// (transitively via ppid) of the process `root_pgid` OR is a member of process group `root_pgid`.
+///
+/// Never includes our own pid, pid 0/1, or anything in our own process group (`libc::getpgrp()`).
+#[cfg(unix)]
+pub fn snapshot_tree(root_pgid: u32) -> TreeSnapshot {
+    if root_pgid <= 1 || root_pgid > i32::MAX as u32 {
+        return TreeSnapshot {
+            root_pgid,
+            processes: Vec::new(),
+        };
+    }
+
+    // SAFETY: getpid and getpgrp are async-signal-safe POSIX calls.
+    let own_pid = unsafe { libc::getpid() as u32 };
+    let own_pgid = unsafe { libc::getpgrp() as u32 };
+
+    if root_pgid == own_pgid {
+        return TreeSnapshot {
+            root_pgid,
+            processes: Vec::new(),
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::collections::{HashMap, HashSet};
+
+        struct RawProc {
+            pid: u32,
+            pgid: u32,
+            start_time: u64,
+        }
+
+        let mut all_procs = HashMap::new();
+        let mut children_map: HashMap<u32, Vec<u32>> = HashMap::new();
+
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let Some(name_str) = file_name.to_str() else {
+                    continue;
+                };
+                let Ok(pid) = name_str.parse::<u32>() else {
+                    continue;
+                };
+                if pid <= 1 || pid > i32::MAX as u32 || pid == own_pid {
+                    continue;
+                }
+                if let Some((ppid, pgid, start_time)) = read_proc_stat(pid) {
+                    if pgid == own_pgid {
+                        continue;
+                    }
+                    all_procs.insert(
+                        pid,
+                        RawProc {
+                            pid,
+                            pgid,
+                            start_time,
+                        },
+                    );
+                    children_map.entry(ppid).or_default().push(pid);
+                }
+            }
+        }
+
+        // Descendant traversal starting from root_pgid
+        let mut matching_pids = HashSet::new();
+        let mut stack = vec![root_pgid];
+
+        // Also check if root_pgid itself is in all_procs
+        if all_procs.contains_key(&root_pgid) {
+            matching_pids.insert(root_pgid);
+        }
+
+        while let Some(parent) = stack.pop() {
+            if let Some(children) = children_map.get(&parent) {
+                for &child_pid in children {
+                    if matching_pids.insert(child_pid) {
+                        stack.push(child_pid);
+                    }
+                }
+            }
+        }
+
+        // Also include any process whose pgid == root_pgid
+        for (&pid, proc_info) in &all_procs {
+            if proc_info.pgid == root_pgid {
+                matching_pids.insert(pid);
+            }
+        }
+
+        let mut processes = Vec::new();
+        for &pid in &matching_pids {
+            if let Some(p) = all_procs.get(&pid) {
+                processes.push(ProcessEntry {
+                    pid: p.pid,
+                    pgid: p.pgid,
+                    start_time: p.start_time,
+                });
+            }
+        }
+
+        TreeSnapshot {
+            root_pgid,
+            processes,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        TreeSnapshot {
+            root_pgid,
+            processes: Vec::new(),
+        }
+    }
+}
+
+/// Terminates an escaped descendant or process group according to `snapshot`.
+///
+/// Signals `root_pgid` and any escaped descendant processes / process groups
+/// (e.g. processes detached via `setsid`), polling every 25ms up to `grace`
+/// before escalating to `SIGKILL`.
+#[cfg(unix)]
+pub async fn terminate_snapshot(snapshot: &TreeSnapshot, root_pgid: u32, grace: Duration) {
+    if root_pgid <= 1 || root_pgid > i32::MAX as u32 {
+        return;
+    }
+    // SAFETY: getpgrp returns caller process group.
+    let own_pgid = unsafe { libc::getpgrp() as u32 };
+    if root_pgid == own_pgid {
+        return;
+    }
+
+    use std::collections::{HashMap, HashSet};
+
+    let snapshot_pids: HashSet<u32> = snapshot.processes.iter().map(|p| p.pid).collect();
+    let mut escaped_groups: HashSet<u32> = HashSet::new();
+    let mut escaped_single_pids: HashMap<u32, u64> = HashMap::new();
+
+    for p in &snapshot.processes {
+        if p.pgid != root_pgid && p.pgid > 1 && p.pgid <= i32::MAX as u32 && p.pgid != own_pgid {
+            if snapshot_pids.contains(&p.pgid) {
+                escaped_groups.insert(p.pgid);
+            } else if p.pid > 1 && p.pid <= i32::MAX as u32 && p.pid != own_pgid {
+                escaped_single_pids.insert(p.pid, p.start_time);
+            }
+        }
+    }
+
+    let signal_all = |sig: GroupSignal| {
+        signal_group(root_pgid, sig);
+        for &pgid in &escaped_groups {
+            signal_group(pgid, sig);
+        }
+        for (&pid, &expected_start) in &escaped_single_pids {
+            #[cfg(target_os = "linux")]
+            if process_start_time(pid) != Some(expected_start) {
+                continue;
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = expected_start;
+
+            let lsig = match sig {
+                GroupSignal::Term => libc::SIGTERM,
+                GroupSignal::Kill => libc::SIGKILL,
+                GroupSignal::Int => libc::SIGINT,
+            };
+            // SAFETY: pid has been validated to be > 1, <= i32::MAX, != own_pgid,
+            // and start_time matches on Linux.
+            unsafe {
+                libc::kill(pid as i32, lsig);
+            }
+        }
+    };
+
+    let check_any_alive = || -> bool {
+        if group_alive(root_pgid) {
+            return true;
+        }
+        for &pgid in &escaped_groups {
+            if group_alive(pgid) {
+                return true;
+            }
+        }
+        for (&pid, &expected_start) in &escaped_single_pids {
+            #[cfg(target_os = "linux")]
+            if process_start_time(pid) != Some(expected_start) {
+                continue;
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = expected_start;
+
+            if is_process_alive(pid) {
+                return true;
+            }
+        }
+        false
+    };
+
+    signal_all(GroupSignal::Term);
+
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if !check_any_alive() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    if check_any_alive() {
+        signal_all(GroupSignal::Kill);
+    }
+}
+
+/// Takes a snapshot of the process tree rooted at `root_pgid` while the root
+/// is still alive, then terminates the snapshot using `terminate_snapshot`.
+#[cfg(unix)]
+pub async fn terminate_tree(root_pgid: u32, grace: Duration) {
+    let snapshot = snapshot_tree(root_pgid);
+    terminate_snapshot(&snapshot, root_pgid, grace).await;
+}
+
 /// Guard that keeps a runner's process group registered in the live-group registry
 /// for as long as it is alive. Runners that keep their own `tokio::process::Child`
 /// (agy, cursor legacy, ACP) register on spawn and unregister on drop.
@@ -1372,5 +1643,155 @@ mod tests {
 
         sup2.stop().await;
         assert!(!group_alive(pgid2), "owner2 group should now be dead");
+    }
+
+    // TC-2270: terminate_tree kills setsid descendants while terminate_group leaves them alive.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tc_2270_terminate_tree_kills_setsid_descendants() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // 1. First demonstrate the bug with terminate_group:
+        // Spawn setsid child, call terminate_group, assert setsid shell survives, then clean it up.
+        let pid_file_legacy = tmp.path().join("child_legacy.pid");
+        let mut cmd_legacy = tokio::process::Command::new("sh");
+        cmd_legacy.args([
+            "-c",
+            &format!(
+                "setsid sh -c 'echo $$ > \"{}\"; while :; do sleep 1; done' & sleep 300",
+                pid_file_legacy.display()
+            ),
+        ]);
+        configure_child(&mut cmd_legacy, &ChildOptions::default());
+        let mut child_legacy = cmd_legacy.spawn().expect("spawn legacy child");
+        let root_pgid_legacy = child_legacy.id().expect("legacy child pid");
+
+        // Wait for pid file
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut setsid_pid_legacy = None;
+        while Instant::now() < deadline {
+            if let Ok(content) = std::fs::read_to_string(&pid_file_legacy)
+                && let Ok(pid) = content.trim().parse::<u32>()
+            {
+                setsid_pid_legacy = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let setsid_pid_legacy = setsid_pid_legacy.expect("legacy setsid pid written");
+
+        // Calling terminate_group on the root group:
+        terminate_group(root_pgid_legacy, Duration::from_millis(300)).await;
+        let _ = child_legacy.wait().await;
+        // Root group should be gone
+        assert!(wait_pid_gone(root_pgid_legacy, Duration::from_secs(3)).await);
+        // But the setsid shell is STILL ALIVE (documents the bug #230)
+        assert!(
+            unsafe { libc::kill(setsid_pid_legacy as i32, 0) == 0 },
+            "setsid shell survived terminate_group (bug #230)"
+        );
+        // Clean up legacy setsid process and its group
+        signal_group(setsid_pid_legacy, GroupSignal::Kill);
+        unsafe {
+            libc::kill(setsid_pid_legacy as i32, libc::SIGKILL);
+        }
+        assert!(wait_pid_gone(setsid_pid_legacy, Duration::from_secs(3)).await);
+
+        // 2. Now verify terminate_tree terminates setsid descendants cleanly:
+        let pid_file = tmp.path().join("child_tree.pid");
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "setsid sh -c 'echo $$ > \"{}\"; while :; do sleep 1; done' & sleep 300",
+                pid_file.display()
+            ),
+        ]);
+        configure_child(&mut cmd, &ChildOptions::default());
+        let mut child = cmd.spawn().expect("spawn tree child");
+        let root_pgid = child.id().expect("child pid");
+
+        // Wait for pid file
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut setsid_pid = None;
+        while Instant::now() < deadline {
+            if let Ok(content) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = content.trim().parse::<u32>()
+            {
+                setsid_pid = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let setsid_pid = setsid_pid.expect("setsid pid written");
+
+        // Verify it is alive before terminate_tree
+        assert!(unsafe { libc::kill(setsid_pid as i32, 0) == 0 });
+
+        terminate_tree(root_pgid, Duration::from_millis(300)).await;
+        let _ = child.wait().await;
+
+        // Assert root group is gone
+        assert!(
+            wait_pid_gone(root_pgid, Duration::from_secs(3)).await,
+            "root group should be gone"
+        );
+        // Assert the setsid shell pid and its group are gone
+        assert!(
+            wait_pid_gone(setsid_pid, Duration::from_secs(3)).await,
+            "setsid pid should be gone"
+        );
+        assert!(!group_alive(setsid_pid), "setsid group should not be alive");
+        assert!(
+            unsafe { libc::kill(setsid_pid as i32, 0) != 0 },
+            "setsid pid kill 0 probe should fail"
+        );
+    }
+
+    // TC-2271: terminate_tree terminates the tree root and descendants but leaves unrelated processes untouched.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tc_2271_terminate_tree_leaves_unrelated_processes() {
+        // Spawn an unrelated sleep 300 in its own process group
+        let mut unrelated_cmd = tokio::process::Command::new("sh");
+        unrelated_cmd.args(["-c", "sleep 300"]);
+        configure_child(&mut unrelated_cmd, &ChildOptions::default());
+        let mut unrelated_child = unrelated_cmd.spawn().expect("spawn unrelated");
+        let unrelated_pid = unrelated_child.id().expect("unrelated pid");
+
+        // Spawn a tree root
+        let mut tree_cmd = tokio::process::Command::new("sh");
+        tree_cmd.args(["-c", "sleep 300"]);
+        configure_child(&mut tree_cmd, &ChildOptions::default());
+        let mut tree_child = tree_cmd.spawn().expect("spawn tree child");
+        let tree_pid = tree_child.id().expect("tree pid");
+
+        assert!(group_alive(unrelated_pid));
+        assert!(group_alive(tree_pid));
+
+        terminate_tree(tree_pid, Duration::from_millis(300)).await;
+
+        // Reap the child so zombie does not keep group entry in kernel table
+        let _ = tree_child.wait().await;
+
+        // Tree root should be gone
+        assert!(wait_pid_gone(tree_pid, Duration::from_secs(3)).await);
+        assert!(!group_alive(tree_pid));
+
+        // Unrelated process should still be alive
+        assert!(
+            group_alive(unrelated_pid),
+            "unrelated process group should still be alive"
+        );
+        assert!(
+            unsafe { libc::kill(unrelated_pid as i32, 0) == 0 },
+            "unrelated process pid should still be alive"
+        );
+
+        // Reap/kill spawned children at test end so no process leaks
+        terminate_group(unrelated_pid, Duration::from_millis(100)).await;
+        signal_group(unrelated_pid, GroupSignal::Kill);
+        let _ = unrelated_child.wait().await;
+        assert!(wait_pid_gone(unrelated_pid, Duration::from_secs(3)).await);
     }
 }

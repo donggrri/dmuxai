@@ -547,7 +547,7 @@ async fn runtime_loop(
                         // queued prompt.
                         let draining = active.take();
                         let was_graph = draining.as_ref().is_some_and(|t| t.is_graph);
-                        kill_turn(draining).await;
+                        kill_turn_tree(draining).await;
                         cancel_queued(&mut queued_send, &event_tx).await;
                         if can_prewarm && !was_graph {
                             warm_process = spawn_warm_process(
@@ -562,7 +562,7 @@ async fn runtime_loop(
                     Some(CursorCommand::Cancel) => {
                         let cancelled_turn = active.take();
                         let was_graph = cancelled_turn.as_ref().is_some_and(|t| t.is_graph);
-                        stop_turn(cancelled_turn, &event_tx).await;
+                        stop_turn_tree(cancelled_turn, &event_tx).await;
                         if can_prewarm && !was_graph {
                             warm_process = spawn_warm_process(
                                 latest_session_id.as_deref(),
@@ -708,11 +708,25 @@ struct ActiveTurn {
 }
 
 async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
+    stop_turn_inner(turn, event_tx, false).await;
+}
+
+async fn stop_turn_tree(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput>) {
+    stop_turn_inner(turn, event_tx, true).await;
+}
+
+async fn stop_turn_inner(
+    turn: Option<ActiveTurn>,
+    event_tx: &mpsc::Sender<AgentOutput>,
+    tree: bool,
+) {
     if let Some(turn) = turn {
         let context = turn.context.clone();
         if let Some(cancel) = turn.acp_cancel.clone() {
             cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = tokio::time::timeout(std::time::Duration::from_millis(1600), turn.handle).await;
+        } else if tree {
+            kill_turn_tree(Some(turn)).await;
         } else {
             kill_turn(Some(turn)).await;
         }
@@ -728,6 +742,26 @@ async fn kill_turn(turn: Option<ActiveTurn>) {
             let pgid = turn.pgid.load(std::sync::atomic::Ordering::SeqCst);
             if pgid > 0 {
                 dmuxai::process::supervisor::terminate_group(
+                    pgid,
+                    std::time::Duration::from_millis(500),
+                )
+                .await;
+            }
+        }
+        turn.handle.abort();
+        let _ = turn.handle.await;
+    }
+}
+
+/// Stops a turn's whole process tree (including escaped `setsid` descendants)
+/// and its task, without reporting it.
+async fn kill_turn_tree(turn: Option<ActiveTurn>) {
+    if let Some(turn) = turn {
+        #[cfg(unix)]
+        {
+            let pgid = turn.pgid.load(std::sync::atomic::Ordering::SeqCst);
+            if pgid > 0 {
+                dmuxai::process::supervisor::terminate_tree(
                     pgid,
                     std::time::Duration::from_millis(500),
                 )
@@ -3208,6 +3242,7 @@ pub(crate) mod tests {
             "FAKE_ACP_MODE_CAPTURE",
             "FAKE_ACP_PROMPT_CAPTURE",
             "FAKE_ACP_MCP_CAPTURE",
+            "FAKE_ACP_SETSID_PIDFILE",
         ];
 
         fn set_fake_env(vars: &[(&str, &std::ffi::OsStr)]) {
@@ -3415,6 +3450,65 @@ pub(crate) mod tests {
                 alive = live_fake_acp_agent_count();
             }
             assert_eq!(alive, 0, "fake-acp-agent process should not outlive turn");
+        }
+
+        // TC-2273 / FR-2271: user cancel stops setsid descendants that left the
+        // ACP agent's process group before the agent exits gracefully.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn tc_2273_acp_cancel_stops_setsid_descendants() {
+            let _guard = lock_env().await;
+            let dir = tempfile::tempdir().unwrap();
+            let pidfile = dir.path().join("setsid.pid");
+            set_fake_env(&[("FAKE_ACP_SETSID_PIDFILE", pidfile.as_os_str())]);
+
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let config = CursorAdapterConfig {
+                protocol: RunnerProtocol::Acp,
+                prewarm: false,
+                prewarm_idle_secs: 300,
+            };
+            let workspace = tempfile::tempdir().unwrap();
+            let (adapter, worker) =
+                spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
+            adapter.send(linger_request("turn-1", "hello")).unwrap();
+
+            let started = Instant::now();
+            let setsid_pid = loop {
+                if let Ok(text) = std::fs::read_to_string(&pidfile)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                    && pid > 0
+                {
+                    break pid;
+                }
+                if started.elapsed() > Duration::from_secs(5) {
+                    panic!("setsid pid was not written");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+
+            adapter.cancel().unwrap();
+            let cancelled_at = Instant::now();
+            let mut cancelled = false;
+            while cancelled_at.elapsed() < Duration::from_secs(3) && !cancelled {
+                if let Ok(Some(output)) = timeout(Duration::from_millis(200), event_rx.recv()).await
+                    && output.event == AgentEvent::Cancelled
+                {
+                    cancelled = true;
+                }
+            }
+            assert!(cancelled, "ACP cancel should end the turn as Cancelled");
+
+            if !wait_pids_gone(&[setsid_pid], Duration::from_secs(3)).await {
+                dmuxai::process::supervisor::signal_group(
+                    setsid_pid,
+                    dmuxai::process::supervisor::GroupSignal::Kill,
+                );
+                panic!("setsid shell {setsid_pid} survived ACP cancel");
+            }
+
+            drop(adapter);
+            let _ = worker.await;
         }
     }
 

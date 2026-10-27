@@ -14,6 +14,13 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
+- **Stop now also stops an agent's shell commands (#230, FR-2270, FR-2271).**
+  Stopping a running turn or graph step (dashboard **Stop**, TUI Ctrl+C) on the
+  Cursor (ACP and legacy) and custom runners now also ends processes the agent
+  started in their own session, such as a shell loop waiting on an external
+  result. Before, only the runner's process group was signalled, so those
+  commands kept running after Stop. Normal turn endings are unchanged.
+
 - **Headless `--agent agy` plan-only replies are no longer a silent success
   (#164, FR-2121).** When AGY stops at its own plan review (it writes
   `implementation_plan.md` to its private artifact directory and asks for

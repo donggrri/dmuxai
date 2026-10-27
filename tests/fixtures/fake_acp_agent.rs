@@ -220,6 +220,34 @@ fn main() {
                     }
                     continue;
                 }
+                if let Some(path) = std::env::var_os("FAKE_ACP_SETSID_PIDFILE") {
+                    let _ = std::process::Command::new("setsid")
+                        .env("FAKE_ACP_SETSID_PIDFILE", &path)
+                        .args([
+                            "sh",
+                            "-c",
+                            "echo $$ > \"$FAKE_ACP_SETSID_PIDFILE\"; while :; do sleep 1; done",
+                        ])
+                        .spawn();
+                    loop {
+                        line_buf.clear();
+                        match reader.read_line(&mut line_buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                if line_buf.contains("\"session/cancel\"") {
+                                    if let Some(id) = id.clone() {
+                                        respond(
+                                            &mut stdout,
+                                            id,
+                                            serde_json::json!({ "stopReason": "cancelled" }),
+                                        );
+                                    }
+                                    std::process::exit(0);
+                                }
+                            }
+                        }
+                    }
+                }
                 if std::env::var("FAKE_ACP_SLEEP_MS").is_ok() {
                     let ms = std::env::var("FAKE_ACP_SLEEP_MS")
                         .ok()

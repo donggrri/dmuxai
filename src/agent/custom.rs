@@ -73,6 +73,7 @@ struct ActiveTurn {
     context: OutputContext,
     pgid: std::sync::Arc<std::sync::atomic::AtomicU32>,
     acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn runtime_loop(
@@ -273,12 +274,14 @@ fn spawn_turn(
     let uses_acp = is_builtin_grok(spec)
         && settings.grok_protocol == dmuxai::runner_protocol::RunnerProtocol::Acp;
     let acp_cancel = uses_acp.then(super::acp::new_cancel_flag);
+    let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let turn_context = context.clone();
     let turn_pgid = pgid.clone();
     let cancel_for_turn = acp_cancel.clone();
+    let turn_stopping = stopping.clone();
     let handle = tokio::spawn(async move {
         send(&event_tx, agent, Some(&turn_context), AgentEvent::Started).await;
-        let event = match run_turn(
+        let result = run_turn(
             agent,
             spec,
             &request,
@@ -290,8 +293,11 @@ fn spawn_turn(
             &turn_pgid,
             cancel_for_turn,
         )
-        .await
-        {
+        .await;
+        if turn_stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let event = match result {
             Ok(()) => AgentEvent::Completed,
             Err(error) if error.kind == AgentErrorKind::Cancelled => AgentEvent::Cancelled,
             Err(error) => AgentEvent::Error(error),
@@ -303,6 +309,7 @@ fn spawn_turn(
         context,
         pgid,
         acp_cancel,
+        stopping,
     }
 }
 
@@ -884,10 +891,9 @@ async fn stop_turn(agent: Agent, turn: Option<ActiveTurn>, event_tx: &mpsc::Send
             let _ = tokio::time::timeout(std::time::Duration::from_millis(1600), turn.handle).await;
         } else {
             let pgid = turn.pgid.load(std::sync::atomic::Ordering::SeqCst);
-            dmuxai::process::supervisor::signal_group(
-                pgid,
-                dmuxai::process::supervisor::GroupSignal::Term,
-            );
+            turn.stopping
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            dmuxai::process::supervisor::terminate_tree(pgid, TERM_GRACE).await;
             turn.handle.abort();
             let _ = turn.handle.await;
         }
@@ -1786,6 +1792,67 @@ env = { FAKE_CFG = "{temp_config}" }
         while still_running(leader) || still_running(grandchild) {
             if std::time::Instant::now() > deadline {
                 panic!("leader {leader} or grandchild {grandchild} still running");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(tx);
+        worker.await.unwrap();
+    }
+
+    // TC-2272 / FR-2271
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tc_2272_cancel_stops_setsid_shell_of_custom_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("setsid.pid");
+        let spec = grok_spec(&[
+            ("GROK_FAKE_MODE", "setsid"),
+            (
+                "GROK_FAKE_PIDFILE",
+                pidfile.to_str().expect("utf8 temp path"),
+            ),
+        ]);
+        let (tx, mut rx, worker) = drive(spec).await;
+        tx.send(CustomCommand::Send(request("hello", None)))
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let setsid_pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && pid > 0
+            {
+                break pid;
+            }
+            if started.elapsed() > Duration::from_secs(5) {
+                panic!("setsid pid was not written");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(pgrp(setsid_pid), Some(setsid_pid));
+        assert!(still_running(setsid_pid));
+
+        tx.send(CustomCommand::Cancel).await.unwrap();
+        let events = until_terminal(&mut rx).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Cancelled)),
+            "{events:?}"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while still_running(setsid_pid) {
+            if std::time::Instant::now() > deadline {
+                dmuxai::process::supervisor::signal_group(
+                    setsid_pid,
+                    dmuxai::process::supervisor::GroupSignal::Kill,
+                );
+                unsafe {
+                    libc::kill(setsid_pid as i32, libc::SIGKILL);
+                }
+                panic!("setsid shell {setsid_pid} survived cancel");
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
