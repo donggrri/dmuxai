@@ -1,7 +1,9 @@
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     io,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Command, Stdio},
 };
 
 use serde_json::{Value, json};
@@ -9,9 +11,10 @@ use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle, time::Duration};
 
 use super::{
     AdapterError, Agent, AgentAdapter, AgentError, AgentEvent, AgentOutput, AgentRequest,
-    ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy,
+    ModelInfo, OutputContext, PLAN_ONLY_APPROVAL_NOTICE, SpawnedAdapter, TurnPolicy,
     implement_outcome::{
-        ImplementTurnTracker, is_plan_only_implement_outcome, is_plan_review_response,
+        ImplementTurnTracker, asks_for_approval, is_plan_approval_request,
+        is_plan_only_implement_outcome, is_plan_review_response,
     },
     map_send_error, prompt_with_image_tokens,
 };
@@ -374,6 +377,66 @@ async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput
     }
 }
 
+/// Computes a workspace fingerprint based on git status, diff, and untracked file metadata,
+/// excluding dmuxai's own `.dmuxai/` state directory.
+///
+/// FR-2121: Used to detect if a turn modified the workspace via shell commands or tools
+/// outside of explicit AGY write tool calls, avoiding false plan-only verdicts.
+fn workspace_fingerprint(cwd: &Path) -> Option<u64> {
+    let status_output = Command::new("git")
+        .args(["-C"])
+        .arg(cwd)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .args(["--", ".", ":(exclude).dmuxai"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !status_output.status.success() {
+        return None;
+    }
+
+    let diff_output = Command::new("git")
+        .args(["-C"])
+        .arg(cwd)
+        .args(["diff", "--no-ext-diff", "--binary", "HEAD"])
+        .args(["--", ".", ":(exclude).dmuxai"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !diff_output.status.success() {
+        return None;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    status_output.stdout.hash(&mut hasher);
+    diff_output.stdout.hash(&mut hasher);
+
+    // For each untracked path listed by status (entries starting with "?? "),
+    // hash the file's size and modified time so edits to an untracked file are seen.
+    for entry in status_output.stdout.split(|&b| b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        if let Ok(entry_str) = std::str::from_utf8(entry)
+            && let Some(path_str) = entry_str.strip_prefix("?? ")
+        {
+            let path = cwd.join(path_str);
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                metadata.len().hash(&mut hasher);
+                if let Ok(mtime) = metadata.modified() {
+                    mtime.hash(&mut hasher);
+                }
+            }
+        }
+    }
+
+    Some(hasher.finish())
+}
+
 async fn run_turn(
     request: &AgentRequest,
     selected_model: Option<String>,
@@ -396,6 +459,15 @@ async fn run_turn(
             agy_prompt(policy, &base_prompt, request.require_file_edits)
         };
 
+        let before = if policy == TurnPolicy::Agent {
+            let cwd_buf = cwd.to_path_buf();
+            tokio::task::spawn_blocking(move || workspace_fingerprint(&cwd_buf))
+                .await
+                .unwrap_or(None)
+        } else {
+            None
+        };
+
         let outcome = run_single_agy_process(
             request,
             selected_model.as_deref(),
@@ -408,16 +480,56 @@ async fn run_turn(
         )
         .await?;
 
+        let changed = match before {
+            Some(b) => {
+                let cwd_buf = cwd.to_path_buf();
+                tokio::task::spawn_blocking(move || workspace_fingerprint(&cwd_buf))
+                    .await
+                    .unwrap_or(None)
+                    != Some(b)
+            }
+            None => false,
+        };
+        let wrote_files = outcome.writes_observed || changed;
+
         resume_session = outcome.conversation_id.clone();
 
         // A failed `finish` (permission denial, protocol, or status check)
         // surfaces as an `Error` terminal; only a `Completed` turn with no
-        // writes and a plan-like reply counts as a plan-only retry.
-        if !request.require_file_edits
-            || policy != TurnPolicy::Agent
-            || !matches!(outcome.terminal, AgentEvent::Completed)
-            || !is_plan_only_implement_outcome(outcome.writes_observed, &outcome.response_text)
-        {
+        // writes and a plan-like reply counts as a plan-only reply.
+        let completed = matches!(outcome.terminal, AgentEvent::Completed);
+
+        if !request.require_file_edits {
+            // FR-2121: the headless exit-7 marker needs an explicit approval
+            // request *and* a plan statement, no writes, and a completed turn.
+            // An ordinary answer that merely mentions a plan is not plan-only.
+            // A structural plan artifact event in the stream is an additional
+            // positive signal: the reply asks for approval and the agent
+            // touched a plan artifact even if the text never says "plan".
+            let plan_approval_request = is_plan_approval_request(&outcome.response_text)
+                || (outcome.plan_artifact_observed && asks_for_approval(&outcome.response_text));
+            if policy == TurnPolicy::Agent && completed && !wrote_files && plan_approval_request {
+                // The turn stopped at AGY's own plan review and no edit was
+                // applied. Tell the app so a headless run can ask for approval
+                // instead of reporting success; the TUI ignores it.
+                send_event(
+                    event_tx,
+                    Some(&context),
+                    AgentEvent::Notice(PLAN_ONLY_APPROVAL_NOTICE.to_owned()),
+                )
+                .await;
+            }
+            emit_terminal_event(event_tx, &context, outcome.terminal).await;
+            return Ok(outcome.conversation_id);
+        }
+
+        // FR-506: an Implement turn that ends at its own plan review retries
+        // once with a stricter edit instruction. This path keeps the loose
+        // `is_plan_review_response` detector.
+        let plan_only_reply = policy == TurnPolicy::Agent
+            && completed
+            && is_plan_only_implement_outcome(wrote_files, &outcome.response_text);
+        if !plan_only_reply {
             emit_terminal_event(event_tx, &context, outcome.terminal).await;
             return Ok(outcome.conversation_id);
         }
@@ -438,6 +550,16 @@ async fn run_turn(
             ),
         )
         .await;
+
+        // FR-2121: the retry is a second agent reply inside the same turn, so
+        // the transcript and the headless output need a separator between the
+        // two answers instead of gluing them together.
+        send_event(
+            event_tx,
+            Some(&context),
+            AgentEvent::TextDelta("\n\n".to_owned()),
+        )
+        .await;
     }
 
     Ok(resume_session)
@@ -447,6 +569,7 @@ struct SingleAgyOutcome {
     conversation_id: Option<String>,
     response_text: String,
     writes_observed: bool,
+    plan_artifact_observed: bool,
     terminal: AgentEvent,
 }
 
@@ -674,6 +797,7 @@ async fn stream_child(
     };
 
     let writes_observed = implement_tracker.writes_observed();
+    let plan_artifact_observed = implement_tracker.plan_artifact_observed();
     let diagnostic = dmuxai::process::supervisor::tail_lines(
         &supervised.stderr_tail().await,
         STDERR_HISTORY_CAPACITY,
@@ -694,6 +818,7 @@ async fn stream_child(
             conversation_id: state.conversation_id,
             response_text: state.response_text,
             writes_observed,
+            plan_artifact_observed,
             terminal: AgentEvent::Error(reason),
         });
     }
@@ -712,6 +837,7 @@ async fn stream_child(
             conversation_id: state.conversation_id,
             response_text: state.response_text,
             writes_observed,
+            plan_artifact_observed,
             terminal: AgentEvent::Error(err),
         });
     }
@@ -720,6 +846,7 @@ async fn stream_child(
         conversation_id: state.conversation_id,
         response_text: state.response_text,
         writes_observed,
+        plan_artifact_observed,
         terminal: state
             .pending_terminal
             .expect("protocol_completed implies a pending terminal event"),
@@ -1808,6 +1935,401 @@ mod tests {
         .await;
 
         outcome.expect("question turn should complete without edit retry");
+    }
+
+    // TC-2123 / FR-2121: an Agent-policy turn that stops at AGY's own plan
+    // review without edits emits the plan-only marker notice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2123_agy_plan_only_reply_emits_approval_notice() {
+        let plan_response = json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "Created plan.md - please review and approve it."
+            }
+        });
+        let plan_line = plan_response.to_string();
+        let (_dir, fake) = write_fake_agy(|_| {
+            format!("#!/bin/sh\nread -r _dmuxai_user\nprintf '%s\\n' '{plan_line}'\n")
+        });
+
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("plan-only-conversation"),
+            turn_id: super::super::TurnId::new("plan-only-turn"),
+            prompt: "implement the plan".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let cwd = std::env::temp_dir();
+
+        let (outcome, notices, terminals) = with_agy_spawn_env(&fake, "0", async {
+            let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
+            let mut notices = Vec::new();
+            let mut terminals = Vec::new();
+            while let Some(output) = event_rx.recv().await {
+                match output.event {
+                    AgentEvent::Notice(notice) => notices.push(notice),
+                    event @ (AgentEvent::Completed
+                    | AgentEvent::Cancelled
+                    | AgentEvent::Error(_)) => terminals.push(event),
+                    _ => {}
+                }
+            }
+            (turn.await.expect("turn task"), notices, terminals)
+        })
+        .await;
+
+        outcome.expect("plan-only turn still completes");
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice == super::super::PLAN_ONLY_APPROVAL_NOTICE),
+            "expected the plan-only marker notice, got {notices:?}"
+        );
+        assert_eq!(terminals.len(), 1, "exactly one terminal event");
+        assert!(matches!(terminals[0], AgentEvent::Completed));
+    }
+
+    // TC-2123 / FR-2121: an ordinary answer that only mentions a plan is not
+    // a plan-only reply, so the headless exit-7 marker must not fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2123_agy_ordinary_plan_answer_does_not_emit_approval_notice() {
+        let ordinary_response = json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "I reviewed docs/plan.md. It has three phases; phase 2 lacks tests."
+            }
+        });
+        let ordinary_line = ordinary_response.to_string();
+        let (_dir, fake) = write_fake_agy(|_| {
+            format!("#!/bin/sh\nread -r _dmuxai_user\nprintf '%s\\n' '{ordinary_line}'\n")
+        });
+
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("ordinary-plan-conversation"),
+            turn_id: super::super::TurnId::new("ordinary-plan-turn"),
+            prompt: "review the plan".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let cwd = std::env::temp_dir();
+
+        let (outcome, notices) = with_agy_spawn_env(&fake, "0", async {
+            let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
+            let mut notices = Vec::new();
+            while let Some(output) = event_rx.recv().await {
+                if let AgentEvent::Notice(notice) = output.event {
+                    notices.push(notice);
+                }
+            }
+            (turn.await.expect("turn task"), notices)
+        })
+        .await;
+
+        outcome.expect("an ordinary answer still completes the turn");
+        assert!(
+            !notices
+                .iter()
+                .any(|notice| notice == super::super::PLAN_ONLY_APPROVAL_NOTICE),
+            "an ordinary answer must not emit the plan-only marker, got {notices:?}"
+        );
+    }
+
+    // TC-2147 / FR-2121: shell writes (outside tool write events) prevent plan-only verdicts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2147_agy_shell_write_is_never_plan_only() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let cwd = tempdir.path().to_path_buf();
+
+        // git init and commit a file
+        let git_run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&cwd)
+                .status()
+                .expect("git status");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        git_run(&["init"]);
+        std::fs::write(cwd.join("a.txt"), "initial\n").expect("write a.txt");
+        git_run(&["add", "a.txt"]);
+        git_run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "init",
+        ]);
+
+        let plan_response = json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "Created plan.md - please review and approve it."
+            }
+        });
+        let plan_line = plan_response.to_string();
+        let target_file = cwd.join("a.txt");
+        let (_dir, fake) = write_fake_agy(|_| {
+            format!(
+                "#!/bin/sh\nread -r _dmuxai_user\necho changed >> \"{}\"\nprintf '%s\\n' '{}'\n",
+                target_file.display(),
+                plan_line
+            )
+        });
+
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("shell-write-conversation"),
+            turn_id: super::super::TurnId::new("shell-write-turn"),
+            prompt: "implement the plan".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+
+        let (outcome, notices) = with_agy_spawn_env(&fake, "0", async {
+            let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
+            let mut notices = Vec::new();
+            while let Some(output) = event_rx.recv().await {
+                if let AgentEvent::Notice(notice) = output.event {
+                    notices.push(notice);
+                }
+            }
+            (turn.await.expect("turn task"), notices)
+        })
+        .await;
+
+        outcome.expect("turn completes");
+        assert!(
+            !notices
+                .iter()
+                .any(|notice| notice == super::super::PLAN_ONLY_APPROVAL_NOTICE),
+            "shell write must not emit the plan-only marker, got {notices:?}"
+        );
+    }
+
+    // TC-2147 / FR-2121: writes under .dmuxai/ do not count as workspace edits and preserve plan-only verdicts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2147_agy_dmuxai_state_write_does_not_hide_plan_only() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let cwd = tempdir.path().to_path_buf();
+
+        // git init and commit a file
+        let git_run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&cwd)
+                .status()
+                .expect("git status");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        git_run(&["init"]);
+        std::fs::write(cwd.join("a.txt"), "initial\n").expect("write a.txt");
+        git_run(&["add", "a.txt"]);
+        git_run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "init",
+        ]);
+
+        let plan_response = json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "Created plan.md - please review and approve it."
+            }
+        });
+        let plan_line = plan_response.to_string();
+        let (_dir, fake) = write_fake_agy(|_| {
+            format!(
+                "#!/bin/sh\nread -r _dmuxai_user\nmkdir -p \"{0}/.dmuxai\" && echo x >> \"{0}/.dmuxai/events.jsonl\"\nprintf '%s\\n' '{1}'\n",
+                cwd.display(),
+                plan_line
+            )
+        });
+
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("dmuxai-state-write-conversation"),
+            turn_id: super::super::TurnId::new("dmuxai-state-write-turn"),
+            prompt: "implement the plan".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+
+        let (outcome, notices) = with_agy_spawn_env(&fake, "0", async {
+            let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
+            let mut notices = Vec::new();
+            while let Some(output) = event_rx.recv().await {
+                if let AgentEvent::Notice(notice) = output.event {
+                    notices.push(notice);
+                }
+            }
+            (turn.await.expect("turn task"), notices)
+        })
+        .await;
+
+        outcome.expect("turn completes");
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice == super::super::PLAN_ONLY_APPROVAL_NOTICE),
+            "dmuxai state write must still emit the plan-only marker, got {notices:?}"
+        );
+    }
+
+    // TC-2124 / FR-2121: with file edits required, AGY retries once with a
+    // stricter edit instruction and the turn then fails with a policy error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2124_agy_plan_only_with_required_edits_fails_after_one_retry() {
+        let plan_response = json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "Created plan.md - please review and approve it."
+            }
+        });
+        let plan_line = plan_response.to_string();
+        let (dir, fake) = write_fake_agy(|dir| {
+            let counter = dir.join("runs").display().to_string();
+            format!(
+                "#!/bin/sh\nread -r _dmuxai_user\necho run >> '{counter}'\nprintf '%s\\n' '{plan_line}'\n"
+            )
+        });
+
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("required-edits-conversation"),
+            turn_id: super::super::TurnId::new("required-edits-turn"),
+            prompt: "implement the plan".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: true,
+            system_prompt: None,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let cwd = std::env::temp_dir();
+
+        let (outcome, notices) = with_agy_spawn_env(&fake, "0", async {
+            let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
+            let mut notices = Vec::new();
+            while let Some(output) = event_rx.recv().await {
+                if let AgentEvent::Notice(notice) = output.event {
+                    notices.push(notice);
+                }
+            }
+            (turn.await.expect("turn task"), notices)
+        })
+        .await;
+
+        let error = outcome.expect_err("a plan-only reply must fail the turn");
+        assert_eq!(error.kind, AgentErrorKind::Policy);
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("retrying once with a stricter edit instruction")),
+            "expected the stricter-edit retry notice, got {notices:?}"
+        );
+        let runs = std::fs::read_to_string(dir.path().join("runs")).unwrap_or_default();
+        assert_eq!(
+            runs.lines().count(),
+            2,
+            "expected one original attempt plus one retry, got {runs:?}"
+        );
+    }
+
+    // TC-2146 / FR-2121: the stricter-edit retry is a second answer in the
+    // same turn, so the transcript must separate the two replies with a blank
+    // line instead of gluing them together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2146_agy_retry_separates_the_two_answers() {
+        let first = json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "Created plan.md - please review and approve it."
+            }
+        });
+        let second = json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "Applied the edits to src/conversation.rs."
+            }
+        });
+        let first_line = first.to_string();
+        let second_line = second.to_string();
+        let (_dir, fake) = write_fake_agy(|dir| {
+            let counter = dir.join("runs").display().to_string();
+            format!(
+                "#!/bin/sh\nread -r _dmuxai_user\ncount=$(cat '{counter}' 2>/dev/null || echo 0)\ncount=$((count + 1))\necho \"$count\" > '{counter}'\nif [ \"$count\" = \"1\" ]; then\n  printf '%s\\n' '{first_line}'\nelse\n  printf '%s\\n' '{second_line}'\nfi\n"
+            )
+        });
+
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("retry-text-conversation"),
+            turn_id: super::super::TurnId::new("retry-text-turn"),
+            prompt: "implement the plan".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: true,
+            system_prompt: None,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let cwd = std::env::temp_dir();
+
+        let (outcome, text) = with_agy_spawn_env(&fake, "0", async {
+            let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
+            let text = timeout(Duration::from_secs(20), async {
+                let mut text = String::new();
+                while let Some(output) = event_rx.recv().await {
+                    if let AgentEvent::TextDelta(delta) = output.event {
+                        text.push_str(&delta);
+                    }
+                }
+                text
+            })
+            .await
+            .expect("the retry turn should finish within 20s");
+
+            let outcome = turn.await.expect("turn task");
+            (outcome, text)
+        })
+        .await;
+
+        outcome.expect("the second answer is not plan-only, so the turn completes");
+        assert!(
+            text.contains("approve it.\n\nApplied the edits"),
+            "the two answers must be separated by a blank line: {text:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

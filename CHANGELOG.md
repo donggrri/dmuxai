@@ -12,6 +12,19 @@ All notable changes to dmuxai are listed here. Versions follow
   naming the node and role, with **Continue** (`graph_continue`) and **Cancel graph**
   (`graph_cancel`) buttons, so queued prompts no longer look stuck.
 
+### Fixed
+
+- **Headless `--agent agy` plan-only replies are no longer a silent success
+  (#164, FR-2121).** When AGY stops at its own plan review (it writes
+  `implementation_plan.md` to its private artifact directory and asks for
+  approval) without editing the workspace, a headless run now exits `7`
+  (approval required) with the plan text kept in `text`. With `--approve-plan`
+  the run requires file edits: AGY retries once with a stricter edit
+  instruction and the run fails with exit `1` if it still only plans. A turn
+  that changed workspace files (through a write tool or a shell command) is
+  never treated as plan-only, and ordinary answers to questions keep exit `0`.
+  Interactive TUI and dashboard runs are unchanged.
+
 ## [0.3.0] - 2026-10-27
 
 ### Changed

@@ -113,8 +113,9 @@ Options:
   --project NAME   Project name for mcp-memory
   run              Run one prompt headless and exit (exit codes: 0 ok, 1 failed,
                    2 usage, 3 not found, 4 busy, 5 runner not allowed, 6 internal,
-                   7 plan approval or sensitive gate (--allow-sensitive or
-                   --agent with --approve-plan confirms sensitive gates), 130 cancelled)
+                   7 plan approval, sensitive gate, or an agent that stopped at
+                   its own plan review (--allow-sensitive or --agent with
+                   --approve-plan confirms sensitive gates), 130 cancelled)
   todo             Add, list or run to-dos without the TUI
   status           Print workspace status (agents, to-dos, last graph, events)
   events           Print state-change events from .dmuxai/events.jsonl
