@@ -1998,6 +1998,7 @@ mod tests {
         );
     }
 
+    // TC-2265 (FR-2262)
     #[test]
     fn tc_2302_api_url_carries_ws() {
         assert!(

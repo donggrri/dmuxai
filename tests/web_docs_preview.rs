@@ -253,6 +253,7 @@ with sync_playwright() as p:
     assert!(screenshot_file.exists(), "screenshot was not captured");
 }
 
+// TC-2266 (FR-2260, FR-2262)
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
 fn docs_diff_unknown_extension_in_headless_chrome() {

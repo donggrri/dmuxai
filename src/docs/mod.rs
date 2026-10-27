@@ -279,6 +279,7 @@ mod tests {
         assert!(DocKind::Html.has_text_content());
     }
 
+    // TC-2260 (FR-2260)
     #[test]
     fn sniff_unknown_extension_text_is_text() {
         let text_bytes = b"SRC_URI += \"file://x\"\n";

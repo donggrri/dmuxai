@@ -1949,6 +1949,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    // TC-2264 (FR-2261, NFR-751)
     #[tokio::test]
     async fn diff_route_returns_git_diff() {
         use std::process::Command;

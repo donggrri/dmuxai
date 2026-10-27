@@ -194,6 +194,7 @@ mod tests {
             .unwrap_or(false)
     }
 
+    // TC-2261 (FR-2261)
     #[test]
     fn git_diff_text_unknown_extension() {
         if !has_git() {
@@ -267,6 +268,7 @@ mod tests {
         assert!(diff.diff.contains("+FILESEXTRAPATHS_prepend := \"y\""));
     }
 
+    // TC-2262 (FR-2261)
     #[test]
     fn git_diff_binary_reports_git_line() {
         if !has_git() {
@@ -334,6 +336,7 @@ mod tests {
         );
     }
 
+    // TC-2263 (FR-2261)
     #[test]
     fn git_diff_untracked_and_deleted() {
         if !has_git() {
@@ -435,6 +438,7 @@ mod tests {
         assert!(diff.diff.contains("+X = \"1\""));
     }
 
+    // TC-2267 (FR-2261, FR-740)
     #[test]
     fn git_diff_rejects_outside_paths() {
         if !has_git() {
