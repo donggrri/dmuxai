@@ -61,6 +61,7 @@ Notes:
   - `dmuxai trust --revoke`: Revokes trust for the workspace configuration regardless of current file content.
   - The trust hash covers only `dmuxai.toml` itself, not files it references (skills, prompt files); those are confined to the workspace while untrusted and are not hashed.
   - Child processes do not inherit the `DMUXAI_TRUST_WORKSPACE_CONFIG` opt-in.
+  - `dmuxai trust --status --json` includes a `warning` field when the trust store or its directory was ignored; text output prints it to stderr. Displayed configuration values have control characters escaped.
   - Dashboard saves of workspace `dmuxai.toml` (`POST /api/skills`, `POST /api/agent-prompts`) on a write-capable `dmuxai --web` dashboard refresh an existing trust record to the new hash only when the on-disk file still matches it right before the write. They never create trust; `dmuxai serve` (view-only) and the one-process opt-in never refresh it.
   - Headless `run` and `todo run` accept `--trust-workspace-config` (or `DMUXAI_TRUST_WORKSPACE_CONFIG=1`) to trust workspace settings for a single process without modifying the persistent trust store.
 - `--model M` requires `--agent`; it sets the Explicit model source for the run

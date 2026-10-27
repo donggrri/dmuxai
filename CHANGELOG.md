@@ -16,7 +16,8 @@ All notable changes to dmuxai are listed here. Versions follow
 
 - Workspace `dmuxai.toml` settings that run commands, read secret environment variables, or set outbound URLs now require `dmuxai trust` (pinned to the file hash); headless runs opt in with `DMUXAI_TRUST_WORKSPACE_CONFIG=1`.
 - Hardened workspace config trust checks (path confinement, trust store permissions, revoke, and clearer approval prompts).
-- Saving workspace settings from a write-capable dashboard keeps an existing trust record current when the file on disk still matches it; untrusted folders and one-process opt-in stay untrusted (FR-2226..FR-2229).
+- Saving workspace settings from a write-capable dashboard keeps an existing trust record current when the file on disk still matches it; untrusted folders and one-process opt-in stay untrusted (FR-2226..FR-2231).
+- Skill and memory paths inside the workspace are confined to it in every trust state; trust output escapes control characters; the trust state directory permissions are checked (FR-2234..FR-2241).
 
 ### Fixed
 

@@ -1046,16 +1046,27 @@ fn trust_workspace(
             );
             return dmuxai::agent_api::exit::FAILED;
         }
+        let warning = store.corrupt_warning().map(str::to_owned);
+        if !json && let Some(warning) = &warning {
+            eprintln!(
+                "warning: {}",
+                dmuxai::workspace_trust::escape_control(warning)
+            );
+        }
         let removed = store.revoke(workspace_root);
         if let Err(error) = store.save() {
             eprintln!("error: {error}");
             return dmuxai::agent_api::exit::INTERNAL;
         }
         if json {
-            print_json(&serde_json::json!({
+            let mut value = serde_json::json!({
                 "status": "revoked",
                 "removed": removed,
-            }));
+            });
+            if let Some(warning) = &warning {
+                value["warning"] = serde_json::json!(warning);
+            }
+            print_json(&value);
         } else if removed {
             println!("revoked");
         } else {
@@ -1064,7 +1075,8 @@ fn trust_workspace(
         return dmuxai::agent_api::exit::OK;
     }
 
-    let (exists, sha, restricted) = dmuxai::settings::inspect_workspace_trust(workspace_root, &env);
+    let (exists, sha, restricted, details) =
+        dmuxai::settings::inspect_workspace_trust_full(workspace_root, &env);
 
     if !exists {
         if status {
@@ -1093,9 +1105,16 @@ fn trust_workspace(
     }
 
     let mut store = TrustStore::load(&env);
+    let warning = store.corrupt_warning().map(str::to_owned);
+    if !(status && json)
+        && let Some(warning) = &warning
+    {
+        eprintln!(
+            "warning: {}",
+            dmuxai::workspace_trust::escape_control(warning)
+        );
+    }
     let already = store.is_trusted(workspace_root, &sha);
-
-    let details = dmuxai::settings::restricted_workspace_details(workspace_root, &env);
 
     if status {
         let state = if already { "trusted" } else { "untrusted" };
@@ -1104,21 +1123,31 @@ fn trust_workspace(
                 .iter()
                 .map(|(k, v)| serde_json::json!({ "key": k, "value": v }))
                 .collect();
-            print_json(&serde_json::json!({
+            let mut value = serde_json::json!({
                 "status": state,
                 "sha256": sha,
                 "ignored": restricted,
                 "details": details_json,
-            }));
+            });
+            if let Some(warning) = &warning {
+                value["warning"] = serde_json::json!(warning);
+            }
+            print_json(&value);
         } else {
             println!("{state}");
         }
         return dmuxai::agent_api::exit::OK;
     }
 
-    println!("workspace: {}", workspace_root.display());
+    println!(
+        "workspace: {}",
+        dmuxai::workspace_trust::escape_control(&workspace_root.display().to_string())
+    );
     println!("sha256: {sha}");
-    println!("restricted keys: {}", restricted.join(", "));
+    println!(
+        "restricted keys: {}",
+        dmuxai::workspace_trust::escape_control(&restricted.join(", "))
+    );
     if !details.is_empty() {
         println!("restricted values:");
         for (k, v) in &details {

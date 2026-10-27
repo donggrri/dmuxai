@@ -130,6 +130,14 @@ Trust records are pinned to the SHA-256 hash of the workspace configuration file
 | FR-2229 | Must | Given the on-disk `dmuxai.toml` differs from the trusted hash (edited outside the dashboard) or from the text the save was based on | No refresh happens; after the save the workspace is untrusted | External edits keep invalidating trust | TC-2229, TC-2231 |
 | FR-2230 | Must | Given a view-only dashboard (`dmuxai serve`) saves workspace `dmuxai.toml` | No trust refresh happens even when a matching record exists | Refresh limited to authenticated write-capable dashboards | TC-2232 |
 | FR-2231 | Must | Given the config write fails | The error is returned and the trust store is not modified | Failed saves never touch trust | TC-2233 |
+| FR-2234 | Must | Given any workspace (trusted, untrusted, or with no restricted keys) and a skill whose `SKILL.md` or skill directory lexically lies in the workspace | The canonical skill directory and `SKILL.md` must stay inside the canonical workspace; otherwise the skill is reported missing | Confinement applies regardless of trust state | TC-2234, TC-2235, TC-2236 |
+| FR-2235 | Must | Given a path skill source from user config that resolves inside the workspace, or outside it | In-workspace sources are confined to the workspace; other path sources are confined to their own source root; git sources to their checkout | Source roots are enforced for every origin | TC-2237 |
+| FR-2236 | Must | When a confined skill is read | `SKILL.md` is opened by its canonical path without following a final symlink and checked as a regular file on the open handle; listed skill files skip symlinks that leave the skill root and never descend into symlinked directories | Read matches the checked path | TC-2238 |
+| FR-2237 | Must | Given a referenced skill directory without `SKILL.md` | The issue says the skill has no `SKILL.md`, not that it resolves outside the workspace | Accurate diagnostics | TC-2239 |
+| FR-2238 | Must | When trust prompts, `dmuxai trust` output, and configuration warnings (TUI, CLI, dashboard) show configuration-derived text | C0/C1 control characters, DEL, line/paragraph separators, and bidirectional controls are shown as `\u{XX}` escapes; prompts show details built from the same bytes that are hashed and trusted | Displayed text cannot alter the terminal | TC-2240, TC-2243, TC-2244 |
+| FR-2239 | Must | Given an existing trust state directory | On load and save it must be a real directory owned by the current user; group/world-writable directories are refused with a warning; other permissive modes are tightened to `0700` | State directory permissions enforced | TC-2241, TC-2242 |
+| FR-2240 | Must | Given a memory vault (from user or workspace config) that lexically lies in the workspace | The canonical vault and memory root must stay inside the canonical workspace; otherwise memory is disabled with a warning | Memory root confinement | TC-2245, TC-2246, TC-2247 |
+| FR-2241 | Should | When the startup trust prompt cannot save the record, or the trust store has a warning | An error is printed instead of silently continuing; `dmuxai trust` (including `--status`, with a `warning` JSON field) reports the store warning | Failures are visible | Manual review of `src/main.rs` `load_settings_with_trust_prompt` and `src/cli.rs` `trust_workspace` |
 
 ## 5. Acceptance scenarios and test design
 
@@ -179,6 +187,20 @@ Trust records are pinned to the SHA-256 hash of the workspace configuration file
 | TC-2231 | FR-2229 | unit | `--web` router, trusted workspace, `dmuxai.toml` then edited externally | `POST /api/agent-prompts` | 200; workspace is untrusted for the saved file hash | `src/web/server.rs` `tc_2231_external_edit_then_dashboard_save_stays_untrusted` |
 | TC-2232 | FR-2230 | unit | View-only router (`web_attached = false`), trusted workspace | `POST /api/skills` | No trust refresh; workspace untrusted for the saved file hash | `src/web/server.rs` `tc_2232_view_only_save_does_not_refresh_trust` |
 | TC-2233 | FR-2231 | unit | `dmuxai.toml` path is a directory, workspace trusted | Same helper | Returns `Err`; trust store file unchanged | `src/workspace_trust.rs` `tc_2233_write_failure_leaves_trust_untouched` |
+| TC-2234 | FR-2234 | unit | No confinement override; `.agents/skills/a/SKILL.md` symlinks outside | `resolve` | Missing, resolves outside the workspace | `src/stage_skills.rs` `tc_2234_skill_md_symlink_outside_rejected_without_restricted_keys` |
+| TC-2235 | FR-2234 | unit | `.agents/skills/b` directory symlink to outside | `resolve` | Missing | `src/stage_skills.rs` `tc_2235_agents_skill_dir_symlink_outside_rejected` |
+| TC-2236 | FR-2234 | unit | `./linked` directory symlink to outside, no restricted keys | `resolve` | Missing | `src/stage_skills.rs` `tc_2236_dotpath_dir_symlink_outside_rejected_without_restricted_keys` |
+| TC-2237 | FR-2235 | unit | User-config relative path source pointing at an in-workspace symlink to outside | `resolve` | Missing | `src/stage_skills.rs` `tc_2237_user_relative_source_to_in_workspace_symlink_rejected` |
+| TC-2238 | FR-2236 | unit | Real in-workspace skill with a regular file and an outward file symlink | `resolve` | Ok; files list has the regular file only | `src/stage_skills.rs` `tc_2238_in_workspace_skill_still_resolves` |
+| TC-2239 | FR-2237 | unit | `./nothing_here` without `SKILL.md` | `resolve` | Missing, has no SKILL.md | `src/stage_skills.rs` `tc_2239_missing_skill_md_reports_missing_not_escape` |
+| TC-2240 | FR-2238 | unit | String with ESC, CR, NUL, C1 and bidi controls | `escape_control` | No control chars remain; escapes present | `src/workspace_trust.rs` `tc_2240_escape_control_chars` |
+| TC-2241 | FR-2239 | unit | State dir with mode 0755 | `TrustStore::save` and `load` | Mode becomes 0700 | `src/workspace_trust.rs` `tc_2241_state_dir_0755_tightened_to_0700` |
+| TC-2242 | FR-2239 | unit | State dir with mode 0775 | `TrustStore::load` and `save` | Warning; save refused; no store file | `src/workspace_trust.rs` `tc_2242_group_writable_state_dir_refused` |
+| TC-2243 | FR-2238 | unit | Notify command value containing control characters | `restricted_workspace_details` | Keys and values contain no control chars | `src/settings.rs` `tc_2243_restricted_details_escape_control_chars` |
+| TC-2244 | FR-2238 | unit | Unparseable workspace config containing a control byte | `DmuxSettings::load_with_user_config_and_env` | Warnings contain no control chars | `src/settings.rs` `tc_2244_config_warnings_escape_control_chars` |
+| TC-2245 | FR-2240 | unit | User vault at an in-workspace symlink to outside | Settings load | Memory disabled with warning | `src/settings.rs` `tc_2245_user_memory_vault_symlink_in_workspace_disabled` |
+| TC-2246 | FR-2240 | unit | User vault at a real in-workspace dir | Settings load | Memory enabled | `src/settings.rs` `tc_2246_workspace_memory_vault_inside_ok` |
+| TC-2247 | FR-2240 | unit | Real in-workspace vault whose `dir` is a symlink to outside | Settings load | Memory disabled | `src/settings.rs` `tc_2247_relative_memory_root_symlink_escape_disabled` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -199,9 +221,10 @@ Trust records are pinned to the SHA-256 hash of the workspace configuration file
 | 3 | CLI trust subcommand and runtime flags | `src/cli.rs`, `src/runtime_env.rs`, `src/main.rs` | FR-2207..FR-2213 | TC-2207..TC-2213 |
 | 4 | Webhook and subprocess trust integration | `tests/workspace_trust.rs` | FR-2214 | TC-2214 |
 | 5 | Dashboard save trust refresh | `src/workspace_trust.rs`, `src/web/server.rs` | FR-2226..FR-2231 | TC-2226..TC-2233 |
-| 6 | Specification and documentation registration | `docs/specs/SPEC-workspace-config-trust.md`, `SECURITY.md`, `docs/API.md` | All | `python3 scripts/check-spec.py --all` |
+| 6 | Always-on skill and memory confinement, display escaping, state dir checks | `src/stage_skills.rs`, `src/settings.rs`, `src/workspace_trust.rs`, `src/cli.rs`, `src/main.rs` | FR-2234..FR-2241 | TC-2234..TC-2247 |
+| 7 | Specification and documentation registration | `docs/specs/SPEC-workspace-config-trust.md`, `SECURITY.md`, `docs/API.md` | All | `python3 scripts/check-spec.py --all` |
 
 ## 8. Review and test exit criteria
 
-- [x] All Must requirements (FR-2190..FR-2231) map to passing automated test evidence (TC-2190..TC-2233).
+- [x] All Must requirements (FR-2190..FR-2240) map to passing automated test evidence (TC-2190..TC-2247).
 - [x] Spec gate checks pass: `python3 scripts/check-spec.py --all` and `python3 scripts/check-tc-links.py`.

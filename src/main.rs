@@ -29,6 +29,7 @@ use dmuxai::web::{
     DEFAULT_PORT, DashboardHub, DashboardServer, DashboardServices, FileGraphSource, ServerConfig,
     SnapshotSource, check_bind, generate_token, start_server,
 };
+use dmuxai::workspace_trust::escape_control;
 use ratatui::{Terminal, backend::CrosstermBackend};
 #[cfg(unix)]
 use tokio::signal::unix::SignalKind;
@@ -490,17 +491,21 @@ fn load_settings_with_trust_prompt(workspace_root: &Path) -> DmuxSettings {
 
     let env = RuntimeEnv::from_process();
     let mut settings = DmuxSettings::load_with_env(workspace_root, &env);
-    if let dmuxai::workspace_trust::WorkspaceTrustStatus::Untrusted { sha256, ignored } =
+    if let dmuxai::workspace_trust::WorkspaceTrustStatus::Untrusted { .. } =
         settings.workspace_trust.clone()
         && std::io::stdin().is_terminal()
         && std::io::stderr().is_terminal()
     {
+        let (_, sha256, ignored, details) =
+            dmuxai::settings::inspect_workspace_trust_full(workspace_root, &env);
         let config_path = workspace_root.join("dmuxai.toml");
         let short_sha = &sha256[..sha256.len().min(12)];
-        let details = dmuxai::settings::restricted_workspace_details(workspace_root, &env);
-        eprintln!("workspace config: {}", config_path.display());
+        eprintln!(
+            "workspace config: {}",
+            escape_control(&config_path.display().to_string())
+        );
         eprintln!("sha256: {short_sha}");
-        eprintln!("ignored: {}", ignored.join(", "));
+        eprintln!("ignored: {}", escape_control(&ignored.join(", ")));
         if !details.is_empty() {
             eprintln!("restricted values:");
             for (k, v) in &details {
@@ -518,9 +523,21 @@ fn load_settings_with_trust_prompt(workspace_root: &Path) -> DmuxSettings {
         };
         if answer {
             let mut store = dmuxai::workspace_trust::TrustStore::load(&env);
+            if let Some(warning) = store.corrupt_warning() {
+                eprintln!("warning: {}", escape_control(warning));
+            }
             store.trust(workspace_root, &sha256);
-            let _ = store.save();
-            settings = DmuxSettings::load_with_env(workspace_root, &env);
+            match store.save() {
+                Ok(()) => {
+                    settings = DmuxSettings::load_with_env(workspace_root, &env);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "error: could not save workspace trust: {}",
+                        escape_control(&error.to_string())
+                    );
+                }
+            }
         }
     }
     settings

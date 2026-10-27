@@ -392,13 +392,13 @@ pub fn resolve(
     ctx: &SkillContext,
     approvals: &Approvals,
 ) -> Result<ResolvedSkill, (IssueKind, String)> {
+    let ws_root = settings
+        .confine_to
+        .clone()
+        .unwrap_or_else(|| ctx.workspace.clone());
+
     if let Some(source) = settings.sources.get(reference) {
-        let confine = if source.from_workspace {
-            settings.confine_to.as_deref()
-        } else {
-            None
-        };
-        return resolve_source(reference, source, ctx, approvals, confine);
+        return resolve_source(reference, source, ctx, approvals, settings, &ws_root);
     }
     if reference.starts_with("./") || reference.starts_with("../") || reference.starts_with(".\\") {
         let dir = ctx.workspace.join(reference);
@@ -408,7 +408,7 @@ pub fn resolve(
             &format!("path {reference}"),
             None,
             None,
-            settings.confine_to.as_deref(),
+            Some(&ws_root),
         );
     }
     if reference.contains('/') || reference.contains('\\') || reference.contains("..") {
@@ -420,14 +420,7 @@ pub fn resolve(
     for rel in WORKSPACE_DIRS {
         let dir = ctx.workspace.join(rel).join(reference);
         if dir.join("SKILL.md").is_file() {
-            return load_skill(
-                &dir,
-                reference,
-                rel,
-                None,
-                None,
-                settings.confine_to.as_deref(),
-            );
+            return load_skill(&dir, reference, rel, None, None, Some(&ws_root));
         }
     }
     if let Some(home) = &ctx.home {
@@ -452,7 +445,8 @@ fn resolve_source(
     source: &SourceToml,
     ctx: &SkillContext,
     approvals: &Approvals,
-    confine_to: Option<&Path>,
+    settings: &StageSkillSettings,
+    ws_root: &Path,
 ) -> Result<ResolvedSkill, (IssueKind, String)> {
     if let Some(problem) = source_problem(source) {
         let kind = if source.git.is_some() {
@@ -463,21 +457,42 @@ fn resolve_source(
         return Err((kind, problem));
     }
     if let Some(path) = &source.path {
-        let mut dir = if Path::new(path).is_absolute() {
+        let lexical_base = if Path::new(path).is_absolute() {
             PathBuf::from(path)
         } else {
             ctx.workspace.join(path)
         };
+        let mut dir = lexical_base.clone();
         if let Some(sub) = &source.subdir {
             dir = dir.join(sub);
         }
+
+        let confine = if source.from_workspace && settings.confine_to.is_some() {
+            settings.confine_to.as_deref()
+        } else {
+            let ws_canon = fs::canonicalize(&ctx.workspace).ok();
+            let base_canon = fs::canonicalize(&lexical_base).ok();
+            let in_ws = lexical_base.starts_with(&ctx.workspace)
+                || ws_canon
+                    .as_ref()
+                    .is_some_and(|wsc| lexical_base.starts_with(wsc))
+                || ws_canon
+                    .as_ref()
+                    .is_some_and(|wsc| base_canon.as_ref().is_some_and(|bc| bc.starts_with(wsc)));
+            if in_ws {
+                Some(ws_root)
+            } else {
+                Some(lexical_base.as_path())
+            }
+        };
+
         return load_skill(
             &dir,
             name,
             &format!("source:{name} (path)"),
             None,
             source.interactive,
-            confine_to,
+            confine,
         );
     }
     let rev = source.rev.clone().unwrap_or_default();
@@ -502,7 +517,7 @@ fn resolve_source(
     }
     let dir = match &source.subdir {
         Some(sub) => checkout.join(sub),
-        None => checkout,
+        None => checkout.clone(),
     };
     load_skill(
         &dir,
@@ -510,7 +525,7 @@ fn resolve_source(
         &format!("source:{name} (git {})", short(&rev)),
         Some(rev),
         source.interactive,
-        confine_to,
+        Some(&checkout),
     )
 }
 
@@ -531,47 +546,140 @@ fn load_skill(
     interactive: Option<bool>,
     confine_to: Option<&Path>,
 ) -> Result<ResolvedSkill, (IssueKind, String)> {
-    if let Some(root) = confine_to {
-        let Ok(canon_dir) = std::fs::canonicalize(dir) else {
-            return Err((
-                IssueKind::Missing,
-                "resolves outside the workspace".to_owned(),
-            ));
+    let canon_skill_md_path = if let Some(root) = confine_to {
+        let canon_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let canon_dir = match std::fs::canonicalize(dir) {
+            Ok(cd) => cd,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err((
+                    IssueKind::Missing,
+                    format!("{} has no SKILL.md", display(dir)),
+                ));
+            }
+            Err(_) => {
+                return Err((
+                    IssueKind::Missing,
+                    "resolves outside the workspace".to_owned(),
+                ));
+            }
         };
-        if !canon_dir.starts_with(root) {
+        if !canon_dir.starts_with(&canon_root) {
             return Err((
                 IssueKind::Missing,
                 "resolves outside the workspace".to_owned(),
             ));
         }
-    }
-    let skill_md = dir.join("SKILL.md");
-    if let Some(root) = confine_to {
-        let Ok(canon_skill_md) = std::fs::canonicalize(&skill_md) else {
-            return Err((
-                IssueKind::Missing,
-                "resolves outside the workspace".to_owned(),
-            ));
+
+        let skill_md = dir.join("SKILL.md");
+        let canon_skill_md = match std::fs::canonicalize(&skill_md) {
+            Ok(csm) => csm,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err((
+                    IssueKind::Missing,
+                    format!("{} has no SKILL.md", display(dir)),
+                ));
+            }
+            Err(_) => {
+                return Err((
+                    IssueKind::Missing,
+                    "resolves outside the workspace".to_owned(),
+                ));
+            }
         };
-        if !canon_skill_md.starts_with(root) {
+        if !canon_skill_md.starts_with(&canon_root) {
             return Err((
                 IssueKind::Missing,
                 "resolves outside the workspace".to_owned(),
             ));
         }
-    }
-    if !skill_md.is_file() {
-        return Err((
-            IssueKind::Missing,
-            format!("{} has no SKILL.md", display(dir)),
-        ));
-    }
-    let raw = fs::read(&skill_md).map_err(|err| {
-        (
-            IssueKind::Unreadable,
-            format!("{}: {err}", display(&skill_md)),
-        )
-    })?;
+        Some(canon_skill_md)
+    } else {
+        None
+    };
+
+    let read_path = match &canon_skill_md_path {
+        Some(p) => p.as_path(),
+        None => &dir.join("SKILL.md"),
+    };
+
+    #[cfg(unix)]
+    let raw = if confine_to.is_some() {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(read_path)
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    (
+                        IssueKind::Missing,
+                        format!("{} has no SKILL.md", display(dir)),
+                    )
+                } else {
+                    (
+                        IssueKind::Unreadable,
+                        format!("{}: {err}", display(read_path)),
+                    )
+                }
+            })?;
+        let meta = file.metadata().map_err(|err| {
+            (
+                IssueKind::Unreadable,
+                format!("{}: {err}", display(read_path)),
+            )
+        })?;
+        if !meta.is_file() {
+            return Err((
+                IssueKind::Missing,
+                format!("{} has no SKILL.md", display(dir)),
+            ));
+        }
+        let mut buf = Vec::new();
+        (&file)
+            .take(MAX_SKILL_BYTES as u64 + 1)
+            .read_to_end(&mut buf)
+            .map_err(|err| {
+                (
+                    IssueKind::Unreadable,
+                    format!("{}: {err}", display(read_path)),
+                )
+            })?;
+        buf
+    } else {
+        let skill_md = dir.join("SKILL.md");
+        if !skill_md.is_file() {
+            return Err((
+                IssueKind::Missing,
+                format!("{} has no SKILL.md", display(dir)),
+            ));
+        }
+        fs::read(&skill_md).map_err(|err| {
+            (
+                IssueKind::Unreadable,
+                format!("{}: {err}", display(&skill_md)),
+            )
+        })?
+    };
+
+    #[cfg(not(unix))]
+    let raw = {
+        let skill_md = read_path;
+        if !skill_md.is_file() {
+            return Err((
+                IssueKind::Missing,
+                format!("{} has no SKILL.md", display(dir)),
+            ));
+        }
+        fs::read(skill_md).map_err(|err| {
+            (
+                IssueKind::Unreadable,
+                format!("{}: {err}", display(skill_md)),
+            )
+        })?
+    };
+
     if raw.len() > MAX_SKILL_BYTES {
         return Err((
             IssueKind::Oversize,
@@ -624,15 +732,30 @@ fn list_files(root: &Path, dir: &Path, out: &mut Vec<String>, depth: usize) {
         return;
     };
     for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
             continue;
         }
-        if path.is_dir() {
+
+        if file_type.is_dir() {
             list_files(root, &path, out, depth + 1);
-        } else if let Ok(rel) = path.strip_prefix(root) {
-            out.push(display(rel));
+        } else if file_type.is_file() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push(display(rel));
+            }
+        } else if file_type.is_symlink() {
+            let canon_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            if let Ok(canon_path) = fs::canonicalize(&path)
+                && canon_path.is_file()
+                && canon_path.starts_with(&canon_root)
+                && let Ok(rel) = path.strip_prefix(root)
+            {
+                out.push(display(rel));
+            }
         }
     }
 }
@@ -1677,5 +1800,177 @@ mod tests {
         let (kind, msg) = res.unwrap_err();
         assert_eq!(kind, IssueKind::Missing);
         assert_eq!(msg, "resolves outside the workspace");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tc_2234_skill_md_symlink_outside_rejected_without_restricted_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let target_md = outside.join("SKILL.md");
+        fs::write(&target_md, "---\nname: outside\n---\nbody").unwrap();
+
+        let skill_dir = ws.join(".agents/skills/a");
+        fs::create_dir_all(&skill_dir).unwrap();
+        std::os::unix::fs::symlink(&target_md, skill_dir.join("SKILL.md")).unwrap();
+
+        let c = SkillContext {
+            workspace: ws,
+            home: None,
+        };
+        let s = settings("");
+        assert!(s.confine_to.is_none());
+
+        let res = resolve("a", &s, &c, &Approvals::default());
+        assert!(res.is_err());
+        let (kind, msg) = res.unwrap_err();
+        assert_eq!(kind, IssueKind::Missing);
+        assert_eq!(msg, "resolves outside the workspace");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tc_2235_agents_skill_dir_symlink_outside_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside_dir = tmp.path().join("outside_skill");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("SKILL.md"), "---\nname: out\n---\nbody").unwrap();
+
+        let agents_skills = ws.join(".agents/skills");
+        fs::create_dir_all(&agents_skills).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, agents_skills.join("b")).unwrap();
+
+        let c = SkillContext {
+            workspace: ws,
+            home: None,
+        };
+        let s = settings("");
+        assert!(s.confine_to.is_none());
+
+        let res = resolve("b", &s, &c, &Approvals::default());
+        assert!(res.is_err());
+        let (kind, msg) = res.unwrap_err();
+        assert_eq!(kind, IssueKind::Missing);
+        assert_eq!(msg, "resolves outside the workspace");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tc_2236_dotpath_dir_symlink_outside_rejected_without_restricted_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside_dir = tmp.path().join("outside_skill");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("SKILL.md"), "---\nname: out\n---\nbody").unwrap();
+
+        let symlink_dir = ws.join("linked");
+        std::os::unix::fs::symlink(&outside_dir, &symlink_dir).unwrap();
+
+        let c = SkillContext {
+            workspace: ws,
+            home: None,
+        };
+        let s = settings("");
+        assert!(s.confine_to.is_none());
+
+        let res = resolve("./linked", &s, &c, &Approvals::default());
+        assert!(res.is_err());
+        let (kind, msg) = res.unwrap_err();
+        assert_eq!(kind, IssueKind::Missing);
+        assert_eq!(msg, "resolves outside the workspace");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tc_2237_user_relative_source_to_in_workspace_symlink_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside_dir = tmp.path().join("outside_skill");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("SKILL.md"), "---\nname: out\n---\nbody").unwrap();
+
+        let symlink_dir = ws.join("vendored");
+        std::os::unix::fs::symlink(&outside_dir, &symlink_dir).unwrap();
+
+        let c = SkillContext {
+            workspace: ws,
+            home: None,
+        };
+        let s = settings("[skills.sources.u]\npath = \"vendored\"\n");
+        assert!(s.confine_to.is_none());
+        assert!(!s.sources["u"].from_workspace);
+
+        let res = resolve("u", &s, &c, &Approvals::default());
+        assert!(res.is_err());
+        let (kind, msg) = res.unwrap_err();
+        assert_eq!(kind, IssueKind::Missing);
+        assert_eq!(msg, "resolves outside the workspace");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tc_2238_in_workspace_skill_still_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let outside_file = outside.join("leak.md");
+        fs::write(&outside_file, "secret").unwrap();
+
+        let skill_dir = ws.join(".agents/skills/ok");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: ok\ndescription: ok skill\n---\ncontent",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("notes.md"), "hello notes").unwrap();
+        std::os::unix::fs::symlink(&outside_file, skill_dir.join("link.md")).unwrap();
+
+        let c = SkillContext {
+            workspace: ws,
+            home: None,
+        };
+        let s = settings("");
+        assert!(s.confine_to.is_none());
+
+        let res = resolve("ok", &s, &c, &Approvals::default()).expect("skill should resolve");
+        assert_eq!(res.name, "ok");
+        assert!(res.files.contains(&"notes.md".to_string()));
+        assert!(!res.files.contains(&"link.md".to_string()));
+    }
+
+    #[test]
+    fn tc_2239_missing_skill_md_reports_missing_not_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let nothing_here = ws.join("nothing_here");
+        fs::create_dir_all(&nothing_here).unwrap();
+
+        let c = SkillContext {
+            workspace: ws.clone(),
+            home: None,
+        };
+        let mut s = settings("");
+        s.confine_to = Some(ws);
+
+        let res = resolve("./nothing_here", &s, &c, &Approvals::default());
+        let (kind, msg) = res.expect_err("should fail for missing SKILL.md");
+        assert_eq!(kind, IssueKind::Missing);
+        assert!(
+            msg.ends_with("has no SKILL.md"),
+            "expected error message to end with 'has no SKILL.md', got: '{msg}'"
+        );
     }
 }

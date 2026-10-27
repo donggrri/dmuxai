@@ -765,6 +765,28 @@ impl DmuxSettings {
                 return;
             }
         };
+        let canonical_workspace = std::fs::canonicalize(workspace).ok();
+        let lexically_inside = vault_path.starts_with(workspace)
+            || canonical_workspace
+                .as_ref()
+                .is_some_and(|canonical| vault_path.starts_with(canonical));
+        if lexically_inside {
+            let outside_workspace = |path: &Path| {
+                let Ok(canonical) = std::fs::canonicalize(path) else {
+                    return true;
+                };
+                canonical_workspace
+                    .as_ref()
+                    .is_none_or(|workspace| !canonical.starts_with(workspace))
+            };
+            if outside_workspace(&vault_path) || (root.exists() && outside_workspace(&root)) {
+                self.config_warnings.push(
+                    "[memory] vault resolves outside the workspace; memory disabled".to_owned(),
+                );
+                self.memory = None;
+                return;
+            }
+        }
         let project = match raw.project.as_deref().map(str::trim) {
             None | Some("") => None,
             Some(name) if crate::memory::is_valid_name(name) => Some(name.to_owned()),
@@ -785,6 +807,10 @@ impl DmuxSettings {
 
     /// Drop repeated warnings while preserving first-seen order.
     fn dedupe_warnings(&mut self) {
+        for warning in &mut self.config_warnings {
+            let escaped = crate::workspace_trust::escape_control(warning);
+            *warning = escaped;
+        }
         let mut seen = std::collections::HashSet::new();
         self.config_warnings.retain(|w| seen.insert(w.clone()));
     }
@@ -1421,7 +1447,18 @@ pub fn restricted_workspace_details(workspace: &Path, env: &RuntimeEnv) -> Vec<(
     let Ok(contents) = std::fs::read_to_string(&config_path) else {
         return Vec::new();
     };
-    let Ok(parsed) = toml::from_str::<DmuxToml>(&contents) else {
+    restricted_workspace_details_from(&contents, workspace, env)
+}
+
+/// Returns the key-value details of all restricted keys in `contents`, a workspace's `dmuxai.toml`.
+///
+/// Keys and values are escaped for terminal display.
+pub fn restricted_workspace_details_from(
+    contents: &str,
+    workspace: &Path,
+    env: &RuntimeEnv,
+) -> Vec<(String, String)> {
+    let Ok(parsed) = toml::from_str::<DmuxToml>(contents) else {
         return Vec::new();
     };
 
@@ -1564,6 +1601,14 @@ pub fn restricted_workspace_details(workspace: &Path, env: &RuntimeEnv) -> Vec<(
     }
 
     details
+        .into_iter()
+        .map(|(key, value)| {
+            (
+                crate::workspace_trust::escape_control(&key),
+                crate::workspace_trust::escape_control(&value),
+            )
+        })
+        .collect()
 }
 
 /// Inspect a workspace's `dmuxai.toml` for trust purposes.
@@ -1572,15 +1617,28 @@ pub fn restricted_workspace_details(workspace: &Path, env: &RuntimeEnv) -> Vec<(
 /// file is present and parses, `sha256` is the hash of its raw bytes, and
 /// `restricted_keys` lists the keys that would be stripped if untrusted.
 pub fn inspect_workspace_trust(workspace: &Path, env: &RuntimeEnv) -> (bool, String, Vec<String>) {
+    let (exists, sha256, keys, _) = inspect_workspace_trust_full(workspace, env);
+    (exists, sha256, keys)
+}
+
+/// Inspect a workspace's `dmuxai.toml` for trust purposes, reading it only once.
+///
+/// Returns `(exists, sha256, restricted_keys, details)` where `details` are the
+/// restricted key-value pairs built from the same contents.
+pub fn inspect_workspace_trust_full(
+    workspace: &Path,
+    env: &RuntimeEnv,
+) -> (bool, String, Vec<String>, Vec<(String, String)>) {
     let config_path = workspace.join("dmuxai.toml");
     let Ok(contents) = std::fs::read_to_string(&config_path) else {
-        return (false, String::new(), Vec::new());
+        return (false, String::new(), Vec::new(), Vec::new());
     };
+    let details = restricted_workspace_details_from(&contents, workspace, env);
     let Ok(parsed) = toml::from_str::<DmuxToml>(&contents) else {
-        return (true, content_hash(contents.as_bytes()), Vec::new());
+        return (true, content_hash(contents.as_bytes()), Vec::new(), details);
     };
     let keys = restricted_workspace_keys(&parsed, workspace, env);
-    (true, content_hash(contents.as_bytes()), keys)
+    (true, content_hash(contents.as_bytes()), keys, details)
 }
 
 impl Default for DmuxSettings {
@@ -5086,5 +5144,170 @@ system_prompt_file = "../claude.prompt"
         unsafe {
             std::env::remove_var(secret_env_name);
         }
+    }
+
+    #[test]
+    fn tc_2243_restricted_details_escape_control_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // TOML basic-string escapes decode to ESC and CR in the command argv.
+        let ws_toml = "[notify]\ncommand = [\"echo\", \"a\\u001b[2Jb\\rc\"]\n";
+        std::fs::write(ws.join("dmuxai.toml"), ws_toml).unwrap();
+
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(dir.path().join("state")),
+            ..RuntimeEnv::default()
+        };
+
+        let details = restricted_workspace_details(&ws, &env);
+        let details_map: std::collections::BTreeMap<_, _> = details.into_iter().collect();
+
+        let command = details_map
+            .get("notify.command")
+            .expect("notify.command detail");
+        assert!(
+            command.contains("\\u{1b}"),
+            "ESC should be escaped: {command}"
+        );
+
+        for (key, value) in &details_map {
+            assert!(
+                !key.chars().any(char::is_control),
+                "key {key:?} contains a control character"
+            );
+            assert!(
+                !value.chars().any(char::is_control),
+                "value for {key:?} contains a control character: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tc_2244_config_warnings_escape_control_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // A raw ESC byte in an invalid key makes parsing fail before escaping.
+        std::fs::write(ws.join("dmuxai.toml"), b"bad\x1b = = 1\n").unwrap();
+
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(dir.path().join("state")),
+            ..RuntimeEnv::default()
+        };
+
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, None, &env);
+        assert!(
+            !settings.config_warnings.is_empty(),
+            "invalid config should produce a warning"
+        );
+        for warning in &settings.config_warnings {
+            assert!(
+                !warning.chars().any(char::is_control),
+                "warning contains a control character: {warning:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tc_2245_user_memory_vault_symlink_in_workspace_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let outside = dir.path().join("outside_vault");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let linked = ws.join("linked_vault");
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+
+        let user_toml = dir.path().join("user.toml");
+        std::fs::write(
+            &user_toml,
+            format!(
+                "[memory]\nvault = \"{}\"\n",
+                linked.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(dir.path().join("state")),
+            ..RuntimeEnv::default()
+        };
+
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user_toml), &env);
+        assert_eq!(settings.memory, None);
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("vault resolves outside the workspace")),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+    }
+
+    #[test]
+    fn tc_2246_workspace_memory_vault_inside_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let vault = ws.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+
+        let user_toml = dir.path().join("user.toml");
+        std::fs::write(
+            &user_toml,
+            format!(
+                "[memory]\nvault = \"{}\"\n",
+                vault.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(dir.path().join("state")),
+            ..RuntimeEnv::default()
+        };
+
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user_toml), &env);
+        assert!(
+            settings.memory.is_some(),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tc_2247_relative_memory_root_symlink_escape_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let vault = ws.join("vault");
+        let outside = dir.path().join("outside_notes");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        std::os::unix::fs::symlink(&outside, vault.join("notes")).unwrap();
+
+        let user_toml = dir.path().join("user.toml");
+        std::fs::write(
+            &user_toml,
+            format!(
+                "[memory]\nvault = \"{}\"\ndir = \"notes\"\n",
+                vault.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(dir.path().join("state")),
+            ..RuntimeEnv::default()
+        };
+
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user_toml), &env);
+        assert_eq!(settings.memory, None);
     }
 }

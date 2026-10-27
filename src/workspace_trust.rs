@@ -11,6 +11,63 @@ use sha2::{Digest, Sha256};
 use crate::runtime_env::RuntimeEnv;
 use crate::workspace::normalize_workspace_path;
 
+/// Replaces ASCII/Unicode control and bidirectional control characters with \u{XX} escapes.
+pub fn escape_control(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let u = c as u32;
+        let is_bidi_or_ls_ps = u == 0x2028
+            || u == 0x2029
+            || (0x202A..=0x202E).contains(&u)
+            || (0x2066..=0x2069).contains(&u);
+        if c.is_control() || is_bidi_or_ls_ps {
+            let _ = write!(out, "\\u{{{u:x}}}");
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+fn check_state_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let meta = fs::symlink_metadata(dir).map_err(|e| {
+        format!(
+            "cannot inspect trust state directory {}: {e}",
+            dir.display()
+        )
+    })?;
+
+    let euid = unsafe { libc::geteuid() };
+    if !meta.is_dir() || meta.uid() != euid {
+        return Err(format!(
+            "trust state directory {} is not owned by current user; ignoring",
+            dir.display()
+        ));
+    }
+
+    let mode = meta.mode() & 0o777;
+    if (mode & 0o022) != 0 {
+        return Err(format!(
+            "trust state directory {} is group/world-writable (mode {:04o}); ignoring",
+            dir.display(),
+            mode
+        ));
+    } else if (mode & 0o077) != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("failed to set permissions on {}: {e}", dir.display()))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_state_dir(_dir: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 /// Calculates the sha256 hex digest of raw bytes.
 pub fn content_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -110,6 +167,20 @@ impl TrustStore {
                 };
             }
         };
+
+        if let Some(parent) = path.parent()
+            && parent.exists()
+            && let Err(msg) = check_state_dir(parent)
+        {
+            return Self {
+                path: Some(path),
+                data: TrustStoreFile {
+                    version: 1,
+                    workspaces: BTreeMap::new(),
+                },
+                corrupt_warning: Some(msg),
+            };
+        }
 
         if !path.exists() {
             return Self {
@@ -248,6 +319,9 @@ impl TrustStore {
 
         if let Some(parent) = store_path.parent() {
             create_state_dir(parent)?;
+            if let Err(msg) = check_state_dir(parent) {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+            }
         }
         let json = serde_json::to_string_pretty(&self.data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -865,5 +939,93 @@ mod tests {
 
         let current_bytes = fs::read(store_file).unwrap();
         assert_eq!(recorded_bytes, current_bytes);
+    }
+
+    #[test]
+    fn tc_2240_escape_control_chars() {
+        let input = "a\x1b[31mb\r\0c\u{9b}d\u{202e}e";
+        let escaped = escape_control(input);
+        for c in escaped.chars() {
+            let u = c as u32;
+            let is_bidi_or_ls_ps = u == 0x2028
+                || u == 0x2029
+                || (0x202A..=0x202E).contains(&u)
+                || (0x2066..=0x2069).contains(&u);
+            assert!(
+                !c.is_control() && !is_bidi_or_ls_ps,
+                "found unescaped control/bidi char {c:?} in {escaped}"
+            );
+        }
+        assert!(escaped.contains(r"\u{1b}"));
+        assert!(escaped.contains(r"\u{9b}"));
+        assert_eq!(escape_control("abc/def"), "abc/def");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tc_2241_state_dir_0755_tightened_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir.clone()),
+            ..RuntimeEnv::default()
+        };
+
+        let mut store = TrustStore::load(&env);
+        assert!(store.corrupt_warning().is_none());
+        let ws = dir.path().join("ws");
+        store.trust(&ws, "deadbeef");
+        store.save().expect("save should succeed");
+
+        let mode = fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "save must tighten mode to 0700");
+
+        // chmod back to 0755, load, check mode 0700
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let store2 = TrustStore::load(&env);
+        assert!(store2.corrupt_warning().is_none());
+        let mode2 = fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode2, 0o700, "load must tighten mode to 0700");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tc_2242_group_writable_state_dir_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o775)).unwrap();
+
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir.clone()),
+            ..RuntimeEnv::default()
+        };
+
+        // load has corrupt_warning containing "group/world-writable"
+        let store = TrustStore::load(&env);
+        let warning = store.corrupt_warning().expect("should have warning");
+        assert!(
+            warning.contains("group/world-writable"),
+            "warning should mention group/world-writable, got: {warning}"
+        );
+
+        // save returns Err, no store file written
+        let mut store_to_save = TrustStore::load(&RuntimeEnv {
+            dmuxai_state_dir: None,
+            ..RuntimeEnv::default()
+        });
+        store_to_save.path = Some(state_dir.join("trusted-workspaces.json"));
+        let err = store_to_save.save().expect_err("save must fail");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        let store_file = state_dir.join("trusted-workspaces.json");
+        assert!(!store_file.exists(), "no store file should be written");
     }
 }
