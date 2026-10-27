@@ -2,6 +2,14 @@
 
 Release history is in [CHANGELOG.md](../CHANGELOG.md). Each item links its SPEC (the contract) and its GitHub issue (status). GitHub milestones: [v0.2.1](https://github.com/donggrri/dmuxai/milestone/1) (released), [v0.2.2](https://github.com/donggrri/dmuxai/milestone/2) (released).
 
+## v0.3.0 (release candidate, 2026-10-27)
+
+Source: Dongjin, 2026-10-27 12:47 KST ("release"). Everything merged to `main` since v0.2.2 (1ce1e97); see the `[0.3.0]` section in [CHANGELOG.md](../CHANGELOG.md). Held and not included: #222, #219, #197, #78, #79, #68.
+
+| # | Item | Kind | SPEC (IDs) | Issue | Status |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Release v0.3.0: CHANGELOG, version bump, release report, tag, verify the Linux asset | release | — | — | release PR `release-candidate-v0.3.0` -> `main`, waiting for Dongjin's OK on the release report; tag `v0.3.0` on its merge commit |
+
 ## v0.2.2 (released 2026-10-19)
 
 Source: Dongjin, 2026-10-18 09:42 KST; item 5 added by Dongjin 2026-10-19 00:00 KST.
