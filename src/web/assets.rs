@@ -2073,4 +2073,36 @@ mod tests {
             "SESSION_CSS must contain .sessions-group-new"
         );
     }
+
+    #[test]
+    fn tc_2310_quit_confirms_running_folders() {
+        assert!(
+            SESSION_JS.contains("Turns are still running in: "),
+            "SESSION_JS must contain Turns are still running in: "
+        );
+        assert!(
+            SESSION_JS.contains("Quitting stops them."),
+            "SESSION_JS must contain Quitting stops them."
+        );
+    }
+
+    #[test]
+    fn tc_2311_sidebar_close_folder() {
+        assert!(
+            SESSION_JS.contains("sessions-group-close"),
+            "SESSION_JS must contain sessions-group-close"
+        );
+        assert!(
+            SESSION_JS.contains("/close"),
+            "SESSION_JS must contain /close"
+        );
+        assert!(
+            SESSION_JS.contains("force: true"),
+            "SESSION_JS must contain force: true"
+        );
+        assert!(
+            SESSION_CSS.contains(".sessions-group-close"),
+            "SESSION_CSS must contain .sessions-group-close"
+        );
+    }
 }

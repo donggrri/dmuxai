@@ -22,6 +22,12 @@ pub struct OpenRequest {
     pub reply: tokio::sync::oneshot::Sender<Result<Arc<WorkspaceEntry>, OpenError>>,
 }
 
+/// Request sent to a closer channel to close a workspace in-process.
+pub struct CloseRequest {
+    pub id: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<(), OpenError>>,
+}
+
 /// Maximum number of workspaces that can be open simultaneously.
 pub const MAX_WORKSPACES: usize = 4;
 
@@ -64,6 +70,7 @@ struct Inner {
 pub struct WorkspaceDirectory {
     inner: RwLock<Inner>,
     opener: RwLock<Option<tokio::sync::mpsc::Sender<OpenRequest>>>,
+    closer: RwLock<Option<tokio::sync::mpsc::Sender<CloseRequest>>>,
 }
 
 impl WorkspaceDirectory {
@@ -84,6 +91,7 @@ impl WorkspaceDirectory {
                 focused: 0,
             }),
             opener: RwLock::new(None),
+            closer: RwLock::new(None),
         }
     }
 
@@ -97,6 +105,18 @@ impl WorkspaceDirectory {
     pub fn opener(&self) -> Option<tokio::sync::mpsc::Sender<OpenRequest>> {
         let opener = self.opener.read().unwrap_or_else(|e| e.into_inner());
         opener.clone()
+    }
+
+    /// Sets the closer sender for in-process workspace closing.
+    pub fn set_closer(&self, tx: tokio::sync::mpsc::Sender<CloseRequest>) {
+        let mut closer = self.closer.write().unwrap_or_else(|e| e.into_inner());
+        *closer = Some(tx);
+    }
+
+    /// Returns a clone of the closer sender, if set.
+    pub fn closer(&self) -> Option<tokio::sync::mpsc::Sender<CloseRequest>> {
+        let closer = self.closer.read().unwrap_or_else(|e| e.into_inner());
+        closer.clone()
     }
 
     /// Returns the currently focused workspace entry.
@@ -616,5 +636,35 @@ mod tests {
         }));
         let res = reply_rx.await.unwrap();
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn tc_2309_closer_roundtrip() {
+        let (hub, services) = (
+            DashboardHub::new(SnapshotSource::Tui, "/test".to_string()),
+            DashboardServices::default(),
+        );
+        let dir = WorkspaceDirectory::single(hub, services);
+        assert!(dir.closer().is_none());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CloseRequest>(4);
+        dir.set_closer(tx);
+        let closer = dir.closer();
+        assert!(closer.is_some());
+
+        let req_closer = closer.unwrap();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        req_closer
+            .send(CloseRequest {
+                id: "w2".to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        let received = rx.recv().await.expect("received close request");
+        assert_eq!(received.id, "w2");
+        let _ = received.reply.send(Ok(()));
+        assert!(reply_rx.await.unwrap().is_ok());
     }
 }

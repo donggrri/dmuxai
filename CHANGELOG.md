@@ -24,6 +24,10 @@ All notable changes to dmuxai are listed here. Versions follow
   groups that are open in this dashboard are marked, a spinner shows folders
   with a running turn, and a `+` button starts a new conversation in that
   folder.
+- **Close a folder and confirm Quit (FR-2309..2311).** `POST
+  /api/workspaces/{id}/close` stops one open folder (running folders need
+  `force`), the sidebar has a close button per open folder, and Quit lists the
+  folders whose turns it would stop.
 
 ### Changed
 

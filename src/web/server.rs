@@ -1922,6 +1922,79 @@ async fn post_workspace_switch(
     .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
 }
 
+#[derive(serde::Deserialize, Default)]
+struct CloseWorkspaceBody {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn post_workspace_close(
+    State(state): State<AppState>,
+    Ws(ws): Ws,
+    Path(id): Path<String>,
+    body: Option<Json<CloseWorkspaceBody>>,
+) -> Response {
+    if !ws.services.web_attached {
+        return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
+    }
+    let Some(entry) = state.workspaces.get(&id) else {
+        return error_json(StatusCode::NOT_FOUND, "no such open folder");
+    };
+    if id == "default" {
+        return error_json(StatusCode::CONFLICT, "the first folder closes with Quit");
+    }
+    let Some(closer) = state.workspaces.closer() else {
+        return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
+    };
+    let force = body.map(|Json(body)| body.force).unwrap_or(false);
+    if !force && crate::web::directory::snapshot_is_running(&entry.hub.snapshot()) {
+        return json_ok(
+            StatusCode::CONFLICT,
+            &serde_json::json!({
+                "error": "turns are running in this folder",
+                "running": true
+            }),
+        );
+    }
+    tokio::spawn(workspace_close_task(closer, id))
+        .await
+        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+}
+
+/// How long `POST /api/workspaces/{id}/close` waits for the App to stop.
+const CLOSE_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+
+async fn workspace_close_task(
+    closer: mpsc::Sender<crate::web::directory::CloseRequest>,
+    id: String,
+) -> Response {
+    let (reply, rx) = oneshot::channel();
+    if closer
+        .send(crate::web::directory::CloseRequest {
+            id: id.clone(),
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
+    }
+
+    match tokio::time::timeout(CLOSE_REPLY_TIMEOUT, rx).await {
+        Ok(Ok(Ok(()))) => json_ok(StatusCode::OK, &serde_json::json!({ "ok": true, "id": id })),
+        Ok(Ok(Err(e))) => {
+            let status =
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            error_json(status, &e.message)
+        }
+        Ok(Err(_)) => error_json(StatusCode::CONFLICT, "requires dmuxai --web"),
+        Err(_) => error_json(
+            StatusCode::GATEWAY_TIMEOUT,
+            "the folder did not close in time",
+        ),
+    }
+}
+
 async fn workspace_switch_in_process_task(
     workspaces: Arc<WorkspaceDirectory>,
     opener: tokio::sync::mpsc::Sender<crate::web::directory::OpenRequest>,
@@ -2113,6 +2186,7 @@ pub fn build_router_with_directory(
         .route("/assets/favicon-failed.svg", get(get_favicon_failed))
         .route("/api/state", get(get_state))
         .route("/api/workspaces", get(get_workspaces))
+        .route("/api/workspaces/{id}/close", post(post_workspace_close))
         .route("/api/workspace", get(get_workspace))
         .route("/api/workspace/dirs", get(get_workspace_dirs))
         .route("/api/workspace/validate", post(post_workspace_validate))
@@ -2259,7 +2333,9 @@ mod tests {
     use crate::todo::{Todo, TodoStore};
     use crate::web::auth::generate_token;
     use crate::web::commands::PromptAccepted;
-    use crate::web::snapshot::{GraphCounts, GraphView, NodeDetail, NodeView, SnapshotSource};
+    use crate::web::snapshot::{
+        AgentView, GraphCounts, GraphView, NodeDetail, NodeView, SnapshotSource,
+    };
 
     fn parse_sse_revisions(buf_str: &str) -> Vec<u64> {
         let mut revs = Vec::new();
@@ -7135,5 +7211,168 @@ mod tests {
         let body_str = read_body(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
         assert_eq!(v["error"], "too many open folders (max 4)");
+    }
+
+    #[tokio::test]
+    async fn tc_2309_close_folder() {
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/repo/project-a".to_string());
+        let dir = Arc::new(WorkspaceDirectory::single(
+            hub,
+            DashboardServices {
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        ));
+        dir.insert(crate::web::directory::WorkspaceEntry {
+            id: "w2".to_string(),
+            path: "/repo/project-b".to_string(),
+            hub: DashboardHub::new(SnapshotSource::Tui, "/repo/project-b".to_string()),
+            services: DashboardServices::default(),
+        })
+        .unwrap();
+
+        let (closer_tx, mut closer_rx) =
+            tokio::sync::mpsc::channel::<crate::web::directory::CloseRequest>(4);
+        dir.set_closer(closer_tx);
+        let dir_clone = dir.clone();
+        tokio::spawn(async move {
+            if let Some(req) = closer_rx.recv().await {
+                assert_eq!(req.id, "w2");
+                let _ = dir_clone.remove(&req.id);
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+
+        let token = "test-token-close-2309";
+        let router =
+            build_router_with_directory(dir.clone(), token.to_owned(), allowed_localhost());
+
+        let req = json_request(
+            "POST",
+            "/api/workspaces/w2/close",
+            token,
+            &serde_json::json!({ "force": false }).to_string(),
+        );
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["id"], "w2");
+
+        let list_req = axum::http::Request::builder()
+            .uri("/api/workspaces")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let list_resp = router.oneshot(list_req).await.unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_body = read_body(list_resp).await;
+        let list_v: serde_json::Value = serde_json::from_str(&list_body).unwrap();
+        let list = list_v["workspaces"].as_array().unwrap();
+        assert!(list.iter().all(|e| e["id"] != "w2"));
+    }
+
+    #[tokio::test]
+    async fn tc_2310_close_running_folder_needs_force() {
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/repo/project-a".to_string());
+        let dir = Arc::new(WorkspaceDirectory::single(
+            hub,
+            DashboardServices {
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        ));
+        let hub2 = DashboardHub::new(SnapshotSource::Tui, "/repo/project-b".to_string());
+        hub2.publish(
+            vec![AgentView {
+                id: "codex".to_string(),
+                label: "Codex".to_string(),
+                busy: true,
+                phase: None,
+                model: None,
+                color: None,
+                run: None,
+                activity: None,
+            }],
+            None,
+            None,
+        );
+        dir.insert(crate::web::directory::WorkspaceEntry {
+            id: "w2".to_string(),
+            path: "/repo/project-b".to_string(),
+            hub: hub2,
+            services: DashboardServices::default(),
+        })
+        .unwrap();
+
+        let (closer_tx, mut closer_rx) =
+            tokio::sync::mpsc::channel::<crate::web::directory::CloseRequest>(4);
+        dir.set_closer(closer_tx);
+
+        let token = "test-token-close-2310";
+        let router =
+            build_router_with_directory(dir.clone(), token.to_owned(), allowed_localhost());
+
+        let req = json_request(
+            "POST",
+            "/api/workspaces/w2/close",
+            token,
+            &serde_json::json!({}).to_string(),
+        );
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body_str = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(v["error"], "turns are running in this folder");
+        assert_eq!(v["running"], true);
+        assert!(closer_rx.try_recv().is_err());
+
+        tokio::spawn(async move {
+            if let Some(req) = closer_rx.recv().await {
+                assert_eq!(req.id, "w2");
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+
+        let req = json_request(
+            "POST",
+            "/api/workspaces/w2/close",
+            token,
+            &serde_json::json!({ "force": true }).to_string(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["id"], "w2");
+    }
+
+    #[tokio::test]
+    async fn tc_2309_close_default_refused() {
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/repo/project-a".to_string());
+        let dir = Arc::new(WorkspaceDirectory::single(
+            hub,
+            DashboardServices {
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        ));
+        let token = "test-token-close-default";
+        let router = build_router_with_directory(dir, token.to_owned(), allowed_localhost());
+
+        let req = json_request(
+            "POST",
+            "/api/workspaces/default/close",
+            token,
+            &serde_json::json!({}).to_string(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body_str = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(v["error"], "the first folder closes with Quit");
     }
 }

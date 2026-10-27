@@ -226,5 +226,7 @@ button.chat-aux-head:focus-visible, .chat-aux-step-btn:focus-visible { outline: 
 .sessions-group-new { margin-left: auto; padding: 0 6px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); font: inherit; font-size: .8rem; line-height: 1.2; cursor: pointer; }
 .sessions-group-new:hover:not(:disabled) { background: var(--bg-chip); color: var(--text); }
 .sessions-group-new:disabled { opacity: .45; cursor: not-allowed; }
+.sessions-group-close { margin-left: 4px; padding: 0 6px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); font: inherit; font-size: .8rem; line-height: 1.2; cursor: pointer; }
+.sessions-group-close:hover:not(:disabled) { background: var(--bg-chip); color: var(--text); }
 .sessions-group-state { margin-left: 6px; color: var(--muted); font-size: .75rem; }
 .sessions-group-running .spinner { display: inline-block; width: .7rem; height: .7rem; margin-left: 6px; border: 2px solid var(--muted); border-top-color: var(--accent); border-radius: 50%; animation: session-picker-spin .8s linear infinite; vertical-align: middle; }
