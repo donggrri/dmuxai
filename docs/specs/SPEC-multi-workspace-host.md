@@ -68,6 +68,8 @@ This spec is delivered in stacked pull requests; each one adds its rows here.
 | FR-2304 | Must | Switch to a folder that is already open | Only focus changes; `opened:false`; no new runtime | — | TC-2304 |
 | FR-2305 | Must | Opening fails | The host's status and message are returned, e.g. `409 too many open folders (max 4); close one first`, `400` for an unwritable folder | Timeout: `504 the folder did not open in time` | TC-2305 |
 | FR-2306 | Must | The dashboard receives an in-process switch result | It optionally loads the requested conversation (`load_conversation`) or starts one (`new_conversation`) in the target folder, then navigates the tab to `?ws=<id>` (no `ws` for `default`) | A `202` result keeps the poll-and-reload flow | TC-2306 |
+| FR-2307 | Must | The Sessions sidebar shows folder groups and `GET /api/workspaces` lists open folders (refreshed every 5 s) | Groups of open folders are marked `open`; a folder whose `running` is true shows a spinner labelled "running in this folder" | Older servers without `/api/workspaces`: groups render as before | TC-2307 |
+| FR-2308 | Must | A folder group in the sidebar | A `+` button starts a new conversation in that folder through the in-process switch (`newConversation: true`) | Re-exec fallback (202) keeps the old reload flow | TC-2308 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -80,6 +82,8 @@ This spec is delivered in stacked pull requests; each one adds its rows here.
 | TC-2304 | FR-2304 | integration | Folder already in the directory | POST switch to it | 200 `opened:false`; opener receives nothing | `src/web/server.rs` `tc_2304_switch_to_open_folder_only_focuses` |
 | TC-2305 | FR-2305 | integration | Opener replies `409 too many open folders (max 4)` | POST switch | 409 with that text | `src/web/server.rs` `tc_2305_switch_reports_open_error` |
 | TC-2306 | FR-2306 | unit (static asset) | Embedded `workspace.js` / `session.js` | Inspect the switch handler | Handles `in_process`, sets `ws` via `searchParams`, posts through `dmuxaiApiUrlFor`; sidebar passes `conversation: c.id` | `src/web/assets.rs` `tc_2306_switch_in_process_navigates` |
+| TC-2307 | FR-2307 | unit (static asset) | Embedded `session.js` | Inspect the sidebar renderer | Reads `/api/workspaces`; adds `sessions-group-open` / `sessions-group-running` and the spinner label | `src/web/assets.rs` `tc_2307_sidebar_marks_open_and_running_folders` |
+| TC-2308 | FR-2308 | unit (static asset) | Embedded `session.js` / `session.css` | Inspect the folder group header | `sessions-group-new` button calls the switch with `newConversation: true`; CSS rule exists | `src/web/assets.rs` `tc_2308_sidebar_new_in_folder` |
 
 ## 6. Data, integration, and safety contracts
 

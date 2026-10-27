@@ -20,6 +20,10 @@ All notable changes to dmuxai are listed here. Versions follow
   same process (up to 4 folders) instead of restarting dmuxai, so it is no longer
   refused while a turn or graph runs elsewhere. Switching to an open folder only
   focuses it; the tab follows with `?ws=<id>`.
+- **Open and running folders in the sidebar (FR-2307, FR-2308).** Folder
+  groups that are open in this dashboard are marked, a spinner shows folders
+  with a running turn, and a `+` button starts a new conversation in that
+  folder.
 
 ### Changed
 
