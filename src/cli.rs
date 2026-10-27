@@ -50,6 +50,13 @@ pub enum AgentCommand {
         workspace: bool,
         force: bool,
     },
+    /// `trust [--status] [--json] [--revoke] [--yes]`.
+    Trust {
+        status: bool,
+        json: bool,
+        revoke: bool,
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -64,10 +71,11 @@ pub struct RunOptions {
     pub json: bool,
     pub model: Option<String>,
     pub progress: bool,
+    pub trust_workspace_config: bool,
 }
 
 /// First arguments that select an agent-facing subcommand.
-pub const SUBCOMMANDS: [&str; 6] = ["run", "todo", "status", "events", "mcp", "init"];
+pub const SUBCOMMANDS: [&str; 7] = ["run", "todo", "status", "events", "mcp", "init", "trust"];
 
 /// Table-driven flag specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +200,11 @@ const RUN_FLAGS: &[FlagSpec] = &[
         takes_value: false,
         hidden: false,
     },
+    FlagSpec {
+        names: &["--trust-workspace-config"],
+        takes_value: false,
+        hidden: false,
+    },
 ];
 
 /// Parses run-style flags; positional words become the prompt.
@@ -224,6 +237,7 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
         json: parsed.flags.contains_key("--json"),
         model: parsed.flags.get("--model").cloned().flatten(),
         progress: parsed.flags.contains_key("--progress"),
+        trust_workspace_config: parsed.flags.contains_key("--trust-workspace-config"),
     };
     if options.graph && options.agent.is_some() {
         return Err("use either --agent or --graph, not both".to_owned());
@@ -403,6 +417,37 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
                 force: parsed.flags.contains_key("--force"),
             })
         }
+        "trust" => {
+            const TRUST_FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--status"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--revoke"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--yes"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, TRUST_FLAGS, false)?;
+            Ok(AgentCommand::Trust {
+                status: parsed.flags.contains_key("--status"),
+                json: parsed.flags.contains_key("--json"),
+                revoke: parsed.flags.contains_key("--revoke"),
+                yes: parsed.flags.contains_key("--yes"),
+            })
+        }
         other => Err(format!("unknown subcommand '{other}'")),
     }
 }
@@ -524,6 +569,12 @@ pub async fn execute(command: AgentCommand) -> i32 {
             exit::OK
         }
         AgentCommand::Init { workspace, force } => init_config(&workspace_root, workspace, force),
+        AgentCommand::Trust {
+            status,
+            json,
+            revoke,
+            yes,
+        } => trust_workspace(&workspace_root, status, json, revoke, yes),
         AgentCommand::Mcp => {
             let backend = CliMcpBackend {
                 workspace_root: workspace_root.clone(),
@@ -737,7 +788,11 @@ async fn run_headless(
 ) -> Result<(HeadlessOutcome, u64, u64), ApiError> {
     let internal = |e: &dyn std::fmt::Display| ApiError::new(exit::INTERNAL, e.to_string());
     dmuxai::workspace::ensure_directory_writable(workspace_root).map_err(|e| internal(&e))?;
-    let settings = DmuxSettings::load(workspace_root);
+    let mut env = dmuxai::runtime_env::RuntimeEnv::from_process();
+    if options.trust_workspace_config {
+        env.trust_workspace_config = true;
+    }
+    let settings = DmuxSettings::load_with_env(workspace_root, &env);
     for warning in &settings.config_warnings {
         eprintln!("warning: {warning}");
     }
@@ -970,6 +1025,180 @@ async fn wait_for_stop_signal() {
     }
 }
 
+fn trust_workspace(
+    workspace_root: &Path,
+    status: bool,
+    json: bool,
+    revoke: bool,
+    yes: bool,
+) -> i32 {
+    use dmuxai::runtime_env::RuntimeEnv;
+    use dmuxai::workspace_trust::TrustStore;
+    use std::io::{IsTerminal, Write};
+
+    let env = RuntimeEnv::from_process();
+
+    if revoke {
+        let mut store = TrustStore::load(&env);
+        if store.path().is_none() {
+            eprintln!(
+                "error: trust store path could not be resolved (neither DMUXAI_STATE_DIR, XDG_STATE_HOME, nor HOME is set)"
+            );
+            return dmuxai::agent_api::exit::FAILED;
+        }
+        let warning = store.corrupt_warning().map(str::to_owned);
+        if !json && let Some(warning) = &warning {
+            eprintln!(
+                "warning: {}",
+                dmuxai::workspace_trust::escape_control(warning)
+            );
+        }
+        let removed = store.revoke(workspace_root);
+        if let Err(error) = store.save() {
+            eprintln!("error: {error}");
+            return dmuxai::agent_api::exit::INTERNAL;
+        }
+        if json {
+            let mut value = serde_json::json!({
+                "status": "revoked",
+                "removed": removed,
+            });
+            if let Some(warning) = &warning {
+                value["warning"] = serde_json::json!(warning);
+            }
+            print_json(&value);
+        } else if removed {
+            println!("revoked");
+        } else {
+            println!("not recorded");
+        }
+        return dmuxai::agent_api::exit::OK;
+    }
+
+    let (exists, sha, restricted, details) =
+        dmuxai::settings::inspect_workspace_trust_full(workspace_root, &env);
+
+    if !exists {
+        if status {
+            if json {
+                print_json(&serde_json::json!({"status": "no_workspace_config"}));
+            } else {
+                println!("no workspace config");
+            }
+        } else {
+            println!("no workspace config");
+        }
+        return dmuxai::agent_api::exit::OK;
+    }
+
+    if restricted.is_empty() {
+        if status {
+            if json {
+                print_json(&serde_json::json!({"status": "not_needed"}));
+            } else {
+                println!("not needed");
+            }
+        } else {
+            println!("not needed");
+        }
+        return dmuxai::agent_api::exit::OK;
+    }
+
+    let mut store = TrustStore::load(&env);
+    let warning = store.corrupt_warning().map(str::to_owned);
+    if !(status && json)
+        && let Some(warning) = &warning
+    {
+        eprintln!(
+            "warning: {}",
+            dmuxai::workspace_trust::escape_control(warning)
+        );
+    }
+    let already = store.is_trusted(workspace_root, &sha);
+
+    if status {
+        let state = if already { "trusted" } else { "untrusted" };
+        if json {
+            let details_json: Vec<serde_json::Value> = details
+                .iter()
+                .map(|(k, v)| serde_json::json!({ "key": k, "value": v }))
+                .collect();
+            let mut value = serde_json::json!({
+                "status": state,
+                "sha256": sha,
+                "ignored": restricted,
+                "details": details_json,
+            });
+            if let Some(warning) = &warning {
+                value["warning"] = serde_json::json!(warning);
+            }
+            print_json(&value);
+        } else {
+            println!("{state}");
+        }
+        return dmuxai::agent_api::exit::OK;
+    }
+
+    println!(
+        "workspace: {}",
+        dmuxai::workspace_trust::escape_control(&workspace_root.display().to_string())
+    );
+    println!("sha256: {sha}");
+    println!(
+        "restricted keys: {}",
+        dmuxai::workspace_trust::escape_control(&restricted.join(", "))
+    );
+    if !details.is_empty() {
+        println!("restricted values:");
+        for (k, v) in &details {
+            println!("  {k} = {v}");
+        }
+    }
+
+    if already {
+        println!("already trusted");
+        return dmuxai::agent_api::exit::OK;
+    }
+
+    let should_trust = if yes {
+        true
+    } else if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        eprint!("Trust this workspace config? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(_) => {
+                let answer = line.trim().to_ascii_lowercase();
+                answer == "y" || answer == "yes"
+            }
+            Err(_) => false,
+        }
+    } else {
+        eprintln!("not a TTY; pass --yes to trust");
+        return dmuxai::agent_api::exit::FAILED;
+    };
+
+    if !should_trust {
+        eprintln!("not trusted");
+        return dmuxai::agent_api::exit::FAILED;
+    }
+
+    if store.path().is_none() {
+        eprintln!(
+            "error: trust store path could not be resolved (neither DMUXAI_STATE_DIR, XDG_STATE_HOME, nor HOME is set)"
+        );
+        return dmuxai::agent_api::exit::FAILED;
+    }
+
+    store.trust(workspace_root, &sha);
+    if let Err(error) = store.save() {
+        eprintln!("error: {error}");
+        return dmuxai::agent_api::exit::INTERNAL;
+    }
+    println!("trusted");
+    dmuxai::agent_api::exit::OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,6 +1225,7 @@ mod tests {
                 json: true,
                 model: None,
                 progress: false,
+                trust_workspace_config: false,
             }))
         );
         assert!(parse(&args(&["run", "x", "--mode", "ask"])).is_err());
@@ -1167,6 +1397,7 @@ mod tests {
                 json: true,
                 model: Some("gemini-3.8-flash-high".into()),
                 progress: false,
+                trust_workspace_config: false,
             }))
         );
         assert!(parse(&args(&["run", "x", "--agent", "agy", "--model"])).is_err());
@@ -1236,6 +1467,7 @@ mod tests {
                 json: true,
                 model: Some("m".into()),
                 progress: true,
+                trust_workspace_config: false,
             }))
         );
         assert_eq!(

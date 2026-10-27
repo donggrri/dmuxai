@@ -298,7 +298,8 @@ fn mcp_memory_reports_disabled_memory() {
         .arg(workspace.path())
         .env("HOME", empty_home.path())
         .env("XDG_CONFIG_HOME", empty_home.path())
-        .env("USERPROFILE", empty_home.path());
+        .env("USERPROFILE", empty_home.path())
+        .env("DMUXAI_TRUST_WORKSPACE_CONFIG", "1");
 
     let requests = vec![
         encode(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})),
@@ -431,7 +432,8 @@ fn mcp_memory_applies_project_override_to_settings() {
         .arg("override")
         .env("HOME", empty_home.path())
         .env("XDG_CONFIG_HOME", empty_home.path())
-        .env("USERPROFILE", empty_home.path());
+        .env("USERPROFILE", empty_home.path())
+        .env("DMUXAI_TRUST_WORKSPACE_CONFIG", "1");
 
     let requests = vec![encode(json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -467,7 +469,8 @@ fn mcp_memory_warns_when_project_given_without_memory() {
         .arg("demo")
         .env("HOME", empty_home.path())
         .env("XDG_CONFIG_HOME", empty_home.path())
-        .env("USERPROFILE", empty_home.path());
+        .env("USERPROFILE", empty_home.path())
+        .env("DMUXAI_TRUST_WORKSPACE_CONFIG", "1");
 
     let requests = vec![encode(json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))];
     let (responses, stderr) = exchange_with_stderr(command, &requests);

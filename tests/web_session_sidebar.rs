@@ -76,10 +76,12 @@ prompt_via = "arg"
 
     let bin = env!("CARGO_BIN_EXE_dmuxai");
     for prompt in ["First seeded session", "Second seeded session"] {
+        // The workspace dmuxai.toml defines a custom agent; opt in to workspace config trust.
         let status = Command::new(bin)
             .args(["run", prompt, "--agent", "fake"])
             .current_dir(workspace.path())
             .env("HOME", home.path())
+            .env("DMUXAI_TRUST_WORKSPACE_CONFIG", "1")
             .env_remove("DMUXAI_WORKSPACE")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -273,6 +275,7 @@ print(json.dumps(out))
         .arg(port.to_string())
         .arg(token)
         .arg(&screenshot_file)
+        .env("DMUXAI_TRUST_WORKSPACE_CONFIG", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()

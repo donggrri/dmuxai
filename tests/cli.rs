@@ -229,6 +229,7 @@ mod plan_gate {
                 .env("XDG_CONFIG_HOME", self.root.join("cfg"))
                 .env("APPDATA", self.root.join("cfg"))
                 .env("HOME", self.root.join("home"))
+                .env("DMUXAI_TRUST_WORKSPACE_CONFIG", "1")
                 .env_remove("DMUXAI_WEB_TOKEN")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())

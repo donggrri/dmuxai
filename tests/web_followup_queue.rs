@@ -177,6 +177,7 @@ async fn followups_queue_in_order_and_survive_stop_in_headless_chrome() {
             web_attached: true,
             memory: None,
             docs: None,
+            trust_env: None,
         },
     };
     let server = start_server(config, hub.clone())

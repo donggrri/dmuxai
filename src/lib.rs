@@ -31,3 +31,4 @@ pub mod todo;
 pub mod ui_png;
 pub mod web;
 pub mod workspace;
+pub mod workspace_trust;

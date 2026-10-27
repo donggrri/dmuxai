@@ -29,6 +29,7 @@ use dmuxai::web::{
     DEFAULT_PORT, DashboardHub, DashboardServer, DashboardServices, FileGraphSource, ServerConfig,
     SnapshotSource, check_bind, generate_token, start_server,
 };
+use dmuxai::workspace_trust::escape_control;
 use ratatui::{Terminal, backend::CrosstermBackend};
 #[cfg(unix)]
 use tokio::signal::unix::SignalKind;
@@ -87,10 +88,11 @@ Usage:
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
-  dmuxai run <prompt|-> [--agent ID] [--model M] [--approve-plan] [--allow-sensitive] [--graph] [--progress] [--json]
+  dmuxai run <prompt|-> [--agent ID] [--model M] [--approve-plan] [--allow-sensitive] [--graph] [--progress] [--json] [--trust-workspace-config]
+  dmuxai todo run <id> [--agent ID | --graph] [--model M] [--progress] [--json] [--trust-workspace-config]
+  dmuxai trust [--status] [--json] [--revoke] [--yes]
   dmuxai todo add <title> [--body TEXT] [--json]
   dmuxai todo list [--status open|running|done] [--json]
-  dmuxai todo run <id> [--agent ID | --graph] [--model M] [--progress] [--json]
   dmuxai status [--json]
   dmuxai events [--since N] [--limit N] [--follow] [--json]
   dmuxai mcp
@@ -481,6 +483,66 @@ fn seed_hub_todos(hub: &DashboardHub, store: &TodoStore) {
     }
 }
 
+/// Load settings, offering to trust an untrusted workspace config on an
+/// interactive terminal (plain `dmuxai`, `serve`, `--web`).
+fn load_settings_with_trust_prompt(workspace_root: &Path) -> DmuxSettings {
+    use dmuxai::runtime_env::RuntimeEnv;
+    use std::io::{IsTerminal, Write};
+
+    let env = RuntimeEnv::from_process();
+    let mut settings = DmuxSettings::load_with_env(workspace_root, &env);
+    if let dmuxai::workspace_trust::WorkspaceTrustStatus::Untrusted { .. } =
+        settings.workspace_trust.clone()
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal()
+    {
+        let (_, sha256, ignored, details) =
+            dmuxai::settings::inspect_workspace_trust_full(workspace_root, &env);
+        let config_path = workspace_root.join("dmuxai.toml");
+        let short_sha = &sha256[..sha256.len().min(12)];
+        eprintln!(
+            "workspace config: {}",
+            escape_control(&config_path.display().to_string())
+        );
+        eprintln!("sha256: {short_sha}");
+        eprintln!("ignored: {}", escape_control(&ignored.join(", ")));
+        if !details.is_empty() {
+            eprintln!("restricted values:");
+            for (k, v) in &details {
+                eprintln!("  {k} = {v}");
+            }
+        }
+        eprint!("Trust this workspace config? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        let answer = if std::io::stdin().read_line(&mut line).is_ok() {
+            let a = line.trim().to_ascii_lowercase();
+            a == "y" || a == "yes"
+        } else {
+            false
+        };
+        if answer {
+            let mut store = dmuxai::workspace_trust::TrustStore::load(&env);
+            if let Some(warning) = store.corrupt_warning() {
+                eprintln!("warning: {}", escape_control(warning));
+            }
+            store.trust(workspace_root, &sha256);
+            match store.save() {
+                Ok(()) => {
+                    settings = DmuxSettings::load_with_env(workspace_root, &env);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "error: could not save workspace trust: {}",
+                        escape_control(&error.to_string())
+                    );
+                }
+            }
+        }
+    }
+    settings
+}
+
 /// `dmuxai serve`: read-only dashboard over persisted graph runs (FR-520, FR-524).
 async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
     let workspace_root = match dmuxai::workspace::resolve_workspace_root() {
@@ -499,7 +561,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         std::process::exit(2);
     }
 
-    let settings = DmuxSettings::load(&workspace_root);
+    let settings = load_settings_with_trust_prompt(&workspace_root);
     let memory = settings
         .memory
         .as_ref()
@@ -542,6 +604,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 memory: memory.clone(),
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
+                trust_env: None,
             }
         }
         Err(error) => {
@@ -555,6 +618,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 // The event log is independent of the to-do database (FR-766).
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
+                trust_env: None,
             }
         }
     };
@@ -671,7 +735,7 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     };
     dmuxai::workspace::ensure_directory_writable(&workspace_root)?;
     let _ = dmuxai::workspace::record_recent_workspace(&workspace_root);
-    let settings = DmuxSettings::load(&workspace_root);
+    let settings = load_settings_with_trust_prompt(&workspace_root);
     let startup_warning = dmuxai::workspace::normalize_workspace_path(&workspace_root)
         .ok()
         .and_then(|normalized| dmuxai::workspace::wsl_mnt_warning(&normalized));
@@ -988,6 +1052,29 @@ mod tests {
     #[test]
     fn tc_1664_help_documents_allow_sensitive() {
         assert!(USAGE.contains("--allow-sensitive"));
+    }
+
+    // The usage block lists each command once; `todo run` keeps the trust flag.
+    #[test]
+    fn tc_2213_usage_lists_todo_run_and_trust_once() {
+        let todo_run: Vec<&str> = USAGE
+            .lines()
+            .filter(|line| line.contains("dmuxai todo run "))
+            .collect();
+        assert_eq!(
+            todo_run,
+            vec![
+                "  dmuxai todo run <id> [--agent ID | --graph] [--model M] [--progress] [--json] [--trust-workspace-config]",
+            ]
+        );
+        let trust: Vec<&str> = USAGE
+            .lines()
+            .filter(|line| line.trim_start().starts_with("dmuxai trust"))
+            .collect();
+        assert_eq!(
+            trust,
+            vec!["  dmuxai trust [--status] [--json] [--revoke] [--yes]"]
+        );
     }
 
     #[test]
