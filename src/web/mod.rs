@@ -8,6 +8,7 @@ pub mod attachments_api;
 mod auth;
 pub mod chat_markdown;
 pub mod commands;
+pub mod directory;
 pub mod discovery;
 pub mod docs_api;
 mod file_source;
