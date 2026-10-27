@@ -174,6 +174,48 @@ impl WorkspaceDirectory {
         }
         Ok(removed)
     }
+
+    /// Resolves a workspace entry based on an optional URL query string.
+    ///
+    /// Parses the query string for `ws=<id>`. If present and non-empty, looks up
+    /// that workspace entry by id (returning `None` if unknown). Otherwise,
+    /// returns the currently focused workspace entry (`Some(self.focused())`).
+    pub fn resolve(&self, query: Option<&str>) -> Option<Arc<WorkspaceEntry>> {
+        if let Some(q) = query {
+            for part in q.split('&') {
+                if let Some((k, v)) = part.split_once('=')
+                    && k == "ws"
+                    && !v.is_empty()
+                {
+                    return self.get(v);
+                }
+            }
+        }
+        Some(self.focused())
+    }
+}
+
+/// Computes whether a workspace is currently running active tasks or turns.
+pub fn snapshot_is_running(snapshot: &crate::web::snapshot::DashboardSnapshot) -> bool {
+    if snapshot.agents.iter().any(|a| a.busy) {
+        return true;
+    }
+    if let Some(turn) = &snapshot.turn {
+        match turn.state.as_str() {
+            "idle" | "done" | "failed" | "cancelled" => {}
+            _ => return true,
+        }
+    }
+    if let Some(graph) = &snapshot.graph {
+        match graph.phase {
+            crate::graph::GraphRunPhase::Completed
+            | crate::graph::GraphRunPhase::Failed
+            | crate::graph::GraphRunPhase::Cancelled
+            | crate::graph::GraphRunPhase::Rejected => {}
+            _ => return true,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -344,5 +386,173 @@ mod tests {
             Some("w2".to_string())
         );
         assert!(dir.find_by_path("/repo/other").is_none());
+    }
+
+    #[test]
+    fn tc_2300_resolve_ws_query() {
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/w1".to_string());
+        let dir = WorkspaceDirectory::single(hub, DashboardServices::default());
+        dir.insert(make_entry("w2", "/w2")).unwrap();
+
+        // no ws -> focused ("default")
+        assert_eq!(dir.resolve(None).unwrap().id, "default");
+        assert_eq!(dir.resolve(Some("")).unwrap().id, "default");
+        assert_eq!(dir.resolve(Some("foo=bar")).unwrap().id, "default");
+
+        // ws=default -> default
+        assert_eq!(dir.resolve(Some("ws=default")).unwrap().id, "default");
+        assert_eq!(
+            dir.resolve(Some("foo=1&ws=default&bar=2")).unwrap().id,
+            "default"
+        );
+
+        // ws=w2 -> w2
+        assert_eq!(dir.resolve(Some("ws=w2")).unwrap().id, "w2");
+
+        // ws=nope -> None
+        assert!(dir.resolve(Some("ws=nope")).is_none());
+        assert!(dir.resolve(Some("foo=1&ws=nope")).is_none());
+
+        // empty ws -> focused
+        assert_eq!(dir.resolve(Some("ws=")).unwrap().id, "default");
+
+        // change focused to w2, then no ws -> w2
+        dir.set_focused("w2");
+        assert_eq!(dir.resolve(None).unwrap().id, "w2");
+        assert_eq!(dir.resolve(Some("other=param")).unwrap().id, "w2");
+    }
+
+    #[test]
+    fn tc_2301_snapshot_is_running() {
+        use crate::graph::GraphRunPhase;
+        use crate::web::snapshot::{AgentView, DashboardSnapshot, GraphView, TurnView};
+
+        let mut snapshot = DashboardSnapshot {
+            schema: "test".to_string(),
+            revision: 1,
+            generated_at_ms: 1000,
+            sent_at_ms: 1000,
+            source: SnapshotSource::Tui,
+            workspace: "/tmp".to_string(),
+            ui: None,
+            agents: vec![],
+            graph: None,
+            todos: vec![],
+            jira_base_url: None,
+            session: None,
+            turn: None,
+        };
+
+        // All empty/idle -> not running
+        assert!(!snapshot_is_running(&snapshot));
+
+        // Agent busy -> running
+        snapshot.agents.push(AgentView {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            busy: true,
+            phase: None,
+            model: None,
+            color: None,
+            run: None,
+            activity: None,
+        });
+        assert!(snapshot_is_running(&snapshot));
+        snapshot.agents[0].busy = false;
+        assert!(!snapshot_is_running(&snapshot));
+
+        // Turn in finished states -> not running
+        for state in ["idle", "done", "failed", "cancelled"] {
+            snapshot.turn = Some(TurnView {
+                state: state.to_string(),
+                conversation_id: "c1".to_string(),
+                graph_id: None,
+                since_ms: 1000,
+            });
+            assert!(
+                !snapshot_is_running(&snapshot),
+                "state {state} should not be running"
+            );
+        }
+
+        // Turn in non-finished states -> running
+        for state in [
+            "running",
+            "pending",
+            "started",
+            "awaiting_approval",
+            "needs_input",
+        ] {
+            snapshot.turn = Some(TurnView {
+                state: state.to_string(),
+                conversation_id: "c1".to_string(),
+                graph_id: None,
+                since_ms: 1000,
+            });
+            assert!(
+                snapshot_is_running(&snapshot),
+                "state {state} should be running"
+            );
+        }
+        snapshot.turn = None;
+
+        // Graph in finished phases -> not running
+        let make_graph_view = |phase| GraphView {
+            id: "g1".to_string(),
+            phase,
+            orchestrator_model: "m1".to_string(),
+            user_prompt: "p1".to_string(),
+            current_nodes: vec![],
+            waiting_gate_node: None,
+            counts: crate::web::snapshot::GraphCounts {
+                pending: 0,
+                ready: 0,
+                running: 0,
+                waiting_gate: 0,
+                completed: 0,
+                failed: 0,
+                skipped: 0,
+            },
+            layers: 0,
+            nodes: vec![],
+            edges: vec![],
+            triage: None,
+            approval: None,
+            plan_history: vec![],
+            tasks: vec![],
+            planner_calls: Default::default(),
+            planner_io: vec![],
+            turns: vec![],
+            earlier_turns: 0,
+            follow_up: vec![],
+        };
+
+        for phase in [
+            GraphRunPhase::Completed,
+            GraphRunPhase::Failed,
+            GraphRunPhase::Cancelled,
+            GraphRunPhase::Rejected,
+        ] {
+            snapshot.graph = Some(make_graph_view(phase));
+            assert!(
+                !snapshot_is_running(&snapshot),
+                "phase {phase:?} should not be running"
+            );
+        }
+
+        // Graph in non-finished phases -> running
+        for phase in [
+            GraphRunPhase::Active,
+            GraphRunPhase::WaitingGate,
+            GraphRunPhase::Triage,
+            GraphRunPhase::Planning,
+            GraphRunPhase::AwaitingApproval,
+        ] {
+            snapshot.graph = Some(make_graph_view(phase));
+            assert!(
+                snapshot_is_running(&snapshot),
+                "phase {phase:?} should be running"
+            );
+        }
     }
 }

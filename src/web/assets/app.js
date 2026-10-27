@@ -1,10 +1,33 @@
 'use strict';
 
-// Single place that maps dashboard API paths to URLs; currently identity.
-function apiUrl(path) {
+// Single place that maps dashboard API paths to URLs; appends the page's folder when set.
+var pageWs = (function () {
+  try {
+    var raw = new URLSearchParams(window.location.search).get('ws');
+    if (typeof raw === 'string' && raw.length > 0 && /^[A-Za-z0-9_-]+$/.test(raw)) {
+      return raw;
+    }
+  } catch (err) { /* ignore */ }
+  return null;
+})();
+
+function appendWs(path, wsId) {
+  if (typeof wsId === 'string' && wsId.length > 0 && /^[A-Za-z0-9_-]+$/.test(wsId)) {
+    return path + (path.indexOf('?') >= 0 ? '&' : '?') + 'ws=' + encodeURIComponent(wsId);
+  }
   return path;
 }
+
+function apiUrl(path) {
+  return appendWs(path, pageWs);
+}
 window.dmuxaiApiUrl = apiUrl;
+window.dmuxaiApiUrlFor = function (ws, path) {
+  return appendWs(path, ws);
+};
+window.dmuxaiWorkspaceId = function () {
+  return pageWs || '';
+};
 
 var TICK_MS = 1000;
 var POLL_INITIAL_MS = 2000;
@@ -4216,7 +4239,7 @@ function startSse() {
   sseFailures = 0;
   setConn('connecting', 'connecting');
   try {
-    sse = new EventSource(apiUrl('/api/events') + '?token=' + encodeURIComponent(token));
+    sse = new EventSource(apiUrl('/api/events?token=' + encodeURIComponent(token)));
   } catch (err) {
     showMsg('dashboard: SSE unavailable, falling back to polling', true);
     startPolling();

@@ -1984,4 +1984,33 @@ mod tests {
             "session gate banner render must not use innerHTML"
         );
     }
+
+    #[test]
+    fn tc_2302_api_url_carries_ws() {
+        assert!(
+            APP_JS.contains("dmuxaiApiUrlFor"),
+            "APP_JS must contain dmuxaiApiUrlFor"
+        );
+        assert!(
+            APP_JS.contains("get('ws')"),
+            "APP_JS must contain get('ws')"
+        );
+
+        let assets = [
+            ("APP_JS", APP_JS),
+            ("DOCS_JS", DOCS_JS),
+            ("SESSION_JS", SESSION_JS),
+            ("WORKSPACE_JS", WORKSPACE_JS),
+            ("SKILLS_JS", SKILLS_JS),
+            ("AGENT_PROMPTS_JS", AGENT_PROMPTS_JS),
+            ("MEMORY_JS", MEMORY_JS),
+        ];
+
+        for (name, content) in assets {
+            assert!(
+                !content.contains("apiUrl('/api/events') +"),
+                "{name} must not contain apiUrl('/api/events') +"
+            );
+        }
+    }
 }
