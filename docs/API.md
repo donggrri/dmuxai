@@ -46,7 +46,10 @@ Notes:
   (see [SPEC-acp-runners](specs/SPEC-acp-runners.md) FR-1318). `--` ends flag parsing
   (`dmuxai run -- --literal prompt`).
 - Without `--agent`, headless `run` uses the same judge → plan path as the TUI.
-  Exit `7` means plan approval (`--approve-plan`) or a sensitive gate. Use
+  Exit `7` means plan approval (`--approve-plan`), a sensitive gate, or an agent
+  that stopped at its own plan review without editing files. The plan-review case
+  needs an explicit approval request together with a plan statement in the
+  reply, so an ordinary answer that only mentions a plan still exits `0`. Use
   `--allow-sensitive`, or `--agent` with `--approve-plan` on a one-step run, to
   confirm sensitive gates headlessly. JSON includes `triage` and, when applicable,
   `plan`.
@@ -111,7 +114,7 @@ Failures with `--json` print `{ "ok": false, "exit_code": <n>, "error": "<messag
 | 4 | Busy / conflict (already running; the workspace conversation database is locked by another process — while it is opened and while a reply is saved) |
 | 5 | Runner not in `[graph] allowed_runners` |
 | 6 | Internal error (including a non-busy conversation-database error while saving the agent reply, which exits 6 rather than 4) |
-| 7 | Plan approval or sensitive gate required (headless); `--approve-plan` for plans; `--allow-sensitive` or `--agent` + `--approve-plan` for sensitive gates |
+| 7 | Plan approval, sensitive gate, or an agent that stopped at its own plan review (headless); `--approve-plan` for plans and for a headless `--agent` run that must edit files; `--allow-sensitive` or `--agent` + `--approve-plan` for sensitive gates |
 | 130 | Cancelled (Ctrl+C) |
 
 A locked workspace conversation database is retried with a bounded backoff

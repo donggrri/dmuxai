@@ -95,6 +95,12 @@ impl fmt::Display for TurnPolicy {
     }
 }
 
+/// FR-2121: marker notice a runner emits when an Agent-policy turn ends at the
+/// agent's own plan review without editing files. The headless run maps it to
+/// "approval required" (exit 7); the TUI ignores it.
+pub const PLAN_ONLY_APPROVAL_NOTICE: &str =
+    "dmuxai: the turn stopped at the agent's own plan review without editing files";
+
 /// Legacy dashboard/MCP mode strings (`ask`, `plan`, `implement`). Omitted mode
 /// means the default write-capable agent policy.
 /// Maps legacy mode strings from the dashboard/MCP/CLI to a [`TurnPolicy`].

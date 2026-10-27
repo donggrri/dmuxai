@@ -87,9 +87,9 @@ use dmuxai::{
 
 use crate::agent::{
     AdapterError, Agent, AgentAdapter, AgentError, AgentErrorKind, AgentEvent, AgentOutput,
-    AgentRequest, ConversationId, CursorAdapterConfig, ModelInfo, TurnId, TurnPolicy,
-    event_channel, is_adapter_turn_busy_rejection, spawn_agy_adapter, spawn_codex_adapter,
-    spawn_cursor_adapter, spawn_custom_adapter,
+    AgentRequest, ConversationId, CursorAdapterConfig, ModelInfo, PLAN_ONLY_APPROVAL_NOTICE,
+    TurnId, TurnPolicy, event_channel, is_adapter_turn_busy_rejection, spawn_agy_adapter,
+    spawn_codex_adapter, spawn_cursor_adapter, spawn_custom_adapter,
 };
 use crate::graph_defer::{DeferPoll, GRAPH_DEFER_RETRY_INTERVAL, GraphDeferQueue};
 #[cfg(test)]
@@ -157,6 +157,8 @@ pub const PLAN_WAITING_APPROVAL_TRANSCRIPT: &str = "Plan waiting for approval â€
 
 const HEADLESS_APPROVAL_NOTE: &str = "approval required (headless)";
 const HEADLESS_GATE_NOTE: &str = "sensitive step needs /graph continue (headless)";
+/// FR-2121: the agent replied with a plan and made no file edits.
+const HEADLESS_PLAN_ONLY_NOTE: &str = "AGY replied with a plan and made no file edits. If you wanted changes applied, re-run with --approve-plan; if this was a question, the reply is in \"text\".";
 
 #[derive(Clone, Copy)]
 struct SlashCommand {
@@ -1471,6 +1473,15 @@ pub struct App {
     /// FR-937: a 1-node run hides the graph progress lines so the transcript
     /// looks like a direct send.
     quiet_graph_run: bool,
+    /// FR-2121: a headless direct run with `--approve-plan` requires file
+    /// edits, so AGY applies its stricter-edit retry instead of stopping at
+    /// its own plan review.
+    headless_require_edits: bool,
+    /// FR-2121: a headless direct run without `--approve-plan` maps a plan-only
+    /// agent reply to "approval required" (exit 7).
+    headless_plan_only_approval: bool,
+    /// FR-2121: a plan-only agent reply was seen during this headless run.
+    headless_plan_only_reply: bool,
     /// Test-only escape hatch: legacy app tests assume a direct send, so they
     /// skip the judge and start a quiet 1-node run with override kind `agent`.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1772,6 +1783,9 @@ impl App {
             graph_node_details: HashMap::new(),
             single_graph_plan: None,
             quiet_graph_run: false,
+            headless_require_edits: false,
+            headless_plan_only_approval: false,
+            headless_plan_only_reply: false,
             skip_judge_for_tests: false,
             last_group_expanded: false,
             all_details_expanded: false,
@@ -10820,6 +10834,15 @@ impl App {
             }
             AgentEvent::TextDelta(delta) => self.append_delta(agent, delta),
             AgentEvent::Notice(notice) => {
+                // FR-2121: the plan-only marker is a headless verdict, not a
+                // transcript line: a headless run maps it to exit 7, and an
+                // interactive run keeps the current behaviour (no notice).
+                if notice == PLAN_ONLY_APPROVAL_NOTICE {
+                    if self.headless_plan_only_approval {
+                        self.headless_plan_only_reply = true;
+                    }
+                    return;
+                }
                 self.messages
                     .push(Message::new(Role::System, format!("{agent}: {notice}")));
             }
@@ -11764,6 +11787,12 @@ impl App {
     }
 
     fn graph_node_expects_file_edits(&self, agent: Agent) -> bool {
+        // FR-2121: a headless direct run with `--approve-plan` asked for the
+        // edit, so the quiet 1-node run must require file edits (AGY retries
+        // once with a stricter edit instruction and then fails the turn).
+        if self.headless_require_edits {
+            return true;
+        }
         // Direct/auto 1-node runs use an Implement node but must not trigger AGY's
         // plan-only forced-edit retry (FR-937 quiet graph).
         if self.quiet_graph_run {
@@ -13313,6 +13342,13 @@ impl App {
         }
     }
 
+    /// FR-2121: clears the headless edit-policy flags when a run ends.
+    fn clear_headless_edit_policy(&mut self) {
+        self.headless_require_edits = false;
+        self.headless_plan_only_approval = false;
+        self.headless_plan_only_reply = false;
+    }
+
     fn headless_outcome_exit_7(
         &self,
         conversation_id: &str,
@@ -13703,6 +13739,16 @@ impl App {
             }
         }
 
+        // FR-2121: a headless direct run on an explicit agent either requires
+        // file edits (`--approve-plan`) or maps a plan-only agent reply to
+        // "approval required" (exit 7). Read-only turns are unaffected.
+        let headless_agent_policy = self.pending_turn_policy.unwrap_or(TurnPolicy::Agent);
+        self.headless_require_edits =
+            is_direct_headless && req.approve_plan && headless_agent_policy == TurnPolicy::Agent;
+        self.headless_plan_only_approval =
+            is_direct_headless && !req.approve_plan && headless_agent_policy == TurnPolicy::Agent;
+        self.headless_plan_only_reply = false;
+
         // FR-1729: pre-load a custom agent's model catalog once so the
         // catalog check can run in the turn path (interactive catalogs are
         // already loaded by the adapter).
@@ -13933,7 +13979,10 @@ impl App {
                 agent_label,
                 approved_plan,
             ) {
-                HeadlessIdleAction::Exit(outcome) => return *outcome,
+                HeadlessIdleAction::Exit(outcome) => {
+                    self.clear_headless_edit_policy();
+                    return *outcome;
+                }
                 HeadlessIdleAction::ContinueAfterApprove => {
                     approved_plan = true;
                     continue;
@@ -13982,6 +14031,10 @@ impl App {
                 run.plan.id == *graph_id && run.phase == GraphRunPhase::Cancelled
             })
         });
+        // FR-2121: a plan-only agent reply is never a success. It needs the
+        // caller's approval, so the run exits 7 (approval required) and keeps
+        // the agent's plan text in the output.
+        let plan_only_reply = self.headless_plan_only_reply;
         let (ok, exit_code, error, error_kind) = if cancelled || graph_cancelled {
             (
                 false,
@@ -14008,11 +14061,19 @@ impl App {
                 )),
                 dmuxai::agent_api::error_kind_for_exit(failure.exit_code).map(str::to_owned),
             )
+        } else if plan_only_reply {
+            (
+                false,
+                dmuxai::agent_api::exit::APPROVAL_REQUIRED,
+                Some(HEADLESS_PLAN_ONLY_NOTE.to_owned()),
+                Some(AgentErrorKind::Policy.as_str().to_owned()),
+            )
         } else {
             (true, dmuxai::agent_api::exit::OK, None, None)
         };
 
         let (triage, plan) = self.headless_plan_snapshot();
+        self.clear_headless_edit_policy();
         HeadlessOutcome {
             ok,
             exit_code,
@@ -25503,6 +25564,149 @@ mod tests {
         assert!(outcome2.ok);
         assert!(outcome2.text.contains("deployment executed"));
         assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    // TC-2121 / FR-2121: a headless direct run with --approve-plan requires
+    // file edits, so AGY's stricter-edit retry runs.
+    #[tokio::test]
+    async fn tc_2121_headless_approve_plan_requires_file_edits() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "apply the changes listed in plan.md".to_owned(),
+            agent: Some("agy".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: true,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(outcome.ok);
+        assert_eq!(outcome.exit_code, 0);
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, Agent::Agy);
+        assert!(
+            requests[0].1.require_file_edits,
+            "--approve-plan must require file edits (FR-2121)"
+        );
+        drop(requests);
+        assert!(
+            !app.headless_require_edits,
+            "flag cleared when the run ends"
+        );
+        assert!(!app.headless_plan_only_approval);
+        assert!(!app.headless_plan_only_reply);
+    }
+
+    // TC-2122 / FR-2121: without --approve-plan a plan-only agent reply is
+    // "approval required" (exit 7), not a success.
+    #[tokio::test]
+    async fn tc_2122_headless_plan_only_reply_exits_seven() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta(
+                                "Created plan.md, please review and approve it.".to_owned(),
+                            ),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::Notice(PLAN_ONLY_APPROVAL_NOTICE.to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "apply the changes listed in plan.md".to_owned(),
+            agent: Some("agy".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(!outcome.ok);
+        assert_eq!(
+            outcome.exit_code,
+            dmuxai::agent_api::exit::APPROVAL_REQUIRED
+        );
+        assert_eq!(outcome.exit_code, 7);
+        assert_eq!(outcome.error.as_deref(), Some(HEADLESS_PLAN_ONLY_NOTE));
+        assert!(
+            outcome.text.contains("Created plan.md"),
+            "the plan text stays in the output: {}",
+            outcome.text
+        );
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].1.require_file_edits,
+            "without --approve-plan the turn does not force edits (FR-2121)"
+        );
+        drop(requests);
+        assert!(
+            !app.headless_plan_only_reply,
+            "flag cleared when the run ends"
+        );
     }
 
     #[test]
