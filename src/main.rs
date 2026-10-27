@@ -6,6 +6,7 @@ mod input_command;
 mod internal_turn;
 mod progress;
 mod todo_link;
+mod workspace_runtime;
 
 use std::{
     error::Error,
@@ -22,10 +23,8 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use dmuxai::conversation::ConversationEngine;
 use dmuxai::settings::DmuxSettings;
 use dmuxai::todo::TodoStore;
-use dmuxai::web::commands::DashboardCommand;
 use dmuxai::web::{
     DEFAULT_PORT, DashboardHub, DashboardServer, DashboardServices, FileGraphSource, ServerConfig,
     SnapshotSource, check_bind, generate_token, start_server,
@@ -466,7 +465,7 @@ fn run_mcp_memory(options: MemoryOptions) -> Result<(), Box<dyn Error>> {
 
 /// Opens the per-repo to-do store (FR-540). Callers report the error as a
 /// warning (`serve`) or a startup notice (`--web`).
-fn open_todo_store(workspace_root: &Path) -> Result<Arc<TodoStore>, String> {
+pub(crate) fn open_todo_store(workspace_root: &Path) -> Result<Arc<TodoStore>, String> {
     let db_path = dmuxai::state_path::repo_db_path(workspace_root).map_err(|e| e.to_string())?;
     TodoStore::open(&db_path)
         .map(Arc::new)
@@ -675,8 +674,6 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     let startup_warning = dmuxai::workspace::normalize_workspace_path(&workspace_root)
         .ok()
         .and_then(|normalized| dmuxai::workspace::wsl_mnt_warning(&normalized));
-    let (db_path, migration_notice) = dmuxai::state_path::prepare_repo_db(&workspace_root)?;
-    let engine = ConversationEngine::open(&db_path, &workspace_root)?;
     let no_color = std::env::var("NO_COLOR").ok();
     let force_env = std::env::var("DMUXAI_FORCE_COLOR").ok();
     let color_enabled = dmuxai::theme::resolve_color_output(
@@ -686,13 +683,9 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     );
     crossterm::style::force_color_output(color_enabled);
     let custom_warnings = dmuxai::custom_agent::install_registry(settings.custom_agents.clone());
+    let (mut app, migration_notice) =
+        workspace_runtime::open_workspace_app(&workspace_root, &settings)?;
     let config_warnings = settings.config_warnings.clone();
-    let mut app = App::new_interactive(engine, workspace_root.clone(), settings.clone())?;
-    app.set_state_repos_dir(
-        dmuxai::state_path::state_base()
-            .ok()
-            .map(|b| b.join("repos")),
-    );
     // SPEC-dashboard-fullwidth FR-1227: a dashboard switch asked to open one
     // conversation of this workspace.
     if let Ok(id) = std::env::var(OPEN_CONVERSATION_ENV) {
@@ -882,84 +875,44 @@ async fn attach_web_dashboard(
     settings: &DmuxSettings,
     options: WebOptions,
 ) -> Option<DashboardServer> {
-    let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
-        .unwrap_or_else(|_| workspace_root.display().to_string());
-
-    let (todos, receiver) = match open_todo_store(workspace_root) {
-        Ok(store) => {
-            store.set_jira_base_url(settings.todo_jira_base_url.clone());
-            let (sender, receiver) = tokio::sync::mpsc::channel::<DashboardCommand>(16);
-            (Some((store, sender)), Some(receiver))
-        }
-        Err(error) => {
-            app.push_startup_notice(format!("to-do board unavailable: {error}"));
-            (None, None)
-        }
-    };
-    let ws = dmuxai::docs::confine::Workspace::new(workspace_root).ok();
-    let doc_changes = dmuxai::docs::changes::ChangeLog::default();
-    let doc_changes_for_app = doc_changes.clone();
-    let open_tickets = Arc::new(std::sync::Mutex::new(dmuxai::web::OpenTickets::new()));
     let mut token_warning = None;
     let token = dashboard_token(|warning| token_warning = Some(warning));
-    let docs = ws.map(|workspace| {
-        let soffice = dmuxai::docs::office::find_soffice();
-        Arc::new(dmuxai::web::docs_api::DocsService::new(
-            workspace,
-            false, // read_only
-            doc_changes,
-            soffice,
-            open_tickets.clone(),
-            token.clone(),
-        ))
-    });
 
-    let services = DashboardServices {
-        todos: todos.as_ref().map(|(store, _)| store.clone()),
-        commands: todos.as_ref().map(|(_, sender)| sender.clone()),
-        mcp: Some(app.mcp_registry()),
-        web_attached: true,
-        memory: DmuxSettings::load(workspace_root)
-            .memory
-            .as_ref()
-            .map(|config| dmuxai::memory::MemoryHandle::from_config(config, workspace_root)),
-        events_path: Some(dmuxai::events::events_path(workspace_root)),
-        docs,
-    };
+    let parts = workspace_runtime::build_web_workspace(app, workspace_root, settings, &token);
+    for notice in parts.notices {
+        app.push_startup_notice(notice);
+    }
+    if let Some(warning) = token_warning {
+        app.push_startup_notice(warning);
+    }
 
-    let sink = cli::build_event_sink(workspace_root, settings);
-    let hub = DashboardHub::new(SnapshotSource::App, workspace).with_events(sink);
-    hub.set_jira_base_url(settings.todo_jira_base_url.clone());
     let config = ServerConfig {
         bind: options.bind,
         port: options.port,
         allow_remote: options.allow_remote,
         token: token.clone(),
-        services,
+        services: parts.services,
     };
-    if let Some(warning) = token_warning {
-        app.push_startup_notice(warning);
-    }
-    let token = config.token.clone();
 
-    match start_server(config, hub.clone()).await {
+    match start_server(config, parts.hub.clone()).await {
         Ok(server) => {
             if let Some(warning) = publish_discovery(workspace_root, &server, &token) {
                 app.push_startup_notice(warning);
             }
-            app.attach_dashboard(hub);
-            app.attach_doc_changes(doc_changes_for_app);
-            app.attach_open_tickets(open_tickets);
             let base_url = server
                 .url
                 .split("/?token=")
                 .next()
                 .unwrap_or(&server.url)
                 .to_string();
-            app.set_dashboard_base_url(base_url);
-            if let (Some((store, _)), Some(receiver)) = (todos, receiver) {
-                app.attach_dashboard_services(store.clone(), receiver);
-            }
+            workspace_runtime::attach_web_workspace(
+                app,
+                parts.hub,
+                parts.doc_changes,
+                parts.open_tickets,
+                parts.todos,
+                base_url,
+            );
             app.push_local_notice(format!("dmuxai dashboard: {}", server.url));
             if let Some(warning) = server.warning.clone() {
                 app.push_startup_notice(warning);
