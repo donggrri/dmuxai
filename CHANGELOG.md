@@ -15,6 +15,11 @@ All notable changes to dmuxai are listed here. Versions follow
   in progress).** Dashboard API requests take an optional `ws=<id>` query
   parameter to pick an open folder, and `GET /api/workspaces` lists the open
   folders with their running state (FR-2300..2302).
+- **Open another folder without stopping running turns (FR-2303..2306).**
+  In headless `dmuxai --web`, switching to another folder opens it inside the
+  same process (up to 4 folders) instead of restarting dmuxai, so it is no longer
+  refused while a turn or graph runs elsewhere. Switching to an open folder only
+  focuses it; the tab follows with `?ws=<id>`.
 
 ### Changed
 

@@ -64,6 +64,10 @@ This spec is delivered in stacked pull requests; each one adds its rows here.
 | FR-2300 | Must | Any `/api/*` request, including docs routes | A `ws=<id>` query parameter selects that open folder; without it the focused folder is used | Unknown id: `404` with `{"error":"no such open folder"}`; docs ticket URLs are found in any open folder | TC-2300 |
 | FR-2301 | Must | `GET /api/workspaces` with a valid token | `{"max":4,"workspaces":[{"id","path","name","focused","running"}]}` in open order; `running` follows the folder's snapshot | Same auth and view-only rules as other `/api` routes | TC-2301 |
 | FR-2302 | Must | The dashboard page URL has `ws=<id>` | Every dashboard API request and the event stream carry the same `ws`; `window.dmuxaiApiUrlFor(id, path)` targets another folder | Without `ws` (or with an invalid id) request URLs are unchanged | TC-2302 |
+| FR-2303 | Must | Headless `dmuxai --web` (the host registers an opener) and `POST /api/workspace/switch` to a folder that is not open | The folder opens in the same process with its own App, hub and to-do store; response `200 {"ok":true,"id","path","in_process":true,"opened":true}`; the new folder becomes focused. The request is never refused because another folder is running | No opener (e.g. `serve`, tests): the previous re-exec flow is unchanged | TC-2303 |
+| FR-2304 | Must | Switch to a folder that is already open | Only focus changes; `opened:false`; no new runtime | — | TC-2304 |
+| FR-2305 | Must | Opening fails | The host's status and message are returned, e.g. `409 too many open folders (max 4); close one first`, `400` for an unwritable folder | Timeout: `504 the folder did not open in time` | TC-2305 |
+| FR-2306 | Must | The dashboard receives an in-process switch result | It optionally loads the requested conversation (`load_conversation`) or starts one (`new_conversation`) in the target folder, then navigates the tab to `?ws=<id>` (no `ws` for `default`) | A `202` result keeps the poll-and-reload flow | TC-2306 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -72,6 +76,10 @@ This spec is delivered in stacked pull requests; each one adds its rows here.
 | TC-2300 | FR-2300 | unit + integration | Directory with two entries | `resolve` with and without `ws`; `GET /api/state?ws=<id>` and `?ws=missing` | Second folder's snapshot is returned; missing id gives 404 `no such open folder` | `src/web/directory.rs` `tc_2300_resolve_ws_query`; `src/web/server.rs` `tc_2300_ws_query_selects_workspace` |
 | TC-2301 | FR-2301 | unit + integration | Two open folders; snapshots with busy agent, running turn, active graph | `snapshot_is_running`; `GET /api/workspaces` | Running flags match; list has ids, names, focused flag, `max` 4 | `src/web/directory.rs` `tc_2301_snapshot_is_running`; `src/web/server.rs` `tc_2301_get_workspaces_lists_open_folders` |
 | TC-2302 | FR-2302 | unit (static asset) | Embedded `app.js` | Inspect `apiUrl` and the event stream URL | `apiUrl` reads `ws` from the page URL; `dmuxaiApiUrlFor` exists; no query is appended after `apiUrl(...)` | `src/web/assets.rs` `tc_2302_api_url_carries_ws` |
+| TC-2303 | FR-2303 | unit + integration | Directory with an opener task that inserts `w2` | Send through the opener; POST switch to a temp dir | Request arrives; 200 with `in_process`, `opened` true, id `w2`; `/api/workspaces` shows `w2` focused | `src/web/directory.rs` `tc_2303_opener_roundtrip`; `src/web/server.rs` `tc_2303_switch_opens_folder_in_process` |
+| TC-2304 | FR-2304 | integration | Folder already in the directory | POST switch to it | 200 `opened:false`; opener receives nothing | `src/web/server.rs` `tc_2304_switch_to_open_folder_only_focuses` |
+| TC-2305 | FR-2305 | integration | Opener replies `409 too many open folders (max 4)` | POST switch | 409 with that text | `src/web/server.rs` `tc_2305_switch_reports_open_error` |
+| TC-2306 | FR-2306 | unit (static asset) | Embedded `workspace.js` / `session.js` | Inspect the switch handler | Handles `in_process`, sets `ws` via `searchParams`, posts through `dmuxaiApiUrlFor`; sidebar passes `conversation: c.id` | `src/web/assets.rs` `tc_2306_switch_in_process_navigates` |
 
 ## 6. Data, integration, and safety contracts
 
