@@ -1951,4 +1951,37 @@ mod tests {
             "APP_JS must export window.dmuxaiApiUrl = apiUrl"
         );
     }
+
+    // TC-1985 (FR-1985): session gate banner assets
+    #[test]
+    fn session_gate_banner_assets() {
+        assert!(SESSION_JS.contains("session-gate-banner"));
+        assert!(SESSION_JS.contains("graph_continue"));
+        assert!(SESSION_JS.contains("graph_cancel"));
+        assert!(SESSION_JS.contains("Waiting for approval: "));
+        assert!(SESSION_JS.contains("Continue"));
+        assert!(SESSION_JS.contains("Cancel graph"));
+        assert!(SESSION_JS.contains("waiting_gate_node"));
+        assert!(SESSION_CSS.contains(".session-gate-banner"));
+        assert!(SESSION_CSS.contains(".session-gate-continue"));
+        assert!(SESSION_CSS.contains(".session-gate-cancel"));
+        let banner_builder_js = js_between(
+            SESSION_JS,
+            "ui.gateBanner = el('div', 'session-gate-banner')",
+            "var form = el('div'",
+        );
+        assert!(
+            !banner_builder_js.contains("innerHTML"),
+            "session gate banner builder must not use innerHTML"
+        );
+        let banner_render_js = js_between(
+            SESSION_JS,
+            "function renderGateBanner",
+            "function renderChatAux",
+        );
+        assert!(
+            !banner_render_js.contains("innerHTML"),
+            "session gate banner render must not use innerHTML"
+        );
+    }
 }
