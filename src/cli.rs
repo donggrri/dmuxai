@@ -782,7 +782,10 @@ async fn run_headless(
             _ = wait_for_stop_signal() => {}
         }
         if !finished_signal.load(Ordering::SeqCst) {
-            dmuxai::process::supervisor::stop_all_live_groups(Duration::from_secs(2));
+            dmuxai::process::supervisor::stop_live_groups_of(
+                dmuxai::process::supervisor::GroupOwner::DEFAULT,
+                Duration::from_secs(2),
+            );
             eprintln!("error: stopped after signal");
             std::process::exit(130);
         }

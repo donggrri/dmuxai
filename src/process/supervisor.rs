@@ -17,6 +17,14 @@ pub enum GroupSignal {
     Int,
 }
 
+/// Identifier for the owner of a supervised process group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GroupOwner(pub u64);
+
+impl GroupOwner {
+    pub const DEFAULT: GroupOwner = GroupOwner(0);
+}
+
 /// Options for configuring a spawned child process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChildOptions {
@@ -43,6 +51,7 @@ pub struct SupervisorConfig {
     pub term_grace: Duration,
     pub stderr_drain_grace: Duration,
     pub child_options: ChildOptions,
+    pub owner: GroupOwner,
 }
 
 impl Default for SupervisorConfig {
@@ -55,6 +64,7 @@ impl Default for SupervisorConfig {
             term_grace: Duration::from_secs(2),
             stderr_drain_grace: Duration::from_secs(2),
             child_options: ChildOptions::default(),
+            owner: GroupOwner::DEFAULT,
         }
     }
 }
@@ -101,14 +111,14 @@ pub fn tail_lines(tail: &str, max_lines: usize) -> String {
 }
 
 #[cfg(unix)]
-static LIVE_GROUPS: std::sync::Mutex<std::collections::BTreeSet<u32>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static LIVE_GROUPS: std::sync::Mutex<std::collections::BTreeMap<u32, GroupOwner>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 #[cfg(unix)]
-fn register_group(pgid: u32) {
+fn register_group(pgid: u32, owner: GroupOwner) {
     if pgid > 1 {
         let mut groups = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
-        groups.insert(pgid);
+        groups.insert(pgid, owner);
     }
 }
 
@@ -122,14 +132,21 @@ fn unregister_group(pgid: u32) {
 #[cfg(unix)]
 pub fn live_groups() -> Vec<u32> {
     let groups = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
-    groups.iter().copied().collect()
+    groups.keys().copied().collect()
 }
 
-/// Signals every registered process group with `SIGTERM`, waits up to `grace`
-/// for group leaders to exit, then sends `SIGKILL` to groups whose leader is still alive.
+/// Returns the process group IDs of all currently live supervised children belonging to `owner`.
 #[cfg(unix)]
-pub fn stop_all_live_groups(grace: Duration) {
-    let groups = live_groups();
+pub fn live_groups_of(owner: GroupOwner) -> Vec<u32> {
+    let groups = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+    groups
+        .iter()
+        .filter_map(|(&pgid, &o)| if o == owner { Some(pgid) } else { None })
+        .collect()
+}
+
+#[cfg(unix)]
+fn stop_groups(groups: Vec<u32>, grace: Duration) {
     for &pgid in &groups {
         signal_group(pgid, GroupSignal::Term);
     }
@@ -151,6 +168,20 @@ pub fn stop_all_live_groups(grace: Duration) {
             signal_group(pgid, GroupSignal::Kill);
         }
     }
+}
+
+/// Signals every registered process group with `SIGTERM`, waits up to `grace`
+/// for group leaders to exit, then sends `SIGKILL` to groups whose leader is still alive.
+#[cfg(unix)]
+pub fn stop_all_live_groups(grace: Duration) {
+    stop_groups(live_groups(), grace);
+}
+
+/// Signals registered process groups belonging to `owner` with `SIGTERM`, waits up to `grace`
+/// for group leaders to exit, then sends `SIGKILL` to groups whose leader is still alive.
+#[cfg(unix)]
+pub fn stop_live_groups_of(owner: GroupOwner, grace: Duration) {
+    stop_groups(live_groups_of(owner), grace);
 }
 
 #[cfg(unix)]
@@ -247,7 +278,11 @@ pub struct GroupGuard(u32);
 #[cfg(unix)]
 impl GroupGuard {
     pub fn register(pgid: u32) -> Self {
-        register_group(pgid);
+        Self::register_for(pgid, GroupOwner::DEFAULT)
+    }
+
+    pub fn register_for(pgid: u32, owner: GroupOwner) -> Self {
+        register_group(pgid, owner);
         Self(pgid)
     }
 }
@@ -657,7 +692,7 @@ pub fn adopt(
         .id()
         .ok_or_else(|| std::io::Error::other("spawned child did not return a pid"))?;
     let pgid = pid;
-    register_group(pgid);
+    register_group(pgid, config.owner);
 
     let stdout = child
         .stdout
@@ -1301,5 +1336,41 @@ mod tests {
         );
         assert_eq!(line_received.as_deref(), Some("partial"));
         supervised.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_group_owner_filtering_and_stop_live_groups_of() {
+        let owner1 = GroupOwner(900_101);
+        let owner2 = GroupOwner(900_102);
+
+        let mut cmd1 = tokio::process::Command::new("sh");
+        cmd1.args(["-c", "sleep 30"]);
+        let mut cfg1 = SupervisorConfig::new("owner1_child");
+        cfg1.owner = owner1;
+        let mut sup1 = spawn(cmd1, cfg1).expect("spawn sup1");
+        let pgid1 = sup1.pgid();
+
+        let mut cmd2 = tokio::process::Command::new("sh");
+        cmd2.args(["-c", "sleep 30"]);
+        let mut cfg2 = SupervisorConfig::new("owner2_child");
+        cfg2.owner = owner2;
+        let mut sup2 = spawn(cmd2, cfg2).expect("spawn sup2");
+        let pgid2 = sup2.pgid();
+
+        assert_eq!(live_groups_of(owner1), vec![pgid1]);
+        assert_eq!(live_groups_of(owner2), vec![pgid2]);
+
+        stop_live_groups_of(owner1, Duration::from_millis(50));
+
+        assert!(
+            wait_pid_gone(pgid1, Duration::from_secs(3)).await,
+            "owner1 child should be dead"
+        );
+        let _ = sup1.stop().await;
+        assert!(!group_alive(pgid1), "owner1 group should be dead");
+        assert!(group_alive(pgid2), "owner2 group should still be alive");
+
+        sup2.stop().await;
+        assert!(!group_alive(pgid2), "owner2 group should now be dead");
     }
 }
