@@ -5,8 +5,10 @@
 # or GROK_FAKE_AUTH=fail (exit 1, "not logged in" on stderr) or
 # GROK_FAKE_AUTH=fast (logged in, only a fast id).
 # Prompt mode (-p) prints canned streaming-json unless GROK_FAKE_MODE is
-# fail, empty, sleep, linger, orphan, noend, or tools:
+# fail, empty, sleep, setsid, linger, orphan, noend, or tools:
 #   tools   prints a tool_call, its completed update, then text and end.
+#   setsid  starts a detached sleeper in its own session (pid in
+#           GROK_FAKE_PIDFILE) and blocks.
 #   linger  prints text, a tool_call, more text and the end line, then leaves a
 #           child holding stdout and idles (grok 1.0.62 after a stranded
 #           auto-wake prompt). The child's pid goes to GROK_FAKE_PIDFILE.
@@ -73,6 +75,12 @@ case "${GROK_FAKE_MODE:-}" in
       echo "$!" > "${GROK_FAKE_PIDFILE:-/dev/null}"
       wait
     ) &
+    sleep 120
+    exit 0
+    ;;
+  setsid)
+    # Detached sleeper in its own session; pid written for tests.
+    setsid sh -c 'echo $$ > "${GROK_FAKE_PIDFILE:-/dev/null}"; while :; do sleep 1; done' &
     sleep 120
     exit 0
     ;;

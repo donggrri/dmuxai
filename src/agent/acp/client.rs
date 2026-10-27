@@ -292,6 +292,12 @@ pub async fn run_acp_turn(
     .await;
 
     let session_id_for_cancel = state.session_id.lock().unwrap().clone();
+    #[cfg(unix)]
+    let cancel_snapshot = if config.cancel.load(Ordering::SeqCst) {
+        child_pid.map(|pid| (dmuxai::process::supervisor::snapshot_tree(pid), pid))
+    } else {
+        None
+    };
     if config.cancel.load(Ordering::SeqCst) {
         send_session_cancel_once(&state, &mut stdin, session_id_for_cancel.as_deref()).await;
         let _ = timeout(
@@ -302,6 +308,11 @@ pub async fn run_acp_turn(
     }
 
     shutdown_acp_child(&mut child, child_pid).await;
+    #[cfg(unix)]
+    if let Some((snapshot, pid)) = cancel_snapshot {
+        dmuxai::process::supervisor::terminate_snapshot(&snapshot, pid, Duration::from_millis(500))
+            .await;
+    }
     reader.abort();
     stderr_reader.abort();
     let status = child.wait().await?;
@@ -637,7 +648,6 @@ async fn run_prompt(
     loop {
         let raw = tokio::select! {
             _ = wait_for_cancel(cancel.clone()) => {
-                send_session_cancel_once(state, stdin, Some(session_id)).await;
                 return Err("cancelled".to_owned());
             }
             line = line_rx.recv() => line,
@@ -811,8 +821,6 @@ async fn request(
     while started.elapsed() < deadline {
         let raw = tokio::select! {
             _ = wait_for_cancel(cancel.clone()) => {
-                let sid = state.session_id.lock().unwrap().clone();
-                send_session_cancel_once(state, stdin, sid.as_deref()).await;
                 return Err("cancelled".to_owned());
             }
             line = line_rx.recv() => line,
