@@ -61,6 +61,16 @@
 .session .btn-small { padding: .1rem .45rem; font-size: .75rem; }
 .session-notice { flex: none; box-sizing: border-box; width: 100%; max-width: var(--chat-col); margin: .4rem auto 0; padding: 0 1rem; font-size: .85rem; color: var(--muted); }
 .session-notice-error { color: var(--error-text); }
+/* Gate banner: amber warning banner directly above the composer form */
+.session-gate-banner { flex: none; box-sizing: border-box; display: flex; align-items: center; justify-content: space-between; gap: .75rem; flex-wrap: wrap; width: calc(100% - 2rem); max-width: calc(var(--chat-col) - 2rem); margin: .5rem auto 0; padding: .55rem .85rem; background: var(--gate-banner-bg); border: 1px solid var(--gate-banner-line); border-radius: .75rem; color: var(--gate-banner-text); font-size: .85rem; box-shadow: 0 2px 8px rgba(0, 0, 0, .08); }
+.session-gate-banner[hidden] { display: none; }
+.session-gate-icon { flex: none; font-size: 1rem; color: var(--warn); }
+.session-gate-text { flex: 1 1 auto; min-width: 0; line-height: 1.4; }
+.session-gate-text code { padding: .1rem .3rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85em; background: rgba(0, 0, 0, .08); border-radius: 4px; border: 1px solid var(--gate-banner-line); }
+.session-gate-actions { display: flex; align-items: center; gap: .5rem; flex: none; }
+.session-gate-actions .btn { padding: .25rem .65rem; font-size: .8rem; border-radius: 6px; }
+.session-gate-continue { white-space: nowrap; }
+.session-gate-cancel { white-space: nowrap; }
 /* Composer: a rounded box pinned under the transcript; Send sits inside it. */
 .session-prompt { flex: none; box-sizing: border-box; display: flex; flex-direction: column; gap: .35rem; width: calc(100% - 2rem); max-width: calc(var(--chat-col) - 2rem); margin: .5rem auto 0; padding: .6rem .75rem .5rem; background: var(--bg-chip); border: 1px solid var(--line); border-radius: 1.5rem; box-shadow: 0 2px 10px rgba(0, 0, 0, .06); }
 .session-prompt:focus-within { border-color: var(--accent); }
@@ -115,6 +125,7 @@
 @media (max-width: 560px) {
   .session { height: calc(100dvh - var(--top-h, 56px) - 24px); min-height: 26rem; }
   .session-transcript > li { padding: 0 .25rem; }
+  .session-gate-banner { width: 100%; max-width: none; border-radius: .5rem; }
   .session-prompt { width: 100%; max-width: none; border-radius: 1rem; }
   .session-transcript .msg-user .msg-text { max-width: 90%; }
 }

@@ -137,6 +137,10 @@ pub enum SessionCommand {
         #[serde(default)]
         note: Option<String>,
     },
+    /// Advance a live graph run waiting at a sensitive-step gate.
+    GraphContinue,
+    /// Cancel a live graph run waiting at a sensitive-step gate.
+    GraphCancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -179,4 +183,20 @@ pub enum DashboardCommand {
     CommitSwitchWorkspace {
         path: std::path::PathBuf,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_graph_continue_and_cancel() {
+        let cmd: SessionCommand =
+            serde_json::from_str(r#"{"command":"graph_continue"}"#).expect("deserialize continue");
+        assert_eq!(cmd, SessionCommand::GraphContinue);
+
+        let cmd: SessionCommand =
+            serde_json::from_str(r#"{"command":"graph_cancel"}"#).expect("deserialize cancel");
+        assert_eq!(cmd, SessionCommand::GraphCancel);
+    }
 }

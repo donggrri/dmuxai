@@ -1193,6 +1193,8 @@ fn session_command_needs_web_write(command: &SessionCommand) -> bool {
             | SessionCommand::PlanTaskEdit { .. }
             | SessionCommand::QueueRemove { .. }
             | SessionCommand::QueueEdit { .. }
+            | SessionCommand::GraphContinue
+            | SessionCommand::GraphCancel
     )
 }
 
@@ -2120,6 +2122,16 @@ mod tests {
             }
         }
         revs
+    }
+
+    #[test]
+    fn graph_commands_need_web_write() {
+        assert!(session_command_needs_web_write(
+            &SessionCommand::GraphContinue
+        ));
+        assert!(session_command_needs_web_write(
+            &SessionCommand::GraphCancel
+        ));
     }
 
     // TC-522: api_requires_token

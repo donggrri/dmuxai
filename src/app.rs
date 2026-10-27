@@ -3465,6 +3465,33 @@ impl App {
                 self.apply_graph_task_edit(edit, DecisionBy::Dashboard)
                     .map_err(PlanDecisionError::into_run_todo_error)?;
             }
+            SessionCommand::GraphContinue => {
+                if !self
+                    .graph_session
+                    .as_ref()
+                    .is_some_and(|s| s.run().phase == GraphRunPhase::WaitingGate)
+                {
+                    return Err(RunTodoError::Invalid(
+                        "no graph run is waiting for confirmation".to_owned(),
+                    ));
+                }
+                self.continue_graph_gate();
+            }
+            SessionCommand::GraphCancel => {
+                if !self
+                    .graph_session
+                    .as_ref()
+                    .is_some_and(|s| s.run().phase == GraphRunPhase::WaitingGate)
+                {
+                    return Err(RunTodoError::Invalid(
+                        "no graph run is waiting for confirmation".to_owned(),
+                    ));
+                }
+                self.dispatch_graph_actions(vec![GraphAction::Cancelled(
+                    "cancelled by user".to_owned(),
+                )]);
+                self.flush_followup_queue();
+            }
         }
         self.dirty = true;
         Ok(self.session_view())
@@ -28909,6 +28936,78 @@ mod tests {
             AgentEvent::Completed
         )));
         assert!(direct.app.graph_session.is_none());
+    }
+
+    #[test]
+    fn session_command_graph_continue_and_cancel() {
+        let mut h = plan_gate_test_app();
+        h.app.input = "/direct deploy hotfix".to_owned();
+        h.app.submit_prompt();
+        assert_eq!(
+            h.app.graph_session.as_ref().unwrap().run().phase,
+            GraphRunPhase::WaitingGate
+        );
+
+        let prompts_before = h.app.dashboard_prompts.len();
+        let view = h
+            .app
+            .handle_session_command(SessionCommand::GraphContinue)
+            .expect("graph continue succeeds");
+        assert_eq!(
+            h.app
+                .graph_session
+                .as_ref()
+                .map(|session| session.run().phase),
+            Some(GraphRunPhase::Active)
+        );
+        assert_eq!(
+            h.app
+                .graph_session
+                .as_ref()
+                .and_then(|session| session.run().waiting_gate_node.as_deref()),
+            None
+        );
+        // Does not add a dashboard prompt
+        assert_eq!(h.app.dashboard_prompts.len(), prompts_before);
+        assert_eq!(view.selected_agent, "codex");
+
+        // Calling continue when not in WaitingGate returns error
+        let err = h
+            .app
+            .handle_session_command(SessionCommand::GraphContinue)
+            .unwrap_err();
+        assert!(
+            matches!(err, RunTodoError::Invalid(ref msg) if msg == "no graph run is waiting for confirmation"),
+            "{err:?}"
+        );
+
+        // Cancel on WaitingGate
+        let mut c = plan_gate_test_app();
+        c.app.input = "/direct deploy hotfix".to_owned();
+        c.app.submit_prompt();
+        assert_eq!(
+            c.app.graph_session.as_ref().unwrap().run().phase,
+            GraphRunPhase::WaitingGate
+        );
+
+        let view = c
+            .app
+            .handle_session_command(SessionCommand::GraphCancel)
+            .expect("graph cancel succeeds");
+        assert!(c.app.graph_session.is_none(), "graph_session cleared");
+        let last_run = c.app.last_graph_run.as_ref().expect("last run saved");
+        assert_eq!(last_run.phase, GraphRunPhase::Cancelled);
+        assert_eq!(view.selected_agent, "codex");
+
+        // Calling cancel when not waiting errors
+        let err = c
+            .app
+            .handle_session_command(SessionCommand::GraphCancel)
+            .unwrap_err();
+        assert!(
+            matches!(err, RunTodoError::Invalid(ref msg) if msg == "no graph run is waiting for confirmation"),
+            "{err:?}"
+        );
     }
 
     // TC-939 / FR-937: a simple verdict runs one node on the selected agent.

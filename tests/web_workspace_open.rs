@@ -109,3 +109,76 @@ fn tc_1471_open_in_new_window_starts_headless_dashboard() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+// TC-1985 (FR-1985): graph_continue without waiting gate errors and is not accepted as prompt
+#[test]
+fn tc_1985_graph_continue_without_waiting_gate_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let child = base_command(&workspace, &state).spawn().unwrap();
+    let mut guard = ChildGuard(Some(child));
+    let discovery_path = workspace.join(".dmuxai").join("web.json");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let discovery: serde_json::Value = loop {
+        if let Ok(text) = std::fs::read_to_string(&discovery_path)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+        {
+            break value;
+        }
+        if let Some(status) = guard.0.as_mut().unwrap().try_wait().unwrap() {
+            panic!("headless dashboard exited early: {status}");
+        }
+        assert!(Instant::now() < deadline, "no web.json within 20 s");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let port = discovery["port"].as_u64().unwrap() as u16;
+    let token = discovery["token"].as_str().unwrap().to_owned();
+
+    let cont = http(
+        port,
+        "POST",
+        "/api/command",
+        &token,
+        r#"{"command":"graph_continue"}"#,
+    );
+    assert!(
+        !cont.starts_with("HTTP/1.1 2"),
+        "expected non-2xx status, got: {cont}"
+    );
+    assert!(
+        cont.contains("waiting"),
+        "error body must mention 'waiting', got: {cont}"
+    );
+
+    let prompts_resp = http(port, "GET", "/api/state", &token, "");
+    assert!(
+        !prompts_resp.contains("graph_continue"),
+        "graph_continue must not be accepted as prompt: {prompts_resp}"
+    );
+
+    let quit = http(
+        port,
+        "POST",
+        "/api/command",
+        &token,
+        r#"{"command":"quit"}"#,
+    );
+    assert!(quit.starts_with("HTTP/1.1 200"), "{quit}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut child = guard.0.take().unwrap();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "quit exits cleanly: {status}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("headless dashboard did not exit after quit");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

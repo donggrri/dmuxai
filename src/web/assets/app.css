@@ -23,6 +23,9 @@
   --busy: #2f4858;
   --ok: #33d17a;
   --warn: #e5a50a;
+  --gate-banner-bg: #2e2410;
+  --gate-banner-line: #8a6a1a;
+  --gate-banner-text: #f3d38a;
   --err: #ff5f56;
   --skip: #7d8aa0;
   --gate: #b98cff;
@@ -94,6 +97,9 @@
   --busy: #d9e2ec;
   --ok: #1a7f37;
   --warn: #8a6100;
+  --gate-banner-bg: #fff8e1;
+  --gate-banner-line: #f0c36d;
+  --gate-banner-text: #6b4a00;
   --err: #c62828;
   --skip: #8fa1b5;
   --gate: #6b2fd6;
@@ -168,6 +174,9 @@
     --busy: #d9e2ec;
     --ok: #1a7f37;
     --warn: #8a6100;
+    --gate-banner-bg: #fff8e1;
+    --gate-banner-line: #f0c36d;
+    --gate-banner-text: #6b4a00;
     --err: #c62828;
     --skip: #8fa1b5;
     --gate: #6b2fd6;

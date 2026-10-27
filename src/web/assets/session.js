@@ -66,6 +66,7 @@
   var stickToBottom = true;
   // Last full dashboard snapshot (graph, agents) for the inline activity rows.
   var lastSnap = null;
+  var gateInFlight = false;
   // Expanded state of inline rows, keyed by data-aux-key (default collapsed).
   var auxExpanded = {};
   var palette = null;
@@ -508,6 +509,44 @@
     ui.notice.hidden = true;
     ui.notice.setAttribute('role', 'status');
     root.appendChild(ui.notice);
+
+    ui.gateBanner = el('div', 'session-gate-banner');
+    ui.gateBanner.hidden = true;
+    ui.gateBanner.setAttribute('role', 'status');
+    ui.gateIcon = el('span', 'session-gate-icon', '\u23F8');
+    ui.gateIcon.setAttribute('aria-hidden', 'true');
+    ui.gateText = el('span', 'session-gate-text');
+    ui.gateContinue = button('Continue', 'gate-continue', function () {
+      if (gateInFlight || viewOnly) { return; }
+      gateInFlight = true;
+      syncGateButtons();
+      command({ command: 'graph_continue' }).then(function () {
+        gateInFlight = false;
+        syncGateButtons();
+      }).catch(function () {
+        gateInFlight = false;
+        syncGateButtons();
+      });
+    }, 'btn btn-primary session-gate-continue');
+    ui.gateCancel = button('Cancel graph', 'gate-cancel', function () {
+      if (gateInFlight || viewOnly) { return; }
+      gateInFlight = true;
+      syncGateButtons();
+      command({ command: 'graph_cancel' }).then(function () {
+        gateInFlight = false;
+        syncGateButtons();
+      }).catch(function () {
+        gateInFlight = false;
+        syncGateButtons();
+      });
+    }, 'btn btn-danger session-gate-cancel');
+    var gateActions = el('div', 'session-gate-actions');
+    gateActions.appendChild(ui.gateContinue);
+    gateActions.appendChild(ui.gateCancel);
+    ui.gateBanner.appendChild(ui.gateIcon);
+    ui.gateBanner.appendChild(ui.gateText);
+    ui.gateBanner.appendChild(gateActions);
+    root.appendChild(ui.gateBanner);
 
     var form = el('div', 'session-prompt');
     ui.attachTray = el('div', 'session-attach-tray');
@@ -984,6 +1023,45 @@
     var t = ui.transcript;
     if (anchor && anchor.parentNode === t) { t.insertBefore(node, anchor.nextSibling); }
     else { t.appendChild(node); }
+  }
+
+  function syncGateButtons() {
+    if (ui.gateContinue) { ui.gateContinue.disabled = gateInFlight || viewOnly; }
+    if (ui.gateCancel) { ui.gateCancel.disabled = gateInFlight || viewOnly; }
+  }
+
+  function renderGateBanner() {
+    if (!ui.gateBanner) { return; }
+    var snap = lastSnap || {};
+    var graph = snap.graph || null;
+    var isWaitingGate = !!(graph && graph.phase === 'waiting_gate' && graph.waiting_gate_node);
+    if (!isWaitingGate) {
+      ui.gateBanner.hidden = true;
+      if (ui.gateText) { while (ui.gateText.firstChild) { ui.gateText.removeChild(ui.gateText.firstChild); } }
+      return;
+    }
+    var nodeId = String(graph.waiting_gate_node);
+    var nodeRole = '';
+    if (Array.isArray(graph.nodes)) {
+      for (var i = 0; i < graph.nodes.length; i++) {
+        if (graph.nodes[i] && String(graph.nodes[i].id) === nodeId) {
+          if (graph.nodes[i].role) { nodeRole = String(graph.nodes[i].role); }
+          break;
+        }
+      }
+    }
+    if (ui.gateText) {
+      while (ui.gateText.firstChild) { ui.gateText.removeChild(ui.gateText.firstChild); }
+      ui.gateText.appendChild(document.createTextNode('Waiting for approval: '));
+      var codeEl = el('code', '', nodeId);
+      ui.gateText.appendChild(codeEl);
+      if (nodeRole) {
+        ui.gateText.appendChild(document.createTextNode(' (' + nodeRole + ')'));
+      }
+      ui.gateText.appendChild(document.createTextNode(' is a sensitive step and needs confirmation.'));
+    }
+    syncGateButtons();
+    ui.gateBanner.hidden = false;
   }
 
   function renderChatAux() {
@@ -1762,6 +1840,7 @@
     if (ui.attachInput) { ui.attachInput.disabled = viewOnly; }
     if (ui.route) { ui.route.disabled = viewOnly; }
     ui.input.disabled = viewOnly;
+    renderGateBanner();
     renderTranscript();
     renderConversations();
   }
@@ -2611,8 +2690,11 @@
       root.classList.add('session-disabled');
       session = null;
       [ui.agentPicker, ui.input, ui.send].forEach(function (c) { if (c) { c.disabled = true; } });
+      renderGateBanner();
       renderConversations();
       renderChatAux();
+    } else {
+      renderGateBanner();
     }
   }
 

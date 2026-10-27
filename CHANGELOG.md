@@ -5,6 +5,13 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Added
+
+- **Gate approval banner in the session chat (FR-1985).** While a graph run waits at
+  a sensitive-step gate, the dashboard session view shows a banner above the composer
+  naming the node and role, with **Continue** (`graph_continue`) and **Cancel graph**
+  (`graph_cancel`) buttons, so queued prompts no longer look stuck.
+
 ## [0.3.0] - 2026-10-27
 
 ### Changed
