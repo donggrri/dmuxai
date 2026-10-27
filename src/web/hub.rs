@@ -323,6 +323,10 @@ impl DashboardHub {
         let _ = self.watch_tx.send_replace(state.snapshot.clone());
     }
 
+    pub fn workspace(&self) -> String {
+        self.state.lock().unwrap().snapshot.workspace.clone()
+    }
+
     pub fn subscribe(&self) -> watch::Receiver<DashboardSnapshot> {
         self.watch_tx.subscribe()
     }
