@@ -418,14 +418,14 @@ fn workspace_fingerprint(cwd: &Path) -> Option<u64> {
         if entry.is_empty() {
             continue;
         }
-        if let Ok(entry_str) = std::str::from_utf8(entry) {
-            if let Some(path_str) = entry_str.strip_prefix("?? ") {
-                let path = cwd.join(path_str);
-                if let Ok(metadata) = std::fs::metadata(&path) {
-                    metadata.len().hash(&mut hasher);
-                    if let Ok(mtime) = metadata.modified() {
-                        mtime.hash(&mut hasher);
-                    }
+        if let Ok(entry_str) = std::str::from_utf8(entry)
+            && let Some(path_str) = entry_str.strip_prefix("?? ")
+        {
+            let path = cwd.join(path_str);
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                metadata.len().hash(&mut hasher);
+                if let Ok(mtime) = metadata.modified() {
+                    mtime.hash(&mut hasher);
                 }
             }
         }
@@ -505,11 +505,7 @@ async fn run_turn(
             // touched a plan artifact even if the text never says "plan".
             let plan_approval_request = is_plan_approval_request(&outcome.response_text)
                 || (outcome.plan_artifact_observed && asks_for_approval(&outcome.response_text));
-            if policy == TurnPolicy::Agent
-                && completed
-                && !wrote_files
-                && plan_approval_request
-            {
+            if policy == TurnPolicy::Agent && completed && !wrote_files && plan_approval_request {
                 // The turn stopped at AGY's own plan review and no edit was
                 // applied. Tell the app so a headless run can ask for approval
                 // instead of reporting success; the TUI ignores it.
@@ -2066,7 +2062,15 @@ mod tests {
         git_run(&["init"]);
         std::fs::write(cwd.join("a.txt"), "initial\n").expect("write a.txt");
         git_run(&["add", "a.txt"]);
-        git_run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init"]);
+        git_run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "init",
+        ]);
 
         let plan_response = json!({
             "event": "result",

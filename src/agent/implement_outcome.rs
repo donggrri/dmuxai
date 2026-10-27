@@ -142,7 +142,40 @@ pub(crate) fn agy_message_indicates_write(message: &Value) -> bool {
         .or_else(|| message.pointer("/step_update/tool_info/name"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    AGY_WRITE_TOOL_NAMES.contains(&tool_name)
+    if !AGY_WRITE_TOOL_NAMES.contains(&tool_name) {
+        return false;
+    }
+    if let Some(path) = agy_write_target_path(message)
+        && is_agy_private_artifact_path(path)
+    {
+        return false;
+    }
+    true
+}
+
+fn agy_write_target_path(message: &Value) -> Option<&str> {
+    const PATH_KEYS: &[&str] = &["Path", "TargetFile", "path", "file_path"];
+
+    for key in PATH_KEYS {
+        let ptr = format!("/step_update/tool_info/parameters/{key}");
+        if let Some(path) = message.pointer(&ptr).and_then(Value::as_str) {
+            return Some(path);
+        }
+    }
+    for key in PATH_KEYS {
+        let ptr = format!("/step_update/parameters/{key}");
+        if let Some(path) = message.pointer(&ptr).and_then(Value::as_str) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// FR-2121: AGY keeps plan artifacts there, outside the workspace.
+pub(crate) fn is_agy_private_artifact_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized.contains("/.gemini/antigravity-cli/brain/")
+        || normalized.contains("/.gemini/antigravity/brain/")
 }
 
 /// FR-2121: a structural "the agent produced a plan" signal in the AGY
@@ -171,9 +204,19 @@ pub(crate) fn agy_message_indicates_plan_artifact(message: &Value) -> bool {
         .or_else(|| message.pointer("/step_update/tool_info/name"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    AGY_PLAN_ARTIFACT_TOOL_NAMES
+    if AGY_PLAN_ARTIFACT_TOOL_NAMES
         .iter()
         .any(|name| tool_name.eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+    if AGY_WRITE_TOOL_NAMES.contains(&tool_name)
+        && let Some(path) = agy_write_target_path(message)
+        && is_agy_private_artifact_path(path)
+    {
+        return true;
+    }
+    false
 }
 
 pub(crate) fn is_plan_review_response(response: &str) -> bool {
@@ -628,5 +671,55 @@ mod tests {
             false,
             "Created plan.md - please review and approve it."
         ));
+    }
+
+    #[test]
+    fn tc_2149_private_artifact_writes_count_as_plan_artifact_not_workspace_write() {
+        let artifact_line = json!({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_info": {
+                    "name": "write_file",
+                    "parameters": {
+                        "Path": "/home/box/.gemini/antigravity-cli/brain/bcb102cc-dcd5-4224-94f1-f8cf9c59e67c/implementation_plan.md"
+                    }
+                }
+            }
+        });
+
+        assert!(!agy_message_indicates_write(&artifact_line));
+        assert!(agy_message_indicates_plan_artifact(&artifact_line));
+
+        let mut tracker = ImplementTurnTracker::new(TurnPolicy::Agent);
+        tracker.observe_agy_message(&artifact_line);
+        assert!(!tracker.writes_observed());
+        assert!(tracker.plan_artifact_observed());
+
+        let workspace_line = json!({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_info": {
+                    "name": "write_file",
+                    "parameters": {
+                        "Path": "/tmp/repo/src/main.rs"
+                    }
+                }
+            }
+        });
+        assert!(agy_message_indicates_write(&workspace_line));
+        assert!(!agy_message_indicates_plan_artifact(&workspace_line));
+
+        let no_params_line = json!({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_info": {
+                    "name": "write_file"
+                }
+            }
+        });
+        assert!(agy_message_indicates_write(&no_params_line));
     }
 }
