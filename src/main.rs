@@ -497,9 +497,16 @@ fn load_settings_with_trust_prompt(workspace_root: &Path) -> DmuxSettings {
     {
         let config_path = workspace_root.join("dmuxai.toml");
         let short_sha = &sha256[..sha256.len().min(12)];
+        let details = dmuxai::settings::restricted_workspace_details(workspace_root, &env);
         eprintln!("workspace config: {}", config_path.display());
         eprintln!("sha256: {short_sha}");
         eprintln!("ignored: {}", ignored.join(", "));
+        if !details.is_empty() {
+            eprintln!("restricted values:");
+            for (k, v) in &details {
+                eprintln!("  {k} = {v}");
+            }
+        }
         eprint!("Trust this workspace config? [y/N] ");
         let _ = std::io::stderr().flush();
         let mut line = String::new();

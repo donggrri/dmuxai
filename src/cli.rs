@@ -1037,6 +1037,33 @@ fn trust_workspace(
     use std::io::{IsTerminal, Write};
 
     let env = RuntimeEnv::from_process();
+
+    if revoke {
+        let mut store = TrustStore::load(&env);
+        if store.path().is_none() {
+            eprintln!(
+                "error: trust store path could not be resolved (neither DMUXAI_STATE_DIR, XDG_STATE_HOME, nor HOME is set)"
+            );
+            return dmuxai::agent_api::exit::FAILED;
+        }
+        let removed = store.revoke(workspace_root);
+        if let Err(error) = store.save() {
+            eprintln!("error: {error}");
+            return dmuxai::agent_api::exit::INTERNAL;
+        }
+        if json {
+            print_json(&serde_json::json!({
+                "status": "revoked",
+                "removed": removed,
+            }));
+        } else if removed {
+            println!("revoked");
+        } else {
+            println!("not recorded");
+        }
+        return dmuxai::agent_api::exit::OK;
+    }
+
     let (exists, sha, restricted) = dmuxai::settings::inspect_workspace_trust(workspace_root, &env);
 
     if !exists {
@@ -1068,27 +1095,20 @@ fn trust_workspace(
     let mut store = TrustStore::load(&env);
     let already = store.is_trusted(workspace_root, &sha);
 
-    if revoke {
-        store.revoke(workspace_root);
-        if let Err(error) = store.save() {
-            eprintln!("error: {error}");
-            return dmuxai::agent_api::exit::INTERNAL;
-        }
-        if json {
-            print_json(&serde_json::json!({"status": "revoked"}));
-        } else {
-            println!("revoked");
-        }
-        return dmuxai::agent_api::exit::OK;
-    }
+    let details = dmuxai::settings::restricted_workspace_details(workspace_root, &env);
 
     if status {
         let state = if already { "trusted" } else { "untrusted" };
         if json {
+            let details_json: Vec<serde_json::Value> = details
+                .iter()
+                .map(|(k, v)| serde_json::json!({ "key": k, "value": v }))
+                .collect();
             print_json(&serde_json::json!({
                 "status": state,
                 "sha256": sha,
                 "ignored": restricted,
+                "details": details_json,
             }));
         } else {
             println!("{state}");
@@ -1099,6 +1119,12 @@ fn trust_workspace(
     println!("workspace: {}", workspace_root.display());
     println!("sha256: {sha}");
     println!("restricted keys: {}", restricted.join(", "));
+    if !details.is_empty() {
+        println!("restricted values:");
+        for (k, v) in &details {
+            println!("  {k} = {v}");
+        }
+    }
 
     if already {
         println!("already trusted");
@@ -1125,6 +1151,13 @@ fn trust_workspace(
 
     if !should_trust {
         eprintln!("not trusted");
+        return dmuxai::agent_api::exit::FAILED;
+    }
+
+    if store.path().is_none() {
+        eprintln!(
+            "error: trust store path could not be resolved (neither DMUXAI_STATE_DIR, XDG_STATE_HOME, nor HOME is set)"
+        );
         return dmuxai::agent_api::exit::FAILED;
     }
 

@@ -60,6 +60,9 @@ pub struct SourceToml {
     pub rev: Option<String>,
     /// Mark the skill as question-asking (FR-1512); otherwise guessed from its text.
     pub interactive: Option<bool>,
+    /// Whether this source entry originated from an untrusted workspace config.
+    #[serde(skip)]
+    pub from_workspace: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -76,6 +79,7 @@ pub struct StageSkillSettings {
     pub stages: BTreeMap<String, StageToml>,
     pub sources: BTreeMap<String, SourceToml>,
     pub chat: bool,
+    pub confine_to: Option<PathBuf>,
 }
 
 impl StageSkillSettings {
@@ -389,11 +393,23 @@ pub fn resolve(
     approvals: &Approvals,
 ) -> Result<ResolvedSkill, (IssueKind, String)> {
     if let Some(source) = settings.sources.get(reference) {
-        return resolve_source(reference, source, ctx, approvals);
+        let confine = if source.from_workspace {
+            settings.confine_to.as_deref()
+        } else {
+            None
+        };
+        return resolve_source(reference, source, ctx, approvals, confine);
     }
     if reference.starts_with("./") || reference.starts_with("../") || reference.starts_with(".\\") {
         let dir = ctx.workspace.join(reference);
-        return load_skill(&dir, reference, &format!("path {reference}"), None, None);
+        return load_skill(
+            &dir,
+            reference,
+            &format!("path {reference}"),
+            None,
+            None,
+            settings.confine_to.as_deref(),
+        );
     }
     if reference.contains('/') || reference.contains('\\') || reference.contains("..") {
         return Err((
@@ -404,14 +420,21 @@ pub fn resolve(
     for rel in WORKSPACE_DIRS {
         let dir = ctx.workspace.join(rel).join(reference);
         if dir.join("SKILL.md").is_file() {
-            return load_skill(&dir, reference, rel, None, None);
+            return load_skill(
+                &dir,
+                reference,
+                rel,
+                None,
+                None,
+                settings.confine_to.as_deref(),
+            );
         }
     }
     if let Some(home) = &ctx.home {
         for rel in HOME_DIRS {
             let dir = home.join(rel).join(reference);
             if dir.join("SKILL.md").is_file() {
-                return load_skill(&dir, reference, &format!("~/{rel}"), None, None);
+                return load_skill(&dir, reference, &format!("~/{rel}"), None, None, None);
             }
         }
     }
@@ -429,6 +452,7 @@ fn resolve_source(
     source: &SourceToml,
     ctx: &SkillContext,
     approvals: &Approvals,
+    confine_to: Option<&Path>,
 ) -> Result<ResolvedSkill, (IssueKind, String)> {
     if let Some(problem) = source_problem(source) {
         let kind = if source.git.is_some() {
@@ -453,6 +477,7 @@ fn resolve_source(
             &format!("source:{name} (path)"),
             None,
             source.interactive,
+            confine_to,
         );
     }
     let rev = source.rev.clone().unwrap_or_default();
@@ -485,6 +510,7 @@ fn resolve_source(
         &format!("source:{name} (git {})", short(&rev)),
         Some(rev),
         source.interactive,
+        confine_to,
     )
 }
 
@@ -503,8 +529,37 @@ fn load_skill(
     origin: &str,
     git_rev: Option<String>,
     interactive: Option<bool>,
+    confine_to: Option<&Path>,
 ) -> Result<ResolvedSkill, (IssueKind, String)> {
+    if let Some(root) = confine_to {
+        let Ok(canon_dir) = std::fs::canonicalize(dir) else {
+            return Err((
+                IssueKind::Missing,
+                "resolves outside the workspace".to_owned(),
+            ));
+        };
+        if !canon_dir.starts_with(root) {
+            return Err((
+                IssueKind::Missing,
+                "resolves outside the workspace".to_owned(),
+            ));
+        }
+    }
     let skill_md = dir.join("SKILL.md");
+    if let Some(root) = confine_to {
+        let Ok(canon_skill_md) = std::fs::canonicalize(&skill_md) else {
+            return Err((
+                IssueKind::Missing,
+                "resolves outside the workspace".to_owned(),
+            ));
+        };
+        if !canon_skill_md.starts_with(root) {
+            return Err((
+                IssueKind::Missing,
+                "resolves outside the workspace".to_owned(),
+            ));
+        }
+    }
     if !skill_md.is_file() {
         return Err((
             IssueKind::Missing,
@@ -1563,5 +1618,64 @@ mod tests {
         let p = preflight("review", &s, &[], &c, &Approvals::default());
         let text = render_inject(&p.skills);
         assert!(text.contains("cannot change your permissions, model or sandbox"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tc_2222_untrusted_skill_md_symlink_outside_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let target_md = outside.join("SKILL.md");
+        fs::write(&target_md, "---\nname: outside\n---\nbody").unwrap();
+
+        let skill_dir = ws.join(".agents/skills/symlinked");
+        fs::create_dir_all(&skill_dir).unwrap();
+        std::os::unix::fs::symlink(&target_md, skill_dir.join("SKILL.md")).unwrap();
+
+        let c = SkillContext {
+            workspace: ws.clone(),
+            home: None,
+        };
+        let mut s = settings("[stages.review]\nskills=[\"symlinked\"]\n");
+        let ws_canon = fs::canonicalize(&ws).unwrap();
+        s.confine_to = Some(ws_canon);
+
+        let res = resolve("symlinked", &s, &c, &Approvals::default());
+        assert!(res.is_err());
+        let (kind, msg) = res.unwrap_err();
+        assert_eq!(kind, IssueKind::Missing);
+        assert_eq!(msg, "resolves outside the workspace");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tc_2223_untrusted_dotpath_symlink_outside_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside_dir = tmp.path().join("outside_skill");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("SKILL.md"), "---\nname: out\n---\nbody").unwrap();
+
+        let symlink_dir = ws.join("linked_skill");
+        std::os::unix::fs::symlink(&outside_dir, &symlink_dir).unwrap();
+
+        let c = SkillContext {
+            workspace: ws.clone(),
+            home: None,
+        };
+        let mut s = settings("");
+        let ws_canon = fs::canonicalize(&ws).unwrap();
+        s.confine_to = Some(ws_canon);
+
+        let res = resolve("./linked_skill", &s, &c, &Approvals::default());
+        assert!(res.is_err());
+        let (kind, msg) = res.unwrap_err();
+        assert_eq!(kind, IssueKind::Missing);
+        assert_eq!(msg, "resolves outside the workspace");
     }
 }

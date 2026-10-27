@@ -342,6 +342,97 @@ events = ["completed"]
     assert_eq!(stdout_json(&status2)["status"], "untrusted");
 }
 
+#[test]
+fn tc_2215_trust_revoke_after_delete_or_edit_config() {
+    let ws_toml = r#"[notify]
+command = ["echo", "ws"]
+events = ["completed"]
+"#;
+    let sandbox = TrustSandbox::new(ws_toml);
+
+    // Trust it first
+    let output_yes = sandbox.run(&["trust", "--yes"]);
+    assert_eq!(output_yes.status.code(), Some(0));
+
+    let status1 = sandbox.run(&["trust", "--status", "--json"]);
+    assert_eq!(stdout_json(&status1)["status"], "trusted");
+
+    // Delete dmuxai.toml
+    std::fs::remove_file(sandbox.workspace.join("dmuxai.toml")).unwrap();
+
+    // Revoke should still remove the record and exit 0
+    let output_revoke = sandbox.run(&["trust", "--revoke"]);
+    assert_eq!(output_revoke.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output_revoke.stdout);
+    assert!(stdout.contains("revoked"));
+
+    // Check trust store file directly: record was removed
+    let store_file = sandbox.root.join("state").join("trusted-workspaces.json");
+    let content = std::fs::read_to_string(&store_file).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let workspaces = json.get("workspaces").unwrap().as_object().unwrap();
+    assert!(
+        workspaces.is_empty(),
+        "workspaces map should be empty after revoke"
+    );
+}
+
+#[test]
+fn tc_2216_trust_store_path_unset_errors_cli() {
+    let ws_toml = r#"[notify]
+command = ["echo", "ws"]
+events = ["completed"]
+"#;
+    let sandbox = TrustSandbox::new(ws_toml);
+
+    // Run trust --yes with all state & home env vars stripped
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dmuxai"));
+    cmd.args(["trust", "--yes"])
+        .current_dir(&sandbox.workspace)
+        .env("DMUXAI_WORKSPACE", &sandbox.workspace)
+        .env_remove("DMUXAI_STATE_DIR")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .env_remove("DMUXAI_TRUST_WORKSPACE_CONFIG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output().expect("execute dmuxai");
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "dmuxai trust --yes should exit non-zero when state/home are unset"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("trust store path could not be resolved") || stderr.contains("configured")
+    );
+
+    // Run trust --revoke with all state & home env vars stripped
+    let mut cmd_revoke = Command::new(env!("CARGO_BIN_EXE_dmuxai"));
+    cmd_revoke
+        .args(["trust", "--revoke"])
+        .current_dir(&sandbox.workspace)
+        .env("DMUXAI_WORKSPACE", &sandbox.workspace)
+        .env_remove("DMUXAI_STATE_DIR")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .env_remove("DMUXAI_TRUST_WORKSPACE_CONFIG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output_revoke = cmd_revoke.output().expect("execute dmuxai");
+    assert_ne!(
+        output_revoke.status.code(),
+        Some(0),
+        "dmuxai trust --revoke should exit non-zero when state/home are unset"
+    );
+}
+
 // Case 7: webhook: start a std::net::TcpListener on 127.0.0.1:0 in the test,
 // workspace `[notify] webhook_url = "http://127.0.0.1:<port>/hook"`,
 // `webhook_secret_env = "DMUXAI_TEST_WS_SECRET"`, set that env var in the child;

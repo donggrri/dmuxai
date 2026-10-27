@@ -55,10 +55,12 @@ Notes:
   confirm sensitive gates headlessly. JSON includes `triage` and, when applicable,
   `plan`.
 - `dmuxai trust` manages workspace configuration trust:
-  - `dmuxai trust`: Interactive prompt in a TTY asking to trust the workspace configuration.
-  - `dmuxai trust --status [--json]`: Reports trust status (`trusted`, `untrusted`, `not_needed`, or `no_workspace_config`), SHA-256 hash, and restricted keys.
+  - `dmuxai trust`: Interactive prompt in a TTY asking to trust the workspace configuration, displaying actual restricted key values (showing secret environment variable names only, never values).
+  - `dmuxai trust --status [--json]`: Reports trust status (`trusted`, `untrusted`, `not_needed`, or `no_workspace_config`), SHA-256 hash, restricted keys, and detailed key-value definitions in JSON mode.
   - `dmuxai trust --yes`: Non-interactively trusts the current workspace configuration.
-  - `dmuxai trust --revoke`: Revokes trust for the workspace configuration.
+  - `dmuxai trust --revoke`: Revokes trust for the workspace configuration regardless of current file content.
+  - The trust hash covers only `dmuxai.toml` itself, not files it references (skills, prompt files); those are confined to the workspace while untrusted and are not hashed.
+  - Child processes do not inherit the `DMUXAI_TRUST_WORKSPACE_CONFIG` opt-in.
   - Headless `run` and `todo run` accept `--trust-workspace-config` (or `DMUXAI_TRUST_WORKSPACE_CONFIG=1`) to trust workspace settings for a single process without modifying the persistent trust store.
 - `--model M` requires `--agent`; it sets the Explicit model source for the run
   (validated with `validate_model_for_runner` / custom `allowed_models`). A disallowed

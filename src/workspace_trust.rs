@@ -69,7 +69,7 @@ pub struct TrustStoreFile {
 }
 
 pub struct TrustStore {
-    path: PathBuf,
+    path: Option<PathBuf>,
     data: TrustStoreFile,
     corrupt_warning: Option<String>,
 }
@@ -93,17 +93,27 @@ impl TrustStore {
     }
 
     /// Loads the trust store file from the environment-configured state directory.
+    /// If no state directory is configured, an empty store with no path is returned.
     /// If the file does not exist, an empty store is returned.
-    /// If the file is corrupt, a corrupt warning is saved and an empty store is returned.
+    /// If the file is corrupt or has invalid permissions, a warning is saved and an empty store is returned.
     pub fn load(env: &RuntimeEnv) -> Self {
         let path = match Self::store_path(env) {
             Ok(p) => p,
-            Err(_) => PathBuf::from("trusted-workspaces.json"),
+            Err(_) => {
+                return Self {
+                    path: None,
+                    data: TrustStoreFile {
+                        version: 1,
+                        workspaces: BTreeMap::new(),
+                    },
+                    corrupt_warning: None,
+                };
+            }
         };
 
         if !path.exists() {
             return Self {
-                path,
+                path: Some(path),
                 data: TrustStoreFile {
                     version: 1,
                     workspaces: BTreeMap::new(),
@@ -112,15 +122,50 @@ impl TrustStore {
             };
         }
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = fs::metadata(&path) {
+                let euid = unsafe { libc::geteuid() };
+                if meta.uid() != euid {
+                    return Self {
+                        path: Some(path.clone()),
+                        data: TrustStoreFile {
+                            version: 1,
+                            workspaces: BTreeMap::new(),
+                        },
+                        corrupt_warning: Some(format!(
+                            "trust store {} is not owned by current user; ignoring",
+                            path.display()
+                        )),
+                    };
+                }
+                if (meta.mode() & 0o022) != 0 {
+                    return Self {
+                        path: Some(path.clone()),
+                        data: TrustStoreFile {
+                            version: 1,
+                            workspaces: BTreeMap::new(),
+                        },
+                        corrupt_warning: Some(format!(
+                            "trust store {} has unsafe group/world-writable permissions (mode {:04o}); ignoring",
+                            path.display(),
+                            meta.mode() & 0o777
+                        )),
+                    };
+                }
+            }
+        }
+
         match fs::read_to_string(&path) {
             Ok(content) => match serde_json::from_str::<TrustStoreFile>(&content) {
                 Ok(data) => Self {
-                    path,
+                    path: Some(path),
                     data,
                     corrupt_warning: None,
                 },
                 Err(err) => Self {
-                    path: path.clone(),
+                    path: Some(path.clone()),
                     data: TrustStoreFile {
                         version: 1,
                         workspaces: BTreeMap::new(),
@@ -132,7 +177,7 @@ impl TrustStore {
                 },
             },
             Err(err) => Self {
-                path: path.clone(),
+                path: Some(path.clone()),
                 data: TrustStoreFile {
                     version: 1,
                     workspaces: BTreeMap::new(),
@@ -143,6 +188,10 @@ impl TrustStore {
                 )),
             },
         }
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     pub fn corrupt_warning(&self) -> Option<&str> {
@@ -183,13 +232,27 @@ impl TrustStore {
     }
 
     pub fn save(&self) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
+        let store_path = self.path.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "trust store directory not configured; unable to persist trust",
+            )
+        })?;
+
+        if let Some(warning) = &self.corrupt_warning {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("refusing to overwrite trust store with warning: {warning}"),
+            ));
+        }
+
+        if let Some(parent) = store_path.parent() {
+            create_state_dir(parent)?;
         }
         let json = serde_json::to_string_pretty(&self.data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = store_path.parent().unwrap_or_else(|| Path::new("."));
         let temp_file = parent.join(format!(
             ".trusted-workspaces-{}-{}.tmp",
             std::process::id(),
@@ -218,8 +281,31 @@ impl TrustStore {
             file.sync_all()?;
         }
 
-        fs::rename(&temp_file, &self.path)?;
+        fs::rename(&temp_file, store_path)?;
         Ok(())
+    }
+}
+
+fn create_state_dir(path: &Path) -> io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        create_state_dir(parent)?;
+    }
+    match fs::create_dir(path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -459,5 +545,102 @@ mod tests {
             decide(&env, &ws, hash),
             TrustDecision::Trusted(TrustSource::Record)
         );
+    }
+
+    #[test]
+    fn tc_2217_unset_state_and_home_returns_untrusted_and_no_store_path() {
+        let env = RuntimeEnv {
+            dmuxai_state_dir: None,
+            xdg_state_home: None,
+            home: None,
+            userprofile: None,
+            trust_workspace_config: false,
+            ..RuntimeEnv::default()
+        };
+        let ws = Path::new("/some/workspace");
+        let hash = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let store = TrustStore::load(&env);
+        assert!(store.path().is_none());
+        assert!(!store.is_trusted(ws, hash));
+        assert_eq!(decide(&env, ws, hash), TrustDecision::Untrusted);
+
+        // Opt-in env still works
+        let opt_in_env = RuntimeEnv {
+            trust_workspace_config: true,
+            ..env
+        };
+        assert_eq!(
+            decide(&opt_in_env, ws, hash),
+            TrustDecision::Trusted(TrustSource::OptIn)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tc_2218_state_dir_created_with_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("new_state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir.clone()),
+            ..RuntimeEnv::default()
+        };
+
+        let mut store = TrustStore::load(&env);
+        store.trust(
+            &dir.path().join("ws"),
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        );
+        store.save().unwrap();
+
+        assert!(state_dir.is_dir());
+        let meta = fs::metadata(&state_dir).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tc_2219_group_writable_trust_store_ignored_with_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let store_file = state_dir.join("trusted-workspaces.json");
+
+        // Write a valid trust store
+        let ws = dir.path().join("ws");
+        let hash = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let valid_json = format!(
+            r#"{{"version": 1, "workspaces": {{"{}": {{"sha256": "{}", "trusted_at": "123"}}}}}}"#,
+            ws.display(),
+            hash
+        );
+        fs::write(&store_file, valid_json).unwrap();
+
+        // Make it group-writable (e.g. 0660)
+        fs::set_permissions(&store_file, fs::Permissions::from_mode(0o660)).unwrap();
+
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            ..RuntimeEnv::default()
+        };
+
+        let store = TrustStore::load(&env);
+        assert!(store.corrupt_warning().is_some());
+        assert!(
+            store
+                .corrupt_warning()
+                .unwrap()
+                .contains("unsafe group/world-writable permissions")
+        );
+        // Treated as empty/untrusted
+        assert!(!store.is_trusted(&ws, hash));
+
+        // Saving should refuse with an error rather than overwrite it
+        assert!(store.save().is_err());
     }
 }

@@ -11,7 +11,7 @@ Related: #208
 
 Workspace-local configuration files (`dmuxai.toml` in the repository root) can declare settings that run external commands, read secret environment variables, clone remote repositories, or establish outbound network connections. DmuxAI activates those restricted keys from a workspace configuration only after the user explicitly trusts that exact file content; the user configuration is unaffected.
 
-Trust records are pinned to the SHA-256 hash of the workspace configuration file and persisted in the user's state directory (`trusted-workspaces.json`). Untrusted workspace configurations have restricted keys stripped during settings loading, with a single summarized warning. User-level configuration remains unchanged and unrestricted. Interactive startup prompts the user to review and trust when run in a TTY, while headless executions never prompt and require either an existing trust record, the `--trust-workspace-config` CLI flag, or the `DMUXAI_TRUST_WORKSPACE_CONFIG=1` environment variable.
+Trust records are pinned to the SHA-256 hash of the workspace configuration file and persisted in the user's state directory (`trusted-workspaces.json`). The trust hash covers only `dmuxai.toml` itself, not files it references (skills, prompt files); those are confined to the workspace while untrusted and are not hashed. Untrusted workspace configurations have restricted keys stripped during settings loading, with a single summarized warning. User-level configuration remains unchanged and unrestricted. Interactive startup prompts the user to review and trust when run in a TTY, while headless executions never prompt and require either an existing trust record, the `--trust-workspace-config` CLI flag, or the `DMUXAI_TRUST_WORKSPACE_CONFIG=1` environment variable.
 
 ## 2. Scope
 
@@ -113,6 +113,17 @@ Trust records are pinned to the SHA-256 hash of the workspace configuration file
 | FR-2212 | Must | Given trusted workspace when `dmuxai trust --revoke` is executed | Workspace entry removed from store; returns exit 0 and status `revoked`; subsequent `--status` reports `untrusted` | Revocation persists in store | TC-2212 |
 | FR-2213 | Must | CLI help and usage string output | Lists `dmuxai trust [--status] [--json] [--revoke] [--yes]` and `--trust-workspace-config` on `run` and `todo run` | Exactly one usage entry per command variant | TC-2213 |
 | FR-2214 | Must | Given workspace `[notify]` webhook with `webhook_secret_env` | Untrusted run delivers no webhook connection; run with `DMUXAI_TRUST_WORKSPACE_CONFIG=1` connects and sends HTTP POST request; assertion messages avoid exposing secrets | Secret environment variables are shielded | TC-2214 |
+| FR-2215 | Must | Given `dmuxai trust --revoke` on a workspace whose config is deleted or edited | Entry is removed from the store, exits 0, and subsequent `--status` reports `untrusted` | Revoke succeeds regardless of config file content | TC-2215 |
+| FR-2216 | Must | Given state directory and home directory environment variables unset | Trust store cannot resolve a storage path; CLI operations requiring the store report an error and exit non-zero | Unconfigured state directory fails cleanly | TC-2216 |
+| FR-2217 | Must | Given state directory and home directory unset during trust decision | `TrustStore::load` returns store without path, `is_trusted` returns `false`, and `decide` returns `Untrusted` (process opt-in remains functional) | Falls back safely to untrusted | TC-2217 |
+| FR-2218 | Must | When creating a new trust state directory on Unix platforms | Directory permissions are set to `0700` | State directory accessible only by owner | TC-2218 |
+| FR-2219 | Must | When loading `trusted-workspaces.json` with group- or world-writable mode on Unix | Trust store treats configuration as untrusted with a corruption warning and refuses overwrite on save | Unsafe permissions are ignored | TC-2219 |
+| FR-2220 | Must | Given untrusted workspace config with skills source pointing through a symlink to outside the workspace | Skills source is stripped and treated as restricted key | Symlink escape outside workspace rejected | TC-2220 |
+| FR-2221 | Must | Given untrusted workspace config with memory vault pointing through a symlink to outside the workspace | Memory vault setting is stripped and treated as restricted key | Symlink escape outside workspace rejected | TC-2221 |
+| FR-2222 | Must | Given untrusted workspace with staged skill whose `SKILL.md` is a symlink resolving outside the workspace | Skill resolution fails with missing issue indicating outside workspace | Canonical target path confinement enforced | TC-2222 |
+| FR-2223 | Must | Given untrusted workspace with dotpath skill reference resolving outside the workspace | Skill resolution fails with missing issue indicating outside workspace | Relative dotpath resolution confined to workspace | TC-2223 |
+| FR-2224 | Must | Given restricted workspace settings during interactive approval prompt or `dmuxai trust` | Prints actual restricted values (argv commands, URLs, headers, agent/MCP commands and env key names only, skill sources, memory vault/dir, Jira URL, prompt files) without ever exposing secret environment variable values | Secret values are shielded while presenting full details | TC-2224 |
+| FR-2225 | Must | Child process command construction under child environment policy | `DMUXAI_TRUST_WORKSPACE_CONFIG` and `DMUXAI_CONFIG` are removed in child process environments | Child processes never inherit trust opt-in | TC-2225 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -143,6 +154,17 @@ Trust records are pinned to the SHA-256 hash of the workspace configuration file
 | TC-2212 | FR-2194, FR-2212 | integration | Workspace config trusted with `trust --yes` | Run `dmuxai trust --revoke` | Exit 0; status reports `revoked`; subsequent `--status --json` reports `untrusted` | `tests/workspace_trust.rs` `tc_2212_trust_revoke` |
 | TC-2213 | FR-2213 | unit | Main CLI `USAGE` text constant | Inspect command lists for `todo run` and `trust` | `dmuxai todo run` includes `--trust-workspace-config`; `dmuxai trust` listed with flags | `src/main.rs` `tc_2213_usage_lists_todo_run_and_trust_once` |
 | TC-2214 | FR-2214 | integration | Workspace `[notify]` with webhook URL, secret env, and listening TCP socket | Run without trust, then run with `DMUXAI_TRUST_WORKSPACE_CONFIG=1` | Untrusted run makes no socket connection; trusted run connects and issues HTTP POST | `tests/workspace_trust.rs` `tc_2214_webhook_trust_enforcement` |
+| TC-2215 | FR-2215 | integration | Workspace config trusted then config deleted | Run `dmuxai trust --revoke` | Exit 0; status reports `revoked`; trust store removes record | `tests/workspace_trust.rs` `tc_2215_trust_revoke_after_delete_or_edit_config` |
+| TC-2216 | FR-2216 | integration | CLI invoked with all state and home env vars stripped | Run `dmuxai trust --yes` or `dmuxai trust --revoke` | Exit non-zero; error message reports trust store path cannot be resolved | `tests/workspace_trust.rs` `tc_2216_trust_store_path_unset_errors_cli` |
+| TC-2217 | FR-2217 | unit | `RuntimeEnv` with all state and home directories unset | Evaluate `TrustStore::load` and `decide` | Store path is None, `is_trusted` is false, `decide` is Untrusted | `src/workspace_trust.rs` `tc_2217_unset_state_and_home_returns_untrusted_and_no_store_path` |
+| TC-2218 | FR-2218 | unit | Unix filesystem environment | `TrustStore::save` when creating state directory | Directory mode is 0700 | `src/workspace_trust.rs` `tc_2218_state_dir_created_with_0700` |
+| TC-2219 | FR-2219 | unit | State directory with group-writable `trusted-workspaces.json` | `TrustStore::load` and `store.save` | Corrupt warning emitted; untrusted; save returns error | `src/workspace_trust.rs` `tc_2219_group_writable_trust_store_ignored_with_warning` |
+| TC-2220 | FR-2220 | unit | Untrusted workspace with skill source symlink pointing outside | `DmuxSettings::load_with_env` | Skill source stripped and ignored | `src/settings.rs` `tc_2220_untrusted_skills_source_symlink_dir_outside_stripped` |
+| TC-2221 | FR-2221 | unit | Untrusted workspace with memory vault symlink pointing outside | `DmuxSettings::load_with_env` | Memory setting stripped | `src/settings.rs` `tc_2221_untrusted_memory_symlink_dir_outside_stripped` |
+| TC-2222 | FR-2222 | unit | Untrusted workspace with skill having `SKILL.md` symlinked outside | `crate::stage_skills::resolve` with `confine_to` | Returns `IssueKind::Missing` resolving outside workspace | `src/stage_skills.rs` `tc_2222_untrusted_skill_md_symlink_outside_rejected` |
+| TC-2223 | FR-2223 | unit | Untrusted workspace with dotpath skill symlinked outside | `crate::stage_skills::resolve` with `confine_to` | Returns `IssueKind::Missing` resolving outside workspace | `src/stage_skills.rs` `tc_2223_untrusted_dotpath_symlink_outside_rejected` |
+| TC-2224 | FR-2224 | unit | Untrusted workspace with commands, webhook, secret env, and custom agents | `restricted_workspace_details` with secret env var set in process | Returns details with command strings and env key names; never contains secret value | `src/settings.rs` `tc_2224_restricted_workspace_details_hides_secret_values` |
+| TC-2225 | FR-2225 | unit | Process command with `DMUXAI_TRUST_WORKSPACE_CONFIG` and `DMUXAI_CONFIG` set | `apply_child_env_policy` | Command environment removes both variables (values are None) | `src/process/mod.rs` `tc_2225_child_env_policy_removes_trust_workspace_config_and_config` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -165,5 +187,5 @@ Trust records are pinned to the SHA-256 hash of the workspace configuration file
 
 ## 8. Review and test exit criteria
 
-- [x] All Must requirements (FR-2190..FR-2214) map to passing automated test evidence (TC-2190..TC-2214).
+- [x] All Must requirements (FR-2190..FR-2225) map to passing automated test evidence (TC-2190..TC-2225).
 - [x] Spec gate checks pass: `python3 scripts/check-spec.py --all` and `python3 scripts/check-tc-links.py`.

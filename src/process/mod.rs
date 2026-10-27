@@ -20,6 +20,9 @@ pub mod supervisor;
 ///   set via `--config` or the environment. Child processes must not inherit this
 ///   override, ensuring child runs (such as MCP servers or nested tools) use
 ///   workspace or default configuration isolation.
+/// - `DMUXAI_TRUST_WORKSPACE_CONFIG`: Process-scoped workspace trust opt-in flag.
+///   Child processes must not inherit this opt-in to maintain isolation and
+///   ensure child runs evaluate trust independently per workspace.
 ///
 /// **Preserved (needed by child processes or user preferences):**
 /// - `DMUXAI_STATE_DIR`: Root directory for DmuxAI state. Preserved so that
@@ -39,7 +42,12 @@ pub mod supervisor;
 /// **Standard system variables:**
 /// - `XDG_*` (such as `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`)
 ///   and `HOME`: The policy must NEVER modify or remove these variables.
-pub const INTERNAL_ENV_VARS: &[&str] = &["DMUXAI_WEB_TOKEN", "DMUXAI_MCP_CONFIG", "DMUXAI_CONFIG"];
+pub const INTERNAL_ENV_VARS: &[&str] = &[
+    "DMUXAI_WEB_TOKEN",
+    "DMUXAI_MCP_CONFIG",
+    "DMUXAI_CONFIG",
+    "DMUXAI_TRUST_WORKSPACE_CONFIG",
+];
 
 /// Applies the child process environment policy to a standard process command.
 ///
@@ -162,6 +170,35 @@ mod tests {
                 "expected {var} to be removed in tokio::process::Command"
             );
         }
+    }
+
+    #[test]
+    fn tc_2225_child_env_policy_removes_trust_workspace_config_and_config() {
+        let mut cmd = std::process::Command::new("true");
+        cmd.env("DMUXAI_TRUST_WORKSPACE_CONFIG", "1");
+        cmd.env("DMUXAI_CONFIG", "/path/to/dmuxai.toml");
+        apply_child_env_policy(&mut cmd);
+
+        let removed: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_str().unwrap().to_owned(),
+                    v.map(|v| v.to_str().unwrap().to_owned()),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            removed.get("DMUXAI_TRUST_WORKSPACE_CONFIG"),
+            Some(&None),
+            "expected DMUXAI_TRUST_WORKSPACE_CONFIG to be removed (value None)"
+        );
+        assert_eq!(
+            removed.get("DMUXAI_CONFIG"),
+            Some(&None),
+            "expected DMUXAI_CONFIG to be removed (value None)"
+        );
     }
 
     #[test]
