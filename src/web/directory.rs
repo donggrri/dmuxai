@@ -59,6 +59,7 @@ pub struct WorkspaceEntry {
     pub path: String,
     pub hub: DashboardHub,
     pub services: DashboardServices,
+    pub restricted: bool,
 }
 
 struct Inner {
@@ -84,6 +85,7 @@ impl WorkspaceDirectory {
             path,
             hub,
             services,
+            restricted: false,
         });
         Self {
             inner: RwLock::new(Inner {
@@ -278,6 +280,7 @@ mod tests {
             path: path.to_string(),
             hub,
             services,
+            restricted: false,
         }
     }
 

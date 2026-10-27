@@ -1629,6 +1629,7 @@ struct WorkspaceListItem {
     name: String,
     focused: bool,
     running: bool,
+    restricted: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -1657,6 +1658,7 @@ async fn get_workspaces(axum::extract::State(state): axum::extract::State<AppSta
                 name,
                 focused: entry.id == focused_id,
                 running,
+                restricted: entry.restricted,
             }
         })
         .collect();
@@ -6968,6 +6970,7 @@ mod tests {
             path: "/repo/project-b".to_string(),
             hub: hub2,
             services: DashboardServices::default(),
+            restricted: false,
         })
         .unwrap();
 
@@ -6992,12 +6995,14 @@ mod tests {
         assert_eq!(list[0]["name"], "project-a");
         assert_eq!(list[0]["focused"], true);
         assert_eq!(list[0]["running"], false);
+        assert_eq!(list[0]["restricted"], false);
 
         assert_eq!(list[1]["id"], "proj2");
         assert_eq!(list[1]["path"], "/repo/project-b");
         assert_eq!(list[1]["name"], "project-b");
         assert_eq!(list[1]["focused"], false);
         assert_eq!(list[1]["running"], false);
+        assert_eq!(list[1]["restricted"], false);
     }
 
     #[tokio::test]
@@ -7013,6 +7018,7 @@ mod tests {
             path: "/repo/project-b".to_string(),
             hub: hub2,
             services: DashboardServices::default(),
+            restricted: false,
         })
         .unwrap();
 
@@ -7076,6 +7082,7 @@ mod tests {
                         path: path_str_for_task,
                         hub: new_hub,
                         services: DashboardServices::default(),
+                        restricted: false,
                     })
                     .unwrap();
                 let _ = req.reply.send(Ok(entry));
@@ -7138,6 +7145,7 @@ mod tests {
             path: canonical_str.clone(),
             hub: hub2,
             services: DashboardServices::default(),
+            restricted: false,
         })
         .unwrap();
 
@@ -7228,6 +7236,7 @@ mod tests {
             path: "/repo/project-b".to_string(),
             hub: DashboardHub::new(SnapshotSource::Tui, "/repo/project-b".to_string()),
             services: DashboardServices::default(),
+            restricted: false,
         })
         .unwrap();
 
@@ -7304,6 +7313,7 @@ mod tests {
             path: "/repo/project-b".to_string(),
             hub: hub2,
             services: DashboardServices::default(),
+            restricted: false,
         })
         .unwrap();
 
