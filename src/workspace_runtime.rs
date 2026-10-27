@@ -1,11 +1,22 @@
 //! One workspace's runtime; a later change opens several.
 
-use std::{error::Error, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    error::Error,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use dmuxai::conversation::ConversationEngine;
 use dmuxai::settings::DmuxSettings;
 use dmuxai::todo::TodoStore;
 use dmuxai::web::commands::DashboardCommand;
+use dmuxai::web::directory::{
+    DirectoryError, MAX_WORKSPACES, OpenError, OpenRequest, WorkspaceDirectory, WorkspaceEntry,
+};
 use dmuxai::web::{DashboardHub, DashboardServices, SnapshotSource};
 use tokio::sync::mpsc::Receiver;
 
@@ -138,16 +149,48 @@ pub(crate) fn attach_web_workspace(
     }
 }
 
-/// Runs a headless host for an App.
+/// Shared dashboard state passed to a headless host so it can open folders
+/// in-process without re-executing `dmuxai`.
+pub(crate) struct HostContext {
+    pub directory: Arc<WorkspaceDirectory>,
+    pub token: String,
+    pub base_url: String,
+}
+
+/// The apps and result returned when a headless host ends.
+pub(crate) struct HostOutcome {
+    /// The app hosting the initial workspace ("default").
+    pub primary: Option<App>,
+    /// Apps opened later through the dashboard.
+    pub others: Vec<App>,
+    /// The primary app's result, or `Ok(())` when ended by a signal.
+    pub result: std::io::Result<()>,
+}
+
+/// Runs a headless host for one or more Apps.
 ///
-/// Hosts one workspace today; a later change hosts several.
+/// The first app always hosts the "default" workspace. When a [`HostContext`]
+/// is supplied, dashboard switch requests are served by spawning additional
+/// apps in this same local set and task loop.
 pub(crate) async fn run_headless_host(
     mut app: App,
-    shutdown: Option<&mut crate::ShutdownSignals>,
-) -> (Option<App>, std::io::Result<()>) {
+    ctx: Option<HostContext>,
+    mut shutdown: Option<&mut crate::ShutdownSignals>,
+) -> HostOutcome {
     let mut tasks = tokio::task::JoinSet::new();
-    let stop = app.stop_handle();
+    let mut stop_flags: HashMap<String, Arc<AtomicBool>> = HashMap::new();
+    let mut next_id = 2u32;
+    let mut rx = match ctx.as_ref() {
+        Some(ctx) => {
+            let (tx, rx) = tokio::sync::mpsc::channel::<OpenRequest>(4);
+            ctx.directory.set_opener(tx);
+            Some(rx)
+        }
+        None => None,
+    };
 
+    let stop = app.stop_handle();
+    stop_flags.insert("default".to_owned(), stop);
     tasks.spawn_local(async move {
         let backend = ratatui::backend::CrosstermBackend::new(std::io::sink());
         let mut terminal = ratatui::Terminal::with_options(
@@ -157,36 +200,212 @@ pub(crate) async fn run_headless_host(
             },
         )?;
         let result = app.run(&mut terminal).await;
-        Ok::<_, std::io::Error>((app, result))
+        Ok::<_, std::io::Error>(("default".to_owned(), app, result))
     });
 
-    let shutdown_fut = async {
-        match shutdown {
-            Some(s) => s.recv().await,
-            None => std::future::pending::<()>().await,
-        }
-    };
+    let mut collected: Vec<(String, App, std::io::Result<()>)> = Vec::new();
+    let mut join_error: Option<std::io::Error> = None;
+    let mut host_ended = false;
 
-    tokio::select! {
-        joined = tasks.join_next() => {
-            match joined {
-                Some(Ok(Ok((app, result)))) => (Some(app), result),
-                Some(Ok(Err(io_err))) => (None, Err(io_err)),
-                Some(Err(join_err)) => (None, Err(std::io::Error::other(join_err))),
-                None => (None, Ok(())),
+    while !host_ended {
+        tokio::select! {
+            joined = tasks.join_next() => {
+                match joined {
+                    Some(Ok(Ok(item))) => collected.push(item),
+                    Some(Ok(Err(error))) => join_error = Some(error),
+                    Some(Err(error)) => join_error = Some(std::io::Error::other(error)),
+                    None => {}
+                }
+                host_ended = true;
             }
-        }
-        _ = shutdown_fut => {
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            match tokio::time::timeout(std::time::Duration::from_secs(5), tasks.join_next()).await {
-                Ok(Some(Ok(Ok((app, result))))) => (Some(app), result),
-                Ok(Some(Ok(Err(io_err)))) => (None, Err(io_err)),
-                Ok(Some(Err(join_err))) => (None, Err(std::io::Error::other(join_err))),
-                _ => {
-                    tasks.abort_all();
-                    (None, Ok(()))
+            _ = async {
+                match shutdown.as_deref_mut() {
+                    Some(signals) => signals.recv().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                host_ended = true;
+            }
+            received = async {
+                match rx.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending::<Option<OpenRequest>>().await,
+                }
+            } => {
+                match received {
+                    Some(OpenRequest { path, reply }) => {
+                        let Some(ctx) = ctx.as_ref() else {
+                            continue;
+                        };
+                        match open_hosted_workspace(ctx, path, &mut next_id).await {
+                            Ok((mut new_app, entry)) => {
+                                let id = entry.id.clone();
+                                let stop = new_app.stop_handle();
+                                stop_flags.insert(id.clone(), stop);
+                                tasks.spawn_local(async move {
+                                    let backend =
+                                        ratatui::backend::CrosstermBackend::new(std::io::sink());
+                                    let mut terminal = ratatui::Terminal::with_options(
+                                        backend,
+                                        ratatui::TerminalOptions {
+                                            viewport: ratatui::Viewport::Fixed(
+                                                ratatui::layout::Rect::new(0, 0, 120, 40),
+                                            ),
+                                        },
+                                    )?;
+                                    let result = new_app.run(&mut terminal).await;
+                                    Ok::<_, std::io::Error>((id, new_app, result))
+                                });
+                                let _ = reply.send(Ok(entry));
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                            }
+                        }
+                    }
+                    None => {
+                        rx = None;
+                    }
                 }
             }
         }
     }
+
+    for stop in stop_flags.values() {
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    let remaining = async {
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(Ok(item)) => collected.push(item),
+                Ok(Err(error)) => join_error = Some(error),
+                Err(error) => join_error = Some(std::io::Error::other(error)),
+            }
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(5), remaining)
+        .await
+        .is_err()
+    {
+        tasks.abort_all();
+    }
+
+    let mut primary = None;
+    let mut others = Vec::new();
+    let mut primary_result = None;
+    for (id, app, result) in collected {
+        if id == "default" {
+            primary = Some(app);
+            primary_result = Some(result);
+        } else {
+            others.push(app);
+        }
+    }
+    let result = match primary_result {
+        Some(result) => result,
+        None => match join_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        },
+    };
+    HostOutcome {
+        primary,
+        others,
+        result,
+    }
+}
+
+/// Opens a workspace inside an existing headless dashboard host.
+///
+/// The dashboard directory already focuses folders that are open; this
+/// function closes the remaining race and performs the validation, app
+/// creation, and registration needed to serve a new folder.
+async fn open_hosted_workspace(
+    ctx: &HostContext,
+    path: PathBuf,
+    next_id: &mut u32,
+) -> Result<(App, Arc<WorkspaceEntry>), OpenError> {
+    let key = dmuxai::workspace::normalize_workspace_path(&path)
+        .unwrap_or_else(|_| path.display().to_string());
+    if ctx.directory.find_by_path(&key).is_some() {
+        return Err(OpenError {
+            status: 409,
+            message: "folder is already open".to_owned(),
+        });
+    }
+    if ctx.directory.len() >= MAX_WORKSPACES {
+        return Err(OpenError {
+            status: 409,
+            message: "too many open folders (max 4); close one first".to_owned(),
+        });
+    }
+    if let Err(error) = dmuxai::workspace::ensure_directory_writable(&path) {
+        return Err(OpenError {
+            status: 400,
+            message: error.to_string(),
+        });
+    }
+
+    let settings = DmuxSettings::load(&path);
+    let (mut app, migration_notice) =
+        open_workspace_app(&path, &settings).map_err(|error| OpenError {
+            status: 500,
+            message: error.to_string(),
+        })?;
+    if !settings.custom_agents.is_empty() {
+        app.push_startup_notice(
+            "Custom agents from this folder's dmuxai.toml are not loaded when it is opened in a dashboard that already serves another folder; start a separate `dmuxai --web` here to use them.".to_owned(),
+        );
+    }
+    for warning in &settings.config_warnings {
+        app.push_startup_notice(warning.clone());
+    }
+    if let Some(notice) = migration_notice {
+        app.push_startup_notice(notice);
+    }
+    app.set_headless(true);
+
+    let mut parts = build_web_workspace(&app, &path, &settings, &ctx.token);
+    for notice in parts.notices.drain(..) {
+        app.push_startup_notice(notice);
+    }
+    if let Some(first) = ctx.directory.get("default")
+        && let Some(config) = first.hub.switch_config()
+    {
+        parts.hub.set_switch_config(config);
+    }
+
+    let id = format!("w{next_id}");
+    *next_id += 1;
+    let entry = ctx
+        .directory
+        .insert(WorkspaceEntry {
+            id,
+            path: key.clone(),
+            hub: parts.hub.clone(),
+            services: parts.services,
+        })
+        .map_err(|error| {
+            let status = match error {
+                DirectoryError::Full | DirectoryError::Duplicate => 409,
+                _ => 500,
+            };
+            OpenError {
+                status,
+                message: error.to_string(),
+            }
+        })?;
+
+    attach_web_workspace(
+        &mut app,
+        parts.hub,
+        parts.doc_changes,
+        parts.open_tickets,
+        parts.todos,
+        ctx.base_url.clone(),
+    );
+    app.push_local_notice(format!("Opened {key} in this dashboard."));
+    let _ = dmuxai::workspace::record_recent_workspace(&path);
+    Ok((app, entry))
 }

@@ -4,9 +4,9 @@
 //!   dialog listing recent paths and subdirectories (no files, no dotdirs);
 //!   entering an invalid path (`/`) shows the validation reason inline and
 //!   disables Switch; captures a screenshot.
-//! - `workspace_switch_reexecs_serve` (TC-876): `POST /api/workspace/switch`
-//!   re-executes `dmuxai --web` on the same port and token in the new workspace
-//!   within 15s.
+//! - `workspace_switch_opens_in_process_for_web` (TC-876): `POST
+//!   /api/workspace/switch` opens the new workspace in process, and the same
+//!   `/api/state` URL serves it within 15s.
 
 #![cfg(unix)]
 
@@ -287,10 +287,10 @@ print(json.dumps(out))
     assert_eq!(&png_bytes[..4], b"\x89PNG");
 }
 
-// TC-876 (FR-874)
+// TC-876 (FR-874, FR-2303)
 #[test]
-#[ignore = "spawns interactive dmuxai --web under pty and re-execs; run with --ignored"]
-fn workspace_switch_reexecs_serve() {
+#[ignore = "spawns interactive dmuxai --web under pty and switches workspace in process; run with --ignored"]
+fn workspace_switch_opens_in_process_for_web() {
     let python = "python3";
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = std::fs::canonicalize(tmp.path()).expect("canonicalize root");
@@ -407,7 +407,7 @@ try:
             pass
         time.sleep(0.15)
     else:
-        raise RuntimeError("timed out waiting for re-exec into ws_b; pty=" + "".join(pty_chunks))
+        raise RuntimeError("timed out waiting for switch into ws_b; pty=" + "".join(pty_chunks))
 finally:
     try:
         os.killpg(pid, signal.SIGKILL)
@@ -455,7 +455,9 @@ print(json.dumps(out))
         parsed["initial_current"].as_str(),
         Some(ws_a.to_string_lossy().as_ref())
     );
-    assert_eq!(parsed["switch_status"].as_u64(), Some(202));
+    assert_eq!(parsed["switch_status"].as_u64(), Some(200));
+    assert_eq!(parsed["switch_body"]["in_process"].as_bool(), Some(true));
+    assert_eq!(parsed["switch_body"]["opened"].as_bool(), Some(true));
     assert_eq!(
         parsed["switched_workspace"].as_str(),
         Some(ws_b.to_string_lossy().as_ref())

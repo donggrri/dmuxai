@@ -310,7 +310,7 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-workspace-dir | FR-872,FR-873,NFR-870 | TC-873 | `workspace_api_lists_dirs_and_validates` | integration | ✅ | v0.2.2 |
 | M8,M2 | SPEC-workspace-dir | FR-871,FR-872 | TC-874 | `workspace_dialog_renders_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.2 |
 | M8,M2 | SPEC-workspace-dir | FR-874 | TC-875 | `workspace_switch_guards` | integration | ✅ | v0.2.2 |
-| M8,M2 | SPEC-workspace-dir | FR-874 | TC-876 | `workspace_switch_reexecs_serve` (ignored) | e2e | ✅ | v0.2.2 |
+| M8,M2 | SPEC-workspace-dir | FR-874 | TC-876 | `workspace_switch_opens_in_process_for_web` (ignored) | e2e | ✅ | v0.2.2 |
 | M8,M2 | SPEC-workspace-dir | FR-875 | TC-877 | `runner_cwd_is_workspace` | unit | ✅ | v0.2.2 |
 | M8,M2 | SPEC-graph-swimlane | FR-880,FR-881,FR-883 | TC-880 | `graph_swimlane_assets` | unit | ✅ | v0.2.2 |
 | M8,M2 | SPEC-graph-swimlane | FR-882,FR-884,UX-880 | TC-881 | `graph_swimlane_math_in_headless_chrome` (ignored) | e2e | ✅ | v0.2.2 |

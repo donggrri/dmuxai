@@ -2312,7 +2312,7 @@
     command({ command: 'prepare_open_conversation', workspace: group.path, id: c.id }).then(function (data) {
       if (!data) { return; }
       notify('Switching to ' + (group.name || group.path) + '\u2026');
-      switcher(group.path).then(function (res) {
+      switcher(group.path, { conversation: c.id }).then(function (res) {
         if (!res || !res.ok) { notify((res && res.error) || 'Workspace switch failed.', true); }
       });
     });

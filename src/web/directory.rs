@@ -9,6 +9,19 @@ use std::sync::{Arc, RwLock};
 use crate::web::hub::DashboardHub;
 use crate::web::server::DashboardServices;
 
+/// Error returned when opening a workspace in-process fails.
+#[derive(Debug, Clone)]
+pub struct OpenError {
+    pub status: u16,
+    pub message: String,
+}
+
+/// Request sent to an opener channel to open a workspace in-process.
+pub struct OpenRequest {
+    pub path: std::path::PathBuf,
+    pub reply: tokio::sync::oneshot::Sender<Result<Arc<WorkspaceEntry>, OpenError>>,
+}
+
 /// Maximum number of workspaces that can be open simultaneously.
 pub const MAX_WORKSPACES: usize = 4;
 
@@ -50,6 +63,7 @@ struct Inner {
 /// Directory of active workspaces. The dashboard currently creates exactly one entry.
 pub struct WorkspaceDirectory {
     inner: RwLock<Inner>,
+    opener: RwLock<Option<tokio::sync::mpsc::Sender<OpenRequest>>>,
 }
 
 impl WorkspaceDirectory {
@@ -69,7 +83,20 @@ impl WorkspaceDirectory {
                 entries: vec![entry],
                 focused: 0,
             }),
+            opener: RwLock::new(None),
         }
+    }
+
+    /// Sets the opener sender for in-process workspace opening.
+    pub fn set_opener(&self, tx: tokio::sync::mpsc::Sender<OpenRequest>) {
+        let mut opener = self.opener.write().unwrap_or_else(|e| e.into_inner());
+        *opener = Some(tx);
+    }
+
+    /// Returns a clone of the opener sender, if set.
+    pub fn opener(&self) -> Option<tokio::sync::mpsc::Sender<OpenRequest>> {
+        let opener = self.opener.read().unwrap_or_else(|e| e.into_inner());
+        opener.clone()
     }
 
     /// Returns the currently focused workspace entry.
@@ -554,5 +581,40 @@ mod tests {
                 "phase {phase:?} should be running"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn tc_2303_opener_roundtrip() {
+        let (hub, services) = (
+            DashboardHub::new(SnapshotSource::Tui, "/test".to_string()),
+            DashboardServices::default(),
+        );
+        let dir = WorkspaceDirectory::single(hub, services);
+        assert!(dir.opener().is_none());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<OpenRequest>(4);
+        dir.set_opener(tx);
+        let opener = dir.opener();
+        assert!(opener.is_some());
+
+        let req_opener = opener.unwrap();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let path = std::path::PathBuf::from("/test/path");
+        req_opener
+            .send(OpenRequest {
+                path: path.clone(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        let received = rx.recv().await.expect("received open request");
+        assert_eq!(received.path, path);
+        let _ = received.reply.send(Err(OpenError {
+            status: 404,
+            message: "not found".to_string(),
+        }));
+        let res = reply_rx.await.unwrap();
+        assert!(res.is_err());
     }
 }

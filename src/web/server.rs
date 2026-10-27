@@ -1887,17 +1887,28 @@ async fn post_workspace_switch(
     if !ws.services.web_attached {
         return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
     }
+    let canonical = match crate::workspace::validate_workspace_dir(std::path::Path::new(&body.path))
+    {
+        Ok(path) => path,
+        Err(reason) => return error_json(StatusCode::BAD_REQUEST, &reason.to_string()),
+    };
+
+    if let Some(opener) = state.workspaces.opener() {
+        return tokio::spawn(workspace_switch_in_process_task(
+            state.workspaces.clone(),
+            opener,
+            canonical,
+        ))
+        .await
+        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"));
+    }
+
     if !is_unix_switch_supported(&ws) {
         return error_json(
             StatusCode::NOT_IMPLEMENTED,
             "workspace switch is not supported on this platform",
         );
     }
-    let canonical = match crate::workspace::validate_workspace_dir(std::path::Path::new(&body.path))
-    {
-        Ok(path) => path,
-        Err(reason) => return error_json(StatusCode::BAD_REQUEST, &reason.to_string()),
-    };
 
     // Run the rest in its own task: once the App has set switch-pending, the
     // flag must be committed or cancelled even if the client disconnects and
@@ -1909,6 +1920,66 @@ async fn post_workspace_switch(
     ))
     .await
     .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+}
+
+async fn workspace_switch_in_process_task(
+    workspaces: Arc<WorkspaceDirectory>,
+    opener: tokio::sync::mpsc::Sender<crate::web::directory::OpenRequest>,
+    canonical: std::path::PathBuf,
+) -> Response {
+    let key = crate::workspace::normalize_workspace_path(&canonical)
+        .unwrap_or_else(|_| canonical.display().to_string());
+    if let Some(entry) = workspaces.find_by_path(&key) {
+        workspaces.set_focused(&entry.id);
+        return json_ok(
+            StatusCode::OK,
+            &serde_json::json!({
+                "ok": true,
+                "path": entry.path,
+                "id": entry.id,
+                "in_process": true,
+                "opened": false
+            }),
+        );
+    }
+
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    if opener
+        .send(crate::web::directory::OpenRequest {
+            path: canonical,
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
+    }
+
+    match tokio::time::timeout(Duration::from_secs(60), rx).await {
+        Ok(Ok(Ok(entry))) => {
+            workspaces.set_focused(&entry.id);
+            json_ok(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "ok": true,
+                    "path": entry.path,
+                    "id": entry.id,
+                    "in_process": true,
+                    "opened": true
+                }),
+            )
+        }
+        Ok(Ok(Err(e))) => {
+            let status =
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            error_json(status, &e.message)
+        }
+        Ok(Err(_)) => error_json(StatusCode::CONFLICT, "requires dmuxai --web"),
+        Err(_) => error_json(
+            StatusCode::GATEWAY_TIMEOUT,
+            "the folder did not open in time",
+        ),
+    }
 }
 
 /// How long `POST /api/workspace/switch` waits for the App (shortened in tests).
@@ -6897,5 +6968,172 @@ mod tests {
         let body_missing = read_body(resp_missing).await;
         let v_err: serde_json::Value = serde_json::from_str(&body_missing).unwrap();
         assert_eq!(v_err["error"], "no such open folder");
+    }
+
+    #[tokio::test]
+    async fn tc_2303_switch_opens_folder_in_process() {
+        let temp_ws = tempfile::tempdir().unwrap();
+        let canonical_path = crate::workspace::validate_workspace_dir(temp_ws.path()).unwrap();
+        let canonical_str = crate::workspace::normalize_workspace_path(&canonical_path).unwrap();
+
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/repo/project-a".to_string());
+        let dir = Arc::new(WorkspaceDirectory::single(
+            hub,
+            DashboardServices {
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        ));
+
+        let (opener_tx, mut opener_rx) =
+            tokio::sync::mpsc::channel::<crate::web::directory::OpenRequest>(4);
+        dir.set_opener(opener_tx);
+
+        let dir_clone = dir.clone();
+        let path_str_for_task = canonical_str.clone();
+        tokio::spawn(async move {
+            if let Some(req) = opener_rx.recv().await {
+                let new_hub = DashboardHub::new(SnapshotSource::Tui, path_str_for_task.clone());
+                let entry = dir_clone
+                    .insert(crate::web::directory::WorkspaceEntry {
+                        id: "w2".to_string(),
+                        path: path_str_for_task,
+                        hub: new_hub,
+                        services: DashboardServices::default(),
+                    })
+                    .unwrap();
+                let _ = req.reply.send(Ok(entry));
+            }
+        });
+
+        let token = "test-token-ws-2303";
+        let router =
+            build_router_with_directory(dir.clone(), token.to_owned(), allowed_localhost());
+
+        let req = json_request(
+            "POST",
+            "/api/workspace/switch",
+            token,
+            &serde_json::json!({ "path": canonical_str }).to_string(),
+        );
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["in_process"], true);
+        assert_eq!(v["opened"], true);
+        assert_eq!(v["id"], "w2");
+
+        // /api/workspaces now shows w2 focused
+        let list_req = axum::http::Request::builder()
+            .uri("/api/workspaces")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let list_resp = router.oneshot(list_req).await.unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_body = read_body(list_resp).await;
+        let list_v: serde_json::Value = serde_json::from_str(&list_body).unwrap();
+        let list = list_v["workspaces"].as_array().unwrap();
+        let w2_entry = list.iter().find(|e| e["id"] == "w2").unwrap();
+        assert_eq!(w2_entry["focused"], true);
+    }
+
+    #[tokio::test]
+    async fn tc_2304_switch_to_open_folder_only_focuses() {
+        let temp_ws = tempfile::tempdir().unwrap();
+        let canonical_path = crate::workspace::validate_workspace_dir(temp_ws.path()).unwrap();
+        let canonical_str = crate::workspace::normalize_workspace_path(&canonical_path).unwrap();
+
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/repo/project-a".to_string());
+        let dir = Arc::new(WorkspaceDirectory::single(
+            hub,
+            DashboardServices {
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        ));
+
+        let hub2 = DashboardHub::new(SnapshotSource::Tui, canonical_str.clone());
+        dir.insert(crate::web::directory::WorkspaceEntry {
+            id: "w2".to_string(),
+            path: canonical_str.clone(),
+            hub: hub2,
+            services: DashboardServices::default(),
+        })
+        .unwrap();
+
+        let (opener_tx, mut opener_rx) =
+            tokio::sync::mpsc::channel::<crate::web::directory::OpenRequest>(4);
+        dir.set_opener(opener_tx);
+
+        let token = "test-token-ws-2304";
+        let router =
+            build_router_with_directory(dir.clone(), token.to_owned(), allowed_localhost());
+
+        let req = json_request(
+            "POST",
+            "/api/workspace/switch",
+            token,
+            &serde_json::json!({ "path": canonical_str }).to_string(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["in_process"], true);
+        assert_eq!(v["opened"], false);
+        assert_eq!(v["id"], "w2");
+
+        // The opener receives nothing
+        assert!(opener_rx.try_recv().is_err());
+        assert_eq!(dir.focused().id, "w2");
+    }
+
+    #[tokio::test]
+    async fn tc_2305_switch_reports_open_error() {
+        let temp_ws = tempfile::tempdir().unwrap();
+        let canonical_path = crate::workspace::validate_workspace_dir(temp_ws.path()).unwrap();
+        let canonical_str = crate::workspace::normalize_workspace_path(&canonical_path).unwrap();
+
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/repo/project-a".to_string());
+        let dir = Arc::new(WorkspaceDirectory::single(
+            hub,
+            DashboardServices {
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        ));
+
+        let (opener_tx, mut opener_rx) =
+            tokio::sync::mpsc::channel::<crate::web::directory::OpenRequest>(4);
+        dir.set_opener(opener_tx);
+
+        tokio::spawn(async move {
+            if let Some(req) = opener_rx.recv().await {
+                let _ = req.reply.send(Err(crate::web::directory::OpenError {
+                    status: 409,
+                    message: "too many open folders (max 4)".to_string(),
+                }));
+            }
+        });
+
+        let token = "test-token-ws-2305";
+        let router = build_router_with_directory(dir, token.to_owned(), allowed_localhost());
+
+        let req = json_request(
+            "POST",
+            "/api/workspace/switch",
+            token,
+            &serde_json::json!({ "path": canonical_str }).to_string(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body_str = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(v["error"], "too many open folders (max 4)");
     }
 }

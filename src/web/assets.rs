@@ -2013,4 +2013,28 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn tc_2306_switch_in_process_navigates() {
+        assert!(
+            WORKSPACE_JS.contains("in_process"),
+            "WORKSPACE_JS must contain 'in_process'"
+        );
+        assert!(
+            WORKSPACE_JS.contains("searchParams"),
+            "WORKSPACE_JS must contain 'searchParams'"
+        );
+        assert!(
+            WORKSPACE_JS.contains("dmuxaiApiUrlFor"),
+            "WORKSPACE_JS must contain 'dmuxaiApiUrlFor'"
+        );
+        assert!(
+            WORKSPACE_JS.contains("newConversation"),
+            "WORKSPACE_JS must contain 'newConversation'"
+        );
+        assert!(
+            SESSION_JS.contains("conversation: c.id"),
+            "SESSION_JS must contain 'conversation: c.id'"
+        );
+    }
 }
