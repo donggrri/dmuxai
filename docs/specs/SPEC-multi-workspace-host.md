@@ -70,6 +70,9 @@ This spec is delivered in stacked pull requests; each one adds its rows here.
 | FR-2306 | Must | The dashboard receives an in-process switch result | It optionally loads the requested conversation (`load_conversation`) or starts one (`new_conversation`) in the target folder, then navigates the tab to `?ws=<id>` (no `ws` for `default`) | A `202` result keeps the poll-and-reload flow | TC-2306 |
 | FR-2307 | Must | The Sessions sidebar shows folder groups and `GET /api/workspaces` lists open folders (refreshed every 5 s) | Groups of open folders are marked `open`; a folder whose `running` is true shows a spinner labelled "running in this folder" | Older servers without `/api/workspaces`: groups render as before | TC-2307 |
 | FR-2308 | Must | A folder group in the sidebar | A `+` button starts a new conversation in that folder through the in-process switch (`newConversation: true`) | Re-exec fallback (202) keeps the old reload flow | TC-2308 |
+| FR-2309 | Must | Headless host and `POST /api/workspaces/{id}/close` | The folder's App stops, its agents are shut down and the entry is removed; `200 {"ok":true}` | Unknown id `404`; the first folder (`default`) `409 the first folder closes with Quit`; no closer registered `409 requires dmuxai --web`; timeout `504` | TC-2309 |
+| FR-2310 | Must | Closing a running folder, or Quit while any folder runs | Close without `force` returns `409` with `running:true`; the dashboard asks "Quit dmuxai? Turns are still running in: …" before Quit | `force:true` closes anyway; nothing running: no prompt | TC-2310 |
+| FR-2311 | Must | An open, non-first folder group in the sidebar | A `×` button closes it, confirming and retrying with `force:true` on `409` running; a tab showing that folder navigates to the first folder | — | TC-2311 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -84,6 +87,9 @@ This spec is delivered in stacked pull requests; each one adds its rows here.
 | TC-2306 | FR-2306 | unit (static asset) | Embedded `workspace.js` / `session.js` | Inspect the switch handler | Handles `in_process`, sets `ws` via `searchParams`, posts through `dmuxaiApiUrlFor`; sidebar passes `conversation: c.id` | `src/web/assets.rs` `tc_2306_switch_in_process_navigates` |
 | TC-2307 | FR-2307 | unit (static asset) | Embedded `session.js` | Inspect the sidebar renderer | Reads `/api/workspaces`; adds `sessions-group-open` / `sessions-group-running` and the spinner label | `src/web/assets.rs` `tc_2307_sidebar_marks_open_and_running_folders` |
 | TC-2308 | FR-2308 | unit (static asset) | Embedded `session.js` / `session.css` | Inspect the folder group header | `sessions-group-new` button calls the switch with `newConversation: true`; CSS rule exists | `src/web/assets.rs` `tc_2308_sidebar_new_in_folder` |
+| TC-2309 | FR-2309 | unit + integration | Directory with a closer task; two entries | Send a close request; POST close for `w2` and `default` | Request arrives; `w2` removed with 200; `default` refused with 409 | `src/web/directory.rs` `tc_2309_closer_roundtrip`; `src/web/server.rs` `tc_2309_close_folder`, `tc_2309_close_default_refused` |
+| TC-2310 | FR-2310 | integration + unit (static asset) | Second folder whose snapshot is running | POST close without and with `force`; inspect `session.js` | 409 `running:true`, then 200; quit text present | `src/web/server.rs` `tc_2310_close_running_folder_needs_force`; `src/web/assets.rs` `tc_2310_quit_confirms_running_folders` |
+| TC-2311 | FR-2311 | unit (static asset) | Embedded `session.js` / `session.css` | Inspect the folder group header | `sessions-group-close` posts `/close` and retries with `force: true` | `src/web/assets.rs` `tc_2311_sidebar_close_folder` |
 
 ## 6. Data, integration, and safety contracts
 

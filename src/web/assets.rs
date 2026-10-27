@@ -2059,6 +2059,22 @@ mod tests {
     }
 
     #[test]
+    fn tc_2308_sidebar_new_in_folder() {
+        assert!(
+            SESSION_JS.contains("sessions-group-new"),
+            "SESSION_JS must contain sessions-group-new"
+        );
+        assert!(
+            SESSION_JS.contains("newConversation: true"),
+            "SESSION_JS must contain newConversation: true"
+        );
+        assert!(
+            SESSION_CSS.contains(".sessions-group-new"),
+            "SESSION_CSS must contain .sessions-group-new"
+        );
+    }
+
+    #[test]
     fn tc_2310_quit_confirms_running_folders() {
         assert!(
             SESSION_JS.contains("Turns are still running in: "),
