@@ -2037,4 +2037,40 @@ mod tests {
             "SESSION_JS must contain 'conversation: c.id'"
         );
     }
+
+    #[test]
+    fn tc_2307_sidebar_marks_open_and_running_folders() {
+        assert!(
+            SESSION_JS.contains("/api/workspaces"),
+            "SESSION_JS must contain /api/workspaces"
+        );
+        assert!(
+            SESSION_JS.contains("sessions-group-open"),
+            "SESSION_JS must contain sessions-group-open"
+        );
+        assert!(
+            SESSION_JS.contains("sessions-group-running"),
+            "SESSION_JS must contain sessions-group-running"
+        );
+        assert!(
+            SESSION_JS.contains("running in this folder"),
+            "SESSION_JS must contain running in this folder"
+        );
+    }
+
+    #[test]
+    fn tc_2308_sidebar_new_in_folder() {
+        assert!(
+            SESSION_JS.contains("sessions-group-new"),
+            "SESSION_JS must contain sessions-group-new"
+        );
+        assert!(
+            SESSION_JS.contains("newConversation: true"),
+            "SESSION_JS must contain newConversation: true"
+        );
+        assert!(
+            SESSION_CSS.contains(".sessions-group-new"),
+            "SESSION_CSS must contain .sessions-group-new"
+        );
+    }
 }
