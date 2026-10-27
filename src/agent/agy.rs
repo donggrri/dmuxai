@@ -377,7 +377,8 @@ async fn stop_turn(turn: Option<ActiveTurn>, event_tx: &mpsc::Sender<AgentOutput
     }
 }
 
-/// Computes a workspace fingerprint based on git status, diff, and untracked file metadata.
+/// Computes a workspace fingerprint based on git status, diff, and untracked file metadata,
+/// excluding dmuxai's own `.dmuxai/` state directory.
 ///
 /// FR-2121: Used to detect if a turn modified the workspace via shell commands or tools
 /// outside of explicit AGY write tool calls, avoiding false plan-only verdicts.
@@ -386,6 +387,7 @@ fn workspace_fingerprint(cwd: &Path) -> Option<u64> {
         .args(["-C"])
         .arg(cwd)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .args(["--", ".", ":(exclude).dmuxai"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -399,6 +401,7 @@ fn workspace_fingerprint(cwd: &Path) -> Option<u64> {
         .args(["-C"])
         .arg(cwd)
         .args(["diff", "--no-ext-diff", "--binary", "HEAD"])
+        .args(["--", ".", ":(exclude).dmuxai"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -2119,6 +2122,84 @@ mod tests {
                 .iter()
                 .any(|notice| notice == super::super::PLAN_ONLY_APPROVAL_NOTICE),
             "shell write must not emit the plan-only marker, got {notices:?}"
+        );
+    }
+
+    // TC-2147 / FR-2121: writes under .dmuxai/ do not count as workspace edits and preserve plan-only verdicts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn tc_2147_agy_dmuxai_state_write_does_not_hide_plan_only() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let cwd = tempdir.path().to_path_buf();
+
+        // git init and commit a file
+        let git_run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&cwd)
+                .status()
+                .expect("git status");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        git_run(&["init"]);
+        std::fs::write(cwd.join("a.txt"), "initial\n").expect("write a.txt");
+        git_run(&["add", "a.txt"]);
+        git_run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "init",
+        ]);
+
+        let plan_response = json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "Created plan.md - please review and approve it."
+            }
+        });
+        let plan_line = plan_response.to_string();
+        let (_dir, fake) = write_fake_agy(|_| {
+            format!(
+                "#!/bin/sh\nread -r _dmuxai_user\nmkdir -p \"{0}/.dmuxai\" && echo x >> \"{0}/.dmuxai/events.jsonl\"\nprintf '%s\\n' '{1}'\n",
+                cwd.display(),
+                plan_line
+            )
+        });
+
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("dmuxai-state-write-conversation"),
+            turn_id: super::super::TurnId::new("dmuxai-state-write-turn"),
+            prompt: "implement the plan".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+
+        let (outcome, notices) = with_agy_spawn_env(&fake, "0", async {
+            let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
+            let mut notices = Vec::new();
+            while let Some(output) = event_rx.recv().await {
+                if let AgentEvent::Notice(notice) = output.event {
+                    notices.push(notice);
+                }
+            }
+            (turn.await.expect("turn task"), notices)
+        })
+        .await;
+
+        outcome.expect("turn completes");
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice == super::super::PLAN_ONLY_APPROVAL_NOTICE),
+            "dmuxai state write must still emit the plan-only marker, got {notices:?}"
         );
     }
 
