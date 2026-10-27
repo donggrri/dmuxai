@@ -48,6 +48,7 @@ This spec is delivered in stacked pull requests; each one adds its rows here.
 | ID | Assumption or question | Owner | Needed by |
 | --- | --- | --- | --- |
 | OQ-2300 | Folder ids are opaque, process-local strings (`default` for the first folder). A reloaded page whose id no longer exists falls back to the first folder. | dmuxai | B2 |
+| OQ-2312 | Resolved: "untrusted" uses the workspace trust store from SPEC-workspace-config-trust (`trusted-workspaces.json` hash check), not the recent-folders list. | owner | merge |
 
 ## 3. Terms and state model
 
@@ -73,6 +74,8 @@ This spec is delivered in stacked pull requests; each one adds its rows here.
 | FR-2309 | Must | Headless host and `POST /api/workspaces/{id}/close` | The folder's App stops, its agents are shut down and the entry is removed; `200 {"ok":true}` | Unknown id `404`; the first folder (`default`) `409 the first folder closes with Quit`; no closer registered `409 requires dmuxai --web`; timeout `504` | TC-2309 |
 | FR-2310 | Must | Closing a running folder, or Quit while any folder runs | Close without `force` returns `409` with `running:true`; the dashboard asks "Quit dmuxai? Turns are still running in: …" before Quit | `force:true` closes anyway; nothing running: no prompt | TC-2310 |
 | FR-2311 | Must | An open, non-first folder group in the sidebar | A `×` button closes it, confirming and retrying with `force:true` on `409` running; a tab showing that folder navigates to the first folder | — | TC-2311 |
+| FR-2312 | Must | The host opens a folder whose `dmuxai.toml` has keys that need trust and has no matching entry in the workspace trust store (SPEC-workspace-config-trust, `WorkspaceTrustStatus::Untrusted`) | It opens restricted: settings load through the trust-aware loader, so keys that run commands, read secrets or set URLs are not applied, and the loader's warning explains how to trust the folder (`dmuxai trust`) | Folders without `dmuxai.toml`, with only keys that need no trust, or trusted with the current file hash open unrestricted; every opened folder is recorded in the recent list | TC-2312 |
+| FR-2313 | Must | `GET /api/workspaces` and the sidebar | Each entry has `restricted`; restricted open folders show a `restricted` badge whose tooltip says the folder's `dmuxai.toml` is not trusted and to run `dmuxai trust` | — | TC-2313 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -90,6 +93,8 @@ This spec is delivered in stacked pull requests; each one adds its rows here.
 | TC-2309 | FR-2309 | unit + integration | Directory with a closer task; two entries | Send a close request; POST close for `w2` and `default` | Request arrives; `w2` removed with 200; `default` refused with 409 | `src/web/directory.rs` `tc_2309_closer_roundtrip`; `src/web/server.rs` `tc_2309_close_folder`, `tc_2309_close_default_refused` |
 | TC-2310 | FR-2310 | integration + unit (static asset) | Second folder whose snapshot is running | POST close without and with `force`; inspect `session.js` | 409 `running:true`, then 200; quit text present | `src/web/server.rs` `tc_2310_close_running_folder_needs_force`; `src/web/assets.rs` `tc_2310_quit_confirms_running_folders` |
 | TC-2311 | FR-2311 | unit (static asset) | Embedded `session.js` / `session.css` | Inspect the folder group header | `sessions-group-close` posts `/close` and retries with `force: true` | `src/web/assets.rs` `tc_2311_sidebar_close_folder` |
+| TC-2312 | FR-2312 | unit | Temp state dir (`RuntimeEnv.dmuxai_state_dir`) and temp folders | `DmuxSettings::load_with_env` then `folder_is_restricted` for: `[notify] command` without trust, the same after `TrustStore::trust` + `save`, only `[ui] theme`, no `dmuxai.toml` | Restricted only in the first case | `src/workspace_runtime.rs` `tc_2312_unknown_folder_with_config_is_restricted` |
+| TC-2313 | FR-2313 | unit (static asset) | Embedded `session.js` | Inspect the folder group header | `sessions-group-restricted` badge is rendered for restricted folders | `src/web/assets.rs` `tc_2313_sidebar_marks_restricted_folder` |
 
 ## 6. Data, integration, and safety contracts
 

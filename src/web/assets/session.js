@@ -2487,6 +2487,11 @@
       head.appendChild(el('span', 'sessions-group-name', group.name || path || 'Workspace'));
       if (group.label) { head.appendChild(el('span', 'sessions-group-label', group.label)); }
       if (isOpen) { head.appendChild(el('span', 'sessions-group-state', 'open')); }
+      if (folder && folder.restricted) {
+        var restrictedBadge = el('span', 'sessions-group-restricted', 'restricted');
+        restrictedBadge.title = 'This folder\u2019s dmuxai.toml is not trusted; settings that run commands, read secrets or set URLs are not applied. Run dmuxai trust in this folder to use them.';
+        head.appendChild(restrictedBadge);
+      }
       if (isRunning) {
         var runSpin = el('span', 'spinner');
         runSpin.setAttribute('role', 'img');

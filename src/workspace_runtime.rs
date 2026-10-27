@@ -411,6 +411,7 @@ async fn open_hosted_workspace(
     }
 
     let settings = DmuxSettings::load(&path);
+    let restricted = folder_is_restricted(&settings);
     let (mut app, migration_notice) =
         open_workspace_app(&path, &settings).map_err(|error| OpenError {
             status: 500,
@@ -448,6 +449,7 @@ async fn open_hosted_workspace(
             path: key.clone(),
             hub: parts.hub.clone(),
             services: parts.services,
+            restricted,
         })
         .map_err(|error| {
             let status = match error {
@@ -471,4 +473,57 @@ async fn open_hosted_workspace(
     app.push_local_notice(format!("Opened {key} in this dashboard."));
     let _ = dmuxai::workspace::record_recent_workspace(&path);
     Ok((app, entry))
+}
+
+fn folder_is_restricted(settings: &DmuxSettings) -> bool {
+    matches!(
+        settings.workspace_trust,
+        dmuxai::workspace_trust::WorkspaceTrustStatus::Untrusted { .. }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tc_2312_unknown_folder_with_config_is_restricted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = dmuxai::runtime_env::RuntimeEnv {
+            dmuxai_state_dir: Some(tmp.path().join("state")),
+            ..Default::default()
+        };
+
+        let with_config = tmp.path().join("with-config");
+        std::fs::create_dir_all(&with_config).unwrap();
+        let content = "[notify]\ncommand = [\"true\"]\n";
+        std::fs::write(with_config.join("dmuxai.toml"), content).unwrap();
+
+        let untrusted = DmuxSettings::load_with_env(&with_config, &env);
+        assert!(folder_is_restricted(&untrusted));
+
+        let mut store = dmuxai::workspace_trust::TrustStore::load(&env);
+        store.trust(
+            &with_config,
+            &dmuxai::workspace_trust::content_hash(content.as_bytes()),
+        );
+        store.save().unwrap();
+
+        let trusted = DmuxSettings::load_with_env(&with_config, &env);
+        assert!(!folder_is_restricted(&trusted));
+
+        let safe = tmp.path().join("safe");
+        std::fs::create_dir_all(&safe).unwrap();
+        std::fs::write(safe.join("dmuxai.toml"), "[ui]\ntheme = \"dark\"\n").unwrap();
+        assert!(!folder_is_restricted(&DmuxSettings::load_with_env(
+            &safe, &env
+        )));
+
+        let without_config = tmp.path().join("without-config");
+        std::fs::create_dir_all(&without_config).unwrap();
+        assert!(!folder_is_restricted(&DmuxSettings::load_with_env(
+            &without_config,
+            &env
+        )));
+    }
 }

@@ -25,6 +25,11 @@ mod tests {
     use crate::web::server::build_router;
     use crate::web::snapshot::SnapshotSource;
 
+    #[test]
+    fn tc_2313_sidebar_marks_restricted_folder() {
+        assert!(SESSION_JS.contains("sessions-group-restricted"));
+    }
+
     // TC-529: static_page_is_embedded_and_hardened
     #[tokio::test]
     async fn static_page_is_embedded_and_hardened() {
