@@ -28,10 +28,10 @@ All notable changes to dmuxai are listed here. Versions follow
   /api/workspaces/{id}/close` stops one open folder (running folders need
   `force`), the sidebar has a close button per open folder, and Quit lists the
   folders whose turns it would stop.
-- **Unknown folders open restricted (FR-2312, FR-2313).** A folder opened in
-  the dashboard that has a `dmuxai.toml` but was never opened with dmuxai
-  before uses only user-level settings and shows a warning and a `restricted`
-  badge until it is opened directly once.
+- **Untrusted folders open restricted (FR-2312, FR-2313).** A folder opened in
+  the dashboard whose `dmuxai.toml` needs trust and is not in the workspace
+  trust store (`dmuxai trust`) has its command, secret and URL settings
+  ignored, and shows a warning and a `restricted` badge.
 
 ### Changed
 
