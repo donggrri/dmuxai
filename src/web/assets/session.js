@@ -2489,7 +2489,7 @@
       if (isOpen) { head.appendChild(el('span', 'sessions-group-state', 'open')); }
       if (folder && folder.restricted) {
         var restrictedBadge = el('span', 'sessions-group-restricted', 'restricted');
-        restrictedBadge.title = 'This folder\u2019s dmuxai.toml is not applied in this dashboard';
+        restrictedBadge.title = 'This folder\u2019s dmuxai.toml is not trusted; settings that run commands, read secrets or set URLs are not applied. Run dmuxai trust in this folder to use them.';
         head.appendChild(restrictedBadge);
       }
       if (isRunning) {
