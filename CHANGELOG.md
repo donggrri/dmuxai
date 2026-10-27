@@ -12,6 +12,19 @@ All notable changes to dmuxai are listed here. Versions follow
   naming the node and role, with **Continue** (`graph_continue`) and **Cancel graph**
   (`graph_cancel`) buttons, so queued prompts no longer look stuck.
 
+### Fixed
+
+- **Headless `--agent agy` plan-only replies are no longer a silent success
+  (#164, FR-2121).** When AGY stops at its own plan review (it writes
+  `implementation_plan.md` to its private artifact directory and asks for
+  approval) without editing the workspace, a headless run now exits `7`
+  (approval required) with the plan text kept in `text`. With `--approve-plan`
+  the run requires file edits: AGY retries once with a stricter edit
+  instruction and the run fails with exit `1` if it still only plans. A turn
+  that changed workspace files (through a write tool or a shell command) is
+  never treated as plan-only, and ordinary answers to questions keep exit `0`.
+  Interactive TUI and dashboard runs are unchanged.
+
 ## [0.3.0] - 2026-10-27
 
 ### Changed
@@ -137,15 +150,6 @@ All notable changes to dmuxai are listed here. Versions follow
 - **CLI:** `dmuxai run` / `todo run` reject `--mode` with an error instead of
   running write-capable turns silently.
 - **AGY:** normal agent turns no longer require observed file writes to succeed.
-- **Headless `--agent agy` plan-only replies are no longer a silent success
-  (#164, FR-2121).** A reply that states a plan (the agent wrote a plan
-  artifact or presents a plan) *and* asks for an explicit approval now ends the
-  headless run with exit `7` (approval required) instead of exit `0`; the plan
-  text stays in `text`. With `--approve-plan` the run requires file edits, so
-  AGY retries once with a stricter edit instruction and the run then fails with
-  exit `1`. Ordinary answers that only mention a plan (a review report, a
-  missing `plan.md`, an instruction such as "to proceed, run cargo test") keep
-  exit `0`.
 - **Single agent turn mode.** Removed `/mode`, the mode picker, and per-agent
   mode state. Every user turn runs in agent mode; judge/plan/replan use
   read-only adapter flags internally. CLI `--mode` and dashboard `set_mode` are
