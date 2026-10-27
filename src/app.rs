@@ -1371,6 +1371,7 @@ const SHORT_CLOSE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub struct App {
     exit: bool,
+    stop: Arc<std::sync::atomic::AtomicBool>,
     /// FR-1470: no terminal; skip key/mouse polling (dashboard-only process).
     headless: bool,
     selected: usize,
@@ -1703,6 +1704,7 @@ impl App {
             turn_save_failures: Vec::new(),
             turn_save_failed_turns: HashSet::new(),
             exit: false,
+            stop: Arc::new(AtomicBool::new(false)),
             headless: false,
             selected: adapter_index(Agent::default()),
             workspace_root,
@@ -2091,7 +2093,7 @@ impl App {
         let mut last_publish = Instant::now();
         let mut dashboard_dirty = false;
 
-        while !self.exit {
+        while !self.exit && !self.stop.load(Ordering::Relaxed) {
             if last_session_heartbeat.elapsed() >= Duration::from_secs(5) {
                 if let Err(error) = self.engine.touch_session() {
                     self.push_system(format!(
@@ -12773,6 +12775,11 @@ impl App {
     /// web dashboard and the `quit` command ends the run.
     pub fn set_headless(&mut self, headless: bool) {
         self.headless = headless;
+    }
+
+    /// Set from outside to end `run` at the next loop iteration, like a signal.
+    pub(crate) fn stop_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
     }
 
     pub fn push_startup_notice(&mut self, content: impl Into<String>) {
