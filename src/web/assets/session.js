@@ -80,6 +80,7 @@
   var workspaceInitialized = null;
   var sessionsOpen = false;
   var sessionsFilter = '';
+  var openFolders = [];
   // A toggle made before the first snapshot names the workspace is kept here
   // and saved under the real workspace key once it is known.
   var pendingSessionsOpen = null;
@@ -456,6 +457,8 @@
     }
     window.addEventListener('resize', syncSessionsBackdrop);
     initSessionsSidebarForWorkspace('default');
+    refreshOpenFolders();
+    window.setInterval(refreshOpenFolders, 5000);
   }
 
   function build() {
@@ -2278,6 +2281,34 @@
     return svg;
   }
 
+  function isOpenFolder(path) {
+    return openFolders.some(function (f) { return !!f && f.path === path; });
+  }
+
+  function openFolderFor(path) {
+    var found = null;
+    openFolders.forEach(function (f) { if (f && f.path === path) { found = f; } });
+    return found;
+  }
+
+  function refreshOpenFolders() {
+    var previous = JSON.stringify(openFolders);
+    fetch(apiUrl('/api/workspaces'), {
+      headers: { Authorization: 'Bearer ' + token },
+      cache: 'no-store'
+    }).then(function (resp) {
+      if (!resp.ok) { throw new Error('HTTP ' + resp.status); }
+      return resp.json();
+    }).then(function (data) {
+      var next = (data && Array.isArray(data.workspaces)) ? data.workspaces : [];
+      openFolders = next;
+      if (JSON.stringify(openFolders) !== previous) { renderConversations(); }
+    }).catch(function () {
+      openFolders = [];
+      if (JSON.stringify(openFolders) !== previous) { renderConversations(); }
+    });
+  }
+
   function sessionGroups() {
     var groups = Array.isArray(session.workspaces) ? session.workspaces.slice() : [];
     var current = null;
@@ -2340,6 +2371,7 @@
     var titleText = c.title || c.id.slice(0, 8);
     var tip = titleText + (c.last_agent ? ' \u00b7 ' + c.last_agent : '');
     if (!group.current && !disabled) { tip += ' \u00b7 opens in ' + (group.name || group.path); }
+    if (!group.current && isOpenFolder(group.path)) { tip += ' \u00b7 open in this dashboard'; }
     if (reason) { tip += ' \u2014 ' + reason; }
     li.title = tip;
 
@@ -2398,7 +2430,7 @@
     var canSwitch = typeof window.dmuxaiWorkspaceCanSwitch === 'function' && window.dmuxaiWorkspaceCanSwitch();
     var collapsed = sessionsCollapsed();
     var key = JSON.stringify([session.conversations, session.workspaces || [], session.conversation_id, q,
-      viewOnly, canSwitch, collapsed, sessionsMore, Math.floor(Date.now() / 60000)]);
+      viewOnly, canSwitch, collapsed, sessionsMore, Math.floor(Date.now() / 60000), JSON.stringify(openFolders)]);
     if (ui.sessionsList.getAttribute('data-key') === key) { return; }
     ui.sessionsList.setAttribute('data-key', key);
     ui.sessionsList.textContent = '';
@@ -2419,20 +2451,60 @@
       if (!list.length && (q || !group.current)) { return; }
       var path = group.path || '';
       var isCollapsed = !q && !!collapsed[path];
-      var gli = el('li', 'sessions-group' + (group.current ? ' sessions-group-current' : '') + (isCollapsed ? ' sessions-group-collapsed' : ''));
+      var folder = openFolderFor(path);
+      var isOpen = !!folder;
+      var isRunning = !!(folder && folder.running);
+      var gli = el('li', 'sessions-group' + (group.current ? ' sessions-group-current' : '') + (isCollapsed ? ' sessions-group-collapsed' : '') + (isOpen ? ' sessions-group-open' : '') + (isRunning ? ' sessions-group-running' : ''));
       gli.setAttribute('data-workspace', path);
       var head = el('button', 'sessions-group-head');
       head.type = 'button';
       head.title = path;
       head.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
+      if (isOpen) { head.classList.add('sessions-group-open'); }
+      if (isRunning) { head.classList.add('sessions-group-running'); }
       head.appendChild(folderIcon());
       head.appendChild(el('span', 'sessions-group-name', group.name || path || 'Workspace'));
       if (group.label) { head.appendChild(el('span', 'sessions-group-label', group.label)); }
+      if (isOpen) { head.appendChild(el('span', 'sessions-group-state', 'open')); }
+      if (isRunning) {
+        var runSpin = el('span', 'spinner');
+        runSpin.setAttribute('role', 'img');
+        runSpin.setAttribute('aria-label', 'running in this folder');
+        head.appendChild(runSpin);
+      }
       head.addEventListener('click', function () {
         setSessionsCollapsed(path, !isCollapsed);
         renderConversations();
       });
       gli.appendChild(head);
+
+      if (!group.current) {
+        var newReason = '';
+        if (viewOnly) { newReason = 'View-only dashboard'; }
+        else if (!group.available) { newReason = 'This workspace folder no longer exists'; }
+        else {
+          var canSwitchNew = typeof window.dmuxaiWorkspaceCanSwitch === 'function' && window.dmuxaiWorkspaceCanSwitch();
+          if (!canSwitchNew) { newReason = 'Switching workspace is not available in this dashboard'; }
+        }
+        var newBtn = el('button', 'sessions-group-new', '+');
+        newBtn.type = 'button';
+        newBtn.title = 'New conversation in ' + (group.name || path || 'Workspace');
+        newBtn.setAttribute('aria-label', 'New conversation in ' + (group.name || path || 'Workspace'));
+        if (newReason) { newBtn.disabled = true; newBtn.setAttribute('aria-disabled', 'true'); }
+        (function (g) {
+          newBtn.addEventListener('click', function () {
+            var switcher = window.dmuxaiSwitchWorkspace;
+            if (typeof switcher !== 'function') {
+              notify('Switching workspace is not available in this dashboard.', true);
+              return;
+            }
+            switcher(g.path, { newConversation: true }).then(function (res) {
+              if (!res || !res.ok) { notify((res && res.error) || 'Workspace switch failed.', true); }
+            });
+          });
+        })(group);
+        gli.appendChild(newBtn);
+      }
 
       var ul = el('ul', 'sessions-group-list');
       ul.hidden = isCollapsed;
