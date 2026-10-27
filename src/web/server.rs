@@ -118,10 +118,15 @@ pub struct DashboardServer {
     pub addr: SocketAddr,
     pub url: String,
     pub warning: Option<String>,
+    workspaces: Arc<WorkspaceDirectory>,
     handle: tokio::task::JoinHandle<()>,
 }
 
 impl DashboardServer {
+    pub fn workspaces(&self) -> Arc<WorkspaceDirectory> {
+        self.workspaces.clone()
+    }
+
     pub fn abort(&self) {
         self.handle.abort();
     }
@@ -1944,13 +1949,11 @@ pub fn build_router(
     build_router_with(hub, token, allowed_hosts, DashboardServices::default())
 }
 
-pub fn build_router_with(
-    hub: DashboardHub,
+pub fn build_router_with_directory(
+    workspaces: Arc<WorkspaceDirectory>,
     token: String,
     allowed_hosts: Option<Vec<String>>,
-    services: DashboardServices,
 ) -> Router {
-    let workspaces = Arc::new(WorkspaceDirectory::single(hub, services));
     let state = AppState {
         token: Arc::new(token),
         allowed_hosts: allowed_hosts.map(Arc::new),
@@ -2018,6 +2021,16 @@ pub fn build_router_with(
         .with_state(state)
 }
 
+pub fn build_router_with(
+    hub: DashboardHub,
+    token: String,
+    allowed_hosts: Option<Vec<String>>,
+    services: DashboardServices,
+) -> Router {
+    let workspaces = Arc::new(WorkspaceDirectory::single(hub, services));
+    build_router_with_directory(workspaces, token, allowed_hosts)
+}
+
 /// FR-1462 warning when an explicit `--port` was taken by another process.
 fn port_in_use_warning(requested: u16, actual: u16) -> String {
     format!(
@@ -2080,7 +2093,8 @@ pub async fn start_server(
         });
     switch_cfg.bound_port = Some(port);
     hub.set_switch_config(switch_cfg);
-    let router = build_router_with(hub, config.token, allowed_hosts, config.services);
+    let workspaces = Arc::new(WorkspaceDirectory::single(hub, config.services));
+    let router = build_router_with_directory(workspaces.clone(), config.token, allowed_hosts);
 
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
@@ -2090,6 +2104,7 @@ pub async fn start_server(
         addr,
         url,
         warning,
+        workspaces,
         handle,
     })
 }

@@ -2276,18 +2276,22 @@ impl App {
         self.switch_ready.take()
     }
 
+    /// Returns true if any agent turns, graph runs, summaries, or deferred turns are currently active.
+    pub(crate) fn has_running_work(&self) -> bool {
+        !self.busy_agents.is_empty()
+            || !self.active_turns.is_empty()
+            || self.graph_session.is_some()
+            || self.pending_summary.is_some()
+            || !self.deferred_turns.is_empty()
+    }
+
     pub fn begin_workspace_switch(&mut self, path: PathBuf) -> Result<(), RunTodoError> {
         if self.switch_pending.is_some() {
             return Err(RunTodoError::Busy(
                 "workspace switch in progress".to_owned(),
             ));
         }
-        if !self.busy_agents.is_empty()
-            || !self.active_turns.is_empty()
-            || self.graph_session.is_some()
-            || self.pending_summary.is_some()
-            || !self.deferred_turns.is_empty()
-        {
+        if self.has_running_work() {
             return Err(RunTodoError::Busy(
                 "a turn or graph run is in progress".to_owned(),
             ));
