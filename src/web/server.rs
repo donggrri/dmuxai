@@ -107,13 +107,16 @@ struct AppState {
 struct Ws(Arc<WorkspaceEntry>);
 
 impl FromRequestParts<AppState> for Ws {
-    type Rejection = Infallible;
+    type Rejection = Response;
 
     async fn from_request_parts(
-        _parts: &mut Parts,
+        parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        Ok(Ws(state.workspaces.focused()))
+        match state.workspaces.resolve(parts.uri.query()) {
+            Some(entry) => Ok(Ws(entry)),
+            None => Err(error_json(StatusCode::NOT_FOUND, "no such open folder")),
+        }
     }
 }
 
@@ -1619,6 +1622,54 @@ async fn get_workspace(Ws(ws): Ws) -> Response {
     )
 }
 
+#[derive(serde::Serialize)]
+struct WorkspaceListItem {
+    id: String,
+    path: String,
+    name: String,
+    focused: bool,
+    running: bool,
+}
+
+#[derive(serde::Serialize)]
+struct WorkspacesListResponse {
+    max: usize,
+    workspaces: Vec<WorkspaceListItem>,
+}
+
+async fn get_workspaces(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
+    let focused_id = state.workspaces.focused().id.clone();
+    let entries = state.workspaces.entries();
+    let workspaces = entries
+        .into_iter()
+        .map(|entry| {
+            let path_buf = std::path::Path::new(&entry.path);
+            let name = path_buf
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&entry.path)
+                .to_owned();
+            let snapshot = entry.hub.snapshot();
+            let running = crate::web::directory::snapshot_is_running(&snapshot);
+            WorkspaceListItem {
+                id: entry.id.clone(),
+                path: entry.path.clone(),
+                name,
+                focused: entry.id == focused_id,
+                running,
+            }
+        })
+        .collect();
+
+    json_ok(
+        StatusCode::OK,
+        &WorkspacesListResponse {
+            max: crate::web::directory::MAX_WORKSPACES,
+            workspaces,
+        },
+    )
+}
+
 #[derive(serde::Deserialize, Default)]
 struct WorkspaceDirsQuery {
     path: Option<String>,
@@ -1990,6 +2041,7 @@ pub fn build_router_with_directory(
         .route("/assets/favicon-done.svg", get(get_favicon_done))
         .route("/assets/favicon-failed.svg", get(get_favicon_failed))
         .route("/api/state", get(get_state))
+        .route("/api/workspaces", get(get_workspaces))
         .route("/api/workspace", get(get_workspace))
         .route("/api/workspace/dirs", get(get_workspace_dirs))
         .route("/api/workspace/validate", post(post_workspace_validate))
@@ -6754,5 +6806,96 @@ mod tests {
             let bytes = std::fs::read(workspace.join("dmuxai.toml")).unwrap();
             assert!(TrustStore::load(&env).is_trusted(&workspace, &content_hash(&bytes)));
         }
+    }
+
+    #[tokio::test]
+    async fn tc_2301_get_workspaces_lists_open_folders() {
+        let hub1 = DashboardHub::new(SnapshotSource::Tui, "/repo/project-a".to_string());
+        let dir = Arc::new(WorkspaceDirectory::single(
+            hub1,
+            DashboardServices::default(),
+        ));
+        let hub2 = DashboardHub::new(SnapshotSource::Tui, "/repo/project-b".to_string());
+        dir.insert(crate::web::directory::WorkspaceEntry {
+            id: "proj2".to_string(),
+            path: "/repo/project-b".to_string(),
+            hub: hub2,
+            services: DashboardServices::default(),
+        })
+        .unwrap();
+
+        let token = "test-token-ws-2301";
+        let router = build_router_with_directory(dir, token.to_owned(), allowed_localhost());
+
+        let req = axum::http::Request::builder()
+            .uri("/api/workspaces")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(v["max"], 4);
+        let list = v["workspaces"].as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["id"], "default");
+        assert_eq!(list[0]["path"], "/repo/project-a");
+        assert_eq!(list[0]["name"], "project-a");
+        assert_eq!(list[0]["focused"], true);
+        assert_eq!(list[0]["running"], false);
+
+        assert_eq!(list[1]["id"], "proj2");
+        assert_eq!(list[1]["path"], "/repo/project-b");
+        assert_eq!(list[1]["name"], "project-b");
+        assert_eq!(list[1]["focused"], false);
+        assert_eq!(list[1]["running"], false);
+    }
+
+    #[tokio::test]
+    async fn tc_2300_ws_query_selects_workspace() {
+        let hub1 = DashboardHub::new(SnapshotSource::Tui, "/repo/project-a".to_string());
+        let dir = Arc::new(WorkspaceDirectory::single(
+            hub1,
+            DashboardServices::default(),
+        ));
+        let hub2 = DashboardHub::new(SnapshotSource::Tui, "/repo/project-b".to_string());
+        dir.insert(crate::web::directory::WorkspaceEntry {
+            id: "proj2".to_string(),
+            path: "/repo/project-b".to_string(),
+            hub: hub2,
+            services: DashboardServices::default(),
+        })
+        .unwrap();
+
+        let token = "test-token-ws-2300";
+        let router = build_router_with_directory(dir, token.to_owned(), allowed_localhost());
+
+        // GET /api/state?ws=proj2 returns the second hub's workspace string
+        let req = axum::http::Request::builder()
+            .uri("/api/state?ws=proj2")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(v["workspace"], "/repo/project-b");
+
+        // ?ws=missing -> 404 with error "no such open folder"
+        let req_missing = axum::http::Request::builder()
+            .uri("/api/state?ws=missing")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_missing = router.oneshot(req_missing).await.unwrap();
+        assert_eq!(resp_missing.status(), StatusCode::NOT_FOUND);
+        let body_missing = read_body(resp_missing).await;
+        let v_err: serde_json::Value = serde_json::from_str(&body_missing).unwrap();
+        assert_eq!(v_err["error"], "no such open folder");
     }
 }

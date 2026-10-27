@@ -175,8 +175,63 @@ pub struct DocsApiState {
 }
 
 impl DocsApiState {
-    pub fn docs(&self) -> Option<Arc<DocsService>> {
-        self.workspaces.focused().services.docs.clone()
+    pub fn docs_for(&self, query: Option<&str>) -> Option<Arc<DocsService>> {
+        self.workspaces
+            .resolve(query)
+            .and_then(|e| e.services.docs.clone())
+    }
+
+    fn find_ticket_service(
+        &self,
+        query: Option<&str>,
+        ticket: &str,
+        purpose: TicketPurpose,
+    ) -> Option<(Arc<DocsService>, PathBuf)> {
+        if let Some(service) = self.docs_for(query) {
+            let found = service.tickets.lock().unwrap().get(ticket, purpose);
+            if let Some(p) = found {
+                return Some((service, p));
+            }
+        }
+        for entry in self.workspaces.entries() {
+            if let Some(service) = &entry.services.docs {
+                let found = service.tickets.lock().unwrap().get(ticket, purpose);
+                if let Some(p) = found {
+                    return Some((service.clone(), p));
+                }
+            }
+        }
+        None
+    }
+
+    fn take_open_ticket(
+        &self,
+        query: Option<&str>,
+        ticket: &str,
+    ) -> Option<(Arc<DocsService>, String)> {
+        if let Some(service) = self.docs_for(query) {
+            let found = service
+                .open_tickets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(ticket);
+            if let Some(relative) = found {
+                return Some((service, relative));
+            }
+        }
+        for entry in self.workspaces.entries() {
+            if let Some(service) = &entry.services.docs {
+                let found = service
+                    .open_tickets
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take(ticket);
+                if let Some(relative) = found {
+                    return Some((service.clone(), relative));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -344,10 +399,10 @@ async fn get_docs_css() -> impl IntoResponse {
     )
 }
 
-async fn get_docs(State(state): State<DocsApiState>) -> Response {
-    let docs = state.docs();
+async fn get_docs(State(state): State<DocsApiState>, uri: axum::http::Uri) -> Response {
+    let docs = state.docs_for(uri.query());
     let Some(service) = &docs else {
-        return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
+        return error_json(StatusCode::NOT_FOUND, "no such open folder");
     };
     let list = crate::docs::list::list_documents(&service.workspace, crate::docs::MAX_LIST_ENTRIES);
     json_ok(StatusCode::OK, &list)
@@ -359,10 +414,14 @@ struct TreeQuery {
     dir: String,
 }
 
-async fn get_tree(State(state): State<DocsApiState>, Query(query): Query<TreeQuery>) -> Response {
-    let docs = state.docs();
+async fn get_tree(
+    State(state): State<DocsApiState>,
+    uri: axum::http::Uri,
+    Query(query): Query<TreeQuery>,
+) -> Response {
+    let docs = state.docs_for(uri.query());
     let Some(service) = &docs else {
-        return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
+        return error_json(StatusCode::NOT_FOUND, "no such open folder");
     };
     match crate::docs::list::list_children(
         &service.workspace,
@@ -376,11 +435,12 @@ async fn get_tree(State(state): State<DocsApiState>, Query(query): Query<TreeQue
 
 async fn get_file(
     State(state): State<DocsApiState>,
+    uri: axum::http::Uri,
     Query(query): Query<FilePathQuery>,
 ) -> Response {
-    let docs = state.docs();
+    let docs = state.docs_for(uri.query());
     let Some(service) = &docs else {
-        return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
+        return error_json(StatusCode::NOT_FOUND, "no such open folder");
     };
     // Reading, hashing and highlighting are blocking work: keep them off
     // the async runtime threads.
@@ -400,11 +460,12 @@ async fn get_file(
 
 async fn put_file(
     State(state): State<DocsApiState>,
+    uri: axum::http::Uri,
     DocsJson(body): DocsJson<SaveFileBody>,
 ) -> Response {
-    let docs = state.docs();
+    let docs = state.docs_for(uri.query());
     let Some(service) = &docs else {
-        return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
+        return error_json(StatusCode::NOT_FOUND, "no such open folder");
     };
 
     // 1. Resolve path (404 / 403 / 400)
@@ -454,11 +515,12 @@ async fn put_file(
 
 async fn get_render(
     State(state): State<DocsApiState>,
+    uri: axum::http::Uri,
     Query(query): Query<RenderPathQuery>,
 ) -> Response {
-    let docs = state.docs();
+    let docs = state.docs_for(uri.query());
     let Some(service) = &docs else {
-        return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
+        return error_json(StatusCode::NOT_FOUND, "no such open folder");
     };
 
     let resolved = match service.workspace.resolve(&query.path) {
@@ -507,11 +569,12 @@ async fn post_render(
 
 async fn post_view(
     State(state): State<DocsApiState>,
+    uri: axum::http::Uri,
     DocsJson(body): DocsJson<ViewBody>,
 ) -> Response {
-    let docs = state.docs();
+    let docs = state.docs_for(uri.query());
     let Some(service) = &docs else {
-        return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
+        return error_json(StatusCode::NOT_FOUND, "no such open folder");
     };
 
     let resolved = match service.workspace.resolve(&body.path) {
@@ -648,24 +711,17 @@ async fn post_view(
 
 async fn get_view_ticket(
     State(state): State<DocsApiState>,
+    uri: axum::http::Uri,
     AxumPath(ticket): AxumPath<String>,
 ) -> Response {
-    let docs = state.docs();
-    let Some(service) = &docs else {
-        return error_json(StatusCode::NOT_FOUND, "not found");
-    };
-    let path = match service
-        .tickets
-        .lock()
-        .unwrap()
-        .get(&ticket, TicketPurpose::View)
-    {
-        Some(p) => p,
-        None => return error_json(StatusCode::NOT_FOUND, "ticket not found or expired"),
+    let Some((service, path)) =
+        state.find_ticket_service(uri.query(), &ticket, TicketPurpose::View)
+    else {
+        return error_json(StatusCode::NOT_FOUND, "ticket not found or expired");
     };
     // Re-check confinement at use time: the file may have been swapped for a
     // symlink that points outside the workspace after the ticket was issued.
-    let Some(path) = confined_ticket_path(service, &path) else {
+    let Some(path) = confined_ticket_path(&service, &path) else {
         return error_json(StatusCode::NOT_FOUND, "ticket not found or expired");
     };
     let bytes = match read_raw(&path) {
@@ -717,24 +773,17 @@ async fn get_view_ticket(
 
 async fn get_download_ticket(
     State(state): State<DocsApiState>,
+    uri: axum::http::Uri,
     AxumPath(ticket): AxumPath<String>,
 ) -> Response {
-    let docs = state.docs();
-    let Some(service) = &docs else {
-        return error_json(StatusCode::NOT_FOUND, "not found");
-    };
-    let path = match service
-        .tickets
-        .lock()
-        .unwrap()
-        .get(&ticket, TicketPurpose::Download)
-    {
-        Some(p) => p,
-        None => return error_json(StatusCode::NOT_FOUND, "ticket not found or expired"),
+    let Some((service, path)) =
+        state.find_ticket_service(uri.query(), &ticket, TicketPurpose::Download)
+    else {
+        return error_json(StatusCode::NOT_FOUND, "ticket not found or expired");
     };
     // Re-check confinement at use time: the file may have been swapped for a
     // symlink that points outside the workspace after the ticket was issued.
-    let Some(path) = confined_ticket_path(service, &path) else {
+    let Some(path) = confined_ticket_path(&service, &path) else {
         return error_json(StatusCode::NOT_FOUND, "ticket not found or expired");
     };
     let bytes = match read_raw(&path) {
@@ -781,18 +830,10 @@ fn percent_encode_doc_fragment(path: &str) -> String {
 
 async fn get_open_ticket(
     State(state): State<DocsApiState>,
+    uri: axum::http::Uri,
     AxumPath(ticket): AxumPath<String>,
 ) -> Response {
-    let docs = state.docs();
-    let Some(service) = &docs else {
-        return plain_not_found();
-    };
-    let relative = service
-        .open_tickets
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take(&ticket);
-    let Some(relative) = relative else {
+    let Some((service, relative)) = state.take_open_ticket(uri.query(), &ticket) else {
         return plain_not_found();
     };
     if service.workspace.resolve(&relative).is_err() {
@@ -829,11 +870,12 @@ async fn get_open_ticket(
 
 async fn get_changes(
     State(state): State<DocsApiState>,
+    uri: axum::http::Uri,
     Query(query): Query<ChangesQuery>,
 ) -> Response {
-    let docs = state.docs();
+    let docs = state.docs_for(uri.query());
     let Some(service) = &docs else {
-        return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
+        return error_json(StatusCode::NOT_FOUND, "no such open folder");
     };
     if service.read_only {
         return json_ok(StatusCode::OK, &serde_json::json!({ "turns": [] }));

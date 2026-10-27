@@ -11,6 +11,10 @@ All notable changes to dmuxai are listed here. Versions follow
   a sensitive-step gate, the dashboard session view shows a banner above the composer
   naming the node and role, with **Continue** (`graph_continue`) and **Cancel graph**
   (`graph_cancel`) buttons, so queued prompts no longer look stuck.
+- **One dashboard process for several folders (SPEC-multi-workspace-host,
+  in progress).** Dashboard API requests take an optional `ws=<id>` query
+  parameter to pick an open folder, and `GET /api/workspaces` lists the open
+  folders with their running state (FR-2300..2302).
 
 ### Changed
 
