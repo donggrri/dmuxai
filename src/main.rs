@@ -794,6 +794,18 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
         app.attach_dashboard(DashboardHub::new(SnapshotSource::Tui, workspace).with_events(sink));
         None
     };
+    let host_ctx = dashboard.as_ref().map(|server| {
+        let (base_url, token) = server
+            .url
+            .split_once("/?token=")
+            .map(|(base, token)| (base.to_owned(), token.to_owned()))
+            .unwrap_or_else(|| (server.url.clone(), String::new()));
+        workspace_runtime::HostContext {
+            directory: server.workspaces(),
+            token,
+            base_url,
+        }
+    });
     let mut session = if headless {
         app.set_headless(true);
         None
@@ -803,26 +815,34 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     // FR-1601: SIGINT/SIGTERM also end a headless `--web` run. When a signal
     // wins, the stop flag ends the run and control continues to the shutdown
     // path below with an `Ok` result.
-    let (app, result) = match session.as_mut() {
+    let (primary, others, result) = match session.as_mut() {
         Some(session) => {
             let res = app.run(session.terminal_mut()).await;
-            (Some(app), res)
+            (Some(app), Vec::new(), res)
         }
         None => {
-            tokio::task::LocalSet::new()
-                .run_until(workspace_runtime::run_headless_host(app, shutdown.as_mut()))
-                .await
+            let outcome = tokio::task::LocalSet::new()
+                .run_until(workspace_runtime::run_headless_host(
+                    app,
+                    host_ctx,
+                    shutdown.as_mut(),
+                ))
+                .await;
+            (outcome.primary, outcome.others, outcome.result)
         }
     };
     let mut switch_target = None;
     let mut open_conversation = None;
-    if let Some(mut app) = app {
+    if let Some(mut app) = primary {
         switch_target = app.take_switch_ready();
         open_conversation = switch_target
             .as_deref()
             .and_then(|target| app.take_switch_open_conversation(target));
         app.shutdown().await;
         drop(app);
+    }
+    for mut app in others {
+        app.shutdown().await;
     }
     drop(session);
     let mut bound_port = None;
