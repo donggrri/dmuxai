@@ -269,6 +269,14 @@ SPEC 안의 테스트 이름은 `rg 'fn <name>' src tests`로 확인했고, 없�
 | M8,M2 | SPEC-docs-preview | UX-753,INT-754 | TC-757 | `static_page_has_docs_panel` | unit | ✅ | docs preview (PR F) |
 | M8,M2 | SPEC-docs-preview | UX-753 | TC-758 | `docs_preview_renders_in_headless_chrome` (ignored) | e2e | ✅ | docs preview (PR F) |
 | M8,M2 | SPEC-docs-preview | INT-754 | TC-759 | `docs_module_exposes_api` | unit | ✅ | docs preview (PR F) |
+| M8,M2 | SPEC-docs-preview | FR-2260 | TC-2260 | `sniff_unknown_extension_text_is_text` | unit | ✅ | git diff view |
+| M8,M2 | SPEC-docs-preview | FR-2261 | TC-2261 | `git_diff_text_unknown_extension` | unit | ✅ | git diff view |
+| M8,M2 | SPEC-docs-preview | FR-2261 | TC-2262 | `git_diff_binary_reports_git_line` | unit | ✅ | git diff view |
+| M8,M2 | SPEC-docs-preview | FR-2261 | TC-2263 | `git_diff_untracked_and_deleted` | unit | ✅ | git diff view |
+| M8,M2 | SPEC-docs-preview | FR-2261,NFR-751 | TC-2264 | `diff_route_returns_git_diff` | integration | ✅ | git diff view |
+| M8,M2 | SPEC-docs-preview | FR-2262 | TC-2265 | `docs_js_diff_view_uses_text_nodes` | unit | ✅ | git diff view |
+| M8,M2 | SPEC-docs-preview | FR-2260,FR-2262 | TC-2266 | `docs_diff_unknown_extension_in_headless_chrome` (ignored) | e2e | ✅ | git diff view |
+| M8,M2 | SPEC-docs-preview | FR-2261,FR-740 | TC-2267 | `git_diff_rejects_outside_paths` | unit | ✅ | git diff view |
 | M8,M2 | SPEC-first-run | FR-810,FR-811 | TC-810 | `builtin_opencode_preset_registration` | unit | ✅ | v0.2.1 |
 | M8,M2 | SPEC-first-run | FR-810,FR-813 | TC-811 | `fresh_install_lists_opencode` | integration | ✅ | v0.2.1 |
 | M8,M2 | SPEC-first-run | FR-812,FR-813 | TC-812 | `preset_without_allowed_models_explains_policy` | unit | ✅ | v0.2.1 |

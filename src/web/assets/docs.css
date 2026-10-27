@@ -187,7 +187,8 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 10;
+  /* Above the sessions/files sidebars (z-index 20) so the modal's buttons are clickable. */
+  z-index: 50;
   padding: 12px;
 }
 
@@ -1492,4 +1493,50 @@ body.sidebar-resizing .sidebar-resize-handle.is-dragging::after {
 
 .todos-count[hidden] {
   display: none;
+}
+
+.doc-diff {
+  margin: 0;
+  padding: 8px 12px;
+  background: var(--bg, #fff);
+  white-space: pre;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.doc-diff span {
+  display: block;
+}
+
+.diff-add {
+  background: color-mix(in srgb, var(--ok, #1a7f37) 16%, transparent);
+}
+
+.diff-del {
+  background: color-mix(in srgb, var(--err, #cf222e) 16%, transparent);
+}
+
+.diff-hunk {
+  color: var(--accent, #6f42c1);
+}
+
+.diff-meta {
+  font-weight: 600;
+  color: var(--muted, inherit);
+}
+
+.diff-bin {
+  font-style: italic;
+}
+
+.doc-diff-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  padding: 6px 12px;
+  color: var(--muted, inherit);
 }
