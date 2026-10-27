@@ -1,4 +1,4 @@
-//! TC-2314 (SPEC-multi-workspace FR-2314): a headless `--web` dashboard keeps
+//! TC-2314 (SPEC-multi-workspace-host FR-2300, FR-2301, FR-2303, FR-2304): a headless `--web` dashboard keeps
 //! the first folder running while a second folder is opened in-process, can
 //! address each folder through `?ws=<id>`, and rejects unknown ids.
 
@@ -77,7 +77,7 @@ fn git_init(dir: &Path) {
     assert!(status.success(), "git init failed in {}", dir.display());
 }
 
-// TC-2314 / FR-2314: second_folder_opens_while_first_runs
+// TC-2314 / FR-2303: second_folder_opens_while_first_runs
 #[test]
 fn tc_2314_second_folder_opens_while_first_runs() {
     let tmp = tempfile::tempdir().unwrap();
