@@ -581,4 +581,52 @@ mod tests {
         tracker.observe_agy_message(&plan_tool);
         assert!(tracker.plan_artifact_observed());
     }
+
+    // FR-2121 / tc_2148
+    #[test]
+    fn tc_2148_informational_answers_are_not_plan_approval_requests() {
+        let informational = [
+            "The function parse_args reads argv and returns a Config. To proceed, run cargo test.",
+            "I reviewed docs/plan.md. It has three phases; phase 2 lacks tests.",
+            "There is no plan.md in this repository.",
+            "The release plan is described in ROADMAP.md: v0.3 adds the dashboard.",
+            "Yes. The build uses cargo; confirm the toolchain with rustup show.",
+            "README.md explains the setup. Review the CI logs for the failing job.",
+            "이 함수는 설정 파일을 읽습니다. 계획 문서는 ROADMAP.md에 있습니다.",
+        ];
+        for reply in informational {
+            assert!(
+                !is_plan_approval_request(reply),
+                "informational answer must not be plan approval request: {reply}"
+            );
+        }
+    }
+
+    #[test]
+    fn tc_2148_plan_approval_requests_are_detected() {
+        let approval_requests = [
+            "Created plan.md - please review and approve it.",
+            "I wrote implementation_plan.md. Shall I proceed?",
+            "Here is the plan:\n1. add flag\n2. add test\nLet me know if I should proceed.",
+            "계획을 작성했습니다. 진행할까요?",
+        ];
+        for reply in approval_requests {
+            assert!(
+                is_plan_approval_request(reply),
+                "plan approval request must be detected: {reply}"
+            );
+        }
+    }
+
+    #[test]
+    fn tc_2148_writes_always_beat_plan_text() {
+        assert!(!is_plan_only_implement_outcome(
+            true,
+            "Created plan.md - please review and approve it."
+        ));
+        assert!(is_plan_only_implement_outcome(
+            false,
+            "Created plan.md - please review and approve it."
+        ));
+    }
 }
