@@ -58,6 +58,10 @@ All notable changes to dmuxai are listed here. Versions follow
   toggle shows it line for line with **Copy raw**. Files opened from the Diff view open
   straight in their diff, and real binaries show git's `Binary files ... differ` line.
 
+- **Dashboard settings UX (FR-2360..FR-2369).** Run controls grouped next to the
+  prompt box, consistent settings rows, a small button system with busy state,
+  inline confirm for destructive actions, and accessibility improvements.
+
 ### Changed
 
 - Workspace `dmuxai.toml` settings that run commands, read secret environment variables, or set outbound URLs now require `dmuxai trust` (pinned to the file hash); headless runs opt in with `DMUXAI_TRUST_WORKSPACE_CONFIG=1`.

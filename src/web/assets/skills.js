@@ -70,7 +70,7 @@
         return skill + ': ' + (row ? row.status : '?') + (row && row.origin ? ' (' + row.origin + ')' : '');
       }).join('; ');
       tr.appendChild(el('td', 'skills-status', status));
-      var save = el('button', 'btn', 'Save');
+      var save = el('button', 'btn btn-secondary', 'Save');
       save.type = 'button';
       save.addEventListener('click', function () {
         var list = input.value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
@@ -84,7 +84,9 @@
       tr.appendChild(tdBtn);
       table.appendChild(tr);
     });
-    root.appendChild(table);
+    var group = el('div', 'skills-group settings-group');
+    group.appendChild(table);
+    root.appendChild(group);
     rows.filter(function (r) { return r.status === 'needs approval'; }).forEach(function (r) {
       var line = el('p', 'skills-approve');
       line.appendChild(document.createTextNode(r.skill + ': pinned commit changed or new. '));

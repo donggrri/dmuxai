@@ -3482,11 +3482,32 @@ function todoViewActions(id, todo) {
   wrap.appendChild(todoButton('btn-edit', 'Edit', function() {
     startEdit(id);
   }));
-  wrap.appendChild(todoButton('btn-delete btn-danger', 'Delete', function() {
-    if (window.confirm('Delete to-do "' + String(todo.title || '') + '"?')) {
+  var deleteBtn = todoButton('btn-delete btn-danger', 'Delete', function() {
+    if (deleteBtn.dataset.confirming === '1') { return; }
+    deleteBtn.dataset.confirming = '1';
+    deleteBtn.hidden = true;
+    var confirmBtn = todoButton('btn-danger', 'Confirm', function() {
+      delete deleteBtn.dataset.confirming;
       deleteTodo(id);
-    }
-  }));
+    });
+    var cancelBtn = todoButton('btn-secondary', 'Cancel', function() {
+      delete deleteBtn.dataset.confirming;
+      if (confirmBtn.parentNode) { confirmBtn.parentNode.removeChild(confirmBtn); }
+      if (cancelBtn.parentNode) { cancelBtn.parentNode.removeChild(cancelBtn); }
+      deleteBtn.hidden = false;
+    });
+    wrap.insertBefore(confirmBtn, deleteBtn);
+    wrap.insertBefore(cancelBtn, deleteBtn);
+    window.setTimeout(function() {
+      if (deleteBtn.dataset.confirming === '1') {
+        delete deleteBtn.dataset.confirming;
+        if (confirmBtn.parentNode) { confirmBtn.parentNode.removeChild(confirmBtn); }
+        if (cancelBtn.parentNode) { cancelBtn.parentNode.removeChild(cancelBtn); }
+        deleteBtn.hidden = false;
+      }
+    }, 4000);
+  });
+  wrap.appendChild(deleteBtn);
   return wrap;
 }
 

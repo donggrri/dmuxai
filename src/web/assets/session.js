@@ -598,17 +598,19 @@
     form.appendChild(ui.attachInput);
 
     var composerTop = el('div', 'session-composer-top');
+    var runControls = el('div', 'session-run-controls');
     ui.agentPicker = el('button', 'session-agent-picker');
     ui.agentPicker.type = 'button';
     ui.agentPicker.setAttribute('data-parity', 'agent');
     ui.agentPicker.setAttribute('aria-haspopup', 'dialog');
     ui.agentPicker.setAttribute('aria-expanded', 'false');
+    ui.agentPicker.setAttribute('aria-label', 'Agent and model');
     ui.agentPicker.addEventListener('click', function (e) {
       e.preventDefault();
       if (viewOnly) { return; }
       if (agentPopover) { closeAgentPopover(); } else { openAgentPopover(); }
     });
-    composerTop.appendChild(ui.agentPicker);
+    runControls.appendChild(ui.agentPicker);
     ui.input = el('textarea', 'session-input');
     ui.input.rows = 1;
     ui.input.placeholder = INPUT_PLACEHOLDER;
@@ -637,6 +639,7 @@
       }
     });
 
+    composerTop.appendChild(runControls);
     composerTop.appendChild(ui.input);
     form.appendChild(composerTop);
     var sendCol = el('div', 'session-send-col');
@@ -645,7 +648,8 @@
     sendLeft.appendChild(ui.attachBtn);
     ui.route = picker('Route', 'route', function () { /* value read on send */ });
     setOptions(ui.route, PROMPT_ROUTES, 'auto');
-    sendLeft.appendChild(ui.route.parentNode);
+    ui.route.parentNode.classList.add('session-mode-select');
+    runControls.appendChild(ui.route.parentNode);
     sendCol.appendChild(sendLeft);
     ui.stop = button('Stop', 'prompt-stop', function () {
       var agent = (session && session.selected_agent) || null;
@@ -1438,7 +1442,7 @@
       });
       if (isSelected) { row.classList.add('session-agent-row-active'); }
       row.setAttribute('aria-selected', isSelected ? 'true' : 'false');
-      if (!a.allowed) { row.disabled = true; }
+      if (!a.allowed) { row.disabled = true; row.title = 'Unavailable'; }
       var dot = el('span', 'session-agent-dot');
       var color = (hub && hub.color) || agentColor(a.id);
       if (color) { dot.style.backgroundColor = color; }

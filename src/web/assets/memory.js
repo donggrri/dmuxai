@@ -134,7 +134,11 @@
 
   function setBusy() {
     var busy = inFlight > 0;
-    if (saveBtn) { saveBtn.disabled = busy; }
+    if (saveBtn) {
+      saveBtn.disabled = busy;
+      saveBtn.textContent = busy ? 'Saving…' : 'Save';
+      saveBtn.classList.toggle('is-busy', busy);
+    }
     if (!pendingMount) { return; }
     var buttons = pendingMount.querySelectorAll('.memory-action-btn');
     for (var i = 0; i < buttons.length; i++) {
@@ -257,7 +261,7 @@
             'Approved.'
           );
         });
-        var rejectBtn = el('button', 'btn memory-action-btn', 'Reject');
+        var rejectBtn = el('button', 'btn btn-secondary memory-action-btn', 'Reject');
         rejectBtn.type = 'button';
         rejectBtn.addEventListener('click', function () {
           var id = String(item.id || '');
@@ -285,9 +289,9 @@
     metaEl = el('p', 'memory-meta');
     root.appendChild(metaEl);
 
-    var controlsWrap = el('div', 'memory-controls');
+    var controlsWrap = el('div', 'memory-controls settings-group');
 
-    var targetRow = el('div', 'memory-target-row');
+    var targetRow = el('div', 'memory-target-row settings-row');
     var targetField = el('label', 'memory-field');
     targetField.appendChild(el('span', 'field-label', 'Target'));
     targetSelect = el('select', 'memory-target-select');
@@ -316,7 +320,7 @@
     targetRow.appendChild(nameField);
     controlsWrap.appendChild(targetRow);
 
-    var saveRow = el('div', 'memory-save-row');
+    var saveRow = el('div', 'memory-save-row settings-row');
     var textField = el('label', 'memory-field');
     textField.appendChild(el('span', 'field-label', 'Entry'));
     textInput = el('input', 'memory-text-input');

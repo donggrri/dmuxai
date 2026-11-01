@@ -230,3 +230,14 @@ button.chat-aux-head:focus-visible, .chat-aux-step-btn:focus-visible { outline: 
 .sessions-group-close:hover:not(:disabled) { background: var(--bg-chip); color: var(--text); }
 .sessions-group-state { margin-left: 6px; color: var(--muted); font-size: .75rem; }
 .sessions-group-running .spinner { display: inline-block; width: .7rem; height: .7rem; margin-left: 6px; border: 2px solid var(--muted); border-top-color: var(--accent); border-radius: 50%; animation: session-picker-spin .8s linear infinite; vertical-align: middle; }
+
+/* Run controls (SPEC-dashboard-settings-ux FR-2360, FR-2361). */
+.session-run-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.session-run-controls .session-agent-picker {
+  min-width: 0;
+}

@@ -2131,4 +2131,106 @@ mod tests {
             "showDiff function must not use innerHTML"
         );
     }
+    #[test]
+    fn tc_2360_run_controls_grouped() {
+        assert!(
+            SESSION_JS.contains("session-run-controls"),
+            "SESSION_JS must contain session-run-controls"
+        );
+        assert!(
+            SESSION_CSS.contains(".session-run-controls"),
+            "SESSION_CSS must contain .session-run-controls"
+        );
+    }
+
+    #[test]
+    fn tc_2361_collapsed_shows_agent_and_model() {
+        assert!(
+            SESSION_JS.contains("ui.agentPicker.textContent = label + model;"),
+            "agent picker shows agent and model"
+        );
+    }
+
+    #[test]
+    fn tc_2362_effort_only_when_supported() {
+        assert!(
+            SESSION_JS.contains("if (efforts.length)"),
+            "effort only when supported"
+        );
+        assert!(
+            SESSION_JS.contains("menuEfforts("),
+            "menuEfforts filters efforts"
+        );
+    }
+
+    #[test]
+    fn tc_2363_unavailable_disabled_with_tooltip() {
+        assert!(
+            SESSION_JS.contains("row.disabled = true; row.title = 'Unavailable';"),
+            "unavailable agent tooltip"
+        );
+    }
+
+    #[test]
+    fn tc_2364_settings_shared_classes() {
+        assert!(
+            APP_CSS.contains(".settings-group"),
+            "APP_CSS must contain .settings-group"
+        );
+        assert!(
+            APP_CSS.contains(".settings-row"),
+            "APP_CSS must contain .settings-row"
+        );
+        assert!(
+            MEMORY_JS.contains("settings-group"),
+            "MEMORY_JS uses settings-group"
+        );
+    }
+
+    #[test]
+    fn tc_2365_long_help_info_tooltip() {
+        assert!(
+            APP_CSS.contains(".settings-info"),
+            "APP_CSS must contain .settings-info"
+        );
+        assert!(APP_CSS.contains("cursor: help;"), "info tooltip cursor");
+    }
+
+    #[test]
+    fn tc_2366_button_system() {
+        assert!(
+            APP_CSS.contains(".btn-secondary"),
+            "APP_CSS must contain .btn-secondary"
+        );
+        assert!(
+            APP_CSS.contains(".btn-danger"),
+            "APP_CSS must contain .btn-danger"
+        );
+        assert!(
+            APP_CSS.contains(".btn:focus-visible"),
+            "APP_CSS must contain .btn:focus-visible"
+        );
+        assert!(
+            APP_CSS.contains(":disabled"),
+            "APP_CSS must contain disabled style"
+        );
+    }
+
+    #[test]
+    fn tc_2367_busy_state() {
+        assert!(MEMORY_JS.contains("Saving…"), "busy text Saving…");
+        assert!(APP_CSS.contains(".is-busy"), "busy class");
+    }
+
+    #[test]
+    fn tc_2368_inline_confirm() {
+        assert!(APP_JS.contains("Confirm"), "APP_JS must contain Confirm");
+        assert!(APP_JS.contains("Cancel"), "APP_JS must contain Cancel");
+    }
+
+    #[test]
+    fn tc_2369_keyboard_and_a11y() {
+        assert!(APP_CSS.contains("prefers-reduced-motion"), "reduced motion");
+        assert!(SESSION_JS.contains("aria-label"), "aria labels");
+    }
 }
