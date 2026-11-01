@@ -7,6 +7,12 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Added
 
+- **Tasks remember their picker (FR-2322).** Each conversation stores its last
+  selected agent, model and reasoning effort; selecting it in the TUI (F3,
+  `/conversations`, `/resume`) or dashboard restores those values after runner
+  availability and model-policy validation, falling back to the global default
+  with a notice when they are no longer available. The dashboard snapshot also
+  exposes each conversation's `settings`.
 - **Gate approval banner in the session chat (FR-1985).** While a graph run waits at
   a sensitive-step gate, the dashboard session view shows a banner above the composer
   naming the node and role, with **Continue** (`graph_continue`) and **Cancel graph**

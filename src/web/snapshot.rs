@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::conversation::TaskSettings;
 use crate::graph::{
     DecisionBy, FallbackCause, GraphEdge, GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase,
     NodeRole, OverrideKind, PlanChange, PlanChangeKind, PlanChangeTrigger, PlanRevision, PlanStep,
@@ -233,6 +234,10 @@ pub struct SessionConversation {
     pub turn_count: u64,
     #[serde(default)]
     pub running: bool,
+    /// Last selected agent, model and effort of this task; `None` for NULL
+    /// settings (FR-2322).
+    #[serde(default)]
+    pub settings: Option<TaskSettings>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1271,16 +1276,26 @@ mod tests {
             last_agent: Some("Cursor".to_string()),
             turn_count: 4,
             running: true,
+            settings: Some(TaskSettings {
+                agent: Some("cursor".to_owned()),
+                model: Some("composer-2.5".to_owned()),
+                effort: None,
+            }),
         };
         let json = serde_json::to_string(&conv).unwrap();
         assert!(json.contains("\"last_agent\":\"Cursor\""), "{json}");
         assert!(json.contains("\"turn_count\":4"), "{json}");
         assert!(json.contains("\"running\":true"), "{json}");
+        assert!(
+            json.contains("\"settings\":{\"agent\":\"cursor\""),
+            "{json}"
+        );
 
         let roundtrip: SessionConversation = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip, conv);
 
-        // Legacy payload without last_agent, turn_count, running still deserializes with defaults.
+        // Legacy payload without last_agent, turn_count, running, settings still
+        // deserializes with defaults.
         let legacy = r#"{"id":"conv-old","title":"Legacy chat","updated_at_ms":42}"#;
         let parsed: SessionConversation = serde_json::from_str(legacy).unwrap();
         assert_eq!(
@@ -1292,6 +1307,7 @@ mod tests {
                 last_agent: None,
                 turn_count: 0,
                 running: false,
+                settings: None,
             }
         );
     }

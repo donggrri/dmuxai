@@ -43,8 +43,8 @@ use dmuxai::{
         AgentKey, BeginTurn, BeginTurnOutcome, ContextProjection, ConversationCard,
         ConversationEngine, ConversationError, ConversationId as StoredConversationId,
         ConversationSelection, ConversationSnapshot, MessageRole, MessageState, SummaryDocument,
-        SummaryJob, TranscriptMessage, TurnEvent, TurnId as StoredTurnId, TurnOutput, TurnSnapshot,
-        TurnStatus,
+        SummaryJob, TaskSettings, TranscriptMessage, TurnEvent, TurnId as StoredTurnId, TurnOutput,
+        TurnSnapshot, TurnStatus,
     },
     docs::{
         MAX_SCAN_FILES,
@@ -2857,6 +2857,141 @@ impl App {
         }
     }
 
+    /// Stores the active task's picker state (FR-2322). A failed write leaves
+    /// the session unchanged and only adds a notice.
+    fn persist_task_settings(&mut self) {
+        let agent = self.adapters[self.selected].agent();
+        let catalog = self.model_catalogs.get(&agent);
+        let settings = TaskSettings {
+            agent: Some(self.agent_runner_name(agent)),
+            model: catalog.and_then(|catalog| catalog.selected.clone()),
+            effort: catalog.and_then(|catalog| catalog.selected_effort.clone()),
+        };
+        if let Err(error) = self.engine.set_task_settings(settings) {
+            self.push_system(format!("Could not save task settings: {error}"));
+        } else {
+            self.session_conversations = None;
+        }
+    }
+
+    /// Resolves a stored agent name to a registered, allowed adapter (FR-2322).
+    fn stored_task_agent(&self, stored: &str) -> Option<Agent> {
+        let agent = runner_from_str(stored)?;
+        let slot = adapter_slot(agent)?;
+        (slot < self.adapters.len() && self.runner_is_allowed(runner_name(agent))).then_some(agent)
+    }
+
+    /// Applies a stored model after policy and catalog validation (FR-2322).
+    fn restore_task_model(&mut self, agent: Agent, model: &str) -> Result<(), String> {
+        let runner = self.agent_runner_name(agent);
+        dmuxai::model_policy::validate_model_for_runner(&runner, model)?;
+        let selected = match self.model_catalogs.get(&agent) {
+            Some(catalog) if !catalog.models.is_empty() => {
+                resolve_catalog_model_id(agent, &catalog.models, model)
+                    .map(|info| info.id)
+                    .ok_or_else(|| format!("model '{model}' is not offered by {runner}"))?
+            }
+            _ => model.to_owned(),
+        };
+        self.adapters[adapter_index(agent)]
+            .select_model(selected.clone())
+            .map_err(|error| error.to_string())?;
+        if let Some(catalog) = self.model_catalogs.get_mut(&agent) {
+            let default_effort = catalog
+                .models
+                .iter()
+                .find(|candidate| candidate.id == selected)
+                .and_then(|candidate| candidate.default_effort.clone());
+            catalog.selected = Some(selected);
+            catalog.selected_effort = default_effort;
+        }
+        Ok(())
+    }
+
+    /// Applies a stored reasoning effort when the selected model offers it.
+    fn restore_task_effort(&mut self, agent: Agent, effort: &str) {
+        if agent != Agent::Codex {
+            return;
+        }
+        let options = self
+            .model_catalogs
+            .get(&agent)
+            .map(selected_effort_options)
+            .unwrap_or_default();
+        if !options.is_empty() && !options.iter().any(|option| option == effort) {
+            return;
+        }
+        if self.adapters[adapter_index(agent)]
+            .select_effort(effort.to_owned())
+            .is_ok()
+            && let Some(catalog) = self.model_catalogs.get_mut(&agent)
+        {
+            catalog.selected_effort = Some(effort.to_owned());
+        }
+    }
+
+    /// Restores a task's saved picker state on select (FR-2322). Empty settings
+    /// keep the previous conversation-derived behavior.
+    fn restore_task_settings(&mut self, settings: &TaskSettings, last_turn_agent: Option<Agent>) {
+        let has_settings =
+            settings.agent.is_some() || settings.model.is_some() || settings.effort.is_some();
+        if !has_settings {
+            if let Some(agent) = last_turn_agent {
+                self.restore_conversation_runner(agent);
+            }
+            return;
+        }
+
+        let agent = if let Some(stored) = settings
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|agent| !agent.is_empty())
+        {
+            match self.stored_task_agent(stored) {
+                Some(agent) => {
+                    self.selected = adapter_index(agent);
+                    agent
+                }
+                None => {
+                    let fallback_index = self.initial_runner_index(None);
+                    let fallback = self.adapters[fallback_index].agent();
+                    self.selected = fallback_index;
+                    self.push_system(format!(
+                        "Saved task agent '{stored}' is no longer available; using '{}'.",
+                        self.agent_runner_name(fallback)
+                    ));
+                    return;
+                }
+            }
+        } else {
+            if let Some(agent) = last_turn_agent {
+                self.restore_conversation_runner(agent);
+            }
+            self.adapters[self.selected].agent()
+        };
+
+        if let Some(model) = settings
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            && let Err(error) = self.restore_task_model(agent, model)
+        {
+            self.push_system(format!(
+                "Saved task model '{model}' is no longer available; using the default ({error})."
+            ));
+        }
+        if let Some(effort) = settings
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty())
+        {
+            self.restore_task_effort(agent, effort);
+        }
+    }
+
     fn simple_question_turn_active(&self, prompt: &str) -> bool {
         if !is_question_prompt(prompt) {
             return false;
@@ -2930,6 +3065,7 @@ impl App {
                                 .map(|agent| self.agent_key_display_name(agent)),
                             turn_count: card.turn_count,
                             running: card.running || self.conversation_run_active(&id),
+                            settings: session_task_settings(card.settings),
                         };
                         if entry.id == conversation_id && ordered.is_empty() {
                             ordered.push(entry);
@@ -3180,6 +3316,7 @@ impl App {
                             .map(|agent| self.agent_key_display_name(agent)),
                         turn_count: card.turn_count,
                         running: card.running,
+                        settings: session_task_settings(card.settings),
                     },
                 )
             })
@@ -3289,6 +3426,7 @@ impl App {
                 let _ = self.adapters[self.selected].prewarm();
                 self.request_builtin_grok_models(target);
                 self.push_system(format!("Active agent: {target}."));
+                self.persist_task_settings();
             }
             SessionCommand::SetMode { mode, .. } => {
                 return Err(RunTodoError::Invalid(format!(
@@ -3357,6 +3495,7 @@ impl App {
                         catalog.selected_effort = info.default_effort.clone();
                     }
                 }
+                self.persist_task_settings();
             }
             SessionCommand::SetEffort { agent, effort } => {
                 let target = self.resolve_dashboard_agent(agent.as_deref())?;
@@ -3393,6 +3532,7 @@ impl App {
                 if let Some(catalog) = self.model_catalogs.get_mut(&target) {
                     catalog.selected_effort = Some(effort);
                 }
+                self.persist_task_settings();
             }
             SessionCommand::QueueRemove { id } => self.edit_queued_followup(id, None)?,
             SessionCommand::QueueEdit { id, text } => self.edit_queued_followup(id, Some(text))?,
@@ -4820,6 +4960,7 @@ impl App {
                     Role::System,
                     format!("Active agent: {agent}."),
                 ));
+                self.persist_task_settings();
             }
             _ => self.agent_picker = Some(picker),
         }
@@ -4919,6 +5060,7 @@ impl App {
                         .get_mut(&agent)
                         .expect("every agent has a model catalog");
                     catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                    self.persist_task_settings();
                     return;
                 }
                 match self.adapters[adapter_index].select_model(model.id.clone()) {
@@ -4939,6 +5081,7 @@ impl App {
                                 .unwrap_or(0);
                             self.effort_picker = Some(EffortPicker { agent, cursor });
                         }
+                        self.persist_task_settings();
                     }
                     Err(error) => {
                         self.messages.push(Message::new(
@@ -4987,9 +5130,10 @@ impl App {
         let Some(picker) = self.effort_picker.as_mut() else {
             return;
         };
+        let agent = picker.agent;
         let catalog = self
             .model_catalogs
-            .get(&picker.agent)
+            .get(&agent)
             .expect("every agent has a model catalog");
         let options = selected_effort_options(catalog);
         match key.code {
@@ -5000,8 +5144,14 @@ impl App {
             }
             KeyCode::Enter if !options.is_empty() => {
                 let effort = options[picker.cursor].clone();
-                match self.adapters[adapter_index(picker.agent)].select_effort(effort.clone()) {
-                    Ok(()) => self.effort_picker = None,
+                match self.adapters[adapter_index(agent)].select_effort(effort.clone()) {
+                    Ok(()) => {
+                        self.effort_picker = None;
+                        if let Some(catalog) = self.model_catalogs.get_mut(&agent) {
+                            catalog.selected_effort = Some(effort);
+                        }
+                        self.persist_task_settings();
+                    }
                     Err(error) => {
                         self.push_system(format!("Could not select Codex effort {effort}: {error}"))
                     }
@@ -5156,6 +5306,7 @@ impl App {
                             Role::System,
                             format!("Active agent: {agent}."),
                         ));
+                        self.persist_task_settings();
                     } else {
                         self.push_system(format!(
                             "Unknown agent: {rest}. Use /agent to pick from available agents."
@@ -6156,9 +6307,7 @@ impl App {
             &offscreen_anchors,
             &stored_activity_turns,
         );
-        if let Some(agent) = restored_runner {
-            self.restore_conversation_runner(agent);
-        }
+        self.restore_task_settings(&snapshot.settings, restored_runner);
         self.chat_scroll = 0;
         self.message_link_cache.clear();
         self.clear_chat_selection();
@@ -16200,6 +16349,10 @@ fn paint_osc8_hyperlink(
     }
 }
 
+fn session_task_settings(settings: TaskSettings) -> Option<TaskSettings> {
+    (settings != TaskSettings::default()).then_some(settings)
+}
+
 fn agent_key(agent: Agent) -> AgentKey {
     match agent {
         Agent::Codex => AgentKey::Codex,
@@ -18934,6 +19087,77 @@ mod tests {
         assert_eq!(other.conversations[0].id, id);
         assert_eq!(other.conversations[0].title, "Other chat");
         assert!(view.conversations.iter().all(|c| c.id != id));
+    }
+
+    // TC-2322 / FR-2322: selecting a task restores its saved agent, model and
+    // effort; an unknown stored agent falls back to the global default with one
+    // system notice.
+    #[test]
+    fn tc_2322_select_restores_task_picker() {
+        let (mut app, _sent) = test_app();
+        let restored = app.conversation_id.clone();
+
+        let catalog = app.model_catalogs.get_mut(&Agent::Codex).unwrap();
+        catalog.models = vec![ModelInfo::with_efforts(
+            "composer-2.5",
+            "Composer 2.5",
+            vec!["low".to_owned(), "high".to_owned()],
+            Some("low".to_owned()),
+        )];
+        catalog.default_model = Some("composer-2.5".to_owned());
+
+        app.engine
+            .set_task_settings(TaskSettings {
+                agent: Some("codex".to_owned()),
+                model: Some("composer-2.5".to_owned()),
+                effort: Some("high".to_owned()),
+            })
+            .unwrap();
+
+        app.create_conversation(Some("Elsewhere".to_owned()));
+        app.selected = adapter_index(Agent::Cursor);
+        app.model_catalogs.get_mut(&Agent::Codex).unwrap().selected = None;
+        app.model_catalogs
+            .get_mut(&Agent::Codex)
+            .unwrap()
+            .selected_effort = None;
+
+        app.select_conversation(restored);
+        assert_eq!(app.adapters[app.selected].agent(), Agent::Codex);
+        let catalog = app.model_catalogs.get(&Agent::Codex).unwrap();
+        assert_eq!(catalog.selected.as_deref(), Some("composer-2.5"));
+        assert_eq!(catalog.selected_effort.as_deref(), Some("high"));
+
+        app.create_conversation(Some("Unknown task".to_owned()));
+        let unknown = app.conversation_id.clone();
+        app.engine
+            .set_task_settings(TaskSettings {
+                agent: Some("missing-runner".to_owned()),
+                model: Some("composer-2.5".to_owned()),
+                effort: Some("high".to_owned()),
+            })
+            .unwrap();
+        app.create_conversation(Some("After unknown".to_owned()));
+
+        app.select_conversation(unknown);
+        assert_eq!(app.adapters[app.selected].agent(), Agent::default());
+        let notices: Vec<&Message> = app
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == Role::System && message.content.contains("no longer available")
+            })
+            .collect();
+        assert_eq!(
+            notices.len(),
+            1,
+            "{:?}",
+            app.messages
+                .iter()
+                .map(|message| &message.content)
+                .collect::<Vec<_>>()
+        );
+        assert!(notices[0].content.contains("missing-runner"));
     }
 
     // TC-1222 / FR-1225: group labels and ordering.
