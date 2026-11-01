@@ -2834,13 +2834,27 @@ impl App {
     }
 
     fn restore_conversation_runner(&mut self, agent: Agent) {
-        let runner = runner_name(agent);
         let registered = adapter_slot(agent).is_some_and(|slot| slot < self.adapters.len());
+        self.restore_runner_selection(runner_name(agent), Some(agent), registered);
+    }
+
+    /// Applies the conversation-runner fallback to a stored runner name. Names
+    /// that no longer resolve keep the unregistered-runner notice so restoring
+    /// a task reuses the same wording as resuming a conversation.
+    fn restore_stored_runner(&mut self, runner: &str) {
+        let agent = runner_from_str(runner);
+        let registered = agent.is_some_and(|agent| {
+            adapter_slot(agent).is_some_and(|slot| slot < self.adapters.len())
+        });
+        self.restore_runner_selection(runner, agent, registered);
+    }
+
+    fn restore_runner_selection(&mut self, runner: &str, agent: Option<Agent>, registered: bool) {
         if registered && self.runner_is_allowed(runner) {
-            self.selected = adapter_index(agent);
+            self.selected = adapter_index(agent.expect("registered runner has an agent"));
             return;
         }
-        let replacement_index = self.initial_runner_index(Some(agent));
+        let replacement_index = self.initial_runner_index(agent);
         let replacement = self.agent_runner_name(self.adapters[replacement_index].agent());
         self.selected = replacement_index;
         if replacement.eq_ignore_ascii_case(runner) {
@@ -2954,13 +2968,7 @@ impl App {
                     agent
                 }
                 None => {
-                    let fallback_index = self.initial_runner_index(None);
-                    let fallback = self.adapters[fallback_index].agent();
-                    self.selected = fallback_index;
-                    self.push_system(format!(
-                        "Saved task agent '{stored}' is no longer available; using '{}'.",
-                        self.agent_runner_name(fallback)
-                    ));
+                    self.restore_stored_runner(stored);
                     return;
                 }
             }
@@ -19145,7 +19153,8 @@ mod tests {
             .messages
             .iter()
             .filter(|message| {
-                message.role == Role::System && message.content.contains("no longer available")
+                message.role == Role::System
+                    && message.content.contains("is no longer configured; using")
             })
             .collect();
         assert_eq!(
