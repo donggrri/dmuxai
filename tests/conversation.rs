@@ -1,7 +1,7 @@
 use dmuxai::conversation::{
     AgentKey, BeginTurn, BeginTurnOutcome, BindingStatus, ConversationEngine, ConversationError,
-    ConversationSelection, MessageRole, MessageState, SummaryDocument, TurnEvent, TurnOutput,
-    TurnStatus,
+    ConversationSelection, MessageRole, MessageState, SummaryDocument, TaskSettings, TurnEvent,
+    TurnOutput, TurnStatus,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -1161,8 +1161,8 @@ fn runtime_session_schema_extension_preserves_existing_data() {
         )
         .unwrap();
     assert_eq!(
-        version, 3,
-        "v3 migrates to include display_text and activities"
+        version, 4,
+        "the current schema includes display_text, activities, and task settings"
     );
     assert_eq!(session_table, 1);
     assert_eq!(owner_column, 1);
@@ -1364,7 +1364,7 @@ fn tc_1900_v2_to_v3_migration_adds_display_text_and_activities() {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 
     // messages.display_text column exists and is NULL for old rows
     let display_text: Option<String> = conn
@@ -1951,4 +1951,440 @@ fn tc_1907_conversation_snapshot_activities_ordered_and_cascade() {
         )
         .unwrap();
     assert_eq!(remaining_t1, 1);
+}
+
+// TC-2320 / FR-2320: a conversation is already a task; listing and selecting
+// it must not copy or rewrite transcript rows.
+#[test]
+fn tc_2320_existing_conversation_is_task_without_transcript_migration() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+
+    let first = engine
+        .select(ConversationSelection::New {
+            title: Some("First task".to_owned()),
+        })
+        .unwrap();
+    let first_request = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Codex,
+                model_id: Some("codex-model".to_owned()),
+                prompt: "First prompt".to_owned(),
+                display_text: None,
+            })
+            .unwrap(),
+    );
+    complete_turn(&mut engine, &first_request, "first-session", "First answer");
+
+    let second = engine
+        .select(ConversationSelection::New {
+            title: Some("Second task".to_owned()),
+        })
+        .unwrap();
+    let second_request = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Cursor,
+                model_id: Some("cursor-model".to_owned()),
+                prompt: "Second prompt".to_owned(),
+                display_text: None,
+            })
+            .unwrap(),
+    );
+    complete_turn(
+        &mut engine,
+        &second_request,
+        "second-session",
+        "Second answer",
+    );
+
+    let transcript_counts = || {
+        let connection = Connection::open(&harness.database).unwrap();
+        let turns: i64 = connection
+            .query_row("SELECT COUNT(*) FROM turns", [], |row| row.get(0))
+            .unwrap();
+        let messages: i64 = connection
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        (turns, messages)
+    };
+    let before = transcript_counts();
+
+    let cards = engine.list().unwrap();
+    assert_eq!(cards.len(), 2);
+    let first_card = cards.iter().find(|card| card.id == first.id).unwrap();
+    assert_eq!(first_card.title, "First task");
+    assert_eq!(first_card.turn_count, 1);
+    assert_eq!(first_card.last_agent, Some(AgentKey::Codex));
+    assert_eq!(first_card.settings.agent.as_deref(), Some("codex"));
+    assert_eq!(first_card.settings.model.as_deref(), Some("codex-model"));
+    assert!(first_card.settings.effort.is_none());
+
+    let first_again = engine
+        .select(ConversationSelection::Existing(first.id.clone()))
+        .unwrap();
+    assert_eq!(first_again.id, first.id);
+    assert_eq!(first_again.title, "First task");
+    assert_eq!(first_again.turns.len(), 1);
+    assert_eq!(first_again.turns[0].id, first_request.turn_id);
+    assert_eq!(first_again.messages.len(), 2);
+    assert_eq!(first_again.messages[1].text, "First answer");
+    assert_eq!(first_again.bindings.len(), 1);
+    assert_eq!(first_again.bindings[0].provider_session_id, "first-session");
+
+    let second_again = engine
+        .select(ConversationSelection::Existing(second.id.clone()))
+        .unwrap();
+    assert_eq!(second_again.id, second.id);
+    assert_eq!(second_again.title, "Second task");
+    assert_eq!(second_again.turns.len(), 1);
+    assert_eq!(second_again.turns[0].id, second_request.turn_id);
+    assert_eq!(second_again.messages.len(), 2);
+    assert_eq!(second_again.messages[1].text, "Second answer");
+    assert_eq!(second_again.bindings.len(), 1);
+    assert_eq!(
+        second_again.bindings[0].provider_session_id,
+        "second-session"
+    );
+
+    assert_eq!(transcript_counts(), before);
+
+    drop(engine);
+    let mut reopened = harness.open();
+    let cards = reopened.list().unwrap();
+    assert_eq!(cards.len(), 2);
+    assert_eq!(transcript_counts(), before);
+
+    let first_reopened = reopened
+        .select(ConversationSelection::Existing(first.id.clone()))
+        .unwrap();
+    assert_eq!(first_reopened.turns.len(), 1);
+    assert_eq!(first_reopened.messages[1].text, "First answer");
+    assert_eq!(
+        first_reopened.bindings[0].provider_session_id,
+        "first-session"
+    );
+    let second_reopened = reopened
+        .select(ConversationSelection::Existing(second.id.clone()))
+        .unwrap();
+    assert_eq!(second_reopened.turns.len(), 1);
+    assert_eq!(second_reopened.messages[1].text, "Second answer");
+    assert_eq!(
+        second_reopened.bindings[0].provider_session_id,
+        "second-session"
+    );
+    assert_eq!(transcript_counts(), before);
+}
+
+// TC-2321 / FR-2321: opening a v3 database adds the nullable task-settings
+// columns once, keeps old rows readable, and leaves the transcript untouched.
+#[test]
+fn tc_2321_task_settings_migration_is_idempotent() {
+    let harness = Harness::new();
+    let conversation_id;
+    {
+        let mut engine = harness.open();
+        let snapshot = engine
+            .select(ConversationSelection::New {
+                title: Some("Migrated task".to_owned()),
+            })
+            .unwrap();
+        conversation_id = snapshot.id;
+        let request = ready(
+            engine
+                .begin_turn(BeginTurn {
+                    agent: AgentKey::Codex,
+                    model_id: Some("codex-model".to_owned()),
+                    prompt: "Before migration".to_owned(),
+                    display_text: None,
+                })
+                .unwrap(),
+        );
+        complete_turn(&mut engine, &request, "migrated-session", "Kept reply");
+        engine
+            .set_task_settings(TaskSettings {
+                agent: Some("cursor".to_owned()),
+                model: Some("cursor-model".to_owned()),
+                effort: Some("high".to_owned()),
+            })
+            .unwrap();
+    }
+
+    // Reshape the database as an older binary would have left it: no task
+    // settings columns and schema version 3.
+    {
+        let connection = Connection::open(&harness.database).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE conversations DROP COLUMN last_agent;
+                 ALTER TABLE conversations DROP COLUMN last_model_id;
+                 ALTER TABLE conversations DROP COLUMN last_reasoning_effort;
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+    }
+
+    let transcript = |path: &std::path::Path| {
+        let connection = Connection::open(path).unwrap();
+        let turns: i64 = connection
+            .query_row("SELECT COUNT(*) FROM turns", [], |row| row.get(0))
+            .unwrap();
+        let messages: i64 = connection
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        let reply: String = connection
+            .query_row(
+                "SELECT text FROM messages WHERE role = 'assistant'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (turns, messages, reply)
+    };
+    let before = transcript(&harness.database);
+
+    let mut engine = harness.open();
+    let snapshot = engine
+        .select(ConversationSelection::Existing(conversation_id.clone()))
+        .unwrap();
+    assert_eq!(snapshot.title, "Migrated task");
+    assert_eq!(snapshot.settings, TaskSettings::default());
+    assert_eq!(snapshot.messages[1].text, "Kept reply");
+    assert_eq!(snapshot.bindings[0].provider_session_id, "migrated-session");
+
+    let settings_columns = |path: &std::path::Path| {
+        let connection = Connection::open(path).unwrap();
+        let mut statement = connection
+            .prepare("PRAGMA table_info(conversations)")
+            .unwrap();
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        names
+            .into_iter()
+            .filter(|name| {
+                name == "last_agent" || name == "last_model_id" || name == "last_reasoning_effort"
+            })
+            .collect::<Vec<_>>()
+    };
+    {
+        let connection = Connection::open(&harness.database).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        let old_row: (Option<String>, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT last_agent, last_model_id, last_reasoning_effort
+                   FROM conversations WHERE id = ?1",
+                [conversation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(old_row, (None, None, None));
+        let names: Vec<String> = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(conversations)")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "mode" || name == "last_mode")
+        );
+        assert!(!names.iter().any(|name| name == "last_model"));
+        assert!(!names.iter().any(|name| name == "last_effort"));
+    }
+    assert_eq!(
+        settings_columns(&harness.database),
+        vec![
+            "last_agent".to_owned(),
+            "last_model_id".to_owned(),
+            "last_reasoning_effort".to_owned()
+        ]
+    );
+    assert_eq!(transcript(&harness.database), before);
+    drop(engine);
+
+    // Reopening at version 4 is a no-op: no duplicate columns, same transcript.
+    let mut reopened = harness.open();
+    let snapshot = reopened
+        .select(ConversationSelection::Existing(conversation_id))
+        .unwrap();
+    assert_eq!(snapshot.settings, TaskSettings::default());
+    assert_eq!(snapshot.messages[1].text, "Kept reply");
+    assert_eq!(
+        settings_columns(&harness.database),
+        vec![
+            "last_agent".to_owned(),
+            "last_model_id".to_owned(),
+            "last_reasoning_effort".to_owned()
+        ]
+    );
+    assert_eq!(transcript(&harness.database), before);
+}
+
+// TC-2322 / FR-2322: task settings round-trip through selection and the list
+// card; NULL, blank, and unknown stored values do not block selection or a turn.
+#[test]
+fn tc_2322_task_settings_round_trip_and_defaults() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+
+    let stored = engine
+        .select(ConversationSelection::New {
+            title: Some("Stored task".to_owned()),
+        })
+        .unwrap();
+    let settings = TaskSettings {
+        agent: Some("cursor".to_owned()),
+        model: Some("cursor-model".to_owned()),
+        effort: Some("high".to_owned()),
+    };
+    engine.set_task_settings(settings.clone()).unwrap();
+
+    let restored = engine
+        .select(ConversationSelection::Existing(stored.id.clone()))
+        .unwrap();
+    assert_eq!(restored.settings, settings);
+    let cards = engine.list().unwrap();
+    assert_eq!(
+        cards
+            .iter()
+            .find(|card| card.id == stored.id)
+            .unwrap()
+            .settings,
+        settings
+    );
+
+    // begin_turn stores the agent and model actually used; effort is untouched.
+    let request = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Agy,
+                model_id: Some("agy-model".to_owned()),
+                prompt: "Use the actual picker".to_owned(),
+                display_text: None,
+            })
+            .unwrap(),
+    );
+    assert_eq!(request.agent, AgentKey::Agy);
+    complete_turn(&mut engine, &request, "agy-session", "Done");
+    let after_turn = engine
+        .select(ConversationSelection::Existing(stored.id.clone()))
+        .unwrap();
+    assert_eq!(
+        after_turn.settings,
+        TaskSettings {
+            agent: Some("agy".to_owned()),
+            model: Some("agy-model".to_owned()),
+            effort: Some("high".to_owned()),
+        }
+    );
+
+    // Blank values are stored as NULL and fall back to the global default.
+    engine
+        .set_task_settings(TaskSettings {
+            agent: Some("   ".to_owned()),
+            model: Some(String::new()),
+            effort: None,
+        })
+        .unwrap();
+    let cleared = engine
+        .select(ConversationSelection::Existing(stored.id.clone()))
+        .unwrap();
+    assert_eq!(cleared.settings, TaskSettings::default());
+
+    // A task that never stored settings selects with defaults and starts a turn.
+    let defaults = engine
+        .select(ConversationSelection::New {
+            title: Some("Default task".to_owned()),
+        })
+        .unwrap();
+    assert_eq!(defaults.settings, TaskSettings::default());
+    {
+        let connection = Connection::open(&harness.database).unwrap();
+        let values: (Option<String>, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT last_agent, last_model_id, last_reasoning_effort
+                   FROM conversations WHERE id = ?1",
+                [defaults.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(values, (None, None, None));
+    }
+    let defaults_card = engine
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|card| card.id == defaults.id)
+        .unwrap();
+    assert_eq!(defaults_card.settings, TaskSettings::default());
+    let default_request = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Codex,
+                model_id: None,
+                prompt: "Use defaults".to_owned(),
+                display_text: None,
+            })
+            .unwrap(),
+    );
+    assert_eq!(default_request.model_id, None);
+
+    // Unknown stored values are exposed without blocking selection or a turn;
+    // the UI layer resolves them to a supported default.
+    let unknown = engine
+        .select(ConversationSelection::New {
+            title: Some("Unknown task".to_owned()),
+        })
+        .unwrap();
+    engine
+        .set_task_settings(TaskSettings {
+            agent: Some("custom-unknown".to_owned()),
+            model: Some("unknown-model".to_owned()),
+            effort: Some("ultra".to_owned()),
+        })
+        .unwrap();
+    let unknown_snapshot = engine
+        .select(ConversationSelection::Existing(unknown.id.clone()))
+        .unwrap();
+    assert_eq!(
+        unknown_snapshot.settings,
+        TaskSettings {
+            agent: Some("custom-unknown".to_owned()),
+            model: Some("unknown-model".to_owned()),
+            effort: Some("ultra".to_owned()),
+        }
+    );
+    let unknown_card = engine
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|card| card.id == unknown.id)
+        .unwrap();
+    assert_eq!(
+        unknown_card.settings.model.as_deref(),
+        Some("unknown-model")
+    );
+    let unknown_request = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Cursor,
+                model_id: Some("cursor-model".to_owned()),
+                prompt: "Unknown stored model must not block".to_owned(),
+                display_text: None,
+            })
+            .unwrap(),
+    );
+    assert_eq!(unknown_request.agent, AgentKey::Cursor);
 }
