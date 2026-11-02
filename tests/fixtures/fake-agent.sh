@@ -55,6 +55,12 @@ dispatch_judge_or_plan() {
 }
 
 case "$behavior" in
+  argv)
+    # Record the real runner argv (TC-2317 / FR-2317).
+    if [ -n "$FAKE_AGENT_ARGV" ]; then
+      printf '%s\n' "$@" > "$FAKE_AGENT_ARGV"
+    fi
+    printf '{"type":"text","sessionID":"ses_1","part":{"text":"argv logged"}}\n' ;;
   jsonl)  printf '{"type":"step_start","sessionID":"ses_1"}\n{"type":"text","sessionID":"ses_1","part":{"text":"echo:%s"}}\n' "$(json_escape "$last")" ;;
   text)   echo "hello $last" ;;
   stdin)  read -r line; echo "stdin:$line" ;;

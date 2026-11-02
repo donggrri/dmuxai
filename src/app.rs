@@ -13678,9 +13678,19 @@ impl App {
                 )
                 .with_error_kind(AgentErrorKind::Policy.as_str().to_owned());
             }
-            // Accepted: Explicit source. Mirror into the catalog so the turn
-            // path reads it like an F2 selection, and remember it for the
-            // resolver's Explicit branch (triage.model / plan pin).
+            // Accepted: Explicit source. Tell the adapter first (the same
+            // select path the F2 picker uses), then mirror into the catalog so
+            // the turn path reads it like an F2 selection, and remember it for
+            // the resolver's Explicit branch (triage.model / plan pin).
+            let index = adapter_index(target_agent);
+            if let Err(error) = self.adapters[index].select_model(model_value.clone()) {
+                return HeadlessOutcome::failure(
+                    dmuxai::agent_api::exit::INTERNAL,
+                    self.conversation_id.as_str().to_owned(),
+                    Some(runner_id),
+                    format!("could not select model {model_value}: {error}"),
+                );
+            }
             self.headless_explicit_model = Some((target_agent, model_value.clone()));
             let catalog = self.model_catalogs.entry(target_agent).or_default();
             catalog.selected = Some(model_value);
