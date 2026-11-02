@@ -7,6 +7,12 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Added
 
+- **Jira tickets in the To-dos sidebar, read-only (SPEC-jira-todos, FR-2400..2408,
+  UX-2409..2411).** A `[jira]` table in `dmuxai.toml` (`base_url`, `email`, `jql`,
+  `max_results`, `token_env`) lists matching Jira Cloud issues in a collapsible
+  **Jira** group with Open in Jira, Start task (prefilled, unsent draft), and Copy to
+  to-do. The API token comes only from the `DMUXAI_JIRA_TOKEN` environment variable
+  (or the one named by `token_env`) and never reaches config, logs, or the browser.
 - **Agents keep their own native session inside a task (FR-2323..FR-2326).**
   When another agent adds completed turns, the original agent resumes its own
   provider session and receives only the unseen turns, labelled with source

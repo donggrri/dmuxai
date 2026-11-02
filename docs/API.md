@@ -216,6 +216,7 @@ clean exit. Read it instead of parsing logs.
 | POST | `/api/todos` | `{title, body?}` | `201` `Todo` | 400, 401, 403, 413, 415, 503 |
 | PATCH | `/api/todos/{id}` | `{title?, body?, status?}` | `200` `Todo` | 400, 401, 403, 404, 415, 503 |
 | DELETE | `/api/todos/{id}` | — | `204` | 401, 403, 404, 503 |
+| GET | `/api/jira/issues[?refresh=1]` | — | `200` `{configured, issues, error, fetched_at}` (read-only Jira search, 60 s cache) | 401 |
 | POST | `/api/todos/{id}/run` | `{mode: "agent"\|"graph", agent?}` | `202` `Todo` | 400, 401, 403, 404, 409, 500, 503, 504 |
 | GET | `/api/mcp/servers` | — | `200` `{servers, warnings}` | 401, 403, 503 |
 | POST | `/api/import` | `{server, query}` | `200` `{imported, updated}` | 400, 401, 403, 404, 502, 503 |
