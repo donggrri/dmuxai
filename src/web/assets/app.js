@@ -3524,8 +3524,8 @@ function todoRunControls(id, status) {
 
   var agents = Array.isArray(snap.agents) ? snap.agents : [];
 
-  // Session agents carry allowed / available (FR-2363). A missing or
-  // uninstalled runner stays in the list, disabled, with the reason as title.
+  // Session agents carry allowed / available (FR-2363). A missing runner
+  // stays in the list, disabled, with unavailable_reason as the title.
   function todoAgentUnavailable(agent) {
     var sessionAgents = snapshot && snapshot.session && Array.isArray(snapshot.session.agents)
       ? snapshot.session.agents : [];
@@ -3533,13 +3533,11 @@ function todoRunControls(id, status) {
     for (var n = 0; n < sessionAgents.length; n++) {
       if (sessionAgents[n] && sessionAgents[n].id === src.id) { src = sessionAgents[n]; break; }
     }
-    var reason = src.reason || src.unavailable_reason || '';
-    if (src.available === false || src.installed === false || src.missing) {
-      var missing = (src.missing && src.missing !== true) ? src.missing : '';
-      return String(reason || missing || 'not available');
+    if (src.available === false) {
+      return String(src.unavailable_reason || 'not available');
     }
     if (src.allowed === false) {
-      return String(reason || 'not allowed');
+      return 'not allowed by runner policy';
     }
     return '';
   }

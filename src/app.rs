@@ -1588,6 +1588,9 @@ pub struct App {
     cursor_session_maybe_read_only: bool,
     /// Cached assistant HTML keyed by transcript message id (`conversation:index`).
     chat_markdown_cache: HashMap<String, (u64, String)>,
+    /// `None` when the runner executable can be started; otherwise the tooltip
+    /// reason. Filled once at startup so snapshots do not stat.
+    agent_availability: HashMap<Agent, Option<String>>,
     pub(crate) progress_tracker: crate::progress::ProgressTracker,
     pub(crate) progress_sink: Option<ProgressSink>,
     last_tool_progress_state: HashMap<(Agent, String), String>,
@@ -1595,6 +1598,92 @@ pub struct App {
 }
 
 pub type ProgressSink = Box<dyn FnMut(&str) + Send>;
+
+/// `Some` when `DMUXAI_*_BIN` names a missing file, or the default binary is not on `PATH`.
+fn runner_binary_unavailable(
+    binary: &str,
+    env_var: &str,
+    override_value: Option<&std::ffi::OsStr>,
+    env: &dmuxai::runtime_env::RuntimeEnv,
+) -> Option<String> {
+    if let Some(raw) = override_value {
+        if program_is_executable_os(raw, env) {
+            return None;
+        }
+        return Some(format!(
+            "{binary} not found ({env_var}={})",
+            raw.to_string_lossy()
+        ));
+    }
+    if dmuxai::settings::find_on_path_from(binary, env).is_some() {
+        return None;
+    }
+    Some(format!("{binary} not found on PATH"))
+}
+
+/// Shared wording for grok and opencode, whose lookups also check a home install.
+fn named_lookup_unavailable(
+    binary: &str,
+    env_var: &str,
+    override_value: Option<&std::ffi::OsStr>,
+    found: bool,
+) -> Option<String> {
+    if found {
+        return None;
+    }
+    if let Some(raw) = override_value {
+        return Some(format!(
+            "{binary} not found ({env_var}={})",
+            raw.to_string_lossy()
+        ));
+    }
+    Some(format!("{binary} not found on PATH"))
+}
+
+fn custom_command_unavailable(
+    command: &[String],
+    env: &dmuxai::runtime_env::RuntimeEnv,
+) -> Option<String> {
+    let Some(program) = command
+        .first()
+        .map(|word| word.trim())
+        .filter(|word| !word.is_empty())
+    else {
+        return Some("command is empty".to_owned());
+    };
+    if program_is_executable(program, env) {
+        return None;
+    }
+    if program_names_a_path(program) {
+        Some(format!("{program} is not an executable file"))
+    } else {
+        Some(format!("{program} not found on PATH"))
+    }
+}
+
+fn program_names_a_path(program: &str) -> bool {
+    Path::new(program).is_absolute() || program.chars().any(std::path::is_separator)
+}
+
+fn program_is_executable(program: &str, env: &dmuxai::runtime_env::RuntimeEnv) -> bool {
+    if program_names_a_path(program) {
+        dmuxai::settings::is_executable_file(Path::new(program))
+    } else {
+        dmuxai::settings::find_on_path_from(program, env).is_some()
+    }
+}
+
+fn program_is_executable_os(
+    program: &std::ffi::OsStr,
+    env: &dmuxai::runtime_env::RuntimeEnv,
+) -> bool {
+    let text = program.to_string_lossy();
+    if program_names_a_path(&text) {
+        dmuxai::settings::is_executable_file(Path::new(program))
+    } else {
+        dmuxai::settings::find_on_path_from(&text, env).is_some()
+    }
+}
 
 impl App {
     pub fn set_progress_sink(&mut self, sink: ProgressSink) {
@@ -1836,11 +1925,13 @@ impl App {
             allow_multi_runner_graph: false,
             cursor_session_maybe_read_only: true,
             chat_markdown_cache: HashMap::new(),
+            agent_availability: HashMap::new(),
             progress_tracker: crate::progress::ProgressTracker::new(),
             progress_sink: None,
             last_tool_progress_state: HashMap::new(),
             last_output_heartbeat_at: HashMap::new(),
         };
+        app.refresh_agent_availability();
         app.selected = app.initial_runner_index(None);
         let runners = app.registered_runner_names();
         app.messages
@@ -3048,6 +3139,69 @@ impl App {
         }
     }
 
+    /// Stat each adapter's executable once. There is no later config reload
+    /// that swaps adapters; snapshots only read this cache.
+    fn refresh_agent_availability(&mut self) {
+        let env = dmuxai::runtime_env::RuntimeEnv::from_process();
+        let agents: Vec<Agent> = self
+            .adapters
+            .iter()
+            .map(|adapter| adapter.agent())
+            .collect();
+        let mut availability = HashMap::with_capacity(agents.len());
+        for agent in agents {
+            availability.insert(agent, self.agent_unavailable_reason(agent, &env));
+        }
+        self.agent_availability = availability;
+    }
+
+    /// `Some` is the tooltip reason. `None` means the runner can be started.
+    fn agent_unavailable_reason(
+        &self,
+        agent: Agent,
+        env: &dmuxai::runtime_env::RuntimeEnv,
+    ) -> Option<String> {
+        match agent {
+            Agent::Cursor => runner_binary_unavailable(
+                "cursor-agent",
+                "DMUXAI_CURSOR_BIN",
+                env.cursor_bin.as_deref(),
+                env,
+            ),
+            Agent::Agy => {
+                runner_binary_unavailable("agy", "DMUXAI_AGY_BIN", env.agy_bin.as_deref(), env)
+            }
+            Agent::Codex => runner_binary_unavailable(
+                "codex",
+                "DMUXAI_CODEX_BIN",
+                env.codex_bin.as_deref(),
+                env,
+            ),
+            Agent::Custom(index) => {
+                let Some(spec) = self.custom_spec(index) else {
+                    return Some("custom agent is not configured".to_owned());
+                };
+                if spec.builtin && spec.name.eq_ignore_ascii_case("opencode") {
+                    return named_lookup_unavailable(
+                        "opencode",
+                        "DMUXAI_OPENCODE_BIN",
+                        env.opencode_bin.as_deref(),
+                        dmuxai::settings::find_opencode_bin_from(env).is_some(),
+                    );
+                }
+                if spec.builtin && spec.name.eq_ignore_ascii_case("grok") {
+                    return named_lookup_unavailable(
+                        "grok",
+                        "DMUXAI_GROK_BIN",
+                        env.grok_bin.as_deref(),
+                        dmuxai::settings::find_grok_bin_from(env).is_some(),
+                    );
+                }
+                custom_command_unavailable(&spec.command, env)
+            }
+        }
+    }
+
     /// The live chat session for the dashboard (SPEC-dashboard-parity FR-780).
     fn session_view(&mut self) -> SessionView {
         const SESSION_CONVERSATIONS_MAX: usize = 200;
@@ -3226,8 +3380,11 @@ impl App {
                 let agent = adapter.agent();
                 let id = self.agent_runner_name(agent);
                 let catalog = self.model_catalogs.get(&agent);
+                let unavailable_reason = self.agent_availability.get(&agent).cloned().flatten();
                 SessionAgent {
                     allowed: self.runner_is_allowed(&id),
+                    available: unavailable_reason.is_none(),
+                    unavailable_reason,
                     label: agent.name().to_owned(),
                     mode: "agent".to_owned(),
                     modes: Vec::new(),
@@ -28539,6 +28696,45 @@ mod tests {
             !plain_first.contains("Codex, Cursor, and AGY use"),
             "{plain_first}"
         );
+    }
+
+    // TC-2363 / FR-2363: a custom command that is not an executable is disabled
+    // in the session snapshot; a command on PATH stays available.
+    #[test]
+    fn tc_2363_custom_agent_availability_follows_command() {
+        pin_test_state_dir();
+        let missing = dmuxai::custom_agent::CustomAgentSpec {
+            name: "missing-bin".to_owned(),
+            command: vec!["/nonexistent/fake-bin".to_owned()],
+            ..dmuxai::custom_agent::CustomAgentSpec::default()
+        };
+        let present = dmuxai::custom_agent::CustomAgentSpec {
+            name: "shell".to_owned(),
+            command: vec!["sh".to_owned()],
+            ..dmuxai::custom_agent::CustomAgentSpec::default()
+        };
+        let mut settings = DmuxSettings::default();
+        settings.custom_agents = vec![missing, present];
+        let mut agents = Agent::BUILTIN.to_vec();
+        agents.push(Agent::Custom(0));
+        agents.push(Agent::Custom(1));
+        let mut app = app_with_runner_agents(agents, settings);
+        let session = app.session_view();
+        let missing_agent = session
+            .agents
+            .iter()
+            .find(|agent| agent.id == "missing-bin")
+            .unwrap();
+        assert!(!missing_agent.available);
+        let reason = missing_agent.unavailable_reason.as_deref().unwrap();
+        assert!(reason.contains("/nonexistent/fake-bin"), "{reason}");
+        let shell = session
+            .agents
+            .iter()
+            .find(|agent| agent.id == "shell")
+            .unwrap();
+        assert!(shell.available, "{shell:?}");
+        assert!(shell.unavailable_reason.is_none());
     }
 
     fn assert_snapshot_omits_token(app: &mut App, hub: &dmuxai::web::DashboardHub, token: &str) {

@@ -151,7 +151,11 @@ pub struct SessionWorkspaceGroup {
     pub conversations: Vec<SessionConversation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionAgent {
     pub id: String,
@@ -162,6 +166,11 @@ pub struct SessionAgent {
     pub effort: Option<String>,
     pub busy: bool,
     pub allowed: bool,
+    /// Older snapshots omit this; they deserialize as available.
+    #[serde(default = "default_true")]
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
     pub models_loading: bool,
     pub models: Vec<SessionModel>,
     /// The model the runner reported as its default the first time its
@@ -170,6 +179,27 @@ pub struct SessionAgent {
     pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunStateView>,
+}
+
+impl Default for SessionAgent {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            mode: String::new(),
+            modes: Vec::new(),
+            model: None,
+            effort: None,
+            busy: false,
+            allowed: false,
+            available: true,
+            unavailable_reason: None,
+            models_loading: false,
+            models: Vec::new(),
+            default_model: None,
+            run: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1902,6 +1932,61 @@ mod tests {
         assert_eq!(adjusted.ended_at_ms, None);
         let unchanged = adjust_run_state_for_plan_approval(done, false);
         assert_eq!(unchanged.state, "done");
+    }
+
+    // TC-2363 / FR-2363: snapshots written before `available` existed stay selectable.
+    #[test]
+    fn tc_2363_session_agent_defaults_available() {
+        let json = r#"{
+            "id": "cursor",
+            "label": "Cursor",
+            "mode": "agent",
+            "modes": [],
+            "model": null,
+            "effort": null,
+            "busy": false,
+            "allowed": true,
+            "models_loading": false,
+            "models": []
+        }"#;
+        let agent: SessionAgent = serde_json::from_str(json).unwrap();
+        assert!(agent.available);
+        assert!(agent.unavailable_reason.is_none());
+
+        let value = serde_json::to_value(SessionAgent {
+            id: "cursor".to_owned(),
+            allowed: true,
+            ..SessionAgent::default()
+        })
+        .unwrap();
+        assert_eq!(value["available"], true);
+        assert!(value.get("unavailable_reason").is_none());
+
+        let explicit: SessionAgent = serde_json::from_str(
+            r#"{
+                "id": "missing-bin",
+                "label": "missing-bin",
+                "mode": "agent",
+                "modes": [],
+                "model": null,
+                "effort": null,
+                "busy": false,
+                "allowed": true,
+                "models_loading": false,
+                "models": [],
+                "available": false,
+                "unavailable_reason": "/nonexistent/fake-bin not found"
+            }"#,
+        )
+        .unwrap();
+        assert!(!explicit.available);
+        assert!(
+            explicit
+                .unavailable_reason
+                .as_deref()
+                .unwrap()
+                .contains("/nonexistent/fake-bin")
+        );
     }
 
     // TC-1762 / FR-1762: SnapshotSource::App serializes as "app"

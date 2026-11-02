@@ -1271,27 +1271,23 @@
     return model.default_effort && efforts.indexOf(model.default_effort) >= 0 ? model.default_effort : '';
   }
 
-  // Missing, uninstalled, or disallowed agents stay in the menu, disabled,
-  // with the snapshot reason in the tooltip (FR-2363).
+  // Missing or disallowed agents stay in the menu, disabled, with the
+  // snapshot reason in the tooltip (FR-2363).
   function agentUnavailableReason(agent) {
     if (!agent) { return ''; }
-    var reason = agent.reason || agent.unavailable_reason || '';
-    if (agent.available === false || agent.installed === false || agent.missing) {
-      var missing = (agent.missing && agent.missing !== true) ? agent.missing : '';
-      return String(reason || missing || 'not available');
+    if (agent.available === false) {
+      return String(agent.unavailable_reason || 'not available');
     }
     if (agent.allowed === false) {
-      return String(reason || 'not allowed');
+      return 'not allowed by runner policy';
     }
     return '';
   }
 
   function modelUnavailableReason(model) {
     if (!model) { return ''; }
-    var reason = model.reason || model.unavailable_reason || '';
-    if (model.available === false || model.installed === false || model.allowed === false || model.missing) {
-      var missing = (model.missing && model.missing !== true) ? model.missing : '';
-      return String(reason || missing || 'not available');
+    if (model.available === false) {
+      return String(model.unavailable_reason || 'not available');
     }
     return '';
   }

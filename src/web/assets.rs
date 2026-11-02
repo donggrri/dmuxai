@@ -2213,6 +2213,17 @@ mod tests {
             APP_JS.contains("opt.disabled = true; opt.title = unavailable;"),
             "to-do runner option is disabled with the reason in title"
         );
+        assert!(
+            SESSION_JS.contains("agent.unavailable_reason"),
+            "tooltip uses the snapshot unavailable_reason"
+        );
+        assert!(SESSION_JS.contains("not allowed by runner policy"));
+        assert!(APP_JS.contains("src.unavailable_reason"));
+        assert!(APP_JS.contains("not allowed by runner policy"));
+        assert!(!SESSION_JS.contains("agent.installed"));
+        assert!(!SESSION_JS.contains("agent.missing"));
+        assert!(!APP_JS.contains("src.installed"));
+        assert!(!APP_JS.contains("src.missing"));
     }
 
     #[test]
