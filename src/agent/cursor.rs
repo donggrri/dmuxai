@@ -3171,6 +3171,9 @@ pub(crate) mod tests {
     #[cfg(unix)]
     mod fake_acp_agent_tests {
         use super::*;
+        use crate::agent::acp::{
+            AcpLifecycle, AcpRunnerKind, AcpTurnConfig, new_cancel_flag, run_acp_turn,
+        };
         use crate::agent::{ConversationId, TurnId};
 
         /// Holds the shared cursor test lock and clears the fake env on drop.
@@ -3238,6 +3241,7 @@ pub(crate) mod tests {
         const FAKE_VARS: &[&str] = &[
             "FAKE_ACP_FAST_ONLY",
             "FAKE_ACP_PERMISSION_OUTSIDE",
+            "FAKE_ACP_PERMISSION_ID_COLLISION",
             "FAKE_ACP_MODES",
             "FAKE_ACP_MODE_CAPTURE",
             "FAKE_ACP_PROMPT_CAPTURE",
@@ -3402,6 +3406,72 @@ pub(crate) mod tests {
                 events
                     .iter()
                     .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("denied")))
+            );
+        }
+
+        // TC-2316 / FR-2316: an agent request with the same id as the pending
+        // session/prompt must not end the turn early.
+        #[tokio::test]
+        async fn tc_2316_permission_request_id_collision_keeps_turn_running() {
+            let _guard = lock_env().await;
+            set_fake_env(&[("FAKE_ACP_PERMISSION_ID_COLLISION", "1".as_ref())]);
+            let workspace = tempfile::tempdir().unwrap();
+            let request = request(TurnPolicy::Agent);
+            let (event_tx, mut event_rx) = mpsc::channel(256);
+            let context = OutputContext::from(&request);
+            let program = PathBuf::from(
+                cursor_command()
+                    .expect("cursor command")
+                    .as_std()
+                    .get_program()
+                    .to_os_string(),
+            );
+            let args = acp_runner::cursor_acp_argv(None, workspace.path()).expect("cursor argv");
+            let outcome = run_acp_turn(
+                &program,
+                &args,
+                workspace.path(),
+                &request.prompt,
+                None,
+                PermissionContext {
+                    workspace: workspace.path().to_string_lossy().into_owned(),
+                    sensitive_gate_active: false,
+                    read_only_fail_closed: false,
+                },
+                &event_tx,
+                Agent::Cursor,
+                &context,
+                AcpTurnConfig {
+                    runner: AcpRunnerKind::Cursor,
+                    policy: TurnPolicy::Agent,
+                    lifecycle: AcpLifecycle::Managed,
+                    requested_model: None,
+                    session_config_model: None,
+                    reasoning_effort: None,
+                    cancel: new_cancel_flag(),
+                },
+            )
+            .await
+            .expect("collision turn should not exit early");
+            drop(event_tx);
+            let mut events = Vec::new();
+            while let Some(output) = event_rx.recv().await {
+                events.push(output.event);
+            }
+            assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
+            let text: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::TextDelta(d) => Some(d.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(text.contains("ACP_OK"), "{text}");
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::Completed)));
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Error(_) | AgentEvent::Cancelled))
             );
         }
 

@@ -93,6 +93,12 @@ impl SharedState {
     }
 }
 
+/// FR-2316: a JSON-RPC response matches only when the id matches and it is not
+/// itself a request or notification (which always carries a `method`).
+fn is_response_to(value: &Value, id: u64) -> bool {
+    value.get("id").and_then(Value::as_u64) == Some(id) && value.get("method").is_none()
+}
+
 /// Run one ACP turn: spawn `program` with `args`, drive protocol, emit events.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_acp_turn(
@@ -662,9 +668,7 @@ async fn run_prompt(
                 continue;
             }
         };
-        if let Some(resp_id) = value.get("id").and_then(Value::as_u64)
-            && resp_id == id
-        {
+        if is_response_to(&value, id) {
             if let Some(err) = value.get("error") {
                 return Err(err.to_string());
             }
@@ -835,7 +839,7 @@ async fn request(
                 continue;
             }
         };
-        if value.get("id").and_then(Value::as_u64) == Some(id) {
+        if is_response_to(&value, id) {
             if let Some(err) = value.get("error") {
                 return Err(err.to_string());
             }
@@ -1011,5 +1015,20 @@ mod tests {
     #[test]
     fn acp_client_version_matches_crate() {
         assert_eq!(super::CLIENT_VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    // TC-2316 / FR-2316: only an id match without `method` is our response.
+    #[test]
+    fn tc_2316_is_response_to_requires_matching_id_without_method() {
+        let response = serde_json::json!({ "jsonrpc": "2.0", "id": 3, "result": {} });
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/request_permission",
+            "params": {}
+        });
+        assert!(super::is_response_to(&response, 3));
+        assert!(!super::is_response_to(&request, 3));
+        assert!(!super::is_response_to(&response, 4));
     }
 }

@@ -189,6 +189,26 @@ fn main() {
                 if let Some(path) = std::env::var_os("FAKE_ACP_PROMPT_CAPTURE") {
                     let _ = std::fs::write(path, b"1");
                 }
+                if std::env::var("FAKE_ACP_PERMISSION_ID_COLLISION").is_ok()
+                    && let Some(req_id) = id.clone()
+                {
+                    let perm = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/request_permission",
+                        "id": req_id,
+                        "params": {
+                            "options": [
+                                {"optionId": "allow", "kind": "allow_once"},
+                                {"optionId": "reject", "kind": "reject-once"}
+                            ]
+                        }
+                    });
+                    writeln!(stdout, "{perm}").unwrap();
+                    stdout.flush().unwrap();
+                    line_buf.clear();
+                    let _ = reader.read_line(&mut line_buf);
+                    line_buf.clear();
+                }
                 let mut denied = false;
                 if std::env::var("FAKE_ACP_PERMISSION_OUTSIDE").is_ok() {
                     let perm = serde_json::json!({
