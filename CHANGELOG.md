@@ -46,6 +46,8 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
+- ACP runners no longer end a turn early when the agent sends a request whose id matches dmuxai's pending prompt (#242).
+
 - **Stop now also stops an agent's shell commands (#230, FR-2270, FR-2271).**
   Stopping a running turn or graph step (dashboard **Stop**, TUI Ctrl+C) on the
   Cursor (ACP and legacy) and custom runners now also ends processes the agent
