@@ -294,7 +294,9 @@
     function settingsCopy(label, hint) {
       var copy = el('div', 'settings-row-copy');
       copy.appendChild(el('div', 'settings-row-label', label));
-      copy.appendChild(el('div', 'settings-row-hint', hint));
+      var hintEl = el('div', 'settings-row-hint', hint);
+      hintEl.title = hint;
+      copy.appendChild(hintEl);
       return copy;
     }
 

@@ -2248,11 +2248,25 @@ mod tests {
             MEMORY_JS.contains("settings-row-hint"),
             "memory hint sits under the label"
         );
+        assert!(
+            MEMORY_JS.contains("hintEl.title = hint"),
+            "settings-row-hint title is the full hint text"
+        );
         assert!(MEMORY_JS.contains("Where the entry is saved"));
         assert!(MEMORY_JS.contains("One fact per entry"));
         assert!(
             APP_CSS.contains(".memory-popover .memory-controls.settings-group > .settings-row"),
             "memory row layout beats older panel styles"
+        );
+        let copy_at = APP_CSS
+            .find(".memory-popover .settings-row > .settings-row-copy {")
+            .expect("memory copy column rule");
+        let copy_rule = &APP_CSS[copy_at..];
+        let copy_end = copy_rule.find('}').expect("copy rule end");
+        let copy_body = &copy_rule[..copy_end];
+        assert!(
+            copy_body.contains("flex: 0 0 auto"),
+            "copy column does not shrink"
         );
     }
 

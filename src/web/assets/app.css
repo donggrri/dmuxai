@@ -1137,8 +1137,9 @@ main {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  min-width: 0;
-  flex: 1 1 auto;
+  flex: 0 0 auto;
+  min-width: max-content;
+  max-width: none;
 }
 .settings-row-hint {
   color: var(--muted);
@@ -1147,7 +1148,6 @@ main {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 60ch;
 }
 .settings-info {
   display: inline-flex;
@@ -1669,32 +1669,42 @@ main {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  min-width: 0;
-  flex: 1 1 auto;
+  flex: 0 0 auto;
+  min-width: max-content;
+  max-width: none;
+}
+.memory-popover .settings-row > .settings-row-copy > .settings-row-hint {
+  white-space: nowrap;
+  max-width: none;
 }
 .memory-popover .settings-row > .settings-row-control {
   display: flex;
   flex-direction: row;
   flex-wrap: nowrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
-  flex: 0 1 auto;
+  flex: 1 1 auto;
   min-width: 0;
-  margin-left: auto;
 }
 .memory-popover .settings-row .memory-field {
   display: flex;
   flex-direction: row;
   align-items: center;
   gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 .memory-popover .settings-row .memory-target-select,
 .memory-popover .settings-row .memory-name-input,
 .memory-popover .settings-row .memory-text-input {
-  width: auto;
+  width: 100%;
   min-width: 0;
-  max-width: 12rem;
-  flex: 0 1 12rem;
+  max-width: none;
+  flex: 1 1 auto;
+}
+.memory-popover .settings-row .memory-action-btn {
+  flex: none;
 }
 
 .memory-status {
