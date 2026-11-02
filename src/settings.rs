@@ -1894,6 +1894,9 @@ fn normalize_jira_config_base_url(value: &str) -> Result<String, String> {
     if trimmed.contains('?') || trimmed.contains('#') {
         return Err("must not contain a query or fragment".to_owned());
     }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("must not contain whitespace or control characters".to_owned());
+    }
     let lower = trimmed.to_ascii_lowercase();
     let (secure, prefix_len) = if lower.starts_with("https://") {
         (true, "https://".len())
@@ -1907,6 +1910,9 @@ fn normalize_jira_config_base_url(value: &str) -> Result<String, String> {
     let authority = &rest[..authority_end];
     if authority.is_empty() {
         return Err("must include a host".to_owned());
+    }
+    if authority.contains('@') {
+        return Err("must not contain user info".to_owned());
     }
     let host = if let Some(rest) = authority.strip_prefix('[') {
         match rest.split_once(']') {
@@ -2783,6 +2789,9 @@ allowed_runners = []
             "http://example.atlassian.net",
             "javascript:alert(1)",
             "https://example.atlassian.net/?x=1",
+            "http://localhost:x@other.example",
+            "https://user@example.atlassian.net",
+            "https://example.atlassian.net/ x",
         ] {
             let settings = load(&format!(
                 "[jira]\nbase_url = \"{bad}\"\nemail = \"user@example.com\"\n"
