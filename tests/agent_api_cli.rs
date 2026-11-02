@@ -158,6 +158,60 @@ timeout_secs = 30
     )
 }
 
+// TC-2317 / FR-2317: headless --model reaches the runner's real argv and the
+// JSON/triage model reports the same value.
+#[cfg(unix)]
+#[test]
+fn tc_2317_headless_model_flag_reaches_runner() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-agent.sh");
+    let config = format!(
+        r#"[graph]
+enabled = false
+
+[[agents.custom]]
+name = "fake"
+command = ["sh", "{fixture}", "argv", "-m", "{{model}}", "{{prompt}}"]
+prompt_via = "arg"
+output = "jsonl"
+text_path = "/part/text"
+text_when = {{ path = "/type", equals = "text" }}
+allowed_models = "^fake/.*$"
+timeout_secs = 30
+"#,
+        fixture = fixture.display().to_string().replace('\\', "/"),
+    );
+    let sandbox = Sandbox::new(&config);
+    let argv_file = sandbox.root.join("runner-argv.txt");
+    let env = [("FAKE_AGENT_ARGV", argv_file.as_os_str().to_os_string())];
+
+    let output = sandbox.run_in_env(
+        &[
+            "run",
+            "hello",
+            "--agent",
+            "fake",
+            "--model",
+            "fake/model-two",
+            "--json",
+        ],
+        None,
+        &env,
+    );
+    let json = stdout_json(&output);
+    assert_eq!(output.status.code(), Some(0), "{json}");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["triage"]["model"], "fake/model-two");
+
+    let argv = std::fs::read_to_string(&argv_file).expect("runner argv log");
+    assert!(
+        argv.lines().any(|arg| arg == "fake/model-two"),
+        "runner argv did not carry the --model value: {argv}"
+    );
+}
+
 // TC-761 / FR-761, NFR-760: a headless run prints exactly one JSON object
 // with the agent text and exits 0; a failing agent exits 1 with ok=false.
 #[cfg(unix)]

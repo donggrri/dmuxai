@@ -63,6 +63,7 @@ DmuxAI resolves the model for a turn through one lib-side resolver, `dmuxai::mod
 | FR-1730 | Must | Given `dmuxai run` or `dmuxai todo run` with `--model M` (requires `--agent`) | Validate with `validate_model_for_runner` / custom `allowed_models`; disallowed -> exit 5 before any turn; accepted model is Explicit source and echoed in `triage.model` | Missing value / `--model` without `--agent` / with `--graph` -> exit 2 | TC-1750, TC-1751, TC-1752 |
 | FR-1731 | Must | Given `[runners.<id>] model = "..."` in config | Provide a ConfigDefault for built-in and custom runners; `[runners.default] model` is ignored with a warning; invalid value -> config warning and ignored | Unknown runner id -> warning and ignored | TC-1753, TC-1754, TC-1755 |
 | FR-1732 | Must | Given the existing model policy | `validate_model_for_runner`, `validate_model_id`, `default_model_for_runner`, `ALLOWED_MODEL`, agy flash-only, fast block, Cursor pin, and custom `allowed_models`/`validate_custom_model` are unchanged | No regression in policy tests | TC-1736, TC-1756 |
+| FR-2317 | Must | Given `dmuxai run` or `dmuxai todo run` with `--agent X --model Y` and an accepted model | The runner process is started with Y (custom `{model}` placeholder or built-in adapter model argument/state), and `--json` (`triage.model` / model fields) reports the model actually used | Adapter selection failure stops the run instead of reporting an unused model | TC-2317 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -92,6 +93,7 @@ DmuxAI resolves the model for a turn through one lib-side resolver, `dmuxai::mod
 | TC-1754 | FR-1731 | unit | settings edge cases | parse settings | default ignored; custom accepted; unknown dropped | `src/settings.rs` `tc_1754_runner_model_default_custom_unknown` |
 | TC-1755 | FR-1731 | integration | custom agent + config model | selected_run_model | precedence explicit > selected > config > custom default > runner default | `src/app.rs` `tc_1755_resolver_precedence_config_model` |
 | TC-1756 | FR-1732 | integration | config model present | policy unchanged | validate still enforces policy | `src/app.rs` `tc_1756_policy_unchanged` |
+| TC-2317 | FR-2317 | integration | custom fake runner whose `command` embeds `{model}` and logs its argv | `dmuxai run --agent fake --model fake/model-two --json` | runner argv contains `fake/model-two`; `triage.model` reports `fake/model-two` | `tests/agent_api_cli.rs` `tc_2317_headless_model_flag_reaches_runner` |
 
 ## 6. Data, integration and safety contracts
 

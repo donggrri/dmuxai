@@ -53,6 +53,8 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
+- `dmuxai run` / `dmuxai todo run` now start the runner with the model given by `--model`, and `--json` reports the model actually used.
+
 - ACP runners no longer end a turn early when the agent sends a request whose id matches dmuxai's pending prompt (#242).
 
 - **Stop now also stops an agent's shell commands (#230, FR-2270, FR-2271).**
