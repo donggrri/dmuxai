@@ -1446,6 +1446,9 @@ pub struct App {
     activities: HashMap<Agent, AgentActivity>,
     streaming_messages: HashMap<Agent, usize>,
     model_catalogs: HashMap<Agent, ModelCatalog>,
+    /// FR-2322: model echoed by an adapter after a task-setting restore, which
+    /// must update the catalog without adding a "model selected" chat item.
+    quiet_model_echo: HashMap<Agent, String>,
     model_picker: Option<ModelPicker>,
     effort_picker: Option<EffortPicker>,
     agent_picker: Option<AgentPicker>,
@@ -1761,6 +1764,7 @@ impl App {
                     (agent, catalog)
                 })
                 .collect(),
+            quiet_model_echo: HashMap::new(),
             model_picker: None,
             effort_picker: None,
             agent_picker: None,
@@ -2910,6 +2914,7 @@ impl App {
         self.adapters[adapter_index(agent)]
             .select_model(selected.clone())
             .map_err(|error| error.to_string())?;
+        self.quiet_model_echo.insert(agent, selected.clone());
         if let Some(catalog) = self.model_catalogs.get_mut(&agent) {
             let default_effort = catalog
                 .models
@@ -3474,6 +3479,7 @@ impl App {
                     )));
                 };
                 let index = adapter_index(target);
+                self.quiet_model_echo.remove(&target);
                 // Same Cursor model pin as the TUI picker (SPEC-cursor-model-pin).
                 if target == Agent::Cursor
                     && let Err(error) =
@@ -5052,6 +5058,7 @@ impl App {
                     .iter()
                     .position(|candidate| *candidate == agent)
                     .expect("picker agent belongs to Agent::all()");
+                self.quiet_model_echo.remove(&agent);
                 if agent == Agent::Cursor
                     && let Err(error) =
                         dmuxai::model_policy::validate_model_for_runner("cursor", &model.id)
@@ -6205,6 +6212,7 @@ impl App {
         self.conversation_title = snapshot.title;
         self.session_conversations = None;
         self.chat_markdown_cache.clear();
+        self.quiet_model_echo.clear();
         self.clear_pending_turn_policy();
         self.clear_turn_runner_pin();
         self.cursor_session_maybe_read_only = true;
@@ -11064,6 +11072,13 @@ impl App {
                 } else {
                     model
                 };
+                let quiet = match self.quiet_model_echo.get(&agent) {
+                    Some(pending) if pending == &model => {
+                        self.quiet_model_echo.remove(&agent);
+                        true
+                    }
+                    _ => false,
+                };
                 let catalog = self
                     .model_catalogs
                     .get_mut(&agent)
@@ -11074,6 +11089,9 @@ impl App {
                     .iter()
                     .find(|candidate| candidate.id == model)
                     .and_then(|candidate| candidate.default_effort.clone());
+                if quiet {
+                    return;
+                }
                 let label = catalog
                     .models
                     .iter()
@@ -19167,6 +19185,88 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(notices[0].content.contains("missing-runner"));
+    }
+
+    // TC-2340 / FR-2322: restoring task settings is silent, while an explicit
+    // model pick still announces the selection.
+    #[test]
+    fn tc_2322_restore_is_quiet() {
+        let (mut app, _sent) = test_app();
+        let restored = app.conversation_id.clone();
+
+        let catalog = app.model_catalogs.get_mut(&Agent::Codex).unwrap();
+        catalog.models = vec![ModelInfo::with_efforts(
+            "composer-2.5",
+            "Composer 2.5",
+            vec!["low".to_owned(), "high".to_owned()],
+            Some("low".to_owned()),
+        )];
+        catalog.default_model = Some("composer-2.5".to_owned());
+
+        app.engine
+            .set_task_settings(TaskSettings {
+                agent: Some("codex".to_owned()),
+                model: Some("composer-2.5".to_owned()),
+                effort: Some("high".to_owned()),
+            })
+            .unwrap();
+
+        app.create_conversation(Some("Elsewhere".to_owned()));
+        app.selected = adapter_index(Agent::Cursor);
+        app.model_catalogs.get_mut(&Agent::Codex).unwrap().selected = None;
+
+        app.select_conversation(restored.clone());
+        app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: None,
+            turn_id: None,
+            event: AgentEvent::ModelSelected("composer-2.5".to_owned()),
+        });
+        assert!(
+            app.messages
+                .iter()
+                .all(|message| !message.content.contains("model selected")),
+            "{:?}",
+            app.messages
+                .iter()
+                .map(|message| &message.content)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.model_catalogs[&Agent::Codex].selected.as_deref(),
+            Some("composer-2.5")
+        );
+
+        // A restore leaves a quiet echo pending; an explicit pick clears it so
+        // the adapter's confirmation is shown as on main.
+        app.create_conversation(Some("Elsewhere again".to_owned()));
+        app.selected = adapter_index(Agent::Cursor);
+        app.select_conversation(restored);
+        app.handle_session_command(SessionCommand::SelectModel {
+            agent: Some("codex".to_owned()),
+            model: "composer-2.5".to_owned(),
+        })
+        .unwrap();
+        app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: None,
+            turn_id: None,
+            event: AgentEvent::ModelSelected("composer-2.5".to_owned()),
+        });
+        let notices = app
+            .messages
+            .iter()
+            .filter(|message| message.content.contains("model selected"))
+            .count();
+        assert_eq!(
+            notices,
+            1,
+            "{:?}",
+            app.messages
+                .iter()
+                .map(|message| &message.content)
+                .collect::<Vec<_>>()
+        );
     }
 
     // TC-1222 / FR-1225: group labels and ordering.
