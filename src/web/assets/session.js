@@ -1271,6 +1271,31 @@
     return model.default_effort && efforts.indexOf(model.default_effort) >= 0 ? model.default_effort : '';
   }
 
+  // Missing, uninstalled, or disallowed agents stay in the menu, disabled,
+  // with the snapshot reason in the tooltip (FR-2363).
+  function agentUnavailableReason(agent) {
+    if (!agent) { return ''; }
+    var reason = agent.reason || agent.unavailable_reason || '';
+    if (agent.available === false || agent.installed === false || agent.missing) {
+      var missing = (agent.missing && agent.missing !== true) ? agent.missing : '';
+      return String(reason || missing || 'not available');
+    }
+    if (agent.allowed === false) {
+      return String(reason || 'not allowed');
+    }
+    return '';
+  }
+
+  function modelUnavailableReason(model) {
+    if (!model) { return ''; }
+    var reason = model.reason || model.unavailable_reason || '';
+    if (model.available === false || model.installed === false || model.allowed === false || model.missing) {
+      var missing = (model.missing && model.missing !== true) ? model.missing : '';
+      return String(reason || missing || 'not available');
+    }
+    return '';
+  }
+
   function updateAgentPickerLabel() {
     if (!ui.agentPicker) { return; }
     var agent = selectedAgent();
@@ -1285,13 +1310,21 @@
       }
     }
     ui.agentPicker.classList.toggle('session-agent-picker-running', running);
+    var span = ui.agentPicker.querySelector('.session-agent-picker-label');
+    if (!span) {
+      span = el('span', 'session-agent-picker-label');
+      ui.agentPicker.appendChild(span);
+    }
     if (!agent) {
-      ui.agentPicker.textContent = 'Agent';
+      span.textContent = 'Agent';
+      ui.agentPicker.title = 'Agent';
       return;
     }
     var label = agent.label || agent.id;
     var model = agent.model ? (' · ' + agent.model) : '';
-    ui.agentPicker.textContent = label + model;
+    // Inner span so the ::before/::after flex children do not swallow the ellipsis.
+    span.textContent = label + model;
+    ui.agentPicker.title = label + model;
     var color = agentColor(agent.id);
     if (color) {
       ui.agentPicker.style.setProperty('--agent-picker-dot', color);
@@ -1376,6 +1409,8 @@
     btn.appendChild(el('span', 'session-model-name', m.label || m.id));
     var current = modelEffort(a, m);
     if (current) { btn.appendChild(el('span', 'session-model-effort', effortLabel(current))); }
+    var blocked = agentUnavailableReason(a) || modelUnavailableReason(m);
+    if (blocked) { btn.disabled = true; btn.title = blocked; }
     row.appendChild(btn);
     if (efforts.length) {
       var open = !!agentMenu.expanded[key];
@@ -1384,6 +1419,7 @@
       more.tabIndex = -1;
       more.setAttribute('aria-label', 'Effort for ' + (m.label || m.id));
       more.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (blocked) { more.disabled = true; more.title = blocked; }
       more.addEventListener('click', function (e) {
         e.preventDefault();
         agentMenu.expanded[key] = !agentMenu.expanded[key];
@@ -1405,6 +1441,7 @@
         eb.setAttribute('aria-selected', on ? 'true' : 'false');
         eb.appendChild(el('span', 'session-menu-check', on ? '✓' : ''));
         eb.appendChild(el('span', 'session-model-name', effortLabel(eff)));
+        if (blocked) { eb.disabled = true; eb.title = blocked; }
         sub.appendChild(eb);
       });
       models.appendChild(sub);
@@ -1432,8 +1469,9 @@
       var group = el('div', 'session-agent-item');
       group.setAttribute('role', 'group');
       group.setAttribute('aria-label', a.label || a.id);
+      var unavailable = agentUnavailableReason(a);
       var row = menuItem('button', 'session-menu-row session-agent-row', 'agent:' + a.id, function () {
-        if (!a.allowed) { return; }
+        if (agentUnavailableReason(a)) { return; }
         command({ command: 'select_agent', agent: a.id }).then(function (ok) {
           if (ok && !a.models.length && !a.models_loading) {
             command({ command: 'load_models', agent: a.id });
@@ -1442,7 +1480,7 @@
       });
       if (isSelected) { row.classList.add('session-agent-row-active'); }
       row.setAttribute('aria-selected', isSelected ? 'true' : 'false');
-      if (!a.allowed) { row.disabled = true; row.title = 'Unavailable'; }
+      if (unavailable) { row.disabled = true; row.title = unavailable; }
       var dot = el('span', 'session-agent-dot');
       var color = (hub && hub.color) || agentColor(a.id);
       if (color) { dot.style.backgroundColor = color; }
@@ -1467,6 +1505,7 @@
             def.appendChild(el('span', 'session-menu-check', ''));
             def.appendChild(el('span', 'session-model-name', 'Default model'));
             def.appendChild(el('span', 'session-model-effort', modelLabel(a, a.default_model) + (isDefault ? ' · current' : '')));
+            if (unavailable) { def.disabled = true; def.title = unavailable; }
             box.appendChild(def);
           }
           models.forEach(function (m) { buildModelRow(a, m, query, box); });
@@ -1476,7 +1515,8 @@
           });
           load.appendChild(el('span', 'session-menu-check', ''));
           load.appendChild(el('span', 'session-model-name', a.models_loading ? 'Loading models…' : 'Load models'));
-          load.disabled = !!a.models_loading;
+          load.disabled = !!a.models_loading || !!unavailable;
+          if (unavailable) { load.title = unavailable; }
           box.appendChild(load);
         }
         if (box.childNodes.length) { group.appendChild(box); }
@@ -1723,9 +1763,9 @@
 
   function picker(label, parity, onChange) {
     var wrap = el('label', 'session-picker');
-    wrap.appendChild(el('span', 'field-label', label));
     var select = el('select', 'session-select');
     select.setAttribute('data-parity', parity);
+    select.setAttribute('aria-label', label);
     select.addEventListener('change', onChange);
     wrap.appendChild(select);
     return select;
@@ -2699,7 +2739,8 @@
 
   function agentChoices() {
     return session.agents.map(function (a) {
-      return { value: a.id, label: a.label + (a.allowed ? '' : ' (not allowed)'), disabled: !a.allowed };
+      var reason = agentUnavailableReason(a);
+      return { value: a.id, label: a.label || a.id, disabled: !!reason, title: reason };
     });
   }
 
@@ -2707,7 +2748,8 @@
     var targets = session.agents.filter(function (a) {
       return SHARE_TARGETS.indexOf(a.id) >= 0 && a.id !== session.selected_agent;
     }).map(function (a) {
-      return { value: a.id, label: 'Share with ' + a.label, disabled: !a.allowed || a.busy };
+      var reason = agentUnavailableReason(a);
+      return { value: a.id, label: 'Share with ' + a.label, disabled: !!reason || a.busy, title: reason };
     });
     ask('Share transcript', targets, function (v) { command({ command: 'share', target: v }); });
   }
@@ -2789,6 +2831,8 @@
         if (entry.parity) { li.setAttribute('data-parity', entry.parity); }
         li.appendChild(el('span', 'session-option-label', entry.label));
         if (entry.hint) { li.appendChild(el('span', 'session-option-hint', entry.hint)); }
+        if (entry.title) { li.title = entry.title; }
+        if (entry.disabled) { li.setAttribute('aria-disabled', 'true'); }
         li.addEventListener('click', function () { pick(entry); });
         list.appendChild(li);
       });

@@ -38,15 +38,15 @@ In scope: `src/web/assets/index.html`, `app.css`, `app.js`, `session.js`, `sessi
 
 | ID | Requirement | Level | Oracle | Test |
 | --- | --- | --- | --- | --- |
-| TC-2360 | FR-2360 | unit (asset) | The session composer has a `.session-run-controls` row grouping the agent picker and route (mode) selector. | `src/web/assets.rs` `tc_2360_run_controls_grouped` |
-| TC-2361 | FR-2361 | unit (asset) | The agent picker label shows the current agent and model. | `src/web/assets.rs` `tc_2361_collapsed_shows_agent_and_model` |
+| TC-2360 | FR-2360 | unit (asset) | `.session-run-controls` is one nowrap row: the agent picker and the route select sit inline, and the route select uses an aria-label instead of a stacked label. | `src/web/assets.rs` `tc_2360_run_controls_grouped` |
+| TC-2361 | FR-2361 | unit (asset) | The agent picker puts "agent · model" in an inner span, sets `title` to that full text, and ellipsizes past 18rem. | `src/web/assets.rs` `tc_2361_collapsed_shows_agent_and_model` |
 | TC-2362 | FR-2362 | unit (asset) | Effort controls are only rendered when a model reports efforts. | `src/web/assets.rs` `tc_2362_effort_only_when_supported` |
-| TC-2363 | FR-2363 | unit (asset) | Unavailable agents get a disabled row with a title tooltip. | `src/web/assets.rs` `tc_2363_unavailable_disabled_with_tooltip` |
-| TC-2364 | FR-2364 | unit (asset) | Shared `.settings-group` and `.settings-row` classes exist in `app.css`. | `src/web/assets.rs` `tc_2364_settings_shared_classes` |
-| TC-2365 | FR-2365 | unit (asset) | Long help uses an info tooltip (`.settings-info` with a `title`). | `src/web/assets.rs` `tc_2365_long_help_info_tooltip` |
+| TC-2363 | FR-2363 | unit (asset) | Unavailable agents are `disabled` with the reason in `title` in the agent popover and the to-do runner select. | `src/web/assets.rs` `tc_2363_unavailable_disabled_with_tooltip` |
+| TC-2364 | FR-2364 | unit (asset) | Memory rows use `.settings-row-label` and a one-line `.settings-row-hint`, with the control on the right. | `src/web/assets.rs` `tc_2364_settings_shared_classes` |
+| TC-2365 | FR-2365 | unit (asset) | Skills help is a `.settings-info` icon whose `title` and aria-label hold the long text. | `src/web/assets.rs` `tc_2365_long_help_info_tooltip` |
 | TC-2366 | FR-2366 | unit (asset) | Button system classes and focus ring exist. | `src/web/assets.rs` `tc_2366_button_system` |
 | TC-2367 | FR-2367 | unit (asset) | Busy state uses "Saving…" text and disables the button. | `src/web/assets.rs` `tc_2367_busy_state` |
-| TC-2368 | FR-2368 | unit (asset) | Destructive actions use inline "Confirm"/"Cancel". | `src/web/assets.rs` `tc_2368_inline_confirm` |
+| TC-2368 | FR-2368 | unit (asset) | To-do delete uses inline Confirm/Cancel, and Confirm uses the filled `.btn-danger.btn-confirm` style. | `src/web/assets.rs` `tc_2368_inline_confirm` |
 | TC-2369 | FR-2369 | unit (asset) | Tab/aria-label/reduced-motion support present. | `src/web/assets.rs` `tc_2369_keyboard_and_a11y` |
 
 ## 6. Exit criteria

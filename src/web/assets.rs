@@ -2131,6 +2131,7 @@ mod tests {
             "showDiff function must not use innerHTML"
         );
     }
+
     #[test]
     fn tc_2360_run_controls_grouped() {
         assert!(
@@ -2141,14 +2142,41 @@ mod tests {
             SESSION_CSS.contains(".session-run-controls"),
             "SESSION_CSS must contain .session-run-controls"
         );
+        assert!(
+            SESSION_CSS.contains("flex-wrap: nowrap"),
+            "run controls stay on one row"
+        );
+        assert!(
+            SESSION_JS.contains("select.setAttribute('aria-label', label)"),
+            "route select uses an aria-label instead of a stacked label"
+        );
+        assert!(
+            !SESSION_JS.contains("el('span', 'field-label', label)"),
+            "route label is not stacked above the select"
+        );
+        assert!(
+            SESSION_JS.contains("runControls.appendChild(ui.route.parentNode)"),
+            "route selector stays in the run-controls row"
+        );
     }
 
     #[test]
     fn tc_2361_collapsed_shows_agent_and_model() {
         assert!(
-            SESSION_JS.contains("ui.agentPicker.textContent = label + model;"),
+            SESSION_JS.contains("span.textContent = label + model;"),
             "agent picker shows agent and model"
         );
+        assert!(
+            SESSION_JS.contains("ui.agentPicker.title = label + model;"),
+            "picker title is the full agent · model text"
+        );
+        assert!(
+            SESSION_JS.contains("session-agent-picker-label"),
+            "label lives in an inner span so the ellipsis can show"
+        );
+        assert!(SESSION_CSS.contains(".session-agent-picker-label"));
+        assert!(SESSION_CSS.contains("text-overflow: ellipsis"));
+        assert!(SESSION_CSS.contains("max-width: 18rem"));
     }
 
     #[test]
@@ -2166,8 +2194,24 @@ mod tests {
     #[test]
     fn tc_2363_unavailable_disabled_with_tooltip() {
         assert!(
-            SESSION_JS.contains("row.disabled = true; row.title = 'Unavailable';"),
-            "unavailable agent tooltip"
+            SESSION_JS.contains("row.disabled = true; row.title = unavailable;"),
+            "unavailable agent row is disabled with a title"
+        );
+        assert!(
+            SESSION_JS.contains("agent.available === false"),
+            "missing or uninstalled agents use the snapshot available flag"
+        );
+        assert!(
+            SESSION_JS.contains("agent.allowed === false"),
+            "disallowed agents stay visible and disabled"
+        );
+        assert!(
+            APP_JS.contains("src.available === false"),
+            "to-do runner select reads availability"
+        );
+        assert!(
+            APP_JS.contains("opt.disabled = true; opt.title = unavailable;"),
+            "to-do runner option is disabled with the reason in title"
         );
     }
 
@@ -2185,6 +2229,20 @@ mod tests {
             MEMORY_JS.contains("settings-group"),
             "MEMORY_JS uses settings-group"
         );
+        assert!(
+            MEMORY_JS.contains("settings-row-label"),
+            "memory label sits in settings-row-label"
+        );
+        assert!(
+            MEMORY_JS.contains("settings-row-hint"),
+            "memory hint sits under the label"
+        );
+        assert!(MEMORY_JS.contains("Where the entry is saved"));
+        assert!(MEMORY_JS.contains("One fact per entry"));
+        assert!(
+            APP_CSS.contains(".memory-popover .memory-controls.settings-group > .settings-row"),
+            "memory row layout beats older panel styles"
+        );
     }
 
     #[test]
@@ -2194,6 +2252,18 @@ mod tests {
             "APP_CSS must contain .settings-info"
         );
         assert!(APP_CSS.contains("cursor: help;"), "info tooltip cursor");
+        assert!(
+            SKILLS_JS.contains("settings-info"),
+            "skills panel uses the info tooltip"
+        );
+        assert!(
+            SKILLS_JS.contains("info.title = help"),
+            "info tooltip title holds the long help text"
+        );
+        assert!(
+            SKILLS_JS.contains("info.setAttribute('aria-label', help)"),
+            "info tooltip has an aria-label"
+        );
     }
 
     #[test]
@@ -2226,6 +2296,22 @@ mod tests {
     fn tc_2368_inline_confirm() {
         assert!(APP_JS.contains("Confirm"), "APP_JS must contain Confirm");
         assert!(APP_JS.contains("Cancel"), "APP_JS must contain Cancel");
+        assert!(
+            APP_JS.contains("btn-danger btn-confirm"),
+            "to-do Confirm uses the filled danger class"
+        );
+        assert!(
+            APP_CSS.contains(".btn-danger.btn-confirm"),
+            "filled danger confirm style exists"
+        );
+        assert!(
+            APP_CSS.contains("background: #c62828;"),
+            "confirm button is a filled danger color"
+        );
+        assert!(
+            APP_CSS.contains("color: #ffffff;"),
+            "confirm label is white"
+        );
     }
 
     #[test]

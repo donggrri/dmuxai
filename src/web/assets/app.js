@@ -3486,7 +3486,7 @@ function todoViewActions(id, todo) {
     if (deleteBtn.dataset.confirming === '1') { return; }
     deleteBtn.dataset.confirming = '1';
     deleteBtn.hidden = true;
-    var confirmBtn = todoButton('btn-danger', 'Confirm', function() {
+    var confirmBtn = todoButton('btn-danger btn-confirm', 'Confirm', function() {
       delete deleteBtn.dataset.confirming;
       deleteTodo(id);
     });
@@ -3524,6 +3524,26 @@ function todoRunControls(id, status) {
 
   var agents = Array.isArray(snap.agents) ? snap.agents : [];
 
+  // Session agents carry allowed / available (FR-2363). A missing or
+  // uninstalled runner stays in the list, disabled, with the reason as title.
+  function todoAgentUnavailable(agent) {
+    var sessionAgents = snapshot && snapshot.session && Array.isArray(snapshot.session.agents)
+      ? snapshot.session.agents : [];
+    var src = agent || {};
+    for (var n = 0; n < sessionAgents.length; n++) {
+      if (sessionAgents[n] && sessionAgents[n].id === src.id) { src = sessionAgents[n]; break; }
+    }
+    var reason = src.reason || src.unavailable_reason || '';
+    if (src.available === false || src.installed === false || src.missing) {
+      var missing = (src.missing && src.missing !== true) ? src.missing : '';
+      return String(reason || missing || 'not available');
+    }
+    if (src.allowed === false) {
+      return String(reason || 'not allowed');
+    }
+    return '';
+  }
+
   var select = el('select', 'todo-agent-select');
   select.setAttribute('aria-label', 'Agent to run this to-do');
   for (var i = 0; i < agents.length; i++) {
@@ -3532,6 +3552,8 @@ function todoRunControls(id, status) {
     opt.value = String(agent.id || '');
     opt.textContent = String(agent.label || agent.id || '');
     if (agent.busy) { opt.disabled = true; }
+    var unavailable = todoAgentUnavailable(agent);
+    if (unavailable) { opt.disabled = true; opt.title = unavailable; }
     select.appendChild(opt);
   }
   row.appendChild(select);

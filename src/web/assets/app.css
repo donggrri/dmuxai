@@ -1073,6 +1073,21 @@ main {
   border-color: var(--err);
 }
 
+/* Filled confirm (FR-2368). --err is too light for white text in the dark
+   palette, so both themes use the same dark red (white contrast about 5.6:1). */
+.btn-danger.btn-confirm,
+.btn-danger-solid {
+  background: #c62828;
+  color: #ffffff;
+  border-color: #c62828;
+}
+.btn-danger.btn-confirm:hover:not(:disabled),
+.btn-danger-solid:hover:not(:disabled) {
+  background: #8e1b1b;
+  color: #ffffff;
+  border-color: #8e1b1b;
+}
+
 /* Button system (SPEC-dashboard-settings-ux FR-2366, FR-2367). */
 .btn {
   min-height: 36px;
@@ -1117,6 +1132,13 @@ main {
 }
 .settings-row-label {
   font-weight: 700;
+}
+.settings-row-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+  flex: 1 1 auto;
 }
 .settings-row-hint {
   color: var(--muted);
@@ -1630,6 +1652,49 @@ main {
 
 .memory-name-input {
   max-width: 14em;
+}
+
+/* FR-2364: label on the left, control on the right. These beat the older
+   .memory-field column, .memory-target-row wrap, and full-width inputs. */
+.memory-popover .memory-controls.settings-group > .settings-row {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 0;
+}
+.memory-popover .settings-row > .settings-row-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.memory-popover .settings-row > .settings-row-control {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 8px;
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: auto;
+}
+.memory-popover .settings-row .memory-field {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.memory-popover .settings-row .memory-target-select,
+.memory-popover .settings-row .memory-name-input,
+.memory-popover .settings-row .memory-text-input {
+  width: auto;
+  min-width: 0;
+  max-width: 12rem;
+  flex: 0 1 12rem;
 }
 
 .memory-status {
@@ -2415,6 +2480,8 @@ main {
 
 /* SPEC-stage-skills UX-1500 / UX-1501 */
 .skills-popover { width: min(46rem, 96vw); max-height: min(80vh, 40rem); }
+.skills-title-row { display: flex; align-items: center; gap: .4rem; margin: 0 0 .5rem; }
+.skills-title-row .memory-title { margin: 0; }
 .skills-table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
 .skills-table th, .skills-table td { border-bottom: 1px solid var(--border, #ddd); padding: 4px 6px; text-align: left; vertical-align: middle; }
 .skills-input { width: 100%; min-width: 180px; }

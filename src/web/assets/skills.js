@@ -47,7 +47,15 @@
 
   function render(data, error) {
     root.replaceChildren();
-    root.appendChild(el('h2', 'memory-title', 'Stage skills'));
+    var heading = el('div', 'skills-title-row');
+    heading.appendChild(el('h2', 'memory-title', 'Stage skills'));
+    var help = 'Git sources: dmuxai skills sync, then /skills approve <source>. Changes apply to the next prompt.';
+    var info = el('span', 'settings-info', 'i');
+    info.title = help;
+    info.setAttribute('aria-label', help);
+    info.tabIndex = 0;
+    heading.appendChild(info);
+    root.appendChild(heading);
     if (error) { root.appendChild(el('p', 'memory-error', error)); }
     var rows = (data && data.rows) || [];
     var stages = (data && data.stages) || [];
@@ -101,7 +109,6 @@
       line.appendChild(btn);
       root.appendChild(line);
     });
-    root.appendChild(el('p', 'memory-hint', 'Git sources: dmuxai skills sync, then /skills approve <source>. Changes apply to the next prompt.'));
   }
 
   function load() {
