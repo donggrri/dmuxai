@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::activity::{ActivityItem, ToolStatus, collapsed_line, merge_activity};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 pub const MAX_ACTIVITIES_PER_TURN: usize = 400;
 pub const MAX_ACTIVITY_TEXT_CHARS: usize = 16_000;
 const MAX_CONTEXT_CHARS: usize = 32_000;
@@ -381,6 +381,48 @@ fn migrate_to_v3(connection: &mut Connection) -> Result<(), ConversationError> {
     Ok(())
 }
 
+/// v4: nullable task-picker columns on `conversations`. NULL means "use the
+/// current global default". Agent names stay free text (custom agents exist),
+/// so the columns have no CHECK constraint. Each `ADD COLUMN` is skipped when
+/// the column is already present.
+fn migrate_to_v4(connection: &mut Connection) -> Result<(), ConversationError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for column in ["last_agent", "last_model_id", "last_reasoning_effort"] {
+        if !table_has_column(&transaction, "conversations", column)? {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE conversations ADD COLUMN {column} TEXT;"
+            ))?;
+        }
+    }
+    transaction.execute_batch("PRAGMA user_version = 4;")?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Trims a stored picker value. Blank text is NULL.
+fn normalize_setting(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
+}
+
+fn task_settings_from_values(
+    agent: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+) -> TaskSettings {
+    TaskSettings {
+        agent: normalize_setting(agent),
+        model: normalize_setting(model),
+        effort: normalize_setting(effort),
+    }
+}
+
 #[derive(Debug)]
 pub enum ConversationError {
     Sqlite(rusqlite::Error),
@@ -695,6 +737,15 @@ pub struct ProviderBinding {
     pub known_through_seq: i64,
 }
 
+/// Last selected agent, model and reasoning effort of a task. `None` means the
+/// global default; stored values are free text because custom agents exist.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSettings {
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationCard {
     pub id: ConversationId,
@@ -702,6 +753,7 @@ pub struct ConversationCard {
     pub updated_at_ms: i64,
     pub turn_count: u64,
     pub last_agent: Option<AgentKey>,
+    pub settings: TaskSettings,
     pub running: bool,
 }
 
@@ -734,6 +786,7 @@ pub struct TurnActivity {
 pub struct ConversationSnapshot {
     pub id: ConversationId,
     pub title: String,
+    pub settings: TaskSettings,
     pub turns: Vec<TurnSnapshot>,
     pub messages: Vec<TranscriptMessage>,
     pub bindings: Vec<ProviderBinding>,
@@ -1053,6 +1106,9 @@ fn open_once(
     if version < 3 {
         migrate_to_v3(&mut connection)?;
     }
+    if version < 4 {
+        migrate_to_v4(&mut connection)?;
+    }
     let session_id = Uuid::new_v4().to_string();
     let now = now_ms()?;
     connection.execute(
@@ -1172,7 +1228,8 @@ impl ConversationEngine {
                           FROM turns active
                          WHERE active.conversation_id = c.id
                            AND active.status IN ('queued', 'running')
-                    )
+                    ),
+                    c.last_agent, c.last_model_id, c.last_reasoning_effort
                FROM conversations c
                LEFT JOIN turns t ON t.conversation_id = c.id
               WHERE c.workspace_root = ?1 AND c.archived_at_ms IS NULL
@@ -1189,6 +1246,7 @@ impl ConversationEngine {
                     rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(error))
                 })?,
                 last_agent: last_agent.as_deref().map(AgentKey::from_db).transpose()?,
+                settings: task_settings_from_values(row.get(6)?, row.get(7)?, row.get(8)?),
                 running: row.get(5)?,
             })
         })?;
@@ -1259,6 +1317,34 @@ impl ConversationEngine {
         Ok(rows > 0)
     }
 
+    /// Stores the last selected picker values on the active conversation.
+    /// Blank values become NULL so the global default applies.
+    pub fn set_task_settings(&mut self, settings: TaskSettings) -> Result<(), ConversationError> {
+        let conversation_id = self
+            .active_conversation
+            .as_ref()
+            .ok_or(ConversationError::NoActiveConversation)?;
+        let settings = task_settings_from_values(settings.agent, settings.model, settings.effort);
+        let changed = self.connection.execute(
+            "UPDATE conversations
+                SET last_agent = ?2, last_model_id = ?3, last_reasoning_effort = ?4
+              WHERE id = ?1 AND workspace_root = ?5 AND archived_at_ms IS NULL",
+            params![
+                conversation_id.as_str(),
+                settings.agent,
+                settings.model,
+                settings.effort,
+                self.workspace_root
+            ],
+        )?;
+        if changed == 0 {
+            return Err(ConversationError::ConversationNotFound(
+                conversation_id.clone(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn begin_turn(&mut self, input: BeginTurn) -> Result<BeginTurnOutcome, ConversationError> {
         let conversation_id = self
             .active_conversation
@@ -1317,12 +1403,16 @@ impl ConversationEngine {
         transaction.execute(
             "UPDATE conversations
                 SET title = CASE WHEN title = 'New conversation' THEN ?2 ELSE title END,
-                    updated_at_ms = ?3
+                    updated_at_ms = ?3,
+                    last_agent = ?4,
+                    last_model_id = ?5
               WHERE id = ?1",
             params![
                 conversation_id.as_str(),
                 title_from_prompt(title_prompt),
-                now
+                now,
+                input.agent.as_db(),
+                normalize_setting(input.model_id.clone()),
             ],
         )?;
         transaction.commit()?;
@@ -1799,10 +1889,16 @@ impl ConversationEngine {
         &self,
         conversation_id: &ConversationId,
     ) -> Result<ConversationSnapshot, ConversationError> {
-        let title = self.connection.query_row(
-            "SELECT title FROM conversations WHERE id = ?1 AND workspace_root = ?2",
+        let (title, settings) = self.connection.query_row(
+            "SELECT title, last_agent, last_model_id, last_reasoning_effort
+               FROM conversations WHERE id = ?1 AND workspace_root = ?2",
             params![conversation_id.as_str(), self.workspace_root],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    task_settings_from_values(row.get(1)?, row.get(2)?, row.get(3)?),
+                ))
+            },
         )?;
 
         let mut turn_statement = self.connection.prepare(
@@ -1893,6 +1989,7 @@ impl ConversationEngine {
         Ok(ConversationSnapshot {
             id: conversation_id.clone(),
             title,
+            settings,
             turns,
             messages,
             bindings,
@@ -2423,7 +2520,12 @@ fn read_conversation_cards(
         return Ok(Vec::new());
     }
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let mut statement = connection.prepare(
+    let settings_columns = if version >= 4 {
+        "c.last_agent, c.last_model_id, c.last_reasoning_effort"
+    } else {
+        "NULL, NULL, NULL"
+    };
+    let sql = format!(
         "SELECT c.id, c.title, c.updated_at_ms,
                 COUNT(t.id),
                 (SELECT requested_agent
@@ -2437,14 +2539,16 @@ fn read_conversation_cards(
                      WHERE active.conversation_id = c.id
                        AND active.status IN ('queued', 'running')
                 ),
-                c.workspace_root
+                c.workspace_root,
+                {settings_columns}
            FROM conversations c
            LEFT JOIN turns t ON t.conversation_id = c.id
           WHERE c.workspace_root != ?1 AND c.archived_at_ms IS NULL
           GROUP BY c.id
           ORDER BY c.updated_at_ms DESC, c.id DESC
-          LIMIT ?2",
-    )?;
+          LIMIT ?2"
+    );
+    let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(params![exclude_workspace, limit], |row| {
         let last_agent: Option<String> = row.get(4)?;
         Ok((
@@ -2457,6 +2561,7 @@ fn read_conversation_cards(
                     rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(error))
                 })?,
                 last_agent: last_agent.as_deref().map(AgentKey::from_db).transpose()?,
+                settings: task_settings_from_values(row.get(7)?, row.get(8)?, row.get(9)?),
                 running: row.get(5)?,
             },
         ))
@@ -2501,7 +2606,7 @@ mod schema_v2_tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         connection
             .execute(
                 "INSERT INTO turns (id, conversation_id, seq, requested_agent, status, created_at_ms)
