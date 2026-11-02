@@ -35,6 +35,13 @@ All notable changes to dmuxai are listed here. Versions follow
 - **A tab for a closed folder falls back to the first folder (FR-2314).** If a
   dashboard tab's `ws` folder is no longer open, the page reloads once on the
   first folder instead of polling a missing folder.
+- **Git diff for any text file in the doc viewer (FR-2260..FR-2262).** Files with an
+  unrecognized extension (for example Yocto `.bbappend`) are now previewed as plain text
+  when their content is text, decided like git (no NUL byte in the first 8000 bytes).
+  A new read-only `GET /api/docs/diff?path=` returns the exact `git diff HEAD` output for
+  one file (untracked and deleted files included, 2 MiB cap), and the viewer's **Diff**
+  toggle shows it line for line with **Copy raw**. Files opened from the Diff view open
+  straight in their diff, and real binaries show git's `Binary files ... differ` line.
 
 ### Changed
 
@@ -43,14 +50,6 @@ All notable changes to dmuxai are listed here. Versions follow
 - Saving workspace settings from a write-capable dashboard keeps an existing trust record current when the file on disk still matches it; untrusted folders and one-process opt-in stay untrusted (FR-2226..FR-2231).
 - Dashboard saves of the workspace `dmuxai.toml` (stage skills, agent prompts) now hold a per-folder lock and write the file atomically, so saves made at the same time no longer drop each other's changes (FR-2242, FR-2243).
 - Skill and memory paths inside the workspace are confined to it in every trust state; trust output escapes control characters; the trust state directory permissions are checked (FR-2234..FR-2241).
-
-- **Git diff for any text file in the doc viewer (FR-2260..FR-2262).** Files with an
-  unrecognized extension (for example Yocto `.bbappend`) are now previewed as plain text
-  when their content is text, decided like git (no NUL byte in the first 8000 bytes).
-  A new read-only `GET /api/docs/diff?path=` returns the exact `git diff HEAD` output for
-  one file (untracked and deleted files included, 2 MiB cap), and the viewer's **Diff**
-  toggle shows it line for line with **Copy raw**. Files opened from the Diff view open
-  straight in their diff, and real binaries show git's `Binary files ... differ` line.
 
 ### Fixed
 
