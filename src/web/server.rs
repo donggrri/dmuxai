@@ -509,6 +509,22 @@ async fn get_skills_js() -> impl IntoResponse {
     )
 }
 
+async fn get_jira_todos_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::JIRA_TODOS_JS,
+    )
+}
+
 async fn get_memory(Ws(ws): Ws) -> Response {
     let Some(memory) = memory_handle(&ws) else {
         return json_ok(StatusCode::OK, &serde_json::json!({ "enabled": false }));
@@ -2197,6 +2213,7 @@ pub fn build_router_with_directory(
         .route("/assets/app.js", get(get_app_js))
         .route("/assets/memory.js", get(get_memory_js))
         .route("/assets/skills.js", get(get_skills_js))
+        .route("/assets/jira-todos.js", get(get_jira_todos_js))
         .route("/assets/agent-prompts.js", get(get_agent_prompts_js))
         .route("/assets/session.js", get(get_session_js))
         .route("/assets/workspace.js", get(get_workspace_js))
@@ -7670,5 +7687,110 @@ mod tests {
         );
         assert!(!response.contains("Authorization"), "401 leaked header");
         server.abort();
+    }
+
+    fn asset_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+        let from = src
+            .find(start)
+            .unwrap_or_else(|| panic!("missing asset marker {start:?}"));
+        let tail = &src[from..];
+        let to = tail
+            .find(end)
+            .unwrap_or_else(|| panic!("missing asset marker {end:?}"));
+        &tail[..to]
+    }
+
+    // TC-2409 / UX-2409: the To-dos panel embeds the Jira group and its assets.
+    #[tokio::test]
+    async fn tc_2409_jira_group_assets() {
+        let token = "dashboard-token-2409";
+        let router = build_router(test_hub(), token.to_string(), allowed_localhost());
+
+        let resp = router
+            .clone()
+            .oneshot(request_without_auth("/"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = read_body(resp).await;
+        for id in [
+            "jira-group",
+            "jira-refresh",
+            "jira-banner",
+            "jira-hint",
+            "jira-list",
+        ] {
+            assert!(
+                html.contains(&format!("id=\"{id}\"")),
+                "index.html missing #{id}"
+            );
+        }
+        assert!(html.contains("id=\"jira-count\""));
+        assert!(html.contains("aria-controls=\"jira-body\""));
+        assert!(html.contains("title=\"Refresh Jira tickets\""));
+        assert!(html.contains("aria-label=\"Refresh Jira tickets\""));
+        assert!(html.contains(
+            "Set [jira] base_url and email in dmuxai.toml and export DMUXAI_JIRA_TOKEN to list tickets."
+        ));
+        assert!(html.contains("<script src=\"/assets/jira-todos.js\" defer></script>"));
+        let jira_pos = html.find("id=\"jira-group\"").expect("jira group");
+        let filter_pos = html.find("class=\"todo-filter\"").expect("todo filter");
+        assert!(
+            jira_pos < filter_pos,
+            "Jira group must sit above the filter"
+        );
+        let skills_pos = html.find("/assets/skills.js").expect("skills.js");
+        let jira_js_pos = html.find("/assets/jira-todos.js").expect("jira-todos.js");
+        assert!(skills_pos < jira_js_pos, "jira-todos.js follows skills.js");
+
+        let resp = router
+            .oneshot(request_without_auth("/assets/jira-todos.js"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers().clone();
+        assert!(
+            headers["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/javascript")
+        );
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(headers["content-security-policy"], "default-src 'self'");
+        assert_eq!(headers["referrer-policy"], "no-referrer");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        let js = read_body(resp).await;
+        assert_eq!(js.as_bytes(), crate::web::assets::JIRA_TODOS_JS.as_bytes());
+        assert!(js.contains("/api/jira/issues"));
+        assert!(js.contains("refresh=1"));
+        assert!(js.contains("window.dmuxaiStartDraft"));
+        assert!(js.contains("window.open(url, '_blank', 'noopener,noreferrer')"));
+        assert!(js.contains("data-category"));
+        assert!(!js.contains("innerHTML"));
+    }
+
+    // TC-2411 / UX-2411: Start task opens a new conversation and fills the
+    // composer draft without sending anything.
+    #[test]
+    fn tc_2411_start_task_prefills_draft() {
+        let start_draft = asset_between(
+            crate::web::assets::SESSION_JS,
+            "window.dmuxaiStartDraft",
+            "function sendPrompt",
+        );
+        assert!(
+            start_draft.contains("command({ command: 'new_conversation' })"),
+            "{start_draft}"
+        );
+        assert!(
+            start_draft.contains("ui.input.value = draft"),
+            "{start_draft}"
+        );
+        assert!(start_draft.contains("ui.input.focus()"), "{start_draft}");
+        assert!(
+            !start_draft.contains("submit"),
+            "Start task must never submit: {start_draft}"
+        );
+        assert!(crate::web::assets::JIRA_TODOS_JS.contains("window.dmuxaiStartDraft"));
     }
 }

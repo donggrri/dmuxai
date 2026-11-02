@@ -2502,3 +2502,138 @@ main {
   .graph-svg .run-dot { animation: none; }
   .btn, .settings-row, .settings-info, .panel-caret { transition: none; animation: none; }
 }
+
+/* SPEC-jira-todos UX-2409..UX-2411: read-only Jira group in the To-dos panel. */
+.jira-group {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  margin: 0 0 10px;
+}
+
+.jira-group [hidden] {
+  display: none;
+}
+
+.jira-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+}
+
+.jira-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  border: none;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.9em;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.jira-toggle:hover {
+  background: var(--bg-chip);
+}
+
+.jira-caret {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.jira-count {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.jira-refresh {
+  margin-left: auto;
+}
+
+#jira-body {
+  border-top: 1px solid var(--line);
+  padding: 8px;
+}
+
+.jira-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.jira-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-chip);
+}
+
+.jira-key {
+  flex: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--jira-key);
+}
+
+.jira-summary {
+  flex: 1 1 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.jira-status {
+  flex: none;
+  font-size: 0.8em;
+  padding: 2px 8px;
+  color: var(--badge-pending-text);
+  background: var(--badge-pending-bg);
+  border-color: var(--badge-pending-line);
+}
+
+.jira-status[data-category="indeterminate"] {
+  color: var(--badge-running-text);
+  background: var(--badge-running-bg);
+  border-color: var(--badge-running-line);
+}
+
+.jira-status[data-category="done"] {
+  color: var(--badge-completed-text);
+  background: var(--badge-completed-bg);
+  border-color: var(--badge-completed-line);
+}
+
+.jira-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.jira-actions .btn {
+  font-size: 0.8em;
+  padding: 2px 8px;
+}
+
+.jira-banner {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  font-size: 0.85em;
+}

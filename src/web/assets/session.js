@@ -294,6 +294,29 @@
     });
   }
 
+  // UX-2411: prefill the composer from a Jira ticket without sending it.
+  window.dmuxaiStartDraft = function (text) {
+    var draft = String(text || '');
+    if (viewOnly || !draft) { return; }
+    function fill() {
+      if (!ui.input) { return; }
+      ui.input.value = draft;
+      ui.input.dispatchEvent(new window.Event('input', { bubbles: true }));
+      ui.input.focus();
+      var reapply = function () {
+        document.removeEventListener('dmuxai:snapshot', reapply);
+        if (ui.input && !ui.input.value) { fill(); }
+      };
+      document.addEventListener('dmuxai:snapshot', reapply);
+    }
+    var pending = command({ command: 'new_conversation' });
+    if (pending && typeof pending.then === 'function') {
+      pending.then(fill, fill);
+    } else {
+      fill();
+    }
+  };
+
   function sendPrompt(text, names) {
     if (viewOnly || !text.trim()) { return Promise.resolve(false); }
     notify('');
