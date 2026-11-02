@@ -1,7 +1,8 @@
 use dmuxai::conversation::{
-    AgentKey, BeginTurn, BeginTurnOutcome, BindingStatus, ConversationEngine, ConversationError,
-    ConversationSelection, MessageRole, MessageState, SummaryDocument, TaskSettings, TurnEvent,
-    TurnOutput, TurnStatus,
+    AgentKey, BeginTurn, BeginTurnOutcome, BindingStatus, ContextProjection, ConversationEngine,
+    ConversationError, ConversationSelection, MAX_UNSEEN_DELTA_BYTES, MAX_UNSEEN_DELTA_TURNS,
+    MessageRole, MessageState, ProjectedTurn, RequestContext, SummaryDocument, TaskSettings,
+    TurnEvent, TurnOutput, TurnStatus,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -62,6 +63,20 @@ fn complete_turn(
         .unwrap();
 }
 
+fn fresh_projection(request: &dmuxai::conversation::AgentRequest) -> &ContextProjection {
+    match &request.context {
+        RequestContext::Fresh(projection) => projection,
+        RequestContext::Resume { fallback, .. } => fallback,
+    }
+}
+
+fn resume_delta(request: &dmuxai::conversation::AgentRequest) -> &[ProjectedTurn] {
+    match &request.context {
+        RequestContext::Resume { delta, .. } => delta,
+        RequestContext::Fresh(_) => panic!("expected a resumed delta, got a fresh projection"),
+    }
+}
+
 #[test]
 fn completed_conversation_and_binding_survive_restart() {
     let harness = Harness::new();
@@ -83,7 +98,7 @@ fn completed_conversation_and_binding_survive_restart() {
                 .unwrap(),
         );
         assert!(request.resume_session.is_none());
-        assert!(request.context.recent.is_empty());
+        assert!(fresh_projection(&request).recent.is_empty());
         complete_turn(&mut engine, &request, "thread-1", "Ownership is explicit.");
     }
 
@@ -116,7 +131,7 @@ fn completed_conversation_and_binding_survive_restart() {
             .unwrap(),
     );
     assert_eq!(next.resume_session.as_deref(), Some("thread-1"));
-    assert_eq!(next.context.recent.len(), 1);
+    assert!(resume_delta(&next).is_empty());
 }
 
 #[test]
@@ -149,9 +164,12 @@ fn projections_are_shared_across_agents_and_bindings_remain_provider_scoped() {
             .unwrap(),
     );
     assert!(cursor.resume_session.is_none());
-    assert_eq!(cursor.context.recent.len(), 1);
-    assert_eq!(cursor.context.recent[0].agent, AgentKey::Codex);
-    assert_eq!(cursor.context.recent[0].user, "Codex-only secret");
+    assert_eq!(fresh_projection(&cursor).recent.len(), 1);
+    assert_eq!(fresh_projection(&cursor).recent[0].agent, AgentKey::Codex);
+    assert_eq!(
+        fresh_projection(&cursor).recent[0].user,
+        "Codex-only secret"
+    );
     complete_turn(&mut engine, &cursor, "cursor-session", "Cursor answer");
 
     let codex_again = ready(
@@ -164,12 +182,12 @@ fn projections_are_shared_across_agents_and_bindings_remain_provider_scoped() {
             })
             .unwrap(),
     );
-    assert!(codex_again.resume_session.is_none());
-    assert_eq!(codex_again.context.recent.len(), 2);
-    assert_eq!(codex_again.context.recent[0].user, "Codex-only secret");
-    assert_eq!(codex_again.context.recent[0].agent, AgentKey::Codex);
-    assert_eq!(codex_again.context.recent[1].user, "What do you know?");
-    assert_eq!(codex_again.context.recent[1].agent, AgentKey::Cursor);
+    assert_eq!(codex_again.resume_session.as_deref(), Some("codex-thread"));
+    let delta = resume_delta(&codex_again);
+    assert_eq!(delta.len(), 1);
+    assert_eq!(delta[0].seq, 2);
+    assert_eq!(delta[0].user, "What do you know?");
+    assert_eq!(delta[0].agent, AgentKey::Cursor);
 }
 
 #[test]
@@ -210,7 +228,7 @@ fn shared_projection_is_scoped_to_the_active_conversation() {
             })
             .unwrap(),
     );
-    assert!(in_b.context.recent.is_empty());
+    assert!(fresh_projection(&in_b).recent.is_empty());
     complete_turn(&mut engine, &in_b, "b-session", "answer B");
 
     engine
@@ -226,11 +244,10 @@ fn shared_projection_is_scoped_to_the_active_conversation() {
             })
             .unwrap(),
     );
-    assert_eq!(in_a.context.recent.len(), 1);
-    assert_eq!(in_a.context.recent[0].user, "private A");
+    assert_eq!(fresh_projection(&in_a).recent.len(), 1);
+    assert_eq!(fresh_projection(&in_a).recent[0].user, "private A");
     assert!(
-        !in_a
-            .context
+        !fresh_projection(&in_a)
             .recent
             .iter()
             .any(|turn| turn.user == "question B")
@@ -249,8 +266,8 @@ fn shared_projection_is_scoped_to_the_active_conversation() {
             })
             .unwrap(),
     );
-    assert_eq!(back_to_b.context.recent.len(), 1);
-    assert_eq!(back_to_b.context.recent[0].user, "question B");
+    assert_eq!(fresh_projection(&back_to_b).recent.len(), 1);
+    assert_eq!(fresh_projection(&back_to_b).recent[0].user, "question B");
 }
 
 #[test]
@@ -411,7 +428,7 @@ fn unfinished_turn_is_interrupted_and_its_binding_is_not_resumed() {
             .unwrap(),
     );
     assert!(next.resume_session.is_none());
-    assert!(next.context.recent.is_empty());
+    assert!(fresh_projection(&next).recent.is_empty());
 }
 
 #[test]
@@ -591,6 +608,9 @@ fn summary_checkpoint_is_used_with_a_gap_free_recent_tail() {
     }
     assert!(committed_summary);
 
+    // Resume with no unseen turns keeps the plain session; retire it so this
+    // test exercises the bounded summary/recent projection instead.
+    engine.retire_active_binding(AgentKey::Codex).unwrap();
     let next = ready(
         engine
             .begin_turn(BeginTurn {
@@ -601,21 +621,22 @@ fn summary_checkpoint_is_used_with_a_gap_free_recent_tail() {
             })
             .unwrap(),
     );
+    let projection = fresh_projection(&next);
     assert!(
-        next.context
+        projection
             .summary
             .as_deref()
             .unwrap()
             .contains("Preserve the long-running goal")
     );
-    assert!(!next.context.recent.is_empty());
+    assert!(!projection.recent.is_empty());
     assert!(
-        next.context
+        projection
             .recent
             .windows(2)
             .all(|window| window[0].seq < window[1].seq)
     );
-    assert_eq!(next.context.through_seq, 24);
+    assert_eq!(projection.through_seq, 24);
 }
 
 #[test]
@@ -761,8 +782,7 @@ fn explicit_summary_is_incremental_and_invalidates_native_resume() {
     );
     assert!(second.resume_session.is_none());
     assert!(
-        second
-            .context
+        fresh_projection(&second)
             .summary
             .as_deref()
             .unwrap()
@@ -1448,6 +1468,9 @@ fn tc_1901_begin_turn_stores_display_text_and_preserves_prompt_projection() {
     assert_eq!(snapshot1.messages[0].shown_text(), "Short User Question");
 
     complete_turn(&mut engine, &req1, "thread-1", "LLM Answer");
+    // Force a fresh projection so the test inspects the shared context rather
+    // than an empty same-agent resume delta.
+    engine.retire_active_binding(AgentKey::Codex).unwrap();
 
     // 2. Second turn: verify context projection uses `text` (the sent prompt), NOT display_text
     let req2 = ready(
@@ -1460,9 +1483,9 @@ fn tc_1901_begin_turn_stores_display_text_and_preserves_prompt_projection() {
             })
             .unwrap(),
     );
-    assert_eq!(req2.context.recent.len(), 1);
+    assert_eq!(fresh_projection(&req2).recent.len(), 1);
     assert_eq!(
-        req2.context.recent[0].user,
+        fresh_projection(&req2).recent[0].user,
         "Actual prompt sent to LLM with full context prefix"
     );
 
@@ -2387,4 +2410,437 @@ fn tc_2322_task_settings_round_trip_and_defaults() {
             .unwrap(),
     );
     assert_eq!(unknown_request.agent, AgentKey::Cursor);
+}
+
+fn begin(
+    engine: &mut ConversationEngine,
+    agent: AgentKey,
+    model_id: Option<&str>,
+    prompt: &str,
+) -> dmuxai::conversation::AgentRequest {
+    ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent,
+                model_id: model_id.map(str::to_owned),
+                prompt: prompt.to_owned(),
+                display_text: None,
+            })
+            .unwrap(),
+    )
+}
+
+fn fail_turn(
+    engine: &mut ConversationEngine,
+    request: &dmuxai::conversation::AgentRequest,
+    message: &str,
+) {
+    let envelope = |event| TurnOutput {
+        conversation_id: request.conversation_id.clone(),
+        turn_id: request.turn_id.clone(),
+        agent: request.agent,
+        event,
+    };
+    engine
+        .record_turn_outputs(&[
+            envelope(TurnEvent::Started),
+            envelope(TurnEvent::Failed {
+                message: message.to_owned(),
+                invalidates_binding: true,
+            }),
+        ])
+        .unwrap();
+}
+
+fn cancel_turn(engine: &mut ConversationEngine, request: &dmuxai::conversation::AgentRequest) {
+    let envelope = |event| TurnOutput {
+        conversation_id: request.conversation_id.clone(),
+        turn_id: request.turn_id.clone(),
+        agent: request.agent,
+        event,
+    };
+    engine
+        .record_turn_outputs(&[
+            envelope(TurnEvent::Started),
+            envelope(TurnEvent::ProviderSessionBound(format!(
+                "{}-cancel",
+                request.agent
+            ))),
+            envelope(TurnEvent::Cancelled),
+        ])
+        .unwrap();
+}
+
+// TC-2323 / FR-2323: another agent's completed turn keeps A's binding active,
+// and A resumes its own native session instead of starting fresh.
+#[test]
+fn tc_2323_agent_resumes_own_session_after_other_agent_turn() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+    let conversation_id = engine
+        .select(ConversationSelection::New { title: None })
+        .unwrap()
+        .id;
+
+    let codex = begin(
+        &mut engine,
+        AgentKey::Codex,
+        Some("codex-model"),
+        "codex turn",
+    );
+    complete_turn(&mut engine, &codex, "codex-thread", "codex answer");
+    let cursor = begin(
+        &mut engine,
+        AgentKey::Cursor,
+        Some("cursor-model"),
+        "cursor turn",
+    );
+    complete_turn(&mut engine, &cursor, "cursor-session", "cursor answer");
+
+    let codex_again = begin(&mut engine, AgentKey::Codex, None, "codex again");
+    assert_eq!(codex_again.resume_session.as_deref(), Some("codex-thread"));
+    let snapshot = engine
+        .select(ConversationSelection::Existing(conversation_id))
+        .unwrap();
+    let binding = snapshot
+        .bindings
+        .iter()
+        .find(|binding| binding.agent == AgentKey::Codex)
+        .unwrap();
+    assert_eq!(binding.status, BindingStatus::Active);
+    assert_eq!(binding.known_through_seq, 1);
+}
+
+// TC-2324 / FR-2324: the resumed request carries only completed turns from
+// other agents after known_through_seq, in order, with agent and model labels.
+#[test]
+fn tc_2324_delta_contains_only_unseen_active_task_turns() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+    let conversation_id = engine
+        .select(ConversationSelection::New { title: None })
+        .unwrap()
+        .id;
+
+    let codex = begin(
+        &mut engine,
+        AgentKey::Codex,
+        Some("codex-model"),
+        "codex private",
+    );
+    complete_turn(&mut engine, &codex, "codex-thread", "codex answer");
+    let cursor = begin(
+        &mut engine,
+        AgentKey::Cursor,
+        Some("cursor-model"),
+        "cursor turn",
+    );
+    complete_turn(&mut engine, &cursor, "cursor-session", "cursor answer");
+    let agy = begin(&mut engine, AgentKey::Agy, Some("agy-model"), "agy turn");
+    complete_turn(&mut engine, &agy, "agy-session", "agy answer");
+
+    let failed = begin(&mut engine, AgentKey::Cursor, None, "cursor failed");
+    fail_turn(&mut engine, &failed, "provider failed");
+    let cancelled = begin(&mut engine, AgentKey::Cursor, None, "cursor cancelled");
+    cancel_turn(&mut engine, &cancelled);
+    let _queued = begin(&mut engine, AgentKey::Cursor, None, "cursor queued");
+
+    let other = engine
+        .select(ConversationSelection::New {
+            title: Some("other task".to_owned()),
+        })
+        .unwrap();
+    let other_turn = begin(&mut engine, AgentKey::Codex, None, "other task prompt");
+    complete_turn(
+        &mut engine,
+        &other_turn,
+        "other-thread",
+        "other task answer",
+    );
+    assert_eq!(other.id, other_turn.conversation_id);
+
+    engine
+        .select(ConversationSelection::Existing(conversation_id))
+        .unwrap();
+    let codex_again = begin(&mut engine, AgentKey::Codex, None, "codex follow-up");
+    assert_eq!(codex_again.resume_session.as_deref(), Some("codex-thread"));
+
+    let delta = resume_delta(&codex_again);
+    let seqs: Vec<i64> = delta.iter().map(|turn| turn.seq).collect();
+    assert_eq!(seqs, vec![2, 3]);
+    assert_eq!(delta[0].agent, AgentKey::Cursor);
+    assert_eq!(delta[0].model_id.as_deref(), Some("cursor-model"));
+    assert_eq!(delta[1].agent, AgentKey::Agy);
+    assert_eq!(delta[1].model_id.as_deref(), Some("agy-model"));
+    assert!(delta.iter().all(|turn| turn.user != "codex private"));
+    assert!(delta.iter().all(|turn| turn.user != "other task prompt"));
+    assert!(delta.iter().all(|turn| !turn.user.contains("queued")));
+    assert!(delta.iter().all(|turn| !turn.user.contains("failed")));
+    assert!(delta.iter().all(|turn| !turn.user.contains("cancelled")));
+}
+
+// TC-2325 / FR-2325: oversized deltas, stale bindings and never-run agents
+// fall back to the existing bounded fresh projection with no resume id.
+#[test]
+fn tc_2325_delta_bounds_and_resume_fallbacks() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+
+    // More than 200 unseen turns.
+    engine
+        .select(ConversationSelection::New {
+            title: Some("too many turns".to_owned()),
+        })
+        .unwrap();
+    let codex = begin(&mut engine, AgentKey::Codex, None, "bound codex");
+    complete_turn(&mut engine, &codex, "codex-thread-many", "first");
+    for index in 0..=MAX_UNSEEN_DELTA_TURNS {
+        let cursor = begin(
+            &mut engine,
+            AgentKey::Cursor,
+            None,
+            &format!("cursor-{index}"),
+        );
+        complete_turn(&mut engine, &cursor, "cursor-session-many", "ok");
+    }
+    let too_many = begin(&mut engine, AgentKey::Codex, None, "after 201");
+    assert!(too_many.resume_session.is_none());
+    assert!(matches!(too_many.context, RequestContext::Fresh(_)));
+
+    // More than 65,536 UTF-8 bytes of text, but under the character budget.
+    engine
+        .select(ConversationSelection::New {
+            title: Some("too many bytes".to_owned()),
+        })
+        .unwrap();
+    let codex = begin(&mut engine, AgentKey::Codex, None, "bound codex");
+    complete_turn(&mut engine, &codex, "codex-thread-bytes", "first");
+    let cursor = begin(&mut engine, AgentKey::Cursor, None, "huge cursor");
+    let huge = "가".repeat(21_846);
+    assert!(huge.len() > MAX_UNSEEN_DELTA_BYTES);
+    complete_turn(&mut engine, &cursor, "cursor-session-bytes", &huge);
+    let too_many_bytes = begin(&mut engine, AgentKey::Codex, None, "after huge");
+    assert!(too_many_bytes.resume_session.is_none());
+    assert!(matches!(too_many_bytes.context, RequestContext::Fresh(_)));
+
+    // A retired binding cannot resume.
+    engine
+        .select(ConversationSelection::New {
+            title: Some("retired binding".to_owned()),
+        })
+        .unwrap();
+    let codex = begin(&mut engine, AgentKey::Codex, None, "bound codex");
+    complete_turn(&mut engine, &codex, "codex-thread-retired", "first");
+    assert!(engine.retire_active_binding(AgentKey::Codex).unwrap());
+    let cursor = begin(&mut engine, AgentKey::Cursor, None, "cursor after retire");
+    complete_turn(
+        &mut engine,
+        &cursor,
+        "cursor-session-retired",
+        "cursor answer",
+    );
+    let retired = begin(&mut engine, AgentKey::Codex, None, "after retire");
+    assert!(retired.resume_session.is_none());
+    assert!(matches!(retired.context, RequestContext::Fresh(_)));
+
+    // An agent that never ran in the task gets the summary/recent projection.
+    engine
+        .select(ConversationSelection::New {
+            title: Some("never ran".to_owned()),
+        })
+        .unwrap();
+    let codex = begin(&mut engine, AgentKey::Codex, None, "only codex");
+    complete_turn(&mut engine, &codex, "codex-thread-never", "codex answer");
+    let agy = begin(&mut engine, AgentKey::Agy, None, "agy first");
+    assert!(agy.resume_session.is_none());
+    assert!(!fresh_projection(&agy).recent.is_empty());
+}
+
+// TC-2326 / FR-2326: known_through_seq advances only for a saved Completed
+// turn; failed, cancelled and interrupted attempts re-deliver the same delta.
+#[test]
+fn tc_2326_delta_is_consumed_only_on_completed() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+    let conversation_id = engine
+        .select(ConversationSelection::New { title: None })
+        .unwrap()
+        .id;
+
+    let codex = begin(&mut engine, AgentKey::Codex, None, "codex first");
+    complete_turn(&mut engine, &codex, "codex-thread-1", "codex answer");
+    let cursor = begin(&mut engine, AgentKey::Cursor, None, "cursor first");
+    complete_turn(&mut engine, &cursor, "cursor-session", "cursor answer");
+
+    let completed = begin(&mut engine, AgentKey::Codex, None, "consume delta");
+    assert_eq!(resume_delta(&completed).len(), 1);
+    complete_turn(&mut engine, &completed, "codex-thread-1", "consumed");
+    let after_completed = engine
+        .select(ConversationSelection::Existing(conversation_id.clone()))
+        .unwrap();
+    let binding = after_completed
+        .bindings
+        .iter()
+        .find(|binding| binding.agent == AgentKey::Codex)
+        .unwrap();
+    assert_eq!(binding.status, BindingStatus::Active);
+    assert_eq!(binding.known_through_seq, 3);
+
+    // Failed attempt leaves the binding's known seq unchanged.
+    let cursor = begin(&mut engine, AgentKey::Cursor, None, "cursor failed case");
+    complete_turn(&mut engine, &cursor, "cursor-session", "cursor answer");
+    let failed = begin(&mut engine, AgentKey::Codex, None, "will fail");
+    assert_eq!(resume_delta(&failed).len(), 1);
+    fail_turn(&mut engine, &failed, "provider failed");
+    let after_failed = engine
+        .select(ConversationSelection::Existing(conversation_id.clone()))
+        .unwrap();
+    let binding = after_failed
+        .bindings
+        .iter()
+        .find(|binding| binding.agent == AgentKey::Codex)
+        .unwrap();
+    assert_eq!(binding.status, BindingStatus::Stale);
+    assert_eq!(binding.known_through_seq, 3);
+    let redelivered = begin(&mut engine, AgentKey::Codex, None, "after failure");
+    assert!(redelivered.resume_session.is_none());
+    assert!(
+        fresh_projection(&redelivered)
+            .recent
+            .iter()
+            .any(|turn| turn.user == "cursor failed case")
+    );
+    complete_turn(&mut engine, &redelivered, "codex-thread-2", "recovered");
+
+    // Cancelled attempt leaves the known seq unchanged.
+    let cursor = begin(&mut engine, AgentKey::Cursor, None, "cursor cancelled case");
+    complete_turn(&mut engine, &cursor, "cursor-session", "cursor answer");
+    let cancelled = begin(&mut engine, AgentKey::Codex, None, "will cancel");
+    assert_eq!(resume_delta(&cancelled).len(), 1);
+    cancel_turn(&mut engine, &cancelled);
+    let after_cancelled = engine
+        .select(ConversationSelection::Existing(conversation_id.clone()))
+        .unwrap();
+    let binding = after_cancelled
+        .bindings
+        .iter()
+        .find(|binding| binding.agent == AgentKey::Codex)
+        .unwrap();
+    assert_eq!(binding.status, BindingStatus::Stale);
+    assert_eq!(binding.known_through_seq, 6);
+    let redelivered = begin(&mut engine, AgentKey::Codex, None, "after cancel");
+    assert!(
+        fresh_projection(&redelivered)
+            .recent
+            .iter()
+            .any(|turn| turn.user == "cursor cancelled case")
+    );
+    complete_turn(
+        &mut engine,
+        &redelivered,
+        "codex-thread-3",
+        "recovered again",
+    );
+
+    // Interrupted attempt after a restart leaves the known seq unchanged.
+    let cursor = begin(
+        &mut engine,
+        AgentKey::Cursor,
+        None,
+        "cursor interrupted case",
+    );
+    complete_turn(&mut engine, &cursor, "cursor-session", "cursor answer");
+    let interrupted = begin(&mut engine, AgentKey::Codex, None, "will interrupt");
+    assert_eq!(resume_delta(&interrupted).len(), 1);
+    let envelope = |event| TurnOutput {
+        conversation_id: interrupted.conversation_id.clone(),
+        turn_id: interrupted.turn_id.clone(),
+        agent: interrupted.agent,
+        event,
+    };
+    engine
+        .record_turn_outputs(&[
+            envelope(TurnEvent::Started),
+            envelope(TurnEvent::ProviderSessionBound("codex-thread-3".to_owned())),
+            envelope(TurnEvent::TextDelta("partial".to_owned())),
+        ])
+        .unwrap();
+    let known_before = engine
+        .select(ConversationSelection::Existing(conversation_id.clone()))
+        .unwrap()
+        .bindings
+        .iter()
+        .find(|binding| binding.agent == AgentKey::Codex)
+        .unwrap()
+        .known_through_seq;
+    drop(engine);
+
+    let mut engine = harness.open();
+    assert_eq!(engine.recover_workspace().unwrap(), 1);
+    engine
+        .select(ConversationSelection::Existing(conversation_id))
+        .unwrap();
+    let after_interrupted = engine
+        .select(ConversationSelection::Existing(codex.conversation_id))
+        .unwrap();
+    let binding = after_interrupted
+        .bindings
+        .iter()
+        .find(|binding| binding.agent == AgentKey::Codex)
+        .unwrap();
+    assert_eq!(binding.status, BindingStatus::Stale);
+    assert_eq!(binding.known_through_seq, known_before);
+    let redelivered = begin(&mut engine, AgentKey::Codex, None, "after interrupt");
+    assert!(redelivered.resume_session.is_none());
+    assert!(
+        fresh_projection(&redelivered)
+            .recent
+            .iter()
+            .any(|turn| turn.user == "cursor interrupted case")
+    );
+}
+
+// TC-2332 / FR-2332: delta content stays scoped to the active task and is
+// carried as data, including shell-looking and secret-looking text.
+#[test]
+fn tc_2332_delta_excludes_other_tasks_and_secrets() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+    let conversation_id = engine
+        .select(ConversationSelection::New { title: None })
+        .unwrap()
+        .id;
+
+    let codex = begin(&mut engine, AgentKey::Codex, None, "codex first");
+    complete_turn(&mut engine, &codex, "codex-thread", "codex answer");
+    let cursor = begin(&mut engine, AgentKey::Cursor, None, "inspect this");
+    complete_turn(
+        &mut engine,
+        &cursor,
+        "cursor-session",
+        "run `rm -rf /tmp/x` and use token sk-secret-abc123; $(touch /tmp/pwn)",
+    );
+
+    engine
+        .select(ConversationSelection::New {
+            title: Some("other task".to_owned()),
+        })
+        .unwrap();
+    let other = begin(&mut engine, AgentKey::Cursor, None, "other task private");
+    complete_turn(&mut engine, &other, "other-session", "other task answer");
+
+    engine
+        .select(ConversationSelection::Existing(conversation_id))
+        .unwrap();
+    let codex_again = begin(&mut engine, AgentKey::Codex, None, "continue");
+    let delta = resume_delta(&codex_again);
+    assert_eq!(delta.len(), 1);
+    assert!(delta[0].assistant.contains("sk-secret-abc123"));
+    assert!(delta[0].assistant.contains("$(touch /tmp/pwn)"));
+    assert!(delta.iter().all(|turn| !turn.user.contains("other task")));
+    assert!(
+        delta
+            .iter()
+            .all(|turn| !turn.assistant.contains("other task answer"))
+    );
 }

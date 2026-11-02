@@ -61,10 +61,10 @@ criteria below.
 | Shared projection | Bounded rolling summary plus recent common turns rendered into a provider request when native resume is unavailable. | The durable canonical transcript |
 | Provider binding | Native session ID owned by one `(conversation, agent)` pair. | A DmuxAI conversation ID |
 
-Completed turns remain terminal and immutable. A provider binding may be
-active only when its `known_through_seq` covers the common projection head;
-otherwise the next request starts a fresh native session with the shared
-projection.
+Completed turns remain terminal and immutable. An active provider binding
+stays resumable when other agents add completed turns; the request carries only
+the bounded unseen delta (or the shared projection when the delta is too large).
+See `SPEC-task-sessions` FR-2323..FR-2325 for the current contract.
 
 ## 4. Requirements
 
@@ -72,7 +72,7 @@ projection.
 | --- | --- | --- | --- | --- | --- |
 | FR-025 | Must | Given a conversation with a completed turn from any agent, when another agent receives a later request in that conversation | The later request contains the earlier turn in its shared context, without `/share` | A queued/running or non-terminal turn is not projected until it reaches a terminal completed state | TC-001, TC-002 |
 | FR-026 | Must | Given completed turns from at least two agents, when either agent is requested after the other agent's turn | The projection contains both turns in sequence order and labels each source agent | Invalid or mismatched output is rejected by existing correlation rules; synthetic prior explicit-import turns are omitted to prevent recursive payloads | TC-002, TC-003, TC-006 |
-| FR-027 | Must | Given a provider binding whose known sequence is behind a newly completed turn from another agent | The request does not resume that stale native session and instead starts a fresh request with the shared projection | A binding that already covers the common head may continue to resume normally | TC-004 |
+| FR-027 | Must | Given a provider binding whose known sequence is behind a newly completed turn from another agent | Superseded by `SPEC-task-sessions` FR-2323..FR-2325: the request resumes the agent's own native session with only the bounded unseen delta; an oversized delta or unusable binding falls back to a fresh request with the shared projection | A binding that already covers the common head continues to resume normally with no delta | TC-004 |
 | FR-028 | Must | Given common history larger than the existing projection budget | Automatic summary/retry uses all-agent source turns, preserves the full transcript, and respects the 32,000-character projection and 20,000-character summary limits | Failed, malformed, stale, or oversized summary leaves the canonical transcript intact and restores the deferred prompt | TC-005 |
 | UX-015 | Must | Given the user switches agents with `/agent` or the picker | No `/share` command is required; the next prompt to the new agent visibly uses the common context | `/share <agent>` remains accepted as an optional explicit replay and does not alter automatic sharing semantics | TC-001, TC-006 |
 | NFR-005 | Must | Given any workspace or conversation selection | Shared projection reads only completed turns in the active conversation and canonical workspace | No turn from another conversation/workspace is included | TC-007 |
@@ -82,9 +82,9 @@ projection.
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
 | TC-001 | FR-025, UX-015 | app integration | Complete a Codex turn, select Cursor, leave `/share` unused | Submit a Cursor prompt | Cursor request is fresh and its prompt contains the Codex user/assistant text and shared-context marker | `src/app.rs` test |
-| TC-002 | FR-026 | conversation integration | Complete Codex then Cursor turns in one conversation | Begin a later Codex turn | Context contains both source agents in seq order; Codex native binding is not resumed after Cursor's turn | `tests/conversation.rs` test |
+| TC-002 | FR-026 | conversation integration | Complete Codex then Cursor turns in one conversation | Begin a later Codex turn | Context/delta contains both source agents in seq order; Codex resumes its own binding and receives only the unseen Cursor turn | `tests/conversation.rs` `projections_are_shared_across_agents_and_bindings_remain_provider_scoped` |
 | TC-003 | FR-026, NFR-005 | conversation integration | Create a second conversation and add turns to both | Begin turns in each conversation | Each projection contains only its own conversation's turns | `tests/conversation.rs` test |
-| TC-004 | FR-027 | conversation integration | Bind an agent at seq N, then complete another agent at seq N+1 | Begin the first agent again | `resume_session` is `None`; the context contains the new cross-agent turn | `tests/conversation.rs` test |
+| TC-004 | FR-027 | conversation integration | Bind an agent at seq N, then complete another agent at seq N+1 | Begin the first agent again | `resume_session` is the agent's own binding and the delta contains the new cross-agent turn; stale or oversized bindings still use `None` plus the shared projection | `tests/conversation.rs` `tc_2323_agent_resumes_own_session_after_other_agent_turn`, `tc_2325_delta_bounds_and_resume_fallbacks` |
 | TC-005 | FR-028 | conversation integration | Build long mixed-agent history beyond 32,000 characters | Begin another agent turn and commit a summary fixture | Summary source includes mixed-agent turns, projection stays within limits, and canonical messages remain | `tests/conversation.rs` test |
 | TC-006 | UX-015 | app unit | Use `/share cursor` after automatic sharing is available | Submit the command | The legacy explicit command remains accepted; ordinary switching still works without it | `src/app.rs` test |
 | TC-007 | NFR-005 | persistence integration | Use two workspaces and two conversations | Begin a request in each | No cross-workspace or cross-conversation text appears | `tests/conversation.rs` test |
@@ -98,7 +98,7 @@ summary/failure limits (TC-005).
 | Area | Contract / change | Compatibility and rollback | Evidence |
 | --- | --- | --- | --- |
 | Persistence | No schema change. Existing checkpoints remain valid only when their source hash matches the common-turn set. | Reverting the code restores same-agent projection; stored canonical turns and checkpoints remain readable. | TC-003, TC-005 |
-| Provider protocol | Requests keep the existing structured `resume_session` field. A stale common-head binding uses `None` and the existing restored-context envelope. | No provider CLI changes; live provider tests remain ignored. | TC-001, TC-004 |
+| Provider protocol | Requests keep the existing structured `resume_session` field. A resumable binding sends only the bounded unseen delta inside the existing restored-context envelope; an oversized, stale, retired, or rejected binding uses `None` and the full bounded projection. | No provider CLI changes; live provider tests remain ignored. | TC-001, TC-004, TC-2323..TC-2326 |
 | Security / permissions | Shared context is bounded, marked as untrusted historical data, and never interpolated into shell commands. | Existing sandbox/mode policy is unchanged. | TC-005, default Rust gates |
 | Platform | No platform-specific behavior change. | Existing Linux process launch paths are unchanged. | Default Rust gates |
 
