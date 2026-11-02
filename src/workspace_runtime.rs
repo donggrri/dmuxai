@@ -97,6 +97,11 @@ pub(crate) fn build_web_workspace(
         ))
     });
 
+    let jira = settings.jira.clone().map(|jira| {
+        Arc::new(dmuxai::jira::JiraService::new(Some(
+            dmuxai::jira::JiraClient::new(jira),
+        )))
+    });
     let services = DashboardServices {
         todos: todos_pair.as_ref().map(|(store, _)| store.clone()),
         commands: todos_pair.as_ref().map(|(_, sender)| sender.clone()),
@@ -106,6 +111,7 @@ pub(crate) fn build_web_workspace(
             .memory
             .as_ref()
             .map(|config| dmuxai::memory::MemoryHandle::from_config(config, workspace_root)),
+        jira,
         events_path: Some(dmuxai::events::events_path(workspace_root)),
         docs,
         trust_env: None,

@@ -592,6 +592,11 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
     for warning in mcp_registry.warnings() {
         eprintln!("warning: {warning}");
     }
+    let jira = settings.jira.clone().map(|jira| {
+        Arc::new(dmuxai::jira::JiraService::new(Some(
+            dmuxai::jira::JiraClient::new(jira),
+        )))
+    });
 
     let services = match open_todo_store(&workspace_root) {
         Ok(store) => {
@@ -602,6 +607,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 mcp: Some(mcp_registry),
                 web_attached: false,
                 memory: memory.clone(),
+                jira: jira.clone(),
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
                 trust_env: None,
@@ -615,6 +621,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 mcp: Some(mcp_registry),
                 web_attached: false,
                 memory,
+                jira,
                 // The event log is independent of the to-do database (FR-766).
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
