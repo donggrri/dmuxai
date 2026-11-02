@@ -80,6 +80,8 @@ pub struct DashboardServices {
     pub web_attached: bool,
     /// Obsidian memory (SPEC-obsidian-memory FR-727); `None` = disabled.
     pub memory: Option<crate::memory::MemoryHandle>,
+    /// Read-only Jira search service (SPEC-jira-todos FR-2406); `None` = not configured.
+    pub jira: Option<Arc<crate::jira::JiraService>>,
     /// Shared workspace event log for `GET /api/events/log` and SSE tailing.
     pub events_path: Option<std::path::PathBuf>,
     pub docs: Option<Arc<crate::web::docs_api::DocsService>>,
@@ -504,6 +506,22 @@ async fn get_skills_js() -> impl IntoResponse {
             (HeaderName::from_static("x-content-type-options"), "nosniff"),
         ],
         crate::web::assets::SKILLS_JS,
+    )
+}
+
+async fn get_jira_todos_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::JIRA_TODOS_JS,
     )
 }
 
@@ -1068,6 +1086,25 @@ async fn list_todos(Ws(ws): Ws) -> Response {
         Ok(todos) => json_ok(StatusCode::OK, &todos),
         Err(error) => todo_error_response(error),
     }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct JiraIssuesQuery {
+    refresh: Option<String>,
+}
+
+async fn jira_issues(Ws(ws): Ws, Query(params): Query<JiraIssuesQuery>) -> Response {
+    let refresh = params
+        .refresh
+        .as_deref()
+        .is_some_and(|value| matches!(value, "1" | "true" | "yes" | "on"));
+    let Some(service) = ws.services.jira.as_ref() else {
+        return json_ok(
+            StatusCode::OK,
+            &crate::jira::JiraIssuesResponse::not_configured(),
+        );
+    };
+    json_ok(StatusCode::OK, &service.issues(refresh).await)
 }
 
 async fn create_todo(Ws(ws): Ws, ApiJson(body): ApiJson<NewTodoBody>) -> Response {
@@ -2176,6 +2213,7 @@ pub fn build_router_with_directory(
         .route("/assets/app.js", get(get_app_js))
         .route("/assets/memory.js", get(get_memory_js))
         .route("/assets/skills.js", get(get_skills_js))
+        .route("/assets/jira-todos.js", get(get_jira_todos_js))
         .route("/assets/agent-prompts.js", get(get_agent_prompts_js))
         .route("/assets/session.js", get(get_session_js))
         .route("/assets/workspace.js", get(get_workspace_js))
@@ -2215,6 +2253,7 @@ pub fn build_router_with_directory(
         .route("/api/todos", get(list_todos).post(create_todo))
         .route("/api/todos/{id}", patch(update_todo).delete(delete_todo))
         .route("/api/todos/{id}/run", post(run_todo))
+        .route("/api/jira/issues", get(jira_issues))
         .route("/api/mcp/servers", get(list_mcp_servers))
         .route("/api/import", post(import_todos))
         .route(
@@ -3375,6 +3414,7 @@ mod tests {
             events_path: None,
             memory: None,
             docs: None,
+            jira: None,
             trust_env: None,
         };
         let router = build_router_with(hub.clone(), token.clone(), allowed_localhost(), services);
@@ -3525,6 +3565,7 @@ mod tests {
             events_path: None,
             memory: None,
             docs: None,
+            jira: None,
             trust_env: None,
         };
         let router = build_router_with(test_hub(), token.clone(), allowed_localhost(), services);
@@ -3668,6 +3709,7 @@ mod tests {
                 web_attached: false,
                 memory: None,
                 docs: None,
+                jira: None,
                 trust_env: None,
             },
         );
@@ -3856,6 +3898,7 @@ mod tests {
                 events_path: None,
                 memory: None,
                 docs: None,
+                jira: None,
                 trust_env: None,
             },
         );
@@ -3883,6 +3926,7 @@ mod tests {
                 events_path: None,
                 memory: None,
                 docs: None,
+                jira: None,
                 trust_env: None,
             },
         );
@@ -3916,6 +3960,7 @@ mod tests {
                 events_path: None,
                 memory: None,
                 docs: None,
+                jira: None,
                 trust_env: None,
             },
         );
@@ -3949,6 +3994,7 @@ mod tests {
                 events_path: None,
                 memory: None,
                 docs: None,
+                jira: None,
                 trust_env: None,
             },
         );
@@ -4199,6 +4245,7 @@ mod tests {
                 events_path: None,
                 memory: None,
                 docs: None,
+                jira: None,
                 trust_env: None,
             },
         );
@@ -4478,6 +4525,7 @@ mod tests {
             events_path: Some(events_file.clone()),
             memory: None,
             docs: None,
+            jira: None,
             trust_env: None,
         };
         let router = build_router_with(hub.clone(), token.clone(), allowed_localhost(), services);
@@ -4543,6 +4591,7 @@ mod tests {
                 events_path: Some(events_file.clone()),
                 memory: None,
                 docs: None,
+                jira: None,
                 trust_env: None,
             },
         };
@@ -4651,6 +4700,7 @@ mod tests {
             memory: Some(memory.clone()),
             events_path: None,
             docs: None,
+            jira: None,
             trust_env: None,
         };
         let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
@@ -4905,6 +4955,7 @@ mod tests {
                 web_attached: false,
                 memory: None,
                 docs: None,
+                jira: None,
                 trust_env: None,
             },
         );
@@ -5001,6 +5052,7 @@ mod tests {
                 web_attached: false,
                 memory: None,
                 docs: None,
+                jira: None,
                 trust_env: None,
             },
         );
@@ -5153,6 +5205,7 @@ mod tests {
                 web_attached: false,
                 memory: None,
                 docs: None,
+                jira: None,
                 trust_env: None,
             },
         );
@@ -5210,6 +5263,7 @@ mod tests {
                 web_attached: false,
                 memory: None,
                 docs: None,
+                jira: None,
                 trust_env: None,
             },
         );
@@ -5665,6 +5719,7 @@ mod tests {
             events_path: None,
             memory: None,
             docs: None,
+            jira: None,
             trust_env: None,
         };
         let config = ServerConfig {
@@ -7384,5 +7439,358 @@ mod tests {
         let body_str = read_body(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
         assert_eq!(v["error"], "the first folder closes with Quit");
+    }
+
+    // ---- Jira dashboard tests (TC-2406..TC-2408) -------------------------
+
+    async fn fake_jira_server(
+        responses: Vec<(u16, String)>,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let handle = tokio::spawn(async move {
+            let mut index = 0;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = vec![0_u8; 16 * 1024];
+                let Ok(read) = socket.read(&mut buffer).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let target = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_owned();
+                recorded.lock().unwrap().push(target);
+                let (status, body) = responses
+                    .get(index)
+                    .cloned()
+                    .unwrap_or((500, "{}".to_owned()));
+                index += 1;
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), calls, handle)
+    }
+
+    fn jira_settings(base_url: &str) -> crate::settings::JiraSettings {
+        crate::settings::JiraSettings {
+            base_url: base_url.to_owned(),
+            email: "user@example.com".to_owned(),
+            jql: "project = DEMO".to_owned(),
+            max_results: 50,
+            token_env: "DMUXAI_JIRA_TOKEN".to_owned(),
+        }
+    }
+
+    fn jira_router(service: Option<Arc<crate::jira::JiraService>>, token: &str) -> axum::Router {
+        build_router_with(
+            test_hub(),
+            token.to_owned(),
+            allowed_localhost(),
+            DashboardServices {
+                jira: service,
+                ..DashboardServices::default()
+            },
+        )
+    }
+
+    fn request_without_auth(uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("Host", "localhost:7420")
+            .header("Origin", "http://localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    const JIRA_BODY: &str = r#"{"issues":[{"key":"DEMO-1","fields":{"summary":"Demo summary","status":{"name":"In Progress","statusCategory":{"key":"indeterminate"}},"priority":{"name":"High"},"issuetype":{"name":"Task"},"updated":"2026-01-01T00:00:00.000+0000"}}]}"#;
+
+    // TC-2406 / FR-2406: auth, not-configured response, and issue payload.
+    #[tokio::test]
+    async fn tc_2406_jira_issues_endpoint() {
+        let token = "dashboard-token-2406";
+        let router = jira_router(None, token);
+        let resp = router
+            .clone()
+            .oneshot(json_request("GET", "/api/jira/issues", token, ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(body["configured"], false);
+        assert_eq!(body["issues"].as_array().unwrap().len(), 0);
+        assert_eq!(body["error"]["kind"], "not_configured");
+        assert!(body["fetched_at"].is_null());
+
+        let resp = router
+            .oneshot(request_without_auth("/api/jira/issues"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let (base, calls, server) = fake_jira_server(vec![(200, JIRA_BODY.to_owned())]).await;
+        let client = crate::jira::JiraClient::with_token(jira_settings(&base), "demo-token-XYZ");
+        let service = Arc::new(crate::jira::JiraService::new(Some(client)));
+        let router = jira_router(Some(service), token);
+        let resp = router
+            .oneshot(json_request("GET", "/api/jira/issues", token, ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(body["configured"], true);
+        assert!(body["error"].is_null());
+        assert_eq!(body["issues"][0]["key"], "DEMO-1");
+        assert_eq!(body["issues"][0]["summary"], "Demo summary");
+        assert_eq!(body["issues"][0]["url"], format!("{base}/browse/DEMO-1"));
+        assert!(body["fetched_at"].as_u64().is_some());
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    // TC-2407 / FR-2407: successful results cache for 60 s; refresh bypasses it.
+    #[tokio::test]
+    async fn tc_2407_jira_issues_cache_and_refresh() {
+        let token = "dashboard-token-2407";
+        let second = JIRA_BODY.replace("DEMO-1", "DEMO-2");
+        let (base, calls, server) =
+            fake_jira_server(vec![(200, JIRA_BODY.to_owned()), (200, second)]).await;
+        let client = crate::jira::JiraClient::with_token(jira_settings(&base), "demo-token-XYZ");
+        let router = jira_router(
+            Some(Arc::new(crate::jira::JiraService::new(Some(client)))),
+            token,
+        );
+
+        let first: serde_json::Value = serde_json::from_str(
+            &read_body(
+                router
+                    .clone()
+                    .oneshot(json_request("GET", "/api/jira/issues", token, ""))
+                    .await
+                    .unwrap(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(first["issues"][0]["key"], "DEMO-1");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        let cached: serde_json::Value = serde_json::from_str(
+            &read_body(
+                router
+                    .clone()
+                    .oneshot(json_request("GET", "/api/jira/issues", token, ""))
+                    .await
+                    .unwrap(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(cached["issues"][0]["key"], "DEMO-1");
+        assert_eq!(cached["fetched_at"], first["fetched_at"]);
+        assert_eq!(calls.lock().unwrap().len(), 1, "cache hit made no request");
+
+        let refreshed: serde_json::Value = serde_json::from_str(
+            &read_body(
+                router
+                    .oneshot(json_request("GET", "/api/jira/issues?refresh=1", token, ""))
+                    .await
+                    .unwrap(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(refreshed["issues"][0]["key"], "DEMO-2");
+        assert_eq!(calls.lock().unwrap().len(), 2, "refresh fetched again");
+        server.abort();
+    }
+
+    // TC-2408 / FR-2408: the Jira token never appears in dashboard responses.
+    #[tokio::test]
+    async fn tc_2408_jira_token_never_in_responses() {
+        let token = "dashboard-token-2408";
+        let jira_token = "distinctive-jira-token-9f3a";
+        let (base, _calls, server) = fake_jira_server(vec![(200, JIRA_BODY.to_owned())]).await;
+        let client = crate::jira::JiraClient::with_token(jira_settings(&base), jira_token);
+        let router = jira_router(
+            Some(Arc::new(crate::jira::JiraService::new(Some(client)))),
+            token,
+        );
+
+        let issues = read_body(
+            router
+                .clone()
+                .oneshot(json_request("GET", "/api/jira/issues", token, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(issues.contains("DEMO-1"));
+        assert!(
+            !issues.contains(jira_token),
+            "issues leaked token: {issues}"
+        );
+        assert!(
+            !issues.contains("DMUXAI_JIRA_TOKEN"),
+            "issues leaked token_env"
+        );
+
+        let state = read_body(
+            router
+                .oneshot(json_request("GET", "/api/state", token, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!state.contains(jira_token), "state leaked token: {state}");
+        assert!(
+            !state.contains("DMUXAI_JIRA_TOKEN"),
+            "state leaked token_env"
+        );
+        server.abort();
+
+        let body = format!(r#"{{"error":"{jira_token}"}}"#);
+        let (base, _calls, server) = fake_jira_server(vec![(401, body)]).await;
+        let client = crate::jira::JiraClient::with_token(jira_settings(&base), jira_token);
+        let router = jira_router(
+            Some(Arc::new(crate::jira::JiraService::new(Some(client)))),
+            token,
+        );
+        let response = read_body(
+            router
+                .oneshot(json_request("GET", "/api/jira/issues", token, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(response.contains("\"unauthorized\""));
+        assert!(
+            !response.contains(jira_token),
+            "401 leaked token: {response}"
+        );
+        assert!(!response.contains("Authorization"), "401 leaked header");
+        server.abort();
+    }
+
+    fn asset_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+        let from = src
+            .find(start)
+            .unwrap_or_else(|| panic!("missing asset marker {start:?}"));
+        let tail = &src[from..];
+        let to = tail
+            .find(end)
+            .unwrap_or_else(|| panic!("missing asset marker {end:?}"));
+        &tail[..to]
+    }
+
+    // TC-2409 / UX-2409: the To-dos panel embeds the Jira group and its assets.
+    #[tokio::test]
+    async fn tc_2409_jira_group_assets() {
+        let token = "dashboard-token-2409";
+        let router = build_router(test_hub(), token.to_string(), allowed_localhost());
+
+        let resp = router
+            .clone()
+            .oneshot(request_without_auth("/"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = read_body(resp).await;
+        for id in [
+            "jira-group",
+            "jira-refresh",
+            "jira-banner",
+            "jira-hint",
+            "jira-list",
+        ] {
+            assert!(
+                html.contains(&format!("id=\"{id}\"")),
+                "index.html missing #{id}"
+            );
+        }
+        assert!(html.contains("id=\"jira-count\""));
+        assert!(html.contains("aria-controls=\"jira-body\""));
+        assert!(html.contains("title=\"Refresh Jira tickets\""));
+        assert!(html.contains("aria-label=\"Refresh Jira tickets\""));
+        assert!(html.contains(
+            "Set [jira] base_url and email in dmuxai.toml and export DMUXAI_JIRA_TOKEN to list tickets."
+        ));
+        assert!(html.contains("<script src=\"/assets/jira-todos.js\" defer></script>"));
+        let jira_pos = html.find("id=\"jira-group\"").expect("jira group");
+        let filter_pos = html.find("class=\"todo-filter\"").expect("todo filter");
+        assert!(
+            jira_pos < filter_pos,
+            "Jira group must sit above the filter"
+        );
+        let skills_pos = html.find("/assets/skills.js").expect("skills.js");
+        let jira_js_pos = html.find("/assets/jira-todos.js").expect("jira-todos.js");
+        assert!(skills_pos < jira_js_pos, "jira-todos.js follows skills.js");
+
+        let resp = router
+            .oneshot(request_without_auth("/assets/jira-todos.js"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers().clone();
+        assert!(
+            headers["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/javascript")
+        );
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(headers["content-security-policy"], "default-src 'self'");
+        assert_eq!(headers["referrer-policy"], "no-referrer");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        let js = read_body(resp).await;
+        assert_eq!(js.as_bytes(), crate::web::assets::JIRA_TODOS_JS.as_bytes());
+        assert!(js.contains("/api/jira/issues"));
+        assert!(js.contains("refresh=1"));
+        assert!(js.contains("window.dmuxaiStartDraft"));
+        assert!(js.contains("window.open(url, '_blank', 'noopener,noreferrer')"));
+        assert!(js.contains("data-category"));
+        assert!(!js.contains("innerHTML"));
+    }
+
+    // TC-2411 / UX-2411: Start task opens a new conversation and fills the
+    // composer draft without sending anything.
+    #[test]
+    fn tc_2411_start_task_prefills_draft() {
+        let start_draft = asset_between(
+            crate::web::assets::SESSION_JS,
+            "window.dmuxaiStartDraft",
+            "function sendPrompt",
+        );
+        assert!(
+            start_draft.contains("command({ command: 'new_conversation' })"),
+            "{start_draft}"
+        );
+        assert!(
+            start_draft.contains("ui.input.value = draft"),
+            "{start_draft}"
+        );
+        assert!(start_draft.contains("ui.input.focus()"), "{start_draft}");
+        assert!(
+            !start_draft.contains("submit"),
+            "Start task must never submit: {start_draft}"
+        );
+        assert!(crate::web::assets::JIRA_TODOS_JS.contains("window.dmuxaiStartDraft"));
     }
 }

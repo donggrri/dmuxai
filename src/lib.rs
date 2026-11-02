@@ -12,6 +12,7 @@ pub mod events;
 pub mod graph;
 pub mod grok_activity;
 pub mod init;
+pub mod jira;
 pub mod mcp;
 pub mod mcp_server;
 pub mod memory;

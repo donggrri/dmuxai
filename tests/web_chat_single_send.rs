@@ -144,6 +144,7 @@ async fn run_scenario(scenario: Scenario) -> Option<Outcome> {
             web_attached: true,
             memory: None,
             docs: None,
+            jira: None,
             trust_env: None,
         },
     };

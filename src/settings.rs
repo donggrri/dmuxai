@@ -83,6 +83,8 @@ pub struct DmuxSettings {
     /// `[todo] jira_base_url` (user or repo, repo wins) used to derive links
     /// for to-dos that carry a Jira issue key (FR-564).
     pub todo_jira_base_url: Option<String>,
+    /// Resolved `[jira]` settings (SPEC-jira-todos FR-2400); `None` = not configured.
+    pub jira: Option<JiraSettings>,
     /// Activity rendering settings (tool calls and model thinking).
     pub ui: UiSettings,
     /// Web dashboard theme settings from `[web]`.
@@ -99,6 +101,8 @@ pub struct DmuxSettings {
     pub memory: Option<crate::memory::MemoryConfig>,
     /// Raw `[memory]` keys merged per key (workspace wins), resolved in `load`.
     memory_raw: MemoryToml,
+    /// Raw `[jira]` keys merged per key (workspace wins), resolved in `load`.
+    jira_raw: JiraToml,
     /// Per-runner system prompt configs keyed by normalized runner ID (or "default") (PR-2.5).
     pub runner_prompts: BTreeMap<String, crate::agent_prompt::RunnerPromptConfig>,
     /// Per-runner model profile from `[runners.<id>] model` (FR-1731), keys
@@ -114,6 +118,22 @@ pub struct DmuxSettings {
 /// Convenience alias for [`DmuxSettings`].
 pub type Settings = DmuxSettings;
 
+/// Resolved `[jira]` settings (SPEC-jira-todos FR-2400).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JiraSettings {
+    /// Absolute Jira Cloud base URL, trailing slash trimmed.
+    pub base_url: String,
+    pub email: String,
+    pub jql: String,
+    pub max_results: u32,
+    pub token_env: String,
+}
+
+const DEFAULT_JIRA_JQL: &str =
+    "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC";
+const DEFAULT_JIRA_MAX_RESULTS: u32 = 50;
+const DEFAULT_JIRA_TOKEN_ENV: &str = "DMUXAI_JIRA_TOKEN";
+
 #[derive(Debug, Default, Deserialize)]
 struct DmuxToml {
     cursor: Option<CursorToml>,
@@ -127,6 +147,7 @@ struct DmuxToml {
     memory: Option<MemoryToml>,
     mcp: Option<McpToml>,
     todo: Option<TodoToml>,
+    jira: Option<JiraToml>,
     workspace: Option<WorkspaceSettings>,
     /// `[stages.<stage>]` skill mapping (SPEC-stage-skills FR-1500).
     stages: Option<std::collections::BTreeMap<String, crate::stage_skills::StageToml>>,
@@ -152,6 +173,16 @@ const MODES_SECTION_DEPRECATED: &str =
 #[derive(Debug, Default, Deserialize)]
 struct TodoToml {
     jira_base_url: Option<String>,
+}
+
+/// `[jira]` table (SPEC-jira-todos FR-2400).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+struct JiraToml {
+    base_url: Option<String>,
+    email: Option<String>,
+    jql: Option<String>,
+    max_results: Option<i64>,
+    token_env: Option<String>,
 }
 
 /// `[memory]` (FR-720).
@@ -713,6 +744,7 @@ impl DmuxSettings {
         }
 
         settings.resolve_memory(workspace, env);
+        settings.resolve_jira();
         if env
             .reduced_motion
             .as_ref()
@@ -729,6 +761,65 @@ impl DmuxSettings {
         }
         settings.dedupe_warnings();
         settings
+    }
+
+    /// SPEC-jira-todos FR-2400: merge one `[jira]` table, validating each key.
+    fn merge_jira(&mut self, jira: JiraToml) {
+        if let Some(base) = jira.base_url {
+            match normalize_jira_config_base_url(&base) {
+                Ok(normalized) => self.jira_raw.base_url = Some(normalized),
+                Err(message) => self
+                    .config_warnings
+                    .push(format!("[jira] base_url ignored: {message}")),
+            }
+        }
+        if let Some(email) = jira.email {
+            match normalize_jira_email(&email) {
+                Some(normalized) => self.jira_raw.email = Some(normalized),
+                None => self
+                    .config_warnings
+                    .push("[jira] email ignored: must be a valid email address".to_owned()),
+            }
+        }
+        if let Some(jql) = jira.jql {
+            let trimmed = jql.trim();
+            if !trimmed.is_empty() {
+                self.jira_raw.jql = Some(trimmed.to_owned());
+            }
+        }
+        if let Some(max_results) = jira.max_results {
+            self.jira_raw.max_results = Some(max_results.clamp(1, 100));
+        }
+        if let Some(token_env) = jira.token_env {
+            let trimmed = token_env.trim();
+            if is_valid_env_name(trimmed) {
+                self.jira_raw.token_env = Some(trimmed.to_owned());
+            } else {
+                self.config_warnings.push(format!(
+                    "[jira] token_env ignored: must match [A-Z_][A-Z0-9_]*; using {DEFAULT_JIRA_TOKEN_ENV}"
+                ));
+                self.jira_raw.token_env = Some(DEFAULT_JIRA_TOKEN_ENV.to_owned());
+            }
+        }
+    }
+
+    /// SPEC-jira-todos FR-2400: build [`JiraSettings`] once every `[jira]` table
+    /// has been merged. Configured requires a valid base URL and email.
+    fn resolve_jira(&mut self) {
+        let raw = std::mem::take(&mut self.jira_raw);
+        let (Some(base_url), Some(email)) = (raw.base_url, raw.email) else {
+            self.jira = None;
+            return;
+        };
+        self.jira = Some(JiraSettings {
+            base_url,
+            email,
+            jql: raw.jql.unwrap_or_else(|| DEFAULT_JIRA_JQL.to_owned()),
+            max_results: raw.max_results.unwrap_or(DEFAULT_JIRA_MAX_RESULTS.into()) as u32,
+            token_env: raw
+                .token_env
+                .unwrap_or_else(|| DEFAULT_JIRA_TOKEN_ENV.to_owned()),
+        });
     }
 
     /// FR-720: turn the merged `[memory]` keys into a [`MemoryConfig`].
@@ -888,6 +979,9 @@ impl DmuxSettings {
                     .config_warnings
                     .push(format!("[todo] jira_base_url ignored: {message}")),
             }
+        }
+        if let Some(jira) = parsed.jira {
+            self.merge_jira(jira);
         }
         if let Some(cursor) = parsed.cursor {
             if let Some(prewarm) = cursor.prewarm {
@@ -1251,6 +1345,9 @@ fn restricted_workspace_keys_with_user(
     {
         keys.push("todo.jira_base_url".to_owned());
     }
+    if parsed.jira.is_some() {
+        keys.push("jira".to_owned());
+    }
     if let Some(runners) = &parsed.runners {
         for (id, raw) in runners {
             if let Some(file) = &raw.system_prompt_file
@@ -1400,6 +1497,7 @@ fn strip_restricted_workspace_keys_with_user(
     if let Some(todo) = &mut parsed.todo {
         todo.jira_base_url = None;
     }
+    parsed.jira = None;
     if let Some(runners) = &mut parsed.runners {
         for raw in runners.values_mut() {
             if let Some(file) = &raw.system_prompt_file
@@ -1578,6 +1676,25 @@ pub fn restricted_workspace_details_from(
         details.push(("todo.jira_base_url".to_owned(), jira.clone()));
     }
 
+    if let Some(jira) = &parsed.jira {
+        let mut parts = Vec::new();
+        if let Some(base) = &jira.base_url {
+            parts.push(format!("base_url: {base}"));
+        }
+        if let Some(email) = &jira.email {
+            parts.push(format!("email: {email}"));
+        }
+        if let Some(token_env) = &jira.token_env {
+            parts.push(format!("token_env: {token_env}"));
+        }
+        let value = if parts.is_empty() {
+            "(jira settings)".to_owned()
+        } else {
+            parts.join(", ")
+        };
+        details.push(("jira".to_owned(), value));
+    }
+
     if let Some(runners) = &parsed.runners {
         for (id, raw) in runners {
             if let Some(file) = &raw.system_prompt_file
@@ -1665,6 +1782,7 @@ impl Default for DmuxSettings {
             builtin_grok: true,
             mcp_servers: Vec::new(),
             todo_jira_base_url: None,
+            jira: None,
             ui: UiSettings::default(),
             web_theme: WebThemeSettings::default(),
             notify: NotifySettings::default(),
@@ -1673,6 +1791,7 @@ impl Default for DmuxSettings {
             config_warnings: Vec::new(),
             memory: None,
             memory_raw: MemoryToml::default(),
+            jira_raw: JiraToml::default(),
             runner_prompts: BTreeMap::new(),
             runner_models: BTreeMap::new(),
             runner_fallback: Default::default(),
@@ -1766,6 +1885,74 @@ fn normalize_jira_base_url(value: &str) -> Result<String, String> {
         return Err("must include a host".to_owned());
     }
     Ok(trimmed.trim_end_matches('/').to_owned())
+}
+
+/// Validates `[jira] base_url` (SPEC-jira-todos FR-2400): an absolute https URL,
+/// or plain http only for loopback hosts. Trailing slashes are trimmed.
+fn normalize_jira_config_base_url(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.contains('?') || trimmed.contains('#') {
+        return Err("must not contain a query or fragment".to_owned());
+    }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("must not contain whitespace or control characters".to_owned());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let (secure, prefix_len) = if lower.starts_with("https://") {
+        (true, "https://".len())
+    } else if lower.starts_with("http://") {
+        (false, "http://".len())
+    } else {
+        return Err("must be an absolute https URL".to_owned());
+    };
+    let rest = &trimmed[prefix_len..];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return Err("must include a host".to_owned());
+    }
+    if authority.contains('@') {
+        return Err("must not contain user info".to_owned());
+    }
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((host, _)) => host,
+            None => return Err("must include a valid host".to_owned()),
+        }
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    let loopback = matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "::1" | "localhost"
+    );
+    if !secure && !loopback {
+        return Err("plain http is allowed only for loopback hosts".to_owned());
+    }
+    Ok(trimmed.trim_end_matches('/').to_owned())
+}
+
+/// Basic RFC-ish email shape check for `[jira] email`; never echoes a value.
+fn normalize_jira_email(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let (local, domain) = trimmed.split_once('@')?;
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+/// Returns true when `value` matches `^[A-Z_][A-Z0-9_]*$`.
+fn is_valid_env_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
 /// Finds the opencode executable (SPEC-first-run FR-810). `DMUXAI_OPENCODE_BIN`
@@ -2540,6 +2727,156 @@ allowed_runners = []
         }
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    // TC-2400 / FR-2400: `[jira]` defaults, trimming, clamping, and validation.
+    #[test]
+    fn tc_2400_jira_config_defaults_and_validation() {
+        let base = tempfile::tempdir().unwrap();
+        let ws = base.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let user = base.path().join("user.toml");
+
+        let load = |contents: &str| {
+            std::fs::write(&user, contents).unwrap();
+            DmuxSettings::load_with_user_config(&ws, Some(&user))
+        };
+
+        let settings = load(
+            "[jira]\nbase_url = \"https://example.atlassian.net/\"\nemail = \"user@example.com\"\n",
+        );
+        let jira = settings.jira.expect("configured");
+        assert_eq!(jira.base_url, "https://example.atlassian.net");
+        assert_eq!(jira.email, "user@example.com");
+        assert_eq!(
+            jira.jql,
+            "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
+        );
+        assert_eq!(jira.max_results, 50);
+        assert_eq!(jira.token_env, "DMUXAI_JIRA_TOKEN");
+        assert!(
+            settings.config_warnings.is_empty(),
+            "{:?}",
+            settings.config_warnings
+        );
+
+        let settings = load(
+            "[jira]\nbase_url = \"https://example.atlassian.net\"\nemail = \"user@example.com\"\njql = \"project = DEMO\"\nmax_results = 500\ntoken_env = \"DEMO_JIRA_TOKEN\"\n",
+        );
+        let jira = settings.jira.expect("configured");
+        assert_eq!(jira.jql, "project = DEMO");
+        assert_eq!(jira.max_results, 100, "upper clamp");
+        assert_eq!(jira.token_env, "DEMO_JIRA_TOKEN");
+        assert!(
+            settings.config_warnings.is_empty(),
+            "{:?}",
+            settings.config_warnings
+        );
+
+        let settings = load(
+            "[jira]\nbase_url = \"https://example.atlassian.net\"\nemail = \"user@example.com\"\nmax_results = 0\n",
+        );
+        assert_eq!(settings.jira.expect("configured").max_results, 1);
+
+        // Plain http is accepted only for loopback hosts.
+        let settings =
+            load("[jira]\nbase_url = \"http://127.0.0.1:8080/\"\nemail = \"user@example.com\"\n");
+        assert_eq!(
+            settings.jira.expect("loopback http").base_url,
+            "http://127.0.0.1:8080"
+        );
+        for bad in [
+            "http://example.atlassian.net",
+            "javascript:alert(1)",
+            "https://example.atlassian.net/?x=1",
+            "http://localhost:x@other.example",
+            "https://user@example.atlassian.net",
+            "https://example.atlassian.net/ x",
+        ] {
+            let settings = load(&format!(
+                "[jira]\nbase_url = \"{bad}\"\nemail = \"user@example.com\"\n"
+            ));
+            assert!(settings.jira.is_none(), "{bad} must be rejected");
+            assert!(
+                settings
+                    .config_warnings
+                    .iter()
+                    .any(|w| w.contains("[jira] base_url ignored")),
+                "warnings: {:?}",
+                settings.config_warnings
+            );
+        }
+
+        let settings = load(
+            "[jira]\nbase_url = \"https://example.atlassian.net\"\nemail = \"user@example.com\"\ntoken_env = \"bad-name\"\n",
+        );
+        assert_eq!(
+            settings.jira.expect("configured").token_env,
+            "DMUXAI_JIRA_TOKEN"
+        );
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[jira] token_env ignored")),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+
+        // Missing table and incomplete configuration are silently not configured.
+        let settings = load("[web]\ntheme = \"dark\"\n");
+        assert!(settings.jira.is_none());
+        let settings = load("[jira]\nbase_url = \"https://example.atlassian.net\"\n");
+        assert!(settings.jira.is_none());
+    }
+
+    // TC-2401 / FR-2401: untrusted repo `[jira]` is stripped; trusted keeps it.
+    #[test]
+    fn tc_2401_untrusted_repo_jira_table_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let user = dir.path().join("user.toml");
+        std::fs::write(
+            &user,
+            "[jira]\nbase_url = \"https://user.atlassian.net\"\nemail = \"user@example.com\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            "[jira]\nbase_url = \"https://repo.atlassian.net\"\nemail = \"repo@example.com\"\ntoken_env = \"REPO_JIRA_TOKEN\"\n",
+        )
+        .unwrap();
+
+        let state_dir = dir.path().join("state");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir.clone()),
+            trust_workspace_config: false,
+            ..RuntimeEnv::default()
+        };
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user), &env);
+        let jira = settings.jira.expect("user config applies");
+        assert_eq!(jira.base_url, "https://user.atlassian.net");
+        assert_eq!(jira.email, "user@example.com");
+        assert_eq!(jira.token_env, "DMUXAI_JIRA_TOKEN");
+        match &settings.workspace_trust {
+            WorkspaceTrustStatus::Untrusted { ignored, .. } => {
+                assert!(ignored.contains(&"jira".to_owned()), "{ignored:?}");
+            }
+            other => panic!("expected untrusted, got {other:?}"),
+        }
+
+        // Trusted workspace keeps the repo table.
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(state_dir),
+            trust_workspace_config: true,
+            ..RuntimeEnv::default()
+        };
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user), &env);
+        let jira = settings.jira.expect("repo config applies");
+        assert_eq!(jira.base_url, "https://repo.atlassian.net");
+        assert_eq!(jira.email, "repo@example.com");
+        assert_eq!(jira.token_env, "REPO_JIRA_TOKEN");
     }
 }
 

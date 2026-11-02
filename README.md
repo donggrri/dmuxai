@@ -366,6 +366,35 @@ fake fixture data only.
 
 ![To-do cards with Jira ticket strips (mock data)](docs/images/web-jira.png)
 
+### Jira tickets in the To-dos sidebar (read-only)
+
+The To-dos tab can also list your Jira Cloud tickets in a collapsible
+**Jira** group. Put this in your **user** `dmuxai.toml` (a repo `dmuxai.toml`
+`[jira]` table is ignored until the workspace is trusted):
+
+```toml
+[jira]
+base_url = "https://example.atlassian.net"
+email = "you@example.com"
+# optional:
+# jql = "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC"
+# max_results = 50
+# token_env = "DMUXAI_JIRA_TOKEN"
+```
+
+Then export a Jira API token in the environment that starts dmuxai, for
+example `export DMUXAI_JIRA_TOKEN=...`. The token is read only from that
+variable; dmuxai never writes it to config, logs, errors, or the browser.
+dmuxai only reads Jira (`/rest/api/3/search/jql`, with `/rest/api/3/search`
+as a fallback) and caches results for 60 seconds; the refresh button forces a
+new fetch. Each ticket has **Open in Jira**, **Copy to to-do**, and **Start
+task**, which opens a new conversation with the key and summary in the draft
+but does not send it.
+
+> **Privacy:** once you send ticket text to an agent, it leaves your machine
+> and goes to that agent's model provider. Pick a model your organization
+> allows for that content before you press Send.
+
 ## Requirements
 
 The release binary does not require Rust, Cargo, or Git; coding-agent CLIs

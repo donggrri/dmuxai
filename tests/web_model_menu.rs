@@ -300,6 +300,7 @@ async fn model_menu_search_keyboard_and_no_fast_in_headless_chrome() {
             web_attached: true,
             memory: None,
             docs: None,
+            jira: None,
             trust_env: None,
         },
     };

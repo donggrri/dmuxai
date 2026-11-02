@@ -202,6 +202,20 @@
         </form>
         <p id="import-status" class="import-status" role="status" aria-live="polite" hidden></p>
       </div>
+      <section id="jira-group" class="jira-group" hidden>
+        <div class="jira-group-header">
+          <button id="jira-toggle" type="button" class="jira-toggle" aria-expanded="true" aria-controls="jira-body">
+            <span class="jira-caret" aria-hidden="true">&#9662;</span> Jira
+            <span id="jira-count" class="jira-count">0</span>
+          </button>
+          <button id="jira-refresh" type="button" class="btn jira-refresh" title="Refresh Jira tickets" aria-label="Refresh Jira tickets">Refresh</button>
+        </div>
+        <div id="jira-body">
+          <p id="jira-hint" class="hint" hidden>Set [jira] base_url and email in dmuxai.toml and export DMUXAI_JIRA_TOKEN to list tickets.</p>
+          <p id="jira-banner" class="jira-banner" role="status" aria-live="polite" hidden></p>
+          <ul id="jira-list" class="jira-list"></ul>
+        </div>
+      </section>
       <div class="todo-filter" role="search" aria-label="Filter to-dos">
         <label class="field-label" for="todo-filter-state">Show</label>
         <select id="todo-filter-state" class="todo-filter-state" aria-label="Filter to-dos by state">
@@ -256,6 +270,7 @@
 </div>
 <script src="/assets/memory.js" defer></script>
 <script src="/assets/skills.js" defer></script>
+<script src="/assets/jira-todos.js" defer></script>
 <script src="/assets/agent-prompts.js" defer></script>
 <script src="/assets/session.js" defer></script>
 <script src="/assets/workspace.js" defer></script>
