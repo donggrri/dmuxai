@@ -98,25 +98,31 @@ pub fn read_file_with_view(
 
     let size = metadata.len();
     let mtime = mtime_ms(&metadata);
-    let kind = DocKind::for_path(&resolved.absolute);
+    let extension_kind = DocKind::for_path(&resolved.absolute);
 
-    let (content, sha256, is_valid_utf8) = if size > MAX_TEXT_BYTES {
+    let (kind, content, sha256, is_valid_utf8) = if size > MAX_TEXT_BYTES {
         let sha256 = hash_file_stream(&resolved.absolute)?;
-        (None, sha256, false)
+        (extension_kind, None, sha256, false)
     } else {
         let bytes = std::fs::read(&resolved.absolute)?;
         let sha256 = sha256_hex(&bytes);
+        let kind = if extension_kind == DocKind::Binary {
+            DocKind::for_path_and_bytes(&resolved.absolute, &bytes)
+        } else {
+            extension_kind
+        };
+
         if kind.has_text_content() {
             match String::from_utf8(bytes) {
-                Ok(text) => (Some(text), sha256, true),
-                Err(_) => (None, sha256, false),
+                Ok(text) => (kind, Some(text), sha256, true),
+                Err(_) => (kind, None, sha256, false),
             }
         } else {
-            (None, sha256, false)
+            (kind, None, sha256, false)
         }
     };
 
-    let editable = kind.editable() && size <= MAX_TEXT_BYTES && is_valid_utf8;
+    let editable = extension_kind.editable() && size <= MAX_TEXT_BYTES && is_valid_utf8;
     let view = match (code_view, &kind, &content) {
         (true, DocKind::Text, Some(text)) => {
             crate::docs::highlight::highlight_file_cached(&resolved.relative, &sha256, text)

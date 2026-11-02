@@ -55,8 +55,9 @@
   var docBody = null;
   var docBodies = {};
   // current: { path, kind, editable, sha256, text, html, download,
-  //            editing, dirty } while a document is open; null when closed.
+  //            editing, dirty, showingDiff, diff } while a document is open; null when closed.
   var current = null;
+  var pendingDiffPath = null;
   var conflictPayload = null;
   var renderTimer = null;
 
@@ -1125,7 +1126,7 @@
       for (var i = 0; i < files.length; i++) {
         var file = files[i] || {};
         var fileRow = el('span', 'doc-file');
-        fileRow.appendChild(docLink(String(file.path || '')));
+        fileRow.appendChild(docLinkDiff(String(file.path || '')));
         var change = String(file.change || 'modified');
         fileRow.appendChild(
           docBadge(change, 'doc-chg doc-chg-' + change, 'file was ' + change)
@@ -1307,7 +1308,12 @@
     var open = el('button', 'btn btn-small msg-doc-card-open', 'Open in Diff');
     open.type = 'button';
     open.setAttribute('aria-controls', 'docs');
-    open.addEventListener('click', function () { revealTurn(turn.id); });
+    open.addEventListener('click', function () {
+      if (files.length === 1 && files[0] && files[0].path) {
+        pendingDiffPath = String(files[0].path);
+      }
+      revealTurn(turn.id);
+    });
     card.appendChild(open);
     return card;
   }
@@ -1387,6 +1393,21 @@
     a.addEventListener('click', function (e) {
       e.preventDefault();
       open(path);
+    });
+    return a;
+  }
+
+  function docLinkDiff(path) {
+    var a = el('a', 'doc-link', path);
+    a.href = '#doc=' + encodeURIComponent(path);
+    a.addEventListener('click', function (e) {
+      e.preventDefault();
+      pendingDiffPath = path;
+      if (current && current.path === path) {
+        showDiff();
+      } else {
+        open(path);
+      }
     });
     return a;
   }
@@ -1574,6 +1595,18 @@
     actions.appendChild(btn('Download', 'btn', function () { downloadCurrent(); }));
     actions.appendChild(btn('Save', 'btn btn-primary', function () { save(); }));
     actions.appendChild(btn('Cancel', 'btn', function () { cancelEdit(); }));
+    var diffBtn = btn('Diff', 'btn', function () {
+      if (!current) { return; }
+      if (!current.showingDiff) {
+        showDiff();
+      } else {
+        current.showingDiff = false;
+        renderDocument();
+        updateDocControls();
+      }
+    });
+    diffBtn.id = 'dmuxai-doc-diff-toggle';
+    actions.appendChild(diffBtn);
     foot.appendChild(actions);
 
     var status = el('span', 'doc-status', '');
@@ -1622,6 +1655,7 @@
     var download = buttons[1];
     var save = buttons[2];
     var cancel = buttons[3];
+    var diffBtn = buttons[4];
     // Findings/UX-753: Edit stays hidden until the serve/--web state is
     // known, so a serve user never even attempts the 403-able PUT.
     var editableNow = current.editable
@@ -1632,6 +1666,10 @@
     download.hidden = !current.download;
     save.hidden = !current.editing;
     cancel.hidden = !current.editing;
+    if (diffBtn) {
+      diffBtn.hidden = Boolean(current.editing);
+      diffBtn.textContent = current.showingDiff ? 'File' : 'Diff';
+    }
     docBodies.hint.hidden = !(readOnlyKnown && readOnly && current.editable);
   }
 
@@ -1664,7 +1702,9 @@
       contentOmitted: false,
       download: null,
       editing: false,
-      dirty: false
+      dirty: false,
+      showingDiff: false,
+      diff: null
     };
     docBody.replaceChildren();
     docBody.appendChild(el('p', 'empty', 'Loading ' + path + ' \u2026'));
@@ -1681,9 +1721,21 @@
         current.codeHtml = typeof doc.code_html === 'string' ? doc.code_html : null;
         current.contentOmitted = Boolean(doc.content_omitted);
         setBadges(doc);
-        renderDocument();
+        if (pendingDiffPath === path) {
+          pendingDiffPath = null;
+          showDiff();
+        } else {
+          renderDocument();
+        }
       })
-      .catch(showLoadError);
+      .catch(function (err) {
+        if (pendingDiffPath === path && err && err.status === 404) {
+          pendingDiffPath = null;
+          showDiff();
+          return;
+        }
+        showLoadError(err);
+      });
   }
 
   function renderDocument() {
@@ -1948,11 +2000,97 @@
     docBody.replaceChildren();
     var wrap = el('div', 'doc-dl');
     wrap.appendChild(el('p', 'doc-error', 'Preview not available for this file type.'));
+    var showDiffBtn = btn('Show git diff', 'btn', function () {
+      showDiff();
+    });
+    wrap.appendChild(showDiffBtn);
     if (download) {
       current.download = String(download);
       wrap.appendChild(downloadAnchor());
     }
     docBody.appendChild(wrap);
+  }
+
+  function diffLineClass(line) {
+    if (
+      line.indexOf('diff --git') === 0 ||
+      line.indexOf('index ') === 0 ||
+      line.indexOf('--- ') === 0 ||
+      line.indexOf('+++ ') === 0 ||
+      line.indexOf('new file mode') === 0 ||
+      line.indexOf('deleted file mode') === 0 ||
+      line.indexOf('similarity') === 0 ||
+      line.indexOf('rename ') === 0 ||
+      line.indexOf('old mode') === 0 ||
+      line.indexOf('new mode') === 0
+    ) {
+      return 'diff-meta';
+    }
+    if (line.indexOf('@@') === 0) {
+      return 'diff-hunk';
+    }
+    if (line.indexOf('+') === 0) {
+      return 'diff-add';
+    }
+    if (line.indexOf('-') === 0) {
+      return 'diff-del';
+    }
+    if (line.indexOf('Binary files ') === 0) {
+      return 'diff-bin';
+    }
+    return 'diff-ctx';
+  }
+
+  function showDiff() {
+    if (!current) { return; }
+    var targetPath = current.path;
+    api('GET', '/api/docs/diff?path=' + encodeURIComponent(targetPath))
+      .then(function (res) {
+        if (!current || current.path !== targetPath) { return; }
+        current.showingDiff = true;
+        current.diff = res.diff;
+        docBody.replaceChildren();
+        if (!res.diff) {
+          docBody.appendChild(el('p', 'empty', 'No changes against HEAD.'));
+        } else {
+          var headText = res.untracked
+            ? 'git diff --no-index /dev/null ' + targetPath
+            : 'git diff HEAD -- ' + targetPath;
+          var headDiv = el('div', 'doc-diff-head');
+          headDiv.appendChild(document.createTextNode(headText));
+          var copyBtn = btn('Copy raw', 'btn', function () {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(res.diff).catch(function () {});
+            }
+          });
+          headDiv.appendChild(copyBtn);
+          docBody.appendChild(headDiv);
+
+          var pre = el('pre', 'doc-diff');
+          var rawLines = res.diff.split('\n');
+          if (rawLines.length > 0 && rawLines[rawLines.length - 1] === '') {
+            rawLines.pop();
+          }
+          for (var i = 0; i < rawLines.length; i++) {
+            var line = rawLines[i];
+            var span = el('span', diffLineClass(line));
+            span.appendChild(document.createTextNode(line + '\n'));
+            pre.appendChild(span);
+          }
+          docBody.appendChild(pre);
+          if (res.truncated) {
+            docBody.appendChild(el('p', 'doc-error', 'Diff truncated at 2 MiB.'));
+          }
+        }
+        updateDocControls();
+      })
+      .catch(function (err) {
+        if (!current || current.path !== targetPath) { return; }
+        current.showingDiff = true;
+        docBody.replaceChildren();
+        docBody.appendChild(el('p', 'doc-error', 'Diff unavailable: ' + (err && err.message ? err.message : String(err))));
+        updateDocControls();
+      });
   }
 
   function downloadAnchor() {

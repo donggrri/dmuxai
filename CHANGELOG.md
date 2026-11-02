@@ -35,6 +35,13 @@ All notable changes to dmuxai are listed here. Versions follow
 - **A tab for a closed folder falls back to the first folder (FR-2314).** If a
   dashboard tab's `ws` folder is no longer open, the page reloads once on the
   first folder instead of polling a missing folder.
+- **Git diff for any text file in the doc viewer (FR-2260..FR-2262).** Files with an
+  unrecognized extension (for example Yocto `.bbappend`) are now previewed as plain text
+  when their content is text, decided like git (no NUL byte in the first 8000 bytes).
+  A new read-only `GET /api/docs/diff?path=` returns the exact `git diff HEAD` output for
+  one file (untracked and deleted files included, 2 MiB cap), and the viewer's **Diff**
+  toggle shows it line for line with **Copy raw**. Files opened from the Diff view open
+  straight in their diff, and real binaries show git's `Binary files ... differ` line.
 
 ### Changed
 

@@ -292,6 +292,7 @@ fn docs_error_response(error: DocsError) -> Response {
                 .into_response()
         }
         DocsError::NotUtf8 => error_json(StatusCode::UNSUPPORTED_MEDIA_TYPE, "not utf-8"),
+        DocsError::NotGitRepo => error_json(StatusCode::CONFLICT, "not a git repository"),
         DocsError::Io(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
 }
@@ -455,6 +456,27 @@ async fn get_file(
         Ok(Ok(doc_file)) => json_ok(StatusCode::OK, &doc_file),
         Ok(Err(e)) => docs_error_response(e),
         Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "read failed"),
+    }
+}
+
+async fn get_diff(
+    State(state): State<DocsApiState>,
+    uri: axum::http::Uri,
+    Query(query): Query<RenderPathQuery>,
+) -> Response {
+    let docs = state.docs_for(uri.query());
+    let Some(service) = &docs else {
+        return error_json(StatusCode::NOT_FOUND, "no such open folder");
+    };
+    let workspace = service.workspace.clone();
+    let path = query.path;
+    let diff =
+        tokio::task::spawn_blocking(move || crate::docs::git_diff::file_diff(&workspace, &path))
+            .await;
+    match diff {
+        Ok(Ok(file_diff)) => json_ok(StatusCode::OK, &file_diff),
+        Ok(Err(e)) => docs_error_response(e),
+        Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "diff failed"),
     }
 }
 
@@ -944,6 +966,7 @@ where
         .route("/api/docs", get(get_docs))
         .route("/api/docs/tree", get(get_tree))
         .route("/api/docs/file", get(get_file).put(put_file))
+        .route("/api/docs/diff", get(get_diff))
         .route("/api/docs/render", get(get_render).post(post_render))
         .route("/api/docs/view", post(post_view))
         .route("/docs/view/{ticket}", get(get_view_ticket))
@@ -1856,6 +1879,15 @@ mod tests {
         let resp_tree = router.clone().oneshot(req_tree).await.unwrap();
         assert_eq!(resp_tree.status(), StatusCode::UNAUTHORIZED);
 
+        // Diff without token -> 401
+        let req_diff = axum::http::Request::builder()
+            .uri("/api/docs/diff?path=some.txt")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_diff = router.clone().oneshot(req_diff).await.unwrap();
+        assert_eq!(resp_diff.status(), StatusCode::UNAUTHORIZED);
+
         // 5. Asset routes require no token -> 200
         let req_js = axum::http::Request::builder()
             .uri("/assets/docs.js")
@@ -1916,6 +1948,98 @@ mod tests {
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // TC-2264 (FR-2261, NFR-751)
+    #[tokio::test]
+    async fn diff_route_returns_git_diff() {
+        use std::process::Command;
+        let has_git = Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_git {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        assert!(
+            Command::new("git")
+                .current_dir(root)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .current_dir(root)
+                .args(["config", "user.name", "t"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .current_dir(root)
+                .args(["config", "user.email", "t@e"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let filename = "openssh_%.bbappend";
+        std::fs::write(root.join(filename), "SRC_URI = \"old\"\n").unwrap();
+        assert!(
+            Command::new("git")
+                .current_dir(root)
+                .args(["add", filename])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .current_dir(root)
+                .args(["commit", "-m", "init"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join(filename), "SRC_URI = \"new\"\n").unwrap();
+
+        let ws = Workspace::new(root).unwrap();
+        let token = "testtoken";
+        let service =
+            test_docs_service(ws, false, crate::docs::changes::ChangeLog::default(), None);
+        let router = test_router(Some(service), token);
+
+        // 1. Without token -> 401
+        let req_unauth = axum::http::Request::builder()
+            .uri("/api/docs/diff?path=openssh_%25.bbappend")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_unauth = router.clone().oneshot(req_unauth).await.unwrap();
+        assert_eq!(resp_unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. With token -> 200 with diff --git
+        let req = axum::http::Request::builder()
+            .uri("/api/docs/diff?path=openssh_%25.bbappend")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["path"], "openssh_%.bbappend");
+        let diff_str = val["diff"].as_str().unwrap();
+        assert!(diff_str.contains("diff --git a/openssh_%.bbappend b/openssh_%.bbappend"));
     }
 
     // TC-831: tree_api_confined_and_bounded (SPEC-docs-tree FR-830, FR-831)

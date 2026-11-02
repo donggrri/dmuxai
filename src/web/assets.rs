@@ -1998,6 +1998,7 @@ mod tests {
         );
     }
 
+    // TC-2265 (FR-2262)
     #[test]
     fn tc_2302_api_url_carries_ws() {
         assert!(
@@ -2116,6 +2117,18 @@ mod tests {
         assert!(
             SESSION_CSS.contains(".sessions-group-close"),
             "SESSION_CSS must contain .sessions-group-close"
+        );
+    }
+
+    #[test]
+    fn docs_js_diff_view_uses_text_nodes() {
+        assert!(DOCS_JS.contains("'/api/docs/diff?path=' + encodeURIComponent"));
+        assert!(DOCS_JS.contains("dmuxai-doc-diff-toggle"));
+        assert!(DOCS_JS.contains("doc-diff"));
+        let diff_js = js_between(DOCS_JS, "function showDiff()", "function downloadAnchor()");
+        assert!(
+            !diff_js.contains("innerHTML"),
+            "showDiff function must not use innerHTML"
         );
     }
 }

@@ -7,6 +7,7 @@
 pub mod changes;
 pub mod confine;
 pub mod file;
+pub mod git_diff;
 pub mod highlight;
 pub mod links;
 pub mod list;
@@ -16,6 +17,16 @@ pub mod office;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+/// Number of initial bytes inspected for binary vs text content.
+pub const BINARY_SNIFF_BYTES: usize = 8000;
+
+/// Returns true if git's binary heuristic detects binary content
+/// (a NUL byte within the first 8000 bytes).
+pub fn looks_binary(bytes: &[u8]) -> bool {
+    let sniff_len = bytes.len().min(BINARY_SNIFF_BYTES);
+    bytes[..sniff_len].contains(&0)
+}
 
 /// NFR-752: read/save/render limit.
 pub const MAX_TEXT_BYTES: u64 = 2 * 1024 * 1024;
@@ -156,6 +167,19 @@ impl DocKind {
         }
     }
 
+    /// Derives the document kind by checking file extension and sniffing content bytes.
+    ///
+    /// Unknown extensions (e.g. Yocto `.bbappend`, `.bb`, `.inc`, `.patch`) are text
+    /// when their content is text.
+    pub fn for_path_and_bytes(path: &Path, bytes: &[u8]) -> DocKind {
+        let kind = Self::for_path(path);
+        if kind == DocKind::Binary && !looks_binary(bytes) && std::str::from_utf8(bytes).is_ok() {
+            DocKind::Text
+        } else {
+            kind
+        }
+    }
+
     /// Kinds whose content may be edited (FR-744/FR-745). Size and UTF-8
     /// validity are checked separately.
     pub fn editable(self) -> bool {
@@ -187,6 +211,8 @@ pub enum DocsError {
     Conflict { sha256: String, mtime_ms: u64 },
     /// Content is not valid UTF-8 -> 415.
     NotUtf8,
+    /// Git repository not found -> 409.
+    NotGitRepo,
     /// I/O or other internal failure -> 500 (message is logged, not returned).
     Io(String),
 }
@@ -251,5 +277,36 @@ mod tests {
         assert!(DocKind::Markdown.editable());
         assert!(!DocKind::Html.editable());
         assert!(DocKind::Html.has_text_content());
+    }
+
+    // TC-2260 (FR-2260)
+    #[test]
+    fn sniff_unknown_extension_text_is_text() {
+        let text_bytes = b"SRC_URI += \"file://x\"\n";
+        assert_eq!(
+            DocKind::for_path_and_bytes(Path::new("a/openssh_%.bbappend"), text_bytes),
+            DocKind::Text
+        );
+
+        let bin_bytes = b"SRC_URI += \"file://x\"\n\0";
+        assert_eq!(
+            DocKind::for_path_and_bytes(Path::new("a/openssh_%.bbappend"), bin_bytes),
+            DocKind::Binary
+        );
+
+        assert_eq!(
+            DocKind::for_path_and_bytes(Path::new("x.md"), text_bytes),
+            DocKind::Markdown
+        );
+
+        // and a read_file on a temp .bbappend returns kind Text, content Some, editable false
+        let temp = tempfile::tempdir().unwrap();
+        let ws = crate::docs::confine::Workspace::new(temp.path()).unwrap();
+        let filename = "recipe_%.bbappend";
+        std::fs::write(temp.path().join(filename), text_bytes).unwrap();
+        let doc = crate::docs::file::read_file(&ws, filename).unwrap();
+        assert_eq!(doc.kind, DocKind::Text);
+        assert_eq!(doc.content.as_deref(), Some("SRC_URI += \"file://x\"\n"));
+        assert!(!doc.editable);
     }
 }

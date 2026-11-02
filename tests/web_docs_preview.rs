@@ -252,3 +252,236 @@ with sync_playwright() as p:
     );
     assert!(screenshot_file.exists(), "screenshot was not captured");
 }
+
+// TC-2266 (FR-2260, FR-2262)
+#[test]
+#[ignore = "needs Chrome/Chromium; run with --ignored"]
+fn docs_diff_unknown_extension_in_headless_chrome() {
+    let git_status = Command::new("git")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !git_status.map(|s| s.success()).unwrap_or(false) {
+        println!("SKIP: git not found or git --version failed");
+        return;
+    }
+
+    let Some(chrome) = find_chrome() else {
+        println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
+        return;
+    };
+
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let ws_path = workspace.path();
+
+    let run_git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(ws_path)
+            .status()
+            .expect("execute git");
+        assert!(status.success(), "git command failed: {args:?}");
+    };
+
+    run_git(&["init", "-q"]);
+    run_git(&["config", "user.name", "t"]);
+    run_git(&["config", "user.email", "t@e"]);
+
+    let bbappend_name = "openssh_%.bbappend";
+    let bbappend_v1 =
+        "FILESEXTRAPATHS_prepend := \"${THISDIR}/files:\"\nSRC_URI += \"file://sample.conf\"\n";
+    let bbappend_path = ws_path.join(bbappend_name);
+    std::fs::write(&bbappend_path, bbappend_v1).expect("write bbappend v1");
+
+    let blob_name = "blob.bin";
+    let blob_v1 = b"\x00\x01binary";
+    let blob_path = ws_path.join(blob_name);
+    std::fs::write(&blob_path, blob_v1).expect("write blob v1");
+
+    run_git(&["add", bbappend_name, blob_name]);
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@e",
+            "commit",
+            "-m",
+            "initial",
+        ])
+        .current_dir(ws_path)
+        .status()
+        .expect("git commit");
+    assert!(status.success(), "git commit failed");
+
+    let bbappend_v2 =
+        "FILESEXTRAPATHS_prepend := \"${THISDIR}/files:\"\nSRC_URI += \"file://other.conf\"\n";
+    std::fs::write(&bbappend_path, bbappend_v2).expect("write bbappend v2");
+
+    let blob_v2 = b"\x00\x02binary2";
+    std::fs::write(&blob_path, blob_v2).expect("write blob v2");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
+        .args(["serve", "--port", "0"])
+        .current_dir(ws_path)
+        .env_remove("DMUXAI_WORKSPACE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn dmuxai serve");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let _guard = ChildGuard(Some(child));
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("dashboard URL line");
+    let url = line
+        .trim()
+        .strip_prefix("dmuxai dashboard: ")
+        .unwrap_or_else(|| panic!("unexpected first stdout line: {line:?}"))
+        .to_owned();
+
+    let script = r##"
+import sys
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    b = p.chromium.launch(executable_path=sys.argv[1], args=["--no-sandbox"])
+    pg = b.new_page()
+
+    # 1. goto url + '#doc=openssh_%25.bbappend'
+    url = sys.argv[2]
+    pg.goto(url + '#doc=' + 'openssh_%25.bbappend')
+    pg.wait_for_selector('.doc-plain-view, .doc-code-view', timeout=15000)
+    plain_content = pg.content()
+    visible = 'file://other.conf' in plain_content
+    print(f"BBAPPEND_VISIBLE:{visible}")
+    if 'Preview not available for this file type.' in plain_content:
+        print("BBAPPEND_HAS_UNAVAILABLE:TRUE")
+    else:
+        print("BBAPPEND_HAS_UNAVAILABLE:FALSE")
+
+    # Click Diff toggle
+    pg.wait_for_selector('#dmuxai-doc-diff-toggle', timeout=15000)
+    pg.click('#dmuxai-doc-diff-toggle')
+    pg.wait_for_selector('pre.doc-diff', timeout=15000)
+    diff_text = pg.query_selector('pre.doc-diff').text_content()
+    print("===BBAPPEND_DIFF_START===")
+    print(diff_text)
+    print("===BBAPPEND_DIFF_END===")
+
+    # 2. goto url + '#doc=blob.bin'
+    pg.goto(url + '#doc=blob.bin')
+    # wait for 'Show git diff' button
+    diff_btn = pg.wait_for_selector('text=Show git diff', timeout=15000)
+    diff_btn.click()
+    pg.wait_for_selector('pre.doc-diff', timeout=15000)
+    blob_diff_text = pg.query_selector('pre.doc-diff').text_content()
+    print("===BLOB_DIFF_START===")
+    print(blob_diff_text)
+    print("===BLOB_DIFF_END===")
+
+    b.close()
+"##;
+
+    let python = "python3";
+    let probe = Command::new(python)
+        .args(["-c", "import playwright"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !probe.map(|status| status.success()).unwrap_or(false) {
+        println!("SKIP: python playwright not installed");
+        return;
+    }
+
+    let mut py_child = Command::new(python)
+        .args(["-c", script])
+        .arg(&chrome)
+        .arg(&url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn playwright");
+    let (tx_out, rx_out) = mpsc::channel();
+    let mut py_stdout = py_child.stdout.take().expect("py stdout");
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut out = Vec::new();
+        let _ = py_stdout.read_to_end(&mut out);
+        let _ = tx_out.send(out);
+    });
+    let out_bytes = match rx_out.recv_timeout(Duration::from_secs(45)) {
+        Ok(b) => {
+            let _ = py_child.wait();
+            b
+        }
+        Err(_) => {
+            let _ = py_child.kill();
+            let _ = py_child.wait();
+            panic!("playwright execution timed out after 45s");
+        }
+    };
+    let output = String::from_utf8_lossy(&out_bytes);
+
+    assert!(
+        output.contains("BBAPPEND_VISIBLE:True"),
+        "bbappend text not visible:\n{output}"
+    );
+    assert!(
+        output.contains("BBAPPEND_HAS_UNAVAILABLE:FALSE"),
+        "page contained 'Preview not available for this file type.':\n{output}"
+    );
+
+    let bbappend_diff = if let Some(start) = output.find("===BBAPPEND_DIFF_START===\n") {
+        let rest = &output[start + "===BBAPPEND_DIFF_START===\n".len()..];
+        if let Some(end) = rest.find("\n===BBAPPEND_DIFF_END===") {
+            &rest[..end]
+        } else {
+            ""
+        }
+    } else {
+        ""
+    };
+
+    assert!(
+        bbappend_diff.contains("diff --git a/openssh_%.bbappend b/openssh_%.bbappend"),
+        "missing diff header in bbappend diff:\n{bbappend_diff}"
+    );
+    assert!(
+        bbappend_diff.contains("@@"),
+        "missing hunk header in bbappend diff:\n{bbappend_diff}"
+    );
+    assert!(
+        bbappend_diff.contains("-SRC_URI += \"file://sample.conf\""),
+        "missing deleted line in bbappend diff:\n{bbappend_diff}"
+    );
+    assert!(
+        bbappend_diff.contains("+SRC_URI += \"file://other.conf\""),
+        "missing added line in bbappend diff:\n{bbappend_diff}"
+    );
+
+    let blob_diff = if let Some(start) = output.find("===BLOB_DIFF_START===\n") {
+        let rest = &output[start + "===BLOB_DIFF_START===\n".len()..];
+        if let Some(end) = rest.find("\n===BLOB_DIFF_END===") {
+            &rest[..end]
+        } else {
+            ""
+        }
+    } else {
+        ""
+    };
+
+    assert!(
+        blob_diff.contains("Binary files a/blob.bin and b/blob.bin differ"),
+        "missing binary files differ line in blob diff:\n{blob_diff}"
+    );
+}
