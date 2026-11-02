@@ -1073,6 +1073,95 @@ main {
   border-color: var(--err);
 }
 
+/* Filled confirm (FR-2368). --err is too light for white text in the dark
+   palette, so both themes use the same dark red (white contrast about 5.6:1). */
+.btn-danger.btn-confirm,
+.btn-danger-solid {
+  background: #c62828;
+  color: #ffffff;
+  border-color: #c62828;
+}
+.btn-danger.btn-confirm:hover:not(:disabled),
+.btn-danger-solid:hover:not(:disabled) {
+  background: #8e1b1b;
+  color: #ffffff;
+  border-color: #8e1b1b;
+}
+
+/* Button system (SPEC-dashboard-settings-ux FR-2366, FR-2367). */
+.btn {
+  min-height: 36px;
+  padding: 9px 14px;
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+}
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn-secondary,
+.btn--secondary {
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  border-color: var(--line);
+}
+.btn.is-busy,
+.btn-busy,
+.btn[aria-busy="true"] {
+  opacity: 0.7;
+  cursor: progress;
+}
+.settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-chip);
+}
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 30px;
+}
+.settings-row-label {
+  font-weight: 700;
+}
+.settings-row-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  flex: 0 0 auto;
+  min-width: max-content;
+  max-width: none;
+}
+.settings-row-hint {
+  color: var(--muted);
+  font-size: 0.85em;
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.settings-info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.75em;
+  cursor: help;
+}
+
 .todo-list {
   margin-top: 10px;
 }
@@ -1563,6 +1652,59 @@ main {
 
 .memory-name-input {
   max-width: 14em;
+}
+
+/* FR-2364: label on the left, control on the right. These beat the older
+   .memory-field column, .memory-target-row wrap, and full-width inputs. */
+.memory-popover .memory-controls.settings-group > .settings-row {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 0;
+}
+.memory-popover .settings-row > .settings-row-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  flex: 0 0 auto;
+  min-width: max-content;
+  max-width: none;
+}
+.memory-popover .settings-row > .settings-row-copy > .settings-row-hint {
+  white-space: nowrap;
+  max-width: none;
+}
+.memory-popover .settings-row > .settings-row-control {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.memory-popover .settings-row .memory-field {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.memory-popover .settings-row .memory-target-select,
+.memory-popover .settings-row .memory-name-input,
+.memory-popover .settings-row .memory-text-input {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+  flex: 1 1 auto;
+}
+.memory-popover .settings-row .memory-action-btn {
+  flex: none;
 }
 
 .memory-status {
@@ -2348,8 +2490,15 @@ main {
 
 /* SPEC-stage-skills UX-1500 / UX-1501 */
 .skills-popover { width: min(46rem, 96vw); max-height: min(80vh, 40rem); }
+.skills-title-row { display: flex; align-items: center; gap: .4rem; margin: 0 0 .5rem; }
+.skills-title-row .memory-title { margin: 0; }
 .skills-table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
 .skills-table th, .skills-table td { border-bottom: 1px solid var(--border, #ddd); padding: 4px 6px; text-align: left; vertical-align: middle; }
 .skills-input { width: 100%; min-width: 180px; }
 .skills-status { color: var(--muted, #666); }
 .graph-approval-skills { font-style: italic; }
+
+@media (prefers-reduced-motion: reduce) {
+  .graph-svg .run-dot { animation: none; }
+  .btn, .settings-row, .settings-info, .panel-caret { transition: none; animation: none; }
+}

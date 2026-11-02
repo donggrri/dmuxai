@@ -75,7 +75,8 @@
 .session-prompt { flex: none; box-sizing: border-box; display: flex; flex-direction: column; gap: .35rem; width: calc(100% - 2rem); max-width: calc(var(--chat-col) - 2rem); margin: .5rem auto 0; padding: .6rem .75rem .5rem; background: var(--bg-chip); border: 1px solid var(--line); border-radius: 1.5rem; box-shadow: 0 2px 10px rgba(0, 0, 0, .06); }
 .session-prompt:focus-within { border-color: var(--accent); }
 .session-composer-top { display: flex; align-items: flex-end; gap: .5rem; width: 100%; }
-.session-agent-picker { flex: none; display: inline-flex; align-items: center; gap: .35rem; max-width: 11rem; padding: .25rem .55rem; border: 1px solid var(--line); border-radius: 999px; background: var(--bg); color: var(--text); font: inherit; font-size: .78rem; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session-agent-picker { flex: 0 1 auto; display: inline-flex; align-items: center; gap: .35rem; max-width: 18rem; min-width: 0; padding: .25rem .55rem; border: 1px solid var(--line); border-radius: 999px; background: var(--bg); color: var(--text); font: inherit; font-size: .78rem; cursor: pointer; }
+.session-agent-picker-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .session-agent-picker::before { content: ""; width: .5rem; height: .5rem; border-radius: 50%; background: var(--agent-picker-dot, var(--accent)); flex: none; }
 .session-agent-picker::after { content: ""; display: none; width: .65rem; height: .65rem; margin-left: .15rem; border: 2px solid var(--muted); border-top-color: var(--accent); border-radius: 50%; animation: session-picker-spin .8s linear infinite; flex: none; }
 .session-agent-picker.session-agent-picker-running::after { display: inline-block; }
@@ -230,3 +231,43 @@ button.chat-aux-head:focus-visible, .chat-aux-step-btn:focus-visible { outline: 
 .sessions-group-close:hover:not(:disabled) { background: var(--bg-chip); color: var(--text); }
 .sessions-group-state { margin-left: 6px; color: var(--muted); font-size: .75rem; }
 .sessions-group-running .spinner { display: inline-block; width: .7rem; height: .7rem; margin-left: 6px; border: 2px solid var(--muted); border-top-color: var(--accent); border-radius: 50%; animation: session-picker-spin .8s linear infinite; vertical-align: middle; }
+
+/* Run controls (SPEC-dashboard-settings-ux FR-2360, FR-2361).
+   One shrinking row: pill and route select share the pill height.
+   nowrap so the route select cannot drop onto a second line. */
+.session-run-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+  min-width: 0;
+  flex: 0 1 auto;
+  max-width: 100%;
+}
+.session-composer-top .session-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
+}
+.session-run-controls .session-agent-picker,
+.session-run-controls .session-select {
+  height: 1.75rem;
+  box-sizing: border-box;
+}
+.session-run-controls .session-agent-picker {
+  min-width: 0;
+}
+.session-run-controls .session-picker {
+  flex-direction: row;
+  align-items: center;
+  gap: 0;
+  min-width: 0;
+  flex: 0 0 auto;
+}
+.session-run-controls .session-select {
+  padding: 0 .6rem;
+  border-radius: 999px;
+  background: var(--bg);
+  font-size: .78rem;
+  line-height: 1.2;
+}

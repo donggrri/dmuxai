@@ -134,7 +134,11 @@
 
   function setBusy() {
     var busy = inFlight > 0;
-    if (saveBtn) { saveBtn.disabled = busy; }
+    if (saveBtn) {
+      saveBtn.disabled = busy;
+      saveBtn.textContent = busy ? 'Saving…' : 'Save';
+      saveBtn.classList.toggle('is-busy', busy);
+    }
     if (!pendingMount) { return; }
     var buttons = pendingMount.querySelectorAll('.memory-action-btn');
     for (var i = 0; i < buttons.length; i++) {
@@ -257,7 +261,7 @@
             'Approved.'
           );
         });
-        var rejectBtn = el('button', 'btn memory-action-btn', 'Reject');
+        var rejectBtn = el('button', 'btn btn-secondary memory-action-btn', 'Reject');
         rejectBtn.type = 'button';
         rejectBtn.addEventListener('click', function () {
           var id = String(item.id || '');
@@ -285,12 +289,22 @@
     metaEl = el('p', 'memory-meta');
     root.appendChild(metaEl);
 
-    var controlsWrap = el('div', 'memory-controls');
+    var controlsWrap = el('div', 'memory-controls settings-group');
 
-    var targetRow = el('div', 'memory-target-row');
-    var targetField = el('label', 'memory-field');
-    targetField.appendChild(el('span', 'field-label', 'Target'));
+    function settingsCopy(label, hint) {
+      var copy = el('div', 'settings-row-copy');
+      copy.appendChild(el('div', 'settings-row-label', label));
+      var hintEl = el('div', 'settings-row-hint', hint);
+      hintEl.title = hint;
+      copy.appendChild(hintEl);
+      return copy;
+    }
+
+    var targetRow = el('div', 'settings-row');
+    targetRow.appendChild(settingsCopy('Target', 'Where the entry is saved'));
+    var targetControl = el('div', 'settings-row-control');
     targetSelect = el('select', 'memory-target-select');
+    targetSelect.setAttribute('aria-label', 'Target');
     [
       ['project', 'Project'],
       ['human', 'User (human.md)'],
@@ -302,33 +316,37 @@
       targetSelect.appendChild(opt);
     });
     targetSelect.addEventListener('change', onTargetChange);
-    targetField.appendChild(targetSelect);
-    targetRow.appendChild(targetField);
+    targetControl.appendChild(targetSelect);
+    targetRow.appendChild(targetControl);
+    controlsWrap.appendChild(targetRow);
 
-    nameField = el('label', 'memory-field');
-    nameField.appendChild(el('span', 'field-label', 'Name'));
+    nameField = el('div', 'settings-row');
+    nameField.appendChild(settingsCopy('Name', 'File name for a decision or gotcha'));
+    var nameControl = el('div', 'settings-row-control');
     nameInput = el('input', 'memory-name-input');
     nameInput.type = 'text';
     nameInput.maxLength = 48;
     nameInput.autocomplete = 'off';
-    nameField.appendChild(nameInput);
+    nameInput.setAttribute('aria-label', 'Name');
+    nameControl.appendChild(nameInput);
+    nameField.appendChild(nameControl);
     nameField.hidden = true;
-    targetRow.appendChild(nameField);
-    controlsWrap.appendChild(targetRow);
+    controlsWrap.appendChild(nameField);
 
-    var saveRow = el('div', 'memory-save-row');
-    var textField = el('label', 'memory-field');
-    textField.appendChild(el('span', 'field-label', 'Entry'));
+    var saveRow = el('div', 'settings-row');
+    saveRow.appendChild(settingsCopy('Entry', 'One fact per entry'));
+    var entryControl = el('div', 'settings-row-control');
     textInput = el('input', 'memory-text-input');
     textInput.type = 'text';
     textInput.maxLength = TEXT_MAX;
     textInput.autocomplete = 'off';
-    textField.appendChild(textInput);
-    saveRow.appendChild(textField);
+    textInput.setAttribute('aria-label', 'Entry');
+    entryControl.appendChild(textInput);
     saveBtn = el('button', 'btn btn-primary memory-action-btn', 'Save');
     saveBtn.type = 'button';
     saveBtn.addEventListener('click', onSaveClick);
-    saveRow.appendChild(saveBtn);
+    entryControl.appendChild(saveBtn);
+    saveRow.appendChild(entryControl);
     controlsWrap.appendChild(saveRow);
 
     statusEl = el('p', 'memory-status');

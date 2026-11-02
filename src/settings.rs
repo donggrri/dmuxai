@@ -1907,7 +1907,7 @@ fn find_on_path_in(name: &str, path_var: Option<&std::ffi::OsStr>) -> Option<Pat
 }
 
 /// A regular file the current user may execute (any execute bit).
-fn is_executable_file(path: &Path) -> bool {
+pub fn is_executable_file(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };

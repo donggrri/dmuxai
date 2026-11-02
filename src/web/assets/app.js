@@ -3482,11 +3482,32 @@ function todoViewActions(id, todo) {
   wrap.appendChild(todoButton('btn-edit', 'Edit', function() {
     startEdit(id);
   }));
-  wrap.appendChild(todoButton('btn-delete btn-danger', 'Delete', function() {
-    if (window.confirm('Delete to-do "' + String(todo.title || '') + '"?')) {
+  var deleteBtn = todoButton('btn-delete btn-danger', 'Delete', function() {
+    if (deleteBtn.dataset.confirming === '1') { return; }
+    deleteBtn.dataset.confirming = '1';
+    deleteBtn.hidden = true;
+    var confirmBtn = todoButton('btn-danger btn-confirm', 'Confirm', function() {
+      delete deleteBtn.dataset.confirming;
       deleteTodo(id);
-    }
-  }));
+    });
+    var cancelBtn = todoButton('btn-secondary', 'Cancel', function() {
+      delete deleteBtn.dataset.confirming;
+      if (confirmBtn.parentNode) { confirmBtn.parentNode.removeChild(confirmBtn); }
+      if (cancelBtn.parentNode) { cancelBtn.parentNode.removeChild(cancelBtn); }
+      deleteBtn.hidden = false;
+    });
+    wrap.insertBefore(confirmBtn, deleteBtn);
+    wrap.insertBefore(cancelBtn, deleteBtn);
+    window.setTimeout(function() {
+      if (deleteBtn.dataset.confirming === '1') {
+        delete deleteBtn.dataset.confirming;
+        if (confirmBtn.parentNode) { confirmBtn.parentNode.removeChild(confirmBtn); }
+        if (cancelBtn.parentNode) { cancelBtn.parentNode.removeChild(cancelBtn); }
+        deleteBtn.hidden = false;
+      }
+    }, 4000);
+  });
+  wrap.appendChild(deleteBtn);
   return wrap;
 }
 
@@ -3503,6 +3524,24 @@ function todoRunControls(id, status) {
 
   var agents = Array.isArray(snap.agents) ? snap.agents : [];
 
+  // Session agents carry allowed / available (FR-2363). A missing runner
+  // stays in the list, disabled, with unavailable_reason as the title.
+  function todoAgentUnavailable(agent) {
+    var sessionAgents = snapshot && snapshot.session && Array.isArray(snapshot.session.agents)
+      ? snapshot.session.agents : [];
+    var src = agent || {};
+    for (var n = 0; n < sessionAgents.length; n++) {
+      if (sessionAgents[n] && sessionAgents[n].id === src.id) { src = sessionAgents[n]; break; }
+    }
+    if (src.available === false) {
+      return String(src.unavailable_reason || 'not available');
+    }
+    if (src.allowed === false) {
+      return 'not allowed by runner policy';
+    }
+    return '';
+  }
+
   var select = el('select', 'todo-agent-select');
   select.setAttribute('aria-label', 'Agent to run this to-do');
   for (var i = 0; i < agents.length; i++) {
@@ -3511,6 +3550,8 @@ function todoRunControls(id, status) {
     opt.value = String(agent.id || '');
     opt.textContent = String(agent.label || agent.id || '');
     if (agent.busy) { opt.disabled = true; }
+    var unavailable = todoAgentUnavailable(agent);
+    if (unavailable) { opt.disabled = true; opt.title = unavailable; }
     select.appendChild(opt);
   }
   row.appendChild(select);

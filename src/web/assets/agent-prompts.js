@@ -76,7 +76,7 @@
       });
       var save = el('button', 'btn btn-primary', 'Save');
       save.type = 'button';
-      var clear = el('button', 'btn', 'Clear');
+      var clear = el('button', 'btn btn-secondary', 'Clear');
       clear.type = 'button';
       save.addEventListener('click', function () {
         api('POST', '/api/agent-prompts', {

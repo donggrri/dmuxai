@@ -2131,4 +2131,217 @@ mod tests {
             "showDiff function must not use innerHTML"
         );
     }
+
+    #[test]
+    fn tc_2360_run_controls_grouped() {
+        assert!(
+            SESSION_JS.contains("session-run-controls"),
+            "SESSION_JS must contain session-run-controls"
+        );
+        assert!(
+            SESSION_CSS.contains(".session-run-controls"),
+            "SESSION_CSS must contain .session-run-controls"
+        );
+        assert!(
+            SESSION_CSS.contains("flex-wrap: nowrap"),
+            "run controls stay on one row"
+        );
+        assert!(
+            SESSION_JS.contains("select.setAttribute('aria-label', label)"),
+            "route select uses an aria-label instead of a stacked label"
+        );
+        assert!(
+            !SESSION_JS.contains("el('span', 'field-label', label)"),
+            "route label is not stacked above the select"
+        );
+        assert!(
+            SESSION_JS.contains("runControls.appendChild(ui.route.parentNode)"),
+            "route selector stays in the run-controls row"
+        );
+    }
+
+    #[test]
+    fn tc_2361_collapsed_shows_agent_and_model() {
+        assert!(
+            SESSION_JS.contains("span.textContent = label + model;"),
+            "agent picker shows agent and model"
+        );
+        assert!(
+            SESSION_JS.contains("ui.agentPicker.title = label + model;"),
+            "picker title is the full agent · model text"
+        );
+        assert!(
+            SESSION_JS.contains("session-agent-picker-label"),
+            "label lives in an inner span so the ellipsis can show"
+        );
+        assert!(SESSION_CSS.contains(".session-agent-picker-label"));
+        assert!(SESSION_CSS.contains("text-overflow: ellipsis"));
+        assert!(SESSION_CSS.contains("max-width: 18rem"));
+    }
+
+    #[test]
+    fn tc_2362_effort_only_when_supported() {
+        assert!(
+            SESSION_JS.contains("if (efforts.length)"),
+            "effort only when supported"
+        );
+        assert!(
+            SESSION_JS.contains("menuEfforts("),
+            "menuEfforts filters efforts"
+        );
+    }
+
+    #[test]
+    fn tc_2363_unavailable_disabled_with_tooltip() {
+        assert!(
+            SESSION_JS.contains("row.disabled = true; row.title = unavailable;"),
+            "unavailable agent row is disabled with a title"
+        );
+        assert!(
+            SESSION_JS.contains("agent.available === false"),
+            "missing or uninstalled agents use the snapshot available flag"
+        );
+        assert!(
+            SESSION_JS.contains("agent.allowed === false"),
+            "disallowed agents stay visible and disabled"
+        );
+        assert!(
+            APP_JS.contains("src.available === false"),
+            "to-do runner select reads availability"
+        );
+        assert!(
+            APP_JS.contains("opt.disabled = true; opt.title = unavailable;"),
+            "to-do runner option is disabled with the reason in title"
+        );
+        assert!(
+            SESSION_JS.contains("agent.unavailable_reason"),
+            "tooltip uses the snapshot unavailable_reason"
+        );
+        assert!(SESSION_JS.contains("not allowed by runner policy"));
+        assert!(APP_JS.contains("src.unavailable_reason"));
+        assert!(APP_JS.contains("not allowed by runner policy"));
+        assert!(!SESSION_JS.contains("agent.installed"));
+        assert!(!SESSION_JS.contains("agent.missing"));
+        assert!(!APP_JS.contains("src.installed"));
+        assert!(!APP_JS.contains("src.missing"));
+    }
+
+    #[test]
+    fn tc_2364_settings_shared_classes() {
+        assert!(
+            APP_CSS.contains(".settings-group"),
+            "APP_CSS must contain .settings-group"
+        );
+        assert!(
+            APP_CSS.contains(".settings-row"),
+            "APP_CSS must contain .settings-row"
+        );
+        assert!(
+            MEMORY_JS.contains("settings-group"),
+            "MEMORY_JS uses settings-group"
+        );
+        assert!(
+            MEMORY_JS.contains("settings-row-label"),
+            "memory label sits in settings-row-label"
+        );
+        assert!(
+            MEMORY_JS.contains("settings-row-hint"),
+            "memory hint sits under the label"
+        );
+        assert!(
+            MEMORY_JS.contains("hintEl.title = hint"),
+            "settings-row-hint title is the full hint text"
+        );
+        assert!(MEMORY_JS.contains("Where the entry is saved"));
+        assert!(MEMORY_JS.contains("One fact per entry"));
+        assert!(
+            APP_CSS.contains(".memory-popover .memory-controls.settings-group > .settings-row"),
+            "memory row layout beats older panel styles"
+        );
+        let copy_at = APP_CSS
+            .find(".memory-popover .settings-row > .settings-row-copy {")
+            .expect("memory copy column rule");
+        let copy_rule = &APP_CSS[copy_at..];
+        let copy_end = copy_rule.find('}').expect("copy rule end");
+        let copy_body = &copy_rule[..copy_end];
+        assert!(
+            copy_body.contains("flex: 0 0 auto"),
+            "copy column does not shrink"
+        );
+    }
+
+    #[test]
+    fn tc_2365_long_help_info_tooltip() {
+        assert!(
+            APP_CSS.contains(".settings-info"),
+            "APP_CSS must contain .settings-info"
+        );
+        assert!(APP_CSS.contains("cursor: help;"), "info tooltip cursor");
+        assert!(
+            SKILLS_JS.contains("settings-info"),
+            "skills panel uses the info tooltip"
+        );
+        assert!(
+            SKILLS_JS.contains("info.title = help"),
+            "info tooltip title holds the long help text"
+        );
+        assert!(
+            SKILLS_JS.contains("info.setAttribute('aria-label', help)"),
+            "info tooltip has an aria-label"
+        );
+    }
+
+    #[test]
+    fn tc_2366_button_system() {
+        assert!(
+            APP_CSS.contains(".btn-secondary"),
+            "APP_CSS must contain .btn-secondary"
+        );
+        assert!(
+            APP_CSS.contains(".btn-danger"),
+            "APP_CSS must contain .btn-danger"
+        );
+        assert!(
+            APP_CSS.contains(".btn:focus-visible"),
+            "APP_CSS must contain .btn:focus-visible"
+        );
+        assert!(
+            APP_CSS.contains(":disabled"),
+            "APP_CSS must contain disabled style"
+        );
+    }
+
+    #[test]
+    fn tc_2367_busy_state() {
+        assert!(MEMORY_JS.contains("Saving…"), "busy text Saving…");
+        assert!(APP_CSS.contains(".is-busy"), "busy class");
+    }
+
+    #[test]
+    fn tc_2368_inline_confirm() {
+        assert!(APP_JS.contains("Confirm"), "APP_JS must contain Confirm");
+        assert!(APP_JS.contains("Cancel"), "APP_JS must contain Cancel");
+        assert!(
+            APP_JS.contains("btn-danger btn-confirm"),
+            "to-do Confirm uses the filled danger class"
+        );
+        assert!(
+            APP_CSS.contains(".btn-danger.btn-confirm"),
+            "filled danger confirm style exists"
+        );
+        assert!(
+            APP_CSS.contains("background: #c62828;"),
+            "confirm button is a filled danger color"
+        );
+        assert!(
+            APP_CSS.contains("color: #ffffff;"),
+            "confirm label is white"
+        );
+    }
+
+    #[test]
+    fn tc_2369_keyboard_and_a11y() {
+        assert!(APP_CSS.contains("prefers-reduced-motion"), "reduced motion");
+        assert!(SESSION_JS.contains("aria-label"), "aria labels");
+    }
 }
