@@ -461,11 +461,12 @@ async fn get_file(
 
 async fn get_diff(
     State(state): State<DocsApiState>,
+    uri: axum::http::Uri,
     Query(query): Query<RenderPathQuery>,
 ) -> Response {
-    let docs = state.docs();
+    let docs = state.docs_for(uri.query());
     let Some(service) = &docs else {
-        return error_json(StatusCode::SERVICE_UNAVAILABLE, "docs unavailable");
+        return error_json(StatusCode::NOT_FOUND, "no such open folder");
     };
     let workspace = service.workspace.clone();
     let path = query.path;
