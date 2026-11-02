@@ -26,6 +26,11 @@ pub const MAX_ACTIVITY_TEXT_CHARS: usize = 16_000;
 const MAX_CONTEXT_CHARS: usize = 32_000;
 const RECENT_TAIL_CHARS: usize = 12_000;
 const MAX_SUMMARY_CHARS: usize = MAX_CONTEXT_CHARS - RECENT_TAIL_CHARS;
+/// Unseen completed turns that may ride along with a resumed native session
+/// (SPEC-task-sessions FR-2324, FR-2325).
+pub const MAX_UNSEEN_DELTA_TURNS: usize = 200;
+/// UTF-8 bytes of user and assistant text in that delta.
+pub const MAX_UNSEEN_DELTA_BYTES: usize = 65_536;
 const SUMMARY_PROMPT_VERSION: &str = "conversation-summary-v1";
 const SESSION_LEASE_MS: i64 = 30_000;
 
@@ -825,7 +830,34 @@ pub struct AgentRequest {
     pub model_id: Option<String>,
     pub prompt: String,
     pub resume_session: Option<String>,
-    pub context: ContextProjection,
+    /// What this turn sends with the prompt. A resume carries only the unseen
+    /// delta; a fresh session carries the bounded shared projection.
+    pub context: RequestContext,
+}
+
+/// Provider handoff for one turn. Resume and fresh are different payloads,
+/// not two interpretations of the same projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestContext {
+    /// Resume this agent's own native session. `delta` is empty when every
+    /// completed turn is already covered by `known_through_seq`. `fallback` is
+    /// the bounded projection to send if the provider rejects the resume.
+    Resume {
+        delta: Vec<ProjectedTurn>,
+        fallback: ContextProjection,
+    },
+    /// Start a fresh provider session with the bounded summary and recent tail.
+    Fresh(ContextProjection),
+}
+
+impl RequestContext {
+    /// The fresh projection to use when a native session cannot be resumed.
+    pub fn fallback_projection(&self) -> &ContextProjection {
+        match self {
+            Self::Resume { fallback, .. } => fallback,
+            Self::Fresh(projection) => projection,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -838,6 +870,8 @@ pub enum BeginTurnOutcome {
 pub struct ProjectedTurn {
     pub seq: i64,
     pub agent: AgentKey,
+    #[serde(default)]
+    pub model_id: Option<String>,
     pub user: String,
     pub assistant: String,
 }
@@ -1356,8 +1390,9 @@ impl ConversationEngine {
             ProjectionBuild::NeedsSummary(job) => return Ok(BeginTurnOutcome::NeedsSummary(job)),
         };
 
-        let resume_session =
-            self.active_binding_for(&conversation_id, input.agent, projection.through_seq)?;
+        let through_seq = projection.through_seq;
+        let (resume_session, context) =
+            self.request_context_for(&conversation_id, input.agent, projection)?;
         let now = now_ms()?;
         let turn_id = TurnId::new(Uuid::new_v4().to_string());
         let message_id = Uuid::new_v4().to_string();
@@ -1383,7 +1418,7 @@ impl ConversationEngine {
                 seq,
                 input.agent.as_db(),
                 input.model_id,
-                projection.through_seq,
+                through_seq,
                 now,
                 self.session_id,
             ],
@@ -1424,7 +1459,7 @@ impl ConversationEngine {
             model_id: input.model_id,
             prompt: input.prompt,
             resume_session,
-            context: projection,
+            context,
         }))
     }
 
@@ -1439,7 +1474,29 @@ impl ConversationEngine {
         if self.agent_is_busy(&conversation_id, agent)? {
             return Err(ConversationError::AgentBusy(agent));
         }
+        self.retire_binding(&conversation_id, agent)
+    }
 
+    /// Retires a binding after the provider rejected its session id, even
+    /// though this agent's turn is still the running one. The caller retries
+    /// the same turn once with [`RequestContext::Fresh`]; a later successful
+    /// turn can bind a new native session.
+    pub fn retire_binding_for_resume_rejection(
+        &mut self,
+        agent: AgentKey,
+    ) -> Result<bool, ConversationError> {
+        let conversation_id = self
+            .active_conversation
+            .clone()
+            .ok_or(ConversationError::NoActiveConversation)?;
+        self.retire_binding(&conversation_id, agent)
+    }
+
+    fn retire_binding(
+        &mut self,
+        conversation_id: &ConversationId,
+        agent: AgentKey,
+    ) -> Result<bool, ConversationError> {
         let changed = self.connection.execute(
             "UPDATE provider_bindings SET status = 'stale', updated_at_ms = ?3
               WHERE conversation_id = ?1 AND agent = ?2 AND status = 'active'",
@@ -1769,23 +1826,93 @@ impl ConversationEngine {
             .map_err(ConversationError::from)
     }
 
-    fn active_binding_for(
+    fn provider_binding_for(
         &self,
         conversation_id: &ConversationId,
         agent: AgentKey,
-        through_seq: i64,
-    ) -> Result<Option<String>, ConversationError> {
+    ) -> Result<Option<ProviderBinding>, ConversationError> {
         self.connection
             .query_row(
-                "SELECT provider_session_id
+                "SELECT provider_session_id, status, known_through_seq
                    FROM provider_bindings
-                  WHERE conversation_id = ?1 AND agent = ?2
-                    AND status = 'active' AND known_through_seq >= ?3",
-                params![conversation_id.as_str(), agent.as_db(), through_seq],
-                |row| row.get(0),
+                  WHERE conversation_id = ?1 AND agent = ?2",
+                params![conversation_id.as_str(), agent.as_db()],
+                |row| {
+                    Ok(ProviderBinding {
+                        agent,
+                        provider_session_id: row.get(0)?,
+                        status: BindingStatus::from_db(&row.get::<_, String>(1)?)?,
+                        known_through_seq: row.get(2)?,
+                    })
+                },
             )
             .optional()
             .map_err(ConversationError::from)
+    }
+
+    /// Decides between resuming this agent's own native session with only the
+    /// unseen completed turns (FR-2323..FR-2325) and starting fresh with the
+    /// bounded shared projection.
+    fn request_context_for(
+        &self,
+        conversation_id: &ConversationId,
+        agent: AgentKey,
+        projection: ContextProjection,
+    ) -> Result<(Option<String>, RequestContext), ConversationError> {
+        let Some(binding) = self.provider_binding_for(conversation_id, agent)? else {
+            return Ok((None, RequestContext::Fresh(projection)));
+        };
+        if binding.status != BindingStatus::Active {
+            return Ok((None, RequestContext::Fresh(projection)));
+        }
+
+        let delta = self.unseen_delta_for(
+            conversation_id,
+            agent,
+            binding.known_through_seq,
+            projection.through_seq,
+        )?;
+        if delta.is_empty() {
+            if binding.known_through_seq >= projection.through_seq {
+                return Ok((
+                    Some(binding.provider_session_id),
+                    RequestContext::Resume {
+                        delta,
+                        fallback: projection,
+                    },
+                ));
+            }
+            return Ok((None, RequestContext::Fresh(projection)));
+        }
+
+        let text_bytes = delta
+            .iter()
+            .map(|turn| turn.user.len() + turn.assistant.len())
+            .sum::<usize>();
+        if delta.len() > MAX_UNSEEN_DELTA_TURNS || text_bytes > MAX_UNSEEN_DELTA_BYTES {
+            return Ok((None, RequestContext::Fresh(projection)));
+        }
+
+        Ok((
+            Some(binding.provider_session_id),
+            RequestContext::Resume {
+                delta,
+                fallback: projection,
+            },
+        ))
+    }
+
+    fn unseen_delta_for(
+        &self,
+        conversation_id: &ConversationId,
+        agent: AgentKey,
+        after_seq: i64,
+        through_seq: i64,
+    ) -> Result<Vec<ProjectedTurn>, ConversationError> {
+        Ok(load_projected_turns(&self.connection, conversation_id)?
+            .into_iter()
+            .filter(|turn| turn.seq > after_seq && turn.seq <= through_seq && turn.agent != agent)
+            .collect())
     }
 
     fn build_projection(
@@ -2147,7 +2274,6 @@ struct TurnIdentity {
     agent: AgentKey,
     seq: i64,
     status: TurnStatus,
-    context_through_seq: i64,
 }
 
 fn load_turn_identity(
@@ -2156,7 +2282,7 @@ fn load_turn_identity(
 ) -> Result<TurnIdentity, ConversationError> {
     transaction
         .query_row(
-            "SELECT conversation_id, requested_agent, seq, status, context_through_seq
+            "SELECT conversation_id, requested_agent, seq, status
                FROM turns WHERE id = ?1",
             [turn_id.as_str()],
             |row| {
@@ -2165,7 +2291,6 @@ fn load_turn_identity(
                     agent: AgentKey::from_db(&row.get::<_, String>(1)?)?,
                     seq: row.get(2)?,
                     status: TurnStatus::from_db(&row.get::<_, String>(3)?)?,
-                    context_through_seq: row.get(4)?,
                 })
             },
         )
@@ -2198,18 +2323,16 @@ fn apply_turn_event(
                 "INSERT INTO provider_bindings
                     (conversation_id, agent, provider_session_id, status,
                      known_through_seq, bound_by_turn_id, created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?6)
+                 VALUES (?1, ?2, ?3, 'active', 0, ?4, ?5, ?5)
                  ON CONFLICT(conversation_id, agent) DO UPDATE SET
                      provider_session_id = excluded.provider_session_id,
                      status = 'active',
-                     known_through_seq = excluded.known_through_seq,
                      bound_by_turn_id = excluded.bound_by_turn_id,
                      updated_at_ms = excluded.updated_at_ms",
                 params![
                     output.conversation_id.as_str(),
                     output.agent.as_db(),
                     provider_session_id,
-                    turn.context_through_seq,
                     output.turn_id.as_str(),
                     now,
                 ],
@@ -2390,13 +2513,14 @@ fn load_projected_turns(
     let mut statement = connection.prepare(
         "SELECT t.seq,
                 t.requested_agent,
+                t.model_id,
                 MAX(CASE WHEN m.role = 'user' THEN m.text END),
                 MAX(CASE WHEN m.role = 'assistant' THEN m.text END)
            FROM turns t
            JOIN messages m ON m.turn_id = t.id
           WHERE t.conversation_id = ?1
             AND t.status = 'completed'
-         GROUP BY t.id, t.seq
+         GROUP BY t.id, t.seq, t.model_id
          HAVING COUNT(CASE WHEN m.role = 'user' THEN 1 END) = 1
             AND COUNT(CASE WHEN m.role = 'assistant' THEN 1 END) = 1
             AND MAX(CASE WHEN m.role = 'user' THEN m.text END)
@@ -2407,8 +2531,9 @@ fn load_projected_turns(
         Ok(ProjectedTurn {
             seq: row.get(0)?,
             agent: AgentKey::from_db(&row.get::<_, String>(1)?)?,
-            user: row.get(2)?,
-            assistant: row.get(3)?,
+            model_id: row.get(2)?,
+            user: row.get(3)?,
+            assistant: row.get(4)?,
         })
     })?;
     turns

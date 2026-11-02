@@ -7,6 +7,15 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Added
 
+- **Agents keep their own native session inside a task (FR-2323..FR-2326).**
+  When another agent adds completed turns, the original agent resumes its own
+  provider session and receives only the unseen turns, labelled with source
+  agent and model, inside the existing untrusted shared-context envelope.
+  Deltas over 200 turns or 65,536 UTF-8 bytes, stale or retired bindings, and
+  provider-rejected resume ids fall back to a fresh session with the bounded
+  projection; rejected resumes are retried once. `known_through_seq` advances
+  only after a completed turn is saved, so failed, cancelled and interrupted
+  attempts re-deliver the same delta.
 - **Tasks remember their picker (FR-2322).** Each conversation stores its last
   selected agent, model and reasoning effort; selecting it in the TUI (F3,
   `/conversations`, `/resume`) or dashboard restores those values after runner
