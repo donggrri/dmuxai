@@ -78,6 +78,14 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
+- **`dmuxai run --read-only` (and the MCP legacy `ask`/`plan` mode) now actually
+  runs read-only (#212, FR-1824).** Creating the headless conversation cleared
+  the pending turn policy, so the turn reached the runner as write-capable.
+  Cursor now gets `--mode ask` without `--force`, custom/opencode temp configs
+  get `edit`/`bash` `deny`, and grok gets `--permission-mode plan`, including
+  with `--agent`/`--model` and on the triage/graph path. Runs without
+  `--read-only` stay write-capable.
+
 - `dmuxai run` / `dmuxai todo run` now start the runner with the model given by `--model`, and `--json` reports the model actually used.
 
 - ACP runners no longer end a turn early when the agent sends a request whose id matches dmuxai's pending prompt (#242).

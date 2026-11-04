@@ -14127,9 +14127,12 @@ impl App {
             catalog.selected = Some(model_value);
         }
 
-        if let Some(ref mode_str) = req.mode {
-            match crate::agent::turn_policy_from_legacy_mode(mode_str) {
-                Ok(policy) => self.pending_turn_policy = Some(policy),
+        // TC-1824 / FR-1824 (#212): validate the legacy mode before creating the
+        // conversation, but apply the policy after it. `create_conversation`
+        // restores a snapshot, which deliberately clears any pending policy.
+        let headless_turn_policy = match req.mode.as_deref() {
+            Some(mode_str) => match crate::agent::turn_policy_from_legacy_mode(mode_str) {
+                Ok(policy) => Some(policy),
                 Err(message) => {
                     return HeadlessOutcome::failure(
                         dmuxai::agent_api::exit::USAGE,
@@ -14138,8 +14141,9 @@ impl App {
                         message,
                     );
                 }
-            }
-        }
+            },
+            None => None,
+        };
 
         let headless_title = {
             let suffix = if let Some(todo_id) = &req.todo_id {
@@ -14150,6 +14154,9 @@ impl App {
             format!("headless: {suffix}")
         };
         self.create_conversation(Some(headless_title));
+        if let Some(policy) = headless_turn_policy {
+            self.pending_turn_policy = Some(policy);
+        }
         let headless_conversation_id = self.conversation_id.as_str().to_owned();
         self.last_graph_run = None;
         self.graph_session = None;
@@ -25558,6 +25565,132 @@ mod tests {
         assert_eq!(outcome.agent.as_deref(), Some("agy"));
         let triage = outcome.triage.expect("triage");
         assert_eq!(triage.model, "gemini-3.8-flash-high");
+    }
+
+    fn complete_first_headless_request(
+        sent: &SentRequests,
+        event_tx: mpsc::Sender<AgentOutput>,
+        text: &str,
+    ) {
+        let sent = Arc::clone(sent);
+        let text = text.to_owned();
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                let maybe_req = {
+                    let lock = sent.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conversation_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conversation_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta(text),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conversation_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    }
+
+    async fn run_headless_policy_case(
+        agent: Agent,
+        request_agent: Option<&str>,
+        mode: Option<&str>,
+        graph: bool,
+        model: Option<&str>,
+    ) -> (Agent, TurnPolicy) {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        app.selected = adapter_index(agent);
+        complete_first_headless_request(&sent, event_tx, "done");
+        let req = HeadlessRequest {
+            prompt: "Say hello".to_owned(),
+            agent: request_agent.map(str::to_owned),
+            mode: mode.map(str::to_owned),
+            graph,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: model.map(str::to_owned),
+        };
+        let outcome = app
+            .run_headless(req, Arc::new(AtomicBool::new(false)))
+            .await;
+        assert!(outcome.ok, "{agent:?} headless run failed: {outcome:?}");
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{agent:?} should send one request");
+        (requests[0].0, requests[0].1.policy)
+    }
+
+    // TC-1824 / FR-1824 (#212): a headless --read-only turn reaches every runner with
+    // TurnPolicy::ReadOnly, including when --agent and --model are also given.
+    #[tokio::test]
+    async fn tc_1824_headless_read_only_reaches_runner() {
+        for agent in [Agent::Cursor, Agent::Agy, Agent::Codex] {
+            let runner = runner_name(agent).to_owned();
+            let (sent_agent, policy) = run_headless_policy_case(
+                agent,
+                Some(&runner),
+                Some("ask"),
+                false,
+                Some("composer-2.5"),
+            )
+            .await;
+            assert_eq!(sent_agent, agent, "{runner} with --agent/--model");
+            assert_eq!(
+                policy,
+                TurnPolicy::ReadOnly,
+                "{runner} with --agent/--model"
+            );
+            let (sent_agent, policy) =
+                run_headless_policy_case(agent, Some(&runner), Some("plan"), false, None).await;
+            assert_eq!(sent_agent, agent, "{runner} plan mode");
+            assert_eq!(policy, TurnPolicy::ReadOnly, "{runner} plan mode");
+        }
+    }
+
+    // TC-1824 / FR-1824 (#212): the read-only policy also survives the default/triage
+    // path and a headless graph request.
+    #[tokio::test]
+    async fn tc_1824_headless_read_only_without_agent_and_graph_reaches_runner() {
+        let (_, policy) =
+            run_headless_policy_case(Agent::Codex, None, Some("ask"), false, None).await;
+        assert_eq!(policy, TurnPolicy::ReadOnly, "triage/default path");
+        let (sent_agent, policy) =
+            run_headless_policy_case(Agent::Codex, Some("codex"), Some("ask"), true, None).await;
+        assert_eq!(sent_agent, Agent::Codex, "graph path");
+        assert_eq!(policy, TurnPolicy::ReadOnly, "graph path");
+    }
+
+    // TC-1824 / FR-1824 (#212): write turns without --read-only stay write-capable.
+    #[tokio::test]
+    async fn tc_1824_headless_normal_run_stays_write_capable() {
+        for agent in [Agent::Cursor, Agent::Agy, Agent::Codex] {
+            let runner = runner_name(agent).to_owned();
+            let (sent_agent, policy) =
+                run_headless_policy_case(agent, Some(&runner), None, false, Some("composer-2.5"))
+                    .await;
+            assert_eq!(sent_agent, agent, "{runner} normal run");
+            assert_eq!(policy, TurnPolicy::Agent, "{runner} normal run");
+            let (sent_agent, policy) =
+                run_headless_policy_case(agent, Some(&runner), Some("implement"), false, None)
+                    .await;
+            assert_eq!(sent_agent, agent, "{runner} implement mode");
+            assert_eq!(policy, TurnPolicy::Agent, "{runner} implement mode");
+        }
     }
 
     // TC-1694 / FR-1682: headless outcome carries error_kind.

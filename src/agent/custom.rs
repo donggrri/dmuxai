@@ -955,6 +955,14 @@ mod tests {
     }
 
     async fn run(spec: &CustomAgentSpec, model: Option<&str>) -> (Result<(), AgentError>, String) {
+        run_with_policy(spec, model, TurnPolicy::Agent).await
+    }
+
+    async fn run_with_policy(
+        spec: &CustomAgentSpec,
+        model: Option<&str>,
+        policy: TurnPolicy,
+    ) -> (Result<(), AgentError>, String) {
         let (tx, mut rx) = mpsc::channel(64);
         let request = AgentRequest {
             conversation_id: ConversationId::new("c"),
@@ -962,7 +970,7 @@ mod tests {
             prompt: "hi --model x".to_owned(),
             resume_session: None,
             image_paths: Vec::new(),
-            policy: TurnPolicy::Agent,
+            policy,
             require_file_edits: false,
             system_prompt: None,
         };
@@ -974,7 +982,7 @@ mod tests {
             spec,
             &request,
             model.map(str::to_owned),
-            TurnPolicy::Agent,
+            policy,
             &cwd,
             &tx,
             &context,
@@ -1119,6 +1127,30 @@ mod tests {
             .next()
             .unwrap();
         assert!(!std::path::Path::new(path).exists());
+    }
+
+    // TC-1824 / FR-1824 (#212): a read-only custom-agent turn writes edit/bash deny to
+    // its temp config; a normal turn stays write-capable.
+    #[tokio::test]
+    async fn tc_1824_custom_read_only_temp_config_denies_edit_and_bash() {
+        let spec = spec(
+            "env",
+            "temp_config_template = '{\"permission\":{\"edit\":\"{edit}\",\"bash\":\"{edit}\"}}'\nenv = { FAKE_CFG = \"{temp_config}\" }",
+        );
+        let (result, text) = run_with_policy(spec, None, TurnPolicy::ReadOnly).await;
+        assert_eq!(result, Ok(()));
+        assert!(
+            text.contains("content={\"permission\":{\"edit\":\"deny\",\"bash\":\"deny\"}}"),
+            "{text}"
+        );
+        assert!(!text.contains("\"allow\""), "{text}");
+
+        let (result, text) = run_with_policy(spec, None, TurnPolicy::Agent).await;
+        assert_eq!(result, Ok(()));
+        assert!(
+            text.contains("content={\"permission\":{\"edit\":\"allow\",\"bash\":\"allow\"}}"),
+            "{text}"
+        );
     }
 
     // TC-1690 / FR-1679: total timeout maps to Timeout.
