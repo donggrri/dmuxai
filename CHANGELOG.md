@@ -93,6 +93,11 @@ All notable changes to dmuxai are listed here. Versions follow
   automation can detect the stop from JSON. Read-only turns skip the gate
   because they cannot perform the sensitive write it protects.
 
+- An idle-timeout (or cancel) failure no longer inherits the
+  "model ... is not offered by ..." hint. That hint is now attached only when
+  the launched model is genuinely absent from a successfully loaded runner model
+  list, judged against the model the runner actually launched (#214).
+
 - `dmuxai run` / `dmuxai todo run` now start the runner with the model given by `--model`, and `--json` reports the model actually used.
 
 - ACP runners no longer end a turn early when the agent sends a request whose id matches dmuxai's pending prompt (#242).

@@ -3997,24 +3997,49 @@ impl App {
     /// process failures keep their kind so they do not trigger a runner
     /// handover (SPEC-runner-fallback).
     fn attach_model_catalog_hint(&self, output: &mut AgentOutput) {
-        if let AgentEvent::Error(err) = &mut output.event
-            && let Some(hint) = self
+        if let AgentEvent::Error(err) = &mut output.event {
+            // Idle and cancelled turns must never carry the "not offered" hint:
+            // the model availability question is unrelated to those failures.
+            if matches!(err.kind, AgentErrorKind::Idle | AgentErrorKind::Cancelled) {
+                return;
+            }
+            if let Some(hint) = self
                 .active_turns
                 .get(&output.agent)
                 .and_then(|turn| turn.model_catalog_hint.clone())
-        {
-            let model_unavailable =
-                dmuxai::runner_fallback::is_model_unavailable_message(&err.message);
-            if err.hint.is_none() {
-                err.hint = Some(hint);
-            }
-            if model_unavailable
-                && matches!(
-                    err.kind,
-                    AgentErrorKind::Provider | AgentErrorKind::ProcessExit
-                )
             {
-                err.kind = AgentErrorKind::ModelUnavailable;
+                // Re-verify against the catalog as currently known: never attach
+                // when the list is unknown/failed (empty) or when the launched
+                // model is in fact present (stale hint).
+                let catalog = self.model_catalogs.get(&output.agent);
+                let models = catalog.map(|c| &c.models).cloned().unwrap_or_default();
+                if !models.is_empty() {
+                    let model = hint
+                        .strip_prefix("model ")
+                        .and_then(|rest| rest.find(" is not offered").map(|idx| &rest[..idx]))
+                        .map(str::to_owned);
+                    if let Some(model) = model
+                        && models.iter().any(|m| m.id.trim() == model.trim())
+                    {
+                        return;
+                    }
+                } else {
+                    // Unknown/failed model list: never attach the hint.
+                    return;
+                }
+                let model_unavailable =
+                    dmuxai::runner_fallback::is_model_unavailable_message(&err.message);
+                if err.hint.is_none() {
+                    err.hint = Some(hint);
+                }
+                if model_unavailable
+                    && matches!(
+                        err.kind,
+                        AgentErrorKind::Provider | AgentErrorKind::ProcessExit
+                    )
+                {
+                    err.kind = AgentErrorKind::ModelUnavailable;
+                }
             }
         }
     }
@@ -6093,12 +6118,21 @@ impl App {
             .get(&agent)
             .map(|catalog| catalog.models.iter().map(|m| m.id.clone()).collect())
             .unwrap_or_default();
+        // Hint must be judged against the model the runner will actually
+        // launch (its selected/default model), not a resolved config default or
+        // other stale entry that the adapter never runs.
+        let launched_model = self
+            .model_catalogs
+            .get(&agent)
+            .and_then(|catalog| catalog.selected.clone())
+            .or_else(|| custom_spec.and_then(|spec| spec.default_model.clone()))
+            .or_else(|| dmuxai::model_policy::default_model_for_runner(runner).map(str::to_owned));
         let catalog_command = custom_spec
             .as_ref()
             .map(|spec| spec.models_command.join(" "))
             .filter(|joined| !joined.trim().is_empty());
         let catalog_hint = match dmuxai::model_policy::check_catalog(
-            resolved_model.as_deref(),
+            launched_model.as_deref(),
             if catalog_ids.is_empty() {
                 None
             } else {
@@ -32841,6 +32875,74 @@ mod tests {
         let outcome = app.drain_agent_events();
         assert!(outcome.errored);
         assert_eq!(outcome.error_kind.as_deref(), Some("provider"));
+        let msgs: Vec<String> = app.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("boom") && m.contains("is not offered")),
+            "{msgs:?}"
+        );
+    }
+
+    // TC-1749 / FR-1729 (#214): idle timeout for a listed model carries no "not offered" hint.
+    #[test]
+    fn tc_1749_idle_timeout_has_no_not_offered_hint_for_listed_model() {
+        let _ = install_shared_test_registry();
+        let idx = dmuxai::custom_agent::index_of("opencode-step")
+            .expect("shared test registry has opencode-step");
+        let agent = Agent::Custom(idx);
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        app.model_catalogs.get_mut(&agent).unwrap().models = vec![ModelInfo::new(
+            "opencode/beam-free".to_owned(),
+            "opencode/beam-free".to_owned(),
+        )];
+        app.selected = adapter_index(agent);
+        let _ = app.try_submit_to_agent(agent, "hello".into(), false, true);
+        let (a, req) = sent.lock().unwrap()[0].clone();
+        event_tx
+            .try_send(AgentOutput {
+                agent: a,
+                conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+                turn_id: Some(TurnId::new(req.turn_id.as_str())),
+                event: AgentEvent::Error(AgentError::idle(
+                    "opencode produced no output for 300s; the provider may be stuck",
+                )),
+            })
+            .unwrap();
+        let outcome = app.drain_agent_events();
+        assert!(outcome.errored);
+        assert_eq!(outcome.error_kind.as_deref(), Some("idle"));
+        let msgs: Vec<String> = app.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            !msgs.iter().any(|m| m.contains("is not offered by")),
+            "{msgs:?}"
+        );
+    }
+
+    // TC-1749 / FR-1729 (#214): a model truly absent from a loaded list still gets the hint.
+    #[test]
+    fn tc_1749_absent_model_still_gets_not_offered_hint() {
+        let _ = install_shared_test_registry();
+        let idx = dmuxai::custom_agent::index_of("opencode-step")
+            .expect("shared test registry has opencode-step");
+        let agent = Agent::Custom(idx);
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        app.model_catalogs.get_mut(&agent).unwrap().models = vec![ModelInfo::new(
+            "opencode/other-free".to_owned(),
+            "opencode/other-free".to_owned(),
+        )];
+        app.selected = adapter_index(agent);
+        let _ = app.try_submit_to_agent(agent, "hello".into(), false, true);
+        let (a, req) = sent.lock().unwrap()[0].clone();
+        event_tx
+            .try_send(AgentOutput {
+                agent: a,
+                conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+                turn_id: Some(TurnId::new(req.turn_id.as_str())),
+                event: AgentEvent::Error(AgentError::provider("request failed: boom")),
+            })
+            .unwrap();
+        let outcome = app.drain_agent_events();
+        assert!(outcome.errored);
         let msgs: Vec<String> = app.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
             msgs.iter()
