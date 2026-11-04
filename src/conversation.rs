@@ -5,6 +5,7 @@
 //! do not need to coordinate those invariants themselves.
 
 use std::{
+    collections::HashMap,
     error::Error,
     fmt, fs,
     path::{Path, PathBuf},
@@ -760,6 +761,20 @@ pub struct ConversationCard {
     pub last_agent: Option<AgentKey>,
     pub settings: TaskSettings,
     pub running: bool,
+    /// Agents with at least one completed turn, ordered by first appearance
+    /// in the task transcript (FR-2331, FR-2341).
+    pub spoken_agents: Vec<AgentKey>,
+}
+
+/// One agent that has completed at least one turn in a task (FR-2331).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpokenAgent {
+    pub agent: AgentKey,
+    /// Model of the agent's latest completed turn.
+    pub model_id: Option<String>,
+    pub turns: u64,
+    /// The task has an `active` provider binding for this agent.
+    pub live: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1282,6 +1297,77 @@ impl ConversationEngine {
                 last_agent: last_agent.as_deref().map(AgentKey::from_db).transpose()?,
                 settings: task_settings_from_values(row.get(6)?, row.get(7)?, row.get(8)?),
                 running: row.get(5)?,
+                spoken_agents: Vec::new(),
+            })
+        })?;
+        let mut cards = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(ConversationError::from)?;
+
+        let mut spoken_statement = self.connection.prepare(
+            "SELECT t.conversation_id, t.requested_agent
+               FROM turns t
+               JOIN conversations c ON c.id = t.conversation_id
+              WHERE t.status = 'completed'
+                AND c.workspace_root = ?1
+                AND c.archived_at_ms IS NULL
+              GROUP BY t.conversation_id, t.requested_agent
+              ORDER BY t.conversation_id, MIN(t.seq)",
+        )?;
+        let mut spoken: HashMap<String, Vec<AgentKey>> = HashMap::new();
+        let mut rows = spoken_statement.query([&self.workspace_root])?;
+        while let Some(row) = rows.next()? {
+            let conversation_id: String = row.get(0)?;
+            let agent = AgentKey::from_db(&row.get::<_, String>(1)?)?;
+            spoken.entry(conversation_id).or_default().push(agent);
+        }
+        for card in &mut cards {
+            card.spoken_agents = spoken.remove(card.id.as_str()).unwrap_or_default();
+        }
+        Ok(cards)
+    }
+
+    /// Agents with at least one completed turn in the active conversation,
+    /// ordered by first appearance in its transcript (FR-2331). Each item
+    /// carries the latest completed model and whether an `active` provider
+    /// binding exists. Stale or retired bindings are not live.
+    pub fn spoken_agents(&self) -> Result<Vec<SpokenAgent>, ConversationError> {
+        let conversation_id = self
+            .active_conversation
+            .as_ref()
+            .ok_or(ConversationError::NoActiveConversation)?;
+        let mut statement = self.connection.prepare(
+            "SELECT t.requested_agent,
+                    (SELECT latest.model_id
+                       FROM turns latest
+                      WHERE latest.conversation_id = t.conversation_id
+                        AND latest.requested_agent = t.requested_agent
+                        AND latest.status = 'completed'
+                      ORDER BY latest.seq DESC
+                      LIMIT 1),
+                    COUNT(t.id),
+                    EXISTS(
+                        SELECT 1
+                          FROM provider_bindings binding
+                         WHERE binding.conversation_id = t.conversation_id
+                           AND binding.agent = t.requested_agent
+                           AND binding.status = 'active'
+                    )
+               FROM turns t
+              WHERE t.conversation_id = ?1 AND t.status = 'completed'
+              GROUP BY t.requested_agent
+              ORDER BY MIN(t.seq)",
+        )?;
+        let rows = statement.query_map([conversation_id.as_str()], |row| {
+            let agent = AgentKey::from_db(&row.get::<_, String>(0)?)?;
+            let turns: i64 = row.get(2)?;
+            Ok(SpokenAgent {
+                agent,
+                model_id: row.get(1)?,
+                turns: turns.try_into().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(2, Type::Integer, Box::new(error))
+                })?,
+                live: row.get(3)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -2688,11 +2774,35 @@ fn read_conversation_cards(
                 last_agent: last_agent.as_deref().map(AgentKey::from_db).transpose()?,
                 settings: task_settings_from_values(row.get(7)?, row.get(8)?, row.get(9)?),
                 running: row.get(5)?,
+                spoken_agents: Vec::new(),
             },
         ))
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(ConversationError::from)
+    let mut cards = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(ConversationError::from)?;
+
+    let mut spoken_statement = connection.prepare(
+        "SELECT t.conversation_id, t.requested_agent
+           FROM turns t
+           JOIN conversations c ON c.id = t.conversation_id
+          WHERE t.status = 'completed'
+            AND c.workspace_root != ?1
+            AND c.archived_at_ms IS NULL
+          GROUP BY t.conversation_id, t.requested_agent
+          ORDER BY t.conversation_id, MIN(t.seq)",
+    )?;
+    let mut spoken: HashMap<String, Vec<AgentKey>> = HashMap::new();
+    let mut rows = spoken_statement.query([exclude_workspace])?;
+    while let Some(row) = rows.next()? {
+        let conversation_id: String = row.get(0)?;
+        let agent = AgentKey::from_db(&row.get::<_, String>(1)?)?;
+        spoken.entry(conversation_id).or_default().push(agent);
+    }
+    for (_, card) in &mut cards {
+        card.spoken_agents = spoken.remove(card.id.as_str()).unwrap_or_default();
+    }
+    Ok(cards)
 }
 
 #[cfg(test)]

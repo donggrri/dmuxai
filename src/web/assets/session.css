@@ -17,7 +17,19 @@
 .session[hidden] { display: none; }
 .session-head, .session-bar, .session-view-only { flex: none; }
 .session-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+/* FR-2331: one compact task row above the transcript; chips scroll rather
+   than wrapping or pushing the composer. */
+.session-task-header[hidden] { display: none; }
+.session-task-header { display: flex; align-items: center; gap: .4rem; flex: 0 0 auto; min-width: 0; padding: .45rem 1rem; border-top: 1px solid var(--line); overflow-x: auto; overflow-y: hidden; white-space: nowrap; scrollbar-width: thin; }
+.session-task-label { flex: none; color: var(--muted); font-size: .72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.session-task-chip { display: inline-flex; align-items: center; gap: .35rem; flex: none; padding: .18rem .55rem; border: 1px solid var(--line); border-radius: 999px; background: var(--bg-chip); color: var(--text); font: inherit; font-size: .75rem; line-height: 1.3; cursor: pointer; }
+.session-task-chip:hover:not(:disabled) { border-color: var(--accent); }
+.session-task-chip:disabled { opacity: .6; cursor: not-allowed; }
+.session-task-chip-active { border-color: var(--accent); color: var(--accent); }
+.session-task-live { width: .48rem; height: .48rem; flex: none; border-radius: 50%; background: #2ea043; box-shadow: 0 0 0 2px color-mix(in srgb, #2ea043 25%, transparent); }
+.session-task-model { max-width: 12rem; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .7rem; }
 .session-transcript { flex: 1 1 auto; min-height: 0; height: clamp(26rem, 55vh, 48rem); list-style: none; margin: 0; padding: .75rem 0 1rem; overflow-y: auto; background: transparent; border: 0; border-top: 1px solid var(--line); scroll-behavior: auto; }
+.session-task-header:not([hidden]) + .session-transcript { border-top: 0; }
 .session-transcript > li { box-sizing: border-box; width: 100%; max-width: var(--chat-col); margin: 0 auto 1rem; padding: 0 1rem; }
 .session-transcript .msg { display: flex; flex-direction: column; align-items: flex-start; gap: .2rem; }
 .session-transcript .msg-who { display: inline-flex; align-items: center; gap: .4rem; font-size: .75rem; font-weight: 600; color: var(--muted); text-transform: lowercase; }

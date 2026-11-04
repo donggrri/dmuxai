@@ -26,6 +26,34 @@ mod tests {
     use crate::web::server::build_router;
     use crate::web::snapshot::SnapshotSource;
 
+    // TC-2331 / FR-2331: the dashboard task header lists spoken agents, marks
+    // live bindings, and switches through the existing select_agent command.
+    #[test]
+    fn tc_2331_task_header_lists_spoken_and_live_agents() {
+        assert!(SESSION_JS.contains("session-task-header"));
+        assert!(SESSION_JS.contains("session.task.agents"));
+        assert!(SESSION_JS.contains("aria-label', 'live session'"));
+        assert!(SESSION_JS.contains("no live session"));
+        assert!(SESSION_JS.contains("command({ command: 'select_agent', agent: a.agent })"));
+        assert!(SESSION_JS.contains("session-task-chip-active"));
+        assert!(SESSION_CSS.contains(".session-task-live"));
+        assert!(SESSION_CSS.contains("#2ea043"));
+        assert!(SESSION_CSS.contains("overflow-x: auto"));
+    }
+
+    // TC-2341 / FR-2341: sidebar task rows show the stored agent/model badge
+    // (falling back to last_agent) and list spoken agents in the tooltip.
+    #[test]
+    fn tc_2341_sidebar_task_row_shows_agent_badge() {
+        assert!(SESSION_JS.contains("sessions-row-badge"));
+        assert!(SESSION_JS.contains("(c.settings && c.settings.agent) || c.last_agent"));
+        assert!(SESSION_JS.contains("(c.settings && c.settings.model)"));
+        assert!(SESSION_JS.contains("c.spoken_agents.join(', ')"));
+        assert!(SESSION_JS.contains("agentDisplayLabel(badgeAgent)"));
+        assert!(DOCS_CSS.contains(".sessions-row-badge-agent"));
+        assert!(DOCS_CSS.contains(".sessions-row-badge-model"));
+    }
+
     #[test]
     fn tc_2313_sidebar_marks_restricted_folder() {
         assert!(SESSION_JS.contains("sessions-group-restricted"));

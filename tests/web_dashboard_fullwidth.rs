@@ -1079,6 +1079,220 @@ with sync_playwright() as p:
     assert_eq!(v["switch"][0]["path"], "/home/u/src/api", "{v}");
 }
 
+// FR-2331 / TC-2331: the task header lists spoken agents, marks only live
+// natives, highlights the selected agent, and switches through select_agent.
+#[test]
+#[ignore = "needs Chrome/Chromium; run with --ignored"]
+fn web_task_header_chips() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let home = tempfile::tempdir().expect("temp home");
+    let (_guard, url) = start_serve(workspace.path(), home.path());
+    let script = r##"
+import sys, json, copy, time
+from playwright.sync_api import sync_playwright
+
+CHIPS = """() => ({
+  hidden: document.querySelector('.session-task-header').hidden,
+  label: (document.querySelector('.session-task-label') || {}).textContent || '',
+  chips: [...document.querySelectorAll('.session-task-chip')].map(c => ({
+    text: c.textContent,
+    title: c.title,
+    active: c.classList.contains('session-task-chip-active'),
+    live: !!c.querySelector('.session-task-live'),
+    live_label: (c.querySelector('.session-task-live') || {}).getAttribute ? c.querySelector('.session-task-live').getAttribute('aria-label') : null
+  }))
+})"""
+
+out = {"commands": []}
+with sync_playwright() as p:
+    b = p.chromium.launch(executable_path=sys.argv[1], args=["--no-sandbox"])
+    probe = b.new_page()
+    probe.goto(sys.argv[2])
+    probe.wait_for_timeout(500)
+    from urllib.parse import urlparse, parse_qs
+    tok = parse_qs(urlparse(sys.argv[2]).query)["token"][0]
+    real = probe.evaluate("""async (t) => {
+        const r = await fetch('/api/state', {headers: {Authorization: 'Bearer ' + t}});
+        return await r.json(); }""", tok)
+    probe.close()
+
+    now = int(time.time() * 1000)
+    snap = copy.deepcopy(real)
+    snap["source"] = "tui"
+    snap["graph"] = None
+    snap["session"] = {
+        "conversation_id": "task-1", "conversation_title": "Cross-agent task",
+        "selected_agent": "cursor", "details_expanded": False,
+        "agents": [], "transcript": [], "transcript_omitted": 0,
+        "conversations": [], "commands": [], "workspaces": [],
+        "task": {"agents": [
+            {"agent": "cursor", "label": "Cursor", "model_id": "composer-2.5", "turns": 2, "live": True},
+            {"agent": "codex", "label": "Codex", "model_id": "gpt-5-codex", "turns": 1, "live": False},
+            {"agent": "agy", "label": "AGY", "model_id": "gemini-3-pro", "turns": 1, "live": True}
+        ]}
+    }
+    state = {"snap": snap, "rev": 100}
+
+    def fulfill_state(route):
+        state["rev"] += 1
+        s = copy.deepcopy(state["snap"])
+        s["revision"] = state["rev"]
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(s))
+
+    def fulfill_command(route):
+        body = json.loads(route.request.post_data or "{}")
+        out["commands"].append(body)
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({"session": state["snap"]["session"]}))
+
+    ctx = b.new_context(viewport={"width": 1440, "height": 900}, bypass_csp=True)
+    ctx.add_init_script("delete window.EventSource;")
+    pg = ctx.new_page()
+    pg.on("pageerror", lambda e: print("PAGEERROR", e, file=sys.stderr))
+    pg.route("**/api/state*", fulfill_state)
+    pg.route("**/api/command*", fulfill_command)
+    pg.goto(sys.argv[2])
+    pg.wait_for_selector(".session-task-chip", timeout=15000)
+    out["header"] = pg.evaluate(CHIPS)
+    pg.click(".session-task-chip:nth-of-type(2)")
+    deadline = time.time() + 10
+    while time.time() < deadline and not out["commands"]:
+        pg.wait_for_timeout(100)
+    print(json.dumps(out))
+    b.close()
+"##;
+    let v = run_probe(python, &chrome, &url, script);
+
+    let header = &v["header"];
+    assert_eq!(header["hidden"], false, "{v}");
+    assert_eq!(header["label"], "Task", "{v}");
+    let chips = header["chips"].as_array().unwrap();
+    assert_eq!(chips.len(), 3, "{v}");
+    // FR-2331: live only for active native bindings; the stale one is spoken.
+    assert_eq!(chips[0]["text"], "Cursorcomposer-2.5", "{v}");
+    assert_eq!(chips[0]["live"], true, "{v}");
+    assert_eq!(chips[0]["live_label"], "live session", "{v}");
+    assert_eq!(chips[0]["active"], true, "{v}");
+    assert_eq!(chips[1]["live"], false, "{v}");
+    assert!(
+        chips[1]["title"]
+            .as_str()
+            .unwrap()
+            .contains("no live session"),
+        "{v}"
+    );
+    assert_eq!(chips[2]["live"], true, "{v}");
+    assert!(
+        v["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["command"] == "select_agent" && c["agent"] == "codex"),
+        "{v}"
+    );
+}
+
+// FR-2341 / TC-2341: sidebar badges use stored task settings, fall back to
+// last_agent, stay hidden when both are absent, and keep unknown ids raw; the
+// row tooltip lists the agents that have spoken.
+#[test]
+#[ignore = "needs Chrome/Chromium; run with --ignored"]
+fn web_sidebar_agent_badges() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let home = tempfile::tempdir().expect("temp home");
+    let (_guard, url) = start_serve(workspace.path(), home.path());
+    let script = r##"
+import sys, json, copy, time
+from playwright.sync_api import sync_playwright
+
+ROWS = """() => Object.fromEntries([...document.querySelectorAll('#sessions-list .sessions-row')].map(r => {
+  const badge = r.querySelector('.sessions-row-badge');
+  return [r.getAttribute('data-id'), {
+    badge: badge ? badge.textContent : null,
+    agent: (badge && badge.querySelector('.sessions-row-badge-agent') || {}).textContent || null,
+    model: (badge && badge.querySelector('.sessions-row-badge-model') || {}).textContent || null,
+    tip: r.title
+  }];
+}))"""
+
+with sync_playwright() as p:
+    b = p.chromium.launch(executable_path=sys.argv[1], args=["--no-sandbox"])
+    probe = b.new_page()
+    probe.goto(sys.argv[2])
+    probe.wait_for_timeout(500)
+    from urllib.parse import urlparse, parse_qs
+    tok = parse_qs(urlparse(sys.argv[2]).query)["token"][0]
+    real = probe.evaluate("""async (t) => {
+        const r = await fetch('/api/state', {headers: {Authorization: 'Bearer ' + t}});
+        return await r.json(); }""", tok)
+    probe.close()
+
+    now = int(time.time() * 1000)
+    snap = copy.deepcopy(real)
+    snap["source"] = "tui"
+    snap["graph"] = None
+    def conv(cid, title, settings, last_agent, spoken, age):
+        return {"id": cid, "title": title, "updated_at_ms": now - age,
+                "last_agent": last_agent, "turn_count": 1, "running": False,
+                "settings": settings, "spoken_agents": spoken}
+    snap["session"] = {
+        "conversation_id": "stored", "conversation_title": "Stored", "selected_agent": "cursor",
+        "details_expanded": False, "agents": [], "transcript": [], "transcript_omitted": 0,
+        "commands": [], "workspaces": [], "task": None,
+        "conversations": [
+            conv("stored", "Stored settings", {"agent": "cursor", "model": "composer-2.5", "effort": None}, "Cursor", ["Cursor", "Codex"], 1),
+            conv("fallback", "Fallback", None, "fancy-runner", [], 2),
+            conv("empty", "No badge", None, None, [], 3),
+            conv("unknown", "Unknown id", {"agent": "mystery", "model": "m1", "effort": None}, "mystery", [], 4)
+        ]
+    }
+    state = {"snap": snap, "rev": 100}
+
+    def fulfill_state(route):
+        state["rev"] += 1
+        s = copy.deepcopy(state["snap"])
+        s["revision"] = state["rev"]
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(s))
+
+    ctx = b.new_context(viewport={"width": 1440, "height": 900}, bypass_csp=True)
+    ctx.add_init_script("delete window.EventSource;")
+    pg = ctx.new_page()
+    pg.on("pageerror", lambda e: print("PAGEERROR", e, file=sys.stderr))
+    pg.route("**/api/state*", fulfill_state)
+    pg.goto(sys.argv[2])
+    pg.wait_for_selector(".sessions-row[data-id='stored']", timeout=15000)
+    if not pg.evaluate("() => document.querySelector('#sessions-sidebar').classList.contains('open')"):
+        pg.click("#sessions-toggle")
+    pg.wait_for_selector(".sessions-row[data-id='stored'] .sessions-row-badge", timeout=15000)
+    if pg.query_selector(".sessions-more-btn"):
+        pg.click(".sessions-more-btn")
+    pg.wait_for_selector(".sessions-row[data-id='unknown'] .sessions-row-badge", timeout=15000)
+    print(json.dumps(pg.evaluate(ROWS)))
+    b.close()
+"##;
+    let v = run_probe(python, &chrome, &url, script);
+
+    assert_eq!(v["stored"]["agent"], "Cursor", "{v}");
+    assert_eq!(v["stored"]["model"], "composer-2.5", "{v}");
+    assert!(
+        v["stored"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("agents: Cursor, Codex"),
+        "{v}"
+    );
+    assert_eq!(v["fallback"]["agent"], "fancy-runner", "{v}");
+    assert!(v["fallback"]["model"].is_null(), "{v}");
+    assert!(v["empty"]["badge"].is_null(), "{v}");
+    assert_eq!(v["unknown"]["agent"], "mystery", "{v}");
+    assert_eq!(v["unknown"]["model"], "m1", "{v}");
+}
+
 // Top bar Chat button: returns to the chat from the Graph/Diff views and the
 // Memory popover, keeping the transcript scroll position and the draft.
 #[test]

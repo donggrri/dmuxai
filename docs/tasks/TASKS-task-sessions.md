@@ -1,6 +1,6 @@
 # TASKS: Task sessions
 
-Status: in progress (PR-B UI wiring and PR-C resume/delta complete)
+Status: in progress (PR-B UI wiring, PR-C resume/delta, and PR-D task header complete)
 Spec: [SPEC-task-sessions.md](../specs/SPEC-task-sessions.md)
 Plan: [PLAN-task-sessions.md](../plans/PLAN-task-sessions.md)
 
@@ -41,3 +41,19 @@ Plan: [PLAN-task-sessions.md](../plans/PLAN-task-sessions.md)
   `cargo test -j 2 --bin dmuxai tc_2332`,
   `bash scripts/check-spec.sh docs/specs/SPEC-task-sessions.md`,
   `bash scripts/check-spec.sh docs/specs/SPEC-automatic-cross-agent-sharing.md`.
+- [x] T8 - Render the dashboard and terminal task header with spoken agents
+  (first-spoken order) and live marks from active native bindings, reusing the
+  existing agent picker to switch; expose the same data as optional `task` on
+  the session snapshot.
+  Requirements: FR-2331. Verify:
+  `cargo test -j 1 --lib tc_23`,
+  `cargo test -j 1 --bin dmuxai tc_2331`,
+  `cargo test -j 1 --test conversation tc_2331`,
+  `cargo test -j 1 --test web_dashboard_fullwidth web_task_header_chips -- --ignored`.
+- [x] T9 - Show the stored task agent/model as a sidebar row badge (falling
+  back to `last_agent`) and list spoken agents in the row tooltip from one
+  batched query per list call.
+  Requirements: FR-2341. Verify:
+  `cargo test -j 1 --lib tc_23`,
+  `cargo test -j 1 --test web_dashboard_fullwidth web_sidebar_agent_badges -- --ignored`,
+  `cargo test -j 1 --test web_session_sidebar -- --ignored`.
