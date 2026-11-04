@@ -239,7 +239,7 @@ async fn run_scenario(scenario: Scenario) -> Option<Outcome> {
 import sys, json, time
 from playwright.sync_api import sync_playwright
 
-TEXT, SECOND, MODE = sys.argv[3], sys.argv[4], sys.argv[5]
+TEXT, SECOND, MODE, EXPECT_REPLY = sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
 out = {"posts": 0, "samples": []}
 with sync_playwright() as p:
     b = p.chromium.launch(executable_path=sys.argv[1], args=["--no-sandbox"])
@@ -253,15 +253,11 @@ with sync_playwright() as p:
     # A second Enter and a Send click while the first send is in flight.
     pg.press(".session-input", "Enter")
     pg.eval_on_selector("[data-parity=\"prompt-send\"]", "e => { e.disabled = false; e.click(); }")
-    start = time.time()
+    start = time.monotonic()
     second_sent = False
-    while time.time() - start < 5.0:
-        if MODE == "two" and not second_sent and time.time() - start > 0.3:
-            pg.fill(".session-input", SECOND)
-            pg.press(".session-input", "Enter")
-            second_sent = True
-            out["second_at"] = round(time.time() - start, 2)
-        out["samples"].append(pg.evaluate("""([t, t2]) => {
+
+    def take_sample():
+        s = pg.evaluate("""([t, t2]) => {
             const count = s => Array.from(document.querySelectorAll('#session li.msg-user'))
                 .filter(li => (li.querySelector('.msg-text') || li).textContent.trim() === s).length;
             return {
@@ -275,9 +271,29 @@ with sync_playwright() as p:
                   .map(n => n.textContent.trim()).join('|'),
               input: document.querySelector('.session-input').value
             };
-        }""", [TEXT, SECOND]))
-        out["samples"][-1]["at"] = round(time.time() - start, 2)
+        }""", [TEXT, SECOND])
+        s["at"] = round(time.monotonic() - start, 2)
+        out["samples"].append(s)
+        return s
+
+    while True:
+        now = time.monotonic()
+        elapsed = now - start
+        if MODE == "two" and not second_sent and elapsed > 0.3:
+            pg.fill(".session-input", SECOND)
+            pg.press(".session-input", "Enter")
+            second_sent = True
+            out["second_at"] = round(time.monotonic() - start, 2)
+        take_sample()
+        if elapsed >= 5.0:
+            if not EXPECT_REPLY:
+                break
+            if EXPECT_REPLY in out["samples"][-1]["agent"]:
+                break
+            if elapsed >= 30.0:
+                break
         pg.wait_for_timeout(100)
+    take_sample()
     print(json.dumps(out))
     b.close()
 "##;
@@ -287,6 +303,10 @@ with sync_playwright() as p:
     } else {
         "one"
     };
+    let expect_reply = match scenario {
+        Scenario::PostedLater | Scenario::TwoSends => "describes the project",
+        Scenario::PlanWaits | Scenario::RefusedLater => "",
+    };
     let output = tokio::task::spawn_blocking(move || {
         Command::new(python)
             .args(["-c", script])
@@ -295,6 +315,7 @@ with sync_playwright() as p:
             .arg(PROMPT)
             .arg(SECOND_PROMPT)
             .arg(mode)
+            .arg(expect_reply)
             .stderr(Stdio::inherit())
             .output()
             .expect("run playwright")
