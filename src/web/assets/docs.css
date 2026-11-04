@@ -1032,6 +1032,35 @@ body.sidebar-resizing .sidebar-resize-handle.is-dragging::after {
   white-space: nowrap;
 }
 
+.sessions-row-badge {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  flex: none;
+  max-width: 42%;
+  overflow: hidden;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg-chip);
+  color: var(--muted);
+  font-size: 0.72em;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.sessions-row-badge-agent {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sessions-row-badge-model {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--faint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 .sessions-row-time {
   flex: none;
   color: var(--faint);

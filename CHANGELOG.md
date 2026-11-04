@@ -7,6 +7,11 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Added
 
+- **Task header and sidebar agent badge (FR-2331, FR-2341).** The dashboard and
+  TUI list the agents that have spoken in the active task and mark those with an
+  `active` native session live; the existing agent picker still switches agents.
+  Sidebar task rows show the task's stored agent and model as a short badge
+  (falling back to the last agent) and list spoken agents in the tooltip.
 - **Jira tickets in the To-dos sidebar, read-only (SPEC-jira-todos, FR-2400..2408,
   UX-2409..2411).** A `[jira]` table in `dmuxai.toml` (`base_url`, `email`, `jql`,
   `max_results`, `token_env`) lists matching Jira Cloud issues in a collapsible

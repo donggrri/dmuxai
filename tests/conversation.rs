@@ -2844,3 +2844,66 @@ fn tc_2332_delta_excludes_other_tasks_and_secrets() {
             .all(|turn| !turn.assistant.contains("other task answer"))
     );
 }
+
+// FR-2331 / TC-2331: spoken agents are ordered by first appearance, carry the
+// latest completed model and turn count, and only active bindings are live.
+#[test]
+fn tc_2331_spoken_agents_query() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+    let conversation = engine
+        .select(ConversationSelection::New { title: None })
+        .unwrap();
+    let conversation_id = conversation.id;
+
+    for (agent, model) in [
+        (AgentKey::Codex, "codex-1"),
+        (AgentKey::Cursor, "composer-2.5"),
+        (AgentKey::Agy, "agy-3"),
+        (AgentKey::Cursor, "composer-2.6"),
+    ] {
+        let request = ready(
+            engine
+                .begin_turn(BeginTurn {
+                    agent,
+                    model_id: Some(model.to_owned()),
+                    prompt: format!("prompt from {agent}"),
+                    display_text: None,
+                })
+                .unwrap(),
+        );
+        complete_turn(&mut engine, &request, &format!("session-{model}"), "done");
+    }
+    assert!(engine.retire_active_binding(AgentKey::Agy).unwrap());
+
+    let spoken = engine.spoken_agents().unwrap();
+    assert_eq!(
+        spoken.iter().map(|agent| agent.agent).collect::<Vec<_>>(),
+        [AgentKey::Codex, AgentKey::Cursor, AgentKey::Agy]
+    );
+    assert_eq!(spoken[0].model_id.as_deref(), Some("codex-1"));
+    assert_eq!(spoken[0].turns, 1);
+    assert!(spoken[0].live);
+    assert_eq!(spoken[1].model_id.as_deref(), Some("composer-2.6"));
+    assert_eq!(spoken[1].turns, 2);
+    assert!(spoken[1].live);
+    assert_eq!(spoken[2].model_id.as_deref(), Some("agy-3"));
+    assert!(!spoken[2].live);
+
+    let cards = engine.list().unwrap();
+    let card = cards
+        .iter()
+        .find(|card| card.id == conversation_id)
+        .unwrap();
+    let card_agents: Vec<_> = card.spoken_agents.to_vec();
+    assert_eq!(
+        card_agents,
+        [AgentKey::Codex, AgentKey::Cursor, AgentKey::Agy]
+    );
+
+    let other = engine
+        .select(ConversationSelection::New { title: None })
+        .unwrap();
+    assert_ne!(other.id, conversation_id);
+    assert!(engine.spoken_agents().unwrap().is_empty());
+}

@@ -117,3 +117,68 @@ Revert the conversation request-context enum, delta queries, renderer, retry
 hook and tests, then restore the cross-agent-sharing FR-027 text. No data
 migration is required; existing bindings remain readable and older code treats
 them as before.
+
+## PR-D: Task header and sidebar agent badge
+
+Status: complete<br>
+Reviewed: 2026-11-04
+
+### Summary
+
+The dashboard and TUI show one compact task row listing agents with completed
+turns, marking those with an `active` native binding live and reusing the
+existing agent picker command to switch. Dashboard sidebar rows show the stored
+task agent/model as a short badge, fall back to `last_agent` when task settings
+are NULL, and list spoken agents in the row tooltip. The data is derived from
+existing turns, bindings and task settings; no schema or route changed.
+
+### Requirement review
+
+| Requirement | Evidence | Result |
+| --- | --- | --- |
+| FR-2331 spoken and live agents | `ConversationEngine::spoken_agents` orders by first turn, returns the latest completed model, turn count and `active`-binding liveness; `tc_2331_spoken_agents_query` covers stale bindings and first-spoken order. Snapshot `task` is filled in `session_view`; the dashboard renders chips with a live dot and no-live tooltip; the TUI title renders `●`/`○`. `tc_2331_task_header_live_session_marks`, `tc_2331_task_header_lists_spoken_and_live_agents` and `web_task_header_chips` cover the UI. | Met |
+| FR-2341 sidebar agent/model badge | `ConversationCard.spoken_agents` is filled by one batched query per list call; `sessionRow` uses `settings.agent`/`settings.model`, falls back to `last_agent`, and appends `agents:` to the tooltip. `tc_2341_sidebar_task_row_shows_agent_badge` covers the asset contract; the existing headless sidebar test still passes. | Met |
+
+### Scope and regression review
+
+- Routes, JSON field names, commands and the conversation schema are unchanged;
+  `task` and `spoken_agents` are additive and omitted when empty, so older
+  snapshots deserialize with defaults.
+- Live means an `active` provider binding only; stale and retired bindings are
+  shown as spoken but not live.
+- The sidebar spoken-agent labels come from the existing list query, avoiding a
+  per-row query. Custom unknown ids in task settings remain raw in the badge; the
+  transcript query collapses unknown ids to the existing unknown-custom key.
+- The task header scrolls horizontally on narrow screens instead of wrapping or
+  pushing the composer, and uses text nodes rather than HTML for agent data.
+
+### Test evidence
+
+- `cargo test -j 1 --test conversation tc_2331_spoken_agents_query` - passed.
+- `cargo test -j 1 --bin dmuxai tc_2331` - passed.
+- `cargo test -j 1 --lib tc_23` - passed (33 tests).
+- `cargo test -j 1 --lib session_` - passed (8 tests).
+- `cargo test -j 1 --lib` - passed (655 tests, 1 ignored) with an isolated
+  `XDG_CONFIG_HOME`; the ambient user config sets agent prompts and makes the
+  pre-existing `agent_prompt_api_get_lists_runners_unset_by_default` fail.
+- `cargo test -j 1 --bin dmuxai` - passed (589 tests, 6 ignored).
+- `cargo test -j 1 --test web_dashboard_fullwidth web_task_header_chips -- --ignored` - passed.
+- `cargo test -j 1 --test web_dashboard_fullwidth web_sidebar_agent_badges -- --ignored` - passed.
+- `XDG_STATE_HOME=<empty> XDG_CONFIG_HOME=<empty> cargo test -j 1 --test web_session_sidebar -- --ignored` - passed; the ambient XDG state dir accumulates prior sessions and makes the original assertions nondeterministic.
+- `python3 scripts/check-spec.py --all` - passed (85 specs).
+- `bash scripts/spec-index.sh` - passed.
+
+### Residual risks
+
+- The TUI queries spoken agents on each chat draw; tasks with very large turn
+  histories rely on the existing indexes and were not load-tested at this scale.
+- A turn whose stored `model_id` is NULL shows only the agent label, not the
+  previous model; this matches the latest-completed-turn rule.
+- The headless chip test mocks the snapshot and covers rendering/switching, not
+  a live provider binding.
+
+### Rollback
+
+Revert the snapshot fields, spoken-agent queries, task header rendering, sidebar
+badge/tooltip, tests and docs. No migration is needed; the added JSON fields are
+optional and ignored by older clients.

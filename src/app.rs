@@ -81,7 +81,7 @@ use dmuxai::{
     },
     web::{
         SessionAgent, SessionCommandInfo, SessionConversation, SessionMessage, SessionModel,
-        SessionView, cap_session_transcript,
+        SessionTask, SessionTaskAgent, SessionView, cap_session_transcript,
     },
 };
 
@@ -3146,6 +3146,36 @@ impl App {
         }
     }
 
+    fn agent_key_runner_name(&self, key: AgentKey) -> String {
+        match key {
+            AgentKey::Codex => "codex".to_owned(),
+            AgentKey::Cursor => "cursor".to_owned(),
+            AgentKey::Agy => "agy".to_owned(),
+            AgentKey::Custom(index) => self
+                .custom_spec(index)
+                .map(|spec| spec.name)
+                .unwrap_or_else(|| "custom".to_owned()),
+        }
+    }
+
+    /// One-line terminal task header for spoken agents (FR-2331). Live agents
+    /// use `●`, spoken-but-not-live agents use `○`.
+    fn task_header_summary(&self) -> Option<String> {
+        let spoken = self.engine.spoken_agents().ok()?;
+        if spoken.is_empty() {
+            return None;
+        }
+        let agents = spoken
+            .iter()
+            .map(|agent| {
+                let mark = if agent.live { "●" } else { "○" };
+                format!("{mark} {}", self.agent_key_display_name(agent.agent))
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        Some(format!("Task · {agents}"))
+    }
+
     /// Stat each adapter's executable once. There is no later config reload
     /// that swaps adapters; snapshots only read this cache.
     fn refresh_agent_availability(&mut self) {
@@ -3244,6 +3274,11 @@ impl App {
                             turn_count: card.turn_count,
                             running: card.running || self.conversation_run_active(&id),
                             settings: session_task_settings(card.settings),
+                            spoken_agents: card
+                                .spoken_agents
+                                .into_iter()
+                                .map(|agent| self.agent_key_display_name(agent))
+                                .collect(),
                         };
                         if entry.id == conversation_id && ordered.is_empty() {
                             ordered.push(entry);
@@ -3437,6 +3472,24 @@ impl App {
                     .to_owned(),
         });
 
+        let task = self
+            .engine
+            .spoken_agents()
+            .ok()
+            .filter(|spoken| !spoken.is_empty())
+            .map(|spoken| SessionTask {
+                agents: spoken
+                    .into_iter()
+                    .map(|agent| SessionTaskAgent {
+                        agent: self.agent_key_runner_name(agent.agent),
+                        label: self.agent_key_display_name(agent.agent),
+                        model_id: agent.model_id,
+                        turns: agent.turns,
+                        live: agent.live,
+                    })
+                    .collect(),
+            });
+
         SessionView {
             conversation_id,
             conversation_title: self.conversation_title.clone(),
@@ -3447,6 +3500,7 @@ impl App {
             transcript_omitted: start + omitted,
             prompt_seq: self.dashboard_prompt_seq,
             run_active: self.followup_run_active(),
+            task,
             workspaces: {
                 let mut groups = Vec::with_capacity(self.session_workspaces.len() + 1);
                 let key = self.engine.workspace_key().to_owned();
@@ -3498,6 +3552,11 @@ impl App {
                         turn_count: card.turn_count,
                         running: card.running,
                         settings: session_task_settings(card.settings),
+                        spoken_agents: card
+                            .spoken_agents
+                            .into_iter()
+                            .map(|agent| self.agent_key_display_name(agent))
+                            .collect(),
                     },
                 )
             })
@@ -15386,11 +15445,15 @@ impl App {
         let scroll = max_scroll
             .saturating_sub(self.chat_scroll.min(max_scroll))
             .min(u16::MAX as usize) as u16;
-        let chat_title = format!(
+        let mut chat_title = format!(
             " {} [{}] ",
             self.conversation_title,
             short_id(self.conversation_id.as_str())
         );
+        if let Some(summary) = self.task_header_summary() {
+            chat_title.push_str(&summary);
+            chat_title.push(' ');
+        }
         let mut block = Block::default().borders(Borders::ALL).title(chat_title);
         if let Some(border) = theme_border {
             block = block.border_style(Style::default().fg(border));
@@ -19490,6 +19553,64 @@ mod tests {
         assert_eq!(other.conversations[0].id, id);
         assert_eq!(other.conversations[0].title, "Other chat");
         assert!(view.conversations.iter().all(|c| c.id != id));
+    }
+
+    // TC-2331 / FR-2331: the task header lists spoken agents in first-spoken
+    // order and marks only agents with an active binding live, in both the
+    // dashboard snapshot and the terminal title.
+    #[test]
+    fn tc_2331_task_header_live_session_marks() {
+        let (mut app, _sent) = test_app();
+        for (agent, model) in [
+            (AgentKey::Codex, "codex-1"),
+            (AgentKey::Cursor, "composer-2.5"),
+            (AgentKey::Agy, "agy-3"),
+        ] {
+            let request = match app
+                .engine
+                .begin_turn(BeginTurn {
+                    agent,
+                    model_id: Some(model.to_owned()),
+                    prompt: format!("prompt from {agent}"),
+                    display_text: None,
+                })
+                .unwrap()
+            {
+                BeginTurnOutcome::Ready(request) => request,
+                BeginTurnOutcome::NeedsSummary(_) => panic!("task needs an unexpected summary"),
+            };
+            let envelope = |event| TurnOutput {
+                conversation_id: request.conversation_id.clone(),
+                turn_id: request.turn_id.clone(),
+                agent: request.agent,
+                event,
+            };
+            app.engine
+                .record_turn_outputs(&[
+                    envelope(TurnEvent::Started),
+                    envelope(TurnEvent::ProviderSessionBound(format!("bind-{model}"))),
+                    envelope(TurnEvent::Completed),
+                ])
+                .unwrap();
+        }
+        app.engine.retire_active_binding(AgentKey::Agy).unwrap();
+
+        let view = app.session_view();
+        let task = view.task.expect("spoken agents in the session snapshot");
+        assert_eq!(
+            task.agents
+                .iter()
+                .map(|agent| (agent.label.as_str(), agent.live))
+                .collect::<Vec<_>>(),
+            [("Codex", true), ("Cursor", true), ("AGY", false)]
+        );
+        assert_eq!(task.agents[0].model_id.as_deref(), Some("codex-1"));
+        assert_eq!(task.agents[1].model_id.as_deref(), Some("composer-2.5"));
+
+        let text = render_test_buffer(&mut app);
+        assert!(text.contains("Task · ● Codex"), "{text}");
+        assert!(text.contains("● Cursor"), "{text}");
+        assert!(text.contains("○ AGY"), "{text}");
     }
 
     // TC-2322 / FR-2322: selecting a task restores its saved agent, model and

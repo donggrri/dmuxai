@@ -128,6 +128,32 @@ pub struct SessionView {
     /// shows Stop.
     #[serde(default)]
     pub run_active: bool,
+    /// Agents that have spoken in this task, with live-session marks
+    /// (FR-2331). Absent/empty when no agent has completed a turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<SessionTask>,
+}
+
+/// Task header data for the active conversation (FR-2331).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionTask {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<SessionTaskAgent>,
+}
+
+/// One agent that has spoken in the active task (FR-2331).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionTaskAgent {
+    pub agent: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub turns: u64,
+    #[serde(default)]
+    pub live: bool,
 }
 
 /// One workspace folder in the Sessions sidebar (FR-1225).
@@ -268,6 +294,10 @@ pub struct SessionConversation {
     /// settings (FR-2322).
     #[serde(default)]
     pub settings: Option<TaskSettings>,
+    /// Labels of agents with completed turns in this task, for the row
+    /// tooltip (FR-2341).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spoken_agents: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1311,6 +1341,7 @@ mod tests {
                 model: Some("composer-2.5".to_owned()),
                 effort: None,
             }),
+            spoken_agents: vec!["Cursor".to_owned(), "Codex".to_owned()],
         };
         let json = serde_json::to_string(&conv).unwrap();
         assert!(json.contains("\"last_agent\":\"Cursor\""), "{json}");
@@ -1318,6 +1349,10 @@ mod tests {
         assert!(json.contains("\"running\":true"), "{json}");
         assert!(
             json.contains("\"settings\":{\"agent\":\"cursor\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"spoken_agents\":[\"Cursor\",\"Codex\"]"),
             "{json}"
         );
 
@@ -1338,8 +1373,32 @@ mod tests {
                 turn_count: 0,
                 running: false,
                 settings: None,
+                spoken_agents: Vec::new(),
             }
         );
+    }
+
+    // FR-2331 / TC-2331: missing task data stays absent, and task agents
+    // round-trip through the dashboard snapshot.
+    #[test]
+    fn session_task_legacy_defaults_and_roundtrip() {
+        let legacy = r#"{"conversation_id":"conv","conversation_title":"Task","selected_agent":"cursor","details_expanded":false,"agents":[],"transcript":[],"conversations":[],"commands":[]}"#;
+        let view: SessionView = serde_json::from_str(legacy).unwrap();
+        assert_eq!(view.task, None);
+        assert!(!serde_json::to_string(&view).unwrap().contains("\"task\""));
+
+        let task = SessionTask {
+            agents: vec![SessionTaskAgent {
+                agent: "cursor".to_owned(),
+                label: "Cursor".to_owned(),
+                model_id: Some("composer-2.5".to_owned()),
+                turns: 2,
+                live: true,
+            }],
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains("\"live\":true"), "{json}");
+        assert_eq!(serde_json::from_str::<SessionTask>(&json).unwrap(), task);
     }
 
     // TC-957 snapshot part (UX-930): `graph.triage` serializes route metadata and

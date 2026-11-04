@@ -543,6 +543,9 @@
     root.appendChild(bar);
 
     var body = el('div', 'session-body');
+    ui.taskHeader = el('div', 'session-task-header');
+    ui.taskHeader.hidden = true;
+    body.appendChild(ui.taskHeader);
     ui.transcript = el('ol', 'session-transcript');
     ui.transcript.setAttribute('aria-live', 'polite');
     ui.transcript.addEventListener('scroll', function () {
@@ -1928,8 +1931,57 @@
     if (ui.route) { ui.route.disabled = viewOnly; }
     ui.input.disabled = viewOnly;
     renderGateBanner();
+    renderTaskHeader();
     renderTranscript();
     renderConversations();
+  }
+
+  function shortModel(id) {
+    var text = String(id || '');
+    if (!text) { return ''; }
+    if (text.length <= 18) { return text; }
+    return text.slice(0, 15) + '\u2026';
+  }
+
+  function agentDisplayLabel(id) {
+    var key = String(id || '');
+    var known = { codex: 'Codex', cursor: 'Cursor', agy: 'AGY' };
+    return known[key.toLowerCase()] || key;
+  }
+
+  // FR-2331: spoken agents for the active task, with live-session marks.
+  // Chips reuse the existing agent picker command; this adds no new route.
+  function renderTaskHeader() {
+    if (!ui.taskHeader) { return; }
+    ui.taskHeader.textContent = '';
+    var agents = (session && session.task && session.task.agents) || [];
+    ui.taskHeader.hidden = agents.length === 0;
+    if (!agents.length) { return; }
+    ui.taskHeader.appendChild(el('span', 'session-task-label', 'Task'));
+    agents.forEach(function (a) {
+      var chip = el('button', 'session-task-chip');
+      chip.type = 'button';
+      if (a.live) {
+        var dot = el('span', 'session-task-live');
+        dot.setAttribute('role', 'img');
+        dot.setAttribute('aria-label', 'live session');
+        chip.appendChild(dot);
+      }
+      chip.appendChild(el('span', 'session-task-agent', a.label || a.agent));
+      if (a.model_id) {
+        chip.appendChild(el('span', 'session-task-model', shortModel(a.model_id)));
+      }
+      chip.title = (a.label || a.agent) + (a.model_id ? ' \u00b7 ' + a.model_id : '') +
+        ' \u00b7 ' + (a.live ? 'live session' : 'no live session');
+      if (a.agent === session.selected_agent) {
+        chip.classList.add('session-task-chip-active');
+      }
+      chip.disabled = viewOnly;
+      chip.addEventListener('click', function () {
+        command({ command: 'select_agent', agent: a.agent });
+      });
+      ui.taskHeader.appendChild(chip);
+    });
   }
 
   function releaseEcho(echo) {
@@ -2454,6 +2506,9 @@
 
     var titleText = c.title || c.id.slice(0, 8);
     var tip = titleText + (c.last_agent ? ' \u00b7 ' + c.last_agent : '');
+    if (c.spoken_agents && c.spoken_agents.length) {
+      tip += ' \u00b7 agents: ' + c.spoken_agents.join(', ');
+    }
     if (!group.current && !disabled) { tip += ' \u00b7 opens in ' + (group.name || group.path); }
     if (!group.current && isOpenFolder(group.path)) { tip += ' \u00b7 open in this dashboard'; }
     if (reason) { tip += ' \u2014 ' + reason; }
@@ -2468,6 +2523,17 @@
     }
     top.appendChild(el('span', 'sessions-row-title', titleText));
     top.appendChild(el('span', 'sessions-row-agent sr-only', c.last_agent || 'none'));
+    // FR-2341: stored task agent/model, falling back to last_agent.
+    var badgeAgent = (c.settings && c.settings.agent) || c.last_agent;
+    var badgeModel = (c.settings && c.settings.model) || '';
+    if (badgeAgent) {
+      var badge = el('span', 'sessions-row-badge');
+      badge.appendChild(el('span', 'sessions-row-badge-agent', agentDisplayLabel(badgeAgent)));
+      if (badgeModel) {
+        badge.appendChild(el('span', 'sessions-row-badge-model', shortModel(badgeModel)));
+      }
+      top.appendChild(badge);
+    }
     var timeEl = el('span', 'sessions-row-time', compactTime(c.updated_at_ms));
     if (c.updated_at_ms) {
       try { timeEl.title = new Date(c.updated_at_ms).toISOString(); } catch (err) { /* ignore */ }
