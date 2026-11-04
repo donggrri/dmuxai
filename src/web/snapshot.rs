@@ -606,6 +606,27 @@ pub struct NodeDetail {
     pub log_tail: Vec<String>,
     #[serde(default)]
     pub changed_files: Vec<String>,
+    /// Current tool/shell activity for the node, when the runner reports one
+    /// (FR-2420). Reuses [`crate::activity::ActivityItem`] without new
+    /// runner protocol parsing.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "tool_activity",
+        alias = "current_activity",
+        alias = "tool"
+    )]
+    pub activity: Option<crate::activity::ActivityItem>,
+    /// In-memory timestamp (ms since epoch) of the last log/activity change
+    /// for this node, used by the 5-minute stall marker (FR-2422).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "last_output_ms",
+        alias = "last_output_at_ms",
+        alias = "updated_at_ms"
+    )]
+    pub last_update_ms: Option<u64>,
 }
 
 pub fn truncate_with_ellipsis(s: &str, limit: usize) -> String {

@@ -3,6 +3,22 @@ use std::collections::{HashMap, HashSet};
 use super::replan::node_send_prompt;
 use super::types::{GraphNode, GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, NodeRole};
 
+/// FR-2421: test and verify nodes must confirm external acceptance and bound waits.
+pub const TEST_NODE_WAIT_GUARD: &str = "\
+Test and verify waits
+- Before waiting on external work, confirm it was accepted by reading the job id or queue response.
+- Bound every wait or poll loop to about 10 minutes; never wait forever.
+- If the job was not accepted or a wait exceeds the bound, fail with a clear message naming the job and the timeout.";
+
+fn node_prompt(job: &str, plan: &GraphPlan, role: NodeRole) -> String {
+    let prompt = node_send_prompt(job, plan);
+    if role == NodeRole::Test {
+        format!("{prompt}\n\n{TEST_NODE_WAIT_GUARD}")
+    } else {
+        prompt
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeAssignment {
     pub node_id: String,
@@ -108,7 +124,7 @@ impl GraphRunSession {
             node_id: node.id.clone(),
             runner: node.runner.clone(),
             model_id: node.model_id.clone(),
-            prompt: node_send_prompt(&node.job, &self.run.plan),
+            prompt: node_prompt(&node.job, &self.run.plan, node.role),
             role: node.role,
         })
     }
@@ -275,7 +291,7 @@ impl GraphRunSession {
                 node_id: node_id.clone(),
                 runner: self.run.plan.nodes[index].runner.clone(),
                 model_id: self.run.plan.nodes[index].model_id.clone(),
-                prompt: node_send_prompt(&job, &self.run.plan),
+                prompt: node_prompt(&job, &self.run.plan, role),
                 role,
             };
 
@@ -865,5 +881,50 @@ mod tests {
                 .any(|action| matches!(action, GraphAction::Failed(_))),
             "waiting is not a failure"
         );
+    }
+
+    // TC-2421 / FR-2421: test/verify nodes get the wait guard in their prompt,
+    // while other roles do not.
+    #[test]
+    fn tc_2421_test_node_prompt_has_wait_guard() {
+        let json = r#"{"tasks":[
+            {"id":"task-1","title":"work","done_check":"d","size":"small"}
+        ],"steps":[
+            {"id":"verify-step","role":"test","job":"verify the external job","runner":"grok","model":"grok-4.7","depends_on":[],"task":"task-1"},
+            {"id":"impl-step","role":"implement","job":"write the code","runner":"grok","model":"grok-4.7","depends_on":[],"task":"task-1"}
+        ]}"#;
+        let session = session_for(plan_from_json(json, 2));
+
+        let test_prompt = session
+            .assignment_for_node("verify-step")
+            .expect("test assignment")
+            .prompt;
+        assert!(test_prompt.contains(TEST_NODE_WAIT_GUARD));
+        for needle in [
+            "job id or queue response",
+            "wait or poll loop",
+            "10 minutes",
+            "fail with a clear message",
+        ] {
+            assert!(test_prompt.contains(needle), "missing {needle:?}");
+        }
+
+        let impl_prompt = session
+            .assignment_for_node("impl-step")
+            .expect("implement assignment")
+            .prompt;
+        assert!(!impl_prompt.contains(TEST_NODE_WAIT_GUARD));
+
+        for prompt in [
+            crate::agent_prompt::BUILTIN_AGY_PROMPT,
+            crate::agent_prompt::BUILTIN_COMPOSER_PROMPT,
+            crate::agent_prompt::BUILTIN_CURSOR_GROK_PROMPT,
+            crate::agent_prompt::BUILTIN_GROK_BUILD_PROMPT,
+        ] {
+            assert!(
+                !prompt.contains(TEST_NODE_WAIT_GUARD),
+                "wait guard must stay scoped to test/verify nodes"
+            );
+        }
     }
 }

@@ -12,6 +12,16 @@ All notable changes to dmuxai are listed here. Versions follow
   `active` native session live; the existing agent picker still switches agents.
   Sidebar task rows show the task's stored agent and model as a short badge
   (falling back to the last agent) and list spoken agents in the tooltip.
+- **Graph node detail shows tool activity and stall markers (#228, FR-2420, FR-2422).**
+  Dashboard graph node details reuse `ActivityItem`/`ToolStatus` to show
+  the current tool or command summary (first line, max 120 chars), elapsed time,
+  and the last 3 output lines; a muted "no new output for N min" marker appears for
+  running nodes whose log tail and activity are unchanged for 5 minutes without
+  stopping or failing the node. The TUI keeps its one-line graph status.
+- **Test and verify nodes cannot wait forever (#228, FR-2421).** Graph `test` and
+  `verify` node prompts now require confirming that external work was accepted (via
+  a job id or queue response) before waiting, bound every wait/poll loop to about
+  10 minutes, and fail with a clear message instead of waiting indefinitely.
 - **Jira tickets in the To-dos sidebar, read-only (SPEC-jira-todos, FR-2400..2408,
   UX-2409..2411).** A `[jira]` table in `dmuxai.toml` (`base_url`, `email`, `jql`,
   `max_results`, `token_env`) lists matching Jira Cloud issues in a collapsible

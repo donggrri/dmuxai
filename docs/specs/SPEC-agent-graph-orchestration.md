@@ -26,6 +26,7 @@ DmuxAI plans multi-step work using the agent-graph-engineering shape by default.
 | NFR-1886 | Must | Same as NFR-GRAPH-1 (Cap parallel nodes (default 2) and retries (default 2)) |
 | FR-1887 | Must | Same as FR-GRAPH-6 (Persist and reload graph run JSON) |
 | FR-1888 | Must | Same as FR-GRAPH-7 (Discover `.agents/skills/*/SKILL.md` for node skill binding) |
+| FR-2421 | Must | Given a graph node with role `test` or `verify`, the system/node prompt instructs the agent to confirm external work was accepted (via job id or queue response) before waiting, bound every wait/poll loop (e.g. 10 minutes), and fail with a clear message instead of waiting indefinitely. |
 
 ### Legacy id map
 
@@ -54,6 +55,7 @@ DmuxAI plans multi-step work using the agent-graph-engineering shape by default.
 | TC-1886 | NFR-1886 | unit | executor defaults (planned — no automated test yet) |
 | TC-1887 | FR-1887 | unit | `tests/graph_orchestration.rs` `store_round_trip` |
 | TC-1888 | FR-1888 | unit | `tests/graph_orchestration.rs` `discover_skills_finds_agent_graph_engineering` |
+| TC-2421 | FR-2421 | unit | `src/graph/executor.rs` `tc_2421_test_node_prompt_has_wait_guard` (test-role node prompt has the guard; implement-role prompt does not) |
 
 ## 6. Non-goals
 

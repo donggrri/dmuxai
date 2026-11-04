@@ -1202,6 +1202,9 @@ struct NodeDetailTracker {
     lines: Vec<String>,
     current_line: String,
     changed_files: Vec<String>,
+    activity: Option<dmuxai::activity::ActivityItem>,
+    tool_started_at_ms: Option<u64>,
+    last_update_ms: Option<u64>,
 }
 
 impl NodeDetailTracker {
@@ -1233,6 +1236,7 @@ impl NodeDetailTracker {
                 self.enforce_current_line_cap();
             }
         }
+        self.last_update_ms = Some(unix_ms_now());
     }
 
     fn record_file_change(&mut self, target: &str, workspace_root: &Path) {
@@ -1251,6 +1255,30 @@ impl NodeDetailTracker {
                 self.changed_files.push(rel);
             }
         }
+        self.last_update_ms = Some(unix_ms_now());
+    }
+
+    fn record_activity(&mut self, item: dmuxai::activity::ActivityItem) {
+        use dmuxai::activity::ActivityItem as AI;
+        if let AI::Tool { .. } = &item {
+            let mut item = item.clone();
+            if let AI::Tool { target, .. } = &mut item {
+                // First line only, capped at 120 chars.
+                let first_line = target.lines().next().unwrap_or("").trim();
+                *target = if first_line.chars().count() > 120 {
+                    let mut s: String = first_line.chars().take(119).collect();
+                    s.push('…');
+                    s
+                } else {
+                    first_line.to_owned()
+                };
+            }
+            self.activity = Some(item);
+            self.tool_started_at_ms = Some(unix_ms_now());
+        } else {
+            self.activity = Some(item);
+        }
+        self.last_update_ms = Some(unix_ms_now());
     }
 
     fn snapshot(&self) -> dmuxai::web::NodeDetail {
@@ -1263,9 +1291,24 @@ impl NodeDetailTracker {
             .iter()
             .map(|l| dmuxai::web::truncate_with_ellipsis(l, 300))
             .collect();
+        // Compute elapsed duration for a still-running tool activity.
+        let mut activity = self.activity.clone();
+        if let Some(dmuxai::activity::ActivityItem::Tool {
+            status: dmuxai::activity::ToolStatus::Running,
+            duration_ms,
+            ..
+        }) = &mut activity
+            && self.tool_started_at_ms.is_some()
+        {
+            let started = self.tool_started_at_ms.unwrap();
+            let now = unix_ms_now();
+            *duration_ms = Some(now.saturating_sub(started));
+        }
         dmuxai::web::NodeDetail {
             log_tail,
             changed_files: self.changed_files.clone(),
+            activity,
+            last_update_ms: self.last_update_ms,
         }
     }
 }
@@ -11338,11 +11381,12 @@ impl App {
                 AgentEvent::TextDelta(delta) => {
                     tracker.record_text(delta);
                 }
-                AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
-                    name, target, ..
-                }) => {
-                    if is_write_tool(name) {
-                        tracker.record_file_change(target, &self.workspace_root);
+                AgentEvent::Activity(item) => {
+                    if let dmuxai::activity::ActivityItem::Tool { name, target, .. } = item {
+                        if is_write_tool(name) {
+                            tracker.record_file_change(target, &self.workspace_root);
+                        }
+                        tracker.record_activity(item.clone());
                     }
                 }
                 AgentEvent::ToolProgress { summary, .. } if summary.starts_with("File changes") => {
@@ -20054,6 +20098,146 @@ mod tests {
                 .any(|f| f.contains("outside"))
         );
         assert_eq!(node.detail.changed_files.len(), 50);
+    }
+
+    // TC-2420 / FR-2420: node detail reuses ActivityItem/ToolStatus to show tool activity.
+    #[test]
+    fn tc_2420_node_detail_shows_tool_activity() {
+        let (mut app, _sent) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            app.workspace_root.to_string_lossy().into_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+
+        app.graph_session = Some(GraphRunSession::new(GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: "run-activity-test".to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: "track activity".to_owned(),
+                limits: dmuxai::graph::GraphLimits::default(),
+                tasks: Vec::new(),
+                nodes: vec![dmuxai::graph::GraphNode {
+                    id: "step-1".to_owned(),
+                    role: NodeRole::Implement,
+                    job: "perform work".to_owned(),
+                    runner: "agy".to_owned(),
+                    model_id: "opencode-default".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Running,
+                    attempt: 1,
+                    task: None,
+                    started_at_ms: None,
+                    finished_at_ms: None,
+                }],
+                edges: vec![],
+            },
+            conversation_id: app.conversation_id.as_str().to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+            ..Default::default()
+        }));
+        app.busy_agents.insert(Agent::Agy);
+        app.graph_agent_nodes
+            .insert(Agent::Agy, "step-1".to_owned());
+
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
+                name: "run".to_owned(),
+                target: "cargo test --all".to_owned(),
+                status: dmuxai::activity::ToolStatus::Running,
+                duration_ms: None,
+                detail: String::new(),
+            }),
+        );
+        // last 3 output lines
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::TextDelta(
+                "out1
+out2
+out3
+"
+                .to_owned(),
+            ),
+        );
+
+        app.publish_dashboard();
+
+        let snapshot = hub.snapshot();
+        let graph = snapshot.graph.expect("expected graph");
+        let node = &graph.nodes[0];
+        let activity = node.detail.activity.as_ref().expect("activity present");
+        // ActivityItem variant check
+        match activity {
+            dmuxai::activity::ActivityItem::Tool {
+                name,
+                target,
+                status,
+                ..
+            } => {
+                assert_eq!(name, "run");
+                assert_eq!(target, "cargo test --all");
+                assert_eq!(*status, dmuxai::activity::ToolStatus::Running);
+            }
+            _ => panic!("expected tool activity"),
+        }
+        assert!(node.detail.last_update_ms.is_some());
+        assert_eq!(node.detail.log_tail, vec!["out1", "out2", "out3"]);
+    }
+
+    // TC-2420 boundary: no activity -> nothing new.
+    #[test]
+    fn tc_2420_node_detail_no_activity() {
+        let (mut app, _sent) = test_app();
+        let hub = dmuxai::web::DashboardHub::new(
+            dmuxai::web::SnapshotSource::Tui,
+            app.workspace_root.to_string_lossy().into_owned(),
+        );
+        app.attach_dashboard(hub.clone());
+
+        app.graph_session = Some(GraphRunSession::new(GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: "run-no-activity".to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: "track".to_owned(),
+                limits: dmuxai::graph::GraphLimits::default(),
+                tasks: Vec::new(),
+                nodes: vec![dmuxai::graph::GraphNode {
+                    id: "step-1".to_owned(),
+                    role: NodeRole::Implement,
+                    job: "perform work".to_owned(),
+                    runner: "agy".to_owned(),
+                    model_id: "opencode-default".to_owned(),
+                    skill: None,
+                    requires_gate: false,
+                    status: dmuxai::graph::GraphNodeStatus::Running,
+                    attempt: 1,
+                    task: None,
+                    started_at_ms: None,
+                    finished_at_ms: None,
+                }],
+                edges: vec![],
+            },
+            conversation_id: app.conversation_id.as_str().to_owned(),
+            phase: GraphRunPhase::Active,
+            waiting_gate_node: None,
+            ..Default::default()
+        }));
+        app.busy_agents.insert(Agent::Agy);
+        app.graph_agent_nodes
+            .insert(Agent::Agy, "step-1".to_owned());
+
+        app.publish_dashboard();
+
+        let snapshot = hub.snapshot();
+        let graph = snapshot.graph.expect("expected graph");
+        let node = &graph.nodes[0];
+        assert!(node.detail.activity.is_none());
     }
 
     // FR-702: parallel runners attribute output to the correct node; retries reset detail.
