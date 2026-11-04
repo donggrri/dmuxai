@@ -67,6 +67,12 @@ case "$behavior" in
     printf '%s\n' '{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"read","state":{"status":"completed","title":"src/app.rs","input":{"filePath":"src/app.rs"}}}}'
     sleep 0.2
     printf '{"type":"text","sessionID":"ses_1","part":{"text":"echo:%s"}}\n' "$(json_escape "$last")" ;;
+  jsonl_file)
+    # Replay a saved JSONL stream (for example the opencode compaction leak).
+    if [ -n "$FAKE_AGENT_JSONL" ]; then
+      cat "$FAKE_AGENT_JSONL"
+    fi
+    ;;
   text)   echo "hello $last" ;;
   stdin)  read -r line; echo "stdin:$line" ;;
   empty)  : ;;

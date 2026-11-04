@@ -158,6 +158,7 @@ pub enum AgentErrorKind {
     Cancelled,
     Policy,
     SensitiveGate,
+    CompactedUnfinished,
 }
 
 impl AgentErrorKind {
@@ -172,6 +173,7 @@ impl AgentErrorKind {
             Self::Cancelled => "cancelled",
             Self::Policy => "policy",
             Self::SensitiveGate => "sensitive_gate",
+            Self::CompactedUnfinished => "compacted_unfinished",
         }
     }
 }
@@ -230,6 +232,10 @@ impl AgentError {
 
     pub fn policy(message: impl Into<String>) -> Self {
         Self::new(AgentErrorKind::Policy, message)
+    }
+
+    pub fn compacted_unfinished(message: impl Into<String>) -> Self {
+        Self::new(AgentErrorKind::CompactedUnfinished, message)
     }
 
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
@@ -530,6 +536,7 @@ mod typed_error_tests {
             (AgentErrorKind::Cancelled, "cancelled"),
             (AgentErrorKind::Policy, "policy"),
             (AgentErrorKind::SensitiveGate, "sensitive_gate"),
+            (AgentErrorKind::CompactedUnfinished, "compacted_unfinished"),
         ];
 
         for (kind, expected) in cases {

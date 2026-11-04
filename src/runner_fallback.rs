@@ -326,7 +326,10 @@ pub fn classify_failure(kind: &str, message: &str) -> Option<FallbackReason> {
     if kind == "stalled" {
         return Some(FallbackReason::Stall);
     }
-    if matches!(kind.as_str(), "cancelled" | "policy" | "timeout" | "idle") {
+    if matches!(
+        kind.as_str(),
+        "cancelled" | "policy" | "timeout" | "idle" | "compacted_unfinished"
+    ) {
         return None;
     }
     if kind == "model_unavailable" {
@@ -716,6 +719,7 @@ mod tests {
         assert_eq!(classify_failure("policy", "permission denied"), None);
         assert_eq!(classify_failure("timeout", "x"), None);
         assert_eq!(classify_failure("idle", "x"), None);
+        assert_eq!(classify_failure("compacted_unfinished", "x"), None);
         assert_eq!(
             classify_failure("provider", "tests failed: 3 failures"),
             None

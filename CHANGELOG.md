@@ -99,6 +99,15 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
+- **opencode compaction no longer leaks into the reply or fakes success (#185, FR-2440..2443).**
+  The opencode preset skips synthetic parts (`text_skip_when`), drops the
+  auto-compaction summary of the open message when opencode's compaction
+  continuation arrives (`compaction_when`, grouped by `message_id_path`) and
+  shows a `context compacted` notice instead. A turn whose stream ends right
+  after a compaction without a final answer now fails with `error_kind`
+  `compacted_unfinished` (no runner fallback) instead of reporting `ok: true`
+  with the summary as the answer. Custom runners without the new options are
+  unchanged.
 - **Dashboard Stop no longer leaves a stale chat (#155, FR-1237).** The reply of
   a session command (Stop, queue remove/edit, picker) could arrive after a newer
   live snapshot and overwrite it, so the next follow-up kept showing as queued

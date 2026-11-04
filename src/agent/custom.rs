@@ -810,10 +810,11 @@ async fn run_turn(
     }
 
     let effective_output = spec.effective_output();
-    let mut reply = String::new();
+    // FR-2440, FR-2441: the collector keeps synthetic parts and compaction
+    // summaries out of the reply.
+    let mut reply = dmuxai::custom_agent::ReplyCollector::new(spec);
     let mut jsonl_error: Option<String> = None;
     let mut bound_session: Option<String> = None;
-    let mut break_pending = false;
     let mut grok_tools = dmuxai::custom_agent::is_builtin_grok(spec)
         .then(|| dmuxai::grok_activity::GrokToolTracker::new(cwd));
     let mut done = false;
@@ -855,6 +856,7 @@ async fn run_turn(
                     && let Some(reason) = detector.check(std::time::Instant::now())
                 {
                     let _ = supervised.stop().await;
+                    flush_reply_text(&mut reply, event_tx, agent, context).await;
                     return Err(AgentError::stalled(format!(
                         "{} stalled: {reason}",
                         spec.label()
@@ -863,12 +865,14 @@ async fn run_turn(
             }
             dmuxai::process::supervisor::LineEvent::Idle(d) => {
                 let _ = supervised.stop().await;
+                flush_reply_text(&mut reply, event_tx, agent, context).await;
                 return Err(AgentError::idle(
                     dmuxai::process::supervisor::idle_error_message(spec.label(), d.as_secs()),
                 ));
             }
             dmuxai::process::supervisor::LineEvent::Timeout(_) => {
                 let _ = supervised.stop().await;
+                flush_reply_text(&mut reply, event_tx, agent, context).await;
                 let (msg, hint) = timeout_parts(spec);
                 return Err(AgentError::timeout(msg).with_hint(hint));
             }
@@ -907,6 +911,7 @@ async fn run_turn(
 
                     if let Some(reason) = detector.check(now) {
                         let _ = supervised.stop().await;
+                        flush_reply_text(&mut reply, event_tx, agent, context).await;
                         return Err(AgentError::stalled(format!(
                             "{} stalled: {reason}",
                             spec.label()
@@ -950,7 +955,7 @@ async fn run_turn(
                         if is_non_empty {
                             line_produced_text = true;
                         }
-                        reply.push_str(&chunk);
+                        reply.push_raw(&chunk);
                         send(event_tx, agent, Some(context), AgentEvent::TextDelta(chunk)).await;
                     }
                     CustomAgentOutput::Jsonl => {
@@ -963,7 +968,7 @@ async fn run_turn(
                             send(event_tx, agent, Some(context), AgentEvent::Activity(item)).await;
                         }
                         let parsed = parse_jsonl_line(spec, &line);
-                        if let Some(session) = parsed.session_id
+                        if let Some(session) = parsed.session_id.clone()
                             && bound_session.as_deref() != Some(session.as_str())
                         {
                             bound_session = Some(session.clone());
@@ -975,20 +980,27 @@ async fn run_turn(
                             )
                             .await;
                         }
-                        if let Some(text) = parsed.text {
-                            if !text.is_empty() {
-                                line_produced_text = true;
-                            }
-                            let chunk = dmuxai::custom_agent::append_reply_text(
-                                &mut reply,
-                                &text,
-                                &mut break_pending,
-                            );
+                        if let Some(text) = parsed.text.as_deref()
+                            && !text.is_empty()
+                        {
+                            line_produced_text = true;
+                        }
+                        // FR-2440, FR-2441: synthetic parts are skipped and a
+                        // compaction summary is dropped instead of streamed.
+                        if let Some(chunk) = reply.push(&parsed) {
                             send(event_tx, agent, Some(context), AgentEvent::TextDelta(chunk))
                                 .await;
                         }
-                        if parsed.text_break {
-                            break_pending = true;
+                        if parsed.compacted {
+                            send(
+                                event_tx,
+                                agent,
+                                Some(context),
+                                AgentEvent::Notice(
+                                    dmuxai::custom_agent::COMPACTION_NOTICE.to_owned(),
+                                ),
+                            )
+                            .await;
                         }
                         if let Some(error) = parsed.error
                             && !error.trim().is_empty()
@@ -1012,6 +1024,11 @@ async fn run_turn(
         }
     };
 
+    // FR-2441: release the text of the last message before the turn ends.
+    if let Some(chunk) = reply.finish() {
+        send(event_tx, agent, Some(context), AgentEvent::TextDelta(chunk)).await;
+    }
+
     let stderr_text = supervised.stderr_tail().await;
     let exit_ok = done || status.success();
     // FR-2125: sample the workspace again after the child exited.
@@ -1024,10 +1041,20 @@ async fn run_turn(
         (fingerprint_before.as_deref(), fingerprint_after.as_deref()),
         (Some(before), Some(after)) if before != after
     );
+
+    // FR-2443: if the stream ended right after a compaction continuation without
+    // an answer, the turn must fail even if the workspace changed.
+    if reply.compacted_without_answer() {
+        return Err(AgentError::compacted_unfinished(format!(
+            "{} stopped after context compaction without a final answer; resume the session to continue",
+            spec.label()
+        )));
+    }
+
     let outcome = dmuxai::custom_agent::classify_turn_outcome(
         spec,
         exit_ok,
-        &reply,
+        reply.reply(),
         &stderr_text,
         jsonl_error.as_deref(),
         workspace_changed,
@@ -1070,7 +1097,7 @@ async fn run_turn(
         };
 
         if !is_policy
-            && !reply.trim().is_empty()
+            && !reply.reply().trim().is_empty()
             && error_at_final
             && dmuxai::runner_fallback::is_transient_provider_error(err_candidate)
         {
@@ -1165,6 +1192,19 @@ async fn send(
     event: AgentEvent,
 ) {
     super::emit(event_tx, agent, context, event).await;
+}
+
+/// Streams the text of the open message when a turn ends before the runner
+/// closed its last message (FR-2441).
+async fn flush_reply_text(
+    reply: &mut dmuxai::custom_agent::ReplyCollector,
+    event_tx: &mpsc::Sender<AgentOutput>,
+    agent: Agent,
+    context: &OutputContext,
+) {
+    if let Some(chunk) = reply.finish() {
+        send(event_tx, agent, Some(context), AgentEvent::TextDelta(chunk)).await;
+    }
 }
 
 // The fake agent is a POSIX shell script; keep test-only on unix.
@@ -1429,6 +1469,110 @@ mod tests {
         assert_eq!(progress.kind, "tool");
         assert!(progress.summary.chars().count() <= crate::progress::MAX_SUMMARY_CHARS);
         assert!(!progress.summary.contains("SECRET_BODY"));
+    }
+
+    /// The saved opencode JSONL stream that reproduces the compaction leak:
+    /// a narration, a compaction summary, the synthetic continuation prompt,
+    /// and the real answer.
+    fn compaction_fixture() -> String {
+        format!(
+            "{}/tests/fixtures/opencode/compaction-leak.jsonl",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    /// A spec that opts into the opencode compaction handling.
+    fn compaction_spec(extra: &str) -> String {
+        format!(
+            "output = \"jsonl\"\ntext_path = \"/part/text\"\ntext_when = {{ path = \"/type\", equals = \"text\" }}\ntext_skip_when = {{ path = \"/part/synthetic\", equals = true }}\ncompaction_when = {{ path = \"/part/metadata/compaction_continue\", equals = true }}\nmessage_id_path = \"/part/messageID\"\nenv = {{ FAKE_AGENT_JSONL = \"{}\" }}\n{extra}",
+            compaction_fixture()
+        )
+    }
+
+    /// The saved opencode JSONL stream where compaction occurs but the runner
+    /// exits without providing a final answer (FR-2443).
+    fn compaction_unfinished_fixture() -> String {
+        format!(
+            "{}/tests/fixtures/opencode/compaction-unfinished.jsonl",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    // TC-2440 / FR-2440, FR-2441: the compaction summary and the continuation
+    // prompt never reach the reply (issue #185).
+    #[tokio::test]
+    async fn tc_2440_opencode_compaction_leak_is_not_in_the_reply() {
+        let spec = spec("jsonl_file", &compaction_spec(""));
+        let (result, text) = run(spec, None).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(text, "Let me look at the file.\nThe real answer.\n");
+        assert!(!text.contains("## Objective"), "{text}");
+        assert!(!text.contains("Continue if you have next steps"), "{text}");
+    }
+
+    // TC-2442 / FR-2442: a runner without the new options keeps every text
+    // part, exactly as before.
+    #[tokio::test]
+    async fn tc_2442_runner_without_options_keeps_the_synthetic_text() {
+        let extra = format!(
+            "output = \"jsonl\"\ntext_path = \"/part/text\"\ntext_when = {{ path = \"/type\", equals = \"text\" }}\nenv = {{ FAKE_AGENT_JSONL = \"{}\" }}",
+            compaction_fixture()
+        );
+        let spec = spec("jsonl_file", &extra);
+        let (result, text) = run(spec, None).await;
+        assert_eq!(result, Ok(()));
+        assert!(text.contains("## Objective"), "{text}");
+        assert!(text.contains("Continue if you have next steps"), "{text}");
+    }
+
+    // TC-2444 / FR-2441: the compaction shows a short notice instead of the
+    // summary.
+    #[tokio::test]
+    async fn tc_2444_compaction_shows_context_compacted_notice() {
+        let spec = spec("jsonl_file", &compaction_spec(""));
+        let (result, events) = run_turn_capture_events(spec).await;
+        assert_eq!(result, Ok(()));
+        let notices: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(notice) => Some(notice.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|notice| notice == "context compacted"),
+            "events: {events:?}"
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TextDelta(delta) => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!text.contains("## Objective"), "{text}");
+        assert!(text.contains("Let me look at the file."), "{text}");
+        assert!(text.contains("The real answer."), "{text}");
+    }
+
+    // TC-2446 / FR-2443: stream ending after compaction continuation without an
+    // answer fails with CompactedUnfinished and drops the summary from the reply.
+    #[tokio::test]
+    async fn tc_2446_compaction_unfinished_fails_without_summary_in_reply() {
+        let extra = format!(
+            "output = \"jsonl\"\ntext_path = \"/part/text\"\ntext_when = {{ path = \"/type\", equals = \"text\" }}\ntext_skip_when = {{ path = \"/part/synthetic\", equals = true }}\ncompaction_when = {{ path = \"/part/metadata/compaction_continue\", equals = true }}\nmessage_id_path = \"/part/messageID\"\nenv = {{ FAKE_AGENT_JSONL = \"{}\" }}",
+            compaction_unfinished_fixture()
+        );
+        let spec = spec("jsonl_file", &extra);
+        let (result, text) = run(spec, None).await;
+        assert_eq!(
+            result,
+            Err(AgentError::compacted_unfinished(format!(
+                "{} stopped after context compaction without a final answer; resume the session to continue",
+                spec.label()
+            )))
+        );
+        assert!(!text.contains("## Objective"), "{text}");
     }
 
     #[tokio::test]
