@@ -1534,6 +1534,43 @@ function renderGraphDetail(graph, nowMs) {
   panel.appendChild(list);
 
   var detail = node.detail && typeof node.detail === 'object' ? node.detail : {};
+  var activity = detail.activity && typeof detail.activity === 'object' ? detail.activity : null;
+  if (activity) {
+    var activitySection = el('div', 'detail-section detail-activity');
+    activitySection.appendChild(el('h4', 'detail-section-title', 'Activity'));
+    var toolName = String(activity.name || 'tool');
+    var summary = String(activity.target || '').split('\n')[0];
+    if (summary.length > 120) { summary = summary.slice(0, 119) + '\u2026'; }
+    var headLine = summary ? (toolName + ' ' + summary) : toolName;
+    if (headLine.length > 120) { headLine = headLine.slice(0, 119) + '\u2026'; }
+    activitySection.appendChild(el('p', 'activity-tool', headLine));
+    if (typeof activity.duration_ms === 'number') {
+      activitySection.appendChild(el('p', 'activity-elapsed', 'elapsed ' + fmtElapsed(activity.duration_ms)));
+    }
+    var status = String(activity.status || '');
+    if (status) { activitySection.appendChild(el('p', 'activity-status', status)); }
+    var outputLines = Array.isArray(detail.log_tail) ? detail.log_tail.slice(-3) : [];
+    if (outputLines.length > 0) {
+      var pre = el('pre', 'detail-log activity-output');
+      pre.textContent = outputLines.join('\n');
+      activitySection.appendChild(pre);
+    }
+    panel.appendChild(activitySection);
+  }
+
+  // FR-2422: muted stall marker for running nodes with no new output for 5 min.
+  if (graphNodeStatus(node) === 'running' && typeof detail.last_update_ms === 'number') {
+    var nowServer = graphServerNow(graph, typeof nowMs === 'number' ? nowMs : Date.now());
+    var ageMs = nowServer - detail.last_update_ms;
+    var thresholdMs = 5 * 60 * 1000;
+    if (ageMs >= thresholdMs) {
+      var minutes = Math.floor(ageMs / 60000);
+      if (minutes < 5) { minutes = 5; }
+      var stall = el('p', 'stall-marker muted', 'no new output for ' + minutes + ' min');
+      panel.appendChild(stall);
+    }
+  }
+
   panel.appendChild(detailSection(
     'Log tail', Array.isArray(detail.log_tail) ? detail.log_tail : [], 'detail-log'
   ));

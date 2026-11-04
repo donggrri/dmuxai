@@ -2373,4 +2373,32 @@ mod tests {
         assert!(APP_CSS.contains("prefers-reduced-motion"), "reduced motion");
         assert!(SESSION_JS.contains("aria-label"), "aria labels");
     }
+
+    // TC-2420 / FR-2420: dashboard node detail shows tool activity.
+    #[test]
+    fn tc_2420_node_detail_shows_tool_activity() {
+        assert!(
+            APP_JS.contains("detail.activity"),
+            "app.js must read detail.activity"
+        );
+        assert!(
+            APP_JS.contains("activity.duration_ms"),
+            "elapsed duration from activity"
+        );
+        assert!(APP_JS.contains("slice(-3)"), "last 3 output lines");
+        assert!(APP_JS.contains("120"), "120 char cap for tool summary");
+        assert!(APP_CSS.contains(".activity-tool"), "activity tool style");
+    }
+
+    // TC-2422 / FR-2422: running node stall marker.
+    #[test]
+    fn tc_2422_running_node_stall_marker() {
+        assert!(APP_JS.contains("no new output for"), "stall marker text");
+        assert!(APP_JS.contains("last_update_ms"), "last update timestamp");
+        assert!(APP_JS.contains("5 * 60 * 1000"), "5 minute threshold");
+        assert!(
+            APP_CSS.contains(".stall-marker"),
+            "muted stall marker style"
+        );
+    }
 }
