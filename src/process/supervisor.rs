@@ -1382,8 +1382,10 @@ mod tests {
     async fn tc_1798_group_alive_and_guard_registry() {
         use std::process::Stdio;
 
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.args(["-c", "sleep 30"]);
+        // Single-process group: killing the child must not leave a grandchild
+        // (e.g. `sh -c "sleep …"`) running in the same pgid.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
         let opts = ChildOptions::default();
         configure_child(&mut cmd, &opts);
         cmd.stdout(Stdio::null());
@@ -1402,7 +1404,14 @@ mod tests {
 
         let _ = child.start_kill();
         let _ = child.wait().await;
-        assert!(!group_alive(pgid));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && group_alive(pgid) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !group_alive(pgid),
+            "process group should be dead after kill and wait"
+        );
     }
 
     #[tokio::test]
