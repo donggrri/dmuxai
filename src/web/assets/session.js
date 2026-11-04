@@ -46,6 +46,9 @@
   var session = null;
   var viewOnly = false;
   var pending = null;
+  // FR-1237 / #155: track snapshots applied from live SSE to prevent stale
+  // command replies from overwriting newer live state.
+  var snapshotSeq = 0;
   var INPUT_PLACEHOLDER = 'Message the selected agent. Enter sends, Shift+Enter adds a line, / opens commands.';
   var conversationShown = null;
   var promptInFlight = false;
@@ -285,8 +288,13 @@
   function command(body) {
     if (viewOnly) { return Promise.resolve(null); }
     notify('');
+    var seqAtSend = snapshotSeq;
     return api('/api/command', body).then(function (data) {
-      if (data && data.session) { render(data.session); }
+      // FR-1237 / #155: skip rendering data.session if a live snapshot arrived
+      // while the HTTP request was in flight.
+      if (data && data.session && snapshotSeq === seqAtSend) {
+        render(data.session);
+      }
       return data;
     }).catch(function (err) {
       notify(err.message, true);
@@ -2976,6 +2984,7 @@
     root.hidden = !viewOnly && !snap.session;
     ui.viewOnly.hidden = !viewOnly;
     if (snap.session) {
+      snapshotSeq += 1;
       render(snap.session);
     } else if (viewOnly) {
       root.classList.add('session-disabled');

@@ -53,6 +53,7 @@ Follow-up states: `queued` -> `started` (terminal) or `queued` -> `removed`
 | FR-1233 | Must | Follow-up still queued | x removes it; Edit changes its text (Save/Cancel) | Already started or removed: error, no change. Empty text or a slash command: refused | TC-1231, TC-1236 |
 | FR-1234 | Must | User presses Stop or Cancel during a run | The run is cancelled; the queue is kept and the next follow-up starts after the cancelled run ended | | TC-1232, TC-1236 |
 | FR-1235 | Must | View-only dashboard | Cannot queue (busy, as before) and cannot remove or edit (403) | | TC-1233, TC-1235 |
+| FR-1237 | Must | The dashboard sends a session command (Stop/Cancel, queue remove/edit, picker actions) and a newer live snapshot arrives over the event stream before the command's HTTP reply | The chat keeps the newer live state; the reply's session is rendered only when no live snapshot was applied while the request was in flight (#155) | A reply that arrives first is still rendered at once; later live snapshots always render | TC-1236, TC-1237 |
 | UX-1236 | Must | Run active on a writable dashboard | Placeholder "Send follow-up"; Stop button next to Send (same cancel path) | Idle: original placeholder, no Stop | TC-1236 |
 
 ## 5. Acceptance scenarios and test design
@@ -66,6 +67,7 @@ Follow-up states: `queued` -> `started` (terminal) or `queued` -> `removed`
 | TC-1234 | FR-1232 | unit | Queued item of another conversation | Run ends | It does not start | `queued_followup_stays_with_its_conversation` |
 | TC-1235 | FR-1235 | integration | Router with and without `web_attached` | POST prompt, queue_remove, queue_edit | allow_queue follows web_attached; 403 view-only | `view_only_dashboard_cannot_queue_followups` |
 | TC-1236 | FR-1230, FR-1231, FR-1232, FR-1233, FR-1234, UX-1236 | headless browser | Real server and assets, fake app | Send during run, x, Edit, Stop | Badges, order, remove, edit, Stop keeps queue | `cargo test --test web_followup_queue -- --ignored` |
+| TC-1237 | FR-1237 | unit + headless browser | Real server and assets, fake app whose Cancel reply is sent 400 ms late (after the next follow-up started and was published) | Stop during a run with two queued follow-ups | The next follow-up shows as running, not still queued; without the guard the test fails every time | `src/web/assets.rs` `tc_1237_command_reply_does_not_overwrite_newer_snapshot`, `cargo test --test web_followup_queue -- --ignored` |
 
 ## 6. Data, integration, and safety contracts
 

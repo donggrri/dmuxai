@@ -67,6 +67,14 @@ mod tests {
         assert!(APP_JS.contains("location.replace(url.toString())"));
     }
 
+    // TC-1237 / FR-1237: command reply does not overwrite newer live snapshot.
+    #[test]
+    fn tc_1237_command_reply_does_not_overwrite_newer_snapshot() {
+        assert!(SESSION_JS.contains("function command("));
+        assert!(SESSION_JS.contains("snapshotSeq"));
+        assert!(SESSION_JS.contains("snapshotSeq === seqAtSend"));
+    }
+
     // TC-529: static_page_is_embedded_and_hardened
     #[tokio::test]
     async fn static_page_is_embedded_and_hardened() {

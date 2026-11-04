@@ -44,7 +44,6 @@ fn find_chrome() -> Option<PathBuf> {
 }
 
 /// The fake app: one run at a time, follow-ups queue behind it.
-#[derive(Default)]
 struct Fake {
     seq: u64,
     /// Finished or cancelled turns: (prompt, reply).
@@ -56,9 +55,23 @@ struct Fake {
     started: Vec<String>,
     cancels: usize,
     submits: usize,
+    release_path: PathBuf,
 }
 
 impl Fake {
+    fn new(release_path: PathBuf) -> Self {
+        Self {
+            seq: 0,
+            done: Vec::new(),
+            running: None,
+            queue: Vec::new(),
+            started: Vec::new(),
+            cancels: 0,
+            submits: 0,
+            release_path,
+        }
+    }
+
     fn view(&self) -> SessionView {
         let mut transcript = vec![msg(0, "system", "ready", false)];
         let mut index = 1;
@@ -112,6 +125,7 @@ impl Fake {
         let mut changed = false;
         if let Some((prompt, Some(end))) = &self.running
             && Instant::now() >= *end
+            && self.release_path.exists()
         {
             let reply = format!("Done: {prompt}");
             self.done.push((prompt.clone(), reply));
@@ -159,7 +173,10 @@ async fn followups_queue_in_order_and_survive_stop_in_headless_chrome() {
         return;
     }
 
-    let fake = Arc::new(Mutex::new(Fake::default()));
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let release_path = tmp_dir.path().join("release");
+
+    let fake = Arc::new(Mutex::new(Fake::new(release_path.clone())));
     let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_owned());
     hub.publish(Vec::new(), None, None);
     hub.set_session(Some(fake.lock().unwrap().view()));
@@ -233,6 +250,7 @@ async fn followups_queue_in_order_and_survive_stop_in_headless_chrome() {
                     }));
                 }
                 DashboardCommand::Session { command, reply } => {
+                    let is_cancel = matches!(command, SessionCommand::Cancel { .. });
                     let result = match command {
                         SessionCommand::Cancel { .. } => {
                             fake.cancels += 1;
@@ -265,7 +283,17 @@ async fn followups_queue_in_order_and_survive_stop_in_headless_chrome() {
                     // the following tick, like the app's run loop.
                     let view = fake.view();
                     app_hub.set_session(Some(view.clone()));
-                    let _ = reply.send(result.map(|()| view));
+                    let response = result.map(|()| view);
+                    // TC-1237 / FR-1237: model a slow HTTP reply for Cancel so the ticker starts
+                    // Task B and its live snapshot reaches the browser before the stale Cancel reply.
+                    if is_cancel {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            let _ = reply.send(response);
+                        });
+                    } else {
+                        let _ = reply.send(response);
+                    }
                 }
                 _ => {}
             }
@@ -322,8 +350,8 @@ with sync_playwright() as p:
     send("Task D")
     pg.wait_for_timeout(400)
     out["steps"]["queued"] = state()
-    if len(sys.argv) > 3:
-        pg.screenshot(path=sys.argv[3] + "-queued.png")
+    if len(sys.argv) > 4:
+        pg.screenshot(path=sys.argv[4] + "-queued.png")
     queued_li("Task D").locator("[aria-label='Remove queued follow-up']").click()
     pg.wait_for_timeout(400)
     out["steps"]["removed"] = state()
@@ -339,11 +367,12 @@ with sync_playwright() as p:
         .some(li => (li.querySelector('.msg-text') || li).textContent.trim() === 'Task B')""", timeout=5000)
     pg.wait_for_timeout(200)
     out["steps"]["after_stop"] = state()
+    open(sys.argv[3], "w").close()
     pg.wait_for_function("() => !document.querySelector('#session li.msg-queued') && !document.querySelector('#session li.msg-streaming')", timeout=10000)
     pg.wait_for_timeout(300)
     out["steps"]["done"] = state()
-    if len(sys.argv) > 3:
-        pg.screenshot(path=sys.argv[3] + "-ran.png")
+    if len(sys.argv) > 4:
+        pg.screenshot(path=sys.argv[4] + "-ran.png")
     print(json.dumps(out))
     b.close()
 "##;
@@ -351,7 +380,10 @@ with sync_playwright() as p:
     let shots = std::env::var("DMUXAI_FOLLOWUP_SHOTS").ok();
     let output = tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new(python);
-        cmd.args(["-c", script]).arg(&chrome).arg(&url);
+        cmd.args(["-c", script])
+            .arg(&chrome)
+            .arg(&url)
+            .arg(&release_path);
         if let Some(prefix) = shots {
             cmd.arg(prefix);
         }

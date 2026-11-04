@@ -99,6 +99,18 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
+- **Dashboard Stop no longer leaves a stale chat (#155, FR-1237).** The reply of
+  a session command (Stop, queue remove/edit, picker) could arrive after a newer
+  live snapshot and overwrite it, so the next follow-up kept showing as queued
+  with no run active until something else changed. The reply is now ignored when
+  a live snapshot was applied while it was in flight. This was the root cause of
+  the flaky `web_followup_queue` browser test, which now also holds the next
+  follow-up open until its `after_stop` check (no wall-clock race).
+- **`web_chat_single_send` no longer fails when the browser driver stalls (#251).**
+  The sampling window used `time.time()` and ended without a sample after a
+  pause; it now uses a monotonic clock, keeps sampling until the expected reply
+  shows (30 s cap), and always takes a final sample.
+
 - **`dmuxai run --read-only` (and the MCP legacy `ask`/`plan` mode) now actually
   runs read-only (#212, FR-1824).** Creating the headless conversation cleared
   the pending turn policy, so the turn reached the runner as write-capable.
