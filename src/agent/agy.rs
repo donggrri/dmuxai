@@ -759,6 +759,17 @@ async fn stream_child(
                 let message: Value = serde_json::from_str(&line).map_err(|error| {
                     AgentError::provider(format!("invalid AGY NDJSON: {error}"))
                 })?;
+                let type_label = message
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .or_else(|| message.get("event").and_then(Value::as_str))
+                    .map(str::to_owned);
+                send_event(
+                    event_tx,
+                    Some(context),
+                    AgentEvent::OutputLine { type_label },
+                )
+                .await;
                 implement_tracker.observe_agy_message(&message);
                 for event in normalize_event(&message, mode, &mut state) {
                     send_event(event_tx, Some(context), event).await;
@@ -1274,6 +1285,7 @@ mod tests {
                     | AgentEvent::ToolProgress { .. }
                     | AgentEvent::Activity(_)
                     | AgentEvent::Status(_)
+                    | AgentEvent::OutputLine { .. }
                     | AgentEvent::Cancelled => {}
                 }
             }

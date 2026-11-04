@@ -745,6 +745,9 @@ mod tests {
             modes: Default::default(),
             done_when: None,
             text_break_when: None,
+            tool_when: None,
+            tool_name_path: None,
+            tool_title_path: None,
             builtin: false,
         };
         assert_eq!(delivery("custom", Some(&custom_spec)), Delivery::Prepend);
@@ -1312,6 +1315,9 @@ mod tests {
             modes: Default::default(),
             done_when: None,
             text_break_when: None,
+            tool_when: None,
+            tool_name_path: None,
+            tool_title_path: None,
             builtin: false,
         };
         assert_eq!(delivery("custom", Some(&spec)), Delivery::Native);

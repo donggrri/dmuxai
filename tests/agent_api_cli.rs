@@ -513,6 +513,57 @@ fn tc_1777_cli_progress_lines_before_final_json() {
     }
 }
 
+// TC-2430 / FR-2430: a JSONL custom runner that prints a tool line produces a
+// `tool` progress line besides started/completed.
+#[cfg(unix)]
+#[test]
+fn tc_2430_cli_progress_emits_tool_line_for_jsonl_runner() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-agent.sh");
+    let config = format!(
+        r#"[graph]
+enabled = false
+
+[[agents.custom]]
+name = "fake"
+command = ["sh", "{fixture}", "jsonl_tool", "{{prompt}}"]
+prompt_via = "arg"
+output = "jsonl"
+text_path = "/part/text"
+text_when = {{ path = "/type", equals = "text" }}
+error_path = "/error/message"
+tool_when = {{ path = "/type", equals = "tool_use" }}
+tool_name_path = "/part/tool"
+tool_title_path = "/part/state/title"
+timeout_secs = 30
+"#,
+        fixture = fixture.display().to_string().replace('\\', "/"),
+    );
+    let sandbox = Sandbox::new(&config);
+    let output = sandbox.run(&["run", "hi", "--agent", "fake", "--json", "--progress"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_json(&output)["ok"], true);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut saw_tool = false;
+    for line in stderr.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+            && v["type"] == "progress"
+            && v["kind"] == "tool"
+        {
+            saw_tool = true;
+            let summary = v["summary"].as_str().unwrap_or_default();
+            assert!(summary.contains("read"), "tool summary: {summary}");
+        }
+    }
+    assert!(
+        saw_tool,
+        "expected at least one tool progress line in stderr: {stderr}"
+    );
+}
+
 // TC-763 / FR-762: todo add, list and run without a TUI.
 // The fixture is a POSIX shell script (same as src/agent/custom.rs tests).
 #[cfg(unix)]

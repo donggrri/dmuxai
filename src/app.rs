@@ -714,6 +714,7 @@ impl AgentActivity {
             AgentEvent::Completed
             | AgentEvent::Cancelled
             | AgentEvent::Error(_)
+            | AgentEvent::OutputLine { .. }
             | AgentEvent::ModelsListed { .. }
             | AgentEvent::ModelSelected(_)
             | AgentEvent::EffortSelected(_)
@@ -3992,6 +3993,22 @@ impl App {
         }
     }
 
+    /// Emits due `--progress` heartbeats for every running headless turn
+    /// (FR-2432). Heartbeats go only to the progress sink; they never enter
+    /// the transcript or reset adapter watchdogs.
+    fn emit_progress_heartbeats(&mut self) {
+        if self.progress_sink.is_none() {
+            return;
+        }
+        let lines = self.progress_tracker.heartbeat_all(unix_ms_now());
+        if let Some(ref mut sink) = self.progress_sink {
+            for line in lines {
+                let json = line.to_json();
+                sink(&json);
+            }
+        }
+    }
+
     fn maybe_emit_activity_event(&mut self, output: &AgentOutput) {
         let Some(hub) = self.dashboard.clone() else {
             return;
@@ -6987,6 +7004,7 @@ impl App {
             AgentEvent::ModelsListed { .. }
             | AgentEvent::ModelSelected(_)
             | AgentEvent::EffortSelected(_)
+            | AgentEvent::OutputLine { .. }
             | AgentEvent::ToolProgress { .. }
             | AgentEvent::Activity(_)
             | AgentEvent::Status(_) => false,
@@ -7224,6 +7242,7 @@ impl App {
             AgentEvent::ModelsListed { .. }
             | AgentEvent::ModelSelected(_)
             | AgentEvent::EffortSelected(_)
+            | AgentEvent::OutputLine { .. }
             | AgentEvent::ToolProgress { .. }
             | AgentEvent::Activity(_)
             | AgentEvent::Status(_) => false,
@@ -9536,6 +9555,7 @@ impl App {
             AgentEvent::ModelsListed { .. }
             | AgentEvent::ModelSelected(_)
             | AgentEvent::EffortSelected(_)
+            | AgentEvent::OutputLine { .. }
             | AgentEvent::ToolProgress { .. }
             | AgentEvent::Activity(_)
             | AgentEvent::Status(_) => false,
@@ -10846,6 +10866,7 @@ impl App {
             AgentEvent::ModelsListed { .. }
             | AgentEvent::ModelSelected(_)
             | AgentEvent::EffortSelected(_)
+            | AgentEvent::OutputLine { .. }
             | AgentEvent::ToolProgress { .. }
             | AgentEvent::Activity(_)
             | AgentEvent::Status(_) => false,
@@ -11415,6 +11436,7 @@ impl App {
             AgentEvent::ProviderSessionBound(session_id) => {
                 let _ = session_id;
             }
+            AgentEvent::OutputLine { .. } => {}
             AgentEvent::TextDelta(delta) => self.append_delta(agent, delta),
             AgentEvent::Notice(notice) => {
                 // FR-2121: the plan-only marker is a headless verdict, not a
@@ -14539,6 +14561,7 @@ impl App {
                 }
                 dirty |= cmd_changed || drain.changed || self.dirty;
                 self.dirty = false;
+                self.emit_progress_heartbeats();
 
                 dashboard_dirty |= drain.changed || dirty;
                 let busy = !self.busy_agents.is_empty();
@@ -17126,6 +17149,7 @@ fn stored_event(event: &AgentEvent) -> Option<TurnEvent> {
             }
         }
         AgentEvent::Activity(_) => None,
+        AgentEvent::OutputLine { .. } => None,
         AgentEvent::Completed => Some(TurnEvent::Completed),
         AgentEvent::Cancelled => Some(TurnEvent::Cancelled),
         AgentEvent::Error(err) => Some(TurnEvent::Failed {

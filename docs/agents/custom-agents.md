@@ -28,6 +28,9 @@ session_id_path = "/sessionID"    # jsonl: JSON pointer of the provider session 
 done_when = { path = "/type", equals = "end" }        # optional: this line ends the turn;
                                   # DmuxAI stops reading, waits 3 s, then stops the process group
 text_break_when = { path = "/type", equals = "tool_call" }   # optional: next text starts a new paragraph
+tool_when = { path = "/type", equals = "tool_use" }          # optional: JSONL line that is a tool event
+tool_name_path = "/part/tool"                # optional: JSON pointer to the tool name
+tool_title_path = "/part/state/title"        # optional: JSON pointer to its title/input summary
 resume_arg = ["--session", "{session_id}"]   # appended when resuming
 timeout_secs = 1800
 idle_timeout_secs = 300               # optional: seconds without stdout before failing (default 300, 0 disables)
@@ -61,6 +64,15 @@ DmuxAI treats the agent as `output = "jsonl"`. If you set `output = "text"` expl
 those path fields remain, they are ignored and startup shows a config warning unless you switch
 to `output = "jsonl"`. In text mode, if the first non-empty stdout line looks like a JSON object,
 DmuxAI emits a one-time notice suggesting `output = "jsonl"` and `text_path`.
+
+Tool progress (`--progress`): when `tool_when` matches a JSONL line, DmuxAI emits a
+tool activity item with the name from `tool_name_path` and the first line of the title
+from `tool_title_path` (or a safe input field such as `command`/`filePath`). Edit,
+write and patch tools with a file path are reported as `file_edit` with a
+workspace-relative path and never their content. The built-in opencode preset has
+defaults for `tool_use` lines (`part.tool`, `part.state.title`); other agents such as
+AGY stream-json can map `step_update`/`tool_name` the same way. Lines that do not
+match are ignored.
 
 Failure (shown as an error turn): spawn error, non-zero exit, timeout, empty reply text,
 a jsonl `error_path` hit, or stderr matching `failure_stderr`.

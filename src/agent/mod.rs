@@ -134,6 +134,11 @@ pub enum AgentEvent {
         state: String,
     },
     Activity(dmuxai::activity::ActivityItem),
+    /// A child stdout line arrived. `type_label` is its JSONL `type` or `event`
+    /// value when available; the progress heartbeat uses it (FR-2432).
+    OutputLine {
+        type_label: Option<String>,
+    },
     Status(String),
     Completed,
     Cancelled,

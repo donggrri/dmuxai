@@ -2227,6 +2227,7 @@ pub(crate) mod tests {
                     | AgentEvent::ToolProgress { .. }
                     | AgentEvent::Activity(_)
                     | AgentEvent::Status(_)
+                    | AgentEvent::OutputLine { .. }
                     | AgentEvent::Cancelled => {}
                 }
             }
