@@ -22,7 +22,7 @@ substrings and quoted/code text. Custom agent children can inherit
 | FR-1663 | Must | A custom or built-in agent child process with no MCP config for the turn | `DMUXAI_MCP_CONFIG` is removed from the child environment so a parent value never leaks | When MCP is configured for the turn, `DMUXAI_MCP_CONFIG` is set as today | TC-1663 |
 | FR-1664 | Must | `dmuxai --help` | Documents `--allow-sensitive` on the `run` usage line and exit-code note for sensitive gates | — | TC-1664 |
 | FR-1665 | Should | README headless `dmuxai run` section | Documents `--allow-sensitive`, and that `--agent` with `--approve-plan` confirms the sensitive gate on a one-step run | — | TC-1665 |
-| FR-1825 | Must | Headless `dmuxai run` reaching a sensitive (`WaitingGate`) gate | The process exits 7 unless `--allow-sensitive` or `--agent` with `--approve-plan` auto-confirms it | Does not replace plan approval | TC-1825 |
+| FR-1825 | Must | Headless `dmuxai run` reaching a sensitive (`WaitingGate`) gate | The process exits 7 unless `--allow-sensitive` or `--agent` with `--approve-plan` auto-confirms it; the error is `sensitive step needs approval: rerun with --allow-sensitive (or --agent <name> --approve-plan)` and `error_kind` is `sensitive_gate` | Does not replace plan approval; a read-only turn (`--read-only`, pending/legacy read-only policy) is not gated | TC-1825, TC-1678 |
 | FR-1826 | Must | `dmuxai run` with `--allow-sensitive` in headless mode | Sensitive gates are auto-confirmed on direct, judge, and graph paths | Plan approval still required for complex plans | TC-1826 |
 | FR-1827 | Must | The same sensitive gate in dashboard (`--web`/TUI) mode | The gate pauses and `/graph continue` resumes it; there is no CLI-flag bypass | view-only `serve` cannot run agents | TC-1827 |
 
@@ -37,5 +37,6 @@ substrings and quoted/code text. Custom agent children can inherit
 | TC-1664 | FR-1664 | `cargo test tc_1664_help_documents_allow_sensitive` |
 | TC-1665 | FR-1665 | manual: README headless section mentions `--allow-sensitive` and agent+approve sensitive bypass |
 | TC-1825 | FR-1825 | `cargo test tc_1660_headless_agent_approve_confirms_sensitive_gate` |
+| TC-1678 | FR-1825 | `cargo test tc_1678_headless_gate_hint_and_error_kind`, `cargo test tc_1678_read_only_turn_skips_sensitive_gate`, `cargo test run_sensitive_gate_exits_7_headless` |
 | TC-1826 | FR-1826 | `cargo test tc_1661_allow_sensitive_bypasses_headless_gate` |
 | TC-1827 | FR-1827 | planned — no automated test yet (Stream B) |

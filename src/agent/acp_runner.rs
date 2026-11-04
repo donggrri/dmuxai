@@ -155,6 +155,17 @@ mod tests {
         );
     }
 
+    // TC-1824 / FR-1824 (#212): grok read-only turns carry `--permission-mode plan`;
+    // write turns do not.
+    #[test]
+    fn tc_1824_grok_read_only_uses_plan_permission_mode() {
+        let read_only = grok_acp_argv("grok-4.7", None, true);
+        assert_eq!(&read_only[..2], ["--permission-mode", "plan"]);
+        let write = grok_acp_argv("grok-4.7", None, false);
+        assert!(!write.iter().any(|arg| arg == "--permission-mode"));
+        assert!(!write.iter().any(|arg| arg == "plan"));
+    }
+
     // FR-1300: cursor root options precede `acp`.
     #[test]
     fn cursor_acp_argv_root_options_before_acp() {

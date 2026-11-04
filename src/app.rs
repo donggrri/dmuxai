@@ -156,7 +156,7 @@ const PLAN_AWAITING_APPROVAL_MSG: &str =
 pub const PLAN_WAITING_APPROVAL_TRANSCRIPT: &str = "Plan waiting for approval — approve or reject in the dashboard (or POST the graph approve command)";
 
 const HEADLESS_APPROVAL_NOTE: &str = "approval required (headless)";
-const HEADLESS_GATE_NOTE: &str = "sensitive step needs /graph continue (headless)";
+const HEADLESS_GATE_NOTE: &str = "sensitive step needs approval: rerun with --allow-sensitive (or --agent <name> --approve-plan)";
 /// FR-2121: the agent replied with a plan and made no file edits.
 const HEADLESS_PLAN_ONLY_NOTE: &str = "AGY replied with a plan and made no file edits. If you wanted changes applied, re-run with --approve-plan; if this was a question, the reply is in \"text\".";
 
@@ -1786,6 +1786,7 @@ impl App {
             .as_ref()
             .map(|config| dmuxai::memory::MemoryHandle::from_config(config, &workspace_root));
         let mcp_registry = Arc::new(McpRegistry::new(mcp_servers, mcp_warnings));
+        let cursor_config_model = Self::configured_cursor_model(&settings);
         let mut app = Self {
             memory,
             memory_injected: HashMap::new(),
@@ -1852,7 +1853,9 @@ impl App {
                 .map(|agent| {
                     let mut catalog = ModelCatalog::default();
                     if agent == Agent::Cursor {
-                        catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                        catalog.selected = cursor_config_model
+                            .clone()
+                            .or_else(|| Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned()));
                     }
                     (agent, catalog)
                 })
@@ -1931,6 +1934,10 @@ impl App {
             last_tool_progress_state: HashMap::new(),
             last_output_heartbeat_at: HashMap::new(),
         };
+        if let Some(model) = cursor_config_model {
+            app.quiet_model_echo.insert(Agent::Cursor, model.clone());
+            let _ = app.adapters[adapter_index(Agent::Cursor)].select_model(model);
+        }
         app.refresh_agent_availability();
         app.selected = app.initial_runner_index(None);
         let runners = app.registered_runner_names();
@@ -3997,24 +4004,49 @@ impl App {
     /// process failures keep their kind so they do not trigger a runner
     /// handover (SPEC-runner-fallback).
     fn attach_model_catalog_hint(&self, output: &mut AgentOutput) {
-        if let AgentEvent::Error(err) = &mut output.event
-            && let Some(hint) = self
+        if let AgentEvent::Error(err) = &mut output.event {
+            // Idle and cancelled turns must never carry the "not offered" hint:
+            // the model availability question is unrelated to those failures.
+            if matches!(err.kind, AgentErrorKind::Idle | AgentErrorKind::Cancelled) {
+                return;
+            }
+            if let Some(hint) = self
                 .active_turns
                 .get(&output.agent)
                 .and_then(|turn| turn.model_catalog_hint.clone())
-        {
-            let model_unavailable =
-                dmuxai::runner_fallback::is_model_unavailable_message(&err.message);
-            if err.hint.is_none() {
-                err.hint = Some(hint);
-            }
-            if model_unavailable
-                && matches!(
-                    err.kind,
-                    AgentErrorKind::Provider | AgentErrorKind::ProcessExit
-                )
             {
-                err.kind = AgentErrorKind::ModelUnavailable;
+                // Re-verify against the catalog as currently known: never attach
+                // when the list is unknown/failed (empty) or when the launched
+                // model is in fact present (stale hint).
+                let catalog = self.model_catalogs.get(&output.agent);
+                let models = catalog.map(|c| &c.models).cloned().unwrap_or_default();
+                if !models.is_empty() {
+                    let model = hint
+                        .strip_prefix("model ")
+                        .and_then(|rest| rest.find(" is not offered").map(|idx| &rest[..idx]))
+                        .map(str::to_owned);
+                    if let Some(model) = model
+                        && models.iter().any(|m| m.id.trim() == model.trim())
+                    {
+                        return;
+                    }
+                } else {
+                    // Unknown/failed model list: never attach the hint.
+                    return;
+                }
+                let model_unavailable =
+                    dmuxai::runner_fallback::is_model_unavailable_message(&err.message);
+                if err.hint.is_none() {
+                    err.hint = Some(hint);
+                }
+                if model_unavailable
+                    && matches!(
+                        err.kind,
+                        AgentErrorKind::Provider | AgentErrorKind::ProcessExit
+                    )
+                {
+                    err.kind = AgentErrorKind::ModelUnavailable;
+                }
             }
         }
     }
@@ -5906,11 +5938,12 @@ impl App {
                     }
                 }
                 None => {
+                    let model = Self::configured_cursor_model(&self.settings)
+                        .unwrap_or_else(|| dmuxai::model_policy::ALLOWED_MODEL.to_owned());
                     if let Some(catalog) = self.model_catalogs.get_mut(&agent) {
-                        catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                        catalog.selected = Some(model.clone());
                     }
-                    let _ = self.adapters[adapter_index]
-                        .select_model(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                    let _ = self.adapters[adapter_index].select_model(model);
                 }
             }
         }
@@ -6093,12 +6126,21 @@ impl App {
             .get(&agent)
             .map(|catalog| catalog.models.iter().map(|m| m.id.clone()).collect())
             .unwrap_or_default();
+        // Hint must be judged against the model the runner will actually
+        // launch (its selected/default model), not a resolved config default or
+        // other stale entry that the adapter never runs.
+        let launched_model = self
+            .model_catalogs
+            .get(&agent)
+            .and_then(|catalog| catalog.selected.clone())
+            .or_else(|| custom_spec.and_then(|spec| spec.default_model.clone()))
+            .or_else(|| dmuxai::model_policy::default_model_for_runner(runner).map(str::to_owned));
         let catalog_command = custom_spec
             .as_ref()
             .map(|spec| spec.models_command.join(" "))
             .filter(|joined| !joined.trim().is_empty());
         let catalog_hint = match dmuxai::model_policy::check_catalog(
-            resolved_model.as_deref(),
+            launched_model.as_deref(),
             if catalog_ids.is_empty() {
                 None
             } else {
@@ -11121,6 +11163,17 @@ impl App {
         }
     }
 
+    fn configured_cursor_model(settings: &DmuxSettings) -> Option<String> {
+        settings
+            .runner_models
+            .get("cursor")
+            .map(|model| model.trim())
+            .filter(|model| {
+                dmuxai::model_policy::validate_model_for_runner("cursor", model).is_ok()
+            })
+            .map(str::to_owned)
+    }
+
     /// The model a turn on `agent` runs with: the explicit selection (checked
     /// by policy), else the runner's own default (FR-1460). `Ok(None)` means
     /// provider default (no `--model`).
@@ -13904,12 +13957,15 @@ impl App {
                 .find(|message| matches!(message.role, Role::System) && !message.local_only)
                 .map(|message| message.content.clone())
                 .unwrap_or_default();
-            return HeadlessIdleAction::Exit(Box::new(self.headless_outcome_exit_7(
-                conversation_id,
-                agent_label,
-                HEADLESS_GATE_NOTE,
-                text,
-            )));
+            return HeadlessIdleAction::Exit(Box::new(
+                self.headless_outcome_exit_7(
+                    conversation_id,
+                    agent_label,
+                    HEADLESS_GATE_NOTE,
+                    text,
+                )
+                .with_error_kind(AgentErrorKind::SensitiveGate.as_str().to_owned()),
+            ));
         }
         if phase == GraphRunPhase::AwaitingApproval {
             if req.approve_plan && !approved_plan {
@@ -14127,9 +14183,12 @@ impl App {
             catalog.selected = Some(model_value);
         }
 
-        if let Some(ref mode_str) = req.mode {
-            match crate::agent::turn_policy_from_legacy_mode(mode_str) {
-                Ok(policy) => self.pending_turn_policy = Some(policy),
+        // TC-1824 / FR-1824 (#212): validate the legacy mode before creating the
+        // conversation, but apply the policy after it. `create_conversation`
+        // restores a snapshot, which deliberately clears any pending policy.
+        let headless_turn_policy = match req.mode.as_deref() {
+            Some(mode_str) => match crate::agent::turn_policy_from_legacy_mode(mode_str) {
+                Ok(policy) => Some(policy),
                 Err(message) => {
                     return HeadlessOutcome::failure(
                         dmuxai::agent_api::exit::USAGE,
@@ -14138,8 +14197,9 @@ impl App {
                         message,
                     );
                 }
-            }
-        }
+            },
+            None => None,
+        };
 
         let headless_title = {
             let suffix = if let Some(todo_id) = &req.todo_id {
@@ -14150,6 +14210,9 @@ impl App {
             format!("headless: {suffix}")
         };
         self.create_conversation(Some(headless_title));
+        if let Some(policy) = headless_turn_policy {
+            self.pending_turn_policy = Some(policy);
+        }
         let headless_conversation_id = self.conversation_id.as_str().to_owned();
         self.last_graph_run = None;
         self.graph_session = None;
@@ -14179,6 +14242,7 @@ impl App {
             if dmuxai::graph::sensitive_keyword_match(&req.prompt)
                 && !req.allow_sensitive
                 && !req.approve_plan
+                && self.pending_turn_policy != Some(TurnPolicy::ReadOnly)
             {
                 return HeadlessOutcome::failure(
                     dmuxai::agent_api::exit::APPROVAL_REQUIRED,
@@ -14186,6 +14250,7 @@ impl App {
                     Some(runner_name(target_agent).to_owned()),
                     HEADLESS_GATE_NOTE.to_owned(),
                 )
+                .with_error_kind(AgentErrorKind::SensitiveGate.as_str().to_owned())
                 .with_triage(self.headless_triage.clone())
                 .with_system_prompt(self.system_prompt_applied.clone());
             }
@@ -25560,6 +25625,132 @@ mod tests {
         assert_eq!(triage.model, "gemini-3.8-flash-high");
     }
 
+    fn complete_first_headless_request(
+        sent: &SentRequests,
+        event_tx: mpsc::Sender<AgentOutput>,
+        text: &str,
+    ) {
+        let sent = Arc::clone(sent);
+        let text = text.to_owned();
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                let maybe_req = {
+                    let lock = sent.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conversation_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conversation_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta(text),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conversation_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    }
+
+    async fn run_headless_policy_case(
+        agent: Agent,
+        request_agent: Option<&str>,
+        mode: Option<&str>,
+        graph: bool,
+        model: Option<&str>,
+    ) -> (Agent, TurnPolicy) {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        app.selected = adapter_index(agent);
+        complete_first_headless_request(&sent, event_tx, "done");
+        let req = HeadlessRequest {
+            prompt: "Say hello".to_owned(),
+            agent: request_agent.map(str::to_owned),
+            mode: mode.map(str::to_owned),
+            graph,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: model.map(str::to_owned),
+        };
+        let outcome = app
+            .run_headless(req, Arc::new(AtomicBool::new(false)))
+            .await;
+        assert!(outcome.ok, "{agent:?} headless run failed: {outcome:?}");
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{agent:?} should send one request");
+        (requests[0].0, requests[0].1.policy)
+    }
+
+    // TC-1824 / FR-1824 (#212): a headless --read-only turn reaches every runner with
+    // TurnPolicy::ReadOnly, including when --agent and --model are also given.
+    #[tokio::test]
+    async fn tc_1824_headless_read_only_reaches_runner() {
+        for agent in [Agent::Cursor, Agent::Agy, Agent::Codex] {
+            let runner = runner_name(agent).to_owned();
+            let (sent_agent, policy) = run_headless_policy_case(
+                agent,
+                Some(&runner),
+                Some("ask"),
+                false,
+                Some("composer-2.5"),
+            )
+            .await;
+            assert_eq!(sent_agent, agent, "{runner} with --agent/--model");
+            assert_eq!(
+                policy,
+                TurnPolicy::ReadOnly,
+                "{runner} with --agent/--model"
+            );
+            let (sent_agent, policy) =
+                run_headless_policy_case(agent, Some(&runner), Some("plan"), false, None).await;
+            assert_eq!(sent_agent, agent, "{runner} plan mode");
+            assert_eq!(policy, TurnPolicy::ReadOnly, "{runner} plan mode");
+        }
+    }
+
+    // TC-1824 / FR-1824 (#212): the read-only policy also survives the default/triage
+    // path and a headless graph request.
+    #[tokio::test]
+    async fn tc_1824_headless_read_only_without_agent_and_graph_reaches_runner() {
+        let (_, policy) =
+            run_headless_policy_case(Agent::Codex, None, Some("ask"), false, None).await;
+        assert_eq!(policy, TurnPolicy::ReadOnly, "triage/default path");
+        let (sent_agent, policy) =
+            run_headless_policy_case(Agent::Codex, Some("codex"), Some("ask"), true, None).await;
+        assert_eq!(sent_agent, Agent::Codex, "graph path");
+        assert_eq!(policy, TurnPolicy::ReadOnly, "graph path");
+    }
+
+    // TC-1824 / FR-1824 (#212): write turns without --read-only stay write-capable.
+    #[tokio::test]
+    async fn tc_1824_headless_normal_run_stays_write_capable() {
+        for agent in [Agent::Cursor, Agent::Agy, Agent::Codex] {
+            let runner = runner_name(agent).to_owned();
+            let (sent_agent, policy) =
+                run_headless_policy_case(agent, Some(&runner), None, false, Some("composer-2.5"))
+                    .await;
+            assert_eq!(sent_agent, agent, "{runner} normal run");
+            assert_eq!(policy, TurnPolicy::Agent, "{runner} normal run");
+            let (sent_agent, policy) =
+                run_headless_policy_case(agent, Some(&runner), Some("implement"), false, None)
+                    .await;
+            assert_eq!(sent_agent, agent, "{runner} implement mode");
+            assert_eq!(policy, TurnPolicy::Agent, "{runner} implement mode");
+        }
+    }
+
     // TC-1694 / FR-1682: headless outcome carries error_kind.
     // TC-761 / FR-761: an agent error yields ok=false and exit 1.
     #[tokio::test]
@@ -26432,6 +26623,92 @@ mod tests {
         assert!(outcome2.ok);
         assert!(outcome2.text.contains("deployment executed"));
         assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    // TC-1678 / FR-1825 (#213): the headless sensitive gate names the headless bypass
+    // and reports a stable error kind.
+    #[tokio::test]
+    async fn tc_1678_headless_gate_hint_and_error_kind() {
+        let (mut app, sent, _event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let req = HeadlessRequest {
+            prompt: "deploy the migration to production".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert_eq!(outcome.exit_code, 7);
+        assert!(!outcome.ok);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some(
+                "sensitive step needs approval: rerun with --allow-sensitive (or --agent <name> --approve-plan)"
+            )
+        );
+        assert_eq!(outcome.error_kind.as_deref(), Some("sensitive_gate"));
+        assert_eq!(sent.lock().unwrap().len(), 0, "no turn should have started");
+    }
+
+    // TC-1678 / FR-1825 (#213): a read-only turn cannot perform the sensitive write, so
+    // it is not gated.
+    #[tokio::test]
+    async fn tc_1678_read_only_turn_skips_sensitive_gate() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("read-only answer".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "deploy the migration to production".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: Some("ask".to_owned()),
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(outcome.ok, "read-only turn must not be gated: {outcome:?}");
+        assert_eq!(outcome.exit_code, 0);
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1.policy, TurnPolicy::ReadOnly);
     }
 
     // TC-2121 / FR-2121: a headless direct run with --approve-plan requires
@@ -32454,6 +32731,20 @@ mod tests {
         );
     }
 
+    // TC-211 / FR-1731: without [runners.cursor] model, Cursor catalog keeps the default selection.
+    #[test]
+    fn tc_211_cursor_default_selection_unchanged_without_config() {
+        let (app, _) = test_app();
+        assert_eq!(
+            app.model_catalogs
+                .get(&Agent::Cursor)
+                .unwrap()
+                .selected
+                .as_deref(),
+            Some(dmuxai::model_policy::ALLOWED_MODEL)
+        );
+    }
+
     // TC-1743 / FR-1727: effective_model_for uses custom default_model
     #[test]
     fn tc_1743_effective_model_custom_default() {
@@ -32617,6 +32908,74 @@ mod tests {
         let outcome = app.drain_agent_events();
         assert!(outcome.errored);
         assert_eq!(outcome.error_kind.as_deref(), Some("provider"));
+        let msgs: Vec<String> = app.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("boom") && m.contains("is not offered")),
+            "{msgs:?}"
+        );
+    }
+
+    // TC-1749 / FR-1729 (#214): idle timeout for a listed model carries no "not offered" hint.
+    #[test]
+    fn tc_1749_idle_timeout_has_no_not_offered_hint_for_listed_model() {
+        let _ = install_shared_test_registry();
+        let idx = dmuxai::custom_agent::index_of("opencode-step")
+            .expect("shared test registry has opencode-step");
+        let agent = Agent::Custom(idx);
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        app.model_catalogs.get_mut(&agent).unwrap().models = vec![ModelInfo::new(
+            "opencode/beam-free".to_owned(),
+            "opencode/beam-free".to_owned(),
+        )];
+        app.selected = adapter_index(agent);
+        let _ = app.try_submit_to_agent(agent, "hello".into(), false, true);
+        let (a, req) = sent.lock().unwrap()[0].clone();
+        event_tx
+            .try_send(AgentOutput {
+                agent: a,
+                conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+                turn_id: Some(TurnId::new(req.turn_id.as_str())),
+                event: AgentEvent::Error(AgentError::idle(
+                    "opencode produced no output for 300s; the provider may be stuck",
+                )),
+            })
+            .unwrap();
+        let outcome = app.drain_agent_events();
+        assert!(outcome.errored);
+        assert_eq!(outcome.error_kind.as_deref(), Some("idle"));
+        let msgs: Vec<String> = app.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            !msgs.iter().any(|m| m.contains("is not offered by")),
+            "{msgs:?}"
+        );
+    }
+
+    // TC-1749 / FR-1729 (#214): a model truly absent from a loaded list still gets the hint.
+    #[test]
+    fn tc_1749_absent_model_still_gets_not_offered_hint() {
+        let _ = install_shared_test_registry();
+        let idx = dmuxai::custom_agent::index_of("opencode-step")
+            .expect("shared test registry has opencode-step");
+        let agent = Agent::Custom(idx);
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        app.model_catalogs.get_mut(&agent).unwrap().models = vec![ModelInfo::new(
+            "opencode/other-free".to_owned(),
+            "opencode/other-free".to_owned(),
+        )];
+        app.selected = adapter_index(agent);
+        let _ = app.try_submit_to_agent(agent, "hello".into(), false, true);
+        let (a, req) = sent.lock().unwrap()[0].clone();
+        event_tx
+            .try_send(AgentOutput {
+                agent: a,
+                conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+                turn_id: Some(TurnId::new(req.turn_id.as_str())),
+                event: AgentEvent::Error(AgentError::provider("request failed: boom")),
+            })
+            .unwrap();
+        let outcome = app.drain_agent_events();
+        assert!(outcome.errored);
         let msgs: Vec<String> = app.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
             msgs.iter()

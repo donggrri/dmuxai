@@ -169,7 +169,6 @@ TC-1820 planned — no automated test yet
 TC-1821 covered by parse_cli_agent_api_subcommands (no TC ref in code yet)
 TC-1822 planned — no automated test yet
 TC-1823 covered by headless_run_reports_agent_error (no TC ref in code yet)
-TC-1824 planned — no automated test yet
 TC-1825 covered by tc_1660_headless_agent_approve_confirms_sensitive_gate (no TC ref in code yet)
 TC-1826 covered by tc_1661_allow_sensitive_bypasses_headless_gate (no TC ref in code yet)
 TC-1827 planned — no automated test yet

@@ -78,6 +78,28 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
+- **`dmuxai run --read-only` (and the MCP legacy `ask`/`plan` mode) now actually
+  runs read-only (#212, FR-1824).** Creating the headless conversation cleared
+  the pending turn policy, so the turn reached the runner as write-capable.
+  Cursor now gets `--mode ask` without `--force`, custom/opencode temp configs
+  get `edit`/`bash` `deny`, and grok gets `--permission-mode plan`, including
+  with `--agent`/`--model` and on the triage/graph path. Runs without
+  `--read-only` stay write-capable.
+
+- **Headless sensitive-gate failures now name the headless way out and report
+  `error_kind: "sensitive_gate"` (#213).** A `dmuxai run` stopped at a
+  sensitive-step gate no longer suggests the TUI-only `/graph continue`; it says
+  to rerun with `--allow-sensitive` (or `--agent <name> --approve-plan`), and
+  automation can detect the stop from JSON. Read-only turns skip the gate
+  because they cannot perform the sensitive write it protects.
+
+- An idle-timeout (or cancel) failure no longer inherits the
+  "model ... is not offered by ..." hint. That hint is now attached only when
+  the launched model is genuinely absent from a successfully loaded runner model
+  list, judged against the model the runner actually launched (#214).
+
+- `[runners.cursor] model` is now used by the Cursor runner: `dmuxai run --agent cursor` launches `cursor-agent` with the configured model and reports it in `triage.model`; an explicit `--model` still wins (#211).
+
 - `dmuxai run` / `dmuxai todo run` now start the runner with the model given by `--model`, and `--json` reports the model actually used.
 
 - ACP runners no longer end a turn early when the agent sends a request whose id matches dmuxai's pending prompt (#242).

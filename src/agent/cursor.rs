@@ -2160,6 +2160,30 @@ pub(crate) mod tests {
         assert!(!implement.iter().any(|arg| arg == "--mode"));
     }
 
+    // TC-1824 / FR-1824 (#212): a read-only Cursor turn uses `--mode ask` and never
+    // `--force`; a write turn keeps the write-capable flags.
+    #[test]
+    fn tc_1824_cursor_read_only_argv_has_no_force() {
+        let cwd = Path::new("workspace");
+        let args_for = |mode| {
+            let mut command = tokio::process::Command::new("cursor-agent");
+            configure_command(&mut command, None, None, mode, cwd);
+            command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let read_only = args_for(TurnPolicy::ReadOnly);
+        assert!(read_only.windows(2).any(|args| args == ["--mode", "ask"]));
+        assert!(!read_only.iter().any(|arg| arg == "--force"));
+
+        let write = args_for(TurnPolicy::Agent);
+        assert!(write.iter().any(|arg| arg == "--force"));
+        assert!(!write.iter().any(|arg| arg == "--mode"));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires a locally installed and authenticated Cursor Agent CLI"]
     async fn real_cursor_turn_streams_to_completion() {

@@ -152,6 +152,7 @@ pub enum AgentErrorKind {
     Stalled,
     Cancelled,
     Policy,
+    SensitiveGate,
 }
 
 impl AgentErrorKind {
@@ -165,6 +166,7 @@ impl AgentErrorKind {
             Self::Stalled => "stalled",
             Self::Cancelled => "cancelled",
             Self::Policy => "policy",
+            Self::SensitiveGate => "sensitive_gate",
         }
     }
 }
@@ -522,6 +524,7 @@ mod typed_error_tests {
             (AgentErrorKind::Stalled, "stalled"),
             (AgentErrorKind::Cancelled, "cancelled"),
             (AgentErrorKind::Policy, "policy"),
+            (AgentErrorKind::SensitiveGate, "sensitive_gate"),
         ];
 
         for (kind, expected) in cases {
