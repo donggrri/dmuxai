@@ -86,6 +86,13 @@ All notable changes to dmuxai are listed here. Versions follow
   with `--agent`/`--model` and on the triage/graph path. Runs without
   `--read-only` stay write-capable.
 
+- **Headless sensitive-gate failures now name the headless way out and report
+  `error_kind: "sensitive_gate"` (#213).** A `dmuxai run` stopped at a
+  sensitive-step gate no longer suggests the TUI-only `/graph continue`; it says
+  to rerun with `--allow-sensitive` (or `--agent <name> --approve-plan`), and
+  automation can detect the stop from JSON. Read-only turns skip the gate
+  because they cannot perform the sensitive write it protects.
+
 - `dmuxai run` / `dmuxai todo run` now start the runner with the model given by `--model`, and `--json` reports the model actually used.
 
 - ACP runners no longer end a turn early when the agent sends a request whose id matches dmuxai's pending prompt (#242).

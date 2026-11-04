@@ -156,7 +156,7 @@ const PLAN_AWAITING_APPROVAL_MSG: &str =
 pub const PLAN_WAITING_APPROVAL_TRANSCRIPT: &str = "Plan waiting for approval — approve or reject in the dashboard (or POST the graph approve command)";
 
 const HEADLESS_APPROVAL_NOTE: &str = "approval required (headless)";
-const HEADLESS_GATE_NOTE: &str = "sensitive step needs /graph continue (headless)";
+const HEADLESS_GATE_NOTE: &str = "sensitive step needs approval: rerun with --allow-sensitive (or --agent <name> --approve-plan)";
 /// FR-2121: the agent replied with a plan and made no file edits.
 const HEADLESS_PLAN_ONLY_NOTE: &str = "AGY replied with a plan and made no file edits. If you wanted changes applied, re-run with --approve-plan; if this was a question, the reply is in \"text\".";
 
@@ -13904,12 +13904,15 @@ impl App {
                 .find(|message| matches!(message.role, Role::System) && !message.local_only)
                 .map(|message| message.content.clone())
                 .unwrap_or_default();
-            return HeadlessIdleAction::Exit(Box::new(self.headless_outcome_exit_7(
-                conversation_id,
-                agent_label,
-                HEADLESS_GATE_NOTE,
-                text,
-            )));
+            return HeadlessIdleAction::Exit(Box::new(
+                self.headless_outcome_exit_7(
+                    conversation_id,
+                    agent_label,
+                    HEADLESS_GATE_NOTE,
+                    text,
+                )
+                .with_error_kind(AgentErrorKind::SensitiveGate.as_str().to_owned()),
+            ));
         }
         if phase == GraphRunPhase::AwaitingApproval {
             if req.approve_plan && !approved_plan {
@@ -14186,6 +14189,7 @@ impl App {
             if dmuxai::graph::sensitive_keyword_match(&req.prompt)
                 && !req.allow_sensitive
                 && !req.approve_plan
+                && self.pending_turn_policy != Some(TurnPolicy::ReadOnly)
             {
                 return HeadlessOutcome::failure(
                     dmuxai::agent_api::exit::APPROVAL_REQUIRED,
@@ -14193,6 +14197,7 @@ impl App {
                     Some(runner_name(target_agent).to_owned()),
                     HEADLESS_GATE_NOTE.to_owned(),
                 )
+                .with_error_kind(AgentErrorKind::SensitiveGate.as_str().to_owned())
                 .with_triage(self.headless_triage.clone())
                 .with_system_prompt(self.system_prompt_applied.clone());
             }
@@ -26565,6 +26570,92 @@ mod tests {
         assert!(outcome2.ok);
         assert!(outcome2.text.contains("deployment executed"));
         assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    // TC-1678 / FR-1825 (#213): the headless sensitive gate names the headless bypass
+    // and reports a stable error kind.
+    #[tokio::test]
+    async fn tc_1678_headless_gate_hint_and_error_kind() {
+        let (mut app, sent, _event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let req = HeadlessRequest {
+            prompt: "deploy the migration to production".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert_eq!(outcome.exit_code, 7);
+        assert!(!outcome.ok);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some(
+                "sensitive step needs approval: rerun with --allow-sensitive (or --agent <name> --approve-plan)"
+            )
+        );
+        assert_eq!(outcome.error_kind.as_deref(), Some("sensitive_gate"));
+        assert_eq!(sent.lock().unwrap().len(), 0, "no turn should have started");
+    }
+
+    // TC-1678 / FR-1825 (#213): a read-only turn cannot perform the sensitive write, so
+    // it is not gated.
+    #[tokio::test]
+    async fn tc_1678_read_only_turn_skips_sensitive_gate() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("read-only answer".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "deploy the migration to production".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: Some("ask".to_owned()),
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(outcome.ok, "read-only turn must not be gated: {outcome:?}");
+        assert_eq!(outcome.exit_code, 0);
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1.policy, TurnPolicy::ReadOnly);
     }
 
     // TC-2121 / FR-2121: a headless direct run with --approve-plan requires

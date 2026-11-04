@@ -353,15 +353,19 @@ fn run_sensitive_gate_exits_7_headless() {
     assert_eq!(output.status.code(), Some(7), "{json}");
     assert_eq!(
         json["error"].as_str(),
-        Some("sensitive step needs /graph continue (headless)")
+        Some(
+            "sensitive step needs approval: rerun with --allow-sensitive (or --agent <name> --approve-plan)"
+        )
     );
+    assert_eq!(json["error_kind"], "sensitive_gate");
     let graph_id = json["graph_id"].as_str().expect("graph_id");
     let run = load_run(sandbox.workspace(), graph_id).expect("gated run");
     assert_eq!(run.phase, GraphRunPhase::WaitingGate);
     assert!(
         run.plan_history
             .iter()
-            .any(|change| change.reason == "sensitive step needs /graph continue (headless)")
+            .any(|change| change.reason
+                == "sensitive step needs approval: rerun with --allow-sensitive (or --agent <name> --approve-plan)")
     );
 
     let with_approve = sandbox.run(&[
@@ -374,8 +378,11 @@ fn run_sensitive_gate_exits_7_headless() {
     assert_eq!(with_approve.status.code(), Some(7), "{approve_json}");
     assert_eq!(
         approve_json["error"].as_str(),
-        Some("sensitive step needs /graph continue (headless)")
+        Some(
+            "sensitive step needs approval: rerun with --allow-sensitive (or --agent <name> --approve-plan)"
+        )
     );
+    assert_eq!(approve_json["error_kind"], "sensitive_gate");
     let graph_id = approve_json["graph_id"].as_str().expect("graph_id");
     let gated = load_run(sandbox.workspace(), graph_id).expect("gated run");
     assert_eq!(gated.phase, GraphRunPhase::WaitingGate);

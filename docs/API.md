@@ -105,14 +105,14 @@ Notes:
 | `text` | string | Final agent text (still returned when the reply could not be saved, see exit code 4) |
 | `messages` | array | `{ role, agent, content }` per message |
 | `error` | string\|null | Failure detail when `ok` is false |
-| `error_kind` | string\|null | Stable failure category next to `error`: `provider`, `model_unavailable`, `process_exit`, `timeout`, `idle`, `stalled`, `cancelled`, `policy`, or `conflict` (exit 4) / `internal` (exit 6); `null` when there is no error |
+| `error_kind` | string\|null | Stable failure category next to `error`: `provider`, `model_unavailable`, `process_exit`, `timeout`, `idle`, `stalled`, `cancelled`, `policy`, `sensitive_gate` (exit 7), or `conflict` (exit 4) / `internal` (exit 6); `null` when there is no error |
 | `todo` | object\|null | To-do after a `todo run` |
 | `triage` | object\|null | Judge/fallback/override verdict (`source`: `judge`, `fallback`, or `override`) when a graph run started |
 | `plan` | object\|null | `{steps, tasks}` when a plan was produced (including exit 7 awaiting approval) |
 | `events` | object | `first_seq`/`last_seq` written for this run; both `null` when the run wrote no events |
 | `fallbacks` | array | Optional list of handovers: `{from_runner, from_model, reason, detail, to_runner, to_model}` (`to_*` null when the chain is exhausted); omitted when empty |
 
-Failures with `--json` print `{ "ok": false, "exit_code": <n>, "error": "<message>", "error_kind": "<kind>|null" }`, where `error_kind` is `conflict` for exit 4 and `internal` for exit 6.
+Failures with `--json` print `{ "ok": false, "exit_code": <n>, "error": "<message>", "error_kind": "<kind>|null" }`, where `error_kind` is `sensitive_gate` for a headless sensitive gate, `conflict` for exit 4 and `internal` for exit 6.
 
 ### Exit codes
 
