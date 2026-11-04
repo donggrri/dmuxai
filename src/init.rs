@@ -81,6 +81,9 @@ const OPENCODE_EXAMPLE: &str = r##"# Built-in opencode runner, as an editable [[
 # tool_when = { path = "/type", equals = "tool_use" }
 # tool_name_path = "/part/tool"
 # tool_title_path = "/part/state/title"
+# text_skip_when = { path = "/part/synthetic", equals = true }
+# compaction_when = { path = "/part/metadata/compaction_continue", equals = true }
+# message_id_path = "/part/messageID"
 # error_path = ["/error/data/message", "/error/message"]
 # session_id_path = "/sessionID"
 # resume_arg = ["--session", "{session_id}"]

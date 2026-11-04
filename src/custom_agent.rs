@@ -53,7 +53,28 @@ pub struct CustomAgentModes {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TextWhen {
     pub path: String,
+    /// The value the pointer must have. A TOML boolean is accepted and
+    /// compared as `"true"` / `"false"` (FR-2440).
+    #[serde(deserialize_with = "deserialize_when_equals")]
     pub equals: String,
+}
+
+/// Accepts a string or a boolean for [`TextWhen::equals`]. A boolean becomes
+/// `"true"` / `"false"`, so `equals = true` works in `dmuxai.toml` (FR-2440).
+fn deserialize_when_equals<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum EqualsInput {
+        Bool(bool),
+        Text(String),
+    }
+    match EqualsInput::deserialize(deserializer)? {
+        EqualsInput::Bool(value) => Ok(value.to_string()),
+        EqualsInput::Text(value) => Ok(value),
+    }
 }
 
 fn deserialize_error_path<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
@@ -101,6 +122,20 @@ pub struct CustomAgentSpec {
     pub text_path: Option<String>,
     #[serde(default)]
     pub text_when: Option<TextWhen>,
+    /// JSONL lines matching this condition never contribute reply text
+    /// (FR-2440). The opencode preset uses it to skip synthetic parts.
+    #[serde(default)]
+    pub text_skip_when: Option<TextWhen>,
+    /// A JSONL line matching this condition marks a compaction: the reply text
+    /// collected for the preceding message is dropped and a `context compacted`
+    /// notice is shown instead (FR-2441).
+    #[serde(default)]
+    pub compaction_when: Option<TextWhen>,
+    /// JSON pointer of the message id of a JSONL part. It groups the text parts
+    /// of one message, so a compaction summary can be dropped as a whole
+    /// (FR-2441).
+    #[serde(default)]
+    pub message_id_path: Option<String>,
     #[serde(default, deserialize_with = "deserialize_error_path")]
     pub error_path: Option<Vec<String>>,
     #[serde(default)]
@@ -182,6 +217,20 @@ pub fn opencode_preset(program: &str) -> CustomAgentSpec {
         }),
         tool_name_path: Some("/part/tool".to_owned()),
         tool_title_path: Some("/part/state/title".to_owned()),
+        // FR-2440: a synthetic part is never reply text (the compaction
+        // continuation prompt must not leak into the answer).
+        text_skip_when: Some(TextWhen {
+            path: "/part/synthetic".to_owned(),
+            equals: "true".to_owned(),
+        }),
+        // FR-2441: the compaction continuation marks the end of the summary
+        // message, whose text is dropped instead of reaching the reply.
+        compaction_when: Some(TextWhen {
+            path: "/part/metadata/compaction_continue".to_owned(),
+            equals: "true".to_owned(),
+        }),
+        // FR-2441: the message id groups the text parts of one message.
+        message_id_path: Some("/part/messageID".to_owned()),
         error_path: Some(vec![
             "/error/data/message".to_owned(),
             "/error/message".to_owned(),
@@ -402,13 +451,17 @@ impl CustomAgentSpec {
         }
     }
 
-    /// Returns whether any of `text_path`, `text_when`, `error_path`, `session_id_path`,
+    /// Returns whether any of `text_path`, `text_when`, `text_skip_when`,
+    /// `compaction_when`, `error_path`, `session_id_path`, `message_id_path`,
     /// `done_when`, or `text_break_when` is set.
     pub fn has_jsonl_path_fields(&self) -> bool {
         self.text_path.is_some()
             || self.text_when.is_some()
+            || self.text_skip_when.is_some()
+            || self.compaction_when.is_some()
             || self.error_path.is_some()
             || self.session_id_path.is_some()
+            || self.message_id_path.is_some()
             || self.done_when.is_some()
             || self.text_break_when.is_some()
     }
@@ -790,12 +843,21 @@ pub struct ParsedLine {
     pub done: bool,
     /// The line matches `text_break_when` (FR-916).
     pub text_break: bool,
+    /// The line matches `compaction_when` (FR-2441).
+    pub compacted: bool,
+    /// The message id of the line's part, when `message_id_path` is set
+    /// (FR-2441).
+    pub message_id: Option<String>,
 }
 
 /// True when `val` has `when.equals` at `when.path` (string or JSON value).
+///
+/// A JSON boolean is compared as `"true"` / `"false"`, so a condition can be
+/// written as `equals = true` in `dmuxai.toml` (FR-2440).
 fn json_matches(val: &serde_json::Value, when: &TextWhen) -> bool {
     match val.pointer(&when.path) {
         Some(serde_json::Value::String(s)) => s == &when.equals,
+        Some(serde_json::Value::Bool(b)) => b.to_string() == when.equals,
         Some(v) => *v == when.equals,
         None => false,
     }
@@ -835,13 +897,20 @@ pub fn parse_jsonl_line(spec: &CustomAgentSpec, line: &str) -> ParsedLine {
         return ParsedLine::default();
     };
 
+    // FR-2440: a line that matches `text_skip_when` never contributes reply
+    // text (the opencode preset skips synthetic parts).
+    let skipped = spec
+        .text_skip_when
+        .as_ref()
+        .is_some_and(|when| json_matches(&val, when));
+
     let text = if let Some(text_path) = &spec.text_path {
         let condition_met = match &spec.text_when {
             None => true,
             Some(when) => json_matches(&val, when),
         };
 
-        if condition_met {
+        if condition_met && !skipped {
             val.pointer(text_path).and_then(|v| match v {
                 serde_json::Value::String(s) => Some(s.clone()),
                 serde_json::Value::Null => None,
@@ -902,6 +971,15 @@ pub fn parse_jsonl_line(spec: &CustomAgentSpec, line: &str) -> ParsedLine {
         })
     });
 
+    // FR-2441: the message id groups the text parts of one message.
+    let message_id = spec.message_id_path.as_ref().and_then(|path| {
+        val.pointer(path).and_then(|v| match v {
+            serde_json::Value::String(s) => (!s.is_empty()).then(|| s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+    });
+
     ParsedLine {
         text,
         error,
@@ -914,6 +992,11 @@ pub fn parse_jsonl_line(spec: &CustomAgentSpec, line: &str) -> ParsedLine {
             .text_break_when
             .as_ref()
             .is_some_and(|when| json_matches(&val, when)),
+        compacted: spec
+            .compaction_when
+            .as_ref()
+            .is_some_and(|when| json_matches(&val, when)),
+        message_id,
     }
 }
 
@@ -932,6 +1015,138 @@ pub fn append_reply_text(reply: &mut String, text: &str, break_pending: &mut boo
     chunk.push_str(text);
     reply.push_str(&chunk);
     chunk
+}
+
+/// The user-visible notice shown when a compaction summary is dropped
+/// (FR-2441).
+pub const COMPACTION_NOTICE: &str = "context compacted";
+
+/// One text segment of the message that is still open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplySegment {
+    text: String,
+    /// The segment starts a new paragraph (FR-916).
+    break_before: bool,
+}
+
+/// Collects the reply text of a JSONL turn.
+///
+/// The text parts are grouped per message (`message_id_path`), so that the
+/// compaction summary of a runner such as opencode can be dropped as a whole
+/// when its compaction continuation arrives (FR-2441). A runner without
+/// `message_id_path` keeps the old behaviour: every text part is appended
+/// immediately (FR-2442).
+#[derive(Debug, Default)]
+pub struct ReplyCollector {
+    /// True when the text parts are grouped per message (FR-2441).
+    grouped: bool,
+    /// The message id of the message that is still open.
+    open_message_id: Option<String>,
+    /// The text segments of the open message.
+    open: Vec<ReplySegment>,
+    /// The released reply text.
+    reply: String,
+    /// A paragraph break is pending (FR-916).
+    break_pending: bool,
+}
+
+impl ReplyCollector {
+    /// Creates a collector for the given specification.
+    pub fn new(spec: &CustomAgentSpec) -> Self {
+        Self {
+            grouped: spec.message_id_path.is_some(),
+            ..Default::default()
+        }
+    }
+
+    /// True when the text parts are grouped per message (FR-2441).
+    fn grouped(&self) -> bool {
+        self.grouped
+    }
+
+    /// Feeds one parsed line and returns the text that is ready to be
+    /// streamed, if any.
+    ///
+    /// A line that matches `compaction_when` drops the text of the open
+    /// message (the compaction summary) and never contributes its own text
+    /// (FR-2441).
+    pub fn push(&mut self, parsed: &ParsedLine) -> Option<String> {
+        if parsed.compacted {
+            // FR-2441: the compaction summary (the text of the open message)
+            // is dropped, and the continuation prompt is never reply text.
+            self.open.clear();
+            self.open_message_id = None;
+            return None;
+        }
+
+        let mut released = String::new();
+        let mut had_text = false;
+
+        if self.grouped()
+            && let Some(message_id) = parsed.message_id.as_deref()
+            && self.open_message_id.as_deref() != Some(message_id)
+        {
+            // The previous message ended: its text can be released.
+            released = self.release();
+            self.open_message_id = Some(message_id.to_owned());
+        }
+
+        if let Some(text) = parsed.text.as_deref() {
+            had_text = true;
+            let break_before = std::mem::take(&mut self.break_pending);
+            self.open.push(ReplySegment {
+                text: text.to_owned(),
+                break_before,
+            });
+            if !self.grouped() {
+                released = self.release();
+            }
+        }
+
+        if parsed.text_break {
+            self.break_pending = true;
+        }
+
+        if self.grouped() {
+            (!released.is_empty()).then_some(released)
+        } else if had_text {
+            Some(released)
+        } else {
+            None
+        }
+    }
+
+    /// Appends raw output text (text mode) to the reply.
+    pub fn push_raw(&mut self, text: &str) {
+        self.reply.push_str(text);
+    }
+
+    /// Releases the text of the open message at the end of the turn.
+    pub fn finish(&mut self) -> Option<String> {
+        let released = self.release();
+        (!released.is_empty()).then_some(released)
+    }
+
+    /// The reply text collected so far.
+    pub fn reply(&self) -> &str {
+        &self.reply
+    }
+
+    /// Appends the segments of the open message to the reply.
+    fn release(&mut self) -> String {
+        let mut released = String::new();
+        for segment in std::mem::take(&mut self.open) {
+            if segment.break_before {
+                self.break_pending = true;
+            }
+            released.push_str(&append_reply_text(
+                &mut self.reply,
+                &segment.text,
+                &mut self.break_pending,
+            ));
+        }
+        released
+    }
 }
 
 /// The failure signal of a finished turn, in the order the checks run.
@@ -2668,5 +2883,107 @@ error_path = "/result/error"
             " tail"
         );
         assert_eq!(reply, "Checking\n\nDone. More\nNext tail");
+    }
+
+    // TC-2441 / FR-2440: a synthetic part is never reply text.
+    #[test]
+    fn tc_2441_synthetic_part_is_skipped() {
+        let spec = opencode_preset("opencode");
+        let synthetic = r#"{"type":"text","part":{"id":"prt_1","messageID":"msg_1","synthetic":true,"text":"Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."}}"#;
+        let parsed = parse_jsonl_line(&spec, synthetic);
+        assert_eq!(parsed.text, None, "a synthetic part must not be reply text");
+
+        let plain = r#"{"type":"text","part":{"id":"prt_2","messageID":"msg_1","text":"The real answer."}}"#;
+        let parsed = parse_jsonl_line(&spec, plain);
+        assert_eq!(parsed.text.as_deref(), Some("The real answer."));
+    }
+
+    // TC-2443 / FR-2440: the new JSONL options parse from `dmuxai.toml`.
+    #[test]
+    fn tc_2443_compaction_options_parse() {
+        let toml_str = r#"
+name = "opencode-like"
+command = ["opencode", "run", "--format", "json"]
+output = "jsonl"
+text_path = "/part/text"
+text_when = { path = "/type", equals = "text" }
+text_skip_when = { path = "/part/synthetic", equals = true }
+compaction_when = { path = "/part/metadata/compaction_continue", equals = true }
+message_id_path = "/part/messageID"
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            spec.text_skip_when,
+            Some(TextWhen {
+                path: "/part/synthetic".to_owned(),
+                equals: "true".to_owned(),
+            })
+        );
+        assert_eq!(
+            spec.compaction_when,
+            Some(TextWhen {
+                path: "/part/metadata/compaction_continue".to_owned(),
+                equals: "true".to_owned(),
+            })
+        );
+        assert_eq!(spec.message_id_path.as_deref(), Some("/part/messageID"));
+        assert!(spec.has_jsonl_path_fields());
+        assert!(spec.validate().is_ok());
+
+        // The built-in opencode preset ships the same options.
+        let preset = opencode_preset("opencode");
+        assert_eq!(preset.text_skip_when, spec.text_skip_when);
+        assert_eq!(preset.compaction_when, spec.compaction_when);
+        assert_eq!(preset.message_id_path, spec.message_id_path);
+    }
+
+    // TC-2440 / FR-2441: the compaction continuation drops the summary text of
+    // the open message and keeps the text of the earlier messages.
+    #[test]
+    fn tc_2440_compaction_drops_summary_and_keeps_earlier_text() {
+        let spec = opencode_preset("opencode");
+        let mut collector = ReplyCollector::new(&spec);
+
+        let narration = r#"{"type":"text","part":{"id":"prt_1","messageID":"msg_1","text":"Narration.\n"}}"#;
+        let summary = r###"{"type":"text","part":{"id":"prt_2","messageID":"msg_2","text":"## Objective\n- summary\n"}}"###;
+        let continuation = r#"{"type":"text","part":{"id":"prt_3","messageID":"msg_3","synthetic":true,"metadata":{"compaction_continue":true},"text":"Continue if you have next steps."}}"#;
+        let answer = r#"{"type":"text","part":{"id":"prt_4","messageID":"msg_4","text":"The real answer.\n"}}"#;
+
+        let mut streamed = String::new();
+        for line in [narration, summary, continuation, answer] {
+            let parsed = parse_jsonl_line(&spec, line);
+            if let Some(chunk) = collector.push(&parsed) {
+                streamed.push_str(&chunk);
+            }
+        }
+        if let Some(chunk) = collector.finish() {
+            streamed.push_str(&chunk);
+        }
+
+        assert_eq!(collector.reply(), "Narration.\nThe real answer.\n");
+        assert_eq!(streamed, "Narration.\nThe real answer.\n");
+        assert!(!collector.reply().contains("summary"));
+        assert!(!collector.reply().contains("Continue if you have next steps"));
+    }
+
+    // TC-2444 / FR-2442: a runner without the new options keeps every text
+    // part, synthetic ones included.
+    #[test]
+    fn tc_2444_runner_without_options_keeps_every_text_part() {
+        let toml_str = r#"
+name = "plain"
+command = ["plain"]
+output = "jsonl"
+text_path = "/part/text"
+text_when = { path = "/type", equals = "text" }
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        let mut collector = ReplyCollector::new(&spec);
+
+        let continuation = r#"{"type":"text","part":{"id":"prt_1","messageID":"msg_1","synthetic":true,"text":"Continue if you have next steps."}}"#;
+        let parsed = parse_jsonl_line(&spec, continuation);
+        assert_eq!(parsed.text.as_deref(), Some("Continue if you have next steps."));
+        assert_eq!(collector.push(&parsed).as_deref(), Some("Continue if you have next steps."));
+        assert_eq!(collector.reply(), "Continue if you have next steps.");
     }
 }
