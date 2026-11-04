@@ -1048,6 +1048,9 @@ pub struct ReplyCollector {
     reply: String,
     /// A paragraph break is pending (FR-916).
     break_pending: bool,
+    /// True when the collector has seen a compaction marker and no real
+    /// reply text has been received since (FR-2443).
+    compacted_pending: bool,
 }
 
 impl ReplyCollector {
@@ -1076,6 +1079,7 @@ impl ReplyCollector {
             // is dropped, and the continuation prompt is never reply text.
             self.open.clear();
             self.open_message_id = None;
+            self.compacted_pending = true;
             return None;
         }
 
@@ -1093,6 +1097,7 @@ impl ReplyCollector {
 
         if let Some(text) = parsed.text.as_deref() {
             had_text = true;
+            self.compacted_pending = false;
             let break_before = std::mem::take(&mut self.break_pending);
             self.open.push(ReplySegment {
                 text: text.to_owned(),
@@ -1130,6 +1135,12 @@ impl ReplyCollector {
     /// The reply text collected so far.
     pub fn reply(&self) -> &str {
         &self.reply
+    }
+
+    /// True if the stream's last compaction marker came after the last real
+    /// reply text, leaving the session compacted without an answer (FR-2443).
+    pub fn compacted_without_answer(&self) -> bool {
+        self.compacted_pending
     }
 
     /// Appends the segments of the open message to the reply.
@@ -2944,7 +2955,8 @@ message_id_path = "/part/messageID"
         let spec = opencode_preset("opencode");
         let mut collector = ReplyCollector::new(&spec);
 
-        let narration = r#"{"type":"text","part":{"id":"prt_1","messageID":"msg_1","text":"Narration.\n"}}"#;
+        let narration =
+            r#"{"type":"text","part":{"id":"prt_1","messageID":"msg_1","text":"Narration.\n"}}"#;
         let summary = r###"{"type":"text","part":{"id":"prt_2","messageID":"msg_2","text":"## Objective\n- summary\n"}}"###;
         let continuation = r#"{"type":"text","part":{"id":"prt_3","messageID":"msg_3","synthetic":true,"metadata":{"compaction_continue":true},"text":"Continue if you have next steps."}}"#;
         let answer = r#"{"type":"text","part":{"id":"prt_4","messageID":"msg_4","text":"The real answer.\n"}}"#;
@@ -2963,7 +2975,11 @@ message_id_path = "/part/messageID"
         assert_eq!(collector.reply(), "Narration.\nThe real answer.\n");
         assert_eq!(streamed, "Narration.\nThe real answer.\n");
         assert!(!collector.reply().contains("summary"));
-        assert!(!collector.reply().contains("Continue if you have next steps"));
+        assert!(
+            !collector
+                .reply()
+                .contains("Continue if you have next steps")
+        );
     }
 
     // TC-2444 / FR-2442: a runner without the new options keeps every text
@@ -2982,8 +2998,43 @@ text_when = { path = "/type", equals = "text" }
 
         let continuation = r#"{"type":"text","part":{"id":"prt_1","messageID":"msg_1","synthetic":true,"text":"Continue if you have next steps."}}"#;
         let parsed = parse_jsonl_line(&spec, continuation);
-        assert_eq!(parsed.text.as_deref(), Some("Continue if you have next steps."));
-        assert_eq!(collector.push(&parsed).as_deref(), Some("Continue if you have next steps."));
+        assert_eq!(
+            parsed.text.as_deref(),
+            Some("Continue if you have next steps.")
+        );
+        assert_eq!(
+            collector.push(&parsed).as_deref(),
+            Some("Continue if you have next steps.")
+        );
         assert_eq!(collector.reply(), "Continue if you have next steps.");
+    }
+
+    // TC-2445 / FR-2443: collector reports compacted_without_answer true when the
+    // stream ends after a compaction continuation without an answer, and false
+    // when an answer follows.
+    #[test]
+    fn tc_2445_compacted_without_answer_state() {
+        let spec = opencode_preset("opencode");
+        let mut collector = ReplyCollector::new(&spec);
+
+        let narration =
+            r#"{"type":"text","part":{"id":"prt_1","messageID":"msg_1","text":"Narration.\n"}}"#;
+        let summary = r###"{"type":"text","part":{"id":"prt_2","messageID":"msg_2","text":"## Objective\n- summary\n"}}"###;
+        let continuation = r#"{"type":"text","part":{"id":"prt_3","messageID":"msg_3","synthetic":true,"metadata":{"compaction_continue":true},"text":"Continue if you have next steps."}}"#;
+        let answer = r#"{"type":"text","part":{"id":"prt_4","messageID":"msg_4","text":"The real answer.\n"}}"#;
+
+        collector.push(&parse_jsonl_line(&spec, narration));
+        collector.push(&parse_jsonl_line(&spec, summary));
+        collector.push(&parse_jsonl_line(&spec, continuation));
+        assert!(
+            collector.compacted_without_answer(),
+            "must be true when stream ends after compaction continuation without an answer"
+        );
+
+        collector.push(&parse_jsonl_line(&spec, answer));
+        assert!(
+            !collector.compacted_without_answer(),
+            "must be false once real answer arrives"
+        );
     }
 }

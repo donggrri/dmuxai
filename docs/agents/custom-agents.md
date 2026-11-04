@@ -28,6 +28,9 @@ session_id_path = "/sessionID"    # jsonl: JSON pointer of the provider session 
 done_when = { path = "/type", equals = "end" }        # optional: this line ends the turn;
                                   # DmuxAI stops reading, waits 3 s, then stops the process group
 text_break_when = { path = "/type", equals = "tool_call" }   # optional: next text starts a new paragraph
+text_skip_when = { path = "/part/synthetic", equals = true }   # optional: matching lines never add reply text
+compaction_when = { path = "/part/metadata/compaction_continue", equals = true }   # optional: drop the open message (a compaction summary); a turn that ends right after it fails with compacted_unfinished
+message_id_path = "/part/messageID"   # optional: group text parts per message (needed by compaction_when)
 tool_when = { path = "/type", equals = "tool_use" }          # optional: JSONL line that is a tool event
 tool_name_path = "/part/tool"                # optional: JSON pointer to the tool name
 tool_title_path = "/part/state/title"        # optional: JSON pointer to its title/input summary

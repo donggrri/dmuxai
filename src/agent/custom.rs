@@ -1041,6 +1041,16 @@ async fn run_turn(
         (fingerprint_before.as_deref(), fingerprint_after.as_deref()),
         (Some(before), Some(after)) if before != after
     );
+
+    // FR-2443: if the stream ended right after a compaction continuation without
+    // an answer, the turn must fail even if the workspace changed.
+    if reply.compacted_without_answer() {
+        return Err(AgentError::compacted_unfinished(format!(
+            "{} stopped after context compaction without a final answer; resume the session to continue",
+            spec.label()
+        )));
+    }
+
     let outcome = dmuxai::custom_agent::classify_turn_outcome(
         spec,
         exit_ok,
@@ -1459,6 +1469,7 @@ mod tests {
         assert_eq!(progress.kind, "tool");
         assert!(progress.summary.chars().count() <= crate::progress::MAX_SUMMARY_CHARS);
         assert!(!progress.summary.contains("SECRET_BODY"));
+    }
 
     /// The saved opencode JSONL stream that reproduces the compaction leak:
     /// a narration, a compaction summary, the synthetic continuation prompt,
@@ -1475,6 +1486,15 @@ mod tests {
         format!(
             "output = \"jsonl\"\ntext_path = \"/part/text\"\ntext_when = {{ path = \"/type\", equals = \"text\" }}\ntext_skip_when = {{ path = \"/part/synthetic\", equals = true }}\ncompaction_when = {{ path = \"/part/metadata/compaction_continue\", equals = true }}\nmessage_id_path = \"/part/messageID\"\nenv = {{ FAKE_AGENT_JSONL = \"{}\" }}\n{extra}",
             compaction_fixture()
+        )
+    }
+
+    /// The saved opencode JSONL stream where compaction occurs but the runner
+    /// exits without providing a final answer (FR-2443).
+    fn compaction_unfinished_fixture() -> String {
+        format!(
+            "{}/tests/fixtures/opencode/compaction-unfinished.jsonl",
+            env!("CARGO_MANIFEST_DIR")
         )
     }
 
@@ -1502,10 +1522,7 @@ mod tests {
         let (result, text) = run(spec, None).await;
         assert_eq!(result, Ok(()));
         assert!(text.contains("## Objective"), "{text}");
-        assert!(
-            text.contains("Continue if you have next steps"),
-            "{text}"
-        );
+        assert!(text.contains("Continue if you have next steps"), "{text}");
     }
 
     // TC-2444 / FR-2441: the compaction shows a short notice instead of the
@@ -1536,6 +1553,26 @@ mod tests {
         assert!(!text.contains("## Objective"), "{text}");
         assert!(text.contains("Let me look at the file."), "{text}");
         assert!(text.contains("The real answer."), "{text}");
+    }
+
+    // TC-2446 / FR-2443: stream ending after compaction continuation without an
+    // answer fails with CompactedUnfinished and drops the summary from the reply.
+    #[tokio::test]
+    async fn tc_2446_compaction_unfinished_fails_without_summary_in_reply() {
+        let extra = format!(
+            "output = \"jsonl\"\ntext_path = \"/part/text\"\ntext_when = {{ path = \"/type\", equals = \"text\" }}\ntext_skip_when = {{ path = \"/part/synthetic\", equals = true }}\ncompaction_when = {{ path = \"/part/metadata/compaction_continue\", equals = true }}\nmessage_id_path = \"/part/messageID\"\nenv = {{ FAKE_AGENT_JSONL = \"{}\" }}",
+            compaction_unfinished_fixture()
+        );
+        let spec = spec("jsonl_file", &extra);
+        let (result, text) = run(spec, None).await;
+        assert_eq!(
+            result,
+            Err(AgentError::compacted_unfinished(format!(
+                "{} stopped after context compaction without a final answer; resume the session to continue",
+                spec.label()
+            )))
+        );
+        assert!(!text.contains("## Objective"), "{text}");
     }
 
     #[tokio::test]
