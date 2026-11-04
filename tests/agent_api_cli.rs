@@ -212,6 +212,81 @@ timeout_secs = 30
     );
 }
 
+// TC-211 / FR-1731, FR-2317: a configured Cursor model reaches cursor-agent's
+// real argv and triage, and an explicit --model still wins.
+#[cfg(unix)]
+#[test]
+fn tc_211_cursor_config_model_reaches_runner() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new(
+        r#"[graph]
+enabled = false
+
+[cursor]
+protocol = "legacy"
+
+[runners.cursor]
+model = "claude-sonnet-5-5-high"
+"#,
+    );
+    let bin = sandbox.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script_path = bin.join("cursor-agent");
+    let argv_log = sandbox.root.join("cursor-argv.log");
+    let script = r#"#!/bin/sh
+SESS="sess-211-$$"
+printf '%s\n' "$*" >> "__LOG__"
+if read -r line; then
+    echo '{"type":"assistant","session_id":"'"$SESS"'","message":{"content":[{"type":"text","text":"OK"}]}}'
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"OK","session_id":"'"$SESS"'"}'
+    exit 0
+fi
+exit 1
+"#
+    .replace("__LOG__", &argv_log.display().to_string());
+    std::fs::write(&script_path, script).unwrap();
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = [("DMUXAI_CURSOR_BIN", script_path.as_os_str().to_os_string())];
+
+    let configured =
+        sandbox.run_in_env(&["run", "hello", "--agent", "cursor", "--json"], None, &env);
+    let json = stdout_json(&configured);
+    assert_eq!(configured.status.code(), Some(0), "{json}");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["triage"]["model"], "claude-sonnet-5-5-high");
+
+    let argv = std::fs::read_to_string(&argv_log).expect("cursor argv log");
+    assert!(
+        argv.split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|args| args == ["--model", "claude-sonnet-5-5-high"]),
+        "configured model did not reach cursor argv: {argv}"
+    );
+
+    let explicit = sandbox.run_in_env(
+        &[
+            "run", "hello", "--agent", "cursor", "--model", "grok-4.7", "--json",
+        ],
+        None,
+        &env,
+    );
+    let json = stdout_json(&explicit);
+    assert_eq!(explicit.status.code(), Some(0), "{json}");
+    assert_eq!(json["triage"]["model"], "grok-4.7");
+
+    let argv = std::fs::read_to_string(&argv_log).expect("cursor argv log");
+    let last = argv.lines().last().unwrap_or_default();
+    assert!(
+        last.split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|args| args == ["--model", "grok-4.7"]),
+        "--model did not override the configured Cursor model: {argv}"
+    );
+}
+
 // TC-761 / FR-761, NFR-760: a headless run prints exactly one JSON object
 // with the agent text and exits 0; a failing agent exits 1 with ok=false.
 #[cfg(unix)]

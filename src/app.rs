@@ -1786,6 +1786,7 @@ impl App {
             .as_ref()
             .map(|config| dmuxai::memory::MemoryHandle::from_config(config, &workspace_root));
         let mcp_registry = Arc::new(McpRegistry::new(mcp_servers, mcp_warnings));
+        let cursor_config_model = Self::configured_cursor_model(&settings);
         let mut app = Self {
             memory,
             memory_injected: HashMap::new(),
@@ -1852,7 +1853,9 @@ impl App {
                 .map(|agent| {
                     let mut catalog = ModelCatalog::default();
                     if agent == Agent::Cursor {
-                        catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                        catalog.selected = cursor_config_model
+                            .clone()
+                            .or_else(|| Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned()));
                     }
                     (agent, catalog)
                 })
@@ -1931,6 +1934,10 @@ impl App {
             last_tool_progress_state: HashMap::new(),
             last_output_heartbeat_at: HashMap::new(),
         };
+        if let Some(model) = cursor_config_model {
+            app.quiet_model_echo.insert(Agent::Cursor, model.clone());
+            let _ = app.adapters[adapter_index(Agent::Cursor)].select_model(model);
+        }
         app.refresh_agent_availability();
         app.selected = app.initial_runner_index(None);
         let runners = app.registered_runner_names();
@@ -5931,11 +5938,12 @@ impl App {
                     }
                 }
                 None => {
+                    let model = Self::configured_cursor_model(&self.settings)
+                        .unwrap_or_else(|| dmuxai::model_policy::ALLOWED_MODEL.to_owned());
                     if let Some(catalog) = self.model_catalogs.get_mut(&agent) {
-                        catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                        catalog.selected = Some(model.clone());
                     }
-                    let _ = self.adapters[adapter_index]
-                        .select_model(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                    let _ = self.adapters[adapter_index].select_model(model);
                 }
             }
         }
@@ -11153,6 +11161,17 @@ impl App {
             replan_budget_chars: self.settings.graph_replan_budget_chars as usize,
             max_nodes: self.settings.graph_max_nodes as usize,
         }
+    }
+
+    fn configured_cursor_model(settings: &DmuxSettings) -> Option<String> {
+        settings
+            .runner_models
+            .get("cursor")
+            .map(|model| model.trim())
+            .filter(|model| {
+                dmuxai::model_policy::validate_model_for_runner("cursor", model).is_ok()
+            })
+            .map(str::to_owned)
     }
 
     /// The model a turn on `agent` runs with: the explicit selection (checked
@@ -32709,6 +32728,20 @@ mod tests {
         assert_eq!(
             app.selected_run_model(Agent::Cursor),
             Ok(Some("composer-2.5".to_owned()))
+        );
+    }
+
+    // TC-211 / FR-1731: without [runners.cursor] model, Cursor catalog keeps the default selection.
+    #[test]
+    fn tc_211_cursor_default_selection_unchanged_without_config() {
+        let (app, _) = test_app();
+        assert_eq!(
+            app.model_catalogs
+                .get(&Agent::Cursor)
+                .unwrap()
+                .selected
+                .as_deref(),
+            Some(dmuxai::model_policy::ALLOWED_MODEL)
         );
     }
 

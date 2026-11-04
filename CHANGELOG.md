@@ -98,6 +98,8 @@ All notable changes to dmuxai are listed here. Versions follow
   the launched model is genuinely absent from a successfully loaded runner model
   list, judged against the model the runner actually launched (#214).
 
+- `[runners.cursor] model` is now used by the Cursor runner: `dmuxai run --agent cursor` launches `cursor-agent` with the configured model and reports it in `triage.model`; an explicit `--model` still wins (#211).
+
 - `dmuxai run` / `dmuxai todo run` now start the runner with the model given by `--model`, and `--json` reports the model actually used.
 
 - ACP runners no longer end a turn early when the agent sends a request whose id matches dmuxai's pending prompt (#242).
