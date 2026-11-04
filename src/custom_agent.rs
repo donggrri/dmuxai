@@ -133,6 +133,16 @@ pub struct CustomAgentSpec {
     /// (SPEC-grok-runner FR-916), e.g. a tool call between two text segments.
     #[serde(default)]
     pub text_break_when: Option<TextWhen>,
+    /// JSONL line that marks a tool invocation (FR-2430). When it matches,
+    /// DmuxAI emits a tool activity item for `--progress`.
+    #[serde(default)]
+    pub tool_when: Option<TextWhen>,
+    /// JSON pointer to the tool name in a matching tool line (FR-2430).
+    #[serde(default)]
+    pub tool_name_path: Option<String>,
+    /// JSON pointer to the tool title or input summary (FR-2430).
+    #[serde(default)]
+    pub tool_title_path: Option<String>,
     /// True for a built-in preset (opencode, grok). Not configurable.
     #[serde(skip)]
     pub builtin: bool,
@@ -166,6 +176,12 @@ pub fn opencode_preset(program: &str) -> CustomAgentSpec {
             path: "/type".to_owned(),
             equals: "text".to_owned(),
         }),
+        tool_when: Some(TextWhen {
+            path: "/type".to_owned(),
+            equals: "tool_use".to_owned(),
+        }),
+        tool_name_path: Some("/part/tool".to_owned()),
+        tool_title_path: Some("/part/state/title".to_owned()),
         error_path: Some(vec![
             "/error/data/message".to_owned(),
             "/error/message".to_owned(),

@@ -5,10 +5,11 @@ use std::{
     time::Duration,
 };
 
+use dmuxai::activity::{ActivityItem, ToolStatus};
 use dmuxai::custom_agent::{
     BUILTIN_MODELS_TIMEOUT, CustomAgentOutput, CustomAgentSpec, SubstitutionContext, build_argv,
-    grok_no_allowed_model_message, is_builtin_grok, list_model_ids, parse_jsonl_line,
-    policy_message, select_grok_model, spec_at, substitute, timeout_parts,
+    grok_no_allowed_model_message, is_builtin_grok, is_builtin_opencode, list_model_ids,
+    parse_jsonl_line, policy_message, select_grok_model, spec_at, substitute, timeout_parts,
 };
 use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 
@@ -257,6 +258,247 @@ fn mode_names(policy: TurnPolicy) -> (&'static str, &'static str) {
         TurnPolicy::ReadOnly => ("ask", "deny"),
         TurnPolicy::Agent => ("implement", "allow"),
     }
+}
+
+fn json_string_at<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a str> {
+    value.pointer(path).and_then(serde_json::Value::as_str)
+}
+
+fn pointer_equals(value: &serde_json::Value, path: &str, expected: &str) -> bool {
+    json_string_at(value, path) == Some(expected)
+}
+
+fn first_json_string_at(value: &serde_json::Value, paths: &[&str]) -> Option<String> {
+    paths
+        .iter()
+        .find_map(|path| json_string_at(value, path))
+        .map(str::to_owned)
+}
+
+fn tool_event_matches(spec: &CustomAgentSpec, value: &serde_json::Value) -> bool {
+    if let Some(when) = &spec.tool_when
+        && pointer_equals(value, &when.path, &when.equals)
+    {
+        return true;
+    }
+    // Built-in opencode accepts either the wrapper line type or the part type.
+    is_builtin_opencode(spec)
+        && (pointer_equals(value, "/type", "tool_use")
+            || pointer_equals(value, "/part/type", "tool"))
+}
+
+fn first_line(value: &str) -> String {
+    value.lines().next().unwrap_or_default().trim().to_owned()
+}
+
+/// Extracts only safe, short input fields; never file contents or tool output.
+fn safe_input_summary(value: &serde_json::Value) -> Option<String> {
+    const SAFE_KEYS: &[&str] = &[
+        "title",
+        "command",
+        "filePath",
+        "file_path",
+        "path",
+        "target_file",
+        "file",
+        "filename",
+        "description",
+        "query",
+        "pattern",
+        "url",
+    ];
+    match value {
+        serde_json::Value::String(text) => {
+            let line = first_line(text);
+            (!line.is_empty()).then_some(line)
+        }
+        serde_json::Value::Object(map) => SAFE_KEYS
+            .iter()
+            .find_map(|key| map.get(*key).and_then(safe_input_summary)),
+        serde_json::Value::Array(items) => items.iter().find_map(safe_input_summary),
+        _ => None,
+    }
+}
+
+fn file_path_from_input(value: &serde_json::Value) -> Option<String> {
+    const PATH_KEYS: &[&str] = &[
+        "filePath",
+        "file_path",
+        "filepath",
+        "path",
+        "target_file",
+        "file",
+        "filename",
+    ];
+    match value {
+        serde_json::Value::Object(map) => PATH_KEYS
+            .iter()
+            .find_map(|key| map.get(*key).and_then(file_path_from_input)),
+        serde_json::Value::String(text) => {
+            let line = first_line(text);
+            (!line.is_empty()).then_some(line)
+        }
+        _ => None,
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Returns a workspace-relative path, or `None` when the path is outside it.
+fn workspace_relative_path(cwd: &Path, raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = Path::new(raw);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let absolute = lexical_normalize(&absolute);
+    let cwd = lexical_normalize(cwd);
+    let relative = absolute.strip_prefix(&cwd).ok()?;
+    let text = relative.to_string_lossy().replace('\\', "/");
+    (!text.is_empty()).then_some(text)
+}
+
+fn tool_status(state: Option<&str>) -> ToolStatus {
+    match state.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("completed" | "complete" | "success" | "succeeded" | "done" | "ok" | "done_ok") => {
+            ToolStatus::Ok
+        }
+        Some("error" | "failed" | "failure" | "cancelled" | "canceled" | "denied") => {
+            ToolStatus::Failed
+        }
+        _ => ToolStatus::Running,
+    }
+}
+
+/// Parses one JSONL tool line into an [`ActivityItem::Tool`] (FR-2430..FR-2433).
+/// Unknown shapes and non-matching lines return `None`.
+fn tool_activity_from_line(spec: &CustomAgentSpec, line: &str, cwd: &Path) -> Option<ActivityItem> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if !tool_event_matches(spec, &value) {
+        return None;
+    }
+
+    let name = spec
+        .tool_name_path
+        .as_deref()
+        .and_then(|path| json_string_at(&value, path))
+        .map(str::to_owned)
+        .or_else(|| {
+            first_json_string_at(
+                &value,
+                &["/part/tool", "/tool", "/tool_name", "/part/name", "/name"],
+            )
+        })
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "tool".to_owned());
+
+    let title = spec
+        .tool_title_path
+        .as_deref()
+        .and_then(|path| json_string_at(&value, path))
+        .map(str::to_owned)
+        .or_else(|| {
+            first_json_string_at(
+                &value,
+                &[
+                    "/part/state/title",
+                    "/part/title",
+                    "/title",
+                    "/step_update/tool_info/title",
+                ],
+            )
+        });
+
+    let input = [
+        "/part/state/input",
+        "/input",
+        "/tool_input",
+        "/arguments",
+        "/args",
+        "/step_update/tool_info/parameters",
+    ]
+    .iter()
+    .find_map(|path| value.pointer(path));
+
+    let state = first_json_string_at(
+        &value,
+        &[
+            "/part/state/status",
+            "/status",
+            "/step_update/state",
+            "/state/status",
+            "/state",
+        ],
+    );
+    let status = tool_status(state.as_deref());
+
+    let file_path = input.and_then(file_path_from_input).or_else(|| {
+        title
+            .as_deref()
+            .and_then(|title| workspace_relative_path(cwd, title))
+    });
+
+    let target = if crate::progress::is_file_edit_tool_name(&name) {
+        match file_path {
+            Some(path) => workspace_relative_path(cwd, &path).unwrap_or(path),
+            None => title
+                .as_deref()
+                .map(first_line)
+                .filter(|line| !line.is_empty())
+                .or_else(|| input.and_then(safe_input_summary))
+                .unwrap_or_default(),
+        }
+    } else {
+        let title = title
+            .as_deref()
+            .map(first_line)
+            .filter(|line| !line.is_empty() && line != &name);
+        title
+            .or_else(|| input.and_then(safe_input_summary))
+            .unwrap_or_default()
+    };
+
+    let target = crate::progress::sanitize_summary(&target, crate::progress::MAX_SUMMARY_CHARS);
+    if target.is_empty() && name == "tool" {
+        return None;
+    }
+
+    Some(ActivityItem::Tool {
+        name,
+        target,
+        status,
+        duration_ms: None,
+        detail: String::new(),
+    })
+}
+
+fn jsonl_type_label(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("event").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
 }
 
 fn spawn_turn(
@@ -690,6 +932,18 @@ async fn run_turn(
                         .await;
                     }
                 }
+                if is_non_empty {
+                    let type_label = (effective_output == CustomAgentOutput::Jsonl)
+                        .then(|| jsonl_type_label(&line))
+                        .flatten();
+                    send(
+                        event_tx,
+                        agent,
+                        Some(context),
+                        AgentEvent::OutputLine { type_label },
+                    )
+                    .await;
+                }
                 match effective_output {
                     CustomAgentOutput::Text => {
                         let chunk = format!("{line}\n");
@@ -703,6 +957,9 @@ async fn run_turn(
                         if let Some(tracker) = grok_tools.as_mut()
                             && let Some(item) = tracker.observe(&line)
                         {
+                            send(event_tx, agent, Some(context), AgentEvent::Activity(item)).await;
+                        }
+                        if let Some(item) = tool_activity_from_line(spec, &line, cwd) {
                             send(event_tx, agent, Some(context), AgentEvent::Activity(item)).await;
                         }
                         let parsed = parse_jsonl_line(spec, &line);
@@ -1063,6 +1320,115 @@ mod tests {
         let (result, text) = run(spec, Some("m1")).await;
         assert_eq!(result, Ok(()));
         assert_eq!(text, "echo:hi --model x");
+    }
+
+    // TC-2430 / FR-2430: built-in opencode tool_use lines become tool progress.
+    #[tokio::test]
+    async fn tc_2430_opencode_tool_lines_emit_tool_progress() {
+        let mut spec = dmuxai::custom_agent::opencode_preset("opencode");
+        spec.command = vec![fixture(), "jsonl_tool".to_owned(), "{prompt}".to_owned()];
+        let dir = tempfile::tempdir().unwrap();
+        let (result, events) = run_turn_capture_events_in(&spec, dir.path().to_path_buf()).await;
+        assert_eq!(result, Ok(()), "events: {events:?}");
+
+        let activity = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::Activity(item) => Some(item),
+                _ => None,
+            })
+            .expect("opencode tool line must emit an activity item");
+        match activity {
+            ActivityItem::Tool { name, target, .. } => {
+                assert_eq!(name, "read");
+                assert_eq!(target, "src/app.rs");
+            }
+            other => panic!("expected a tool activity item, got {other:?}"),
+        }
+        let line = crate::progress::format_progress_event(
+            "opencode",
+            &AgentEvent::Activity(activity.clone()),
+            1,
+        )
+        .expect("tool activity maps to a progress line");
+        assert_eq!(line.kind, "tool");
+        assert!(line.summary.contains("read"), "{}", line.summary);
+        assert!(line.summary.contains("src/app.rs"), "{}", line.summary);
+    }
+
+    // TC-2431 / FR-2431: edit tools emit file_edit with a workspace-relative
+    // path and never the edit content.
+    #[test]
+    fn tc_2431_edit_tool_emits_file_edit_with_relative_path() {
+        let spec = dmuxai::custom_agent::opencode_preset("opencode");
+        let cwd = Path::new("/workspace/project");
+        let line = r#"{"type":"tool_use","part":{"type":"tool","tool":"edit","state":{"status":"completed","input":{"filePath":"/workspace/project/src/app.rs","oldString":"before","newString":"SECRET_NEW_CONTENT"}}}}"#;
+
+        let item = tool_activity_from_line(&spec, line, cwd).expect("edit line is a tool");
+        match &item {
+            ActivityItem::Tool {
+                name,
+                target,
+                status,
+                ..
+            } => {
+                assert_eq!(name, "edit");
+                assert_eq!(target, "src/app.rs");
+                assert_eq!(*status, ToolStatus::Ok);
+            }
+            other => panic!("expected a tool activity item, got {other:?}"),
+        }
+
+        let progress =
+            crate::progress::format_progress_event("opencode", &AgentEvent::Activity(item), 1)
+                .expect("file edit maps to a progress line");
+        assert_eq!(progress.kind, "file_edit");
+        assert!(
+            progress.summary.contains("src/app.rs"),
+            "{}",
+            progress.summary
+        );
+        assert!(
+            !progress.summary.contains("SECRET_NEW_CONTENT"),
+            "file content leaked: {}",
+            progress.summary
+        );
+    }
+
+    // TC-2433 / FR-2433: summaries use only safe fields, stay on one line, and
+    // never include file contents, tool output, env values, or full payloads.
+    #[test]
+    fn tc_2433_progress_summaries_never_include_content() {
+        let spec = dmuxai::custom_agent::opencode_preset("opencode");
+        let cwd = Path::new("/workspace/project");
+        let line = r#"{"type":"tool_use","part":{"type":"tool","tool":"write","state":{"status":"completed","input":{"filePath":"/workspace/project/src/secret.rs","content":"SECRET_TOKEN=abc\nmore secret content","output":"FULL_TOOL_OUTPUT"}}}}"#;
+
+        let item = tool_activity_from_line(&spec, line, cwd).expect("write line is a tool");
+        let progress =
+            crate::progress::format_progress_event("opencode", &AgentEvent::Activity(item), 1)
+                .expect("write maps to a progress line");
+        assert_eq!(progress.kind, "file_edit");
+        assert!(progress.summary.contains("src/secret.rs"));
+        for leaked in ["SECRET_TOKEN", "more secret content", "FULL_TOOL_OUTPUT"] {
+            assert!(
+                !progress.summary.contains(leaked),
+                "{leaked} leaked into {}",
+                progress.summary
+            );
+        }
+        assert!(!progress.summary.contains('\n'));
+
+        let long_line = format!(
+            r#"{{"type":"tool_use","part":{{"type":"tool","tool":"read","state":{{"status":"running","title":"first line {}","input":{{"content":"SECRET_BODY"}}}}}}}}"#,
+            "x".repeat(300)
+        );
+        let item = tool_activity_from_line(&spec, &long_line, cwd).expect("long title is a tool");
+        let progress =
+            crate::progress::format_progress_event("opencode", &AgentEvent::Activity(item), 1)
+                .expect("long title maps to a progress line");
+        assert_eq!(progress.kind, "tool");
+        assert!(progress.summary.chars().count() <= crate::progress::MAX_SUMMARY_CHARS);
+        assert!(!progress.summary.contains("SECRET_BODY"));
     }
 
     #[tokio::test]

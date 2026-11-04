@@ -9,6 +9,8 @@ use dmuxai::activity::ActivityItem;
 
 pub const MAX_SUMMARY_CHARS: usize = 160;
 pub const TEXT_COALESCE_INTERVAL_MS: u64 = 2000;
+/// How often a running headless turn emits a progress heartbeat (FR-2432).
+pub const HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 
 /// Live progress line written to STDERR as JSON Lines when `--progress` is enabled.
 ///
@@ -94,13 +96,33 @@ pub fn activity_item_summary(item: &ActivityItem) -> String {
     }
 }
 
+/// Returns true if the tool name represents a file-edit operation.
+pub fn is_file_edit_tool_name(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "edit"
+            | "file_edit"
+            | "write"
+            | "write_file"
+            | "write_to_file"
+            | "write_file_content"
+            | "patch"
+            | "apply_patch"
+            | "multiedit"
+            | "multi_edit"
+            | "replace_file_content"
+            | "str_replace"
+            | "str_replace_based_edit_tool"
+            | "edit_file"
+            | "create_file"
+    )
+}
+
 /// Returns true if the [`ActivityItem`] represents a file-edit operation.
 pub fn is_file_edit_activity(item: &ActivityItem) -> bool {
     match item {
-        ActivityItem::Tool { name, .. } => {
-            let n = name.trim().to_ascii_lowercase();
-            n == "edit" || n == "file_edit" || n == "write_to_file" || n == "replace_file_content"
-        }
+        ActivityItem::Tool { name, .. } => is_file_edit_tool_name(name),
         _ => false,
     }
 }
@@ -121,11 +143,16 @@ pub fn format_progress_event(agent: &str, event: &AgentEvent, now_ms: u64) -> Op
             ))
         }
         AgentEvent::Activity(item) => {
+            let kind = match item {
+                ActivityItem::Tool { .. } if is_file_edit_activity(item) => "file_edit",
+                ActivityItem::Tool { .. } => "tool",
+                ActivityItem::Thinking { .. } => "activity",
+            };
             let text = activity_item_summary(item);
             Some(ProgressLine::new(
                 now_ms,
                 agent,
-                "activity",
+                kind,
                 sanitize_summary(&text, MAX_SUMMARY_CHARS),
             ))
         }
@@ -150,7 +177,8 @@ pub fn format_progress_event(agent: &str, event: &AgentEvent, now_ms: u64) -> Op
             sanitize_summary(&err.message, MAX_SUMMARY_CHARS),
         )),
         AgentEvent::TextDelta(_) => None,
-        AgentEvent::ProviderSessionBound(_)
+        AgentEvent::OutputLine { .. }
+        | AgentEvent::ProviderSessionBound(_)
         | AgentEvent::ModelsListed { .. }
         | AgentEvent::ModelSelected(_)
         | AgentEvent::EffortSelected(_) => None,
@@ -223,9 +251,30 @@ impl ProgressThrottle {
 }
 
 /// Tracks agent events and produces [`ProgressLine`]s for a progress sink.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ProgressTracker {
     throttle: ProgressThrottle,
+    heartbeats: HashMap<String, HeartbeatState>,
+    heartbeat_interval_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct HeartbeatState {
+    active: bool,
+    started_ms: u64,
+    last_output_ms: u64,
+    last_output_type: Option<String>,
+    last_heartbeat_ms: u64,
+}
+
+impl Default for ProgressTracker {
+    fn default() -> Self {
+        Self {
+            throttle: ProgressThrottle::default(),
+            heartbeats: HashMap::new(),
+            heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+        }
+    }
 }
 
 impl ProgressTracker {
@@ -233,8 +282,18 @@ impl ProgressTracker {
         Self::default()
     }
 
+    /// Test hook: shorten the heartbeat interval (FR-2432).
+    #[allow(dead_code)]
+    pub fn with_heartbeat_interval_ms(interval_ms: u64) -> Self {
+        Self {
+            heartbeat_interval_ms: interval_ms.max(1),
+            ..Self::default()
+        }
+    }
+
     /// Observes an [`AgentEvent`] at `now_ms` and returns progress lines to emit.
     pub fn observe(&mut self, agent: &str, event: &AgentEvent, now_ms: u64) -> Vec<ProgressLine> {
+        self.observe_heartbeat(agent, event, now_ms);
         let mut lines = Vec::new();
         match event {
             AgentEvent::Started => {
@@ -264,12 +323,91 @@ impl ProgressTracker {
                     lines.push(line);
                 }
             }
-            AgentEvent::ProviderSessionBound(_)
+            AgentEvent::OutputLine { .. }
+            | AgentEvent::ProviderSessionBound(_)
             | AgentEvent::ModelsListed { .. }
             | AgentEvent::ModelSelected(_)
             | AgentEvent::EffortSelected(_) => {}
         }
         lines
+    }
+
+    fn observe_heartbeat(&mut self, agent: &str, event: &AgentEvent, now_ms: u64) {
+        match event {
+            AgentEvent::Started => {
+                self.heartbeats.insert(
+                    agent.to_owned(),
+                    HeartbeatState {
+                        active: true,
+                        started_ms: now_ms,
+                        last_output_ms: now_ms,
+                        last_output_type: None,
+                        last_heartbeat_ms: now_ms,
+                    },
+                );
+            }
+            AgentEvent::Completed | AgentEvent::Cancelled | AgentEvent::Error(_) => {
+                if let Some(state) = self.heartbeats.get_mut(agent) {
+                    state.active = false;
+                }
+            }
+            AgentEvent::OutputLine { type_label } => {
+                if let Some(state) = self.heartbeats.get_mut(agent)
+                    && state.active
+                {
+                    state.last_output_ms = now_ms;
+                    state.last_heartbeat_ms = now_ms;
+                    if let Some(label) = type_label.as_deref().filter(|label| !label.is_empty()) {
+                        state.last_output_type = Some(label.to_owned());
+                    }
+                }
+            }
+            _ => {
+                if let Some(state) = self.heartbeats.get_mut(agent)
+                    && state.active
+                {
+                    state.last_output_ms = now_ms;
+                    state.last_heartbeat_ms = now_ms;
+                }
+            }
+        }
+    }
+
+    /// Emits a heartbeat for one running agent when its interval has elapsed.
+    pub fn heartbeat(&mut self, agent: &str, now_ms: u64) -> Option<ProgressLine> {
+        let state = self.heartbeats.get_mut(agent)?;
+        if !state.active
+            || now_ms.saturating_sub(state.last_heartbeat_ms) < self.heartbeat_interval_ms
+        {
+            return None;
+        }
+        state.last_heartbeat_ms = now_ms;
+        let elapsed_s = now_ms.saturating_sub(state.started_ms) / 1000;
+        let output_age_s = now_ms.saturating_sub(state.last_output_ms) / 1000;
+        let mut summary = format!("running {elapsed_s}s; last output {output_age_s}s ago");
+        if let Some(label) = &state.last_output_type {
+            summary.push_str(&format!(" (type={label})"));
+        }
+        Some(ProgressLine::new(
+            now_ms,
+            agent,
+            "heartbeat",
+            sanitize_summary(&summary, MAX_SUMMARY_CHARS),
+        ))
+    }
+
+    /// Emits due heartbeats for every running agent.
+    pub fn heartbeat_all(&mut self, now_ms: u64) -> Vec<ProgressLine> {
+        let agents: Vec<String> = self
+            .heartbeats
+            .iter()
+            .filter(|(_, state)| state.active)
+            .map(|(agent, _)| agent.clone())
+            .collect();
+        agents
+            .into_iter()
+            .filter_map(|agent| self.heartbeat(&agent, now_ms))
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -310,7 +448,7 @@ mod tests {
                     duration_ms: None,
                     detail: String::new(),
                 }),
-                "activity",
+                "file_edit",
                 "edit line1 line2 line3",
             ),
             (
@@ -444,5 +582,53 @@ mod tests {
         assert_eq!(flushed[0].summary.chars().count(), 160);
         // It must be the last 160 characters
         assert!(flushed[0].summary.ends_with("0123456789"));
+    }
+
+    // TC-2432 / FR-2432: a running turn gets one heartbeat per interval with
+    // turn age, last-output age and the last JSONL type; none after terminal.
+    #[test]
+    fn tc_2432_heartbeat_every_interval_with_last_output_age() {
+        let mut tracker = ProgressTracker::with_heartbeat_interval_ms(1_000);
+
+        tracker.observe("opencode", &AgentEvent::Started, 10_000);
+        tracker.observe(
+            "opencode",
+            &AgentEvent::OutputLine {
+                type_label: Some("step_start".to_owned()),
+            },
+            12_000,
+        );
+
+        assert!(tracker.heartbeat("opencode", 12_500).is_none());
+        let line = tracker
+            .heartbeat("opencode", 13_000)
+            .expect("first heartbeat is due");
+        assert_eq!(line.kind, "heartbeat");
+        assert_eq!(
+            line.summary,
+            "running 3s; last output 1s ago (type=step_start)"
+        );
+
+        assert!(tracker.heartbeat("opencode", 13_500).is_none());
+        let second = tracker
+            .heartbeat("opencode", 14_000)
+            .expect("next interval is due");
+        assert_eq!(
+            second.summary,
+            "running 4s; last output 2s ago (type=step_start)"
+        );
+
+        tracker.observe("opencode", &AgentEvent::Completed, 14_100);
+        assert!(
+            tracker.heartbeat("opencode", 20_000).is_none(),
+            "no heartbeat after completed"
+        );
+
+        // Every running agent is covered, including built-in runners.
+        tracker.observe("cursor", &AgentEvent::Started, 20_000);
+        let lines = tracker.heartbeat_all(21_000);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].agent, "cursor");
+        assert_eq!(lines[0].summary, "running 1s; last output 1s ago");
     }
 }

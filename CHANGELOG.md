@@ -7,6 +7,12 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Added
 
+- **Busy headless runs are distinguishable from stalled ones (#166, FR-2430..2433).**
+  `dmuxai run --progress` now emits `tool` lines for opencode/JSONL tool events,
+  `file_edit` lines with workspace-relative paths (never file content), and a
+  `heartbeat` line about every 30 s with turn age, last-output age and the last
+  JSONL `type`/`event`. Custom `[[agents.custom]]` runners can map their own tool
+  lines with `tool_when`, `tool_name_path` and `tool_title_path`.
 - **Task header and sidebar agent badge (FR-2331, FR-2341).** The dashboard and
   TUI list the agents that have spoken in the active task and mark those with an
   `active` native session live; the existing agent picker still switches agents.

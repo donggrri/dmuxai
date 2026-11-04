@@ -78,6 +78,9 @@ const OPENCODE_EXAMPLE: &str = r##"# Built-in opencode runner, as an editable [[
 # output = "jsonl"
 # text_path = "/part/text"
 # text_when = { path = "/type", equals = "text" }
+# tool_when = { path = "/type", equals = "tool_use" }
+# tool_name_path = "/part/tool"
+# tool_title_path = "/part/state/title"
 # error_path = ["/error/data/message", "/error/message"]
 # session_id_path = "/sessionID"
 # resume_arg = ["--session", "{session_id}"]
