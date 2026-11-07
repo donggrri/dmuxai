@@ -25,6 +25,10 @@ ships only after the owner approves it (step 7) and is published by hand (step 8
      subsection headings (for example `### Added`, `### Changed`, `### Fixed`). Leave
      `## Unreleased` in place, empty. Add the `[X.Y.Z]: .../compare/vPREV...vX.Y.Z` link at the
      bottom of the file next to the other release links.
+   - **Verify private vulnerability reporting** on the GitHub repository: confirm **Settings →
+     Security → Private vulnerability reporting** is enabled so **Security → Report a vulnerability**
+     works as described in [SECURITY.md](../SECURITY.md). If it is disabled, enable it or update
+     `SECURITY.md` before shipping.
 1. **Audit specs against the implementation.** For every `docs/specs/SPEC-*.md` and
    [docs/specs/DMUXAI-BASELINE.md](specs/DMUXAI-BASELINE.md), list requirements that the code
    does not implement, implements differently, or only partly implements. Record each gap as an
