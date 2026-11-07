@@ -300,7 +300,7 @@ impl EventLog {
             .path
             .parent()
             .ok_or_else(|| std::io::Error::other("events path has no parent"))?;
-        std::fs::create_dir_all(dir)?;
+        crate::workspace::ensure_state_dir(dir)?;
 
         let guard = acquire_lock(&dir.join("events.lock"))?;
 
@@ -697,7 +697,7 @@ fn log_append_failure(events_path: &Path, error: &std::io::Error) {
     let Some(dir) = events_path.parent() else {
         return;
     };
-    let _ = std::fs::create_dir_all(dir);
+    let _ = crate::workspace::ensure_state_dir(dir);
     let line = format!(
         "{} events append failed: {:?}",
         format_ts(now_ms()),
@@ -948,6 +948,12 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(written.len(), 3);
+        // TC-2504 / FR-2501, FR-2503: the first append creates the state
+        // directory with its self-ignoring file.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
 
         let path = events_path(dir.path());
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();

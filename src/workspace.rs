@@ -7,6 +7,50 @@ use std::{
 /// Maximum number of entries persisted in `recent-workspaces.json` (FR-872).
 pub const MAX_RECENT_WORKSPACES: usize = 10;
 
+/// Workspace-local directory for DmuxAI-generated state.
+pub const WORKSPACE_STATE_DIR: &str = ".dmuxai";
+
+/// Self-ignoring content for `<workspace>/.dmuxai/.gitignore` (FR-2501).
+pub const WORKSPACE_STATE_GITIGNORE: &str = "*\n";
+
+/// Ensures `dir` (normally `<workspace>/.dmuxai`) exists and contains a
+/// self-ignoring `.gitignore`. An existing ignore file is never modified.
+pub fn ensure_state_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let ignore = dir.join(".gitignore");
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&ignore)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(WORKSPACE_STATE_GITIGNORE.as_bytes())?;
+            file.flush()?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+/// Ensures the workspace state directory that owns `path` exists and is
+/// self-ignoring, then creates `path` itself (FR-2501..FR-2503).
+pub fn ensure_state_path(path: &Path) -> io::Result<()> {
+    let state_dir = path
+        .ancestors()
+        .find(|candidate| candidate.file_name() == Some(std::ffi::OsStr::new(WORKSPACE_STATE_DIR)))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not inside the workspace state directory",
+            )
+        })?;
+    ensure_state_dir(state_dir)?;
+    fs::create_dir_all(path)?;
+    Ok(())
+}
+
 /// Credential directories relative to `$HOME` that are never valid workspaces (FR-873).
 pub const CREDENTIAL_DIRS_FROM_HOME: &[&str] = &[
     ".ssh",
@@ -646,6 +690,54 @@ mod tests {
         let nested = dir.path().join("nested").join("workspace");
         ensure_directory_writable(&nested).unwrap();
         assert!(nested.is_dir());
+    }
+
+    // TC-2501 / FR-2501, FR-2502: first creation writes `*`, repeated calls
+    // are idempotent, an existing ignore file is preserved, and the workspace
+    // root `.gitignore` is never touched.
+    #[test]
+    fn tc_2501_state_dir_gitignore_is_created_idempotently() {
+        let dir = tempdir().unwrap();
+        let root_ignore = dir.path().join(".gitignore");
+        fs::write(&root_ignore, "target\n").unwrap();
+        let state = dir.path().join(WORKSPACE_STATE_DIR);
+
+        ensure_state_path(&state.join("attachments")).unwrap();
+        assert_eq!(
+            fs::read_to_string(state.join(".gitignore")).unwrap(),
+            WORKSPACE_STATE_GITIGNORE
+        );
+        assert_eq!(fs::read_to_string(&root_ignore).unwrap(), "target\n");
+
+        fs::write(state.join("attachments").join("keep.txt"), "keep").unwrap();
+        ensure_state_path(&state.join("attachments")).unwrap();
+        assert_eq!(
+            fs::read_to_string(state.join(".gitignore")).unwrap(),
+            WORKSPACE_STATE_GITIGNORE
+        );
+        assert_eq!(
+            fs::read_to_string(state.join("attachments").join("keep.txt")).unwrap(),
+            "keep"
+        );
+
+        fs::write(state.join(".gitignore"), "custom\n").unwrap();
+        ensure_state_dir(&state).unwrap();
+        assert_eq!(
+            fs::read_to_string(state.join(".gitignore")).unwrap(),
+            "custom\n",
+            "an existing user ignore file must not be overwritten or appended"
+        );
+
+        let missing = tempdir().unwrap();
+        fs::create_dir_all(missing.path().join(WORKSPACE_STATE_DIR)).unwrap();
+        ensure_state_dir(&missing.path().join(WORKSPACE_STATE_DIR)).unwrap();
+        assert_eq!(
+            fs::read_to_string(missing.path().join(WORKSPACE_STATE_DIR).join(".gitignore"))
+                .unwrap(),
+            WORKSPACE_STATE_GITIGNORE,
+            "an existing state directory without an ignore file is filled in"
+        );
+        assert!(!missing.path().join(".gitignore").exists());
     }
 
     // TC-870 (FR-870, FR-873): precedence order and directory validation.

@@ -33,7 +33,7 @@ impl GraphStore {
     }
 
     pub fn save(&self, run: &GraphRun) -> io::Result<PathBuf> {
-        fs::create_dir_all(&self.root)?;
+        crate::workspace::ensure_state_path(&self.root)?;
         let record = cap_run_revision_raw(run);
         let path = self.root.join(format!("{}.json", record.plan.id));
         let json = serde_json::to_string_pretty(&record)?;
@@ -249,6 +249,12 @@ mod tests {
             decided_at_ms: Some(1_700_000_000_000),
         });
         save_run(root, &run).unwrap();
+        // TC-2505 / FR-2501, FR-2503: graph runs create the self-ignoring
+        // state directory.
+        assert_eq!(
+            fs::read_to_string(root.join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
         let loaded = load_run(root, "triaged-run").unwrap();
         assert_eq!(loaded.conversation_id, run.conversation_id);
         assert_eq!(loaded.triage, run.triage);

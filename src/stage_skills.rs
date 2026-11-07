@@ -943,6 +943,7 @@ pub fn deliver_native(
         if dest.exists() {
             fs::remove_dir_all(&dest)?;
         }
+        crate::workspace::ensure_state_path(&dest)?;
         copy_dir(&skill.dir, &dest)?;
         lines.push(format!(
             "- {}: {}",
@@ -1031,7 +1032,7 @@ impl Approvals {
         approvals.approved.insert(name.to_owned(), rev.clone());
         let path = ctx.approvals_path();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+            crate::workspace::ensure_state_dir(parent).map_err(|err| err.to_string())?;
         }
         let text = serde_json::to_string_pretty(&approvals).map_err(|err| err.to_string())?;
         fs::write(&path, text).map_err(|err| err.to_string())?;
@@ -1080,7 +1081,7 @@ fn sync_one(ctx: &SkillContext, name: &str, url: &str, rev: &str) -> Result<Stri
     if dest.exists() {
         fs::remove_dir_all(&dest).map_err(|err| err.to_string())?;
     }
-    fs::create_dir_all(&dest).map_err(|err| err.to_string())?;
+    crate::workspace::ensure_state_path(&dest).map_err(|err| err.to_string())?;
     let result = (|| {
         git(&dest, &["init", "-q"])?;
         git(&dest, &["remote", "add", "origin", url])?;
@@ -1152,7 +1153,7 @@ impl SkillRunRecord {
         edit(&mut record);
         let path = Self::path(ctx, run_id);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            crate::workspace::ensure_state_path(parent)?;
         }
         fs::write(
             path,
@@ -1614,6 +1615,12 @@ mod tests {
         assert!(root.join(".grok/skills/r/SKILL.md").is_file());
         assert!(text.contains(".grok/skills/r/SKILL.md"));
         assert!(!c.workspace.join(".grok").exists());
+        // TC-2506 / FR-2501, FR-2503: native delivery under `.dmuxai` also
+        // creates the self-ignoring state directory.
+        assert_eq!(
+            fs::read_to_string(c.workspace.join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
         let (_, other) = stage_prompt_prefix(Delivery::Native, "custom-x", &p.skills, &root);
         assert_eq!(other, Delivery::Inject);
     }
@@ -1698,6 +1705,12 @@ mod tests {
         let r = SkillRunRecord::load(&c, "r1").unwrap();
         assert_eq!(r.uses.len(), 1);
         assert_eq!(r.interview_rounds, 2);
+        // TC-2506 / FR-2501, FR-2503: skill run records create the
+        // self-ignoring state directory.
+        assert_eq!(
+            fs::read_to_string(c.workspace.join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
     }
 
     // TC-1510 (unit part): round cap wording.

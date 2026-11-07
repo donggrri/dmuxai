@@ -355,7 +355,7 @@ async fn deliver_command(
 /// directory if needed. Failures are swallowed: logging never panics.
 fn append_log(log_path: &Path, line: &str) {
     if let Some(parent) = log_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = crate::workspace::ensure_state_dir(parent);
     }
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -496,6 +496,20 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         false
+    }
+
+    // TC-2507 / FR-2501, FR-2503: best-effort notify logging still creates the
+    // self-ignoring state directory.
+    #[test]
+    fn tc_2507_notify_log_creates_state_gitignore() {
+        let workspace = tempfile::tempdir().unwrap();
+        let log_path = workspace.path().join(".dmuxai").join("notify.log");
+        append_log(&log_path, "line");
+        assert!(log_path.is_file());
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
     }
 
     #[tokio::test]

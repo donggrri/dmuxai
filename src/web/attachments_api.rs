@@ -111,7 +111,7 @@ pub fn save_web_attachment(workspace: &Path, bytes: &[u8]) -> Result<SavedAttach
     }
     let (ext, mime) = sniff_image(bytes).ok_or(UploadError::UnsupportedType)?;
     let dir = attachments_dir(workspace);
-    std::fs::create_dir_all(&dir).map_err(|e| UploadError::Io(e.to_string()))?;
+    crate::workspace::ensure_state_path(&dir).map_err(|e| UploadError::Io(e.to_string()))?;
     let name = format!("web-{}.{}", uuid::Uuid::new_v4().simple(), ext);
     let path = dir.join(&name);
     std::fs::write(&path, bytes).map_err(|e| UploadError::Io(e.to_string()))?;
@@ -191,6 +191,12 @@ mod tests {
                 .starts_with(dir.path().join(".dmuxai").join("attachments"))
         );
         assert!(saved.path.is_file());
+        // TC-2503 / FR-2501, FR-2503: web uploads create the self-ignoring
+        // state directory.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
     }
 
     #[test]

@@ -103,7 +103,7 @@ impl ImageAttachmentStore {
             });
         }
         let dir = attachments_dir(workspace);
-        fs::create_dir_all(&dir)?;
+        crate::workspace::ensure_state_path(&dir)?;
         let extension = resolved
             .extension()
             .and_then(|ext| ext.to_str())
@@ -300,5 +300,11 @@ mod tests {
         let mut store = ImageAttachmentStore::new();
         let attachment = store.ingest_path(dir.path(), &file).unwrap();
         assert!(attachment.path.starts_with(attachments_dir(dir.path())));
+        // TC-2503 / FR-2501, FR-2502, FR-2503: attachment creation also
+        // creates the self-ignoring state directory.
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
     }
 }

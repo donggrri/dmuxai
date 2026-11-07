@@ -58,6 +58,25 @@ fn readme_matches_release_layout() {
     }
 }
 
+// TC-2508 / FR-2504 (SPEC-workspace-state-gitignore): README documents the
+// self-ignoring state directory and untouched project root `.gitignore`.
+#[test]
+fn tc_2508_readme_documents_workspace_state_gitignore() {
+    let readme = read("README.md");
+    for needle in [
+        ".dmuxai/.gitignore",
+        "containing `*`",
+        "does not edit your project root `.gitignore`",
+        "never overwrites an",
+        "existing `.dmuxai/.gitignore`",
+    ] {
+        assert!(
+            readme.contains(needle),
+            "README must document workspace state gitignore (missing {needle})"
+        );
+    }
+}
+
 // TC-905 / FR-900
 #[test]
 fn readme_and_changelog_mention_builtin_grok() {
