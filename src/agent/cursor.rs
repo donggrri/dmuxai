@@ -14,7 +14,7 @@ use super::{
     ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy, implement_outcome::ImplementTurnTracker,
     map_send_error, prompt_with_image_tokens,
 };
-use dmuxai::process::cursor_command;
+use dmuxai::process::{apply_child_cwd_tokio, cursor_command};
 use dmuxai::runner_protocol::RunnerProtocol;
 use dmuxai::settings::DmuxSettings;
 
@@ -254,8 +254,8 @@ fn spawn_warm_process(
         &mut command,
         &dmuxai::process::supervisor::ChildOptions::default(),
     );
+    apply_child_cwd_tokio(&mut command, cwd);
     command
-        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -876,10 +876,8 @@ async fn run_turn_with_child(
                 mode,
                 cwd,
             );
-            command
-                .current_dir(cwd)
-                .stdin(Stdio::piped())
-                .kill_on_drop(true);
+            apply_child_cwd_tokio(&mut command, cwd);
+            command.stdin(Stdio::piped()).kill_on_drop(true);
             dmuxai::process::supervisor::spawn(command, config)
                 .map_err(|e| AgentError::process_exit(format!("could not start Cursor: {e}")))?
         }
@@ -1256,9 +1254,9 @@ fn normalize_event(message: &Value, state: &mut CursorStreamState) -> Vec<AgentE
 
 async fn list_models(cwd: &Path) -> io::Result<(Vec<ModelInfo>, Option<String>)> {
     let mut command = cursor_command()?;
+    apply_child_cwd_tokio(&mut command, cwd);
     command
         .arg("--list-models")
-        .current_dir(cwd)
         .stdin(Stdio::null())
         .kill_on_drop(true);
     let output = command.output().await?;

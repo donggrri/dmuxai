@@ -122,6 +122,27 @@ fn fake_opencode(root: &Path) -> PathBuf {
     bin
 }
 
+/// Writes a fake `opencode` that reports both its actual cwd and the `PWD` it
+/// inherited from the DmuxAI parent. It reads `/proc/$$/environ` because POSIX
+/// shells overwrite a mismatched `PWD` during startup.
+#[cfg(target_os = "linux")]
+fn fake_opencode_reporting_inherited_pwd(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.join("bin-pwd-probe");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("opencode");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+if [ \"$1\" = models ]; then echo opencode/glm-5-free; exit 0; fi\n\
+inherited_pwd=$(tr '\\0' '\\n' </proc/$$/environ | sed -n 's/^PWD=//p')\n\
+printf '{\"type\":\"text\",\"sessionID\":\"ses_1\",\"part\":{\"text\":\"pwd=%s env=%s\"}}\\n' \"$(pwd)\" \"$inherited_pwd\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
 /// `PATH` with `dir` first, so the fake opencode wins the lookup.
 #[cfg(unix)]
 fn path_with(dir: &Path) -> OsString {
@@ -715,6 +736,41 @@ fn fresh_install_lists_opencode() {
     assert!(
         agents.iter().all(|agent| agent["id"] != "opencode"),
         "{json}"
+    );
+}
+
+// TC-2450 / FR-2450, FR-2451: `-C <target>` makes the built-in opencode runner
+// run with the target workspace as both its actual cwd and its inherited PWD.
+// The caller cwd (Sandbox::workspace) differs from the target on purpose.
+#[cfg(target_os = "linux")]
+#[test]
+fn tc_2450_opencode_run_uses_the_workspace_cwd_and_pwd() {
+    let sandbox = Sandbox::bare();
+    let target = sandbox.root.join("target-ws");
+    std::fs::create_dir_all(&target).unwrap();
+    let target_arg = target.to_str().unwrap();
+    let target_canonical = std::fs::canonicalize(&target).unwrap();
+    let expected = target_canonical.display().to_string();
+
+    let bin = fake_opencode_reporting_inherited_pwd(&sandbox.root);
+    let env = [("PATH", path_with(&bin))];
+    let output = sandbox.run_in_env(
+        &[
+            "-C", target_arg, "run", "hi", "--agent", "opencode", "--json",
+        ],
+        None,
+        &env,
+    );
+    let json = stdout_json(&output);
+    assert_eq!(output.status.code(), Some(0), "{json}");
+    let text = json["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains(&format!("pwd={expected}")),
+        "opencode cwd was not the target workspace: {json}"
+    );
+    assert!(
+        text.contains(&format!("env={expected}")),
+        "opencode inherited PWD was not the target workspace: {json}"
     );
 }
 

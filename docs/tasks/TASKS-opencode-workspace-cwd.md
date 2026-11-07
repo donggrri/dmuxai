@@ -1,0 +1,10 @@
+# TASKS: opencode workspace cwd
+
+Status: complete
+
+- [x] T1 — FR-2450: add the shared cwd/`PWD` helper with std and Tokio entry points. Test: `cargo test --lib child_cwd_sets_current_dir_and_pwd` (TC-2451).
+- [x] T2 — FR-2450: use the helper in the changed built-in runner and custom-runner spawn paths, including model listing and workspace fingerprint subprocesses. Test: `cargo test --lib runner_cwd_is_workspace` and `cargo test --test agent_api_cli tc_2450_opencode_run_uses_the_workspace_cwd_and_pwd` (TC-2450, TC-2451).
+- [x] T3 — FR-2450: add deterministic coverage that asserts both actual cwd and inherited `PWD` for opencode under `-C` and for the shared helper. Test: `cargo test --test agent_api_cli tc_2450_opencode_run_uses_the_workspace_cwd_and_pwd` (TC-2450).
+- [x] T4 — Isolate `tc_2084_no_runner_gets_mcp_args_or_files` from the real user config so it checks only the two workspace MCP servers; the runner-intent assertions are unchanged. Test: `cargo test --lib tc_2084_no_runner_gets_mcp_args_or_files`.
+- [x] T5 — FR-2450: parent verification. Final results: `scripts/gate.sh --keep-going` exit 0 (fmt, clippy `--all-targets --all-features -- -D warnings`, all-features tests, all-spec/TC-link gates); `cargo test --locked --all-targets --no-fail-fast` exit 0; `bash scripts/check-spec.sh docs/specs/SPEC-opencode-workspace-cwd.md` exit 0; `cargo build --release --locked` exit 0. Prior live free-model `pwd` smoke from a different shell cwd returned exactly the target workspace (exit 0, `ok=true`, `error_kind=null`). Prior run history kept: `cargo fmt --check` initially FAILED (corrected with `cargo fmt`); `cargo test --locked --all-targets --no-fail-fast` initially had one environment-dependent failure, `tc_2084_no_runner_gets_mcp_args_or_files`, fixed under T4. No Rust or test changes were made in this documentation-only pass. Live testing covered OpenCode only; other providers were not exercised live.
+- [x] T6 — FR-2450: record the final full-test rerun and spec-gate results in `docs/reviews/REVIEW-opencode-workspace-cwd.md`.

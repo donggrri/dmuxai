@@ -1146,9 +1146,9 @@ const WORKSPACE_FINGERPRINT_TIMEOUT: Duration = Duration::from_secs(5);
 /// fingerprint.
 async fn workspace_fingerprint(cwd: &Path) -> Option<String> {
     let mut command = tokio::process::Command::new("git");
+    dmuxai::process::apply_child_cwd_tokio(&mut command, cwd);
     command
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
-        .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
     let output = tokio::time::timeout(WORKSPACE_FINGERPRINT_TIMEOUT, command.output())
@@ -1955,7 +1955,8 @@ headers = { Authorization = "Bearer secret" }
         std::fs::write(ws.path().join("dmuxai.toml"), toml_settings).unwrap();
         let mut env = dmuxai::runtime_env::RuntimeEnv::from_process();
         env.trust_workspace_config = true;
-        let settings = dmuxai::settings::DmuxSettings::load_with_env(ws.path(), &env);
+        let settings =
+            dmuxai::settings::DmuxSettings::load_with_user_config_and_env(ws.path(), None, &env);
         assert_eq!(settings.mcp_servers.len(), 2);
 
         // 1. Codex app-server argv has no mcp_servers
