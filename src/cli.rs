@@ -886,6 +886,35 @@ fn mcp_run_timeout() -> Duration {
         .unwrap_or(MCP_RUN_TIMEOUT)
 }
 
+/// Builds the child argv for an MCP `run` call (FR-2450..FR-2452).
+fn mcp_run_argv(args: &RunArgs) -> Vec<String> {
+    let mut argv: Vec<String> = match &args.todo_id {
+        Some(id) => vec!["todo".into(), "run".into(), id.clone()],
+        None => vec!["run".into()],
+    };
+    if let Some(agent) = &args.agent {
+        argv.extend(["--agent".into(), agent.clone()]);
+    }
+    if let Some(model) = &args.model {
+        argv.extend(["--model".into(), model.clone()]);
+    }
+    if args.approve_plan {
+        argv.push("--approve-plan".into());
+    }
+    if args.allow_sensitive {
+        argv.push("--allow-sensitive".into());
+    }
+    if args.graph {
+        argv.push("--graph".into());
+    }
+    argv.push("--json".into());
+    if args.todo_id.is_none() {
+        argv.push("--".into());
+        argv.push(args.prompt.clone().unwrap_or_default());
+    }
+    argv
+}
+
 impl CliMcpBackend {
     fn run_child(&self, args: Vec<String>) -> Result<Value, String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -973,25 +1002,7 @@ impl McpBackend for CliMcpBackend {
     }
 
     fn run(&self, args: RunArgs) -> Result<Value, String> {
-        let mut argv: Vec<String> = match &args.todo_id {
-            Some(id) => vec!["todo".into(), "run".into(), id.clone()],
-            None => vec!["run".into()],
-        };
-        if let Some(agent) = args.agent {
-            argv.extend(["--agent".into(), agent]);
-        }
-        if args.read_only {
-            argv.push("--read-only".into());
-        }
-        if args.graph {
-            argv.push("--graph".into());
-        }
-        argv.push("--json".into());
-        if args.todo_id.is_none() {
-            argv.push("--".into());
-            argv.push(args.prompt.unwrap_or_default());
-        }
-        self.run_child(argv)
+        self.run_child(mcp_run_argv(&args))
     }
 
     fn status(&self) -> Result<Value, String> {
@@ -1485,6 +1496,71 @@ mod tests {
             Ok(AgentCommand::TodoRun { run, .. }) => assert!(!run.progress),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    // TC-2450 / FR-2450, FR-2451: the MCP backend forwards the parity fields
+    // to the child CLI as the same flags accepted by `run` / `todo run`.
+    #[test]
+    fn tc_2450_mcp_run_argv_forwards_parity_flags() {
+        let args = RunArgs {
+            prompt: Some("ship it".into()),
+            agent: Some("agy".into()),
+            model: Some("m".into()),
+            approve_plan: true,
+            allow_sensitive: true,
+            graph: false,
+            todo_id: None,
+        };
+        assert_eq!(
+            mcp_run_argv(&args),
+            vec![
+                "run",
+                "--agent",
+                "agy",
+                "--model",
+                "m",
+                "--approve-plan",
+                "--allow-sensitive",
+                "--json",
+                "--",
+                "ship it"
+            ]
+        );
+
+        let todo = RunArgs {
+            prompt: None,
+            agent: Some("agy".into()),
+            model: Some("m".into()),
+            approve_plan: true,
+            allow_sensitive: true,
+            graph: false,
+            todo_id: Some("t1".into()),
+        };
+        assert_eq!(
+            mcp_run_argv(&todo),
+            vec![
+                "todo",
+                "run",
+                "t1",
+                "--agent",
+                "agy",
+                "--model",
+                "m",
+                "--approve-plan",
+                "--allow-sensitive",
+                "--json"
+            ]
+        );
+
+        let graph = RunArgs {
+            prompt: Some("plan it".into()),
+            graph: true,
+            ..RunArgs::default()
+        };
+        assert_eq!(
+            mcp_run_argv(&graph),
+            vec!["run", "--graph", "--json", "--", "plan it"]
+        );
     }
 
     // TC-1770: error messages unchanged by table-driven parser.

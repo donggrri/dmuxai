@@ -15,9 +15,9 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", 
 pub struct RunArgs {
     pub prompt: Option<String>,
     pub agent: Option<String>,
-    pub mode: Option<String>,
-    /// When true, the child `dmuxai run` uses `--read-only` (legacy ask/plan modes).
-    pub read_only: bool,
+    pub model: Option<String>,
+    pub approve_plan: bool,
+    pub allow_sensitive: bool,
     pub graph: bool,
     pub todo_id: Option<String>,
 }
@@ -58,15 +58,23 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "run",
-            "description": "Run a prompt (or an existing to-do with todo_id) through a DmuxAI agent or the graph planner and wait for the result. Returns JSON with ok, exit_code, text and messages.",
+            "description": "Run a prompt (or an existing to-do with todo_id) through a DmuxAI agent or the graph planner and wait for the result. Returns JSON with ok, exit_code, text and messages. The deprecated mode argument is rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "prompt": { "type": "string" },
                     "agent": { "type": "string", "description": "Runner id, e.g. agy or a custom agent name" },
-                    "mode": {
+                    "model": {
                         "type": "string",
-                        "description": "Deprecated legacy argument. ask or plan runs read-only; implement or agent, or omit, runs write-capable; other values are an error."
+                        "description": "Runner model id (same as dmuxai run --model); requires agent and cannot be used with graph"
+                    },
+                    "approve_plan": {
+                        "type": "boolean",
+                        "description": "Approve a pending plan and confirm sensitive gates like dmuxai run --approve-plan"
+                    },
+                    "allow_sensitive": {
+                        "type": "boolean",
+                        "description": "Confirm every sensitive gate like dmuxai run --allow-sensitive"
                     },
                     "graph": { "type": "boolean", "description": "Use the graph planner" },
                     "todo_id": { "type": "string", "description": "Run this to-do instead of a prompt" }
@@ -102,8 +110,14 @@ fn error_response(id: &Value, code: i64, message: &str) -> Value {
 
 fn tool_result(outcome: Result<Value, String>) -> Value {
     match outcome {
-        Ok(value) => {
-            let is_error = value.get("ok") == Some(&Value::Bool(false));
+        Ok(mut value) => {
+            // Exit 7 is a headless approval gate. Surface it explicitly on the
+            // MCP result so clients do not have to interpret the exit code.
+            let approval_required = value.get("exit_code").and_then(Value::as_i64) == Some(7);
+            if approval_required {
+                value["approval_required"] = Value::Bool(true);
+            }
+            let is_error = value.get("ok") == Some(&Value::Bool(false)) || approval_required;
             json!({
                 "content": [{ "type": "text", "text": value.to_string() }],
                 "structuredContent": value,
@@ -129,24 +143,24 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
         }
         "todo_list" => backend.todo_list(str_arg(args, "status")),
         "run" => {
-            let mode = str_arg(args, "mode");
-            let read_only = match mode {
-                None => false,
-                Some(value) => match value.trim().to_ascii_lowercase().as_str() {
-                    "ask" | "plan" => true,
-                    "implement" | "agent" => false,
-                    other => {
-                        return Err(format!(
-                            "invalid mode '{other}'; use ask or plan (read-only), implement (agent), or omit mode"
-                        ));
-                    }
-                },
-            };
+            if args.get("mode").is_some() {
+                return Err(
+                    "mode was removed; DmuxAI runs a single agent mode (write-capable). Omit mode."
+                        .to_owned(),
+                );
+            }
             let run = RunArgs {
                 prompt: str_arg(args, "prompt").map(str::to_owned),
                 agent: str_arg(args, "agent").map(str::to_owned),
-                mode: mode.map(str::to_owned),
-                read_only,
+                model: str_arg(args, "model").map(str::to_owned),
+                approve_plan: args
+                    .get("approve_plan")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                allow_sensitive: args
+                    .get("allow_sensitive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 graph: args.get("graph").and_then(Value::as_bool).unwrap_or(false),
                 todo_id: str_arg(args, "todo_id").map(str::to_owned),
             };
@@ -155,6 +169,12 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
             }
             if run.graph && run.agent.is_some() {
                 return Err("use either agent or graph, not both".to_owned());
+            }
+            if run.model.is_some() && run.graph {
+                return Err("model cannot be used with graph".to_owned());
+            }
+            if run.model.is_some() && run.agent.is_none() {
+                return Err("model needs agent".to_owned());
             }
             backend.run(run)
         }
@@ -271,6 +291,7 @@ mod tests {
     #[derive(Default)]
     struct Stub {
         runs: Mutex<Vec<RunArgs>>,
+        run_result: Mutex<Option<Value>>,
     }
 
     impl McpBackend for Stub {
@@ -282,7 +303,12 @@ mod tests {
         }
         fn run(&self, args: RunArgs) -> Result<Value, String> {
             self.runs.lock().unwrap().push(args);
-            Ok(json!({ "ok": true, "exit_code": 0, "text": "done" }))
+            Ok(self
+                .run_result
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| json!({ "ok": true, "exit_code": 0, "text": "done" })))
         }
         fn status(&self) -> Result<Value, String> {
             Ok(json!({ "workspace": "/w" }))
@@ -335,11 +361,19 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "run")
             .expect("run tool");
-        let mode_desc = run_tool["inputSchema"]["properties"]["mode"]["description"]
-            .as_str()
-            .expect("mode description");
-        assert!(!mode_desc.contains("ignored"));
-        assert!(mode_desc.to_ascii_lowercase().contains("read-only"));
+        let run_properties = &run_tool["inputSchema"]["properties"];
+        // TC-2453 / FR-2452: the run tool schema advertises the parity fields
+        // and never the removed `mode` argument.
+        for field in ["model", "approve_plan", "allow_sensitive"] {
+            assert!(
+                run_properties.get(field).is_some(),
+                "run schema is missing {field}"
+            );
+        }
+        assert!(
+            run_properties.get("mode").is_none(),
+            "the deprecated mode argument must not be advertised"
+        );
 
         let add = call(
             &stub,
@@ -361,7 +395,7 @@ mod tests {
 
         let run = call(
             &stub,
-            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"hi","agent":"agy","mode":"ask"}}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"hi","agent":"agy","model":"m","approve_plan":true,"allow_sensitive":true}}}),
         );
         assert_eq!(run["result"]["structuredContent"]["text"], "done");
         assert_eq!(stub.runs.lock().unwrap()[0].agent.as_deref(), Some("agy"));
@@ -406,6 +440,135 @@ mod tests {
         let out = String::from_utf8(out).unwrap();
         assert_eq!(out.lines().count(), 1);
         assert!(out.contains("\"id\":1"));
+    }
+
+    // TC-2450 / FR-2450, FR-2451: model, approve_plan and allow_sensitive are
+    // parsed and forwarded to the backend, for prompt and to-do runs.
+    #[test]
+    fn tc_2450_mcp_run_forwards_parity_fields() {
+        let stub = Stub::default();
+        let result = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"ship it","agent":"agy","model":"gemini-3.8-flash-high","approve_plan":true,"allow_sensitive":true}}}),
+        );
+        assert_eq!(result["result"]["isError"], false);
+        {
+            let runs = stub.runs.lock().unwrap();
+            assert_eq!(
+                runs[0],
+                RunArgs {
+                    prompt: Some("ship it".to_owned()),
+                    agent: Some("agy".to_owned()),
+                    model: Some("gemini-3.8-flash-high".to_owned()),
+                    approve_plan: true,
+                    allow_sensitive: true,
+                    graph: false,
+                    todo_id: None,
+                }
+            );
+        }
+
+        let todo = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run","arguments":{"todo_id":"t1","agent":"agy","model":"m","approve_plan":true,"allow_sensitive":true}}}),
+        );
+        assert_eq!(todo["result"]["isError"], false);
+        let runs = stub.runs.lock().unwrap();
+        assert_eq!(runs[1].todo_id.as_deref(), Some("t1"));
+        assert_eq!(runs[1].model.as_deref(), Some("m"));
+        assert!(runs[1].approve_plan);
+        assert!(runs[1].allow_sensitive);
+    }
+
+    // TC-2451 / FR-2452: the deprecated mode is rejected like the CLI's
+    // removed --mode, and the model rules mirror parse_run_options.
+    #[test]
+    fn tc_2451_mcp_run_rejects_mode_and_validates_model() {
+        let stub = Stub::default();
+        for mode in ["ask", "plan", "implement", "agent", "anything"] {
+            let result = call(
+                &stub,
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"hi","agent":"agy","mode":mode}}}),
+            );
+            assert_eq!(result["result"]["isError"], true);
+            let text = result["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("mode was removed"), "{text}");
+            assert!(text.contains("Omit mode"), "{text}");
+        }
+
+        let model_without_agent = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"hi","model":"m"}}}),
+        );
+        assert_eq!(
+            model_without_agent["result"]["content"][0]["text"],
+            "model needs agent"
+        );
+
+        let model_with_graph = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"hi","graph":true,"model":"m"}}}),
+        );
+        assert_eq!(
+            model_with_graph["result"]["content"][0]["text"],
+            "model cannot be used with graph"
+        );
+
+        let agent_with_graph = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"hi","agent":"agy","graph":true}}}),
+        );
+        assert_eq!(
+            agent_with_graph["result"]["content"][0]["text"],
+            "use either agent or graph, not both"
+        );
+
+        assert!(
+            stub.runs.lock().unwrap().is_empty(),
+            "invalid runs must never reach the backend"
+        );
+    }
+
+    // TC-2452 / FR-2453: exit 7 is an approval gate, not an opaque failure.
+    #[test]
+    fn tc_2452_mcp_run_surfaces_exit_7_approval_required() {
+        let stub = Stub::default();
+        *stub.run_result.lock().unwrap() = Some(json!({
+            "ok": false,
+            "exit_code": 7,
+            "error": "approval required (headless)",
+            "text": "step one"
+        }));
+        let result = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"plan it"}}}),
+        );
+        assert_eq!(result["result"]["isError"], true);
+        assert_eq!(result["result"]["structuredContent"]["exit_code"], 7);
+        assert_eq!(
+            result["result"]["structuredContent"]["approval_required"],
+            true
+        );
+        assert_eq!(
+            result["result"]["structuredContent"]["error"],
+            "approval required (headless)"
+        );
+        assert_eq!(result["result"]["structuredContent"]["text"], "step one");
+
+        *stub.run_result.lock().unwrap() = Some(json!({
+            "ok": true,
+            "exit_code": 0,
+            "text": "done"
+        }));
+        let success = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"hi"}}}),
+        );
+        assert!(
+            success["result"]["structuredContent"]
+                .get("approval_required")
+                .is_none()
+        );
     }
 
     fn call_raw(stub: &Stub, line: &str) -> Value {
