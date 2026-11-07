@@ -25,6 +25,24 @@ Continuous integration runs [gitleaks](https://github.com/gitleaks/gitleaks) on 
 history. Known test fixtures are allowlisted in [.gitleaks.toml](.gitleaks.toml); do not add
 real credentials, API keys, or private keys to the tree or to commit messages.
 
+## Dashboard access token
+
+`dmuxai --web` and `dmuxai serve` print a dashboard URL that includes a **per-start access
+token** as the `?token=` query parameter. That token authorizes every `/api/*` request for
+that server instance until it exits. With the default loopback bind, exposure is limited to
+processes and users on the same machine (or anyone who can reach a non-loopback bind when
+`--allow-remote` is used), but the token must still be treated as a **secret**.
+
+- The startup line can persist in **terminal scrollback**, session logs, CI output, and
+  screenshots.
+- Opening the URL in a browser can record the full token in **browser history**.
+- **Redact** dashboard URLs and token values before pasting logs into a **bug report**, a
+  public issue, or a chat channel.
+- `DMUXAI_WEB_TOKEN` sets a fixed token instead of a random per-start value. Do not commit
+  it, publish it in configuration repos, or reuse a production token in development logs.
+
+See the **Dashboard token** section in [README.md](README.md) for user-facing detail.
+
 ## Workspace configuration trust
 
 A repository's workspace configuration (`dmuxai.toml`) cannot run commands, reference secret environment variables, or set outbound URLs until the user trusts it with `dmuxai trust`. Restricted keys include:
