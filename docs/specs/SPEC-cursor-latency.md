@@ -48,10 +48,10 @@ Decision: pre-warm the next cursor-agent process (FR-805..FR-807) and document w
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |
-| TC-805 | FR-805, FR-806 | unit | fake cursor binary that records spawn time and argv | After a turn completes, a warm process exists with the next-turn argv; the next prompt reuses it (one spawn total for turn 2); nothing is written to its stdin before the prompt | `src/agent/cursor.rs` `prewarm_reused_when_args_match` |
-| TC-806 | FR-806, FR-807 | unit | fake binary | Changing the mode or model before the prompt discards the warm process, and its pid no longer exists afterwards; a fresh one is spawned; `/new` discards it the same way | `src/agent/cursor.rs` `prewarm_discarded_on_arg_change` |
-| TC-807 | FR-807, NFR-805 | unit | fake binary, `prewarm = false` | No warm spawn when disabled, in headless `run`, or for graph nodes; idle expiry and quit kill it (pid gone) | `src/agent/cursor.rs` `prewarm_disabled_and_expiry` |
-| TC-808 | FR-806 | unit | fake binary that exits immediately | A warm process that has exited is reaped and the prompt runs in a fresh process | `src/agent/cursor.rs` `prewarm_exited_process_is_replaced` |
+| TC-805 | FR-805, FR-806 | unit | fake cursor binary that records spawn time and argv | After a turn completes, a warm process exists with the next-turn argv; the next prompt reuses it (one spawn total for turn 2); nothing is written to its stdin before the prompt | `src/agent/cursor.rs` `tc_805_prewarm_reused_when_args_match` |
+| TC-806 | FR-806, FR-807 | unit | fake binary | Changing the mode or model before the prompt discards the warm process, and its pid no longer exists afterwards; a fresh one is spawned; `/new` discards it the same way | `src/agent/cursor.rs` `tc_806_prewarm_discarded_on_arg_change` |
+| TC-807 | FR-807, NFR-805 | unit | fake binary, `prewarm = false` | No warm spawn when disabled, in headless `run`, or for graph nodes; idle expiry and quit kill it (pid gone) | `src/agent/cursor.rs` `tc_807_prewarm_disabled_and_expiry` |
+| TC-808 | FR-806 | unit | fake binary that exits immediately | A warm process that has exited is reaped and the prompt runs in a fresh process | `src/agent/cursor.rs` `tc_808_prewarm_exited_process_is_replaced` |
 
 ## 6. Out of scope
 

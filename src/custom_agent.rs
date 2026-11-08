@@ -1762,7 +1762,7 @@ implement = []
 
     // TC-338 (FR-333)
     #[test]
-    fn timeout_message_mentions_config_for_user_agent() {
+    fn tc_338_timeout_message_mentions_config_for_user_agent() {
         let spec = CustomAgentSpec {
             name: "my-agent".to_owned(),
             label: Some("my-label".to_owned()),
@@ -1792,7 +1792,7 @@ implement = []
 
     // TC-339 (FR-339)
     #[test]
-    fn builtin_presets_use_default_timeout() {
+    fn tc_339_builtin_presets_use_default_timeout() {
         assert_eq!(
             opencode_preset("opencode").timeout_secs(),
             DEFAULT_TIMEOUT_SECS

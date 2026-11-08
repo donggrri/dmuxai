@@ -1416,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn agy_idle_timeout_env_parsing() {
+    fn tc_442_agy_idle_timeout_env_parsing() {
         // FR-442 / TC-442: unset uses the default, "0" disables, a valid value
         // overrides, and invalid or non-positive values use the default.
         assert_eq!(parse_idle_timeout_secs(None), Some(300));
@@ -1431,19 +1431,11 @@ mod tests {
     }
 
     #[test]
-    fn implement_prompt_forbids_background_commands() {
-        // FR-443 / TC-443, FR-502 / TC-502: Implement mode must apply edits,
+    fn tc_443_implement_prompt_forbids_background_commands() {
+        // FR-443 / TC-443: Implement mode must apply edits,
         // keep commands in the foreground with a bounded timeout, and avoid
-        // background or detached processes; Ask/Plan stay untouched.
+        // background or detached processes.
         let wrapped = agy_prompt(TurnPolicy::Agent, "build the thing", true);
-        assert!(
-            wrapped.starts_with("Apply edits directly"),
-            "unexpected Implement prompt: {wrapped}"
-        );
-        assert!(
-            wrapped.contains("Do not produce plans"),
-            "unexpected Implement prompt: {wrapped}"
-        );
         assert!(
             wrapped.contains("background"),
             "unexpected Implement prompt: {wrapped}"
@@ -1454,7 +1446,24 @@ mod tests {
     }
 
     #[test]
-    fn result_event_defers_terminal_until_process_exit() {
+    // TC-502 / FR-500: Implement prompt requires direct edits and forbids plans; Ask/Plan omit them.
+    fn tc_502_implement_prompt_omits_implement_clauses_for_ask_and_plan() {
+        let wrapped = agy_prompt(TurnPolicy::Agent, "build the thing", true);
+        assert!(
+            wrapped.starts_with("Apply edits directly"),
+            "unexpected Implement prompt: {wrapped}"
+        );
+        assert!(
+            wrapped.contains("Do not produce plans"),
+            "unexpected Implement prompt: {wrapped}"
+        );
+        assert!(!agy_prompt(TurnPolicy::ReadOnly, "hi", false).contains("Apply edits directly"));
+        assert!(!agy_prompt(TurnPolicy::Agent, "hi", false).contains("Apply edits directly"));
+    }
+
+    #[test]
+    // TC-506 / FR-504: Normalized result handling defers terminal event until process exit.
+    fn tc_506_result_event_defers_terminal_until_process_exit() {
         let mut state = AgyStreamState::default();
         let result = json!({
             "event": "result",
@@ -1556,10 +1565,10 @@ mod tests {
         run_turn(&request, None, &cwd, &event_tx).await
     }
 
-    // TC-1691 / FR-1679: idle watchdog maps to Idle.
+    // TC-440 / FR-440; TC-1691 / FR-1679: idle watchdog maps to Idle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
-    async fn tc_1691_agy_idle_timeout_kills_silent_child() {
+    async fn tc_440_1691_agy_idle_timeout_kills_silent_child() {
         // FR-440 / TC-440: after one activity line the fake AGY goes silent, so
         // the idle deadline must kill the child and fail the turn with a
         // `no events for <N>s` error that calls out background commands.
@@ -1633,7 +1642,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
-    async fn agy_idle_timer_resets_on_each_event() {
+    async fn tc_441_agy_idle_timer_resets_on_each_event() {
         // FR-441 / TC-441: every stdout line re-arms the idle deadline, so the
         // turn survives when the cumulative runtime exceeds the timeout while
         // no single gap between stdout lines does.
@@ -1676,7 +1685,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
-    async fn agy_result_grace_kills_lingering_child_after_result() {
+    async fn tc_505_agy_result_grace_kills_lingering_child_after_result() {
         // FR-503 / TC-505: after the result line the adapter waits briefly for
         // process exit, then kills the child and emits a single terminal event.
         let result_event = json!({
@@ -2346,7 +2355,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
-    async fn implement_permission_denial_with_plan_like_response_is_not_a_plan_only_retry() {
+    async fn tc_509_implement_permission_denial_with_plan_like_response_is_not_a_plan_only_retry() {
         // FR-508 / TC-509: a permission-denial `finish` failure must fail the
         // Implement turn immediately, even when the (no-write) response text
         // looks plan-only; the denial terminal must not be swallowed by the

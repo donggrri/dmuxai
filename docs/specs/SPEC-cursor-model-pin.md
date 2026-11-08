@@ -56,11 +56,11 @@ Every Cursor turn in DmuxAI must pass `--model composer-2.5` to `cursor-agent` u
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-410 | INT-410 | unit | `configure_command` with `selected_model: None` | Generate argv for Cursor process | `args.windows(2)` contains `["--model", "composer-2.5"]` | `src/agent/cursor.rs` |
-| TC-411 | FR-411, INT-410 | unit | `configure_command` with `selected_model: Some("composer-2.5-fast")` or `"other-model"` | Generate argv for Cursor process | Fast/foreign model is rejected; args contains `["--model", "composer-2.5"]` | `src/agent/cursor.rs` |
-| TC-412 | FR-411 | unit | App state with Cursor selected and catalog model set to `"composer-2.5-fast"` | User submits prompt or calls `submit_to_agent` | Model is replaced with `composer-2.5`, system notice is emitted | `src/app.rs` |
-| TC-413 | FR-410, FR-412 | unit | Fresh app with Cursor agent and unset model catalog, input starting with `/test` | `app.handle_enter()` / `submit_to_agent` | Model passed to adapter and catalog selected is `composer-2.5` | `src/app.rs` |
-| TC-414 | UX-410 | unit | Fresh app or app with Cursor selected and no F2 model selected | Render status bar or inspect status segments | Model segment displays `"composer-2.5"`, not `"provider default"` | `src/app.rs` |
+| TC-410 | INT-410 | unit | `configure_command` with `selected_model: None` | Generate argv for Cursor process | `args.windows(2)` contains `["--model", "composer-2.5"]` | `src/agent/cursor.rs` `tc_410_cursor_argv_always_contains_composer_2_5_by_default` |
+| TC-411 | FR-411, INT-410 | unit | `configure_command` with `selected_model: Some("composer-2.5-fast")` or `"other-model"` | Generate argv for Cursor process | Fast/foreign model is rejected; args contains `["--model", "composer-2.5"]` | `src/agent/cursor.rs` `tc_411_cursor_argv_rejects_and_replaces_fast_model` |
+| TC-412 | FR-411 | unit | App state with Cursor selected and catalog model set to `"composer-2.5-fast"` | User submits prompt or calls `submit_to_agent` | Model is replaced with `composer-2.5`, system notice is emitted | `src/app.rs` `tc_412_disallowed_model_in_app_is_replaced_with_composer_2_5_and_notified` |
+| TC-413 | FR-410, FR-412 | unit | Fresh app with Cursor agent and unset model catalog, input starting with `/test` | `app.handle_enter()` / `submit_to_agent` | Model passed to adapter and catalog selected is `composer-2.5` | `src/app.rs` `tc_413_slash_prefixed_prompt_to_cursor_still_pins_composer_2_5` |
+| TC-414 | UX-410 | unit | Fresh app or app with Cursor selected and no F2 model selected | Render status bar or inspect status segments | Model segment displays `"composer-2.5"`, not `"provider default"` | `src/app.rs` `tc_414_cursor_status_shows_composer_2_5_instead_of_provider_default` |
 | TC-1866 | FR-1866 | unit | `configure_command` with unset or foreign model | build argv | argv contains `["--model", "composer-2.5"]` | `src/agent/cursor.rs` `cursor_argv_always_contains_composer_2_5_by_default`, `cursor_argv_rejects_and_replaces_fast_model` |
 
 ## 6. Data, integration, and safety contracts

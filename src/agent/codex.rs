@@ -1489,7 +1489,7 @@ mod tests {
 
     #[test]
     // TC-040: selected effort is a per-turn override and preserves safety fields.
-    fn codex_turn_request_includes_selected_effort() {
+    fn tc_040_codex_turn_request_includes_selected_effort() {
         let request = request("inspect this");
         let payload = turn_start_request(
             1,
@@ -1513,7 +1513,7 @@ mod tests {
 
     #[test]
     // TC-042 and TC-043: only recognized tool items become concise lifecycle events.
-    fn normalizes_codex_tool_item_lifecycle() {
+    fn tc_042_normalizes_codex_tool_item_lifecycle() {
         let started = json!({
             "method": "item/started",
             "params": { "item": {
@@ -1552,7 +1552,7 @@ mod tests {
 
     #[test]
     // TC-044 and TC-045: provider status can be complete or explicitly unavailable.
-    fn codex_status_formats_usage_and_rate_limit_fixtures() {
+    fn tc_044_codex_status_formats_usage_and_rate_limit_fixtures() {
         let usage = json!({
             "result": {
                 "summary": { "lifetimeTokens": 12345 },
@@ -1576,6 +1576,27 @@ mod tests {
         );
         assert_eq!(
             format_rate_limits(&json!({ "result": {} })),
+            "Rate limits: unavailable"
+        );
+    }
+
+    #[test]
+    // TC-045: missing/unauthenticated/malformed status fixtures report explicit unavailable text without error.
+    fn tc_045_codex_status_reports_unavailable_provider_data() {
+        assert_eq!(
+            format_usage(&json!({ "result": {} })),
+            "Token activity: lifetime unavailable; latest day unavailable"
+        );
+        assert_eq!(
+            format_usage(&json!({ "error": { "message": "unauthenticated" } })),
+            "Token activity: lifetime unavailable; latest day unavailable"
+        );
+        assert_eq!(
+            format_rate_limits(&json!({ "result": {} })),
+            "Rate limits: unavailable"
+        );
+        assert_eq!(
+            format_rate_limits(&json!({ "result": { "rateLimits": null } })),
             "Rate limits: unavailable"
         );
     }
@@ -1625,7 +1646,7 @@ mod tests {
 
     #[test]
     // TC-046 / INT-040: App Server requires a tagged sandbox-policy object.
-    fn codex_execution_modes_set_per_turn_sandbox_and_approval_policy() {
+    fn tc_046_codex_execution_modes_set_per_turn_sandbox_and_approval_policy() {
         let request = request("implement this");
 
         let ask = turn_start_request(1, "thread", &request, None, None, TurnPolicy::ReadOnly);

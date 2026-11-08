@@ -69,7 +69,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn assign_runner_honors_allowed_runners_and_order() {
+    fn tc_430_assign_runner_honors_allowed_runners_and_order() {
         // TC-430, TC-431, FR-431
         let mut settings = DmuxSettings::default();
 
@@ -105,6 +105,18 @@ mod tests {
         settings.graph_allowed_runners = None;
         assert!(is_runner_allowed("cursor", &settings));
         assert!(is_runner_allowed("agy", &settings));
+    }
+
+    #[test]
+    // TC-431 / FR-431: routing default not allowed falls back to cursor or first allowed runner.
+    fn tc_431_routing_default_not_allowed_falls_back() {
+        let mut settings = DmuxSettings::default();
+        settings.routing_default_agent = Some("codex".to_owned());
+        settings.graph_allowed_runners = Some(vec!["cursor".to_owned(), "agy".to_owned()]);
+        assert_eq!(assign_runner(NodeRole::Implement, &settings), "cursor");
+
+        settings.graph_allowed_runners = Some(vec!["agy".to_owned(), "opencode".to_owned()]);
+        assert_eq!(assign_runner(NodeRole::Implement, &settings), "agy");
     }
 
     #[test]

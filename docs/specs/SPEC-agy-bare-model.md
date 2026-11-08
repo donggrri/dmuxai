@@ -24,6 +24,6 @@ In scope: AGY model selection (`SessionCommand::SelectModel`), `src/agent/acp/cl
 ## 5. Acceptance scenarios and test design
 | TC | Covers | Test |
 |---|---|---|
-| TC-1493 | FR-1493 | Automated: `agy_bare_model_resolves_to_medium` (bare -> `-medium`; exact match kept; unknown still errors; non-agy unchanged). Manual: in `dmuxai --web`, `POST /api/command {"command":"select_model","agent":"agy","model":"gemini-3.8-flash"}` succeeds, then an agy prompt runs and replies. Expected: no `unknown model` error; agy model shows `gemini-3.8-flash-medium`. |
+| TC-1493 | FR-1493 | Automated: `tc_1493_agy_bare_model_resolves_to_medium` (bare -> `-medium`; exact match kept; unknown still errors; non-agy unchanged). Manual: in `dmuxai --web`, `POST /api/command {"command":"select_model","agent":"agy","model":"gemini-3.8-flash"}` succeeds, then an agy prompt runs and replies. Expected: no `unknown model` error; agy model shows `gemini-3.8-flash-medium`. |
 | TC-1494 | FR-1494 | Automated: `acp_client_version_matches_crate` |
 | TC-1857 | FR-1857 | Automated: `src/app.rs` `agy_bare_model_resolves_to_medium` |

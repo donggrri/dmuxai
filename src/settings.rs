@@ -2563,8 +2563,8 @@ text_path = "/part/text"
     }
 
     #[test]
-    fn user_config_merged_and_overridden_by_workspace() {
-        // TC-434, FR-433
+    fn tc_433_user_config_merged_and_overridden_by_workspace() {
+        // TC-433, FR-433
         let temp_base =
             std::env::temp_dir().join(format!("dmuxai-user-cfg-{}", std::process::id()));
         let user_dir = temp_base.join("user");

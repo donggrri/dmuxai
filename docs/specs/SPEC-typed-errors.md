@@ -58,7 +58,7 @@ Runner failures are no longer reported as bare strings or NUL-prefixed sentinels
 | TC-1688 | FR-1678 | unit | `AgentError` constructors | build and display each error | `kind`, `message`, `hint`, and Display text | `src/agent/mod.rs` `tc_1688_agent_error_constructors_and_display` |
 | TC-1689 | FR-1679 | integration | custom runner fixtures | run failing turns | errors map to provider, policy, and process_exit | `src/agent/custom.rs` `tc_1689_failures_are_detected` |
 | TC-1690 | FR-1679 | integration | sleeping child | total timeout elapses | `Timeout` kind | `src/agent/custom.rs` `tc_1690_timeout_kills_the_process_group` |
-| TC-1691 | FR-1679 | integration | silent agy child | idle watchdog elapses | `Idle` kind | `src/agent/agy.rs` `tc_1691_agy_idle_timeout_kills_silent_child` |
+| TC-1691 | FR-1679 | integration | silent agy child | idle watchdog elapses | `Idle` kind | `src/agent/agy.rs` `tc_440_1691_agy_idle_timeout_kills_silent_child` |
 | TC-1692 | FR-1679 | unit | ACP cancel result | map to event | `Cancelled` event without NUL sentinels | `src/agent/custom.rs` `tc_1692_acp_cancel_emits_cancelled_event_without_sentinel` |
 | TC-1693 | FR-1679 | unit | graph stop notice | format a failed step | agent error text propagates | `src/app.rs` `tc_1421_1693_cancelled_graph_step_not_reported_as_failed` |
 | TC-1694 | FR-1682 | integration | headless run | agent emits error | `outcome.error_kind` is set | `src/app.rs` `tc_1694_headless_run_reports_agent_error` |

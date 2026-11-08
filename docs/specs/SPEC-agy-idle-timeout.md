@@ -26,10 +26,10 @@ In scope: AGY adapter (`src/agent/agy.rs`). Out of scope: the other providers, w
 ## 5. Acceptance scenarios and test design
 | TC | Covers | Test |
 |---|---|---|
-| TC-440 | FR-440 | `agy_idle_timeout_kills_silent_child` (fake AGY script that prints one init event, then sleeps) |
-| TC-441 | FR-441 | `agy_idle_timer_resets_on_each_event` |
-| TC-442 | FR-442 | `agy_idle_timeout_env_parsing` |
-| TC-443 | FR-443 | `implement_prompt_forbids_background_commands` |
+| TC-440 | FR-440 | `tc_440_1691_agy_idle_timeout_kills_silent_child` (fake AGY script that prints one init event, then sleeps) |
+| TC-441 | FR-441 | `tc_441_agy_idle_timer_resets_on_each_event` |
+| TC-442 | FR-442 | `tc_442_agy_idle_timeout_env_parsing` |
+| TC-443 | FR-443 | `tc_443_implement_prompt_forbids_background_commands` |
 | TC-1855 | FR-1855 | `src/agent/agy.rs` `agy_idle_timeout_env_parsing` |
 | TC-1856 | FR-1856 | `src/agent/agy.rs` `agy_idle_timeout_kills_silent_child` |
 
