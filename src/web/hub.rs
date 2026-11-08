@@ -411,7 +411,7 @@ mod tests {
 
     // TC-526: hub_tracks_node_timings_and_revisions
     #[test]
-    fn hub_tracks_node_timings_and_revisions() {
+    fn tc_526_hub_tracks_node_timings_and_revisions() {
         let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
         assert_eq!(hub.snapshot().revision, 0);
 

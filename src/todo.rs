@@ -746,7 +746,7 @@ mod tests {
     // (source, source_ref), mark_running/finish_run, invalid inputs, and the
     // conversation engine can still open the same DB file afterwards.
     #[test]
-    fn todo_store_persists_and_orders() {
+    fn tc_540_todo_store_persists_and_orders() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("nested").join("conversations.sqlite3");
         let store = TodoStore::open(&db_path).unwrap();
@@ -959,7 +959,7 @@ mod tests {
     // TC-570 / FR-563: the link columns are added to an existing slice B DB
     // without a `user_version` bump, values validate, and PATCH null clears.
     #[test]
-    fn todo_link_columns_migrate_and_validate() {
+    fn tc_570_todo_link_columns_migrate_and_validate() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("legacy.sqlite3");
 
@@ -1153,7 +1153,7 @@ mod tests {
 
     // TC-571 / FR-564: base-URL derivation and browse-URL key extraction.
     #[test]
-    fn todo_jira_key_and_url_derivation() {
+    fn tc_571_todo_jira_key_and_url_derivation() {
         let base = "https://example.atlassian.net";
 
         // Pure derivation.

@@ -8,7 +8,7 @@ use dmuxai::mcp::config::{ResolvedMcpServer, ServerKind, ToolNames, Transport};
 use serde_json::json;
 
 #[tokio::test]
-async fn mcp_client_stdio_and_http_against_mock() {
+async fn tc_561_mcp_client_stdio_and_http_against_mock() {
     // -------------------------------------------------------------------------
     // 1. Stdio transport against in-repo mock: dmuxai __mock-mcp
     // -------------------------------------------------------------------------
@@ -244,7 +244,7 @@ async fn mcp_client_smoke_server_everything() {
 }
 
 #[tokio::test]
-async fn mcp_client_refuses_redirects() {
+async fn tc_574_mcp_client_refuses_redirects() {
     // TC-574, NFR-561: HTTP MCP requests never follow redirects (3xx is an error naming the server).
     // The redirect target receives no request.
     use std::sync::Arc;
@@ -325,7 +325,7 @@ async fn mcp_client_refuses_redirects() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn mcp_client_kills_stdio_process_group() {
+async fn tc_575_mcp_client_kills_stdio_process_group() {
     // TC-575, NFR-561: stdio server runs in its own process group (unix),
     // which is killed on drop, timeout or error, so launcher grandchildren (e.g. npx) do not survive.
     // Grandchild pid is gone within 2 s.
@@ -529,7 +529,7 @@ done
 }
 
 #[tokio::test]
-async fn mcp_client_bounds_writes_and_streams_sse() {
+async fn tc_576_mcp_client_bounds_writes_and_streams_sse() {
     // TC-576, NFR-561: stdio server that never reads stdin; HTTP server whose SSE stream stays open
     // after the response event and splits it over two data: lines.
     // Call with a 1 s timeout: stdio -> timeout error naming the server within ~1 s;

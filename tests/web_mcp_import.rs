@@ -114,7 +114,7 @@ fn parse_json_payload(body: &str) -> serde_json::Value {
 }
 
 #[test]
-fn serve_imports_from_mock_mcp_end_to_end() {
+fn tc_569_serve_imports_from_mock_mcp_end_to_end() {
     let workspace = tempfile::tempdir().expect("temp workspace");
     let state_dir = tempfile::tempdir().expect("temp state dir");
 
@@ -250,7 +250,7 @@ args = ["__mock-mcp"]
 }
 
 #[test]
-fn serve_snapshot_has_jira_base_url_at_startup() {
+fn tc_579_serve_snapshot_has_jira_base_url_at_startup() {
     // TC-579: dmuxai serve with [todo] jira_base_url seeds the hub snapshot at startup before any mutation.
     let workspace = tempfile::tempdir().expect("temp workspace");
     let state_dir = tempfile::tempdir().expect("temp state dir");

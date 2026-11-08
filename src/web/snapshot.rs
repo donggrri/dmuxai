@@ -1144,7 +1144,7 @@ mod tests {
 
     // TC-525: snapshot_reports_current_node_runner_and_counts
     #[test]
-    fn snapshot_reports_current_node_runner_and_counts() {
+    fn tc_525_snapshot_reports_current_node_runner_and_counts() {
         let long_job = "a".repeat(300);
         let run = GraphRun {
             plan: GraphPlan {

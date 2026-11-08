@@ -70,7 +70,7 @@ mod tests {
 
     // TC-521: token_is_random_hex_and_url_has_token
     #[test]
-    fn token_is_random_hex_and_url_has_token() {
+    fn tc_521_token_is_random_hex_and_url_has_token() {
         let t1 = generate_token();
         let t2 = generate_token();
 
@@ -105,7 +105,7 @@ mod tests {
 
     // TC-524: bind_policy_requires_opt_in_for_non_loopback
     #[test]
-    fn bind_policy_requires_opt_in_for_non_loopback() {
+    fn tc_524_bind_policy_requires_opt_in_for_non_loopback() {
         // Loopback v4
         let res_v4 = check_bind(IpAddr::V4(Ipv4Addr::LOCALHOST), false);
         assert_eq!(res_v4, Ok(BindCheck::Loopback));

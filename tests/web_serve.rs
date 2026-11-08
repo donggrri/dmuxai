@@ -93,7 +93,7 @@ fn write_graph_fixture(workspace: &std::path::Path) {
 }
 
 #[test]
-fn serve_prints_token_url_and_serves_state() {
+fn tc_531_serve_prints_token_url_and_serves_state() {
     let workspace = tempfile::tempdir().expect("temp workspace");
     write_graph_fixture(workspace.path());
 

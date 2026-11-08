@@ -142,7 +142,7 @@ fn run_probe(python: &str, chrome: &Path, url: &str, script: &str) -> serde_json
 // TC-1204: document_text_rendered_once_in_headless_chrome
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn document_text_rendered_once_in_headless_chrome() {
+fn tc_1204_document_text_rendered_once_in_headless_chrome() {
     let Some((chrome, python)) = prepare() else {
         return;
     };
@@ -300,7 +300,7 @@ fn workspace_with_run(json: &str) -> tempfile::TempDir {
 // FR-1213, FR-1214, FR-1216)
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn center_views_toggle_in_headless_chrome() {
+fn tc_1207_center_views_toggle_in_headless_chrome() {
     let Some((chrome, python)) = prepare() else {
         return;
     };
@@ -406,7 +406,7 @@ with sync_playwright() as p:
 // TC-1208: approval_opens_graph_in_headless_chrome (FR-1214, FR-1215)
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn approval_opens_graph_in_headless_chrome() {
+fn tc_1208_approval_opens_graph_in_headless_chrome() {
     let Some((chrome, python)) = prepare() else {
         return;
     };
@@ -488,7 +488,7 @@ with sync_playwright() as p:
 // FR-1219, FR-1220)
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn inline_activity_rows_in_headless_chrome() {
+fn tc_1211_inline_activity_rows_in_headless_chrome() {
     let Some((chrome, python)) = prepare() else {
         return;
     };
@@ -679,7 +679,7 @@ with sync_playwright() as p:
 // served snapshot: conversation A has two runs, B has none.
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn per_turn_run_rows_and_session_graphs_in_headless_chrome() {
+fn tc_1218_per_turn_run_rows_and_session_graphs_in_headless_chrome() {
     let Some((chrome, python)) = prepare() else {
         return;
     };
@@ -866,7 +866,7 @@ with sync_playwright() as p:
 // TC-1224: sessions_grouped_by_workspace_in_headless_chrome
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn sessions_grouped_by_workspace_in_headless_chrome() {
+fn tc_1224_sessions_grouped_by_workspace_in_headless_chrome() {
     let Some((chrome, python)) = prepare() else {
         return;
     };

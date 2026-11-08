@@ -1145,7 +1145,7 @@ mod tests {
 
     // TC-520 / FR-520: serve and --web flag parsing.
     #[test]
-    fn parse_cli_serve_and_web_flags() {
+    fn tc_520_parse_cli_serve_and_web_flags() {
         assert_eq!(parse_cli(["serve"]), CliAction::Serve(web_default()));
         assert_eq!(
             parse_cli(["serve", "--port", "9000"]),
