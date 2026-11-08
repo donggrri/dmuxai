@@ -3032,7 +3032,44 @@ mod tests {
         tx
     }
 
-    // TC-959 (UX-932): `plan_decision` HTTP mapping with an awaiting-approval double.
+    // TC-1830 (FR-1830): plan_decision approve returns 200 + session view.
+    #[tokio::test]
+    async fn tc_1830_plan_decision_approve_returns_session_view() {
+        let token = "plan-decision-token".to_string();
+        let plan_id = "plan-abc".to_string();
+        let revision = 2_u32;
+        let tx = spawn_plan_decision_double(plan_id.clone(), revision);
+        let router = build_router_with(
+            test_hub(),
+            token.clone(),
+            allowed_localhost(),
+            DashboardServices {
+                commands: Some(tx),
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        );
+        let approve_body = serde_json::json!({
+            "command": "plan_decision",
+            "plan_id": plan_id,
+            "revision": revision,
+            "decision": "approve"
+        });
+        let resp = router
+            .oneshot(json_request(
+                "POST",
+                "/api/command",
+                &token,
+                &approve_body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(json["session"]["conversation_id"], "conv-plan");
+    }
+
+    // TC-959 (UX-932) / TC-1830 (FR-1830): `plan_decision` HTTP mapping with an awaiting-approval double.
     #[tokio::test]
     async fn tc_959_plan_decision_command_contract() {
         let token = "plan-decision-token".to_string();
@@ -4103,9 +4140,9 @@ mod tests {
         tx
     }
 
-    // TC-954 / FR-947: graph to-do waits for plan approval; reject reopens the to-do.
+    // TC-954 (FR-947) / TC-1831 (FR-1831): graph to-do waits for plan approval; reject reopens the to-do.
     #[tokio::test]
-    async fn todo_graph_run_waits_for_plan_approval() {
+    async fn tc_1831_todo_graph_run_waits_for_plan_approval() {
         let token = "todo-plan-gate-token".to_string();
         let temp_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(TodoStore::open(&temp_dir.path().join("todos.db")).unwrap());

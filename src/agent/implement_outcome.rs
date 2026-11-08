@@ -458,8 +458,9 @@ mod tests {
         assert!(error.message.contains("without any observed file changes"));
     }
 
+    // TC-501 (FR-501): parse write tools from AGY step_update tool names.
     #[test]
-    fn agy_write_tools_are_detected_from_step_updates() {
+    fn tc_501_agy_write_tools_are_detected_from_step_updates() {
         let write = json!({
             "event": "step_update",
             "step_update": {
@@ -493,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn init_line_does_not_count_as_write_via_text_scan() {
+    fn tc_501_init_line_does_not_count_as_write_via_text_scan() {
         let init_line = r#"{"event":"init","tools":["write_to_file","replace_file_content"]}"#;
         let mut tracker = ImplementTurnTracker::new(TurnPolicy::Agent);
         tracker.observe_provider_line(init_line);
@@ -501,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_line_write_needles_cover_cursor_and_custom() {
+    fn tc_501_provider_line_write_needles_cover_cursor_and_custom() {
         let cursor_edit = r#"{"type":"tool_call","tool":{"name":"edit_file","args":{}}}"#;
         let cursor_write = r#"{"type":"tool_call","tool":{"name":"write_file","args":{}}}"#;
         let assistant_text = r#"{"type":"assistant","text":"Updated the configuration file"}"#;
@@ -530,8 +531,9 @@ mod tests {
         );
     }
 
+    // TC-503 (FR-502): Plan-only classifier detects plan.md / review patterns.
     #[test]
-    fn plan_review_response_detection_covers_implement_plan_only() {
+    fn tc_503_plan_review_response_detection_covers_implement_plan_only() {
         assert!(is_plan_review_response(
             "I drafted the implementation plan in plan.md. Please review before I apply edits."
         ));
@@ -544,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_only_outcome_requires_missing_writes_and_plan_like_text() {
+    fn tc_503_plan_only_outcome_requires_missing_writes_and_plan_like_text() {
         assert!(is_plan_only_implement_outcome(
             false,
             "Created plan.md — approve to proceed."

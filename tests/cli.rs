@@ -275,7 +275,57 @@ timeout_secs = 60
     }
 }
 
-/// TC-955 / TC-1818: complex plan needs `--approve-plan`; `--agent` sets triage override.
+/// TC-1828 (FR-1828): headless complex plan without `--approve-plan` exits 7 and records cancelled.
+#[cfg(unix)]
+#[test]
+fn tc_1828_run_complex_without_approve_plan_exits_7_cancelled() {
+    use dmuxai::graph::{GraphRunPhase, load_run};
+    use plan_gate::{Sandbox, plan_gate_config, stdout_json};
+
+    let sandbox = Sandbox::new(&plan_gate_config("plan"));
+    let first = sandbox.run(&[
+        "run",
+        "ship the whole feature across several steps",
+        "--json",
+    ]);
+    let json = stdout_json(&first);
+    assert_eq!(first.status.code(), Some(7), "{json}");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["exit_code"], 7);
+    assert_eq!(json["error"].as_str(), Some("approval required (headless)"));
+    let graph_id = json["graph_id"].as_str().expect("graph_id");
+    let run = load_run(sandbox.workspace(), graph_id).expect("saved run");
+    assert_eq!(run.phase, GraphRunPhase::Cancelled);
+}
+
+/// TC-1829 (FR-1829): headless complex plan with `--approve-plan` exits 0 with decided_by cli.
+#[cfg(unix)]
+#[test]
+fn tc_1829_run_complex_with_approve_plan_exits_0_decided_by_cli() {
+    use dmuxai::graph::load_run;
+    use plan_gate::{Sandbox, plan_gate_config, stdout_json};
+
+    let sandbox = Sandbox::new(&plan_gate_config("plan"));
+    let approved = sandbox.run(&[
+        "run",
+        "ship the whole feature across several steps",
+        "--json",
+        "--approve-plan",
+    ]);
+    let approved_json = stdout_json(&approved);
+    assert_eq!(approved.status.code(), Some(0), "{approved_json}");
+    assert_eq!(approved_json["ok"], true);
+    let graph_id = approved_json["graph_id"].as_str().expect("graph_id");
+    let run = load_run(sandbox.workspace(), graph_id).expect("approved run");
+    assert_eq!(
+        run.approval
+            .as_ref()
+            .and_then(|approval| approval.decided_by),
+        Some(dmuxai::graph::DecisionBy::Cli)
+    );
+}
+
+/// TC-955 / TC-1818: complex plan needs `--approve-plan`.
 #[cfg(unix)]
 #[test]
 fn tc_955_1818_run_complex_needs_approve_plan() {
