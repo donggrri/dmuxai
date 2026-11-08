@@ -57,6 +57,13 @@ pub enum AgentCommand {
         revoke: bool,
         yes: bool,
     },
+    /// `runs [--limit N] [--failed] [--json]` or `runs show <id> [--json]`.
+    Runs {
+        show_id: Option<String>,
+        limit: usize,
+        failed: bool,
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -76,7 +83,9 @@ pub struct RunOptions {
 }
 
 /// First arguments that select an agent-facing subcommand.
-pub const SUBCOMMANDS: [&str; 7] = ["run", "todo", "status", "events", "mcp", "init", "trust"];
+pub const SUBCOMMANDS: [&str; 8] = [
+    "run", "todo", "status", "events", "mcp", "init", "trust", "runs",
+];
 
 /// Table-driven flag specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -466,6 +475,70 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
                 yes: parsed.flags.contains_key("--yes"),
             })
         }
+        "runs" => {
+            const RUNS_FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--limit"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--failed"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+
+            if rest.first().map(String::as_str) == Some("show") {
+                const SHOW_FLAGS: &[FlagSpec] = &[FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                }];
+                let parsed = parse_flags(&rest[1..], SHOW_FLAGS, true)?;
+                if parsed.positionals.is_empty() {
+                    return Err("runs show requires a run id".to_owned());
+                }
+                if parsed.positionals.len() > 1 {
+                    return Err(format!("unexpected argument '{}'", parsed.positionals[1]));
+                }
+                let id = parsed.positionals[0].clone();
+                if !dmuxai::run_journal::valid_run_id(&id) {
+                    return Err(format!("invalid run id '{id}'"));
+                }
+                return Ok(AgentCommand::Runs {
+                    show_id: Some(id),
+                    limit: 20,
+                    failed: false,
+                    json: parsed.flags.contains_key("--json"),
+                });
+            }
+
+            let parsed = parse_flags(rest, RUNS_FLAGS, false)?;
+            let mut limit = 20usize;
+            if let Some(raw) = parsed.flags.get("--limit").cloned().flatten() {
+                limit = raw
+                    .parse()
+                    .map_err(|_| "--limit must be a number".to_owned())?;
+                if limit == 0 {
+                    return Err("--limit must be at least 1".to_owned());
+                }
+            }
+            let failed = parsed.flags.contains_key("--failed");
+            let json = parsed.flags.contains_key("--json");
+
+            Ok(AgentCommand::Runs {
+                show_id: None,
+                limit,
+                failed,
+                json,
+            })
+        }
         other => Err(format!("unknown subcommand '{other}'")),
     }
 }
@@ -593,6 +666,12 @@ pub async fn execute(command: AgentCommand) -> i32 {
             revoke,
             yes,
         } => trust_workspace(&workspace_root, status, json, revoke, yes),
+        AgentCommand::Runs {
+            show_id,
+            limit,
+            failed,
+            json,
+        } => execute_runs(&workspace_root, show_id, limit, failed, json),
         AgentCommand::Mcp => {
             let backend = CliMcpBackend {
                 workspace_root: workspace_root.clone(),
@@ -615,6 +694,152 @@ pub async fn execute(command: AgentCommand) -> i32 {
                 }
             }
         }
+    }
+}
+
+/// Executes `dmuxai runs` or `dmuxai runs show <id>` (SPEC-run-journal FR-2562).
+fn execute_runs(
+    workspace_root: &Path,
+    show_id: Option<String>,
+    limit: usize,
+    failed: bool,
+    json: bool,
+) -> i32 {
+    let runs_dir = match dmuxai::run_journal::repo_runs_dir(workspace_root) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return exit::INTERNAL;
+        }
+    };
+
+    let store = dmuxai::run_journal::JournalStore::new(runs_dir.clone());
+
+    if let Some(id) = show_id {
+        if !dmuxai::run_journal::valid_run_id(&id) {
+            eprintln!("error: invalid run id '{id}'");
+            return exit::USAGE;
+        }
+        let run_dir = runs_dir.join(&id);
+        if let Ok(true) = dmuxai::run_journal::is_symlink(&run_dir) {
+            eprintln!("error: symlink rejected at {}", run_dir.display());
+            return exit::INTERNAL;
+        }
+        if !run_dir.exists() {
+            eprintln!("error: run '{id}' not found");
+            return exit::NOT_FOUND;
+        }
+        match store.load(&id) {
+            Ok(manifest) => {
+                if json {
+                    match serde_json::to_value(&manifest) {
+                        Ok(val) => print_json(&val),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            return exit::INTERNAL;
+                        }
+                    }
+                } else {
+                    println!("Run ID:    {}", manifest.run_id);
+                    println!("Status:    {}", manifest.status);
+                    println!("Created:   {}", manifest.created_at_ms);
+                    if let Some(runner) = &manifest.requested_runner {
+                        println!("Runner:    {runner}");
+                    }
+                    if let Some(err) = &manifest.error_summary {
+                        println!("Error:     {err}");
+                    }
+                }
+                exit::OK
+            }
+            Err(dmuxai::run_journal::JournalError::Io(e)) => {
+                eprintln!("error: {e}");
+                exit::INTERNAL
+            }
+            Err(dmuxai::run_journal::JournalError::SymlinkDetected(p)) => {
+                eprintln!("error: symlink rejected at {}", p.display());
+                exit::INTERNAL
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                exit::INTERNAL
+            }
+        }
+    } else {
+        // List runs
+        if !runs_dir.exists() {
+            if json {
+                print_json(&serde_json::Value::Array(Vec::new()));
+            }
+            return exit::OK;
+        }
+
+        if let Ok(true) = dmuxai::run_journal::is_symlink(&runs_dir) {
+            eprintln!("error: symlink rejected at {}", runs_dir.display());
+            return exit::INTERNAL;
+        }
+
+        let entries = match std::fs::read_dir(&runs_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return exit::INTERNAL;
+            }
+        };
+
+        let mut manifests = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(true) = dmuxai::run_journal::is_symlink(&path) {
+                continue;
+            }
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !dmuxai::run_journal::valid_run_id(name) {
+                continue;
+            }
+
+            match store.load(name) {
+                Ok(m) => {
+                    if failed && m.status != "failed" {
+                        continue;
+                    }
+                    manifests.push(m);
+                }
+                Err(dmuxai::run_journal::JournalError::UnknownSchemaVersion(v)) => {
+                    eprintln!("warning: unknown schema version {v} in run '{name}', skipping");
+                }
+                Err(dmuxai::run_journal::JournalError::CorruptManifest(msg)) => {
+                    eprintln!("warning: corrupt manifest in run '{name}': {msg}, skipping");
+                }
+                Err(e) => {
+                    eprintln!("warning: could not load run '{name}': {e}, skipping");
+                }
+            }
+        }
+
+        // Sort newest first by created_at_ms
+        manifests.sort_by_key(|m| std::cmp::Reverse(m.created_at_ms));
+
+        if manifests.len() > limit {
+            manifests.truncate(limit);
+        }
+
+        if json {
+            let val =
+                serde_json::to_value(&manifests).unwrap_or(serde_json::Value::Array(Vec::new()));
+            print_json(&val);
+        } else {
+            for m in manifests {
+                println!("{}\t{}\t{}", m.run_id, m.status, m.created_at_ms);
+            }
+        }
+
+        exit::OK
     }
 }
 

@@ -111,6 +111,8 @@ pub struct DmuxSettings {
     /// Runner fallback chains and stall policy from `[runners.<id>]`
     /// `fallback`/`stall_*` (SPEC-runner-fallback, FR-2101).
     pub runner_fallback: crate::runner_fallback::FallbackSettings,
+    /// Run journal retention configuration from `[runs]` (SPEC-run-journal FR-2565).
+    pub runs: crate::run_journal::JournalConfig,
     /// Trust status of workspace configuration.
     pub workspace_trust: WorkspaceTrustStatus,
 }
@@ -157,6 +159,16 @@ struct DmuxToml {
     modes: Option<LegacyModesToml>,
     /// `[runners.<id>]` prompt configuration (PR-2.5).
     runners: Option<std::collections::BTreeMap<String, crate::agent_prompt::RunnerPromptToml>>,
+    /// `[runs]` retention configuration (SPEC-run-journal FR-2565).
+    runs: Option<RunsToml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RunsToml {
+    retention_days: Option<u32>,
+    retention_bytes: Option<u64>,
+    max_age_ms: Option<u64>,
+    max_total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -983,6 +995,16 @@ impl DmuxSettings {
         if let Some(jira) = parsed.jira {
             self.merge_jira(jira);
         }
+        if let Some(runs) = parsed.runs {
+            if let Some(days) = runs.retention_days {
+                self.runs.max_age_ms = (days as u64) * 86_400 * 1000;
+            } else if let Some(ms) = runs.max_age_ms {
+                self.runs.max_age_ms = ms;
+            }
+            if let Some(bytes) = runs.retention_bytes.or(runs.max_total_bytes) {
+                self.runs.max_total_bytes = bytes;
+            }
+        }
         if let Some(cursor) = parsed.cursor {
             if let Some(prewarm) = cursor.prewarm {
                 self.cursor_prewarm = prewarm;
@@ -1795,6 +1817,7 @@ impl Default for DmuxSettings {
             runner_prompts: BTreeMap::new(),
             runner_models: BTreeMap::new(),
             runner_fallback: Default::default(),
+            runs: crate::run_journal::JournalConfig::default(),
             workspace_trust: WorkspaceTrustStatus::NoWorkspaceConfig,
         }
     }

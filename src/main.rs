@@ -94,6 +94,8 @@ Usage:
   dmuxai todo add <title> [--body TEXT] [--json]
   dmuxai todo list [--status open|running|done] [--json]
   dmuxai status [--json]
+  dmuxai runs [--limit N] [--failed] [--json]
+  dmuxai runs show <id> [--json]
   dmuxai events [--since N] [--limit N] [--follow] [--json]
   dmuxai mcp
   dmuxai init [--workspace] [--force]
@@ -120,6 +122,7 @@ Options:
                    --approve-plan confirms sensitive gates), 130 cancelled)
   todo             Add, list or run to-dos without the TUI
   status           Print workspace status (agents, to-dos, last graph, events)
+  runs             List or inspect recorded execution runs
   events           Print state-change events from .dmuxai/events.jsonl
   mcp              Serve DmuxAI as an MCP server over stdio
   init             Write a commented starter dmuxai.toml to the user config
