@@ -1739,9 +1739,9 @@ mod tests {
         assert!(done.contains("answer 1: A") && !done.contains(INTERVIEW_DONE_MARKER));
     }
 
-    // TC-1511 (toml edit part)
+    // TC-1511 (toml edit part): dashboard Settings writes dmuxai.toml keeping other keys
     #[test]
-    fn toml_edit_keeps_other_keys() {
+    fn tc_1511_toml_edit_keeps_other_keys() {
         let text = "[graph]\nmax_nodes = 4\n";
         let out = set_stage_skills_in_toml(text, "planner", &["grill-me".into()]).unwrap();
         assert!(out.contains("max_nodes = 4"));

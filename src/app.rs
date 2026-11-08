@@ -22596,7 +22596,7 @@ out3
 
     #[test]
     // TC-048 / FR-043: agent turns resume native sessions when a binding exists.
-    fn agent_turn_resumes_provider_session_after_completion() {
+    fn tc_048_agent_turn_resumes_provider_session_after_completion() {
         let (mut app, sent) = test_app();
         app.input = "first question".to_owned();
         app.submit_prompt();
@@ -22626,7 +22626,7 @@ out3
 
     #[test]
     // TC-480 / INT-480: /mode is gone; bindings stay active after the warning.
-    fn typed_mode_command_does_not_retire_binding() {
+    fn tc_480_typed_mode_command_does_not_retire_binding() {
         let (mut app, sent) = test_app();
         app.input = "first".to_owned();
         app.submit_prompt();
@@ -32672,9 +32672,9 @@ out3
         assert!(nodes.iter().all(|r| !r.prompt.contains("REVIEW-BODY")));
     }
 
-    // UX-1500: /skills lists the map.
+    // TC-1511 / UX-1500: TUI /skills shows source and status (ok, missing, etc.).
     #[test]
-    fn stage_skills_slash_lists_map() {
+    fn tc_1511_stage_skills_slash_lists_map_with_source_and_status() {
         let mut h = stage_skill_harness(
             "[stages.planner]\nskills = [\"grill-me\"]\n[stages.review]\nskills = [\"missing-one\"]\n",
         );
@@ -32689,7 +32689,11 @@ out3
             .map(|m| m.content.clone())
             .unwrap_or_default();
         assert!(text.contains("grill-me") && text.contains(" ok "), "{text}");
-        assert!(text.contains("missing-one") && text.contains("missing"));
+        assert!(text.contains(".agents/skills"), "{text}");
+        assert!(
+            text.contains("missing-one") && text.contains("missing"),
+            "{text}"
+        );
     }
 
     fn valid_codex_plan_json() -> &'static str {

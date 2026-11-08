@@ -6,8 +6,8 @@
 // FR-472 / TC-472: scripts/spec-index.sh prints a markdown table (SPEC link,
 //   Status, ID ranges) generated from the SPEC files
 //   -> `spec_index_script_lists_every_spec`.
-// FR-473 / TC-473 is a manual review of docs/TEST-PLAN.md §0.1 (kept as prose
-//   only) and has no automated test.
+// FR-473 / TC-473: TEST-PLAN §0.1 has no per-spec rows and points to the generator and rule.
+//   -> `tc_473_test_plan_section_0_1_has_no_per_spec_rows`.
 
 // FR-1800 / TC-1800: `python3 scripts/check-spec.py --all` exits 0 on this repo
 //   with the committed allowlist -> `tc_1800_check_spec_all_passes_with_allowlist`.
@@ -214,6 +214,43 @@ fn tc_472_spec_index_script_lists_every_spec() {
             Path::new(SPECS_DIR).join(name).is_file(),
             "spec-index.sh emitted a row for nonexistent SPEC file {name}"
         );
+    }
+}
+
+#[test]
+// FR-473 / TC-473: TEST-PLAN §0.1 no longer has per-spec rows. It points to the generator and the rule.
+fn tc_473_test_plan_section_0_1_has_no_per_spec_rows() {
+    let test_plan_path = Path::new("docs/TEST-PLAN.md");
+    let content =
+        fs::read_to_string(test_plan_path).expect("docs/TEST-PLAN.md must exist and be readable");
+
+    let section_0_1 = content
+        .find("## 0.1 SPEC 색인")
+        .or_else(|| content.find("## 0.1"))
+        .expect("TEST-PLAN §0.1 section heading must exist");
+
+    let section_end = content[section_0_1..]
+        .find("\n## 1.")
+        .map(|idx| section_0_1 + idx)
+        .unwrap_or(content.len());
+
+    let section_text = &content[section_0_1..section_end];
+
+    // Assert it mentions scripts/spec-index.sh
+    assert!(
+        section_text.contains("scripts/spec-index.sh"),
+        "§0.1 must mention scripts/spec-index.sh"
+    );
+
+    // Assert it contains no per-spec table rows (no `| SPEC-` / `SPEC-*.md` link rows)
+    for line in section_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('|') {
+            assert!(
+                !trimmed.contains("SPEC-"),
+                "§0.1 must not contain per-spec table rows: {trimmed}"
+            );
+        }
     }
 }
 
