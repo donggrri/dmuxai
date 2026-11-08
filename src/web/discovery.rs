@@ -92,7 +92,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovery_file_and_token_env() {
+    fn tc_774_discovery_file_and_token_env() {
         // TC-774 / FR-773: content, permissions, removal, env token rules.
         let workspace = tempfile::tempdir().unwrap();
         let discovery = Discovery {

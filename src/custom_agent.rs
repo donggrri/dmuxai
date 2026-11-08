@@ -2953,7 +2953,7 @@ Available models:
     // TC-1696 / FR-1683: preset drift guard for opencode error_path.
     // Preset drift guard: docs/agents/presets.toml opencode error_path == built-in.
     #[test]
-    fn presets_opencode_error_path_matches_builtin() {
+    fn tc_1696_presets_opencode_error_path_matches_builtin() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(root.join("docs/agents/presets.toml")).unwrap();
         let value: toml::Value = toml::from_str(&text).unwrap();
@@ -2973,7 +2973,7 @@ Available models:
 
     // TC-1697 / FR-1683: list pointer surfaces provider message.
     #[test]
-    fn opencode_error_jsonl_surfaces_provider_message() {
+    fn tc_1697_opencode_error_jsonl_surfaces_provider_message() {
         let spec = opencode_preset("opencode");
         let line = r#"{"type":"error","sessionID":"ses_x","error":{"name":"UnknownError","data":{"message":"Unexpected server error. Check server logs for details."}}}"#;
         let parsed = parse_jsonl_line(&spec, line);
@@ -2985,7 +2985,7 @@ Available models:
 
     // TC-1698 / FR-1683: single pointer still works.
     #[test]
-    fn single_string_error_path_still_works() {
+    fn tc_1698_single_string_error_path_still_works() {
         let toml_str = r#"
 name = "x"
 command = ["x"]
@@ -2999,7 +2999,7 @@ error_path = "/error/message"
 
     // TC-1699 / FR-1683: compact JSON fallback.
     #[test]
-    fn error_object_without_message_surfaces_compact_json() {
+    fn tc_1699_error_object_without_message_surfaces_compact_json() {
         let spec = opencode_preset("opencode");
         let line = r#"{"type":"error","sessionID":"ses_x","error":{"name":"UnknownError","data":{"foo":"bar"}}}"#;
         let parsed = parse_jsonl_line(&spec, line);

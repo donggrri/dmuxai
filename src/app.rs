@@ -25536,7 +25536,7 @@ out3
 
     // TC-761 / FR-761: a completed turn yields ok=true, exit 0, text contains the streamed delta
     #[tokio::test]
-    async fn headless_run_returns_agent_text() {
+    async fn tc_761_headless_run_returns_agent_text() {
         let (mut app, sent, event_tx) = test_app_with_event_sender();
         let conv_before = app.conversation_id.as_str().to_owned();
         app.last_graph_run = Some(GraphRun {
@@ -26097,7 +26097,7 @@ out3
 
     // TC-762 / NFR-762: rejects unknown and disallowed agent
     #[tokio::test]
-    async fn headless_run_rejects_unknown_and_disallowed_agent() {
+    async fn tc_762_headless_run_rejects_unknown_and_disallowed_agent() {
         let (mut app, _sent) = test_app();
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -26515,7 +26515,7 @@ out3
     // TC-1694 / FR-1682: headless outcome carries error_kind.
     // TC-761 / FR-761: an agent error yields ok=false and exit 1.
     #[tokio::test]
-    async fn headless_run_reports_agent_error() {
+    async fn tc_1694_headless_run_reports_agent_error() {
         let (mut app, sent, event_tx) = test_app_with_event_sender();
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -26603,7 +26603,7 @@ out3
 
     // TC-775 / FR-768: agent lifecycle events are appended through the hub sink.
     #[tokio::test]
-    async fn app_emits_agent_lifecycle_events() {
+    async fn tc_775_app_emits_agent_lifecycle_events() {
         use dmuxai::events::{EventLog, EventSink, events_path, read_since};
         use dmuxai::web::SnapshotSource;
 
@@ -37618,7 +37618,7 @@ mod graph_stop_notice_tests {
     // TC-1693 / FR-1679: graph stop notice propagates agent error text.
     // TC-1421 / FR-1416: a cancelled step is reported as cancelled, not failed.
     #[test]
-    fn tc_1421_cancelled_graph_step_not_reported_as_failed() {
+    fn tc_1421_1693_cancelled_graph_step_not_reported_as_failed() {
         assert_eq!(
             super::graph_stop_notice(&GraphStopReason::Cancelled(
                 "step n1 was cancelled".to_owned()

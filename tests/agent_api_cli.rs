@@ -621,7 +621,7 @@ timeout_secs = 30
 // The fixture is a POSIX shell script (same as src/agent/custom.rs tests).
 #[cfg(unix)]
 #[test]
-fn todo_cli_add_list_run() {
+fn tc_763_todo_cli_add_list_run() {
     let sandbox = Sandbox::new(&fake_agent_config("jsonl", None));
     let added = sandbox.run(&[
         "todo",
@@ -672,7 +672,7 @@ fn todo_cli_add_list_run() {
 
 // TC-764 / FR-763: status JSON carries every contract key.
 #[test]
-fn status_json_has_contract_keys() {
+fn tc_764_status_json_has_contract_keys() {
     let sandbox = Sandbox::new(&fake_agent_config("jsonl", Some(r#""fake", "agy""#)));
     let output = sandbox.run(&["status", "--json"]);
     assert_eq!(output.status.code(), Some(0));

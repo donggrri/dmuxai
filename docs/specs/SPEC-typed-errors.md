@@ -54,19 +54,19 @@ Runner failures are no longer reported as bare strings or NUL-prefixed sentinels
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-1687 | FR-1678 | unit | `AgentErrorKind` variants | serialize and display each kind | stable snake_case strings | `src/agent/mod.rs` `agent_error_kind_strings_and_display` |
-| TC-1688 | FR-1678 | unit | `AgentError` constructors | build and display each error | `kind`, `message`, `hint`, and Display text | `src/agent/mod.rs` `agent_error_constructors_and_display` |
-| TC-1689 | FR-1679 | integration | custom runner fixtures | run failing turns | errors map to provider, policy, and process_exit | `src/agent/custom.rs` `failures_are_detected` |
-| TC-1690 | FR-1679 | integration | sleeping child | total timeout elapses | `Timeout` kind | `src/agent/custom.rs` `timeout_kills_the_process_group` |
-| TC-1691 | FR-1679 | integration | silent agy child | idle watchdog elapses | `Idle` kind | `src/agent/agy.rs` `agy_idle_timeout_kills_silent_child` |
-| TC-1692 | FR-1679 | unit | ACP cancel result | map to event | `Cancelled` event without NUL sentinels | `src/agent/custom.rs` `acp_cancel_emits_cancelled_event_without_sentinel` |
-| TC-1693 | FR-1679 | unit | graph stop notice | format a failed step | agent error text propagates | `src/app.rs` `tc_1421_cancelled_graph_step_not_reported_as_failed` |
-| TC-1694 | FR-1682 | integration | headless run | agent emits error | `outcome.error_kind` is set | `src/app.rs` `headless_run_reports_agent_error` |
+| TC-1687 | FR-1678 | unit | `AgentErrorKind` variants | serialize and display each kind | stable snake_case strings | `src/agent/mod.rs` `tc_1687_agent_error_kind_strings_and_display` |
+| TC-1688 | FR-1678 | unit | `AgentError` constructors | build and display each error | `kind`, `message`, `hint`, and Display text | `src/agent/mod.rs` `tc_1688_agent_error_constructors_and_display` |
+| TC-1689 | FR-1679 | integration | custom runner fixtures | run failing turns | errors map to provider, policy, and process_exit | `src/agent/custom.rs` `tc_1689_failures_are_detected` |
+| TC-1690 | FR-1679 | integration | sleeping child | total timeout elapses | `Timeout` kind | `src/agent/custom.rs` `tc_1690_timeout_kills_the_process_group` |
+| TC-1691 | FR-1679 | integration | silent agy child | idle watchdog elapses | `Idle` kind | `src/agent/agy.rs` `tc_1691_agy_idle_timeout_kills_silent_child` |
+| TC-1692 | FR-1679 | unit | ACP cancel result | map to event | `Cancelled` event without NUL sentinels | `src/agent/custom.rs` `tc_1692_acp_cancel_emits_cancelled_event_without_sentinel` |
+| TC-1693 | FR-1679 | unit | graph stop notice | format a failed step | agent error text propagates | `src/app.rs` `tc_1421_1693_cancelled_graph_step_not_reported_as_failed` |
+| TC-1694 | FR-1682 | integration | headless run | agent emits error | `outcome.error_kind` is set | `src/app.rs` `tc_1694_headless_run_reports_agent_error` |
 | TC-1695 | FR-1682 | unit | `HeadlessOutcome` | serialize via `outcome_json` | `error_kind` appears next to `error` | `src/cli.rs` `tc_1695_outcome_json_includes_error_kind` |
-| TC-1696 | FR-1683 | unit | `docs/agents/presets.toml` | deserialize opencode preset | `error_path` matches builtin | `src/custom_agent.rs` `presets_opencode_error_path_matches_builtin` |
-| TC-1697 | FR-1683 | unit | opencode error JSONL line | parse line | provider message surfaces | `src/custom_agent.rs` `opencode_error_jsonl_surfaces_provider_message` |
-| TC-1698 | FR-1683 | unit | TOML with single `error_path` | parse line | single pointer still works | `src/custom_agent.rs` `single_string_error_path_still_works` |
-| TC-1699 | FR-1683 | unit | `/error` object without message | parse line | compact JSON fallback | `src/custom_agent.rs` `error_object_without_message_surfaces_compact_json` |
+| TC-1696 | FR-1683 | unit | `docs/agents/presets.toml` | deserialize opencode preset | `error_path` matches builtin | `src/custom_agent.rs` `tc_1696_presets_opencode_error_path_matches_builtin` |
+| TC-1697 | FR-1683 | unit | opencode error JSONL line | parse line | provider message surfaces | `src/custom_agent.rs` `tc_1697_opencode_error_jsonl_surfaces_provider_message` |
+| TC-1698 | FR-1683 | unit | TOML with single `error_path` | parse line | single pointer still works | `src/custom_agent.rs` `tc_1698_single_string_error_path_still_works` |
+| TC-1699 | FR-1683 | unit | `/error` object without message | parse line | compact JSON fallback | `src/custom_agent.rs` `tc_1699_error_object_without_message_surfaces_compact_json` |
 | TC-1722 | FR-1721 | unit | agy success line with `/result.error` null | parse line | no error and text "done" | `src/custom_agent.rs` `tc_1722_agy_success_result_object_is_not_an_error` |
 | TC-1723 | FR-1721 | unit | agy success line with `/result.error` missing | parse line | no error and text "done" | `src/custom_agent.rs` `tc_1723_agy_missing_error_key_is_not_an_error`, `src/custom_agent.rs` `tc_1723_empty_error_container_still_surfaces` |
 | TC-1724 | FR-1721 | unit | agy error line with `/result.error` string | parse line | error "quota exhausted" | `src/custom_agent.rs` `tc_1724_agy_error_result_surfaces_error_string`, `src/agent/custom.rs` `tc_1724_e2e_agy_success_line_finishes_without_error` |

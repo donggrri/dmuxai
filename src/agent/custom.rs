@@ -1700,7 +1700,7 @@ env = { FAKE_AGENT_FINISH_REASON = "omit" }
 
     // TC-1689 / FR-1679: runner conditions map to kinds.
     #[tokio::test]
-    async fn failures_are_detected() {
+    async fn tc_1689_failures_are_detected() {
         let (empty, _) = run(spec("empty", ""), None).await;
         let empty_err = empty.unwrap_err();
         assert!(empty_err.to_string().contains("empty reply"));
@@ -1774,7 +1774,7 @@ env = { FAKE_AGENT_FINISH_REASON = "omit" }
 
     // TC-1690 / FR-1679: total timeout maps to Timeout.
     #[tokio::test]
-    async fn timeout_kills_the_process_group() {
+    async fn tc_1690_timeout_kills_the_process_group() {
         let spec = spec("sleep", "timeout_secs = 1");
         let started = std::time::Instant::now();
         let (result, _) = run(spec, None).await;
@@ -2783,7 +2783,7 @@ env = { FAKE_CFG = "{temp_config}" }
 
     // TC-1692 / FR-1679: cancel maps to Cancelled without NUL sentinels.
     #[tokio::test]
-    async fn acp_cancel_emits_cancelled_event_without_sentinel() {
+    async fn tc_1692_acp_cancel_emits_cancelled_event_without_sentinel() {
         // FR-1416: ACP cancel turns return AgentError with kind Cancelled,
         // which maps directly to AgentEvent::Cancelled without sentinel strings.
         let err = AgentError::cancelled("ACP turn cancelled");

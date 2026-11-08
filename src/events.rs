@@ -937,7 +937,7 @@ mod tests {
     // TC-765 / FR-764 / NFR-760: read_since skips malformed lines, filters by
     // seq and honors the limit (first `limit` records, oldest first).
     #[test]
-    fn read_since_skips_malformed_and_filters() {
+    fn tc_765_read_since_skips_malformed_and_filters() {
         let dir = tempfile::tempdir().unwrap();
         let log = EventLog::open(dir.path(), "ws".to_string());
         let written = log
@@ -982,7 +982,7 @@ mod tests {
     // TC-769 / FR-768: one event per transition, nothing for repeats; the first
     // observe is a silent baseline.
     #[test]
-    fn tracker_emits_one_event_per_transition() {
+    fn tc_769_tracker_emits_one_event_per_transition() {
         let mut tracker = StateTracker::new();
         let base = snapshot_with(
             Some(graph("g1", GraphRunPhase::Active, GraphNodeStatus::Ready)),
@@ -1115,7 +1115,7 @@ mod tests {
     // TC-770 / FR-768: concurrent appends from two handles on one workspace get
     // strictly increasing, unique seqs and the log resumes after reopen.
     #[test]
-    fn event_log_seq_is_monotonic_across_handles() {
+    fn tc_770_event_log_seq_is_monotonic_across_handles() {
         let dir = tempfile::tempdir().unwrap();
         let first = EventLog::open(dir.path(), "ws".to_string());
         let second = EventLog::open(dir.path(), "ws".to_string());
@@ -1207,7 +1207,7 @@ mod tests {
     // TC-771 / FR-769: one stalled event per busy span, reset by activity; a
     // zero threshold disables detection.
     #[test]
-    fn stall_detector_emits_once_and_resets() {
+    fn tc_771_stall_detector_emits_once_and_resets() {
         let after = Duration::from_secs(10);
         let mut detector = StallDetector::new(after);
         let start = Instant::now();

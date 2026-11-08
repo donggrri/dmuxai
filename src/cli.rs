@@ -1246,7 +1246,7 @@ mod tests {
 
     // TC-760 / FR-760: agent-facing subcommands and flags.
     #[test]
-    fn parse_cli_agent_api_subcommands() {
+    fn tc_760_parse_cli_agent_api_subcommands() {
         assert_eq!(
             parse(&args(&[
                 "run", "fix", "the", "bug", "--agent", "agy", "--json"

@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_posts_json_with_secret_no_redirect() {
+    async fn tc_772_webhook_posts_json_with_secret_no_redirect() {
         // TC-772 / FR-770, FR-772, NFR-761: local mock listener, no network.
         let workspace = tempfile::tempdir().unwrap();
         let log_path = workspace.path().join(".dmuxai").join("notify.log");
@@ -646,7 +646,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn command_hook_receives_event_on_stdin() {
+    async fn tc_773_command_hook_receives_event_on_stdin() {
         // TC-773 / FR-771: the hook runs in the workspace directory and reads
         // the event JSON from stdin.
         let workspace = tempfile::tempdir().unwrap();

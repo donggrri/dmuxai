@@ -341,7 +341,7 @@ mod tests {
     // TC-768 / FR-767: initialize, tools/list, tools/call for every tool,
     // unknown tool, bad arguments, notifications and the stdio loop.
     #[test]
-    fn mcp_stdio_protocol_and_tools() {
+    fn tc_768_mcp_stdio_protocol_and_tools() {
         let stub = Stub::default();
         let init = call(
             &stub,
