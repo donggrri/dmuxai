@@ -67,7 +67,8 @@ use dmuxai::{
         judge_line_text, judging_line_text, next_plan_change_rev, parse_plan, parse_replan,
         parse_replan_marker, parse_verdict, pin_graph_plan_runners, plan_json_for_edit,
         replan_allowed, replan_revision_steps, revision_needs_approval, save_run,
-        strip_replan_marker, task_counter_text, validate_plan, write_tasks_file_if_enabled,
+        strip_replan_marker, task_counter_text, validate_plan_with_limit,
+        write_tasks_file_if_enabled,
     },
     mcp::config::ResolvedMcpServer,
     mcp::registry::McpRegistry,
@@ -8828,6 +8829,7 @@ impl App {
         }
         let index = adapter_index(agent);
         let nonce = Uuid::new_v4().simple().to_string();
+        let max_steps = self.graph_limits().max_nodes.clamp(1, 8);
         let (runner_names, model_lists) = self.plan_prompt_runners();
         let model_refs: Vec<Vec<&str>> = model_lists
             .iter()
@@ -8848,6 +8850,7 @@ impl App {
                 nonce: &nonce,
                 verdict_reason: &verdict_reason,
                 runners: &allowed_refs,
+                max_steps,
                 mode: PlanPromptMode::Repair { errors: &errors },
             })
         } else if let Some((previous, feedback)) = edit.as_ref() {
@@ -8856,6 +8859,7 @@ impl App {
                 nonce: &nonce,
                 verdict_reason: &verdict_reason,
                 runners: &allowed_refs,
+                max_steps,
                 mode: PlanPromptMode::Edit {
                     previous_plan: previous,
                     feedback,
@@ -8867,6 +8871,7 @@ impl App {
                 nonce: &nonce,
                 verdict_reason: &verdict_reason,
                 runners: &allowed_refs,
+                max_steps,
                 mode: PlanPromptMode::Initial,
             })
         } else {
@@ -8876,6 +8881,7 @@ impl App {
                 nonce: &nonce,
                 verdict_reason: &verdict_reason,
                 runners: &allowed_refs,
+                max_steps,
                 mode: PlanPromptMode::Repair { errors: &errors },
             })
         } {
@@ -9374,8 +9380,11 @@ impl App {
                 self.end_run_state(pending.agent, true, false);
                 match parse_plan(pending.buffer.as_str()) {
                     Ok(doc) => {
-                        let result =
-                            self.with_plan_context(&pending.prompt, |ctx| validate_plan(&doc, ctx));
+                        let cap = self.graph_limits().max_nodes.clamp(1, 8);
+                        let over_limit = doc.steps.len() > cap || doc.tasks.len() > cap;
+                        let result = self.with_plan_context(&pending.prompt, |ctx| {
+                            validate_plan_with_limit(&doc, ctx, cap)
+                        });
                         match result {
                             Ok(graph_plan) => {
                                 self.record_pending_plan_io(&pending, true);
@@ -9418,6 +9427,10 @@ impl App {
                                         &pending,
                                         "plan invalid twice",
                                     );
+                                } else if over_limit {
+                                    let error_lines: Vec<String> =
+                                        errors.iter().map(|err| err.to_string()).collect();
+                                    self.fail_over_limit_plan(&pending, error_lines);
                                 } else {
                                     let raw = cap_revision_raw(pending.buffer.as_str());
                                     let error_lines: Vec<String> =
@@ -10353,6 +10366,25 @@ impl App {
                 None,
             );
         }
+    }
+
+    fn fail_over_limit_plan(&mut self, pending: &PendingPlan, errors: Vec<String>) {
+        let detail = errors.join("; ");
+        self.push_system(format!("Plan exceeds the effective step cap: {detail}"));
+        let save_error = if let Some(run) = self
+            .last_graph_run
+            .as_mut()
+            .filter(|run| run.plan.id == pending.run_id && run.phase == GraphRunPhase::Planning)
+        {
+            run.phase = GraphRunPhase::Failed;
+            save_run(&self.workspace_root, run).err()
+        } else {
+            None
+        };
+        if let Some(error) = save_error {
+            self.push_system(format!("Could not save the failed run: {error}"));
+        }
+        self.finish_linked_graph_todo(false, Some(detail));
     }
 
     fn internal_turn_busy_error(event: &AgentEvent) -> Option<&str> {
@@ -32494,6 +32526,15 @@ out3
         ]}"#
     }
 
+    fn four_step_codex_plan_json() -> &'static str {
+        r#"{"tasks":[{"id":"task-1","title":"work","done_check":"done","areas":[],"size":"small","depends_on":[]}],"steps":[
+            {"id":"step-1","role":"research","job":"research","runner":"codex","model":"composer-2.5","depends_on":[],"task":"task-1"},
+            {"id":"step-2","role":"implement","job":"build","runner":"codex","model":"composer-2.5","depends_on":["step-1"],"task":"task-1"},
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
+            {"id":"step-4","role":"review","job":"review","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"task":"task-1"}
+        ]}"#
+    }
+
     fn korean_three_task_codex_plan_json() -> &'static str {
         r#"{"tasks":[
             {"id":"task-1","title":"설계 문서를 읽고 요약하기","done_check":"done","areas":[],"size":"small","depends_on":[]},
@@ -33059,6 +33100,97 @@ out3
         assert_eq!(no_model.app.input, "fix");
         assert!(last_system(&no_model.app).contains("fast models"));
         assert!(no_model.app.last_graph_run.is_none());
+    }
+
+    // TC-2544 / FR-2542: the initial plan is capped at min(8, max_nodes); an
+    // over-limit plan uses the repair turn and approval shows the 3-step plan.
+    #[test]
+    fn tc_2544_over_limit_plan_repairs_to_effective_cap() {
+        let mut h = plan_gate_test_app();
+        h.app.settings.graph_max_nodes = 3;
+        let plan_req = complete_complex_judge(&mut h);
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::TextDelta(four_step_codex_plan_json().to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::Completed
+        )));
+        let repair_req = h.sent.lock().unwrap().last().unwrap().1.clone();
+        assert_ne!(repair_req.turn_id.as_str(), plan_req.turn_id.as_str());
+        assert!(repair_req.prompt.contains("Validation errors"));
+        assert!(repair_req.prompt.contains("step count must be 1 to 3"));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &repair_req,
+            AgentEvent::TextDelta(three_step_codex_plan_json().to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &repair_req,
+            AgentEvent::Completed
+        )));
+        let run = h.app.last_graph_run.as_ref().expect("repaired plan");
+        assert_eq!(run.phase, GraphRunPhase::AwaitingApproval);
+        assert_eq!(run.plan.nodes.len(), 3);
+        assert_eq!(
+            run.approval
+                .as_ref()
+                .unwrap()
+                .revisions
+                .last()
+                .unwrap()
+                .steps
+                .len(),
+            3
+        );
+        assert_eq!(run.planner_calls.repair, 1);
+    }
+
+    // TC-2545 / FR-2544: a second over-limit plan fails the run (exit 1),
+    // never parks a fallback plan for approval (exit 7).
+    #[test]
+    fn tc_2545_over_limit_plan_twice_fails_without_approval() {
+        let mut h = plan_gate_test_app();
+        h.app.settings.graph_max_nodes = 3;
+        complete_complex_judge(&mut h);
+        for _ in 0..2 {
+            let req = h.sent.lock().unwrap().last().unwrap().1.clone();
+            assert!(h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &req,
+                AgentEvent::TextDelta(four_step_codex_plan_json().to_owned())
+            )));
+            assert!(h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &req,
+                AgentEvent::Completed
+            )));
+        }
+        let run = h.app.last_graph_run.as_ref().expect("failed planning run");
+        assert_eq!(run.phase, GraphRunPhase::Failed);
+        assert!(run.approval.is_none());
+        assert!(last_system(&h.app).contains("step count must be 1 to 3"));
+        assert_eq!(run.planner_calls.repair, 1);
+    }
+
+    // TC-2546 / FR-2543: the plan prompt states the effective step cap.
+    #[test]
+    fn tc_2546_plan_prompt_states_effective_cap() {
+        let mut h = plan_gate_test_app();
+        h.app.settings.graph_max_nodes = 3;
+        let plan_req = complete_complex_judge(&mut h);
+        assert!(
+            plan_req
+                .prompt
+                .contains("Use 1 to 3 tasks and at most 3 steps"),
+            "prompt missing the effective cap: {}",
+            plan_req.prompt
+        );
+        assert!(!plan_req.prompt.contains("at most 8 steps"));
     }
 
     // TC-1460 / FR-1460: a grok follow-up with no selected model is not

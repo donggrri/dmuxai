@@ -135,6 +135,7 @@ pub struct PlanPromptRequest<'a> {
     pub verdict_reason: &'a str,
     pub runners: &'a [AllowedRunner<'a>],
     pub mode: PlanPromptMode<'a>,
+    pub max_steps: usize,
 }
 
 /// Runners the App has registered, the allow-list check, each runner's
@@ -171,8 +172,14 @@ pub fn build_plan_prompt(request: &PlanPromptRequest<'_>) -> Result<String, Prom
         }
     }
 
+    let max_steps = request.max_steps.max(1);
     let mut out = String::new();
-    out.push_str(PLAN_PROMPT);
+    if max_steps == 8 {
+        out.push_str(PLAN_PROMPT);
+    } else {
+        let cap = format!("Use 1 to {max_steps} tasks and at most {max_steps} steps");
+        out.push_str(&PLAN_PROMPT.replace("Use 1 to 8 tasks and at most 8 steps", &cap));
+    }
     out.push('\n');
     out.push_str("Verdict reason:\n");
     push_block(&mut out, nonce, request.verdict_reason);
@@ -480,7 +487,7 @@ pub fn pin_graph_plan_runners(
 
 /// Same rules as [`validate_plan`] but with an explicit executable-step cap.
 /// Replan revisions use the run's `max_nodes` instead of the initial 8.
-pub(crate) fn validate_plan_with_limit(
+pub fn validate_plan_with_limit(
     doc: &PlanDoc,
     ctx: &PlanContext<'_>,
     max_steps: usize,
@@ -1436,6 +1443,7 @@ mod tests {
             nonce,
             verdict_reason: "several steps",
             runners: &runners,
+            max_steps: 8,
             mode: PlanPromptMode::Initial,
         })
         .unwrap();
@@ -1484,6 +1492,7 @@ DATA-nonce1>>>>
             nonce,
             verdict_reason: "complex",
             runners: &runners[..1],
+            max_steps: 8,
             mode: PlanPromptMode::Repair {
                 errors: &["step a: duplicate id"],
             },
@@ -1500,6 +1509,7 @@ DATA-nonce1>>>>
             nonce,
             verdict_reason: "complex",
             runners: &runners[..1],
+            max_steps: 8,
             mode: PlanPromptMode::Edit {
                 previous_plan: r#"{"steps":[]}"#,
                 feedback: "drop the test step",
@@ -1518,6 +1528,7 @@ DATA-nonce1>>>>
             nonce,
             verdict_reason: "complex",
             runners: &runners[..1],
+            max_steps: 8,
             mode: PlanPromptMode::Edit {
                 previous_plan: r#"{"steps":[]}"#,
                 feedback: &marker,
