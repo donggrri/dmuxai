@@ -539,7 +539,7 @@ mod typed_error_tests {
 
     // TC-1687 / FR-1678: stable snake_case kind strings.
     #[test]
-    fn agent_error_kind_strings_and_display() {
+    fn tc_1687_agent_error_kind_strings_and_display() {
         let cases = [
             (AgentErrorKind::Provider, "provider"),
             (AgentErrorKind::ModelUnavailable, "model_unavailable"),
@@ -565,7 +565,7 @@ mod typed_error_tests {
 
     // TC-1688 / FR-1678: AgentError fields and Display text.
     #[test]
-    fn agent_error_constructors_and_display() {
+    fn tc_1688_agent_error_constructors_and_display() {
         let err = AgentError::provider("connection failed");
         assert_eq!(err.kind(), AgentErrorKind::Provider);
         assert_eq!(err.message(), "connection failed");

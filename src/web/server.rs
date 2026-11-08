@@ -4224,7 +4224,7 @@ mod tests {
 
     // TC-766 / FR-765: prompt route contract
     #[tokio::test]
-    async fn prompt_route_contract() {
+    async fn tc_766_prompt_route_contract() {
         let token = "test-token-123".to_string();
         let accepted = PromptAccepted {
             conversation_id: "conv-1".to_string(),
@@ -4470,7 +4470,7 @@ mod tests {
 
     // TC-767 / FR-766: REST catch-up and SSE `state-change` frames tail the log file.
     #[tokio::test]
-    async fn events_log_and_sse_state_change() {
+    async fn tc_767_events_log_and_sse_state_change() {
         use crate::events::{EventDraft, EventLog, events_path, read_since};
 
         let dir = tempfile::tempdir().unwrap();

@@ -1559,7 +1559,7 @@ mod tests {
     // TC-1691 / FR-1679: idle watchdog maps to Idle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
-    async fn agy_idle_timeout_kills_silent_child() {
+    async fn tc_1691_agy_idle_timeout_kills_silent_child() {
         // FR-440 / TC-440: after one activity line the fake AGY goes silent, so
         // the idle deadline must kill the child and fail the turn with a
         // `no events for <N>s` error that calls out background commands.
