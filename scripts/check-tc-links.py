@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -147,6 +148,16 @@ def main() -> int:
         help="Path to allowlist file (default: scripts/tc-link-allowlist.txt)",
     )
     parser.add_argument(
+        "--baseline",
+        default=None,
+        help="Path to baseline file (default: scripts/tc-link-baseline.json)",
+    )
+    parser.add_argument(
+        "--base",
+        default=None,
+        help="Git ref to ratchet against (compares baseline, allowlist, and changed TCs)",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="Report TCs linked only by comment",
@@ -200,6 +211,31 @@ def main() -> int:
             print(f"{raw_tc} {reason}")
         return 0
 
+    if args.baseline is not None:
+        baseline_path = Path(args.baseline)
+        if not baseline_path.is_absolute() and not baseline_path.is_file():
+            if (root / baseline_path).is_file():
+                baseline_path = root / baseline_path
+            else:
+                baseline_path = baseline_path.resolve()
+    else:
+        baseline_path = root / "scripts" / "tc-link-baseline.json"
+
+    # FR-2552: Load baseline
+    if not baseline_path.is_file():
+        print(f"TC LINK CHECK: missing baseline file: {baseline_path}", file=sys.stderr)
+        return 1
+
+    try:
+        baseline_data = json.loads(baseline_path.read_text(encoding="utf-8"))
+        if not isinstance(baseline_data, dict):
+            raise ValueError("baseline is not a JSON object")
+        base_comment_only = int(baseline_data["comment_only"])
+        base_allowlisted = int(baseline_data["allowlisted"])
+    except Exception as exc:
+        print(f"TC LINK CHECK: malformed baseline file {baseline_path}: {exc}", file=sys.stderr)
+        return 1
+
     allowlist_entries, bad_allowlist, undefined_allowlist = parse_allowlist(
         allowlist_path, defined_tcs
     )
@@ -238,8 +274,106 @@ def main() -> int:
     u = len(undefined_tests)
     x = len(stale_allowlist)
 
+    ratchet_errors: list[str] = []
+    ratchet_notices: list[str] = []
+
+    # FR-2552: Enforce baseline
+    if c > base_comment_only:
+        ratchet_errors.append(
+            f"TC LINK CHECK: comment-only count {c} exceeds baseline {base_comment_only}"
+        )
+    elif c < base_comment_only:
+        ratchet_notices.append(f"lower the baseline: comment_only {c}")
+
+    if a > base_allowlisted:
+        ratchet_errors.append(
+            f"TC LINK CHECK: allowlisted count {a} exceeds baseline {base_allowlisted}"
+        )
+    elif a < base_allowlisted:
+        ratchet_notices.append(f"lower the baseline: allowlisted {a}")
+
+    # FR-2553 & FR-2554: If --base is given
+    changed_tc_count = 0
+    if args.base:
+        # Resolve merge-base
+        mb_proc = subprocess.run(
+            ["git", "-C", str(root), "merge-base", args.base, "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        if mb_proc.returncode != 0:
+            print(
+                f"TC LINK CHECK: unable to resolve base ref '{args.base}': {mb_proc.stderr.strip()}",
+                file=sys.stderr,
+            )
+            return 1
+        merge_base = mb_proc.stdout.strip()
+
+        # Check base allowlist
+        base_allowlist_proc = subprocess.run(
+            ["git", "-C", str(root), "show", f"{merge_base}:scripts/tc-link-allowlist.txt"],
+            capture_output=True,
+            text=True,
+        )
+        base_allowlist_tcs = set()
+        if base_allowlist_proc.returncode == 0:
+            for line in base_allowlist_proc.stdout.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(None, 1)
+                if parts:
+                    base_allowlist_tcs.add(parts[0])
+
+        for raw_tc in sorted(allowlist_entries.keys(), key=tc_sort_key):
+            if raw_tc not in base_allowlist_tcs:
+                ratchet_errors.append(f"TC LINK CHECK: NEW allowlist entry: {raw_tc}")
+
+        # Check base baseline
+        base_baseline_proc = subprocess.run(
+            ["git", "-C", str(root), "show", f"{merge_base}:scripts/tc-link-baseline.json"],
+            capture_output=True,
+            text=True,
+        )
+        if base_baseline_proc.returncode == 0:
+            try:
+                base_ref_baseline = json.loads(base_baseline_proc.stdout)
+                if (
+                    base_comment_only > int(base_ref_baseline.get("comment_only", 0))
+                    or base_allowlisted > int(base_ref_baseline.get("allowlisted", 0))
+                ):
+                    ratchet_errors.append(
+                        f"TC LINK CHECK: baseline raised: comment_only {base_comment_only} > {base_ref_baseline.get('comment_only')}, allowlisted {base_allowlisted} > {base_ref_baseline.get('allowlisted')}"
+                    )
+            except Exception as exc:
+                ratchet_errors.append(f"TC LINK CHECK: malformed baseline in base ref: {exc}")
+
+        # FR-2554: TC rows added or changed in docs/specs/SPEC-*.md since merge-base
+        diff_proc = subprocess.run(
+            ["git", "-C", str(root), "diff", merge_base, "--", "docs/specs/SPEC-*.md"],
+            capture_output=True,
+            text=True,
+        )
+        if diff_proc.returncode == 0:
+            changed_tcs = set()
+            for line in diff_proc.stdout.splitlines():
+                if line.startswith("+|"):
+                    # Check if it defines a TC
+                    m = re.match(r"^\+\|\s*(TC-[0-9]+)\s*\|", line)
+                    if m:
+                        changed_tcs.add(m.group(1))
+            changed_tc_count = len(changed_tcs)
+            for raw_tc in sorted(changed_tcs, key=tc_sort_key):
+                if raw_tc not in strong_set:
+                    ratchet_errors.append(f"TC LINK CHECK: NEW TC needs a strong link: {raw_tc}")
+
     has_errors = bool(
-        orphans or undefined_tests or stale_allowlist or undefined_allowlist or bad_allowlist
+        orphans
+        or undefined_tests
+        or stale_allowlist
+        or undefined_allowlist
+        or bad_allowlist
+        or ratchet_errors
     )
     if args.strict_fail and c > 0:
         has_errors = True
@@ -284,15 +418,24 @@ def main() -> int:
     for raw_tc, err in bad_allowlist:
         print(f"TC LINK CHECK: allowlist entry {raw_tc}: {err}")
 
+    for err in ratchet_errors:
+        print(err)
+
+    for notice in ratchet_notices:
+        print(notice)
+
     if args.strict:
         for raw_tc in sorted(comment_only_set, key=tc_sort_key):
             ref = comment_links[raw_tc][0]
             print(f"TC LINK CHECK: comment-only link: {raw_tc} ({ref[0]}:{ref[1]})")
 
-    print(
+    summary = (
         f"TC LINKS: {d} defined, {s} strong, {c} comment-only, {a} allowlisted, "
         f"{o} orphan, {u} undefined-test, {x} stale"
     )
+    if args.base:
+        summary += f"; ratchet vs {args.base}: {changed_tc_count} changed TCs checked"
+    print(summary)
 
     return 1 if has_errors else 0
 

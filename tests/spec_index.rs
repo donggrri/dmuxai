@@ -18,6 +18,14 @@
 // FR-1804 / TC-1804: check-tc-links.py reports orphans both ways (unlinked specs,
 //   undefined tests, stale allowlist entries, undefined allowlist entries)
 //   -> `tc_1804_tc_link_check_reports_orphans_both_ways`.
+// FR-2552 / TC-2551: check-tc-links.py ratchet fails on raised baseline or exceeding counts
+//   -> `tc_2551_tc_link_baseline_ratchet`.
+// FR-2553 / TC-2552: check-tc-links.py --base rejects new allowlist entries and raised baseline
+//   -> `tc_2552_tc_link_base_rejects_new_allowlist_and_raised_baseline`.
+// FR-2554 / TC-2553: check-tc-links.py --base requires strong links for changed TCs
+//   -> `tc_2553_tc_link_base_requires_strong_links_for_changed_tcs`.
+// FR-2555 / TC-2554: scripts/gate.sh TC-link step uses --base origin/main when ref exists
+//   -> `tc_2554_gate_tc_links_step_uses_base`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -205,6 +213,505 @@ fn spec_index_script_lists_every_spec() {
         assert!(
             Path::new(SPECS_DIR).join(name).is_file(),
             "spec-index.sh emitted a row for nonexistent SPEC file {name}"
+        );
+    }
+}
+
+fn run_git_cmd(repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("git must run");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {:?}:\nstdout:\n{}\nstderr:\n{}",
+        repo,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn tc_2551_tc_link_baseline_ratchet() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temp_root = std::env::temp_dir().join(format!(
+        "dmuxai-tc-link-2551-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(temp_root.join("docs/specs")).expect("create temp docs/specs");
+    fs::create_dir_all(temp_root.join("src")).expect("create temp src");
+    fs::create_dir_all(temp_root.join("scripts")).expect("create temp scripts");
+
+    // Fixture with one comment-only (TC-1) and one allowlisted (TC-2)
+    fs::write(
+        temp_root.join("docs/specs/SPEC-test.md"),
+        "Status: Draft\n\n## 4. Requirements\n\n\
+         | ID | Priority | P | R | F | Evidence |\n|---|---|---|---|---|---|\n\
+         | FR-1 | Must | p | r | f | TC-1 |\n\
+         | FR-2 | Must | p | r | f | TC-2 |\n\n\
+         ## 5. Acceptance scenarios and test design\n\n\
+         | TC-1 | FR-1 | unit | s | a | o | loc |\n\
+         | TC-2 | FR-2 | unit | s | a | o | loc |\n",
+    )
+    .expect("write SPEC-test.md");
+
+    // TC-1 is linked only by comment in src/lib.rs
+    fs::write(temp_root.join("src/lib.rs"), "// TC-1 link in comment\n").expect("write src/lib.rs");
+
+    // TC-2 is allowlisted
+    let allowlist = temp_root.join("scripts/tc-link-allowlist.txt");
+    fs::write(&allowlist, "TC-2 manual\n").expect("write allowlist");
+
+    let script = root.join("scripts/check-tc-links.py");
+    let baseline = temp_root.join("scripts/tc-link-baseline.json");
+
+    // 1) Baseline 1/1: comment_only=1, allowlisted=1 -> exit 0
+    fs::write(&baseline, r#"{"comment_only": 1, "allowlisted": 1}"#).expect("write baseline 1/1");
+    let out_1_1 = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_root)
+        .output()
+        .expect("run script");
+    assert_eq!(
+        out_1_1.status.code(),
+        Some(0),
+        "1/1 should exit 0\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_1_1.stdout),
+        String::from_utf8_lossy(&out_1_1.stderr)
+    );
+
+    // 2) Baseline 0/1: comment_only=0, allowlisted=1 -> exit 1 naming comment-only count
+    fs::write(&baseline, r#"{"comment_only": 0, "allowlisted": 1}"#).expect("write baseline 0/1");
+    let out_0_1 = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_root)
+        .output()
+        .expect("run script");
+    assert_eq!(
+        out_0_1.status.code(),
+        Some(1),
+        "0/1 should exit 1\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_0_1.stdout),
+        String::from_utf8_lossy(&out_0_1.stderr)
+    );
+    let combined_0_1 = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out_0_1.stdout),
+        String::from_utf8_lossy(&out_0_1.stderr)
+    );
+    assert!(
+        combined_0_1.contains("comment-only") && combined_0_1.contains("baseline"),
+        "0/1 must name comment-only count and baseline:\n{combined_0_1}"
+    );
+
+    // 3) Baseline 1/0: comment_only=1, allowlisted=0 -> exit 1 naming allowlisted count
+    fs::write(&baseline, r#"{"comment_only": 1, "allowlisted": 0}"#).expect("write baseline 1/0");
+    let out_1_0 = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_root)
+        .output()
+        .expect("run script");
+    assert_eq!(
+        out_1_0.status.code(),
+        Some(1),
+        "1/0 should exit 1\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_1_0.stdout),
+        String::from_utf8_lossy(&out_1_0.stderr)
+    );
+    let combined_1_0 = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out_1_0.stdout),
+        String::from_utf8_lossy(&out_1_0.stderr)
+    );
+    assert!(
+        combined_1_0.contains("allowlisted") && combined_1_0.contains("baseline"),
+        "1/0 must name allowlisted count and baseline:\n{combined_1_0}"
+    );
+
+    // 4) Baseline 2/2: comment_only=2, allowlisted=2 -> exit 0 and prints `lower the baseline`
+    fs::write(&baseline, r#"{"comment_only": 2, "allowlisted": 2}"#).expect("write baseline 2/2");
+    let out_2_2 = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_root)
+        .output()
+        .expect("run script");
+    assert_eq!(
+        out_2_2.status.code(),
+        Some(0),
+        "2/2 should exit 0\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_2_2.stdout),
+        String::from_utf8_lossy(&out_2_2.stderr)
+    );
+    let combined_2_2 = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out_2_2.stdout),
+        String::from_utf8_lossy(&out_2_2.stderr)
+    );
+    assert!(
+        combined_2_2.contains("lower the baseline"),
+        "2/2 must print 'lower the baseline':\n{combined_2_2}"
+    );
+
+    // 5) Missing baseline file -> exit 1
+    fs::remove_file(&baseline).expect("remove baseline");
+    let out_missing = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_root)
+        .output()
+        .expect("run script");
+    assert_eq!(
+        out_missing.status.code(),
+        Some(1),
+        "missing baseline should exit 1\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_missing.stdout),
+        String::from_utf8_lossy(&out_missing.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn tc_2552_tc_link_base_rejects_new_allowlist_and_raised_baseline() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temp_repo = std::env::temp_dir().join(format!(
+        "dmuxai-tc-link-2552-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(temp_repo.join("docs/specs")).expect("create temp docs/specs");
+    fs::create_dir_all(temp_repo.join("src")).expect("create temp src");
+    fs::create_dir_all(temp_repo.join("scripts")).expect("create temp scripts");
+
+    run_git_cmd(&temp_repo, &["init"]);
+
+    fs::write(
+        temp_repo.join("docs/specs/SPEC-a.md"),
+        "Status: Draft\n\n## 4. Requirements\n\n\
+         | ID | Priority | P | R | F | Evidence |\n|---|---|---|---|---|---|\n\
+         | FR-1 | Must | p | r | f | TC-1 |\n\
+         | FR-2 | Must | p | r | f | TC-2 |\n\
+         | FR-3 | Must | p | r | f | TC-3 |\n\
+         | FR-4 | Must | p | r | f | TC-4 |\n\n\
+         ## 5. Acceptance scenarios and test design\n\n\
+         | TC-1 | FR-1 | unit | s | a | o | loc |\n\
+         | TC-2 | FR-2 | unit | s | a | o | loc |\n\
+         | TC-3 | FR-3 | unit | s | a | o | loc |\n\
+         | TC-4 | FR-4 | unit | s | a | o | loc |\n",
+    )
+    .expect("write SPEC-a.md");
+
+    // TC-1 has strong test, TC-2 has comment link, TC-3 is allowlisted, TC-4 has strong test in base
+    fs::write(
+        temp_repo.join("src/lib.rs"),
+        "#[test]\nfn tc_1_ok() {}\n// TC-2\n#[test]\nfn tc_4_ok() {}\n",
+    )
+    .expect("write src/lib.rs");
+
+    let allowlist = temp_repo.join("scripts/tc-link-allowlist.txt");
+    fs::write(&allowlist, "TC-3 manual\n").expect("write base allowlist");
+
+    let baseline = temp_repo.join("scripts/tc-link-baseline.json");
+    fs::write(&baseline, r#"{"comment_only": 1, "allowlisted": 1}"#).expect("write base baseline");
+
+    run_git_cmd(&temp_repo, &["add", "."]);
+    run_git_cmd(
+        &temp_repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "base commit",
+        ],
+    );
+
+    // Create branch "base"
+    run_git_cmd(&temp_repo, &["branch", "base_ref"]);
+
+    let script = root.join("scripts/check-tc-links.py");
+
+    // Case A: Head adds TC-4 to the allowlist (removing its test from src/lib.rs so it's not stale)
+    fs::write(
+        temp_repo.join("src/lib.rs"),
+        "#[test]\nfn tc_1_ok() {}\n// TC-2\n",
+    )
+    .expect("update src/lib.rs");
+    fs::write(&allowlist, "TC-3 manual\nTC-4 manual\n").expect("add TC-4 to allowlist");
+    fs::write(&baseline, r#"{"comment_only": 1, "allowlisted": 2}"#).expect("update baseline");
+
+    let out_new_allowlist = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_repo)
+        .arg("--base")
+        .arg("base_ref")
+        .output()
+        .expect("run script");
+    assert_eq!(
+        out_new_allowlist.status.code(),
+        Some(1),
+        "new allowlist entry should exit 1"
+    );
+    let combined_new_al = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out_new_allowlist.stdout),
+        String::from_utf8_lossy(&out_new_allowlist.stderr)
+    );
+    assert!(
+        combined_new_al.contains("NEW allowlist entry: TC-4"),
+        "output must name 'NEW allowlist entry: TC-4':\n{combined_new_al}"
+    );
+
+    // Case B: Separately raises the baseline (revert allowlist to {TC-3}, restore TC-4 test, but raise baseline to 2/2)
+    fs::write(
+        temp_repo.join("src/lib.rs"),
+        "#[test]\nfn tc_1_ok() {}\n// TC-2\n#[test]\nfn tc_4_ok() {}\n",
+    )
+    .expect("restore src/lib.rs");
+    fs::write(&allowlist, "TC-3 manual\n").expect("restore allowlist");
+    fs::write(&baseline, r#"{"comment_only": 2, "allowlisted": 1}"#).expect("raise baseline");
+
+    let out_raised = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_repo)
+        .arg("--base")
+        .arg("base_ref")
+        .output()
+        .expect("run script");
+    assert_eq!(
+        out_raised.status.code(),
+        Some(1),
+        "raised baseline should exit 1"
+    );
+    let combined_raised = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out_raised.stdout),
+        String::from_utf8_lossy(&out_raised.stderr)
+    );
+    assert!(
+        combined_raised.contains("baseline raised"),
+        "output must name 'baseline raised':\n{combined_raised}"
+    );
+
+    // Case C: Head that only removes entries exits 0 (e.g. TC-3 gets a test, removed from allowlist, baseline 1/0)
+    fs::write(
+        temp_repo.join("src/lib.rs"),
+        "#[test]\nfn tc_1_ok() {}\n// TC-2\n#[test]\nfn tc_3_ok() {}\n#[test]\nfn tc_4_ok() {}\n",
+    )
+    .expect("lib.rs with tc_3 test");
+    fs::write(&allowlist, "# empty\n").expect("empty allowlist");
+    fs::write(&baseline, r#"{"comment_only": 1, "allowlisted": 0}"#).expect("lowered baseline");
+
+    let out_shrink = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_repo)
+        .arg("--base")
+        .arg("base_ref")
+        .output()
+        .expect("run script");
+    assert_eq!(
+        out_shrink.status.code(),
+        Some(0),
+        "head removing allowlist entries and lowering baseline should exit 0\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_shrink.stdout),
+        String::from_utf8_lossy(&out_shrink.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&temp_repo);
+}
+
+#[test]
+fn tc_2553_tc_link_base_requires_strong_links_for_changed_tcs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temp_repo = std::env::temp_dir().join(format!(
+        "dmuxai-tc-link-2553-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(temp_repo.join("docs/specs")).expect("create temp docs/specs");
+    fs::create_dir_all(temp_repo.join("src")).expect("create temp src");
+    fs::create_dir_all(temp_repo.join("scripts")).expect("create temp scripts");
+
+    run_git_cmd(&temp_repo, &["init"]);
+
+    // Base commit has TC-7
+    fs::write(
+        temp_repo.join("docs/specs/SPEC-test.md"),
+        "Status: Draft\n\n## 4. Requirements\n\n\
+         | ID | Priority | P | R | F | Evidence |\n|---|---|---|---|---|---|\n\
+         | FR-7 | Must | p | r | f | TC-7 |\n\n\
+         ## 5. Acceptance scenarios and test design\n\n\
+         | TC-7 | FR-7 | unit | old setup | old act | old exp | old loc |\n",
+    )
+    .expect("write base SPEC-test.md");
+
+    // Base has comment link for TC-7
+    fs::write(temp_repo.join("src/lib.rs"), "// TC-7 comment\n").expect("write base src/lib.rs");
+
+    let allowlist = temp_repo.join("scripts/tc-link-allowlist.txt");
+    fs::write(&allowlist, "# allowlist\n").expect("write base allowlist");
+
+    let baseline = temp_repo.join("scripts/tc-link-baseline.json");
+    fs::write(&baseline, r#"{"comment_only": 2, "allowlisted": 0}"#).expect("write base baseline");
+
+    run_git_cmd(&temp_repo, &["add", "."]);
+    run_git_cmd(
+        &temp_repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "base commit",
+        ],
+    );
+
+    run_git_cmd(&temp_repo, &["branch", "base_ref"]);
+
+    // Head adds TC-5 (comment-only) and TC-6 (strong) rows and edits the TC-7 row
+    fs::write(
+        temp_repo.join("docs/specs/SPEC-test.md"),
+        "Status: Draft\n\n## 4. Requirements\n\n\
+         | ID | Priority | P | R | F | Evidence |\n|---|---|---|---|---|---|\n\
+         | FR-5 | Must | p | r | f | TC-5 |\n\
+         | FR-6 | Must | p | r | f | TC-6 |\n\
+         | FR-7 | Must | p | r | f | TC-7 |\n\n\
+         ## 5. Acceptance scenarios and test design\n\n\
+         | TC-5 | FR-5 | unit | new setup 5 | act 5 | exp 5 | loc 5 |\n\
+         | TC-6 | FR-6 | unit | new setup 6 | act 6 | exp 6 | loc 6 |\n\
+         | TC-7 | FR-7 | unit | edited setup 7 | act 7 | exp 7 | loc 7 |\n",
+    )
+    .expect("update SPEC-test.md");
+
+    // lib.rs has comment for TC-5, strong for TC-6, comment for TC-7
+    fs::write(
+        temp_repo.join("src/lib.rs"),
+        "// TC-5\n#[test]\nfn tc_6_strong() {}\n// TC-7\n",
+    )
+    .expect("update src/lib.rs");
+
+    let script = root.join("scripts/check-tc-links.py");
+
+    // Run --base base_ref: TC-5 and TC-7 lack strong links, TC-6 has one
+    let out_missing_strong = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_repo)
+        .arg("--base")
+        .arg("base_ref")
+        .output()
+        .expect("run script");
+    assert_eq!(
+        out_missing_strong.status.code(),
+        Some(1),
+        "should exit 1 when changed TCs lack strong links\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_missing_strong.stdout),
+        String::from_utf8_lossy(&out_missing_strong.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out_missing_strong.stdout),
+        String::from_utf8_lossy(&out_missing_strong.stderr)
+    );
+    assert!(
+        combined.contains("TC-5") && combined.contains("needs a strong link"),
+        "must name TC-5:\n{combined}"
+    );
+    assert!(
+        combined.contains("TC-7") && combined.contains("needs a strong link"),
+        "must name TC-7:\n{combined}"
+    );
+    assert!(
+        !combined.contains("TC-6 needs a strong link"),
+        "TC-6 has strong link and must not be flagged:\n{combined}"
+    );
+
+    // After adding strong tests for TC-5 and TC-7, exit 0
+    fs::write(
+        temp_repo.join("src/lib.rs"),
+        "#[test]\nfn tc_5_strong() {}\n#[test]\nfn tc_6_strong() {}\n#[test]\nfn tc_7_strong() {}\n",
+    )
+    .expect("add strong tests for all");
+
+    let out_all_strong = Command::new("python3")
+        .arg(&script)
+        .arg("--root")
+        .arg(&temp_repo)
+        .arg("--base")
+        .arg("base_ref")
+        .output()
+        .expect("run script");
+    assert_eq!(
+        out_all_strong.status.code(),
+        Some(0),
+        "after adding strong tests exit 0\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out_all_strong.stdout),
+        String::from_utf8_lossy(&out_all_strong.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&temp_repo);
+}
+
+#[test]
+fn tc_2554_gate_tc_links_step_uses_base() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new("bash")
+        .arg("scripts/gate.sh")
+        .arg("--print-tc-links-cmd")
+        .current_dir(root)
+        .output()
+        .expect("bash must run scripts/gate.sh --print-tc-links-cmd");
+    assert!(
+        output.status.success(),
+        "gate.sh --print-tc-links-cmd failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cmd = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        cmd.contains("check-tc-links.py"),
+        "output must contain check-tc-links.py:\n{cmd}"
+    );
+
+    let origin_main_exists = Command::new("git")
+        .args(["rev-parse", "--verify", "-q", "origin/main"])
+        .current_dir(root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if origin_main_exists {
+        assert!(
+            cmd.contains("--base origin/main"),
+            "when origin/main exists, command must pass --base origin/main:\n{cmd}"
+        );
+    } else {
+        assert!(
+            !cmd.contains("--base"),
+            "when origin/main does not exist, command must not pass --base:\n{cmd}"
         );
     }
 }
@@ -397,6 +904,9 @@ fn tc_1804_tc_link_check_reports_orphans_both_ways() {
 
     let allowlist = temp_root.join("scripts/tc-link-allowlist.txt");
     fs::write(&allowlist, "TC-1 manual\nTC-3 planned\n").expect("write allowlist");
+
+    let baseline = temp_root.join("scripts/tc-link-baseline.json");
+    fs::write(&baseline, r#"{"comment_only": 1, "allowlisted": 1}"#).expect("write baseline");
 
     let script = root.join("scripts/check-tc-links.py");
     let bad_output = Command::new("python3")
