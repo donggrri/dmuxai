@@ -159,6 +159,8 @@ const HEADLESS_APPROVAL_NOTE: &str = "approval required (headless)";
 const HEADLESS_GATE_NOTE: &str = "sensitive step needs approval: rerun with --allow-sensitive (or --agent <name> --approve-plan)";
 /// FR-2121: the agent replied with a plan and made no file edits.
 const HEADLESS_PLAN_ONLY_NOTE: &str = "AGY replied with a plan and made no file edits. If you wanted changes applied, re-run with --approve-plan; if this was a question, the reply is in \"text\".";
+const READ_ONLY_WORKSPACE_WRITE_ERROR: &str =
+    "read-only run changed workspace files (a file was created or modified outside .dmuxai/)";
 
 #[derive(Clone, Copy)]
 struct SlashCommand {
@@ -14341,6 +14343,12 @@ impl App {
         if let Some(policy) = headless_turn_policy {
             self.pending_turn_policy = Some(policy);
         }
+        let read_only_run = self.pending_turn_policy == Some(TurnPolicy::ReadOnly);
+        let read_only_workspace_before = if read_only_run {
+            dmuxai::workspace::git_worktree_fingerprint(&self.workspace_root).await
+        } else {
+            None
+        };
         let headless_conversation_id = self.conversation_id.as_str().to_owned();
         self.last_graph_run = None;
         self.graph_session = None;
@@ -14671,6 +14679,16 @@ impl App {
             .find(|m| m.role == Role::System && !m.local_only)
             .map(|m| m.content.clone());
 
+        let read_only_workspace_violation = if read_only_run {
+            dmuxai::workspace::read_only_workspace_write_detected(
+                read_only_workspace_before.as_deref(),
+                &self.workspace_root,
+            )
+            .await
+        } else {
+            false
+        };
+
         // FR-1416: a graph stopped by a cancelled step is not a success.
         let graph_cancelled = last_graph_id.as_ref().is_some_and(|graph_id| {
             self.last_graph_run.as_ref().is_some_and(|run| {
@@ -14706,6 +14724,13 @@ impl App {
                     failure.agent, failure.detail
                 )),
                 dmuxai::agent_api::error_kind_for_exit(failure.exit_code).map(str::to_owned),
+            )
+        } else if read_only_workspace_violation {
+            (
+                false,
+                dmuxai::agent_api::exit::FAILED,
+                Some(READ_ONLY_WORKSPACE_WRITE_ERROR.to_owned()),
+                Some(AgentErrorKind::Policy.as_str().to_owned()),
             )
         } else if plan_only_reply {
             (
@@ -26063,6 +26088,102 @@ out3
             run_headless_policy_case(Agent::Codex, Some("codex"), Some("ask"), true, None).await;
         assert_eq!(sent_agent, Agent::Codex, "graph path");
         assert_eq!(policy, TurnPolicy::ReadOnly, "graph path");
+    }
+
+    // TC-2542 / FR-2540: read-only headless runs fail when the worktree changes.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2542_headless_read_only_workspace_write_is_policy_error() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        let git_run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        git_run(&["init", "-q"]);
+        std::fs::write(workspace.join("README.md"), "initial\n").unwrap();
+        git_run(&["add", "README.md"]);
+        git_run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (mut app, sent, event_tx) =
+            test_app_with_engine_and_event_sender(engine, workspace.clone());
+
+        let workspace_write = workspace.clone();
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    std::fs::write(workspace_write.join("SQA_WRITE.txt"), "wrote\n").unwrap();
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("done".to_owned()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt: "hello".to_owned(),
+            agent: Some("codex".to_owned()),
+            mode: Some("ask".to_owned()),
+            graph: false,
+            approve_plan: false,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app
+            .run_headless(req, Arc::new(AtomicBool::new(false)))
+            .await;
+        assert!(
+            !outcome.ok,
+            "read-only workspace write must fail: {outcome:?}"
+        );
+        assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::FAILED);
+        assert_eq!(
+            outcome.error_kind.as_deref(),
+            Some(AgentErrorKind::Policy.as_str())
+        );
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some(READ_ONLY_WORKSPACE_WRITE_ERROR)
+        );
     }
 
     // TC-1824 / FR-1824 (#212): write turns without --read-only stay write-capable.

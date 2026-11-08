@@ -1,8 +1,25 @@
 use std::{
-    fs, io,
+    collections::hash_map::DefaultHasher,
+    fs,
+    hash::Hasher,
+    io::{self, Read},
     path::{Path, PathBuf},
+    process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
+
+/// How long `git status` may run when sampling the workspace for read-only checks.
+const GIT_WORKTREE_FINGERPRINT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Chunk size used to stream worktree file content through the fingerprint
+/// hash (FR-2540). Memory per file is bounded to this buffer regardless of
+/// file size; the whole file is still hashed.
+const GIT_FINGERPRINT_HASH_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Maximum number of porcelain entries hashed into the read-only fingerprint;
+/// beyond this only the status text is sampled (FR-2540).
+const GIT_FINGERPRINT_MAX_ENTRIES: usize = 4096;
 
 /// Maximum number of entries persisted in `recent-workspaces.json` (FR-872).
 pub const MAX_RECENT_WORKSPACES: usize = 10;
@@ -610,6 +627,176 @@ pub fn spawn_dashboard(exe: &Path, workspace: &Path) -> io::Result<std::process:
 /// always headless, so the variable no longer gates behaviour.
 pub const HEADLESS_DASHBOARD_ENV: &str = "DMUXAI_HEADLESS_DASHBOARD";
 
+/// Worktree-state fingerprint of the workspace, excluding `.dmuxai/` (FR-2540).
+///
+/// The fingerprint combines `git status --porcelain=v2` entries with the staged
+/// blob hash (`hI`) and a worktree content summary for every listed path, so
+/// changing the content of an already-dirty or already-untracked file is
+/// detected even though the file's status line would stay identical to a
+/// filename/status-only comparison.
+///
+/// Returns `None` when the directory is not inside a git repository, git is
+/// missing, or the sampling does not finish in time.
+pub fn git_worktree_fingerprint_sync(workspace: &Path) -> Option<String> {
+    let status = run_git_quiet(
+        workspace,
+        &[
+            "status",
+            "--porcelain=v2",
+            "--untracked-files=all",
+            "--no-renames",
+            "-z",
+            "--",
+            ".",
+            ":(exclude).dmuxai",
+        ],
+    )?;
+    // Porcelain paths are relative to the repository root, which may be above
+    // the workspace when the workspace is a subdirectory.
+    let repo_root = run_git_quiet(workspace, &["rev-parse", "--show-toplevel"])?;
+    let repo_root = PathBuf::from(String::from_utf8_lossy(&repo_root).trim().to_owned());
+
+    let mut fingerprint = String::new();
+    let mut entries = 0usize;
+    for raw in status.split(|byte| *byte == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        entries += 1;
+        if entries > GIT_FINGERPRINT_MAX_ENTRIES {
+            fingerprint.push_str("truncated\n");
+            break;
+        }
+        fingerprint.push_str(&fingerprint_entry(
+            &String::from_utf8_lossy(raw),
+            &repo_root,
+        ));
+        fingerprint.push('\n');
+    }
+    Some(fingerprint)
+}
+
+fn run_git_quiet(workspace: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(output.stdout)
+    } else {
+        None
+    }
+}
+
+/// Canonical fingerprint contribution of one porcelain entry (FR-2540): status
+/// letters, modes, staged blob hash, path, and a worktree content summary.
+fn fingerprint_entry(token: &str, repo_root: &Path) -> String {
+    let kind = token.split(' ').next().unwrap_or("");
+    match kind {
+        "1" => {
+            let mut fields = token.splitn(9, ' ');
+            let _ = fields.next();
+            let x_y = fields.next().unwrap_or("");
+            let sub = fields.next().unwrap_or("");
+            let m_h = fields.next().unwrap_or("");
+            let m_i = fields.next().unwrap_or("");
+            let m_w = fields.next().unwrap_or("");
+            let head_hash = fields.next().unwrap_or("");
+            let index_hash = fields.next().unwrap_or("");
+            let path = fields.next().unwrap_or("");
+            format!(
+                "{x_y} {sub} {m_h} {m_i} {m_w} {head_hash} {index_hash} {path} {}",
+                worktree_content_summary(&repo_root.join(path)),
+            )
+        }
+        "u" => {
+            let mut fields = token.splitn(11, ' ');
+            let _ = fields.next();
+            let x_y = fields.next().unwrap_or("");
+            let sub = fields.next().unwrap_or("");
+            let m1 = fields.next().unwrap_or("");
+            let m2 = fields.next().unwrap_or("");
+            let m3 = fields.next().unwrap_or("");
+            let m_w = fields.next().unwrap_or("");
+            let h1 = fields.next().unwrap_or("");
+            let h2 = fields.next().unwrap_or("");
+            let h3 = fields.next().unwrap_or("");
+            let path = fields.next().unwrap_or("");
+            format!(
+                "{x_y} {sub} {m1} {m2} {m3} {m_w} {h1} {h2} {h3} {path} {}",
+                worktree_content_summary(&repo_root.join(path)),
+            )
+        }
+        "?" => {
+            let path = token.strip_prefix("? ").unwrap_or("");
+            format!(
+                "? {path} {}",
+                worktree_content_summary(&repo_root.join(path))
+            )
+        }
+        _ => token.to_owned(),
+    }
+}
+
+/// Content summary of a worktree file used by the read-only fingerprint
+/// (FR-2540): the file length plus a full-file streaming hash, read in
+/// bounded [`GIT_FINGERPRINT_HASH_CHUNK_BYTES`] chunks, so an edit at any
+/// offset of an already-dirty or untracked file is detected even when its
+/// length and porcelain line stay identical. Unreadable paths and non-regular
+/// files (FIFOs, sockets, directories — opening one can block) get a stable
+/// marker so deletions and permission failures remain deterministic across
+/// samples.
+fn worktree_content_summary(path: &Path) -> String {
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return "unreadable".to_owned(),
+    };
+    if !meta.is_file() {
+        return "unreadable".to_owned();
+    }
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return "unreadable".to_owned(),
+    };
+    let len = meta.len();
+    let mut hasher = DefaultHasher::new();
+    let mut buf = vec![0u8; GIT_FINGERPRINT_HASH_CHUNK_BYTES];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.write(&buf[..n]),
+            Err(_) => return "i/o-error".to_owned(),
+        }
+    }
+    format!("len={len}hash={:016x}", hasher.finish())
+}
+
+/// Async wrapper around [`git_worktree_fingerprint_sync`] with a bounded wait.
+pub async fn git_worktree_fingerprint(workspace: &Path) -> Option<String> {
+    let workspace = workspace.to_path_buf();
+    tokio::time::timeout(
+        GIT_WORKTREE_FINGERPRINT_TIMEOUT,
+        tokio::task::spawn_blocking(move || git_worktree_fingerprint_sync(&workspace)),
+    )
+    .await
+    .ok()?
+    .ok()?
+}
+
+/// Returns true when the worktree fingerprint changed since `before` (FR-2540).
+pub async fn read_only_workspace_write_detected(before: Option<&str>, workspace: &Path) -> bool {
+    let Some(before) = before else {
+        return false;
+    };
+    git_worktree_fingerprint(workspace)
+        .await
+        .is_some_and(|after| after != before)
+}
+
 /// If `workspace` already has a live dashboard, return its URL.
 pub fn live_dashboard_url(workspace: &Path) -> Option<String> {
     let discovery = crate::web::discovery::read_discovery(workspace)?;
@@ -964,5 +1151,205 @@ mod tests {
                 None => std::env::remove_var("DMUXAI_WORKSPACE"),
             }
         }
+    }
+
+    fn git_init_commit_repo(dir: &Path) -> impl Fn(&[&str]) + '_ {
+        let run = move |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.join("README.md"), "# test\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        run
+    }
+
+    // TC-2540 / FR-2540: the fingerprint ignores `.dmuxai/` and detects plain
+    // path changes as well as content edits to files that are already dirty or
+    // untracked, where porcelain status alone would not change.
+    #[test]
+    fn tc_2540_git_worktree_fingerprint_excludes_dmuxai_and_sees_content_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = git_init_commit_repo(root);
+        let before = super::git_worktree_fingerprint_sync(root).unwrap();
+        assert!(before.is_empty(), "clean repo: {before:?}");
+
+        std::fs::create_dir_all(root.join(".dmuxai/graphs")).unwrap();
+        std::fs::write(root.join(".dmuxai/graphs/run.json"), "{}").unwrap();
+        assert_eq!(
+            super::git_worktree_fingerprint_sync(root).as_deref(),
+            Some(before.as_str()),
+            ".dmuxai changes must not affect the fingerprint"
+        );
+
+        // Content edits to an already-dirty tracked file change the fingerprint
+        // even though the porcelain status line is `"M README.md"` both times.
+        std::fs::write(root.join("README.md"), "dirty edit one\n").unwrap();
+        let dirty_one = super::git_worktree_fingerprint_sync(root).unwrap();
+        assert_ne!(
+            before, dirty_one,
+            "worktree edit must change the fingerprint"
+        );
+        std::fs::write(root.join("README.md"), "dirty edit two\n").unwrap();
+        let dirty_two = super::git_worktree_fingerprint_sync(root).unwrap();
+        assert_ne!(
+            dirty_one, dirty_two,
+            "a second edit to the same already-dirty file must change the fingerprint"
+        );
+
+        // Staging different content changes the staged blob hash.
+        git(&["add", "README.md"]);
+        let staged = super::git_worktree_fingerprint_sync(root).unwrap();
+        assert_ne!(
+            dirty_two, staged,
+            "staging new content must change the fingerprint"
+        );
+
+        // Untracked file: creation and later content edits are detected.
+        std::fs::write(root.join("SQA_WRITE.txt"), "one\n").unwrap();
+        let untracked_one = super::git_worktree_fingerprint_sync(root).unwrap();
+        assert_ne!(staged, untracked_one);
+        std::fs::write(root.join("SQA_WRITE.txt"), "two\n").unwrap();
+        let untracked_two = super::git_worktree_fingerprint_sync(root).unwrap();
+        assert_ne!(
+            untracked_one, untracked_two,
+            "editing an already-untracked file must change the fingerprint"
+        );
+    }
+
+    // TC-2543 (FR-2540): content detection covers the entire file, not just a
+    // prefix. Editing a single byte beyond the first MiB with unchanged length
+    // and an identical porcelain status line must change the fingerprint for
+    // an already-dirty tracked file and for an already-untracked file.
+    #[test]
+    fn tc_2543_fingerprint_detects_tail_edit_beyond_first_mib() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = git_init_commit_repo(root);
+
+        let mut body = vec![b'a'; 1 << 20];
+        body.extend_from_slice(b"tailA\n");
+        std::fs::write(root.join("big.txt"), &body).unwrap();
+        git(&["add", "big.txt"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "big",
+        ]);
+
+        // Make the tracked file already-dirty with a head-region edit.
+        body[0] = b'b';
+        std::fs::write(root.join("big.txt"), &body).unwrap();
+        let dirty_one = super::git_worktree_fingerprint_sync(root).unwrap();
+        let status_one = porcelain_line(root, "big.txt");
+
+        // Tail-only edit: same length, byte at offset 1 MiB, porcelain status
+        // unchanged — this is exactly what a first-MiB prefix hash would miss.
+        body[1 << 20] = b'B';
+        std::fs::write(root.join("big.txt"), &body).unwrap();
+        let dirty_two = super::git_worktree_fingerprint_sync(root).unwrap();
+        let status_two = porcelain_line(root, "big.txt");
+        assert_eq!(
+            status_one, status_two,
+            "porcelain status must stay identical"
+        );
+        assert_ne!(
+            dirty_one, dirty_two,
+            "a tail edit beyond the first MiB must change the fingerprint"
+        );
+
+        // Already-untracked file larger than 1 MiB; tail-only edit with
+        // unchanged length and unchanged porcelain status.
+        let mut untracked = vec![b'x'; 1 << 20];
+        untracked.extend_from_slice(b"tailU\n");
+        std::fs::write(root.join("UNTRACKED_BIG.txt"), &untracked).unwrap();
+        let untracked_one = super::git_worktree_fingerprint_sync(root).unwrap();
+        let untracked_status_one = porcelain_line(root, "UNTRACKED_BIG.txt");
+        untracked[1 << 20] = b'Y';
+        std::fs::write(root.join("UNTRACKED_BIG.txt"), &untracked).unwrap();
+        let untracked_two = super::git_worktree_fingerprint_sync(root).unwrap();
+        let untracked_status_two = porcelain_line(root, "UNTRACKED_BIG.txt");
+        assert_eq!(
+            untracked_status_one, untracked_status_two,
+            "untracked porcelain status must stay identical"
+        );
+        assert_ne!(
+            untracked_one, untracked_two,
+            "a tail edit to an already-untracked file must change the fingerprint"
+        );
+    }
+
+    /// The single porcelain v1 line git reports for `path`, as raw status
+    /// evidence that the tracked tail-edit case leaves the line identical.
+    fn porcelain_line(root: &Path, path: &str) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["status", "--porcelain", "--untracked-files=all", "--", path])
+            .output()
+            .expect("git status");
+        assert!(out.status.success(), "git status {path} failed");
+        String::from_utf8_lossy(&out.stdout).trim_end().to_owned()
+    }
+
+    // FR-2540 robustness (whole-file streaming): opening a non-regular file
+    // (a FIFO here) must neither hang the sampling thread on a blocking
+    // open(2) nor break fingerprint determinism across samples. Note: git
+    // status itself does not list FIFOs, so the helper is also asserted
+    // directly.
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_skips_untracked_fifo_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let _git = git_init_commit_repo(root);
+        let fifo = root.join("pipe.fifo");
+        let ok = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .current_dir(root)
+            .status()
+            .expect("mkfifo")
+            .success();
+        assert!(ok, "mkfifo failed");
+
+        let started = std::time::Instant::now();
+        let summary = super::worktree_content_summary(&fifo);
+        assert_eq!(
+            summary, "unreadable",
+            "a non-regular file gets the stable unreadable marker {summary:?}"
+        );
+        let second_summary = super::worktree_content_summary(&fifo);
+        assert_eq!(
+            summary, second_summary,
+            "FIFO handling must be deterministic across samples"
+        );
+
+        let first = super::git_worktree_fingerprint_sync(root).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "fingerprinting must not block on a FIFO open: {first:?}"
+        );
+        let second = super::git_worktree_fingerprint_sync(root).unwrap();
+        assert_eq!(first, second);
     }
 }
