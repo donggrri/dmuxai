@@ -823,7 +823,7 @@ fn execute_runs(
         }
 
         // Sort newest first by created_at_ms
-        manifests.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        manifests.sort_by_key(|m| std::cmp::Reverse(m.created_at_ms));
 
         if manifests.len() > limit {
             manifests.truncate(limit);
