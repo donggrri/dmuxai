@@ -1469,6 +1469,18 @@ mod tests {
         list.iter().map(|s| (*s).to_owned()).collect()
     }
 
+    // TC-1492 / FR-1318: --mode is rejected with a parse error, not silently ignored.
+    #[test]
+    fn tc_1492_mode_flag_is_rejected_with_error() {
+        let err = parse(&args(&["run", "x", "--mode", "ask"])).unwrap_err();
+        assert!(err.contains("--mode was removed"), "{err}");
+
+        let err_todo = parse(&args(&["todo", "run", "abc", "--mode", "ask"])).unwrap_err();
+        assert!(err_todo.contains("--mode was removed"), "{err_todo}");
+
+        assert!(parse(&args(&["run", "x", "--mode", "fast"])).is_err());
+    }
+
     // TC-760 / FR-760, TC-1816 / FR-1816, TC-1817 / FR-1817, TC-1821 / FR-1821: agent-facing subcommands and flags.
     #[test]
     fn tc_760_1816_1817_1821_parse_cli_agent_api_subcommands() {
@@ -1491,8 +1503,6 @@ mod tests {
                 trust_workspace_config: false,
             }))
         );
-        assert!(parse(&args(&["run", "x", "--mode", "ask"])).is_err());
-        assert!(parse(&args(&["todo", "run", "abc", "--mode", "ask"])).is_err());
         assert_eq!(
             parse(&args(&["run", "--graph", "--", "--literal prompt"])),
             Ok(AgentCommand::Run(RunOptions {
@@ -1925,13 +1935,6 @@ mod tests {
         assert_eq!(
             parse(&args(&["run", "x", "--agent", "--json"])),
             Err("--agent needs a value".to_owned())
-        );
-        assert_eq!(
-            parse(&args(&["run", "x", "--mode", "ask"])),
-            Err(
-                "--mode was removed; DmuxAI runs a single agent mode (write-capable). Omit --mode."
-                    .to_owned()
-            )
         );
         assert_eq!(
             parse(&args(&["run", "x", "--agent", "a", "--graph"])),

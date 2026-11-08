@@ -120,3 +120,22 @@ fn tc_905_readme_and_changelog_mention_builtin_grok() {
         "CHANGELOG must state the graph exception"
     );
 }
+
+// TC-1312 / FR-1309: ACP runners are documented as Linux-only.
+#[test]
+fn tc_1312_acp_runners_are_documented_as_linux_only() {
+    let spec = read("docs/specs/SPEC-acp-runners.md");
+    assert!(
+        spec.contains("Behavior in this spec is supported on **Linux only**")
+            || spec.contains("**Linux only**"),
+        "SPEC-acp-runners must state Linux-only support"
+    );
+
+    let readme = read("README.md");
+    assert!(
+        readme.contains("ACP is\nsupported on Linux only")
+            || readme.contains("ACP is supported on Linux only")
+            || readme.contains("supported on Linux only"),
+        "README must state ACP is supported on Linux only"
+    );
+}

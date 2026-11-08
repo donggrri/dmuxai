@@ -95,11 +95,6 @@ TC-1233 legacy: no test reference yet
 TC-1234 legacy: no test reference yet
 TC-1235 legacy: no test reference yet
 TC-1236 e2e/browser (ignored)
-TC-1301 legacy: no test reference yet
-TC-1303 legacy: no test reference yet
-TC-1308 legacy: no test reference yet
-TC-1312 manual
-TC-1333 legacy: no test reference yet
 TC-1480 manual
 TC-1481 manual
 TC-1482 manual
@@ -112,7 +107,6 @@ TC-1488 manual
 TC-1489 manual
 TC-1490 manual
 TC-1491 legacy: no test reference yet
-TC-1492 e2e/browser (ignored)
 TC-1494 legacy: no test reference yet
 TC-1509 legacy: no test reference yet
 TC-1515 legacy: no test reference yet
@@ -164,7 +158,6 @@ TC-1858 covered by builtin_opencode_preset_registration (no TC ref in code yet)
 TC-1859 planned — no automated test yet
 TC-1860 covered by permission_denial_is_detected_in_stderr (no TC ref in code yet)
 TC-1861 covered by finish_accepts_forced_kill_after_result_in_agent_mode (no TC ref in code yet)
-TC-1862 legacy: no test reference yet
 TC-1863 covered by tc_1420_permission_denied_ends_cancelled (no TC ref in code yet)
 TC-1864 covered by grok_acp_argv_puts_model_before_stdio (no TC ref in code yet)
 TC-1865 covered by grok_auth_is_models_stdout_only (no TC ref in code yet)

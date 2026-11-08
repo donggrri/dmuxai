@@ -30708,6 +30708,25 @@ out3
         assert_eq!(session.run().plan.nodes.len(), 1);
     }
 
+    // TC-1333 / FR-1307, FR-1317: Internal judge turn uses TurnPolicy::ReadOnly.
+    #[test]
+    fn tc_1333_judge_turn_policy_is_read_only() {
+        let mut harness = plan_gate_test_app();
+        harness.app.selected = adapter_index(Agent::Agy);
+        harness
+            .app
+            .model_catalogs
+            .get_mut(&Agent::Agy)
+            .unwrap()
+            .selected = Some("gemini-3.8-flash-medium".to_owned());
+        harness.app.input = "please compare the two import paths".to_owned();
+        harness.app.submit_prompt();
+
+        let judge = harness.sent.lock().unwrap()[0].1.clone();
+        assert!(judge.turn_id.as_str().starts_with("judge-"));
+        assert_eq!(judge.policy, TurnPolicy::ReadOnly);
+    }
+
     // TC-933 / FR-932: the judge runs read-only on the selected agent's model.
     #[test]
     fn tc_933_judge_turn_uses_selected_agent_read_only() {
