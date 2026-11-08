@@ -14057,7 +14057,15 @@ impl App {
             if run.phase != GraphRunPhase::AwaitingApproval {
                 return None;
             }
-            let revision = run.approval.as_ref()?.revisions.last()?;
+            // FR-2551: save the latest revision without validation errors —
+            // the same revision plan approval would execute.
+            let revision = run
+                .approval
+                .as_ref()?
+                .revisions
+                .iter()
+                .rev()
+                .find(|revision| revision.errors.is_none())?;
             (
                 run.plan.user_prompt.clone(),
                 run.plan.tasks.clone(),
@@ -14118,6 +14126,13 @@ impl App {
                 message,
             ))
         };
+        // FR-2550: reject a malformed id as usage before the path is used.
+        if !dmuxai::state_path::valid_pending_plan_hash(plan_hash) {
+            return Err(fail(
+                dmuxai::agent_api::exit::USAGE,
+                "--approve-plan-id must be 16 lowercase hex characters".to_owned(),
+            ));
+        }
         if !req.graph {
             return Err(fail(
                 dmuxai::agent_api::exit::USAGE,
@@ -33626,6 +33641,110 @@ out3
         assert!(!mismatch.ok);
         assert!(path.is_file(), "a mismatched plan is not consumed");
         assert_eq!(sent.lock().unwrap().len(), 0);
+    }
+
+    // TC-2550 / FR-2550: a non-hex --approve-plan-id is usage exit 2 before
+    // the pending-plan path is touched.
+    #[tokio::test]
+    async fn tc_2550_headless_approve_plan_id_rejects_non_hex() {
+        pin_test_state_dir();
+        let (mut app, sent) = test_app();
+        for bad in ["../x", "ABC", "deadbeefdeadbee", "ABCDEF0123456789"] {
+            let outcome = app
+                .run_headless(
+                    graph_headless_request("any prompt", Some(bad.to_owned())),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await;
+            assert_eq!(outcome.exit_code, 2, "{bad}: {outcome:?}");
+            assert!(!outcome.ok);
+            let touched = dmuxai::state_path::state_base()
+                .unwrap()
+                .join("graph-pending")
+                .join(format!("{bad}.json"));
+            assert!(
+                !touched.exists(),
+                "no filesystem access may happen for {bad}"
+            );
+        }
+        assert_eq!(sent.lock().unwrap().len(), 0);
+    }
+
+    // TC-2550 / FR-2551: exit 7 saves the latest revision without validation
+    // errors — the same revision approval would run — not merely the last one.
+    #[test]
+    fn tc_2550_write_pending_plan_skips_error_revision() {
+        pin_test_state_dir();
+        let step = |id: &str, job: &str| dmuxai::graph::PlanStep {
+            id: id.to_owned(),
+            role: "implement".to_owned(),
+            job: job.to_owned(),
+            runner: "agy".to_owned(),
+            model: None,
+            depends_on: Vec::new(),
+            sensitive: None,
+            task: None,
+            ..Default::default()
+        };
+        let revision =
+            |n: u32, jobs: &[&str], errors: Option<Vec<String>>| dmuxai::graph::PlanRevision {
+                n,
+                source: "model".to_owned(),
+                steps: jobs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, job)| step(&format!("step-{index}"), job))
+                    .collect(),
+                added: Vec::new(),
+                changed: Vec::new(),
+                feedback: None,
+                errors,
+                raw: None,
+            };
+        let (mut app, _) = test_app();
+        app.last_graph_run = Some(GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "graph.v1".to_owned(),
+                id: "plan-1".to_owned(),
+                orchestrator_model: "m".to_owned(),
+                user_prompt: "plan it".to_owned(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                limits: dmuxai::graph::default_limits(),
+                tasks: Vec::new(),
+            },
+            conversation_id: app.conversation_id.to_string(),
+            phase: GraphRunPhase::AwaitingApproval,
+            approval: Some(dmuxai::graph::Approval {
+                state: dmuxai::graph::ApprovalState::Pending,
+                revisions: vec![
+                    revision(1, &["valid one"], None),
+                    revision(
+                        2,
+                        &["valid one", "valid two"],
+                        Some(vec!["bad revision".to_owned()]),
+                    ),
+                    revision(3, &["latest valid one"], None),
+                ],
+                decided_by: None,
+                decided_at_ms: None,
+            }),
+            ..Default::default()
+        });
+        let plan_hash = app.headless_write_pending_plan().expect("plan saved");
+        let path = dmuxai::state_path::state_base()
+            .unwrap()
+            .join("graph-pending")
+            .join(format!("{plan_hash}.json"));
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let steps: Vec<&str> = saved["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["job"].as_str().unwrap())
+            .collect();
+        assert_eq!(steps, vec!["latest valid one"], "{saved:?}");
     }
 
     // TC-1460 / FR-1460: a grok follow-up with no selected model is not

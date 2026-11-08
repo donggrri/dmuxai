@@ -25,6 +25,11 @@ Related: SPEC-plan-gate, SPEC-agent-graph-orchestration FR-958, SPEC-agent-api, 
    keeps the current behaviour (fresh plan, auto-approved).
 3. MCP `run` accepts `approve_plan_id` (string) and forwards it as
    `--approve-plan-id`; it requires `graph: true`.
+4. Follow-up: `approve_plan_id` is used in a file path, so every entry point
+   (CLI parser, headless launch, MCP `run`) rejects a value that is not
+   exactly 16 lowercase hex characters with the usage error (exit 2) before
+   any filesystem access. Exit 7 saves the latest plan revision whose
+   validation `errors` are empty, matching what plan approval executes.
 
 Minimal-design rationale: a content hash of a persisted file needs no daemon
 and no database change, and comparing the stored prompt prevents approving a
@@ -41,6 +46,8 @@ plan for a different task.
 | FR-2546 | `--approve-plan-id <hash>` (implies plan approval, requires `--graph`) executes the stored plan without a new planner turn; missing file → exit 3, prompt mismatch → exit 2, invalid against current limits → exit 1. The pending file is removed after it is used. |
 | FR-2547 | `--approve-plan-id` does NOT confirm sensitive gates beyond what `--approve-plan` confirms today. |
 | FR-2548 | MCP `run` forwards `approve_plan_id` (requires `graph`). |
+| FR-2550 | A `--approve-plan-id` / `approve_plan_id` value that is not exactly 16 lowercase hex characters is rejected with the usage error (exit 2) before any filesystem access, in the CLI parser, in the headless launch, and in MCP `run`. |
+| FR-2551 | Headless exit 7 saves the latest revision whose `errors` are `None` (the same revision plan approval would run); revisions with validation errors are never persisted. |
 
 ## 5. Acceptance scenarios and test design
 
@@ -52,3 +59,4 @@ plan for a different task.
 | TC-2547 | exit 7 writes pending file and plan_hash; `--approve-plan-id` runs that plan with no planner turn. |
 | TC-2548 | `--approve-plan-id` missing → 3; prompt mismatch → 2. |
 | TC-2549 | CLI parse / MCP forwarding of approve_plan_id. |
+| TC-2550 | FR-2550, FR-2551: rejected ids (`../x`, uppercase, 15/17 chars) get the usage error (exit 2) in the CLI parser, headless launch and MCP `run`, with no filesystem access and no provider request; exit 7 saves the latest error-free revision, skipping one with validation errors. |

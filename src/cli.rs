@@ -250,6 +250,13 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
     if options.graph && options.agent.is_some() {
         return Err("use either --agent or --graph, not both".to_owned());
     }
+    // FR-2550: the id is interpolated into the pending-plan path, so a
+    // malformed id is usage before any other validation or filesystem access.
+    if let Some(plan_id) = &options.approve_plan_id
+        && !dmuxai::state_path::valid_pending_plan_hash(plan_id)
+    {
+        return Err("--approve-plan-id must be 16 lowercase hex characters".to_owned());
+    }
     if options.approve_plan_id.is_some() && !options.graph {
         return Err("--approve-plan-id needs --graph".to_owned());
     }
@@ -1597,26 +1604,31 @@ mod tests {
             "run",
             "--graph",
             "--approve-plan-id",
-            "abc123",
+            "deadbeefdeadbeef",
             "do it",
         ])) {
             Ok(AgentCommand::Run(run)) => {
                 assert!(run.graph);
                 assert!(run.approve_plan, "--approve-plan-id implies approval");
-                assert_eq!(run.approve_plan_id.as_deref(), Some("abc123"));
+                assert_eq!(run.approve_plan_id.as_deref(), Some("deadbeefdeadbeef"));
                 assert_eq!(run.prompt, "do it");
             }
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(
-            parse(&args(&["run", "--approve-plan-id", "abc123", "do it"])),
+            parse(&args(&[
+                "run",
+                "--approve-plan-id",
+                "deadbeefdeadbeef",
+                "do it"
+            ])),
             Err("--approve-plan-id needs --graph".to_owned())
         );
         assert!(parse(&args(&["run", "--graph", "--approve-plan-id"])).is_err());
 
         let forwarded = RunArgs {
             prompt: Some("plan it".into()),
-            approve_plan_id: Some("abc123".into()),
+            approve_plan_id: Some("deadbeefdeadbeef".into()),
             graph: true,
             ..RunArgs::default()
         };
@@ -1625,12 +1637,52 @@ mod tests {
             vec![
                 "run",
                 "--approve-plan-id",
-                "abc123",
+                "deadbeefdeadbeef",
                 "--graph",
                 "--json",
                 "--",
                 "plan it"
             ]
+        );
+    }
+
+    // TC-2550 / FR-2550: --approve-plan-id must be exactly 16 lowercase hex
+    // characters; anything else is a usage error before any filesystem access.
+    #[test]
+    fn tc_2550_approve_plan_id_rejects_non_hex() {
+        for bad in [
+            "../x",
+            "ABC",
+            "ABCDEF0123456789",
+            "deadbeefdeadbee",
+            "deadbeefdeadbeef1",
+            "g000000000000000",
+        ] {
+            assert_eq!(
+                parse(&args(&[
+                    "run",
+                    "--graph",
+                    "--approve-plan-id",
+                    bad,
+                    "do it"
+                ])),
+                Err("--approve-plan-id must be 16 lowercase hex characters".to_owned())
+            );
+            assert_eq!(
+                parse(&args(&["run", "--approve-plan-id", bad, "do it"])),
+                Err("--approve-plan-id must be 16 lowercase hex characters".to_owned()),
+                "format check precedes the graph check for {bad}"
+            );
+        }
+        assert!(
+            parse(&args(&[
+                "run",
+                "--graph",
+                "--approve-plan-id",
+                "deadbeefdeadbeef",
+                "do it"
+            ]))
+            .is_ok()
         );
     }
 
