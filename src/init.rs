@@ -265,7 +265,7 @@ mod tests {
 
     // TC-906 / FR-900
     #[test]
-    fn starter_config_mentions_builtin_grok() {
+    fn tc_906_starter_config_mentions_builtin_grok() {
         let detected = starter_config(false, true);
         let undetected = starter_config(true, false);
         for text in [&detected, &undetected] {

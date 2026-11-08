@@ -118,7 +118,7 @@ mod tests {
 
     // TC-1316, TC-1414 / FR-1301, FR-1412: agent-mode grok argv.
     #[test]
-    fn grok_acp_argv_puts_model_before_stdio() {
+    fn tc_1316_1414_grok_acp_argv_puts_model_before_stdio() {
         let args = grok_acp_argv("grok-4.7", Some("high"), false);
         assert_eq!(
             args,

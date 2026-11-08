@@ -231,7 +231,7 @@ mod tests {
 
     // TC-1306
     #[test]
-    fn denies_permission_when_path_outside_workspace() {
+    fn tc_1306_denies_permission_when_path_outside_workspace() {
         let params = json!({
             "options": [
                 {"optionId": "allow", "kind": "allow"},
@@ -252,7 +252,7 @@ mod tests {
 
     // TC-1325 / FR-1304: prefer allow_once over always-allow (Grok).
     #[test]
-    fn prefers_allow_once_over_always_allow() {
+    fn tc_1325_prefers_allow_once_over_always_allow() {
         let params = json!({
             "options": [
                 {"optionId": "always", "kind": "allow_always"},
@@ -311,7 +311,7 @@ mod tests {
 
     // TC-1331 / FR-1329: active reject-once counts as permission denied.
     #[test]
-    fn reject_once_option_counts_as_denied() {
+    fn tc_1331_reject_once_option_counts_as_denied() {
         let params = json!({
             "options": [
                 {"optionId": "allow", "kind": "allow_once"},
@@ -330,7 +330,7 @@ mod tests {
 
     // TC-1307
     #[test]
-    fn sensitive_gate_cancels_permission() {
+    fn tc_1307_sensitive_gate_cancels_permission() {
         let params = json!({
             "options": [{"optionId": "allow", "kind": "allow"}]
         });

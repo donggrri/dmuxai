@@ -113,11 +113,11 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 
 | Test ID | Requirement IDs | Type | Setup | Action | Oracle | Location |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-1410 | FR-1410 | unit | Empty settings | Load | Cursor protocol `legacy` | `src/settings.rs` |
+| TC-1410 | FR-1410 | unit | Empty settings | Load | Cursor protocol `legacy` | `src/settings.rs` `tc_1410_cursor_runner_defaults_to_legacy` |
 | TC-1411 | FR-1411 | unit | `composer-2.5[fast=true]` / `composer-2.5-fast` | `is_fast_model` | true | `src/agent/acp/session.rs` |
-| TC-1412 | FR-1411 | integration | Fake agent fast-only | Cursor ACP turn | Error, no prompt observed | `src/agent/cursor.rs` |
+| TC-1412 | FR-1411 | integration | Fake agent fast-only | Cursor ACP turn | Error, no prompt observed | `src/agent/cursor.rs` `tc_1412_fast_only_refused_without_prompt` |
 | TC-1413 | FR-1412 | unit | `grok_acp_argv` read-only | Build argv | `--permission-mode plan` before `agent` | `src/agent/acp_runner.rs` |
-| TC-1414 | FR-1412 | unit | `grok_acp_argv` agent mode | Build argv | `agent` then `stdio` last, no `--permission-mode` | `src/agent/acp_runner.rs` |
+| TC-1414 | FR-1412 | unit | `grok_acp_argv` agent mode | Build argv | `agent` then `stdio` last, no `--permission-mode` | `src/agent/acp_runner.rs` `tc_1316_1414_grok_acp_argv_puts_model_before_stdio` |
 | TC-1415 | FR-1413 | unit | `modes` advertised | `read_only_mode_request` | `session/set_mode` | `src/agent/acp/session.rs` |
 | TC-1416 | FR-1413 | unit | `configOptions` mode only | `read_only_mode_request` | `session/set_config_option` | `src/agent/acp/session.rs` |
 | TC-1417 | FR-1413 | unit | No mode support | Permission policy read-only | Edit denied | `src/agent/acp/permissions.rs` |
@@ -125,9 +125,9 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | TC-1420 | FR-1416 | integration | Fake agent denies outside-workspace permission | Cursor ACP turn | `Cancelled` + notice, no `Error` | `src/agent/cursor.rs` |
 | TC-1421 | FR-1416 | unit | Cancelled graph step | `graph_stop_notice` | "Graph cancelled" | `src/app.rs` |
 | TC-1422 | FR-1417 | unit | `execute` tool_call with command | Map update | Command in row | `src/agent/acp/updates.rs` |
-| TC-1423 | FR-1418 | unit | Settings with `opencode_protocol` | Load | No ACP for opencode | `src/settings.rs` |
-| TC-1424 | NFR-1410, FR-1413 | integration | Fake `FAKE_ACP_MODES` = modes / config / none | Read-only Cursor ACP turn | set_mode ask / set_config_option plan / none | `src/agent/cursor.rs` |
-| TC-1425 | NFR-1410, FR-1413 | integration | Fake `FAKE_ACP_MODES=both` | Read-only Cursor ACP turn | set_mode preferred | `src/agent/cursor.rs` |
+| TC-1423 | FR-1418 | unit | Settings with `opencode_protocol` | Load | No ACP for opencode | `src/settings.rs` `tc_1423_opencode_has_no_acp_protocol_switch` |
+| TC-1424 | NFR-1410, FR-1413 | integration | Fake `FAKE_ACP_MODES` = modes / config / none | Read-only Cursor ACP turn | set_mode ask / set_config_option plan / none | `src/agent/cursor.rs` `tc_1424_read_only_mode_shapes` |
+| TC-1425 | NFR-1410, FR-1413 | integration | Fake `FAKE_ACP_MODES=both` | Read-only Cursor ACP turn | set_mode preferred | `src/agent/cursor.rs` `tc_1425_read_only_mode_prefers_modes_when_both_advertised` |
 | TC-1862 | FR-1862 | unit | `DmuxSettings::default()` and `CursorAdapterConfig::default()` | Compare protocol fields | settings default is Legacy, adapter default is Acp | `src/settings.rs` |
 | TC-1863 | FR-1863 | unit | unauthorized or read-only tool request | `session/request_permission` evaluation | permission denied; notice emitted; turn cancelled | `src/agent/cursor.rs` `tc_1420_permission_denied_ends_cancelled`, `src/agent/acp/permissions.rs` `denies_permission_when_path_outside_workspace` |
 | TC-2316 | FR-2316 | unit + integration | Response carrying the pending id with and without `method`; fake agent sends `session/request_permission` with the same id as `session/prompt` | `is_response_to`; Cursor ACP turn with `FAKE_ACP_PERMISSION_ID_COLLISION` | unit: method => false, plain response => true, other id => false; integration: text `ACP_OK`, `Completed`, stop reason `end_turn`, no `Error`/`Cancelled` | `src/agent/acp/client.rs` `tc_2316_is_response_to_requires_matching_id_without_method`; `src/agent/cursor.rs` `tc_2316_permission_request_id_collision_keeps_turn_running` |
@@ -138,32 +138,32 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | TC-1491 | NFR-1301, FR-1315, FR-1324, FR-1329 | review | PR diff | Code review + `DMUXAI_ACP_LOG=/tmp/x.log dmuxai run --agent grok "say hi"` | No ACP trace on stderr; trace in the log file; denied permission ends cancelled (see TC-1420) | review / hands-on |
 | TC-1492 | FR-1318 | unit | CLI args | `dmuxai run x --mode ask` | Parse error, not ignored | `src/cli.rs` (`--mode` rejection asserts) |
 | TC-1484 | FR-1411 | manual | `[cursor] protocol = "acp"` in `dmuxai.toml` | `dmuxai run --agent cursor "say hi"` | Refused before any prompt: error names the fast model | hands-on |
-| TC-1300 | FR-1300, NFR-1300 | integration | Fake ACP binary as `DMUXAI_CURSOR_BIN` parent | Send prompt | Streaming text, `Completed`, session bound | `src/agent/acp.rs` |
+| TC-1300 | FR-1300, NFR-1300 | integration | Fake ACP binary as `DMUXAI_CURSOR_BIN` parent | Send prompt | Streaming text, `Completed`, session bound | `src/agent/cursor.rs` `tc_1300_cursor_acp_turn_with_fake_agent` |
 | TC-1301 | FR-1301 | unit | grok preset + `acp` protocol | Build argv | Contains `agent`, `stdio`, `-m` | `src/custom_agent.rs` |
-| TC-1302 | FR-1302 | unit | Fixture NDJSON | Parse updates | Expected `AgentEvent` sequence | `src/acp/` |
+| TC-1302 | FR-1302 | unit | Fixture NDJSON | Parse updates | Expected `AgentEvent` sequence | `src/agent/acp/updates.rs` `tc_1302_maps_agent_message_chunk` |
 | TC-1303 | FR-1303 | integration | Fake agent | Cancel mid-turn | `Cancelled`, child gone | `src/agent/acp.rs` |
-| TC-1304 | FR-1304 | integration | Fake agent exits 1 | Prompt | `Error` surfaced | `src/agent/acp.rs` |
+| TC-1304 | FR-1304 | integration | Fake agent exits 1 | Prompt | `Error` surfaced | `src/agent/cursor.rs` `tc_1304_fake_agent_exit_nonzero_surfaces_error` |
 | TC-1305 | FR-1300, FR-1301 | unit | Settings parse | Load toml | Cursor `legacy`, grok `acp` | `src/settings.rs` |
-| TC-1306 | FR-1304 | unit | Permission payload outside workspace | Policy | Deny | `src/acp/permissions.rs` |
-| TC-1307 | FR-1304 | unit | Permission with sensitive gate active | Policy | Gate path | `src/acp/permissions.rs` |
+| TC-1306 | FR-1304 | unit | Permission payload outside workspace | Policy | Deny | `src/agent/acp/permissions.rs` `tc_1306_denies_permission_when_path_outside_workspace` |
+| TC-1307 | FR-1304 | unit | Permission with sensitive gate active | Policy | Gate path | `src/agent/acp/permissions.rs` `tc_1307_sensitive_gate_cancels_permission` |
 | TC-1308 | FR-1305 | integration | `protocol=legacy` + fake legacy cursor | Prompt | No `acp` in argv | `src/agent/cursor.rs` |
-| TC-1309 | FR-1306 | unit | App snapshot / slash list | Inspect | No `/mode` | `src/app.rs` |
+| TC-1309 | FR-1306 | unit | App snapshot / slash list | Inspect | No `/mode` | `src/app.rs` `tc_1309_fast_typed_mode_command_sets_mode_without_sending` |
 | TC-1333 | FR-1307, FR-1317 | integration | Judge turn | Start judge | Read-only argv/policy | `src/app.rs` |
 | TC-1312 | FR-1309 | manual | Read docs | — | Linux-only stated | `docs/specs/SPEC-acp-runners.md` |
 | TC-1313 | FR-1314 | unit | Permission JSON with sessionId | Policy | Allow in-workspace shell | `src/agent/acp/permissions.rs` |
 | TC-1314 | FR-1314 | unit | `/proj` vs `/proj-evil` | Prefix check | Deny outside | `src/agent/acp/permissions.rs` |
-| TC-1315 | FR-1302, FR-1325 | unit | `tool_call_update` payload | Map update | Title/kind/status | `src/agent/acp/updates.rs` |
-| TC-1316 | FR-1301 | unit | `grok_acp_argv` | Build argv | `-m` before `stdio` | `src/agent/acp_runner.rs` |
-| TC-1317 | FR-1316, FR-1323 | integration | Fake agent + cancel | Cancel turn | `session/cancel` observed | `tests/fixtures/fake_acp_agent.rs` |
-| TC-1318 | FR-1313 | unit | Fast model payload | `cursor_acp_model_check` | Error | `src/agent/acp/session.rs` |
-| TC-1319 | FR-1319 | unit | `currentModelId` fast vs requested | `cursor_acp_model_check` | Uses reported id | `src/agent/acp/session.rs` |
-| TC-1323 | FR-1320 | unit | `session_load_params` | Inspect JSON | `cwd`, `mcpServers` | `src/agent/acp/session.rs` |
-| TC-1324 | FR-1321, FR-1328 | unit | `session_set_mode_params` | Inspect JSON | `modeId` present | `src/agent/acp/session.rs` |
-| TC-1325 | FR-1322 | unit | Grok-style options | `choose_permission_option` | `allow_once` wins | `src/agent/acp/permissions.rs` |
-| TC-1328 | FR-1330 | unit | Mixed model list | `pick_non_fast_model` | Stays on composer family | `src/agent/acp/session.rs` |
-| TC-1329 | FR-1327 | integration | Fake agent fast-only | ACP turn | Child reaped | `src/agent/cursor.rs` |
-| TC-1331 | FR-1329 | integration | Fake agent permission outside | ACP turn | `Cancelled`, not `Completed` | `src/agent/cursor.rs` |
-| TC-1332 | FR-1302 | unit | Duplicate `tool_call_update` ids | Map updates | Single activity row | `src/agent/acp/updates.rs` |
+| TC-1315 | FR-1302, FR-1325 | unit | `tool_call_update` payload | Map update | Title/kind/status | `src/agent/acp/updates.rs` `tc_1315_maps_tool_call_update_fields` |
+| TC-1316 | FR-1301 | unit | `grok_acp_argv` | Build argv | `-m` before `stdio` | `src/agent/acp_runner.rs` `tc_1316_1414_grok_acp_argv_puts_model_before_stdio` |
+| TC-1317 | FR-1316, FR-1323 | integration | Fake agent + cancel | Cancel turn | `session/cancel` observed | `src/agent/cursor.rs` `tc_1317_cancel_sends_session_cancel_observed` |
+| TC-1318 | FR-1313 | unit | Fast model payload | `cursor_acp_model_check` | Error | `src/agent/acp/session.rs` `tc_1318_cursor_acp_rejects_fast_model_report` |
+| TC-1319 | FR-1319 | unit | `currentModelId` fast vs requested | `cursor_acp_model_check` | Uses reported id | `src/agent/acp/session.rs` `tc_1319_cursor_acp_reads_models_current_model_id` |
+| TC-1323 | FR-1320 | unit | `session_load_params` | Inspect JSON | `cwd`, `mcpServers` | `src/agent/acp/session.rs` `tc_1323_session_load_params_schema` |
+| TC-1324 | FR-1321, FR-1328 | unit | `session_set_mode_params` | Inspect JSON | `modeId` present | `src/agent/acp/session.rs` `tc_1324_session_set_mode_uses_mode_id` |
+| TC-1325 | FR-1322 | unit | Grok-style options | `choose_permission_option` | `allow_once` wins | `src/agent/acp/permissions.rs` `tc_1325_prefers_allow_once_over_always_allow` |
+| TC-1328 | FR-1330 | unit | Mixed model list | `pick_non_fast_model` | Stays on composer family | `src/agent/acp/session.rs` `tc_1328_pick_non_fast_model_stays_in_requested_family` |
+| TC-1329 | FR-1327 | integration | Fake agent fast-only | ACP turn | Child reaped | `src/agent/cursor.rs` `tc_1329_fast_only_refused_child_reaped` |
+| TC-1331 | FR-1329 | integration | Fake agent permission outside | ACP turn | `Cancelled`, not `Completed` | `src/agent/acp/permissions.rs` `tc_1331_reject_once_option_counts_as_denied` |
+| TC-1332 | FR-1302 | unit | Duplicate `tool_call_update` ids | Map updates | Single activity row | `src/agent/acp/updates.rs` `tc_1332_merges_tool_call_updates_by_id` |
 
 Deterministic ACP integration tests run under plain `cargo test`: the test helper builds the `fake-acp-agent` bin (`--features test-fixtures`) on first use.
 
