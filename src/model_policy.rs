@@ -271,8 +271,9 @@ mod tests {
         assert!(!is_allowed_model("grok-4.7-medium-fast"));
     }
 
+    // TC-1882 / FR-1882: Reject any model id containing fast or not equal to composer-2.5
     #[test]
-    fn validate_rejects_fast_and_foreign_models() {
+    fn tc_1882_validate_rejects_fast_and_foreign_models() {
         assert!(validate_model_id("composer-2.5").is_ok());
         assert!(validate_model_id("composer-2.5-fast").is_err());
         assert!(validate_model_id("grok-4.7-medium").is_err());

@@ -17,10 +17,10 @@ DmuxAI plans multi-step work using the agent-graph-engineering shape by default.
 
 | ID | Priority | Requirement |
 | --- | --- | --- |
-| FR-1880 | Must | Same as FR-GRAPH-1 (Orchestrator model is `composer-2.5` on graph plans) |
+| FR-1880 | Retired (superseded by plan gate, #67) | Same as FR-GRAPH-1 (Orchestrator model is `composer-2.5` on graph plans) |
 | FR-1881 | Must | Same as FR-GRAPH-2 (All role buckets use `composer-2.5` only) |
 | FR-1882 | Must | Same as FR-GRAPH-3 (Reject any model id containing `fast` or not equal to composer-2.5) |
-| FR-1883 | Must | Same as FR-GRAPH-4 (≤2-step estimates use single-agent path) |
+| FR-1883 | Retired (superseded by plan gate, #67) | Same as FR-GRAPH-4 (≤2-step estimates use single-agent path) |
 | UX-1884 | Must | Same as UX-GRAPH-1 (UI shows assignment summary; user can override via `/graph`) |
 | FR-1885 | Must | Same as FR-GRAPH-5 (Gates pause on merge/DB/auth-class steps until `/graph continue`) |
 | NFR-1886 | Must | Same as NFR-GRAPH-1 (Cap parallel nodes (default 2) and retries (default 2)) |
@@ -46,18 +46,20 @@ DmuxAI plans multi-step work using the agent-graph-engineering shape by default.
 
 | Test ID | Requirement IDs | Type | Test |
 | --- | --- | --- | --- |
-| TC-1880 | FR-1880 | unit | planned — no automated test yet |
-| TC-1881 | FR-1881 | unit | `tests/graph_orchestration.rs` `validate_rejects_fast_and_non_composer_models` |
-| TC-1882 | FR-1882 | unit | `src/model_policy.rs` `validate_model_id` |
-| TC-1883 | FR-1883 | unit | planned — no automated test yet |
+| TC-1881 | FR-1881 | unit | `tests/graph_orchestration.rs` `tc_1881_validate_rejects_fast_and_non_composer_models` |
+| TC-1882 | FR-1882 | unit | `src/model_policy.rs` `tc_1882_validate_rejects_fast_and_foreign_models` |
 | TC-1884 | UX-1884 | manual | manual / integration |
-| TC-1885 | FR-1885 | unit | `tests/graph_orchestration.rs` `gate_pauses_until_continue` |
-| TC-1886 | NFR-1886 | unit | executor defaults (planned — no automated test yet) |
-| TC-1887 | FR-1887 | unit | `tests/graph_orchestration.rs` `store_round_trip` |
-| TC-1888 | FR-1888 | unit | `tests/graph_orchestration.rs` `discover_skills_finds_agent_graph_engineering` |
+| TC-1885 | FR-1885 | unit | `tests/graph_orchestration.rs` `tc_1885_gate_pauses_until_continue` |
+| TC-1886 | NFR-1886 | unit | `tests/graph_orchestration.rs` `tc_1886_executor_and_plan_limits_defaults` |
+| TC-1887 | FR-1887 | unit | `tests/graph_orchestration.rs` `tc_1887_store_round_trip` |
+| TC-1888 | FR-1888 | unit | `tests/graph_orchestration.rs` `tc_1888_discover_skills_finds_agent_graph_engineering` |
 | TC-2421 | FR-2421 | unit | `src/graph/executor.rs` `tc_2421_test_node_prompt_has_wait_guard` (test-role node prompt has the guard; implement-role prompt does not) |
 
 ## 6. Non-goals
 
 - Live calls to external orchestrator APIs outside existing CLIs
 - tmux multiplexer panes (logical parallel only)
+
+### Retired test cases
+
+TC-1880 and TC-1883 are retired. Their behavior was the static keyword planner that set the orchestrator model and the single-agent bypass for estimates of 2 steps or fewer. #67 (`a4d1b9b`) replaced both with agent-planned dynamic graphs and judge triage (see SPEC-plan-gate), and removed their tests `planner_sets_orchestrator_model` and `simple_prompt_uses_single_agent`. No code path remains to test.

@@ -2907,3 +2907,63 @@ fn tc_2331_spoken_agents_query() {
     assert_ne!(other.id, conversation_id);
     assert!(engine.spoken_agents().unwrap().is_empty());
 }
+
+// TC-303 / FR-302, FR-300: Turn outputs can complete without writes or fail with failure reason persisted.
+#[test]
+fn tc_303_turn_completion_and_failure_reason_persisted() {
+    let harness = Harness::new();
+    let mut engine = harness.open();
+    let snapshot = engine
+        .select(ConversationSelection::New { title: None })
+        .unwrap();
+
+    // 1. A turn that completes normally (read-only/plan style, no writes needed).
+    let req1 = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Cursor,
+                model_id: None,
+                prompt: "plan the migration".to_owned(),
+                display_text: None,
+            })
+            .unwrap(),
+    );
+    complete_turn(&mut engine, &req1, "cursor-sess-1", "Plan details here");
+
+    // 2. An implement turn that fails due to permission denial / write error.
+    let req2 = ready(
+        engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Cursor,
+                model_id: None,
+                prompt: "implement the changes".to_owned(),
+                display_text: None,
+            })
+            .unwrap(),
+    );
+    let fail_output = TurnOutput {
+        conversation_id: req2.conversation_id.clone(),
+        turn_id: req2.turn_id.clone(),
+        agent: req2.agent,
+        event: TurnEvent::Failed {
+            message: "permission denied: sandbox write blocked".to_owned(),
+            invalidates_binding: true,
+        },
+    };
+    engine.record_turn_outputs(&[fail_output]).unwrap();
+
+    let reopened = engine
+        .select(ConversationSelection::Existing(snapshot.id))
+        .unwrap();
+    assert_eq!(reopened.turns.len(), 2);
+    assert_eq!(reopened.turns[0].status, TurnStatus::Completed);
+    assert_eq!(reopened.turns[1].status, TurnStatus::Failed);
+    assert!(
+        reopened.turns[1]
+            .error_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("permission denied: sandbox write blocked"),
+        "expected failure reason persisted on the turn"
+    );
+}
