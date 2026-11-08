@@ -886,7 +886,7 @@ fn mcp_run_timeout() -> Duration {
         .unwrap_or(MCP_RUN_TIMEOUT)
 }
 
-/// Builds the child argv for an MCP `run` call (FR-2450..FR-2452).
+/// Builds the child argv for an MCP `run` call (FR-2509..FR-2511).
 fn mcp_run_argv(args: &RunArgs) -> Vec<String> {
     let mut argv: Vec<String> = match &args.todo_id {
         Some(id) => vec!["todo".into(), "run".into(), id.clone()],
@@ -1498,10 +1498,10 @@ mod tests {
         }
     }
 
-    // TC-2450 / FR-2450, FR-2451: the MCP backend forwards the parity fields
+    // TC-2509 / FR-2509, FR-2510: the MCP backend forwards the parity fields
     // to the child CLI as the same flags accepted by `run` / `todo run`.
     #[test]
-    fn tc_2450_mcp_run_argv_forwards_parity_flags() {
+    fn tc_2509_mcp_run_argv_forwards_parity_flags() {
         let args = RunArgs {
             prompt: Some("ship it".into()),
             agent: Some("agy".into()),

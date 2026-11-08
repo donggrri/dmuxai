@@ -39,7 +39,7 @@ approval exit code 7 explicit in the tool result.
 
 | ID | Assumption or question | Owner | Needed by |
 | --- | --- | --- | --- |
-| OQ-2450 | `mode` remains removed everywhere; MCP rejects it rather than keeping a compatibility shim. Decided. | DmuxAI | Spec approval |
+| OQ-2509 | `mode` remains removed everywhere; MCP rejects it rather than keeping a compatibility shim. Decided. | DmuxAI | Spec approval |
 
 ## 3. Terms and state model
 
@@ -53,28 +53,28 @@ approval exit code 7 explicit in the tool result.
 
 | ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| FR-2450 | Must | Given an MCP `run` call with `model` | Then the child `dmuxai run` / `dmuxai todo run` receives `--model <value>` and the result is the CLI run JSON | `model` without `agent` is a tool error `model needs agent`; `model` with `graph` is a tool error `model cannot be used with graph`; no child starts | TC-2450 |
-| FR-2451 | Must | Given an MCP `run` call with `approve_plan` and/or `allow_sensitive` | Then the child receives `--approve-plan` and/or `--allow-sensitive` exactly when the booleans are true | Omitted or false fields add no flag | TC-2450 |
-| FR-2452 | Must | Given an MCP `run` call that includes a `mode` key | Then the call is rejected before any child starts with the removed-mode message (`mode was removed; DmuxAI runs a single agent mode (write-capable). Omit mode.`); `tools/list` does not advertise `mode` | This applies to every value, including `ask`, `plan`, `implement` and `agent`; `--mode` and `--read-only` are never passed to the child | TC-2451 |
-| FR-2453 | Must | Given an MCP `run` whose child exits `7` | Then the tool result has `isError: true` and `structuredContent.approval_required: true` while keeping `exit_code: 7`, `error`, `text` and any `plan`; a successful run has no `approval_required` marker | Exit 7 is still the same run JSON documented for `run --json`; clients can branch on either the marker or the exit code | TC-2452 |
+| FR-2509 | Must | Given an MCP `run` call with `model` | Then the child `dmuxai run` / `dmuxai todo run` receives `--model <value>` and the result is the CLI run JSON | `model` without `agent` is a tool error `model needs agent`; `model` with `graph` is a tool error `model cannot be used with graph`; no child starts | TC-2509 |
+| FR-2510 | Must | Given an MCP `run` call with `approve_plan` and/or `allow_sensitive` | Then the child receives `--approve-plan` and/or `--allow-sensitive` exactly when the booleans are true | Omitted or false fields add no flag | TC-2509 |
+| FR-2511 | Must | Given an MCP `run` call that includes a `mode` key | Then the call is rejected before any child starts with the removed-mode message (`mode was removed; DmuxAI runs a single agent mode (write-capable). Omit mode.`); `tools/list` does not advertise `mode` | This applies to every value, including `ask`, `plan`, `implement` and `agent`; `--mode` and `--read-only` are never passed to the child | TC-2510 |
+| FR-2512 | Must | Given an MCP `run` whose child exits `7` | Then the tool result has `isError: true` and `structuredContent.approval_required: true` while keeping `exit_code: 7`, `error`, `text` and any `plan`; a successful run has no `approval_required` marker | Exit 7 is still the same run JSON documented for `run --json`; clients can branch on either the marker or the exit code | TC-2511 |
 
 ## 5. Acceptance scenarios and test design
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-2450 | FR-2450, FR-2451 | unit | Stub MCP backend, no provider | `tools/call` run with prompt + agent + model + both booleans, then a to-do run | Backend receives the exact fields; `mcp_run_argv` emits the matching `--model`, `--approve-plan`, `--allow-sensitive` flags for `run` and `todo run` | `src/mcp_server.rs` `tc_2450_mcp_run_forwards_parity_fields`; `src/cli.rs` `tc_2450_mcp_run_argv_forwards_parity_flags` |
-| TC-2451 | FR-2452 | unit | Stub MCP backend, no provider | Call `run` with `mode` values and with invalid model combinations | Tool error for every `mode`; `model needs agent` and `model cannot be used with graph`; no backend run recorded | `src/mcp_server.rs` `tc_2451_mcp_run_rejects_mode_and_validates_model` |
-| TC-2452 | FR-2453 | unit | Stub returning exit 7, then a success | Call `run` | Exit 7 result has `isError` and `approval_required: true`; success result omits the marker | `src/mcp_server.rs` `tc_2452_mcp_run_surfaces_exit_7_approval_required` |
-| TC-2453 | FR-2452 | unit | `tools/list` | Inspect the `run` input schema | `model`, `approve_plan`, `allow_sensitive` are present; `mode` is absent | `src/mcp_server.rs` `mcp_stdio_protocol_and_tools` |
+| TC-2509 | FR-2509, FR-2510 | unit | Stub MCP backend, no provider | `tools/call` run with prompt + agent + model + both booleans, then a to-do run | Backend receives the exact fields; `mcp_run_argv` emits the matching `--model`, `--approve-plan`, `--allow-sensitive` flags for `run` and `todo run` | `src/mcp_server.rs` `tc_2509_mcp_run_forwards_parity_fields`; `src/cli.rs` `tc_2509_mcp_run_argv_forwards_parity_flags` |
+| TC-2510 | FR-2511 | unit | Stub MCP backend, no provider | Call `run` with `mode` values and with invalid model combinations | Tool error for every `mode`; `model needs agent` and `model cannot be used with graph`; no backend run recorded | `src/mcp_server.rs` `tc_2510_mcp_run_rejects_mode_and_validates_model` |
+| TC-2511 | FR-2512 | unit | Stub returning exit 7, then a success | Call `run` | Exit 7 result has `isError` and `approval_required: true`; success result omits the marker | `src/mcp_server.rs` `tc_2511_mcp_run_surfaces_exit_7_approval_required` |
+| TC-2512 | FR-2511 | unit | `tools/list` | Inspect the `run` input schema | `model`, `approve_plan`, `allow_sensitive` are present; `mode` is absent | `src/mcp_server.rs` `mcp_stdio_protocol_and_tools` |
 
 ## 6. Data, integration, and safety contracts
 
 | Area | Contract / change | Compatibility and rollback | Evidence |
 | --- | --- | --- | --- |
-| Persistence | No schema or storage change. | MCP run results keep the CLI JSON shape. | TC-2452 |
-| Provider protocol | MCP JSON-RPC tool arguments only; no provider protocol change. | Clients that still send `mode` receive a clear tool error instead of a silent policy change. | TC-2451 |
-| Security / permissions | Approval and sensitive flags are explicit opt-ins; omitting them keeps exit 7. | Rollback removes the new fields and restores the previous tool schema. | TC-2450, TC-2452 |
-| Platform | Child process spawning is unchanged. | No platform-specific behavior added. | TC-2450 |
+| Persistence | No schema or storage change. | MCP run results keep the CLI JSON shape. | TC-2511 |
+| Provider protocol | MCP JSON-RPC tool arguments only; no provider protocol change. | Clients that still send `mode` receive a clear tool error instead of a silent policy change. | TC-2510 |
+| Security / permissions | Approval and sensitive flags are explicit opt-ins; omitting them keeps exit 7. | Rollback removes the new fields and restores the previous tool schema. | TC-2509, TC-2511 |
+| Platform | Child process spawning is unchanged. | No platform-specific behavior added. | TC-2509 |
 
 ## 7. Implementation plan
 
@@ -83,10 +83,10 @@ See [PLAN-mcp-run-parity](../plans/PLAN-mcp-run-parity.md) and
 
 | Order | Change | Files / modules | Requirement IDs | Verification |
 | --- | --- | --- | --- | --- |
-| 1 | Add MCP run fields, schema, validation and mode rejection | `src/mcp_server.rs` | FR-2450, FR-2451, FR-2452 | TC-2450, TC-2451, TC-2453 |
-| 2 | Forward the new fields to the child CLI | `src/cli.rs` | FR-2450, FR-2451 | TC-2450 |
-| 3 | Surface exit 7 explicitly | `src/mcp_server.rs` | FR-2453 | TC-2452 |
-| 4 | Update the API/MCP docs | `docs/API.md`, `docs/specs/SPEC-agent-api.md` | FR-2450..FR-2453 | manual review |
+| 1 | Add MCP run fields, schema, validation and mode rejection | `src/mcp_server.rs` | FR-2509, FR-2510, FR-2511 | TC-2509, TC-2510, TC-2512 |
+| 2 | Forward the new fields to the child CLI | `src/cli.rs` | FR-2509, FR-2510 | TC-2509 |
+| 3 | Surface exit 7 explicitly | `src/mcp_server.rs` | FR-2512 | TC-2511 |
+| 4 | Update the API/MCP docs | `docs/API.md`, `docs/specs/SPEC-agent-api.md` | FR-2509..FR-2512 | manual review |
 
 ## 8. Review and test exit criteria
 

@@ -362,7 +362,7 @@ mod tests {
             .find(|t| t["name"] == "run")
             .expect("run tool");
         let run_properties = &run_tool["inputSchema"]["properties"];
-        // TC-2453 / FR-2452: the run tool schema advertises the parity fields
+        // TC-2512 / FR-2511: the run tool schema advertises the parity fields
         // and never the removed `mode` argument.
         for field in ["model", "approve_plan", "allow_sensitive"] {
             assert!(
@@ -442,10 +442,10 @@ mod tests {
         assert!(out.contains("\"id\":1"));
     }
 
-    // TC-2450 / FR-2450, FR-2451: model, approve_plan and allow_sensitive are
+    // TC-2509 / FR-2509, FR-2510: model, approve_plan and allow_sensitive are
     // parsed and forwarded to the backend, for prompt and to-do runs.
     #[test]
-    fn tc_2450_mcp_run_forwards_parity_fields() {
+    fn tc_2509_mcp_run_forwards_parity_fields() {
         let stub = Stub::default();
         let result = call(
             &stub,
@@ -480,10 +480,10 @@ mod tests {
         assert!(runs[1].allow_sensitive);
     }
 
-    // TC-2451 / FR-2452: the deprecated mode is rejected like the CLI's
+    // TC-2510 / FR-2511: the deprecated mode is rejected like the CLI's
     // removed --mode, and the model rules mirror parse_run_options.
     #[test]
-    fn tc_2451_mcp_run_rejects_mode_and_validates_model() {
+    fn tc_2510_mcp_run_rejects_mode_and_validates_model() {
         let stub = Stub::default();
         for mode in ["ask", "plan", "implement", "agent", "anything"] {
             let result = call(
@@ -529,9 +529,9 @@ mod tests {
         );
     }
 
-    // TC-2452 / FR-2453: exit 7 is an approval gate, not an opaque failure.
+    // TC-2511 / FR-2512: exit 7 is an approval gate, not an opaque failure.
     #[test]
-    fn tc_2452_mcp_run_surfaces_exit_7_approval_required() {
+    fn tc_2511_mcp_run_surfaces_exit_7_approval_required() {
         let stub = Stub::default();
         *stub.run_result.lock().unwrap() = Some(json!({
             "ok": false,

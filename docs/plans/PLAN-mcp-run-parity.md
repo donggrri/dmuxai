@@ -16,22 +16,22 @@ argument, and mark approval exit code 7 explicitly.
 
 1. `src/mcp_server.rs`
    - Replace `RunArgs.mode` / `RunArgs.read_only` with `model`,
-     `approve_plan` and `allow_sensitive` (FR-2450, FR-2451).
-   - Add the fields to the `run` input schema and remove `mode` (FR-2452).
+     `approve_plan` and `allow_sensitive` (FR-2509, FR-2510).
+   - Add the fields to the `run` input schema and remove `mode` (FR-2511).
    - Reject any `mode` key before building `RunArgs`, using the CLI's
-     removed-mode wording (FR-2452).
+     removed-mode wording (FR-2511).
    - Validate `model` like `parse_run_options`: graph+agent conflict first,
-     then `model` + `graph`, then `model` without `agent` (FR-2450).
+     then `model` + `graph`, then `model` without `agent` (FR-2509).
    - In `tool_result`, set `approval_required: true` and `isError: true` when a
-     run outcome has exit code 7 (FR-2453).
+     run outcome has exit code 7 (FR-2512).
 2. `src/cli.rs`
    - Extract `mcp_run_argv(&RunArgs)` and forward `--model`,
      `--approve-plan` and `--allow-sensitive` for both `run` and
-     `todo run` (FR-2450, FR-2451).
+     `todo run` (FR-2509, FR-2510).
 3. Tests
    - MCP stub tests for field capture, validation, mode rejection, schema and
-     exit 7 (TC-2450..TC-2453).
-   - CLI argv test for the exact child flags (TC-2450).
+     exit 7 (TC-2509..TC-2512).
+   - CLI argv test for the exact child flags (TC-2509).
 4. Documentation
    - Update `docs/API.md` §3 and the run notes.
    - Update `docs/specs/SPEC-agent-api.md` FR-767 and the internal-flag note.
