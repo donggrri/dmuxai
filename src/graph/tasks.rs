@@ -519,7 +519,7 @@ mod tests {
 
     // TC-995 / FR-966: task status follows node states; task_counts tracks done.
     #[test]
-    fn task_status_follows_nodes() {
+    fn tc_995_task_status_follows_nodes() {
         let tasks = vec![task("task-1"), task("task-2")];
         let empty = plan(Vec::new(), tasks.clone());
         assert_eq!(state_for(&empty, "task-1"), TaskState::Pending);
@@ -676,7 +676,7 @@ mod tests {
 
     // TC-994 / FR-965: rename, delete, merge, move renumber refs; refuse unknown id and delete-all.
     #[test]
-    fn task_edits_rebuild_plan() {
+    fn tc_994_task_edits_rebuild_plan() {
         let ctx = PlanCtx::new(&["cursor"]);
         let plan_ctx = ctx.context("build it");
         let max_steps = 8;
@@ -813,7 +813,7 @@ mod tests {
 
     // TC-998 / FR-967: tasks file path, markdown shape, setting gate, persistence.
     #[test]
-    fn tasks_file_setting_and_persistence() {
+    fn tc_998_tasks_file_setting_and_persistence() {
         use std::fs;
 
         let dir = tempfile::tempdir().unwrap();

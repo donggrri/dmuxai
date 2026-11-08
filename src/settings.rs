@@ -2419,7 +2419,7 @@ text_path = "/part/text"
 
     // TC-932 (FR-931): `[graph] enabled` is deprecated and ignored; other keys apply.
     #[test]
-    fn graph_enabled_key_is_deprecated_and_ignored() {
+    fn tc_932_graph_enabled_key_is_deprecated_and_ignored() {
         let dir =
             std::env::temp_dir().join(format!("dmuxai-graph-settings-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

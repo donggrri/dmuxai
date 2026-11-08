@@ -1184,7 +1184,7 @@ mod tests {
 
     // TC-942 / FR-939, FR-944
     #[test]
-    fn validate_plan_accepts_dag() {
+    fn tc_942_validate_plan_accepts_dag() {
         let json = r#"
             prose before the plan
             {"tasks":[
@@ -1280,7 +1280,7 @@ mod tests {
 
     // TC-943 / FR-939
     #[test]
-    fn validate_plan_rejects_each_rule() {
+    fn tc_943_validate_plan_rejects_each_rule() {
         let runners = &["cursor", "agy"];
         let policy = |model: &str| {
             crate::model_policy::validate_model_for_runner("cursor", model).unwrap_err()
@@ -1539,7 +1539,7 @@ DATA-nonce1>>>>
 
     // TC-988 / FR-953: the plan prompt asks for the agent-planned DAG rules.
     #[test]
-    fn plan_prompt_asks_for_dag() {
+    fn tc_988_plan_prompt_asks_for_dag() {
         assert!(
             PLAN_PROMPT.contains("no fixed role order"),
             "expected the no-fixed-role-order rule in PLAN_PROMPT"
@@ -1595,7 +1595,7 @@ DATA-nonce1>>>>
     // TC-969 / FR-952: parse_plan and validate_plan accept any Unicode job and
     // keep it verbatim.
     #[test]
-    fn korean_plan_jobs_kept() {
+    fn tc_969_korean_plan_jobs_kept() {
         let json = r#"
             {"tasks":[
                 {"id":"task-1","title":"설계 문서 읽기","done_check":"문서 확인","size":"small"},
@@ -1619,7 +1619,7 @@ DATA-nonce1>>>>
     // `step-1` (implement, selected runner, prompt verbatim) plus the note,
     // whatever the cause; a runner with no allowed model fails FR-941.
     #[test]
-    fn fallback_plan_is_one_node() {
+    fn tc_967_fallback_plan_is_one_node() {
         let prompt = "Julia로 CSV 비교 스크립트 작성";
         for (cause, runner, effective) in [
             (
@@ -1688,7 +1688,7 @@ DATA-nonce1>>>>
     // TC-991 / FR-963, FR-975: tasks parse in list order with their fields,
     // Korean titles are kept, and over-long titles are cut on a char boundary.
     #[test]
-    fn plan_tasks_parse_and_validate() {
+    fn tc_991_plan_tasks_parse_and_validate() {
         let long_title: String = "가".repeat(130);
         let json = format!(
             r#"{{
@@ -1747,7 +1747,7 @@ DATA-nonce1>>>>
     // TC-992 / FR-963: every task-schema error is reported and PLAN_PROMPT
     // carries the tasks schema and the split rule.
     #[test]
-    fn plan_tasks_invalid_cases() {
+    fn tc_992_plan_tasks_invalid_cases() {
         // Missing tasks array.
         let errors = validate_errors(
             r#"{"steps":[{"id":"a","role":"implement","job":"one","runner":"cursor"}]}"#,
@@ -1881,7 +1881,7 @@ DATA-nonce1>>>>
     // roots; a cross-task step dependency not backed by a task dependency and
     // a task without steps are errors.
     #[test]
-    fn tasks_build_dag_with_parallel_branches() {
+    fn tc_993_tasks_build_dag_with_parallel_branches() {
         let json = r#"{"tasks":[
                 {"id":"task-1","title":"a","done_check":"d","size":"small"},
                 {"id":"task-2","title":"b","done_check":"d","size":"small"},

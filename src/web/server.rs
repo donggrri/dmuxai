@@ -3034,7 +3034,7 @@ mod tests {
 
     // TC-959 (UX-932): `plan_decision` HTTP mapping with an awaiting-approval double.
     #[tokio::test]
-    async fn plan_decision_command_contract() {
+    async fn tc_959_plan_decision_command_contract() {
         let token = "plan-decision-token".to_string();
         let plan_id = "plan-abc".to_string();
         let revision = 2_u32;

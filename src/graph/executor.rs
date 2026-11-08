@@ -813,7 +813,7 @@ mod tests {
     // TC-965 / FR-949: independent roots start together up to max_parallel,
     // and a join step starts only after all its parents complete.
     #[test]
-    fn schedule_runs_independent_steps_in_parallel() {
+    fn tc_965_schedule_runs_independent_steps_in_parallel() {
         let json = r#"{"tasks":[
             {"id":"task-1","title":"a","done_check":"d","size":"small"},
             {"id":"task-2","title":"b","done_check":"d","size":"small"},
@@ -860,7 +860,7 @@ mod tests {
     // TC-966 / FR-949 / OQ-934: one turn per runner, so a ready step on a busy
     // runner waits instead of failing.
     #[test]
-    fn same_runner_steps_wait_for_runner() {
+    fn tc_966_same_runner_steps_wait_for_runner() {
         let json = r#"{"tasks":[
             {"id":"task-1","title":"a","done_check":"d","size":"small"},
             {"id":"task-2","title":"b","done_check":"d","size":"small"}

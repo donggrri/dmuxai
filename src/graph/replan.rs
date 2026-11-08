@@ -1031,7 +1031,7 @@ mod tests {
 
     // TC-999 / FR-968: only pending tasks may change; task counts on PlanChange.
     #[test]
-    fn replan_revises_only_pending_tasks() {
+    fn tc_999_replan_revises_only_pending_tasks() {
         fn sample_task(id: &str, title: &str) -> PlanTask {
             PlanTask {
                 id: id.to_owned(),
@@ -1221,7 +1221,7 @@ mod tests {
     // TC-974 / FR-957: only pending steps change; immutable nodes are copied
     // byte-identically and every invalid shape names the step and rule.
     #[test]
-    fn replan_changes_only_pending_steps() {
+    fn tc_974_replan_changes_only_pending_steps() {
         let run = four_step_run();
         let ctx = PlanCtx::new(&["cursor", "agy"]);
 
@@ -1477,7 +1477,7 @@ mod tests {
 
     // TC-975 / FR-958: caps, budget, and the prompt cuts.
     #[test]
-    fn replan_caps_enforced() {
+    fn tc_975_replan_caps_enforced() {
         let mut run = four_step_run();
         run.plan.limits.max_replans = 2;
         run.plan.limits.max_nodes = 5;
@@ -1848,7 +1848,7 @@ mod tests {
 
     // TC-978 / FR-961, NFR-930.
     #[test]
-    fn replan_prompt_snapshot() {
+    fn tc_978_replan_prompt_snapshot() {
         assert!(REPLAN_PROMPT.chars().count() <= 1_500);
         assert_eq!(
             REPLAN_PROMPT,

@@ -206,7 +206,7 @@ mod tests {
     // simple when at most one executable role is inferred (FR-937); it never
     // builds a plan (FR-948).
     #[test]
-    fn heuristic_route_handles_korean_and_english() {
+    fn tc_936_heuristic_route_handles_korean_and_english() {
         assert_eq!(heuristic_route("README 오타 고쳐줘"), Route::Simple);
         assert_eq!(
             heuristic_route("조사하고 설계한 다음 구현하고 테스트해줘"),
