@@ -39,7 +39,7 @@ fn dmuxai_graph_yaml_declares_composer_only_policy() {
 
 // TC-912 / FR-912
 #[test]
-fn dmuxai_graph_yaml_keeps_grok_disallow_and_explains_why() {
+fn tc_912_dmuxai_graph_yaml_keeps_grok_disallow_and_explains_why() {
     let yaml = fs::read_to_string("docs/dmuxai-graph.yaml").expect("graph yaml");
     assert!(yaml.contains("allowed_only: composer-2.5"));
     assert!(yaml.contains("*-fast"));

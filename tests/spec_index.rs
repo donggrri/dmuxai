@@ -853,6 +853,60 @@ fn tc_1801_check_spec_all_flags_stale_and_unknown_allowlist() {
 }
 
 #[test]
+// TC-1802 / FR-1802: single spec check exits 1 on failing spec and 0 on passing spec.
+fn tc_1802_check_spec_single_file_mode() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let specs_dir = std::env::temp_dir().join(format!(
+        "dmuxai-spec-gate-single-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&specs_dir).expect("create temp specs dir");
+
+    let passing_spec = specs_dir.join("SPEC-passing.md");
+    let failing_spec = specs_dir.join("SPEC-failing.md");
+    fs::write(
+        &passing_spec,
+        "Status: Implemented\n\n## 4. Requirements\n\n\
+         | ID | Priority | P | R | F | E |\n|---|---|---|---|---|---|\n\
+         | FR-999 | Must | given | then | none | TC-999 |\n\n\
+         ## 5. Acceptance scenarios and test design\n\n\
+         | TC-999 | FR-999 | unit | s | a | o |\n",
+    )
+    .expect("write passing spec");
+    fs::write(&failing_spec, "# failing spec\n").expect("write failing spec");
+
+    let single_fail = Command::new("python3")
+        .arg("scripts/check-spec.py")
+        .arg(&failing_spec)
+        .current_dir(root)
+        .output()
+        .expect("python3 must be available");
+    assert_eq!(
+        single_fail.status.code(),
+        Some(1),
+        "failing spec single-file should exit 1"
+    );
+
+    let single_pass = Command::new("python3")
+        .arg("scripts/check-spec.py")
+        .arg(&passing_spec)
+        .current_dir(root)
+        .output()
+        .expect("python3 must be available");
+    assert_eq!(
+        single_pass.status.code(),
+        Some(0),
+        "passing spec single-file should exit 0"
+    );
+
+    let _ = fs::remove_dir_all(&specs_dir);
+}
+
+#[test]
 fn tc_1803_tc_links_have_tests_or_allowlist() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let output = Command::new("python3")

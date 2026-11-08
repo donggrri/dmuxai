@@ -614,6 +614,31 @@ mod tests {
         );
     }
 
+    // TC-2512 / FR-2511: the run tool schema advertises the parity fields
+    // and never the removed `mode` argument.
+    #[test]
+    fn tc_2512_mcp_run_schema_advertises_parity_fields_and_omits_mode() {
+        let stub = Stub::default();
+        let list = call(&stub, json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
+        let run_tool = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "run")
+            .expect("run tool");
+        let run_properties = &run_tool["inputSchema"]["properties"];
+        for field in ["model", "approve_plan", "allow_sensitive"] {
+            assert!(
+                run_properties.get(field).is_some(),
+                "run schema is missing {field}"
+            );
+        }
+        assert!(
+            run_properties.get("mode").is_none(),
+            "the deprecated mode argument must not be advertised"
+        );
+    }
+
     // TC-2511 / FR-2512: exit 7 is an approval gate, not an opaque failure.
     #[test]
     fn tc_2511_mcp_run_surfaces_exit_7_approval_required() {

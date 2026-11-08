@@ -294,7 +294,7 @@ mod tests {
 
     // TC-910 / FR-910
     #[test]
-    fn fast_models_are_rejected_for_every_runner() {
+    fn tc_910_fast_models_are_rejected_for_every_runner() {
         let runners = ["cursor", "agy", "opencode", "grok", "codex"];
         let fast_ids = [
             "composer-2.5-fast",
@@ -319,7 +319,7 @@ mod tests {
 
     // TC-911 / FR-911
     #[test]
-    fn grok_models_are_allowed_only_for_the_grok_runner() {
+    fn tc_911_grok_models_are_allowed_only_for_the_grok_runner() {
         for id in ["grok-4.7", "grok-4.6", "Grok-4.7"] {
             assert!(validate_model_for_runner("grok", id).is_ok(), "{id}");
             assert!(validate_model_for_runner("GROK", id).is_ok(), "{id}");

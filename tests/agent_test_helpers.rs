@@ -5,7 +5,7 @@
 use std::fs;
 
 #[test]
-fn agents_md_documents_agent_test_helpers() {
+fn tc_510_agents_md_documents_agent_test_helpers() {
     let agents = fs::read_to_string("AGENTS.md").expect("AGENTS.md readable");
     assert!(
         agents.contains("## Agent test helpers"),
@@ -34,7 +34,7 @@ fn agents_md_documents_agent_test_helpers() {
 }
 
 #[test]
-fn app_tests_module_doc_lists_helpers() {
+fn tc_512_app_tests_module_doc_lists_helpers() {
     let app_rs = fs::read_to_string("src/app.rs").expect("src/app.rs readable");
     let app_rs = app_rs.replace("\r\n", "\n");
     let marker = "#[cfg(test)]\nmod tests {";

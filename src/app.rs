@@ -22207,7 +22207,7 @@ out3
 
     #[test]
     // TC-412 / FR-411: If a disallowed model is somehow set for Cursor, it is replaced with composer-2.5 and a system notice is pushed.
-    fn disallowed_model_in_app_is_replaced_with_composer_2_5_and_notified() {
+    fn tc_412_disallowed_model_in_app_is_replaced_with_composer_2_5_and_notified() {
         let (mut app, sent) = test_app();
         app.selected = adapter_index(Agent::Cursor);
         app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected =
@@ -22236,7 +22236,7 @@ out3
 
     #[test]
     // TC-413 / FR-410, FR-412: Slash-prefixed prompt to Cursor still pins composer-2.5.
-    fn slash_prefixed_prompt_to_cursor_still_pins_composer_2_5() {
+    fn tc_413_slash_prefixed_prompt_to_cursor_still_pins_composer_2_5() {
         let (mut app, sent) = test_app();
         disable_builtin_prompts(&mut app);
         app.selected = adapter_index(Agent::Cursor);
@@ -22257,7 +22257,7 @@ out3
 
     #[test]
     // TC-414 / UX-410: Cursor status bar shows composer-2.5 instead of provider default.
-    fn cursor_status_shows_composer_2_5_instead_of_provider_default() {
+    fn tc_414_cursor_status_shows_composer_2_5_instead_of_provider_default() {
         let (mut app, _sent) = test_app();
         app.terminal_area = Rect::new(0, 0, 100, 30);
         app.selected = adapter_index(Agent::Cursor);
@@ -24066,7 +24066,7 @@ out3
 
     #[test]
     // TC-041: Codex effort options are model-scoped and unavailable to other agents.
-    fn effort_picker_is_codex_only_and_uses_selected_model_options() {
+    fn tc_041_effort_picker_is_codex_only_and_uses_selected_model_options() {
         let (mut app, _) = test_app();
         app.apply_agent_event(
             Agent::Codex,
@@ -24097,7 +24097,7 @@ out3
 
     #[test]
     // TC-047 / UX-040: Tab selects the highlighted Codex model and opens its effort choices.
-    fn model_picker_tab_selects_codex_model_and_opens_its_effort_picker() {
+    fn tc_047_model_picker_tab_selects_codex_model_and_opens_its_effort_picker() {
         let (mut app, _) = test_app();
         app.apply_agent_event(
             Agent::Codex,
@@ -24135,7 +24135,7 @@ out3
 
     #[test]
     // TC-043: only the active turn can render and update its transient tool progress.
-    fn codex_tool_progress_is_scoped_and_bounded_to_its_active_turn() {
+    fn tc_043_codex_tool_progress_is_scoped_and_bounded_to_its_active_turn() {
         let (mut app, sent) = test_app();
         app.input = "inspect".to_owned();
         app.submit_prompt();
@@ -25485,8 +25485,8 @@ out3
     }
 
     #[test]
-    fn graph_status_shows_allowed_runners() {
-        // TC-435, UX-430
+    fn tc_434_graph_status_shows_allowed_runners() {
+        // TC-434, UX-430
         let (mut app, _) = test_app();
         app.settings.graph_allowed_runners = Some(vec!["agy".to_owned(), "opencode".to_owned()]);
         app.input = "/graph status".to_owned();
@@ -25518,8 +25518,8 @@ out3
     }
 
     #[test]
-    fn graph_override_rejects_disallowed_runner() {
-        // TC-432, FR-432
+    fn tc_435_graph_override_rejects_disallowed_runner() {
+        // TC-435, INT-430
         let (mut app, _) = test_app();
         app.settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
 
@@ -25574,8 +25574,8 @@ out3
     }
 
     #[test]
-    fn empty_allowed_runners_falls_back_to_single_agent_with_notice() {
-        // TC-433, INT-430
+    fn tc_432_empty_allowed_runners_falls_back_to_single_agent_with_notice() {
+        // TC-432, FR-432
         let (mut app, sent) = test_app();
         app.settings.graph_allowed_runners = Some(Vec::new());
 
@@ -36474,7 +36474,7 @@ out3
     // TC-1493 (FR-1493): exact matches win; only agy falls back to `-medium`
     // for a bare id; unknown ids and non-agy fallbacks stay unresolved.
     #[test]
-    fn agy_bare_model_resolves_to_medium() {
+    fn tc_1493_agy_bare_model_resolves_to_medium() {
         let agy_models = vec![
             ModelInfo::new("gemini-3.8-flash-medium", "Gemini 3.8 Flash Medium"),
             ModelInfo::new("gemini-3.8-flash-high", "Gemini 3.8 Flash High"),

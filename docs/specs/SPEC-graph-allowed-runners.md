@@ -28,12 +28,12 @@ Out of scope: restricting the runner a user picks by hand for a single-agent tur
 ## 5. Acceptance scenarios and test design
 | TC | Covers | Test |
 |---|---|---|
-| TC-430 | FR-430, FR-431 | `assign_runner_honors_allowed_runners_and_order` |
-| TC-431 | FR-431 | `routing_default_not_allowed_falls_back` |
-| TC-432 | FR-432 | `empty_allowed_runners_planner_falls_back_to_single`, `empty_allowed_runners_falls_back_to_single_agent_with_notice` |
-| TC-433 | FR-433 | `user_config_merged_and_overridden_by_workspace` |
-| TC-434 | UX-430 | `graph_status_shows_allowed_runners` |
-| TC-435 | INT-430 | `graph_override_rejects_disallowed_runner` |
+| TC-430 | FR-430, FR-431 | `tc_430_assign_runner_honors_allowed_runners_and_order` |
+| TC-431 | FR-431 | `tc_431_routing_default_not_allowed_falls_back` |
+| TC-432 | FR-432 | `tc_432_empty_allowed_runners_falls_back_to_single_agent_with_notice` |
+| TC-433 | FR-433 | `tc_433_user_config_merged_and_overridden_by_workspace` |
+| TC-434 | UX-430 | `tc_434_graph_status_shows_allowed_runners` |
+| TC-435 | INT-430 | `tc_435_graph_override_rejects_disallowed_runner` |
 
 ## 6. Data and safety contracts
 Box default: `~/.config/dmuxai/dmuxai.toml` sets `[graph] allowed_runners = ["agy"]`, so graph work never reaches the company-account cursor-agent.

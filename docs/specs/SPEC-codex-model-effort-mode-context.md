@@ -62,7 +62,7 @@ The durable conversation and completed context remain unchanged.
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-047 | UX-040, NFR-042 | UI state | Codex catalog with two models and distinct effort lists. | Highlight the second model and press Tab. | The model is selected, its default effort is active, and its model-scoped effort picker opens. | `cargo test model_picker_tab_selects_codex_model_and_opens_its_effort_picker` |
+| TC-047 | UX-040, NFR-042 | UI state | Codex catalog with two models and distinct effort lists. | Highlight the second model and press Tab. | The model is selected, its default effort is active, and its model-scoped effort picker opens. | `cargo test tc_047_model_picker_tab_selects_codex_model_and_opens_its_effort_picker` |
 | TC-048 | FR-043, NFR-042 | UI/conversation integration | Completed Codex turn with an active provider binding. | Switch to Implement, then submit a follow-up. | Follow-up has no resume id, contains the completed context, and mode is Implement. | `cargo test mode_change_reopens_the_agent_with_shared_context` |
 | TC-049 | BR-042, NFR-042 | UI state | Selected agent has an active turn. | Open `/mode`. | Picker does not open; binding and mode stay unchanged. | `cargo test busy_agent_cannot_open_mode_picker` |
 

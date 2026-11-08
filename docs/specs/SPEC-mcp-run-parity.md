@@ -65,7 +65,7 @@ approval exit code 7 explicit in the tool result.
 | TC-2509 | FR-2509, FR-2510 | unit | Stub MCP backend, no provider | `tools/call` run with prompt + agent + model + both booleans, then a to-do run | Backend receives the exact fields; `mcp_run_argv` emits the matching `--model`, `--approve-plan`, `--allow-sensitive` flags for `run` and `todo run` | `src/mcp_server.rs` `tc_2509_mcp_run_forwards_parity_fields`; `src/cli.rs` `tc_2509_mcp_run_argv_forwards_parity_flags` |
 | TC-2510 | FR-2511 | unit | Stub MCP backend, no provider | Call `run` with `mode` values and with invalid model combinations | Tool error for every `mode`; `model needs agent` and `model cannot be used with graph`; no backend run recorded | `src/mcp_server.rs` `tc_2510_mcp_run_rejects_mode_and_validates_model` |
 | TC-2511 | FR-2512 | unit | Stub returning exit 7, then a success | Call `run` | Exit 7 result has `isError` and `approval_required: true`; success result omits the marker | `src/mcp_server.rs` `tc_2511_mcp_run_surfaces_exit_7_approval_required` |
-| TC-2512 | FR-2511 | unit | `tools/list` | Inspect the `run` input schema | `model`, `approve_plan`, `allow_sensitive` are present; `mode` is absent | `src/mcp_server.rs` `mcp_stdio_protocol_and_tools` |
+| TC-2512 | FR-2511 | unit | `tools/list` | Inspect the `run` input schema | `model`, `approve_plan`, `allow_sensitive` are present; `mode` is absent | `src/mcp_server.rs` `tc_2512_mcp_run_schema_advertises_parity_fields_and_omits_mode` |
 
 ## 6. Data, integration, and safety contracts
 

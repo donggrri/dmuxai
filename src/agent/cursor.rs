@@ -1374,7 +1374,7 @@ pub(crate) mod tests {
     // TC-800 / FR-800: a recorded cursor-agent 2026.10.16 stream (plan mode,
     // tool calls between text segments) yields each text exactly once.
     #[test]
-    fn recorded_cursor_stream_text_appears_once() {
+    fn tc_800_recorded_cursor_stream_text_appears_once() {
         let fixture =
             include_str!("../../tests/fixtures/cursor/stream-partial-tool-segments.jsonl");
         let mut state = CursorStreamState::default();
@@ -1407,7 +1407,7 @@ pub(crate) mod tests {
     // without partials they carry the whole segment; the final aggregate is
     // used only when nothing was streamed.
     #[test]
-    fn cursor_segment_aggregates_add_only_missing_text() {
+    fn tc_801_cursor_segment_aggregates_add_only_missing_text() {
         let partial = |text: &str| json!({"type": "assistant", "timestamp_ms": 1, "message": {"content": [{"type": "text", "text": text}]}});
         let segment = |text: &str| json!({"type": "assistant", "timestamp_ms": 2, "model_call_id": "m", "message": {"content": [{"type": "text", "text": text}]}});
         let deltas = |events: Vec<AgentEvent>| {
@@ -1958,7 +1958,7 @@ pub(crate) mod tests {
 
     #[test]
     // TC-410 / INT-410: cursor argv always contains --model composer-2.5 by default.
-    fn cursor_argv_always_contains_composer_2_5_by_default() {
+    fn tc_410_cursor_argv_always_contains_composer_2_5_by_default() {
         let cwd = Path::new("workspace");
         let request = AgentRequest {
             conversation_id: super::super::ConversationId::new("conversation"),
@@ -1993,7 +1993,7 @@ pub(crate) mod tests {
 
     #[test]
     // TC-411 / FR-411, INT-410: a fast model is rejected and replaced with composer-2.5 in argv.
-    fn cursor_argv_rejects_and_replaces_fast_model() {
+    fn tc_411_cursor_argv_rejects_and_replaces_fast_model() {
         let cwd = Path::new("workspace");
         let request = AgentRequest {
             conversation_id: super::super::ConversationId::new("conversation"),
@@ -2430,7 +2430,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     // TC-805 / FR-805, FR-806: After a turn completes, a warm process exists with the next-turn argv;
     // the next prompt reuses it (one spawn total for turn 2); nothing is written to its stdin before the prompt.
-    async fn prewarm_reused_when_args_match() {
+    async fn tc_805_prewarm_reused_when_args_match() {
         let fixture = FakeCursorFixture::new().await;
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
@@ -2875,7 +2875,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     // TC-806 / FR-806, FR-807: Changing the mode or model before the prompt discards the warm process,
     // and its pid no longer exists afterwards; a fresh one is spawned; /new discards it the same way.
-    async fn prewarm_discarded_on_arg_change() {
+    async fn tc_806_prewarm_discarded_on_arg_change() {
         let fixture = FakeCursorFixture::new().await;
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let config = CursorAdapterConfig {
@@ -3001,7 +3001,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     // TC-807 / FR-807, NFR-805: No warm spawn when disabled, in headless run, or for graph nodes;
     // idle expiry and quit kill it (pid gone).
-    async fn prewarm_disabled_and_expiry() {
+    async fn tc_807_prewarm_disabled_and_expiry() {
         let fixture = FakeCursorFixture::new().await;
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let workspace = tempfile::tempdir().unwrap();
@@ -3129,7 +3129,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[cfg(unix)]
     // TC-808 / FR-806: A warm process that has exited is reaped and the prompt runs in a fresh process.
-    async fn prewarm_exited_process_is_replaced() {
+    async fn tc_808_prewarm_exited_process_is_replaced() {
         const WAIT: Duration = Duration::from_secs(15);
         let fixture = FakeCursorFixture::new().await;
         let (event_tx, mut event_rx) = mpsc::channel(64);

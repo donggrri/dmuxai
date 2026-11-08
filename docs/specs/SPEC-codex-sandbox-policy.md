@@ -50,7 +50,7 @@ and workspace-write Implement permissions.
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-046 | INT-040, NFR-041 | unit | One request per Codex mode. | Build `turn/start` JSON. | The discriminator object is present and legacy string shape is absent; approval/model/effort values are preserved. | `cargo test codex_execution_modes_set_per_turn_sandbox_and_approval_policy` |
+| TC-046 | INT-040, NFR-041 | unit | One request per Codex mode. | Build `turn/start` JSON. | The discriminator object is present and legacy string shape is absent; approval/model/effort values are preserved. | `cargo test tc_046_codex_execution_modes_set_per_turn_sandbox_and_approval_policy` |
 
 ## 6. Data, integration, and safety contracts
 

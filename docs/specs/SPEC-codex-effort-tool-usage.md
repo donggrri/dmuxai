@@ -76,12 +76,12 @@ misowned events are ignored using the existing active-turn ownership gate.
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-040 | FR-040 | unit | A Codex request and selected effort. | Build the turn request. | `effort` is sent and safety mode fields are unchanged. | `cargo test codex_turn_request_includes_selected_effort` |
-| TC-041 | FR-040, BR-040 | UI state | Idle Codex model catalog with supported efforts; then busy/non-Codex states. | Open/select `/effort`. | Picker selects supported value; busy/non-Codex cases preserve settings and show a message. | `cargo test effort_picker` |
-| TC-042 | FR-041 | adapter unit | App Server command, MCP, and file-change item fixtures. | Normalize started/completed notifications. | Concise tool lifecycle events contain type/action/state. | `cargo test normalizes_codex_tool_item_lifecycle` |
-| TC-043 | FR-041, BR-041, NFR-040 | UI integration | Active turn plus malformed, oversized, and mismatched tool fixtures. | Apply outputs. | Only owned bounded summaries render; malformed/mismatched items do not render. | `cargo test codex_tool_progress` |
-| TC-044 | FR-042 | adapter/UI integration | Successful rate-limit and usage response fixtures. | Run `/status`. | Model/effort, usage, remaining percent, and reset text render without a provider turn. | `cargo test codex_status` |
-| TC-045 | FR-042, NFR-040 | adapter/UI unit | Missing/unauthenticated/malformed status fixtures. | Run `/status`. | Unavailable fields are explicit and no fatal agent error occurs. | `cargo test codex_status_reports_unavailable_provider_data` |
+| TC-040 | FR-040 | unit | A Codex request and selected effort. | Build the turn request. | `effort` is sent and safety mode fields are unchanged. | `cargo test tc_040_codex_turn_request_includes_selected_effort` |
+| TC-041 | FR-040, BR-040 | UI state | Idle Codex model catalog with supported efforts; then busy/non-Codex states. | Open/select `/effort`. | Picker selects supported value; busy/non-Codex cases preserve settings and show a message. | `cargo test tc_041_effort_picker_is_codex_only_and_uses_selected_model_options` |
+| TC-042 | FR-041 | adapter unit | App Server command, MCP, and file-change item fixtures. | Normalize started/completed notifications. | Concise tool lifecycle events contain type/action/state. | `cargo test tc_042_normalizes_codex_tool_item_lifecycle` |
+| TC-043 | FR-041, BR-041, NFR-040 | UI integration | Active turn plus malformed, oversized, and mismatched tool fixtures. | Apply outputs. | Only owned bounded summaries render; malformed/mismatched items do not render. | `cargo test tc_043_codex_tool_progress_is_scoped_and_bounded_to_its_active_turn` |
+| TC-044 | FR-042 | adapter/UI integration | Successful rate-limit and usage response fixtures. | Run `/status`. | Model/effort, usage, remaining percent, and reset text render without a provider turn. | `cargo test tc_044_codex_status_formats_usage_and_rate_limit_fixtures` |
+| TC-045 | FR-042, NFR-040 | adapter/UI unit | Missing/unauthenticated/malformed status fixtures. | Run `/status`. | Unavailable fields are explicit and no fatal agent error occurs. | `cargo test tc_045_codex_status_reports_unavailable_provider_data` |
 
 ## 6. Data, integration, and safety contracts
 
