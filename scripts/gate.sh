@@ -20,6 +20,7 @@ keep_going=0
 print_env=0
 print_browser_cmd=0
 print_test_cmd=0
+print_tc_links_cmd=0
 help=0
 
 for arg in "$@"; do
@@ -32,6 +33,7 @@ for arg in "$@"; do
         --print-env) print_env=1 ;;
         --print-browser-cmd) print_browser_cmd=1 ;;
         --print-test-cmd) print_test_cmd=1 ;;
+        --print-tc-links-cmd) print_tc_links_cmd=1 ;;
         -h|--help) help=1 ;;
         *)
             echo "gate.sh: unknown option: $arg" >&2
@@ -59,6 +61,7 @@ Hidden/debug:
   --print-env          Print the env var names passed to steps and exit.
   --print-browser-cmd  Print the browser test cargo command and exit.
   --print-test-cmd     Print the test cargo command and exit.
+  --print-tc-links-cmd Print the tc-links check command and exit.
 USAGE
     exit 0
 fi
@@ -100,6 +103,20 @@ fi
 
 if (( print_test_cmd )); then
     echo "$test_label"
+    exit 0
+fi
+
+# Determine TC-links step command. Passes --base origin/main when that ref exists.
+tc_links_cmd=(python3 scripts/check-tc-links.py)
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then
+    tc_links_cmd+=(--base origin/main)
+    tc_links_label="python3 scripts/check-tc-links.py --base origin/main"
+else
+    tc_links_label="python3 scripts/check-tc-links.py"
+fi
+
+if (( print_tc_links_cmd )); then
+    echo "$tc_links_label"
     exit 0
 fi
 
@@ -267,10 +284,10 @@ if ! run_step "python3 scripts/check-spec.py --all" python3 scripts/check-spec.p
 fi
 
 # Step 5
-if ! run_step "python3 scripts/check-tc-links.py" python3 scripts/check-tc-links.py; then
-    record_failure "python3 scripts/check-tc-links.py"
+if ! run_step "$tc_links_label" "${tc_links_cmd[@]}"; then
+    record_failure "$tc_links_label"
     if (( ! keep_going )); then
-        echo "GATE: FAIL at python3 scripts/check-tc-links.py"
+        echo "GATE: FAIL at $tc_links_label"
         exit 1
     fi
 fi
