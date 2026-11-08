@@ -45,8 +45,9 @@ fn gated_plan() -> GraphPlan {
     plan
 }
 
+// TC-1881 / FR-1881: All role buckets use composer-2.5 only.
 #[test]
-fn validate_rejects_fast_and_non_composer_models() {
+fn tc_1881_validate_rejects_fast_and_non_composer_models() {
     assert!(validate_model_id("grok-4.7-medium-fast").is_err());
     assert!(validate_model_id("grok-4.7-medium").is_err());
     assert!(validate_model_id("claude-haiku-5-5-high").is_err());
@@ -56,8 +57,9 @@ fn validate_rejects_fast_and_non_composer_models() {
     assert!(validate_model_id("composer-2.5").is_ok());
 }
 
+// TC-1887 / FR-1887: Persist and reload graph run JSON.
 #[test]
-fn store_round_trip() {
+fn tc_1887_store_round_trip() {
     let dir = tempdir().unwrap();
     let run = GraphRun {
         plan: gated_plan(),
@@ -72,8 +74,9 @@ fn store_round_trip() {
     assert_eq!(loaded.plan.id, run.plan.id);
 }
 
+// TC-1885 / FR-1885: Gates pause on merge/DB/auth-class steps until /graph continue.
 #[test]
-fn gate_pauses_until_continue() {
+fn tc_1885_gate_pauses_until_continue() {
     let dir = tempdir().unwrap();
     let run = GraphRun {
         plan: gated_plan(),
@@ -105,8 +108,9 @@ fn gate_pauses_until_continue() {
     let _ = dir;
 }
 
+// TC-1888 / FR-1888: Discover .agents/skills/*/SKILL.md for node skill binding.
 #[test]
-fn discover_skills_finds_agent_graph_engineering() {
+fn tc_1888_discover_skills_finds_agent_graph_engineering() {
     let skills = discover_skills(std::path::Path::new("."));
     assert!(
         skills
@@ -114,4 +118,12 @@ fn discover_skills_finds_agent_graph_engineering() {
             .any(|skill| skill.id == "agent-graph-engineering"),
         "expected agent-graph-engineering skill in repo"
     );
+}
+
+// TC-1886 / NFR-1886: Cap parallel nodes (default 2) and retries (default 2).
+#[test]
+fn tc_1886_executor_and_plan_limits_defaults() {
+    let limits = dmuxai::graph::default_limits();
+    assert_eq!(limits.max_parallel, 2, "default max_parallel must be 2");
+    assert_eq!(limits.max_retries, 2, "default max_retries must be 2");
 }

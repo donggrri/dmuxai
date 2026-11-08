@@ -361,17 +361,19 @@ mod tests {
 
     use serde_json::json;
 
+    // TC-300 / FR-300: Stderr with permission denied triggers denial detection.
     #[test]
-    fn permission_denial_is_detected_in_stderr() {
+    fn tc_300_permission_denial_is_detected_in_stderr() {
         assert!(stderr_indicates_permission_denial(
             "error: permission denied: sandbox"
         ));
         assert!(!stderr_indicates_permission_denial("ok"));
     }
 
+    // TC-301 / FR-301: Implement turn with no observable writes fails when require_writes is active.
     #[test]
     #[cfg(unix)]
-    fn implement_without_writes_fails() {
+    fn tc_301_implement_without_writes_fails() {
         let tracker = ImplementTurnTracker::new(TurnPolicy::Agent);
         let status = ExitStatus::from_raw(0);
         let error = tracker
@@ -380,9 +382,10 @@ mod tests {
         assert!(error.message.contains("without any observed file changes"));
     }
 
+    // TC-302 / FR-302: ReadOnly / Ask mode does not require writes.
     #[test]
     #[cfg(unix)]
-    fn read_only_does_not_require_writes() {
+    fn tc_302_read_only_does_not_require_writes() {
         let tracker = ImplementTurnTracker::new(TurnPolicy::ReadOnly);
         let status = ExitStatus::from_raw(0);
         assert!(tracker.finish(&status, "", true, true, false).is_ok());
@@ -411,6 +414,48 @@ mod tests {
             tracker.finish(&killed, "", true, true, false).is_err(),
             "without the forced-kill flag a signal exit should still fail"
         );
+    }
+
+    // TC-1860 / FR-1860: Permission denial diagnostics are detected in stderr patterns.
+    #[test]
+    fn tc_1860_permission_denial_patterns_detected_in_stderr() {
+        for pattern in [
+            "permission denied",
+            "approval required",
+            "read-only filesystem",
+            "operation not permitted",
+        ] {
+            assert!(
+                stderr_indicates_permission_denial(&format!("error: {pattern}")),
+                "expected denial detected for pattern {pattern:?}"
+            );
+        }
+        assert!(!stderr_indicates_permission_denial(
+            "build succeeded without issues"
+        ));
+    }
+
+    // TC-1861 / FR-1861: Missing observable writes ok when require_writes false, fails when true.
+    #[test]
+    #[cfg(unix)]
+    fn tc_1861_implement_turn_tracker_require_writes_scope() {
+        let status = ExitStatus::from_raw(0);
+
+        // Interactive / conversational implement turn: require_writes = false -> succeeds
+        let tracker_interactive = ImplementTurnTracker::new(TurnPolicy::Agent);
+        assert!(
+            tracker_interactive
+                .finish(&status, "", true, false, false)
+                .is_ok(),
+            "when require_writes is false, missing writes should succeed"
+        );
+
+        // Graph implement step requiring edits: require_writes = true -> fails
+        let tracker_graph_step = ImplementTurnTracker::new(TurnPolicy::Agent);
+        let error = tracker_graph_step
+            .finish(&status, "", true, true, false)
+            .expect_err("when require_writes is true, missing writes must fail");
+        assert!(error.message.contains("without any observed file changes"));
     }
 
     #[test]

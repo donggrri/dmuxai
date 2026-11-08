@@ -22,12 +22,6 @@ TC-108 legacy: no test reference yet
 TC-109 legacy: no test reference yet
 TC-110 legacy: no test reference yet
 TC-111 manual
-TC-300 legacy: no test reference yet
-TC-301 legacy: no test reference yet
-TC-302 legacy: no test reference yet
-TC-303 legacy: no test reference yet
-TC-304 legacy: no test reference yet
-TC-305 legacy: no test reference yet
 TC-312 legacy: no test reference yet
 TC-315 legacy: no test reference yet
 TC-320 legacy: no test reference yet
@@ -143,20 +137,10 @@ TC-1856 covered by agy_idle_timeout_kills_silent_child (no TC ref in code yet)
 TC-1857 covered by agy_bare_model_resolves_to_medium (no TC ref in code yet)
 TC-1858 covered by builtin_opencode_preset_registration (no TC ref in code yet)
 TC-1859 planned — no automated test yet
-TC-1860 covered by permission_denial_is_detected_in_stderr (no TC ref in code yet)
-TC-1861 covered by finish_accepts_forced_kill_after_result_in_agent_mode (no TC ref in code yet)
 TC-1864 covered by grok_acp_argv_puts_model_before_stdio (no TC ref in code yet)
 TC-1865 covered by grok_auth_is_models_stdout_only (no TC ref in code yet)
 TC-1866 covered by cursor_argv_always_contains_composer_2_5_by_default (no TC ref in code yet)
-TC-1880 planned — no automated test yet
-TC-1881 covered by validate_rejects_fast_and_non_composer_models (no TC ref in code yet)
-TC-1882 covered by validate_model_id (no TC ref in code yet)
-TC-1883 planned — no automated test yet
 TC-1884 manual
-TC-1885 covered by gate_pauses_until_continue (no TC ref in code yet)
-TC-1886 planned — no automated test yet
-TC-1887 covered by store_round_trip (no TC ref in code yet)
-TC-1888 covered by discover_skills_finds_agent_graph_engineering (no TC ref in code yet)
 TC-1889 covered by legacy_ask_and_plan_are_read_only (no TC ref in code yet)
 TC-1890 covered by image_slash_command_attaches_supported_file (no TC ref in code yet)
 TC-1891 covered by rejects_oversized_images (no TC ref in code yet)
