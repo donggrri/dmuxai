@@ -281,7 +281,7 @@ mod tests {
 
     // TC-2260 (FR-2260)
     #[test]
-    fn sniff_unknown_extension_text_is_text() {
+    fn tc_2260_sniff_unknown_extension_text_is_text() {
         let text_bytes = b"SRC_URI += \"file://x\"\n";
         assert_eq!(
             DocKind::for_path_and_bytes(Path::new("a/openssh_%.bbappend"), text_bytes),

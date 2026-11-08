@@ -3822,7 +3822,7 @@ mod agent_prompt_tests {
 
     // TC-1707 (FR-1700): inline text
     #[test]
-    fn agent_prompt_inline_text() {
+    fn tc_1707_agent_prompt_inline_text() {
         let ws = tempfile::tempdir().unwrap();
         let config = r#"
 [runners.default]
@@ -3911,7 +3911,7 @@ system_prompt_file = "{}"
 
     // TC-1708 (FR-1700): both set warns
     #[test]
-    fn agent_prompt_both_set_warns_and_ignored() {
+    fn tc_1708_agent_prompt_both_set_warns_and_ignored() {
         let ws = tempfile::tempdir().unwrap();
         let config = r#"
 [runners.default]
@@ -4009,7 +4009,7 @@ system_prompt_file = "missing_prompt_file.txt"
 
     // TC-1709 (FR-1703): workspace overrides user
     #[test]
-    fn agent_prompt_workspace_overrides_user() {
+    fn tc_1709_agent_prompt_workspace_overrides_user() {
         let user_dir = tempfile::tempdir().unwrap();
         let user_toml = user_dir.path().join("user.toml");
         std::fs::write(
@@ -4070,7 +4070,7 @@ system_prompt = "Codex prompt"
 
     // TC-1710 (FR-1701): default inject session
     #[test]
-    fn agent_prompt_default_inject_session() {
+    fn tc_1710_agent_prompt_default_inject_session() {
         let ws = tempfile::tempdir().unwrap();
         let config = r#"
 [runners.default]
@@ -4129,7 +4129,7 @@ prompt_inject = "immediately"
 
     // TC-1711 (FR-1702): default roles
     #[test]
-    fn agent_prompt_default_roles() {
+    fn tc_1711_agent_prompt_default_roles() {
         let ws = tempfile::tempdir().unwrap();
         let config = r#"
 [runners.default]

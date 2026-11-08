@@ -313,9 +313,9 @@ fn add_target_blank(html: &str) -> String {
 mod tests {
     use super::*;
 
-    // TC-744: renders_gfm_features (FR-743)
+    // TC-744: tc_744_renders_gfm_features (FR-743)
     #[test]
-    fn renders_gfm_features() {
+    fn tc_744_renders_gfm_features() {
         let source = "\
 # Title
 
@@ -366,7 +366,6 @@ fn main() { let x = 1; }
         }
     }
 
-    // TC-745: sanitizes_script_and_handlers (FR-743)
     #[test]
     fn drops_non_https_images() {
         let html = render_markdown(
@@ -379,8 +378,9 @@ fn main() { let x = 1; }
         assert!(!chat.contains("<img"));
     }
 
+    // TC-745: tc_745_sanitizes_script_and_handlers (FR-743)
     #[test]
-    fn sanitizes_script_and_handlers() {
+    fn tc_745_sanitizes_script_and_handlers() {
         let source = "\
 <script>alert('xss')</script>
 

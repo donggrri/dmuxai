@@ -358,9 +358,9 @@ mod tests {
         assert!(!html.contains("data-theme"));
     }
 
-    // TC-757: static_page_has_docs_panel (SPEC-docs-preview UX-753, INT-754)
+    // TC-757: tc_757_static_page_has_docs_panel (SPEC-docs-preview UX-753, INT-754)
     #[test]
-    fn static_page_has_docs_panel() {
+    fn tc_757_static_page_has_docs_panel() {
         // index only gains the docs stylesheet, the deferred docs module and
         // the docs panel section.
         assert!(INDEX_HTML.contains(r#"<link rel="stylesheet" href="/assets/docs.css">"#));
@@ -406,9 +406,9 @@ mod tests {
         }
     }
 
-    // TC-759: docs_module_exposes_api (SPEC-docs-preview INT-754)
+    // TC-759: tc_759_docs_module_exposes_api (SPEC-docs-preview INT-754)
     #[test]
-    fn docs_module_exposes_api() {
+    fn tc_759_docs_module_exposes_api() {
         assert!(DOCS_JS.contains("window.DmuxDocs = {"));
         for member in [
             "open: open",
@@ -485,9 +485,9 @@ mod tests {
         assert!(DOCS_CSS.contains(".todos-count"));
     }
 
-    // TC-833: docs_tree_sidebar_assets (SPEC-docs-tree FR-832, FR-833, UX-830)
+    // TC-833: tc_833_docs_tree_sidebar_assets (SPEC-docs-tree FR-832, FR-833, UX-830)
     #[test]
-    fn docs_tree_sidebar_assets() {
+    fn tc_833_docs_tree_sidebar_assets() {
         // 1. index.html contains sidebar container, toggle button, role="tree", tabs
         assert!(INDEX_HTML.contains(r#"<aside id="sidebar" class="sidebar""#));
         assert!(INDEX_HTML.contains(r#"aria-controls="sidebar""#));
@@ -2035,7 +2035,6 @@ mod tests {
         );
     }
 
-    // TC-2265 (FR-2262)
     #[test]
     fn tc_2302_api_url_carries_ws() {
         assert!(
@@ -2157,8 +2156,9 @@ mod tests {
         );
     }
 
+    // TC-2265 (FR-2262)
     #[test]
-    fn docs_js_diff_view_uses_text_nodes() {
+    fn tc_2265_docs_js_diff_view_uses_text_nodes() {
         assert!(DOCS_JS.contains("'/api/docs/diff?path=' + encodeURIComponent"));
         assert!(DOCS_JS.contains("dmuxai-doc-diff-toggle"));
         assert!(DOCS_JS.contains("doc-diff"));

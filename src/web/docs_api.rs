@@ -1021,9 +1021,9 @@ mod tests {
         )
     }
 
-    // TC-743: read_file_contract (FR-742, NFR-752)
+    // TC-743: tc_743_read_file_contract (FR-742, NFR-752)
     #[tokio::test]
-    async fn read_file_contract() {
+    async fn tc_743_read_file_contract() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
         std::fs::create_dir_all(dir.path().join("sub")).unwrap();
@@ -1272,9 +1272,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
-    // TC-746: save_with_concurrency_check (FR-744, NFR-752)
+    // TC-746: tc_746_save_with_concurrency_check (FR-744, NFR-752)
     #[tokio::test]
-    async fn save_with_concurrency_check() {
+    async fn tc_746_save_with_concurrency_check() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
         let file_path = dir.path().join("doc.md");
@@ -1365,9 +1365,9 @@ mod tests {
         );
     }
 
-    // TC-747: save_rejections (FR-745)
+    // TC-747: tc_747_save_rejections (FR-745)
     #[tokio::test]
-    async fn save_rejections() {
+    async fn tc_747_save_rejections() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
         let html_file = dir.path().join("page.html");
@@ -1505,9 +1505,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&md_file).unwrap(), "# markdown");
     }
 
-    // TC-748: html_view_ticket_is_sandboxed (FR-746)
+    // TC-748: tc_748_html_view_ticket_is_sandboxed (FR-746)
     #[tokio::test]
-    async fn html_view_ticket_is_sandboxed() {
+    async fn tc_748_html_view_ticket_is_sandboxed() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
         std::fs::write(dir.path().join("page.html"), "<h1>Sandbox Test</h1>").unwrap();
@@ -1576,9 +1576,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    // TC-749: office_falls_back_without_soffice (FR-747)
+    // TC-749: tc_749_office_falls_back_without_soffice (FR-747)
     #[tokio::test]
-    async fn office_falls_back_without_soffice() {
+    async fn tc_749_office_falls_back_without_soffice() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
         let docx_bytes = b"PKmock office document bytes";
@@ -1627,10 +1627,10 @@ mod tests {
         assert_eq!(body.as_ref(), docx_bytes);
     }
 
-    // TC-750: office_converts_with_soffice (FR-747)
+    // TC-750: tc_750_office_converts_with_soffice (FR-747)
     #[ignore]
     #[tokio::test]
-    async fn office_converts_with_soffice() {
+    async fn tc_750_office_converts_with_soffice() {
         let soffice = crate::docs::office::find_soffice();
         assert!(soffice.is_some(), "soffice must be available for this test");
 
@@ -1681,9 +1681,9 @@ mod tests {
         assert!(body.starts_with(b"%PDF-"));
     }
 
-    // TC-752: changes_api_filters_and_bounds (FR-748, NFR-752)
+    // TC-752: tc_752_changes_api_filters_and_bounds (FR-748, NFR-752)
     #[tokio::test]
-    async fn changes_api_filters_and_bounds() {
+    async fn tc_752_changes_api_filters_and_bounds() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
         let changes = crate::docs::changes::ChangeLog::default();
@@ -1762,9 +1762,9 @@ mod tests {
         assert_eq!(val["turns"].as_array().unwrap().len(), 0);
     }
 
-    // TC-756: open_ticket_is_single_use
+    // TC-756: tc_756_open_ticket_is_single_use
     #[tokio::test]
-    async fn open_ticket_is_single_use() {
+    async fn tc_756_open_ticket_is_single_use() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("docs")).unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
@@ -1829,9 +1829,29 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    // TC-756: docs_routes_require_auth (NFR-751)
+    // TC-756 / TC-832: docs_routes_require_auth (NFR-751)
     #[tokio::test]
-    async fn docs_routes_require_auth() {
+    async fn tc_832_docs_tree_requires_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        let token = "valid-token";
+        let service =
+            test_docs_service(ws, false, crate::docs::changes::ChangeLog::default(), None);
+        let router = test_router(Some(service), token);
+
+        // Missing token for /api/docs/tree -> 401 (TC-832)
+        let req_tree = axum::http::Request::builder()
+            .uri("/api/docs/tree")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_tree = router.clone().oneshot(req_tree).await.unwrap();
+        assert_eq!(resp_tree.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // TC-756: tc_756_docs_routes_require_auth (NFR-751)
+    #[tokio::test]
+    async fn tc_756_docs_routes_require_auth() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
         let token = "valid-token";
@@ -1952,7 +1972,7 @@ mod tests {
 
     // TC-2264 (FR-2261, NFR-751)
     #[tokio::test]
-    async fn diff_route_returns_git_diff() {
+    async fn tc_2264_diff_route_returns_git_diff() {
         use std::process::Command;
         let has_git = Command::new("git")
             .arg("--version")
@@ -2042,9 +2062,9 @@ mod tests {
         assert!(diff_str.contains("diff --git a/openssh_%.bbappend b/openssh_%.bbappend"));
     }
 
-    // TC-831: tree_api_confined_and_bounded (SPEC-docs-tree FR-830, FR-831)
+    // TC-831: tc_831_tree_api_confined_and_bounded (SPEC-docs-tree FR-830, FR-831)
     #[tokio::test]
-    async fn tree_api_confined_and_bounded() {
+    async fn tc_831_tree_api_confined_and_bounded() {
         let dir = tempfile::tempdir().unwrap();
         for ignored in crate::docs::IGNORED_DIRS {
             std::fs::create_dir_all(dir.path().join(ignored).join("nested")).unwrap();

@@ -2796,7 +2796,7 @@ env = { FAKE_CFG = "{temp_config}" }
     }
     // TC-1717 (FR-1704): custom placeholders render
     #[tokio::test]
-    async fn agent_prompt_custom_placeholders_render() {
+    async fn tc_1717_agent_prompt_custom_placeholders_render() {
         let toml = r#"
 name = "sp-agent"
 command = ["sh", "-c", "echo sys=[$SYS]; echo file=[$SYSFILE]; echo cfg=[$FAKE_CFG]; if [ -n \"$SYSFILE\" ]; then echo content=[$(cat \"$SYSFILE\")]; fi", "--", "{prompt}"]

@@ -129,9 +129,9 @@ fn canonicalize_path(path: &Path) -> std::io::Result<PathBuf> {
 mod tests {
     use super::*;
 
-    // TC-740: rejects_traversal_and_absolute_paths (FR-740)
+    // TC-740: tc_740_rejects_traversal_and_absolute_paths (FR-740)
     #[test]
-    fn rejects_traversal_and_absolute_paths() {
+    fn tc_740_rejects_traversal_and_absolute_paths() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("docs")).unwrap();
         std::fs::write(dir.path().join("ok.md"), "# ok").unwrap();
@@ -169,10 +169,10 @@ mod tests {
         );
     }
 
-    // TC-741: rejects_symlink_escape (FR-740)
+    // TC-741: tc_741_rejects_symlink_escape (FR-740)
     #[cfg(unix)]
     #[test]
-    fn rejects_symlink_escape() {
+    fn tc_741_rejects_symlink_escape() {
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret.md"), "secret").unwrap();

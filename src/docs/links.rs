@@ -285,9 +285,9 @@ mod tests {
         (dir, ws)
     }
 
-    // TC-753: extracts_workspace_links_only (FR-749)
+    // TC-753: tc_753_extracts_workspace_links_only (FR-749)
     #[test]
-    fn extracts_workspace_links_only() {
+    fn tc_753_extracts_workspace_links_only() {
         let (dir, ws) = workspace();
         let root = file_uri_root(dir.path());
         let text = format!(

@@ -262,9 +262,9 @@ mod tests {
         }
     }
 
-    // TC-751: scan_diff_reports_created_modified_deleted (FR-748)
+    // TC-751: tc_751_scan_diff_reports_created_modified_deleted (FR-748)
     #[test]
-    fn scan_diff_reports_created_modified_deleted() {
+    fn tc_751_scan_diff_reports_created_modified_deleted() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("keep.md"), "keep").unwrap();
         std::fs::write(dir.path().join("gone.md"), "gone").unwrap();

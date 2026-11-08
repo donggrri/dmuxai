@@ -1804,7 +1804,7 @@ mod tests {
 
     // TC-1716 (FR-1704): codex thread/start developerInstructions
     #[test]
-    fn agent_prompt_codex_thread_start_developer_instructions() {
+    fn tc_1716_agent_prompt_codex_thread_start_developer_instructions() {
         let v = thread_open_request(1, std::path::Path::new("workspace"), None, Some("SYS"));
         assert_eq!(
             v.get("method").and_then(serde_json::Value::as_str),

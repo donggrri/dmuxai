@@ -705,7 +705,7 @@ mod tests {
 
     // TC-1714 (FR-1704): delivery per runner
     #[test]
-    fn agent_prompt_delivery_per_runner() {
+    fn tc_1714_agent_prompt_delivery_per_runner() {
         assert_eq!(delivery("opencode", None), Delivery::Native);
         assert_eq!(delivery("OpenCode", None), Delivery::Native);
         assert_eq!(delivery("codex", None), Delivery::Native);
@@ -773,7 +773,7 @@ mod tests {
 
     // TC-1713 (FR-1701): should_inject truth table
     #[test]
-    fn agent_prompt_should_inject_truth_table() {
+    fn tc_1713_agent_prompt_should_inject_truth_table() {
         let hash = "abc1234567890def";
         let other = "fed0987654321cba";
 
@@ -832,7 +832,7 @@ mod tests {
 
     // TC-1712 (FR-1702): resolve none unconfigured
     #[test]
-    fn agent_prompt_resolve_none_for_unconfigured_runner() {
+    fn tc_1712_agent_prompt_resolve_none_for_unconfigured_runner() {
         let settings = Settings::default();
         assert!(resolve(&settings, "cursor", PromptRole::Chat).is_none());
         assert!(resolve(&settings, "codex", PromptRole::Worker).is_none());

@@ -196,7 +196,7 @@ mod tests {
 
     // TC-2261 (FR-2261)
     #[test]
-    fn git_diff_text_unknown_extension() {
+    fn tc_2261_git_diff_text_unknown_extension() {
         if !has_git() {
             return;
         }
@@ -270,7 +270,7 @@ mod tests {
 
     // TC-2262 (FR-2261)
     #[test]
-    fn git_diff_binary_reports_git_line() {
+    fn tc_2262_git_diff_binary_reports_git_line() {
         if !has_git() {
             return;
         }
@@ -338,7 +338,7 @@ mod tests {
 
     // TC-2263 (FR-2261)
     #[test]
-    fn git_diff_untracked_and_deleted() {
+    fn tc_2263_git_diff_untracked_and_deleted() {
         if !has_git() {
             return;
         }
@@ -440,7 +440,7 @@ mod tests {
 
     // TC-2267 (FR-2261, FR-740)
     #[test]
-    fn git_diff_rejects_outside_paths() {
+    fn tc_2267_git_diff_rejects_outside_paths() {
         if !has_git() {
             return;
         }

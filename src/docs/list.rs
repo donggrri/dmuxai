@@ -338,9 +338,9 @@ pub fn list_documents(ws: &Workspace, limit: usize) -> DocList {
 mod tests {
     use super::*;
 
-    // TC-742: list_skips_ignored_dirs_and_truncates (FR-741)
+    // TC-742: tc_742_list_skips_ignored_dirs_and_truncates (FR-741)
     #[test]
-    fn list_skips_ignored_dirs_and_truncates() {
+    fn tc_742_list_skips_ignored_dirs_and_truncates() {
         let dir = tempfile::tempdir().unwrap();
         for ignored in IGNORED_DIRS {
             std::fs::create_dir_all(dir.path().join(ignored).join("nested")).unwrap();
@@ -399,9 +399,9 @@ mod tests {
         assert_eq!(capped.entries[0].path, "docs/a.md");
     }
 
-    // TC-830: tree_children_lists_one_level (SPEC-docs-tree FR-830, FR-831)
+    // TC-830: tc_830_tree_children_lists_one_level (SPEC-docs-tree FR-830, FR-831)
     #[test]
-    fn tree_children_lists_one_level() {
+    fn tc_830_tree_children_lists_one_level() {
         let dir = tempfile::tempdir().unwrap();
         for ignored in IGNORED_DIRS {
             std::fs::create_dir_all(dir.path().join(ignored).join("nested")).unwrap();

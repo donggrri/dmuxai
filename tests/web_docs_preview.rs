@@ -44,10 +44,10 @@ fn find_chrome() -> Option<PathBuf> {
     None
 }
 
-// TC-758: docs_preview_renders_in_headless_chrome (UX-753)
+// TC-758: tc_758_docs_preview_renders_in_headless_chrome (UX-753)
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn docs_preview_renders_in_headless_chrome() {
+fn tc_758_docs_preview_renders_in_headless_chrome() {
     let Some(chrome) = find_chrome() else {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
         return;
@@ -130,10 +130,10 @@ with sync_playwright() as p:
     assert!(dom.contains("hl-"), "code not highlighted:\n{dom}");
 }
 
-// TC-834: docs_tree_renders_in_headless_chrome (FR-832, UX-830)
+// TC-834: tc_834_docs_tree_renders_in_headless_chrome (FR-832, UX-830)
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn docs_tree_renders_in_headless_chrome() {
+fn tc_834_docs_tree_renders_in_headless_chrome() {
     let Some(chrome) = find_chrome() else {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
         return;
@@ -256,7 +256,7 @@ with sync_playwright() as p:
 // TC-2266 (FR-2260, FR-2262)
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn docs_diff_unknown_extension_in_headless_chrome() {
+fn tc_2266_docs_diff_unknown_extension_in_headless_chrome() {
     let git_status = Command::new("git")
         .arg("--version")
         .stdout(Stdio::null())
