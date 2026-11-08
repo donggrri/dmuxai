@@ -25592,9 +25592,9 @@ out3
         assert_eq!(sent.lock().unwrap().len(), 1);
     }
 
-    // TC-761 / FR-761: a completed turn yields ok=true, exit 0, text contains the streamed delta
+    // TC-761 / FR-761 / TC-1810 / FR-1810: a completed turn yields ok=true, exit 0, text contains the streamed delta
     #[tokio::test]
-    async fn tc_761_headless_run_returns_agent_text() {
+    async fn tc_761_1810_headless_run_returns_agent_text() {
         let (mut app, sent, event_tx) = test_app_with_event_sender();
         let conv_before = app.conversation_id.as_str().to_owned();
         app.last_graph_run = Some(GraphRun {
@@ -26153,9 +26153,9 @@ out3
         );
     }
 
-    // TC-762 / NFR-762: rejects unknown and disallowed agent
+    // TC-762 / NFR-762 / TC-1814 / FR-1814: rejects unknown and disallowed agent
     #[tokio::test]
-    async fn tc_762_headless_run_rejects_unknown_and_disallowed_agent() {
+    async fn tc_762_1814_headless_run_rejects_unknown_and_disallowed_agent() {
         let (mut app, _sent) = test_app();
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -26571,9 +26571,9 @@ out3
     }
 
     // TC-1694 / FR-1682: headless outcome carries error_kind.
-    // TC-761 / FR-761: an agent error yields ok=false and exit 1.
+    // TC-761 / FR-761 / TC-1823 / FR-1823: an agent error yields ok=false and exit 1.
     #[tokio::test]
-    async fn tc_1694_headless_run_reports_agent_error() {
+    async fn tc_1694_1823_headless_run_reports_agent_error() {
         let (mut app, sent, event_tx) = test_app_with_event_sender();
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -27379,9 +27379,9 @@ out3
         assert!(outcome.plan.is_none());
     }
 
-    // TC-1767 / FR-1767: direct sensitive prompt exits 7 without flag; runs with approve_plan.
+    // TC-1767 / FR-1767 / TC-1819 / FR-1819: direct sensitive prompt exits 7 without flag; runs with approve_plan.
     #[tokio::test]
-    async fn tc_1767_headless_direct_sensitive_prompt_needs_flag() {
+    async fn tc_1767_1819_headless_direct_sensitive_prompt_needs_flag() {
         let (mut app, sent, event_tx) = test_app_with_event_sender();
         let cancel = Arc::new(AtomicBool::new(false));
 

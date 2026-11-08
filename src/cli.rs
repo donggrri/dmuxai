@@ -1244,9 +1244,9 @@ mod tests {
         list.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    // TC-760 / FR-760: agent-facing subcommands and flags.
+    // TC-760 / FR-760, TC-1816 / FR-1816, TC-1817 / FR-1817, TC-1821 / FR-1821: agent-facing subcommands and flags.
     #[test]
-    fn tc_760_parse_cli_agent_api_subcommands() {
+    fn tc_760_1816_1817_1821_parse_cli_agent_api_subcommands() {
         assert_eq!(
             parse(&args(&[
                 "run", "fix", "the", "bug", "--agent", "agy", "--json"
@@ -1743,6 +1743,19 @@ mod tests {
                 graph: true,
                 ..RunOptions::default()
             }))
+        );
+    }
+
+    // TC-1815 / FR-1815: empty prompt or whitespace-only prompt fails with exit 2 message.
+    #[test]
+    fn tc_1815_empty_prompt_rejected_at_parse_and_stdin() {
+        assert_eq!(
+            parse(&args(&["run", "   "])),
+            Err("run needs a prompt (use - to read it from stdin)".to_owned())
+        );
+        assert_eq!(
+            parse(&args(&["run", ""])),
+            Err("run needs a prompt (use - to read it from stdin)".to_owned())
         );
     }
 

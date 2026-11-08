@@ -1364,8 +1364,9 @@ mod tests {
         assert_eq!(text, "echo:hi --model x");
     }
 
+    // TC-332 / FR-332: provider output arrives, jsonl extracts text and session
     #[tokio::test]
-    async fn jsonl_agent_streams_text_and_keeps_prompt_as_one_arg() {
+    async fn tc_332_jsonl_agent_streams_text_and_keeps_prompt_as_one_arg() {
         let spec = spec(
             "jsonl",
             "output = \"jsonl\"\ntext_path = \"/part/text\"\nsession_id_path = \"/sessionID\"\nerror_path = \"/error/message\"",
@@ -1698,9 +1699,9 @@ env = { FAKE_AGENT_FINISH_REASON = "omit" }
         assert_eq!(text.trim(), "stdin:hi --model x");
     }
 
-    // TC-1689 / FR-1679: runner conditions map to kinds.
+    // TC-333 / FR-333, TC-1689 / FR-1679: runner conditions map to kinds.
     #[tokio::test]
-    async fn tc_1689_failures_are_detected() {
+    async fn tc_333_1689_failures_are_detected() {
         let (empty, _) = run(spec("empty", ""), None).await;
         let empty_err = empty.unwrap_err();
         assert!(empty_err.to_string().contains("empty reply"));
@@ -1729,8 +1730,30 @@ env = { FAKE_AGENT_FINISH_REASON = "omit" }
         assert_eq!(error_err.kind, AgentErrorKind::Provider);
     }
 
+    // TC-1820 / FR-1820: custom agent missing binary fails to spawn and returns process_exit error naming program
     #[tokio::test]
-    async fn temp_config_is_written_passed_and_removed() {
+    async fn tc_1820_custom_agent_missing_binary_emits_agent_error() {
+        let (err_res, _) = run(
+            &CustomAgentSpec {
+                name: "missing".to_owned(),
+                command: vec!["nonexistent-binary-xyz-12345".to_owned()],
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        let err = err_res.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to start nonexistent-binary-xyz-12345"),
+            "unexpected error message: {err}"
+        );
+        assert_eq!(err.kind, AgentErrorKind::ProcessExit);
+    }
+
+    // TC-336 / FR-335: resume arg + env + temp config is written, passed, and removed
+    #[tokio::test]
+    async fn tc_336_temp_config_is_written_passed_and_removed() {
         let spec = spec(
             "env",
             "temp_config_template = '{\"edit\":\"{edit}\"}'\nenv = { FAKE_CFG = \"{temp_config}\" }",
@@ -1772,9 +1795,9 @@ env = { FAKE_AGENT_FINISH_REASON = "omit" }
         );
     }
 
-    // TC-1690 / FR-1679: total timeout maps to Timeout.
+    // TC-334 / TC-1690 / FR-333, FR-1679: total timeout maps to Timeout.
     #[tokio::test]
-    async fn tc_1690_timeout_kills_the_process_group() {
+    async fn tc_334_1690_timeout_kills_the_process_group() {
         let spec = spec("sleep", "timeout_secs = 1");
         let started = std::time::Instant::now();
         let (result, _) = run(spec, None).await;

@@ -1732,6 +1732,21 @@ plan = []
 implement = []
 "##;
 
+    // TC-330 / FR-330: valid spec registers, invalid produces validation error
+    #[test]
+    fn tc_330_deserialize_and_validate_constraints() {
+        let spec: CustomAgentSpec = toml::from_str(OPENCODE_TOML).unwrap();
+        assert_eq!(spec.name, "opencode");
+        assert!(spec.validate().is_ok());
+
+        let invalid_spec = CustomAgentSpec {
+            name: "invalid name with spaces".to_string(),
+            command: vec!["tool".to_string()],
+            ..Default::default()
+        };
+        assert!(invalid_spec.validate().is_err());
+    }
+
     #[test]
     fn test_deserialize_full_spec() {
         let spec: CustomAgentSpec = toml::from_str(OPENCODE_TOML).unwrap();
@@ -1760,9 +1775,9 @@ implement = []
         assert!(spec.validate().is_ok());
     }
 
-    // TC-338 (FR-333)
+    // TC-338 (FR-333), TC-1850 (FR-1850)
     #[test]
-    fn tc_338_timeout_message_mentions_config_for_user_agent() {
+    fn tc_338_1850_timeout_message_mentions_config_for_user_agent() {
         let spec = CustomAgentSpec {
             name: "my-agent".to_owned(),
             label: Some("my-label".to_owned()),
@@ -2006,8 +2021,9 @@ text_path = "/part/text"
         );
     }
 
+    // TC-331 / FR-331, TC-1845 / FR-1845: prompt with spaces/quotes expands without shell evaluation
     #[test]
-    fn test_build_argv_prompt_injection_prevented() {
+    fn tc_331_1845_build_argv_prompt_injection_prevented() {
         let spec: CustomAgentSpec = toml::from_str(OPENCODE_TOML).unwrap();
         let injection_prompt = "--model x; rm -rf /";
         let ctx = SubstitutionContext {
@@ -2275,8 +2291,9 @@ implement = ["--mode", "implement"]
         );
     }
 
+    // TC-1847 / FR-1847: build_argv empty image_arg appends @path to prompt
     #[test]
-    fn test_build_argv_empty_image_arg_appends_to_prompt() {
+    fn tc_1847_build_argv_empty_image_arg_appends_to_prompt() {
         let toml_str = r#"
 name = "pi"
 command = ["pi", "{prompt}"]
@@ -2300,8 +2317,9 @@ image_arg = []
         assert_eq!(argv, vec!["pi", "Look at this @a.png @b.png"]);
     }
 
+    // TC-1848 / FR-1848: opencode preset jsonl parses text, session and error
     #[test]
-    fn test_parse_jsonl_opencode_sample() {
+    fn tc_1848_parse_jsonl_opencode_sample() {
         let spec: CustomAgentSpec = toml::from_str(OPENCODE_TOML).unwrap();
 
         let session_line = r#"{"type":"session","sessionID":"ses_abc123"}"#;
@@ -2330,8 +2348,9 @@ image_arg = []
         assert_eq!(parse_jsonl_line(&spec, invalid_line), ParsedLine::default());
     }
 
+    // TC-1849 / FR-1849: failure reason priority and direct command hint on empty stderr
     #[test]
-    fn test_failure_reason() {
+    fn tc_1849_failure_reason() {
         let spec: CustomAgentSpec = toml::from_str(OPENCODE_TOML).unwrap();
 
         // 1. JSONL error takes priority
@@ -2440,8 +2459,9 @@ image_arg = []
         );
     }
 
+    // TC-335 / FR-334: models_command filtered by models_filter, disallowed rejected
     #[test]
-    fn models_are_filtered_and_policy_enforced() {
+    fn tc_335_models_are_filtered_and_policy_enforced() {
         let spec: CustomAgentSpec = toml::from_str(
             "name = \"oc\"\ncommand = [\"oc\"]\nmodels_filter = \"-free$\"\nallowed_models = \"^opencode/.*-free$\"",
         )
@@ -2630,10 +2650,10 @@ command = ["x", "--mcp", "{mcp_config}", "{prompt}"]
         assert!(!argv.iter().any(|arg| arg.contains("{mcp_config}")));
     }
 
-    // TC-877 (FR-875), TC-2451 (FR-2450)
+    // TC-877 (FR-875), TC-1846 (FR-1846), TC-2451 (FR-2450)
     #[cfg(unix)]
     #[tokio::test]
-    async fn tc_877_2451_runner_cwd_is_workspace() {
+    async fn tc_877_1846_2451_runner_cwd_is_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = std::fs::canonicalize(tmp.path()).unwrap();
         let test_cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
