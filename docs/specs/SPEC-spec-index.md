@@ -19,7 +19,7 @@ Every parallel worktree appended a row to the hand-maintained SPEC table in `doc
 | TC-470 | FR-470 | `tc_470_every_spec_has_status_line` |
 | TC-471 | FR-471 | `tc_471_spec_ids_are_unique_across_specs` |
 | TC-472 | FR-472 | `tc_472_spec_index_script_lists_every_spec` |
-| TC-473 | FR-473 | manual review |
+| TC-473 | FR-473 | `tc_473_test_plan_section_0_1_has_no_per_spec_rows` |
 
 ## 6. Exit criteria
 TCs pass in CI. Dogfood #14 is downgraded from friction to resolved.

@@ -1477,9 +1477,9 @@ mod tests {
         );
     }
 
-    // TC-996 (UX-936): task checklist panel below the swimlane.
+    // TC-996 (UX-936) / TC-1310 (UX-1310): task checklist panel and progress lines.
     #[test]
-    fn tc_996_task_checklist_asset() {
+    fn tc_996_1310_task_checklist_asset() {
         assert!(INDEX_HTML.contains("id=\"task-checklist\""));
         assert!(INDEX_HTML.contains("data-parity=\"task-checklist\""));
         assert!(INDEX_HTML.contains("graph-stage-layout"));

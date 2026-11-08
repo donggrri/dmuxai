@@ -59,4 +59,4 @@ node via `checklistStatusFromNode` (same mapping as per-node checklist icons).
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-1310 | UX-1310 | unit (asset) | Bundled `app.js` and `app.css` | Inspect the task-checklist renderer | Selected-row markup uses `task-checklist-prompt` and `task-checklist-progress`, reads `user_prompt` and agent `activity`, and does not use `innerHTML` in the checklist block | `src/web/assets.rs` `task_checklist_asset` |
+| TC-1310 | UX-1310 | unit (asset) | Bundled `app.js` and `app.css` | Inspect the task-checklist renderer | Selected-row markup uses `task-checklist-prompt` and `task-checklist-progress`, reads `user_prompt` and agent `activity`, and does not use `innerHTML` in the checklist block | `src/web/assets.rs` `tc_996_1310_task_checklist_asset` |
