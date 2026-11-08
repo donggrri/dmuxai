@@ -1601,6 +1601,22 @@ mod tests {
         assert!(text.contains("extra.md"));
     }
 
+    // TC-2506 / FR-2501, FR-2503: native delivery and skill run records create .dmuxai/.gitignore
+    #[test]
+    fn tc_2506_native_delivery_creates_state_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = ctx(tmp.path());
+        write_skill(&c.workspace.join(".agents/skills/r"), "r", "B");
+        let s = settings("[stages.review]\nskills=[\"r\"]\ndelivery=\"native\"\n");
+        let p = preflight("review", &s, &[], &c, &Approvals::default());
+        let root = c.native_root("run-1");
+        let (_text, _used) = stage_prompt_prefix(s.delivery("review"), "grok", &p.skills, &root);
+        assert_eq!(
+            fs::read_to_string(c.workspace.join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
+    }
+
     // TC-1504
     #[test]
     fn tc_1504_native_copies_into_run_folder_only() {
@@ -1615,12 +1631,7 @@ mod tests {
         assert!(root.join(".grok/skills/r/SKILL.md").is_file());
         assert!(text.contains(".grok/skills/r/SKILL.md"));
         assert!(!c.workspace.join(".grok").exists());
-        // TC-2506 / FR-2501, FR-2503: native delivery under `.dmuxai` also
-        // creates the self-ignoring state directory.
-        assert_eq!(
-            fs::read_to_string(c.workspace.join(".dmuxai").join(".gitignore")).unwrap(),
-            "*\n"
-        );
+
         let (_, other) = stage_prompt_prefix(Delivery::Native, "custom-x", &p.skills, &root);
         assert_eq!(other, Delivery::Inject);
     }
@@ -1705,8 +1716,6 @@ mod tests {
         let r = SkillRunRecord::load(&c, "r1").unwrap();
         assert_eq!(r.uses.len(), 1);
         assert_eq!(r.interview_rounds, 2);
-        // TC-2506 / FR-2501, FR-2503: skill run records create the
-        // self-ignoring state directory.
         assert_eq!(
             fs::read_to_string(c.workspace.join(".dmuxai").join(".gitignore")).unwrap(),
             "*\n"

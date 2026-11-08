@@ -3290,7 +3290,7 @@ mod builtin_opencode_tests {
     // installed, no config names its own `opencode`, and `builtin_opencode` is
     // not false. `allowed_runners = ["opencode"]` validates with the preset.
     #[test]
-    fn builtin_opencode_preset_registration() {
+    fn tc_810_builtin_opencode_preset_registration() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_opencode(dir.path());
         let ws = dir.path().join("ws");
@@ -3435,7 +3435,7 @@ mod builtin_opencode_tests {
     // TC-814 / FR-814: the starter config is all comments, so it parses to the
     // defaults, with or without the opencode example, and names every section.
     #[test]
-    fn starter_config_parses() {
+    fn tc_814_starter_config_parses() {
         let _guard = test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dmuxai.toml");

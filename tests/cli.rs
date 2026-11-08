@@ -126,7 +126,7 @@ fn non_tty_start_fails_with_clear_message() {
 /// TC-871 / FR-870: `dmuxai -C <a> status --json` from cwd `<b>` reports `<a>`;
 /// `-C /nonexistent` exits 2 with one line on stderr.
 #[test]
-fn workspace_dir_flag_sets_workspace() {
+fn tc_871_workspace_dir_flag_sets_workspace() {
     let dir_a = tempfile::tempdir().expect("tempdir a");
     let dir_b = tempfile::tempdir().expect("tempdir b");
     let state_dir = tempfile::tempdir().expect("state dir");

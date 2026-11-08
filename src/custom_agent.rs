@@ -2459,7 +2459,7 @@ image_arg = []
     // way out; a valid listing keeps only the allowed ids.
     #[cfg(unix)]
     #[tokio::test]
-    async fn preset_without_allowed_models_explains_policy() {
+    async fn tc_812_preset_without_allowed_models_explains_policy() {
         let env = RuntimeEnv::default();
         let cwd = std::env::temp_dir();
         let timeout = Some(Duration::from_millis(300));
@@ -2633,7 +2633,7 @@ command = ["x", "--mcp", "{mcp_config}", "{prompt}"]
     // TC-877 (FR-875), TC-2451 (FR-2450)
     #[cfg(unix)]
     #[tokio::test]
-    async fn runner_cwd_is_workspace() {
+    async fn tc_877_2451_runner_cwd_is_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = std::fs::canonicalize(tmp.path()).unwrap();
         let test_cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();

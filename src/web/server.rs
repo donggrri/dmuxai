@@ -4679,7 +4679,7 @@ mod tests {
 
     // TC-728 (FR-727): memory API routes and auth.
     #[tokio::test]
-    async fn memory_routes_api() {
+    async fn tc_728_memory_routes_api() {
         use crate::memory::{MemoryStore, ProposalInput};
 
         let vault = tempfile::tempdir().unwrap();
@@ -5361,7 +5361,7 @@ mod tests {
     // The env lock must span the whole test (HOME/state dir are process-wide);
     // a current-thread test runtime never contends on it across awaits.
     #[allow(clippy::await_holding_lock)]
-    async fn workspace_api_lists_dirs_and_validates() {
+    async fn tc_873_workspace_api_lists_dirs_and_validates() {
         let _env_guard = crate::state_path::test_env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
@@ -5748,7 +5748,7 @@ mod tests {
     // TC-879 (FR-876): opening another workspace does not need the App lock and
     // reuses a live discovery file. A second call spawns the given executable.
     #[tokio::test]
-    async fn workspace_open_reuses_live_dashboard_and_spawns() {
+    async fn tc_879_workspace_open_reuses_live_dashboard_and_spawns() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().join("proj");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -5902,7 +5902,7 @@ mod tests {
     // The env lock must span the whole test (HOME/state dir are process-wide);
     // a current-thread test runtime never contends on it across awaits.
     #[allow(clippy::await_holding_lock)]
-    async fn workspace_switch_guards() {
+    async fn tc_875_workspace_switch_guards() {
         let _env_guard = crate::state_path::test_env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();

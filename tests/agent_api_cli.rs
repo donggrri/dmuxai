@@ -745,7 +745,7 @@ fn events_cli_since_json() {
 // set while allowed_runners is unset. Without opencode it is not listed.
 #[cfg(unix)]
 #[test]
-fn fresh_install_lists_opencode() {
+fn tc_811_fresh_install_lists_opencode() {
     let sandbox = Sandbox::bare();
     let bin = fake_opencode(&sandbox.root);
     let with_opencode = [("PATH", path_with(&bin))];
@@ -853,7 +853,7 @@ fn fake_grok(root: &Path) -> PathBuf {
 // second run is refused without --force, and --workspace writes the workspace.
 #[cfg(unix)]
 #[test]
-fn init_writes_starter_config() {
+fn tc_813_init_writes_starter_config() {
     let sandbox = Sandbox::bare();
     let bin = fake_opencode(&sandbox.root);
     let env = [("PATH", path_with(&bin))];

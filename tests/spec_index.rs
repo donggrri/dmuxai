@@ -121,7 +121,7 @@ fn print_gate_cmd(root: &Path, args: &[&str]) -> String {
 }
 
 #[test]
-fn every_spec_has_status_line() {
+fn tc_470_every_spec_has_status_line() {
     for path in spec_paths() {
         let contents = fs::read_to_string(&path).expect("SPEC file readable");
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -133,7 +133,7 @@ fn every_spec_has_status_line() {
 }
 
 #[test]
-fn spec_ids_are_unique_across_specs() {
+fn tc_471_spec_ids_are_unique_across_specs() {
     let row_id = Regex::new(r"^\|[[:space:]]*((FR|NFR|UX|INT|TC)-[0-9]+)[[:space:]]*\|")
         .expect("valid ID regex");
     let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -163,7 +163,7 @@ fn spec_ids_are_unique_across_specs() {
 }
 
 #[test]
-fn spec_index_script_lists_every_spec() {
+fn tc_472_spec_index_script_lists_every_spec() {
     let output = Command::new("bash")
         .arg("scripts/spec-index.sh")
         .output()

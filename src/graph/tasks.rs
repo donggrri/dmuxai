@@ -877,8 +877,6 @@ mod tests {
             .unwrap()
             .expect("written");
         assert_eq!(written, path);
-        // TC-2505 / FR-2501, FR-2503: task exports create the self-ignoring
-        // state directory.
         assert_eq!(
             fs::read_to_string(workspace.join(".dmuxai").join(".gitignore")).unwrap(),
             "*\n"

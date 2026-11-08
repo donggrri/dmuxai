@@ -91,6 +91,24 @@ pub fn token_from_env(value: Option<&str>) -> Result<Option<String>, String> {
 mod tests {
     use super::*;
 
+    // TC-2502 / FR-2501, FR-2503: creating the state dir writes .dmuxai/.gitignore
+    #[test]
+    fn tc_2502_discovery_creates_state_gitignore() {
+        let workspace = tempfile::tempdir().unwrap();
+        let discovery = Discovery {
+            base_url: "http://127.0.0.1".to_owned(),
+            port: 7420,
+            pid: std::process::id(),
+            token: "abcd1234".repeat(5),
+        };
+        write_discovery(workspace.path(), &discovery).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
+        assert!(!workspace.path().join(".gitignore").exists());
+    }
+
     #[test]
     fn tc_774_discovery_file_and_token_env() {
         // TC-774 / FR-773: content, permissions, removal, env token rules.
@@ -105,13 +123,6 @@ mod tests {
         let path = write_discovery(workspace.path(), &discovery).unwrap();
         assert_eq!(path, discovery_path(workspace.path()));
         assert_eq!(read_discovery(workspace.path()).as_ref(), Some(&discovery));
-        // TC-2502 / FR-2501, FR-2503: creating the state dir also makes it
-        // self-ignoring without touching the workspace root.
-        assert_eq!(
-            std::fs::read_to_string(workspace.path().join(".dmuxai").join(".gitignore")).unwrap(),
-            "*\n"
-        );
-        assert!(!workspace.path().join(".gitignore").exists());
 
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("\"token\""), "pretty JSON carries the token");

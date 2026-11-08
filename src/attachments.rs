@@ -292,16 +292,15 @@ mod tests {
         assert_eq!(paths[1], PathBuf::from("docs/x.webp"));
     }
 
+    // TC-2503 / FR-2501, FR-2502, FR-2503: attachment creation creates .dmuxai/.gitignore
     #[test]
-    fn copies_supported_image_into_workspace_store() {
+    fn tc_2503_copies_supported_image_into_workspace_store() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("shot.png");
         fs::write(&file, b"\x89PNG").unwrap();
         let mut store = ImageAttachmentStore::new();
         let attachment = store.ingest_path(dir.path(), &file).unwrap();
         assert!(attachment.path.starts_with(attachments_dir(dir.path())));
-        // TC-2503 / FR-2501, FR-2502, FR-2503: attachment creation also
-        // creates the self-ignoring state directory.
         assert_eq!(
             fs::read_to_string(dir.path().join(".dmuxai").join(".gitignore")).unwrap(),
             "*\n"

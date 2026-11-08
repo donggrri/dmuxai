@@ -38,13 +38,13 @@ see FR-1623).
 ## 5. Acceptance scenarios and test design
 | TC | Covers | Test |
 |---|---|---|
-| TC-1620 | FR-1620 | Automated: `concurrent_send_other_conversation_other_agent_starts`. Manual (dashboard): start a long grok turn in A, open B, send to cursor. Expected: B reply arrives while A still streams; `queued: false`. |
-| TC-1621 | FR-1621 | Automated: `switch_conversation_keeps_background_turn`. Manual: during A's grok turn switch to B and back. Expected: A finishes with full output; B transcript has no A text. |
+| TC-1620 | FR-1620 | Automated: `tc_1620_concurrent_send_other_conversation_other_agent_starts`. Manual (dashboard): start a long grok turn in A, open B, send to cursor. Expected: B reply arrives while A still streams; `queued: false`. |
+| TC-1621 | FR-1621 | Automated: `tc_1621_switch_conversation_keeps_background_turn`. Manual: during A's grok turn switch to B and back. Expected: A finishes with full output; B transcript has no A text. |
 | TC-1622 | FR-1622 | Manual: switch to A while it streams. Expected: live text grows; final result shown when done. Light-theme screenshot. |
-| TC-1623 | FR-1623 | Automated: `same_agent_other_conversation_refused`, existing follow-up queue tests. Manual: grok running in A, send grok in B. Expected: 409 with the message above; sending again in A is queued as before. |
-| TC-1624 | FR-1624 | Automated: `sessions_running_flag_per_conversation`. Manual: A and B both running → both entries show the spinner; each clears when its turn ends. Screenshot. |
-| TC-1625 | FR-1625 | Automated: `background_turn_end_clears_run_state`. Manual: after A finishes in the background, a new prompt in B is `queued: false`. |
-| TC-1626 | FR-1620..1625 | Manual matrix in one dashboard process: grok A + cursor (composer-2.5) B, cursor A + agy (gemini-3.8-flash) B, agy A + grok B. Expected: each pair runs concurrently and both results are correct. |
+| TC-1623 | FR-1623 | Automated: `tc_1623_same_agent_other_conversation_refused`, existing follow-up queue tests. Manual: grok running in A, send grok in B. Expected: 409 with the message above; sending again in A is queued as before. |
+| TC-1624 | FR-1624 | Automated: `tc_1624_sessions_running_flag_per_conversation`. Manual: A and B both running → both entries show the spinner; each clears when its turn ends. Screenshot. |
+| TC-1625 | FR-1625 | Automated: `tc_1625_background_turn_end_clears_run_state`. Manual: after A finishes in the background, a new prompt in B is `queued: false`. |
+| TC-1626 | FR-1620..1625 | Automated: `tc_1626_two_conversations_graph_runs_complete_independently`. Manual matrix in one dashboard process: grok A + cursor (composer-2.5) B, cursor A + agy (gemini-3.8-flash) B, agy A + grok B. Expected: each pair runs concurrently and both results are correct. |
 | TC-1666 | FR-1666 | Automated: `tc_1666_background_graph_snapshot_stays_live_when_switching_back`. Manual: grok turn in A, cursor turn in B, reopen A while both run. Expected: chat graph row shows running (spinner), not `Run stopped`. |
 | TC-1667 | FR-1667 | Automated: `tc_1667_background_graph_snapshot_updates_when_turn_ends`. Manual: same setup; stay on A until grok finishes. Expected: card shows completed/stopped correctly without reload. |
 | TC-1668 | FR-1668 | Automated: `tc_1668_background_graph_stays_live_after_other_graph_ends`. Manual: long grok turn in A, short cursor turn in B; wait until B finishes (`graph_session` cleared), reopen A while grok still runs. Expected: running graph card, not `Run stopped`. |

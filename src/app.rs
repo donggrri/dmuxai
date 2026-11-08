@@ -20078,7 +20078,7 @@ mod tests {
     // TC-2340 / FR-2322: restoring task settings is silent, while an explicit
     // model pick still announces the selection.
     #[test]
-    fn tc_2322_restore_is_quiet() {
+    fn tc_2340_restore_is_quiet() {
         let (mut app, _sent) = test_app();
         let restored = app.conversation_id.clone();
 
@@ -24553,7 +24553,7 @@ out3
 
     #[test]
     // TC-050 / FR-050, FR-052: a live peer receives a separate startup conversation.
-    fn multiple_live_instances_start_in_separate_conversations() {
+    fn tc_050_multiple_live_instances_start_in_separate_conversations() {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("state.sqlite3");
         let workspace = std::env::current_dir().unwrap();
@@ -24986,7 +24986,7 @@ out3
 
     #[test]
     // TC-726 (FR-722): a fresh turn gets the <memory> block; the stored prompt does not.
-    fn memory_context_is_prepended_to_fresh_turns_only_in_the_request() {
+    fn tc_726_memory_context_is_prepended_to_fresh_turns_only_in_the_request() {
         let vault = tempfile::tempdir().unwrap();
         let (mut app, sent) = memory_test_app(vault.path());
         app.input = "/remember Use cargo nextest here".to_owned();
@@ -25129,7 +25129,7 @@ out3
 
     #[test]
     // TC-727 (FR-726): /remember targets, /memory list/approve/reject, disabled message.
-    fn memory_slash_commands_save_list_and_decide() {
+    fn tc_727_memory_slash_commands_save_list_and_decide() {
         let vault = tempfile::tempdir().unwrap();
         let (mut app, sent) = memory_test_app(vault.path());
         let last = |app: &App| app.messages.last().unwrap().content.clone();
@@ -29793,7 +29793,7 @@ out3
 
     // TC-816 (FR-983): the welcome line names adapters in picker order.
     #[test]
-    fn welcome_lists_registered_runners() {
+    fn tc_816_welcome_lists_registered_runners() {
         let mut with_custom = DmuxSettings::default();
         with_custom.custom_agents = vec![
             dmuxai::custom_agent::opencode_preset("opencode"),
@@ -34692,7 +34692,7 @@ out3
 
     // TC-1620 / FR-1620: another agent in another conversation starts immediately.
     #[test]
-    fn concurrent_send_other_conversation_other_agent_starts() {
+    fn tc_1620_concurrent_send_other_conversation_other_agent_starts() {
         let mut h = plan_gate_test_app();
         let a = h.app.conversation_id.clone();
         let first = submit_direct_agent(&mut h.app, "codex", "task in A");
@@ -34709,7 +34709,7 @@ out3
 
     // TC-1621 / FR-1621: switching away does not drop a background turn.
     #[test]
-    fn switch_conversation_keeps_background_turn() {
+    fn tc_1621_switch_conversation_keeps_background_turn() {
         let mut h = plan_gate_test_app();
         let a = h.app.conversation_id.clone();
         submit_direct_agent(&mut h.app, "codex", "background work");
@@ -35629,7 +35629,7 @@ out3
 
     // TC-1623 / FR-1623: same agent cannot run in two conversations at once.
     #[test]
-    fn same_agent_other_conversation_refused() {
+    fn tc_1623_same_agent_other_conversation_refused() {
         let mut h = plan_gate_test_app();
         submit_direct_agent(&mut h.app, "codex", "first in A");
         h.app.create_conversation(Some("conversation B".to_owned()));
@@ -35650,7 +35650,7 @@ out3
 
     // TC-1624 / FR-1624: Sessions list marks each running conversation.
     #[test]
-    fn sessions_running_flag_per_conversation() {
+    fn tc_1624_sessions_running_flag_per_conversation() {
         let mut h = plan_gate_test_app();
         let a = h.app.conversation_id.as_str().to_owned();
         submit_direct_agent(&mut h.app, "codex", "run A");
@@ -35780,7 +35780,7 @@ out3
 
     // TC-1625 / FR-1625: a background turn ending clears process-wide queue gating.
     #[test]
-    fn background_turn_end_clears_run_state() {
+    fn tc_1625_background_turn_end_clears_run_state() {
         let mut h = plan_gate_test_app();
         submit_direct_agent(&mut h.app, "codex", "background");
         let (agent, request) = h.sent.lock().unwrap()[0].clone();
@@ -35823,7 +35823,7 @@ out3
 
     // TC-1626: concurrent graph runs in two conversations both complete cleanly.
     #[test]
-    fn two_conversations_graph_runs_complete_independently() {
+    fn tc_1626_two_conversations_graph_runs_complete_independently() {
         let mut h = plan_gate_test_app();
         let a = h.app.conversation_id.clone();
         submit_direct_agent(&mut h.app, "codex", "run A");
