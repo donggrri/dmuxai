@@ -19482,7 +19482,7 @@ mod tests {
     // TC-461 / FR-461: graph_assignment_line resolves per runner, so an AGY
     // node with no F2 pick shows "provider default", never composer-2.5, both
     // in the stored line and in the system message printed at run start.
-    fn graph_assignment_shows_agy_model_not_composer() {
+    fn tc_461_graph_assignment_shows_agy_model_not_composer() {
         let (mut app, _) = test_app();
         app.model_catalogs.get_mut(&Agent::Agy).unwrap().selected = None;
         start_multi_node_graph(
@@ -19523,7 +19523,7 @@ mod tests {
     #[test]
     // TC-462 / FR-462: Cursor nodes stay pinned to composer-2.5 in the
     // assignment line, even with a disallowed F2 pick.
-    fn graph_assignment_cursor_stays_composer() {
+    fn tc_462_graph_assignment_cursor_stays_composer() {
         let (mut app, _) = test_app();
         app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
         start_multi_node_graph(
@@ -20294,7 +20294,7 @@ mod tests {
     // TC-703 / FR-702: running graph nodes carry log_tail (last 20 lines, truncated to 300 chars)
     // and changed_files (workspace-relative, max 50, no paths outside workspace).
     #[test]
-    fn dashboard_nodes_carry_log_tail_and_changed_files() {
+    fn tc_703_dashboard_nodes_carry_log_tail_and_changed_files() {
         let (mut app, _sent) = test_app();
         let hub = dmuxai::web::DashboardHub::new(
             dmuxai::web::SnapshotSource::Tui,
@@ -22027,7 +22027,7 @@ out3
 
     // TC-601 / FR-600: tui_renders_theme_background_and_border
     #[test]
-    fn tui_renders_theme_background_and_border() {
+    fn tc_601_tui_renders_theme_background_and_border() {
         let (mut app, _sent) = test_app();
         let bg = Color::Rgb(0x10, 0x20, 0x30);
         let border = Color::Rgb(0x40, 0x50, 0x60);
@@ -22050,7 +22050,7 @@ out3
 
     // TC-603 / FR-601: tui_uses_per_agent_text_colors
     #[test]
-    fn tui_uses_per_agent_text_colors() {
+    fn tc_603_tui_uses_per_agent_text_colors() {
         let (mut app, _sent) = test_app();
         let codex_color = Color::Rgb(0xaa, 0x11, 0x22);
         let custom_color = Color::Rgb(0x33, 0xbb, 0x44);
@@ -22146,7 +22146,7 @@ out3
 
     // TC-609 / FR-604: dashboard_agents_carry_tui_colors
     #[test]
-    fn dashboard_agents_carry_tui_colors() {
+    fn tc_609_dashboard_agents_carry_tui_colors() {
         let (mut app, _sent) = test_app();
         let hub =
             dmuxai::web::DashboardHub::new(dmuxai::web::SnapshotSource::Tui, "/test".to_string());
@@ -22333,7 +22333,7 @@ out3
 
     #[test]
     // TC-060 / FR-060: accepted requests are visible before provider start.
-    fn queued_activity_is_visible_after_request_acceptance() {
+    fn tc_060_queued_activity_is_visible_after_request_acceptance() {
         let (mut app, _) = test_app();
         app.input = "keep working".to_owned();
 
@@ -22356,7 +22356,7 @@ out3
 
     #[test]
     // TC-061 / FR-061, UX-030: observable events update the displayed phase.
-    fn running_activity_reflects_observable_phase() {
+    fn tc_061_running_activity_reflects_observable_phase() {
         let (mut app, sent) = test_app();
         app.input = "inspect the workspace".to_owned();
         app.submit_prompt();
@@ -22369,19 +22369,22 @@ out3
             event,
         };
         assert!(app.apply_agent_output(output(AgentEvent::Started)));
-        assert_eq!(
-            app.activities.get(&Agent::Codex).unwrap().phase,
-            ActivityPhase::Starting
-        );
+        let act_started = app.activities.get(&Agent::Codex).unwrap();
+        assert_eq!(act_started.state, ActivityState::Running);
+        assert_eq!(act_started.phase, ActivityPhase::Starting);
+        let time_started = act_started.last_event_at;
 
+        std::thread::sleep(std::time::Duration::from_millis(5));
         assert!(app.apply_agent_output(output(AgentEvent::TextDelta(
             "I am checking the files.".to_owned(),
         ))));
-        assert_eq!(
-            app.activities.get(&Agent::Codex).unwrap().phase,
-            ActivityPhase::Responding
-        );
+        let act_delta = app.activities.get(&Agent::Codex).unwrap();
+        assert_eq!(act_delta.state, ActivityState::Running);
+        assert_eq!(act_delta.phase, ActivityPhase::Responding);
+        assert!(act_delta.last_event_at >= time_started);
+        let time_delta = act_delta.last_event_at;
 
+        std::thread::sleep(std::time::Duration::from_millis(5));
         assert!(
             app.apply_agent_output(output(AgentEvent::ToolProgress {
                 item_id: "tool-1".to_owned(),
@@ -22391,7 +22394,9 @@ out3
             }))
         );
         let activity = app.activities.get(&Agent::Codex).unwrap();
+        assert_eq!(activity.state, ActivityState::Running);
         assert_eq!(activity.phase, ActivityPhase::Tool);
+        assert!(activity.last_event_at >= time_delta);
         assert!(
             activity.detail.as_deref().unwrap().chars().count() <= MAX_ACTIVITY_DETAIL_CHARS + 1
         );
@@ -22403,7 +22408,7 @@ out3
 
     #[test]
     // TC-062 / FR-061, UX-030: elapsed and last-event age remain observations.
-    fn activity_status_reports_observed_event_age() {
+    fn tc_062_activity_status_reports_observed_event_age() {
         let (mut app, _) = test_app();
         let now = Instant::now();
         app.activities.insert(
@@ -22426,7 +22431,7 @@ out3
 
     #[test]
     // TC-063 / UX-031, FR-062: active agents are discoverable and terminal cleanup is isolated.
-    fn active_agents_are_visible_and_terminal_activity_is_cleared() {
+    fn tc_063_active_agents_are_visible_and_terminal_activity_is_cleared() {
         let (mut app, sent) = test_app();
         app.input = "codex work".to_owned();
         app.submit_prompt();
@@ -22477,7 +22482,7 @@ out3
 
     #[test]
     // TC-982 / FR-981: dashboard activity matches the TUI status-bar detail.
-    fn dashboard_agent_activity_matches_tui_status() {
+    fn tc_982_dashboard_agent_activity_matches_tui_status() {
         let (mut app, sent) = test_app();
         let hub =
             dmuxai::web::DashboardHub::new(dmuxai::web::SnapshotSource::Tui, "/test".to_owned());
@@ -23568,7 +23573,7 @@ out3
     #[test]
     // TC-820 / FR-820: summary turns end their run state on completion,
     // error and cancel, so the spinner does not run forever.
-    fn summary_turns_end_their_run_state() {
+    fn tc_820_summary_turns_end_their_run_state() {
         for (event, expected) in [
             (AgentEvent::Completed, "done"),
             (AgentEvent::Error(AgentError::provider("boom")), "failed"),
@@ -23877,7 +23882,7 @@ out3
     // TC-984 (FR-982): cancel writes one notice for every runner, and a late
     // adapter Cancelled does not write a second one.
     #[test]
-    fn cancel_appends_one_cancelled_notice_for_every_runner() {
+    fn tc_984_cancel_appends_one_cancelled_notice_for_every_runner() {
         // First install wins process-wide; the other test installs the same grok preset.
         let _ = install_shared_test_registry();
         assert!(dmuxai::custom_agent::index_of("grok").is_some());
@@ -24251,7 +24256,7 @@ out3
 
     #[test]
     // TC-019 / UX-011: exact /quit exits without starting a provider turn.
-    fn exact_quit_command_exits_without_starting_a_turn() {
+    fn tc_019_exact_quit_command_exits_without_starting_a_turn() {
         let (mut app, sent) = test_app();
         app.input = "/quit".to_owned();
 
@@ -24264,7 +24269,7 @@ out3
 
     #[test]
     // TC-020 / UX-011: slash preview selection can execute /quit.
-    fn slash_preview_can_execute_quit_with_tab() {
+    fn tc_020_slash_preview_can_execute_quit_with_tab() {
         let (mut app, sent) = test_app();
 
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
@@ -24320,7 +24325,7 @@ out3
 
     #[test]
     // TC-021 / UX-012: Esc dismisses UI but never exits the application.
-    fn escape_never_exits_the_application() {
+    fn tc_021_escape_never_exits_the_application() {
         let (mut app, _) = test_app();
 
         app.input = "draft".to_owned();
@@ -24348,7 +24353,7 @@ out3
 
     #[test]
     // TC-022 / UX-011: // escape keeps /quit on the ordinary prompt path.
-    fn quit_with_whitespace_is_regular_prompt_text() {
+    fn tc_022_quit_with_whitespace_is_regular_prompt_text() {
         let (mut app, sent) = test_app();
         app.input = "//quit ".to_owned();
 
@@ -24827,7 +24832,7 @@ out3
 
     #[test]
     // TC-360 / FR-360: Tool calls render as single collapsed lines with status symbols.
-    fn tool_call_collapsed_rendering() {
+    fn tc_360_tool_call_collapsed_rendering() {
         let (mut app, _) = test_app();
         app.apply_agent_event(
             Agent::Agy,
@@ -24841,6 +24846,8 @@ out3
         );
         let text = render_test_buffer(&mut app);
         assert!(text.contains("▸ edit src/app.rs (+12 -3)"));
+        assert!(!text.contains(r#"{"name":"#));
+        assert!(!text.contains(r#""target":"#));
 
         // Running tool updates in place to Ok
         app.apply_agent_event(
@@ -24855,6 +24862,7 @@ out3
         );
         let text = render_test_buffer(&mut app);
         assert!(text.contains("▸ edit src/app.rs (+12 -3) ✓ 4.2s"));
+        assert!(!text.contains(r#"{"name":"#));
 
         // Failed tool call
         app.apply_agent_event(
@@ -24869,11 +24877,12 @@ out3
         );
         let text = render_test_buffer(&mut app);
         assert!(text.contains("▸ run cargo test ✗ 1.5s"));
+        assert!(!text.contains(r#"{"name":"#));
     }
 
     #[test]
     // TC-361 / FR-360 / UX-360 / UX-361: Interactive expand/collapse via Ctrl+O and /details.
-    fn tool_call_expand_collapse_and_truncation() {
+    fn tc_361_tool_call_expand_collapse_and_truncation() {
         let (mut app, _) = test_app();
         let content_60 = (1..=60)
             .map(|i| format!("line_{i}"))
@@ -24922,7 +24931,7 @@ out3
 
     #[test]
     // TC-365 / FR-364: show_tools = "hidden" and show_thinking = "hidden" suppress rendering.
-    fn activity_rendering_hidden_config() {
+    fn tc_365_activity_rendering_hidden_config() {
         let (mut app, _) = test_app();
         app.settings.ui.show_tools = dmuxai::activity::ShowTools::Hidden;
         app.settings.ui.show_thinking = dmuxai::activity::ShowThinking::Hidden;
@@ -24949,6 +24958,18 @@ out3
         let text = render_test_buffer(&mut app);
         assert!(!text.contains("src/hidden.rs"));
         assert!(!text.contains("hidden thinking stream"));
+
+        // Defaults to show_tools = "collapsed", show_thinking = "live";
+        // parses "expanded" and "hidden"; invalid falls back to defaults.
+        let default_ui = dmuxai::activity::UiSettings::default();
+        assert_eq!(
+            default_ui.show_tools,
+            dmuxai::activity::ShowTools::Collapsed
+        );
+        assert_eq!(
+            default_ui.show_thinking,
+            dmuxai::activity::ShowThinking::Live
+        );
     }
 
     fn memory_test_app(dir: &std::path::Path) -> (App, SentRequests) {
@@ -25187,7 +25208,7 @@ out3
 
     #[test]
     // TC-364 / FR-362 / FR-363: Activity events never produce TurnEvents or enter shared transcript.
-    fn thinking_never_persisted_to_db_or_shared_context() {
+    fn tc_364_thinking_never_persisted_to_db_or_shared_context() {
         let tool_event = AgentEvent::Activity(dmuxai::activity::ActivityItem::Tool {
             name: "edit".to_owned(),
             target: "src/app.rs".to_owned(),
@@ -25197,33 +25218,70 @@ out3
         });
         assert_eq!(stored_event(&tool_event), None);
 
-        let thinking_event = AgentEvent::Activity(dmuxai::activity::ActivityItem::Thinking {
+        let thinking_item = dmuxai::activity::ActivityItem::Thinking {
             text: "ephemeral internal thought".to_owned(),
             started_ms: 0,
             finished_ms: Some(12000),
-        });
+        };
+        let thinking_event = AgentEvent::Activity(thinking_item.clone());
         assert_eq!(stored_event(&thinking_event), None);
 
-        let (mut app, _) = test_app();
-        app.apply_agent_event(Agent::Agy, thinking_event);
-        app.messages
-            .push(Message::new(Role::User, "user instruction".to_owned()));
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("conversations.sqlite3");
+        let engine = ConversationEngine::open(&db_path, temp_dir.path()).unwrap();
+        let (mut app, sent) = test_app_with_engine(engine);
+        app.input = "instruction".to_owned();
+        app.submit_prompt();
+        let codex = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(codex.conversation_id.clone()),
+            turn_id: Some(codex.turn_id.clone()),
+            event: AgentEvent::Activity(thinking_item),
+        }));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(codex.conversation_id.clone()),
+            turn_id: Some(codex.turn_id.clone()),
+            event: AgentEvent::TextDelta("final response text".to_owned()),
+        }));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(codex.conversation_id),
+            turn_id: Some(codex.turn_id),
+            event: AgentEvent::Completed,
+        }));
 
-        // Verify transcript sharing excludes Activity items
-        let transcript = app
-            .messages
-            .iter()
-            .filter(|m| m.role != Role::System && !matches!(m.role, Role::Activity(_)))
-            .map(|m| m.content.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(!transcript.contains("ephemeral internal thought"));
-        assert!(transcript.contains("user instruction"));
+        // Verify SQLite DB messages table contains only final response text; thinking tokens are completely absent.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mut stmt = conn.prepare("SELECT text FROM messages").unwrap();
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+        let mut found_final = false;
+        for row in rows {
+            let text = row.unwrap();
+            assert!(!text.contains("ephemeral internal thought"));
+            if text == "final response text" {
+                found_final = true;
+            }
+        }
+        assert!(
+            found_final,
+            "messages table must contain final response text"
+        );
+
+        // Verify cross-agent context projection contains only final response text; thinking tokens are absent.
+        app.selected = adapter_index(Agent::Cursor);
+        app.input = "cursor follow-up".to_owned();
+        app.submit_prompt();
+        let cursor_req = sent.lock().unwrap()[1].1.clone();
+        assert!(cursor_req.prompt.contains("[DmuxAI shared context]"));
+        assert!(cursor_req.prompt.contains("final response text"));
+        assert!(!cursor_req.prompt.contains("ephemeral internal thought"));
     }
 
     #[test]
     // TC-420 / FR-420: messages starting with // send a literal / prompt (escape).
-    fn escaped_slash_prompt_is_sent_as_regular_prompt() {
+    fn tc_420_escaped_slash_prompt_is_sent_as_regular_prompt() {
         let (mut app, sent) = test_app();
         app.input = "//agent agy".to_owned();
 
@@ -25251,7 +25309,7 @@ out3
 
     #[test]
     // TC-421 / FR-421: unknown slash not sent (sent list empty).
-    fn unknown_slash_command_is_not_sent_and_keeps_input() {
+    fn tc_421_unknown_slash_command_is_not_sent_and_keeps_input() {
         let (mut app, sent) = test_app();
         app.input = "/x arg".to_owned();
 
@@ -25269,7 +25327,7 @@ out3
 
     #[test]
     // TC-422 / FR-422: "/agent agy" typed char by char then Enter switches agent without sending.
-    fn fast_typed_agent_command_switches_agent_without_sending() {
+    fn tc_422_fast_typed_agent_command_switches_agent_without_sending() {
         let (mut app, sent) = test_app();
         app.selected = adapter_index(Agent::Cursor);
 
@@ -25301,7 +25359,7 @@ out3
 
     #[test]
     // TC-424 / FR-423: drain_agent_events returning completion always triggers immediate draw.
-    fn drain_agent_events_completion_triggers_immediate_draw() {
+    fn tc_424_drain_agent_events_completion_triggers_immediate_draw() {
         let (mut app, _) = test_app();
         app.active_turns.insert(
             Agent::Cursor,
@@ -25339,7 +25397,7 @@ out3
 
     #[test]
     // TC-425 / FR-424: tick marks dirty while busy.
-    fn tick_marks_dirty_while_busy() {
+    fn tc_425_tick_marks_dirty_while_busy() {
         let (mut app, _) = test_app();
         assert!(!app.dirty);
         assert!(!app.tick());
@@ -25352,7 +25410,7 @@ out3
 
     #[test]
     // TC-426 / FR-425: activity event resets last-event age.
-    fn activity_event_resets_last_event_age() {
+    fn tc_426_activity_event_resets_last_event_age() {
         let (mut app, _) = test_app();
         let now = Instant::now();
         let old_time = now - Duration::from_secs(65);
@@ -28011,7 +28069,7 @@ out3
     // TC-780 (FR-780): `--web` snapshots carry the session with every contract key;
     // a TUI without the dashboard command channel publishes none.
     #[test]
-    fn dashboard_session_snapshot_has_contract_keys() {
+    fn tc_780_dashboard_session_snapshot_has_contract_keys() {
         let (mut app, _sent, hub) = web_app();
         app.publish_dashboard();
         let snapshot = serde_json::to_value(hub.snapshot()).unwrap();
@@ -28071,7 +28129,7 @@ out3
     // TC-781 (FR-780, OQ-781): the transcript keeps the newest messages within
     // the count/byte limits and marks cut messages; `serve` has no session.
     #[test]
-    fn dashboard_session_transcript_is_capped() {
+    fn tc_781_dashboard_session_transcript_is_capped() {
         let (mut app, _sent, _hub) = web_app();
         app.messages.clear();
         for index in 0..250 {
@@ -28114,7 +28172,7 @@ out3
     // TC-782 (FR-782): a dashboard prompt shows the user message and a streaming
     // agent reply that settles on completion; the TUI draft is kept.
     #[tokio::test]
-    async fn dashboard_prompt_streams_into_transcript() {
+    async fn tc_782_dashboard_prompt_streams_into_transcript() {
         let (mut app, sent, event_tx) = test_app_with_event_sender();
         let (tx, rx) = mpsc::channel(4);
         app.dashboard_commands = Some(rx);
@@ -28188,7 +28246,7 @@ out3
     // TC-783 (FR-781, UX-780): picker and lifecycle commands do what the TUI
     // command does, with the documented refusals.
     #[test]
-    fn dashboard_commands_match_tui_actions() {
+    fn tc_783_dashboard_commands_match_tui_actions() {
         let (mut app, _sent, _hub) = web_app();
 
         let session = app
@@ -28432,7 +28490,7 @@ out3
 
     // TC-985 (FR-982): dashboard cancel ends the session transcript with one notice.
     #[test]
-    fn dashboard_cancel_shows_cancelled_notice() {
+    fn tc_985_dashboard_cancel_shows_cancelled_notice() {
         let (mut app, sent, hub) = web_app();
         app.input = "cancel from dashboard".to_owned();
         app.submit_prompt();
@@ -28489,9 +28547,30 @@ out3
 
     // TC-784 (FR-781): new and load conversation switch the active conversation.
     #[test]
-    fn dashboard_new_and_load_conversation() {
-        let (mut app, _sent, _hub) = web_app();
+    fn tc_784_dashboard_new_and_load_conversation() {
+        let (mut app, sent, _hub) = web_app();
+        app.input = "first prompt".to_owned();
+        app.submit_prompt();
+        let codex = sent.lock().unwrap()[0].1.clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(codex.conversation_id.clone()),
+            turn_id: Some(codex.turn_id.clone()),
+            event: AgentEvent::TextDelta("first answer".to_owned()),
+        }));
+        assert!(app.apply_agent_output(AgentOutput {
+            agent: Agent::Codex,
+            conversation_id: Some(codex.conversation_id),
+            turn_id: Some(codex.turn_id),
+            event: AgentEvent::Completed,
+        }));
         let first = app.conversation_id.as_str().to_owned();
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("first answer"))
+        );
+
         let session = app
             .handle_session_command(SessionCommand::NewConversation {
                 title: Some("Second".to_owned()),
@@ -28500,10 +28579,22 @@ out3
         assert_ne!(session.conversation_id, first);
         assert_eq!(session.conversation_title, "Second");
         assert!(session.conversations.iter().any(|c| c.id == first));
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("first answer"))
+        );
+
         let session = app
             .handle_session_command(SessionCommand::LoadConversation { id: first.clone() })
             .unwrap();
         assert_eq!(session.conversation_id, first);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("first answer")),
+            "transcript restored after load"
+        );
         assert!(matches!(
             app.handle_session_command(SessionCommand::LoadConversation {
                 id: "does-not-exist".to_owned()
@@ -28515,7 +28606,7 @@ out3
     // TC-785 (FR-783): slash commands sent as prompts behave like typing them,
     // including while the agent is busy.
     #[tokio::test]
-    async fn dashboard_slash_commands_via_prompt() {
+    async fn tc_785_dashboard_slash_commands_via_prompt() {
         let (mut app, sent, _hub) = web_app();
         let (tx, rx) = mpsc::channel(8);
         app.dashboard_commands = Some(rx);
@@ -28575,7 +28666,7 @@ out3
 
     // TC-787 (FR-784): every TUI slash command has a dashboard control.
     #[test]
-    fn tui_commands_have_dashboard_controls() {
+    fn tc_787_tui_commands_have_dashboard_controls() {
         let js = dmuxai::web::assets::SESSION_JS;
         for name in SLASH_COMMANDS
             .iter()
@@ -28861,7 +28952,7 @@ out3
 
     #[test]
     // TC-820 / FR-820, NFR-820: run_state_transitions_follow_turn_events
-    fn run_state_transitions_follow_turn_events() {
+    fn tc_820_run_state_transitions_follow_turn_events() {
         let (mut app, _) = test_app();
         let hub = dmuxai::web::DashboardHub::new(
             dmuxai::web::SnapshotSource::Tui,
@@ -28965,7 +29056,7 @@ out3
 
     #[test]
     // TC-821 / FR-821, FR-822, UX-820: status_bar_spinner_and_end_marks
-    fn status_bar_spinner_and_end_marks() {
+    fn tc_821_status_bar_spinner_and_end_marks() {
         let (mut app, _) = test_app();
         app.color_enabled = false;
         assert!(!app.colors_enabled());
@@ -29048,7 +29139,7 @@ out3
 
     #[test]
     // TC-822 / FR-821, UX-821: spinner_frames_and_reduced_motion
-    fn spinner_frames_and_reduced_motion() {
+    fn tc_822_spinner_frames_and_reduced_motion() {
         // Frame advances with elapsed time
         assert_eq!(spinner_frame(Duration::from_millis(0), false), "⠋");
         assert_eq!(spinner_frame(Duration::from_millis(100), false), "⠙");
@@ -29198,7 +29289,7 @@ out3
 
     #[test]
     // TC-861 / FR-860: session_conversations_report_running_and_agent
-    fn session_conversations_report_running_and_agent() {
+    fn tc_861_session_conversations_report_running_and_agent() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("conversations.sqlite3");
         let engine = ConversationEngine::open(&db_path, dir.path()).unwrap();
@@ -29268,7 +29359,7 @@ out3
 
     #[test]
     // TC-864 / FR-864: conversation_picker_shows_agent_time_running
-    fn conversation_picker_shows_agent_time_running() {
+    fn tc_864_conversation_picker_shows_agent_time_running() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("conversations.sqlite3");
         let engine = ConversationEngine::open(&db_path, dir.path()).unwrap();
@@ -29515,7 +29606,7 @@ out3
 
     #[test]
     // TC-865 / FR-865: conversation_picker_scales_with_terminal_width
-    fn conversation_picker_scales_with_terminal_width() {
+    fn tc_865_conversation_picker_scales_with_terminal_width() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("conversations.sqlite3");
         let engine = ConversationEngine::open(&db_path, dir.path()).unwrap();
@@ -29963,7 +30054,7 @@ out3
 
     #[test]
     // TC-866 / FR-865: conversation_picker_width_borders
-    fn conversation_picker_width_borders() {
+    fn tc_866_conversation_picker_width_borders() {
         for (terminal, natural, expected) in [
             (50, 500, 50),
             (59, 500, 59),
@@ -29989,7 +30080,7 @@ out3
 
     #[test]
     // TC-867 / FR-865: ellipsize_to_width_edge_cases
-    fn ellipsize_to_width_edge_cases() {
+    fn tc_867_ellipsize_to_width_edge_cases() {
         let cases = [
             ("", 0, ""),
             ("", 5, ""),
@@ -30014,7 +30105,7 @@ out3
 
     #[test]
     // TC-868 / FR-865: conversation_picker_overflow_keeps_time_and_running
-    fn conversation_picker_overflow_keeps_time_and_running() {
+    fn tc_868_conversation_picker_overflow_keeps_time_and_running() {
         let agent_label = "opencode-deepseek-v4.1-flash-free-review";
         assert_eq!(
             UnicodeWidthStr::width(agent_label),
@@ -30212,7 +30303,7 @@ out3
 
     #[test]
     // TC-869 / FR-865: conversation_picker_sanitizes_title_newlines
-    fn conversation_picker_sanitizes_title_newlines() {
+    fn tc_869_conversation_picker_sanitizes_title_newlines() {
         assert_eq!(
             sanitize_picker_text("first line\nsecond"),
             "first line second"

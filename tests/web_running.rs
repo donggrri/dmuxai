@@ -282,7 +282,7 @@ impl CdpClient {
 
 #[tokio::test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-async fn running_indicator_renders_in_headless_chrome() {
+async fn tc_824_running_indicator_renders_in_headless_chrome() {
     let chrome_bin = find_chrome_binary().expect(
         "Chrome or Chromium binary was not found on PATH or via CHROME_BIN; \
          install Google Chrome or Chromium to run this ignored e2e test",

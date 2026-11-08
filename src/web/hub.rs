@@ -525,7 +525,7 @@ mod tests {
 
     // TC-606 / FR-603: snapshot_exposes_ui_theme
     #[tokio::test]
-    async fn snapshot_exposes_ui_theme() {
+    async fn tc_606_snapshot_exposes_ui_theme() {
         use crate::web::server::build_router;
         use crate::web::snapshot::{AgentView, UiTheme};
         use http_body_util::BodyExt;

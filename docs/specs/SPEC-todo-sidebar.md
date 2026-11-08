@@ -31,6 +31,6 @@ Decision: move the to-do UI into a toggleable sidebar panel, opened from a heade
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |
-| TC-840 | FR-840, FR-841, FR-842, UX-840 | unit (asset) | index.html, JS and CSS assets | Header `To-dos` button with badge and `aria-controls`; the to-do form/list live inside the sidebar tab panel; state filter and search; Esc handler | `src/web/assets.rs` `todo_sidebar_assets` |
-| TC-841 | FR-840, FR-841 | unit | `web::parity` matrix | To-do actions keep their parity rows (create/run/done/delete/import) after the move | `src/web/parity.rs` `todo_actions_still_covered` |
-| TC-842 | FR-840, FR-841, FR-842 | e2e (ignored, headless Chrome) | demo snapshot with to-dos | Clicking `To-dos` opens the panel with items; the `done` filter and a search term reduce the visible items to the expected ones (FR-841 behaviour); switching to Files changes the tab; screenshot captured | `tests/web_todo_sidebar.rs` `todo_sidebar_renders_in_headless_chrome` |
+| TC-840 | FR-840, FR-841, FR-842, UX-840 | unit (asset) | index.html, JS and CSS assets | Header `To-dos` button with badge and `aria-controls`; the to-do form/list live inside the sidebar tab panel; state filter and search; Esc handler | `src/web/assets.rs` `tc_840_todo_sidebar_assets` |
+| TC-841 | FR-840, FR-841 | unit | `web::parity` matrix | To-do actions keep their parity rows (create/run/done/delete/import) after the move | `src/web/parity.rs` `tc_841_todo_actions_still_covered` |
+| TC-842 | FR-840, FR-841, FR-842 | e2e (ignored, headless Chrome) | demo snapshot with to-dos | Clicking `To-dos` opens the panel with items; the `done` filter and a search term reduce the visible items to the expected ones (FR-841 behaviour); switching to Files changes the tab; screenshot captured | `tests/web_todo_sidebar.rs` `tc_842_todo_sidebar_renders_in_headless_chrome` |

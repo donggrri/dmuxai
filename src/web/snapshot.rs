@@ -1267,7 +1267,7 @@ mod tests {
 
     // TC-702 / FR-701: nodes expose deps and layout, graph exposes layers.
     #[test]
-    fn snapshot_exposes_deps_and_layout() {
+    fn tc_702_snapshot_exposes_deps_and_layout() {
         let make_node = |id: &str, job: &str| GraphNode {
             id: id.to_string(),
             role: NodeRole::Implement,
@@ -1349,7 +1349,7 @@ mod tests {
 
     // TC-860 / FR-860: SessionConversation new fields serialize and legacy JSON without them deserializes.
     #[test]
-    fn session_conversation_fields_roundtrip() {
+    fn tc_860_session_conversation_fields_roundtrip() {
         let conv = SessionConversation {
             id: "conv-123".to_string(),
             title: "Refactor sidebar".to_string(),

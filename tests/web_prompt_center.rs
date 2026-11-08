@@ -51,7 +51,7 @@ fn find_chrome() -> Option<PathBuf> {
 // TC-851: prompt_stays_centered_in_headless_chrome (FR-850..FR-852, UX-850)
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn prompt_stays_centered_in_headless_chrome() {
+fn tc_851_prompt_stays_centered_in_headless_chrome() {
     let Some(chrome) = find_chrome() else {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
         return;

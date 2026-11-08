@@ -200,7 +200,7 @@ mod tests {
     // TC-786 (FR-782, FR-783, UX-780, NFR-780): the session module is wired
     // into the page and carries the prompt, palette and busy-state behavior.
     #[test]
-    fn session_module_has_parity_controls() {
+    fn tc_786_session_module_has_parity_controls() {
         assert!(INDEX_HTML.contains("id=\"session\""));
         assert!(INDEX_HTML.contains("/assets/session.js"));
         assert!(INDEX_HTML.contains("/assets/session.css"));
@@ -278,7 +278,7 @@ mod tests {
 
     // TC-607: static_page_has_theme_controls (SPEC-theme-colors UX-600, FR-603)
     #[tokio::test]
-    async fn static_page_has_theme_controls() {
+    async fn tc_607_static_page_has_theme_controls() {
         let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
         let router = build_router(hub, "testtoken123".to_string(), None);
 
@@ -428,7 +428,7 @@ mod tests {
 
     // TC-840: todo_sidebar_assets (SPEC-todo-sidebar FR-840..FR-842, UX-840)
     #[test]
-    fn todo_sidebar_assets() {
+    fn tc_840_todo_sidebar_assets() {
         // Header button with badge, wired to the shared sidebar.
         assert!(INDEX_HTML.contains(r#"id="todos-toggle""#));
         assert!(INDEX_HTML.contains(r#"id="todos-count""#));
@@ -522,7 +522,7 @@ mod tests {
 
     // TC-608: theme_palettes_meet_wcag_contrast (SPEC-theme-colors NFR-600)
     #[test]
-    fn theme_palettes_meet_wcag_contrast() {
+    fn tc_608_theme_palettes_meet_wcag_contrast() {
         type Rgb = [u8; 3];
 
         fn palette_vars(css: &str, theme: &str) -> Vec<(String, Rgb)> {
@@ -798,7 +798,7 @@ mod tests {
     // toggle, a running pulse with a reduced-motion override, and no external
     // resources.
     #[test]
-    fn graph_view_svg_structure() {
+    fn tc_704_graph_view_svg_structure() {
         // The renderer creates SVG nodes in the SVG namespace.
         assert!(APP_JS.contains("document.createElementNS(SVG_NS"));
         assert!(APP_JS.contains("var SVG_NS = 'http://www.w3.org/2000/svg';"));
@@ -919,7 +919,7 @@ mod tests {
     // swimlane renderer pieces exist, the subway station code is gone, and the
     // detail panel is an overlay drawer.
     #[test]
-    fn graph_swimlane_assets() {
+    fn tc_880_graph_swimlane_assets() {
         for needle in [
             "function buildSwimlaneGeometry",
             "function graphEstimate",
@@ -971,7 +971,7 @@ mod tests {
 
     #[test]
     // TC-823 / FR-823, UX-821, NFR-820: dashboard_has_run_status_indicators
-    fn dashboard_has_run_status_indicators() {
+    fn tc_823_dashboard_has_run_status_indicators() {
         assert!(INDEX_HTML.contains("id=\"run-status\""));
         assert!(INDEX_HTML.contains("role=\"status\""));
         assert!(INDEX_HTML.contains("id=\"favicon\""));
@@ -1023,7 +1023,7 @@ mod tests {
 
     #[test]
     // TC-983 / FR-981: dashboard_shows_agent_activity_detail
-    fn dashboard_shows_agent_activity_detail() {
+    fn tc_983_dashboard_shows_agent_activity_detail() {
         let key_at = APP_JS
             .find("function computeAgentsKey")
             .expect("computeAgentsKey");
@@ -1071,7 +1071,7 @@ mod tests {
 
     // TC-850: prompt_centering_assets (SPEC-centered-prompt FR-850, UX-850)
     #[test]
-    fn prompt_centering_assets() {
+    fn tc_850_prompt_centering_assets() {
         // Dock custom properties default to 0px. Above 900px an open sidebar
         // reserves its width. The default width is still 320px (FR-851); the
         // dock follows --left/right-sidebar-width so a resize stays centered.
@@ -1105,7 +1105,7 @@ mod tests {
 
     // TC-862: session_sidebar_assets (SPEC-session-sidebar FR-861, FR-862, FR-863, UX-860)
     #[test]
-    fn session_sidebar_assets() {
+    fn tc_862_session_sidebar_assets() {
         assert!(INDEX_HTML.contains("id=\"sessions-toggle\""));
         assert!(INDEX_HTML.contains("aria-controls=\"sessions-sidebar\""));
         assert!(INDEX_HTML.contains("id=\"sessions-sidebar\""));
@@ -1194,7 +1194,7 @@ mod tests {
 
     // TC-970: sidebar_resize_assets (FR-970, FR-971, FR-973, FR-974, UX-970, UX-971)
     #[tokio::test]
-    async fn sidebar_resize_assets() {
+    async fn tc_970_sidebar_resize_assets() {
         assert!(INDEX_HTML.contains("id=\"sessions-resize\""));
         assert!(INDEX_HTML.contains("id=\"sidebar-resize\""));
         assert!(INDEX_HTML.contains("class=\"sidebar-resize-handle\""));

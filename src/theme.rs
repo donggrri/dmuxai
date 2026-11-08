@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn theme_parses_surface_colors_with_warnings() {
+    fn tc_600_theme_parses_surface_colors_with_warnings() {
         // TC-600, FR-600
         let parsed: ThemeToml = toml::from_str(
             r##"
@@ -591,7 +591,7 @@ mod color_output_tests {
     }
 
     #[test]
-    fn no_color_disables_new_theme_keys() {
+    fn tc_604_no_color_disables_new_theme_keys() {
         // TC-604, FR-602
         assert!(!colors_enabled(Some("1"), None, false));
         assert!(colors_enabled(Some("1"), Some(true), false));

@@ -66,10 +66,10 @@ change the application exit state.
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-019 | UX-011 | unit | A test app has an idle main prompt and no overlay. | Set input to `/quit` and submit it. | Input is empty, `exit` is true, and no adapter request was sent. | `cargo test exact_quit_command_exits_without_starting_a_turn` |
-| TC-020 | UX-011 | unit | A test app has slash preview active after typing `/q`. | Press Enter or Tab on the highlighted `/quit` command. | The preview closes, input is empty, and `exit` is true without an adapter request. | `cargo test slash_preview_can_execute_quit_with_enter`; `cargo test slash_preview_can_execute_quit_with_tab` |
-| TC-021 | UX-012 | unit | A test app is running; repeat with a slash preview and a conversation picker. | Press `Esc` in each state. | Preview/picker dismisses where applicable, but `exit` remains false; a bare `Esc` preserves the prompt and also leaves `exit` false. | `cargo test escape_never_exits_the_application` |
-| TC-022 | UX-011 | boundary | A test app has an idle selected adapter. | Set input to `/quit ` and submit it. | The exact text is sent as an ordinary provider prompt and `exit` remains false. | `cargo test quit_with_whitespace_is_regular_prompt_text` |
+| TC-019 | UX-011 | unit | A test app has an idle main prompt and no overlay. | Set input to `/quit` and submit it. | Input is empty, `exit` is true, and no adapter request was sent. | `cargo test tc_019_exact_quit_command_exits_without_starting_a_turn` |
+| TC-020 | UX-011 | unit | A test app has slash preview active after typing `/q`. | Press Enter or Tab on the highlighted `/quit` command. | The preview closes, input is empty, and `exit` is true without an adapter request. | `cargo test slash_preview_can_execute_quit_with_enter`; `cargo test tc_020_slash_preview_can_execute_quit_with_tab` |
+| TC-021 | UX-012 | unit | A test app is running; repeat with a slash preview and a conversation picker. | Press `Esc` in each state. | Preview/picker dismisses where applicable, but `exit` remains false; a bare `Esc` preserves the prompt and also leaves `exit` false. | `cargo test tc_021_escape_never_exits_the_application` |
+| TC-022 | UX-011 | boundary | A test app has an idle selected adapter. | Set input to `/quit ` and submit it. | The exact text is sent as an ordinary provider prompt and `exit` remains false. | `cargo test tc_022_quit_with_whitespace_is_regular_prompt_text` |
 
 ## 6. Data, integration, and safety contracts
 

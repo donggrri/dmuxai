@@ -49,7 +49,7 @@ fn find_chrome() -> Option<PathBuf> {
 // TC-842: todo_sidebar_renders_in_headless_chrome (FR-840..FR-842)
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn todo_sidebar_renders_in_headless_chrome() {
+fn tc_842_todo_sidebar_renders_in_headless_chrome() {
     let Some(chrome) = find_chrome() else {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
         return;

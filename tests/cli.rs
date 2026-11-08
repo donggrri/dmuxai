@@ -5,7 +5,7 @@ const EXPECTED_NOTTY_MESSAGE: &str =
 
 /// TC-380 / FR-380: `dmuxai --help` and `-h` print usage and exit 0 without requiring a TTY.
 #[test]
-fn help_flag_prints_usage_without_tty() {
+fn tc_380_help_flag_prints_usage_without_tty() {
     for flag in ["--help", "-h"] {
         let output = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
             .arg(flag)
@@ -49,7 +49,7 @@ fn help_flag_prints_usage_without_tty() {
 
 /// TC-381 / FR-381: `dmuxai --version` and `-V` print version string and exit 0 without a TTY.
 #[test]
-fn version_flag_prints_version_without_tty() {
+fn tc_381_version_flag_prints_version_without_tty() {
     let expected = format!("dmuxai {}\n", env!("CARGO_PKG_VERSION"));
     for flag in ["--version", "-V"] {
         let output = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
@@ -74,7 +74,7 @@ fn version_flag_prints_version_without_tty() {
 
 /// TC-382 / FR-380: unknown flags print an error message, show usage, and exit 2.
 #[test]
-fn unknown_flag_exits_with_code_2() {
+fn tc_382_unknown_flag_exits_with_code_2() {
     let output = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
         .arg("--unknown-flag")
         .stdin(Stdio::null())

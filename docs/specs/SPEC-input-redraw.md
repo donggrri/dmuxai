@@ -51,13 +51,13 @@ status ages keep advancing while agents work.
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-420 | FR-420 | unit | App with an active agent and `//` prompt in input. | Submit the prompt. | The prompt is sent to the agent as a regular prompt. | `src/app.rs`: `escaped_slash_prompt_is_sent_as_regular_prompt` |
-| TC-421 | FR-421 | unit | App with an unknown `/x` command in input. | Submit it. | An unknown-command error is shown and the input is kept; nothing is sent. | `src/app.rs`: `unknown_slash_command_is_not_sent_and_keeps_input` |
-| TC-422 | FR-422 | unit | Fast-typed `/agent agy` without the popup open. | Submit with Enter. | The selected agent switches without sending a prompt. | `src/app.rs`: `fast_typed_agent_command_switches_agent_without_sending` |
+| TC-420 | FR-420 | unit | App with an active agent and `//` prompt in input. | Submit the prompt. | The prompt is sent to the agent as a regular prompt. | `src/app.rs`: `tc_420_escaped_slash_prompt_is_sent_as_regular_prompt` |
+| TC-421 | FR-421 | unit | App with an unknown `/x` command in input. | Submit it. | An unknown-command error is shown and the input is kept; nothing is sent. | `src/app.rs`: `tc_421_unknown_slash_command_is_not_sent_and_keeps_input` |
+| TC-422 | FR-422 | unit | Fast-typed `/agent agy` without the popup open. | Submit with Enter. | The selected agent switches without sending a prompt. | `src/app.rs`: `tc_422_fast_typed_agent_command_switches_agent_without_sending` |
 | TC-423 | FR-422 | unit | Fast-typed `/mode ask` without the popup open. | Submit with Enter. | The mode is set without sending a prompt. | `src/app.rs`: `fast_typed_mode_command_sets_mode_without_sending` |
-| TC-424 | FR-423 | unit | App draining events that include turn completion. | Drain agent events. | Completion forces an immediate draw. | `src/app.rs`: `drain_agent_events_completion_triggers_immediate_draw` |
-| TC-425 | FR-424 | unit | App with a busy agent. | Call the busy tick. | The UI is marked dirty so status ages advance. | `src/app.rs`: `tick_marks_dirty_while_busy` |
-| TC-426 | FR-425 | unit | Agent emits a `Tool`/`Thinking` activity event. | Apply the event. | The last-event age resets. | `src/app.rs`: `activity_event_resets_last_event_age` |
+| TC-424 | FR-423 | unit | App draining events that include turn completion. | Drain agent events. | Completion forces an immediate draw. | `src/app.rs`: `tc_424_drain_agent_events_completion_triggers_immediate_draw` |
+| TC-425 | FR-424 | unit | App with a busy agent. | Call the busy tick. | The UI is marked dirty so status ages advance. | `src/app.rs`: `tc_425_tick_marks_dirty_while_busy` |
+| TC-426 | FR-425 | unit | Agent emits a `Tool`/`Thinking` activity event. | Apply the event. | The last-event age resets. | `src/app.rs`: `tc_426_activity_event_resets_last_event_age` |
 
 ## 6. Data, integration, and safety contracts
 

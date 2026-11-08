@@ -2147,7 +2147,7 @@ mod theme_config_tests {
     }
 
     #[test]
-    fn web_theme_settings_parse_with_fallbacks() {
+    fn tc_605_web_theme_settings_parse_with_fallbacks() {
         // TC-605, FR-603
         let temp_base = tempfile::tempdir().unwrap();
         let user_dir = temp_base.path().join("user");
@@ -2227,7 +2227,7 @@ mod theme_config_tests {
     }
 
     #[test]
-    fn theme_agents_real_nesting_and_unknown_ids() {
+    fn tc_602_theme_agents_real_nesting_and_unknown_ids() {
         // TC-602, FR-601: parse `[theme]` + `[theme.agents]` through the real
         // config path, honor custom agents from either config, and drop unknown
         // ids with a truthful warning. Identical warnings are deduped.
@@ -2554,6 +2554,11 @@ text_path = "/part/text"
 
     #[test]
     fn ui_config_activity_rendering_parsing() {
+        parses_ui_section();
+    }
+
+    #[test]
+    fn tc_365_ui_config_activity_rendering_parsing() {
         parses_ui_section();
     }
 
