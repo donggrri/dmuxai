@@ -751,6 +751,10 @@ mod tests {
             tool_when: None,
             tool_name_path: None,
             tool_title_path: None,
+            text_mode: None,
+            finish_when: None,
+            finish_reason_path: None,
+            finish_ok: vec![],
             builtin: false,
         };
         assert_eq!(delivery("custom", Some(&custom_spec)), Delivery::Prepend);
@@ -1324,6 +1328,10 @@ mod tests {
             tool_when: None,
             tool_name_path: None,
             tool_title_path: None,
+            text_mode: None,
+            finish_when: None,
+            finish_reason_path: None,
+            finish_ok: vec![],
             builtin: false,
         };
         assert_eq!(delivery("custom", Some(&spec)), Delivery::Native);

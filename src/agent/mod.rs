@@ -160,6 +160,9 @@ pub enum AgentErrorKind {
     Policy,
     SensitiveGate,
     CompactedUnfinished,
+    /// The runner's own lifecycle says the turn did not finish (FR-2532,
+    /// FR-2534).
+    Unfinished,
 }
 
 impl AgentErrorKind {
@@ -176,6 +179,7 @@ impl AgentErrorKind {
             Self::Policy => "policy",
             Self::SensitiveGate => "sensitive_gate",
             Self::CompactedUnfinished => "compacted_unfinished",
+            Self::Unfinished => "unfinished",
         }
     }
 }
@@ -242,6 +246,10 @@ impl AgentError {
 
     pub fn compacted_unfinished(message: impl Into<String>) -> Self {
         Self::new(AgentErrorKind::CompactedUnfinished, message)
+    }
+
+    pub fn unfinished(message: impl Into<String>) -> Self {
+        Self::new(AgentErrorKind::Unfinished, message)
     }
 
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
@@ -544,6 +552,7 @@ mod typed_error_tests {
             (AgentErrorKind::Policy, "policy"),
             (AgentErrorKind::SensitiveGate, "sensitive_gate"),
             (AgentErrorKind::CompactedUnfinished, "compacted_unfinished"),
+            (AgentErrorKind::Unfinished, "unfinished"),
         ];
 
         for (kind, expected) in cases {

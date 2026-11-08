@@ -1059,6 +1059,11 @@ async fn run_turn(
         )));
     }
 
+    // FR-2532, FR-2534: runner lifecycle-based completion.
+    if let Some(reason) = reply.unfinished_reason(spec, exit_ok) {
+        return Err(AgentError::unfinished(reason));
+    }
+
     let outcome = dmuxai::custom_agent::classify_turn_outcome(
         spec,
         exit_ok,
@@ -1581,6 +1586,102 @@ mod tests {
             )))
         );
         assert!(!text.contains("## Objective"), "{text}");
+    }
+
+    // TC-2532 / FR-2532: last step_finish reason tool-calls -> unfinished.
+    #[tokio::test]
+    async fn tc_2532_last_finish_reason_not_ok_is_unfinished() {
+        let extra = r#"
+output = "jsonl"
+text_path = "/part/text"
+text_when = { path = "/type", equals = "text" }
+finish_when = { path = "/type", equals = "step_finish" }
+finish_reason_path = "/part/reason"
+finish_ok = ["stop"]
+env = { FAKE_AGENT_FINISH_REASON = "tool-calls" }
+"#;
+        let spec = spec("jsonl_finish_reason", extra);
+        let (result, _) = run(spec, None).await;
+        assert_eq!(
+            result,
+            Err(AgentError::unfinished(format!(
+                "{} stopped before finishing the turn (last step reason: tool-calls)",
+                spec.label()
+            )))
+        );
+    }
+
+    // TC-2534 / FR-2532: clean exit without any finish line -> unfinished.
+    #[tokio::test]
+    async fn tc_2534_missing_finish_event_is_unfinished() {
+        let extra = r#"
+output = "jsonl"
+text_path = "/part/text"
+text_when = { path = "/type", equals = "text" }
+finish_when = { path = "/type", equals = "step_finish" }
+finish_reason_path = "/part/reason"
+finish_ok = ["stop"]
+env = { FAKE_AGENT_FINISH_REASON = "omit" }
+"#;
+        let spec = spec("jsonl_finish_reason", extra);
+        let (result, _) = run(spec, None).await;
+        assert_eq!(
+            result,
+            Err(AgentError::unfinished(format!(
+                "{} stopped before finishing the turn (last step reason: none)",
+                spec.label()
+            )))
+        );
+    }
+
+    // TC-2535 / FR-2532, FR-2535: short reply after multiple tools with reason stop succeeds.
+    #[tokio::test]
+    async fn tc_2535_short_final_answer_with_stop_succeeds() {
+        let extra = r#"
+output = "jsonl"
+text_path = "/part/text"
+text_when = { path = "/type", equals = "text" }
+tool_when = { path = "/type", equals = "tool_use" }
+finish_when = { path = "/type", equals = "step_finish" }
+finish_reason_path = "/part/reason"
+finish_ok = ["stop"]
+"#;
+        let spec = spec("jsonl_short_after_tools", extra);
+        let (result, text) = run(spec, None).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(text, "OK");
+    }
+
+    // TC-2536 / FR-2534: without finish_when, done_when never seen -> unfinished; neither set -> ok.
+    #[tokio::test]
+    async fn tc_2536_done_when_missing_is_unfinished() {
+        let extra_with_done = r#"
+output = "jsonl"
+text_path = "/part/text"
+text_when = { path = "/type", equals = "text" }
+done_when = { path = "/type", equals = "never_matching_done" }
+env = { FAKE_AGENT_FINISH_REASON = "omit" }
+"#;
+        let spec_done = spec("jsonl_finish_reason", extra_with_done);
+        let (result_done, _) = run(spec_done, None).await;
+        assert_eq!(
+            result_done,
+            Err(AgentError::unfinished(format!(
+                "{} stopped before finishing the turn",
+                spec_done.label()
+            )))
+        );
+
+        let extra_neither = r#"
+output = "jsonl"
+text_path = "/part/text"
+text_when = { path = "/type", equals = "text" }
+env = { FAKE_AGENT_FINISH_REASON = "omit" }
+"#;
+        let spec_neither = spec("jsonl_finish_reason", extra_neither);
+        let (result_neither, text_neither) = run(spec_neither, None).await;
+        assert_eq!(result_neither, Ok(()));
+        assert_eq!(text_neither, "Narration before tool.");
     }
 
     #[tokio::test]
@@ -2606,9 +2707,10 @@ env = { FAKE_CFG = "{temp_config}" }
         assert_gone(child).await;
     }
 
-    // TC-916 / FR-915: without an end line the turn still ends at EOF and exit.
+    // TC-916 / FR-915 (amended by FR-2534): without an end line a clean exit
+    // fails with `error_kind = unfinished`.
     #[tokio::test]
-    async fn grok_turn_without_end_line_completes_at_exit() {
+    async fn grok_turn_without_end_line_fails_as_unfinished() {
         let spec = grok_spec(&[("GROK_FAKE_MODE", "noend")]);
         let (tx, mut rx, worker) = drive(spec).await;
         tx.send(CustomCommand::Send(request("hello", None)))
@@ -2616,7 +2718,13 @@ env = { FAKE_CFG = "{temp_config}" }
             .unwrap();
         let events = until_terminal(&mut rx).await;
         assert_eq!(texts(&events), "OK");
-        assert!(completed(&events), "{events:?}");
+        assert_eq!(
+            events.last(),
+            Some(&AgentEvent::Error(AgentError::unfinished(
+                "grok stopped before finishing the turn"
+            ))),
+            "{events:?}"
+        );
         drop(tx);
         worker.await.unwrap();
     }

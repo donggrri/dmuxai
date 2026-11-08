@@ -328,7 +328,13 @@ pub fn classify_failure(kind: &str, message: &str) -> Option<FallbackReason> {
     }
     if matches!(
         kind.as_str(),
-        "cancelled" | "policy" | "timeout" | "idle" | "auth" | "compacted_unfinished"
+        "cancelled"
+            | "policy"
+            | "timeout"
+            | "idle"
+            | "auth"
+            | "compacted_unfinished"
+            | "unfinished"
     ) {
         return None;
     }
@@ -733,6 +739,7 @@ mod tests {
         assert_eq!(classify_failure("timeout", "x"), None);
         assert_eq!(classify_failure("idle", "x"), None);
         assert_eq!(classify_failure("compacted_unfinished", "x"), None);
+        assert_eq!(classify_failure("unfinished", "x"), None);
         assert_eq!(
             classify_failure("auth", "grok: not logged in. Run `grok login`."),
             None

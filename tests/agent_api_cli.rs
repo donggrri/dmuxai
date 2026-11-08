@@ -136,7 +136,8 @@ fn fake_opencode_reporting_inherited_pwd(root: &Path) -> PathBuf {
         "#!/bin/sh\n\
 if [ \"$1\" = models ]; then echo opencode/glm-5-free; exit 0; fi\n\
 inherited_pwd=$(tr '\\0' '\\n' </proc/$$/environ | sed -n 's/^PWD=//p')\n\
-printf '{\"type\":\"text\",\"sessionID\":\"ses_1\",\"part\":{\"text\":\"pwd=%s env=%s\"}}\\n' \"$(pwd)\" \"$inherited_pwd\"\n",
+printf '{\"type\":\"text\",\"sessionID\":\"ses_1\",\"part\":{\"text\":\"pwd=%s env=%s\"}}\\n' \"$(pwd)\" \"$inherited_pwd\"\n\
+printf '{\"type\":\"step_finish\",\"sessionID\":\"ses_1\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}\\n'\n",
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
