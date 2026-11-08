@@ -328,7 +328,7 @@ pub fn classify_failure(kind: &str, message: &str) -> Option<FallbackReason> {
     }
     if matches!(
         kind.as_str(),
-        "cancelled" | "policy" | "timeout" | "idle" | "compacted_unfinished"
+        "cancelled" | "policy" | "timeout" | "idle" | "auth" | "compacted_unfinished"
     ) {
         return None;
     }
@@ -713,6 +713,19 @@ mod tests {
         );
     }
 
+    // TC-2282 / FR-2282
+    #[test]
+    fn tc_2282_auth_error_kind_never_falls_back() {
+        assert_eq!(
+            classify_failure("auth", "grok: not logged in. Run `grok login`."),
+            None
+        );
+        assert_eq!(
+            classify_failure("auth", "authentication expired, please log in again"),
+            None
+        );
+    }
+
     #[test]
     fn tc_2105_no_fallback_on_normal_failure() {
         assert_eq!(classify_failure("cancelled", "x"), None);
@@ -720,6 +733,10 @@ mod tests {
         assert_eq!(classify_failure("timeout", "x"), None);
         assert_eq!(classify_failure("idle", "x"), None);
         assert_eq!(classify_failure("compacted_unfinished", "x"), None);
+        assert_eq!(
+            classify_failure("auth", "grok: not logged in. Run `grok login`."),
+            None
+        );
         assert_eq!(
             classify_failure("provider", "tests failed: 3 failures"),
             None
