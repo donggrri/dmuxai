@@ -439,6 +439,13 @@ When another live DmuxAI window already owns that workspace, a new window
 starts in its own conversation and provider processes; the existing workspace
 conversation list remains available from `/conversations` or `F3`.
 
+Generated workspace state lives in `.dmuxai/` (dashboard discovery file and
+token, event log, graph/task state, skill caches, notify log and image
+attachments). When DmuxAI creates that directory it also creates
+`.dmuxai/.gitignore` containing `*`, so `git add` does not stage this state.
+DmuxAI does not edit your project root `.gitignore` and never overwrites an
+existing `.dmuxai/.gitignore`.
+
 ## First run
 
 DmuxAI needs no configuration to start. Run `dmuxai` in a project folder:

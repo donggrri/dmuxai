@@ -1939,7 +1939,9 @@ error_path = "/result/error"
     // TC-2084 / FR-2084: no runner gets MCP args or files
     #[tokio::test]
     async fn tc_2084_no_runner_gets_mcp_args_or_files() {
-        let toml_settings = r#"
+        let xdg_home = tempfile::tempdir().unwrap();
+        with_custom_env(xdg_home.path(), async {
+            let toml_settings = r#"
 [[mcp.servers]]
 name = "stdio-srv"
 command = "echo"
@@ -1951,98 +1953,131 @@ name = "http-srv"
 url = "https://example.com/mcp"
 headers = { Authorization = "Bearer secret" }
 "#;
-        let ws = tempfile::tempdir().unwrap();
-        std::fs::write(ws.path().join("dmuxai.toml"), toml_settings).unwrap();
-        let mut env = dmuxai::runtime_env::RuntimeEnv::from_process();
-        env.trust_workspace_config = true;
-        let settings =
-            dmuxai::settings::DmuxSettings::load_with_user_config_and_env(ws.path(), None, &env);
-        assert_eq!(settings.mcp_servers.len(), 2);
+            let ws = tempfile::tempdir().unwrap();
+            std::fs::write(ws.path().join("dmuxai.toml"), toml_settings).unwrap();
+            let mut env = dmuxai::runtime_env::RuntimeEnv::from_process();
+            env.trust_workspace_config = true;
+            let settings = dmuxai::settings::DmuxSettings::load_with_user_config_and_env(
+                ws.path(),
+                None,
+                &env,
+            );
+            let server_names: Vec<&str> = settings
+                .mcp_servers
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect();
+            assert_eq!(server_names, ["stdio-srv", "http-srv"]);
 
-        // 1. Codex app-server argv has no mcp_servers
-        let codex_argv = crate::agent::codex::build_codex_app_server_args();
-        assert!(
-            !codex_argv.iter().any(|arg| arg.contains("mcp_servers")),
-            "codex argv must not contain mcp_servers: {codex_argv:?}"
-        );
+            // 1. Codex app-server argv has no mcp_servers
+            let codex_argv = crate::agent::codex::build_codex_app_server_args();
+            assert!(
+                !codex_argv.iter().any(|arg| arg.contains("mcp_servers")),
+                "codex argv must not contain mcp_servers: {codex_argv:?}"
+            );
 
-        // 2 & 3. Custom / opencode agent run:
-        let temp_dir = std::env::temp_dir();
-        let mcp_files_before: Vec<_> = std::fs::read_dir(&temp_dir)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("dmuxai-mcp-"))
-            .collect();
+            // 2 & 3. Custom / opencode agent run:
+            let temp_dir = std::env::temp_dir();
+            let mcp_files_before: Vec<_> = std::fs::read_dir(&temp_dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("dmuxai-mcp-"))
+                .collect();
 
-        let agent_toml = r#"
+            let agent_toml = r#"
 name = "mcp-test-runner"
 command = ["sh", "-c", "echo env=$DMUXAI_MCP_CONFIG; cat \"$FAKE_CFG\""]
 temp_config_template = '{"instructions": []}'
 env = { FAKE_CFG = "{temp_config}" }
 "#;
-        let spec: &'static CustomAgentSpec =
-            Box::leak(Box::new(toml::from_str(agent_toml).unwrap()));
-        let (tx, mut rx) = mpsc::channel(64);
-        let request = AgentRequest {
-            conversation_id: ConversationId::new("c"),
-            turn_id: TurnId::new("t"),
-            prompt: "hello".to_owned(),
-            resume_session: None,
-            image_paths: Vec::new(),
-            policy: TurnPolicy::Agent,
-            require_file_edits: false,
-            system_prompt: None,
-        };
-        let context = OutputContext::from(&request);
-        let pgid = std::sync::atomic::AtomicU32::new(0);
-        let result = run_turn(
-            Agent::Custom(0),
-            spec,
-            &request,
-            None,
-            TurnPolicy::Agent,
-            ws.path(),
-            &tx,
-            &context,
-            &pgid,
-            None,
-        )
-        .await;
-        drop(tx);
-        assert_eq!(result, Ok(()));
+            let spec: &'static CustomAgentSpec =
+                Box::leak(Box::new(toml::from_str(agent_toml).unwrap()));
+            let (tx, mut rx) = mpsc::channel(64);
+            let request = AgentRequest {
+                conversation_id: ConversationId::new("c"),
+                turn_id: TurnId::new("t"),
+                prompt: "hello".to_owned(),
+                resume_session: None,
+                image_paths: Vec::new(),
+                policy: TurnPolicy::Agent,
+                require_file_edits: false,
+                system_prompt: None,
+            };
+            let context = OutputContext::from(&request);
+            let pgid = std::sync::atomic::AtomicU32::new(0);
+            let result = run_turn(
+                Agent::Custom(0),
+                spec,
+                &request,
+                None,
+                TurnPolicy::Agent,
+                ws.path(),
+                &tx,
+                &context,
+                &pgid,
+                None,
+            )
+            .await;
+            drop(tx);
+            assert_eq!(result, Ok(()));
 
-        let mut output_text = String::new();
-        while let Some(output) = rx.recv().await {
-            if let AgentEvent::TextDelta(delta) = output.event {
-                output_text.push_str(&delta);
+            let mut output_text = String::new();
+            while let Some(output) = rx.recv().await {
+                if let AgentEvent::TextDelta(delta) = output.event {
+                    output_text.push_str(&delta);
+                }
             }
-        }
 
-        assert!(
-            output_text.contains("env="),
-            "output must show env=: {output_text}"
-        );
-        let env_line = output_text.lines().find(|l| l.starts_with("env=")).unwrap();
-        assert_eq!(
-            env_line, "env=",
-            "DMUXAI_MCP_CONFIG must not be set: {env_line}"
-        );
+            assert!(
+                output_text.contains("env="),
+                "output must show env=: {output_text}"
+            );
+            let env_line = output_text.lines().find(|l| l.starts_with("env=")).unwrap();
+            assert_eq!(
+                env_line, "env=",
+                "DMUXAI_MCP_CONFIG must not be set: {env_line}"
+            );
 
-        assert!(
-            !output_text.contains("\"mcp\""),
-            "rendered temp config must not contain mcp key: {output_text}"
-        );
+            assert!(
+                !output_text.contains("\"mcp\""),
+                "rendered temp config must not contain mcp key: {output_text}"
+            );
 
-        let mcp_files_after: Vec<_> = std::fs::read_dir(&temp_dir)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("dmuxai-mcp-"))
-            .collect();
-        assert_eq!(
-            mcp_files_before.len(),
-            mcp_files_after.len(),
-            "no dmuxai-mcp-*.json files should be left"
-        );
+            let mcp_files_after: Vec<_> = std::fs::read_dir(&temp_dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("dmuxai-mcp-"))
+                .collect();
+            assert_eq!(
+                mcp_files_before.len(),
+                mcp_files_after.len(),
+                "no dmuxai-mcp-*.json files should be left"
+            );
+
+            let state_dir = ws.path().join(dmuxai::workspace::WORKSPACE_STATE_DIR);
+            if state_dir.is_dir() {
+                let entries: Vec<String> = std::fs::read_dir(&state_dir)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                for name in &entries {
+                    assert!(
+                        !name.starts_with("dmuxai-mcp"),
+                        "runner must not leave MCP files under .dmuxai: {entries:?}"
+                    );
+                }
+                let without_gitignore: Vec<_> = entries
+                    .iter()
+                    .filter(|name| name.as_str() != ".gitignore")
+                    .collect();
+                assert!(
+                    without_gitignore.len() <= 2,
+                    "unexpected state under .dmuxai (`.gitignore` allowed): {entries:?}"
+                );
+            }
+        })
+        .await;
     }
 
     #[test]

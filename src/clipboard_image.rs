@@ -77,7 +77,7 @@ pub fn read_clipboard_png_with(cmds: &[ClipboardCmd]) -> Option<Vec<u8>> {
 /// Saves clipboard PNG bytes in the DmuxAI workspace attachment directory.
 pub fn save_attachment(workspace_root: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     let dir = attachments_dir(workspace_root);
-    fs::create_dir_all(&dir)?;
+    crate::workspace::ensure_state_path(&dir)?;
     let path = dir.join(format!("clip-{}.png", uuid::Uuid::new_v4()));
     fs::write(&path, bytes)?;
     Ok(path)
@@ -220,6 +220,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = save_attachment(dir.path(), PNG_BYTES).unwrap();
         assert!(path.starts_with(attachments_dir(dir.path())));
+        // TC-2503 / FR-2501, FR-2503: clipboard attachments make the state
+        // directory self-ignoring too.
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
         assert!(
             path.file_name()
                 .unwrap()

@@ -29,8 +29,8 @@ pub fn discovery_path(workspace_root: &Path) -> PathBuf {
 /// same directory, flushed, then atomically renamed over the final path (a
 /// pre-existing `web.json` with mode 0o644 is replaced, not amplified).
 pub fn write_discovery(workspace_root: &Path, d: &Discovery) -> io::Result<PathBuf> {
-    let dir = workspace_root.join(".dmuxai");
-    std::fs::create_dir_all(&dir)?;
+    let dir = workspace_root.join(crate::workspace::WORKSPACE_STATE_DIR);
+    crate::workspace::ensure_state_dir(&dir)?;
     let path = dir.join("web.json");
     let body = serde_json::to_string_pretty(d)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
@@ -105,6 +105,13 @@ mod tests {
         let path = write_discovery(workspace.path(), &discovery).unwrap();
         assert_eq!(path, discovery_path(workspace.path()));
         assert_eq!(read_discovery(workspace.path()).as_ref(), Some(&discovery));
+        // TC-2502 / FR-2501, FR-2503: creating the state dir also makes it
+        // self-ignoring without touching the workspace root.
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
+        assert!(!workspace.path().join(".gitignore").exists());
 
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("\"token\""), "pretty JSON carries the token");

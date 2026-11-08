@@ -438,7 +438,7 @@ pub fn write_tasks_file(workspace: &Path, run: &GraphRun) -> io::Result<PathBuf>
         ));
     }
     let dir = workspace.join(".dmuxai").join("tasks");
-    fs::create_dir_all(&dir)?;
+    crate::workspace::ensure_state_path(&dir)?;
     let path = tasks_file_path(workspace, run);
     let body = render_tasks_markdown(run);
     let temp_path = dir.join(format!(
@@ -877,6 +877,12 @@ mod tests {
             .unwrap()
             .expect("written");
         assert_eq!(written, path);
+        // TC-2505 / FR-2501, FR-2503: task exports create the self-ignoring
+        // state directory.
+        assert_eq!(
+            fs::read_to_string(workspace.join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
         let approved = fs::read_to_string(&path).unwrap();
         assert!(approved.contains("# Tasks run-a1b2"));
         assert!(approved.contains("- [ ] task-1 First — done: tests pass (pending)"));
