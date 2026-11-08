@@ -197,7 +197,7 @@ mod tests {
     // FR-453 / TC-453: FNV-1a 64 must match published fixed test vectors so
     // the repo key is stable across runs and builds.
     #[test]
-    fn repo_key_is_stable_fnv1a() {
+    fn tc_453_repo_key_is_stable_fnv1a() {
         assert_eq!(fnv1a64(""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a64("a"), 0xaf63_dc4c_8601_ec8c);
         assert_eq!(fnv1a64("foobar"), 0x85944171f73967e8);
@@ -223,7 +223,7 @@ mod tests {
     // FR-450 / TC-450: different canonical workspace roots map to different
     // database paths.
     #[test]
-    fn different_workspaces_get_different_db_paths() {
+    fn tc_450_different_workspaces_get_different_db_paths() {
         let dir = temp_dir("diff");
         let left = temp_dir("diff-a");
         let right = temp_dir("diff-b");
@@ -242,7 +242,7 @@ mod tests {
 
     // FR-451 / TC-451: DMUXAI_STATE_DIR overrides the state base.
     #[test]
-    fn state_dir_env_overrides_base() {
+    fn tc_451_state_dir_env_overrides_base() {
         let _guard = lock_env();
         set_env("DMUXAI_STATE_DIR", "/custom/dmuxai-state");
         let base = state_base().unwrap();
@@ -254,7 +254,7 @@ mod tests {
     // location and leaves the original untouched; subsequent opens neither
     // copy again nor report a notice.
     #[test]
-    fn legacy_db_is_copied_once_and_left_in_place() {
+    fn tc_452_legacy_db_is_copied_once_and_left_in_place() {
         let _guard = lock_env();
         let dir = temp_dir("legacy");
         let workspace = temp_dir("legacy-ws");
@@ -288,7 +288,7 @@ mod tests {
     // FR-454 / TC-454: the UnsupportedSchema message names the database
     // path, says a newer dmuxai wrote it, and suggests DMUXAI_STATE_DIR.
     #[test]
-    fn unsupported_schema_message_names_path() {
+    fn tc_454_unsupported_schema_message_names_path() {
         let error = crate::conversation::ConversationError::UnsupportedSchema {
             version: 3,
             db_path: PathBuf::from("/state/dmuxai/repos/x-abc/conversations.sqlite3"),

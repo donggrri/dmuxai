@@ -31,4 +31,4 @@ The workspace dialog can start a second DmuxAI dashboard for another directory w
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-879 | FR-876 | integration | Temp workspace with a live discovery pid, then a script executable | `POST /api/workspace/open` | First response reuses the URL; second response is the URL the script published | `src/web/server.rs` `workspace_open_reuses_live_dashboard_and_spawns` |
+| TC-879 | FR-876 | integration | Temp workspace with a live discovery pid, then a script executable | `POST /api/workspace/open` | First response reuses the URL; second response is the URL the script published | `src/web/server.rs` `tc_879_workspace_open_reuses_live_dashboard_and_spawns` |

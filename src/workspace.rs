@@ -929,7 +929,7 @@ mod tests {
 
     // TC-870 (FR-870, FR-873): precedence order and directory validation.
     #[test]
-    fn workspace_dir_precedence_and_validation() {
+    fn tc_870_workspace_dir_precedence_and_validation() {
         let _guard = crate::state_path::test_env_lock();
         let root = tempdir().unwrap();
         let home = root.path().join("home");

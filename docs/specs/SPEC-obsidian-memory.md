@@ -88,18 +88,18 @@ Both are terminal; deciding a non-pending proposal is an error.
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-720 | FR-720 | unit | temp vault dir, user + workspace toml | load settings | root, default dir, `~/` expansion, project override, warnings for missing vault / absolute or `..` dir / bad project | `src/settings.rs` `memory_settings_*` |
-| TC-721 | FR-721 | unit | temp root with human, project, decisions, gotchas (one CRLF file) | `build_context` | exact section order and lines; empty root -> `""` | `src/memory.rs` `context_*` |
-| TC-722 | FR-721 | unit | many long entries | `build_context` | section ≤ 900 with `…(N omitted)`; body ≤ 3000 + `…(truncated)`; multibyte safe | `src/memory.rs` `context_budget_*` |
-| TC-723 | FR-723, NFR-731 | unit | — | validate texts/targets | each secret pattern, empty, multi-line, 201 chars (and 200 Korean chars OK), `../x.md`, `projects/A.md` rejected | `src/memory.rs` `validate_*` |
-| TC-724 | FR-724 | unit | temp root | `save` twice, into new and placeholder files, with `index.md` | file created with frontmatter, line format, dedup, placeholder removed, index link once | `src/memory.rs` `save_*` |
-| TC-725 | FR-725, NFR-731 | unit | temp root | propose / approve / reject / duplicate / unknown / corrupt queue | states, JSON fields, errors, corrupt file untouched | `src/memory.rs` `queue_*` |
-| TC-726 | FR-722 | unit | `test_app` with a temp memory root | submit prompts (fresh, resumed, changed, disabled) | adapter request prompt starts with the block only when required; stored prompt unchanged | `src/app.rs` `memory_context_*` |
-| TC-727 | FR-726 | unit | `test_app` with a temp memory root | `/remember …`, `/memory`, `/memory approve|reject` | files/queue changed, system lines, no agent request | `src/app.rs` `memory_slash_*` |
-| TC-728 | FR-727 | integration | router with a temp memory root | GET/POST routes with and without token | statuses and JSON per FR-727; no absolute path in body | `src/web/server.rs` `memory_routes_*` |
-| TC-729 | INT-729 | integration | built binary, temp vault | spawn `dmuxai mcp-memory --vault …`, send JSON-RPC lines | initialize, tools/list names, each tool result, `-32601`, `-32700`, disabled server `isError` | `tests/memory_mcp.rs` `mcp_memory_serves_tools_against_a_vault`, `mcp_memory_reports_disabled_memory`, `mcp_memory_rejects_*`, `mcp_memory_null_id_notification_is_silent`, `mcp_memory_oversized_line_is_parse_error_and_serving_continues` |
-| TC-730 | FR-730 | unit | temp root | search terms, limit, empty | hits, limit, error | `src/memory.rs` `search_*` |
-| TC-731 | UX-728 | unit + manual | embedded assets | read index/app assets | Memory panel ids and API paths exist; screenshot via headless Chromium recorded in the review | `src/web/assets.rs` `memory_panel_assets_present` |
+| TC-720 | FR-720 | unit | temp vault dir, user + workspace toml | load settings | root, default dir, `~/` expansion, project override, warnings for missing vault / absolute or `..` dir / bad project | `src/settings.rs` `memory_settings_*`, `src/memory.rs` `tc_720_short_repo_derivation` |
+| TC-721 | FR-721 | unit | temp root with human, project, decisions, gotchas (one CRLF file) | `build_context` | exact section order and lines; empty root -> `""` | `src/memory.rs` `tc_721_context_*` |
+| TC-722 | FR-721 | unit | many long entries | `build_context` | section ≤ 900 with `…(N omitted)`; body ≤ 3000 + `…(truncated)`; multibyte safe | `src/memory.rs` `tc_722_context_budget_*` |
+| TC-723 | FR-723, NFR-731 | unit | — | validate texts/targets | each secret pattern, empty, multi-line, 201 chars (and 200 Korean chars OK), `../x.md`, `projects/A.md` rejected | `src/memory.rs` `tc_723_validate_*` |
+| TC-724 | FR-724 | unit | temp root | `save` twice, into new and placeholder files, with `index.md` | file created with frontmatter, line format, dedup, placeholder removed, index link once | `src/memory.rs` `tc_724_save_*` |
+| TC-725 | FR-725, NFR-731 | unit | temp root | propose / approve / reject / duplicate / unknown / corrupt queue | states, JSON fields, errors, corrupt file untouched | `src/memory.rs` `tc_725_queue_*` |
+| TC-726 | FR-722 | unit | `test_app` with a temp memory root | submit prompts (fresh, resumed, changed, disabled) | adapter request prompt starts with the block only when required; stored prompt unchanged | `src/app.rs` `tc_726_memory_context_*` |
+| TC-727 | FR-726 | unit | `test_app` with a temp memory root | `/remember …`, `/memory`, `/memory approve|reject` | files/queue changed, system lines, no agent request | `src/app.rs` `tc_727_memory_slash_*` |
+| TC-728 | FR-727 | integration | router with a temp memory root | GET/POST routes with and without token | statuses and JSON per FR-727; no absolute path in body | `src/web/server.rs` `tc_728_memory_routes_*` |
+| TC-729 | INT-729 | integration | built binary, temp vault | spawn `dmuxai mcp-memory --vault …`, send JSON-RPC lines | initialize, tools/list names, each tool result, `-32601`, `-32700`, disabled server `isError` | `tests/memory_mcp.rs` `tc_729_mcp_memory_serves_tools_against_a_vault`, `src/main.rs` `tc_729_parse_cli_mcp_memory_flags`, `mcp_memory_reports_disabled_memory`, `mcp_memory_rejects_*`, `mcp_memory_null_id_notification_is_silent`, `mcp_memory_oversized_line_is_parse_error_and_serving_continues` |
+| TC-730 | FR-730 | unit | temp root | search terms, limit, empty | hits, limit, error | `src/memory.rs` `tc_730_search_*` |
+| TC-731 | UX-728 | unit + manual | embedded assets | read index/app assets | Memory panel ids and API paths exist; screenshot via headless Chromium recorded in the review | `src/web/assets.rs` `tc_731_memory_panel_assets_present` |
 
 ## 6. Data, integration, and safety contracts
 

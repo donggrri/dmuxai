@@ -143,7 +143,7 @@ fn tool_response(response: &Value) -> (&str, bool) {
 // initialize, tools/list, the three tools, an unknown method and a malformed
 // line over piped stdio.
 #[test]
-fn mcp_memory_serves_tools_against_a_vault() {
+fn tc_729_mcp_memory_serves_tools_against_a_vault() {
     let vault = tempfile::tempdir().expect("vault");
     let root = vault.path().join("memory");
     std::fs::create_dir_all(root.join("gotchas")).expect("mkdir gotchas");

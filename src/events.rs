@@ -934,6 +934,18 @@ mod tests {
         }
     }
 
+    // TC-2504 / FR-2501, FR-2503: event log append creates .dmuxai/.gitignore
+    #[test]
+    fn tc_2504_event_log_append_creates_state_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::open(dir.path(), "ws".to_string());
+        log.append(vec![draft("agent", "started")]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
+    }
+
     // TC-765 / FR-764 / NFR-760: read_since skips malformed lines, filters by
     // seq and honors the limit (first `limit` records, oldest first).
     #[test]
@@ -948,12 +960,6 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(written.len(), 3);
-        // TC-2504 / FR-2501, FR-2503: the first append creates the state
-        // directory with its self-ignoring file.
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join(".dmuxai").join(".gitignore")).unwrap(),
-            "*\n"
-        );
 
         let path = events_path(dir.path());
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();

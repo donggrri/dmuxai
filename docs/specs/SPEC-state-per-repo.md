@@ -32,11 +32,11 @@ The conversation DB was one global file, `$XDG_STATE_HOME/dmuxai/conversations.s
 ## 5. Acceptance scenarios and test design
 | TC | Covers | Test |
 |---|---|---|
-| TC-450 | FR-450 | `different_workspaces_get_different_db_paths` |
-| TC-451 | FR-451 | `state_dir_env_overrides_base` |
-| TC-452 | FR-452 | `legacy_db_is_copied_once_and_left_in_place` |
-| TC-453 | FR-453 | `repo_key_is_stable_fnv1a` (fixed expected value) |
-| TC-454 | FR-454 | `unsupported_schema_message_names_path` |
+| TC-450 | FR-450 | `tc_450_different_workspaces_get_different_db_paths` |
+| TC-451 | FR-451 | `tc_451_state_dir_env_overrides_base` |
+| TC-452 | FR-452 | `tc_452_legacy_db_is_copied_once_and_left_in_place` |
+| TC-453 | FR-453 | `tc_453_repo_key_is_stable_fnv1a` (fixed expected value) |
+| TC-454 | FR-454 | `tc_454_unsupported_schema_message_names_path` |
 | TC-1837 | FR-1837 | `state_dir_env_overrides_base` |
 | TC-1838 | FR-1838 | `repo_key_is_stable_fnv1a` |
 | TC-1839 | FR-1839 | `legacy_db_is_copied_once_and_left_in_place` |

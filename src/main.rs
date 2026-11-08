@@ -1232,7 +1232,7 @@ mod tests {
     // TC-729 (INT-729): `mcp-memory` and its options parse like the other
     // subcommands; it is only valid as the first argument.
     #[test]
-    fn parse_cli_mcp_memory_flags() {
+    fn tc_729_parse_cli_mcp_memory_flags() {
         assert_eq!(
             parse_cli(["mcp-memory"]),
             CliAction::McpMemory(MemoryOptions::default())

@@ -943,7 +943,7 @@ fn failed_initial_migration_rolls_back_every_schema_change() {
 // TC-052 / FR-051, BR-050: closed and expired owners are recovered, including
 // their partial assistant text and provider binding.
 #[test]
-fn closed_or_expired_session_turns_are_recovered() {
+fn tc_052_closed_or_expired_session_turns_are_recovered() {
     let harness = Harness::new();
     let mut closed = harness.open();
     let closed_conversation = closed
@@ -1046,7 +1046,7 @@ fn closed_or_expired_session_turns_are_recovered() {
 // TC-054 / BR-051: the busy invariant is checked inside the write transaction
 // and applies across separate runtime-session database connections.
 #[test]
-fn busy_agent_is_rejected_across_runtime_sessions() {
+fn tc_054_busy_agent_is_rejected_across_runtime_sessions() {
     let harness = Harness::new();
     let mut first = harness.open();
     let conversation_id = first
@@ -1087,7 +1087,7 @@ fn busy_agent_is_rejected_across_runtime_sessions() {
 // TC-055 / BR-051: separate instance conversations can run the same provider
 // concurrently without sharing the per-conversation busy state.
 #[test]
-fn same_agent_can_run_in_separate_instance_conversations() {
+fn tc_055_same_agent_can_run_in_separate_instance_conversations() {
     let harness = Harness::new();
     let mut first = harness.open();
     first
@@ -1122,7 +1122,7 @@ fn same_agent_can_run_in_separate_instance_conversations() {
 // TC-056 / NFR-050: an old v1-shaped database receives the additive session
 // objects transactionally without losing its canonical transcript.
 #[test]
-fn runtime_session_schema_extension_preserves_existing_data() {
+fn tc_056_runtime_session_schema_extension_preserves_existing_data() {
     let harness = Harness::new();
     let conversation_id;
     {

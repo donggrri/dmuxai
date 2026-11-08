@@ -42,7 +42,7 @@ fn find_chrome() -> Option<PathBuf> {
 // TC-874 (FR-871, FR-872)
 #[test]
 #[ignore = "needs Chrome/Chromium and python playwright; run with --ignored"]
-fn workspace_dialog_renders_in_headless_chrome() {
+fn tc_874_workspace_dialog_renders_in_headless_chrome() {
     let Some(chrome) = find_chrome() else {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
         return;
@@ -290,7 +290,7 @@ print(json.dumps(out))
 // TC-876 (FR-874, FR-2303)
 #[test]
 #[ignore = "spawns interactive dmuxai --web under pty and switches workspace in process; run with --ignored"]
-fn workspace_switch_opens_in_process_for_web() {
+fn tc_876_workspace_switch_opens_in_process_for_web() {
     let python = "python3";
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = std::fs::canonicalize(tmp.path()).expect("canonicalize root");

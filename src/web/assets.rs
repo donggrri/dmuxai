@@ -187,7 +187,7 @@ mod tests {
 
     // TC-731 (UX-728): Memory panel markup and client API paths.
     #[test]
-    fn memory_panel_assets_present() {
+    fn tc_731_memory_panel_assets_present() {
         assert!(INDEX_HTML.contains("id=\"memory-toggle\""));
         assert!(INDEX_HTML.contains("id=\"memory-popover\""));
         assert!(INDEX_HTML.contains("/assets/memory.js"));
@@ -1146,7 +1146,7 @@ mod tests {
 
     // TC-872: workspace_dir_assets (SPEC-workspace-dir FR-871, FR-872)
     #[tokio::test]
-    async fn workspace_dir_assets() {
+    async fn tc_872_workspace_dir_assets() {
         assert!(INDEX_HTML.contains("id=\"workspace-button\""));
         assert!(INDEX_HTML.contains("aria-haspopup=\"dialog\""));
         assert!(INDEX_HTML.contains("title=\"\""));

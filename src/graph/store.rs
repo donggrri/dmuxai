@@ -187,6 +187,19 @@ mod tests {
         }
     }
 
+    // TC-2505 / FR-2501, FR-2503: graph save_run creates .dmuxai/.gitignore
+    #[test]
+    fn tc_2505_graph_save_run_creates_state_gitignore() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let run = run("triaged-run");
+        save_run(root, &run).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(".dmuxai").join(".gitignore")).unwrap(),
+            "*\n"
+        );
+    }
+
     // TC-953 (FR-946): a record written before triage/approval persistence
     // loads with defaults; a record with triage and a revision round-trips and
     // the failed-parse raw text stays at most 4 KiB cut on a char boundary.
@@ -249,12 +262,7 @@ mod tests {
             decided_at_ms: Some(1_700_000_000_000),
         });
         save_run(root, &run).unwrap();
-        // TC-2505 / FR-2501, FR-2503: graph runs create the self-ignoring
-        // state directory.
-        assert_eq!(
-            fs::read_to_string(root.join(".dmuxai").join(".gitignore")).unwrap(),
-            "*\n"
-        );
+
         let loaded = load_run(root, "triaged-run").unwrap();
         assert_eq!(loaded.conversation_id, run.conversation_id);
         assert_eq!(loaded.triage, run.triage);

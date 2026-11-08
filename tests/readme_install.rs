@@ -9,7 +9,7 @@ fn read(relative: &str) -> String {
 }
 
 #[test]
-fn readme_matches_release_layout() {
+fn tc_815_readme_matches_release_layout() {
     let readme = read("README.md");
     let release = read(".github/workflows/release.yml");
 

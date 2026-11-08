@@ -922,7 +922,7 @@ mod tests {
 
     // TC-721 (FR-721): empty or missing root returns empty string.
     #[test]
-    fn context_empty_or_missing_root_returns_empty_string() {
+    fn tc_721_context_empty_or_missing_root_returns_empty_string() {
         let missing = MemoryStore::new(PathBuf::from("/nonexistent/vault/root"));
         assert_eq!(missing.build_context("dmuxai"), "");
 
@@ -1010,7 +1010,7 @@ mod tests {
 
     // TC-722 (FR-721): section keeps whole entries within 900 chars and appends marker.
     #[test]
-    fn context_budget_section_limit_and_omitted_marker() {
+    fn tc_722_context_budget_section_limit_and_omitted_marker() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::new(dir.path());
 
@@ -1088,7 +1088,7 @@ mod tests {
 
     // TC-723 (FR-723): empty and multi-line strings are rejected.
     #[test]
-    fn validate_text_empty_and_multiline() {
+    fn tc_723_validate_text_empty_and_multiline() {
         assert_eq!(validate_text(""), Err(Rejection::Empty));
         assert_eq!(validate_text("   "), Err(Rejection::Empty));
         assert_eq!(validate_text("\n"), Err(Rejection::Empty));
@@ -1199,7 +1199,7 @@ mod tests {
 
     // TC-724 (FR-724): save creates missing file with frontmatter and adds index link.
     #[test]
-    fn save_creates_file_frontmatter_and_index_link() {
+    fn tc_724_save_creates_file_frontmatter_and_index_link() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::new(dir.path());
 
@@ -1310,7 +1310,7 @@ mod tests {
 
     // TC-725 (FR-725): proposals queued with unique id and camelCase JSON fields.
     #[test]
-    fn queue_propose_and_json_format() {
+    fn tc_725_queue_propose_and_json_format() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::new(dir.path());
 
@@ -1569,7 +1569,7 @@ mod tests {
 
     // TC-730 (FR-730): search splits on whitespace, requires all terms, respects order and limit.
     #[test]
-    fn search_terms_ordering_and_clamping() {
+    fn tc_730_search_terms_ordering_and_clamping() {
         let dir = tempdir().unwrap();
         let store = MemoryStore::new(dir.path());
 
@@ -1615,7 +1615,7 @@ mod tests {
 
     // TC-720 (FR-720): short repo derived correctly.
     #[test]
-    fn short_repo_derivation() {
+    fn tc_720_short_repo_derivation() {
         assert_eq!(short_repo(Path::new("/a/b/c/dmuxai")), "dmuxai");
         assert_eq!(short_repo(Path::new("")), "repo");
         assert_eq!(short_repo(Path::new("---")), "repo");

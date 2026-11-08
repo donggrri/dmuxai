@@ -16,9 +16,9 @@ Every parallel worktree appended a row to the hand-maintained SPEC table in `doc
 ## 5. Acceptance scenarios and test design
 | TC | Covers | Test |
 |---|---|---|
-| TC-470 | FR-470 | `every_spec_has_status_line` |
-| TC-471 | FR-471 | `spec_ids_are_unique_across_specs` |
-| TC-472 | FR-472 | `spec_index_script_lists_every_spec` |
+| TC-470 | FR-470 | `tc_470_every_spec_has_status_line` |
+| TC-471 | FR-471 | `tc_471_spec_ids_are_unique_across_specs` |
+| TC-472 | FR-472 | `tc_472_spec_index_script_lists_every_spec` |
 | TC-473 | FR-473 | manual review |
 
 ## 6. Exit criteria
