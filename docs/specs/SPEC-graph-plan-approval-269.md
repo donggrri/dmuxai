@@ -30,7 +30,7 @@ Minimal-design rationale: a content hash of a persisted file needs no daemon
 and no database change, and comparing the stored prompt prevents approving a
 plan for a different task.
 
-## 2. Requirements
+## 2. Functional requirements
 
 | ID | Requirement |
 |----|-------------|
@@ -42,7 +42,7 @@ plan for a different task.
 | FR-2547 | `--approve-plan-id` does NOT confirm sensitive gates beyond what `--approve-plan` confirms today. |
 | FR-2548 | MCP `run` forwards `approve_plan_id` (requires `graph`). |
 
-## 3. Tests
+## 5. Acceptance scenarios and test design
 
 | ID | Covers |
 |----|--------|
