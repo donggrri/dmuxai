@@ -42,10 +42,10 @@ Notes:
 - `run` accepts either `--agent` or `--graph`, not both. `--graph` is accepted as a
   no-op (legacy scripts); it does not change judge routing. `--read-only` is an internal
   flag (not shown in `dmuxai --help`): runs the prompt's turn with the read-only turn
-  policy; the MCP `run` tool passes it for legacy `mode` `ask` or `plan`. `--mode` was removed:
-  any `--mode` on `run` or `todo run` prints a usage error to stderr and exits `2`
-  (see [SPEC-acp-runners](specs/SPEC-acp-runners.md) FR-1318). `--` ends flag parsing
-  (`dmuxai run -- --literal prompt`).
+  policy. `--mode` was removed: any `--mode` on `run` or `todo run` prints a usage
+  error to stderr and exits `2` (see [SPEC-acp-runners](specs/SPEC-acp-runners.md)
+  FR-1318); the MCP `run` tool rejects a `mode` argument the same way. `--` ends
+  flag parsing (`dmuxai run -- --literal prompt`).
 - Without `--agent`, headless `run` uses the same judge → plan path as the TUI.
   Exit `7` means plan approval (`--approve-plan`), a sensitive gate, or an agent
   that stopped at its own plan review without editing files. The plan-review case
@@ -318,15 +318,17 @@ Tools (`tools/list`):
 | --- | --- | --- |
 | `todo_add` | `title` (required), `body` | Created to-do |
 | `todo_list` | `status` (`open`\|`running`\|`done`) | Array of to-dos |
-| `run` | `prompt`, `agent`, `graph`, `todo_id`, `mode` (optional, deprecated legacy) | Run outcome JSON (same keys as `run --json`). Legacy `mode`: `ask`/`plan` → read-only child run (`--read-only`); `implement`/`agent` or omit → write-capable; other values error. The MCP server never passes `--mode` to the CLI. |
+| `run` | `prompt`, `agent`, `model`, `approve_plan`, `allow_sensitive`, `graph`, `todo_id` | Run outcome JSON (same keys as `run --json`), plus `approval_required: true` when the child exits `7`. The fields forward to the same child flags as the CLI: `model` → `--model` (requires `agent`, conflicts with `graph`), `approve_plan` → `--approve-plan`, `allow_sensitive` → `--allow-sensitive`. `agent` and `graph` are mutually exclusive. The deprecated `mode` argument is rejected with a removed-mode tool error; the MCP server never passes `--mode` or `--read-only`. |
 | `status` | — | Status JSON (see §1) |
 | `events_since` | `since` (≥0), `limit` (1–1000, default 200) | `{events, last_seq}` |
 
 `run` spawns a child `dmuxai run --json` (or `dmuxai todo run <id> --json`), adding
-`--read-only` when legacy `mode` is `ask` or `plan`, and blocks until it finishes,
-so the result is final. Tool results use
-`content: [{type:"text", text:"<json>"}]` with `isError: true` on failure;
-unknown tools return JSON-RPC `-32602`.
+the forwarded flags, and blocks until it finishes, so the result is final. Tool
+results use `content: [{type:"text", text:"<json>"}]` with `isError: true` on
+failure; unknown tools return JSON-RPC `-32602`. A child exit code `7` (plan
+approval, sensitive gate, or a plan-only agent reply) is always an `isError: true`
+result whose `structuredContent` keeps `exit_code: 7`, the CLI error note and
+`plan`/`text`, and adds `approval_required: true`.
 
 Client configuration (generic):
 
