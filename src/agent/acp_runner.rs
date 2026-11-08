@@ -116,6 +116,19 @@ pub fn grok_acp_argv(model: &str, reasoning_effort: Option<&str>, read_only: boo
 mod tests {
     use super::*;
 
+    // TC-1301 / FR-1301: grok preset + acp protocol builds argv with agent, stdio, and -m.
+    #[test]
+    fn tc_1301_grok_preset_acp_protocol_argv() {
+        let preset = dmuxai::custom_agent::grok_preset("grok");
+        let model = "grok-4.7";
+        let argv = grok_acp_argv(model, None, false);
+        assert_eq!(preset.name, "grok");
+        assert!(argv.contains(&"agent".to_owned()));
+        assert!(argv.contains(&"stdio".to_owned()));
+        assert!(argv.contains(&"-m".to_owned()));
+        assert!(argv.contains(&model.to_owned()));
+    }
+
     // TC-1316, TC-1414 / FR-1301, FR-1412: agent-mode grok argv.
     #[test]
     fn tc_1316_1414_grok_acp_argv_puts_model_before_stdio() {

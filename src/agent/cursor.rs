@@ -3608,6 +3608,56 @@ pub(crate) mod tests {
             );
         }
 
+        // TC-1303 / FR-1303: fake agent cancel mid-turn yields Cancelled and reaps child process.
+        #[tokio::test]
+        async fn tc_1303_cancel_mid_turn_yields_cancelled_and_reaps_child() {
+            let _guard = lock_env().await;
+            set_fake_env(&[("FAKE_ACP_SLEEP_MS", "300".as_ref())]);
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let config = CursorAdapterConfig {
+                protocol: RunnerProtocol::Acp,
+                prewarm: false,
+                prewarm_idle_secs: 300,
+            };
+            let workspace = tempfile::tempdir().unwrap();
+            let (adapter, worker) =
+                spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
+            adapter.send(linger_request("turn-1", "hello")).unwrap();
+
+            // Give the agent a moment to start processing the prompt mid-turn
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            adapter.cancel().unwrap();
+
+            let cancelled_at = Instant::now();
+            let mut cancelled = false;
+            while cancelled_at.elapsed() < Duration::from_secs(3) && !cancelled {
+                if let Ok(Some(output)) = timeout(Duration::from_millis(200), event_rx.recv()).await
+                    && output.event == AgentEvent::Cancelled
+                {
+                    cancelled = true;
+                }
+            }
+            assert!(cancelled, "turn should end Cancelled on mid-turn cancel");
+
+            drop(adapter);
+            let _ = tokio::time::timeout(Duration::from_secs(3), worker)
+                .await
+                .expect("adapter worker did not finish after drop");
+
+            let mut alive = live_fake_acp_agent_count();
+            for _ in 0..50 {
+                if alive == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                alive = live_fake_acp_agent_count();
+            }
+            assert_eq!(
+                alive, 0,
+                "fake-acp-agent child process should be gone after cancel"
+            );
+        }
+
         // TC-1966 / FR-1966: ACP client uses the shared supervisor::terminate_group;
         // no lingering fake ACP agent process remains after the turn.
         #[tokio::test]
@@ -3688,6 +3738,48 @@ pub(crate) mod tests {
             drop(adapter);
             let _ = worker.await;
         }
+    }
+
+    // TC-1308 / FR-1305: protocol=legacy with fake legacy cursor spawns without acp in argv.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_1308_legacy_protocol_argv_has_no_acp() {
+        let fixture = FakeCursorFixture::new().await;
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let config = CursorAdapterConfig {
+            protocol: RunnerProtocol::Legacy,
+            prewarm: false,
+            prewarm_idle_secs: 300,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let (adapter, worker) =
+            spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
+
+        let req = AgentRequest {
+            conversation_id: super::super::ConversationId::new("conv-tc-1308"),
+            turn_id: super::super::TurnId::new("turn-tc-1308"),
+            prompt: "hello from legacy test".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+        };
+        adapter.send(req).unwrap();
+        wait_for_turn_completion(&mut event_rx).await;
+
+        let spawns = fixture.read_spawns();
+        assert!(!spawns.is_empty(), "cursor process should have spawned");
+        for spawn in &spawns {
+            assert!(
+                !spawn.argv.iter().any(|arg| arg == "acp"),
+                "legacy cursor argv must not contain 'acp': {:?}",
+                spawn.argv
+            );
+        }
+
+        drop(adapter);
+        let _ = timeout(Duration::from_secs(5), worker).await;
     }
 
     #[tokio::test]

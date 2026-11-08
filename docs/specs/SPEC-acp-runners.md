@@ -104,7 +104,7 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | FR-1417 | Must | ACP `execute` tool call. | Activity row shows the command (`rawInput.command` or title), not the cwd. | — | TC-1422 |
 | FR-1418 | Must | agy and opencode runners. | Keep existing headless modes (`agy --print` stream-json, `opencode run` jsonl); no ACP path or `*_protocol` switch for them. | — | TC-1423 |
 | NFR-1410 | Must | Test fixtures. | Fake ACP agent can advertise `modes` only, `configOptions` only, both, or a fast-only model. | — | TC-1424, TC-1425 |
-| FR-1862 | Must | Cursor adapter protocol configuration defaults (`src/settings.rs`, `src/agent/cursor.rs`). | In application settings (`DmuxSettings`), `cursor_protocol` defaults to `RunnerProtocol::Legacy`. When constructed from settings (`CursorAdapterConfig::from(&settings)`), the adapter uses `settings.cursor_protocol` (`Legacy`). Standalone `CursorAdapterConfig::default()` specifies `RunnerProtocol::Acp`. | Standalone adapter tests defaulting to ACP do not override repository settings default `legacy`. | TC-1862 |
+| FR-1862 | Retired (superseded by FR-1793, #163) | Cursor adapter protocol configuration defaults (`src/settings.rs`, `src/agent/cursor.rs`). | In application settings (`DmuxSettings`), `cursor_protocol` defaults to `RunnerProtocol::Legacy`. When constructed from settings (`CursorAdapterConfig::from(&settings)`), the adapter uses `settings.cursor_protocol` (`Legacy`). Standalone `CursorAdapterConfig::default()` specifies `RunnerProtocol::Acp`. | Standalone adapter tests defaulting to ACP do not override repository settings default `legacy`. | TC-1862 |
 | FR-1863 | Must | ACP tool execution and permission denial lifecycle (`src/agent/acp/client.rs`, `src/agent/acp/permissions.rs`). | `session/request_permission` checks target file paths against the normalized workspace root; if a path lies outside workspace or the turn policy is ReadOnly, the permission is denied client-side, `AgentEvent::Notice` with `PERMISSION_DENIED_NOTICE` is emitted, and the turn terminates with `AgentEvent::Cancelled`. | Child process is terminated without leaving background orphans. | TC-1863 |
 | FR-2316 | Must | ACP agent sends an inbound request or notification whose JSON-RPC `id` equals a pending dmuxai request id during `session/prompt` or a blocking client `request()`. | The message is handled as inbound traffic (`dispatch_inbound` / existing `method` branch) and not treated as the response; the pending prompt keeps waiting for the real response. | A message counts as a response only when its id matches and it carries no `method`; the turn completes with the agent's result and stop reason. | TC-2316 |
 
@@ -128,7 +128,6 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | TC-1423 | FR-1418 | unit | Settings with `opencode_protocol` | Load | No ACP for opencode | `src/settings.rs` `tc_1423_opencode_has_no_acp_protocol_switch` |
 | TC-1424 | NFR-1410, FR-1413 | integration | Fake `FAKE_ACP_MODES` = modes / config / none | Read-only Cursor ACP turn | set_mode ask / set_config_option plan / none | `src/agent/cursor.rs` `tc_1424_read_only_mode_shapes` |
 | TC-1425 | NFR-1410, FR-1413 | integration | Fake `FAKE_ACP_MODES=both` | Read-only Cursor ACP turn | set_mode preferred | `src/agent/cursor.rs` `tc_1425_read_only_mode_prefers_modes_when_both_advertised` |
-| TC-1862 | FR-1862 | unit | `DmuxSettings::default()` and `CursorAdapterConfig::default()` | Compare protocol fields | settings default is Legacy, adapter default is Acp | `src/settings.rs` |
 | TC-1863 | FR-1863 | unit | unauthorized or read-only tool request | `session/request_permission` evaluation | permission denied; notice emitted; turn cancelled | `src/agent/cursor.rs` `tc_1420_permission_denied_ends_cancelled`, `src/agent/acp/permissions.rs` `denies_permission_when_path_outside_workspace` |
 | TC-2316 | FR-2316 | unit + integration | Response carrying the pending id with and without `method`; fake agent sends `session/request_permission` with the same id as `session/prompt` | `is_response_to`; Cursor ACP turn with `FAKE_ACP_PERMISSION_ID_COLLISION` | unit: method => false, plain response => true, other id => false; integration: text `ACP_OK`, `Completed`, stop reason `end_turn`, no `Error`/`Cancelled` | `src/agent/acp/client.rs` `tc_2316_is_response_to_requires_matching_id_without_method`; `src/agent/cursor.rs` `tc_2316_permission_request_id_collision_keeps_turn_running` |
 | TC-1480 | FR-1412, FR-1301 | manual | Built `dmuxai`, grok logged in, temp git workspace | `dmuxai run --agent grok "create hello.txt containing hi"` | File created in workspace; reply text shown | hands-on |
@@ -148,8 +147,8 @@ Live probe on Linux (cursor-agent, grok 1.0.67): Cursor `session/new` returns bo
 | TC-1307 | FR-1304 | unit | Permission with sensitive gate active | Policy | Gate path | `src/agent/acp/permissions.rs` `tc_1307_sensitive_gate_cancels_permission` |
 | TC-1308 | FR-1305 | integration | `protocol=legacy` + fake legacy cursor | Prompt | No `acp` in argv | `src/agent/cursor.rs` |
 | TC-1309 | FR-1306 | unit | App snapshot / slash list | Inspect | No `/mode` | `src/app.rs` `tc_1309_fast_typed_mode_command_sets_mode_without_sending` |
-| TC-1333 | FR-1307, FR-1317 | integration | Judge turn | Start judge | Read-only argv/policy | `src/app.rs` |
-| TC-1312 | FR-1309 | manual | Read docs | — | Linux-only stated | `docs/specs/SPEC-acp-runners.md` |
+| TC-1333 | FR-1307, FR-1317 | integration | Judge turn | Start judge | Read-only argv/policy | `src/app.rs` `tc_1333_judge_turn_policy_is_read_only` |
+| TC-1312 | FR-1309 | unit | Read docs | — | Linux-only stated | `tests/readme_install.rs` `tc_1312_acp_runners_are_documented_as_linux_only` |
 | TC-1313 | FR-1314 | unit | Permission JSON with sessionId | Policy | Allow in-workspace shell | `src/agent/acp/permissions.rs` |
 | TC-1314 | FR-1314 | unit | `/proj` vs `/proj-evil` | Prefix check | Deny outside | `src/agent/acp/permissions.rs` |
 | TC-1315 | FR-1302, FR-1325 | unit | `tool_call_update` payload | Map update | Title/kind/status | `src/agent/acp/updates.rs` `tc_1315_maps_tool_call_update_fields` |
@@ -172,6 +171,10 @@ Deterministic ACP integration tests run under plain `cargo test`: the test helpe
 1. Logged-in `cursor-agent`: `DMUXAI_CURSOR_BIN=cursor-agent protocol=acp` — send a prompt, see streaming reply, cancel once.
 2. Logged-in `grok`: built-in grok with default ACP — model list and one prompt.
 3. `protocol = "legacy"` for each — prior CLI behavior.
+
+### Retired test cases
+
+TC-1862 is retired. Its oracle was "settings default is Legacy, adapter default is Acp", but the shared runner supervisor refactor (#163, `1e813d8`) made `CursorAdapterConfig::default().protocol` equal the settings default (Legacy). That unified behavior is SPEC-process-supervisor FR-1793, tested by `tc_1793_cursor_adapter_default_protocol_matches_settings` (`src/agent/cursor.rs`). A separate test for the old split default would assert behavior that no longer exists.
 
 ## 6. Integration and safety
 
