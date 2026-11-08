@@ -65,11 +65,11 @@ Repository graph definitions, subagents and DmuxAI routing defaults use only `co
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-310 | FR-310 | integration | repository files | scan | composer-only | `cargo test graph_agent_definitions_use_composer_only`; `dmuxai_graph_yaml_declares_composer_only_policy`; `mission_doc_states_composer_policy` |
-| TC-311 | FR-311 | unit | model ids | validate | only composer-2.5 passes | `cargo test only_composer_2_5_is_allowed`; `validate_rejects_fast_and_foreign_models`; `validate_rejects_fast_and_non_composer_models` |
+| TC-310 | FR-310 | integration | repository files | scan | composer-only | `cargo test tc_310_graph_agent_definitions_use_composer_only`; `dmuxai_graph_yaml_declares_composer_only_policy`; `mission_doc_states_composer_policy` |
+| TC-311 | FR-311 | unit | model ids | validate | only composer-2.5 passes | `cargo test tc_311_only_composer_2_5_is_allowed`; `validate_rejects_fast_and_foreign_models`; `validate_rejects_fast_and_non_composer_models` |
 | TC-312 | FR-312 | unit | AGY + F2 Gemini Flash | submit | AGY request model = F2 model | `cargo test user_selected_agy_model_wins_over_graph_default` |
-| TC-313 | FR-313 | unit | no F2 selection | submit to Cursor / AGY | composer-2.5 only on Cursor | `cargo test graph_default_model_only_applies_to_cursor` |
-| TC-314 | FR-314 | unit | runner-aware policy | validate per runner | AGY flash allowed only on AGY | `cargo test runner_aware_policy_allows_agy_flash_only_on_agy` |
+| TC-313 | FR-313 | unit | no F2 selection | submit to Cursor / AGY | composer-2.5 only on Cursor | `cargo test tc_313_graph_default_model_only_applies_to_cursor` |
+| TC-314 | FR-314 | unit | runner-aware policy | validate per runner | AGY flash allowed only on AGY | `cargo test tc_314_runner_aware_policy_allows_agy_flash_only_on_agy` |
 | TC-315 | FR-314 | unit | opencode runner; `/graph override` | validate free/non-free model | free allowed, others rejected | *proposed*: `opencode_policy_allows_free_models_only`, `graph_override_validates_runner_policy` |
 | TC-910 | FR-910 | unit | Ids `composer-2.5`, `composer-2.5-fast`, `grok-4.7-build-fast`, `gemini-3.8-flash-medium`, `gemini-3-flash-fast`, `opencode/glm-5.3-flash-free`, `opencode/glm-fast-free` | `validate_model_for_runner` for cursor, agy, opencode, grok, and codex | Every id containing `fast` is an error on every runner; flash and free ids that do not contain `fast` stay allowed on their runners; `composer-2.5` stays allowed on cursor | `src/model_policy.rs` `tc_910_fast_models_are_rejected_for_every_runner` |
 | TC-911 | FR-911 | unit | `grok-4.7`, `grok-4.6`, `Grok-4.7`, `composer-2.5`, `grok`, `opencode/glm-5.3-flash-free` | `validate_model_for_runner` with runner `grok`, `GROK`, `cursor`, `agy`, `codex`, `opencode` | `grok-*` without `fast` passes only for runner `grok`; cursor still accepts `composer-2.5` and rejects `grok-4.7`; grok rejects `composer-2.5` with an empty registry | `src/model_policy.rs` `tc_911_grok_models_are_allowed_only_for_the_grok_runner` |

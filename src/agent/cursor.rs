@@ -3447,6 +3447,62 @@ pub(crate) mod tests {
             );
         }
 
+        // TC-1863 / FR-1863: under ReadOnly policy, a permission request from the agent
+        // is denied client-side, notice is emitted, and the turn ends Cancelled.
+        // Uses the outside-workspace case under ReadOnly policy.
+        #[tokio::test]
+        async fn tc_1863_read_only_tool_request_is_denied_with_notice_and_cancel() {
+            let _guard = lock_env().await;
+            set_fake_env(&[("FAKE_ACP_PERMISSION_OUTSIDE", "1".as_ref())]);
+            let workspace = tempfile::tempdir().unwrap();
+            let (event_tx, mut event_rx) = mpsc::channel(256);
+            let req = request(TurnPolicy::ReadOnly);
+            let turn_task = tokio::spawn(async move {
+                run_turn(
+                    &req,
+                    None,
+                    TurnPolicy::ReadOnly,
+                    workspace.path(),
+                    &event_tx,
+                    RunnerProtocol::Acp,
+                )
+                .await
+            });
+
+            let mut events = Vec::new();
+            let recv_deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < recv_deadline {
+                match tokio::time::timeout(Duration::from_millis(500), event_rx.recv()).await {
+                    Ok(Some(output)) => events.push(output.event),
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+
+            let result = tokio::time::timeout(Duration::from_secs(5), turn_task)
+                .await
+                .expect("worker task timed out")
+                .expect("worker task join failed");
+            result.expect("denied turn is not an error");
+
+            assert!(
+                events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
+                "turn must end Cancelled on denied read-only tool request"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Error(_) | AgentEvent::Completed)),
+                "denied turn must not complete or error"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("denied"))),
+                "AgentEvent::Notice must be emitted mentioning denial"
+            );
+        }
+
         // TC-2316 / FR-2316: an agent request with the same id as the pending
         // session/prompt must not end the turn early.
         #[tokio::test]

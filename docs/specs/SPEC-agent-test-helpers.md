@@ -66,13 +66,13 @@ still compiles.
 | TC-510 | FR-510, FR-511, FR-512, FR-513, FR-514 | unit | Repository checkout | Read `AGENTS.md` | Section lists `submit_prompt`, `test_app`, and extended helpers | `tests/agent_test_helpers.rs` `tc_510_agents_md_documents_agent_test_helpers` |
 | TC-511 | FR-511, FR-516 | unit | `test_app()`, `app.input` set | `app.handle_enter()` | Same adapter send count as `submit_prompt()` | `src/app.rs` |
 | TC-512 | FR-515 | unit | Repository checkout | Read `src/app.rs` test module doc | Mentions `submit_prompt` and `test_app` | `tests/agent_test_helpers.rs` `tc_512_app_tests_module_doc_lists_helpers` |
-| TC-513 | FR-519 | unit | All `SPEC-*.md` files | `cargo test every_spec_has_status_line` | This SPEC has `Status:` in first 10 lines | `tests/spec_index.rs` |
-| TC-514 | FR-519 | unit | All `SPEC-*.md` files | `cargo test spec_ids_are_unique_across_specs` | IDs 510–519 appear only here | `tests/spec_index.rs` |
-| TC-515 | FR-519 | unit | SPEC files on disk | `cargo test spec_index_script_lists_every_spec` | Index includes `SPEC-agent-test-helpers` | `tests/spec_index.rs` |
+| TC-513 | FR-519 | unit | All `SPEC-*.md` files | `cargo test every_spec_has_status_line` | This SPEC has `Status:` in first 10 lines | `tests/agent_test_helpers.rs` `tc_513_spec_agent_test_helpers_has_status_line` |
+| TC-514 | FR-519 | unit | All `SPEC-*.md` files | `cargo test spec_ids_are_unique_across_specs` | IDs 510–519 appear only here | `tests/agent_test_helpers.rs` `tc_514_spec_ids_510_to_519_are_unique_to_agent_test_helpers` |
+| TC-515 | FR-519 | unit | SPEC files on disk | `cargo test spec_index_script_lists_every_spec` | Index includes `SPEC-agent-test-helpers` | `tests/agent_test_helpers.rs` `tc_515_spec_index_lists_agent_test_helpers` |
 | TC-516 | FR-512 | unit | `test_app()`, Codex selected | `submit_prompt` after setting input | Request routed to selected agent | `src/app.rs` `submitting_routes_to_the_selected_agent` |
-| TC-517 | FR-517 | manual | PR diff | Review dogfood log | #23 marked fixed | `docs/dogfood/README.md` |
-| TC-518 | FR-518 | manual | PR diff | Review TEST-PLAN §1 | Rows for SPEC-agent-test-helpers | `docs/TEST-PLAN.md` |
-| TC-519 | FR-510 | manual | Run generator | `bash scripts/spec-index.sh` | Row for this SPEC with ID ranges including FR-510..519 | `scripts/spec-index.sh` |
+| TC-517 | FR-517 | unit | Dogfood log | Read dogfood README | #23 marked fixed | `tests/agent_test_helpers.rs` `tc_517_dogfood_23_marked_fixed` |
+| TC-518 | FR-518 | unit | TEST-PLAN | Read TEST-PLAN §1 | Rows for SPEC-agent-test-helpers | `tests/agent_test_helpers.rs` `tc_518_test_plan_has_agent_test_helpers_rows` |
+| TC-519 | FR-510 | unit | Run generator | `bash scripts/spec-index.sh` | Row for this SPEC with ID ranges including FR-510..519 | `tests/agent_test_helpers.rs` `tc_519_spec_index_includes_helper_id_ranges` |
 
 ## 6. Data, integration, and safety contracts
 

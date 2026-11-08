@@ -264,7 +264,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_composer_2_5_is_allowed() {
+    fn tc_311_only_composer_2_5_is_allowed() {
         assert!(is_allowed_model("composer-2.5"));
         assert!(is_allowed_model(" Composer-2.5 "));
         assert!(!is_allowed_model("claude-haiku-5-5-high"));
@@ -282,8 +282,9 @@ mod tests {
         assert!(validate_model_id("gemini-4").is_err());
     }
 
+    // TC-314 / FR-314
     #[test]
-    fn runner_aware_policy_allows_agy_flash_only_on_agy() {
+    fn tc_314_runner_aware_policy_allows_agy_flash_only_on_agy() {
         assert!(validate_model_for_runner("agy", "gemini-3.8-flash-medium").is_ok());
         assert!(validate_model_for_runner("agy", "composer-2.5").is_ok());
         assert!(validate_model_for_runner("agy", "gemini-4-pro").is_err());
@@ -394,6 +395,81 @@ mod tests {
         let cursor = default_model_for_runner("cursor").unwrap();
         assert!(!cursor.contains("fast"));
         assert!(validate_model_for_runner("cursor", cursor).is_ok());
+    }
+
+    // TC-1852 / FR-1852
+    #[test]
+    fn tc_1852_validate_model_for_runner_enforces_runner_policy() {
+        // Fast models rejected for all runners
+        for runner in ["cursor", "agy", "opencode", "grok", "codex"] {
+            assert!(validate_model_for_runner(runner, "composer-2.5-fast").is_err());
+            assert!(validate_model_for_runner(runner, "model-fast").is_err());
+        }
+        // Provider default allowed for non-Cursor runners, rejected for Cursor
+        assert!(validate_model_for_runner("cursor", PROVIDER_DEFAULT).is_err());
+        for runner in ["grok", "agy", "opencode", "codex"] {
+            assert!(validate_model_for_runner(runner, PROVIDER_DEFAULT).is_ok());
+        }
+        // Grok models allowed on grok and cursor, rejected on others
+        assert!(validate_model_for_runner("grok", "grok-4.7").is_ok());
+        assert!(validate_model_for_runner("cursor", "grok-4.7").is_ok());
+        assert!(validate_model_for_runner("agy", "grok-4.7").is_err());
+        assert!(validate_model_for_runner("codex", "grok-4.7").is_err());
+        assert!(validate_model_for_runner("opencode", "grok-4.7").is_err());
+        // AGY accepts gemini flash and composer-2.5
+        assert!(validate_model_for_runner("agy", "gemini-3.8-flash-medium").is_ok());
+        assert!(validate_model_for_runner("agy", "composer-2.5").is_ok());
+        assert!(validate_model_for_runner("agy", "gemini-4-pro").is_err());
+        // Opencode accepts opencode/*-free
+        assert!(validate_model_for_runner("opencode", "opencode/glm-5.3-flash-free").is_ok());
+        assert!(validate_model_for_runner("opencode", "opencode/glm-paid").is_err());
+        // Cursor accepts non-fast models
+        assert!(validate_model_for_runner("cursor", "composer-2.5").is_ok());
+        assert!(validate_model_for_runner("cursor", "gpt-5").is_ok());
+        // Codex accepts only composer-2.5
+        assert!(validate_model_for_runner("codex", "composer-2.5").is_ok());
+        assert!(validate_model_for_runner("codex", "gpt-5").is_err());
+    }
+
+    // TC-1853 / FR-1853
+    #[test]
+    fn tc_1853_default_model_for_runner_resolves_cursor_only() {
+        assert_eq!(default_model_for_runner("cursor"), Some("composer-2.5"));
+        assert_eq!(default_model_for_runner("Cursor"), Some("composer-2.5"));
+        for runner in ["grok", "agy", "opencode", "codex", "custom"] {
+            assert_eq!(default_model_for_runner(runner), None, "{runner}");
+        }
+    }
+
+    // TC-1854 / FR-1854
+    #[test]
+    fn tc_1854_validate_model_rejection_error_messages() {
+        // Empty model id
+        assert_eq!(
+            validate_model_for_runner("cursor", "").unwrap_err(),
+            "model id must not be empty"
+        );
+        // Fast models
+        let fast_err = validate_model_for_runner("cursor", "any-fast").unwrap_err();
+        assert_eq!(fast_err, "fast models are blocked by policy: any-fast");
+        // Misrouted grok model
+        let grok_misrouted = validate_model_for_runner("agy", "grok-4.7").unwrap_err();
+        assert_eq!(
+            grok_misrouted,
+            "model grok-4.7 is not allowed for agy; only grok and cursor runners accept grok models"
+        );
+        // Non-grok model on grok
+        let non_grok = validate_model_for_runner("grok", "composer-2.5").unwrap_err();
+        assert_eq!(
+            non_grok,
+            "model composer-2.5 is not allowed for grok; only grok-* models without fast are permitted"
+        );
+        // Provider default on cursor
+        let cursor_default = validate_model_for_runner("cursor", PROVIDER_DEFAULT).unwrap_err();
+        assert_eq!(
+            cursor_default,
+            "model provider default is not allowed for cursor; only composer-2.5 is permitted"
+        );
     }
 
     // TC-1734 / FR-1725: precedence explicit > selected > config > runner > provider
