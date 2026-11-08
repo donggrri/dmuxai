@@ -61,12 +61,35 @@ case "$behavior" in
       printf '%s\n' "$@" > "$FAKE_AGENT_ARGV"
     fi
     printf '{"type":"text","sessionID":"ses_1","part":{"text":"argv logged"}}\n' ;;
-  jsonl)  printf '{"type":"step_start","sessionID":"ses_1"}\n{"type":"text","sessionID":"ses_1","part":{"text":"echo:%s"}}\n' "$(json_escape "$last")" ;;
+  jsonl)
+    printf '{"type":"step_start","sessionID":"ses_1"}\n{"type":"text","sessionID":"ses_1","part":{"text":"echo:%s"}}\n' "$(json_escape "$last")"
+    printf '%s\n' '{"type":"step_finish","sessionID":"ses_1","part":{"type":"step-finish","reason":"stop"}}' ;;
   jsonl_tool)
     printf '%s\n' '{"type":"step_start","sessionID":"ses_1"}'
     printf '%s\n' '{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"read","state":{"status":"completed","title":"src/app.rs","input":{"filePath":"src/app.rs"}}}}'
     sleep 0.2
-    printf '{"type":"text","sessionID":"ses_1","part":{"text":"echo:%s"}}\n' "$(json_escape "$last")" ;;
+    printf '{"type":"text","sessionID":"ses_1","part":{"text":"echo:%s"}}\n' "$(json_escape "$last")"
+    printf '%s\n' '{"type":"step_finish","sessionID":"ses_1","part":{"type":"step-finish","reason":"stop"}}' ;;
+  jsonl_finish_reason)
+    reason="${FAKE_AGENT_FINISH_REASON:-stop}"
+    printf '%s\n' '{"type":"step_start","sessionID":"ses_1"}'
+    printf '%s\n' '{"type":"text","sessionID":"ses_1","part":{"text":"Narration before tool."}}'
+    printf '%s\n' '{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"read"}}'
+    if [ "$reason" != "omit" ]; then
+      printf '{"type":"step_finish","sessionID":"ses_1","part":{"type":"step-finish","reason":"%s"}}\n' "$reason"
+    fi
+    ;;
+  jsonl_short_after_tools)
+    printf '%s\n' '{"type":"step_start","sessionID":"ses_1"}'
+    printf '%s\n' '{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"read"}}'
+    printf '%s\n' '{"type":"step_finish","sessionID":"ses_1","part":{"type":"step-finish","reason":"tool-calls"}}'
+    printf '%s\n' '{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"grep"}}'
+    printf '%s\n' '{"type":"step_finish","sessionID":"ses_1","part":{"type":"step-finish","reason":"tool-calls"}}'
+    printf '%s\n' '{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"edit"}}'
+    printf '%s\n' '{"type":"step_finish","sessionID":"ses_1","part":{"type":"step-finish","reason":"tool-calls"}}'
+    printf '%s\n' '{"type":"text","sessionID":"ses_1","part":{"text":"OK"}}'
+    printf '%s\n' '{"type":"step_finish","sessionID":"ses_1","part":{"type":"step-finish","reason":"stop"}}'
+    ;;
   jsonl_file)
     # Replay a saved JSONL stream (for example the opencode compaction leak).
     if [ -n "$FAKE_AGENT_JSONL" ]; then

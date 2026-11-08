@@ -81,8 +81,13 @@ const OPENCODE_EXAMPLE: &str = r##"# Built-in opencode runner, as an editable [[
 # tool_when = { path = "/type", equals = "tool_use" }
 # tool_name_path = "/part/tool"
 # tool_title_path = "/part/state/title"
+# text_mode = "concat"
+# text_break_when = { path = "/type", equals = "tool_use" }
 # text_skip_when = { path = "/part/synthetic", equals = true }
 # compaction_when = { path = "/part/metadata/compaction_continue", equals = true }
+# finish_when = { path = "/type", equals = "step_finish" }
+# finish_reason_path = "/part/reason"
+# finish_ok = ["stop"]
 # message_id_path = "/part/messageID"
 # error_path = ["/error/data/message", "/error/message"]
 # session_id_path = "/sessionID"
@@ -116,6 +121,7 @@ const GROK_EXAMPLE: &str = r##"# Built-in grok runner, as an editable [[agents.c
 # idle_timeout_secs = 300
 # done_when = { path = "/type", equals = "end" }
 # text_break_when = { path = "/type", equals = "tool_call" }
+# text_mode = "concat"
 # [agents.custom.env]
 # GROK_AUTO_WAKE = "0"
 # [agents.custom.modes]

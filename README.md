@@ -320,6 +320,7 @@ default_model = "opencode/glm-5.3-flash-free"
 output = "jsonl"                  # required for --format json
 text_path = "/part/text"
 text_when = { path = "/type", equals = "text" }
+text_mode = "last"                # default: final text block after tools; use "concat" to keep every part
 session_id_path = "/sessionID"
 resume_arg = ["--session", "{session_id}"]
 

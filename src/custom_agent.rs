@@ -49,6 +49,19 @@ pub struct CustomAgentModes {
     pub implement: Vec<String>,
 }
 
+/// How JSONL text parts fold into the final reply (FR-2530, FR-2531).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TextMode {
+    /// Keep only the text of the block after the last `tool_when` /
+    /// `text_break_when` boundary.
+    #[default]
+    Last,
+    /// Keep every text part; parts are joined with a newline when no
+    /// paragraph break is pending (FR-2451, FR-2531).
+    Concat,
+}
+
 /// Optional condition for matching JSONL text lines.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TextWhen {
@@ -178,6 +191,23 @@ pub struct CustomAgentSpec {
     /// JSON pointer to the tool title or input summary (FR-2430).
     #[serde(default)]
     pub tool_title_path: Option<String>,
+    /// How JSONL text parts fold into the final reply; JSONL agents only
+    /// (FR-2530). Default `last`.
+    #[serde(default)]
+    pub text_mode: Option<TextMode>,
+    /// JSONL line that marks a runner end-of-step event (FR-2532). With a
+    /// clean exit the turn is finished only when the LAST matching line's
+    /// `finish_reason_path` value is in `finish_ok`; otherwise it fails with
+    /// error kind `unfinished`.
+    #[serde(default)]
+    pub finish_when: Option<TextWhen>,
+    /// JSON pointer to the step reason on a `finish_when` line (FR-2532).
+    #[serde(default)]
+    pub finish_reason_path: Option<String>,
+    /// Reason values on `finish_when` lines that mean the turn is complete
+    /// (FR-2532).
+    #[serde(default)]
+    pub finish_ok: Vec<String>,
     /// True for a built-in preset (opencode, grok). Not configurable.
     #[serde(skip)]
     pub builtin: bool,
@@ -231,6 +261,22 @@ pub fn opencode_preset(program: &str) -> CustomAgentSpec {
         }),
         // FR-2441: the message id groups the text parts of one message.
         message_id_path: Some("/part/messageID".to_owned()),
+        // FR-2533: opencode streams narration and a final answer across
+        // messages, so every part is kept (folding per FR-2531 and FR-2442).
+        text_mode: Some(TextMode::Concat),
+        text_break_when: Some(TextWhen {
+            path: "/type".to_owned(),
+            equals: "tool_use".to_owned(),
+        }),
+        // FR-2533: opencode's end-of-step event. Live opencode ends a tool
+        // step with reason "tool-calls" and the final step with "stop",
+        // which alone completes the turn (FR-2532).
+        finish_when: Some(TextWhen {
+            path: "/type".to_owned(),
+            equals: "step_finish".to_owned(),
+        }),
+        finish_reason_path: Some("/part/reason".to_owned()),
+        finish_ok: vec!["stop".to_owned()],
         error_path: Some(vec![
             "/error/data/message".to_owned(),
             "/error/message".to_owned(),
@@ -301,6 +347,9 @@ pub fn grok_preset(program: &str) -> CustomAgentSpec {
             path: "/type".to_owned(),
             equals: "tool_call".to_owned(),
         }),
+        // FR-916: stream both status and final paragraphs across tool calls;
+        // the turn finishes on the `done_when` end line (FR-2534).
+        text_mode: Some(TextMode::Concat),
         modes: CustomAgentModes {
             ask: words(&["--permission-mode", "plan"]),
             plan: words(&["--permission-mode", "plan"]),
@@ -445,6 +494,11 @@ impl CustomAgentSpec {
         self.color.as_deref().unwrap_or("white")
     }
 
+    /// Effective JSONL reply folding mode (FR-2530).
+    pub fn effective_text_mode(&self) -> TextMode {
+        self.text_mode.unwrap_or_default()
+    }
+
     /// Returns the timeout in seconds, defaulting to [`DEFAULT_TIMEOUT_SECS`].
     pub fn timeout_secs(&self) -> u64 {
         self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)
@@ -462,7 +516,7 @@ impl CustomAgentSpec {
 
     /// Returns whether any of `text_path`, `text_when`, `text_skip_when`,
     /// `compaction_when`, `error_path`, `session_id_path`, `message_id_path`,
-    /// `done_when`, or `text_break_when` is set.
+    /// `done_when`, `text_break_when`, or `finish_when` is set.
     pub fn has_jsonl_path_fields(&self) -> bool {
         self.text_path.is_some()
             || self.text_when.is_some()
@@ -473,6 +527,7 @@ impl CustomAgentSpec {
             || self.message_id_path.is_some()
             || self.done_when.is_some()
             || self.text_break_when.is_some()
+            || self.finish_when.is_some()
     }
 
     /// Whether any field references `{mcp_config}`, which was deprecated when
@@ -858,6 +913,12 @@ pub struct ParsedLine {
     /// The message id of the line's part, when `message_id_path` is set
     /// (FR-2441).
     pub message_id: Option<String>,
+    /// The line matches `tool_when` (FR-2530).
+    pub tool_event: bool,
+    /// The line matches `finish_when` (FR-2532).
+    pub finish: bool,
+    /// The value at `finish_reason_path` on a `finish_when` line (FR-2532).
+    pub finish_reason: Option<String>,
 }
 
 /// True when `val` has `when.equals` at `when.path` (string or JSON value).
@@ -990,6 +1051,25 @@ pub fn parse_jsonl_line(spec: &CustomAgentSpec, line: &str) -> ParsedLine {
         })
     });
 
+    // FR-2532: the last `finish_when` line's reason decides whether a turn
+    // finished.
+    let finish = spec
+        .finish_when
+        .as_ref()
+        .is_some_and(|when| json_matches(&val, when));
+    let finish_reason = if finish {
+        spec.finish_reason_path
+            .as_ref()
+            .and_then(|path| val.pointer(path))
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => (!s.is_empty()).then(|| s.clone()),
+                serde_json::Value::Null => None,
+                other => Some(other.to_string()),
+            })
+    } else {
+        None
+    };
+
     ParsedLine {
         text,
         error,
@@ -1007,6 +1087,12 @@ pub fn parse_jsonl_line(spec: &CustomAgentSpec, line: &str) -> ParsedLine {
             .as_ref()
             .is_some_and(|when| json_matches(&val, when)),
         message_id,
+        tool_event: spec
+            .tool_when
+            .as_ref()
+            .is_some_and(|when| json_matches(&val, when)),
+        finish,
+        finish_reason,
     }
 }
 
@@ -1050,6 +1136,8 @@ struct ReplySegment {
 pub struct ReplyCollector {
     /// True when the text parts are grouped per message (FR-2441).
     grouped: bool,
+    /// The reply folding mode (FR-2530).
+    text_mode: TextMode,
     /// The message id of the message that is still open.
     open_message_id: Option<String>,
     /// The text segments of the open message.
@@ -1061,6 +1149,12 @@ pub struct ReplyCollector {
     /// True when the collector has seen a compaction marker and no real
     /// reply text has been received since (FR-2443).
     compacted_pending: bool,
+    /// True when a `done_when` line has been seen (FR-2534).
+    done_seen: bool,
+    /// True when a `finish_when` line has been seen (FR-2532).
+    finish_seen: bool,
+    /// The reason of the LAST `finish_when` line (FR-2532).
+    last_finish_reason: Option<String>,
 }
 
 impl ReplyCollector {
@@ -1068,6 +1162,7 @@ impl ReplyCollector {
     pub fn new(spec: &CustomAgentSpec) -> Self {
         Self {
             grouped: spec.message_id_path.is_some(),
+            text_mode: spec.effective_text_mode(),
             ..Default::default()
         }
     }
@@ -1084,6 +1179,15 @@ impl ReplyCollector {
     /// message (the compaction summary) and never contributes its own text
     /// (FR-2441).
     pub fn push(&mut self, parsed: &ParsedLine) -> Option<String> {
+        if parsed.done {
+            self.done_seen = true;
+        }
+        if parsed.finish {
+            self.finish_seen = true;
+            if let Some(reason) = parsed.finish_reason.as_deref() {
+                self.last_finish_reason = Some(reason.to_owned());
+            }
+        }
         if parsed.compacted {
             // FR-2441: the compaction summary (the text of the open message)
             // is dropped, and the continuation prompt is never reply text.
@@ -1091,6 +1195,10 @@ impl ReplyCollector {
             self.open_message_id = None;
             self.compacted_pending = true;
             return None;
+        }
+
+        if parsed.tool_event && self.text_mode == TextMode::Last {
+            self.begin_new_block();
         }
 
         let mut released = String::new();
@@ -1119,6 +1227,9 @@ impl ReplyCollector {
         }
 
         if parsed.text_break {
+            if self.text_mode == TextMode::Last && !parsed.tool_event {
+                self.begin_new_block();
+            }
             self.break_pending = true;
         }
 
@@ -1156,9 +1267,22 @@ impl ReplyCollector {
     /// Appends the segments of the open message to the reply.
     fn release(&mut self) -> String {
         let mut released = String::new();
+        let join_with_newline = self.text_mode == TextMode::Concat;
         for segment in std::mem::take(&mut self.open) {
             if segment.break_before {
                 self.break_pending = true;
+            }
+            // FR-2531: concat separates two parts with a newline when no
+            // paragraph break is pending.
+            if join_with_newline
+                && !self.reply.is_empty()
+                && !segment.break_before
+                && !self.break_pending
+                && !self.reply.ends_with('\n')
+                && !segment.text.starts_with('\n')
+            {
+                self.reply.push('\n');
+                released.push('\n');
             }
             released.push_str(&append_reply_text(
                 &mut self.reply,
@@ -1167,6 +1291,52 @@ impl ReplyCollector {
             ));
         }
         released
+    }
+
+    /// Starts a fresh stored reply block (`TextMode::Last`, FR-2530).
+    fn begin_new_block(&mut self) {
+        self.reply.clear();
+        self.open.clear();
+        self.open_message_id = None;
+        self.break_pending = false;
+    }
+
+    /// The `unfinished` failure of a turn whose process exited cleanly, if
+    /// any (FR-2532, FR-2534).
+    ///
+    /// With `finish_when` set, the turn is finished only when the LAST
+    /// matching line's `finish_reason_path` value is in `finish_ok`; a
+    /// missing line or a different reason yields a message naming the last
+    /// reason. Without `finish_when`, a `done_when` line that never matched
+    /// is `unfinished`. Agents with neither, and turns with a non-zero exit,
+    /// are unchanged. Reply length and tool count never decide this
+    /// (FR-2535).
+    pub fn unfinished_reason(&self, spec: &CustomAgentSpec, exit_ok: bool) -> Option<String> {
+        if !exit_ok {
+            return None;
+        }
+        if spec.finish_when.is_some() {
+            let finished = self
+                .last_finish_reason
+                .as_deref()
+                .map(|reason| spec.finish_ok.iter().any(|ok| ok == reason))
+                .unwrap_or(false);
+            if finished {
+                return None;
+            }
+            return Some(format!(
+                "{} stopped before finishing the turn (last step reason: {})",
+                spec.label(),
+                self.last_finish_reason.as_deref().unwrap_or("none"),
+            ));
+        }
+        if spec.done_when.is_some() && !self.done_seen {
+            return Some(format!(
+                "{} stopped before finishing the turn",
+                spec.label(),
+            ));
+        }
+        None
     }
 }
 
@@ -3072,5 +3242,88 @@ text_when = { path = "/type", equals = "text" }
             !collector.compacted_without_answer(),
             "must be false once real answer arrives"
         );
+    }
+
+    // TC-2530 / FR-2531: concat mode joins parts with newlines.
+    #[test]
+    fn tc_2530_concat_mode_joins_text_parts_with_newlines() {
+        let toml_str = r#"
+name = "plain"
+command = ["plain"]
+output = "jsonl"
+text_mode = "concat"
+text_path = "/part/text"
+text_when = { path = "/type", equals = "text" }
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        let mut collector = ReplyCollector::new(&spec);
+        collector.push(&parse_jsonl_line(
+            &spec,
+            r#"{"type":"text","part":{"text":"underway"}}"#,
+        ));
+        collector.push(&parse_jsonl_line(
+            &spec,
+            r#"{"type":"text","part":{"text":"Deep read in progress"}}"#,
+        ));
+        collector.finish();
+        assert_eq!(
+            collector.reply(),
+            "underway\nDeep read in progress",
+            "concat must join without running words together"
+        );
+    }
+
+    // TC-2531 / FR-2530: last mode keeps only the text after the last tool.
+    #[test]
+    fn tc_2531_last_mode_keeps_final_text_block_after_tools() {
+        let toml_str = r#"
+name = "plain"
+command = ["plain"]
+output = "jsonl"
+text_path = "/part/text"
+text_when = { path = "/type", equals = "text" }
+tool_when = { path = "/type", equals = "tool_use" }
+text_break_when = { path = "/type", equals = "tool_use" }
+"#;
+        let spec: CustomAgentSpec = toml::from_str(toml_str).unwrap();
+        assert_eq!(spec.effective_text_mode(), TextMode::Last);
+        let mut collector = ReplyCollector::new(&spec);
+        collector.push(&parse_jsonl_line(
+            &spec,
+            r#"{"type":"text","part":{"text":"underway"}}"#,
+        ));
+        collector.push(&parse_jsonl_line(
+            &spec,
+            r#"{"type":"tool_use","part":{"tool":"read"}}"#,
+        ));
+        collector.push(&parse_jsonl_line(
+            &spec,
+            r#"{"type":"text","part":{"text":"The final report."}}"#,
+        ));
+        collector.finish();
+        assert_eq!(collector.reply(), "The final report.");
+    }
+
+    // TC-2533 / FR-2533: built-in opencode preset finish settings and concat text_mode.
+    #[test]
+    fn tc_2533_opencode_preset_finish_settings() {
+        let preset = opencode_preset("opencode");
+        assert_eq!(preset.effective_text_mode(), TextMode::Concat);
+        assert_eq!(
+            preset.text_break_when,
+            Some(TextWhen {
+                path: "/type".to_owned(),
+                equals: "tool_use".to_owned()
+            })
+        );
+        assert_eq!(
+            preset.finish_when,
+            Some(TextWhen {
+                path: "/type".to_owned(),
+                equals: "step_finish".to_owned()
+            })
+        );
+        assert_eq!(preset.finish_reason_path.as_deref(), Some("/part/reason"));
+        assert_eq!(preset.finish_ok, vec!["stop".to_owned()]);
     }
 }
