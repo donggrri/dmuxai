@@ -1312,7 +1312,7 @@ impl ReplyCollector {
     /// are unchanged. Reply length and tool count never decide this
     /// (FR-2535).
     pub fn unfinished_reason(&self, spec: &CustomAgentSpec, exit_ok: bool) -> Option<String> {
-        if !exit_ok {
+        if !exit_ok || spec.effective_output() != CustomAgentOutput::Jsonl {
             return None;
         }
         if spec.finish_when.is_some() {
