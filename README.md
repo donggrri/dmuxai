@@ -58,6 +58,27 @@ startup; other origins/hosts are rejected. Binding elsewhere requires
 open the printed URL in the browser (`localhost` is forwarded).
 Details: [SPEC-web-dashboard](docs/specs/SPEC-web-dashboard.md).
 
+### Dashboard token
+
+`dmuxai --web` and `dmuxai serve` print a line such as
+`dmuxai dashboard: http://127.0.0.1:7420/?token=…`. The **per-start access
+token** in that URL is a session credential: anyone who can reach the bind
+address and knows the token can use the dashboard API (run agents, change
+settings, and so on). Treat it like a password.
+
+- The printed line can remain in **terminal scrollback**, tmux or screen logs,
+  CI job output, and your shell's copy-paste buffer.
+- Opening the URL in a normal browser tab stores the full address, including
+  the token, in **browser history** (use a private window if you want to avoid
+  that, or clear the query string from the address bar after load).
+- **Redact** `?token=…` and the token value before sharing logs, screenshots,
+  or bug reports.
+
+`DMUXAI_WEB_TOKEN` pins a fixed token (32–128 characters of `A-Za-z0-9_-`)
+instead of a random one. Use it only on a machine you trust; the value is still
+a secret and must not be committed to git or pasted into public issues. If the
+value is invalid, DmuxAI prints a warning and uses a random token instead.
+
 ### Graph view
 
 ![Graph run as a subway map (demo data)](docs/images/web-graph-view.png)

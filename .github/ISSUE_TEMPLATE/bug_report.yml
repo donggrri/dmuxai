@@ -61,7 +61,7 @@ body:
     id: logs
     attributes:
       label: Logs or screenshots
-      description: Redact access tokens, API keys, and private paths before pasting
+      description: Redact dashboard access tokens (?token= URLs from dmuxai --web or serve), other access tokens, API keys, and private paths before pasting
       render: shell
 
   - type: dropdown
