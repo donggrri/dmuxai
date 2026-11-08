@@ -28602,9 +28602,9 @@ out3
         }
     }
 
-    // TC-754: tui_file_link_open_target (FR-750)
+    // TC-754: tc_754_tui_file_link_open_target (FR-750)
     #[test]
-    fn tui_file_link_open_target() {
+    fn tc_754_tui_file_link_open_target() {
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
         std::fs::create_dir_all(&docs_dir).unwrap();
@@ -28645,9 +28645,9 @@ out3
         assert!(spaced_uri.contains("%20"));
     }
 
-    // TC-755: tui_file_links_emit_osc8 (FR-750)
+    // TC-755: tc_755_tui_file_links_emit_osc8 (FR-750)
     #[test]
-    fn tui_file_links_emit_osc8() {
+    fn tc_755_tui_file_links_emit_osc8() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("docs")).unwrap();
         std::fs::write(dir.path().join("docs/a.md"), "x").unwrap();
@@ -32434,7 +32434,7 @@ out3
     // TC-1510: grill-me on the planner runs a read-only interview, the answer
     // reaches the next round, and the marker hands the notes to the plan turn.
     #[test]
-    fn stage_skills_planner_interview_flow() {
+    fn tc_1510_stage_skills_planner_interview_flow() {
         let mut h = stage_skill_harness("[stages.planner]\nskills = [\"grill-me\"]\n");
         h.app.input = "/plan build a login page".to_owned();
         h.app.submit_prompt();
@@ -32477,7 +32477,7 @@ out3
 
     // TC-1514: the round cap ends the interview without the marker.
     #[test]
-    fn stage_skills_interview_round_cap() {
+    fn tc_1514_stage_skills_interview_round_cap() {
         let mut h =
             stage_skill_harness("[stages.planner]\nskills = [\"grill-me\"]\nmax_rounds = 2\n");
         h.app.input = "/plan build it".to_owned();
@@ -32512,7 +32512,7 @@ out3
 
     // TC-1506: a missing required skill blocks before the judge.
     #[test]
-    fn stage_skills_preflight_blocks_missing() {
+    fn tc_1506_stage_skills_preflight_blocks_missing() {
         let mut h = stage_skill_harness("[stages.review]\nskills = [\"nope\"]\n");
         h.app.input = "build a multi-step feature".to_owned();
         h.app.submit_prompt();
@@ -32529,7 +32529,7 @@ out3
     // TC-1503, TC-1511: implement-stage skill shows on the approval card and
     // is injected into the node prompt, recorded with its hash.
     #[test]
-    fn stage_skills_node_injection_and_approval_card() {
+    fn tc_1503_tc_1511_stage_skills_node_injection_and_approval_card() {
         let mut h =
             stage_skill_harness("[stages.implement]\nskills = [\"./skills/review-list\"]\n");
         reach_awaiting_approval(&mut h);
@@ -36434,7 +36434,7 @@ out3
 
     // TC-1715 (FR-1705): session injects fresh only
     #[test]
-    fn agent_prompt_session_injects_on_fresh_session_only() {
+    fn tc_1715_agent_prompt_session_injects_on_fresh_session_only() {
         let (mut app, sent) = test_app();
         use dmuxai::agent_prompt::PromptInject;
         agent_prompt_configure(&mut app, "agy", "INSTR", PromptInject::Session);
@@ -36660,7 +36660,7 @@ out3
 
     // TC-1718 (FR-1706): headless json source/hash
     #[tokio::test]
-    async fn agent_prompt_headless_json_reports_source_and_hash() {
+    async fn tc_1718_agent_prompt_headless_json_reports_source_and_hash() {
         let (mut app, sent, event_tx) = test_app_with_event_sender();
         use dmuxai::agent_prompt::{PromptInject, PromptTextWithSource, RunnerPromptConfig};
         app.settings.runner_prompts.insert(

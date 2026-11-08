@@ -46,7 +46,7 @@ fn find_chrome() -> Option<PathBuf> {
 // TC-1720 (FR-1706): panel renders
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn agent_prompts_panel_renders_in_headless_chrome() {
+fn tc_1720_agent_prompts_panel_renders_in_headless_chrome() {
     let Some(chrome) = find_chrome() else {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
         return;

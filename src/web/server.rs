@@ -6527,7 +6527,7 @@ mod tests {
     // PR-2.5 part 4: agent prompt API tests
     // TC-1719 (FR-1706): api get unset
     #[tokio::test]
-    async fn agent_prompt_api_get_lists_runners_unset_by_default() {
+    async fn tc_1719_agent_prompt_api_get_lists_runners_unset_by_default() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().join("proj");
         std::fs::create_dir_all(&workspace).unwrap();

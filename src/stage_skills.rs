@@ -1424,7 +1424,7 @@ mod tests {
 
     // TC-1500
     #[test]
-    fn unknown_stage_and_judge_warn() {
+    fn tc_1500_unknown_stage_and_judge_warn() {
         let s = settings(
             "[stages.planner]\nskills=[\"a\"]\n[stages.bogus]\nskills=[\"a\"]\n[stages.judge]\nskills=[\"a\"]\n",
         );
@@ -1437,7 +1437,7 @@ mod tests {
 
     // TC-1507
     #[test]
-    fn judge_needs_force() {
+    fn tc_1507_judge_needs_force() {
         let s = settings("[stages.judge]\nskills=[\"a\"]\n");
         assert!(
             s.stage_skills("judge", &[SkillOverride::Add("b".into())])
@@ -1450,7 +1450,7 @@ mod tests {
 
     // TC-1501
     #[test]
-    fn lookup_order() {
+    fn tc_1501_lookup_order() {
         let tmp = tempfile::tempdir().unwrap();
         let c = ctx(tmp.path());
         write_skill(&c.workspace.join(".claude/skills/x"), "claude-x", "c");
@@ -1479,7 +1479,7 @@ mod tests {
 
     // TC-1502
     #[test]
-    fn git_needs_full_sha_and_sync_and_approval() {
+    fn tc_1502_git_needs_full_sha_and_sync_and_approval() {
         let tmp = tempfile::tempdir().unwrap();
         let c = ctx(tmp.path());
         fs::create_dir_all(&c.workspace).unwrap();
@@ -1501,7 +1501,7 @@ mod tests {
 
     // TC-1513: sync from a local fixture repo (no network), approval per commit.
     #[test]
-    fn sync_and_approve_local_repo() {
+    fn tc_1513_sync_and_approve_local_repo() {
         if Command::new("git").arg("--version").output().is_err() {
             return;
         }
@@ -1584,7 +1584,7 @@ mod tests {
 
     // TC-1503
     #[test]
-    fn inject_strips_frontmatter() {
+    fn tc_1503_inject_strips_frontmatter() {
         let tmp = tempfile::tempdir().unwrap();
         let c = ctx(tmp.path());
         write_skill(
@@ -1603,7 +1603,7 @@ mod tests {
 
     // TC-1504
     #[test]
-    fn native_copies_into_run_folder_only() {
+    fn tc_1504_native_copies_into_run_folder_only() {
         let tmp = tempfile::tempdir().unwrap();
         let c = ctx(tmp.path());
         write_skill(&c.workspace.join(".agents/skills/r"), "r", "B");
@@ -1627,7 +1627,7 @@ mod tests {
 
     // TC-1505
     #[test]
-    fn size_limits_block() {
+    fn tc_1505_size_limits_block() {
         let tmp = tempfile::tempdir().unwrap();
         let c = ctx(tmp.path());
         write_skill(
@@ -1655,7 +1655,7 @@ mod tests {
 
     // TC-1506
     #[test]
-    fn optional_missing_does_not_block() {
+    fn tc_1506_optional_missing_does_not_block() {
         let tmp = tempfile::tempdir().unwrap();
         let c = ctx(tmp.path());
         let s = settings("[stages.review]\nskills=[\"a\",\"b\"]\noptional=[\"b\"]\n");
@@ -1669,7 +1669,7 @@ mod tests {
 
     // TC-1508
     #[test]
-    fn overrides_and_record() {
+    fn tc_1508_overrides_and_record() {
         let (o, rest) = parse_skill_overrides("--skills grill-me,-tdd build it");
         assert_eq!(
             o,
@@ -1742,7 +1742,7 @@ mod tests {
 
     // TC-1512
     #[test]
-    fn skill_text_is_bounded_data() {
+    fn tc_1512_skill_text_is_bounded_data() {
         let tmp = tempfile::tempdir().unwrap();
         let c = ctx(tmp.path());
         write_skill(
