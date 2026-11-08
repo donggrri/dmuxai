@@ -96,8 +96,8 @@ Releases follow [docs/RELEASE-PROCESS.md](docs/RELEASE-PROCESS.md), including th
 
 ## Security
 
-Report vulnerabilities through GitHub **private vulnerability reporting** (repository
-**Security** tab → **Report a vulnerability**). See [SECURITY.md](SECURITY.md).
+Report vulnerabilities as described in [SECURITY.md](SECURITY.md) (repository **Security** tab →
+**Report a vulnerability** when available).
 
 ## Code of conduct
 
