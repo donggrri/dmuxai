@@ -153,6 +153,16 @@ fn path_with(dir: &Path) -> OsString {
     std::env::join_paths(paths).unwrap()
 }
 
+#[cfg(unix)]
+fn git_init_quiet(workspace: &Path) {
+    let status = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(workspace)
+        .status()
+        .expect("git init");
+    assert!(status.success(), "git init failed");
+}
+
 fn fake_agent_config(behavior: &str, allowed: Option<&str>) -> String {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -177,6 +187,27 @@ timeout_secs = 30
 "#,
         fixture = fixture.display().to_string().replace('\\', "/"),
     )
+}
+
+// TC-2541 / FR-2540: headless `--read-only` fails when a stub runner writes the workspace.
+#[cfg(unix)]
+#[test]
+fn tc_2541_headless_read_only_detects_workspace_write() {
+    let sandbox = Sandbox::new(&fake_agent_config("readonly_write", None));
+    git_init_quiet(&sandbox.workspace);
+    let output = sandbox.run(&["run", "hello", "--agent", "fake", "--read-only", "--json"]);
+    let json = stdout_json(&output);
+    assert_eq!(output.status.code(), Some(1), "{json}");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error_kind"], "policy");
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("read-only run changed workspace files")),
+        "unexpected error: {:?}",
+        json["error"]
+    );
+    assert!(sandbox.workspace.join("SQA_WRITE.txt").is_file());
 }
 
 // TC-2317 / FR-2317: headless --model reaches the runner's real argv and the

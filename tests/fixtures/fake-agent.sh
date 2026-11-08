@@ -82,6 +82,11 @@ case "$behavior" in
       printf 'changed\n' > "$FAKE_AGENT_OUT"
     fi
     ;;
+  readonly_write)
+    # Simulates a runner that writes despite read-only policy (FR-2540).
+    printf 'wrote\n' > "SQA_WRITE.txt"
+    printf '{"type":"text","sessionID":"ses_1","part":{"text":"wrote despite read-only"}}\n'
+    ;;
   denied) echo "Error: permission denied for bash" >&2; echo "partial" ;;
   fail)   echo "boom" >&2; exit 3 ;;
   error)  printf '{"type":"error","error":{"message":"model not found"}}\n' ;;
