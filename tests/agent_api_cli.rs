@@ -340,11 +340,11 @@ exit 1
     );
 }
 
-// TC-761 / FR-761, NFR-760: a headless run prints exactly one JSON object
+// TC-761 / FR-761, NFR-760, TC-1813 / FR-1813: a headless run prints exactly one JSON object
 // with the agent text and exits 0; a failing agent exits 1 with ok=false.
 #[cfg(unix)]
 #[test]
-fn headless_run_json_success_and_failure() {
+fn tc_1813_headless_run_json_success_and_failure() {
     let ok = Sandbox::new(&fake_agent_config("jsonl", None));
     let output = ok.run(&["run", "hello", "world", "--agent", "fake", "--json"]);
     let json = stdout_json(&output);
@@ -617,11 +617,11 @@ timeout_secs = 30
     );
 }
 
-// TC-763 / FR-762: todo add, list and run without a TUI.
+// TC-763 / FR-762 / TC-1811 / FR-1811: todo add, list and run without a TUI.
 // The fixture is a POSIX shell script (same as src/agent/custom.rs tests).
 #[cfg(unix)]
 #[test]
-fn tc_763_todo_cli_add_list_run() {
+fn tc_763_1811_todo_cli_add_list_run() {
     let sandbox = Sandbox::new(&fake_agent_config("jsonl", None));
     let added = sandbox.run(&[
         "todo",
@@ -670,9 +670,9 @@ fn tc_763_todo_cli_add_list_run() {
     }
 }
 
-// TC-764 / FR-763: status JSON carries every contract key.
+// TC-764 / FR-763 / TC-1812 / FR-1812: status JSON carries every contract key.
 #[test]
-fn tc_764_status_json_has_contract_keys() {
+fn tc_764_1812_status_json_has_contract_keys() {
     let sandbox = Sandbox::new(&fake_agent_config("jsonl", Some(r#""fake", "agy""#)));
     let output = sandbox.run(&["status", "--json"]);
     assert_eq!(output.status.code(), Some(0));
