@@ -126,7 +126,7 @@ mod tests {
 
     // TC-901 / FR-899
     #[test]
-    fn builtin_grok_is_not_graph_routed_unless_listed() {
+    fn tc_901_builtin_grok_is_not_graph_routed_unless_listed() {
         let mut settings = DmuxSettings::default();
         settings
             .custom_agents

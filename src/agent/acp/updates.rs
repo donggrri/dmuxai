@@ -290,7 +290,7 @@ mod tests {
 
     // TC-1302
     #[test]
-    fn maps_agent_message_chunk() {
+    fn tc_1302_maps_agent_message_chunk() {
         let update = json!({
             "sessionUpdate": "agent_message_chunk",
             "content": {"type": "text", "text": "hello"}
@@ -303,7 +303,7 @@ mod tests {
 
     // TC-1315 / FR-1302: tool_call_update reads top-level fields.
     #[test]
-    fn maps_tool_call_update_fields() {
+    fn tc_1315_maps_tool_call_update_fields() {
         let update = json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": "tc-1",
@@ -325,7 +325,7 @@ mod tests {
 
     // TC-1332: merge generic completion into earlier titled tool row.
     #[test]
-    fn merges_tool_call_updates_by_id() {
+    fn tc_1332_merges_tool_call_updates_by_id() {
         let mut cache = ToolCallCache::default();
         let first = json!({
             "sessionUpdate": "tool_call_update",

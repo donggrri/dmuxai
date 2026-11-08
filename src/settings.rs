@@ -3201,13 +3201,24 @@ runners = ["custom-agent"]
         assert_eq!(settings.cursor_prewarm_idle_secs, 120);
     }
 
-    // TC-1305, TC-1410 / FR-1300, FR-1301, FR-1410: runner protocol defaults and TOML parsing.
+    // TC-1305 / FR-1300, FR-1301: runner protocol defaults and TOML parsing.
     #[test]
     fn tc_1305_runner_protocol_defaults_and_parse() {
         let defaults = DmuxSettings::default();
         assert_eq!(defaults.cursor_protocol, RunnerProtocol::Legacy);
         assert_eq!(defaults.grok_protocol, RunnerProtocol::Acp);
+    }
 
+    // TC-1410 / FR-1410: cursor runner defaults to legacy stream-json.
+    #[test]
+    fn tc_1410_cursor_runner_defaults_to_legacy() {
+        let settings = DmuxSettings::default();
+        assert_eq!(settings.cursor_protocol, RunnerProtocol::Legacy);
+    }
+
+    // TC-1423 / FR-1418: opencode has no ACP switch.
+    #[test]
+    fn tc_1423_opencode_has_no_acp_protocol_switch() {
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(
             ws.path().join("dmuxai.toml"),
@@ -3217,7 +3228,6 @@ runners = ["custom-agent"]
         let settings = DmuxSettings::load(ws.path());
         assert_eq!(settings.cursor_protocol, RunnerProtocol::Legacy);
         assert_eq!(settings.grok_protocol, RunnerProtocol::Legacy);
-        // TC-1423 / FR-1418: opencode has no ACP switch.
         assert!(
             settings
                 .config_warnings
@@ -3517,7 +3527,7 @@ mod builtin_grok_tests {
 
     // TC-890 / FR-890, FR-891
     #[test]
-    fn builtin_grok_preset_registration() {
+    fn tc_890_builtin_grok_preset_registration() {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();

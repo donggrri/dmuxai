@@ -2688,7 +2688,7 @@ command = ["x", "--mcp", "{mcp_config}", "{prompt}"]
 
     // TC-892 / FR-892, FR-894, NFR-890
     #[test]
-    fn grok_preset_argv_is_headless_and_not_a_shell() {
+    fn tc_892_grok_preset_argv_is_headless_and_not_a_shell() {
         let spec = grok_preset("grok");
         let prompt = "hello; $(rm)";
         let base = [
@@ -2742,7 +2742,7 @@ command = ["x", "--mcp", "{mcp_config}", "{prompt}"]
 
     // TC-893 / FR-893, FR-894
     #[test]
-    fn grok_streaming_json_extracts_text_and_session() {
+    fn tc_893_grok_streaming_json_extracts_text_and_session() {
         let spec = grok_preset("grok");
         let lines = [
             r#"{"type":"thought","data":"thinking"}"#,
@@ -2775,7 +2775,7 @@ command = ["x", "--mcp", "{mcp_config}", "{prompt}"]
 
     // TC-895 / FR-895
     #[test]
-    fn grok_models_parse_default_filter_and_fast() {
+    fn tc_895_grok_models_parse_default_filter_and_fast() {
         let listed = parse_grok_model_ids(
             "You are logged in with grok.com.\n* grok-4.7 (default)\n- grok-4.6\n- grok-4.7-build-fast\n- grok-4.7\n",
         );
@@ -2832,7 +2832,7 @@ command = ["x", "--mcp", "{mcp_config}", "{prompt}"]
 
     // TC-896 / FR-896, NFR-890
     #[test]
-    fn grok_auth_is_models_stdout_only() {
+    fn tc_896_grok_auth_is_models_stdout_only() {
         assert!(grok_models_authenticated(
             "You are logged in with grok.com.\n",
             true
@@ -2909,7 +2909,7 @@ Available models:
 
     // TC-899 / FR-898
     #[test]
-    fn grok_preset_color_is_distinct() {
+    fn tc_899_grok_preset_color_is_distinct() {
         let color = grok_preset("grok").color.expect("preset color");
         assert_eq!(color, "#6366f1");
         let parsed = crate::theme::parse_color(&color).expect("hex color");
@@ -2926,7 +2926,7 @@ Available models:
     // TC-913 / FR-913: the grok preset turns auto-wake off and does not wait
     // for background work, and marks the end and tool-call lines.
     #[test]
-    fn grok_preset_avoids_stranded_auto_wake() {
+    fn tc_913_grok_preset_avoids_stranded_auto_wake() {
         let spec = grok_preset("grok");
         assert_eq!(
             spec.env.get("GROK_AUTO_WAKE").map(String::as_str),
@@ -3074,7 +3074,7 @@ error_path = "/result/error"
     // TC-917 / FR-916: a pending break adds one blank line only between two
     // words, never at the start or after existing whitespace.
     #[test]
-    fn append_reply_text_breaks_paragraphs_once() {
+    fn tc_917_append_reply_text_breaks_paragraphs_once() {
         let mut reply = String::new();
         let mut pending = true;
         assert_eq!(

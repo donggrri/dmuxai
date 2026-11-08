@@ -3270,6 +3270,9 @@ pub(crate) mod tests {
             "FAKE_ACP_PROMPT_CAPTURE",
             "FAKE_ACP_MCP_CAPTURE",
             "FAKE_ACP_SETSID_PIDFILE",
+            "FAKE_ACP_SLEEP_MS",
+            "FAKE_ACP_CANCEL_CAPTURE",
+            "FAKE_ACP_CRASH",
         ];
 
         fn set_fake_env(vars: &[(&str, &std::ffi::OsStr)]) {
@@ -3342,8 +3345,9 @@ pub(crate) mod tests {
                 .count()
         }
 
+        // TC-1300 / FR-1300, NFR-1300: Cursor ACP protocol drives a fake ACP agent binary.
         #[tokio::test]
-        async fn cursor_acp_turn_with_fake_agent() {
+        async fn tc_1300_cursor_acp_turn_with_fake_agent() {
             let _guard = lock_env().await;
             set_fake_env(&[]);
             let workspace = tempfile::tempdir().unwrap();
@@ -3383,8 +3387,7 @@ pub(crate) mod tests {
             assert_eq!(captured.trim(), "[]", "captured: {captured}");
         }
 
-        // TC-1412, TC-1329 / FR-1411, FR-1327: fast-only session refused before any
-        // prompt; child reaped.
+        // TC-1412 / FR-1411: fast-only session refused before any prompt; no session/prompt sent.
         #[tokio::test]
         async fn tc_1412_fast_only_refused_without_prompt() {
             let _guard = lock_env().await;
@@ -3400,6 +3403,18 @@ pub(crate) mod tests {
             let err = result.unwrap_err();
             assert!(err.to_string().contains("fast"), "{err}");
             assert!(!capture.path().exists(), "no session/prompt may be sent");
+        }
+
+        // TC-1329 / FR-1327: fast-only session exit reaps child process.
+        #[tokio::test]
+        async fn tc_1329_fast_only_refused_child_reaped() {
+            let _guard = lock_env().await;
+            set_fake_env(&[("FAKE_ACP_FAST_ONLY", "1".as_ref())]);
+            let workspace = tempfile::tempdir().unwrap();
+            let (result, _events) =
+                drive(TurnPolicy::Agent, Some("composer-2.5"), workspace.path()).await;
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("fast"), "{err}");
             let mut alive = live_fake_acp_agent_count();
             for _ in 0..30 {
                 if alive == 0 {
@@ -3510,7 +3525,7 @@ pub(crate) mod tests {
             std::fs::read_to_string(capture.path()).unwrap_or_default()
         }
 
-        // TC-1424, TC-1425 / FR-1413, NFR-1410: modes / configOptions / both / none.
+        // TC-1424 / NFR-1410, FR-1413: single mode shape advertisements.
         #[tokio::test]
         async fn tc_1424_read_only_mode_shapes() {
             let _guard = lock_env().await;
@@ -3519,8 +3534,78 @@ pub(crate) mod tests {
                 read_only_mode_call("config").await,
                 "session/set_config_option plan"
             );
-            assert_eq!(read_only_mode_call("both").await, "session/set_mode ask");
             assert_eq!(read_only_mode_call("none").await, "");
+        }
+
+        // TC-1425 / NFR-1410, FR-1413: both modes and configOptions advertised prefers modes.
+        #[tokio::test]
+        async fn tc_1425_read_only_mode_prefers_modes_when_both_advertised() {
+            let _guard = lock_env().await;
+            assert_eq!(read_only_mode_call("both").await, "session/set_mode ask");
+        }
+
+        // TC-1304 / FR-1304: fake agent non-zero exit surfaces Error event.
+        #[tokio::test]
+        async fn tc_1304_fake_agent_exit_nonzero_surfaces_error() {
+            let _guard = lock_env().await;
+            set_fake_env(&[("FAKE_ACP_CRASH", "1".as_ref())]);
+            let workspace = tempfile::tempdir().unwrap();
+            let (result, events) = tokio::time::timeout(
+                Duration::from_secs(5),
+                drive(TurnPolicy::Agent, None, workspace.path()),
+            )
+            .await
+            .expect("timed out waiting for fake agent exit");
+            assert!(
+                result.is_err() || events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+                "result: {result:?}, events: {events:?}"
+            );
+        }
+
+        // TC-1317 / FR-1316, FR-1323: user cancel sends session/cancel before killing child.
+        #[tokio::test]
+        async fn tc_1317_cancel_sends_session_cancel_observed() {
+            let _guard = lock_env().await;
+            let cancel_capture = tempfile::NamedTempFile::new().unwrap();
+            std::fs::remove_file(cancel_capture.path()).ok();
+            set_fake_env(&[
+                ("FAKE_ACP_SLEEP_MS", "200".as_ref()),
+                ("FAKE_ACP_CANCEL_CAPTURE", cancel_capture.path().as_os_str()),
+            ]);
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let config = CursorAdapterConfig {
+                protocol: RunnerProtocol::Acp,
+                prewarm: false,
+                prewarm_idle_secs: 300,
+            };
+            let workspace = tempfile::tempdir().unwrap();
+            let (adapter, worker) =
+                spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
+            adapter.send(linger_request("turn-1", "hello")).unwrap();
+
+            // Give the agent a moment to start processing the prompt
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            adapter.cancel().unwrap();
+
+            let cancelled_at = Instant::now();
+            let mut cancelled = false;
+            while cancelled_at.elapsed() < Duration::from_secs(3) && !cancelled {
+                if let Ok(Some(output)) = timeout(Duration::from_millis(200), event_rx.recv()).await
+                    && output.event == AgentEvent::Cancelled
+                {
+                    cancelled = true;
+                }
+            }
+            assert!(cancelled, "ACP cancel should end the turn as Cancelled");
+
+            drop(adapter);
+            let _ = tokio::time::timeout(Duration::from_secs(3), worker)
+                .await
+                .expect("adapter worker did not finish after drop");
+            assert!(
+                cancel_capture.path().exists(),
+                "session/cancel should have been captured"
+            );
         }
 
         // TC-1966 / FR-1966: ACP client uses the shared supervisor::terminate_group;

@@ -810,7 +810,7 @@ fn tc_2450_opencode_run_uses_the_workspace_cwd_and_pwd() {
 // it not graph-allowed. An empty PATH and a home without ~/.grok/bin/grok drops it.
 #[cfg(unix)]
 #[test]
-fn fresh_install_lists_grok() {
+fn tc_891_fresh_install_lists_grok() {
     let sandbox = Sandbox::bare();
     let bin = fake_grok(&sandbox.root);
     let with_grok = [("PATH", path_with(&bin))];

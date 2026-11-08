@@ -79,7 +79,7 @@ fn tc_2508_readme_documents_workspace_state_gitignore() {
 
 // TC-905 / FR-900
 #[test]
-fn readme_and_changelog_mention_builtin_grok() {
+fn tc_905_readme_and_changelog_mention_builtin_grok() {
     let readme = read("README.md");
     let first_run = readme
         .split("## First run")

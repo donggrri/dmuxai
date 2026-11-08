@@ -216,7 +216,7 @@ mod tests {
 
     // Requirement/TC traceability: FR-980 / TC-980
     #[test]
-    fn grok_tool_lines_map_to_activity_items() {
+    fn tc_980_grok_tool_lines_map_to_activity_items() {
         let mut tracker = GrokToolTracker::new("/ws");
         let start = Instant::now();
 

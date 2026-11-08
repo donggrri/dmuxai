@@ -25283,9 +25283,9 @@ out3
         assert_eq!(app.input, "");
     }
 
-    #[test]
     // TC-1309: /mode is removed; typed /mode does not send a prompt.
-    fn fast_typed_mode_command_sets_mode_without_sending() {
+    #[test]
+    fn tc_1309_fast_typed_mode_command_sets_mode_without_sending() {
         let (mut app, sent) = test_app();
         app.input = "/mode implement".to_owned();
         app.submit_prompt();
@@ -29325,7 +29325,7 @@ out3
 
     // TC-900 / FR-898
     #[test]
-    fn grok_chat_and_dashboard_use_preset_color() {
+    fn tc_900_grok_chat_and_dashboard_use_preset_color() {
         let (mut app, sent) = test_app();
         app.settings.custom_agents = vec![dmuxai::custom_agent::grok_preset("grok")];
         if !app
@@ -29386,7 +29386,7 @@ out3
 
     // TC-902 / FR-899
     #[test]
-    fn grok_effective_model_skips_composer_default() {
+    fn tc_902_grok_effective_model_skips_composer_default() {
         let (mut app, _) = test_app();
         app.settings.custom_agents = vec![dmuxai::custom_agent::grok_preset("grok")];
         assert_eq!(
@@ -29406,7 +29406,7 @@ out3
 
     // TC-903 / FR-899
     #[test]
-    fn graph_status_names_builtin_grok_exception() {
+    fn tc_903_graph_status_names_builtin_grok_exception() {
         let (mut app, _) = test_app();
         app.settings
             .custom_agents
@@ -29447,7 +29447,7 @@ out3
 
     // TC-904 / FR-896
     #[test]
-    fn selecting_grok_requests_a_model_probe() {
+    fn tc_904_selecting_grok_requests_a_model_probe() {
         let warnings = install_shared_test_registry();
         assert_eq!(
             dmuxai::custom_agent::index_of("grok"),

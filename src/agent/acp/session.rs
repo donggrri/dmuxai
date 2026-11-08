@@ -275,7 +275,7 @@ mod tests {
 
     // TC-1318 / FR-1313: reject Cursor ACP fast-only models.
     #[test]
-    fn cursor_acp_rejects_fast_model_report() {
+    fn tc_1318_cursor_acp_rejects_fast_model_report() {
         let payload = json!({ "models": { "currentModelId": "composer-2.5[fast=true]" } });
         let err = cursor_acp_model_check(&payload, Some("composer-2.5")).unwrap_err();
         assert!(err.contains("fast"), "{err}");
@@ -283,7 +283,7 @@ mod tests {
 
     // TC-1319 / FR-1313: read currentModelId not requested id.
     #[test]
-    fn cursor_acp_reads_models_current_model_id() {
+    fn tc_1319_cursor_acp_reads_models_current_model_id() {
         let payload = json!({
             "models": {
                 "currentModelId": "composer-2.5",
@@ -298,7 +298,7 @@ mod tests {
 
     // TC-1328 / FR-1313: do not switch to unrelated non-fast models.
     #[test]
-    fn pick_non_fast_model_stays_in_requested_family() {
+    fn tc_1328_pick_non_fast_model_stays_in_requested_family() {
         let candidates = vec![
             "auto-smart".to_owned(),
             "claude-opus-5-5".to_owned(),
@@ -313,7 +313,7 @@ mod tests {
 
     // TC-1323 / FR-1316: session/load params include cwd and mcpServers.
     #[test]
-    fn session_load_params_schema() {
+    fn tc_1323_session_load_params_schema() {
         let params = session_load_params("sid-1", Path::new("/proj"));
         assert_eq!(params["sessionId"], "sid-1");
         assert_eq!(params["cwd"], "/proj");
@@ -322,7 +322,7 @@ mod tests {
 
     // TC-1324: session/set_mode uses modeId.
     #[test]
-    fn session_set_mode_uses_mode_id() {
+    fn tc_1324_session_set_mode_uses_mode_id() {
         let params = session_set_mode_params("sid", "ask");
         assert_eq!(params["modeId"], "ask");
         assert!(params.get("mode").is_none());

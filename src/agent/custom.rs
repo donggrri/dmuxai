@@ -2295,7 +2295,7 @@ env = { FAKE_CFG = "{temp_config}" }
 
     // TC-894 / FR-893, FR-894, FR-895
     #[tokio::test]
-    async fn grok_mock_turn_returns_text_and_reports_errors() {
+    async fn tc_894_grok_mock_turn_returns_text_and_reports_errors() {
         let dir = tempfile::tempdir().unwrap();
         let argv_path = dir.path().join("argv.txt");
         let spec = grok_spec(&[(
@@ -2373,7 +2373,7 @@ env = { FAKE_CFG = "{temp_config}" }
 
     // TC-897 / FR-896; TC-2281 / FR-2281
     #[tokio::test]
-    async fn grok_unauthenticated_send_explains_login() {
+    async fn tc_897_2281_grok_unauthenticated_send_explains_login() {
         let dir = tempfile::tempdir().unwrap();
         for auth in ["0", "fail"] {
             let argv_path = dir.path().join(format!("argv-{auth}.txt"));
@@ -2444,7 +2444,7 @@ env = { FAKE_CFG = "{temp_config}" }
     // TC-898 / FR-897
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn grok_cancel_kills_the_process_group() {
+    async fn tc_898_grok_cancel_kills_the_process_group() {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("grandchild.pid");
         let spec = grok_spec(&[
@@ -2576,7 +2576,7 @@ env = { FAKE_CFG = "{temp_config}" }
     // TC-981 / FR-980
     #[cfg(unix)]
     #[tokio::test]
-    async fn grok_tool_calls_emit_activity_events() {
+    async fn tc_981_grok_tool_calls_emit_activity_events() {
         let spec = grok_spec(&[("GROK_FAKE_MODE", "tools")]);
         let (tx, mut rx, worker) = drive(spec).await;
         tx.send(CustomCommand::Send(request("read src/app.rs", None)))
@@ -2685,7 +2685,7 @@ env = { FAKE_CFG = "{temp_config}" }
     // idles afterwards and a child still holds stdout. Both are stopped.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn grok_end_line_finishes_turn_and_reaps_group() {
+    async fn tc_914_grok_end_line_finishes_turn_and_reaps_group() {
         let (events, elapsed, child) = lingering_turn("linger").await;
         assert!(completed(&events), "{events:?}");
         // 3 s grace, then TERM; generous margin for loaded CI machines.
@@ -2698,7 +2698,7 @@ env = { FAKE_CFG = "{temp_config}" }
     // child is stopped.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn grok_orphan_holding_stdout_does_not_block_turn() {
+    async fn tc_915_grok_orphan_holding_stdout_does_not_block_turn() {
         let (events, elapsed, child) = lingering_turn("orphan").await;
         assert_eq!(texts(&events), "OK");
         assert!(completed(&events), "{events:?}");
@@ -2710,7 +2710,7 @@ env = { FAKE_CFG = "{temp_config}" }
     // TC-916 / FR-915 (amended by FR-2534): without an end line a clean exit
     // fails with `error_kind = unfinished`.
     #[tokio::test]
-    async fn grok_turn_without_end_line_fails_as_unfinished() {
+    async fn tc_916_grok_turn_without_end_line_fails_as_unfinished() {
         let spec = grok_spec(&[("GROK_FAKE_MODE", "noend")]);
         let (tx, mut rx, worker) = drive(spec).await;
         tx.send(CustomCommand::Send(request("hello", None)))
@@ -2733,7 +2733,7 @@ env = { FAKE_CFG = "{temp_config}" }
     // break, so "Checking" and "Done." do not run together.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn grok_text_after_tool_call_starts_new_paragraph() {
+    async fn tc_918_grok_text_after_tool_call_starts_new_paragraph() {
         let (events, _, _) = lingering_turn("linger").await;
         assert_eq!(texts(&events), "Checking\n\nDone.");
     }
@@ -2742,7 +2742,7 @@ env = { FAKE_CFG = "{temp_config}" }
     // `cargo test` does not run it and must not count it as passed.
     #[tokio::test]
     #[ignore = "live grok smoke; requires a logged-in grok binary"]
-    async fn grok_live_smoke_headless_turn() {
+    async fn tc_907_grok_live_smoke_headless_turn() {
         let Some(bin) = dmuxai::settings::find_grok_bin() else {
             panic!("grok binary not found");
         };
