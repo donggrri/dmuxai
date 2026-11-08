@@ -77,7 +77,7 @@ mod tests {
 
     // TC-529: static_page_is_embedded_and_hardened
     #[tokio::test]
-    async fn static_page_is_embedded_and_hardened() {
+    async fn tc_529_static_page_is_embedded_and_hardened() {
         assert!(INDEX_HTML.contains("/assets/app.js"));
         assert!(APP_JS.contains("/api/events"));
         assert_ne!(APP_CSS.len(), 0);
@@ -266,7 +266,7 @@ mod tests {
 
     // TC-543: static_page_has_todo_panel (SPEC-web-dashboard UX-540)
     #[test]
-    fn static_page_has_todo_panel() {
+    fn tc_543_static_page_has_todo_panel() {
         assert!(INDEX_HTML.contains("id=\"todos\""));
         assert!(INDEX_HTML.contains("id=\"todo-form\""));
         assert!(APP_JS.contains("/api/todos"));
@@ -756,7 +756,7 @@ mod tests {
 
     // TC-572: static_page_has_todo_links (SPEC-web-dashboard UX-561)
     #[test]
-    fn static_page_has_todo_links() {
+    fn tc_572_static_page_has_todo_links() {
         assert!(INDEX_HTML.contains("id=\"todos\""));
         assert!(INDEX_HTML.contains("id=\"todo-list\""));
         // UX-561: form has the Jira ticket field and preview element.
@@ -785,7 +785,7 @@ mod tests {
 
     // TC-568: static_page_has_import_panel (SPEC-web-dashboard UX-560)
     #[test]
-    fn static_page_has_import_panel() {
+    fn tc_568_static_page_has_import_panel() {
         assert!(INDEX_HTML.contains("id=\"import-form\""));
         assert!(APP_JS.contains("/api/import"));
         assert!(APP_JS.contains("/api/mcp/servers"));
@@ -1627,7 +1627,7 @@ mod tests {
     // has no width cap and no centered fixed container; the graph re-lays out
     // when the column width changes without a window resize.
     #[test]
-    fn center_column_uses_full_width() {
+    fn tc_1200_center_column_uses_full_width() {
         let main_rule = css_rule(APP_CSS, "main");
         assert!(main_rule.contains("max-width: none;"), "{main_rule}");
         assert!(main_rule.contains("margin: 0;"), "{main_rule}");
@@ -1649,7 +1649,7 @@ mod tests {
     // Documents panel is collapsed in the served HTML, with an accessible
     // toggle button.
     #[test]
-    fn documents_panel_is_collapsed_by_default() {
+    fn tc_1201_documents_panel_is_collapsed_by_default() {
         let start = INDEX_HTML.find("<section id=\"docs\"").expect("docs panel");
         let end = INDEX_HTML[start..].find("</section>").expect("closes") + start;
         let panel = &INDEX_HTML[start..end];
@@ -1670,7 +1670,7 @@ mod tests {
     // aria-expanded and hidden together, defaults to collapsed, keeps the state
     // in sessionStorage only, and the header shows the change count.
     #[test]
-    fn documents_toggle_script() {
+    fn tc_1202_documents_toggle_script() {
         let toggle_js = js_between(DOCS_JS, "var DOCS_EXPANDED_KEY", "function docBadge");
         assert!(toggle_js.contains("'dmuxai.docsExpanded'"));
         assert!(toggle_js.contains("window.sessionStorage.getItem(DOCS_EXPANDED_KEY) === '1'"));
@@ -1702,7 +1702,7 @@ mod tests {
     // TC-1206 (SPEC-dashboard-fullwidth FR-1206..FR-1210): ChatGPT-style chat
     // and the single place an agent turn's text is rendered.
     #[test]
-    fn chatgpt_style_chat_assets() {
+    fn tc_1206_chatgpt_style_chat_assets() {
         let text_js = js_between(
             SESSION_JS,
             "function renderMessagePlain",
@@ -1739,7 +1739,7 @@ mod tests {
     // TC-1209 (SPEC-dashboard-fullwidth FR-1211, FR-1212, FR-1213, FR-1214, FR-1215, FR-1216): Diff and Graph are
     // header-button center views, hidden in the served HTML.
     #[test]
-    fn diff_and_graph_center_view_assets() {
+    fn tc_1209_diff_and_graph_center_view_assets() {
         for (id, panel, view) in [
             ("diff-toggle", "docs", "diff"),
             ("graph-toggle", "graph", "graph"),
@@ -1837,7 +1837,7 @@ mod tests {
     // TC-1212 (SPEC-dashboard-fullwidth FR-1217, FR-1218, FR-1219, FR-1220,
     // FR-1221, UX-1202): inline agent-processing rows in the chat.
     #[test]
-    fn chat_inline_activity_assets() {
+    fn tc_1212_chat_inline_activity_assets() {
         let aux = js_between(
             SESSION_JS,
             "function fmtElapsed",
@@ -1882,7 +1882,7 @@ mod tests {
     // TC-1219 (SPEC-dashboard-fullwidth FR-1223, FR-1224): one run row per
     // exchange from the turn bands; older runs open through `show_graph_run`.
     #[test]
-    fn per_turn_run_row_assets() {
+    fn tc_1219_per_turn_run_row_assets() {
         let aux = js_between(
             SESSION_JS,
             "function fmtElapsed",
@@ -1905,7 +1905,7 @@ mod tests {
 
     // TC-1225 / SPEC-dashboard-fullwidth FR-1225..FR-1227
     #[test]
-    fn sessions_grouped_by_workspace_assets() {
+    fn tc_1225_sessions_grouped_by_workspace_assets() {
         let list = js_between(
             SESSION_JS,
             "var SESSIONS_GROUP_VISIBLE = 3;",

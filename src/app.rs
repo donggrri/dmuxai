@@ -19560,7 +19560,7 @@ mod tests {
     // TC-530 / FR-530: the App publishes its graph session and busy agents to
     // the attached dashboard hub with the `tui` source.
     #[test]
-    fn app_publishes_graph_state_to_dashboard() {
+    fn tc_530_app_publishes_graph_state_to_dashboard() {
         let (mut app, _sent) = test_app();
         let hub = dmuxai::web::DashboardHub::new(
             dmuxai::web::SnapshotSource::Tui,
@@ -19736,7 +19736,7 @@ mod tests {
     // TC-1214 / SPEC-dashboard-fullwidth FR-1222: A -> B -> A restores each
     // conversation's own latest run; B never shows A's.
     #[test]
-    fn conversation_switch_restores_own_graph_run() {
+    fn tc_1214_conversation_switch_restores_own_graph_run() {
         let (mut h, hub) = history_app();
         let a = h.app.conversation_id.clone();
         h.app.input = "/direct first".to_owned();
@@ -19784,7 +19784,7 @@ mod tests {
     // TC-1215 / FR-1222: a run left mid-run is shown cancelled (file kept);
     // a live run of the conversation wins; a stored awaiting run is stale.
     #[test]
-    fn restored_graph_history_is_safe() {
+    fn tc_1215_restored_graph_history_is_safe() {
         let (mut h, hub) = history_app();
         let a = h.app.conversation_id.clone();
         h.app.input = "/direct first".to_owned();
@@ -19824,7 +19824,7 @@ mod tests {
     // TC-1216 / FR-1224: the dashboard can show an older run of this
     // conversation, never another conversation's, and not over a pending plan.
     #[test]
-    fn show_graph_run_command_is_scoped() {
+    fn tc_1216_show_graph_run_command_is_scoped() {
         let (mut h, hub) = history_app();
         let a = h.app.conversation_id.clone();
         h.app.input = "/direct first".to_owned();
@@ -19916,7 +19916,7 @@ mod tests {
     // other workspaces' sessions (read from the state dir) after the current
     // workspace's group.
     #[test]
-    fn session_view_groups_other_workspaces() {
+    fn tc_1221_session_view_groups_other_workspaces() {
         let (mut h, _hub) = history_app();
         let state = tempfile::tempdir().unwrap();
         let repos = state.path().join("repos");
@@ -20159,7 +20159,7 @@ mod tests {
 
     // TC-1222 / FR-1225: group labels and ordering.
     #[test]
-    fn workspace_group_labels_and_order() {
+    fn tc_1222_workspace_group_labels_and_order() {
         let meta = workspace_group_meta("/home/u/src/dmux", Some("/home/u"), None);
         assert_eq!((meta.name.as_str(), meta.label.as_str()), ("dmux", "~/src"));
         let meta = workspace_group_meta("/home/u/dmux", Some("/home/u/"), None);
@@ -20200,7 +20200,7 @@ mod tests {
     // TC-1223 / FR-1227: opening another workspace's session is prepared,
     // validated and handed to the re-exec only for that workspace.
     #[test]
-    fn prepare_open_conversation_is_scoped() {
+    fn tc_1223_prepare_open_conversation_is_scoped() {
         let (mut h, _hub) = history_app();
         let state = tempfile::tempdir().unwrap();
         let repos = state.path().join("repos");
@@ -20266,7 +20266,7 @@ mod tests {
     // TC-1217 / FR-1223: bands link to their own user message, in order, even
     // when a prompt repeats or carries a route prefix.
     #[test]
-    fn turn_bands_link_to_user_messages() {
+    fn tc_1217_turn_bands_link_to_user_messages() {
         let runs = vec![
             history_run("r1", "c", 1, "fix it", GraphRunPhase::Completed),
             history_run("r2", "c", 2, "add docs", GraphRunPhase::Completed),
@@ -20794,7 +20794,7 @@ out3
     // TC-542 / FR-542: run to-do as agent or through graph planner;
     // status transitions and allowed_runners / busy enforcement.
     #[test]
-    fn dashboard_run_todo_with_agent_and_graph() {
+    fn tc_542_dashboard_run_todo_with_agent_and_graph() {
         let (mut app, sent) = test_app();
         let hub = dmuxai::web::DashboardHub::new(
             dmuxai::web::SnapshotSource::Tui,
@@ -28807,7 +28807,7 @@ out3
     // dashboard chat message that holds the same text, so the dashboard
     // renders the reply once.
     #[test]
-    fn doc_change_record_links_chat_message() {
+    fn tc_1205_doc_change_record_links_chat_message() {
         let dir = tempfile::tempdir().unwrap();
         let engine =
             ConversationEngine::open(std::path::Path::new(":memory:"), dir.path()).unwrap();
@@ -29800,7 +29800,7 @@ out3
 
     // TC-986 (FR-984): the dashboard URL stays on the TUI and out of snapshots.
     #[test]
-    fn dashboard_snapshot_never_contains_startup_token() {
+    fn tc_986_dashboard_snapshot_never_contains_startup_token() {
         const TOKEN: &str = "tc986-token-9f3a7c";
         let (mut app, _sent, hub) = web_app();
         app.push_startup_notice("ordinary startup notice".to_owned());
@@ -29872,7 +29872,7 @@ out3
 
     // TC-987 (FR-984): `/api/state` and `POST /api/command` (session body) omit the token.
     #[tokio::test]
-    async fn api_snapshots_do_not_echo_token() {
+    async fn tc_987_api_snapshots_do_not_echo_token() {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 

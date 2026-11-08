@@ -374,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_config_merges_user_and_repo_by_name() {
+    fn tc_560_mcp_config_merges_user_and_repo_by_name() {
         // TC-560, INT-560: repo overrides user by name; enabled=false removes;
         // env refs resolve; a missing env var disables with a value-free
         // warning; Debug output contains no secret.

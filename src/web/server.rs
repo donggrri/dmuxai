@@ -2405,7 +2405,7 @@ mod tests {
 
     // TC-522: api_requires_token
     #[tokio::test]
-    async fn api_requires_token() {
+    async fn tc_522_api_requires_token() {
         let hub = DashboardHub::new(SnapshotSource::Tui, "/test".to_string());
         let token = "test-token-secret-12345".to_string();
         let allowed = Some(vec!["localhost:7420".to_string()]);
@@ -2538,7 +2538,7 @@ mod tests {
 
     // TC-523: foreign_origin_and_host_are_rejected
     #[tokio::test]
-    async fn foreign_origin_and_host_are_rejected() {
+    async fn tc_523_foreign_origin_and_host_are_rejected() {
         let hub = DashboardHub::new(SnapshotSource::Tui, "/test".to_string());
         let token = "tok".to_string();
         let allowed = Some(vec![
@@ -2579,7 +2579,7 @@ mod tests {
 
     // TC-527: sse_streams_initial_and_updated_snapshots
     #[tokio::test]
-    async fn sse_streams_initial_and_updated_snapshots() {
+    async fn tc_527_sse_streams_initial_and_updated_snapshots() {
         let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
         let token = generate_token();
         let config = ServerConfig {
@@ -3401,7 +3401,7 @@ mod tests {
 
     // TC-541 / FR-541: CRUD routes and the snapshot reflect every mutation.
     #[tokio::test]
-    async fn todo_routes_crud_and_snapshot() {
+    async fn tc_541_todo_routes_crud_and_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(TodoStore::open(&dir.path().join("conversations.sqlite3")).unwrap());
         let hub = test_hub();
@@ -3553,7 +3553,7 @@ mod tests {
 
     // TC-544 / FR-541: invalid and unauthorized requests get the exact codes.
     #[tokio::test]
-    async fn todo_routes_reject_invalid_requests() {
+    async fn tc_544_todo_routes_reject_invalid_requests() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(TodoStore::open(&dir.path().join("conversations.sqlite3")).unwrap());
         let token = "todo-token-123".to_string();
@@ -3861,7 +3861,7 @@ mod tests {
 
     // TC-545 / FR-542: running a to-do needs the --web command channel.
     #[tokio::test]
-    async fn todo_run_requires_web_mode() {
+    async fn tc_545_todo_run_requires_web_mode() {
         let token = "todo-token-123".to_string();
 
         // No command channel (`dmuxai serve`) -> 409 with the web-mode hint.
@@ -4925,7 +4925,7 @@ mod tests {
     // TC-567 / FR-562: the server listing redacts env values, header values and
     // URL query strings; a missing registry is 503.
     #[tokio::test]
-    async fn mcp_servers_route_redacts_secrets() {
+    async fn tc_567_mcp_servers_route_redacts_secrets() {
         let token = "mcp-token-123".to_string();
         let registry = McpRegistry::new(
             vec![
@@ -4995,7 +4995,7 @@ mod tests {
     // TC-562 / FR-561, NFR-560: import from the in-repo mock over streamable
     // HTTP for a Jira search, a Confluence page id, and the failure paths.
     #[tokio::test]
-    async fn import_creates_todos_from_mock_jira_and_confluence() {
+    async fn tc_562_import_creates_todos_from_mock_jira_and_confluence() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mock = tokio::spawn(crate::mcp::mock::serve_http(listener));
@@ -5227,7 +5227,7 @@ mod tests {
     // re-import refreshes them, user PATCH is rejected, and the snapshot carries
     // the configured base URL for link previews.
     #[tokio::test]
-    async fn import_updates_external_status() {
+    async fn tc_573_import_updates_external_status() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mock = tokio::spawn(crate::mcp::mock::serve_http(listener));

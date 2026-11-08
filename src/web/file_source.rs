@@ -111,7 +111,7 @@ mod tests {
 
     // TC-528: file_source_picks_latest_valid_run
     #[test]
-    fn file_source_picks_latest_valid_run() {
+    fn tc_528_file_source_picks_latest_valid_run() {
         let temp_dir = tempfile::tempdir().unwrap();
         let workspace = temp_dir.path();
         let mut source = FileGraphSource::new(workspace);
