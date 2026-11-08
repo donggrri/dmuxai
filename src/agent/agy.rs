@@ -20,7 +20,7 @@ use super::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dmuxai::process::{headless_command, resolve_program};
+use dmuxai::process::{apply_child_cwd_tokio, headless_command, resolve_program};
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const STDERR_HISTORY_CAPACITY: usize = 8;
@@ -587,7 +587,7 @@ async fn run_single_agy_process(
     let program = resolve_program(AGY_BINARY_OVERRIDE, "agy");
     let mut command = headless_command(program);
     configure_command_for_resume(&mut command, request, selected_model, mode, resume_session);
-    command.current_dir(cwd);
+    apply_child_cwd_tokio(&mut command, cwd);
     command.stdin(Stdio::piped());
 
     let mut config = dmuxai::process::supervisor::SupervisorConfig::new("AGY");
@@ -1017,9 +1017,9 @@ fn normalize_event(
 async fn list_models(cwd: &Path) -> io::Result<Vec<ModelInfo>> {
     let program = resolve_program(AGY_BINARY_OVERRIDE, "agy");
     let mut command = headless_command(program);
+    apply_child_cwd_tokio(&mut command, cwd);
     command
         .arg("models")
-        .current_dir(cwd)
         .stdin(Stdio::null())
         .kill_on_drop(true);
     let output = command.output().await?;

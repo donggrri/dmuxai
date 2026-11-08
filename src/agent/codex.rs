@@ -19,7 +19,7 @@ use super::{
     AdapterError, Agent, AgentAdapter, AgentError, AgentEvent, AgentOutput, AgentRequest,
     ConversationId, ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy, map_send_error,
 };
-use dmuxai::process::{headless_command, resolve_program};
+use dmuxai::process::{apply_child_cwd_tokio, headless_command, resolve_program};
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const RAW_MESSAGE_CHANNEL_CAPACITY: usize = 64;
@@ -122,9 +122,9 @@ impl CodexClient {
         let program = resolve_program(CODEX_BINARY_OVERRIDE, "codex");
         let mut command = headless_command(program);
         let args = build_codex_app_server_args();
+        apply_child_cwd_tokio(&mut command, cwd);
         command
             .args(&args)
-            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

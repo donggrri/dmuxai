@@ -795,7 +795,8 @@ fn program_is_opencode(program: &str) -> bool {
 }
 
 /// Builds a headless `tokio::process::Command` for a custom agent turn with
-/// `.current_dir(workspace)` and substituted environment variables (FR-875).
+/// the workspace as its cwd and `PWD`, and substituted environment variables
+/// (FR-875, FR-2450).
 pub fn build_custom_command(
     spec: &CustomAgentSpec,
     ctx: &SubstitutionContext,
@@ -806,9 +807,9 @@ pub fn build_custom_command(
         .split_first()
         .ok_or_else(|| format!("{}: empty command", spec.label()))?;
     let mut command = tokio::process::Command::new(program);
+    crate::process::apply_child_cwd_tokio(&mut command, workspace);
     command
         .args(args)
-        .current_dir(workspace)
         .stdin(if spec.prompt_via == PromptVia::Stdin {
             Stdio::piped()
         } else {
@@ -1390,11 +1391,8 @@ async fn run_models_output(
         return Err(format!("{} models: command is empty", spec.label()));
     };
     let mut command = tokio::process::Command::new(program);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
+    crate::process::apply_child_cwd_tokio(&mut command, cwd);
+    command.args(args).stdin(Stdio::null()).kill_on_drop(true);
     crate::process::apply_child_env_policy_tokio(&mut command);
     // Test fixtures set GROK_FAKE_* on the preset. Production grok env is empty.
     // Opencode keeps its models command free of OPENCODE_CONFIG substitution.
@@ -2453,7 +2451,7 @@ command = ["x", "--mcp", "{mcp_config}", "{prompt}"]
         assert!(!argv.iter().any(|arg| arg.contains("{mcp_config}")));
     }
 
-    // TC-877 (FR-875)
+    // TC-877 (FR-875), TC-2451 (FR-2450)
     #[cfg(unix)]
     #[tokio::test]
     async fn runner_cwd_is_workspace() {
@@ -2481,6 +2479,21 @@ command = ["x", "--mcp", "{mcp_config}", "{prompt}"]
             "deny",
         );
         let mut cmd = build_custom_command(&spec, &ctx, &workspace).unwrap();
+        assert_eq!(
+            cmd.as_std().get_current_dir(),
+            Some(workspace.as_path()),
+            "built command must run in the workspace"
+        );
+        let pwd = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| key.to_str() == Some("PWD"))
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            pwd,
+            Some(workspace.as_os_str()),
+            "built command must inherit a PWD matching the workspace"
+        );
         let out = cmd.output().await.unwrap();
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);

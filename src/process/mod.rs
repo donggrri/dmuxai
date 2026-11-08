@@ -1,4 +1,7 @@
-use std::{io, path::PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use tokio::process::Command;
 
@@ -67,6 +70,24 @@ pub fn apply_child_env_policy_tokio(cmd: &mut Command) {
     apply_child_env_policy(cmd.as_std_mut());
 }
 
+/// Sets a child's working directory and keeps the conventional `PWD`
+/// environment variable consistent with it (FR-2450).
+///
+/// `Command::current_dir` changes the kernel working directory but leaves the
+/// inherited `PWD` pointing at DmuxAI's own launch directory. Some runner CLIs,
+/// notably opencode, resolve their project root from `PWD`, so they would
+/// otherwise operate on the caller's directory even though the child was
+/// spawned in the workspace.
+pub fn apply_child_cwd(cmd: &mut std::process::Command, cwd: &Path) {
+    cmd.current_dir(cwd);
+    cmd.env("PWD", cwd);
+}
+
+/// Tokio variant of [`apply_child_cwd`].
+pub fn apply_child_cwd_tokio(cmd: &mut Command, cwd: &Path) {
+    apply_child_cwd(cmd.as_std_mut(), cwd);
+}
+
 /// FR-1010: child agent/runner processes must not inherit the dashboard token.
 ///
 /// Kept for backwards compatibility; delegates to [`apply_child_env_policy`] to
@@ -128,6 +149,32 @@ mod tests {
         let path = resolve_program_value(None, "codex");
 
         assert_eq!(path, PathBuf::from("codex"));
+    }
+
+    // TC-2451 / FR-2450: setting the workspace cwd must also update PWD, which
+    // some runner CLIs use as their project root.
+    #[test]
+    fn child_cwd_sets_current_dir_and_pwd() {
+        let workspace = Path::new("/tmp/dmuxai-workspace");
+
+        let mut std_cmd = std::process::Command::new("true");
+        apply_child_cwd(&mut std_cmd, workspace);
+        assert_eq!(std_cmd.get_current_dir(), Some(workspace));
+        let std_pwd = std_cmd
+            .get_envs()
+            .find(|(key, _)| *key == "PWD")
+            .and_then(|(_, value)| value);
+        assert_eq!(std_pwd, Some(workspace.as_os_str()));
+
+        let mut tokio_cmd = Command::new("true");
+        apply_child_cwd_tokio(&mut tokio_cmd, workspace);
+        assert_eq!(tokio_cmd.as_std().get_current_dir(), Some(workspace));
+        let tokio_pwd = tokio_cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "PWD")
+            .and_then(|(_, value)| value);
+        assert_eq!(tokio_pwd, Some(workspace.as_os_str()));
     }
 
     #[test]

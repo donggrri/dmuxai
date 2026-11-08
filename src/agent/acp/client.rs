@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
 use crate::agent::{Agent, AgentError, AgentEvent, AgentOutput, OutputContext, TurnPolicy};
-use dmuxai::process::apply_child_env_policy;
+use dmuxai::process::{apply_child_cwd_tokio, apply_child_env_policy};
 
 use super::debug::acp_trace;
 use super::permissions::{PermissionContext, choose_permission_option, permission_option_denies};
@@ -115,7 +115,7 @@ pub async fn run_acp_turn(
 ) -> io::Result<AcpRunOutcome> {
     let mut command = Command::new(program);
     command.args(args);
-    command.current_dir(cwd);
+    apply_child_cwd_tokio(&mut command, cwd);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
