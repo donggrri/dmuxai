@@ -18496,7 +18496,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_default_model_only_applies_to_cursor() {
+    fn tc_313_graph_default_model_only_applies_to_cursor() {
         let (mut app, _sent) = test_app();
         app.model_catalogs.get_mut(&Agent::Agy).unwrap().selected = None;
         app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;

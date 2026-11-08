@@ -4,7 +4,7 @@ use std::path::Path;
 use dmuxai::model_policy::{ALLOWED_MODEL, validate_model_id};
 
 #[test]
-fn graph_agent_definitions_use_composer_only() {
+fn tc_310_graph_agent_definitions_use_composer_only() {
     let agents_dir = Path::new(".cursor/agents");
     for entry in fs::read_dir(agents_dir).expect("graph agents directory") {
         let path = entry.expect("dir entry").path();

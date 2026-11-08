@@ -28,11 +28,7 @@ TC-302 legacy: no test reference yet
 TC-303 legacy: no test reference yet
 TC-304 legacy: no test reference yet
 TC-305 legacy: no test reference yet
-TC-310 legacy: no test reference yet
-TC-311 legacy: no test reference yet
 TC-312 legacy: no test reference yet
-TC-313 legacy: no test reference yet
-TC-314 legacy: no test reference yet
 TC-315 legacy: no test reference yet
 TC-320 legacy: no test reference yet
 TC-321 legacy: no test reference yet
@@ -74,13 +70,7 @@ TC-504 legacy: no test reference yet
 TC-507 legacy: no test reference yet
 TC-508 legacy: no test reference yet
 TC-511 legacy: no test reference yet
-TC-513 legacy: no test reference yet
-TC-514 legacy: no test reference yet
-TC-515 legacy: no test reference yet
 TC-516 legacy: no test reference yet
-TC-517 manual
-TC-518 manual
-TC-519 manual
 TC-878 legacy: no test reference yet
 TC-962 manual
 TC-1203 manual
@@ -148,9 +138,6 @@ TC-1841 covered by multiple_live_instances_start_in_separate_conversations (no T
 TC-1842 covered by busy_agent_is_rejected_across_runtime_sessions (no TC ref in code yet)
 TC-1843 covered by tc_1463_explicit_port_in_use_falls_back_with_warning (no TC ref in code yet)
 TC-1844 planned — no automated test yet
-TC-1852 covered by fast_models_are_rejected_for_every_runner (no TC ref in code yet)
-TC-1853 covered by tc_1461_default_model_for_runner_is_per_runner (no TC ref in code yet)
-TC-1854 covered by fast_models_are_rejected_for_every_runner (no TC ref in code yet)
 TC-1855 covered by agy_idle_timeout_env_parsing (no TC ref in code yet)
 TC-1856 covered by agy_idle_timeout_kills_silent_child (no TC ref in code yet)
 TC-1857 covered by agy_bare_model_resolves_to_medium (no TC ref in code yet)
@@ -158,7 +145,6 @@ TC-1858 covered by builtin_opencode_preset_registration (no TC ref in code yet)
 TC-1859 planned — no automated test yet
 TC-1860 covered by permission_denial_is_detected_in_stderr (no TC ref in code yet)
 TC-1861 covered by finish_accepts_forced_kill_after_result_in_agent_mode (no TC ref in code yet)
-TC-1863 covered by tc_1420_permission_denied_ends_cancelled (no TC ref in code yet)
 TC-1864 covered by grok_acp_argv_puts_model_before_stdio (no TC ref in code yet)
 TC-1865 covered by grok_auth_is_models_stdout_only (no TC ref in code yet)
 TC-1866 covered by cursor_argv_always_contains_composer_2_5_by_default (no TC ref in code yet)
