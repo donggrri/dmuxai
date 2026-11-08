@@ -809,6 +809,8 @@ Before a PR run `scripts/gate.sh` (add `--browser` for UI changes).
 
 ## Delivery workflow
 
+프로젝트 방향: [비전과 3단계 로드맵](docs/VISION.md).
+
 All behavior changes follow `Spec -> Plan -> Execute -> Review -> Test`.
 The current product contract and test traceability matrix are in
 [docs/specs/DMUXAI-BASELINE.md](docs/specs/DMUXAI-BASELINE.md); start a new
