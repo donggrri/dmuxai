@@ -3,12 +3,12 @@
 Status: implemented
 Owner: DmuxAI Team
 Created: 2026-11-08
-Baseline: 94 specs passing, latest main FR-2555 / TC-2554
+Baseline: main 1a1dc8b; existing highest FR-2555 / TC-2554; PR1a adds FR/TC-2560–2567
 Related: SPEC-state-per-repo, SPEC-turn-record, SPEC-agent-api, SPEC-process-supervisor
 
 ## 1. Decision summary
 
-Every direct or graph execution from the CLI, web dashboard, or TUI leaves a durable, private local execution record under `$XDG_DATA_HOME/dmuxai/repos/<repo-key>/runs/<16hexid>/` (fallback `~/.local/share/dmuxai/repos/<repo-key>/runs/<16hexid>/`), completely isolated from the SQLite conversation database and state directory. Stored run records contain schema_version 1 manifests with explicit null values for unknown fields, bounded UTF-8 safe write/read diagnostics, pre-persistence credential/secret masking, POSIX 0700 directory and 0600 file permissions AT CREATION, and 90-day / 1 GiB configurable retention. Operators inspect run history using the CLI commands `dmuxai runs [--limit N] [--failed] [--json]` and `dmuxai runs show <id> [--json]`.
+PR1a provides storage and inspection for durable, private local execution records under `$XDG_DATA_HOME/dmuxai/repos/<repo-key>/runs/<16hexid>/` (fallback `~/.local/share/dmuxai/repos/<repo-key>/runs/<16hexid>/`), completely isolated from the SQLite conversation database and state directory. Automatic creation for CLI/web/TUI executions is deferred to PR1b; PR1a does not yet generate records during real runs. Stored run records contain schema_version 1 manifests with explicit null values for unknown fields, bounded UTF-8 safe write/read diagnostics, pre-persistence credential/secret masking, POSIX 0700 directory and 0600 file permissions AT CREATION, and 90-day / 1 GiB configurable retention. Operators inspect run history using the CLI commands `dmuxai runs [--limit N] [--failed] [--json]` and `dmuxai runs show <id> [--json]`.
 
 ## 2. Scope
 

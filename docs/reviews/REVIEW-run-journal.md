@@ -59,3 +59,13 @@ Note: PR1a implements the storage engine, schema, and inspection CLI only; live 
 
 - PR1a deliberately contains no live execution hooks (`src/app.rs` untouched).
 - PR1b will wire process execution lifecycle events, live stderr capture into `diagnostics.txt`, and generate `end_summary`.
+
+## Coordinator verification (2026-11-08 KST)
+- Test-first independently observed before implementation: `cargo test --test run_journal_cli` => 1 passed / 6 failed (missing CLI runtime contract); storage suite => E0432 missing run_journal module. Production code was absent at both RED checkpoints.
+- Final `scripts/gate.sh --browser --keep-going` with empty temporary XDG config: PASS. `cargo test --all-features --no-fail-fast`: 1471 passed / 0 failed / 42 ignored; browser stage: 34 passed / 0 failed.
+- Separate `cargo test --test 'web_*' -- --ignored` with fresh isolated config/state/data: PASS (34 passed / 0 failed). `cargo clean` completed successfully afterward.
+- Spec checker: 95/95 pass. TC links: 1090 defined, 904 strong (+8 versus rebased main), 0 comment-only, 186 allowlisted, no orphan/undefined/stale. Ratchet checked all 8 added TC rows.
+- Authorship: all feature and test code written by dmuxai → agy-flash (`gemini-3.8-flash-low`). Coordinator only performed Git/rebase, cargo fmt, four exact clippy style suggestions, and specification/review text.
+- Prior gate attempts exposed style warnings (corrected) and same-state browser seed accumulation, filed as #288 after duplicate checks; final suites used fresh state and passed. No test was removed or skipped to get green.
+- GLM rejection was a configuration mismatch: its alias existed in config-goal, but allowed_runners contained only opencode-deepseek. No dmuxai defect or GLM issue filed.
+- PR1a deliberately does not wire real executions into the journal. PR1b must connect start records, capped real child stderr, structured end summary and transcript references. Dashboard/MCP expansion remains deferred.
