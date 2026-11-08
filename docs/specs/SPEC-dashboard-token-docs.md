@@ -34,14 +34,14 @@ pasting logs.
 
 | ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| FR-2450 | Must | Given README.md | A **Dashboard token** heading documents that `dmuxai --web` and `dmuxai serve` print a URL with a per-start access token; users must treat it as a secret; they should redact `?token=` before sharing logs or screenshots; opening the URL can store the token in browser history; and `DMUXAI_WEB_TOKEN` pins a fixed token with usage cautions | — | TC-2450 |
-| FR-2451 | Must | Given SECURITY.md | A section documents the same dashboard-token risks (per-start credential, scrollback and logs, redact before sharing, browser history, `DMUXAI_WEB_TOKEN` must not be committed or pasted into public issues) | — | TC-2451 |
-| FR-2452 | Must | Given `.github/ISSUE_TEMPLATE/bug_report.yml` | The logs/screenshots field description explicitly reminds reporters to redact dashboard access tokens (e.g. `?token=` URLs) in addition to API keys | — | TC-2452 |
+| FR-2513 | Must | Given README.md | A **Dashboard token** heading documents that `dmuxai --web` and `dmuxai serve` print a URL with a per-start access token; users must treat it as a secret; they should redact `?token=` before sharing logs or screenshots; opening the URL can store the token in browser history; and `DMUXAI_WEB_TOKEN` pins a fixed token with usage cautions | — | TC-2513 |
+| FR-2514 | Must | Given SECURITY.md | A section documents the same dashboard-token risks (per-start credential, scrollback and logs, redact before sharing, browser history, `DMUXAI_WEB_TOKEN` must not be committed or pasted into public issues) | — | TC-2514 |
+| FR-2515 | Must | Given `.github/ISSUE_TEMPLATE/bug_report.yml` | The logs/screenshots field description explicitly reminds reporters to redact dashboard access tokens (e.g. `?token=` URLs) in addition to API keys | — | TC-2515 |
 
 ## 5. Acceptance scenarios and test design
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-2450 | FR-2450 | unit (doc) | README.md | Read the Dashboard token section | Required phrases present | `tests/dashboard_token_docs.rs` `tc_2450_readme_documents_dashboard_token` |
-| TC-2451 | FR-2451 | unit (doc) | SECURITY.md | Read the dashboard token section | Required phrases present | `tests/dashboard_token_docs.rs` `tc_2451_security_documents_dashboard_token` |
-| TC-2452 | FR-2452 | unit (doc) | bug_report.yml | Read the logs field description | Mentions redacting dashboard tokens | `tests/dashboard_token_docs.rs` `tc_2452_bug_report_reminds_redact_dashboard_tokens` |
+| TC-2513 | FR-2513 | unit (doc) | README.md | Read the Dashboard token section | Required phrases present | `tests/dashboard_token_docs.rs` `tc_2513_readme_documents_dashboard_token` |
+| TC-2514 | FR-2514 | unit (doc) | SECURITY.md | Read the dashboard token section | Required phrases present | `tests/dashboard_token_docs.rs` `tc_2514_security_documents_dashboard_token` |
+| TC-2515 | FR-2515 | unit (doc) | bug_report.yml | Read the logs field description | Mentions redacting dashboard tokens | `tests/dashboard_token_docs.rs` `tc_2515_bug_report_reminds_redact_dashboard_tokens` |

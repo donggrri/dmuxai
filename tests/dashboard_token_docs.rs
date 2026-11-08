@@ -15,9 +15,9 @@ fn section_after_heading<'a>(doc: &'a str, heading: &str) -> &'a str {
     after.split("\n### ").next().unwrap_or(after)
 }
 
-// TC-2450 / FR-2450
+// TC-2513 / FR-2513
 #[test]
-fn tc_2450_readme_documents_dashboard_token() {
+fn tc_2513_readme_documents_dashboard_token() {
     let readme = read("README.md");
     let section = section_after_heading(&readme, "### Dashboard token");
     for needle in [
@@ -41,9 +41,9 @@ fn tc_2450_readme_documents_dashboard_token() {
     }
 }
 
-// TC-2451 / FR-2451
+// TC-2514 / FR-2514
 #[test]
-fn tc_2451_security_documents_dashboard_token() {
+fn tc_2514_security_documents_dashboard_token() {
     let security = read("SECURITY.md");
     let section = section_after_heading(&security, "## Dashboard access token");
     for needle in [
@@ -65,9 +65,9 @@ fn tc_2451_security_documents_dashboard_token() {
     }
 }
 
-// TC-2452 / FR-2452
+// TC-2515 / FR-2515
 #[test]
-fn tc_2452_bug_report_reminds_redact_dashboard_tokens() {
+fn tc_2515_bug_report_reminds_redact_dashboard_tokens() {
     let template = read(".github/ISSUE_TEMPLATE/bug_report.yml");
     let logs_block = template
         .split("id: logs")
