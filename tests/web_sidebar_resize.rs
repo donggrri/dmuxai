@@ -489,7 +489,7 @@ def boot(pg, width, height):
 // TC-971: sidebar_resize_in_headless_chrome (FR-970, FR-972, FR-973, UX-970)
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn sidebar_resize_in_headless_chrome() {
+fn tc_971_sidebar_resize_in_headless_chrome() {
     let Some((chrome, _python)) = prepare() else {
         return;
     };
@@ -744,7 +744,7 @@ with sync_playwright() as p:
 // TC-972: sidebar_resize_clamps_and_narrow_layout (FR-971, FR-972, FR-974)
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn sidebar_resize_clamps_and_narrow_layout() {
+fn tc_972_sidebar_resize_clamps_and_narrow_layout() {
     let Some((chrome, _python)) = prepare() else {
         return;
     };

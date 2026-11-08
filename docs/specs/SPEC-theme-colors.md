@@ -68,16 +68,16 @@ meaning.
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-600 | FR-600 | unit | TOML with background/foreground/border/accent, one invalid | `Theme::from_toml` + warnings | parsed colors; invalid key -> default + warning naming it | `src/theme.rs` `theme_parses_surface_colors_with_warnings` |
-| TC-601 | FR-600 | unit | App test helper with a themed background/border | render one frame into a test backend | cells in the chat area use the background; the block border uses `border` | `src/app.rs` `tui_renders_theme_background_and_border` |
-| TC-602 | FR-601 | unit | `[theme.agents]` for `opencode-glm`, `codex`, an unknown id and an invalid color | resolve agent colors | per-agent colors; warnings for unknown/invalid; case-insensitive | `src/theme.rs` `theme_agent_colors_resolve_with_fallbacks` |
-| TC-603 | FR-601 | unit | App with a custom agent message and a codex message | render | each message's fg equals the configured agent color | `src/app.rs` `tui_uses_per_agent_text_colors` |
-| TC-604 | FR-602 | unit | color policy with `NO_COLOR` set, with and without force | `color_output_enabled` / theme application | disabled without force; enabled with force | `src/theme.rs` `no_color_disables_new_theme_keys` |
-| TC-605 | FR-603 | unit | `[web] theme="dark" accent="#3366ff"`; invalid values | settings load + snapshot | `ui.theme == "dark"`, `ui.accent == "#3366ff"`; invalid -> `system`/default + warnings | `src/settings.rs` `web_theme_settings_parse_with_fallbacks` |
-| TC-606 | FR-603 | integration | router with a hub that has `ui` set | GET `/api/state` | JSON contains `ui.theme` and `ui.accent`; no token | `src/web` `snapshot_exposes_ui_theme` |
-| TC-607 | UX-600 | integration | router | GET `/`, `/assets/app.js`, `/assets/app.css` | markup has the theme control and the accent input; JS uses `localStorage` and `prefers-color-scheme`; CSS defines `[data-theme="light"]` and `[data-theme="dark"]` variables | `src/web` `static_page_has_theme_controls` |
-| TC-608 | NFR-600 | unit | the CSS variables for both themes, parsed in a test | compute WCAG contrast ratios | text/background >= 4.5, badge/button text >= 3.0 in both themes; `text_on(accent)` returns black or white with the higher ratio | `src/web` `theme_palettes_meet_wcag_contrast` |
-| TC-609 | FR-604 | unit | App with `[theme.agents]` set for one agent | publish the dashboard snapshot | that agent has `color: "#rrggbb"`; others null or their default hex | `src/app.rs` `dashboard_agents_carry_tui_colors` |
+| TC-600 | FR-600 | unit | TOML with background/foreground/border/accent, one invalid | `Theme::from_toml` + warnings | parsed colors; invalid key -> default + warning naming it | `src/theme.rs` `tc_600_theme_parses_surface_colors_with_warnings` |
+| TC-601 | FR-600 | unit | App test helper with a themed background/border | render one frame into a test backend | cells in the chat area use the background; the block border uses `border` | `src/app.rs` `tc_601_tui_renders_theme_background_and_border` |
+| TC-602 | FR-601 | unit | `[theme.agents]` for `opencode-glm`, `codex`, an unknown id and an invalid color | resolve agent colors | per-agent colors; warnings for unknown/invalid; case-insensitive | `src/settings.rs` `tc_602_theme_agents_real_nesting_and_unknown_ids` |
+| TC-603 | FR-601 | unit | App with a custom agent message and a codex message | render | each message's fg equals the configured agent color | `src/app.rs` `tc_603_tui_uses_per_agent_text_colors` |
+| TC-604 | FR-602 | unit | color policy with `NO_COLOR` set, with and without force | `color_output_enabled` / theme application | disabled without force; enabled with force | `src/theme.rs` `tc_604_no_color_disables_new_theme_keys` |
+| TC-605 | FR-603 | unit | `[web] theme="dark" accent="#3366ff"`; invalid values | settings load + snapshot | `ui.theme == "dark"`, `ui.accent == "#3366ff"`; invalid -> `system`/default + warnings | `src/settings.rs` `tc_605_web_theme_settings_parse_with_fallbacks` |
+| TC-606 | FR-603 | integration | router with a hub that has `ui` set | GET `/api/state` | JSON contains `ui.theme` and `ui.accent`; no token | `src/web` `tc_606_snapshot_exposes_ui_theme` |
+| TC-607 | UX-600 | integration | router | GET `/`, `/assets/app.js`, `/assets/app.css` | markup has the theme control and the accent input; JS uses `localStorage` and `prefers-color-scheme`; CSS defines `[data-theme="light"]` and `[data-theme="dark"]` variables | `src/web` `tc_607_static_page_has_theme_controls` |
+| TC-608 | NFR-600 | unit | the CSS variables for both themes, parsed in a test | compute WCAG contrast ratios | text/background >= 4.5, badge/button text >= 3.0 in both themes; `text_on(accent)` returns black or white with the higher ratio | `src/web` `tc_608_theme_palettes_meet_wcag_contrast` |
+| TC-609 | FR-604 | unit | App with `[theme.agents]` set for one agent | publish the dashboard snapshot | that agent has `color: "#rrggbb"`; others null or their default hex | `src/app.rs` `tc_609_dashboard_agents_carry_tui_colors` |
 
 ## 6. Data, integration, and safety contracts
 

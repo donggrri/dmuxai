@@ -42,7 +42,7 @@ fn find_chrome() -> Option<PathBuf> {
 // TC-863: session_sidebar_renders_in_headless_chrome (FR-861..FR-863, UX-860)
 #[test]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-fn session_sidebar_renders_in_headless_chrome() {
+fn tc_863_session_sidebar_renders_in_headless_chrome() {
     let Some(chrome) = find_chrome() else {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
         return;

@@ -269,7 +269,7 @@ impl CdpClient {
 // allows node inspection, and persists view mode across reloads.
 #[test]
 #[ignore]
-fn graph_view_renders_in_headless_chrome() {
+fn tc_705_graph_view_renders_in_headless_chrome() {
     let chrome_bin = match find_chrome_binary() {
         Some(bin) => bin,
         None => {
@@ -743,7 +743,7 @@ fn write_swimlane_fixture(workspace: &Path) {
 // arrow-routing and light-theme contrast math, run in the real page.
 #[test]
 #[ignore]
-fn graph_swimlane_math_in_headless_chrome() {
+fn tc_881_graph_swimlane_math_in_headless_chrome() {
     let Some(chrome_bin) = find_chrome_binary() else {
         println!("skipping graph_swimlane_math_in_headless_chrome: chrome binary not found");
         return;
@@ -836,7 +836,7 @@ fn graph_swimlane_math_in_headless_chrome() {
 // timeline; Fit at 900px keeps every text at 11px or more.
 #[test]
 #[ignore]
-fn graph_swimlane_renders_in_headless_chrome() {
+fn tc_882_graph_swimlane_renders_in_headless_chrome() {
     let Some(chrome_bin) = find_chrome_binary() else {
         println!("skipping graph_swimlane_renders_in_headless_chrome: chrome binary not found");
         return;

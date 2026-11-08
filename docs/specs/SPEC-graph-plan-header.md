@@ -15,9 +15,9 @@ The `Graph assignment:` line printed `node.model_id`, which the planner always s
 ## 5. Acceptance scenarios and test design
 | TC | Covers | Test |
 |---|---|---|
-| TC-460 | FR-460 | `assignment_line_uses_resolver_per_runner` |
-| TC-461 | FR-461 | `graph_assignment_shows_agy_model_not_composer` |
-| TC-462 | FR-462 | `graph_assignment_cursor_stays_composer` |
+| TC-460 | FR-460 | `tc_460_assignment_line_uses_resolver_per_runner` |
+| TC-461 | FR-461 | `tc_461_graph_assignment_shows_agy_model_not_composer` |
+| TC-462 | FR-462 | `tc_462_graph_assignment_cursor_stays_composer` |
 
 ## 6. Exit criteria
 TCs pass in CI. Dogfood #22 is closed.

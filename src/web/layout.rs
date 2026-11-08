@@ -123,7 +123,7 @@ mod tests {
 
     // TC-700 / FR-700: diamond + isolated node + edge to a missing node.
     #[test]
-    fn layout_assigns_layers_and_stable_order() {
+    fn tc_700_layout_assigns_layers_and_stable_order() {
         let ids = ["a", "b", "c", "d", "e"];
         let edges = [
             ("a", "b"),
@@ -149,7 +149,7 @@ mod tests {
 
     // TC-701 / FR-700: cycles, self-loops, and the empty plan.
     #[test]
-    fn layout_is_cycle_safe_and_handles_empty() {
+    fn tc_701_layout_is_cycle_safe_and_handles_empty() {
         let ids = ["r", "x", "y"];
         let edges = [("r", "x"), ("x", "y"), ("y", "x"), ("x", "x")];
 

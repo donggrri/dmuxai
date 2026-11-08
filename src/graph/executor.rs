@@ -654,7 +654,7 @@ mod tests {
     // TC-460 / FR-460 / FR-462: `assignment_line_with` renders
     // `<id>:<role>→<runner>:<model>`, calls `resolve(runner, planned)` per node,
     // and keeps orchestrate nodes out of the line.
-    fn assignment_line_uses_resolver_per_runner() {
+    fn tc_460_assignment_line_uses_resolver_per_runner() {
         let plan = GraphPlan {
             schema: "cursor-agent-graph/v1".to_owned(),
             id: "test-assignment".to_owned(),

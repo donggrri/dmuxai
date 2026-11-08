@@ -238,7 +238,7 @@ mod tests {
     // and MCP import, each with its control in the To-dos panel and its
     // handler in app.js.
     #[test]
-    fn todo_actions_still_covered() {
+    fn tc_841_todo_actions_still_covered() {
         let html = crate::web::assets::INDEX_HTML;
         let js = crate::web::assets::APP_JS;
         let panel = html

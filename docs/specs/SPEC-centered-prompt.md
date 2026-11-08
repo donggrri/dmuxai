@@ -29,5 +29,5 @@ Decision: the layout reserves space for each open docked sidebar. The chat colum
 
 | ID | Requirement | Level | Fixture | Oracle | Test |
 | --- | --- | --- | --- | --- | --- |
-| TC-850 | FR-850, UX-850 | unit (asset) | CSS assets | Dock variables and the centering rule exist; the old `margin-right: 320px` per-state rule is gone; reduced-motion disables the transition | `src/web/assets.rs` `prompt_centering_assets` |
-| TC-851 | FR-850, FR-851, FR-852, UX-850 | e2e (ignored, headless Chrome) | `dmuxai serve` on a temp workspace | For the widths 1280, 1440, 1920 and 800, and the four sidebar states, the measured `getBoundingClientRect()` of `.session-prompt` is centered (±2px) in the content area and does not intersect an open docked sidebar; typed prompt text survives the toggles | `tests/web_prompt_center.rs` `prompt_stays_centered_in_headless_chrome` |
+| TC-850 | FR-850, UX-850 | unit (asset) | CSS assets | Dock variables and the centering rule exist; the old `margin-right: 320px` per-state rule is gone; reduced-motion disables the transition | `src/web/assets.rs` `tc_850_prompt_centering_assets` |
+| TC-851 | FR-850, FR-851, FR-852, UX-850 | e2e (ignored, headless Chrome) | `dmuxai serve` on a temp workspace | For the widths 1280, 1440, 1920 and 800, and the four sidebar states, the measured `getBoundingClientRect()` of `.session-prompt` is centered (±2px) in the content area and does not intersect an open docked sidebar; typed prompt text survives the toggles | `tests/web_prompt_center.rs` `tc_851_prompt_stays_centered_in_headless_chrome` |
