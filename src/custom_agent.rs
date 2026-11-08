@@ -402,6 +402,15 @@ pub fn grok_no_allowed_model_message() -> String {
     "grok: no allowed models (ids must match ^grok-; ids containing fast are rejected)".to_owned()
 }
 
+/// Stable `error_kind` string for a built-in preset model-probe failure (FR-2281).
+pub fn builtin_probe_error_kind(spec: &CustomAgentSpec, message: &str) -> &'static str {
+    if is_builtin_grok(spec) && message == grok_login_message() {
+        "auth"
+    } else {
+        "model_unavailable"
+    }
+}
+
 /// User-visible timeout message prefix and hint when a custom-agent turn exceeds `timeout_secs` (FR-333).
 pub fn timeout_parts(spec: &CustomAgentSpec) -> (String, String) {
     let prefix = format!("{} timed out after {}s", spec.label(), spec.timeout_secs());
@@ -2635,6 +2644,20 @@ command = ["x", "--mcp", "{mcp_config}", "{prompt}"]
         let message = grok_no_allowed_model_message();
         assert!(message.contains("^grok-"), "{message}");
         assert!(message.contains("fast"), "{message}");
+    }
+
+    // TC-2280 / FR-2281
+    #[test]
+    fn tc_2280_builtin_probe_agent_error_maps_grok_login_to_auth() {
+        let grok = grok_preset("grok");
+        let login = grok_login_message();
+        assert_eq!(builtin_probe_error_kind(&grok, &login), "auth");
+
+        let no_models = grok_no_allowed_model_message();
+        assert_eq!(
+            builtin_probe_error_kind(&grok, &no_models),
+            "model_unavailable"
+        );
     }
 
     // TC-896 / FR-896, NFR-890

@@ -8,8 +8,9 @@ use std::{
 use dmuxai::activity::{ActivityItem, ToolStatus};
 use dmuxai::custom_agent::{
     BUILTIN_MODELS_TIMEOUT, CustomAgentOutput, CustomAgentSpec, SubstitutionContext, build_argv,
-    grok_no_allowed_model_message, is_builtin_grok, is_builtin_opencode, list_model_ids,
-    parse_jsonl_line, policy_message, select_grok_model, spec_at, substitute, timeout_parts,
+    builtin_probe_error_kind, grok_no_allowed_model_message, is_builtin_grok, is_builtin_opencode,
+    list_model_ids, parse_jsonl_line, policy_message, select_grok_model, spec_at, substitute,
+    timeout_parts,
 };
 use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 
@@ -20,6 +21,13 @@ use super::{
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const STDERR_LIMIT: usize = 16 * 1024;
+
+fn builtin_probe_agent_error(spec: &CustomAgentSpec, message: String) -> AgentError {
+    match builtin_probe_error_kind(spec, &message) {
+        "auth" => AgentError::auth(message),
+        _ => AgentError::model_unavailable(message),
+    }
+}
 
 enum CustomCommand {
     Send(AgentRequest),
@@ -138,7 +146,7 @@ async fn runtime_loop_with_spec(
                         &event_tx,
                         agent,
                         Some(&context),
-                        AgentEvent::Error(AgentError::model_unavailable(error)),
+                        AgentEvent::Error(builtin_probe_agent_error(spec, error)),
                     )
                     .await;
                     continue;
@@ -171,7 +179,7 @@ async fn runtime_loop_with_spec(
                             selected_effort: None,
                         }
                     }
-                    Err(error) => AgentEvent::Error(AgentError::model_unavailable(error)),
+                    Err(error) => AgentEvent::Error(builtin_probe_agent_error(spec, error)),
                 };
                 send(&event_tx, agent, None, event).await;
             }
@@ -2262,7 +2270,7 @@ env = { FAKE_CFG = "{temp_config}" }
         }
     }
 
-    // TC-897 / FR-896
+    // TC-897 / FR-896; TC-2281 / FR-2281
     #[tokio::test]
     async fn grok_unauthenticated_send_explains_login() {
         let dir = tempfile::tempdir().unwrap();
@@ -2282,22 +2290,30 @@ env = { FAKE_CFG = "{temp_config}" }
             tx.send(CustomCommand::ListModels).await.unwrap();
             let listed = until_terminal(&mut rx).await;
             let list_error = listed.iter().find_map(|event| match event {
-                AgentEvent::Error(error) => Some(error.to_string()),
+                AgentEvent::Error(error) => Some(error.clone()),
                 _ => None,
             });
             let list_error = list_error.expect("models error");
-            assert!(list_error.contains("grok login"), "{auth}: {list_error}");
+            assert_eq!(list_error.kind, AgentErrorKind::Auth);
+            assert!(
+                list_error.message.contains("grok login"),
+                "{auth}: {list_error}"
+            );
 
             tx.send(CustomCommand::Send(request("hello; $(rm)", None)))
                 .await
                 .unwrap();
             let sent = until_terminal(&mut rx).await;
             let send_error = sent.iter().find_map(|event| match event {
-                AgentEvent::Error(error) => Some(error.to_string()),
+                AgentEvent::Error(error) => Some(error.clone()),
                 _ => None,
             });
             let send_error = send_error.expect("send error");
-            assert!(send_error.contains("grok login"), "{auth}: {send_error}");
+            assert_eq!(send_error.kind, AgentErrorKind::Auth);
+            assert!(
+                send_error.message.contains("grok login"),
+                "{auth}: {send_error}"
+            );
             let argv = std::fs::read_to_string(&argv_path).unwrap_or_default();
             assert!(!argv.lines().any(|line| line == "-p"), "{auth}: {argv}");
             drop(tx);

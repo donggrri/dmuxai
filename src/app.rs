@@ -4126,7 +4126,10 @@ impl App {
         if let AgentEvent::Error(err) = &mut output.event {
             // Idle and cancelled turns must never carry the "not offered" hint:
             // the model availability question is unrelated to those failures.
-            if matches!(err.kind, AgentErrorKind::Idle | AgentErrorKind::Cancelled) {
+            if matches!(
+                err.kind,
+                AgentErrorKind::Idle | AgentErrorKind::Cancelled | AgentErrorKind::Auth
+            ) {
                 return;
             }
             if let Some(hint) = self
@@ -36137,6 +36140,28 @@ out3
         assert_eq!(sent.lock().unwrap().len(), 1);
         assert!(!app.busy_agents.contains(&Agent::Agy));
         assert!(!app.busy_agents.contains(&Agent::Codex));
+        assert!(app.fallback_history.is_empty());
+    }
+
+    // FR-2282 / TC-2283: explicit auth failures do not hand over to the next runner.
+    #[test]
+    fn tc_2283_auth_error_does_not_fall_back() {
+        let (mut app, sent) = test_app();
+        app.settings.runner_fallback = agy_to_codex_fallback_settings();
+        app.selected = adapter_index(Agent::Agy);
+        app.input = "need grok".to_owned();
+        app.submit_prompt();
+
+        let (agent, req) = sent.lock().unwrap()[0].clone();
+        let login = dmuxai::custom_agent::grok_login_message();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::auth(login)),
+        }));
+
+        assert_eq!(sent.lock().unwrap().len(), 1);
         assert!(app.fallback_history.is_empty());
     }
 

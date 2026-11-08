@@ -151,6 +151,7 @@ pub enum AgentEvent {
 pub enum AgentErrorKind {
     Provider,
     ModelUnavailable,
+    Auth,
     ProcessExit,
     Timeout,
     Idle,
@@ -166,6 +167,7 @@ impl AgentErrorKind {
         match self {
             Self::Provider => "provider",
             Self::ModelUnavailable => "model_unavailable",
+            Self::Auth => "auth",
             Self::ProcessExit => "process_exit",
             Self::Timeout => "timeout",
             Self::Idle => "idle",
@@ -208,6 +210,10 @@ impl AgentError {
 
     pub fn model_unavailable(message: impl Into<String>) -> Self {
         Self::new(AgentErrorKind::ModelUnavailable, message)
+    }
+
+    pub fn auth(message: impl Into<String>) -> Self {
+        Self::new(AgentErrorKind::Auth, message)
     }
 
     pub fn process_exit(message: impl Into<String>) -> Self {
@@ -529,6 +535,7 @@ mod typed_error_tests {
         let cases = [
             (AgentErrorKind::Provider, "provider"),
             (AgentErrorKind::ModelUnavailable, "model_unavailable"),
+            (AgentErrorKind::Auth, "auth"),
             (AgentErrorKind::ProcessExit, "process_exit"),
             (AgentErrorKind::Timeout, "timeout"),
             (AgentErrorKind::Idle, "idle"),
