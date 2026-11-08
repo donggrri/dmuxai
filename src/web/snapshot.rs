@@ -1791,7 +1791,7 @@ mod tests {
     // TC-990 (FR-955): conv-A runs form ordered turn bands with `follow_up` edges;
     // conv-B absent; 22 runs → 20 bands plus `earlier_turns: 2`.
     #[test]
-    fn snapshot_conversation_turns_append() {
+    fn tc_990_snapshot_conversation_turns_append() {
         fn turn_run(
             conversation_id: &str,
             turn_index: u32,

@@ -18707,7 +18707,7 @@ mod tests {
 
     // TC-1004 / FR-979: adapter busy on an internal replan turn waits and retries once.
     #[test]
-    fn internal_turn_waits_for_adapter_release() {
+    fn tc_1004_internal_turn_waits_for_adapter_release() {
         let mut h = plan_gate_test_app();
         start_approved_three_step_run(&mut h);
         let step2 = last_graph_node_request_index(&h.sent);
@@ -18995,7 +18995,7 @@ mod tests {
     // TC-1001 / FR-976: adapter "already running" defers the next node without
     // counting an attempt; it starts once the runner is free.
     #[test]
-    fn next_node_waits_for_adapter_release() {
+    fn tc_1001_next_node_waits_for_adapter_release() {
         let (mut app, sent, _tx) = test_app_with_event_sender();
         app.selected = adapter_index(Agent::Cursor);
         app.quiet_graph_run = false;
@@ -19314,7 +19314,7 @@ mod tests {
     // TC-1002 / FR-977: terminal node failure updates the record, snapshot, and
     // graph status line together.
     #[test]
-    fn node_failure_marks_run_failed_everywhere() {
+    fn tc_1002_node_failure_marks_run_failed_everywhere() {
         let (mut app, sent) = test_app();
         app.selected = adapter_index(Agent::Cursor);
         app.quiet_graph_run = false;
@@ -19367,7 +19367,7 @@ mod tests {
     // TC-1003 / FR-978: terminal completion updates the record, snapshot, and
     // graph status line together (multi-node and quiet 1-node runs).
     #[test]
-    fn completed_run_shows_final_state_everywhere() {
+    fn tc_1003_completed_run_shows_final_state_everywhere() {
         fn assert_completed_everywhere(
             app: &mut App,
             hub: &dmuxai::web::DashboardHub,
@@ -20965,7 +20965,7 @@ out3
 
     // TC-954 / FR-947: to-do graph runs use judge triage; complex plans wait at the gate.
     #[test]
-    fn todo_graph_run_goes_through_judge() {
+    fn tc_954_todo_graph_run_goes_through_judge() {
         let workspace = std::env::temp_dir().join(format!("dmuxai-todo-graph-{}", Uuid::new_v4()));
         let mut h = plan_gate_harness_in_workspace(workspace, &[]);
         let temp_dir = tempfile::tempdir().unwrap();
@@ -21796,7 +21796,7 @@ out3
 
     #[test]
     // TC-956 / UX-930: judge line text, styles, and ellipsize above the prompt.
-    fn judge_reason_line_renders() {
+    fn tc_956_judge_reason_line_renders() {
         let (mut app, _sent) = test_app();
         app.terminal_area = Rect::new(0, 0, 100, 30);
         let theme = app.settings.theme.clone();
@@ -30355,7 +30355,7 @@ out3
     // short-prompt fast path needs more than 3 words / 40 chars, so this uses a
     // longer prompt).
     #[test]
-    fn plan_gate_every_prompt_enters_triage() {
+    fn tc_930_plan_gate_every_prompt_enters_triage() {
         let mut harness = plan_gate_test_app();
         harness.app.input = "please explain the build steps".to_owned();
         harness.app.submit_prompt();
@@ -30444,7 +30444,7 @@ out3
     // (plan + implement), so the judge fast path must not fire: the judge turn
     // starts and no 1-node run exists yet.
     #[test]
-    fn tc_1613_short_planning_prompt_still_judged() {
+    fn tc_1615_short_planning_prompt_still_judged() {
         assert_eq!(heuristic_route("plan the refactor"), Route::Complex);
         assert!(is_trivial_prompt("plan the refactor"));
 
@@ -30592,7 +30592,7 @@ out3
 
     // TC-931 / FR-930: an empty allowed_runners list notices and sends directly.
     #[test]
-    fn plan_gate_empty_allowed_runners_sends_direct() {
+    fn tc_931_plan_gate_empty_allowed_runners_sends_direct() {
         let mut harness = plan_gate_test_app();
         harness.app.settings.graph_allowed_runners = Some(Vec::new());
         harness.app.input = "hello".to_owned();
@@ -30619,7 +30619,7 @@ out3
 
     // TC-933 / FR-932: the judge runs read-only on the selected agent's model.
     #[test]
-    fn judge_turn_uses_selected_agent_read_only() {
+    fn tc_933_judge_turn_uses_selected_agent_read_only() {
         let mut harness = plan_gate_test_app();
         harness.app.selected = adapter_index(Agent::Agy);
         harness
@@ -30694,7 +30694,7 @@ out3
 
     // TC-934 / FR-932: a busy selected agent refuses the prompt before any judge.
     #[test]
-    fn judge_refused_when_selected_agent_busy() {
+    fn tc_934_judge_refused_when_selected_agent_busy() {
         let mut harness = plan_gate_test_app();
         harness.app.busy_agents.insert(Agent::Codex);
         harness.app.input = "please review this busy path".to_owned();
@@ -30854,7 +30854,7 @@ out3
 
     // TC-937 / FR-935: silence past 90 s falls back; recent events keep it alive.
     #[test]
-    fn judge_timeout_falls_back_to_heuristic() {
+    fn tc_937_judge_timeout_falls_back_to_heuristic() {
         let mut harness = plan_gate_test_app();
         harness.app.input = "please explain the retry schedule".to_owned();
         harness.app.submit_prompt();
@@ -30910,7 +30910,7 @@ out3
 
     // TC-938 / FR-935: invalid verdict, error, and user cancel.
     #[test]
-    fn judge_failure_modes() {
+    fn tc_938_judge_failure_modes() {
         let mut h = plan_gate_test_app();
         h.app.input = "research, plan, implement and test X".to_owned();
         h.app.submit_prompt();
@@ -30963,7 +30963,7 @@ out3
 
     // TC-951 / FR-944: sensitive-step gates on approved plans and 1-node runs.
     #[test]
-    fn sensitive_gate_kept_for_plans() {
+    fn tc_951_sensitive_gate_kept_for_plans() {
         let mut h = plan_gate_test_app();
         h.app.input = "please deploy the release".to_owned();
         h.app.submit_prompt();
@@ -31177,7 +31177,7 @@ out3
 
     // TC-939 / FR-937: a simple verdict runs one node on the selected agent.
     #[test]
-    fn simple_verdict_runs_one_node_graph() {
+    fn tc_939_simple_verdict_runs_one_node_graph() {
         let mut h = plan_gate_test_app();
         h.app.selected = adapter_index(Agent::Cursor);
         h.app.settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
@@ -31359,7 +31359,7 @@ out3
 
     // TC-940 / FR-937, FR-945: /direct skips the judge.
     #[test]
-    fn direct_override_skips_judge() {
+    fn tc_940_direct_override_skips_judge() {
         let mut h = plan_gate_test_app();
         h.app.input = "/direct fix it".to_owned();
         h.app.submit_prompt();
@@ -31382,7 +31382,7 @@ out3
 
     // TC-952 / FR-945: `/plan` and `/direct` are listed for the TUI and session.
     #[test]
-    fn slash_list_has_plan_and_direct() {
+    fn tc_952_slash_list_has_plan_and_direct() {
         let plan = SLASH_COMMANDS
             .iter()
             .find(|command| command.name == "/plan")
@@ -31473,7 +31473,7 @@ out3
 
     // TC-946 / FR-942: awaiting approval blocks new sends, not other slash commands.
     #[test]
-    fn awaiting_approval_blocks_new_prompts() {
+    fn tc_946_awaiting_approval_blocks_new_prompts() {
         let mut h = plan_gate_test_app();
         reach_awaiting_approval(&mut h);
         let sent_before = h.sent.lock().unwrap().len();
@@ -31507,7 +31507,7 @@ out3
 
     // TC-947 / FR-942: restart keeps awaiting approval as stale; triage/planning cancel.
     #[test]
-    fn stale_records_after_restart() {
+    fn tc_947_stale_records_after_restart() {
         let workspace = std::env::temp_dir().join(format!("dmuxai-plan-gate-{}", Uuid::new_v4()));
         let mut h = plan_gate_harness_in_workspace(workspace.clone(), &[]);
         let conversation_id = h.app.conversation_id.as_str().to_owned();
@@ -31612,7 +31612,7 @@ out3
 
     // TC-964 / FR-948: an English keyword prompt never builds a keyword chain.
     #[test]
-    fn keyword_prompt_never_builds_chain() {
+    fn tc_964_keyword_prompt_never_builds_chain() {
         let mut h = plan_gate_test_app();
         h.app.input = "research, plan, review and implement X".to_owned();
         h.app.submit_prompt();
@@ -31683,7 +31683,7 @@ out3
 
     // TC-968 / FR-951: the record keeps the triage agent and its effective model.
     #[test]
-    fn orchestrate_node_records_triage_agent() {
+    fn tc_968_orchestrate_node_records_triage_agent() {
         let mut h = plan_gate_test_app();
         h.app.selected = adapter_index(Agent::Agy);
         h.app.model_catalogs.get_mut(&Agent::Agy).unwrap().selected =
@@ -31738,7 +31738,7 @@ out3
 
     // TC-948 / FR-943: approve starts scheduling from the validated plan.
     #[test]
-    fn approve_starts_graph() {
+    fn tc_948_approve_starts_graph() {
         let mut h = plan_gate_test_app();
         h.app.settings.graph_max_parallel = 2;
         let plan_req = complete_complex_judge(&mut h);
@@ -31784,7 +31784,7 @@ out3
 
     // TC-973 / FR-956: replan turns only on failure, marker, or user request.
     #[test]
-    fn replan_only_on_trigger() {
+    fn tc_973_replan_only_on_trigger() {
         let mut h = plan_gate_test_app();
         h.app.settings.graph_max_retries = 1;
         reach_awaiting_approval_with_plan(&mut h, three_step_codex_plan_json());
@@ -32036,7 +32036,7 @@ out3
 
     // TC-949 / FR-943: edit feedback runs a new plan turn and caps revisions at five.
     #[test]
-    fn edit_replans_with_feedback() {
+    fn tc_949_edit_replans_with_feedback() {
         let mut h = plan_gate_test_app();
         reach_awaiting_approval(&mut h);
         let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
@@ -32197,7 +32197,7 @@ out3
 
     // TC-950 / FR-943: reject ends the run; later approve is refused; Ctrl+C rejects too.
     #[test]
-    fn reject_stops_run() {
+    fn tc_950_reject_stops_run() {
         let mut h = plan_gate_test_app();
         reach_awaiting_approval(&mut h);
         let sent_before = h.sent.lock().unwrap().len();
@@ -32314,7 +32314,7 @@ out3
 
     // TC-963 / FR-943: only the first decision for the current revision applies.
     #[test]
-    fn concurrent_plan_decisions_first_wins() {
+    fn tc_963_concurrent_plan_decisions_first_wins() {
         let mut h = plan_gate_test_app();
         reach_awaiting_approval(&mut h);
         let plan_id = h.app.last_graph_run.as_ref().unwrap().plan.id.clone();
@@ -32901,7 +32901,7 @@ out3
 
     // TC-941 / FR-938: complex verdict starts an internal plan turn on the pinned agent.
     #[test]
-    fn complex_verdict_starts_plan_turn() {
+    fn tc_941_complex_verdict_starts_plan_turn() {
         let mut h = plan_gate_test_app();
         let plan_req = complete_complex_judge(&mut h);
         assert!(
@@ -32933,7 +32933,7 @@ out3
 
     // TC-1008 / FR-1008: planner_io records prompt/response sizes per internal call.
     #[test]
-    fn planner_io_records_sizes() {
+    fn tc_1008_planner_io_records_sizes() {
         let mut h = plan_gate_test_app();
         h.app.terminal_area = Rect::new(0, 0, 120, 30);
         h.app.input = "/plan needs several steps".to_owned();
@@ -33098,7 +33098,7 @@ out3
 
     // TC-1009 / FR-1009: `/plan` override line and queued replan feedback.
     #[test]
-    fn plan_override_and_replan_queue_feedback() {
+    fn tc_1009_plan_override_and_replan_queue_feedback() {
         let mut h = plan_gate_test_app();
         h.app.terminal_area = Rect::new(0, 0, 100, 30);
         h.app.input = "/plan needs several steps".to_owned();
@@ -33123,7 +33123,7 @@ out3
 
     // TC-944 / FR-940: one repair turn after an invalid first plan.
     #[test]
-    fn invalid_plan_gets_one_repair() {
+    fn tc_944_invalid_plan_gets_one_repair() {
         let mut h = plan_gate_test_app();
         let plan_req = complete_complex_judge(&mut h);
         assert!(h.app.apply_agent_output(triage_output(
@@ -33230,7 +33230,7 @@ out3
     // TC-1011 / FR-941, FR-950: approving a fallback plan starts the run, from
     // the TUI and from the dashboard.
     #[test]
-    fn plan_fallback_approve_starts_run() {
+    fn tc_1011_plan_fallback_approve_starts_run() {
         let mut tui = plan_gate_test_app();
         park_invalid_twice_fallback(&mut tui);
         tui.app.input = "/graph approve".to_owned();
@@ -33268,7 +33268,7 @@ out3
 
     // TC-945 / FR-941, FR-950: fallback plans still need approval.
     #[test]
-    fn plan_fallback_requires_approval() {
+    fn tc_945_plan_fallback_requires_approval() {
         let mut invalid_twice = plan_gate_test_app();
         complete_complex_judge(&mut invalid_twice);
         for _ in 0..2 {
@@ -35872,7 +35872,7 @@ out3
 
     // TC-1007 / FR-1007: one revision counter per run; a rejected replan keeps its excerpt.
     #[test]
-    fn replan_revisions_share_counter() {
+    fn tc_1007_replan_revisions_share_counter() {
         let mut h = plan_gate_test_app();
         h.app.terminal_area = Rect::new(0, 0, 120, 30);
         start_approved_three_step_run(&mut h);
@@ -35898,7 +35898,7 @@ out3
 
     // TC-976 / FR-959: sensitive replan revisions pause for approval.
     #[test]
-    fn sensitive_replan_needs_approval() {
+    fn tc_976_sensitive_replan_needs_approval() {
         let mut h = plan_gate_test_app();
         h.app.terminal_area = Rect::new(0, 0, 120, 30);
         start_approved_three_step_run(&mut h);
@@ -36021,7 +36021,7 @@ out3
 
     // TC-958 / UX-931: approval panel rows, deps, fallback notes, hint; gone after approve.
     #[test]
-    fn plan_approval_panel_renders() {
+    fn tc_958_plan_approval_panel_renders() {
         let mut h = plan_gate_test_app();
         h.app.terminal_area = Rect::new(0, 0, 100, 30);
         h.app.color_enabled = true;
@@ -36065,7 +36065,7 @@ out3
 
     // TC-997 / UX-937, FR-975: task counter, grouped steps, char-safe cuts at 40 columns.
     #[test]
-    fn task_counter_and_grouped_panel_render() {
+    fn tc_997_task_counter_and_grouped_panel_render() {
         let mut h = plan_gate_test_app();
         reach_awaiting_approval_with_plan(&mut h, korean_three_task_codex_plan_json());
         {
@@ -36119,7 +36119,7 @@ out3
 
     // TC-979 / UX-935: revision notice text in the TUI transcript.
     #[test]
-    fn revision_notice_renders() {
+    fn tc_979_revision_notice_renders() {
         let mut h = plan_gate_test_app();
         h.app.terminal_area = Rect::new(0, 0, 100, 30);
         start_approved_three_step_run(&mut h);
@@ -36183,7 +36183,7 @@ out3
 
     // TC-989 / FR-954: every user turn gets a graph run record before its first node.
     #[test]
-    fn every_turn_is_recorded_as_graph_run() {
+    fn tc_989_every_turn_is_recorded_as_graph_run() {
         let mut h = plan_gate_test_app();
         let conversation_id = h.app.conversation_id.as_str().to_owned();
         let store = dmuxai::graph::GraphStore::new(&h.app.workspace_root);

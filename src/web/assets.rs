@@ -1389,7 +1389,7 @@ mod tests {
 
     // TC-957 (UX-930): `#graph-judge-line` from `graph.triage.line`, text nodes only.
     #[test]
-    fn judge_line_asset() {
+    fn tc_957_judge_line_asset() {
         assert!(INDEX_HTML.contains("id=\"graph-judge-line\""));
         assert!(APP_JS.contains("function renderGraphJudgeLine"));
         assert!(APP_JS.contains("function fillJudgeLineContent"));
@@ -1423,7 +1423,7 @@ mod tests {
 
     // TC-960 (UX-932, UX-933, INT-930): approval panel, plan commands, parity ids.
     #[test]
-    fn approval_panel_asset() {
+    fn tc_960_approval_panel_asset() {
         assert!(INDEX_HTML.contains("id=\"graph-approval\""));
         assert!(SESSION_JS.contains("parityButton"));
         assert!(SESSION_JS.contains("classList.add"));
@@ -1479,7 +1479,7 @@ mod tests {
 
     // TC-996 (UX-936): task checklist panel below the swimlane.
     #[test]
-    fn task_checklist_asset() {
+    fn tc_996_task_checklist_asset() {
         assert!(INDEX_HTML.contains("id=\"task-checklist\""));
         assert!(INDEX_HTML.contains("data-parity=\"task-checklist\""));
         assert!(INDEX_HTML.contains("graph-stage-layout"));

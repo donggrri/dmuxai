@@ -191,7 +191,7 @@ mod tests {
     // loads with defaults; a record with triage and a revision round-trips and
     // the failed-parse raw text stays at most 4 KiB cut on a char boundary.
     #[test]
-    fn run_record_triage_and_approval_round_trip() {
+    fn tc_953_run_record_triage_and_approval_round_trip() {
         let dir = tempdir().unwrap();
         let legacy_json = r#"{
             "plan": {
@@ -278,7 +278,7 @@ mod tests {
     // rejected entries, an old record without the field loads empty, and
     // pushes beyond 50 drop the oldest entry only.
     #[test]
-    fn plan_history_round_trip() {
+    fn tc_977_plan_history_round_trip() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let legacy_json = r#"{

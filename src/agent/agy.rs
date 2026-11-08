@@ -1115,7 +1115,7 @@ mod tests {
     // TC-1010 / FR-1010: the shared headless builder (used by every runner,
     // judge and planner turn) removes the dashboard token and internal env vars without any extra call.
     #[test]
-    fn agent_child_env_drops_web_token() {
+    fn tc_1010_agent_child_env_drops_web_token() {
         fn env_removed(command: &tokio::process::Command, var: &str) -> bool {
             command
                 .as_std()

@@ -278,7 +278,7 @@ timeout_secs = 60
 /// TC-955: complex plan needs `--approve-plan`; `--agent` sets triage override.
 #[cfg(unix)]
 #[test]
-fn run_complex_needs_approve_plan() {
+fn tc_955_run_complex_needs_approve_plan() {
     use dmuxai::graph::{GraphRunPhase, load_run};
     use plan_gate::{Sandbox, plan_gate_config, stdout_json};
 
