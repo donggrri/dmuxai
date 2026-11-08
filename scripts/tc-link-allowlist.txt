@@ -60,22 +60,7 @@ TC-386 legacy: no test reference yet
 TC-387 legacy: no test reference yet
 TC-388 legacy: no test reference yet
 TC-389 legacy: no test reference yet
-TC-390 legacy: no test reference yet
-TC-391 legacy: no test reference yet
-TC-392 legacy: no test reference yet
-TC-393 legacy: no test reference yet
-TC-394 legacy: no test reference yet
-TC-395 legacy: no test reference yet
-TC-396 legacy: no test reference yet
-TC-397 legacy: no test reference yet
-TC-398 legacy: no test reference yet
 TC-399 manual
-TC-400 manual
-TC-401 manual
-TC-402 legacy: no test reference yet
-TC-403 legacy: no test reference yet
-TC-404 manual
-TC-405 legacy: no test reference yet
 TC-423 legacy: no test reference yet
 TC-481 legacy: no test reference yet
 TC-482 legacy: no test reference yet
