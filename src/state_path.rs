@@ -16,6 +16,21 @@ pub fn fnv1a64(value: &str) -> u64 {
     hash
 }
 
+/// Length of a pending-plan id (SPEC-graph-plan-approval-269 FR-2545): the
+/// first 16 characters of the sha256 hex of the saved plan JSON.
+pub const PENDING_PLAN_HASH_LEN: usize = 16;
+
+/// SPEC-graph-plan-approval-269 FR-2550: a pending-plan id is interpolated
+/// into a `-16 hex.json` path inside `graph-pending`, so only exactly 16
+/// lowercase hex characters are accepted; anything else would let a caller
+/// shape the path (traversal) or misspell the id.
+pub fn valid_pending_plan_hash(value: &str) -> bool {
+    value.len() == PENDING_PLAN_HASH_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// State base directory for DmuxAI-owned state (FR-451): `$DMUXAI_STATE_DIR`
 /// when set, otherwise `$XDG_STATE_HOME/dmuxai` or `~/.local/state/dmuxai`.
 pub fn state_base() -> io::Result<PathBuf> {
@@ -124,6 +139,20 @@ pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use std::{sync::MutexGuard, time::Duration};
+
+    // TC-2550 / SPEC-graph-plan-approval-269 FR-2550: only exactly 16
+    // lowercase hex characters validate.
+    #[test]
+    fn valid_pending_plan_hash_accepts_only_16_lowercase_hex() {
+        assert!(valid_pending_plan_hash("deadbeefdeadbeef"));
+        assert!(!valid_pending_plan_hash("../x"));
+        assert!(!valid_pending_plan_hash("ABC"));
+        assert!(!valid_pending_plan_hash("ABCDEF0123456789"));
+        assert!(!valid_pending_plan_hash("deadbeefdeadbee"), "15 chars");
+        assert!(!valid_pending_plan_hash("deadbeefdeadbeef1"), "17 chars");
+        assert!(!valid_pending_plan_hash("g000000000000000"), "non-hex char");
+        assert!(!valid_pending_plan_hash("deadbeef deadbeef"), "space");
+    }
 
     // TC-1221 / SPEC-dashboard-fullwidth FR-1225: a stored workspace key maps
     // to the same repo directory as the live path.

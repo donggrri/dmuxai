@@ -67,6 +67,7 @@ pub struct RunOptions {
     pub read_only: bool,
     pub graph: bool,
     pub approve_plan: bool,
+    pub approve_plan_id: Option<String>,
     pub allow_sensitive: bool,
     pub json: bool,
     pub model: Option<String>,
@@ -181,6 +182,11 @@ const RUN_FLAGS: &[FlagSpec] = &[
         hidden: false,
     },
     FlagSpec {
+        names: &["--approve-plan-id"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
         names: &["--allow-sensitive"],
         takes_value: false,
         hidden: false,
@@ -222,6 +228,7 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
     {
         return Err(format!("unexpected argument '{word}'"));
     }
+    let approve_plan_id = parsed.flags.get("--approve-plan-id").cloned().flatten();
     let options = RunOptions {
         prompt: if allow_prompt {
             parsed.positionals.join(" ")
@@ -232,7 +239,8 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
         mode: None,
         read_only: parsed.flags.contains_key("--read-only"),
         graph: parsed.flags.contains_key("--graph"),
-        approve_plan: parsed.flags.contains_key("--approve-plan"),
+        approve_plan: parsed.flags.contains_key("--approve-plan") || approve_plan_id.is_some(),
+        approve_plan_id,
         allow_sensitive: parsed.flags.contains_key("--allow-sensitive"),
         json: parsed.flags.contains_key("--json"),
         model: parsed.flags.get("--model").cloned().flatten(),
@@ -241,6 +249,16 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
     };
     if options.graph && options.agent.is_some() {
         return Err("use either --agent or --graph, not both".to_owned());
+    }
+    // FR-2550: the id is interpolated into the pending-plan path, so a
+    // malformed id is usage before any other validation or filesystem access.
+    if let Some(plan_id) = &options.approve_plan_id
+        && !dmuxai::state_path::valid_pending_plan_hash(plan_id)
+    {
+        return Err("--approve-plan-id must be 16 lowercase hex characters".to_owned());
+    }
+    if options.approve_plan_id.is_some() && !options.graph {
+        return Err("--approve-plan-id needs --graph".to_owned());
     }
     if options.model.is_some() && options.graph {
         return Err("--model cannot be used with --graph".to_owned());
@@ -731,6 +749,10 @@ fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Val
             json!({ "first_seq": null, "last_seq": null })
         },
     });
+    // FR-2545: the saved pending graph plan hash, omitted when there is none.
+    if let Some(plan_hash) = &outcome.plan_hash {
+        value["plan_hash"] = json!(plan_hash);
+    }
     // FR-2119: the runner fallbacks of this run, omitted when there were none.
     if !outcome.fallbacks.is_empty() {
         value["fallbacks"] = json!(outcome.fallbacks);
@@ -856,6 +878,7 @@ async fn run_headless(
         mode,
         graph: options.graph,
         approve_plan: options.approve_plan,
+        approve_plan_id: options.approve_plan_id.clone(),
         allow_sensitive: options.allow_sensitive,
         todo_id,
         model: options.model.clone(),
@@ -900,6 +923,9 @@ fn mcp_run_argv(args: &RunArgs) -> Vec<String> {
     }
     if args.approve_plan {
         argv.push("--approve-plan".into());
+    }
+    if let Some(approve_plan_id) = &args.approve_plan_id {
+        argv.extend(["--approve-plan-id".into(), approve_plan_id.clone()]);
     }
     if args.allow_sensitive {
         argv.push("--allow-sensitive".into());
@@ -1232,6 +1258,7 @@ mod tests {
                 read_only: false,
                 graph: false,
                 approve_plan: false,
+                approve_plan_id: None,
                 allow_sensitive: false,
                 json: true,
                 model: None,
@@ -1356,6 +1383,7 @@ mod tests {
             todo: None,
             triage: None,
             plan: None,
+            plan_hash: None,
             system_prompt: None,
             fallbacks: Vec::new(),
         };
@@ -1376,6 +1404,7 @@ mod tests {
             todo: None,
             triage: None,
             plan: None,
+            plan_hash: None,
             system_prompt: None,
             fallbacks: Vec::new(),
         };
@@ -1404,6 +1433,7 @@ mod tests {
                 read_only: false,
                 graph: false,
                 approve_plan: false,
+                approve_plan_id: None,
                 allow_sensitive: false,
                 json: true,
                 model: Some("gemini-3.8-flash-high".into()),
@@ -1474,6 +1504,7 @@ mod tests {
                 read_only: false,
                 graph: false,
                 approve_plan: false,
+                approve_plan_id: None,
                 allow_sensitive: false,
                 json: true,
                 model: Some("m".into()),
@@ -1507,6 +1538,7 @@ mod tests {
             agent: Some("agy".into()),
             model: Some("m".into()),
             approve_plan: true,
+            approve_plan_id: None,
             allow_sensitive: true,
             graph: false,
             todo_id: None,
@@ -1532,6 +1564,7 @@ mod tests {
             agent: Some("agy".into()),
             model: Some("m".into()),
             approve_plan: true,
+            approve_plan_id: None,
             allow_sensitive: true,
             graph: false,
             todo_id: Some("t1".into()),
@@ -1560,6 +1593,96 @@ mod tests {
         assert_eq!(
             mcp_run_argv(&graph),
             vec!["run", "--graph", "--json", "--", "plan it"]
+        );
+    }
+
+    // TC-2549 / FR-2546, FR-2548: CLI parses --approve-plan-id (which implies
+    // plan approval and requires --graph) and MCP forwards it.
+    #[test]
+    fn tc_2549_approve_plan_id_cli_and_mcp_forwarding() {
+        match parse(&args(&[
+            "run",
+            "--graph",
+            "--approve-plan-id",
+            "deadbeefdeadbeef",
+            "do it",
+        ])) {
+            Ok(AgentCommand::Run(run)) => {
+                assert!(run.graph);
+                assert!(run.approve_plan, "--approve-plan-id implies approval");
+                assert_eq!(run.approve_plan_id.as_deref(), Some("deadbeefdeadbeef"));
+                assert_eq!(run.prompt, "do it");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            parse(&args(&[
+                "run",
+                "--approve-plan-id",
+                "deadbeefdeadbeef",
+                "do it"
+            ])),
+            Err("--approve-plan-id needs --graph".to_owned())
+        );
+        assert!(parse(&args(&["run", "--graph", "--approve-plan-id"])).is_err());
+
+        let forwarded = RunArgs {
+            prompt: Some("plan it".into()),
+            approve_plan_id: Some("deadbeefdeadbeef".into()),
+            graph: true,
+            ..RunArgs::default()
+        };
+        assert_eq!(
+            mcp_run_argv(&forwarded),
+            vec![
+                "run",
+                "--approve-plan-id",
+                "deadbeefdeadbeef",
+                "--graph",
+                "--json",
+                "--",
+                "plan it"
+            ]
+        );
+    }
+
+    // TC-2550 / FR-2550: --approve-plan-id must be exactly 16 lowercase hex
+    // characters; anything else is a usage error before any filesystem access.
+    #[test]
+    fn tc_2550_approve_plan_id_rejects_non_hex() {
+        for bad in [
+            "../x",
+            "ABC",
+            "ABCDEF0123456789",
+            "deadbeefdeadbee",
+            "deadbeefdeadbeef1",
+            "g000000000000000",
+        ] {
+            assert_eq!(
+                parse(&args(&[
+                    "run",
+                    "--graph",
+                    "--approve-plan-id",
+                    bad,
+                    "do it"
+                ])),
+                Err("--approve-plan-id must be 16 lowercase hex characters".to_owned())
+            );
+            assert_eq!(
+                parse(&args(&["run", "--approve-plan-id", bad, "do it"])),
+                Err("--approve-plan-id must be 16 lowercase hex characters".to_owned()),
+                "format check precedes the graph check for {bad}"
+            );
+        }
+        assert!(
+            parse(&args(&[
+                "run",
+                "--graph",
+                "--approve-plan-id",
+                "deadbeefdeadbeef",
+                "do it"
+            ]))
+            .is_ok()
         );
     }
 

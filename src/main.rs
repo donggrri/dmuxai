@@ -88,7 +88,7 @@ Usage:
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
-  dmuxai run <prompt|-> [--agent ID] [--model M] [--approve-plan] [--allow-sensitive] [--graph] [--progress] [--json] [--trust-workspace-config]
+  dmuxai run <prompt|-> [--agent ID] [--model M] [--approve-plan] [--approve-plan-id HASH] [--allow-sensitive] [--graph] [--progress] [--json] [--trust-workspace-config]
   dmuxai todo run <id> [--agent ID | --graph] [--model M] [--progress] [--json] [--trust-workspace-config]
   dmuxai trust [--status] [--json] [--revoke] [--yes]
   dmuxai todo add <title> [--body TEXT] [--json]

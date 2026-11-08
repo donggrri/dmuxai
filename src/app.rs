@@ -67,7 +67,8 @@ use dmuxai::{
         judge_line_text, judging_line_text, next_plan_change_rev, parse_plan, parse_replan,
         parse_replan_marker, parse_verdict, pin_graph_plan_runners, plan_json_for_edit,
         replan_allowed, replan_revision_steps, revision_needs_approval, save_run,
-        strip_replan_marker, task_counter_text, validate_plan, write_tasks_file_if_enabled,
+        strip_replan_marker, task_counter_text, validate_plan_with_limit,
+        write_tasks_file_if_enabled,
     },
     mcp::config::ResolvedMcpServer,
     mcp::registry::McpRegistry,
@@ -1046,9 +1047,18 @@ pub struct HeadlessRequest {
     pub mode: Option<String>,
     pub graph: bool,
     pub approve_plan: bool,
+    pub approve_plan_id: Option<String>,
     pub allow_sensitive: bool,
     pub todo_id: Option<String>,
     pub model: Option<String>,
+}
+
+/// FR-2545: persisted plan document for `--approve-plan-id`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct HeadlessPendingPlan {
+    prompt: String,
+    tasks: Vec<PlanTask>,
+    steps: Vec<PlanStep>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1088,6 +1098,9 @@ pub struct HeadlessOutcome {
     pub triage: Option<Triage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<HeadlessPlan>,
+    /// FR-2545: content hash of the saved pending graph plan (exit 7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<HeadlessSystemPrompt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1114,6 +1127,7 @@ impl HeadlessOutcome {
             todo: None,
             triage: None,
             plan: None,
+            plan_hash: None,
             system_prompt: None,
             fallbacks: Vec::new(),
         }
@@ -1141,6 +1155,11 @@ impl HeadlessOutcome {
 
     pub fn with_plan(mut self, plan: Option<HeadlessPlan>) -> Self {
         self.plan = plan;
+        self
+    }
+
+    pub fn with_plan_hash(mut self, plan_hash: Option<String>) -> Self {
+        self.plan_hash = plan_hash;
         self
     }
 
@@ -8828,6 +8847,7 @@ impl App {
         }
         let index = adapter_index(agent);
         let nonce = Uuid::new_v4().simple().to_string();
+        let max_steps = self.graph_limits().max_nodes.clamp(1, 8);
         let (runner_names, model_lists) = self.plan_prompt_runners();
         let model_refs: Vec<Vec<&str>> = model_lists
             .iter()
@@ -8848,6 +8868,7 @@ impl App {
                 nonce: &nonce,
                 verdict_reason: &verdict_reason,
                 runners: &allowed_refs,
+                max_steps,
                 mode: PlanPromptMode::Repair { errors: &errors },
             })
         } else if let Some((previous, feedback)) = edit.as_ref() {
@@ -8856,6 +8877,7 @@ impl App {
                 nonce: &nonce,
                 verdict_reason: &verdict_reason,
                 runners: &allowed_refs,
+                max_steps,
                 mode: PlanPromptMode::Edit {
                     previous_plan: previous,
                     feedback,
@@ -8867,6 +8889,7 @@ impl App {
                 nonce: &nonce,
                 verdict_reason: &verdict_reason,
                 runners: &allowed_refs,
+                max_steps,
                 mode: PlanPromptMode::Initial,
             })
         } else {
@@ -8876,6 +8899,7 @@ impl App {
                 nonce: &nonce,
                 verdict_reason: &verdict_reason,
                 runners: &allowed_refs,
+                max_steps,
                 mode: PlanPromptMode::Repair { errors: &errors },
             })
         } {
@@ -9374,8 +9398,11 @@ impl App {
                 self.end_run_state(pending.agent, true, false);
                 match parse_plan(pending.buffer.as_str()) {
                     Ok(doc) => {
-                        let result =
-                            self.with_plan_context(&pending.prompt, |ctx| validate_plan(&doc, ctx));
+                        let cap = self.graph_limits().max_nodes.clamp(1, 8);
+                        let over_limit = doc.steps.len() > cap || doc.tasks.len() > cap;
+                        let result = self.with_plan_context(&pending.prompt, |ctx| {
+                            validate_plan_with_limit(&doc, ctx, cap)
+                        });
                         match result {
                             Ok(graph_plan) => {
                                 self.record_pending_plan_io(&pending, true);
@@ -9418,6 +9445,10 @@ impl App {
                                         &pending,
                                         "plan invalid twice",
                                     );
+                                } else if over_limit {
+                                    let error_lines: Vec<String> =
+                                        errors.iter().map(|err| err.to_string()).collect();
+                                    self.fail_over_limit_plan(&pending, error_lines);
                                 } else {
                                     let raw = cap_revision_raw(pending.buffer.as_str());
                                     let error_lines: Vec<String> =
@@ -10353,6 +10384,25 @@ impl App {
                 None,
             );
         }
+    }
+
+    fn fail_over_limit_plan(&mut self, pending: &PendingPlan, errors: Vec<String>) {
+        let detail = errors.join("; ");
+        self.push_system(format!("Plan exceeds the effective step cap: {detail}"));
+        let save_error = if let Some(run) = self
+            .last_graph_run
+            .as_mut()
+            .filter(|run| run.plan.id == pending.run_id && run.phase == GraphRunPhase::Planning)
+        {
+            run.phase = GraphRunPhase::Failed;
+            save_run(&self.workspace_root, run).err()
+        } else {
+            None
+        };
+        if let Some(error) = save_error {
+            self.push_system(format!("Could not save the failed run: {error}"));
+        }
+        self.finish_linked_graph_todo(false, Some(detail));
     }
 
     fn internal_turn_busy_error(event: &AgentEvent) -> Option<&str> {
@@ -14000,6 +14050,231 @@ impl App {
         .with_system_prompt(self.system_prompt_applied.clone())
     }
 
+    /// FR-2545: writes the awaiting graph plan plus its hash under the state dir.
+    fn headless_write_pending_plan(&mut self) -> Option<String> {
+        let (prompt, tasks, steps) = {
+            let run = self.last_graph_run.as_ref()?;
+            if run.phase != GraphRunPhase::AwaitingApproval {
+                return None;
+            }
+            // FR-2551: save the latest revision without validation errors —
+            // the same revision plan approval would execute.
+            let revision = run
+                .approval
+                .as_ref()?
+                .revisions
+                .iter()
+                .rev()
+                .find(|revision| revision.errors.is_none())?;
+            (
+                run.plan.user_prompt.clone(),
+                run.plan.tasks.clone(),
+                revision.steps.clone(),
+            )
+        };
+        let pending = HeadlessPendingPlan {
+            prompt,
+            tasks,
+            steps,
+        };
+        let json = match serde_json::to_string(&pending) {
+            Ok(json) => json,
+            Err(error) => {
+                self.push_system(format!("Could not save the pending plan: {error}"));
+                return None;
+            }
+        };
+        let hash: String = dmuxai::docs::sha256_hex(json.as_bytes())
+            .chars()
+            .take(16)
+            .collect();
+        let dir = match dmuxai::state_path::state_base() {
+            Ok(base) => base.join("graph-pending"),
+            Err(error) => {
+                self.push_system(format!("Could not resolve the state directory: {error}"));
+                return None;
+            }
+        };
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            self.push_system(format!(
+                "Could not create the pending plan directory: {error}"
+            ));
+            return None;
+        }
+        if let Err(error) = std::fs::write(dir.join(format!("{hash}.json")), json) {
+            self.push_system(format!("Could not save the pending plan: {error}"));
+            return None;
+        }
+        Some(hash)
+    }
+
+    /// FR-2546: loads a persisted plan for `--approve-plan-id` and starts it
+    /// already approved, without a planner turn.
+    fn headless_start_approved_plan(
+        &mut self,
+        req: &HeadlessRequest,
+    ) -> Result<(), Box<HeadlessOutcome>> {
+        let Some(plan_hash) = req.approve_plan_id.as_deref() else {
+            return Ok(());
+        };
+        let conversation_id = self.conversation_id.as_str().to_owned();
+        let fail = |exit_code: i32, message: String| {
+            Box::new(HeadlessOutcome::failure(
+                exit_code,
+                conversation_id.clone(),
+                None,
+                message,
+            ))
+        };
+        // FR-2550: reject a malformed id as usage before the path is used.
+        if !dmuxai::state_path::valid_pending_plan_hash(plan_hash) {
+            return Err(fail(
+                dmuxai::agent_api::exit::USAGE,
+                "--approve-plan-id must be 16 lowercase hex characters".to_owned(),
+            ));
+        }
+        if !req.graph {
+            return Err(fail(
+                dmuxai::agent_api::exit::USAGE,
+                "--approve-plan-id requires --graph".to_owned(),
+            ));
+        }
+        if req.todo_id.is_some() {
+            return Err(fail(
+                dmuxai::agent_api::exit::USAGE,
+                "--approve-plan-id cannot be used with todo run".to_owned(),
+            ));
+        }
+        let path = match dmuxai::state_path::state_base() {
+            Ok(base) => base.join("graph-pending").join(format!("{plan_hash}.json")),
+            Err(error) => {
+                return Err(fail(
+                    dmuxai::agent_api::exit::INTERNAL,
+                    format!("Could not resolve the state directory: {error}"),
+                ));
+            }
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(fail(
+                    dmuxai::agent_api::exit::NOT_FOUND,
+                    format!("No pending plan found for '{plan_hash}'"),
+                ));
+            }
+            Err(error) => {
+                return Err(fail(
+                    dmuxai::agent_api::exit::INTERNAL,
+                    format!("Could not read the pending plan: {error}"),
+                ));
+            }
+        };
+        let pending: HeadlessPendingPlan = match serde_json::from_slice(&bytes) {
+            Ok(pending) => pending,
+            Err(error) => {
+                return Err(fail(
+                    dmuxai::agent_api::exit::FAILED,
+                    format!("Pending plan '{plan_hash}' is invalid: {error}"),
+                ));
+            }
+        };
+        if pending.prompt != req.prompt {
+            return Err(fail(
+                dmuxai::agent_api::exit::USAGE,
+                "The pending plan was saved for a different prompt".to_owned(),
+            ));
+        }
+
+        let run_id = Uuid::new_v4().to_string();
+        let fallback_runner = runner_name(self.adapters[self.selected].agent()).to_owned();
+        let fallback_model = self
+            .selected_run_model_label(self.adapters[self.selected].agent())
+            .unwrap_or_else(|_| dmuxai::model_policy::PROVIDER_DEFAULT.to_owned());
+        let (runner, model) = pending
+            .steps
+            .first()
+            .map(|step| {
+                (
+                    step.runner.clone(),
+                    step.model.clone().unwrap_or_else(|| fallback_model.clone()),
+                )
+            })
+            .unwrap_or((fallback_runner, fallback_model));
+        let limits = self.graph_limits();
+        let result = self.with_plan_context(&pending.prompt, |ctx| {
+            graph_plan_from_revision_steps(
+                &run_id,
+                &pending.prompt,
+                &model,
+                &pending.tasks,
+                &pending.steps,
+                limits,
+                ctx,
+            )
+        });
+        let graph_plan = match result {
+            Ok(plan) => plan,
+            Err(errors) => {
+                let message = errors
+                    .iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(fail(
+                    dmuxai::agent_api::exit::FAILED,
+                    format!("Approved plan is invalid: {message}"),
+                ));
+            }
+        };
+        let doc = PlanDoc {
+            steps: pending.steps.clone(),
+            tasks: pending.tasks.clone(),
+            require_tasks: !pending.tasks.is_empty(),
+            task_errors: Vec::new(),
+        };
+        let agent = runner_from_str(&runner).unwrap_or(self.adapters[self.selected].agent());
+        let pending_plan = PendingPlan {
+            agent,
+            defer_origin: None,
+            conversation_id: self.conversation_id.clone(),
+            turn_id: StoredTurnId::new(format!("approved-{run_id}")),
+            adapter_prompt: String::new(),
+            buffer: TurnBuffer::new(),
+            started: Instant::now(),
+            last_event: Instant::now(),
+            prompt: pending.prompt.clone(),
+            run_id: run_id.clone(),
+            route: Route::Complex,
+            verdict_reason: "approved plan".to_owned(),
+            triage_source: TriageSource::Override,
+            triage_cause: None,
+            judge_calls: 0,
+            plan_calls: 0,
+            repair_calls: 0,
+            attempt: 0,
+            orchestrate_started_ms: unix_ms_now(),
+            triage_elapsed_ms: 0,
+            model,
+            runner,
+            edit_previous_json: None,
+            edit_feedback: None,
+            override_kind: Some(OverrideKind::Plan),
+            adapter_sent: false,
+        };
+        self.begin_user_prompt_turn();
+        self.finish_validated_plan(pending_plan, &doc, graph_plan);
+        if let Err(error) = self.approve_awaiting_plan(DecisionBy::Cli) {
+            return Err(fail(
+                dmuxai::agent_api::exit::FAILED,
+                Self::plan_decision_notice(error),
+            ));
+        }
+        if let Err(error) = std::fs::remove_file(&path) {
+            self.push_system(format!("Could not remove the pending plan: {error}"));
+        }
+        Ok(())
+    }
+
     fn headless_submit_prompt(&mut self, req: &HeadlessRequest) -> Result<(), RunTodoError> {
         if is_slash_command(&req.prompt) {
             if self.submit_precheck(&req.prompt) {
@@ -14121,13 +14396,18 @@ impl App {
                     .as_ref()
                     .map(Self::headless_plan_text)
                     .unwrap_or_default();
+                // FR-2545: save the exact plan before the awaiting run is cancelled.
+                let plan_hash = self.headless_write_pending_plan();
                 self.headless_cancel_awaiting_plan(HEADLESS_APPROVAL_NOTE);
-                return HeadlessIdleAction::Exit(Box::new(self.headless_outcome_exit_7(
-                    conversation_id,
-                    agent_label,
-                    HEADLESS_APPROVAL_NOTE,
-                    text,
-                )));
+                return HeadlessIdleAction::Exit(Box::new(
+                    self.headless_outcome_exit_7(
+                        conversation_id,
+                        agent_label,
+                        HEADLESS_APPROVAL_NOTE,
+                        text,
+                    )
+                    .with_plan_hash(plan_hash),
+                ));
             }
         }
         HeadlessIdleAction::Done
@@ -14197,6 +14477,11 @@ impl App {
         req: HeadlessRequest,
         cancel: Arc<AtomicBool>,
     ) -> HeadlessOutcome {
+        let mut req = req;
+        // FR-2546: `--approve-plan-id` implies plan approval.
+        if req.approve_plan_id.is_some() {
+            req.approve_plan = true;
+        }
         let start_fallbacks_len = self.fallback_history.len();
         if let Some(ref agent_str) = req.agent {
             let runner_clean = agent_str.trim().to_ascii_lowercase();
@@ -14447,6 +14732,14 @@ impl App {
         let mut last_error_kind: Option<String> = None;
         let mut last_graph_id: Option<String> = None;
         let mut cancelled = false;
+
+        if req.approve_plan_id.is_some() {
+            if let Err(outcome) = self.headless_start_approved_plan(&req) {
+                return *outcome;
+            }
+            prompt_submitted = true;
+            approved_plan = true;
+        }
 
         loop {
             if !prompt_submitted {
@@ -14758,6 +15051,7 @@ impl App {
             todo,
             triage,
             plan,
+            plan_hash: None,
             system_prompt: self.system_prompt_applied.clone(),
             fallbacks: self.fallback_history[start_fallbacks_len..].to_vec(),
         }
@@ -25305,6 +25599,7 @@ out3
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -25477,6 +25772,7 @@ out3
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -25553,6 +25849,7 @@ out3
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -25595,6 +25892,7 @@ out3
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -25637,6 +25935,7 @@ out3
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -25677,6 +25976,7 @@ out3
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -25753,6 +26053,7 @@ out3
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -25807,6 +26108,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -25824,6 +26126,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -25892,6 +26195,7 @@ out3
                 mode: None,
                 graph: false,
                 approve_plan: false,
+                approve_plan_id: None,
                 allow_sensitive: false,
                 todo_id: None,
                 model: Some("gemini-4-argon".to_owned()),
@@ -25913,6 +26217,7 @@ out3
                 mode: None,
                 graph: false,
                 approve_plan: false,
+                approve_plan_id: None,
                 allow_sensitive: false,
                 todo_id: None,
                 model: Some("composer-2.5-fast".to_owned()),
@@ -25970,6 +26275,7 @@ out3
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: Some("gemini-3.8-flash-high".to_owned()),
@@ -26037,6 +26343,7 @@ out3
             mode: mode.map(str::to_owned),
             graph,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: model.map(str::to_owned),
@@ -26164,6 +26471,7 @@ out3
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -26241,6 +26549,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -26280,6 +26589,7 @@ out3
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -26469,6 +26779,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -26587,6 +26898,7 @@ out3
                 mode: None,
                 graph: false,
                 approve_plan: false,
+                approve_plan_id: None,
                 allow_sensitive: false,
                 todo_id: None,
                 model: None,
@@ -26674,6 +26986,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -26742,6 +27055,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -26913,6 +27227,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -26990,6 +27305,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -27018,6 +27334,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -27067,6 +27384,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: true,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -27091,6 +27409,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -27152,6 +27471,7 @@ out3
             mode: Some("ask".to_owned()),
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -27200,6 +27520,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: true,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -27277,6 +27598,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -28859,6 +29181,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -30517,6 +30840,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,
@@ -32494,6 +32818,15 @@ out3
         ]}"#
     }
 
+    fn four_step_codex_plan_json() -> &'static str {
+        r#"{"tasks":[{"id":"task-1","title":"work","done_check":"done","areas":[],"size":"small","depends_on":[]}],"steps":[
+            {"id":"step-1","role":"research","job":"research","runner":"codex","model":"composer-2.5","depends_on":[],"task":"task-1"},
+            {"id":"step-2","role":"implement","job":"build","runner":"codex","model":"composer-2.5","depends_on":["step-1"],"task":"task-1"},
+            {"id":"step-3","role":"test","job":"test","runner":"codex","model":"composer-2.5","depends_on":["step-2"],"task":"task-1"},
+            {"id":"step-4","role":"review","job":"review","runner":"codex","model":"composer-2.5","depends_on":["step-3"],"task":"task-1"}
+        ]}"#
+    }
+
     fn korean_three_task_codex_plan_json() -> &'static str {
         r#"{"tasks":[
             {"id":"task-1","title":"설계 문서를 읽고 요약하기","done_check":"done","areas":[],"size":"small","depends_on":[]},
@@ -33059,6 +33392,359 @@ out3
         assert_eq!(no_model.app.input, "fix");
         assert!(last_system(&no_model.app).contains("fast models"));
         assert!(no_model.app.last_graph_run.is_none());
+    }
+
+    // TC-2544 / FR-2542: the initial plan is capped at min(8, max_nodes); an
+    // over-limit plan uses the repair turn and approval shows the 3-step plan.
+    #[test]
+    fn tc_2544_over_limit_plan_repairs_to_effective_cap() {
+        let mut h = plan_gate_test_app();
+        h.app.settings.graph_max_nodes = 3;
+        let plan_req = complete_complex_judge(&mut h);
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::TextDelta(four_step_codex_plan_json().to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &plan_req,
+            AgentEvent::Completed
+        )));
+        let repair_req = h.sent.lock().unwrap().last().unwrap().1.clone();
+        assert_ne!(repair_req.turn_id.as_str(), plan_req.turn_id.as_str());
+        assert!(repair_req.prompt.contains("Validation errors"));
+        assert!(repair_req.prompt.contains("step count must be 1 to 3"));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &repair_req,
+            AgentEvent::TextDelta(three_step_codex_plan_json().to_owned())
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &repair_req,
+            AgentEvent::Completed
+        )));
+        let run = h.app.last_graph_run.as_ref().expect("repaired plan");
+        assert_eq!(run.phase, GraphRunPhase::AwaitingApproval);
+        assert_eq!(run.plan.nodes.len(), 3);
+        assert_eq!(
+            run.approval
+                .as_ref()
+                .unwrap()
+                .revisions
+                .last()
+                .unwrap()
+                .steps
+                .len(),
+            3
+        );
+        assert_eq!(run.planner_calls.repair, 1);
+    }
+
+    // TC-2545 / FR-2544: a second over-limit plan fails the run (exit 1),
+    // never parks a fallback plan for approval (exit 7).
+    #[test]
+    fn tc_2545_over_limit_plan_twice_fails_without_approval() {
+        let mut h = plan_gate_test_app();
+        h.app.settings.graph_max_nodes = 3;
+        complete_complex_judge(&mut h);
+        for _ in 0..2 {
+            let req = h.sent.lock().unwrap().last().unwrap().1.clone();
+            assert!(h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &req,
+                AgentEvent::TextDelta(four_step_codex_plan_json().to_owned())
+            )));
+            assert!(h.app.apply_agent_output(triage_output(
+                Agent::Codex,
+                &req,
+                AgentEvent::Completed
+            )));
+        }
+        let run = h.app.last_graph_run.as_ref().expect("failed planning run");
+        assert_eq!(run.phase, GraphRunPhase::Failed);
+        assert!(run.approval.is_none());
+        assert!(last_system(&h.app).contains("step count must be 1 to 3"));
+        assert_eq!(run.planner_calls.repair, 1);
+    }
+
+    // TC-2546 / FR-2543: the plan prompt states the effective step cap.
+    #[test]
+    fn tc_2546_plan_prompt_states_effective_cap() {
+        let mut h = plan_gate_test_app();
+        h.app.settings.graph_max_nodes = 3;
+        let plan_req = complete_complex_judge(&mut h);
+        assert!(
+            plan_req
+                .prompt
+                .contains("Use 1 to 3 tasks and at most 3 steps"),
+            "prompt missing the effective cap: {}",
+            plan_req.prompt
+        );
+        assert!(!plan_req.prompt.contains("at most 8 steps"));
+    }
+
+    fn graph_headless_request(prompt: &str, approve_plan_id: Option<String>) -> HeadlessRequest {
+        HeadlessRequest {
+            prompt: prompt.to_owned(),
+            agent: None,
+            mode: None,
+            graph: true,
+            approve_plan: false,
+            approve_plan_id,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        }
+    }
+
+    // TC-2547 / FR-2545, FR-2546: exit 7 writes the pending plan and its hash;
+    // `--approve-plan-id` then runs that exact plan without a planner turn.
+    #[tokio::test]
+    async fn tc_2547_exit_7_writes_pending_plan_and_approve_plan_id_runs_it() {
+        pin_test_state_dir();
+        let workspace = tempfile::tempdir().unwrap();
+        let engine = ConversationEngine::open(Path::new(":memory:"), workspace.path()).unwrap();
+        let (mut app, sent, event_tx) =
+            test_app_with_engine_and_event_sender(engine, workspace.path().to_path_buf());
+        let stop = Arc::new(AtomicBool::new(false));
+        let responder = {
+            let sent = Arc::clone(&sent);
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let mut handled = 0usize;
+                loop {
+                    let requests = {
+                        let requests = sent.lock().unwrap();
+                        requests[handled..].to_vec()
+                    };
+                    if requests.is_empty() {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        continue;
+                    }
+                    for (agent, request) in requests {
+                        handled += 1;
+                        let turn_id = request.turn_id.as_str();
+                        let text = if turn_id.starts_with("judge-") {
+                            Some(
+                                "{\"route\":\"complex\",\"reason\":\"needs several steps\"}"
+                                    .to_owned(),
+                            )
+                        } else if turn_id.starts_with("plan-") {
+                            Some(three_step_codex_plan_json().to_owned())
+                        } else {
+                            None
+                        };
+                        if let Some(text) = text {
+                            let _ = event_tx
+                                .send(triage_output(agent, &request, AgentEvent::TextDelta(text)))
+                                .await;
+                        }
+                        let _ = event_tx
+                            .send(triage_output(agent, &request, AgentEvent::Completed))
+                            .await;
+                    }
+                }
+            })
+        };
+
+        let prompt = "headless exact plan approval request";
+        let outcome = app
+            .run_headless(
+                graph_headless_request(prompt, None),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert_eq!(outcome.exit_code, 7, "{outcome:?}");
+        assert!(!outcome.ok);
+        let plan_hash = outcome.plan_hash.clone().expect("plan_hash on exit 7");
+        assert_eq!(plan_hash.len(), 16);
+        let path = dmuxai::state_path::state_base()
+            .unwrap()
+            .join("graph-pending")
+            .join(format!("{plan_hash}.json"));
+        assert!(path.is_file(), "pending plan was not written: {path:?}");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["prompt"], prompt);
+        assert_eq!(saved["steps"].as_array().unwrap().len(), 3);
+        assert_eq!(saved["tasks"].as_array().unwrap().len(), 1);
+
+        let sent_before = sent.lock().unwrap().len();
+        let outcome = app
+            .run_headless(
+                graph_headless_request(prompt, Some(plan_hash.clone())),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert!(outcome.ok, "{outcome:?}");
+        assert_eq!(outcome.exit_code, 0);
+        assert!(!path.exists(), "pending plan must be removed after use");
+        {
+            let requests = sent.lock().unwrap();
+            let planner_turns = requests[sent_before..]
+                .iter()
+                .filter(|(_, request)| {
+                    let turn_id = request.turn_id.as_str();
+                    turn_id.starts_with("judge-") || turn_id.starts_with("plan-")
+                })
+                .count();
+            assert_eq!(planner_turns, 0, "approve-plan-id must not plan again");
+        }
+        stop.store(true, Ordering::Relaxed);
+        responder.await.unwrap();
+    }
+
+    // TC-2548 / FR-2546: a missing pending plan is exit 3 and a prompt
+    // mismatch is exit 2; neither starts a planner turn.
+    #[tokio::test]
+    async fn tc_2548_approve_plan_id_missing_and_prompt_mismatch() {
+        pin_test_state_dir();
+        let (mut app, sent) = test_app();
+
+        let missing = app
+            .run_headless(
+                graph_headless_request("missing pending plan", Some("deadbeefdeadbeef".into())),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert_eq!(missing.exit_code, 3, "{missing:?}");
+        assert!(!missing.ok);
+        assert_eq!(sent.lock().unwrap().len(), 0);
+
+        let mut pending: serde_json::Value =
+            serde_json::from_str(three_step_codex_plan_json()).unwrap();
+        pending["prompt"] = serde_json::json!("the saved prompt");
+        let json = serde_json::to_string(&pending).unwrap();
+        let plan_hash: String = dmuxai::docs::sha256_hex(json.as_bytes())
+            .chars()
+            .take(16)
+            .collect();
+        let dir = dmuxai::state_path::state_base()
+            .unwrap()
+            .join("graph-pending");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{plan_hash}.json"));
+        std::fs::write(&path, &json).unwrap();
+
+        let mismatch = app
+            .run_headless(
+                graph_headless_request("a different prompt", Some(plan_hash.clone())),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert_eq!(mismatch.exit_code, 2, "{mismatch:?}");
+        assert!(!mismatch.ok);
+        assert!(path.is_file(), "a mismatched plan is not consumed");
+        assert_eq!(sent.lock().unwrap().len(), 0);
+    }
+
+    // TC-2550 / FR-2550: a non-hex --approve-plan-id is usage exit 2 before
+    // the pending-plan path is touched.
+    #[tokio::test]
+    async fn tc_2550_headless_approve_plan_id_rejects_non_hex() {
+        pin_test_state_dir();
+        let (mut app, sent) = test_app();
+        for bad in ["../x", "ABC", "deadbeefdeadbee", "ABCDEF0123456789"] {
+            let outcome = app
+                .run_headless(
+                    graph_headless_request("any prompt", Some(bad.to_owned())),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await;
+            assert_eq!(outcome.exit_code, 2, "{bad}: {outcome:?}");
+            assert!(!outcome.ok);
+            let touched = dmuxai::state_path::state_base()
+                .unwrap()
+                .join("graph-pending")
+                .join(format!("{bad}.json"));
+            assert!(
+                !touched.exists(),
+                "no filesystem access may happen for {bad}"
+            );
+        }
+        assert_eq!(sent.lock().unwrap().len(), 0);
+    }
+
+    // TC-2550 / FR-2551: exit 7 saves the latest revision without validation
+    // errors — the same revision approval would run — not merely the last one.
+    #[test]
+    fn tc_2550_write_pending_plan_skips_error_revision() {
+        pin_test_state_dir();
+        let step = |id: &str, job: &str| dmuxai::graph::PlanStep {
+            id: id.to_owned(),
+            role: "implement".to_owned(),
+            job: job.to_owned(),
+            runner: "agy".to_owned(),
+            model: None,
+            depends_on: Vec::new(),
+            sensitive: None,
+            task: None,
+            ..Default::default()
+        };
+        let revision =
+            |n: u32, jobs: &[&str], errors: Option<Vec<String>>| dmuxai::graph::PlanRevision {
+                n,
+                source: "model".to_owned(),
+                steps: jobs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, job)| step(&format!("step-{index}"), job))
+                    .collect(),
+                added: Vec::new(),
+                changed: Vec::new(),
+                feedback: None,
+                errors,
+                raw: None,
+            };
+        let (mut app, _) = test_app();
+        app.last_graph_run = Some(GraphRun {
+            plan: dmuxai::graph::GraphPlan {
+                schema: "graph.v1".to_owned(),
+                id: "plan-1".to_owned(),
+                orchestrator_model: "m".to_owned(),
+                user_prompt: "plan it".to_owned(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                limits: dmuxai::graph::default_limits(),
+                tasks: Vec::new(),
+            },
+            conversation_id: app.conversation_id.to_string(),
+            phase: GraphRunPhase::AwaitingApproval,
+            approval: Some(dmuxai::graph::Approval {
+                state: dmuxai::graph::ApprovalState::Pending,
+                revisions: vec![
+                    revision(1, &["valid one"], None),
+                    revision(
+                        2,
+                        &["valid one", "valid two"],
+                        Some(vec!["bad revision".to_owned()]),
+                    ),
+                    revision(3, &["latest valid one"], None),
+                ],
+                decided_by: None,
+                decided_at_ms: None,
+            }),
+            ..Default::default()
+        });
+        let plan_hash = app.headless_write_pending_plan().expect("plan saved");
+        let path = dmuxai::state_path::state_base()
+            .unwrap()
+            .join("graph-pending")
+            .join(format!("{plan_hash}.json"));
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let steps: Vec<&str> = saved["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["job"].as_str().unwrap())
+            .collect();
+        assert_eq!(steps, vec!["latest valid one"], "{saved:?}");
     }
 
     // TC-1460 / FR-1460: a grok follow-up with no selected model is not
@@ -36029,6 +36715,7 @@ out3
             mode: None,
             graph: false,
             approve_plan: false,
+            approve_plan_id: None,
             allow_sensitive: false,
             todo_id: None,
             model: None,

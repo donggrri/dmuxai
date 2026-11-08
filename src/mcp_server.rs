@@ -17,6 +17,7 @@ pub struct RunArgs {
     pub agent: Option<String>,
     pub model: Option<String>,
     pub approve_plan: bool,
+    pub approve_plan_id: Option<String>,
     pub allow_sensitive: bool,
     pub graph: bool,
     pub todo_id: Option<String>,
@@ -71,6 +72,10 @@ fn tool_definitions() -> Value {
                     "approve_plan": {
                         "type": "boolean",
                         "description": "Approve a pending plan and confirm sensitive gates like dmuxai run --approve-plan"
+                    },
+                    "approve_plan_id": {
+                        "type": "string",
+                        "description": "Run a plan saved by a previous exit 7 (same as dmuxai run --graph --approve-plan-id); 16 lowercase hex chars; requires graph"
                     },
                     "allow_sensitive": {
                         "type": "boolean",
@@ -157,6 +162,7 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
                     .get("approve_plan")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                approve_plan_id: str_arg(args, "approve_plan_id").map(str::to_owned),
                 allow_sensitive: args
                     .get("allow_sensitive")
                     .and_then(Value::as_bool)
@@ -169,6 +175,16 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
             }
             if run.graph && run.agent.is_some() {
                 return Err("use either agent or graph, not both".to_owned());
+            }
+            if run.approve_plan_id.is_some() && !run.graph {
+                return Err("approve_plan_id requires graph".to_owned());
+            }
+            // FR-2550: reject a malformed id before the backend touches the
+            // pending-plan path.
+            if let Some(plan_id) = &run.approve_plan_id
+                && !crate::state_path::valid_pending_plan_hash(plan_id)
+            {
+                return Err("approve_plan_id must be 16 lowercase hex characters".to_owned());
             }
             if run.model.is_some() && run.graph {
                 return Err("model cannot be used with graph".to_owned());
@@ -461,6 +477,7 @@ mod tests {
                     agent: Some("agy".to_owned()),
                     model: Some("gemini-3.8-flash-high".to_owned()),
                     approve_plan: true,
+                    approve_plan_id: None,
                     allow_sensitive: true,
                     graph: false,
                     todo_id: None,
@@ -478,6 +495,74 @@ mod tests {
         assert_eq!(runs[1].model.as_deref(), Some("m"));
         assert!(runs[1].approve_plan);
         assert!(runs[1].allow_sensitive);
+    }
+
+    // TC-2549 / FR-2548: `run` accepts approve_plan_id and requires graph.
+    #[test]
+    fn tc_2549_mcp_run_approve_plan_id_requires_graph() {
+        let stub = Stub::default();
+        let result = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"plan it","graph":true,"approve_plan_id":"deadbeefdeadbeef"}}}),
+        );
+        assert_eq!(result["result"]["isError"], false);
+        {
+            let runs = stub.runs.lock().unwrap();
+            assert_eq!(runs[0].approve_plan_id.as_deref(), Some("deadbeefdeadbeef"));
+            assert!(runs[0].graph);
+        }
+
+        let rejected = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"plan it","approve_plan_id":"deadbeefdeadbeef"}}}),
+        );
+        assert_eq!(
+            rejected["result"]["content"][0]["text"],
+            "approve_plan_id requires graph"
+        );
+        assert_eq!(stub.runs.lock().unwrap().len(), 1);
+
+        let tools = call(&stub, json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}));
+        let run_tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "run")
+            .expect("run tool");
+        assert_eq!(
+            run_tool["inputSchema"]["properties"]["approve_plan_id"]["type"],
+            "string"
+        );
+    }
+
+    // TC-2550 / FR-2550: the run tool rejects approve_plan_id values that are
+    // not exactly 16 lowercase hex characters, without calling the backend.
+    #[test]
+    fn tc_2550_mcp_run_approve_plan_id_rejects_non_hex() {
+        let stub = Stub::default();
+        for bad in [
+            "../x",
+            "ABC",
+            "ABCDEF0123456789",
+            "deadbeefdeadbee",
+            "deadbeefdeadbeef1",
+            "g000000000000000",
+        ] {
+            let rejected = call(
+                &stub,
+                json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"plan it","graph":true,"approve_plan_id":bad}}}),
+            );
+            assert_eq!(
+                rejected["result"]["content"][0]["text"],
+                "approve_plan_id must be 16 lowercase hex characters",
+                "{bad}"
+            );
+            assert_eq!(
+                rejected["result"]["isError"], true,
+                "non-hex id {bad} must be an error"
+            );
+        }
+        assert_eq!(stub.runs.lock().unwrap().len(), 0, "backend never called");
     }
 
     // TC-2510 / FR-2511: the deprecated mode is rejected like the CLI's
