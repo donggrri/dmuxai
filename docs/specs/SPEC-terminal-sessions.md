@@ -1,30 +1,32 @@
-# SPEC-terminal-sessions: Persistent named terminal sessions (`dmuxai term`), PR1a
+# SPEC-terminal-sessions: Persistent named terminal sessions (`dmuxai term`)
 
-Status: in progress (PR1a implemented in tree: Linux PTY shell/cmd sessions, session host, CLI, journal; PR1b–PR4 pending)
+Status: in progress (PR1a on main 0bfc67b; PR1b adds native serial, usbipd attach, policy/approve, bench)
 Owner: DmuxAI Team
 Created: 2026-11-09
-Baseline: main 4c59eac (v0.3.1); highest existing FR/TC-2567, NFR-1886. IDs 2600–2699 are reserved for terminal sessions; PR1a defines FR/TC-2600–2609, 2620, 2621, 2632, NFR/TC-2690–2693, INT/TC-2695.
+Baseline: main 0bfc67b (PR1a). IDs 2600–2699 are reserved for terminal sessions. PR1a shipped FR/TC-2600–2609, 2620, 2621, 2632, NFR/TC-2690–2693, INT/TC-2695. PR1b adds FR/TC-2610–2616, 2618, 2630.
 Related: #301 (overhead budget), #228 (invisible long-running command), #230 (tree kill), #194 (Display errors), SPEC-run-journal, SPEC-process-supervisor, SPEC-agent-api
 
 ## 1. Decision summary
 
-Agents and humans need long-lived terminals (a shell, an `ssh` session, later a serial console) that survive a single CLI call, so a test node can start a command, come back for its output, and be watched by a human. dmuxai adds named sessions owned by a per-workspace **session host** and driven by `dmuxai term …` subcommands with `--json`. Completion is detected by an output regex, an idle period, or (for POSIX shells) a nonce exit marker. Every input and output event is written, masked, to a local journal. PR1a ships Linux PTY sessions; serial, the dangerous-command guard, agent integration, the dashboard view, and Windows follow in PR1b–PR4.
+Agents and humans need long-lived terminals (a shell, an `ssh` session, later a serial console) that survive a single CLI call, so a test node can start a command, come back for its output, and be watched by a human. dmuxai adds named sessions owned by a per-workspace **session host** and driven by `dmuxai term …` subcommands with `--json`. Completion is detected by an output regex, an idle period, or (for POSIX shells) a nonce exit marker. Every input and output event is written, masked, to a local journal. PR1a shipped Linux PTY sessions. PR1b adds native serial consoles (including WSL usbipd attach), a dangerous-command block-and-approve guard with a per-workspace allowlist, a local bench script, and two leftover tightenings: `exec` returns only the command output, and `wait` without `--since` does not search old output.
 
 ## 2. Scope
 
 ### In scope
 
-- `dmuxai term open/send/read/wait/exec/list/show/resize/close/reopen`, all with `--json`.
-- A session host process that autostarts on the first `term` call, outlives the CLI, and exits when idle.
-- Linux PTY sessions of kind `shell` (default `$SHELL -l`, else `/bin/sh`) and `cmd` (`-- <argv>`).
-- Per-session ring buffer with monotonic sequence numbers; regex, idle, and timeout waits.
-- A masked, local, 0600 JSONL journal of all I/O per session.
-- A human-takeover lock that rejects non-human input (the dashboard toggle itself is PR3).
+- PR1a: `dmuxai term open/send/read/wait/exec/list/show/resize/close/reopen`, session host, Linux PTY `shell`/`cmd`, journal, takeover lock.
+- Native serial: `term open <name> --serial DEV --baud N` via `serial2` (no extra tool). `--kind cmd -- picocom …` remains supported as a PTY command.
+- Serial errors with their own `error_kind` and no retry loop (missing device, permission, busy).
+- When the device is missing on WSL2, dmuxai runs `usbipd.exe attach --wsl --busid <id>` itself (busid from `--usbipd-busid` or trusted `[terminal.serial] usbipd_busid`; `usbipd.exe list` may resolve it). Failure prints a clear hint and does not loop.
+- WSL1: `--serial COM3` is accepted and mapped to `/dev/ttyS3` (`COMn` → `/dev/ttySn`).
+- Unplug (EIO/ENXIO) moves the session to `lost`; `term reopen <name>` retries the same settings.
+- `term open … --wait-for REGEX --timeout DUR` opens and waits in one call.
+- Dangerous-command guard on `send`/`exec` text: exit 7 with `approval_id`; `term approve <id>` (refused when `DMUXAI_RUN_ID` is set) lets that one input through. Per-workspace `[terminal.policy] allow` / extra `deny` apply only when the workspace is trusted.
+- `scripts/bench-term.sh` (local, not CI) records release-build send/read and exec-vs-direct numbers.
+- Leftovers: `exec` text has no echoed command, marker, or trailing prompt; `wait` without `--since` starts from the current seq.
 
 ### Out of scope / non-goals
 
-- Native serial (`--serial`), WSL `usbipd attach` automation, and serial errors: PR1b.
-- Dangerous-command block-and-approve with a per-workspace allowlist, and `term approve`: PR1b.
 - `DMUXAI_RUN_ID`/`DMUXAI_RUNNER` runner env, prompt block, `[terminal] allowed_runners` enforcement, `term log`: PR2.
 - Dashboard light text view, takeover toggle, approval banner: PR3. No xterm.js.
 - Native Windows (ConPTY, COM, named pipes): PR4.
@@ -45,12 +47,13 @@ Agents and humans need long-lived terminals (a shell, an `ssh` session, later a 
 | --- | --- | --- |
 | Session | A named, long-lived PTY child plus its output buffer and journal, unique per workspace. | A conversation/task session in the SQLite DB. |
 | Session host | One background `dmuxai` process per workspace that owns all sessions and serves a Unix socket. | The web dashboard server. |
-| Kind | `shell` (interactive POSIX shell, exit markers allowed) or `cmd` (any argv, no marker). `serial` is added in PR1b. | Runner kinds. |
+| Kind | `shell` (interactive POSIX shell, exit markers allowed), `cmd` (any argv, no marker), or `serial` (native device via serial2). | Runner kinds. |
 | Seq | A per-session monotonic counter; each output chunk covers a seq range so readers neither miss nor repeat data. | Journal line numbers. |
 | Marker | A per-call nonce line `__DMUXAI_<nonce>_<exit>__` appended by `exec` to learn the exit code; it is removed from returned output. | Prompt regexes. |
 | Takeover | A per-session flag meaning a human holds the session; non-human input is rejected while it is set. | Plan approval. |
+| Approval | A one-shot id created when the dangerous-command guard blocks an input. `term approve <id>` releases that one input. | Graph plan approval. |
 
-States: `starting → open → exited | closed`; `open ↔ takeover` (flag, input lock only); `lost` is reserved for serial (PR1b). `exited` carries `exit_code` or `signal`. `exited` and `closed` are terminal; `reopen` starts a new child with the same spec and name.
+States: `starting → open → exited | closed | lost`; `open ↔ takeover` (flag, input lock only). `lost` is used when a serial device disappears (EIO/ENXIO). `exited` carries `exit_code` or `signal`. `exited` and `closed` are terminal. `reopen` on a `lost` (or still-specified) session starts a new backend with the same spec and name.
 
 ## 4. Requirements
 
@@ -60,8 +63,8 @@ States: `starting → open → exited | closed`; `open ↔ takeover` (flag, inpu
 | FR-2601 | Must | When any `term` subcommand runs and no host is listening | The host starts detached, listens on a per-workspace Unix socket in a 0700 directory with the socket at 0600, rejects peers with another uid, removes a stale socket, and exits after its last session ends plus an idle grace (default 600 s, `DMUXAI_TERM_IDLE_SECS` overrides). | If the socket path would exceed the platform limit, a short path under `$XDG_RUNTIME_DIR` or `/tmp/dmuxai-<uid>/` keyed by the repo key is used. A host that cannot start exits 6 with a Display message. | TC-2601 |
 | FR-2602 | Must | When `term send <name> <text> [--no-newline]` or `term send <name> --keys K[,K...]` runs | The text plus `\n` (unless `--no-newline`) or the named keys (`C-a`..`C-z`, `Enter`, `Tab`, `Esc`, `Up`, `Down`, `Left`, `Right`, `Backspace`, `Space`, `F1`..`F12`) are written to the PTY, and the reply carries the seq at the time of the write. | More than 64 KiB per call exits 2; an unknown key name exits 2 naming it; a session that is not open exits 3 (unknown) or 4 (exited/closed). | TC-2602 |
 | FR-2603 | Must | When `term read <name> [--since SEQ] [--tail N] [--raw]` runs | Output after `SEQ` (or the last N lines) is returned with `seq_from`, `seq_to`, and `dropped_bytes`; ANSI/control sequences are stripped unless `--raw`. | The buffer holds 1 MiB per session; data evicted before `SEQ` is reported in `dropped_bytes`, never silently skipped. | TC-2603 |
-| FR-2604 | Must | When `term wait <name> (--match REGEX \| --idle DUR) --timeout DUR [--since SEQ]` runs | It returns as soon as stripped output after `SEQ` matches, or output has been quiet for `--idle`, with `reason: "match"` or `"idle"`, and `reason: "exited"` if the child exits first. | On timeout it exits 1 with `reason: "timeout"` and the output tail; an invalid regex or missing `--timeout` exits 2. | TC-2604 |
-| FR-2605 | Must | When `term exec <name> <cmd> [--timeout DUR]` runs on a `shell` session | The command is sent followed by a nonce exit marker; the reply has the command output without the marker or its echo, `exit_code`, `reason: "marker"`, and `elapsed_ms`. | On a `cmd` session it sends and waits for idle and returns `exit_code: null` with `reason`; on timeout it exits 1 with `reason: "timeout"`. | TC-2605 |
+| FR-2604 | Must | When `term wait <name> (--match REGEX \| --idle DUR) --timeout DUR [--since SEQ]` runs | It returns as soon as stripped output after `SEQ` matches, or output has been quiet for `--idle`, with `reason: "match"` or `"idle"`, and `reason: "exited"` if the child exits first. When `--since` is omitted, the wait starts from the current seq (output already in the buffer is not searched). | On timeout it exits 1 with `reason: "timeout"` and the output tail; an invalid regex or missing `--timeout` exits 2. | TC-2604, TC-2615 |
+| FR-2605 | Must | When `term exec <name> <cmd> [--timeout DUR]` runs on a `shell` session | The command is sent followed by a nonce exit marker; the reply has the command's own output only: no echoed command line, no marker, and no trailing shell prompt, plus `exit_code`, `reason: "marker"`, and `elapsed_ms`. | On a `cmd` session it sends and waits for idle and returns `exit_code: null` with `reason`; on timeout it exits 1 with `reason: "timeout"`. | TC-2605, TC-2616 |
 | FR-2606 | Must | When `term list` or `term show <name>` runs | Each session reports name, kind, state, pid, created_ms, last_output_ms, cols, rows, takeover, exit_code/signal, and seq. | An unknown name in `show` exits 3. With no host running, `list` returns `[]` without starting one. | TC-2606 |
 | FR-2607 | Must | When `term close <name> [--force]` or `term close --all` runs, or the child exits on its own | Close sends SIGHUP, then after a 2 s grace (0 with `--force`) kills the whole process group tree; state becomes `closed`. A child that exits by itself moves the session to `exited` with its code or signal. | Closing an unknown name exits 3; closing an already closed session is a no-op success. | TC-2607 |
 | FR-2608 | Must | When `term resize <name> --cols N --rows N` runs | The PTY window size changes and the child sees it (`stty size`). | Values outside 1–1000 exit 2. | TC-2608 |
@@ -69,6 +72,14 @@ States: `starting → open → exited | closed`; `open ↔ takeover` (flag, inpu
 | FR-2620 | Must | For every input, key, resize, state change, and output chunk | A JSONL line `{seq, t_ms, dir, by, run_id, data, bytes}` is appended to `$XDG_DATA_HOME/dmuxai/repos/<repo-key>/terms/<16hex>/io.jsonl` next to a `manifest.json` (schema_version 1); data is ANSI-stripped and passed through `mask_sensitive_tokens` before it is written; dirs 0700, files 0600, symlinks refused. | Output is coalesced into chunks of at most 50 ms / 8 KiB. A journal write error is reported in `show` as `journal_error` and does not kill the session. | TC-2620 |
 | FR-2621 | Must | When `send --secret` is used, or the latest output matches `[Pp]assword:\|passphrase\|PIN:` | The journal records that input as `[REDACTED input]` and no reply echoes the typed text. | — | TC-2621 |
 | FR-2632 | Must | When a session child starts | Its environment is scrubbed like runner children (`DMUXAI_WEB_TOKEN` and other dashboard secrets removed); `--env K=V` is added after scrubbing. | — | TC-2632 |
+| FR-2610 | Must | When `term open <name> --serial DEV --baud N [--parity none\|even\|odd] [--data 8] [--stop 1] [--flow none\|rtscts]` runs | The host opens the device with serial2 (no external tool), the session kind is `serial`, and `send`/`read`/`wait` work as for a PTY session. `--kind cmd -- picocom -b N DEV` (or minicom) remains a supported alternative. | A missing `--baud` with `--serial` exits 2. `--serial` together with a shell argv exits 2. | TC-2610 |
+| FR-2611 | Must | When opening a serial device fails | The CLI exits with a Display message and a distinct `error_kind`, and does not retry in a loop. Missing device: `serial device <path> not found. On WSL2 attach the USB device from Windows: usbipd list; usbipd attach --wsl --busid <id>. On WSL1, COMn is /dev/ttySn.` Permission denied: `permission denied on <path>. Add yourself to the dialout group: sudo usermod -aG dialout $USER, then log in again (WSL: wsl --shutdown).` Busy: `device is in use by pid N (<comm>)` when that process can be found. | dmuxai never suggests `chmod 666` or sudo to open the device. | TC-2611 |
+| FR-2612 | Must | When `term open … --wait-for REGEX --timeout DUR` runs, or `term wait --match` is used on a serial session | Open succeeds and then waits for the regex on new output (boot banner, prompt, and similar strings) with the same timeout rules as `term wait`. | A missing `--timeout` with `--wait-for` exits 2. | TC-2612 |
+| FR-2613 | Must | When a serial reader sees EIO or ENXIO (device unplugged) | The session state becomes `lost`. `term reopen <name>` retries with the same serial settings and, on success, returns state `open`. | `reopen` of an unknown name exits 3; `reopen` of a non-lost PTY session starts a new child with the same spec (already required in PR1a). | TC-2613 |
+| FR-2614 | Must | When `--serial` points at a missing path, the environment looks like WSL2 (`/proc/version` contains `microsoft` or `WSL`), and a busid is available (`--usbipd-busid` or trusted `[terminal.serial] usbipd_busid`, else parsed from `usbipd.exe list`) | dmuxai runs `usbipd.exe attach --wsl --busid <id>` once (Windows interop from WSL), waits a short time for the device node, then opens it. | If `usbipd.exe` is not found, the device is not bound (admin `usbipd bind` needed), attach fails, or the node is still missing, the command exits with `error_kind` naming the cause plus the FR-2611 manual hint. There is no retry loop. | TC-2614 |
+| FR-2615 | Must | When `term wait --match` is invoked without `--since` after earlier output that would match | The wait does not succeed against that earlier output; only data arriving after the wait starts can match. | — | TC-2615 |
+| FR-2616 | Must | When `term exec` runs a simple command such as `printf x` on a shell session | The returned `text` is exactly the command output (`x`), with no echoed command line, no nonce marker, and no trailing prompt. | — | TC-2616 |
+| FR-2630 | Must | When `term send` or `term exec` text from a CLI or agent caller matches a default deny pattern (or an extra trusted `[terminal.policy] deny` regex), and does not match a trusted `[terminal.policy] allow` regex | The write is not sent. The command exits 7 with `error_kind` `approval_required` and JSON `{approval_id, matched, session}`. `term approve <id>` (refused when `DMUXAI_RUN_ID` is set) then allows that one input through. Approvals expire after `[terminal.policy] approve_timeout` (default 10m). Default deny patterns include `rm -rf`/`rm -fr` on `/`, `~`, `*`, or `..`; `dd` with `of=`; `mkfs`/`wipefs`/`fdisk`/`parted`/`sgdisk`; writes to `/dev/sd*`, `nvme`, `mmcblk`, `mtd`; `flash_erase`/`flashcp`/`nandwrite`/`mtd erase`; U-Boot `nand erase`/`sf erase`/`mmc erase`/`erase `/`env default -a`/`saveenv`; `fastboot` flash/erase/format; `reboot`/`poweroff`/`shutdown`/`halt`/`init 0|6`/`systemctl reboot|poweroff`; `chmod -R 777 /`; and a fork-bomb pattern. Workspace `[terminal]` keys apply only when the workspace is trusted. | The guard is a seatbelt, not a sandbox: a script already running inside the session is not inspected. `--keys` cannot be used to send free text. | TC-2630 |
 | NFR-2690 | Must | When `dmuxai run` (or any non-`term` command) runs with no session | No host is started and no term socket is created or opened. | — | TC-2690 |
 | NFR-2691 | Should | Warm host on the box | `term send` + `term read` round trip p50 ≤ 30 ms, p95 ≤ 80 ms; the gate test asserts only a loose bound (p50 ≤ 90 ms). | — | TC-2691 |
 | NFR-2692 | Should | `term exec` vs. `bash -c` | Overhead ≤ 10 % for commands ≥ 1 s and ≤ 50 ms for shorter ones (#301); gate test asserts a loose ×3 bound. | — | TC-2692 |
@@ -85,8 +96,8 @@ All integration tests spawn the built binary with isolated `HOME`/`XDG_*` dirs a
 | TC-2601 | FR-2601 | integration + unit | temp workspace | first `term open` | socket file mode 0600, dir 0700, host pid alive; long-path fallback chosen by unit test | `tests/term_cli.rs`, `src/term/client.rs` |
 | TC-2602 | FR-2602 | unit + integration | open shell | send `echo hi`; send `--keys C-c`; send 65 KiB; send `--keys Nope` | output has `hi`; oversize and unknown key exit 2; key table maps C-c to 0x03 | `src/term/mod.rs`, `tests/term_cli.rs` |
 | TC-2603 | FR-2603 | unit | ring buffer with small capacity | push past capacity, read since 0 | seq monotonic, `dropped_bytes` > 0, no duplicate data; ANSI stripped unless raw | `src/term/buffer.rs` |
-| TC-2604 | FR-2604 | unit + integration | open shell | wait `--match done` after `sleep 0.2; echo done`; wait with a regex that never matches | reason `match`; never-matching exits 1 with `timeout` | `src/term/wait.rs`, `tests/term_cli.rs` |
-| TC-2605 | FR-2605 | unit + integration | open shell | exec `true`, exec `false`, exec `printf x` | exit codes 0, 1, 0; output `x` without marker text | `src/term/wait.rs`, `tests/term_cli.rs` |
+| TC-2604 | FR-2604 | unit + integration | open shell | wait `--match done` after sending a command that prints `done`; wait with a regex that never matches | reason `match`; never-matching exits 1 with `timeout` | `src/term/wait.rs`, `tests/term_cli.rs` |
+| TC-2605 | FR-2605 | unit + integration | open shell | exec `true`, exec `false`, exec `printf x` | exit codes 0, 1, 0; output does not contain the marker | `src/term/wait.rs`, `tests/term_cli.rs` |
 | TC-2606 | FR-2606 | integration | two sessions | list, show one, show unknown, list with no host | fields present; unknown exit 3; empty list starts no host | `tests/term_cli.rs` |
 | TC-2607 | FR-2607 | integration | shell running `sleep 100 &` child | close; separately `exit 3` inside a shell | process group gone, state closed; self-exit gives state exited, exit_code 3 | `tests/term_cli.rs` |
 | TC-2608 | FR-2608 | integration | open shell | resize 100x30, exec `stty size` | output `30 100`; resize 0 exits 2 | `tests/term_cli.rs` |
@@ -94,6 +105,15 @@ All integration tests spawn the built binary with isolated `HOME`/`XDG_*` dirs a
 | TC-2620 | FR-2620 | unit + integration | open shell | send `echo sk-test-AAAAAAAAAAAAAAAAAAAAAAAA` | io.jsonl has in/out lines, token masked, modes 0600/0700 | `src/term/journal.rs`, `tests/term_cli.rs` |
 | TC-2621 | FR-2621 | unit | journal writer | `--secret` input; input after `Password:` output | journal line data is `[REDACTED input]` | `src/term/journal.rs` |
 | TC-2632 | FR-2632 | integration | `DMUXAI_WEB_TOKEN` set in CLI env | open shell, exec `echo ${DMUXAI_WEB_TOKEN:-unset}` | output `unset` | `tests/term_cli.rs` |
+| TC-2610 | FR-2610 | integration | in-process PTY pair: master runs a fake board, slave path is passed as `--serial` | `term open board --serial <slave> --baud 115200` then send/read | kind `serial`, output from the fake board is readable; no socat or extra tool | `tests/term_cli.rs`, `src/term/serial.rs` |
+| TC-2611 | FR-2611 | integration | isolated dirs | open `--serial` a nonexistent path (not on WSL, or with usbipd disabled); open a 0000-mode PTY slave (skip if root) | missing device: exit not 0, `error_kind` set, hint text names the path; permission: hint mentions the dialout group | `tests/term_cli.rs` |
+| TC-2612 | FR-2612 | integration | fake board prints a banner then a prompt | `term open … --serial <slave> --baud 115200 --wait-for` the banner `--timeout 5s` | open returns after the banner, `reason` is `match` | `tests/term_cli.rs` |
+| TC-2613 | FR-2613 | integration | open a fake-board serial session | close the master (EIO); `show`; `reopen` after restoring a pair or against the same slave if still present | state becomes `lost`; reopen with a live slave returns `open` | `tests/term_cli.rs` |
+| TC-2614 | FR-2614 | unit + integration | PATH has a fake `usbipd.exe` that records argv and a missing device path; `/proc/version` treated as WSL2 via a test hook or by running the helper directly | open `--serial` missing path `--usbipd-busid 1-2` | the fake binary is invoked with `attach --wsl --busid 1-2`; when the fake fails, the error names the cause and includes the manual hint; no busy loop | `src/term/serial.rs`, `tests/term_cli.rs` |
+| TC-2615 | FR-2615, FR-2604 | integration | open shell, send `echo already_there` and wait until it appears | `term wait --match already_there --timeout 1s` without `--since` | exit 1, `reason: timeout` (old output is not a match) | `tests/term_cli.rs` |
+| TC-2616 | FR-2616, FR-2605 | integration | open shell | `term exec 'printf x' --timeout 5s` | `text` equals `x` (no echo, no marker, no prompt) | `tests/term_cli.rs` |
+| TC-2618 | FR-2610 | integration (ignored) | `socat` on PATH | optional PTY pair via socat, then `--kind cmd -- picocom` if present | send/read works; skipped when tools are missing (`#[ignore]`, not required in the gate) | `tests/term_cli.rs` |
+| TC-2630 | FR-2630 | unit + integration | open shell | `term send`/`exec` a default-denied command such as `reboot`; `term approve` the id; send again; `term approve` with `DMUXAI_RUN_ID` set; trusted workspace `allow = ["^reboot$"]` | first call exits 7 with `approval_id` and does not run; after approve the same text is sent; approve inside a run exits 5 or 7 as forbidden; allowlisted text is sent without approve | `src/term/policy.rs`, `tests/term_cli.rs` |
 | TC-2690 | NFR-2690 | integration | isolated dirs | run `dmuxai status --json` | no term socket dir created, no host process | `tests/term_cli.rs` |
 | TC-2691 | NFR-2691 | integration | warm host | 20 send+read round trips | p50 under the loose bound | `tests/term_cli.rs` |
 | TC-2692 | NFR-2692 | integration | warm shell | exec `sleep 0.5` vs `bash -c 'sleep 0.5'` | overhead within ×3 bound | `tests/term_cli.rs` |
@@ -106,20 +126,20 @@ All integration tests spawn the built binary with isolated `HOME`/`XDG_*` dirs a
 | --- | --- | --- | --- |
 | Persistence | New `terms/` tree beside `runs/` (manifest.json + io.jsonl, rotate at 8 MiB). No SQLite schema change. | Delete `terms/` to roll back; nothing else reads it. | TC-2620 |
 | Provider protocol | Host protocol: one length-prefixed (u32 BE) JSON request per connection with `"v":1`; responses are JSON with `ok` or `error_kind`/`message`. | Unknown `v` is rejected with a clear error. | TC-2695 |
-| Security / permissions | Socket 0600 in 0700 dir + peer uid check; child env scrubbed; journal masked, local only. The takeover lock rejects non-human input. The dangerous-command guard arrives in PR1b; until then a session is as powerful as the user's shell. | Must not weaken runner env scrubbing or journal masking. | TC-2601, TC-2609, TC-2620, TC-2632 |
-| Platform | Linux (incl. WSL2) via `portable-pty`; the release musl static build must still link. | Windows is PR4; `term` on Windows exits 2 with "not supported yet". | gate + musl build |
+| Security / permissions | Socket 0600 in 0700 dir + peer uid check; child env scrubbed; journal masked, local only. The takeover lock rejects non-human input. The dangerous-command guard (FR-2630) blocks matching `send`/`exec` text until `term approve`. It is a seatbelt, not a sandbox. | Must not weaken runner env scrubbing or journal masking. | TC-2601, TC-2609, TC-2620, TC-2630, TC-2632 |
+| Platform | Linux (incl. WSL2) via `portable-pty` and `serial2`. WSL2 may invoke `usbipd.exe` once on a missing serial device. | Windows native serial is PR4. `term` on Windows still exits 2. | TC-2610, TC-2611, TC-2614 |
 
 ## 7. Implementation plan
 
-The detailed plan is kept as working notes outside the repo; PR1a order:
+PR1a is on main (`0bfc67b`). PR1b order:
 
 | Order | Change | Files / modules | Requirement IDs | Verification |
 | --- | --- | --- | --- | --- |
-| 1 | Spec | `docs/specs/SPEC-terminal-sessions.md` | all | check-spec |
-| 2 | Buffer, wait, marker, key table | `src/term/{mod,buffer,wait}.rs` | FR-2602–2605, NFR-2693 | TC-2602–2605, TC-2693 |
-| 3 | PTY backend, host, protocol, client | `src/term/{backend,host,proto,client}.rs` | FR-2600, 2601, 2607–2609, 2632 | TC-2600, 2601, 2607–2609, 2632 |
-| 4 | Journal | `src/term/journal.rs` | FR-2620, 2621 | TC-2620, 2621 |
-| 5 | CLI + integration tests | `src/cli.rs`, `src/main.rs`, `tests/term_cli.rs` | FR-2600–2609, INT-2695, NFR-2690–2692 | `cargo test --test term_cli` |
+| 1 | Spec | `docs/specs/SPEC-terminal-sessions.md` | new rows | check-spec |
+| 2 | Serial backend + usbipd helper + virtual board tests | `src/term/serial.rs`, `src/term/{mod,backend,host,client}.rs`, Cargo.toml (`serial2`) | FR-2610–2614 | TC-2610–2614 |
+| 3 | Policy + `term approve` | `src/term/policy.rs`, settings `[terminal]`, `src/cli.rs` | FR-2630 | TC-2630 |
+| 4 | Leftover wait/exec tightening | `src/term/wait.rs`, exec path | FR-2615, FR-2616 | TC-2615, TC-2616 |
+| 5 | CLI flags, tests, bench script, lab checklist | `src/cli.rs`, `tests/term_cli.rs`, `scripts/bench-term.sh`, `docs/term-serial-lab-checklist.md` | NFR-2691, NFR-2692 | `cargo test --test term_cli`; script is local only |
 
 ## 8. Review and test exit criteria
 
