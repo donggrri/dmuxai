@@ -28,7 +28,9 @@ pub mod settings;
 pub mod skills;
 pub mod stage_skills;
 pub mod state_path;
+pub mod term;
 pub mod theme;
+
 pub mod todo;
 pub mod ui_png;
 pub mod web;

@@ -379,7 +379,7 @@ pub fn is_symlink(path: &Path) -> Result<bool, io::Error> {
 
 /// Helper to secure permissions of an existing directory without following symlinks.
 #[cfg(unix)]
-fn secure_dir_permissions_0700(path: &Path) -> Result<(), io::Error> {
+pub(crate) fn secure_dir_permissions_0700(path: &Path) -> Result<(), io::Error> {
     if is_symlink(path)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -399,13 +399,13 @@ fn secure_dir_permissions_0700(path: &Path) -> Result<(), io::Error> {
 }
 
 #[cfg(not(unix))]
-fn secure_dir_permissions_0700(_path: &Path) -> Result<(), io::Error> {
+pub(crate) fn secure_dir_permissions_0700(_path: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 
 /// Helper to fsync a directory after file rename or modification without following symlinks.
 #[cfg(unix)]
-fn sync_dir(path: &Path) -> Result<(), io::Error> {
+pub(crate) fn sync_dir(path: &Path) -> Result<(), io::Error> {
     if is_symlink(path)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -420,13 +420,13 @@ fn sync_dir(path: &Path) -> Result<(), io::Error> {
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_path: &Path) -> Result<(), io::Error> {
+pub(crate) fn sync_dir(_path: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 
-/// Resolves the XDG data home base directory for dmuxai runs:
-/// `$XDG_DATA_HOME/dmuxai/repos/<repo-key>/runs` or `~/.local/share/dmuxai/repos/<repo-key>/runs`.
-pub fn repo_runs_dir(workspace_root: &Path) -> io::Result<PathBuf> {
+/// Resolves the per-repo data directory for dmuxai artifacts:
+/// `$XDG_DATA_HOME/dmuxai/repos/<repo-key>` or `~/.local/share/dmuxai/repos/<repo-key>`.
+pub fn repo_data_dir(workspace_root: &Path) -> io::Result<PathBuf> {
     let base = if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
         if !data_home.is_empty() {
             PathBuf::from(data_home).join("dmuxai")
@@ -437,7 +437,13 @@ pub fn repo_runs_dir(workspace_root: &Path) -> io::Result<PathBuf> {
         fallback_data_base()?
     };
     let key = repo_key(workspace_root)?;
-    Ok(base.join("repos").join(key).join("runs"))
+    Ok(base.join("repos").join(key))
+}
+
+/// Resolves the XDG data home base directory for dmuxai runs:
+/// `$XDG_DATA_HOME/dmuxai/repos/<repo-key>/runs` or `~/.local/share/dmuxai/repos/<repo-key>/runs`.
+pub fn repo_runs_dir(workspace_root: &Path) -> io::Result<PathBuf> {
+    Ok(repo_data_dir(workspace_root)?.join("runs"))
 }
 
 fn fallback_data_base() -> io::Result<PathBuf> {
@@ -455,7 +461,7 @@ fn fallback_data_base() -> io::Result<PathBuf> {
 
 /// Open a file for writing with O_NOFOLLOW and 0600 permissions.
 #[cfg(unix)]
-fn open_file_write_nofollow(path: &Path, create_new: bool) -> Result<File, io::Error> {
+pub(crate) fn open_file_write_nofollow(path: &Path, create_new: bool) -> Result<File, io::Error> {
     let mut opts = OpenOptions::new();
     opts.write(true);
     if create_new {
@@ -469,7 +475,7 @@ fn open_file_write_nofollow(path: &Path, create_new: bool) -> Result<File, io::E
 }
 
 #[cfg(not(unix))]
-fn open_file_write_nofollow(path: &Path, create_new: bool) -> Result<File, io::Error> {
+pub(crate) fn open_file_write_nofollow(path: &Path, create_new: bool) -> Result<File, io::Error> {
     let mut opts = OpenOptions::new();
     opts.write(true);
     if create_new {
