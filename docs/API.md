@@ -159,6 +159,53 @@ dmuxai events --follow --json
 `last_graph` (`{id, phase, counts}` or `null`), `events` (`{path, last_seq}`),
 `dashboard` (`{base_url, port, pid, token_file}` or `null`) and `warnings` (array).
 
+### `term`: persistent terminal sessions (Linux, SPEC-terminal-sessions)
+
+Named PTY sessions owned by a per-workspace session host. The host starts on the first
+`term` call (never from `run` or any other command), listens on
+`$XDG_STATE_HOME/dmuxai/repos/<repo-key>/term/host.sock` (dir 0700, socket 0600, peer uid
+checked; a short path under `$XDG_RUNTIME_DIR` or `/tmp/dmuxai-<uid>/` is used when that path
+is too long), and exits after its last session ends plus an idle grace (600 s,
+`DMUXAI_TERM_IDLE_SECS`).
+
+```
+dmuxai term open   <name> [--kind shell|cmd] [--cwd DIR] [--env K=V]... [--cols N --rows N] [--json] [-- argv...]
+dmuxai term send   <name> <text> [--no-newline] [--secret] [--json]
+dmuxai term send   <name> --keys C-c[,Enter,Up,Tab,Esc,F1,...]
+dmuxai term read   <name> [--since SEQ] [--tail N] [--raw] [--json]
+dmuxai term wait   <name> (--match REGEX | --idle DUR) --timeout DUR [--since SEQ] [--json]
+dmuxai term exec   <name> <cmd> [--timeout DUR] [--json]
+dmuxai term list   [--json]
+dmuxai term show   <name> [--json]
+dmuxai term resize <name> --cols N --rows N
+dmuxai term close  <name> [--force] | --all
+dmuxai term reopen <name>
+```
+
+- Names match `[a-z0-9][a-z0-9-]{0,31}`; a duplicate open exits 4.
+- `send` returns `{"seq":N}`; pass it to `wait --since N` so a match only looks at output
+  that came after your input (without `--since`, the whole buffer is searched).
+- `read`/`wait`/`exec` return `{text, seq_from, seq_to, dropped_bytes}`, plus `reason`
+  (`match`, `idle`, `exited`, `marker`, `timeout`) and `exit_code`. Output is ANSI-stripped
+  unless `--raw`. The buffer keeps 1 MiB per session.
+- `exec` on a `shell` session appends a nonce exit marker and reports the command's
+  `exit_code` (the CLI itself exits 0); the marker is removed from `text`. A timeout exits 1
+  with `reason: "timeout"`.
+- `close` sends SIGHUP to the session's whole process tree (including children that moved to
+  their own process group), then SIGKILL after 2 s (`--force`: at once).
+- While a human holds a session (takeover, dashboard in a later PR), non-human input exits 4
+  with `session '<name>' is in human takeover; ask the user to release it`.
+- Session children get the same environment scrub as runner children (`DMUXAI_WEB_TOKEN`
+  etc. removed); `--env` is added afterwards.
+- Every input and output event is journaled, masked, to
+  `$XDG_DATA_HOME/dmuxai/repos/<repo-key>/terms/<16hex>/{manifest.json,io.jsonl}` (0700/0600).
+  `--secret` input, and input right after a `Password:`/`passphrase`/`PIN:` prompt, is written
+  as `[REDACTED input]`.
+- With `--json`, stdout is one JSON object; errors are
+  `{"ok":false,"error":"…","error_kind":"not_found","exit_code":3}` with the exit codes above.
+- Not a sandbox: a session is a real shell with your rights. The dangerous-command guard and
+  `term approve` come in the next PR. On non-Unix platforms `term` exits 2.
+
 ## 2. HTTP API
 
 Start a dashboard, then drive it over HTTP:

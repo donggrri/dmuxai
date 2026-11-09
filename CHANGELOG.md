@@ -5,6 +5,17 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Added
+
+- **Persistent terminal sessions: `dmuxai term` (PR1a of SPEC-terminal-sessions,
+  FR-2600..2609, FR-2620, FR-2621, FR-2632).** Named Linux PTY sessions (`shell` or `cmd`)
+  owned by a per-workspace session host on a private Unix socket: `open`, `send`
+  (text or named keys), `read`, `wait` (regex, idle, timeout), `exec` (exit code via a nonce
+  marker), `list`, `show`, `resize`, `close`, `reopen`, all with `--json`. Every input and
+  output event goes to a masked local journal under `terms/`. `dmuxai run` never starts the
+  host. Serial ports, the dangerous-command guard, agent integration, and the dashboard view
+  follow in later PRs.
+
 ## [0.3.1] - 2026-11-09
 
 ### Added

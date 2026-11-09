@@ -1,6 +1,6 @@
 # SPEC-terminal-sessions: Persistent named terminal sessions (`dmuxai term`), PR1a
 
-Status: draft (PR1a: Linux PTY shell/cmd sessions, session host, CLI, journal)
+Status: in progress (PR1a implemented in tree: Linux PTY shell/cmd sessions, session host, CLI, journal; PR1b–PR4 pending)
 Owner: DmuxAI Team
 Created: 2026-11-09
 Baseline: main 4c59eac (v0.3.1); highest existing FR/TC-2567, NFR-1886. IDs 2600–2699 are reserved for terminal sessions; PR1a defines FR/TC-2600–2609, 2620, 2621, 2632, NFR/TC-2690–2693, INT/TC-2695.
