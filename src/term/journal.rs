@@ -9,15 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 use regex::Regex;
 use serde::Serialize;
 
-use crate::run_journal::{
-    generate_run_id, is_symlink, mask_sensitive_tokens, open_file_write_nofollow, repo_data_dir,
-    secure_dir_permissions_0700, sync_dir, verify_no_symlinks,
-};
+use crate::run_journal::{generate_run_id, is_symlink, mask_sensitive_tokens, verify_no_symlinks};
 
 /// Manifest schema version written beside `io.jsonl` (FR-2620).
 pub const TERM_MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -44,8 +41,19 @@ pub fn output_prompts_secret(output: &str) -> bool {
 }
 
 /// `$XDG_DATA_HOME/dmuxai/repos/<repo-key>/terms` (FR-2620).
+///
+/// Sibling of the runs tree: the final `runs` component of
+/// [`crate::run_journal::repo_runs_dir`] is replaced with `terms`.
 pub fn repo_terms_dir(workspace_root: &Path) -> io::Result<PathBuf> {
-    Ok(repo_data_dir(workspace_root)?.join("terms"))
+    let mut path = crate::run_journal::repo_runs_dir(workspace_root)?;
+    if path.file_name() != Some(std::ffi::OsStr::new("runs")) || !path.pop() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runs directory path does not end in runs",
+        ));
+    }
+    path.push("terms");
+    Ok(path)
 }
 
 /// Direction of a journaled I/O event.
@@ -446,6 +454,79 @@ impl Drop for TermJournal {
     }
 }
 
+/// Secure permissions of an existing directory without following symlinks.
+#[cfg(unix)]
+fn secure_dir_permissions_0700(path: &Path) -> Result<(), io::Error> {
+    if is_symlink(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to chmod symlink at {}", path.display()),
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        file.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_dir_permissions_0700(_path: &Path) -> Result<(), io::Error> {
+    Ok(())
+}
+
+/// Fsync a directory after a rename or write without following symlinks.
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> Result<(), io::Error> {
+    if is_symlink(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to sync symlink directory at {}", path.display()),
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    file.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<(), io::Error> {
+    Ok(())
+}
+
+/// Open a file for writing with `O_NOFOLLOW` and mode 0600.
+#[cfg(unix)]
+fn open_file_write_nofollow(path: &Path, create_new: bool) -> Result<File, io::Error> {
+    let mut opts = OpenOptions::new();
+    opts.write(true);
+    if create_new {
+        opts.create_new(true);
+    } else {
+        opts.create(true).truncate(true);
+    }
+    opts.mode(0o600);
+    opts.custom_flags(libc::O_NOFOLLOW);
+    opts.open(path)
+}
+
+#[cfg(not(unix))]
+fn open_file_write_nofollow(path: &Path, create_new: bool) -> Result<File, io::Error> {
+    let mut opts = OpenOptions::new();
+    opts.write(true);
+    if create_new {
+        opts.create_new(true);
+    } else {
+        opts.create(true).truncate(true);
+    }
+    opts.open(path)
+}
+
 fn ensure_dir_0700(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -462,6 +543,7 @@ fn ensure_dir_0700(path: &Path) -> io::Result<()> {
         if !path.exists() {
             fs::create_dir_all(path)?;
         }
+        secure_dir_permissions_0700(path)?;
     }
     Ok(())
 }
