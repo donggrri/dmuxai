@@ -1,6 +1,6 @@
 # SPEC: JSONL custom-agent text folding and lifecycle-based turn completion (#184)
 
-Status: in progress (PR #265, reworked 2026-11-08)
+Status: implemented (PR #265, merged ed7e16d; ships in v0.3.1)
 Owner: dmuxai
 Created: 2026-11-07
 Baseline: `2b1f4f6`
