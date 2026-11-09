@@ -43,7 +43,6 @@ const IDLE_SECS: &str = "5";
 
 struct Sandbox {
     _dir: tempfile::TempDir,
-    root: PathBuf,
     workspace: PathBuf,
     data_home: PathBuf,
     state_home: PathBuf,
@@ -60,18 +59,11 @@ impl Sandbox {
         let state_home = root.join("state");
         let runtime_dir = root.join("runtime");
         let home = root.join("home");
-        for dir in [
-            &workspace,
-            &data_home,
-            &state_home,
-            &runtime_dir,
-            &home,
-        ] {
+        for dir in [&workspace, &data_home, &state_home, &runtime_dir, &home] {
             std::fs::create_dir_all(dir).unwrap();
         }
         Self {
             _dir: dir,
-            root,
             workspace,
             data_home,
             state_home,
@@ -128,7 +120,10 @@ impl Sandbox {
 
     /// Per-workspace socket directory: `$XDG_STATE_HOME/dmuxai/repos/<key>`.
     fn socket_dir(&self) -> PathBuf {
-        self.state_home.join("dmuxai").join("repos").join(self.repo_key())
+        self.state_home
+            .join("dmuxai")
+            .join("repos")
+            .join(self.repo_key())
     }
 
     fn socket_file(&self) -> PathBuf {
@@ -146,7 +141,12 @@ impl Sandbox {
 
     /// Pids of running `dmuxai … -C <workspace> … term __host` processes.
     fn host_pids(&self) -> Vec<u32> {
-        procs_with_args(&["-C", self.workspace.to_str().expect("utf8 workspace"), "term", "__host"])
+        procs_with_args(&[
+            "-C",
+            self.workspace.to_str().expect("utf8 workspace"),
+            "term",
+            "__host",
+        ])
     }
 
     /// Closes every live session in the workspace; a no-op when no host runs.
@@ -162,13 +162,6 @@ impl Sandbox {
 
     fn close_guard(&self) -> CloseGuard<'_> {
         CloseGuard { sandbox: self }
-    }
-
-    /// Sends a raw protocol request to the running host (TC-2609 needs the
-    /// takeover/release host requests, which have no CLI surface in PR1a).
-    fn host_request(&self, op: RequestOp) -> Response {
-        let stream = UnixStream::connect(self.socket_file()).expect("connect to term host");
-        self.host_request_on(stream, op)
     }
 
     fn host_request_on(&self, mut stream: UnixStream, op: RequestOp) -> Response {
@@ -207,8 +200,9 @@ impl Out {
 
     /// Parses `stdout` as exactly one JSON value (INT-2695 contract).
     fn json(&self, what: &str) -> Value {
-        serde_json::from_str(self.stdout.trim())
-            .unwrap_or_else(|error| panic!("{what} is not one JSON object: {error}\n{}", self.stdout))
+        serde_json::from_str(self.stdout.trim()).unwrap_or_else(|error| {
+            panic!("{what} is not one JSON object: {error}\n{}", self.stdout)
+        })
     }
 }
 
@@ -262,7 +256,10 @@ fn procs_with_args(needles: &[&str]) -> Vec<u32> {
             .split(|byte| *byte == 0)
             .map(|arg| String::from_utf8_lossy(arg).into_owned())
             .collect();
-        if needles.iter().all(|needle| args.iter().any(|arg| arg == needle)) {
+        if needles
+            .iter()
+            .all(|needle| args.iter().any(|arg| arg == needle))
+        {
             pids.push(pid);
         }
     }
@@ -334,7 +331,10 @@ fn tc_2601_socket_modes_and_host_alive() {
 
     let socket = sandbox.socket_file();
     assert!(socket.exists(), "socket at {}", socket.display());
-    let dir_mode = std::fs::metadata(sandbox.socket_dir()).unwrap().permissions().mode();
+    let dir_mode = std::fs::metadata(sandbox.socket_dir())
+        .unwrap()
+        .permissions()
+        .mode();
     assert_eq!(dir_mode & 0o777, 0o700, "socket dir mode 0700");
     let socket_mode = std::fs::metadata(&socket).unwrap().permissions().mode();
     assert_eq!(socket_mode & 0o777, 0o600, "socket file mode 0600");
@@ -365,8 +365,16 @@ fn tc_2602_send_echo_keys_and_limits() {
     assert_eq!(out.code, 0, "send failed: {out:?}");
     assert!(sent["seq"].is_u64(), "send reply carries seq: {sent:?}");
     let (out, waited) = sandbox.term_json(&[
-        "term", "wait", "a", "--match", r"\bhi\b", "--since",
-        &since.to_string(), "--timeout", "5s", "--json",
+        "term",
+        "wait",
+        "a",
+        "--match",
+        r"\bhi\b",
+        "--since",
+        &since.to_string(),
+        "--timeout",
+        "5s",
+        "--json",
     ]);
     assert_eq!(out.code, 0, "wait for output failed: {out:?}");
     assert_eq!(waited["reason"], "match", "wait: {waited:?}");
@@ -382,9 +390,10 @@ fn tc_2602_send_echo_keys_and_limits() {
         "unknown key names the key: {json:?}"
     );
 
-    // More than 64 KiB per call exits 2.
-    let oversize = "x".repeat(64 * 1024); // + newline exceeds 64 KiB
-    let (out, json) = sandbox.term_json(&["term", "send", "a", "--no-newline", &oversize, "--json"]);
+    // More than 64 KiB per call exits 2 (65537 bytes with --no-newline).
+    let oversize = "x".repeat(65537);
+    let (out, json) =
+        sandbox.term_json(&["term", "send", "a", "--no-newline", &oversize, "--json"]);
     assert_eq!(out.code, 2, "oversize send must exit 2: {out:?}");
     assert_eq!(json["error_kind"], "usage", "oversize: {json:?}");
 }
@@ -399,18 +408,34 @@ fn tc_2604_wait_match_and_timeout() {
 
     let (_, read) = sandbox.term_json(&["term", "read", "a", "--json"]);
     let since = read["seq_to"].as_u64().expect("seq_to");
-    let (out, sent) = sandbox.term_json(&[
-        "term", "send", "a", "--no-newline", "sleep 0.2; echo done_$((1+1))\n",
+    let (out, _) = sandbox.term_json(&[
+        "term",
+        "send",
+        "a",
+        "--no-newline",
+        "sleep 0.2; echo done_$((1+1))\n",
+        "--json",
     ]);
     assert_eq!(out.code, 0, "send failed: {out:?}");
     let (out, waited) = sandbox.term_json(&[
-        "term", "wait", "a", "--match", r"\bdone_2\b", "--since",
-        &since.to_string(), "--timeout", "5s", "--json",
+        "term",
+        "wait",
+        "a",
+        "--match",
+        r"\bdone_2\b",
+        "--since",
+        &since.to_string(),
+        "--timeout",
+        "5s",
+        "--json",
     ]);
     assert_eq!(out.code, 0, "wait match failed: {out:?}");
     assert_eq!(waited["reason"], "match", "wait: {waited:?}");
     assert!(
-        waited["text"].as_str().unwrap_or_default().contains("done_2"),
+        waited["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("done_2"),
         "wait text: {waited:?}"
     );
 
@@ -418,12 +443,23 @@ fn tc_2604_wait_match_and_timeout() {
     let (_, read) = sandbox.term_json(&["term", "read", "a", "--json"]);
     let since = read["seq_to"].as_u64().expect("seq_to");
     let (out, timed) = sandbox.term_json(&[
-        "term", "wait", "a", "--match", "zz-never-match-zz", "--since",
-        &since.to_string(), "--timeout", "2s", "--json",
+        "term",
+        "wait",
+        "a",
+        "--match",
+        "zz-never-match-zz",
+        "--since",
+        &since.to_string(),
+        "--timeout",
+        "2s",
+        "--json",
     ]);
     assert_eq!(out.code, 1, "never-matching wait must exit 1: {out:?}");
     assert_eq!(timed["reason"], "timeout", "wait: {timed:?}");
-    assert!(timed["text"].is_string(), "timeout reply carries output tail");
+    assert!(
+        timed["text"].is_string(),
+        "timeout reply carries output tail"
+    );
 
     // Invalid regex exits 2 on the client before reaching the host.
     let out = sandbox.run(&["term", "wait", "a", "--match", "([", "--timeout", "1s"]);
@@ -478,9 +514,20 @@ fn tc_2606_list_show_and_unknown() {
     let sessions = listed.as_array().expect("list array");
     assert_eq!(sessions.len(), 2, "list: {sessions:?}");
     for entry in sessions {
-        for field in ["name", "kind", "state", "pid", "created_ms", "last_output_ms", "cols", "rows", "takeover", "seq"] {
+        for field in [
+            "name",
+            "kind",
+            "state",
+            "pid",
+            "created_ms",
+            "last_output_ms",
+            "cols",
+            "rows",
+            "takeover",
+            "seq",
+        ] {
             assert!(
-                !entry[field].is_null(),
+                entry.get(field).is_some(),
                 "list entry missing {field}: {entry:?}"
             );
         }
@@ -488,8 +535,22 @@ fn tc_2606_list_show_and_unknown() {
 
     let (out, shown) = sandbox.term_json(&["term", "show", "b", "--json"]);
     assert_eq!(out.code, 0, "show failed: {out:?}");
-    for field in ["name", "kind", "state", "pid", "created_ms", "last_output_ms", "cols", "rows", "takeover", "exit_code", "signal", "seq"] {
-        assert!(!shown[field].is_null(), "show field {field}: {shown:?}");
+    for field in [
+        "name",
+        "kind",
+        "state",
+        "pid",
+        "created_ms",
+        "last_output_ms",
+        "cols",
+        "rows",
+        "takeover",
+        "exit_code",
+        "signal",
+        "seq",
+    ] {
+        // exit_code and signal are legitimately null while the session is open.
+        assert!(shown.get(field).is_some(), "show field {field}: {shown:?}");
     }
     assert_eq!(shown["name"], "b");
     assert_eq!(shown["state"], "open", "showed: {shown:?}");
@@ -509,7 +570,8 @@ fn tc_2607_close_process_group_and_self_exit() {
 
     // A background `sleep` inside the shell is part of the process group.
     sandbox.open_shell("a");
-    let (out, exec) = sandbox.term_json(&["term", "exec", "a", "sleep 100 & echo CHILD_$!", "--json"]);
+    let (out, exec) =
+        sandbox.term_json(&["term", "exec", "a", "sleep 100 & echo CHILD_$!", "--json"]);
     assert_eq!(out.code, 0, "exec failed: {out:?}");
     let sleep_pid = child_pid_from(exec["text"].as_str().unwrap_or_default(), "CHILD_");
     assert!(pid_exists(sleep_pid), "sleep pid {sleep_pid} started");
@@ -564,9 +626,9 @@ fn tc_2608_resize_visible_to_child() {
         "stty size must report rows 30 cols 100: {exec:?}"
     );
 
-    let (out, _) = sandbox.term_json(&["term", "resize", "a", "--cols", "0", "--rows", "30"]);
+    let out = sandbox.run(&["term", "resize", "a", "--cols", "0", "--rows", "30"]);
     assert_eq!(out.code, 2, "resize 0 must exit 2: {out:?}");
-    let (out, _) = sandbox.term_json(&["term", "resize", "a", "--cols", "100", "--rows", "1001"]);
+    let out = sandbox.run(&["term", "resize", "a", "--cols", "100", "--rows", "1001"]);
     assert_eq!(out.code, 2, "resize 1001 rows must exit 2: {out:?}");
 }
 
@@ -670,21 +732,30 @@ fn tc_2620_journal_masked_jsonl_and_modes() {
             (name.len() == 16 && name.chars().all(|c| c.is_ascii_hexdigit())).then_some(path)
         })
         .collect();
-    assert_eq!(session_dirs.len(), 1, "one 16-hex session dir: {session_dirs:?}");
+    assert_eq!(
+        session_dirs.len(),
+        1,
+        "one 16-hex session dir: {session_dirs:?}"
+    );
     let session_dir = &session_dirs[0];
 
-    let dir_mode = std::fs::metadata(sandbox.terms_dir()).unwrap().permissions().mode();
+    let dir_mode = std::fs::metadata(sandbox.terms_dir())
+        .unwrap()
+        .permissions()
+        .mode();
     assert_eq!(dir_mode & 0o777, 0o700, "terms dir mode 0700");
     let dir_mode = std::fs::metadata(session_dir).unwrap().permissions().mode();
     assert_eq!(dir_mode & 0o777, 0o700, "session dir mode 0700");
 
     let manifest_path = session_dir.join("manifest.json");
-    let manifest_mode = std::fs::metadata(&manifest_path).unwrap().permissions().mode();
+    let manifest_mode = std::fs::metadata(&manifest_path)
+        .unwrap()
+        .permissions()
+        .mode();
     assert_eq!(manifest_mode & 0o777, 0o600, "manifest mode 0600");
-    let manifest: Value = serde_json::from_str(
-        &std::fs::read_to_string(&manifest_path).expect("manifest"),
-    )
-    .expect("manifest json");
+    let manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("manifest"))
+            .expect("manifest json");
     assert_eq!(manifest["schema_version"], 1, "manifest: {manifest:?}");
     assert_eq!(manifest["name"], "a", "manifest: {manifest:?}");
 
@@ -696,11 +767,12 @@ fn tc_2620_journal_masked_jsonl_and_modes() {
     let mut saw_in = false;
     let mut saw_out = false;
     for line in content.lines() {
-        let line_value: Value =
-            serde_json::from_str(line).unwrap_or_else(|error| panic!("journal line {error}: {line}"));
+        let line_value: Value = serde_json::from_str(line)
+            .unwrap_or_else(|error| panic!("journal line {error}: {line}"));
         for field in ["seq", "t_ms", "dir", "by", "run_id", "data", "bytes"] {
+            // run_id is legitimately null outside run contexts.
             assert!(
-                !line_value[field].is_null(),
+                line_value.get(field).is_some(),
                 "journal line missing {field}: {line_value:?}"
             );
         }
@@ -738,21 +810,33 @@ fn tc_2632_child_env_scrub_and_explicit_env() {
     let sandbox = Sandbox::new();
     let _guard = sandbox.close_guard();
 
-    let (out, opened) = sandbox.term_json(&["term", "open", "a", "--env", "DMUXAI_CUSTOM=f5", "--json"]);
+    let (out, opened) =
+        sandbox.term_json(&["term", "open", "a", "--env", "DMUXAI_CUSTOM=f5", "--json"]);
     assert_eq!(out.code, 0, "open failed: {out:?}");
     assert_eq!(opened["state"], "open", "opened: {opened:?}");
 
     // Ambient DMUXAI_WEB_TOKEN never reaches the child.
     let (_, exec) = sandbox.term_json(&[
-        "term", "exec", "a", "echo ${DMUXAI_WEB_TOKEN:-unset}", "--json",
+        "term",
+        "exec",
+        "a",
+        "echo ${DMUXAI_WEB_TOKEN:-unset}",
+        "--json",
     ]);
     let text = exec["text"].as_str().unwrap_or_default();
     assert!(text.contains("unset"), "web token scrubbed: {exec:?}");
-    assert!(!text.contains("ambient-web-token-value"), "token leaked: {exec:?}");
+    assert!(
+        !text.contains("ambient-web-token-value"),
+        "token leaked: {exec:?}"
+    );
 
     // `--env K=V` is added after scrubbing.
     let (_, exec) = sandbox.term_json(&[
-        "term", "exec", "a", "echo ${DMUXAI_CUSTOM:-missing}", "--json",
+        "term",
+        "exec",
+        "a",
+        "echo ${DMUXAI_CUSTOM:-missing}",
+        "--json",
     ]);
     let text = exec["text"].as_str().unwrap_or_default();
     assert!(text.contains("f5"), "explicit env delivered: {exec:?}");
@@ -769,8 +853,14 @@ fn tc_2690_non_term_command_never_starts_host() {
     assert_eq!(out.code, 0, "status failed: {out:?}");
     assert!(json.is_object(), "status json: {json:?}");
 
-    assert!(sandbox.host_pids().is_empty(), "status must not start a host");
-    assert!(!sandbox.socket_file().exists(), "status must not create a term socket");
+    assert!(
+        sandbox.host_pids().is_empty(),
+        "status must not start a host"
+    );
+    assert!(
+        !sandbox.socket_file().exists(),
+        "status must not create a term socket"
+    );
     let (out, listed) = sandbox.term_json(&["term", "list", "--json"]);
     assert_eq!(out.code, 0, "list failed: {out:?}");
     assert_eq!(listed, json!([]), "list: {listed:?}");
@@ -804,9 +894,7 @@ fn tc_2691_send_read_p50_within_loose_bound() {
     }
     round_trips.sort_unstable();
     let p50 = round_trips[10];
-    eprintln!(
-        "TC-2691 send+read round trips (ms): sorted={round_trips:?} p50={p50}"
-    );
+    eprintln!("TC-2691 send+read round trips (ms): sorted={round_trips:?} p50={p50}");
     assert!(p50 <= 90, "p50 {p50} ms exceeds the loose 90 ms bound");
 }
 
@@ -858,7 +946,7 @@ fn tc_2695_json_error_shape() {
     // host response path, and emits exactly one JSON error object.
     let (out, json) = sandbox.term_json(&["term", "show", "ghost", "--json"]);
     assert_eq!(out.code, 3, "unknown show must exit 3: {out:?}");
-    assert_eq!(json.is_object(), true, "error json: {json:?}");
+    assert!(json.is_object(), "error json: {json:?}");
     assert_eq!(json["error_kind"], "not_found", "error json: {json:?}");
 
     // The non-json human path prints a diagnostic on stderr instead.

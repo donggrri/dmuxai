@@ -12,7 +12,7 @@ use portable_pty::ChildKiller;
 use portable_pty::{CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
 
 use crate::process::INTERNAL_ENV_VARS;
-use crate::process::supervisor::{GroupSignal, group_alive, signal_group};
+use crate::process::supervisor::{TreeSnapshot, group_alive, snapshot_tree, terminate_snapshot};
 use crate::term::buffer::{BufferRead, DEFAULT_CAPACITY, RingBuffer};
 use crate::term::journal::{TermJournal, TermJournalDir};
 use crate::term::{
@@ -233,20 +233,27 @@ impl Backend {
 
     pub fn close(&self, force: bool) {
         if let Some(pgid) = self.pgid {
-            if force {
-                let _ = signal_group(pgid, GroupSignal::Kill);
+            // Snapshot before signalling: an interactive shell with job control
+            // puts background jobs in their own process group, and once the
+            // root exits those descendants may no longer be discoverable.
+            let snapshot = snapshot_tree(pgid);
+            signal_snapshot_hup(&snapshot, pgid);
+            let grace = if force {
+                Duration::ZERO
             } else {
-                signal_hup(pgid);
-                let deadline = Instant::now() + Duration::from_secs(2);
-                while Instant::now() < deadline {
-                    if !group_alive(pgid) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(20));
+                Duration::from_secs(2)
+            };
+            let deadline = Instant::now() + grace;
+            while Instant::now() < deadline {
+                if !snapshot_alive(&snapshot, pgid) {
+                    break;
                 }
-                if group_alive(pgid) {
-                    let _ = signal_group(pgid, GroupSignal::Kill);
-                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            if snapshot_alive(&snapshot, pgid) {
+                // #230 pattern: kill every member recorded in the snapshot,
+                // including descendants that escaped into another group.
+                terminate_snapshot_blocking(&snapshot, pgid);
             }
         }
         if let Ok(mut killer) = self.killer.lock() {
@@ -296,6 +303,51 @@ impl Drop for Backend {
     }
 }
 
+fn snapshot_groups(snapshot: &TreeSnapshot, root_pgid: u32) -> std::collections::BTreeSet<u32> {
+    let mut groups = std::collections::BTreeSet::new();
+    if root_pgid > 1 && root_pgid <= i32::MAX as u32 {
+        groups.insert(root_pgid);
+    }
+    for process in &snapshot.processes {
+        if process.pgid > 1 && process.pgid <= i32::MAX as u32 {
+            groups.insert(process.pgid);
+        }
+    }
+    groups
+}
+
+fn signal_snapshot_hup(snapshot: &TreeSnapshot, root_pgid: u32) {
+    for pgid in snapshot_groups(snapshot, root_pgid) {
+        signal_hup(pgid);
+    }
+}
+
+fn snapshot_alive(snapshot: &TreeSnapshot, root_pgid: u32) -> bool {
+    snapshot_groups(snapshot, root_pgid)
+        .into_iter()
+        .any(group_alive)
+}
+
+fn terminate_snapshot_blocking(snapshot: &TreeSnapshot, root_pgid: u32) {
+    let snapshot = snapshot.clone();
+    let terminate = move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+        else {
+            return;
+        };
+        runtime.block_on(terminate_snapshot(&snapshot, root_pgid, Duration::ZERO));
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // A nested block_on would panic on a runtime worker, so run the
+        // supervisor future on a plain thread instead.
+        let _ = thread::spawn(terminate).join();
+    } else {
+        terminate();
+    }
+}
+
 fn signal_hup(pgid: u32) -> bool {
     if pgid <= 1 || pgid > i32::MAX as u32 {
         return false;
@@ -334,4 +386,110 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tc_2607_close_kills_background_child_in_other_group() {
+        let workspace = std::env::temp_dir();
+        let spec = SessionSpec::cmd("jobcontrol", vec!["/bin/sh".into(), "-i".into()]);
+        let backend = Backend::spawn(&spec, &workspace, None).expect("spawn session");
+        let root_pid = backend.pid().expect("session pid");
+        let root_pgid = backend.pgid.expect("session pgid");
+
+        backend
+            .send(b"set -m; sleep 100 & echo CHILD_$!\n", false)
+            .expect("send job-control command");
+        let sleep_pid =
+            wait_for_child_pid(&backend, Duration::from_secs(5)).expect("background child pid");
+        let child_pgid = proc_pgid(sleep_pid).expect("child /proc stat");
+        assert_ne!(
+            child_pgid, root_pgid,
+            "job control should put the background child in its own group"
+        );
+        assert_eq!(
+            child_pgid, sleep_pid,
+            "background child should lead its own process group"
+        );
+
+        backend.close(false);
+
+        let child_gone = wait_for_exit(sleep_pid, Duration::from_secs(3));
+        let root_gone = wait_for_exit(root_pid, Duration::from_secs(3));
+        if !child_gone {
+            unsafe {
+                libc::kill(sleep_pid as i32, libc::SIGKILL);
+            }
+        }
+        assert!(child_gone, "close left background child {sleep_pid} alive");
+        assert!(root_gone, "close left session child {root_pid} alive");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_child_pid(backend: &Backend, limit: Duration) -> Option<u32> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let read = backend.read_since(0, true);
+            if let Some(pid) = child_pid_in(&read.text) {
+                return Some(pid);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn child_pid_in(text: &str) -> Option<u32> {
+        for (index, _) in text.match_indices("CHILD_") {
+            let rest = &text[index + "CHILD_".len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(pid) = digits.parse() {
+                return Some(pid);
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn proc_pgid(pid: u32) -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = &stat[stat.rfind(')')? + 1..];
+        let mut fields = rest.split_whitespace();
+        let _state = fields.next()?;
+        let _ppid = fields.next()?;
+        fields.next()?.parse().ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_exit(pid: u32, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            if !process_alive(pid) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_alive(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let rest = match stat.rfind(')') {
+            Some(index) => &stat[index + 1..],
+            None => return false,
+        };
+        let state = rest.split_whitespace().next().unwrap_or_default();
+        state != "Z"
+    }
 }
