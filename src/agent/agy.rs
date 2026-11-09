@@ -1224,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn marks_plan_review_responses_as_a_notice() {
+    fn tc_508_marks_plan_review_responses_as_a_notice() {
         let mut state = AgyStreamState::default();
         let result = json!({
             "event": "result",
@@ -1443,6 +1443,20 @@ mod tests {
         assert!(wrapped.ends_with("\n\nbuild the thing"));
         assert!(!agy_prompt(TurnPolicy::ReadOnly, "hi", false).contains("background"));
         assert!(!agy_prompt(TurnPolicy::Agent, "hi", false).contains("background"));
+    }
+
+    #[test]
+    // TC-500 / FR-500: Implement prompt contains apply-edits and no-plan language.
+    fn tc_500_implement_prompt_contains_apply_edits_and_no_plan() {
+        let wrapped = agy_prompt(TurnPolicy::Agent, "build the thing", true);
+        assert!(
+            wrapped.contains("Apply edits directly"),
+            "unexpected Implement prompt: {wrapped}"
+        );
+        assert!(
+            wrapped.contains("Do not produce plans"),
+            "unexpected Implement prompt: {wrapped}"
+        );
     }
 
     #[test]
@@ -1879,8 +1893,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
-    async fn implement_plan_only_retries_once_then_fails() {
-        // FR-506 / TC-506: plan-only Implement outcomes retry once, then fail.
+    async fn tc_504_implement_plan_only_retries_once_then_fails() {
+        // FR-502 / FR-506 / TC-504: plan-only Implement outcomes retry once, then fail.
         let plan_response = json!({
             "event": "result",
             "result": {

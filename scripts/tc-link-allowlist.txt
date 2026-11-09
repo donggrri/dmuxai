@@ -57,12 +57,7 @@ TC-482 legacy: no test reference yet
 TC-483 legacy: no test reference yet
 TC-490 legacy: no test reference yet
 TC-491 legacy: no test reference yet
-TC-500 legacy: no test reference yet
-TC-501 legacy: no test reference yet
-TC-503 legacy: no test reference yet
-TC-504 legacy: no test reference yet
 TC-507 legacy: no test reference yet
-TC-508 legacy: no test reference yet
 TC-511 legacy: no test reference yet
 TC-516 legacy: no test reference yet
 TC-878 legacy: no test reference yet
@@ -115,10 +110,6 @@ TC-1822 planned — no automated test yet
 TC-1825 covered by tc_1660_headless_agent_approve_confirms_sensitive_gate (no TC ref in code yet)
 TC-1826 covered by tc_1661_allow_sensitive_bypasses_headless_gate (no TC ref in code yet)
 TC-1827 planned — no automated test yet
-TC-1828 covered by run_complex_needs_approve_plan (no TC ref in code yet)
-TC-1829 covered by run_complex_needs_approve_plan (no TC ref in code yet)
-TC-1830 covered by plan_decision_command_contract (no TC ref in code yet)
-TC-1831 covered by todo_graph_run_waits_for_plan_approval (no TC ref in code yet)
 TC-1832 covered by workspace_dir_flag_sets_workspace (no TC ref in code yet)
 TC-1833 covered by workspace_switch_guards (no TC ref in code yet)
 TC-1834 planned — no automated test yet
