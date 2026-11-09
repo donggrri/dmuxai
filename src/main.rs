@@ -97,6 +97,7 @@ Usage:
   dmuxai runs [--limit N] [--failed] [--json]
   dmuxai runs show <id> [--json]
   dmuxai events [--since N] [--limit N] [--follow] [--json]
+  dmuxai term open|send|read|wait|exec|list|show|resize|close|reopen [--json] ...
   dmuxai mcp
   dmuxai init [--workspace] [--force]
 
@@ -124,6 +125,7 @@ Options:
   status           Print workspace status (agents, to-dos, last graph, events)
   runs             List or inspect recorded execution runs
   events           Print state-change events from .dmuxai/events.jsonl
+  term             Manage persistent named terminal sessions
   mcp              Serve DmuxAI as an MCP server over stdio
   init             Write a commented starter dmuxai.toml to the user config
                    (or the workspace with --workspace); --force overwrites
@@ -377,6 +379,11 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         let code = dmuxai::stage_skills::run_cli(&args[1..], &workspace, &settings.stage_skills);
         std::process::exit(code);
     }
+    let term_json = args.first().map(String::as_str) == Some("term")
+        && args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| arg == "--json");
     let action = parse_cli(args);
     match action {
         CliAction::Help => {
@@ -396,6 +403,9 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         CliAction::Usage(message) => {
+            if term_json {
+                std::process::exit(cli::term_usage_error(message, true));
+            }
             eprintln!("error: {message}\n\n{USAGE}");
             std::process::exit(dmuxai::agent_api::exit::USAGE);
         }

@@ -14,6 +14,8 @@ use dmuxai::conversation::{ConversationEngine, ConversationError};
 use dmuxai::events::{EventLog, EventSink};
 use dmuxai::mcp_server::{McpBackend, RunArgs};
 use dmuxai::settings::DmuxSettings;
+use dmuxai::term::proto::{RequestOp, Response};
+use dmuxai::term::{self, SessionKind, TermError};
 use dmuxai::web::DashboardHub;
 
 use crate::app::{App, HeadlessOutcome, HeadlessRequest};
@@ -64,6 +66,74 @@ pub enum AgentCommand {
         failed: bool,
         json: bool,
     },
+    /// Persistent named terminal sessions (SPEC-terminal-sessions).
+    Term(TermCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermCommand {
+    pub op: TermOp,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TermOp {
+    Open {
+        name: String,
+        kind: SessionKind,
+        cwd: Option<PathBuf>,
+        env: Vec<(String, String)>,
+        cols: u16,
+        rows: u16,
+        argv: Vec<String>,
+    },
+    Send {
+        name: String,
+        text: String,
+        newline: bool,
+        secret: bool,
+    },
+    SendKeys {
+        name: String,
+        keys: String,
+    },
+    Read {
+        name: String,
+        since: u64,
+        tail: Option<usize>,
+        raw: bool,
+    },
+    Wait {
+        name: String,
+        regex: Option<String>,
+        idle_ms: Option<u64>,
+        timeout_ms: u64,
+        since: u64,
+    },
+    Exec {
+        name: String,
+        command: String,
+        timeout_ms: Option<u64>,
+    },
+    List,
+    Show {
+        name: String,
+    },
+    Resize {
+        name: String,
+        cols: u16,
+        rows: u16,
+    },
+    Close {
+        name: Option<String>,
+        force: bool,
+        all: bool,
+    },
+    Reopen {
+        name: String,
+    },
+    /// Hidden host entry point used by the client to autostart a host.
+    Host,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -83,8 +153,8 @@ pub struct RunOptions {
 }
 
 /// First arguments that select an agent-facing subcommand.
-pub const SUBCOMMANDS: [&str; 8] = [
-    "run", "todo", "status", "events", "mcp", "init", "trust", "runs",
+pub const SUBCOMMANDS: [&str; 9] = [
+    "run", "todo", "status", "events", "mcp", "init", "trust", "runs", "term",
 ];
 
 /// Table-driven flag specification.
@@ -539,8 +609,506 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
                 json,
             })
         }
+        "term" => parse_term(rest).map(AgentCommand::Term),
         other => Err(format!("unknown subcommand '{other}'")),
     }
+}
+
+fn parse_term(args: &[String]) -> Result<TermCommand, String> {
+    let Some(subcommand) = args.first() else {
+        return Err(
+            "term needs a subcommand: open, send, read, wait, exec, list, show, resize, close or reopen"
+                .to_owned(),
+        );
+    };
+    let rest = &args[1..];
+    match subcommand.as_str() {
+        "open" => parse_term_open(rest),
+        "send" => {
+            const SEND_FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--keys"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--no-newline"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--secret"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, SEND_FLAGS, true)?;
+            let json = parsed.flags.contains_key("--json");
+            let Some(name) = parsed.positionals.first() else {
+                return Err("term send needs a session name".to_owned());
+            };
+            term::validate_name(name).map_err(|error| error.message)?;
+            let keys = parsed.flags.get("--keys").cloned().flatten();
+            let text = parsed.positionals[1..].join(" ");
+            if keys.is_some() {
+                if !text.is_empty() {
+                    return Err("term send takes text or --keys, not both".to_owned());
+                }
+                let keys = keys.unwrap_or_default();
+                term::parse_key_list(&keys).map_err(|error| error.message)?;
+                return Ok(TermCommand {
+                    op: TermOp::SendKeys {
+                        name: name.clone(),
+                        keys,
+                    },
+                    json,
+                });
+            }
+            if parsed.positionals.len() < 2 {
+                return Err("term send needs text or --keys".to_owned());
+            }
+            Ok(TermCommand {
+                op: TermOp::Send {
+                    name: name.clone(),
+                    text,
+                    newline: !parsed.flags.contains_key("--no-newline"),
+                    secret: parsed.flags.contains_key("--secret"),
+                },
+                json,
+            })
+        }
+        "read" => {
+            const READ_FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--since"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--tail"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--raw"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, READ_FLAGS, true)?;
+            let name = single_term_name(&parsed, "term read")?;
+            let since = optional_u64_flag(&parsed, "--since", "--since")?.unwrap_or(0);
+            let tail = optional_usize_flag(&parsed, "--tail", "--tail")?;
+            Ok(TermCommand {
+                op: TermOp::Read {
+                    name,
+                    since,
+                    tail,
+                    raw: parsed.flags.contains_key("--raw"),
+                },
+                json: parsed.flags.contains_key("--json"),
+            })
+        }
+        "wait" => {
+            const WAIT_FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--match"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--idle"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--timeout"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--since"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, WAIT_FLAGS, true)?;
+            let name = single_term_name(&parsed, "term wait")?;
+            let regex = parsed.flags.get("--match").cloned().flatten();
+            let idle_ms = duration_flag(&parsed, "--idle", "--idle")?;
+            if regex.is_some() == idle_ms.is_some() {
+                return Err("term wait needs exactly one of --match or --idle".to_owned());
+            }
+            if let Some(pattern) = &regex {
+                regex::Regex::new(pattern)
+                    .map_err(|error| format!("invalid regex '{pattern}': {error}"))?;
+            }
+            let timeout_ms = duration_flag(&parsed, "--timeout", "--timeout")?
+                .ok_or_else(|| "term wait needs --timeout".to_owned())?;
+            let since = optional_u64_flag(&parsed, "--since", "--since")?.unwrap_or(0);
+            Ok(TermCommand {
+                op: TermOp::Wait {
+                    name,
+                    regex,
+                    idle_ms,
+                    timeout_ms,
+                    since,
+                },
+                json: parsed.flags.contains_key("--json"),
+            })
+        }
+        "exec" => {
+            const EXEC_FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--timeout"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, EXEC_FLAGS, true)?;
+            let json = parsed.flags.contains_key("--json");
+            let Some(name) = parsed.positionals.first() else {
+                return Err("term exec needs a session name".to_owned());
+            };
+            term::validate_name(name).map_err(|error| error.message)?;
+            if parsed.positionals.len() < 2 {
+                return Err("term exec needs a command".to_owned());
+            }
+            let command = parsed.positionals[1..].join(" ");
+            let timeout_ms = duration_flag(&parsed, "--timeout", "--timeout")?;
+            Ok(TermCommand {
+                op: TermOp::Exec {
+                    name: name.clone(),
+                    command,
+                    timeout_ms,
+                },
+                json,
+            })
+        }
+        "list" => {
+            const LIST_FLAGS: &[FlagSpec] = &[FlagSpec {
+                names: &["--json"],
+                takes_value: false,
+                hidden: false,
+            }];
+            let parsed = parse_flags(rest, LIST_FLAGS, false)?;
+            Ok(TermCommand {
+                op: TermOp::List,
+                json: parsed.flags.contains_key("--json"),
+            })
+        }
+        "show" => {
+            const SHOW_FLAGS: &[FlagSpec] = &[FlagSpec {
+                names: &["--json"],
+                takes_value: false,
+                hidden: false,
+            }];
+            let parsed = parse_flags(rest, SHOW_FLAGS, true)?;
+            let name = single_term_name(&parsed, "term show")?;
+            Ok(TermCommand {
+                op: TermOp::Show { name },
+                json: parsed.flags.contains_key("--json"),
+            })
+        }
+        "resize" => {
+            const RESIZE_FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--cols"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--rows"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, RESIZE_FLAGS, true)?;
+            let name = single_term_name(&parsed, "term resize")?;
+            let cols = required_u16_flag(&parsed, "--cols", "--cols")?;
+            let rows = required_u16_flag(&parsed, "--rows", "--rows")?;
+            term::validate_dimensions(cols, rows).map_err(|error| error.message)?;
+            Ok(TermCommand {
+                op: TermOp::Resize { name, cols, rows },
+                json: parsed.flags.contains_key("--json"),
+            })
+        }
+        "close" => {
+            const CLOSE_FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--force"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--all"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, CLOSE_FLAGS, true)?;
+            if parsed.positionals.len() > 1 {
+                return Err(format!("unexpected argument '{}'", parsed.positionals[1]));
+            }
+            let all = parsed.flags.contains_key("--all");
+            let name = parsed.positionals.first().cloned();
+            if all && name.is_some() {
+                return Err("term close takes a session name or --all, not both".to_owned());
+            }
+            if !all && name.is_none() {
+                return Err("term close needs a session name or --all".to_owned());
+            }
+            if let Some(name) = &name {
+                term::validate_name(name).map_err(|error| error.message)?;
+            }
+            Ok(TermCommand {
+                op: TermOp::Close {
+                    name,
+                    force: parsed.flags.contains_key("--force"),
+                    all,
+                },
+                json: parsed.flags.contains_key("--json"),
+            })
+        }
+        "reopen" => {
+            const REOPEN_FLAGS: &[FlagSpec] = &[FlagSpec {
+                names: &["--json"],
+                takes_value: false,
+                hidden: false,
+            }];
+            let parsed = parse_flags(rest, REOPEN_FLAGS, true)?;
+            let name = single_term_name(&parsed, "term reopen")?;
+            Ok(TermCommand {
+                op: TermOp::Reopen { name },
+                json: parsed.flags.contains_key("--json"),
+            })
+        }
+        "__host" => {
+            if let Some(argument) = rest.first() {
+                return Err(format!("unexpected argument '{argument}'"));
+            }
+            Ok(TermCommand {
+                op: TermOp::Host,
+                json: false,
+            })
+        }
+        other => Err(format!("unknown term subcommand '{other}'")),
+    }
+}
+
+fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
+    let mut name = None;
+    let mut kind = SessionKind::Shell;
+    let mut cwd = None;
+    let mut env = Vec::new();
+    let mut cols = term::DEFAULT_COLS;
+    let mut rows = term::DEFAULT_ROWS;
+    let mut json = false;
+    let mut argv = Vec::new();
+    let mut after_separator = false;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if after_separator {
+            argv.push(argument.clone());
+            index += 1;
+            continue;
+        }
+        match argument.as_str() {
+            "--" => after_separator = true,
+            "--json" => json = true,
+            "--kind" => {
+                index += 1;
+                kind = match args.get(index).map(String::as_str) {
+                    Some("shell") => SessionKind::Shell,
+                    Some("cmd") => SessionKind::Cmd,
+                    _ => return Err("--kind must be 'shell' or 'cmd'".to_owned()),
+                };
+            }
+            "--cwd" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--cwd needs a value".to_owned())?;
+                cwd = Some(PathBuf::from(value));
+            }
+            "--env" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--env needs K=V".to_owned())?;
+                let (key, value) = value
+                    .split_once('=')
+                    .ok_or_else(|| "--env needs K=V".to_owned())?;
+                if key.is_empty() {
+                    return Err("--env needs a non-empty name before '='".to_owned());
+                }
+                env.push((key.to_owned(), value.to_owned()));
+            }
+            "--cols" => {
+                index += 1;
+                cols = parse_u16_value(args.get(index), "--cols")?;
+            }
+            "--rows" => {
+                index += 1;
+                rows = parse_u16_value(args.get(index), "--rows")?;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unexpected argument '{other}'"));
+            }
+            other => {
+                if name.is_some() {
+                    return Err(format!("unexpected argument '{other}'"));
+                }
+                name = Some(other.to_owned());
+            }
+        }
+        index += 1;
+    }
+    let name = name.ok_or_else(|| "term open needs a session name".to_owned())?;
+    term::validate_name(&name).map_err(|error| error.message)?;
+    term::validate_dimensions(cols, rows).map_err(|error| error.message)?;
+    if kind == SessionKind::Cmd && argv.is_empty() {
+        return Err("--kind cmd needs a command after --".to_owned());
+    }
+    if kind == SessionKind::Shell && !argv.is_empty() {
+        return Err("shell sessions do not take a command after --".to_owned());
+    }
+    Ok(TermCommand {
+        op: TermOp::Open {
+            name,
+            kind,
+            cwd,
+            env,
+            cols,
+            rows,
+            argv,
+        },
+        json,
+    })
+}
+
+fn single_term_name(parsed: &ParsedFlags, command: &str) -> Result<String, String> {
+    let Some(name) = parsed.positionals.first() else {
+        return Err(format!("{command} needs a session name"));
+    };
+    if parsed.positionals.len() > 1 {
+        return Err(format!("unexpected argument '{}'", parsed.positionals[1]));
+    }
+    term::validate_name(name).map_err(|error| error.message)?;
+    Ok(name.clone())
+}
+
+fn required_u16_flag(parsed: &ParsedFlags, name: &str, label: &str) -> Result<u16, String> {
+    let raw = parsed
+        .flags
+        .get(name)
+        .cloned()
+        .flatten()
+        .ok_or_else(|| format!("{label} needs a value"))?;
+    parse_u16_value(Some(&raw), label)
+}
+
+fn parse_u16_value(raw: Option<&String>, label: &str) -> Result<u16, String> {
+    let raw = raw.ok_or_else(|| format!("{label} needs a value"))?;
+    raw.parse::<u16>()
+        .map_err(|_| format!("{label} must be a number between 1 and 1000"))
+}
+
+fn optional_u64_flag(parsed: &ParsedFlags, name: &str, label: &str) -> Result<Option<u64>, String> {
+    parsed
+        .flags
+        .get(name)
+        .cloned()
+        .flatten()
+        .map(|raw| {
+            raw.parse::<u64>()
+                .map_err(|_| format!("{label} must be a non-negative integer"))
+        })
+        .transpose()
+}
+
+fn optional_usize_flag(
+    parsed: &ParsedFlags,
+    name: &str,
+    label: &str,
+) -> Result<Option<usize>, String> {
+    parsed
+        .flags
+        .get(name)
+        .cloned()
+        .flatten()
+        .map(|raw| {
+            raw.parse::<usize>()
+                .map_err(|_| format!("{label} must be a non-negative integer"))
+        })
+        .transpose()
+}
+
+fn duration_flag(parsed: &ParsedFlags, name: &str, label: &str) -> Result<Option<u64>, String> {
+    parsed
+        .flags
+        .get(name)
+        .cloned()
+        .flatten()
+        .map(|raw| parse_duration_ms(&raw, label))
+        .transpose()
+}
+
+fn parse_duration_ms(raw: &str, label: &str) -> Result<u64, String> {
+    let trimmed = raw.trim();
+    let (number, multiplier) = if let Some(number) = trimmed.strip_suffix("ms") {
+        (number, 1.0)
+    } else if let Some(number) = trimmed.strip_suffix('s') {
+        (number, 1_000.0)
+    } else if let Some(number) = trimmed.strip_suffix('m') {
+        (number, 60_000.0)
+    } else if let Some(number) = trimmed.strip_suffix('h') {
+        (number, 3_600_000.0)
+    } else {
+        (trimmed, 1_000.0)
+    };
+    let value = number
+        .parse::<f64>()
+        .map_err(|_| format!("{label} must be a duration like 500ms, 2s or 1m"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("{label} must be a non-negative duration"));
+    }
+    let milliseconds = value * multiplier;
+    if milliseconds > u64::MAX as f64 {
+        return Err(format!("{label} is too large"));
+    }
+    Ok(milliseconds.round() as u64)
 }
 
 /// Builds the per-workspace event sink (FR-768, FR-770).
@@ -672,6 +1240,7 @@ pub async fn execute(command: AgentCommand) -> i32 {
             failed,
             json,
         } => execute_runs(&workspace_root, show_id, limit, failed, json),
+        AgentCommand::Term(command) => execute_term(&workspace_root, command),
         AgentCommand::Mcp => {
             let backend = CliMcpBackend {
                 workspace_root: workspace_root.clone(),
@@ -695,6 +1264,245 @@ pub async fn execute(command: AgentCommand) -> i32 {
             }
         }
     }
+}
+
+#[cfg(not(unix))]
+fn execute_term(_workspace_root: &Path, command: TermCommand) -> i32 {
+    term_fail(
+        TermError::usage("terminal sessions are not supported on this platform yet"),
+        command.json,
+    )
+}
+
+#[cfg(unix)]
+fn execute_term(workspace_root: &Path, command: TermCommand) -> i32 {
+    let TermCommand { op, json } = command;
+    if matches!(&op, TermOp::Host) {
+        return match dmuxai::term::host::run(workspace_root) {
+            Ok(()) => exit::OK,
+            Err(error) => term_fail(error, false),
+        };
+    }
+
+    let response = match &op {
+        TermOp::List => match dmuxai::term::client::try_connect(workspace_root) {
+            Ok(mut client) => client.call(RequestOp::List),
+            Err(_) => {
+                if json {
+                    print_json(&json!([]));
+                } else {
+                    println!("No terminal sessions.");
+                }
+                return exit::OK;
+            }
+        },
+        _ => match dmuxai::term::client::connect(workspace_root) {
+            Ok(mut client) => client.call(term_request_op(&op)),
+            Err(error) => return term_fail(error, json),
+        },
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => return term_fail(error, json),
+    };
+    report_term_response(&op, response, json)
+}
+
+#[cfg(unix)]
+fn report_term_response(op: &TermOp, response: Response, json: bool) -> i32 {
+    let code = response.exit_code.unwrap_or(exit::OK);
+    let data = response.data.unwrap_or(Value::Null);
+    if json {
+        print_json(&data);
+    } else {
+        print_term_human(op, &data);
+    }
+    code
+}
+
+#[cfg(unix)]
+fn term_request_op(op: &TermOp) -> RequestOp {
+    match op {
+        TermOp::Open {
+            name,
+            kind,
+            cwd,
+            env,
+            cols,
+            rows,
+            argv,
+        } => RequestOp::Open {
+            name: name.clone(),
+            kind: *kind,
+            cwd: cwd.as_ref().map(|path| path.display().to_string()),
+            env: env.clone(),
+            cols: *cols,
+            rows: *rows,
+            argv: argv.clone(),
+        },
+        TermOp::Send {
+            name,
+            text,
+            newline,
+            secret,
+        } => RequestOp::Send {
+            name: name.clone(),
+            text: text.clone(),
+            newline: *newline,
+            secret: *secret,
+        },
+        TermOp::SendKeys { name, keys } => RequestOp::SendKeys {
+            name: name.clone(),
+            keys: keys.clone(),
+        },
+        TermOp::Read {
+            name,
+            since,
+            tail,
+            raw,
+        } => RequestOp::Read {
+            name: name.clone(),
+            since: *since,
+            tail: *tail,
+            raw: *raw,
+        },
+        TermOp::Wait {
+            name,
+            regex,
+            idle_ms,
+            timeout_ms,
+            since,
+        } => RequestOp::Wait {
+            name: name.clone(),
+            regex: regex.clone(),
+            idle_ms: *idle_ms,
+            timeout_ms: Some(*timeout_ms),
+            since: *since,
+        },
+        TermOp::Exec {
+            name,
+            command,
+            timeout_ms,
+        } => RequestOp::Exec {
+            name: name.clone(),
+            command: command.clone(),
+            timeout_ms: *timeout_ms,
+        },
+        TermOp::List => RequestOp::List,
+        TermOp::Show { name } => RequestOp::Show { name: name.clone() },
+        TermOp::Resize { name, cols, rows } => RequestOp::Resize {
+            name: name.clone(),
+            cols: *cols,
+            rows: *rows,
+        },
+        TermOp::Close { name, force, all } => RequestOp::Close {
+            name: name.clone(),
+            force: *force,
+            all: *all,
+        },
+        TermOp::Reopen { name } => RequestOp::Reopen { name: name.clone() },
+        TermOp::Host => unreachable!("the host entry point is handled before requests"),
+    }
+}
+
+#[cfg(unix)]
+fn print_term_human(op: &TermOp, data: &Value) {
+    match op {
+        TermOp::Open { .. } | TermOp::Reopen { .. } => {
+            println!(
+                "{}\t{}\t{}\t{}",
+                text_field(data, "name"),
+                text_field(data, "kind"),
+                text_field(data, "state"),
+                data.get("pid")
+                    .and_then(Value::as_u64)
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+            );
+        }
+        TermOp::Send { .. } | TermOp::SendKeys { .. } => {
+            println!(
+                "seq {}",
+                data.get("seq")
+                    .and_then(Value::as_u64)
+                    .map(|seq| seq.to_string())
+                    .unwrap_or_else(|| "-".to_owned())
+            );
+        }
+        TermOp::Read { .. } | TermOp::Wait { .. } | TermOp::Exec { .. } => {
+            if let Some(text) = data.get("text").and_then(Value::as_str) {
+                print!("{text}");
+                let _ = io::stdout().flush();
+            }
+            if data.get("reason").and_then(Value::as_str) == Some("timeout") {
+                eprintln!("timeout");
+            }
+        }
+        TermOp::List => {
+            if let Some(sessions) = data.as_array() {
+                for session in sessions {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        text_field(session, "name"),
+                        text_field(session, "kind"),
+                        text_field(session, "state"),
+                        session
+                            .get("pid")
+                            .and_then(Value::as_u64)
+                            .map(|pid| pid.to_string())
+                            .unwrap_or_else(|| "-".to_owned()),
+                    );
+                }
+            }
+        }
+        TermOp::Show { .. } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string())
+            );
+        }
+        TermOp::Resize { name, .. } => {
+            println!(
+                "resized {} to {}x{}",
+                name,
+                text_field(data, "cols"),
+                text_field(data, "rows")
+            );
+        }
+        TermOp::Close { .. } => {
+            if let Some(closed) = data.get("closed").and_then(Value::as_array) {
+                println!("closed {} session(s)", closed.len());
+            } else {
+                println!("closed {}", text_field(data, "name"));
+            }
+        }
+        TermOp::Host => {}
+    }
+}
+
+#[cfg(unix)]
+fn text_field(value: &Value, key: &str) -> String {
+    match value.get(key) {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => number.to_string(),
+        Some(Value::Bool(flag)) => flag.to_string(),
+        Some(Value::Null) | None => "-".to_owned(),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn term_fail(error: TermError, json: bool) -> i32 {
+    if json {
+        print_json(&error.to_json());
+    } else {
+        eprintln!("error: {}", error.message);
+    }
+    error.code
+}
+
+/// Reports a term usage error; `--json` still emits exactly one JSON object.
+pub fn term_usage_error(message: impl Into<String>, json: bool) -> i32 {
+    term_fail(TermError::usage(message), json)
 }
 
 /// Executes `dmuxai runs` or `dmuxai runs show <id>` (SPEC-run-journal FR-2562).
