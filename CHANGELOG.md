@@ -5,6 +5,8 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+## [0.3.1] - 2026-11-09
+
 ### Added
 
 - **Busy headless runs are distinguishable from stalled ones (#166, FR-2430..2433).**
@@ -723,6 +725,7 @@ Changes since v0.1.1 (2026-08-24), PRs #1-#38.
   - the non-Windows `dmuxai-launcher` stub (#17)
   - bash-only spec-index tests are gated on Windows (#24)
 
+[0.3.1]: https://github.com/donggrri/dmuxai/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/donggrri/dmuxai/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/donggrri/dmuxai/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/donggrri/dmuxai/compare/v0.2.0...v0.2.1
