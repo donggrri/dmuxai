@@ -90,7 +90,8 @@ pub fn socket_path(workspace_root: &Path) -> io::Result<PathBuf> {
     let preferred = crate::state_path::state_base()?
         .join("repos")
         .join(&key)
-        .join("term.sock");
+        .join("term")
+        .join("host.sock");
     let fallback = fallback_socket_path(&key);
     Ok(choose_socket_path(preferred, fallback))
 }
@@ -103,7 +104,8 @@ fn fallback_socket_path(repo_key: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     base.join(format!("dmuxai-{uid}"))
         .join(repo_key)
-        .join("term.sock")
+        .join("term")
+        .join("host.sock")
 }
 
 fn choose_socket_path(preferred: PathBuf, fallback: PathBuf) -> PathBuf {
@@ -151,17 +153,43 @@ mod tests {
 
     #[test]
     fn tc_2601_long_socket_path_uses_the_short_fallback() {
-        let long = PathBuf::from(format!("/tmp/{}", "a".repeat(200))).join("term.sock");
-        let short = PathBuf::from("/tmp/dmuxai-1/repo/term.sock");
+        let long = PathBuf::from(format!("/tmp/{}", "a".repeat(200)))
+            .join("term")
+            .join("host.sock");
+        let short = PathBuf::from("/tmp/dmuxai-1/repo/term/host.sock");
         assert!(!socket_path_fits(&long));
         assert!(socket_path_fits(&short));
         assert_eq!(choose_socket_path(long, short.clone()), short);
         assert_eq!(
             choose_socket_path(
-                PathBuf::from("/tmp/short/term.sock"),
-                PathBuf::from("/tmp/other/term.sock")
+                PathBuf::from("/tmp/short/term/host.sock"),
+                PathBuf::from("/tmp/other/term/host.sock")
             ),
-            PathBuf::from("/tmp/short/term.sock")
+            PathBuf::from("/tmp/short/term/host.sock")
         );
+    }
+
+    #[test]
+    fn tc_2601_socket_lives_in_dedicated_term_dir() {
+        let _guard = crate::state_path::test_env_lock();
+        let base = tempfile::tempdir().unwrap();
+        let state = base.path().join("state");
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let previous = std::env::var_os("DMUXAI_STATE_DIR");
+        // SAFETY: test_env_lock serializes access to the process environment.
+        unsafe { std::env::set_var("DMUXAI_STATE_DIR", &state) };
+
+        let path = socket_path(&workspace).unwrap();
+        let key = crate::state_path::repo_key(&workspace).unwrap();
+        let term_dir = state.join("repos").join(key).join("term");
+        assert_eq!(path.parent(), Some(term_dir.as_path()));
+        assert_eq!(path.file_name().unwrap(), "host.sock");
+        assert_eq!(term_dir.file_name().unwrap(), "term");
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("DMUXAI_STATE_DIR", value) },
+            None => unsafe { std::env::remove_var("DMUXAI_STATE_DIR") },
+        }
     }
 }

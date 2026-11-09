@@ -2,20 +2,23 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use crate::run_journal::generate_run_id;
 use crate::term::backend::{Backend, now_ms};
+use crate::term::buffer::RingBuffer;
 use crate::term::client::socket_path;
-use crate::term::journal::TermJournal;
+use crate::term::journal::{TERM_IO_COALESCE_MAX_DELAY_MS, TermJournal};
 use crate::term::proto::{PROTOCOL_VERSION, RequestOp, Response, read_request, write_response};
 use crate::term::wait::{
     MARKER_PREFIX, WaitOptions, WaitReason, WaitResult, marker_command, parse_exit_marker,
@@ -27,9 +30,11 @@ use crate::term::{
 };
 
 const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(600);
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const JOURNAL_CHECK_WINDOW: Duration = Duration::from_millis(250);
 const EXEC_CMD_IDLE: Duration = Duration::from_millis(200);
 const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
+
+type SessionHandle = Arc<Mutex<Session>>;
 
 struct Session {
     spec: SessionSpec,
@@ -73,12 +78,20 @@ impl Session {
     }
 }
 
-pub struct Host {
+struct Shared {
     workspace_root: PathBuf,
+    sessions: Mutex<BTreeMap<String, SessionHandle>>,
+    shutdown: AtomicBool,
+    wake: UnixStream,
+}
+
+pub struct Host {
+    shared: Arc<Shared>,
     listener: UnixListener,
-    sessions: BTreeMap<String, Session>,
     idle_grace: Duration,
-    shutdown: bool,
+    journal_flushed: BTreeMap<String, u64>,
+    journal_check_after: Option<Instant>,
+    wake_rx: UnixStream,
 }
 
 pub fn run(workspace_root: &Path) -> Result<(), TermError> {
@@ -96,12 +109,28 @@ pub(crate) fn run_at(workspace_root: &Path, path: &Path) -> Result<(), TermError
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_IDLE_GRACE);
-    let mut host = Host {
+    let (wake, wake_rx) = UnixStream::pair().map_err(|error| {
+        TermError::internal(format!("could not create the term wake socket: {error}"))
+    })?;
+    wake.set_nonblocking(true).map_err(|error| {
+        TermError::internal(format!("could not configure the term wake socket: {error}"))
+    })?;
+    wake_rx.set_nonblocking(true).map_err(|error| {
+        TermError::internal(format!("could not configure the term wake socket: {error}"))
+    })?;
+    let shared = Arc::new(Shared {
         workspace_root: workspace_root.to_path_buf(),
+        sessions: Mutex::new(BTreeMap::new()),
+        shutdown: AtomicBool::new(false),
+        wake,
+    });
+    let mut host = Host {
+        shared,
         listener,
-        sessions: BTreeMap::new(),
         idle_grace,
-        shutdown: false,
+        journal_flushed: BTreeMap::new(),
+        journal_check_after: None,
+        wake_rx,
     };
     host.event_loop()
 }
@@ -111,12 +140,11 @@ impl Host {
         let mut idle_since: Option<Instant> = None;
         loop {
             self.flush_journals();
-            self.refresh_sessions();
-            if self
-                .sessions
-                .values()
-                .any(|session| !session.state.is_terminal())
-            {
+            self.shared.refresh_sessions();
+            if self.shared.shutdown.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if self.shared.has_live_sessions() {
                 idle_since = None;
             } else {
                 let since = *idle_since.get_or_insert_with(Instant::now);
@@ -125,10 +153,18 @@ impl Host {
                 }
             }
 
-            if poll_readable(self.listener.as_raw_fd(), POLL_INTERVAL)? {
+            let timeout = self.next_poll_timeout(idle_since);
+            let ready = poll_ready(
+                &[self.listener.as_raw_fd(), self.wake_rx.as_raw_fd()],
+                timeout,
+            )?;
+            if ready.get(1).copied().unwrap_or(false) {
+                drain_wake(&self.wake_rx);
+            }
+            if ready.first().copied().unwrap_or(false) {
                 loop {
                     match self.listener.accept() {
-                        Ok((stream, _)) => self.handle_connection(stream),
+                        Ok((stream, _)) => self.spawn_connection(stream)?,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                         Err(error) => {
                             return Err(TermError::internal(format!(
@@ -136,36 +172,125 @@ impl Host {
                             )));
                         }
                     }
-                    if self.shutdown {
-                        return Ok(());
-                    }
                 }
             }
-            if self.shutdown {
+            if self.shared.shutdown.load(Ordering::SeqCst) {
                 return Ok(());
             }
         }
         Ok(())
     }
 
-    fn refresh_sessions(&mut self) {
-        for session in self.sessions.values_mut() {
-            session.refresh();
-        }
+    fn spawn_connection(&mut self, stream: UnixStream) -> Result<(), TermError> {
+        self.journal_check_after = Some(Instant::now() + JOURNAL_CHECK_WINDOW);
+        let shared = Arc::clone(&self.shared);
+        thread::Builder::new()
+            .name("term-connection".to_owned())
+            .spawn(move || shared.handle_connection(stream))
+            .map(|_| ())
+            .map_err(|error| {
+                TermError::internal(format!("could not start a term connection thread: {error}"))
+            })
     }
 
-    fn flush_journals(&self) {
+    fn flush_journals(&mut self) {
         let time = now_ms();
-        for session in self.sessions.values() {
+        for (name, handle) in self.shared.snapshot_sessions() {
+            let session = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let last = session.backend.last_output_ms();
+            let flushed = self.journal_flushed.get(&name).copied().unwrap_or(0);
+            if last <= flushed {
+                continue;
+            }
             if let Some(journal) = session.backend.journal()
                 && let Ok(mut journal) = journal.lock()
             {
                 let _ = journal.flush_output_due(time);
             }
+            if time >= last.saturating_add(TERM_IO_COALESCE_MAX_DELAY_MS) {
+                self.journal_flushed.insert(name, last);
+            }
+        }
+        if self
+            .journal_check_after
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.journal_check_after = None;
         }
     }
 
-    fn handle_connection(&mut self, mut stream: UnixStream) {
+    fn next_poll_timeout(&self, idle_since: Option<Instant>) -> Option<Duration> {
+        let now = Instant::now();
+        let mut next = idle_since.map(|since| since + self.idle_grace);
+        let now_ms = now_ms();
+        for (name, handle) in self.shared.snapshot_sessions() {
+            let session = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let last = session.backend.last_output_ms();
+            let flushed = self.journal_flushed.get(&name).copied().unwrap_or(0);
+            if last > flushed {
+                let due_ms = last.saturating_add(TERM_IO_COALESCE_MAX_DELAY_MS);
+                let due = if due_ms <= now_ms {
+                    now
+                } else {
+                    now + Duration::from_millis(due_ms - now_ms)
+                };
+                next = Some(next.map_or(due, |current| current.min(due)));
+            }
+        }
+        if let Some(check) = self.journal_check_after {
+            next = Some(next.map_or(check, |current| current.min(check)));
+        }
+        next.map(|deadline| {
+            deadline
+                .checked_duration_since(now)
+                .unwrap_or(Duration::ZERO)
+        })
+    }
+}
+
+impl Shared {
+    fn snapshot_sessions(&self) -> Vec<(String, SessionHandle)> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(name, session)| (name.clone(), Arc::clone(session)))
+            .collect()
+    }
+
+    fn refresh_sessions(&self) {
+        for (_, handle) in self.snapshot_sessions() {
+            let mut session = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            session.refresh();
+        }
+    }
+
+    fn has_live_sessions(&self) -> bool {
+        self.snapshot_sessions().into_iter().any(|(_, handle)| {
+            let mut session = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            session.refresh();
+            !session.state.is_terminal()
+        })
+    }
+
+    fn session(&self, name: &str) -> Result<SessionHandle, TermError> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .cloned()
+            .ok_or_else(|| TermError::not_found(name))
+    }
+
+    fn handle_connection(&self, mut stream: UnixStream) {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
         let allowed = peer_uid(&stream)
@@ -189,14 +314,14 @@ impl Host {
         let _ = write_response(&mut stream, &response);
     }
 
-    fn dispatch(&mut self, op: RequestOp) -> Response {
+    fn dispatch(&self, op: RequestOp) -> Response {
         match self.dispatch_op(op) {
             Ok(response) => response,
             Err(error) => Response::error(&error),
         }
     }
 
-    fn dispatch_op(&mut self, op: RequestOp) -> Result<Response, TermError> {
+    fn dispatch_op(&self, op: RequestOp) -> Result<Response, TermError> {
         match op {
             RequestOp::Open {
                 name,
@@ -226,14 +351,28 @@ impl Host {
                     data.push(b'\n');
                 }
                 ensure_input_within_limit(data.len())?;
-                let session = self.open_session_mut(&name)?;
+                let handle = self.session(&name)?;
+                let mut session = handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                session.refresh();
+                if session.state != SessionState::Open {
+                    return Err(TermError::conflict(format!("session '{name}' is not open")));
+                }
                 ensure_input_allowed(&name, session.takeover)?;
                 let seq = session.backend.send(&data, secret)?;
                 Ok(Response::ok(json!({"seq": seq})))
             }
             RequestOp::SendKeys { name, keys } => {
                 let data = parse_key_list(&keys)?;
-                let session = self.open_session_mut(&name)?;
+                let handle = self.session(&name)?;
+                let mut session = handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                session.refresh();
+                if session.state != SessionState::Open {
+                    return Err(TermError::conflict(format!("session '{name}' is not open")));
+                }
                 ensure_input_allowed(&name, session.takeover)?;
                 let seq = session.backend.send(&data, false)?;
                 Ok(Response::ok(json!({"seq": seq})))
@@ -244,7 +383,10 @@ impl Host {
                 tail,
                 raw,
             } => {
-                let session = self.session_mut(&name)?;
+                let handle = self.session(&name)?;
+                let mut session = handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 session.refresh();
                 let read = match tail {
                     Some(lines) => session.backend.read_tail(lines, raw),
@@ -272,9 +414,14 @@ impl Host {
                     timeout: Duration::from_millis(timeout),
                     since,
                 };
-                let session = self.session_mut(&name)?;
-                session.refresh();
-                let buffer = session.backend.buffer();
+                let handle = self.session(&name)?;
+                let buffer = {
+                    let mut session = handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    session.refresh();
+                    session.backend.buffer()
+                };
                 let result = wait(&buffer, &options)?;
                 let data = wait_result_json(&result);
                 if result.reason == WaitReason::Timeout {
@@ -291,14 +438,23 @@ impl Host {
             RequestOp::List => {
                 self.refresh_sessions();
                 let sessions: Vec<Value> = self
-                    .sessions
-                    .values()
-                    .map(|session| serde_json::to_value(session.info()).unwrap_or(Value::Null))
+                    .snapshot_sessions()
+                    .into_iter()
+                    .map(|(_, handle)| {
+                        let mut session = handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        session.refresh();
+                        serde_json::to_value(session.info()).unwrap_or(Value::Null)
+                    })
                     .collect();
                 Ok(Response::ok(json!(sessions)))
             }
             RequestOp::Show { name } => {
-                let session = self.session_mut(&name)?;
+                let handle = self.session(&name)?;
+                let mut session = handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 session.refresh();
                 Ok(Response::ok(
                     serde_json::to_value(session.info()).unwrap_or(Value::Null),
@@ -306,7 +462,14 @@ impl Host {
             }
             RequestOp::Resize { name, cols, rows } => {
                 validate_dimensions(cols, rows)?;
-                let session = self.open_session_mut(&name)?;
+                let handle = self.session(&name)?;
+                let mut session = handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                session.refresh();
+                if session.state != SessionState::Open {
+                    return Err(TermError::conflict(format!("session '{name}' is not open")));
+                }
                 session.backend.resize(cols, rows)?;
                 session.spec.cols = cols;
                 session.spec.rows = rows;
@@ -315,43 +478,59 @@ impl Host {
             RequestOp::Close { name, force, all } => self.close(name, force, all),
             RequestOp::Reopen { name } => self.reopen(&name),
             RequestOp::Takeover { name } => {
-                let session = self.session_mut(&name)?;
+                let handle = self.session(&name)?;
+                let mut session = handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 session.takeover = true;
                 session.backend.record_event("takeover");
                 Ok(Response::ok(json!({"takeover": true})))
             }
             RequestOp::Release { name } => {
-                let session = self.session_mut(&name)?;
+                let handle = self.session(&name)?;
+                let mut session = handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 session.takeover = false;
                 session.backend.record_event("release");
                 Ok(Response::ok(json!({"takeover": false})))
             }
             RequestOp::Shutdown => {
-                for session in self.sessions.values_mut() {
+                for (_, handle) in self.snapshot_sessions() {
+                    let mut session = handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     session.backend.close(true);
                     session.state = SessionState::Closed;
                 }
-                self.shutdown = true;
+                self.shutdown.store(true, Ordering::SeqCst);
+                let _ = (&self.wake).write(&[1]);
                 Ok(Response::ok(json!({"state": "closed"})))
             }
         }
     }
 
-    fn open(&mut self, spec: SessionSpec) -> Result<Response, TermError> {
+    fn open(&self, spec: SessionSpec) -> Result<Response, TermError> {
         validate_name(&spec.name)?;
         validate_dimensions(spec.cols, spec.rows)?;
         if spec.kind == SessionKind::Cmd && spec.argv.is_empty() {
             return Err(TermError::usage("--kind cmd needs a command after --"));
         }
-        if let Some(existing) = self.sessions.get(&spec.name)
-            && !existing.state.is_terminal()
-        {
-            return Err(TermError::conflict(format!(
-                "session '{}' is already open",
-                spec.name
-            )));
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = sessions.get(&spec.name) {
+            let existing = existing
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !existing.state.is_terminal() {
+                return Err(TermError::conflict(format!(
+                    "session '{}' is already open",
+                    spec.name
+                )));
+            }
         }
-        self.sessions.remove(&spec.name);
         let name = spec.name.clone();
         let session = self.spawn_session(spec)?;
         let data = json!({
@@ -360,7 +539,8 @@ impl Host {
             "state": "open",
             "pid": session.backend.pid(),
         });
-        self.sessions.insert(name, session);
+        sessions.remove(&name);
+        sessions.insert(name, Arc::new(Mutex::new(session)));
         Ok(Response::ok(data))
     }
 
@@ -376,6 +556,7 @@ impl Host {
             Err(error) => (None, Some(error.to_string())),
         };
         let backend = Backend::spawn(&spec, &self.workspace_root, journal)?;
+        self.spawn_session_watcher(backend.buffer());
         Ok(Session {
             spec,
             state: SessionState::Open,
@@ -386,8 +567,28 @@ impl Host {
         })
     }
 
+    fn spawn_session_watcher(&self, buffer: Arc<RingBuffer>) {
+        let Ok(wake) = self.wake.try_clone() else {
+            return;
+        };
+        let _ = thread::Builder::new()
+            .name("term-session-watch".to_owned())
+            .spawn(move || {
+                let mut inner = buffer.lock();
+                while inner.exit.is_none() {
+                    inner = buffer
+                        .condvar()
+                        .wait(inner)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let _ = (&wake).write(&[1]);
+                }
+                drop(inner);
+                let _ = (&wake).write(&[1]);
+            });
+    }
+
     fn exec(
-        &mut self,
+        &self,
         name: String,
         command: String,
         timeout_ms: Option<u64>,
@@ -397,7 +598,14 @@ impl Host {
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_EXEC_TIMEOUT);
         let (buffer, since, nonce, kind) = {
-            let session = self.open_session_mut(&name)?;
+            let handle = self.session(&name)?;
+            let mut session = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            session.refresh();
+            if session.state != SessionState::Open {
+                return Err(TermError::conflict(format!("session '{name}' is not open")));
+            }
             ensure_input_allowed(&name, session.takeover)?;
             let since = session.backend.seq();
             match session.spec.kind {
@@ -466,14 +674,13 @@ impl Host {
         Ok(Response::ok(data))
     }
 
-    fn close(
-        &mut self,
-        name: Option<String>,
-        force: bool,
-        all: bool,
-    ) -> Result<Response, TermError> {
+    fn close(&self, name: Option<String>, force: bool, all: bool) -> Result<Response, TermError> {
         if all {
-            let names: Vec<String> = self.sessions.keys().cloned().collect();
+            let names: Vec<String> = self
+                .snapshot_sessions()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
             for name in &names {
                 self.close_session(name, force)?;
             }
@@ -484,8 +691,11 @@ impl Host {
         Ok(Response::ok(json!({"name": name, "state": "closed"})))
     }
 
-    fn close_session(&mut self, name: &str, force: bool) -> Result<(), TermError> {
-        let session = self.session_mut(name)?;
+    fn close_session(&self, name: &str, force: bool) -> Result<(), TermError> {
+        let handle = self.session(name)?;
+        let mut session = handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         session.refresh();
         if session.state == SessionState::Closed {
             return Ok(());
@@ -496,9 +706,14 @@ impl Host {
         Ok(())
     }
 
-    fn reopen(&mut self, name: &str) -> Result<Response, TermError> {
-        let spec = self.session(name)?.spec.clone();
-        self.sessions.remove(name);
+    fn reopen(&self, name: &str) -> Result<Response, TermError> {
+        let spec = {
+            let handle = self.session(name)?;
+            let session = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            session.spec.clone()
+        };
         let session = self.spawn_session(spec)?;
         let data = json!({
             "name": name,
@@ -506,29 +721,13 @@ impl Host {
             "state": "open",
             "pid": session.backend.pid(),
         });
-        self.sessions.insert(name.to_owned(), session);
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sessions.remove(name);
+        sessions.insert(name.to_owned(), Arc::new(Mutex::new(session)));
         Ok(Response::ok(data))
-    }
-
-    fn session(&self, name: &str) -> Result<&Session, TermError> {
-        self.sessions
-            .get(name)
-            .ok_or_else(|| TermError::not_found(name))
-    }
-
-    fn session_mut(&mut self, name: &str) -> Result<&mut Session, TermError> {
-        self.sessions
-            .get_mut(name)
-            .ok_or_else(|| TermError::not_found(name))
-    }
-
-    fn open_session_mut(&mut self, name: &str) -> Result<&mut Session, TermError> {
-        let session = self.session_mut(name)?;
-        session.refresh();
-        if session.state != SessionState::Open {
-            return Err(TermError::conflict(format!("session '{name}' is not open")));
-        }
-        Ok(session)
     }
 }
 
@@ -624,14 +823,26 @@ fn prepare_listener(path: &Path) -> Result<UnixListener, TermError> {
     Ok(listener)
 }
 
-fn poll_readable(fd: RawFd, timeout: Duration) -> Result<bool, TermError> {
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
+fn poll_ready(fds: &[RawFd], timeout: Option<Duration>) -> Result<Vec<bool>, TermError> {
+    let mut pollfds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|fd| libc::pollfd {
+            fd: *fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let timeout_ms = timeout
+        .map(|duration| duration.as_millis().min(i32::MAX as u128) as i32)
+        .unwrap_or(-1);
     loop {
-        let result = unsafe { libc::poll(&mut pollfd, 1, timeout.as_millis() as i32) };
+        let result = unsafe {
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
         if result < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -641,7 +852,23 @@ fn poll_readable(fd: RawFd, timeout: Duration) -> Result<bool, TermError> {
                 "could not poll the term socket: {error}"
             )));
         }
-        return Ok(result > 0);
+        return Ok(pollfds
+            .iter()
+            .map(|pollfd| pollfd.revents & libc::POLLIN != 0)
+            .collect());
+    }
+}
+
+fn drain_wake(stream: &UnixStream) {
+    let mut reader = stream;
+    let mut buffer = [0u8; 64];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
     }
 }
 
@@ -685,6 +912,86 @@ impl Drop for SocketGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_shared() -> (Arc<Shared>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let (wake, wake_rx) = UnixStream::pair().unwrap();
+        drop(wake_rx);
+        let shared = Arc::new(Shared {
+            workspace_root: dir.path().to_path_buf(),
+            sessions: Mutex::new(BTreeMap::new()),
+            shutdown: AtomicBool::new(false),
+            wake,
+        });
+        (shared, dir)
+    }
+
+    fn insert_cmd_session(shared: &Shared, name: &str, command: &str) {
+        let spec = SessionSpec::cmd(
+            name,
+            vec!["/bin/sh".to_owned(), "-c".to_owned(), command.to_owned()],
+        );
+        let backend = Backend::spawn(&spec, &shared.workspace_root, None).unwrap();
+        let session = Session {
+            spec,
+            state: SessionState::Open,
+            backend,
+            created_ms: now_ms(),
+            takeover: false,
+            journal_error: None,
+        };
+        shared
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), Arc::new(Mutex::new(session)));
+    }
+
+    #[test]
+    fn tc_2693_wait_does_not_block_other_clients() {
+        let (shared, _dir) = test_shared();
+        insert_cmd_session(&shared, "a", "sleep 30");
+
+        let waiter = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                shared
+                    .dispatch_op(RequestOp::Wait {
+                        name: "a".to_owned(),
+                        regex: Some("never".to_owned()),
+                        idle_ms: None,
+                        timeout_ms: Some(2_000),
+                        since: 0,
+                    })
+                    .unwrap()
+            })
+        };
+
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        let response = shared
+            .dispatch_op(RequestOp::Read {
+                name: "a".to_owned(),
+                since: 0,
+                tail: None,
+                raw: true,
+            })
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(response.ok, "read during wait failed: {response:?}");
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "read during a wait took {elapsed:?}"
+        );
+
+        let waited = waiter.join().unwrap();
+        assert_eq!(waited.exit_code, Some(exit::FAILED));
+        let _ = shared.dispatch_op(RequestOp::Close {
+            name: Some("a".to_owned()),
+            force: true,
+            all: false,
+        });
+    }
 
     #[test]
     fn tc_2609_takeover_lock_rejects_input_until_release() {

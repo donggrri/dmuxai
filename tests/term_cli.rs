@@ -25,6 +25,8 @@
 //! - TC-2690 (NFR-2690): non-term commands never start a host
 //! - TC-2691 (NFR-2691): warm-host send+read p50 under the loose bound
 //! - TC-2692 (NFR-2692): exec overhead within the loose x3 bound
+//! - TC-2693 (NFR-2693): a read from a second client is served while the host
+//!   is still blocked in another client's wait
 //! - TC-2695 (INT-2695): `--json` errors are exactly one JSON object
 
 #![cfg(unix)]
@@ -32,7 +34,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -118,16 +120,17 @@ impl Sandbox {
         dmuxai::state_path::repo_key(&self.workspace).expect("repo_key")
     }
 
-    /// Per-workspace socket directory: `$XDG_STATE_HOME/dmuxai/repos/<key>`.
+    /// Per-workspace socket directory: `$XDG_STATE_HOME/dmuxai/repos/<key>/term`.
     fn socket_dir(&self) -> PathBuf {
         self.state_home
             .join("dmuxai")
             .join("repos")
             .join(self.repo_key())
+            .join("term")
     }
 
     fn socket_file(&self) -> PathBuf {
-        self.socket_dir().join("term.sock")
+        self.socket_dir().join("host.sock")
     }
 
     /// Session journal roots: `$XDG_DATA_HOME/dmuxai/repos/<key>/terms`.
@@ -274,6 +277,19 @@ fn child_pid_from(text: &str, prefix: &str) -> u32 {
         .captures(text)
         .unwrap_or_else(|| panic!("no {prefix}<pid> in exec output: {text:?}"));
     caps[1].parse().unwrap()
+}
+
+/// Kills and reaps a spawned CLI child on drop so a failing assert never
+/// leaves the process behind.
+struct ReapOnDrop(Option<Child>);
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// TC-2600 / FR-2600: open ok with pid, duplicate exit 4, bad name exit 2, and
@@ -933,6 +949,74 @@ fn tc_2692_exec_overhead_within_loose_bound() {
         term_ms <= base_ms.saturating_mul(3).max(base_ms + 200),
         "term exec {term_ms} ms vs bash -c {base_ms} ms exceeds the x3 bound"
     );
+}
+
+/// TC-2693 / NFR-2693: while one client connection is parked in `term wait`,
+/// a second client's `term read` is served immediately instead of queueing
+/// behind the wait — the host serves each accepted connection on its own
+/// thread. Mirrors the in-process unit test `tc_2693_wait_does_not_block_
+/// other_clients` (a read during a 2 s wait returns in under 300 ms).
+#[test]
+fn tc_2693_parallel_read_during_wait() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    sandbox.open_shell("a");
+
+    // A never-matching regex with a 2 s timeout parks one connection in the
+    // host wait path for the whole window.
+    let waiter = sandbox
+        .command(&[
+            "term",
+            "wait",
+            "a",
+            "--match",
+            "zz-never-match-zz",
+            "--timeout",
+            "2s",
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn background wait client");
+    let mut waiter = ReapOnDrop(Some(waiter));
+
+    // Give the wait client time to connect and enter the blocking wait.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // A second client process reads while the first is still waiting.
+    let started = Instant::now();
+    let (out, read) = sandbox.term_json(&["term", "read", "a", "--json"]);
+    let elapsed = started.elapsed();
+    assert_eq!(out.code, 0, "read during wait failed: {out:?}");
+    assert!(read["text"].is_string(), "read during wait: {read:?}");
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "read during a 2 s wait took {elapsed:?}; the host blocked it behind the wait"
+    );
+
+    // The read truly overlapped the wait: the wait client is still running.
+    assert!(
+        waiter.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "wait client finished before the read; the read did not overlap it"
+    );
+
+    // The wait ends on its own timeout: exit 1 with reason "timeout".
+    let waited = waiter
+        .0
+        .take()
+        .unwrap()
+        .wait_with_output()
+        .expect("reap wait client");
+    assert_eq!(
+        waited.status.code(),
+        Some(1),
+        "wait must exit 1 on timeout: {}",
+        String::from_utf8_lossy(&waited.stdout)
+    );
+    let waited_json: Value = serde_json::from_slice(&waited.stdout).expect("wait json");
+    assert_eq!(waited_json["reason"], "timeout", "wait: {waited_json:?}");
 }
 
 /// TC-2695 / INT-2695: `term <op> --json` always prints exactly one JSON object
