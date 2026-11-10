@@ -14,7 +14,10 @@
 //! - TC-2604 (FR-2604): wait match, wait timeout (unit covers never-match regex
 //!   semantics in `src/term/wait.rs`)
 //! - TC-2605 (FR-2605): exec true/false/printf, marker removed
-//! - TC-2606 (FR-2606): list/show/unknown/empty list without host
+//! - TC-2606 (FR-2606): list/show/unknown/empty list without host; closed and
+//!   exited sessions are history hidden from the default list, shown by
+//!   `list --all` and still reported by `show`; both list forms return []
+//!   without a host and never start one
 //! - TC-2607 (FR-2607): close kills the process-group child, self-exit state;
 //!   close --all / close NAME without a listening host spawn no host
 //! - TC-2608 (FR-2608): resize propagated to the PTY, invalid dims exit 2
@@ -31,6 +34,8 @@
 //!   `usbipd_busid_missing`; `--no-usbipd-attach` skips attach even with a
 //!   busid
 //! - TC-2615 (FR-2615): wait without --since does not match older buffer text
+//! - TC-2622 (FR-2604): `wait --match` matches a prompt emitted in several
+//!   writes and wrapped in ANSI escapes/CR; `read --raw` still shows ESC
 //! - TC-2616 (FR-2616): exec reply text is exactly the command output
 //! - TC-2617 (FR-2617): `term --help`, `term open --help` and `--help`/`-h`
 //!   for every other term subcommand exit 0 with subcommand-local help, not
@@ -45,6 +50,8 @@
 //! - TC-2620 (FR-2620): masked io.jsonl with modes 0600/0700 (unit covers the
 //!   writer in `src/term/journal.rs`)
 //! - TC-2632 (FR-2632): child env scrubbed, `--env` still delivered
+//! - TC-2623 (#317): the host process cwd is not the workspace and the host
+//!   exits within the idle grace plus slack after the last session closes
 //! - TC-2690 (NFR-2690): non-term commands never start a host
 //! - TC-2691 (NFR-2691): warm-host send+read p50 under the loose bound
 //! - TC-2692 (NFR-2692): exec overhead within the loose x3 bound
@@ -319,7 +326,14 @@ struct PtyBoard {
     master: i32,
     slave: i32,
     stop: Arc<AtomicBool>,
+    emit_tx: std::sync::mpsc::Sender<Vec<u8>>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn drain_emits(rx: &std::sync::mpsc::Receiver<Vec<u8>>, master: i32) {
+    while let Ok(data) = rx.try_recv() {
+        board_write(master, &data);
+    }
 }
 
 impl PtyBoard {
@@ -357,10 +371,12 @@ impl PtyBoard {
 
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let (emit_tx, emit_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let thread = std::thread::spawn(move || {
             board_write(master, b"BOOT READY\r\n");
             let mut buffer = [0u8; 1024];
             while !thread_stop.load(Ordering::Relaxed) {
+                drain_emits(&emit_rx, master);
                 let mut pollfd = libc::pollfd {
                     fd: master,
                     events: libc::POLLIN,
@@ -392,12 +408,21 @@ impl PtyBoard {
             master,
             slave,
             stop,
+            emit_tx,
             thread: Some(thread),
         }
     }
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Sends raw bytes to the fake board from the test side; the board thread
+    /// writes them onto the PTY master within roughly one poll tick.
+    fn emit(&self, data: &[u8]) {
+        self.emit_tx
+            .send(data.to_vec())
+            .expect("board thread alive");
     }
 
     fn close(&mut self) {
@@ -758,6 +783,73 @@ fn tc_2615_wait_without_since_ignores_older_output() {
     assert_eq!(matched["reason"], "match", "wait: {matched:?}");
 }
 
+/// TC-2622 / FR-2604: `wait --match '[#$] '` succeeds when the PTY fake board
+/// emits its prompt split across separate writes and wrapped in ANSI escapes
+/// and CR — the matcher strips the wrapping. `read --raw` still shows the
+/// raw ESC bytes.
+#[test]
+fn tc_2622_wait_match_prompt_across_writes_with_ansi_and_cr() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let board = PtyBoard::start();
+    let serial = board.path().to_str().expect("utf8 slave path").to_owned();
+
+    let (out, opened) = sandbox.term_json(&[
+        "term", "open", "board", "--serial", &serial, "--baud", "115200", "--json",
+    ]);
+    assert_eq!(out.code, 0, "serial open failed: {out:?}");
+    assert_eq!(opened["state"], "open", "open: {opened:?}");
+
+    // Consume the startup banner first so the later wait starts fresh.
+    let (out, _) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "board",
+        "--match",
+        "BOOT READY",
+        "--since",
+        "0",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "banner wait failed: {out:?}");
+
+    // The board prints its prompt in several writes, wrapped in a title OSC,
+    // CSI color sequences and CRs, so no single write contains "[#$] ".
+    board.emit(b"\x1b]0;board\x07");
+    board.emit(b"\r");
+    board.emit(b"\x1b[1;32m");
+    board.emit(b"boar");
+    board.emit(b"d0\x1b[0m");
+    board.emit(b"\r");
+    board.emit(b"boar");
+    board.emit(b"d0# ");
+
+    let (out, waited) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "board",
+        "--match",
+        r"[#$] ",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "wait for wrapped prompt failed: {out:?}");
+    assert_eq!(waited["reason"], "match", "wait: {waited:?}");
+    let text = waited["text"].as_str().unwrap_or_default().to_owned();
+    assert!(text.contains("d0# "), "match text: {text:?}");
+    assert!(!text.contains("\x1b"), "match text is stripped: {text:?}");
+
+    // TC-2622: `read --raw` keeps the escape bytes.
+    let (out, read) = sandbox.term_json(&["term", "read", "board", "--raw", "--json"]);
+    assert_eq!(out.code, 0, "raw read failed: {out:?}");
+    let raw = read["text"].as_str().unwrap_or_default().to_owned();
+    assert!(raw.contains("\x1b"), "raw read keeps ESC: {raw:?}");
+    assert!(raw.contains("d0"), "raw read has the prompt: {raw:?}");
+}
+
 /// TC-2616 / FR-2616: the exec reply `text` is exactly the command output —
 /// no echoed command line, no nonce marker and no trailing prompt.
 #[test]
@@ -1077,12 +1169,18 @@ fn tc_2606_list_show_and_unknown() {
     let sandbox = Sandbox::new();
     let _guard = sandbox.close_guard();
 
-    // No host running: `list --json` returns [] and does not start a host.
-    let (out, listed) = sandbox.term_json(&["term", "list", "--json"]);
-    assert_eq!(out.code, 0, "list without host failed: {out:?}");
-    assert_eq!(listed, json!([]), "empty list: {listed:?}");
-    assert!(sandbox.host_pids().is_empty(), "list must not start a host");
-    assert!(!sandbox.socket_file().exists(), "no socket for list alone");
+    // No host running: `list --json` and `list --all --json` return [] and
+    // neither starts a host.
+    for args in [
+        vec!["term", "list", "--json"],
+        vec!["term", "list", "--all", "--json"],
+    ] {
+        let (out, listed) = sandbox.term_json(&args);
+        assert_eq!(out.code, 0, "list without host failed: {out:?}");
+        assert_eq!(listed, json!([]), "empty list: {listed:?}");
+        assert!(sandbox.host_pids().is_empty(), "list must not start a host");
+        assert!(!sandbox.socket_file().exists(), "no socket for list alone");
+    }
 
     sandbox.open_shell("b");
     sandbox.open_shell("c");
@@ -1132,6 +1230,42 @@ fn tc_2606_list_show_and_unknown() {
     }
     assert_eq!(shown["name"], "b");
     assert_eq!(shown["state"], "open", "showed: {shown:?}");
+
+    // TC-2606 / FR-2606: a closed session stays in the host's list as
+    // intended history. The default list hides it, `list --all` includes it
+    // with state=closed, and `show` still reports closed.
+    let (out, _) = sandbox.term_json(&["term", "close", "c", "--json"]);
+    assert_eq!(out.code, 0, "close c failed: {out:?}");
+
+    let (out, listed) = sandbox.term_json(&["term", "list", "--json"]);
+    assert_eq!(out.code, 0, "list after close failed: {out:?}");
+    let names: Vec<&str> = listed
+        .as_array()
+        .expect("list array")
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"b") && !names.contains(&"c"),
+        "closed session must be hidden from the default list: {names:?}"
+    );
+
+    let (out, listed_all) = sandbox.term_json(&["term", "list", "--all", "--json"]);
+    assert_eq!(out.code, 0, "list --all after close failed: {out:?}");
+    let entries = listed_all.as_array().expect("list --all array");
+    assert_eq!(entries.len(), 2, "list --all includes closed: {entries:?}");
+    let closed = entries
+        .iter()
+        .find(|entry| entry["name"].as_str() == Some("c"))
+        .expect("closed entry in --all");
+    assert_eq!(closed["state"], "closed", "closed entry: {closed:?}");
+
+    let (out, shown) = sandbox.term_json(&["term", "show", "c", "--json"]);
+    assert_eq!(out.code, 0, "show closed failed: {out:?}");
+    assert_eq!(
+        shown["state"], "closed",
+        "show still reports closed: {shown:?}"
+    );
 
     let (out, json) = sandbox.term_json(&["term", "show", "ghost", "--json"]);
     assert_eq!(out.code, 3, "unknown show must exit 3: {out:?}");
@@ -1227,6 +1361,44 @@ fn tc_2607_close_named_without_host_reports_not_found() {
     assert!(
         !sandbox.socket_file().exists(),
         "close NAME must not create a socket"
+    );
+}
+
+/// TC-2623 (#317): the host process is not pinned to the workspace and does
+/// not outlive its sessions by much: its cwd symlink under procfs is not the
+/// sandbox workspace (when procfs exposes it), and after the last session is
+/// closed the host process exits within DMUXAI_TERM_IDLE_SECS (5) plus a
+/// small slack (about 3s).
+#[test]
+fn tc_2623_host_cwd_not_workspace_and_exits_after_close() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    sandbox.open_shell("a");
+
+    let pids = sandbox.host_pids();
+    assert_eq!(pids.len(), 1, "one host process: {pids:?}");
+    let host_pid = pids[0];
+
+    // Skipped when the procfs symlink cannot be read (anything but "the
+    // workspace" is fine; the host keeps its journal cwd instead).
+    if let Ok(cwd) = std::fs::read_link(format!("/proc/{host_pid}/cwd")) {
+        assert_ne!(
+            cwd, sandbox.workspace,
+            "host cwd must not be the sandbox workspace: {cwd:?}"
+        );
+    }
+
+    let (out, _) = sandbox.term_json(&["term", "close", "a", "--json"]);
+    assert_eq!(out.code, 0, "close failed: {out:?}");
+
+    // IDLE_SECS is 5 in every test run; allow ~3s of slack.
+    let exited = poll_until(
+        Duration::from_secs(IDLE_SECS.parse::<u64>().expect("idle secs") + 3),
+        || !pid_exists(host_pid),
+    );
+    assert!(
+        exited,
+        "host process {host_pid} must exit within idle grace + slack"
     );
 }
 
@@ -1789,7 +1961,7 @@ fn tc_2617_term_help_and_open_help_are_subcommand_local() {
         ("wait", &["--match", "--idle", "--timeout", "--since"]),
         ("exec", &["--timeout"]),
         ("approve", &["16 lowercase hex"]),
-        ("list", &["never starts one"]),
+        ("list", &["--all", "never starts one"]),
         ("resize", &["--cols", "--rows"]),
         ("close", &["--all", "--force"]),
         ("reopen", &["same spec"]),
