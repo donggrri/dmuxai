@@ -17,11 +17,14 @@ All notable changes to dmuxai are listed here. Versions follow
 - **Terminal sessions PR1b (FR-2610..2616, FR-2630).** `term open --serial DEV --baud N`
   opens the device with serial2 (parity/data/stop/flow; no extra tool). Missing, permission,
   and busy failures use distinct `error_kind` values and the FR-2611 hint text (never
-  `chmod 666`). WSL1 maps `COMn` to `/dev/ttySn`. On WSL2 a missing path runs
-  `usbipd.exe attach --wsl --busid <id>` once (id from `--usbipd-busid` or trusted
-  `[terminal.serial] usbipd_busid`; never auto-selected from `usbipd.exe list`).
-  Without an explicit busid, attach is skipped. `--no-usbipd-attach` (or trusted
-  `[terminal.serial] usbipd_attach = false`) disables attach even when a busid is set.
+  `chmod 666`). WSL1 maps `COMn` to `/dev/ttySn`. On WSL a missing path never invokes
+  `usbipd.exe`; the command exits 3 with `error_kind` `needs_usbipd_attach`, `busid`
+  when known (`--usbipd-busid` or trusted `[terminal.serial] usbipd_busid`), and the
+  elevated Windows PowerShell commands `usbipd bind --busid <id>` (first time only)
+  and `usbipd attach --wsl --busid <id>`. Without a known busid the commands use a
+  `<busid>` placeholder and `usbipd list`. `--no-usbipd-attach` is a deprecated no-op;
+  `[terminal.serial] usbipd_attach` is ignored if present. Native Linux missing devices
+  use `serial_not_found`.
   Unplug (EIO/ENXIO) moves the
   session to `lost`; `term reopen` drops the old file descriptor before retrying.
   `open --wait-for REGEX --timeout` waits for a banner. `term wait` without `--since`
@@ -43,13 +46,13 @@ All notable changes to dmuxai are listed here. Versions follow
 - **`term list` hides closed and exited sessions (#316).** They remain history: `show NAME` still works, and `term list --all` includes them.
 - **The terminal host idle-exits even when launched with `-C` on a non-Linux cwd (#317).**
   After binding the socket it chdirs to the socket directory (failure ignored). Idle expiry is decided before session I/O log flush, and flush is skipped once no live sessions remain.
-- **`term open --serial` no longer auto-attaches the first `usbipd list` device (#308).**
-  Without an explicit busid, dmuxai does not invoke `usbipd.exe` (no `list`, no `attach`)
-  and exits with `error_kind` `usbipd_busid_missing` plus a hint to pass `--usbipd-busid`.
-
-- **`--no-usbipd-attach` skips usbipd attach even when a busid is set and a host is
-  already running (#310).** The flag travels on the open request (`SerialConfig`), so a
-  warm host does not inherit-only via `DMUXAI_NO_USBIPD_ATTACH`.
+- **`term open --serial` never runs usbipd from WSL (#319, supersedes #308 and #310).**
+  A missing device on WSL exits 3 with `error_kind` `needs_usbipd_attach`. JSON includes
+  `busid` when known and the elevated Windows PowerShell commands `usbipd bind --busid <id>`
+  (first time only) and `usbipd attach --wsl --busid <id>`. Without a known busid the
+  guidance uses a `<busid>` placeholder and `usbipd list`. Native Linux still reports
+  `serial_not_found`. `--no-usbipd-attach` is accepted as a deprecated no-op (warn on
+  stderr). `[terminal.serial] usbipd_attach` is ignored.
 - **Every `dmuxai term <subcommand> --help` prints that subcommand's help (#311),**
   not the parent `term` list. `term wait --help` names `--match`, `--idle`, `--timeout`,
   and `--since`.

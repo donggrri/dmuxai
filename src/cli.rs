@@ -200,7 +200,8 @@ Subcommands:
   reopen NAME   Reopen a lost session with the same spec
 
 Run `dmuxai term open --help` for open options (including --serial, --baud,
---usbipd-busid and --no-usbipd-attach). Run `dmuxai --help` for the root usage.
+--usbipd-busid and the deprecated --no-usbipd-attach). Run `dmuxai --help` for
+the root usage.
 ";
 
 /// Subcommand-local help for `dmuxai term open --help` / `-h` (FR-2617).
@@ -234,15 +235,15 @@ Serial options:
   --data B                 Data bits 5-8 (default 8)
   --stop S                 Stop bits 1 or 2 (default 1)
   --flow F                 Flow control: none or rtscts (default none)
-  --usbipd-busid ID        Explicit usbipd busid for a WSL2 attach; never
-                           selected from `usbipd list` output
-  --no-usbipd-attach       Do not run usbipd.exe attach even when a busid is
-                           set
+   --usbipd-busid ID        Busid named only in needs_usbipd_attach guidance;
+                            never selected from `usbipd list` output
+   --no-usbipd-attach       Deprecated no-op; accepted for compatibility,
+                            dmuxai never runs usbipd attach
 
-On WSL2 with a missing device, `usbipd.exe attach --wsl --busid <id>` runs
-once only when an explicit busid is given (--usbipd-busid or trusted
-[terminal.serial] usbipd_busid). Without a busid the command exits with
-error_kind usbipd_busid_missing and never invokes usbipd.exe.
+On WSL2 with a missing --serial device, dmuxai exits with error_kind
+needs_usbipd_attach and never runs usbipd.exe; its guidance names the bind and
+attach commands for an elevated Windows PowerShell. --usbipd-busid (or trusted
+[terminal.serial] usbipd_busid) only names the busid in that guidance.
 ";
 
 /// Subcommand-local help for `dmuxai term send --help` / `-h` (FR-2617).
@@ -1382,8 +1383,9 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
             config.stop = stop;
             config.flow = flow;
             config.usbipd_busid = usbipd_busid.filter(|value| !value.trim().is_empty());
-            // FR-2614: carry the flag in the open request itself so a warm
-            // host skips usbipd.exe even when it did not inherit the CLI env.
+            // Deprecated flag: still carried in the open request so a warm
+            // host's saved session spec keeps its shape; it no longer changes
+            // any behavior there.
             config.no_usbipd_attach = no_usbipd_attach;
             config.validate().map_err(|error| error.message)?;
             Some(config)
@@ -1428,6 +1430,13 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
         }
     } else if timeout_ms.is_some() {
         return Err("--timeout needs --wait-for".to_owned());
+    }
+    if no_usbipd_attach {
+        // Deprecated: the flag parses and travels with the request, but dmuxai
+        // never runs usbipd attach from WSL, so it has no effect.
+        eprintln!(
+            "warning: --no-usbipd-attach is deprecated and has no effect; dmuxai never runs usbipd attach from WSL"
+        );
     }
     Ok(TermCommand {
         op: TermOp::Open {
@@ -1731,21 +1740,9 @@ fn execute_term(_workspace_root: &Path, command: TermCommand) -> i32 {
 #[cfg(unix)]
 fn execute_term(workspace_root: &Path, command: TermCommand) -> i32 {
     let TermCommand { op, json } = command;
-    // FR-2614: `--no-usbipd-attach` must disable the usbipd attach in the host
-    // that opens the serial device. The host inherits this process env when it
-    // is autostarted, and `term::serial` reads the same variable.
-    if let TermOp::Open {
-        serial: Some(_),
-        no_usbipd_attach: true,
-        ..
-    } = &op
-    {
-        // SAFETY: called once on the CLI startup path before the tokio spawn
-        // helpers or the terminal host are started.
-        unsafe {
-            std::env::set_var("DMUXAI_NO_USBIPD_ATTACH", "1");
-        }
-    }
+    // FR-2614 as amended: dmuxai never runs usbipd attach from WSL, so
+    // `--no-usbipd-attach` is accepted only for compatibility; the deprecated
+    // flag no longer changes any behavior on the host side.
     if matches!(&op, TermOp::Host) {
         return match dmuxai::term::host::run(workspace_root) {
             Ok(()) => exit::OK,

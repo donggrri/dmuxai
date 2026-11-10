@@ -3,12 +3,12 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use serde_json::json;
 use serial2::{CharSize, FlowControl, Parity, SerialPort, Settings, StopBits};
 
 use crate::term::buffer::{BufferRead, DEFAULT_CAPACITY, RingBuffer};
@@ -17,21 +17,18 @@ use crate::term::{ExitStatus, TermError, check_input_size, exit, validate_dimens
 
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-const USBIPD_ATTACH_WAIT: Duration = Duration::from_secs(3);
-const USBIPD_ATTACH_POLL: Duration = Duration::from_millis(50);
 
 pub const ERROR_MISSING: &str = "serial_not_found";
 pub const ERROR_PERMISSION: &str = "serial_permission";
 pub const ERROR_BUSY: &str = "serial_busy";
 pub const ERROR_INVALID: &str = "serial_invalid_settings";
+pub const ERROR_NEEDS_USBIPD_ATTACH: &str = "needs_usbipd_attach";
+// Kept so the host/client error-kind interner still recognizes historical
+// usbipd errors from an older host. New serial opens never emit these.
 pub const ERROR_USBIPD_NOT_FOUND: &str = "usbipd_not_found";
 pub const ERROR_USBIPD_LIST: &str = "usbipd_list_failed";
 pub const ERROR_USBIPD_BUSID: &str = "usbipd_busid_missing";
 pub const ERROR_USBIPD_ATTACH: &str = "usbipd_attach_failed";
-
-const USBIPD_ATTACH_ENV: &str = "DMUXAI_USBIPD_ATTACH";
-const USBIPD_ATTACH_ENV_ALIAS: &str = "DMUXAI_TERM_USBIPD_ATTACH";
-const USBIPD_NO_ATTACH_ENV: &str = "DMUXAI_NO_USBIPD_ATTACH";
 
 pub use crate::term::{SerialConfig, SerialFlow, SerialParity};
 
@@ -257,57 +254,11 @@ pub fn open_with_env(
     match open_port(config, &device) {
         Ok(port) => Ok(SerialBackend::start(config, device, port, journal)),
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) && env.wsl2 => {
-            if config.no_usbipd_attach {
-                return Err(missing_device_error(&device));
-            }
-            attach_usbipd(config, env, &device)?;
-            match open_port(config, &device) {
-                Ok(port) => Ok(SerialBackend::start(config, device, port, journal)),
-                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
-                    let mut failure = missing_device_error(&device);
-                    failure.message = format!(
-                        "usbipd attach completed but the device is still missing. {}",
-                        failure.message
-                    );
-                    Err(failure)
-                }
-                Err(error) => Err(map_open_error(&device, &error)),
-            }
+            let busid = resolve_busid(config.usbipd_busid.as_deref(), env.trusted_busid.as_deref());
+            Err(needs_usbipd_attach_error(&device, busid.as_deref()))
         }
         Err(error) => Err(map_open_error(&device, &error)),
     }
-}
-
-fn usbipd_program() -> PathBuf {
-    if let Some(path) = std::env::var_os("DMUXAI_USBIPD_BIN") {
-        return PathBuf::from(path);
-    }
-    if let Some(dir) = std::env::var_os("DMUXAI_USBIPD_DIR") {
-        return PathBuf::from(dir).join("usbipd.exe");
-    }
-    PathBuf::from("usbipd.exe")
-}
-
-fn usbipd_output(device: &Path, args: &[&str]) -> Result<std::process::Output, TermError> {
-    Command::new(usbipd_program())
-        .args(args)
-        .output()
-        .map_err(|error| {
-            let message = if error.kind() == io::ErrorKind::NotFound {
-                format!(
-                    "usbipd.exe was not found. Install usbipd-win and run `usbipd bind` as administrator from Windows. {}",
-                    manual_hint(device)
-                )
-            } else {
-                format!("could not run usbipd.exe: {error}")
-            };
-            let kind = if error.kind() == io::ErrorKind::NotFound {
-                ERROR_USBIPD_NOT_FOUND
-            } else {
-                ERROR_USBIPD_ATTACH
-            };
-            serial_error(exit::INTERNAL, kind, message)
-        })
 }
 
 pub fn resolve_busid(explicit: Option<&str>, trusted: Option<&str>) -> Option<String> {
@@ -320,95 +271,39 @@ pub fn resolve_busid(explicit: Option<&str>, trusted: Option<&str>) -> Option<St
     None
 }
 
-fn env_truthy(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-fn env_falsey(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "0" | "false" | "no" | "off"
-    )
-}
-
-fn env_attach_disabled() -> Option<bool> {
-    for name in [USBIPD_ATTACH_ENV, USBIPD_ATTACH_ENV_ALIAS] {
-        if let Some(value) = std::env::var_os(name) {
-            return Some(env_falsey(&value.to_string_lossy()));
-        }
-    }
-    std::env::var_os(USBIPD_NO_ATTACH_ENV).map(|value| env_truthy(&value.to_string_lossy()))
-}
-
-fn trusted_attach_disabled() -> bool {
-    let Some(workspace) = crate::workspace::resolve_workspace_root().ok() else {
-        return false;
+fn needs_usbipd_attach_error(device: &Path, busid: Option<&str>) -> TermError {
+    let path = device.display();
+    let (message, data) = match busid {
+        Some(busid) => (
+            format!(
+                "serial device {path} not found. On WSL2, run these commands in an elevated Windows PowerShell (usbipd-win): `usbipd bind --busid {busid}` (first time only), then `usbipd attach --wsl --busid {busid}`. dmuxai does not run usbipd."
+            ),
+            json!({
+                "busid": busid,
+                "commands": [
+                    format!("usbipd bind --busid {busid}"),
+                    format!("usbipd attach --wsl --busid {busid}"),
+                ],
+            }),
+        ),
+        None => (
+            format!(
+                "serial device {path} not found. On WSL2, run these commands in an elevated Windows PowerShell (usbipd-win): `usbipd list` to find the busid, then `usbipd bind --busid <busid>` (first time only), then `usbipd attach --wsl --busid <busid>`. dmuxai does not run usbipd."
+            ),
+            json!({
+                "commands": [
+                    "usbipd list",
+                    "usbipd bind --busid <busid>",
+                    "usbipd attach --wsl --busid <busid>",
+                ],
+            }),
+        ),
     };
-    crate::settings::DmuxSettings::load(&workspace).terminal_serial_usbipd_attach == Some(false)
-}
-
-fn attach_disabled() -> bool {
-    env_attach_disabled().unwrap_or_else(trusted_attach_disabled)
-}
-
-fn attach_usbipd(config: &SerialConfig, env: &SerialEnv, device: &Path) -> Result<(), TermError> {
-    let hint = manual_hint(device);
-    if config.no_usbipd_attach {
-        return Err(missing_device_error(device));
-    }
-    let Some(busid) = resolve_busid(config.usbipd_busid.as_deref(), env.trusted_busid.as_deref())
-    else {
-        return Err(serial_error(
-            exit::INTERNAL,
-            ERROR_USBIPD_BUSID,
-            format!(
-                "could not resolve a usbipd busid. Run `usbipd list` in Windows and pass --usbipd-busid <id>. {hint}"
-            ),
-        ));
-    };
-    if attach_disabled() {
-        return Err(missing_device_error(device));
-    }
-
-    let output = usbipd_output(device, &["attach", "--wsl", "--busid", &busid])?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        return Err(serial_error(
-            exit::INTERNAL,
-            ERROR_USBIPD_ATTACH,
-            format!(
-                "usbipd.exe attach --wsl --busid {busid} failed: {detail}. Make sure the device is bound once with an administrator `usbipd bind`. {hint}"
-            ),
-        ));
-    }
-
-    let deadline = Instant::now() + USBIPD_ATTACH_WAIT;
-    while Instant::now() < deadline {
-        if device.exists() {
-            return Ok(());
-        }
-        thread::sleep(USBIPD_ATTACH_POLL);
-    }
-    if device.exists() {
-        Ok(())
-    } else {
-        Err(serial_error(
-            exit::NOT_FOUND,
-            ERROR_MISSING,
-            format!(
-                "usbipd.exe attach --wsl --busid {busid} completed but {} is still missing. {hint}",
-                device.display()
-            ),
-        ))
+    TermError {
+        code: exit::NOT_FOUND,
+        message,
+        error_kind: Some(ERROR_NEEDS_USBIPD_ATTACH),
+        data: Some(data),
     }
 }
 
@@ -656,15 +551,14 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
 
-    const TEST_ENV: [&str; 7] = [
+    const TEST_ENV: [&str; 5] = [
         "DMUXAI_USBIPD_BIN",
         "DMUXAI_USBIPD_ATTACH",
         "DMUXAI_TERM_USBIPD_ATTACH",
         "DMUXAI_NO_USBIPD_ATTACH",
-        "DMUXAI_WORKSPACE",
-        "DMUXAI_TRUST_WORKSPACE_CONFIG",
-        "DMUXAI_CONFIG",
+        "DMUXAI_SERIAL_WSL2",
     ];
 
     fn with_path<R>(path: &Path, action: impl FnOnce() -> R) -> R {
@@ -776,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn tc_2614_wsl2_without_busid_does_not_run_usbipd() {
+    fn tc_2614_wsl2_without_busid_reports_guidance_without_running_usbipd() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("usbipd.log");
         fake_usbipd(
@@ -795,71 +689,36 @@ mod tests {
         let error = with_path(dir.path(), || {
             open_with_env(&config, &env, None).expect_err("no explicit busid")
         });
-        assert_eq!(error.error_kind, Some(ERROR_USBIPD_BUSID));
-        assert!(error.message.contains("usbipd list"));
-        assert!(error.message.contains("--usbipd-busid <id>"));
+        assert_eq!(error.code, exit::NOT_FOUND);
+        assert_eq!(error.error_kind, Some(ERROR_NEEDS_USBIPD_ATTACH));
         assert!(
             error.message.contains(&device.display().to_string()),
             "hint must name the real device path: {}",
             error.message
+        );
+        assert!(error.message.contains("usbipd list"));
+        assert!(error.message.contains("<busid>"));
+        assert!(error.message.contains("first time only"));
+        assert!(error.message.contains("elevated Windows PowerShell"));
+
+        let data = error.data.expect("guidance data");
+        assert!(data.get("busid").is_none());
+        assert_eq!(
+            data["commands"],
+            serde_json::json!([
+                "usbipd list",
+                "usbipd bind --busid <busid>",
+                "usbipd attach --wsl --busid <busid>",
+            ])
         );
         assert!(
             !log.exists(),
-            "usbipd must not be invoked without an explicit busid"
+            "usbipd must not be invoked without a known busid"
         );
     }
 
     #[test]
-    fn tc_2614_wsl2_attaches_once_and_returns_the_manual_hint() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("usbipd.log");
-        fake_usbipd(
-            dir.path(),
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  list) printf 'BUSID VID:PID DEVICE STATE\\n1-2 0403:6001 USB Serial Not attached\\n' ;;\n  attach) exit 0 ;;\nesac\n",
-                log.display()
-            ),
-        );
-        let device = dir.path().join("missing-device");
-        let mut config = SerialConfig::new(&device, 115_200);
-        config.usbipd_busid = Some("1-2".to_owned());
-        let env = SerialEnv {
-            wsl2: true,
-            trusted_busid: None,
-        };
-        let error = with_path(dir.path(), || {
-            open_with_env(&config, &env, None).expect_err("device is still missing")
-        });
-        assert_eq!(error.error_kind, Some(ERROR_MISSING));
-        assert!(error.message.contains("usbipd attach --wsl --busid"));
-        assert!(error.message.contains("device is still missing"));
-        assert!(
-            error.message.contains(&device.display().to_string()),
-            "hint must name the real device path: {}",
-            error.message
-        );
-
-        let calls = fs::read_to_string(&log).unwrap();
-        assert_eq!(
-            calls
-                .lines()
-                .filter(|line| line.starts_with("attach"))
-                .count(),
-            1,
-            "usbipd attach must run exactly once: {calls}"
-        );
-        assert!(
-            !calls.lines().any(|line| line == "list"),
-            "an explicit busid must not list: {calls}"
-        );
-        assert!(
-            calls.lines().any(|line| line == "attach --wsl --busid 1-2"),
-            "attach argv: {calls}"
-        );
-    }
-
-    #[test]
-    fn tc_2614_attach_env_skips_usbipd_and_reports_missing_device() {
+    fn tc_2614_wsl2_with_busid_reports_guidance_without_running_usbipd() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("usbipd.log");
         fake_usbipd(
@@ -877,18 +736,66 @@ mod tests {
             trusted_busid: None,
         };
         let error = with_path(dir.path(), || {
-            unsafe { std::env::set_var("DMUXAI_USBIPD_ATTACH", "0") };
-            open_with_env(&config, &env, None).expect_err("attach is disabled")
+            open_with_env(&config, &env, None).expect_err("device is still missing")
         });
-        assert_eq!(error.error_kind, Some(ERROR_MISSING));
+        assert_eq!(error.code, exit::NOT_FOUND);
+        assert_eq!(error.error_kind, Some(ERROR_NEEDS_USBIPD_ATTACH));
+        assert!(
+            error.message.contains(&device.display().to_string()),
+            "hint must name the real device path: {}",
+            error.message
+        );
+        assert!(error.message.contains("usbipd bind --busid 1-2"));
+        assert!(error.message.contains("usbipd attach --wsl --busid 1-2"));
+        assert!(!error.message.contains("usbipd list"));
+        assert!(error.message.contains("first time only"));
+        assert!(error.message.contains("elevated Windows PowerShell"));
+
+        let data = error.data.expect("guidance data");
+        assert_eq!(data["busid"], "1-2");
+        assert_eq!(
+            data["commands"],
+            serde_json::json!(["usbipd bind --busid 1-2", "usbipd attach --wsl --busid 1-2",])
+        );
         assert!(
             !log.exists(),
-            "attach disabled must not invoke usbipd even with a busid"
+            "usbipd must not be invoked even with a known busid"
         );
     }
 
     #[test]
-    fn tc_2614_no_attach_config_skips_usbipd_even_with_busid() {
+    fn tc_2614_trusted_busid_names_the_id_in_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("usbipd.log");
+        fake_usbipd(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+                log.display()
+            ),
+        );
+        let device = dir.path().join("missing-device");
+        let config = SerialConfig::new(&device, 115_200);
+        let env = SerialEnv {
+            wsl2: true,
+            trusted_busid: Some("3-1".to_owned()),
+        };
+        let error = with_path(dir.path(), || {
+            open_with_env(&config, &env, None).expect_err("trusted busid only names the id")
+        });
+        assert_eq!(error.code, exit::NOT_FOUND);
+        assert_eq!(error.error_kind, Some(ERROR_NEEDS_USBIPD_ATTACH));
+        assert!(error.message.contains("usbipd bind --busid 3-1"));
+        assert!(error.message.contains("usbipd attach --wsl --busid 3-1"));
+        assert_eq!(
+            error.data.expect("guidance data")["busid"],
+            serde_json::Value::String("3-1".to_owned())
+        );
+        assert!(!log.exists(), "a trusted busid must not run usbipd");
+    }
+
+    #[test]
+    fn tc_2614_no_usbipd_attach_is_a_noop_for_wsl_guidance() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("usbipd.log");
         fake_usbipd(
@@ -907,37 +814,17 @@ mod tests {
             trusted_busid: None,
         };
         let error = with_path(dir.path(), || {
-            open_with_env(&config, &env, None).expect_err("config disables attach")
+            open_with_env(&config, &env, None).expect_err("device missing")
         });
         assert_eq!(error.code, exit::NOT_FOUND);
-        assert_eq!(error.error_kind, Some(ERROR_MISSING));
-        assert!(
-            !log.exists(),
-            "no_usbipd_attach must not invoke usbipd even with an explicit busid"
-        );
+        assert_eq!(error.error_kind, Some(ERROR_NEEDS_USBIPD_ATTACH));
+        assert_eq!(error.data.expect("guidance data")["busid"], "9-99");
+        assert!(!log.exists(), "the deprecated no-op must not invoke usbipd");
     }
 
     #[test]
-    fn tc_2614_no_attach_defaults_false_and_serializes_for_the_host() {
-        let config: SerialConfig =
-            serde_json::from_str(r#"{"device":"/dev/ttyUSB0","baud":115200}"#).unwrap();
-        assert!(!config.no_usbipd_attach);
-        let mut config = config;
-        config.no_usbipd_attach = true;
-        let value = serde_json::to_value(&config).unwrap();
-        assert_eq!(value["no_usbipd_attach"], true);
-    }
-
-    #[test]
-    fn tc_2614_trusted_config_can_disable_attach() {
+    fn tc_2614_attach_env_does_not_change_wsl_guidance() {
         let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("ws");
-        fs::create_dir_all(&workspace).unwrap();
-        fs::write(
-            workspace.join("dmuxai.toml"),
-            "[terminal.serial]\nusbipd_attach = false\n",
-        )
-        .unwrap();
         let log = dir.path().join("usbipd.log");
         fake_usbipd(
             dir.path(),
@@ -955,63 +842,27 @@ mod tests {
         };
         let error = with_path(dir.path(), || {
             unsafe {
-                std::env::set_var("DMUXAI_WORKSPACE", &workspace);
-                std::env::set_var("DMUXAI_TRUST_WORKSPACE_CONFIG", "1");
+                std::env::set_var("DMUXAI_USBIPD_ATTACH", "0");
+                std::env::set_var("DMUXAI_NO_USBIPD_ATTACH", "1");
             }
-            open_with_env(&config, &env, None).expect_err("trusted config disables attach")
+            open_with_env(&config, &env, None).expect_err("device missing")
         });
-        assert_eq!(error.error_kind, Some(ERROR_MISSING));
+        assert_eq!(error.error_kind, Some(ERROR_NEEDS_USBIPD_ATTACH));
         assert!(
             !log.exists(),
-            "trusted usbipd_attach = false must not invoke usbipd"
+            "attach-disable env vars are not preconditions"
         );
     }
 
     #[test]
-    fn tc_2614_attach_failure_reports_the_cause_and_hint() {
-        let dir = tempfile::tempdir().unwrap();
-        fake_usbipd(
-            dir.path(),
-            "#!/bin/sh\necho 'device is not bound' >&2\nexit 1\n",
-        );
-        let device = dir.path().join("missing-device");
-        let mut config = SerialConfig::new(&device, 115_200);
-        config.usbipd_busid = Some("1-2".to_owned());
-        let env = SerialEnv {
-            wsl2: true,
-            trusted_busid: None,
-        };
-        let error = with_path(dir.path(), || {
-            open_with_env(&config, &env, None).expect_err("attach fails")
-        });
-        assert_eq!(error.error_kind, Some(ERROR_USBIPD_ATTACH));
-        assert!(error.message.contains("1-2"));
-        assert!(error.message.contains("device is not bound"));
-        assert!(error.message.contains("usbipd attach --wsl --busid"));
-    }
-
-    #[test]
-    fn tc_2614_missing_usbipd_reports_install_and_bind_hint() {
-        let dir = tempfile::tempdir().unwrap();
-        let device = dir.path().join("missing-device");
-        let mut config = SerialConfig::new(&device, 115_200);
-        config.usbipd_busid = Some("1-2".to_owned());
-        let env = SerialEnv {
-            wsl2: true,
-            trusted_busid: None,
-        };
-        let error = with_path(dir.path(), || {
-            open_with_env(&config, &env, None).expect_err("usbipd.exe is absent")
-        });
-        assert_eq!(error.error_kind, Some(ERROR_USBIPD_NOT_FOUND));
-        assert!(error.message.contains("usbipd.exe was not found"));
-        assert!(error.message.contains("usbipd bind"));
-        assert!(error.message.contains("usbipd attach --wsl --busid"));
-        assert!(
-            error.message.contains(&device.display().to_string()),
-            "hint must name the real device path: {}",
-            error.message
-        );
+    fn tc_2614_no_attach_defaults_false_and_serializes_for_the_host() {
+        let config: SerialConfig =
+            serde_json::from_str(r#"{"device":"/dev/ttyUSB0","baud":115200}"#).unwrap();
+        assert!(!config.no_usbipd_attach);
+        let mut config = config;
+        config.no_usbipd_attach = true;
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value["no_usbipd_attach"], true);
     }
 
     #[test]
@@ -1034,7 +885,14 @@ mod tests {
         let error = with_path(dir.path(), || {
             open_with_env(&config, &env, None).expect_err("device missing")
         });
+        assert_eq!(error.code, exit::NOT_FOUND);
         assert_eq!(error.error_kind, Some(ERROR_MISSING));
+        assert!(
+            error.message.contains(&device.display().to_string()),
+            "missing-path message must name the path: {}",
+            error.message
+        );
+        assert!(error.data.is_none());
         assert!(!log.exists(), "usbipd must not run outside WSL2");
     }
 
