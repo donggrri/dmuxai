@@ -57,6 +57,8 @@ impl Default for WebOptions {
 #[derive(Debug, PartialEq, Eq)]
 enum CliAction {
     Help,
+    /// Subcommand-local help text printed instead of the root usage (FR-2617).
+    HelpTopic(&'static str),
     Version,
     Run,
     Serve(WebOptions),
@@ -167,11 +169,21 @@ where
         .is_some_and(|first| cli::SUBCOMMANDS.contains(&first.as_str()))
     {
         // Stop at `--`: anything after it is prompt text.
-        if args
+        let wants_help = args
             .iter()
             .take_while(|arg| arg.as_str() != "--")
-            .any(|arg| arg == "-h" || arg == "--help")
-        {
+            .any(|arg| arg == "-h" || arg == "--help");
+        // FR-2617: `term --help` and `term open --help` print their own help,
+        // not the root usage. Other subcommands keep the root usage.
+        if wants_help && args.first().map(String::as_str) == Some("term") {
+            let text = if args.get(1).map(String::as_str) == Some("open") {
+                cli::TERM_OPEN_USAGE
+            } else {
+                cli::TERM_USAGE
+            };
+            return CliAction::HelpTopic(text);
+        }
+        if wants_help {
             return CliAction::Help;
         }
         return match cli::parse(&args) {
@@ -391,6 +403,10 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     match action {
         CliAction::Help => {
             print!("{USAGE}");
+            Ok(())
+        }
+        CliAction::HelpTopic(text) => {
+            print!("{text}");
             Ok(())
         }
         CliAction::Version => {
@@ -1312,6 +1328,68 @@ mod tests {
         }
         assert!(matches!(parse_cli(["todo"]), CliAction::Usage(_)));
         assert!(matches!(parse_cli(["mcp", "x"]), CliAction::Usage(_)));
+    }
+
+    // TC-2617 / FR-2617: `term --help` and `term open --help` (or `-h`) print
+    // subcommand-local help; `dmuxai --help` and `dmuxai run --help` keep the
+    // root usage.
+    #[test]
+    fn tc_2617_term_help_topics_are_subcommand_local() {
+        assert_eq!(
+            parse_cli(["term", "--help"]),
+            CliAction::HelpTopic(cli::TERM_USAGE)
+        );
+        assert_eq!(
+            parse_cli(["term", "-h"]),
+            CliAction::HelpTopic(cli::TERM_USAGE)
+        );
+        assert_eq!(
+            parse_cli(["term", "open", "--help"]),
+            CliAction::HelpTopic(cli::TERM_OPEN_USAGE)
+        );
+        assert_eq!(
+            parse_cli(["term", "open", "-h"]),
+            CliAction::HelpTopic(cli::TERM_OPEN_USAGE)
+        );
+        assert_eq!(parse_cli(["--help"]), CliAction::Help);
+        assert_eq!(parse_cli(["run", "--help"]), CliAction::Help);
+        // `--help` after `--` is a shell argument, not help.
+        match parse_cli(["term", "exec", "sh", "--", "--help"]) {
+            CliAction::Agent(cli::AgentCommand::Term(command)) => {
+                assert!(matches!(command.op, cli::TermOp::Exec { .. }));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // TC-2617 / FR-2617 content: term help names the operations, open help
+    // names the serial options, and neither is the root usage.
+    #[test]
+    fn tc_2617_term_help_content() {
+        assert!(cli::TERM_USAGE != USAGE);
+        assert!(cli::TERM_OPEN_USAGE != USAGE);
+        for operation in ["open", "send", "read", "wait", "exec", "approve"] {
+            assert!(
+                cli::TERM_USAGE.contains(&format!("  {operation}")),
+                "term help lists {operation}"
+            );
+        }
+        for operation in ["list", "show", "resize", "close", "reopen"] {
+            assert!(
+                cli::TERM_USAGE.contains(operation),
+                "term help lists {operation}"
+            );
+        }
+        for option in ["--serial", "--baud", "--usbipd-busid", "--no-usbipd-attach"] {
+            assert!(
+                cli::TERM_OPEN_USAGE.contains(option),
+                "term open help documents {option}"
+            );
+        }
+        assert!(
+            !USAGE.contains("--no-usbipd-attach"),
+            "the root usage is unchanged by FR-2617"
+        );
     }
 
     // FR-540/FR-541: `serve` seeds the hub with persisted to-dos at startup so

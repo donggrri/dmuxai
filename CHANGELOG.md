@@ -18,8 +18,11 @@ All notable changes to dmuxai are listed here. Versions follow
   opens the device with serial2 (parity/data/stop/flow; no extra tool). Missing, permission,
   and busy failures use distinct `error_kind` values and the FR-2611 hint text (never
   `chmod 666`). WSL1 maps `COMn` to `/dev/ttySn`. On WSL2 a missing path runs
-  `usbipd.exe attach --wsl --busid <id>` once (id from `--usbipd-busid`, trusted
-  `[terminal.serial] usbipd_busid`, or `usbipd.exe list`). Unplug (EIO/ENXIO) moves the
+  `usbipd.exe attach --wsl --busid <id>` once (id from `--usbipd-busid` or trusted
+  `[terminal.serial] usbipd_busid`; never auto-selected from `usbipd.exe list`).
+  Without an explicit busid, attach is skipped. `--no-usbipd-attach` (or trusted
+  `[terminal.serial] usbipd_attach = false`) disables attach even when a busid is set.
+  Unplug (EIO/ENXIO) moves the
   session to `lost`; `term reopen` drops the old file descriptor before retrying.
   `open --wait-for REGEX --timeout` waits for a banner. `term wait` without `--since`
   starts at the current seq so older buffer text cannot match. `term exec` `text` is only
@@ -28,6 +31,14 @@ All notable changes to dmuxai are listed here. Versions follow
   when `DMUXAI_RUN_ID` is set); trusted `[terminal.policy]` can add allow/deny patterns
   and `approve_timeout`. `scripts/bench-term.sh` prints p50/p95 for status, send+read,
   and exec versus `bash -c`.
+- **`dmuxai term --help` and `dmuxai term open --help` print term-specific usage (FR-2617, #309),**
+  not the root help. `dmuxai --help` and `dmuxai run --help` are unchanged.
+
+### Fixed
+
+- **`term open --serial` no longer auto-attaches the first `usbipd list` device (#308).**
+  Without an explicit busid, dmuxai does not invoke `usbipd.exe` (no `list`, no `attach`)
+  and exits with `error_kind` `usbipd_busid_missing` plus a hint to pass `--usbipd-busid`.
 
 ## [0.3.1] - 2026-11-09
 

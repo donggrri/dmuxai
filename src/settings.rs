@@ -116,6 +116,9 @@ pub struct DmuxSettings {
     /// Trusted `[terminal]` settings (SPEC-terminal-sessions FR-2614, FR-2630).
     /// Workspace keys are merged only when the workspace is trusted.
     pub terminal: crate::term::policy::TerminalSettings,
+    /// Trusted `[terminal.serial] usbipd_attach` (FR-2614). `None` keeps the
+    /// default (attach enabled); `Some(false)` skips a WSL2 usbipd attach.
+    pub terminal_serial_usbipd_attach: Option<bool>,
     /// Trust status of workspace configuration.
     pub workspace_trust: WorkspaceTrustStatus,
 }
@@ -197,6 +200,7 @@ struct TerminalPolicyToml {
 #[derive(Debug, Default, Deserialize)]
 struct TerminalSerialToml {
     usbipd_busid: Option<String>,
+    usbipd_attach: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1197,13 +1201,19 @@ impl DmuxSettings {
                 }
             }
         }
-        if let Some(busid) = terminal.serial.and_then(|serial| serial.usbipd_busid) {
-            let trimmed = busid.trim().to_owned();
-            if trimmed.is_empty() {
-                self.config_warnings
-                    .push("[terminal.serial] usbipd_busid ignored: must not be empty".to_owned());
-            } else {
-                self.terminal.serial_usbipd_busid = Some(trimmed);
+        if let Some(serial) = terminal.serial {
+            if let Some(busid) = serial.usbipd_busid {
+                let trimmed = busid.trim().to_owned();
+                if trimmed.is_empty() {
+                    self.config_warnings.push(
+                        "[terminal.serial] usbipd_busid ignored: must not be empty".to_owned(),
+                    );
+                } else {
+                    self.terminal.serial_usbipd_busid = Some(trimmed);
+                }
+            }
+            if let Some(attach) = serial.usbipd_attach {
+                self.terminal_serial_usbipd_attach = Some(attach);
             }
         }
     }
@@ -1829,12 +1839,16 @@ pub fn restricted_workspace_details_from(
                 ));
             }
         }
-        if let Some(busid) = terminal
-            .serial
-            .as_ref()
-            .and_then(|serial| serial.usbipd_busid.as_ref())
-        {
-            details.push(("terminal.serial.usbipd_busid".to_owned(), busid.clone()));
+        if let Some(serial) = &terminal.serial {
+            if let Some(busid) = &serial.usbipd_busid {
+                details.push(("terminal.serial.usbipd_busid".to_owned(), busid.clone()));
+            }
+            if let Some(attach) = serial.usbipd_attach {
+                details.push((
+                    "terminal.serial.usbipd_attach".to_owned(),
+                    attach.to_string(),
+                ));
+            }
         }
     }
 
@@ -1918,6 +1932,7 @@ impl Default for DmuxSettings {
             runner_fallback: Default::default(),
             runs: crate::run_journal::JournalConfig::default(),
             terminal: crate::term::policy::TerminalSettings::default(),
+            terminal_serial_usbipd_attach: None,
             workspace_trust: WorkspaceTrustStatus::NoWorkspaceConfig,
         }
     }
@@ -5799,10 +5814,11 @@ approve_timeout = "5m"
 
 [terminal.serial]
 usbipd_busid = "1-2"
+usbipd_attach = false
 "#;
 
     /// TC-2630 / FR-2630, FR-2614: a trusted workspace's `[terminal]` keys are
-    /// loaded (allow, extra deny, approve_timeout, usbipd_busid).
+    /// loaded (allow, extra deny, approve_timeout, usbipd_busid, usbipd_attach).
     #[test]
     fn tc_2630_terminal_settings_load_for_trusted_workspace() {
         let dir = tempfile::tempdir().unwrap();
@@ -5820,6 +5836,7 @@ usbipd_busid = "1-2"
             settings.terminal.serial_usbipd_busid.as_deref(),
             Some("1-2")
         );
+        assert_eq!(settings.terminal_serial_usbipd_attach, Some(false));
         assert!(
             !settings
                 .config_warnings
@@ -5850,6 +5867,7 @@ usbipd_busid = "1-2"
             settings.terminal,
             crate::term::policy::TerminalSettings::default()
         );
+        assert_eq!(settings.terminal_serial_usbipd_attach, None);
         assert!(
             settings
                 .config_warnings
@@ -5942,5 +5960,6 @@ usbipd_busid = "1-2"
             Some("1-2"),
             "workspace wins"
         );
+        assert_eq!(settings.terminal_serial_usbipd_attach, Some(false));
     }
 }

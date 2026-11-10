@@ -25,9 +25,14 @@
 //! - TC-2612 (FR-2612): `open --wait-for` returns on the fake board banner
 //! - TC-2613 (FR-2613): closing the PTY master marks the session lost; reopen
 //!   against a restored slave returns open
-//! - TC-2614 (FR-2614): WSL2 usbipd attach runs once with the explicit busid
+//! - TC-2614 (FR-2614): WSL2 usbipd attach runs once with the explicit busid;
+//!   without a busid usbipd.exe is never invoked and the error is
+//!   `usbipd_busid_missing`; `--no-usbipd-attach` skips attach even with a
+//!   busid
 //! - TC-2615 (FR-2615): wait without --since does not match older buffer text
 //! - TC-2616 (FR-2616): exec reply text is exactly the command output
+//! - TC-2617 (FR-2617): `term --help` and `term open --help` (also `-h`) exit 0
+//!   with subcommand-local help, not the root usage
 //! - TC-2618 (FR-2610): optional socat PTY pair (`#[ignore]`, skips if absent)
 //!   plus a picocom `--kind cmd` reader on the same pair when picocom exists
 //! - TC-2630 (FR-2630): default-deny send and exec each need one-shot
@@ -1559,6 +1564,168 @@ fn tc_2614_wsl2_usbipd_attach_once_with_explicit_busid() {
     assert!(
         !calls.lines().any(|line| line == "list"),
         "an explicit busid must not list: {calls}"
+    );
+}
+
+/// TC-2614 / FR-2614: on fake WSL2 with a missing `--serial` path and no
+/// explicit busid, dmuxai never invokes usbipd.exe (no `list`, no `attach`)
+/// and exits with `error_kind` `usbipd_busid_missing` plus a message that names
+/// `usbipd list` and `--usbipd-busid`.
+#[test]
+fn tc_2614_without_busid_usbipd_is_never_called() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let log = sandbox.workspace.join("usbipd.log");
+    let fake = fake_usbipd(
+        &sandbox.workspace,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\necho 'device is not bound' >&2\nexit 1\n",
+            log.display()
+        ),
+    );
+    let missing = sandbox.workspace.join("missing-serial");
+    let output = sandbox
+        .command(&[
+            "term",
+            "open",
+            "board",
+            "--serial",
+            missing.to_str().expect("utf8 path"),
+            "--baud",
+            "115200",
+            "--json",
+        ])
+        .env("DMUXAI_SERIAL_WSL2", "1")
+        .env("DMUXAI_USBIPD_BIN", &fake)
+        .stdin(Stdio::null())
+        .output()
+        .expect("execute dmuxai");
+    let out = Out::new(output);
+    let json = out.json("stdout");
+    assert_eq!(
+        out.code, 6,
+        "a missing busid must exit 6 (internal): {out:?}"
+    );
+    assert_eq!(
+        json["error_kind"], "usbipd_busid_missing",
+        "error: {json:?}"
+    );
+    let message = json["error"].as_str().unwrap_or_default();
+    assert!(message.contains("usbipd list"), "hint: {json:?}");
+    assert!(message.contains("--usbipd-busid"), "hint: {json:?}");
+    assert!(
+        !log.exists(),
+        "usbipd.exe must not be invoked without an explicit busid"
+    );
+}
+
+/// TC-2614 / FR-2614: `--no-usbipd-attach` skips the usbipd.exe attach even
+/// when an explicit busid is set and reports the normal missing-device error.
+#[test]
+fn tc_2614_no_attach_flag_skips_usbipd_with_busid() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let log = sandbox.workspace.join("usbipd.log");
+    let fake = fake_usbipd(
+        &sandbox.workspace,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\necho 'device is not bound' >&2\nexit 1\n",
+            log.display()
+        ),
+    );
+    let missing = sandbox.workspace.join("missing-serial");
+    let output = sandbox
+        .command(&[
+            "term",
+            "open",
+            "board",
+            "--serial",
+            missing.to_str().expect("utf8 path"),
+            "--baud",
+            "115200",
+            "--usbipd-busid",
+            "1-2",
+            "--no-usbipd-attach",
+            "--json",
+        ])
+        .env("DMUXAI_SERIAL_WSL2", "1")
+        .env("DMUXAI_USBIPD_BIN", &fake)
+        .stdin(Stdio::null())
+        .output()
+        .expect("execute dmuxai");
+    let out = Out::new(output);
+    let json = out.json("stdout");
+    assert_eq!(
+        out.code, 3,
+        "a disabled attach must report the missing device: {out:?}"
+    );
+    assert_eq!(json["error_kind"], "serial_not_found", "error: {json:?}");
+    let message = json["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("usbipd attach --wsl --busid"),
+        "FR-2611 manual hint: {json:?}"
+    );
+    assert!(
+        !log.exists(),
+        "usbipd.exe must not be invoked when attach is disabled"
+    );
+}
+
+/// TC-2617 / FR-2617: `term --help` and `term open --help` (also `-h`) exit 0
+/// with subcommand-local help; neither prints the root usage and the root
+/// `dmuxai --help` is unchanged.
+#[test]
+fn tc_2617_term_help_and_open_help_are_subcommand_local() {
+    let sandbox = Sandbox::new();
+
+    for args in [vec!["term", "--help"], vec!["term", "-h"]] {
+        let out = sandbox.run(&args);
+        assert_eq!(out.code, 0, "term help must exit 0: {out:?}");
+        let text = out.stdout.as_str();
+        assert!(
+            text.contains("Usage: dmuxai term"),
+            "term help usage line: {out:?}"
+        );
+        assert!(
+            text.contains("  open ") && text.contains("  send ") && text.contains("  approve "),
+            "term help names open, send and approve: {out:?}"
+        );
+        assert!(
+            !text.contains("dmuxai [--help|--version]") && !text.contains("One terminal"),
+            "term help must not print the root usage: {out:?}"
+        );
+    }
+
+    for args in [vec!["term", "open", "--help"], vec!["term", "open", "-h"]] {
+        let out = sandbox.run(&args);
+        assert_eq!(out.code, 0, "term open help must exit 0: {out:?}");
+        let text = out.stdout.as_str();
+        assert!(
+            text.contains("Usage: dmuxai term open"),
+            "term open help usage line: {out:?}"
+        );
+        for option in ["--serial", "--baud", "--usbipd-busid", "--no-usbipd-attach"] {
+            assert!(
+                text.contains(option),
+                "term open help documents {option}: {out:?}"
+            );
+        }
+        assert!(
+            !text.contains("dmuxai [--help|--version]") && !text.contains("One terminal"),
+            "term open help must not print the root usage: {out:?}"
+        );
+    }
+
+    // The root usage is unchanged.
+    let out = sandbox.run(&["--help"]);
+    assert_eq!(out.code, 0, "root help must exit 0: {out:?}");
+    assert!(
+        out.stdout.contains("dmuxai [--help|--version]"),
+        "root help: {out:?}"
+    );
+    assert!(
+        !out.stdout.contains("--no-usbipd-attach"),
+        "root help must not document term-open serial flags: {out:?}"
     );
 }
 

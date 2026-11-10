@@ -87,6 +87,7 @@ pub enum TermOp {
         rows: u16,
         argv: Vec<String>,
         serial: Option<term::SerialConfig>,
+        no_usbipd_attach: bool,
         wait_for: Option<String>,
         timeout_ms: Option<u64>,
     },
@@ -162,6 +163,80 @@ pub struct RunOptions {
 pub const SUBCOMMANDS: [&str; 9] = [
     "run", "todo", "status", "events", "mcp", "init", "trust", "runs", "term",
 ];
+
+/// Subcommand-local help for `dmuxai term --help` / `-h` (FR-2617). This text
+/// replaces the root usage for term; the root `dmuxai --help` is unchanged.
+pub const TERM_USAGE: &str = "\
+Usage: dmuxai term <subcommand> [args...]
+
+Persistent named terminal sessions.
+
+Subcommands:
+  open NAME [options] [-- CMD...]  Start a shell, a --kind cmd command, or a
+                                   --serial DEV session and keep it running
+  send NAME TEXT | NAME --keys KEYS
+                                   Send text or named keys (C-c, Enter, ...)
+  read NAME [--since N] [--tail N] [--raw]
+                                   Read session output
+  wait NAME --match REGEX|--idle MS --timeout DUR [--since N]
+                                   Wait for a regex match or an idle period
+  exec NAME COMMAND [--timeout DUR]
+                                   Run a command in the session and return
+                                   exactly its output
+  approve ID    Approve one pending terminal-policy approval (16 lowercase
+                hex characters)
+  list          List sessions (empty when no host runs)
+  show NAME     Show one session
+  resize NAME --cols N --rows N
+                Resize a session
+  close NAME|--all [--force]
+                Close a session (or all sessions with --all)
+  reopen NAME   Reopen a lost session with the same spec
+
+Run `dmuxai term open --help` for open options (including --serial, --baud,
+--usbipd-busid and --no-usbipd-attach). Run `dmuxai --help` for the root usage.
+";
+
+/// Subcommand-local help for `dmuxai term open --help` / `-h` (FR-2617).
+pub const TERM_OPEN_USAGE: &str = "\
+Usage: dmuxai term open NAME [--kind shell|cmd|serial] [--cwd DIR] [--env K=V]
+                [--cols N --rows N] [--json] [-- CMD...]
+                [--serial DEV --baud N [--parity none|even|odd]
+                 [--data 5-8] [--stop 1|2] [--flow none|rtscts]
+                 [--usbipd-busid ID] [--no-usbipd-attach]]
+                [--wait-for REGEX --timeout DUR]
+
+Starts a named terminal session; it stays alive under the terminal host after
+this command exits.
+
+Session options:
+  --kind shell|cmd|serial  Session kind (default shell; --serial implies
+                           serial)
+  --cwd DIR                Working directory for the session
+  --env K=V                Extra session environment (repeatable)
+  --cols N --rows N        Terminal size (default 80x24)
+  --wait-for REGEX         Return after REGEX appears in the output; requires
+  --timeout DUR            --timeout (e.g. 500ms, 2s)
+  -- CMD...                Command for --kind cmd; serial and shell sessions
+                           take no command
+
+Serial options:
+  --serial DEV             Open DEV as a serial port instead of a shell
+  --baud N                 Baud rate (required with --serial)
+  --parity P               Parity: none, even or odd (default none)
+  --data B                 Data bits 5-8 (default 8)
+  --stop S                 Stop bits 1 or 2 (default 1)
+  --flow F                 Flow control: none or rtscts (default none)
+  --usbipd-busid ID        Explicit usbipd busid for a WSL2 attach; never
+                           selected from `usbipd list` output
+  --no-usbipd-attach       Do not run usbipd.exe attach even when a busid is
+                           set
+
+On WSL2 with a missing device, `usbipd.exe attach --wsl --busid <id>` runs
+once only when an explicit busid is given (--usbipd-busid or trusted
+[terminal.serial] usbipd_busid). Without a busid the command exits with
+error_kind usbipd_busid_missing and never invokes usbipd.exe.
+";
 
 /// Table-driven flag specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -980,6 +1055,7 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
     let mut stop = 1u8;
     let mut flow = term::SerialFlow::None;
     let mut usbipd_busid = None;
+    let mut no_usbipd_attach = false;
     let mut wait_for = None;
     let mut timeout_ms = None;
     let mut index = 0;
@@ -1089,6 +1165,7 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
                         .clone(),
                 );
             }
+            "--no-usbipd-attach" => no_usbipd_attach = true,
             "--wait-for" => {
                 index += 1;
                 wait_for = Some(
@@ -1144,11 +1221,11 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
             if baud.is_some() {
                 return Err("--baud needs --serial".to_owned());
             }
-            if parity != term::SerialParity::None
+            if flow != term::SerialFlow::None
                 || data != 8
                 || stop != 1
-                || flow != term::SerialFlow::None
                 || usbipd_busid.is_some()
+                || no_usbipd_attach
             {
                 return Err("serial settings need --serial".to_owned());
             }
@@ -1188,6 +1265,7 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
             rows,
             argv,
             serial,
+            no_usbipd_attach,
             wait_for,
             timeout_ms,
         },
@@ -1454,6 +1532,21 @@ fn execute_term(_workspace_root: &Path, command: TermCommand) -> i32 {
 #[cfg(unix)]
 fn execute_term(workspace_root: &Path, command: TermCommand) -> i32 {
     let TermCommand { op, json } = command;
+    // FR-2614: `--no-usbipd-attach` must disable the usbipd attach in the host
+    // that opens the serial device. The host inherits this process env when it
+    // is autostarted, and `term::serial` reads the same variable.
+    if let TermOp::Open {
+        serial: Some(_),
+        no_usbipd_attach: true,
+        ..
+    } = &op
+    {
+        // SAFETY: called once on the CLI startup path before the tokio spawn
+        // helpers or the terminal host are started.
+        unsafe {
+            std::env::set_var("DMUXAI_NO_USBIPD_ATTACH", "1");
+        }
+    }
     if matches!(&op, TermOp::Host) {
         return match dmuxai::term::host::run(workspace_root) {
             Ok(()) => exit::OK,
