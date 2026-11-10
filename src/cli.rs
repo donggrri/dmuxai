@@ -122,7 +122,10 @@ pub enum TermOp {
     Approve {
         id: String,
     },
-    List,
+    List {
+        /// FR-2606: `--all` includes closed and exited history sessions.
+        all: bool,
+    },
     Show {
         name: String,
     },
@@ -187,7 +190,8 @@ Subcommands:
                                    exactly its output
   approve ID    Approve one pending terminal-policy approval (16 lowercase
                 hex characters)
-  list          List sessions (empty when no host runs)
+  list [--all]  List sessions (empty when no host runs); closed and exited
+                sessions are history shown only with --all
   show NAME     Show one session
   resize NAME --cols N --rows N
                 Resize a session
@@ -196,7 +200,8 @@ Subcommands:
   reopen NAME   Reopen a lost session with the same spec
 
 Run `dmuxai term open --help` for open options (including --serial, --baud,
---usbipd-busid and --no-usbipd-attach). Run `dmuxai --help` for the root usage.
+--usbipd-busid and the deprecated --no-usbipd-attach). Run `dmuxai --help` for
+the root usage.
 ";
 
 /// Subcommand-local help for `dmuxai term open --help` / `-h` (FR-2617).
@@ -230,15 +235,15 @@ Serial options:
   --data B                 Data bits 5-8 (default 8)
   --stop S                 Stop bits 1 or 2 (default 1)
   --flow F                 Flow control: none or rtscts (default none)
-  --usbipd-busid ID        Explicit usbipd busid for a WSL2 attach; never
-                           selected from `usbipd list` output
-  --no-usbipd-attach       Do not run usbipd.exe attach even when a busid is
-                           set
+   --usbipd-busid ID        Busid named only in needs_usbipd_attach guidance;
+                            never selected from `usbipd list` output
+   --no-usbipd-attach       Deprecated no-op; accepted for compatibility,
+                            dmuxai never runs usbipd attach
 
-On WSL2 with a missing device, `usbipd.exe attach --wsl --busid <id>` runs
-once only when an explicit busid is given (--usbipd-busid or trusted
-[terminal.serial] usbipd_busid). Without a busid the command exits with
-error_kind usbipd_busid_missing and never invokes usbipd.exe.
+On WSL2 with a missing --serial device, dmuxai exits with error_kind
+needs_usbipd_attach and never runs usbipd.exe; its guidance names the bind and
+attach commands for an elevated Windows PowerShell. --usbipd-busid (or trusted
+[terminal.serial] usbipd_busid) only names the busid in that guidance.
 ";
 
 /// Subcommand-local help for `dmuxai term send --help` / `-h` (FR-2617).
@@ -280,7 +285,8 @@ is 500ms; suffixes work too (500ms, 1s, 1m). A bare number for --timeout is
 seconds, so --timeout 8 and --timeout 8s both mean 8 seconds, and
 --timeout 500ms means 500ms. --since applies only to the --match search;
 without it the search starts at the current seq, so output already in the
-buffer is not matched. --idle succeeds when no new output arrives for that
+buffer is not matched. After send, pass --since from that send's reply to
+match output caused by the send. --idle succeeds when no new output arrives for that
 duration: the idle clock starts when the wait starts and resets whenever
 new output arrives, so a quiet session returns almost immediately.
 
@@ -320,11 +326,14 @@ exactly one identical send or exec and is then consumed.
 
 /// Subcommand-local help for `dmuxai term list --help` / `-h` (FR-2617).
 pub const TERM_LIST_USAGE: &str = "\
-Usage: dmuxai term list [--json]
+Usage: dmuxai term list [--all] [--json]
 
-List this workspace's terminal sessions. Prints nothing (an empty JSON
+List this workspace's terminal sessions. Closed and exited sessions are
+intended history: the default list hides them, `show NAME` still reports
+them, and `list --all` includes them. Prints nothing (an empty JSON
 array with --json) when no host runs; list never starts one.
 
+  --all           Include closed and exited history sessions
   --json          Print a machine-readable reply
 ";
 
@@ -1065,14 +1074,23 @@ fn parse_term(args: &[String]) -> Result<TermCommand, String> {
             })
         }
         "list" => {
-            const LIST_FLAGS: &[FlagSpec] = &[FlagSpec {
-                names: &["--json"],
-                takes_value: false,
-                hidden: false,
-            }];
+            const LIST_FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--all"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
             let parsed = parse_flags(rest, LIST_FLAGS, false)?;
             Ok(TermCommand {
-                op: TermOp::List,
+                op: TermOp::List {
+                    all: parsed.flags.contains_key("--all"),
+                },
                 json: parsed.flags.contains_key("--json"),
             })
         }
@@ -1365,8 +1383,9 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
             config.stop = stop;
             config.flow = flow;
             config.usbipd_busid = usbipd_busid.filter(|value| !value.trim().is_empty());
-            // FR-2614: carry the flag in the open request itself so a warm
-            // host skips usbipd.exe even when it did not inherit the CLI env.
+            // Deprecated flag: still carried in the open request so a warm
+            // host's saved session spec keeps its shape; it no longer changes
+            // any behavior there.
             config.no_usbipd_attach = no_usbipd_attach;
             config.validate().map_err(|error| error.message)?;
             Some(config)
@@ -1411,6 +1430,13 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
         }
     } else if timeout_ms.is_some() {
         return Err("--timeout needs --wait-for".to_owned());
+    }
+    if no_usbipd_attach {
+        // Deprecated: the flag parses and travels with the request, but dmuxai
+        // never runs usbipd attach from WSL, so it has no effect.
+        eprintln!(
+            "warning: --no-usbipd-attach is deprecated and has no effect; dmuxai never runs usbipd attach from WSL"
+        );
     }
     Ok(TermCommand {
         op: TermOp::Open {
@@ -1714,21 +1740,9 @@ fn execute_term(_workspace_root: &Path, command: TermCommand) -> i32 {
 #[cfg(unix)]
 fn execute_term(workspace_root: &Path, command: TermCommand) -> i32 {
     let TermCommand { op, json } = command;
-    // FR-2614: `--no-usbipd-attach` must disable the usbipd attach in the host
-    // that opens the serial device. The host inherits this process env when it
-    // is autostarted, and `term::serial` reads the same variable.
-    if let TermOp::Open {
-        serial: Some(_),
-        no_usbipd_attach: true,
-        ..
-    } = &op
-    {
-        // SAFETY: called once on the CLI startup path before the tokio spawn
-        // helpers or the terminal host are started.
-        unsafe {
-            std::env::set_var("DMUXAI_NO_USBIPD_ATTACH", "1");
-        }
-    }
+    // FR-2614 as amended: dmuxai never runs usbipd attach from WSL, so
+    // `--no-usbipd-attach` is accepted only for compatibility; the deprecated
+    // flag no longer changes any behavior on the host side.
     if matches!(&op, TermOp::Host) {
         return match dmuxai::term::host::run(workspace_root) {
             Ok(()) => exit::OK,
@@ -1750,7 +1764,7 @@ fn execute_term(workspace_root: &Path, command: TermCommand) -> i32 {
     }
 
     let response = match &op {
-        TermOp::List => match dmuxai::term::client::try_connect(workspace_root) {
+        TermOp::List { .. } => match dmuxai::term::client::try_connect(workspace_root) {
             Ok(mut client) => client.call(RequestOp::List),
             Err(_) => {
                 if json {
@@ -1846,7 +1860,24 @@ fn merge_open_wait(open: Response, wait: Response) -> Response {
 #[cfg(unix)]
 fn report_term_response(op: &TermOp, response: Response, json: bool) -> i32 {
     let code = response.exit_code.unwrap_or(exit::OK);
-    let data = response.data.unwrap_or(Value::Null);
+    let mut data = response.data.unwrap_or(Value::Null);
+    // FR-2606 / FR-2607: closed and exited sessions are intended history; the
+    // default list hides them while `show` and `--all` still cover them.
+    if matches!(op, TermOp::List { all: false })
+        && let Some(sessions) = data.as_array().cloned()
+    {
+        data = Value::Array(
+            sessions
+                .into_iter()
+                .filter(|session| {
+                    !matches!(
+                        session.get("state").and_then(Value::as_str),
+                        Some("closed") | Some("exited")
+                    )
+                })
+                .collect(),
+        );
+    }
     if json {
         print_json(&data);
     } else {
@@ -1927,7 +1958,7 @@ fn term_request_op(op: &TermOp) -> RequestOp {
             timeout_ms: *timeout_ms,
         },
         TermOp::Approve { id } => RequestOp::Approve { id: id.clone() },
-        TermOp::List => RequestOp::List,
+        TermOp::List { .. } => RequestOp::List,
         TermOp::Show { name } => RequestOp::Show { name: name.clone() },
         TermOp::Resize { name, cols, rows } => RequestOp::Resize {
             name: name.clone(),
@@ -1977,7 +2008,7 @@ fn print_term_human(op: &TermOp, data: &Value) {
                 eprintln!("timeout");
             }
         }
-        TermOp::List => {
+        TermOp::List { .. } => {
             if let Some(sessions) = data.as_array() {
                 for session in sessions {
                     println!(

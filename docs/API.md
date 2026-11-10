@@ -159,9 +159,11 @@ dmuxai events --follow --json
 `last_graph` (`{id, phase, counts}` or `null`), `events` (`{path, last_seq}`),
 `dashboard` (`{base_url, port, pid, token_file}` or `null`) and `warnings` (array).
 
-### `term`: persistent terminal sessions (Linux, SPEC-terminal-sessions)
+### `term`: persistent terminal sessions (Linux/WSL, SPEC-terminal-sessions)
 
-Named PTY sessions owned by a per-workspace session host. The host starts when a
+Named PTY or serial sessions owned by a per-workspace session host. `term` is
+Linux/WSL only: there is no Windows ConPTY build, and there is no native `ssh`
+session kind (run `ssh` inside a `shell` session). The host starts when a
 `term` command needs one (never from `run` or any other command). `term list` and
 `term close` do not start a host: with none running, `list` returns `[]` and
 `close --all` succeeds with zero sessions closed (exit 0); `close NAME` exits 3
@@ -175,12 +177,14 @@ to stay alive until that grace elapses; this is intentional (FR-2601), not a lea
 
 ```
 dmuxai term open   <name> [--kind shell|cmd] [--cwd DIR] [--env K=V]... [--cols N --rows N] [--json] [-- argv...]
+dmuxai term open   <name> --serial DEV --baud N [--parity none|even|odd] [--data 8] [--stop 1]
+                   [--flow none|rtscts] [--usbipd-busid ID] [--no-usbipd-attach] [--json]
 dmuxai term send   <name> <text> [--no-newline] [--secret] [--json]
 dmuxai term send   <name> --keys C-c[,Enter,Up,Tab,Esc,F1,...]
 dmuxai term read   <name> [--since SEQ] [--tail N] [--raw] [--json]
 dmuxai term wait   <name> (--match REGEX | --idle DUR) --timeout DUR [--since SEQ] [--json]
 dmuxai term exec   <name> <cmd> [--timeout DUR] [--json]
-dmuxai term list   [--json]
+dmuxai term list   [--all] [--json]
 dmuxai term show   <name> [--json]
 dmuxai term resize <name> --cols N --rows N
 dmuxai term close  <name> [--force] | --all
@@ -188,8 +192,20 @@ dmuxai term reopen <name>
 ```
 
 - Names match `[a-z0-9][a-z0-9-]{0,31}`; a duplicate open exits 4.
+- `--serial DEV --baud N` opens the device with serial2 (no extra tool). `--baud` is
+  required. WSL1 maps `COMn` to `/dev/ttySn`. On WSL, if the device node is missing,
+  the command exits 3 with `error_kind` `needs_usbipd_attach` and does **not** run
+  `usbipd.exe`. JSON includes `busid` when known (`--usbipd-busid` or trusted
+  `[terminal.serial] usbipd_busid`) and `commands` to type in an elevated Windows
+  PowerShell: `usbipd bind --busid <id>` (first time only) and
+  `usbipd attach --wsl --busid <id>`. Without a known busid, the commands use a
+  `<busid>` placeholder and include `usbipd list`. On native Linux a missing device
+  is `serial_not_found` (also exit 3). `--usbipd-busid` only names the id in that
+  guidance. `--no-usbipd-attach` is accepted as a deprecated no-op (warn on stderr).
+- `term list` hides `closed` and `exited` sessions; `term list --all` includes them.
 - `send` returns `{"seq":N}`; pass it to `wait --since N` so a match only looks at output
-  that came after your input (without `--since`, the whole buffer is searched).
+  that came after your input (without `--since`, wait starts at the current seq and
+  does not search earlier buffer text).
 - `read`/`wait`/`exec` return `{text, seq_from, seq_to, dropped_bytes}`, plus `reason`
   (`match`, `idle`, `exited`, `marker`, `timeout`) and `exit_code`. Output is ANSI-stripped
   unless `--raw`. The buffer keeps 1 MiB per session.
@@ -213,8 +229,8 @@ dmuxai term reopen <name>
   as `[REDACTED input]`.
 - With `--json`, stdout is one JSON object; errors are
   `{"ok":false,"error":"…","error_kind":"not_found","exit_code":3}` with the exit codes above.
-- Not a sandbox: a session is a real shell with your rights. The dangerous-command guard and
-  `term approve` come in the next PR. On non-Unix platforms `term` exits 2.
+- Not a sandbox: a session is a real shell with your rights. On non-Unix platforms
+  `term` exits 2. There is no Windows ConPTY build and no native `ssh` session kind.
 
 ## 2. HTTP API
 

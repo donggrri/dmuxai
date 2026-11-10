@@ -110,6 +110,12 @@ pub fn run(workspace_root: &Path) -> Result<(), TermError> {
 pub(crate) fn run_at(workspace_root: &Path, path: &Path) -> Result<(), TermError> {
     let listener = prepare_listener(path)?;
     let _guard = SocketGuard(path.to_path_buf());
+    if let Some(directory) = path
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+    {
+        let _ = std::env::set_current_dir(directory);
+    }
     let idle_grace = std::env::var("DMUXAI_TERM_IDLE_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -150,12 +156,11 @@ impl Host {
     fn event_loop(&mut self) -> Result<(), TermError> {
         let mut idle_since: Option<Instant> = None;
         loop {
-            self.flush_journals();
-            self.shared.refresh_sessions();
             if self.shared.shutdown.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            if self.shared.has_live_sessions() {
+            let live = self.shared.has_live_sessions();
+            if live {
                 idle_since = None;
             } else {
                 let since = *idle_since.get_or_insert_with(Instant::now);
@@ -163,8 +168,11 @@ impl Host {
                     break;
                 }
             }
+            if live {
+                self.flush_journals();
+            }
 
-            let timeout = self.next_poll_timeout(idle_since);
+            let timeout = self.next_poll_timeout(idle_since, live);
             let ready = poll_ready(
                 &[self.listener.as_raw_fd(), self.wake_rx.as_raw_fd()],
                 timeout,
@@ -232,9 +240,16 @@ impl Host {
         }
     }
 
-    fn next_poll_timeout(&self, idle_since: Option<Instant>) -> Option<Duration> {
+    fn next_poll_timeout(&self, idle_since: Option<Instant>, live: bool) -> Option<Duration> {
         let now = Instant::now();
         let mut next = idle_since.map(|since| since + self.idle_grace);
+        if !live {
+            return next.map(|deadline| {
+                deadline
+                    .checked_duration_since(now)
+                    .unwrap_or(Duration::ZERO)
+            });
+        }
         let now_ms = now_ms();
         for (name, handle) in self.shared.snapshot_sessions() {
             let session = handle

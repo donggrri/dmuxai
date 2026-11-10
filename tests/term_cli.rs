@@ -14,7 +14,10 @@
 //! - TC-2604 (FR-2604): wait match, wait timeout (unit covers never-match regex
 //!   semantics in `src/term/wait.rs`)
 //! - TC-2605 (FR-2605): exec true/false/printf, marker removed
-//! - TC-2606 (FR-2606): list/show/unknown/empty list without host
+//! - TC-2606 (FR-2606): list/show/unknown/empty list without host; closed and
+//!   exited sessions are history hidden from the default list, shown by
+//!   `list --all` and still reported by `show`; both list forms return []
+//!   without a host and never start one
 //! - TC-2607 (FR-2607): close kills the process-group child, self-exit state;
 //!   close --all / close NAME without a listening host spawn no host
 //! - TC-2608 (FR-2608): resize propagated to the PTY, invalid dims exit 2
@@ -26,11 +29,17 @@
 //! - TC-2612 (FR-2612): `open --wait-for` returns on the fake board banner
 //! - TC-2613 (FR-2613): closing the PTY master marks the session lost; reopen
 //!   against a restored slave returns open
-//! - TC-2614 (FR-2614): WSL2 usbipd attach runs once with the explicit busid;
-//!   without a busid usbipd.exe is never invoked and the error is
-//!   `usbipd_busid_missing`; `--no-usbipd-attach` skips attach even with a
-//!   busid
+//! - TC-2614 (FR-2614): a missing `--serial` path in WSL (DMUXAI_SERIAL_WSL2
+//!   test hook) exits 3 with `needs_usbipd_attach`; the JSON names the busid
+//!   from `--usbipd-busid` and the elevated Windows PowerShell
+//!   `usbipd bind/attach` commands, and usbipd.exe is never invoked; without a
+//!   busid the guidance names `usbipd list` and the literal `<busid>`; the
+//!   deprecated `--no-usbipd-attach` no-op still returns `needs_usbipd_attach`
+//!   (the request can be served by a warm host); outside WSL (DMUXAI_SERIAL_WSL2=0)
+//!   the same missing path reports `serial_not_found`
 //! - TC-2615 (FR-2615): wait without --since does not match older buffer text
+//! - TC-2622 (FR-2604): `wait --match` matches a prompt emitted in several
+//!   writes and wrapped in ANSI escapes/CR; `read --raw` still shows ESC
 //! - TC-2616 (FR-2616): exec reply text is exactly the command output
 //! - TC-2617 (FR-2617): `term --help`, `term open --help` and `--help`/`-h`
 //!   for every other term subcommand exit 0 with subcommand-local help, not
@@ -45,6 +54,8 @@
 //! - TC-2620 (FR-2620): masked io.jsonl with modes 0600/0700 (unit covers the
 //!   writer in `src/term/journal.rs`)
 //! - TC-2632 (FR-2632): child env scrubbed, `--env` still delivered
+//! - TC-2623 (#317): the host process cwd is not the workspace and the host
+//!   exits within the idle grace plus slack after the last session closes
 //! - TC-2690 (NFR-2690): non-term commands never start a host
 //! - TC-2691 (NFR-2691): warm-host send+read p50 under the loose bound
 //! - TC-2692 (NFR-2692): exec overhead within the loose x3 bound
@@ -319,7 +330,14 @@ struct PtyBoard {
     master: i32,
     slave: i32,
     stop: Arc<AtomicBool>,
+    emit_tx: std::sync::mpsc::Sender<Vec<u8>>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn drain_emits(rx: &std::sync::mpsc::Receiver<Vec<u8>>, master: i32) {
+    while let Ok(data) = rx.try_recv() {
+        board_write(master, &data);
+    }
 }
 
 impl PtyBoard {
@@ -357,10 +375,12 @@ impl PtyBoard {
 
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let (emit_tx, emit_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let thread = std::thread::spawn(move || {
             board_write(master, b"BOOT READY\r\n");
             let mut buffer = [0u8; 1024];
             while !thread_stop.load(Ordering::Relaxed) {
+                drain_emits(&emit_rx, master);
                 let mut pollfd = libc::pollfd {
                     fd: master,
                     events: libc::POLLIN,
@@ -392,12 +412,21 @@ impl PtyBoard {
             master,
             slave,
             stop,
+            emit_tx,
             thread: Some(thread),
         }
     }
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Sends raw bytes to the fake board from the test side; the board thread
+    /// writes them onto the PTY master within roughly one poll tick.
+    fn emit(&self, data: &[u8]) {
+        self.emit_tx
+            .send(data.to_vec())
+            .expect("board thread alive");
     }
 
     fn close(&mut self) {
@@ -758,6 +787,73 @@ fn tc_2615_wait_without_since_ignores_older_output() {
     assert_eq!(matched["reason"], "match", "wait: {matched:?}");
 }
 
+/// TC-2622 / FR-2604: `wait --match '[#$] '` succeeds when the PTY fake board
+/// emits its prompt split across separate writes and wrapped in ANSI escapes
+/// and CR — the matcher strips the wrapping. `read --raw` still shows the
+/// raw ESC bytes.
+#[test]
+fn tc_2622_wait_match_prompt_across_writes_with_ansi_and_cr() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let board = PtyBoard::start();
+    let serial = board.path().to_str().expect("utf8 slave path").to_owned();
+
+    let (out, opened) = sandbox.term_json(&[
+        "term", "open", "board", "--serial", &serial, "--baud", "115200", "--json",
+    ]);
+    assert_eq!(out.code, 0, "serial open failed: {out:?}");
+    assert_eq!(opened["state"], "open", "open: {opened:?}");
+
+    // Consume the startup banner first so the later wait starts fresh.
+    let (out, _) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "board",
+        "--match",
+        "BOOT READY",
+        "--since",
+        "0",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "banner wait failed: {out:?}");
+
+    // The board prints its prompt in several writes, wrapped in a title OSC,
+    // CSI color sequences and CRs, so no single write contains "[#$] ".
+    board.emit(b"\x1b]0;board\x07");
+    board.emit(b"\r");
+    board.emit(b"\x1b[1;32m");
+    board.emit(b"boar");
+    board.emit(b"d0\x1b[0m");
+    board.emit(b"\r");
+    board.emit(b"boar");
+    board.emit(b"d0# ");
+
+    let (out, waited) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "board",
+        "--match",
+        r"[#$] ",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "wait for wrapped prompt failed: {out:?}");
+    assert_eq!(waited["reason"], "match", "wait: {waited:?}");
+    let text = waited["text"].as_str().unwrap_or_default().to_owned();
+    assert!(text.contains("d0# "), "match text: {text:?}");
+    assert!(!text.contains("\x1b"), "match text is stripped: {text:?}");
+
+    // TC-2622: `read --raw` keeps the escape bytes.
+    let (out, read) = sandbox.term_json(&["term", "read", "board", "--raw", "--json"]);
+    assert_eq!(out.code, 0, "raw read failed: {out:?}");
+    let raw = read["text"].as_str().unwrap_or_default().to_owned();
+    assert!(raw.contains("\x1b"), "raw read keeps ESC: {raw:?}");
+    assert!(raw.contains("d0"), "raw read has the prompt: {raw:?}");
+}
+
 /// TC-2616 / FR-2616: the exec reply `text` is exactly the command output —
 /// no echoed command line, no nonce marker and no trailing prompt.
 #[test]
@@ -1077,12 +1173,18 @@ fn tc_2606_list_show_and_unknown() {
     let sandbox = Sandbox::new();
     let _guard = sandbox.close_guard();
 
-    // No host running: `list --json` returns [] and does not start a host.
-    let (out, listed) = sandbox.term_json(&["term", "list", "--json"]);
-    assert_eq!(out.code, 0, "list without host failed: {out:?}");
-    assert_eq!(listed, json!([]), "empty list: {listed:?}");
-    assert!(sandbox.host_pids().is_empty(), "list must not start a host");
-    assert!(!sandbox.socket_file().exists(), "no socket for list alone");
+    // No host running: `list --json` and `list --all --json` return [] and
+    // neither starts a host.
+    for args in [
+        vec!["term", "list", "--json"],
+        vec!["term", "list", "--all", "--json"],
+    ] {
+        let (out, listed) = sandbox.term_json(&args);
+        assert_eq!(out.code, 0, "list without host failed: {out:?}");
+        assert_eq!(listed, json!([]), "empty list: {listed:?}");
+        assert!(sandbox.host_pids().is_empty(), "list must not start a host");
+        assert!(!sandbox.socket_file().exists(), "no socket for list alone");
+    }
 
     sandbox.open_shell("b");
     sandbox.open_shell("c");
@@ -1132,6 +1234,42 @@ fn tc_2606_list_show_and_unknown() {
     }
     assert_eq!(shown["name"], "b");
     assert_eq!(shown["state"], "open", "showed: {shown:?}");
+
+    // TC-2606 / FR-2606: a closed session stays in the host's list as
+    // intended history. The default list hides it, `list --all` includes it
+    // with state=closed, and `show` still reports closed.
+    let (out, _) = sandbox.term_json(&["term", "close", "c", "--json"]);
+    assert_eq!(out.code, 0, "close c failed: {out:?}");
+
+    let (out, listed) = sandbox.term_json(&["term", "list", "--json"]);
+    assert_eq!(out.code, 0, "list after close failed: {out:?}");
+    let names: Vec<&str> = listed
+        .as_array()
+        .expect("list array")
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"b") && !names.contains(&"c"),
+        "closed session must be hidden from the default list: {names:?}"
+    );
+
+    let (out, listed_all) = sandbox.term_json(&["term", "list", "--all", "--json"]);
+    assert_eq!(out.code, 0, "list --all after close failed: {out:?}");
+    let entries = listed_all.as_array().expect("list --all array");
+    assert_eq!(entries.len(), 2, "list --all includes closed: {entries:?}");
+    let closed = entries
+        .iter()
+        .find(|entry| entry["name"].as_str() == Some("c"))
+        .expect("closed entry in --all");
+    assert_eq!(closed["state"], "closed", "closed entry: {closed:?}");
+
+    let (out, shown) = sandbox.term_json(&["term", "show", "c", "--json"]);
+    assert_eq!(out.code, 0, "show closed failed: {out:?}");
+    assert_eq!(
+        shown["state"], "closed",
+        "show still reports closed: {shown:?}"
+    );
 
     let (out, json) = sandbox.term_json(&["term", "show", "ghost", "--json"]);
     assert_eq!(out.code, 3, "unknown show must exit 3: {out:?}");
@@ -1227,6 +1365,44 @@ fn tc_2607_close_named_without_host_reports_not_found() {
     assert!(
         !sandbox.socket_file().exists(),
         "close NAME must not create a socket"
+    );
+}
+
+/// TC-2623 (#317): the host process is not pinned to the workspace and does
+/// not outlive its sessions by much: its cwd symlink under procfs is not the
+/// sandbox workspace (when procfs exposes it), and after the last session is
+/// closed the host process exits within DMUXAI_TERM_IDLE_SECS (5) plus a
+/// small slack (about 3s).
+#[test]
+fn tc_2623_host_cwd_not_workspace_and_exits_after_close() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    sandbox.open_shell("a");
+
+    let pids = sandbox.host_pids();
+    assert_eq!(pids.len(), 1, "one host process: {pids:?}");
+    let host_pid = pids[0];
+
+    // Skipped when the procfs symlink cannot be read (anything but "the
+    // workspace" is fine; the host keeps its journal cwd instead).
+    if let Ok(cwd) = std::fs::read_link(format!("/proc/{host_pid}/cwd")) {
+        assert_ne!(
+            cwd, sandbox.workspace,
+            "host cwd must not be the sandbox workspace: {cwd:?}"
+        );
+    }
+
+    let (out, _) = sandbox.term_json(&["term", "close", "a", "--json"]);
+    assert_eq!(out.code, 0, "close failed: {out:?}");
+
+    // IDLE_SECS is 5 in every test run; allow ~3s of slack.
+    let exited = poll_until(
+        Duration::from_secs(IDLE_SECS.parse::<u64>().expect("idle secs") + 3),
+        || !pid_exists(host_pid),
+    );
+    assert!(
+        exited,
+        "host process {host_pid} must exit within idle grace + slack"
     );
 }
 
@@ -1554,11 +1730,12 @@ fn tc_2613_serial_lost_then_reopen() {
     assert_eq!(waited["reason"], "match", "wait after reopen: {waited:?}");
 }
 
-/// TC-2614 / FR-2614: a WSL2-looking environment runs the fake usbipd.exe
-/// attach exactly once with the explicit busid, then reports the attach failure
-/// with the cause and the FR-2611 manual hint.
+/// TC-2614 / FR-2614: with the DMUXAI_SERIAL_WSL2 test hook set, a missing
+/// `--serial` path and an explicit busid exits 3 with `needs_usbipd_attach`;
+/// the JSON names the busid and both elevated PowerShell commands, and the
+/// fake usbipd.exe is never invoked.
 #[test]
-fn tc_2614_wsl2_usbipd_attach_once_with_explicit_busid() {
+fn tc_2614_wsl_with_busid_guides_bind_and_attach_without_invoking_usbipd() {
     let sandbox = Sandbox::new();
     let _guard = sandbox.close_guard();
     let log = sandbox.workspace.join("usbipd.log");
@@ -1590,43 +1767,44 @@ fn tc_2614_wsl2_usbipd_attach_once_with_explicit_busid() {
         .expect("execute dmuxai");
     let out = Out::new(output);
     let json = out.json("stdout");
-    assert_eq!(out.code, 6, "attach failure must exit 6: {out:?}");
     assert_eq!(
-        json["error_kind"], "usbipd_attach_failed",
-        "error: {json:?}"
+        out.code, 3,
+        "WSL plus a missing path must exit 3 with needs_usbipd_attach: {out:?}"
+    );
+    assert_eq!(json["error_kind"], "needs_usbipd_attach", "error: {json:?}");
+    assert_eq!(
+        json["busid"], "1-2",
+        "the explicit busid must be named: {json:?}"
+    );
+    let commands: Vec<&str> = json["commands"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(
+        commands.contains(&"usbipd bind --busid 1-2"),
+        "bind command: {json:?}"
+    );
+    assert!(
+        commands.contains(&"usbipd attach --wsl --busid 1-2"),
+        "attach command: {json:?}"
     );
     let message = json["error"].as_str().unwrap_or_default();
-    assert!(message.contains("device is not bound"), "cause: {json:?}");
     assert!(
-        message.contains("usbipd attach --wsl --busid"),
-        "manual hint: {json:?}"
-    );
-
-    let calls = std::fs::read_to_string(&log).expect("usbipd log");
-    assert_eq!(
-        calls
-            .lines()
-            .filter(|line| line.starts_with("attach"))
-            .count(),
-        1,
-        "attach must run once: {calls}"
+        !message.contains("device is not bound"),
+        "the fake usbipd must not have run: {json:?}"
     );
     assert!(
-        calls.lines().any(|line| line == "attach --wsl --busid 1-2"),
-        "attach argv: {calls}"
-    );
-    assert!(
-        !calls.lines().any(|line| line == "list"),
-        "an explicit busid must not list: {calls}"
+        !log.exists(),
+        "the fake usbipd.exe must never be invoked (no list, no attach)"
     );
 }
 
-/// TC-2614 / FR-2614: on fake WSL2 with a missing `--serial` path and no
-/// explicit busid, dmuxai never invokes usbipd.exe (no `list`, no `attach`)
-/// and exits with `error_kind` `usbipd_busid_missing` plus a message that names
-/// `usbipd list` and `--usbipd-busid`.
+/// TC-2614 / FR-2614: with the DMUXAI_SERIAL_WSL2 test hook set, a missing
+/// `--serial` path and no busid exits 3 with `needs_usbipd_attach`; the
+/// message names `usbipd list` and the literal `<busid>` placeholder, and the
+/// fake usbipd.exe is never invoked.
 #[test]
-fn tc_2614_without_busid_usbipd_is_never_called() {
+fn tc_2614_wsl_without_busid_guides_usbipd_list_without_invoking_usbipd() {
     let sandbox = Sandbox::new();
     let _guard = sandbox.close_guard();
     let log = sandbox.workspace.join("usbipd.log");
@@ -1657,28 +1835,43 @@ fn tc_2614_without_busid_usbipd_is_never_called() {
     let out = Out::new(output);
     let json = out.json("stdout");
     assert_eq!(
-        out.code, 6,
-        "a missing busid must exit 6 (internal): {out:?}"
+        out.code, 3,
+        "WSL plus a missing path without a busid must exit 3: {out:?}"
     );
-    assert_eq!(
-        json["error_kind"], "usbipd_busid_missing",
-        "error: {json:?}"
+    assert_eq!(json["error_kind"], "needs_usbipd_attach", "error: {json:?}");
+    assert!(
+        json.get("busid").is_none(),
+        "no busid must be invented without --usbipd-busid: {json:?}"
     );
+    let commands: Vec<&str> = json["commands"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for command in [
+        "usbipd list",
+        "usbipd bind --busid <busid>",
+        "usbipd attach --wsl --busid <busid>",
+    ] {
+        assert!(commands.contains(&command), "command '{command}': {json:?}");
+    }
     let message = json["error"].as_str().unwrap_or_default();
     assert!(message.contains("usbipd list"), "hint: {json:?}");
-    assert!(message.contains("--usbipd-busid"), "hint: {json:?}");
+    assert!(message.contains("<busid>"), "literal placeholder: {json:?}");
     assert!(
         !log.exists(),
-        "usbipd.exe must not be invoked without an explicit busid"
+        "the fake usbipd.exe must never be invoked (no list, no attach)"
     );
 }
 
-/// TC-2614 / FR-2614: `--no-usbipd-attach` skips the usbipd.exe attach even
-/// when an explicit busid is set and reports the normal missing-device error.
-/// The host is already warm (a shell session was opened first), so the flag
-/// must travel inside the open request, not through inherited env vars.
+/// TC-2614 / FR-2614: the deprecated `--no-usbipd-attach` flag is still
+/// accepted but changes nothing: with a busid on a missing path in WSL the
+/// open still returns `needs_usbipd_attach`, the stderr line is a deprecation
+/// warning, stdout stays one JSON object, and the fake usbipd.exe is never
+/// invoked. The host is already warm (a shell session was opened first), so
+/// the flag must travel inside the open request, not through inherited env
+/// vars.
 #[test]
-fn tc_2614_no_attach_flag_skips_usbipd_with_busid() {
+fn tc_2614_wsl_missing_path_with_deprecated_no_attach_flag_still_guides() {
     let sandbox = Sandbox::new();
     let _guard = sandbox.close_guard();
     let log = sandbox.workspace.join("usbipd.log");
@@ -1689,9 +1882,22 @@ fn tc_2614_no_attach_flag_skips_usbipd_with_busid() {
             log.display()
         ),
     );
-    // Warm host: the serial open below is served by this running host, so the
-    // CLI's own environment is not enough; the request must carry the flag.
-    sandbox.open_shell("warm");
+    // Warm the host with the WSL hook already in the host environment, so the
+    // serial open run inside the host sees the same WSL state; the deprecated
+    // flag and the busid must travel inside the open request, not through the
+    // CLI env.
+    let warm = sandbox
+        .command(&["term", "open", "warm", "--json"])
+        .env("DMUXAI_SERIAL_WSL2", "1")
+        .env("DMUXAI_USBIPD_BIN", &fake)
+        .stdin(Stdio::null())
+        .output()
+        .expect("execute dmuxai");
+    assert_eq!(
+        Out::new(warm).code,
+        0,
+        "warm shell open failed before the serial open"
+    );
     let missing = sandbox.workspace.join("missing-serial");
     let output = sandbox
         .command(&[
@@ -1716,12 +1922,13 @@ fn tc_2614_no_attach_flag_skips_usbipd_with_busid() {
     let json = out.json("stdout");
     assert_eq!(
         out.code, 3,
-        "a disabled attach must report the missing device: {out:?}"
+        "the flag must not change the error or its exit code: {out:?}"
     );
     assert_eq!(
-        json["error_kind"], "serial_not_found",
-        "the missing-device path, not usbipd_attach_failed: {json:?}"
+        json["error_kind"], "needs_usbipd_attach",
+        "the deprecated no-op must not downgrade to serial_not_found: {json:?}"
     );
+    assert_eq!(json["busid"], "9-99", "busid guidance: {json:?}");
     assert!(
         !json["error"]
             .as_str()
@@ -1730,8 +1937,70 @@ fn tc_2614_no_attach_flag_skips_usbipd_with_busid() {
         "the fake usbipd must not have run: {json:?}"
     );
     assert!(
+        out.stderr.contains("deprecated"),
+        "the flag must warn on stderr: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("--no-usbipd-attach"),
+        "the warning must name the flag: {}",
+        out.stderr
+    );
+    assert!(
         !log.exists(),
-        "the fake usbipd.exe must not be invoked (no list, no attach) when attach is disabled"
+        "the fake usbipd.exe must never be invoked (no list, no attach)"
+    );
+}
+
+/// TC-2614 / FR-2614: outside WSL (DMUXAI_SERIAL_WSL2=0) a missing `--serial`
+/// path reports the normal missing-device error `serial_not_found` (still exit
+/// 3), even with a busid, and the fake usbipd.exe is never invoked.
+#[test]
+fn tc_2614_non_wsl_missing_path_reports_serial_not_found() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let log = sandbox.workspace.join("usbipd.log");
+    let fake = fake_usbipd(
+        &sandbox.workspace,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\necho 'device is not bound' >&2\nexit 1\n",
+            log.display()
+        ),
+    );
+    let missing = sandbox.workspace.join("missing-serial");
+    let output = sandbox
+        .command(&[
+            "term",
+            "open",
+            "board",
+            "--serial",
+            missing.to_str().expect("utf8 path"),
+            "--baud",
+            "115200",
+            "--usbipd-busid",
+            "1-2",
+            "--json",
+        ])
+        .env("DMUXAI_SERIAL_WSL2", "0")
+        .env("DMUXAI_USBIPD_BIN", &fake)
+        .stdin(Stdio::null())
+        .output()
+        .expect("execute dmuxai");
+    let out = Out::new(output);
+    let json = out.json("stdout");
+    assert_eq!(
+        out.code, 3,
+        "a missing device outside WSL must still exit 3: {out:?}"
+    );
+    assert_eq!(json["error_kind"], "serial_not_found", "error: {json:?}");
+    let message = json["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(missing.to_str().expect("utf8 path")),
+        "the message must name the missing path: {json:?}"
+    );
+    assert!(
+        !log.exists(),
+        "the fake usbipd.exe must never be invoked (no list, no attach)"
     );
 }
 
@@ -1789,7 +2058,7 @@ fn tc_2617_term_help_and_open_help_are_subcommand_local() {
         ("wait", &["--match", "--idle", "--timeout", "--since"]),
         ("exec", &["--timeout"]),
         ("approve", &["16 lowercase hex"]),
-        ("list", &["never starts one"]),
+        ("list", &["--all", "never starts one"]),
         ("resize", &["--cols", "--rows"]),
         ("close", &["--all", "--force"]),
         ("reopen", &["same spec"]),
