@@ -1,12 +1,21 @@
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::run_journal::strip_ansi_and_control;
 use crate::term::buffer::{BufferRead, RingBuffer};
 use crate::term::{ExitStatus, TermError};
 
 pub const MARKER_PREFIX: &str = "__DMUXAI_";
+
+static CSI_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]").unwrap());
+
+fn strip_for_match(input: &str) -> String {
+    strip_ansi_and_control(&CSI_RE.replace_all(input, ""))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -65,7 +74,8 @@ pub fn wait(buffer: &RingBuffer, options: &WaitOptions) -> Result<WaitResult, Te
     let deadline = started + options.timeout;
     let mut inner = buffer.lock();
     loop {
-        let output = inner.read_since(options.since, false);
+        let mut output = inner.read_since(options.since, true);
+        output.text = strip_for_match(&output.text);
         if let Some(regex) = &regex
             && regex.is_match(&output.text)
         {
@@ -274,6 +284,66 @@ mod tests {
         let buffer = RingBuffer::new(1024);
         let error = wait(&buffer, &options_match("(", Duration::from_millis(30))).unwrap_err();
         assert_eq!(error.code, crate::term::exit::USAGE);
+    }
+
+    #[test]
+    fn tc_2622_match_accumulates_prompt_across_reset_and_space() {
+        let buffer = RingBuffer::new(1024);
+        buffer.push_str("#");
+        buffer.push_str("\x1b[0m ");
+        let result = wait(
+            &buffer,
+            &options_match(r"[#\$] ", Duration::from_millis(30)),
+        )
+        .unwrap();
+        assert_eq!(result.reason, WaitReason::Match);
+        assert!(result.text.contains("# "), "text: {:?}", result.text);
+    }
+
+    #[test]
+    fn tc_2622_match_strips_private_mode_csi_between_hash_and_space() {
+        let buffer = RingBuffer::new(1024);
+        buffer.push_str("#\x1b[?2004h ");
+        let result = wait(
+            &buffer,
+            &options_match(r"[#\$] ", Duration::from_millis(30)),
+        )
+        .unwrap();
+        assert_eq!(result.reason, WaitReason::Match);
+        assert!(result.text.contains("# "), "text: {:?}", result.text);
+        let raw = buffer.read_since(0, true);
+        assert!(raw.text.contains('\x1b'), "raw text: {:?}", raw.text);
+        assert!(raw.text.contains("?2004h"), "raw text: {:?}", raw.text);
+    }
+
+    #[test]
+    fn tc_2622_match_handles_cr_wrapped_prompt() {
+        let buffer = RingBuffer::new(1024);
+        buffer.push_str("\r# \r\n");
+        let result = wait(
+            &buffer,
+            &options_match(r"[#\$] ", Duration::from_millis(30)),
+        )
+        .unwrap();
+        assert_eq!(result.reason, WaitReason::Match);
+    }
+
+    #[test]
+    fn tc_2622_prompt_before_since_still_times_out() {
+        let buffer = RingBuffer::new(1024);
+        buffer.push_str("# ");
+        let since = buffer.seq();
+        let result = wait(
+            &buffer,
+            &WaitOptions {
+                regex: Some(r"[#\$] ".to_owned()),
+                idle: None,
+                timeout: Duration::from_millis(30),
+                since,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.reason, WaitReason::Timeout);
     }
 
     #[test]

@@ -122,7 +122,10 @@ pub enum TermOp {
     Approve {
         id: String,
     },
-    List,
+    List {
+        /// FR-2606: `--all` includes closed and exited history sessions.
+        all: bool,
+    },
     Show {
         name: String,
     },
@@ -187,7 +190,8 @@ Subcommands:
                                    exactly its output
   approve ID    Approve one pending terminal-policy approval (16 lowercase
                 hex characters)
-  list          List sessions (empty when no host runs)
+  list [--all]  List sessions (empty when no host runs); closed and exited
+                sessions are history shown only with --all
   show NAME     Show one session
   resize NAME --cols N --rows N
                 Resize a session
@@ -280,7 +284,8 @@ is 500ms; suffixes work too (500ms, 1s, 1m). A bare number for --timeout is
 seconds, so --timeout 8 and --timeout 8s both mean 8 seconds, and
 --timeout 500ms means 500ms. --since applies only to the --match search;
 without it the search starts at the current seq, so output already in the
-buffer is not matched. --idle succeeds when no new output arrives for that
+buffer is not matched. After send, pass --since from that send's reply to
+match output caused by the send. --idle succeeds when no new output arrives for that
 duration: the idle clock starts when the wait starts and resets whenever
 new output arrives, so a quiet session returns almost immediately.
 
@@ -320,11 +325,14 @@ exactly one identical send or exec and is then consumed.
 
 /// Subcommand-local help for `dmuxai term list --help` / `-h` (FR-2617).
 pub const TERM_LIST_USAGE: &str = "\
-Usage: dmuxai term list [--json]
+Usage: dmuxai term list [--all] [--json]
 
-List this workspace's terminal sessions. Prints nothing (an empty JSON
+List this workspace's terminal sessions. Closed and exited sessions are
+intended history: the default list hides them, `show NAME` still reports
+them, and `list --all` includes them. Prints nothing (an empty JSON
 array with --json) when no host runs; list never starts one.
 
+  --all           Include closed and exited history sessions
   --json          Print a machine-readable reply
 ";
 
@@ -1065,14 +1073,23 @@ fn parse_term(args: &[String]) -> Result<TermCommand, String> {
             })
         }
         "list" => {
-            const LIST_FLAGS: &[FlagSpec] = &[FlagSpec {
-                names: &["--json"],
-                takes_value: false,
-                hidden: false,
-            }];
+            const LIST_FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--all"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
             let parsed = parse_flags(rest, LIST_FLAGS, false)?;
             Ok(TermCommand {
-                op: TermOp::List,
+                op: TermOp::List {
+                    all: parsed.flags.contains_key("--all"),
+                },
                 json: parsed.flags.contains_key("--json"),
             })
         }
@@ -1750,7 +1767,7 @@ fn execute_term(workspace_root: &Path, command: TermCommand) -> i32 {
     }
 
     let response = match &op {
-        TermOp::List => match dmuxai::term::client::try_connect(workspace_root) {
+        TermOp::List { .. } => match dmuxai::term::client::try_connect(workspace_root) {
             Ok(mut client) => client.call(RequestOp::List),
             Err(_) => {
                 if json {
@@ -1846,7 +1863,24 @@ fn merge_open_wait(open: Response, wait: Response) -> Response {
 #[cfg(unix)]
 fn report_term_response(op: &TermOp, response: Response, json: bool) -> i32 {
     let code = response.exit_code.unwrap_or(exit::OK);
-    let data = response.data.unwrap_or(Value::Null);
+    let mut data = response.data.unwrap_or(Value::Null);
+    // FR-2606 / FR-2607: closed and exited sessions are intended history; the
+    // default list hides them while `show` and `--all` still cover them.
+    if matches!(op, TermOp::List { all: false })
+        && let Some(sessions) = data.as_array().cloned()
+    {
+        data = Value::Array(
+            sessions
+                .into_iter()
+                .filter(|session| {
+                    !matches!(
+                        session.get("state").and_then(Value::as_str),
+                        Some("closed") | Some("exited")
+                    )
+                })
+                .collect(),
+        );
+    }
     if json {
         print_json(&data);
     } else {
@@ -1927,7 +1961,7 @@ fn term_request_op(op: &TermOp) -> RequestOp {
             timeout_ms: *timeout_ms,
         },
         TermOp::Approve { id } => RequestOp::Approve { id: id.clone() },
-        TermOp::List => RequestOp::List,
+        TermOp::List { .. } => RequestOp::List,
         TermOp::Show { name } => RequestOp::Show { name: name.clone() },
         TermOp::Resize { name, cols, rows } => RequestOp::Resize {
             name: name.clone(),
@@ -1977,7 +2011,7 @@ fn print_term_human(op: &TermOp, data: &Value) {
                 eprintln!("timeout");
             }
         }
-        TermOp::List => {
+        TermOp::List { .. } => {
             if let Some(sessions) = data.as_array() {
                 for session in sessions {
                     println!(

@@ -38,6 +38,11 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
+- **`term wait --match` searches accumulated output after a stronger CSI strip (#315).**
+  A prompt split across reads, or wrapped in private-mode CSI (for example ESC [ ? 2004 h) or CR, now matches. Without `--since`, text already in the buffer still does not match (FR-2615). `term read --raw` is unchanged.
+- **`term list` hides closed and exited sessions (#316).** They remain history: `show NAME` still works, and `term list --all` includes them.
+- **The terminal host idle-exits even when launched with `-C` on a non-Linux cwd (#317).**
+  After binding the socket it chdirs to the socket directory (failure ignored). Idle expiry is decided before session I/O log flush, and flush is skipped once no live sessions remain.
 - **`term open --serial` no longer auto-attaches the first `usbipd list` device (#308).**
   Without an explicit busid, dmuxai does not invoke `usbipd.exe` (no `list`, no `attach`)
   and exits with `error_kind` `usbipd_busid_missing` plus a hint to pass `--usbipd-busid`.
