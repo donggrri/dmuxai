@@ -178,8 +178,10 @@ Subcommands:
                                    Send text or named keys (C-c, Enter, ...)
   read NAME [--since N] [--tail N] [--raw]
                                    Read session output
-  wait NAME --match REGEX|--idle MS --timeout DUR [--since N]
+  wait NAME --match REGEX|--idle DUR --timeout DUR [--since N]
                                    Wait for a regex match or an idle period
+                                   (--idle: bare number is ms; --timeout:
+                                   bare number is seconds)
   exec NAME COMMAND [--timeout DUR]
                                    Run a command in the session and return
                                    exactly its output
@@ -216,7 +218,8 @@ Session options:
   --env K=V                Extra session environment (repeatable)
   --cols N --rows N        Terminal size (default 80x24)
   --wait-for REGEX         Return after REGEX appears in the output; requires
-  --timeout DUR            --timeout (e.g. 500ms, 2s)
+  --timeout DUR            --timeout; a bare number is seconds (8 and 8s =
+                           8 seconds), suffixes work (500ms = 500ms)
   -- CMD...                Command for --kind cmd; serial and shell sessions
                            take no command
 
@@ -268,20 +271,24 @@ Print the output the session has produced so far.
 
 /// Subcommand-local help for `dmuxai term wait --help` / `-h` (FR-2617).
 pub const TERM_WAIT_USAGE: &str = "\
-Usage: dmuxai term wait NAME (--match REGEX | --idle MS) --timeout DUR
+Usage: dmuxai term wait NAME (--match REGEX | --idle DUR) --timeout DUR
                      [--since SEQ] [--json]
 
 Wait until stripped output after SEQ matches REGEX, or until output has
-been quiet for MS milliseconds. --since applies only to the --match
-search; without it the search starts at the current seq, so output
-already in the buffer is not matched. --idle succeeds when no new output
-arrives for that duration: the idle clock starts when the wait starts
-and resets whenever new output arrives, so a quiet session returns
-almost immediately.
+been quiet for DUR. A bare number for --idle is milliseconds, so --idle 500
+is 500ms; suffixes work too (500ms, 1s, 1m). A bare number for --timeout is
+seconds, so --timeout 8 and --timeout 8s both mean 8 seconds, and
+--timeout 500ms means 500ms. --since applies only to the --match search;
+without it the search starts at the current seq, so output already in the
+buffer is not matched. --idle succeeds when no new output arrives for that
+duration: the idle clock starts when the wait starts and resets whenever
+new output arrives, so a quiet session returns almost immediately.
 
   --match REGEX   Wait until REGEX matches new output
-  --idle MS       Succeed after MS milliseconds without new output
-  --timeout DUR   Give up after DUR (e.g. 500ms, 2s); exits 1
+  --idle DUR      Succeed after DUR without new output; a bare number is
+                  milliseconds (500 = 500ms), suffixes work (500ms, 1s)
+  --timeout DUR   Give up after DUR; a bare number is seconds (8 and 8s =
+                  8 seconds), suffixes work (500ms = 500ms); exits 1
   --since SEQ     Search for REGEX only in output after SEQ
   --json          Print a machine-readable reply
 ";
@@ -294,7 +301,9 @@ Type COMMAND into the session, press Enter and return exactly the output
 the command prints together with its exit code; the internal completion
 marker never appears in the reply.
 
-  --timeout DUR   Give up after DUR and exit 1 (default 30s)
+  --timeout DUR   Give up after DUR and exit 1 (default 30s); a bare number
+                  is seconds (8 and 8s = 8 seconds), suffixes work
+                  (500ms = 500ms)
   --json          Print a machine-readable reply
 ";
 
@@ -976,7 +985,7 @@ fn parse_term(args: &[String]) -> Result<TermCommand, String> {
             let parsed = parse_flags(rest, WAIT_FLAGS, true)?;
             let name = single_term_name(&parsed, "term wait")?;
             let regex = parsed.flags.get("--match").cloned().flatten();
-            let idle_ms = duration_flag(&parsed, "--idle", "--idle")?;
+            let idle_ms = idle_duration_flag(&parsed, "--idle", "--idle")?;
             if regex.is_some() == idle_ms.is_some() {
                 return Err("term wait needs exactly one of --match or --idle".to_owned());
             }
@@ -1479,16 +1488,41 @@ fn optional_usize_flag(
 }
 
 fn duration_flag(parsed: &ParsedFlags, name: &str, label: &str) -> Result<Option<u64>, String> {
+    duration_flag_with_unitless(parsed, name, label, 1_000.0)
+}
+
+fn idle_duration_flag(
+    parsed: &ParsedFlags,
+    name: &str,
+    label: &str,
+) -> Result<Option<u64>, String> {
+    duration_flag_with_unitless(parsed, name, label, 1.0)
+}
+
+fn duration_flag_with_unitless(
+    parsed: &ParsedFlags,
+    name: &str,
+    label: &str,
+    unitless_multiplier: f64,
+) -> Result<Option<u64>, String> {
     parsed
         .flags
         .get(name)
         .cloned()
         .flatten()
-        .map(|raw| parse_duration_ms(&raw, label))
+        .map(|raw| parse_duration_ms_with_unitless(&raw, label, unitless_multiplier))
         .transpose()
 }
 
 fn parse_duration_ms(raw: &str, label: &str) -> Result<u64, String> {
+    parse_duration_ms_with_unitless(raw, label, 1_000.0)
+}
+
+fn parse_duration_ms_with_unitless(
+    raw: &str,
+    label: &str,
+    unitless_multiplier: f64,
+) -> Result<u64, String> {
     let trimmed = raw.trim();
     let (number, multiplier) = if let Some(number) = trimmed.strip_suffix("ms") {
         (number, 1.0)
@@ -1499,7 +1533,7 @@ fn parse_duration_ms(raw: &str, label: &str) -> Result<u64, String> {
     } else if let Some(number) = trimmed.strip_suffix('h') {
         (number, 3_600_000.0)
     } else {
-        (trimmed, 1_000.0)
+        (trimmed, unitless_multiplier)
     };
     let value = number
         .parse::<f64>()
@@ -1758,6 +1792,25 @@ fn execute_term(workspace_root: &Path, command: TermCommand) -> i32 {
                 Err(error) => return term_fail(error, json),
             };
             Ok(merge_open_wait(open, wait))
+        }
+        TermOp::Close { name, all, .. } => {
+            match dmuxai::term::client::try_connect(workspace_root) {
+                Ok(mut client) => client.call(term_request_op(&op)),
+                Err(_) if *all => {
+                    if json {
+                        print_json(&json!({"closed": []}));
+                    } else {
+                        println!("closed 0 session(s)");
+                    }
+                    return exit::OK;
+                }
+                Err(_) => {
+                    return term_fail(
+                        TermError::not_found(name.as_deref().unwrap_or_default()),
+                        json,
+                    );
+                }
+            }
         }
         _ => match dmuxai::term::client::connect(workspace_root) {
             Ok(mut client) => client.call(term_request_op(&op)),
@@ -3481,6 +3534,53 @@ mod tests {
                 term_subcommand_usage("wait").contains(flag),
                 "term wait help documents {flag}"
             );
+        }
+    }
+
+    // TC-2619 / FR-2604: a bare `--idle` value is milliseconds, while
+    // suffixes keep their usual meaning.
+    #[test]
+    fn tc_2619_parse_term_wait_idle_bare_number_is_milliseconds() {
+        for (raw, expected) in [("500", 500), ("500ms", 500), ("1s", 1_000)] {
+            match parse(&args(&[
+                "term",
+                "wait",
+                "a",
+                "--idle",
+                raw,
+                "--timeout",
+                "8s",
+            ])) {
+                Ok(AgentCommand::Term(command)) => match command.op {
+                    TermOp::Wait { idle_ms, .. } => assert_eq!(idle_ms, Some(expected), "{raw}"),
+                    other => panic!("unexpected {other:?}"),
+                },
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    // TC-2619 / FR-2604: `--timeout` keeps seconds for a bare number.
+    #[test]
+    fn tc_2619_parse_term_wait_timeout_bare_number_is_seconds() {
+        for raw in ["8", "8s"] {
+            match parse(&args(&[
+                "term",
+                "wait",
+                "a",
+                "--match",
+                "r",
+                "--timeout",
+                raw,
+            ])) {
+                Ok(AgentCommand::Term(command)) => match command.op {
+                    TermOp::Wait { timeout_ms, .. } => {
+                        assert_eq!(timeout_ms, 8_000, "{raw}")
+                    }
+                    other => panic!("unexpected {other:?}"),
+                },
+                other => panic!("unexpected {other:?}"),
+            }
         }
     }
 }

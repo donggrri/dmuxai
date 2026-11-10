@@ -51,6 +51,13 @@ All notable changes to dmuxai are listed here. Versions follow
 - **`term wait --idle` succeeds when output has already stopped (#312).** The idle clock
   starts when the wait starts (and resets if new output arrives). It does not require new
   bytes after `--since`; `--since` still applies only to `--match`.
+- **`term wait --idle 500` (no unit) is 500 milliseconds (#313).** A bare number for
+  `--idle` is milliseconds as documented; suffixes `ms`/`s`/`m`/`h` still work.
+  `--timeout` (and other duration flags) still treat a bare number as seconds. Help
+  for wait, open, and exec states each flag's unit.
+- **`term close --all` does not start a host when none is running (#314).** It exits 0
+  with an empty `closed` list. `close NAME` with no host exits 3 (`not_found`) and
+  also does not spawn one. `term list` already behaved this way.
 
 ## [0.3.1] - 2026-11-09
 

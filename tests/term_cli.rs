@@ -15,7 +15,8 @@
 //!   semantics in `src/term/wait.rs`)
 //! - TC-2605 (FR-2605): exec true/false/printf, marker removed
 //! - TC-2606 (FR-2606): list/show/unknown/empty list without host
-//! - TC-2607 (FR-2607): close kills the process-group child, self-exit state
+//! - TC-2607 (FR-2607): close kills the process-group child, self-exit state;
+//!   close --all / close NAME without a listening host spawn no host
 //! - TC-2608 (FR-2608): resize propagated to the PTY, invalid dims exit 2
 //! - TC-2609 (FR-2609): takeover lock rejects send/exec, read/wait ok, release
 //!   (unit covers the lock helper in `src/term/host.rs`)
@@ -35,7 +36,7 @@
 //!   for every other term subcommand exit 0 with subcommand-local help, not
 //!   the root usage
 //! - TC-2619 (FR-2604): `wait --idle` without `--since` succeeds on a quiet
-//!   session well before the timeout
+//!   session well before the timeout; a bare `--idle 500` is 500 ms
 //! - TC-2618 (FR-2610): optional socat PTY pair (`#[ignore]`, skips if absent)
 //!   plus a picocom `--kind cmd` reader on the same pair when picocom exists
 //! - TC-2630 (FR-2630): default-deny send and exec each need one-shot
@@ -1179,6 +1180,56 @@ fn tc_2607_close_process_group_and_self_exit() {
     assert!(reached, "self-exit did not record state exited/exit_code 3");
 }
 
+/// TC-2607 / FR-2607: with no host listening, `term close --all --json` (with
+/// or without `--force`) exits 0 with an empty `closed` array and never starts
+/// a host or creates the per-workspace socket.
+#[test]
+fn tc_2607_close_all_without_host_spawns_nothing() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+
+    assert!(
+        sandbox.host_pids().is_empty(),
+        "no host before the first term command"
+    );
+    for args in [
+        vec!["term", "close", "--all", "--json"],
+        vec!["term", "close", "--all", "--force", "--json"],
+    ] {
+        let (out, closed) = sandbox.term_json(&args);
+        assert_eq!(out.code, 0, "close --all without a host failed: {out:?}");
+        assert_eq!(closed["closed"], json!([]), "closed: {closed:?}");
+        assert!(
+            sandbox.host_pids().is_empty(),
+            "close --all must not start a host: {args:?}"
+        );
+        assert!(
+            !sandbox.socket_file().exists(),
+            "close --all must not create a socket: {args:?}"
+        );
+    }
+}
+
+/// TC-2607 / FR-2607: with no host listening, `term close ghost --json` exits 3
+/// with `not_found` and, like `close --all`, never spawns a host or socket.
+#[test]
+fn tc_2607_close_named_without_host_reports_not_found() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+
+    let (out, json) = sandbox.term_json(&["term", "close", "ghost", "--json"]);
+    assert_eq!(out.code, 3, "close without a host must exit 3: {out:?}");
+    assert_eq!(json["error_kind"], "not_found", "close ghost: {json:?}");
+    assert!(
+        sandbox.host_pids().is_empty(),
+        "close NAME must not start a host"
+    );
+    assert!(
+        !sandbox.socket_file().exists(),
+        "close NAME must not create a socket"
+    );
+}
+
 /// TC-2608 / FR-2608: resize changes the PTY window the child sees
 /// (`stty size` prints "<rows> <cols>"); values outside 1-1000 exit 2.
 #[test]
@@ -1791,7 +1842,8 @@ fn tc_2617_term_help_and_open_help_are_subcommand_local() {
 
 /// TC-2619 / FR-2604: after output has settled, `term wait --idle 1s` without
 /// `--since` succeeds with reason "idle" well before the 8s timeout; the idle
-/// clock starts at wait start and needs no new output after it begins.
+/// clock starts at wait start and needs no new output after it begins. A bare
+/// `--idle 500` is 500 ms (not 500 s) and also succeeds well before 8s.
 #[test]
 fn tc_2619_idle_wait_without_since_succeeds_on_quiet_session() {
     let sandbox = Sandbox::new();
@@ -1834,6 +1886,50 @@ fn tc_2619_idle_wait_without_since_succeeds_on_quiet_session() {
     assert!(
         elapsed < Duration::from_secs(8),
         "idle wait took {elapsed:?}; it must finish well before the 8s timeout"
+    );
+
+    // A fresh successful match, then the bare-number form: `--idle 500` is
+    // 500 ms (not 500 s), so the wait still ends with reason idle well before
+    // the 8s timeout instead of timing out (TC-2619 / FR-2604).
+    let (out, matched) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "a",
+        "--match",
+        "settled",
+        "--since",
+        "0",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(
+        out.code, 0,
+        "wait --match before the bare idle wait: {out:?}"
+    );
+    assert_eq!(matched["reason"], "match", "wait: {matched:?}");
+
+    let started = Instant::now();
+    let (out, waited) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "a",
+        "--idle",
+        "500",
+        "--timeout",
+        "8s",
+        "--json",
+    ]);
+    let elapsed = started.elapsed();
+    assert_eq!(out.code, 0, "bare --idle 500 wait failed: {out:?}");
+    assert_eq!(waited["reason"], "idle", "bare --idle 500: {waited:?}");
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "bare --idle 500 finished after {elapsed:?}; the unitless value must mean 500 ms"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "bare --idle 500 wait took {elapsed:?}; it must finish well before the 8s timeout"
     );
 }
 
