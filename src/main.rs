@@ -57,6 +57,8 @@ impl Default for WebOptions {
 #[derive(Debug, PartialEq, Eq)]
 enum CliAction {
     Help,
+    /// Subcommand-local help text printed instead of the root usage (FR-2617).
+    HelpTopic(&'static str),
     Version,
     Run,
     Serve(WebOptions),
@@ -97,7 +99,10 @@ Usage:
   dmuxai runs [--limit N] [--failed] [--json]
   dmuxai runs show <id> [--json]
   dmuxai events [--since N] [--limit N] [--follow] [--json]
-  dmuxai term open|send|read|wait|exec|list|show|resize|close|reopen [--json] ...
+  dmuxai term open NAME [--serial DEV --baud N --parity P --data B --stop S --flow F --usbipd-busid ID --wait-for REGEX --timeout DUR --kind shell|cmd|serial --cwd DIR --env K=V] [--]
+  dmuxai term send NAME <text|text --keys KEYS> | term read NAME [--since N] [--tail N] [--raw]
+  dmuxai term wait NAME --match REGEX|--idle MS --timeout DUR [--since N] | term exec NAME <command> [--timeout DUR]
+  dmuxai term approve <id> [--json] | term list|show|resize|close|reopen ...
   dmuxai mcp
   dmuxai init [--workspace] [--force]
 
@@ -164,11 +169,21 @@ where
         .is_some_and(|first| cli::SUBCOMMANDS.contains(&first.as_str()))
     {
         // Stop at `--`: anything after it is prompt text.
-        if args
+        let wants_help = args
             .iter()
             .take_while(|arg| arg.as_str() != "--")
-            .any(|arg| arg == "-h" || arg == "--help")
-        {
+            .any(|arg| arg == "-h" || arg == "--help");
+        // FR-2617: `term --help` and `term <subcommand> --help` (or `-h`)
+        // print their own help, not the root usage. Other subcommands keep
+        // the root usage.
+        if wants_help && args.first().map(String::as_str) == Some("term") {
+            let text = match args.get(1).map(String::as_str) {
+                Some(subcommand) => cli::term_subcommand_usage(subcommand),
+                None => cli::TERM_USAGE,
+            };
+            return CliAction::HelpTopic(text);
+        }
+        if wants_help {
             return CliAction::Help;
         }
         return match cli::parse(&args) {
@@ -388,6 +403,10 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     match action {
         CliAction::Help => {
             print!("{USAGE}");
+            Ok(())
+        }
+        CliAction::HelpTopic(text) => {
+            print!("{text}");
             Ok(())
         }
         CliAction::Version => {
@@ -1309,6 +1328,107 @@ mod tests {
         }
         assert!(matches!(parse_cli(["todo"]), CliAction::Usage(_)));
         assert!(matches!(parse_cli(["mcp", "x"]), CliAction::Usage(_)));
+    }
+
+    // TC-2617 / FR-2617: `term --help`, `term open --help` and every other
+    // term subcommand's `--help` / `-h` print subcommand-local help; `dmuxai
+    // --help` and `dmuxai run --help` keep the root usage.
+    #[test]
+    fn tc_2617_term_help_topics_are_subcommand_local() {
+        assert_eq!(
+            parse_cli(["term", "--help"]),
+            CliAction::HelpTopic(cli::TERM_USAGE)
+        );
+        assert_eq!(
+            parse_cli(["term", "-h"]),
+            CliAction::HelpTopic(cli::TERM_USAGE)
+        );
+        for subcommand in [
+            "open", "send", "read", "wait", "exec", "approve", "list", "show", "resize", "close",
+            "reopen",
+        ] {
+            for flag in ["--help", "-h"] {
+                assert_eq!(
+                    parse_cli(["term", subcommand, flag]),
+                    CliAction::HelpTopic(cli::term_subcommand_usage(subcommand)),
+                    "term {subcommand} {flag} must print its own topic"
+                );
+                assert_ne!(
+                    cli::term_subcommand_usage(subcommand),
+                    cli::TERM_USAGE,
+                    "term {subcommand} help must not be the parent term list"
+                );
+            }
+        }
+        assert_eq!(parse_cli(["--help"]), CliAction::Help);
+        assert_eq!(parse_cli(["run", "--help"]), CliAction::Help);
+        // `--help` after `--` is a shell argument, not help.
+        match parse_cli(["term", "exec", "sh", "--", "--help"]) {
+            CliAction::Agent(cli::AgentCommand::Term(command)) => {
+                assert!(matches!(command.op, cli::TermOp::Exec { .. }));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // TC-2617 / FR-2617 content: term help names the operations, every
+    // subcommand help documents its own flags, open help names the serial
+    // options, wait help names its four flags, and none of them is the root
+    // usage or only the parent term list.
+    #[test]
+    fn tc_2617_term_help_content() {
+        assert!(cli::TERM_USAGE != USAGE);
+        assert!(cli::TERM_OPEN_USAGE != USAGE);
+        for operation in ["open", "send", "read", "wait", "exec", "approve"] {
+            assert!(
+                cli::TERM_USAGE.contains(&format!("  {operation}")),
+                "term help lists {operation}"
+            );
+        }
+        for operation in ["list", "show", "resize", "close", "reopen"] {
+            assert!(
+                cli::TERM_USAGE.contains(operation),
+                "term help lists {operation}"
+            );
+        }
+        for option in ["--serial", "--baud", "--usbipd-busid", "--no-usbipd-attach"] {
+            assert!(
+                cli::TERM_OPEN_USAGE.contains(option),
+                "term open help documents {option}"
+            );
+        }
+        let topics: [(&str, &[&str]); 10] = [
+            ("send", &["--keys", "--no-newline", "--secret"]),
+            ("read", &["--since", "--tail", "--raw"]),
+            ("wait", &["--match", "--idle", "--timeout", "--since"]),
+            ("exec", &["--timeout"]),
+            ("approve", &["16 lowercase hex"]),
+            ("list", &["never starts one"]),
+            ("show", &["takeover"]),
+            ("resize", &["--cols", "--rows"]),
+            ("close", &["--all", "--force"]),
+            ("reopen", &["same spec"]),
+        ];
+        for (subcommand, options) in topics {
+            let text = cli::term_subcommand_usage(subcommand);
+            assert!(text.contains(&format!("dmuxai term {subcommand}")));
+            assert_ne!(text, USAGE, "term {subcommand} help is not the root usage");
+            assert_ne!(
+                text,
+                cli::TERM_USAGE,
+                "term {subcommand} help is not only the parent term list"
+            );
+            for option in options {
+                assert!(
+                    text.contains(option),
+                    "term {subcommand} help documents {option}"
+                );
+            }
+        }
+        assert!(
+            !USAGE.contains("--no-usbipd-attach"),
+            "the root usage is unchanged by FR-2617"
+        );
     }
 
     // FR-540/FR-541: `serve` seeds the hub with persisted to-dos at startup so

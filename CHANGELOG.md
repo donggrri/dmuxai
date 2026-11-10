@@ -13,8 +13,51 @@ All notable changes to dmuxai are listed here. Versions follow
   (text or named keys), `read`, `wait` (regex, idle, timeout), `exec` (exit code via a nonce
   marker), `list`, `show`, `resize`, `close`, `reopen`, all with `--json`. Every input and
   output event goes to a masked local journal under `terms/`. `dmuxai run` never starts the
-  host. Serial ports, the dangerous-command guard, agent integration, and the dashboard view
-  follow in later PRs.
+  host. Agent integration and the dashboard view follow in later PRs.
+- **Terminal sessions PR1b (FR-2610..2616, FR-2630).** `term open --serial DEV --baud N`
+  opens the device with serial2 (parity/data/stop/flow; no extra tool). Missing, permission,
+  and busy failures use distinct `error_kind` values and the FR-2611 hint text (never
+  `chmod 666`). WSL1 maps `COMn` to `/dev/ttySn`. On WSL2 a missing path runs
+  `usbipd.exe attach --wsl --busid <id>` once (id from `--usbipd-busid` or trusted
+  `[terminal.serial] usbipd_busid`; never auto-selected from `usbipd.exe list`).
+  Without an explicit busid, attach is skipped. `--no-usbipd-attach` (or trusted
+  `[terminal.serial] usbipd_attach = false`) disables attach even when a busid is set.
+  Unplug (EIO/ENXIO) moves the
+  session to `lost`; `term reopen` drops the old file descriptor before retrying.
+  `open --wait-for REGEX --timeout` waits for a banner. `term wait` without `--since`
+  starts at the current seq so older buffer text cannot match. `term exec` `text` is only
+  the command output (no echo, nonce marker, or trailing prompt). A seatbelt (not a
+  sandbox) blocks default-denied `send`/`exec` text until `term approve <id>` (refused
+  when `DMUXAI_RUN_ID` is set); trusted `[terminal.policy]` can add allow/deny patterns
+  and `approve_timeout`. `scripts/bench-term.sh` prints p50/p95 for status, send+read,
+  and exec versus `bash -c`.
+- **`dmuxai term --help` and `dmuxai term <subcommand> --help` print topic-specific usage (FR-2617, #309, #311),**
+  not the root help and not only the parent term list. `term wait --help` documents
+  `--match`, `--idle`, `--timeout`, and `--since`. `dmuxai --help` and `dmuxai run --help`
+  are unchanged.
+
+### Fixed
+
+- **`term open --serial` no longer auto-attaches the first `usbipd list` device (#308).**
+  Without an explicit busid, dmuxai does not invoke `usbipd.exe` (no `list`, no `attach`)
+  and exits with `error_kind` `usbipd_busid_missing` plus a hint to pass `--usbipd-busid`.
+
+- **`--no-usbipd-attach` skips usbipd attach even when a busid is set and a host is
+  already running (#310).** The flag travels on the open request (`SerialConfig`), so a
+  warm host does not inherit-only via `DMUXAI_NO_USBIPD_ATTACH`.
+- **Every `dmuxai term <subcommand> --help` prints that subcommand's help (#311),**
+  not the parent `term` list. `term wait --help` names `--match`, `--idle`, `--timeout`,
+  and `--since`.
+- **`term wait --idle` succeeds when output has already stopped (#312).** The idle clock
+  starts when the wait starts (and resets if new output arrives). It does not require new
+  bytes after `--since`; `--since` still applies only to `--match`.
+- **`term wait --idle 500` (no unit) is 500 milliseconds (#313).** A bare number for
+  `--idle` is milliseconds as documented; suffixes `ms`/`s`/`m`/`h` still work.
+  `--timeout` (and other duration flags) still treat a bare number as seconds. Help
+  for wait, open, and exec states each flag's unit.
+- **`term close --all` does not start a host when none is running (#314).** It exits 0
+  with an empty `closed` list. `close NAME` with no host exits 3 (`not_found`) and
+  also does not spawn one. `term list` already behaved this way.
 
 ## [0.3.1] - 2026-11-09
 

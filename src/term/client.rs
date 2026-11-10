@@ -34,13 +34,35 @@ impl Client {
         if response.ok {
             Ok(response)
         } else {
-            Err(TermError::new(
-                response.exit_code.unwrap_or(crate::term::exit::INTERNAL),
-                response
+            Err(TermError {
+                code: response.exit_code.unwrap_or(crate::term::exit::INTERNAL),
+                message: response
                     .error
                     .unwrap_or_else(|| "term host request failed".to_owned()),
-            ))
+                error_kind: response.error_kind.map(intern_error_kind),
+                data: response.data,
+            })
         }
+    }
+}
+
+fn intern_error_kind(kind: String) -> &'static str {
+    match kind.as_str() {
+        "usage" => "usage",
+        "not_found" => "not_found",
+        "conflict" => "conflict",
+        "forbidden" => "forbidden",
+        "internal" => "internal",
+        "approval_required" => "approval_required",
+        crate::term::serial::ERROR_MISSING => crate::term::serial::ERROR_MISSING,
+        crate::term::serial::ERROR_PERMISSION => crate::term::serial::ERROR_PERMISSION,
+        crate::term::serial::ERROR_BUSY => crate::term::serial::ERROR_BUSY,
+        crate::term::serial::ERROR_INVALID => crate::term::serial::ERROR_INVALID,
+        crate::term::serial::ERROR_USBIPD_NOT_FOUND => crate::term::serial::ERROR_USBIPD_NOT_FOUND,
+        crate::term::serial::ERROR_USBIPD_LIST => crate::term::serial::ERROR_USBIPD_LIST,
+        crate::term::serial::ERROR_USBIPD_BUSID => crate::term::serial::ERROR_USBIPD_BUSID,
+        crate::term::serial::ERROR_USBIPD_ATTACH => crate::term::serial::ERROR_USBIPD_ATTACH,
+        other => Box::leak(other.to_owned().into_boxed_str()),
     }
 }
 

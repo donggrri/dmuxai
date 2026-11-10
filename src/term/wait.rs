@@ -60,7 +60,9 @@ pub fn wait(buffer: &RingBuffer, options: &WaitOptions) -> Result<WaitResult, Te
         None => None,
     };
 
-    let deadline = Instant::now() + options.timeout;
+    let start_seq = buffer.seq();
+    let started = Instant::now();
+    let deadline = started + options.timeout;
     let mut inner = buffer.lock();
     loop {
         let output = inner.read_since(options.since, false);
@@ -74,10 +76,13 @@ pub fn wait(buffer: &RingBuffer, options: &WaitOptions) -> Result<WaitResult, Te
         }
 
         let now = Instant::now();
-        let idle_deadline = options.idle.and_then(|idle| {
-            (output.seq_to > options.since)
-                .then(|| inner.last_output.map(|last| last + idle))
-                .flatten()
+        let idle_deadline = options.idle.map(|idle| {
+            let idle_start = if output.seq_to > start_seq {
+                inner.last_output.unwrap_or(started)
+            } else {
+                started
+            };
+            idle_start + idle
         });
         if let Some(idle_deadline) = idle_deadline
             && now >= idle_deadline
@@ -151,6 +156,72 @@ pub fn strip_exit_marker(text: &str, nonce: &str) -> String {
         }
     }
     out
+}
+
+/// FR-2616: the `exec` reply text is exactly the command output. The marker
+/// command shares the sent line, so the buffer is `echoed-line`, then the raw
+/// output, then the numbered marker; text is sliced between them and the
+/// trailing newline of the marker print is trimmed away.
+pub fn exec_output_text(full: &str, command: &str, nonce: &str) -> String {
+    let token = format!("{MARKER_PREFIX}{nonce}_%s__");
+    let echo_line = format!("{command}; printf '\\n{token}\\n' \"$?\"");
+    let body_start = full
+        .find(&echo_line)
+        .and_then(|pos| line_end(full, pos + echo_line.len()));
+    let marker = marker_start(full, nonce);
+
+    match (body_start, marker) {
+        (Some(start), Some(end)) if end >= start => {
+            strip_leading_prompt(full[start..end].trim_end()).to_owned()
+        }
+        (Some(start), _) => {
+            let text = strip_exit_marker(&full[start..], nonce);
+            strip_leading_prompt(&text).to_owned()
+        }
+        (None, Some(end)) => {
+            let text = strip_exit_marker(&full[..end], nonce);
+            strip_leading_prompt(text.trim_end()).to_owned()
+        }
+        (None, None) => {
+            let text = strip_exit_marker(full, nonce);
+            strip_leading_prompt(&text).to_owned()
+        }
+    }
+}
+
+fn marker_start(full: &str, nonce: &str) -> Option<usize> {
+    let prefix = format!("{MARKER_PREFIX}{nonce}_");
+    full.match_indices(&prefix)
+        .find(|(pos, _)| {
+            let rest = &full[pos + prefix.len()..];
+            let digits = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
+                .count();
+            digits > 0 && rest[digits..].starts_with("__")
+        })
+        .map(|(pos, _)| pos)
+}
+
+fn line_end(full: &str, from: usize) -> Option<usize> {
+    let rest = &full[from..];
+    let offset = rest.find(['\r', '\n'])?;
+    let mut end = from + offset;
+    if full[end..].starts_with("\r\n") {
+        end += 2;
+    } else {
+        end += 1;
+    }
+    Some(end)
+}
+
+fn strip_leading_prompt(text: &str) -> &str {
+    for prompt in ["$ ", "# ", "> "] {
+        if let Some(rest) = text.strip_prefix(prompt) {
+            return rest;
+        }
+    }
+    text
 }
 
 #[cfg(test)]
@@ -257,9 +328,83 @@ mod tests {
     }
 
     #[test]
+    fn tc_2616_exec_output_text_is_exactly_the_command_output() {
+        let nonce = "01ab40d3";
+        let token = format!("{MARKER_PREFIX}{nonce}_%s__");
+        let marker_args = format!("printf '\\n{token}\\n' \"$?\"");
+
+        // Plain output plus shell prompt before and after: text is exactly `x`.
+        let full = format!(
+            "$ printf x; {marker_args}\r\nx\r\n{}\r\n$ ",
+            exit_marker(nonce, 0)
+        );
+        let text = exec_output_text(&full, "printf x", nonce);
+        assert_eq!(text, "x", "plain output: {text:?}");
+        assert!(!text.contains("__DMUXAI_"), "marker leaked: {text:?}");
+        assert!(!text.contains("printf x"), "command echo leaked: {text:?}");
+        assert!(!text.contains('$'), "prompt leaked: {text:?}");
+
+        // Multi-line output keeps its interior newline.
+        let full = format!(
+            "$ echo hi; {marker_args}\r\nhi\r\nbye\r\n\r\n{}\r\n$ ",
+            exit_marker(nonce, 1)
+        );
+        assert_eq!(exec_output_text(&full, "echo hi", nonce), "hi\r\nbye");
+
+        // Empty output stays empty.
+        let full = format!(
+            "$ true; {marker_args}\r\n\r\n{}\r\n$ ",
+            exit_marker(nonce, 0)
+        );
+        assert_eq!(exec_output_text(&full, "true", nonce), "");
+
+        // Older output in the window does not fool the echo slice: the slice
+        // anchors on the echoed command line, not the first text occurrence.
+        let full = format!(
+            "$ echo hi\r\nhi\r\n$ echo hi; {marker_args}\r\nhi\r\n\r\n{}\r\n$ ",
+            exit_marker(nonce, 0)
+        );
+        assert_eq!(exec_output_text(&full, "echo hi", nonce), "hi");
+    }
+
+    #[test]
+    fn tc_2616_exec_output_text_falls_back_on_timeout_and_missing_echo() {
+        let nonce = "0badc0de";
+        let token = format!("{MARKER_PREFIX}{nonce}_%s__");
+        let marker_args = format!("printf '\\n{token}\\n' \"$?\"");
+
+        // Without the numbered marker (timeout) the echo line is stripped but
+        // the rest of the window is kept.
+        let full = format!("$ true; {marker_args}\r\noutput line\r\n");
+        assert_eq!(exec_output_text(&full, "true", nonce), "output line\r\n");
+
+        // Echo disabled: same fallback.
+        let no_echo = "some output\nmore\n".to_owned();
+        assert_eq!(exec_output_text(&no_echo, "true", nonce), no_echo);
+    }
+
+    #[test]
+    fn tc_2616_exec_output_text_drops_leading_prompt_when_echo_is_missing() {
+        let nonce = "feedbeef";
+        let marker = exit_marker(nonce, 0);
+
+        // The echo line is missing: the prompt before the output must not leak.
+        let full = format!("$ x\r\n{marker}\r\n");
+        assert_eq!(exec_output_text(&full, "printf x", nonce), "x");
+
+        // A CR-wrapped echo line still slices to the command output.
+        let token = format!("{MARKER_PREFIX}{nonce}_%s__");
+        let marker_args = format!("printf '\\n{token}\\n' \"$?\"");
+        let full = format!("$ printf x; {marker_args}\rx\r\n{marker}\r\n");
+        assert_eq!(exec_output_text(&full, "printf x", nonce), "x");
+    }
+
+    #[test]
     fn tc_2693_idle_wait_uses_notification_without_polling() {
         let buffer = Arc::new(RingBuffer::new(1024));
+        let idle = Duration::from_millis(100);
         let (sender, receiver) = mpsc::channel();
+        let started = Instant::now();
         let waiter = {
             let buffer = Arc::clone(&buffer);
             thread::spawn(move || {
@@ -267,7 +412,7 @@ mod tests {
                     &buffer,
                     &WaitOptions {
                         regex: None,
-                        idle: Some(Duration::from_millis(100)),
+                        idle: Some(idle),
                         timeout: Duration::from_secs(3),
                         since: 0,
                     },
@@ -277,17 +422,90 @@ mod tests {
             })
         };
 
-        thread::sleep(Duration::from_millis(150));
+        thread::sleep(Duration::from_millis(30));
         assert!(
             receiver.try_recv().is_err(),
-            "idle wait must not complete before any output arrives"
+            "idle wait must block until the idle duration elapses"
         );
 
-        let pushed = Instant::now();
-        buffer.push_str("hello\n");
         let (reason, finished) = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(reason, WaitReason::Idle);
-        assert!(finished.duration_since(pushed) < Duration::from_secs(2));
+        let elapsed = finished.duration_since(started);
+        assert!(
+            elapsed >= idle,
+            "idle fired before the idle duration: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "idle must use a timed notification rather than polling: {elapsed:?}"
+        );
+        assert_eq!(buffer.seq(), 0, "an idle wait must not need a push");
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn tc_2619_idle_succeeds_when_since_is_current_seq() {
+        let buffer = RingBuffer::new(1024);
+        buffer.push_str("old output\n");
+        let since = buffer.seq();
+        let started = Instant::now();
+        let result = wait(
+            &buffer,
+            &WaitOptions {
+                regex: None,
+                idle: Some(Duration::from_millis(100)),
+                timeout: Duration::from_secs(3),
+                since,
+            },
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(result.reason, WaitReason::Idle);
+        assert_eq!(result.seq_from, since);
+        assert_eq!(result.seq_to, since);
+        assert!(result.text.is_empty());
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "idle returned too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "idle did not use the wait-start clock: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn tc_2619_idle_timer_resets_after_later_output() {
+        let buffer = Arc::new(RingBuffer::new(1024));
+        let idle = Duration::from_millis(200);
+        let (sender, receiver) = mpsc::channel();
+        let waiter = {
+            let buffer = Arc::clone(&buffer);
+            thread::spawn(move || {
+                let result = wait(
+                    &buffer,
+                    &WaitOptions {
+                        regex: None,
+                        idle: Some(idle),
+                        timeout: Duration::from_secs(3),
+                        since: 0,
+                    },
+                )
+                .unwrap();
+                sender.send((result.reason, Instant::now())).unwrap();
+            })
+        };
+
+        thread::sleep(Duration::from_millis(50));
+        let pushed = Instant::now();
+        buffer.push_str("late\n");
+        let (reason, finished) = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(reason, WaitReason::Idle);
+        let after_push = finished.duration_since(pushed);
+        assert!(
+            after_push >= Duration::from_millis(170),
+            "output must reset the idle clock instead of using the wait start: {after_push:?}"
+        );
         waiter.join().unwrap();
     }
 }

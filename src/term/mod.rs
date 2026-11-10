@@ -8,7 +8,10 @@ pub mod buffer;
 pub mod client;
 pub mod host;
 pub mod journal;
+pub mod policy;
 pub mod proto;
+#[cfg(unix)]
+pub mod serial;
 pub mod wait;
 
 pub use crate::agent_api::exit;
@@ -26,6 +29,7 @@ pub enum SessionKind {
     #[default]
     Shell,
     Cmd,
+    Serial,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +39,7 @@ pub enum SessionState {
     Open,
     Exited,
     Closed,
+    Lost,
 }
 
 impl SessionState {
@@ -65,6 +70,151 @@ impl ExitStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SerialParity {
+    #[default]
+    None,
+    Even,
+    Odd,
+}
+
+impl SerialParity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Even => "even",
+            Self::Odd => "odd",
+        }
+    }
+}
+
+impl std::str::FromStr for SerialParity {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "even" => Ok(Self::Even),
+            "odd" => Ok(Self::Odd),
+            other => Err(format!(
+                "invalid parity '{other}' (expected none, even or odd)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SerialFlow {
+    #[default]
+    None,
+    RtsCts,
+}
+
+impl SerialFlow {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::RtsCts => "rtscts",
+        }
+    }
+}
+
+impl std::str::FromStr for SerialFlow {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "rtscts" | "rts/cts" | "rts-cts" => Ok(Self::RtsCts),
+            other => Err(format!(
+                "invalid flow control '{other}' (expected none or rtscts)"
+            )),
+        }
+    }
+}
+
+fn default_data_bits() -> u8 {
+    8
+}
+
+fn default_stop_bits() -> u8 {
+    1
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerialConfig {
+    pub device: PathBuf,
+    pub baud: u32,
+    #[serde(default)]
+    pub parity: SerialParity,
+    #[serde(default = "default_data_bits")]
+    pub data: u8,
+    #[serde(default = "default_stop_bits")]
+    pub stop: u8,
+    #[serde(default)]
+    pub flow: SerialFlow,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usbipd_busid: Option<String>,
+    #[serde(default, serialize_with = "serialize_no_usbipd_attach")]
+    pub no_usbipd_attach: bool,
+}
+
+fn serialize_no_usbipd_attach<S>(value: &bool, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let env_disabled = std::env::var("DMUXAI_NO_USBIPD_ATTACH").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    serializer.serialize_bool(*value || env_disabled)
+}
+
+impl Default for SerialConfig {
+    fn default() -> Self {
+        Self {
+            device: PathBuf::new(),
+            baud: 115_200,
+            parity: SerialParity::None,
+            data: default_data_bits(),
+            stop: default_stop_bits(),
+            flow: SerialFlow::None,
+            usbipd_busid: None,
+            no_usbipd_attach: false,
+        }
+    }
+}
+
+impl SerialConfig {
+    pub fn new(device: impl Into<PathBuf>, baud: u32) -> Self {
+        Self {
+            device: device.into(),
+            baud,
+            ..Self::default()
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), TermError> {
+        if self.device.as_os_str().is_empty() {
+            return Err(TermError::usage("--serial needs a device path"));
+        }
+        if self.baud == 0 {
+            return Err(TermError::usage("--baud must be greater than zero"));
+        }
+        if !matches!(self.data, 5..=8) {
+            return Err(TermError::usage("--data must be 5, 6, 7 or 8"));
+        }
+        if !matches!(self.stop, 1 | 2) {
+            return Err(TermError::usage("--stop must be 1 or 2"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSpec {
     pub name: String,
@@ -76,6 +226,8 @@ pub struct SessionSpec {
     pub rows: u16,
     #[serde(default)]
     pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<SerialConfig>,
 }
 
 impl SessionSpec {
@@ -88,6 +240,15 @@ impl SessionSpec {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             argv: Vec::new(),
+            serial: None,
+        }
+    }
+
+    pub fn serial(name: impl Into<String>, config: SerialConfig) -> Self {
+        Self {
+            kind: SessionKind::Serial,
+            serial: Some(config),
+            ..Self::shell(name)
         }
     }
 
@@ -123,6 +284,9 @@ pub struct TermError {
     pub code: i32,
     pub message: String,
     pub error_kind: Option<&'static str>,
+    /// Optional structured fields merged into `to_json()` (for example the
+    /// approval id and matched pattern of an FR-2630 refusal).
+    pub data: Option<Value>,
 }
 
 impl TermError {
@@ -131,6 +295,23 @@ impl TermError {
             code,
             message: message.into(),
             error_kind: error_kind_for_exit(code),
+            data: None,
+        }
+    }
+
+    /// FR-2630: a dangerous command needs one-shot human approval.
+    pub fn approval_required(session: &str, matched: &str, approval_id: &str) -> Self {
+        Self {
+            code: exit::APPROVAL_REQUIRED,
+            message: format!(
+                "input blocked by terminal policy (matched '{matched}'); ask a human to run `dmuxai term approve {approval_id}`"
+            ),
+            error_kind: Some("approval_required"),
+            data: Some(json!({
+                "approval_id": approval_id,
+                "matched": matched,
+                "session": session,
+            })),
         }
     }
 
@@ -151,12 +332,18 @@ impl TermError {
     }
 
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "ok": false,
             "exit_code": self.code,
             "error": self.message,
             "error_kind": self.error_kind,
-        })
+        });
+        if let (Some(map), Some(Value::Object(extra))) = (value.as_object_mut(), &self.data) {
+            for (key, item) in extra {
+                map.insert(key.clone(), item.clone());
+            }
+        }
+        value
     }
 }
 
@@ -167,6 +354,7 @@ pub fn error_kind_for_exit(code: i32) -> Option<&'static str> {
         exit::CONFLICT => Some("conflict"),
         exit::FORBIDDEN => Some("forbidden"),
         exit::INTERNAL => Some("internal"),
+        exit::APPROVAL_REQUIRED => Some("approval_required"),
         _ => None,
     }
 }

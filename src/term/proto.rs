@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::term::{SessionKind, TermError};
+use crate::term::{SerialConfig, SessionKind, TermError};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -21,6 +21,8 @@ pub enum RequestOp {
         rows: u16,
         #[serde(default)]
         argv: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        serial: Option<SerialConfig>,
     },
     Send {
         name: String,
@@ -48,7 +50,10 @@ pub enum RequestOp {
         idle_ms: Option<u64>,
         timeout_ms: Option<u64>,
         #[serde(default)]
-        since: u64,
+        since: Option<u64>,
+    },
+    Approve {
+        id: String,
     },
     Exec {
         name: String,
@@ -139,7 +144,7 @@ impl Response {
             error_kind: error.error_kind.map(str::to_owned),
             error: Some(error.message.clone()),
             exit_code: Some(error.code),
-            data: None,
+            data: error.data.clone(),
         }
     }
 }
@@ -193,6 +198,23 @@ fn read_json<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tc_2610_protocol_carries_serial_config() {
+        let request = Request::new(RequestOp::Open {
+            name: "board".to_owned(),
+            kind: SessionKind::Serial,
+            cwd: None,
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
+            argv: Vec::new(),
+            serial: Some(SerialConfig::new("/dev/ttyS3", 115_200)),
+        });
+        let mut bytes = Vec::new();
+        write_request(&mut bytes, &request).unwrap();
+        assert_eq!(read_request(&mut bytes.as_slice()).unwrap(), request);
+    }
 
     #[test]
     fn tc_2601_protocol_round_trip_is_length_prefixed_json_v1() {

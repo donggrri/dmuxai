@@ -86,6 +86,10 @@ pub enum TermOp {
         cols: u16,
         rows: u16,
         argv: Vec<String>,
+        serial: Option<term::SerialConfig>,
+        no_usbipd_attach: bool,
+        wait_for: Option<String>,
+        timeout_ms: Option<u64>,
     },
     Send {
         name: String,
@@ -108,12 +112,15 @@ pub enum TermOp {
         regex: Option<String>,
         idle_ms: Option<u64>,
         timeout_ms: u64,
-        since: u64,
+        since: Option<u64>,
     },
     Exec {
         name: String,
         command: String,
         timeout_ms: Option<u64>,
+    },
+    Approve {
+        id: String,
     },
     List,
     Show {
@@ -156,6 +163,234 @@ pub struct RunOptions {
 pub const SUBCOMMANDS: [&str; 9] = [
     "run", "todo", "status", "events", "mcp", "init", "trust", "runs", "term",
 ];
+
+/// Subcommand-local help for `dmuxai term --help` / `-h` (FR-2617). This text
+/// replaces the root usage for term; the root `dmuxai --help` is unchanged.
+pub const TERM_USAGE: &str = "\
+Usage: dmuxai term <subcommand> [args...]
+
+Persistent named terminal sessions.
+
+Subcommands:
+  open NAME [options] [-- CMD...]  Start a shell, a --kind cmd command, or a
+                                   --serial DEV session and keep it running
+  send NAME TEXT | NAME --keys KEYS
+                                   Send text or named keys (C-c, Enter, ...)
+  read NAME [--since N] [--tail N] [--raw]
+                                   Read session output
+  wait NAME --match REGEX|--idle DUR --timeout DUR [--since N]
+                                   Wait for a regex match or an idle period
+                                   (--idle: bare number is ms; --timeout:
+                                   bare number is seconds)
+  exec NAME COMMAND [--timeout DUR]
+                                   Run a command in the session and return
+                                   exactly its output
+  approve ID    Approve one pending terminal-policy approval (16 lowercase
+                hex characters)
+  list          List sessions (empty when no host runs)
+  show NAME     Show one session
+  resize NAME --cols N --rows N
+                Resize a session
+  close NAME|--all [--force]
+                Close a session (or all sessions with --all)
+  reopen NAME   Reopen a lost session with the same spec
+
+Run `dmuxai term open --help` for open options (including --serial, --baud,
+--usbipd-busid and --no-usbipd-attach). Run `dmuxai --help` for the root usage.
+";
+
+/// Subcommand-local help for `dmuxai term open --help` / `-h` (FR-2617).
+pub const TERM_OPEN_USAGE: &str = "\
+Usage: dmuxai term open NAME [--kind shell|cmd|serial] [--cwd DIR] [--env K=V]
+                [--cols N --rows N] [--json] [-- CMD...]
+                [--serial DEV --baud N [--parity none|even|odd]
+                 [--data 5-8] [--stop 1|2] [--flow none|rtscts]
+                 [--usbipd-busid ID] [--no-usbipd-attach]]
+                [--wait-for REGEX --timeout DUR]
+
+Starts a named terminal session; it stays alive under the terminal host after
+this command exits.
+
+Session options:
+  --kind shell|cmd|serial  Session kind (default shell; --serial implies
+                           serial)
+  --cwd DIR                Working directory for the session
+  --env K=V                Extra session environment (repeatable)
+  --cols N --rows N        Terminal size (default 80x24)
+  --wait-for REGEX         Return after REGEX appears in the output; requires
+  --timeout DUR            --timeout; a bare number is seconds (8 and 8s =
+                           8 seconds), suffixes work (500ms = 500ms)
+  -- CMD...                Command for --kind cmd; serial and shell sessions
+                           take no command
+
+Serial options:
+  --serial DEV             Open DEV as a serial port instead of a shell
+  --baud N                 Baud rate (required with --serial)
+  --parity P               Parity: none, even or odd (default none)
+  --data B                 Data bits 5-8 (default 8)
+  --stop S                 Stop bits 1 or 2 (default 1)
+  --flow F                 Flow control: none or rtscts (default none)
+  --usbipd-busid ID        Explicit usbipd busid for a WSL2 attach; never
+                           selected from `usbipd list` output
+  --no-usbipd-attach       Do not run usbipd.exe attach even when a busid is
+                           set
+
+On WSL2 with a missing device, `usbipd.exe attach --wsl --busid <id>` runs
+once only when an explicit busid is given (--usbipd-busid or trusted
+[terminal.serial] usbipd_busid). Without a busid the command exits with
+error_kind usbipd_busid_missing and never invokes usbipd.exe.
+";
+
+/// Subcommand-local help for `dmuxai term send --help` / `-h` (FR-2617).
+pub const TERM_SEND_USAGE: &str = "\
+Usage: dmuxai term send NAME TEXT [--no-newline] [--secret] [--json]
+       dmuxai term send NAME --keys KEYS [--json]
+
+Send TEXT to the session as if typed; a newline is appended unless
+--no-newline is set. With --keys, send named keys such as C-c, Enter or
+C-c,C-c (separated by ',' or '+') instead of text. --secret masks the
+input in the session journal.
+
+  --keys KEYS     Send named keys (C-c, Enter, ...) instead of text
+  --no-newline    Do not append a newline after TEXT
+  --secret        Mask this input in the session journal
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term read --help` / `-h` (FR-2617).
+pub const TERM_READ_USAGE: &str = "\
+Usage: dmuxai term read NAME [--since SEQ] [--tail N] [--raw] [--json]
+
+Print the output the session has produced so far.
+
+  --since SEQ     Only output after sequence number SEQ (default 0)
+  --tail N        Only the last N bytes of the stripped output
+  --raw           Print raw bytes including control characters
+  --json          Print a machine-readable reply with seq_from/seq_to
+";
+
+/// Subcommand-local help for `dmuxai term wait --help` / `-h` (FR-2617).
+pub const TERM_WAIT_USAGE: &str = "\
+Usage: dmuxai term wait NAME (--match REGEX | --idle DUR) --timeout DUR
+                     [--since SEQ] [--json]
+
+Wait until stripped output after SEQ matches REGEX, or until output has
+been quiet for DUR. A bare number for --idle is milliseconds, so --idle 500
+is 500ms; suffixes work too (500ms, 1s, 1m). A bare number for --timeout is
+seconds, so --timeout 8 and --timeout 8s both mean 8 seconds, and
+--timeout 500ms means 500ms. --since applies only to the --match search;
+without it the search starts at the current seq, so output already in the
+buffer is not matched. --idle succeeds when no new output arrives for that
+duration: the idle clock starts when the wait starts and resets whenever
+new output arrives, so a quiet session returns almost immediately.
+
+  --match REGEX   Wait until REGEX matches new output
+  --idle DUR      Succeed after DUR without new output; a bare number is
+                  milliseconds (500 = 500ms), suffixes work (500ms, 1s)
+  --timeout DUR   Give up after DUR; a bare number is seconds (8 and 8s =
+                  8 seconds), suffixes work (500ms = 500ms); exits 1
+  --since SEQ     Search for REGEX only in output after SEQ
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term exec --help` / `-h` (FR-2617).
+pub const TERM_EXEC_USAGE: &str = "\
+Usage: dmuxai term exec NAME COMMAND [--timeout DUR] [--json]
+
+Type COMMAND into the session, press Enter and return exactly the output
+the command prints together with its exit code; the internal completion
+marker never appears in the reply.
+
+  --timeout DUR   Give up after DUR and exit 1 (default 30s); a bare number
+                  is seconds (8 and 8s = 8 seconds), suffixes work
+                  (500ms = 500ms)
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term approve --help` / `-h` (FR-2617).
+pub const TERM_APPROVE_USAGE: &str = "\
+Usage: dmuxai term approve ID [--json]
+
+Approve one pending terminal-policy approval. ID is the 16 lowercase hex
+characters from the approval_required error; the approval releases
+exactly one identical send or exec and is then consumed.
+
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term list --help` / `-h` (FR-2617).
+pub const TERM_LIST_USAGE: &str = "\
+Usage: dmuxai term list [--json]
+
+List this workspace's terminal sessions. Prints nothing (an empty JSON
+array with --json) when no host runs; list never starts one.
+
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term show --help` / `-h` (FR-2617).
+pub const TERM_SHOW_USAGE: &str = "\
+Usage: dmuxai term show NAME [--json]
+
+Show one session: kind, state, pid, size, takeover flag and output
+sequence.
+
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term resize --help` / `-h` (FR-2617).
+pub const TERM_RESIZE_USAGE: &str = "\
+Usage: dmuxai term resize NAME --cols N --rows N [--json]
+
+Resize the session's terminal. N must be between 1 and 1000.
+
+  --cols N        New number of columns (required)
+  --rows N        New number of rows (required)
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term close --help` / `-h` (FR-2617).
+pub const TERM_CLOSE_USAGE: &str = "\
+Usage: dmuxai term close NAME [--force] [--json]
+       dmuxai term close --all [--force] [--json]
+
+Close one session, or every session of this workspace with --all.
+Children in the session's process group are asked to hang up first.
+
+  --all           Close every session of this workspace
+  --force         Skip the 2s grace period and terminate immediately
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term reopen --help` / `-h` (FR-2617).
+pub const TERM_REOPEN_USAGE: &str = "\
+Usage: dmuxai term reopen NAME [--json]
+
+Reopen a lost session with the same spec: the same name, kind, size,
+command (for --kind cmd) or serial settings.
+
+  --json          Print a machine-readable reply
+";
+
+/// Per-subcommand term help (FR-2617): `term <sub> --help` / `-h` prints this
+/// topic instead of the parent `term` list or the root usage. `open` keeps
+/// [`TERM_OPEN_USAGE`]; an unknown subcommand falls back to [`TERM_USAGE`].
+pub fn term_subcommand_usage(subcommand: &str) -> &'static str {
+    match subcommand {
+        "open" => TERM_OPEN_USAGE,
+        "send" => TERM_SEND_USAGE,
+        "read" => TERM_READ_USAGE,
+        "wait" => TERM_WAIT_USAGE,
+        "exec" => TERM_EXEC_USAGE,
+        "approve" => TERM_APPROVE_USAGE,
+        "list" => TERM_LIST_USAGE,
+        "show" => TERM_SHOW_USAGE,
+        "resize" => TERM_RESIZE_USAGE,
+        "close" => TERM_CLOSE_USAGE,
+        "reopen" => TERM_REOPEN_USAGE,
+        _ => TERM_USAGE,
+    }
+}
 
 /// Table-driven flag specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -617,7 +852,7 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
 fn parse_term(args: &[String]) -> Result<TermCommand, String> {
     let Some(subcommand) = args.first() else {
         return Err(
-            "term needs a subcommand: open, send, read, wait, exec, list, show, resize, close or reopen"
+            "term needs a subcommand: open, send, read, wait, exec, approve, list, show, resize, close or reopen"
                 .to_owned(),
         );
     };
@@ -750,7 +985,7 @@ fn parse_term(args: &[String]) -> Result<TermCommand, String> {
             let parsed = parse_flags(rest, WAIT_FLAGS, true)?;
             let name = single_term_name(&parsed, "term wait")?;
             let regex = parsed.flags.get("--match").cloned().flatten();
-            let idle_ms = duration_flag(&parsed, "--idle", "--idle")?;
+            let idle_ms = idle_duration_flag(&parsed, "--idle", "--idle")?;
             if regex.is_some() == idle_ms.is_some() {
                 return Err("term wait needs exactly one of --match or --idle".to_owned());
             }
@@ -760,7 +995,7 @@ fn parse_term(args: &[String]) -> Result<TermCommand, String> {
             }
             let timeout_ms = duration_flag(&parsed, "--timeout", "--timeout")?
                 .ok_or_else(|| "term wait needs --timeout".to_owned())?;
-            let since = optional_u64_flag(&parsed, "--since", "--since")?.unwrap_or(0);
+            let since = optional_u64_flag(&parsed, "--since", "--since")?;
             Ok(TermCommand {
                 op: TermOp::Wait {
                     name,
@@ -803,6 +1038,30 @@ fn parse_term(args: &[String]) -> Result<TermCommand, String> {
                     timeout_ms,
                 },
                 json,
+            })
+        }
+        "approve" => {
+            const APPROVE_FLAGS: &[FlagSpec] = &[FlagSpec {
+                names: &["--json"],
+                takes_value: false,
+                hidden: false,
+            }];
+            let parsed = parse_flags(rest, APPROVE_FLAGS, true)?;
+            if parsed.positionals.is_empty() {
+                return Err("term approve needs an approval id".to_owned());
+            }
+            if parsed.positionals.len() > 1 {
+                return Err(format!("unexpected argument '{}'", parsed.positionals[1]));
+            }
+            let id = parsed.positionals[0].clone();
+            if !valid_approval_id(&id) {
+                return Err(format!(
+                    "invalid approval id '{id}' (must be 16 lowercase hex characters)"
+                ));
+            }
+            Ok(TermCommand {
+                op: TermOp::Approve { id },
+                json: parsed.flags.contains_key("--json"),
             })
         }
         "list" => {
@@ -926,9 +1185,16 @@ fn parse_term(args: &[String]) -> Result<TermCommand, String> {
     }
 }
 
+fn valid_approval_id(id: &str) -> bool {
+    id.len() == 16
+        && id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
 fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
     let mut name = None;
-    let mut kind = SessionKind::Shell;
+    let mut kind = None;
     let mut cwd = None;
     let mut env = Vec::new();
     let mut cols = term::DEFAULT_COLS;
@@ -936,6 +1202,16 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
     let mut json = false;
     let mut argv = Vec::new();
     let mut after_separator = false;
+    let mut serial_device = None;
+    let mut baud = None;
+    let mut parity = term::SerialParity::None;
+    let mut data = 8u8;
+    let mut stop = 1u8;
+    let mut flow = term::SerialFlow::None;
+    let mut usbipd_busid = None;
+    let mut no_usbipd_attach = false;
+    let mut wait_for = None;
+    let mut timeout_ms = None;
     let mut index = 0;
     while index < args.len() {
         let argument = &args[index];
@@ -949,11 +1225,12 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
             "--json" => json = true,
             "--kind" => {
                 index += 1;
-                kind = match args.get(index).map(String::as_str) {
+                kind = Some(match args.get(index).map(String::as_str) {
                     Some("shell") => SessionKind::Shell,
                     Some("cmd") => SessionKind::Cmd,
-                    _ => return Err("--kind must be 'shell' or 'cmd'".to_owned()),
-                };
+                    Some("serial") => SessionKind::Serial,
+                    _ => return Err("--kind must be 'shell', 'cmd' or 'serial'".to_owned()),
+                });
             }
             "--cwd" => {
                 index += 1;
@@ -983,6 +1260,81 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
                 index += 1;
                 rows = parse_u16_value(args.get(index), "--rows")?;
             }
+            "--serial" => {
+                index += 1;
+                serial_device = Some(
+                    args.get(index)
+                        .ok_or_else(|| "--serial needs a device path".to_owned())?
+                        .clone(),
+                );
+            }
+            "--baud" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--baud needs a value".to_owned())?;
+                baud = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| "--baud must be a positive integer".to_owned())?,
+                );
+            }
+            "--parity" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--parity needs a value".to_owned())?;
+                parity = value.parse().map_err(|error: String| error)?;
+            }
+            "--data" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--data needs a value".to_owned())?;
+                data = value
+                    .parse::<u8>()
+                    .map_err(|_| "--data must be 5, 6, 7 or 8".to_owned())?;
+            }
+            "--stop" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--stop needs a value".to_owned())?;
+                stop = value
+                    .parse::<u8>()
+                    .map_err(|_| "--stop must be 1 or 2".to_owned())?;
+            }
+            "--flow" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--flow needs a value".to_owned())?;
+                flow = value.parse().map_err(|error: String| error)?;
+            }
+            "--usbipd-busid" => {
+                index += 1;
+                usbipd_busid = Some(
+                    args.get(index)
+                        .ok_or_else(|| "--usbipd-busid needs a value".to_owned())?
+                        .clone(),
+                );
+            }
+            "--no-usbipd-attach" => no_usbipd_attach = true,
+            "--wait-for" => {
+                index += 1;
+                wait_for = Some(
+                    args.get(index)
+                        .ok_or_else(|| "--wait-for needs a regex".to_owned())?
+                        .clone(),
+                );
+            }
+            "--timeout" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--timeout needs a value".to_owned())?;
+                timeout_ms = Some(parse_duration_ms(value, "--timeout")?);
+            }
             other if other.starts_with('-') => {
                 return Err(format!("unexpected argument '{other}'"));
             }
@@ -998,11 +1350,67 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
     let name = name.ok_or_else(|| "term open needs a session name".to_owned())?;
     term::validate_name(&name).map_err(|error| error.message)?;
     term::validate_dimensions(cols, rows).map_err(|error| error.message)?;
+
+    let serial = match serial_device {
+        Some(device) => {
+            if matches!(kind, Some(kind) if kind != SessionKind::Serial) {
+                return Err(
+                    "--serial cannot be combined with --kind shell or --kind cmd".to_owned(),
+                );
+            }
+            let baud = baud.ok_or_else(|| "term open --serial needs --baud".to_owned())?;
+            let mut config = term::SerialConfig::new(device, baud);
+            config.parity = parity;
+            config.data = data;
+            config.stop = stop;
+            config.flow = flow;
+            config.usbipd_busid = usbipd_busid.filter(|value| !value.trim().is_empty());
+            // FR-2614: carry the flag in the open request itself so a warm
+            // host skips usbipd.exe even when it did not inherit the CLI env.
+            config.no_usbipd_attach = no_usbipd_attach;
+            config.validate().map_err(|error| error.message)?;
+            Some(config)
+        }
+        None => {
+            if kind == Some(SessionKind::Serial) {
+                return Err("--kind serial needs --serial DEV".to_owned());
+            }
+            if baud.is_some() {
+                return Err("--baud needs --serial".to_owned());
+            }
+            if flow != term::SerialFlow::None
+                || data != 8
+                || stop != 1
+                || usbipd_busid.is_some()
+                || no_usbipd_attach
+            {
+                return Err("serial settings need --serial".to_owned());
+            }
+            None
+        }
+    };
+    let kind = if serial.is_some() {
+        SessionKind::Serial
+    } else {
+        kind.unwrap_or(SessionKind::Shell)
+    };
     if kind == SessionKind::Cmd && argv.is_empty() {
         return Err("--kind cmd needs a command after --".to_owned());
     }
+    if kind == SessionKind::Serial && !argv.is_empty() {
+        return Err("serial sessions do not take a command after --".to_owned());
+    }
     if kind == SessionKind::Shell && !argv.is_empty() {
         return Err("shell sessions do not take a command after --".to_owned());
+    }
+    if let Some(pattern) = &wait_for {
+        regex::Regex::new(pattern)
+            .map_err(|error| format!("invalid regex '{pattern}': {error}"))?;
+        if timeout_ms.is_none() {
+            return Err("--wait-for needs --timeout".to_owned());
+        }
+    } else if timeout_ms.is_some() {
+        return Err("--timeout needs --wait-for".to_owned());
     }
     Ok(TermCommand {
         op: TermOp::Open {
@@ -1013,6 +1421,10 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
             cols,
             rows,
             argv,
+            serial,
+            no_usbipd_attach,
+            wait_for,
+            timeout_ms,
         },
         json,
     })
@@ -1076,16 +1488,41 @@ fn optional_usize_flag(
 }
 
 fn duration_flag(parsed: &ParsedFlags, name: &str, label: &str) -> Result<Option<u64>, String> {
+    duration_flag_with_unitless(parsed, name, label, 1_000.0)
+}
+
+fn idle_duration_flag(
+    parsed: &ParsedFlags,
+    name: &str,
+    label: &str,
+) -> Result<Option<u64>, String> {
+    duration_flag_with_unitless(parsed, name, label, 1.0)
+}
+
+fn duration_flag_with_unitless(
+    parsed: &ParsedFlags,
+    name: &str,
+    label: &str,
+    unitless_multiplier: f64,
+) -> Result<Option<u64>, String> {
     parsed
         .flags
         .get(name)
         .cloned()
         .flatten()
-        .map(|raw| parse_duration_ms(&raw, label))
+        .map(|raw| parse_duration_ms_with_unitless(&raw, label, unitless_multiplier))
         .transpose()
 }
 
 fn parse_duration_ms(raw: &str, label: &str) -> Result<u64, String> {
+    parse_duration_ms_with_unitless(raw, label, 1_000.0)
+}
+
+fn parse_duration_ms_with_unitless(
+    raw: &str,
+    label: &str,
+    unitless_multiplier: f64,
+) -> Result<u64, String> {
     let trimmed = raw.trim();
     let (number, multiplier) = if let Some(number) = trimmed.strip_suffix("ms") {
         (number, 1.0)
@@ -1096,7 +1533,7 @@ fn parse_duration_ms(raw: &str, label: &str) -> Result<u64, String> {
     } else if let Some(number) = trimmed.strip_suffix('h') {
         (number, 3_600_000.0)
     } else {
-        (trimmed, 1_000.0)
+        (trimmed, unitless_multiplier)
     };
     let value = number
         .parse::<f64>()
@@ -1277,11 +1714,39 @@ fn execute_term(_workspace_root: &Path, command: TermCommand) -> i32 {
 #[cfg(unix)]
 fn execute_term(workspace_root: &Path, command: TermCommand) -> i32 {
     let TermCommand { op, json } = command;
+    // FR-2614: `--no-usbipd-attach` must disable the usbipd attach in the host
+    // that opens the serial device. The host inherits this process env when it
+    // is autostarted, and `term::serial` reads the same variable.
+    if let TermOp::Open {
+        serial: Some(_),
+        no_usbipd_attach: true,
+        ..
+    } = &op
+    {
+        // SAFETY: called once on the CLI startup path before the tokio spawn
+        // helpers or the terminal host are started.
+        unsafe {
+            std::env::set_var("DMUXAI_NO_USBIPD_ATTACH", "1");
+        }
+    }
     if matches!(&op, TermOp::Host) {
         return match dmuxai::term::host::run(workspace_root) {
             Ok(()) => exit::OK,
             Err(error) => term_fail(error, false),
         };
+    }
+
+    if let TermOp::Approve { .. } = &op {
+        let run_id = std::env::var(dmuxai::term::policy::RUN_ID_ENV).unwrap_or_default();
+        if !run_id.trim().is_empty() {
+            return term_fail(
+                TermError::new(
+                    exit::FORBIDDEN,
+                    "term approve is refused while a dmuxai run is active (DMUXAI_RUN_ID is set); ask a human to approve",
+                ),
+                json,
+            );
+        }
     }
 
     let response = match &op {
@@ -1296,6 +1761,57 @@ fn execute_term(workspace_root: &Path, command: TermCommand) -> i32 {
                 return exit::OK;
             }
         },
+        TermOp::Open {
+            name,
+            wait_for: Some(regex),
+            timeout_ms,
+            ..
+        } => {
+            let open = {
+                let mut client = match dmuxai::term::client::connect(workspace_root) {
+                    Ok(client) => client,
+                    Err(error) => return term_fail(error, json),
+                };
+                match client.call(term_request_op(&op)) {
+                    Ok(response) => response,
+                    Err(error) => return term_fail(error, json),
+                }
+            };
+            let mut client = match dmuxai::term::client::connect(workspace_root) {
+                Ok(client) => client,
+                Err(error) => return term_fail(error, json),
+            };
+            let wait = match client.call(RequestOp::Wait {
+                name: name.clone(),
+                regex: Some(regex.clone()),
+                idle_ms: None,
+                timeout_ms: Some(timeout_ms.unwrap_or(0)),
+                since: Some(0),
+            }) {
+                Ok(response) => response,
+                Err(error) => return term_fail(error, json),
+            };
+            Ok(merge_open_wait(open, wait))
+        }
+        TermOp::Close { name, all, .. } => {
+            match dmuxai::term::client::try_connect(workspace_root) {
+                Ok(mut client) => client.call(term_request_op(&op)),
+                Err(_) if *all => {
+                    if json {
+                        print_json(&json!({"closed": []}));
+                    } else {
+                        println!("closed 0 session(s)");
+                    }
+                    return exit::OK;
+                }
+                Err(_) => {
+                    return term_fail(
+                        TermError::not_found(name.as_deref().unwrap_or_default()),
+                        json,
+                    );
+                }
+            }
+        }
         _ => match dmuxai::term::client::connect(workspace_root) {
             Ok(mut client) => client.call(term_request_op(&op)),
             Err(error) => return term_fail(error, json),
@@ -1306,6 +1822,25 @@ fn execute_term(workspace_root: &Path, command: TermCommand) -> i32 {
         Err(error) => return term_fail(error, json),
     };
     report_term_response(&op, response, json)
+}
+
+#[cfg(unix)]
+fn merge_open_wait(open: Response, wait: Response) -> Response {
+    let mut data = match open.data {
+        Some(Value::Object(map)) => Value::Object(map),
+        Some(other) => other,
+        None => Value::Object(serde_json::Map::new()),
+    };
+    if let (Some(map), Some(Value::Object(wait_data))) = (data.as_object_mut(), wait.data) {
+        map.extend(wait_data);
+    }
+    Response {
+        ok: wait.ok,
+        error_kind: wait.error_kind,
+        error: wait.error,
+        exit_code: wait.exit_code,
+        data: Some(data),
+    }
 }
 
 #[cfg(unix)]
@@ -1331,6 +1866,8 @@ fn term_request_op(op: &TermOp) -> RequestOp {
             cols,
             rows,
             argv,
+            serial,
+            ..
         } => RequestOp::Open {
             name: name.clone(),
             kind: *kind,
@@ -1339,6 +1876,7 @@ fn term_request_op(op: &TermOp) -> RequestOp {
             cols: *cols,
             rows: *rows,
             argv: argv.clone(),
+            serial: serial.clone(),
         },
         TermOp::Send {
             name,
@@ -1388,6 +1926,7 @@ fn term_request_op(op: &TermOp) -> RequestOp {
             command: command.clone(),
             timeout_ms: *timeout_ms,
         },
+        TermOp::Approve { id } => RequestOp::Approve { id: id.clone() },
         TermOp::List => RequestOp::List,
         TermOp::Show { name } => RequestOp::Show { name: name.clone() },
         TermOp::Resize { name, cols, rows } => RequestOp::Resize {
@@ -1475,6 +2014,9 @@ fn print_term_human(op: &TermOp, data: &Value) {
             } else {
                 println!("closed {}", text_field(data, "name"));
             }
+        }
+        TermOp::Approve { id } => {
+            println!("approved {id}");
         }
         TermOp::Host => {}
     }
@@ -2839,5 +3381,206 @@ mod tests {
         assert_eq!(other.code, exit::INTERNAL);
         assert_eq!(other.code, 6);
         assert_eq!(other.to_json()["error_kind"], "internal");
+    }
+
+    // TC-2630 / FR-2630: `term approve <id> [--json]` validates the 16-hex id.
+    #[test]
+    fn tc_2630_parse_term_approve() {
+        match parse(&args(&["term", "approve", "deadbeefdeadbeef"])) {
+            Ok(AgentCommand::Term(TermCommand {
+                op: TermOp::Approve { id },
+                json,
+            })) => {
+                assert_eq!(id, "deadbeefdeadbeef");
+                assert!(!json);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&args(&["term", "approve", "0123456789abcdef", "--json"])) {
+            Ok(AgentCommand::Term(command)) => assert!(command.json),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parse(&args(&["term", "approve"])).is_err());
+        assert!(parse(&args(&["term", "approve", "nope"])).is_err());
+        assert!(parse(&args(&["term", "approve", "DEADBEEFDEADBEEF"])).is_err());
+        assert!(parse(&args(&["term", "approve", "deadbeefdeadbeef1"])).is_err());
+        assert!(parse(&args(&["term", "approve", "extra", "deadbeefdeadbeef"])).is_err());
+    }
+
+    // TC-2615 / FR-2615: `term wait` parses `--since` as optional; absent
+    // means the host starts the wait at the current sequence (no old match).
+    #[test]
+    fn tc_2615_parse_term_wait_since_is_optional() {
+        match parse(&args(&[
+            "term",
+            "wait",
+            "a",
+            "--match",
+            "r",
+            "--timeout",
+            "1s",
+        ])) {
+            Ok(AgentCommand::Term(command)) => match command.op {
+                TermOp::Wait { since, .. } => assert_eq!(since, None),
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&args(&[
+            "term",
+            "wait",
+            "a",
+            "--match",
+            "r",
+            "--since",
+            "7",
+            "--timeout",
+            "1s",
+        ])) {
+            Ok(AgentCommand::Term(command)) => match command.op {
+                TermOp::Wait { since, .. } => assert_eq!(since, Some(7)),
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // TC-2614 / FR-2614: `--no-usbipd-attach` lands both on the open op and
+    // inside the serial config, so the request carries the flag to a warm host
+    // without relying on env-var inheritance.
+    #[test]
+    fn tc_2614_parse_no_usbipd_attach_sets_serial_config() {
+        let open_args = [
+            "term",
+            "open",
+            "board",
+            "--serial",
+            "/dev/ttyMissing",
+            "--baud",
+            "115200",
+            "--usbipd-busid",
+            "9-99",
+            "--no-usbipd-attach",
+        ];
+        match parse(&args(&open_args)) {
+            Ok(AgentCommand::Term(TermCommand {
+                op:
+                    TermOp::Open {
+                        serial,
+                        no_usbipd_attach,
+                        ..
+                    },
+                ..
+            })) => {
+                assert!(no_usbipd_attach, "op flag must be set");
+                let serial = serial.expect("serial config present");
+                assert!(
+                    serial.no_usbipd_attach,
+                    "config flag must travel to the host"
+                );
+                assert_eq!(serial.usbipd_busid.as_deref(), Some("9-99"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Without the flag both stay false.
+        match parse(&args(&[
+            "term",
+            "open",
+            "board",
+            "--serial",
+            "/dev/ttyMissing",
+            "--baud",
+            "115200",
+            "--usbipd-busid",
+            "9-99",
+        ])) {
+            Ok(AgentCommand::Term(TermCommand {
+                op:
+                    TermOp::Open {
+                        serial,
+                        no_usbipd_attach,
+                        ..
+                    },
+                ..
+            })) => {
+                assert!(!no_usbipd_attach);
+                assert!(!serial.expect("serial config present").no_usbipd_attach);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // TC-2617 / FR-2617: every term subcommand has its own help topic; only
+    // `term` itself (no subcommand) and unknown subcommands fall back to the
+    // parent term list.
+    #[test]
+    fn tc_2617_term_subcommand_usage_topics() {
+        for subcommand in [
+            "open", "send", "read", "wait", "exec", "approve", "list", "show", "resize", "close",
+            "reopen",
+        ] {
+            let text = term_subcommand_usage(subcommand);
+            assert!(
+                text.contains(&format!("Usage: dmuxai term {subcommand}")),
+                "term {subcommand} help has its own usage line"
+            );
+            assert_ne!(text, TERM_USAGE);
+            assert!(!text.contains("Subcommands:"));
+        }
+        assert_eq!(term_subcommand_usage("open"), TERM_OPEN_USAGE);
+        assert_eq!(term_subcommand_usage("nope"), TERM_USAGE);
+        for flag in ["--match", "--idle", "--timeout", "--since"] {
+            assert!(
+                term_subcommand_usage("wait").contains(flag),
+                "term wait help documents {flag}"
+            );
+        }
+    }
+
+    // TC-2619 / FR-2604: a bare `--idle` value is milliseconds, while
+    // suffixes keep their usual meaning.
+    #[test]
+    fn tc_2619_parse_term_wait_idle_bare_number_is_milliseconds() {
+        for (raw, expected) in [("500", 500), ("500ms", 500), ("1s", 1_000)] {
+            match parse(&args(&[
+                "term",
+                "wait",
+                "a",
+                "--idle",
+                raw,
+                "--timeout",
+                "8s",
+            ])) {
+                Ok(AgentCommand::Term(command)) => match command.op {
+                    TermOp::Wait { idle_ms, .. } => assert_eq!(idle_ms, Some(expected), "{raw}"),
+                    other => panic!("unexpected {other:?}"),
+                },
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    // TC-2619 / FR-2604: `--timeout` keeps seconds for a bare number.
+    #[test]
+    fn tc_2619_parse_term_wait_timeout_bare_number_is_seconds() {
+        for raw in ["8", "8s"] {
+            match parse(&args(&[
+                "term",
+                "wait",
+                "a",
+                "--match",
+                "r",
+                "--timeout",
+                raw,
+            ])) {
+                Ok(AgentCommand::Term(command)) => match command.op {
+                    TermOp::Wait { timeout_ms, .. } => {
+                        assert_eq!(timeout_ms, 8_000, "{raw}")
+                    }
+                    other => panic!("unexpected {other:?}"),
+                },
+                other => panic!("unexpected {other:?}"),
+            }
+        }
     }
 }
