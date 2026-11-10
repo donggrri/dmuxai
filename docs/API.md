@@ -161,14 +161,17 @@ dmuxai events --follow --json
 
 ### `term`: persistent terminal sessions (Linux, SPEC-terminal-sessions)
 
-Named PTY sessions owned by a per-workspace session host. The host starts on the first
-`term` call (never from `run` or any other command), listens on
+Named PTY sessions owned by a per-workspace session host. The host starts when a
+`term` command needs one (never from `run` or any other command). `term list` and
+`term close` do not start a host: with none running, `list` returns `[]` and
+`close --all` succeeds with zero sessions closed (exit 0); `close NAME` exits 3
+(`not_found`). The host listens on
 `$XDG_STATE_HOME/dmuxai/repos/<repo-key>/term/host.sock` (dir 0700, socket 0600, peer uid
 checked; a short path under `$XDG_RUNTIME_DIR` or `/tmp/dmuxai-<uid>/` is used when that path
 is too long), and exits after its last session ends plus an idle grace (600 s,
-`DMUXAI_TERM_IDLE_SECS`). After `term close --all` (including `--force`) the
-`dmuxai term __host` process is expected to stay alive until that grace elapses;
-this is intentional (FR-2601), not a leak.
+`DMUXAI_TERM_IDLE_SECS`). After `term close --all` (including `--force`) of
+sessions that were already running, the `dmuxai term __host` process is expected
+to stay alive until that grace elapses; this is intentional (FR-2601), not a leak.
 
 ```
 dmuxai term open   <name> [--kind shell|cmd] [--cwd DIR] [--env K=V]... [--cols N --rows N] [--json] [-- argv...]
@@ -193,8 +196,13 @@ dmuxai term reopen <name>
 - `exec` on a `shell` session appends a nonce exit marker and reports the command's
   `exit_code` (the CLI itself exits 0); the marker is removed from `text`. A timeout exits 1
   with `reason: "timeout"`.
+- For `wait`, a bare number for `--idle` is milliseconds (`--idle 500` is 500 ms);
+  suffixes `ms`/`s`/`m`/`h` are accepted. A bare number for `--timeout` (and for
+  `exec --timeout` / `open --timeout`) is seconds (`8` and `8s` are 8 seconds;
+  `500ms` is 500 ms).
 - `close` sends SIGHUP to the session's whole process tree (including children that moved to
-  their own process group), then SIGKILL after 2 s (`--force`: at once).
+  their own process group), then SIGKILL after 2 s (`--force`: at once). With no host
+  running, `close --all` reports zero closed and does not start one.
 - While a human holds a session (takeover, dashboard in a later PR), non-human input exits 4
   with `session '<name>' is in human takeover; ask the user to release it`.
 - Session children get the same environment scrub as runner children (`DMUXAI_WEB_TOKEN`
