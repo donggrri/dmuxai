@@ -116,8 +116,8 @@ pub struct DmuxSettings {
     /// Trusted `[terminal]` settings (SPEC-terminal-sessions FR-2614, FR-2630).
     /// Workspace keys are merged only when the workspace is trusted.
     pub terminal: crate::term::policy::TerminalSettings,
-    /// Trusted `[terminal.serial] usbipd_attach` (FR-2614). `None` keeps the
-    /// default (attach enabled); `Some(false)` skips a WSL2 usbipd attach.
+    /// Trusted `[terminal.serial] usbipd_attach` (FR-2614), parsed for
+    /// compatibility. dmuxai never runs usbipd from WSL, so it has no effect.
     pub terminal_serial_usbipd_attach: Option<bool>,
     /// Trust status of workspace configuration.
     pub workspace_trust: WorkspaceTrustStatus,

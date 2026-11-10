@@ -29,10 +29,14 @@
 //! - TC-2612 (FR-2612): `open --wait-for` returns on the fake board banner
 //! - TC-2613 (FR-2613): closing the PTY master marks the session lost; reopen
 //!   against a restored slave returns open
-//! - TC-2614 (FR-2614): WSL2 usbipd attach runs once with the explicit busid;
-//!   without a busid usbipd.exe is never invoked and the error is
-//!   `usbipd_busid_missing`; `--no-usbipd-attach` skips attach even with a
-//!   busid
+//! - TC-2614 (FR-2614): a missing `--serial` path in WSL (DMUXAI_SERIAL_WSL2
+//!   test hook) exits 3 with `needs_usbipd_attach`; the JSON names the busid
+//!   from `--usbipd-busid` and the elevated Windows PowerShell
+//!   `usbipd bind/attach` commands, and usbipd.exe is never invoked; without a
+//!   busid the guidance names `usbipd list` and the literal `<busid>`; the
+//!   deprecated `--no-usbipd-attach` no-op still returns `needs_usbipd_attach`
+//!   (the request can be served by a warm host); outside WSL (DMUXAI_SERIAL_WSL2=0)
+//!   the same missing path reports `serial_not_found`
 //! - TC-2615 (FR-2615): wait without --since does not match older buffer text
 //! - TC-2622 (FR-2604): `wait --match` matches a prompt emitted in several
 //!   writes and wrapped in ANSI escapes/CR; `read --raw` still shows ESC
@@ -1726,11 +1730,12 @@ fn tc_2613_serial_lost_then_reopen() {
     assert_eq!(waited["reason"], "match", "wait after reopen: {waited:?}");
 }
 
-/// TC-2614 / FR-2614: a WSL2-looking environment runs the fake usbipd.exe
-/// attach exactly once with the explicit busid, then reports the attach failure
-/// with the cause and the FR-2611 manual hint.
+/// TC-2614 / FR-2614: with the DMUXAI_SERIAL_WSL2 test hook set, a missing
+/// `--serial` path and an explicit busid exits 3 with `needs_usbipd_attach`;
+/// the JSON names the busid and both elevated PowerShell commands, and the
+/// fake usbipd.exe is never invoked.
 #[test]
-fn tc_2614_wsl2_usbipd_attach_once_with_explicit_busid() {
+fn tc_2614_wsl_with_busid_guides_bind_and_attach_without_invoking_usbipd() {
     let sandbox = Sandbox::new();
     let _guard = sandbox.close_guard();
     let log = sandbox.workspace.join("usbipd.log");
@@ -1762,43 +1767,44 @@ fn tc_2614_wsl2_usbipd_attach_once_with_explicit_busid() {
         .expect("execute dmuxai");
     let out = Out::new(output);
     let json = out.json("stdout");
-    assert_eq!(out.code, 6, "attach failure must exit 6: {out:?}");
     assert_eq!(
-        json["error_kind"], "usbipd_attach_failed",
-        "error: {json:?}"
+        out.code, 3,
+        "WSL plus a missing path must exit 3 with needs_usbipd_attach: {out:?}"
+    );
+    assert_eq!(json["error_kind"], "needs_usbipd_attach", "error: {json:?}");
+    assert_eq!(
+        json["busid"], "1-2",
+        "the explicit busid must be named: {json:?}"
+    );
+    let commands: Vec<&str> = json["commands"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(
+        commands.contains(&"usbipd bind --busid 1-2"),
+        "bind command: {json:?}"
+    );
+    assert!(
+        commands.contains(&"usbipd attach --wsl --busid 1-2"),
+        "attach command: {json:?}"
     );
     let message = json["error"].as_str().unwrap_or_default();
-    assert!(message.contains("device is not bound"), "cause: {json:?}");
     assert!(
-        message.contains("usbipd attach --wsl --busid"),
-        "manual hint: {json:?}"
-    );
-
-    let calls = std::fs::read_to_string(&log).expect("usbipd log");
-    assert_eq!(
-        calls
-            .lines()
-            .filter(|line| line.starts_with("attach"))
-            .count(),
-        1,
-        "attach must run once: {calls}"
+        !message.contains("device is not bound"),
+        "the fake usbipd must not have run: {json:?}"
     );
     assert!(
-        calls.lines().any(|line| line == "attach --wsl --busid 1-2"),
-        "attach argv: {calls}"
-    );
-    assert!(
-        !calls.lines().any(|line| line == "list"),
-        "an explicit busid must not list: {calls}"
+        !log.exists(),
+        "the fake usbipd.exe must never be invoked (no list, no attach)"
     );
 }
 
-/// TC-2614 / FR-2614: on fake WSL2 with a missing `--serial` path and no
-/// explicit busid, dmuxai never invokes usbipd.exe (no `list`, no `attach`)
-/// and exits with `error_kind` `usbipd_busid_missing` plus a message that names
-/// `usbipd list` and `--usbipd-busid`.
+/// TC-2614 / FR-2614: with the DMUXAI_SERIAL_WSL2 test hook set, a missing
+/// `--serial` path and no busid exits 3 with `needs_usbipd_attach`; the
+/// message names `usbipd list` and the literal `<busid>` placeholder, and the
+/// fake usbipd.exe is never invoked.
 #[test]
-fn tc_2614_without_busid_usbipd_is_never_called() {
+fn tc_2614_wsl_without_busid_guides_usbipd_list_without_invoking_usbipd() {
     let sandbox = Sandbox::new();
     let _guard = sandbox.close_guard();
     let log = sandbox.workspace.join("usbipd.log");
@@ -1829,28 +1835,43 @@ fn tc_2614_without_busid_usbipd_is_never_called() {
     let out = Out::new(output);
     let json = out.json("stdout");
     assert_eq!(
-        out.code, 6,
-        "a missing busid must exit 6 (internal): {out:?}"
+        out.code, 3,
+        "WSL plus a missing path without a busid must exit 3: {out:?}"
     );
-    assert_eq!(
-        json["error_kind"], "usbipd_busid_missing",
-        "error: {json:?}"
+    assert_eq!(json["error_kind"], "needs_usbipd_attach", "error: {json:?}");
+    assert!(
+        json.get("busid").is_none(),
+        "no busid must be invented without --usbipd-busid: {json:?}"
     );
+    let commands: Vec<&str> = json["commands"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for command in [
+        "usbipd list",
+        "usbipd bind --busid <busid>",
+        "usbipd attach --wsl --busid <busid>",
+    ] {
+        assert!(commands.contains(&command), "command '{command}': {json:?}");
+    }
     let message = json["error"].as_str().unwrap_or_default();
     assert!(message.contains("usbipd list"), "hint: {json:?}");
-    assert!(message.contains("--usbipd-busid"), "hint: {json:?}");
+    assert!(message.contains("<busid>"), "literal placeholder: {json:?}");
     assert!(
         !log.exists(),
-        "usbipd.exe must not be invoked without an explicit busid"
+        "the fake usbipd.exe must never be invoked (no list, no attach)"
     );
 }
 
-/// TC-2614 / FR-2614: `--no-usbipd-attach` skips the usbipd.exe attach even
-/// when an explicit busid is set and reports the normal missing-device error.
-/// The host is already warm (a shell session was opened first), so the flag
-/// must travel inside the open request, not through inherited env vars.
+/// TC-2614 / FR-2614: the deprecated `--no-usbipd-attach` flag is still
+/// accepted but changes nothing: with a busid on a missing path in WSL the
+/// open still returns `needs_usbipd_attach`, the stderr line is a deprecation
+/// warning, stdout stays one JSON object, and the fake usbipd.exe is never
+/// invoked. The host is already warm (a shell session was opened first), so
+/// the flag must travel inside the open request, not through inherited env
+/// vars.
 #[test]
-fn tc_2614_no_attach_flag_skips_usbipd_with_busid() {
+fn tc_2614_wsl_missing_path_with_deprecated_no_attach_flag_still_guides() {
     let sandbox = Sandbox::new();
     let _guard = sandbox.close_guard();
     let log = sandbox.workspace.join("usbipd.log");
@@ -1861,9 +1882,22 @@ fn tc_2614_no_attach_flag_skips_usbipd_with_busid() {
             log.display()
         ),
     );
-    // Warm host: the serial open below is served by this running host, so the
-    // CLI's own environment is not enough; the request must carry the flag.
-    sandbox.open_shell("warm");
+    // Warm the host with the WSL hook already in the host environment, so the
+    // serial open run inside the host sees the same WSL state; the deprecated
+    // flag and the busid must travel inside the open request, not through the
+    // CLI env.
+    let warm = sandbox
+        .command(&["term", "open", "warm", "--json"])
+        .env("DMUXAI_SERIAL_WSL2", "1")
+        .env("DMUXAI_USBIPD_BIN", &fake)
+        .stdin(Stdio::null())
+        .output()
+        .expect("execute dmuxai");
+    assert_eq!(
+        Out::new(warm).code,
+        0,
+        "warm shell open failed before the serial open"
+    );
     let missing = sandbox.workspace.join("missing-serial");
     let output = sandbox
         .command(&[
@@ -1888,12 +1922,13 @@ fn tc_2614_no_attach_flag_skips_usbipd_with_busid() {
     let json = out.json("stdout");
     assert_eq!(
         out.code, 3,
-        "a disabled attach must report the missing device: {out:?}"
+        "the flag must not change the error or its exit code: {out:?}"
     );
     assert_eq!(
-        json["error_kind"], "serial_not_found",
-        "the missing-device path, not usbipd_attach_failed: {json:?}"
+        json["error_kind"], "needs_usbipd_attach",
+        "the deprecated no-op must not downgrade to serial_not_found: {json:?}"
     );
+    assert_eq!(json["busid"], "9-99", "busid guidance: {json:?}");
     assert!(
         !json["error"]
             .as_str()
@@ -1902,8 +1937,70 @@ fn tc_2614_no_attach_flag_skips_usbipd_with_busid() {
         "the fake usbipd must not have run: {json:?}"
     );
     assert!(
+        out.stderr.contains("deprecated"),
+        "the flag must warn on stderr: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("--no-usbipd-attach"),
+        "the warning must name the flag: {}",
+        out.stderr
+    );
+    assert!(
         !log.exists(),
-        "the fake usbipd.exe must not be invoked (no list, no attach) when attach is disabled"
+        "the fake usbipd.exe must never be invoked (no list, no attach)"
+    );
+}
+
+/// TC-2614 / FR-2614: outside WSL (DMUXAI_SERIAL_WSL2=0) a missing `--serial`
+/// path reports the normal missing-device error `serial_not_found` (still exit
+/// 3), even with a busid, and the fake usbipd.exe is never invoked.
+#[test]
+fn tc_2614_non_wsl_missing_path_reports_serial_not_found() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let log = sandbox.workspace.join("usbipd.log");
+    let fake = fake_usbipd(
+        &sandbox.workspace,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\necho 'device is not bound' >&2\nexit 1\n",
+            log.display()
+        ),
+    );
+    let missing = sandbox.workspace.join("missing-serial");
+    let output = sandbox
+        .command(&[
+            "term",
+            "open",
+            "board",
+            "--serial",
+            missing.to_str().expect("utf8 path"),
+            "--baud",
+            "115200",
+            "--usbipd-busid",
+            "1-2",
+            "--json",
+        ])
+        .env("DMUXAI_SERIAL_WSL2", "0")
+        .env("DMUXAI_USBIPD_BIN", &fake)
+        .stdin(Stdio::null())
+        .output()
+        .expect("execute dmuxai");
+    let out = Out::new(output);
+    let json = out.json("stdout");
+    assert_eq!(
+        out.code, 3,
+        "a missing device outside WSL must still exit 3: {out:?}"
+    );
+    assert_eq!(json["error_kind"], "serial_not_found", "error: {json:?}");
+    let message = json["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(missing.to_str().expect("utf8 path")),
+        "the message must name the missing path: {json:?}"
+    );
+    assert!(
+        !log.exists(),
+        "the fake usbipd.exe must never be invoked (no list, no attach)"
     );
 }
 
