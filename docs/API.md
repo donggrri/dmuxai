@@ -166,7 +166,9 @@ Named PTY sessions owned by a per-workspace session host. The host starts on the
 `$XDG_STATE_HOME/dmuxai/repos/<repo-key>/term/host.sock` (dir 0700, socket 0600, peer uid
 checked; a short path under `$XDG_RUNTIME_DIR` or `/tmp/dmuxai-<uid>/` is used when that path
 is too long), and exits after its last session ends plus an idle grace (600 s,
-`DMUXAI_TERM_IDLE_SECS`).
+`DMUXAI_TERM_IDLE_SECS`). After `term close --all` (including `--force`) the
+`dmuxai term __host` process is expected to stay alive until that grace elapses;
+this is intentional (FR-2601), not a leak.
 
 ```
 dmuxai term open   <name> [--kind shell|cmd] [--cwd DIR] [--env K=V]... [--cols N --rows N] [--json] [-- argv...]
