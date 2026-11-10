@@ -97,7 +97,10 @@ Usage:
   dmuxai runs [--limit N] [--failed] [--json]
   dmuxai runs show <id> [--json]
   dmuxai events [--since N] [--limit N] [--follow] [--json]
-  dmuxai term open|send|read|wait|exec|list|show|resize|close|reopen [--json] ...
+  dmuxai term open NAME [--serial DEV --baud N --parity P --data B --stop S --flow F --usbipd-busid ID --wait-for REGEX --timeout DUR --kind shell|cmd|serial --cwd DIR --env K=V] [--]
+  dmuxai term send NAME <text|text --keys KEYS> | term read NAME [--since N] [--tail N] [--raw]
+  dmuxai term wait NAME --match REGEX|--idle MS --timeout DUR [--since N] | term exec NAME <command> [--timeout DUR]
+  dmuxai term approve <id> [--json] | term list|show|resize|close|reopen ...
   dmuxai mcp
   dmuxai init [--workspace] [--force]
 

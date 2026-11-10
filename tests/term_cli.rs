@@ -19,6 +19,20 @@
 //! - TC-2608 (FR-2608): resize propagated to the PTY, invalid dims exit 2
 //! - TC-2609 (FR-2609): takeover lock rejects send/exec, read/wait ok, release
 //!   (unit covers the lock helper in `src/term/host.rs`)
+//! - TC-2610 (FR-2610): native serial open/send/read/wait over an in-process
+//!   PTY pair (no socat); TC-2611 (FR-2611): serial error kinds survive the
+//!   host, and a 0000 slave (root skip) reports the dialout hint, not chmod 666
+//! - TC-2612 (FR-2612): `open --wait-for` returns on the fake board banner
+//! - TC-2613 (FR-2613): closing the PTY master marks the session lost; reopen
+//!   against a restored slave returns open
+//! - TC-2614 (FR-2614): WSL2 usbipd attach runs once with the explicit busid
+//! - TC-2615 (FR-2615): wait without --since does not match older buffer text
+//! - TC-2616 (FR-2616): exec reply text is exactly the command output
+//! - TC-2618 (FR-2610): optional socat PTY pair (`#[ignore]`, skips if absent)
+//!   plus a picocom `--kind cmd` reader on the same pair when picocom exists
+//! - TC-2630 (FR-2630): default-deny send and exec each need one-shot
+//!   approval; trusted allow bypasses it; approve is refused while
+//!   DMUXAI_RUN_ID is set
 //! - TC-2620 (FR-2620): masked io.jsonl with modes 0600/0700 (unit covers the
 //!   writer in `src/term/journal.rs`)
 //! - TC-2632 (FR-2632): child env scrubbed, `--env` still delivered
@@ -35,6 +49,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -163,6 +179,13 @@ impl Sandbox {
         }
     }
 
+    fn link_serial(&self, name: &str, board: &PtyBoard) -> PathBuf {
+        let link = self.workspace.join(name);
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(board.path(), &link).expect("link serial board");
+        link
+    }
+
     fn close_guard(&self) -> CloseGuard<'_> {
         CloseGuard { sandbox: self }
     }
@@ -277,6 +300,174 @@ fn child_pid_from(text: &str, prefix: &str) -> u32 {
         .captures(text)
         .unwrap_or_else(|| panic!("no {prefix}<pid> in exec output: {text:?}"));
     caps[1].parse().unwrap()
+}
+
+/// An in-process PTY pair used as a virtual serial board. The slave path is
+/// passed to `--serial`; the master side prints a banner and answers PING with
+/// PONG. No socat or external serial tool is involved.
+struct PtyBoard {
+    path: PathBuf,
+    master: i32,
+    slave: i32,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PtyBoard {
+    fn start() -> Self {
+        let mut master = -1;
+        let mut slave = -1;
+        let result = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "openpty failed: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe {
+            libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        let path = std::fs::read_link(format!("/proc/self/fd/{slave}"))
+            .expect("resolve the PTY slave path");
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(slave, &mut termios) == 0 {
+                libc::cfmakeraw(&mut termios);
+                let _ = libc::tcsetattr(slave, libc::TCSANOW, &termios);
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            board_write(master, b"BOOT READY\r\n");
+            let mut buffer = [0u8; 1024];
+            while !thread_stop.load(Ordering::Relaxed) {
+                let mut pollfd = libc::pollfd {
+                    fd: master,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe { libc::poll(&mut pollfd, 1, 50) };
+                if ready <= 0 {
+                    continue;
+                }
+                let read = unsafe {
+                    libc::read(
+                        master,
+                        buffer.as_mut_ptr().cast::<libc::c_void>(),
+                        buffer.len(),
+                    )
+                };
+                if read <= 0 {
+                    break;
+                }
+                let data = &buffer[..read as usize];
+                if data.windows(4).any(|window| window == b"PING") {
+                    board_write(master, b"PONG\r\n");
+                }
+            }
+        });
+
+        Self {
+            path,
+            master,
+            slave,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn close(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        if self.master >= 0 {
+            unsafe {
+                libc::close(self.master);
+            }
+            self.master = -1;
+        }
+        if self.slave >= 0 {
+            unsafe {
+                libc::close(self.slave);
+            }
+            self.slave = -1;
+        }
+    }
+}
+
+impl Drop for PtyBoard {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn fake_usbipd(dir: &Path, script: &str) -> PathBuf {
+    let path = dir.join("usbipd.exe");
+    std::fs::write(&path, script).unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+fn approval_id_from(json: &Value) -> String {
+    assert_eq!(json["ok"].as_bool(), Some(false), "blocked send: {json:?}");
+    assert_eq!(
+        json["exit_code"].as_i64(),
+        Some(7),
+        "blocked send: {json:?}"
+    );
+    assert_eq!(
+        json["error_kind"], "approval_required",
+        "blocked send: {json:?}"
+    );
+    assert_eq!(json["session"], "a", "blocked send: {json:?}");
+    let matched = json["matched"].as_str().unwrap_or_default();
+    assert!(!matched.is_empty(), "blocked send has matched: {json:?}");
+    let id = json["approval_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no approval_id: {json:?}"))
+        .to_owned();
+    assert_eq!(id.len(), 16, "approval id: {id}");
+    assert!(
+        id.chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()),
+        "approval id must be lowercase hex: {id}"
+    );
+    id
+}
+
+fn board_write(fd: i32, data: &[u8]) {
+    let mut offset = 0;
+    while offset < data.len() {
+        let written = unsafe {
+            libc::write(
+                fd,
+                data[offset..].as_ptr().cast::<libc::c_void>(),
+                data.len() - offset,
+            )
+        };
+        if written <= 0 {
+            break;
+        }
+        offset += written as usize;
+    }
 }
 
 /// Kills and reaps a spawned CLI child on drop so a failing assert never
@@ -508,6 +699,368 @@ fn tc_2605_exec_exit_codes_and_marker_stripped() {
     assert!(!text.contains("__DMUXAI_"), "marker leaked: {result:?}");
 }
 
+/// TC-2615 / FR-2615: a `term wait --match` without `--since` starts at the
+/// current sequence, so output already in the buffer does not satisfy it; an
+/// explicit `--since 0` still matches older output.
+#[test]
+fn tc_2615_wait_without_since_ignores_older_output() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    sandbox.open_shell("a");
+
+    let (out, _) = sandbox.term_json(&["term", "send", "a", "echo already_there", "--json"]);
+    assert_eq!(out.code, 0, "send failed: {out:?}");
+    let appeared = poll_until(Duration::from_secs(5), || {
+        let (out, read) = sandbox.term_json(&["term", "read", "a", "--json"]);
+        out.code == 0
+            && read["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("already_there")
+    });
+    assert!(appeared, "`echo already_there` never reached the buffer");
+
+    let (out, timed) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "a",
+        "--match",
+        "already_there",
+        "--timeout",
+        "1s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 1, "old output must not match: {out:?}");
+    assert_eq!(timed["reason"], "timeout", "wait: {timed:?}");
+
+    let (out, matched) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "a",
+        "--match",
+        "already_there",
+        "--since",
+        "0",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "explicit --since 0 must still match: {out:?}");
+    assert_eq!(matched["reason"], "match", "wait: {matched:?}");
+}
+
+/// TC-2616 / FR-2616: the exec reply `text` is exactly the command output —
+/// no echoed command line, no nonce marker and no trailing prompt.
+#[test]
+fn tc_2616_exec_text_is_exactly_command_output() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    sandbox.open_shell("a");
+
+    let (out, result) = sandbox.term_json(&["term", "exec", "a", "printf x", "--json"]);
+    assert_eq!(out.code, 0, "exec printf failed: {out:?}");
+    assert_eq!(result["reason"], "marker", "exec printf: {result:?}");
+    assert_eq!(result["text"], json!("x"), "exec printf: {result:?}");
+
+    let (out, result) = sandbox.term_json(&["term", "exec", "a", "echo hi", "--json"]);
+    assert_eq!(out.code, 0, "exec echo failed: {out:?}");
+    assert_eq!(result["text"], json!("hi"), "exec echo: {result:?}");
+
+    let (out, result) = sandbox.term_json(&["term", "exec", "a", "true", "--json"]);
+    assert_eq!(out.code, 0, "exec true failed: {out:?}");
+    assert_eq!(result["text"], json!(""), "exec true: {result:?}");
+    assert!(
+        !result["text"].as_str().unwrap().contains("__DMUXAI_"),
+        "marker leaked: {result:?}"
+    );
+}
+
+/// TC-2630 / FR-2630: a default-denied send and a default-denied exec are not
+/// written/executed, each exits 7 with a structured approval id (approval_id,
+/// matched, session), and `term approve` releases exactly one identical input.
+/// `term approve` is refused while a run id is present.
+#[test]
+fn tc_2630_dangerous_send_needs_one_shot_approval() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    sandbox.open_shell("a");
+
+    let (out, blocked) = sandbox.term_json(&["term", "send", "a", "echo shutdown", "--json"]);
+    assert_eq!(out.code, 7, "blocked send: {out:?}");
+    let id = approval_id_from(&blocked);
+
+    let (out, waited) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "a",
+        "--match",
+        "shutdown",
+        "--since",
+        "0",
+        "--timeout",
+        "1s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 1, "blocked text must not run: {out:?}");
+    assert_eq!(waited["reason"], "timeout", "blocked wait: {waited:?}");
+
+    let (out, approved) = sandbox.term_json(&["term", "approve", &id, "--json"]);
+    assert_eq!(out.code, 0, "approve failed: {out:?}");
+    assert_eq!(approved["approved"], id.as_str(), "approve: {approved:?}");
+
+    let (out, _) = sandbox.term_json(&["term", "send", "a", "echo shutdown", "--json"]);
+    assert_eq!(out.code, 0, "approved send failed: {out:?}");
+    let (out, waited) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "a",
+        "--match",
+        "shutdown",
+        "--since",
+        "0",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "approved text must run: {out:?}");
+    assert_eq!(waited["reason"], "match", "approved wait: {waited:?}");
+
+    let (out, blocked_again) = sandbox.term_json(&["term", "send", "a", "echo shutdown", "--json"]);
+    assert_eq!(out.code, 7, "approval is one-shot: {out:?}");
+    let id_again = approval_id_from(&blocked_again);
+    assert_ne!(id, id_again, "a fresh approval id is issued");
+
+    // TC-2630 covers `exec` the same way: a denied command exits 7 with the
+    // structured approval JSON, the text never reaches the shell, and the
+    // approval releases exactly one identical exec.
+    let (out, blocked_exec) = sandbox.term_json(&["term", "exec", "a", "echo halt", "--json"]);
+    assert_eq!(out.code, 7, "blocked exec: {out:?}");
+    let id_exec = approval_id_from(&blocked_exec);
+    let matched = blocked_exec["matched"].as_str().unwrap_or_default();
+    assert!(
+        matched.contains("halt"),
+        "exec refusal names the matched pattern: {blocked_exec:?}"
+    );
+
+    let (out, waited) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "a",
+        "--match",
+        r"\bhalt\b",
+        "--since",
+        "0",
+        "--timeout",
+        "1s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 1, "blocked exec text must not run: {out:?}");
+    assert_eq!(waited["reason"], "timeout", "blocked exec wait: {waited:?}");
+
+    let (out, approved) = sandbox.term_json(&["term", "approve", &id_exec, "--json"]);
+    assert_eq!(out.code, 0, "approve exec failed: {out:?}");
+    assert_eq!(
+        approved["approved"],
+        id_exec.as_str(),
+        "approve: {approved:?}"
+    );
+
+    let (out, result) = sandbox.term_json(&["term", "exec", "a", "echo halt", "--json"]);
+    assert_eq!(out.code, 0, "approved exec failed: {out:?}");
+    assert_eq!(result["exit_code"], 0, "allowed exec: {result:?}");
+    assert_eq!(result["reason"], "marker", "allowed exec: {result:?}");
+    assert_eq!(result["text"], json!("halt"), "allowed exec: {result:?}");
+
+    let (out, blocked_exec_again) =
+        sandbox.term_json(&["term", "exec", "a", "echo halt", "--json"]);
+    assert_eq!(out.code, 7, "exec approval is one-shot: {out:?}");
+    let id_exec_again = approval_id_from(&blocked_exec_again);
+    assert_ne!(id_exec, id_exec_again, "a fresh approval id is issued");
+
+    let output = sandbox
+        .command(&["term", "approve", &id_again, "--json"])
+        .env("DMUXAI_RUN_ID", "run-1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("execute dmuxai");
+    let out = Out::new(output);
+    let json = out.json("stdout");
+    assert_eq!(
+        out.code, 5,
+        "approve inside a run must be forbidden: {out:?}"
+    );
+    assert_eq!(json["error_kind"], "forbidden", "run guard: {json:?}");
+}
+
+/// TC-2630 / FR-2630: a trusted workspace `[terminal.policy] allow` regex
+/// bypasses the default deny list, so the same text is written directly.
+#[test]
+fn tc_2630_trusted_allow_bypasses_default_deny() {
+    let sandbox = Sandbox::new();
+    std::fs::write(
+        sandbox.workspace.join("dmuxai.toml"),
+        "[terminal.policy]\nallow = [\"^echo shutdown$\"]\n",
+    )
+    .unwrap();
+    let _guard = sandbox.close_guard();
+    sandbox.open_shell("a");
+
+    let (out, sent) = sandbox.term_json(&["term", "send", "a", "echo shutdown", "--json"]);
+    assert_eq!(out.code, 0, "allowlisted send failed: {out:?}");
+    assert!(sent["seq"].is_u64(), "send reply: {sent:?}");
+    let (out, waited) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "a",
+        "--match",
+        "shutdown",
+        "--since",
+        "0",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "allowlisted text must run: {out:?}");
+    assert_eq!(waited["reason"], "match", "allowlisted wait: {waited:?}");
+}
+
+/// TC-2618 / FR-2610 (ignored): an external socat PTY pair is optional and is
+/// skipped cleanly when socat is not installed.
+#[test]
+#[ignore = "requires socat; skipped when the tool is missing"]
+fn tc_2618_socat_serial_pair_optional() {
+    if Command::new("socat")
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("skipping TC-2618: socat is not installed");
+        return;
+    }
+
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let link = sandbox.workspace.join("socat-serial");
+    let board = sandbox.workspace.join("socat-board.sh");
+    std::fs::write(
+        &board,
+        "#!/bin/sh\nprintf 'BOOT READY\\r\\n'\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *PING*) printf 'PONG\\r\\n' ;;\n  esac\ndone\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&board).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&board, permissions).unwrap();
+
+    let socat = Command::new("socat")
+        .args([
+            "-d",
+            "-d",
+            &format!("pty,raw,echo=0,link={}", link.display()),
+            &format!("exec:{}", board.display()),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn socat");
+    let _reap = ReapOnDrop(Some(socat));
+    if !poll_until(Duration::from_secs(5), || link.exists()) {
+        eprintln!("skipping TC-2618: socat did not create the PTY link");
+        return;
+    }
+
+    let (out, opened) = sandbox.term_json(&[
+        "term",
+        "open",
+        "board",
+        "--serial",
+        link.to_str().expect("utf8 link"),
+        "--baud",
+        "115200",
+        "--wait-for",
+        "BOOT READY",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "socat serial open failed: {out:?}");
+    assert_eq!(opened["reason"], "match", "socat open wait: {opened:?}");
+    let (out, _) = sandbox.term_json(&["term", "send", "board", "PING", "--json"]);
+    assert_eq!(out.code, 0, "socat serial send failed: {out:?}");
+    let (out, waited) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "board",
+        "--match",
+        "PONG",
+        "--since",
+        "0",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "socat serial reply failed: {out:?}");
+    assert_eq!(waited["reason"], "match", "socat serial reply: {waited:?}");
+
+    // TC-2618 extra piece: with picocom installed, a `--kind cmd` session
+    // drives the same socat PTY pair. If picocom is missing, only this extra
+    // part is skipped; the socat serial path above still ran.
+    let picocom = Command::new("picocom")
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
+    if !picocom {
+        eprintln!("skipping TC-2618 picocom part: picocom is not installed");
+        return;
+    }
+
+    let (out, opened) = sandbox.term_json(&[
+        "term",
+        "open",
+        "picocom-board",
+        "--kind",
+        "cmd",
+        "--json",
+        "--",
+        "picocom",
+        "--noinit",
+        "--nolock",
+        "-b",
+        "115200",
+        link.to_str().expect("utf8 link"),
+    ]);
+    assert_eq!(out.code, 0, "picocom open failed: {out:?}");
+    assert_eq!(opened["kind"], "cmd", "open: {opened:?}");
+    assert_eq!(opened["state"], "open", "open: {opened:?}");
+    assert!(opened["pid"].is_u64(), "cmd session has a pid: {opened:?}");
+
+    let (out, sent) = sandbox.term_json(&["term", "send", "picocom-board", "PING", "--json"]);
+    assert_eq!(out.code, 0, "picocom send failed: {out:?}");
+    assert!(sent["seq"].is_u64(), "send reply: {sent:?}");
+    let (out, waited) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "picocom-board",
+        "--match",
+        "PONG",
+        "--since",
+        "0",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "picocom reply read failed: {out:?}");
+    assert_eq!(waited["reason"], "match", "picocom reply: {waited:?}");
+    assert!(
+        waited["text"].as_str().unwrap_or_default().contains("PONG"),
+        "reply text: {waited:?}"
+    );
+}
+
 /// TC-2606 / FR-2606: list with no host returns `[]` without starting one;
 /// show reports the session fields; unknown names exit 3.
 #[test]
@@ -699,6 +1252,314 @@ fn tc_2609_takeover_lock_blocks_input_until_release() {
     assert!(sent["seq"].is_u64(), "send after release: {sent:?}");
     let (_, shown) = sandbox.term_json(&["term", "show", "a", "--json"]);
     assert_eq!(shown["takeover"], false, "show after release: {shown:?}");
+}
+
+/// TC-2610 / FR-2610: a native serial session opens the PTY-pair slave path
+/// with serial2 (no external tool), reports kind `serial`, and send/read/wait
+/// work against the fake board on the master side.
+#[test]
+fn tc_2610_serial_open_send_read_with_pty_board() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let board = PtyBoard::start();
+    let serial = board.path().to_str().expect("utf8 slave path").to_owned();
+
+    let (out, opened) = sandbox.term_json(&[
+        "term", "open", "board", "--serial", &serial, "--baud", "115200", "--json",
+    ]);
+    assert_eq!(out.code, 0, "serial open failed: {out:?}");
+    assert_eq!(opened["name"], "board");
+    assert_eq!(opened["kind"], "serial", "open: {opened:?}");
+    assert_eq!(opened["state"], "open", "open: {opened:?}");
+    assert!(opened["pid"].is_null(), "serial sessions have no child pid");
+
+    let (out, waited) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "board",
+        "--match",
+        "BOOT READY",
+        "--since",
+        "0",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "wait for banner failed: {out:?}");
+    assert_eq!(waited["reason"], "match", "wait: {waited:?}");
+    assert!(
+        waited["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("BOOT READY"),
+        "banner text: {waited:?}"
+    );
+
+    let (out, _) = sandbox.term_json(&["term", "send", "board", "PING", "--json"]);
+    assert_eq!(out.code, 0, "serial send failed: {out:?}");
+    let (out, waited) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "board",
+        "--match",
+        "PONG",
+        "--since",
+        "0",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "wait for reply failed: {out:?}");
+    assert_eq!(waited["reason"], "match", "reply: {waited:?}");
+}
+
+/// TC-2611 / FR-2611: serial open failures keep the host's distinct
+/// `error_kind` through the client and include the FR-2611 hint.
+#[test]
+fn tc_2611_serial_missing_device_keeps_error_kind() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let missing = sandbox.workspace.join("missing-serial");
+    let output = sandbox
+        .command(&[
+            "term",
+            "open",
+            "board",
+            "--serial",
+            missing.to_str().expect("utf8 path"),
+            "--baud",
+            "115200",
+            "--json",
+        ])
+        .env("DMUXAI_SERIAL_WSL2", "0")
+        .stdin(Stdio::null())
+        .output()
+        .expect("execute dmuxai");
+    let out = Out::new(output);
+    let json = out.json("stdout");
+    assert_eq!(out.code, 3, "missing serial must exit 3: {out:?}");
+    assert_eq!(json["error_kind"], "serial_not_found", "error: {json:?}");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(missing.to_str().unwrap()),
+        "hint names the path: {json:?}"
+    );
+}
+
+/// TC-2611 / FR-2611: a slave whose mode denies the open reports
+/// `serial_permission` with the dialout-group manual hint and never suggests
+/// `chmod 666`. Skipped as root, who bypasses permission checks, and tested
+/// against a real PTY slave so the device path exists.
+#[test]
+fn tc_2611_serial_permission_denied_names_dialout() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping TC-2611 0000-slave case: running as root");
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let board = PtyBoard::start();
+    let serial = board.path().to_str().expect("utf8 slave path").to_owned();
+    std::fs::set_permissions(board.path(), std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 0000 the PTY slave");
+
+    let output = sandbox
+        .command(&[
+            "term", "open", "board", "--serial", &serial, "--baud", "115200", "--json",
+        ])
+        .env("DMUXAI_SERIAL_WSL2", "0")
+        .stdin(Stdio::null())
+        .output()
+        .expect("execute dmuxai");
+    let out = Out::new(output);
+    let json = out.json("stdout");
+    assert_eq!(out.code, 5, "denied slave open must exit 5: {out:?}");
+    assert_eq!(json["error_kind"], "serial_permission", "error: {json:?}");
+    let message = json["error"].as_str().unwrap_or_default().to_owned();
+    assert!(message.contains("dialout"), "dialout hint: {json:?}");
+    assert!(
+        message.contains(&serial),
+        "hint names the path: {message:?}"
+    );
+    assert!(
+        !message.contains("chmod 666"),
+        "must never suggest chmod 666: {message:?}"
+    );
+}
+
+/// TC-2612 / FR-2612: `open --wait-for REGEX --timeout DUR` returns after the
+/// fake board banner and reports `reason: match`; missing --timeout exits 2.
+#[test]
+fn tc_2612_open_wait_for_banner() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let board = PtyBoard::start();
+    let serial = board.path().to_str().expect("utf8 slave path").to_owned();
+
+    let (out, opened) = sandbox.term_json(&[
+        "term",
+        "open",
+        "board",
+        "--serial",
+        &serial,
+        "--baud",
+        "115200",
+        "--wait-for",
+        "BOOT READY",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "open --wait-for failed: {out:?}");
+    assert_eq!(opened["reason"], "match", "open wait: {opened:?}");
+    assert_eq!(opened["kind"], "serial", "open wait: {opened:?}");
+    assert!(
+        opened["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("BOOT READY"),
+        "open wait text: {opened:?}"
+    );
+
+    let out = sandbox.run(&[
+        "term",
+        "open",
+        "board2",
+        "--serial",
+        &serial,
+        "--baud",
+        "115200",
+        "--wait-for",
+        "BOOT READY",
+    ]);
+    assert_eq!(out.code, 2, "--wait-for without --timeout must exit 2");
+}
+
+/// TC-2613 / FR-2613: closing the master side makes the serial session `lost`;
+/// `reopen` with a live slave path for the same spec returns state `open`.
+#[test]
+fn tc_2613_serial_lost_then_reopen() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let mut board = PtyBoard::start();
+    let link = sandbox.link_serial("board", &board);
+    let serial = link.to_str().expect("utf8 link path").to_owned();
+
+    let (out, opened) = sandbox.term_json(&[
+        "term", "open", "board", "--serial", &serial, "--baud", "115200", "--json",
+    ]);
+    assert_eq!(out.code, 0, "serial open failed: {out:?}");
+    assert_eq!(opened["state"], "open", "open: {opened:?}");
+    let (out, _) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "board",
+        "--match",
+        "BOOT READY",
+        "--since",
+        "0",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "banner wait failed: {out:?}");
+
+    board.close();
+    let lost = poll_until(Duration::from_secs(5), || {
+        let (out, shown) = sandbox.term_json(&["term", "show", "board", "--json"]);
+        out.code == 0 && shown["state"] == "lost"
+    });
+    assert!(lost, "closing the master must move the session to lost");
+
+    let new_board = PtyBoard::start();
+    sandbox.link_serial("board", &new_board);
+    let (out, reopened) = sandbox.term_json(&["term", "reopen", "board", "--json"]);
+    assert_eq!(out.code, 0, "reopen failed: {out:?}");
+    assert_eq!(reopened["state"], "open", "reopen: {reopened:?}");
+    assert_eq!(reopened["kind"], "serial", "reopen: {reopened:?}");
+    let (out, waited) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "board",
+        "--match",
+        "BOOT READY",
+        "--since",
+        "0",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "wait after reopen failed: {out:?}");
+    assert_eq!(waited["reason"], "match", "wait after reopen: {waited:?}");
+}
+
+/// TC-2614 / FR-2614: a WSL2-looking environment runs the fake usbipd.exe
+/// attach exactly once with the explicit busid, then reports the attach failure
+/// with the cause and the FR-2611 manual hint.
+#[test]
+fn tc_2614_wsl2_usbipd_attach_once_with_explicit_busid() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let log = sandbox.workspace.join("usbipd.log");
+    let fake = fake_usbipd(
+        &sandbox.workspace,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\necho 'device is not bound' >&2\nexit 1\n",
+            log.display()
+        ),
+    );
+    let missing = sandbox.workspace.join("missing-serial");
+    let output = sandbox
+        .command(&[
+            "term",
+            "open",
+            "board",
+            "--serial",
+            missing.to_str().expect("utf8 path"),
+            "--baud",
+            "115200",
+            "--usbipd-busid",
+            "1-2",
+            "--json",
+        ])
+        .env("DMUXAI_SERIAL_WSL2", "1")
+        .env("DMUXAI_USBIPD_BIN", &fake)
+        .stdin(Stdio::null())
+        .output()
+        .expect("execute dmuxai");
+    let out = Out::new(output);
+    let json = out.json("stdout");
+    assert_eq!(out.code, 6, "attach failure must exit 6: {out:?}");
+    assert_eq!(
+        json["error_kind"], "usbipd_attach_failed",
+        "error: {json:?}"
+    );
+    let message = json["error"].as_str().unwrap_or_default();
+    assert!(message.contains("device is not bound"), "cause: {json:?}");
+    assert!(
+        message.contains("usbipd attach --wsl --busid"),
+        "manual hint: {json:?}"
+    );
+
+    let calls = std::fs::read_to_string(&log).expect("usbipd log");
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("attach"))
+            .count(),
+        1,
+        "attach must run once: {calls}"
+    );
+    assert!(
+        calls.lines().any(|line| line == "attach --wsl --busid 1-2"),
+        "attach argv: {calls}"
+    );
+    assert!(
+        !calls.lines().any(|line| line == "list"),
+        "an explicit busid must not list: {calls}"
+    );
 }
 
 /// TC-2620 / FR-2620: every input and output chunk lands in a masked io.jsonl

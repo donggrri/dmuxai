@@ -19,10 +19,11 @@ use crate::term::backend::{Backend, now_ms};
 use crate::term::buffer::RingBuffer;
 use crate::term::client::socket_path;
 use crate::term::journal::{TERM_IO_COALESCE_MAX_DELAY_MS, TermJournal};
+use crate::term::policy::{ApprovalGate, Decision, Policy, RUN_ID_ENV, approve_with_run_guard};
 use crate::term::proto::{PROTOCOL_VERSION, RequestOp, Response, read_request, write_response};
 use crate::term::wait::{
-    MARKER_PREFIX, WaitOptions, WaitReason, WaitResult, marker_command, parse_exit_marker,
-    strip_exit_marker, wait,
+    MARKER_PREFIX, WaitOptions, WaitReason, WaitResult, exec_output_text, marker_command,
+    parse_exit_marker, wait,
 };
 use crate::term::{
     SessionInfo, SessionKind, SessionSpec, SessionState, TermError, check_input_size,
@@ -47,11 +48,14 @@ struct Session {
 
 impl Session {
     fn refresh(&mut self) {
-        if self.state == SessionState::Open
-            && let Some(exit) = self.backend.exit_status()
-        {
+        if self.state != SessionState::Open {
+            return;
+        }
+        if self.backend.is_lost() {
+            self.state = SessionState::Lost;
+            self.backend.record_event("state lost");
+        } else if self.backend.exit_status().is_some() {
             self.state = SessionState::Exited;
-            let _ = exit;
         }
     }
 
@@ -81,6 +85,8 @@ impl Session {
 struct Shared {
     workspace_root: PathBuf,
     sessions: Mutex<BTreeMap<String, SessionHandle>>,
+    policy: Policy,
+    approvals: ApprovalGate,
     shutdown: AtomicBool,
     wake: UnixStream,
 }
@@ -118,9 +124,14 @@ pub(crate) fn run_at(workspace_root: &Path, path: &Path) -> Result<(), TermError
     wake_rx.set_nonblocking(true).map_err(|error| {
         TermError::internal(format!("could not configure the term wake socket: {error}"))
     })?;
+    let terminal_settings = crate::settings::DmuxSettings::load(workspace_root).terminal;
+    let (policy, _warnings) = Policy::compile(&terminal_settings);
+    let approve_timeout = policy.approve_timeout();
     let shared = Arc::new(Shared {
         workspace_root: workspace_root.to_path_buf(),
         sessions: Mutex::new(BTreeMap::new()),
+        policy,
+        approvals: ApprovalGate::new(approve_timeout),
         shutdown: AtomicBool::new(false),
         wake,
     });
@@ -331,6 +342,7 @@ impl Shared {
                 cols,
                 rows,
                 argv,
+                serial,
             } => self.open(SessionSpec {
                 name,
                 kind,
@@ -339,6 +351,7 @@ impl Shared {
                 cols,
                 rows,
                 argv,
+                serial,
             }),
             RequestOp::Send {
                 name,
@@ -346,11 +359,8 @@ impl Shared {
                 newline,
                 secret,
             } => {
-                let mut data = text.into_bytes();
-                if newline {
-                    data.push(b'\n');
-                }
-                ensure_input_within_limit(data.len())?;
+                let size = text.len() + usize::from(newline);
+                ensure_input_within_limit(size)?;
                 let handle = self.session(&name)?;
                 let mut session = handle
                     .lock()
@@ -360,6 +370,11 @@ impl Shared {
                     return Err(TermError::conflict(format!("session '{name}' is not open")));
                 }
                 ensure_input_allowed(&name, session.takeover)?;
+                self.ensure_policy_allows(&name, &text)?;
+                let mut data = text.into_bytes();
+                if newline {
+                    data.push(b'\n');
+                }
                 let seq = session.backend.send(&data, secret)?;
                 Ok(Response::ok(json!({"seq": seq})))
             }
@@ -408,19 +423,20 @@ impl Shared {
             } => {
                 let timeout =
                     timeout_ms.ok_or_else(|| TermError::usage("wait requires --timeout"))?;
+                let handle = self.session(&name)?;
+                let (buffer, since) = {
+                    let mut session = handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    session.refresh();
+                    let since = since.unwrap_or_else(|| session.backend.seq());
+                    (session.backend.buffer(), since)
+                };
                 let options = WaitOptions {
                     regex,
                     idle: idle_ms.map(Duration::from_millis),
                     timeout: Duration::from_millis(timeout),
                     since,
-                };
-                let handle = self.session(&name)?;
-                let buffer = {
-                    let mut session = handle
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    session.refresh();
-                    session.backend.buffer()
                 };
                 let result = wait(&buffer, &options)?;
                 let data = wait_result_json(&result);
@@ -477,6 +493,15 @@ impl Shared {
             }
             RequestOp::Close { name, force, all } => self.close(name, force, all),
             RequestOp::Reopen { name } => self.reopen(&name),
+            RequestOp::Approve { id } => {
+                approve_with_run_guard(
+                    &self.approvals,
+                    &id,
+                    std::env::var(RUN_ID_ENV).ok().as_deref(),
+                    Instant::now(),
+                )?;
+                Ok(Response::ok(json!({"approved": id})))
+            }
             RequestOp::Takeover { name } => {
                 let handle = self.session(&name)?;
                 let mut session = handle
@@ -510,11 +535,47 @@ impl Shared {
         }
     }
 
+    /// FR-2630: evaluate CLI/agent input against the trusted policy. A blocked
+    /// input is not written; it creates a one-shot approval and reports the id.
+    /// An already-approved identical input on this session is consumed here.
+    fn ensure_policy_allows(&self, name: &str, text: &str) -> Result<(), TermError> {
+        match self.policy.evaluate(text) {
+            Decision::Allowed => Ok(()),
+            Decision::ApprovalRequired { matched } => {
+                let now = Instant::now();
+                if self.approvals.release(name, text, now).is_some() {
+                    return Ok(());
+                }
+                let id = self.approvals.issue(name, text, &matched, now);
+                Err(TermError::approval_required(name, &matched, &id))
+            }
+        }
+    }
+
     fn open(&self, spec: SessionSpec) -> Result<Response, TermError> {
         validate_name(&spec.name)?;
         validate_dimensions(spec.cols, spec.rows)?;
-        if spec.kind == SessionKind::Cmd && spec.argv.is_empty() {
-            return Err(TermError::usage("--kind cmd needs a command after --"));
+        match spec.kind {
+            SessionKind::Cmd if spec.argv.is_empty() => {
+                return Err(TermError::usage("--kind cmd needs a command after --"));
+            }
+            SessionKind::Serial => {
+                let config = spec.serial.as_ref().ok_or_else(|| {
+                    TermError::usage("serial sessions need a --serial device path")
+                })?;
+                config.validate()?;
+                if !spec.argv.is_empty() {
+                    return Err(TermError::usage(
+                        "serial sessions do not take a command after --",
+                    ));
+                }
+            }
+            _ if spec.serial.is_some() => {
+                return Err(TermError::usage(
+                    "--serial is only valid for serial sessions",
+                ));
+            }
+            _ => {}
         }
         let mut sessions = self
             .sessions
@@ -607,11 +668,12 @@ impl Shared {
                 return Err(TermError::conflict(format!("session '{name}' is not open")));
             }
             ensure_input_allowed(&name, session.takeover)?;
+            self.ensure_policy_allows(&name, &command)?;
             let since = session.backend.seq();
             match session.spec.kind {
                 SessionKind::Shell => {
                     let nonce = generate_run_id();
-                    let text = format!("{command}\n{}\n", marker_command(&nonce));
+                    let text = format!("{command}; {}\n", marker_command(&nonce));
                     check_input_size(text.as_bytes())?;
                     session.backend.send(text.as_bytes(), false)?;
                     (
@@ -621,7 +683,7 @@ impl Shared {
                         SessionKind::Shell,
                     )
                 }
-                SessionKind::Cmd => {
+                SessionKind::Cmd | SessionKind::Serial => {
                     let text = format!("{command}\n");
                     check_input_size(text.as_bytes())?;
                     session.backend.send(text.as_bytes(), false)?;
@@ -657,7 +719,14 @@ impl Shared {
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if result.reason == WaitReason::Timeout {
             return Ok(Response::with_exit_code(
-                exec_json(&result, None, elapsed_ms, &nonce, WaitReason::Timeout),
+                exec_json(
+                    &result,
+                    None,
+                    elapsed_ms,
+                    &command,
+                    &nonce,
+                    WaitReason::Timeout,
+                ),
                 exit::FAILED,
             ));
         }
@@ -670,7 +739,7 @@ impl Shared {
         } else {
             result.reason
         };
-        let data = exec_json(&result, exit_code, elapsed_ms, &nonce, reason);
+        let data = exec_json(&result, exit_code, elapsed_ms, &command, &nonce, reason);
         Ok(Response::ok(data))
     }
 
@@ -707,13 +776,34 @@ impl Shared {
     }
 
     fn reopen(&self, name: &str) -> Result<Response, TermError> {
-        let spec = {
-            let handle = self.session(name)?;
-            let session = handle
+        let (spec, handle) = {
+            let sessions = self
+                .sessions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            session.spec.clone()
+            let handle = sessions
+                .get(name)
+                .cloned()
+                .ok_or_else(|| TermError::not_found(name))?;
+            let spec = {
+                let session = handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                session.spec.clone()
+            };
+            (spec, handle)
         };
+        if matches!(spec.kind, SessionKind::Serial) {
+            let mut session = handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            session.refresh();
+            if let Backend::Serial(serial) = &mut session.backend {
+                serial.release();
+            }
+            session.state = SessionState::Lost;
+            session.backend.record_event("state lost");
+        }
         let session = self.spawn_session(spec)?;
         let data = json!({
             "name": name,
@@ -735,11 +825,12 @@ fn exec_json(
     result: &WaitResult,
     exit_code: Option<i32>,
     elapsed_ms: u64,
+    command: &str,
     nonce: &Option<String>,
     reason: WaitReason,
 ) -> Value {
     let text = match nonce {
-        Some(nonce) => strip_exit_marker(&result.text, nonce),
+        Some(nonce) => exec_output_text(&result.text, command, nonce),
         None => result.text.clone(),
     };
     json!({
@@ -769,6 +860,7 @@ fn kind_name(kind: SessionKind) -> &'static str {
     match kind {
         SessionKind::Shell => "shell",
         SessionKind::Cmd => "cmd",
+        SessionKind::Serial => "serial",
     }
 }
 
@@ -912,6 +1004,7 @@ impl Drop for SocketGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::term::policy::DEFAULT_APPROVE_TIMEOUT_MS;
 
     fn test_shared() -> (Arc<Shared>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -920,6 +1013,8 @@ mod tests {
         let shared = Arc::new(Shared {
             workspace_root: dir.path().to_path_buf(),
             sessions: Mutex::new(BTreeMap::new()),
+            policy: Policy::default(),
+            approvals: ApprovalGate::new(Duration::from_millis(DEFAULT_APPROVE_TIMEOUT_MS)),
             shutdown: AtomicBool::new(false),
             wake,
         });
@@ -961,7 +1056,7 @@ mod tests {
                         regex: Some("never".to_owned()),
                         idle_ms: None,
                         timeout_ms: Some(2_000),
-                        since: 0,
+                        since: Some(0),
                     })
                     .unwrap()
             })

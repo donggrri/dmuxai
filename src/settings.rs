@@ -113,6 +113,9 @@ pub struct DmuxSettings {
     pub runner_fallback: crate::runner_fallback::FallbackSettings,
     /// Run journal retention configuration from `[runs]` (SPEC-run-journal FR-2565).
     pub runs: crate::run_journal::JournalConfig,
+    /// Trusted `[terminal]` settings (SPEC-terminal-sessions FR-2614, FR-2630).
+    /// Workspace keys are merged only when the workspace is trusted.
+    pub terminal: crate::term::policy::TerminalSettings,
     /// Trust status of workspace configuration.
     pub workspace_trust: WorkspaceTrustStatus,
 }
@@ -161,6 +164,9 @@ struct DmuxToml {
     runners: Option<std::collections::BTreeMap<String, crate::agent_prompt::RunnerPromptToml>>,
     /// `[runs]` retention configuration (SPEC-run-journal FR-2565).
     runs: Option<RunsToml>,
+    /// `[terminal]` sessions config (SPEC-terminal-sessions FR-2614, FR-2630).
+    /// A restricted key: dropped from a workspace config unless it is trusted.
+    terminal: Option<TerminalToml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -169,6 +175,28 @@ struct RunsToml {
     retention_bytes: Option<u64>,
     max_age_ms: Option<u64>,
     max_total_bytes: Option<u64>,
+}
+
+/// `[terminal]` (SPEC-terminal-sessions FR-2614, FR-2630).
+#[derive(Debug, Default, Deserialize)]
+struct TerminalToml {
+    policy: Option<TerminalPolicyToml>,
+    serial: Option<TerminalSerialToml>,
+}
+
+/// `[terminal.policy]` (SPEC-terminal-sessions FR-2630).
+#[derive(Debug, Default, Deserialize)]
+struct TerminalPolicyToml {
+    allow: Option<Vec<String>>,
+    deny: Option<Vec<String>>,
+    /// Milliseconds (integer) or a duration string like `"10m"`.
+    approve_timeout: Option<toml::Value>,
+}
+
+/// `[terminal.serial]` (SPEC-terminal-sessions FR-2614).
+#[derive(Debug, Default, Deserialize)]
+struct TerminalSerialToml {
+    usbipd_busid: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1005,6 +1033,9 @@ impl DmuxSettings {
                 self.runs.max_total_bytes = bytes;
             }
         }
+        if let Some(terminal) = parsed.terminal {
+            self.merge_terminal(terminal);
+        }
         if let Some(cursor) = parsed.cursor {
             if let Some(prewarm) = cursor.prewarm {
                 self.cursor_prewarm = prewarm;
@@ -1142,6 +1173,38 @@ impl DmuxSettings {
                 self.config_warnings.push(format!("notify: {warning}"));
             }
             self.notify = notify;
+        }
+    }
+
+    /// SPEC-terminal-sessions FR-2630/FR-2614: merge one `[terminal]` table.
+    /// A workspace's `[terminal]` reaches this only when the workspace is
+    /// trusted (the restricted-key strip removes it otherwise); a user-config
+    /// `[terminal]` is always applied.
+    fn merge_terminal(&mut self, terminal: TerminalToml) {
+        if let Some(policy) = terminal.policy {
+            if let Some(allow) = policy.allow {
+                self.terminal.allow = allow;
+            }
+            if let Some(deny) = policy.deny {
+                self.terminal.deny = deny;
+            }
+            if let Some(timeout) = policy.approve_timeout {
+                match crate::term::policy::parse_approve_timeout_ms(&timeout) {
+                    Some(ms) => self.terminal.approve_timeout_ms = ms,
+                    None => self.config_warnings.push(format!(
+                        "[terminal.policy] approve_timeout = {timeout} ignored: expected positive milliseconds or a duration like \"10m\"; using the default"
+                    )),
+                }
+            }
+        }
+        if let Some(busid) = terminal.serial.and_then(|serial| serial.usbipd_busid) {
+            let trimmed = busid.trim().to_owned();
+            if trimmed.is_empty() {
+                self.config_warnings
+                    .push("[terminal.serial] usbipd_busid ignored: must not be empty".to_owned());
+            } else {
+                self.terminal.serial_usbipd_busid = Some(trimmed);
+            }
         }
     }
 
@@ -1370,6 +1433,11 @@ fn restricted_workspace_keys_with_user(
     if parsed.jira.is_some() {
         keys.push("jira".to_owned());
     }
+    // SPEC-terminal-sessions FR-2630: allow and extra deny patterns may only
+    // loosen or tighten the dangerous-command guard, so they require trust.
+    if parsed.terminal.is_some() {
+        keys.push("terminal".to_owned());
+    }
     if let Some(runners) = &parsed.runners {
         for (id, raw) in runners {
             if let Some(file) = &raw.system_prompt_file
@@ -1520,6 +1588,7 @@ fn strip_restricted_workspace_keys_with_user(
         todo.jira_base_url = None;
     }
     parsed.jira = None;
+    parsed.terminal = None;
     if let Some(runners) = &mut parsed.runners {
         for raw in runners.values_mut() {
             if let Some(file) = &raw.system_prompt_file
@@ -1739,6 +1808,36 @@ pub fn restricted_workspace_details_from(
         }
     }
 
+    if let Some(terminal) = &parsed.terminal {
+        if let Some(policy) = &terminal.policy {
+            if let Some(allow) = &policy.allow {
+                details.push((
+                    "terminal.policy.allow".to_owned(),
+                    format!("[{}]", allow.join(", ")),
+                ));
+            }
+            if let Some(deny) = &policy.deny {
+                details.push((
+                    "terminal.policy.deny".to_owned(),
+                    format!("[{}]", deny.join(", ")),
+                ));
+            }
+            if let Some(timeout) = &policy.approve_timeout {
+                details.push((
+                    "terminal.policy.approve_timeout".to_owned(),
+                    timeout.to_string(),
+                ));
+            }
+        }
+        if let Some(busid) = terminal
+            .serial
+            .as_ref()
+            .and_then(|serial| serial.usbipd_busid.as_ref())
+        {
+            details.push(("terminal.serial.usbipd_busid".to_owned(), busid.clone()));
+        }
+    }
+
     details
         .into_iter()
         .map(|(key, value)| {
@@ -1818,6 +1917,7 @@ impl Default for DmuxSettings {
             runner_models: BTreeMap::new(),
             runner_fallback: Default::default(),
             runs: crate::run_journal::JournalConfig::default(),
+            terminal: crate::term::policy::TerminalSettings::default(),
             workspace_trust: WorkspaceTrustStatus::NoWorkspaceConfig,
         }
     }
@@ -5684,5 +5784,163 @@ system_prompt_file = "../claude.prompt"
 
         let settings = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user_toml), &env);
         assert_eq!(settings.memory, None);
+    }
+}
+
+#[cfg(test)]
+mod terminal_settings_tests {
+    use super::*;
+
+    const TERMINAL_TOML: &str = r#"
+[terminal.policy]
+allow = ["^reboot$"]
+deny = ["^curl\\s"]
+approve_timeout = "5m"
+
+[terminal.serial]
+usbipd_busid = "1-2"
+"#;
+
+    /// TC-2630 / FR-2630, FR-2614: a trusted workspace's `[terminal]` keys are
+    /// loaded (allow, extra deny, approve_timeout, usbipd_busid).
+    #[test]
+    fn tc_2630_terminal_settings_load_for_trusted_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("dmuxai.toml"), TERMINAL_TOML).unwrap();
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, None, &env);
+        assert_eq!(settings.terminal.allow, vec!["^reboot$".to_owned()]);
+        assert_eq!(settings.terminal.deny, vec![r"^curl\s".to_owned()]);
+        assert_eq!(settings.terminal.approve_timeout_ms, 300_000);
+        assert_eq!(
+            settings.terminal.serial_usbipd_busid.as_deref(),
+            Some("1-2")
+        );
+        assert!(
+            !settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("terminal"))
+        );
+        // The compiled policy applies the trusted allow regex.
+        let (policy, warnings) = crate::term::policy::Policy::compile(&settings.terminal);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            policy.evaluate("reboot"),
+            crate::term::policy::Decision::Allowed
+        );
+    }
+
+    /// TC-2630 / FR-2630: the same keys are stripped from an untrusted
+    /// workspace config and the guard keeps its defaults.
+    #[test]
+    fn tc_2630_terminal_settings_stripped_for_untrusted_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("dmuxai.toml"), TERMINAL_TOML).unwrap();
+        let env = RuntimeEnv::from_process();
+
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, None, &env);
+        assert_eq!(
+            settings.terminal,
+            crate::term::policy::TerminalSettings::default()
+        );
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("ignored: terminal"))
+                || settings
+                    .config_warnings
+                    .iter()
+                    .any(|w| w.contains("not trusted") && w.contains("terminal")),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        assert_eq!(
+            settings.workspace_trust,
+            WorkspaceTrustStatus::Untrusted {
+                sha256: crate::workspace_trust::content_hash(TERMINAL_TOML.as_bytes()),
+                ignored: vec!["terminal".to_owned()],
+            }
+        );
+    }
+
+    /// TC-2630: an invalid `approve_timeout` falls back to the default with a
+    /// warning, and an empty usbipd_busid is ignored.
+    #[test]
+    fn tc_2630_terminal_invalid_values_warn_and_keep_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            "[terminal.policy]\napprove_timeout = \"90x\"\n\n[terminal.serial]\nusbipd_busid = \" \"\n",
+        )
+        .unwrap();
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, None, &env);
+        assert_eq!(
+            settings.terminal.approve_timeout_ms,
+            crate::term::policy::DEFAULT_APPROVE_TIMEOUT_MS
+        );
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[terminal.policy] approve_timeout")),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[terminal.serial] usbipd_busid")),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        assert_eq!(settings.terminal.serial_usbipd_busid, None);
+    }
+
+    /// TC-2630: the workspace `[terminal]` table replaces the user one, and a
+    /// workspace without `[terminal]` keeps the user settings (user config is
+    /// its own owner, so it is not trust-gated).
+    #[test]
+    fn tc_2630_terminal_workspace_overrides_user_when_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_dir = dir.path().join("user");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            user_dir.join("dmuxai.toml"),
+            "[terminal.policy]\nallow = [\"^ls$\"]\ndeny = [\"^echo$\"]\napprove_timeout = 120_000\n\n[terminal.serial]\nusbipd_busid = \"3-1\"\n",
+        )
+        .unwrap();
+        std::fs::write(ws.join("dmuxai.toml"), TERMINAL_TOML).unwrap();
+        let mut env = RuntimeEnv::from_process();
+        env.trust_workspace_config = true;
+
+        let settings = DmuxSettings::load_with_user_config_and_env(
+            &ws,
+            Some(&user_dir.join("dmuxai.toml")),
+            &env,
+        );
+        assert_eq!(settings.terminal.allow, vec!["^reboot$".to_owned()]);
+        assert_eq!(settings.terminal.deny, vec![r"^curl\s".to_owned()]);
+        assert_eq!(settings.terminal.approve_timeout_ms, 300_000);
+        assert_eq!(
+            settings.terminal.serial_usbipd_busid.as_deref(),
+            Some("1-2"),
+            "workspace wins"
+        );
     }
 }

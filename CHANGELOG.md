@@ -13,8 +13,21 @@ All notable changes to dmuxai are listed here. Versions follow
   (text or named keys), `read`, `wait` (regex, idle, timeout), `exec` (exit code via a nonce
   marker), `list`, `show`, `resize`, `close`, `reopen`, all with `--json`. Every input and
   output event goes to a masked local journal under `terms/`. `dmuxai run` never starts the
-  host. Serial ports, the dangerous-command guard, agent integration, and the dashboard view
-  follow in later PRs.
+  host. Agent integration and the dashboard view follow in later PRs.
+- **Terminal sessions PR1b (FR-2610..2616, FR-2630).** `term open --serial DEV --baud N`
+  opens the device with serial2 (parity/data/stop/flow; no extra tool). Missing, permission,
+  and busy failures use distinct `error_kind` values and the FR-2611 hint text (never
+  `chmod 666`). WSL1 maps `COMn` to `/dev/ttySn`. On WSL2 a missing path runs
+  `usbipd.exe attach --wsl --busid <id>` once (id from `--usbipd-busid`, trusted
+  `[terminal.serial] usbipd_busid`, or `usbipd.exe list`). Unplug (EIO/ENXIO) moves the
+  session to `lost`; `term reopen` drops the old file descriptor before retrying.
+  `open --wait-for REGEX --timeout` waits for a banner. `term wait` without `--since`
+  starts at the current seq so older buffer text cannot match. `term exec` `text` is only
+  the command output (no echo, nonce marker, or trailing prompt). A seatbelt (not a
+  sandbox) blocks default-denied `send`/`exec` text until `term approve <id>` (refused
+  when `DMUXAI_RUN_ID` is set); trusted `[terminal.policy]` can add allow/deny patterns
+  and `approve_timeout`. `scripts/bench-term.sh` prints p50/p95 for status, send+read,
+  and exec versus `bash -c`.
 
 ## [0.3.1] - 2026-11-09
 

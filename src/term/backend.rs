@@ -13,13 +13,15 @@ use portable_pty::{CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_syste
 
 use crate::process::INTERNAL_ENV_VARS;
 use crate::process::supervisor::{TreeSnapshot, group_alive, snapshot_tree, terminate_snapshot};
+use crate::settings::DmuxSettings;
 use crate::term::buffer::{BufferRead, DEFAULT_CAPACITY, RingBuffer};
 use crate::term::journal::{TermJournal, TermJournalDir};
+use crate::term::serial::{self, SerialBackend, SerialEnv};
 use crate::term::{
     ExitStatus, SessionKind, SessionSpec, TermError, check_input_size, validate_dimensions,
 };
 
-pub struct Backend {
+pub struct PtyBackend {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
@@ -30,7 +32,7 @@ pub struct Backend {
     journal: Option<Arc<Mutex<TermJournal>>>,
 }
 
-impl Backend {
+impl PtyBackend {
     pub fn spawn(
         spec: &SessionSpec,
         workspace_root: &Path,
@@ -66,6 +68,11 @@ impl Backend {
                 let mut command = CommandBuilder::new(&spec.argv[0]);
                 command.args(&spec.argv[1..]);
                 command
+            }
+            SessionKind::Serial => {
+                return Err(TermError::internal(
+                    "serial sessions must use the serial backend",
+                ));
             }
         };
         for variable in INTERNAL_ENV_VARS {
@@ -297,9 +304,149 @@ impl Backend {
     }
 }
 
-impl Drop for Backend {
+impl Drop for PtyBackend {
     fn drop(&mut self) {
         self.close(true);
+    }
+}
+
+/// A live terminal backend: a PTY-backed child process or a native serial
+/// device. Host code talks to this enum so both kinds share send/read/wait.
+pub enum Backend {
+    Pty(PtyBackend),
+    Serial(SerialBackend),
+}
+
+impl Backend {
+    pub fn spawn(
+        spec: &SessionSpec,
+        workspace_root: &Path,
+        journal: Option<Arc<Mutex<TermJournal>>>,
+    ) -> Result<Self, TermError> {
+        if spec.kind == SessionKind::Serial {
+            let config = spec
+                .serial
+                .as_ref()
+                .ok_or_else(|| TermError::usage("serial sessions need a --serial device path"))?;
+            config.validate()?;
+            if !spec.argv.is_empty() {
+                return Err(TermError::usage(
+                    "serial sessions do not take a command after --",
+                ));
+            }
+            let trusted_busid = if config.usbipd_busid.is_some() {
+                None
+            } else {
+                DmuxSettings::load(workspace_root)
+                    .terminal
+                    .serial_usbipd_busid
+            };
+            let env = SerialEnv {
+                wsl2: serial::is_wsl2(),
+                trusted_busid,
+            };
+            let backend = serial::open_with_env(config, &env, journal)?;
+            return Ok(Self::Serial(backend));
+        }
+        Ok(Self::Pty(PtyBackend::spawn(spec, workspace_root, journal)?))
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Pty(backend) => backend.pid(),
+            Self::Serial(backend) => backend.pid(),
+        }
+    }
+
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::Pty(backend) => backend.seq(),
+            Self::Serial(backend) => backend.seq(),
+        }
+    }
+
+    pub fn buffer(&self) -> Arc<RingBuffer> {
+        match self {
+            Self::Pty(backend) => backend.buffer(),
+            Self::Serial(backend) => backend.buffer(),
+        }
+    }
+
+    pub fn last_output_ms(&self) -> u64 {
+        match self {
+            Self::Pty(backend) => backend.last_output_ms(),
+            Self::Serial(backend) => backend.last_output_ms(),
+        }
+    }
+
+    pub fn exit_status(&self) -> Option<ExitStatus> {
+        match self {
+            Self::Pty(backend) => backend.exit_status(),
+            Self::Serial(backend) => backend.exit_status(),
+        }
+    }
+
+    pub fn is_lost(&self) -> bool {
+        match self {
+            Self::Pty(_) => false,
+            Self::Serial(backend) => backend.is_lost(),
+        }
+    }
+
+    pub fn read_since(&self, since: u64, raw: bool) -> BufferRead {
+        match self {
+            Self::Pty(backend) => backend.read_since(since, raw),
+            Self::Serial(backend) => backend.read_since(since, raw),
+        }
+    }
+
+    pub fn read_tail(&self, lines: usize, raw: bool) -> BufferRead {
+        match self {
+            Self::Pty(backend) => backend.read_tail(lines, raw),
+            Self::Serial(backend) => backend.read_tail(lines, raw),
+        }
+    }
+
+    pub fn send(&self, data: &[u8], secret: bool) -> Result<u64, TermError> {
+        match self {
+            Self::Pty(backend) => backend.send(data, secret),
+            Self::Serial(backend) => backend.send(data, secret),
+        }
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), TermError> {
+        match self {
+            Self::Pty(backend) => backend.resize(cols, rows),
+            Self::Serial(backend) => backend.resize(cols, rows),
+        }
+    }
+
+    pub fn close(&self, force: bool) {
+        match self {
+            Self::Pty(backend) => backend.close(force),
+            Self::Serial(backend) => backend.close(force),
+        }
+    }
+
+    pub fn journal(&self) -> Option<Arc<Mutex<TermJournal>>> {
+        match self {
+            Self::Pty(backend) => backend.journal(),
+            Self::Serial(backend) => backend.journal(),
+        }
+    }
+
+    pub fn journal_error(&self) -> Option<String> {
+        match self {
+            Self::Pty(backend) => backend.journal_error(),
+            Self::Serial(backend) => backend.journal_error(),
+        }
+    }
+
+    pub fn record_event(&self, data: &str) {
+        match self {
+            Self::Pty(backend) => backend.record_event(data),
+            Self::Serial(backend) => backend.record_event(data),
+        }
     }
 }
 
@@ -397,7 +544,7 @@ mod tests {
     fn tc_2607_close_kills_background_child_in_other_group() {
         let workspace = std::env::temp_dir();
         let spec = SessionSpec::cmd("jobcontrol", vec!["/bin/sh".into(), "-i".into()]);
-        let backend = Backend::spawn(&spec, &workspace, None).expect("spawn session");
+        let backend = PtyBackend::spawn(&spec, &workspace, None).expect("spawn session");
         let root_pid = backend.pid().expect("session pid");
         let root_pgid = backend.pgid.expect("session pgid");
 
@@ -430,7 +577,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn wait_for_child_pid(backend: &Backend, limit: Duration) -> Option<u32> {
+    fn wait_for_child_pid(backend: &PtyBackend, limit: Duration) -> Option<u32> {
         let deadline = Instant::now() + limit;
         loop {
             let read = backend.read_since(0, true);
