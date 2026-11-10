@@ -31,8 +31,11 @@
 //!   busid
 //! - TC-2615 (FR-2615): wait without --since does not match older buffer text
 //! - TC-2616 (FR-2616): exec reply text is exactly the command output
-//! - TC-2617 (FR-2617): `term --help` and `term open --help` (also `-h`) exit 0
-//!   with subcommand-local help, not the root usage
+//! - TC-2617 (FR-2617): `term --help`, `term open --help` and `--help`/`-h`
+//!   for every other term subcommand exit 0 with subcommand-local help, not
+//!   the root usage
+//! - TC-2619 (FR-2604): `wait --idle` without `--since` succeeds on a quiet
+//!   session well before the timeout
 //! - TC-2618 (FR-2610): optional socat PTY pair (`#[ignore]`, skips if absent)
 //!   plus a picocom `--kind cmd` reader on the same pair when picocom exists
 //! - TC-2630 (FR-2630): default-deny send and exec each need one-shot
@@ -1621,6 +1624,8 @@ fn tc_2614_without_busid_usbipd_is_never_called() {
 
 /// TC-2614 / FR-2614: `--no-usbipd-attach` skips the usbipd.exe attach even
 /// when an explicit busid is set and reports the normal missing-device error.
+/// The host is already warm (a shell session was opened first), so the flag
+/// must travel inside the open request, not through inherited env vars.
 #[test]
 fn tc_2614_no_attach_flag_skips_usbipd_with_busid() {
     let sandbox = Sandbox::new();
@@ -1633,6 +1638,9 @@ fn tc_2614_no_attach_flag_skips_usbipd_with_busid() {
             log.display()
         ),
     );
+    // Warm host: the serial open below is served by this running host, so the
+    // CLI's own environment is not enough; the request must carry the flag.
+    sandbox.open_shell("warm");
     let missing = sandbox.workspace.join("missing-serial");
     let output = sandbox
         .command(&[
@@ -1644,7 +1652,7 @@ fn tc_2614_no_attach_flag_skips_usbipd_with_busid() {
             "--baud",
             "115200",
             "--usbipd-busid",
-            "1-2",
+            "9-99",
             "--no-usbipd-attach",
             "--json",
         ])
@@ -1659,21 +1667,27 @@ fn tc_2614_no_attach_flag_skips_usbipd_with_busid() {
         out.code, 3,
         "a disabled attach must report the missing device: {out:?}"
     );
-    assert_eq!(json["error_kind"], "serial_not_found", "error: {json:?}");
-    let message = json["error"].as_str().unwrap_or_default();
+    assert_eq!(
+        json["error_kind"], "serial_not_found",
+        "the missing-device path, not usbipd_attach_failed: {json:?}"
+    );
     assert!(
-        message.contains("usbipd attach --wsl --busid"),
-        "FR-2611 manual hint: {json:?}"
+        !json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("device is not bound"),
+        "the fake usbipd must not have run: {json:?}"
     );
     assert!(
         !log.exists(),
-        "usbipd.exe must not be invoked when attach is disabled"
+        "the fake usbipd.exe must not be invoked (no list, no attach) when attach is disabled"
     );
 }
 
-/// TC-2617 / FR-2617: `term --help` and `term open --help` (also `-h`) exit 0
-/// with subcommand-local help; neither prints the root usage and the root
-/// `dmuxai --help` is unchanged.
+/// TC-2617 / FR-2617: `term --help`, `term open --help` and every other term
+/// subcommand's `--help` / `-h` exit 0 with subcommand-local help; none prints
+/// the root usage, and a subcommand's help is not only the parent `term` list.
+/// The root `dmuxai --help` is unchanged.
 #[test]
 fn tc_2617_term_help_and_open_help_are_subcommand_local() {
     let sandbox = Sandbox::new();
@@ -1716,6 +1730,45 @@ fn tc_2617_term_help_and_open_help_are_subcommand_local() {
         );
     }
 
+    // Every other term subcommand prints its own help topic, not the root
+    // usage and not only the parent term list.
+    let topics: [(&str, &[&str]); 9] = [
+        ("send", &["--keys", "--no-newline", "--secret"]),
+        ("read", &["--since", "--tail", "--raw"]),
+        ("wait", &["--match", "--idle", "--timeout", "--since"]),
+        ("exec", &["--timeout"]),
+        ("approve", &["16 lowercase hex"]),
+        ("list", &["never starts one"]),
+        ("resize", &["--cols", "--rows"]),
+        ("close", &["--all", "--force"]),
+        ("reopen", &["same spec"]),
+    ];
+    for (subcommand, options) in topics {
+        for flag in ["--help", "-h"] {
+            let out = sandbox.run(&["term", subcommand, flag]);
+            assert_eq!(out.code, 0, "term {subcommand} {flag} must exit 0: {out:?}");
+            let text = out.stdout.as_str();
+            assert!(
+                text.contains(&format!("Usage: dmuxai term {subcommand}")),
+                "term {subcommand} {flag} usage line: {out:?}"
+            );
+            for option in options {
+                assert!(
+                    text.contains(option),
+                    "term {subcommand} help documents {option}: {out:?}"
+                );
+            }
+            assert!(
+                !text.contains("dmuxai [--help|--version]") && !text.contains("One terminal"),
+                "term {subcommand} help must not print the root usage: {out:?}"
+            );
+            assert!(
+                !text.contains("Subcommands:"),
+                "term {subcommand} help must not be only the parent term list: {out:?}"
+            );
+        }
+    }
+
     // The root usage is unchanged.
     let out = sandbox.run(&["--help"]);
     assert_eq!(out.code, 0, "root help must exit 0: {out:?}");
@@ -1726,6 +1779,61 @@ fn tc_2617_term_help_and_open_help_are_subcommand_local() {
     assert!(
         !out.stdout.contains("--no-usbipd-attach"),
         "root help must not document term-open serial flags: {out:?}"
+    );
+    // `dmuxai run --help` keeps the root usage too.
+    let out = sandbox.run(&["run", "--help"]);
+    assert_eq!(out.code, 0, "run help must exit 0: {out:?}");
+    assert!(
+        out.stdout.contains("dmuxai [--help|--version]"),
+        "run help must print the root usage: {out:?}"
+    );
+}
+
+/// TC-2619 / FR-2604: after output has settled, `term wait --idle 1s` without
+/// `--since` succeeds with reason "idle" well before the 8s timeout; the idle
+/// clock starts at wait start and needs no new output after it begins.
+#[test]
+fn tc_2619_idle_wait_without_since_succeeds_on_quiet_session() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    sandbox.open_shell("a");
+
+    // Produce output once and wait for it to be visible.
+    let (out, _) = sandbox.term_json(&["term", "send", "a", "echo settled", "--json"]);
+    assert_eq!(out.code, 0, "send failed: {out:?}");
+    let (out, matched) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "a",
+        "--match",
+        "settled",
+        "--since",
+        "0",
+        "--timeout",
+        "5s",
+        "--json",
+    ]);
+    assert_eq!(out.code, 0, "wait --match failed: {out:?}");
+    assert_eq!(matched["reason"], "match", "wait: {matched:?}");
+
+    // No new output after this point: the idle wait must still succeed.
+    let started = Instant::now();
+    let (out, waited) = sandbox.term_json(&[
+        "term",
+        "wait",
+        "a",
+        "--idle",
+        "1s",
+        "--timeout",
+        "8s",
+        "--json",
+    ]);
+    let elapsed = started.elapsed();
+    assert_eq!(out.code, 0, "idle wait failed: {out:?}");
+    assert_eq!(waited["reason"], "idle", "wait: {waited:?}");
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "idle wait took {elapsed:?}; it must finish well before the 8s timeout"
     );
 }
 

@@ -238,6 +238,151 @@ once only when an explicit busid is given (--usbipd-busid or trusted
 error_kind usbipd_busid_missing and never invokes usbipd.exe.
 ";
 
+/// Subcommand-local help for `dmuxai term send --help` / `-h` (FR-2617).
+pub const TERM_SEND_USAGE: &str = "\
+Usage: dmuxai term send NAME TEXT [--no-newline] [--secret] [--json]
+       dmuxai term send NAME --keys KEYS [--json]
+
+Send TEXT to the session as if typed; a newline is appended unless
+--no-newline is set. With --keys, send named keys such as C-c, Enter or
+C-c,C-c (separated by ',' or '+') instead of text. --secret masks the
+input in the session journal.
+
+  --keys KEYS     Send named keys (C-c, Enter, ...) instead of text
+  --no-newline    Do not append a newline after TEXT
+  --secret        Mask this input in the session journal
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term read --help` / `-h` (FR-2617).
+pub const TERM_READ_USAGE: &str = "\
+Usage: dmuxai term read NAME [--since SEQ] [--tail N] [--raw] [--json]
+
+Print the output the session has produced so far.
+
+  --since SEQ     Only output after sequence number SEQ (default 0)
+  --tail N        Only the last N bytes of the stripped output
+  --raw           Print raw bytes including control characters
+  --json          Print a machine-readable reply with seq_from/seq_to
+";
+
+/// Subcommand-local help for `dmuxai term wait --help` / `-h` (FR-2617).
+pub const TERM_WAIT_USAGE: &str = "\
+Usage: dmuxai term wait NAME (--match REGEX | --idle MS) --timeout DUR
+                     [--since SEQ] [--json]
+
+Wait until stripped output after SEQ matches REGEX, or until output has
+been quiet for MS milliseconds. --since applies only to the --match
+search; without it the search starts at the current seq, so output
+already in the buffer is not matched. --idle succeeds when no new output
+arrives for that duration: the idle clock starts when the wait starts
+and resets whenever new output arrives, so a quiet session returns
+almost immediately.
+
+  --match REGEX   Wait until REGEX matches new output
+  --idle MS       Succeed after MS milliseconds without new output
+  --timeout DUR   Give up after DUR (e.g. 500ms, 2s); exits 1
+  --since SEQ     Search for REGEX only in output after SEQ
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term exec --help` / `-h` (FR-2617).
+pub const TERM_EXEC_USAGE: &str = "\
+Usage: dmuxai term exec NAME COMMAND [--timeout DUR] [--json]
+
+Type COMMAND into the session, press Enter and return exactly the output
+the command prints together with its exit code; the internal completion
+marker never appears in the reply.
+
+  --timeout DUR   Give up after DUR and exit 1 (default 30s)
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term approve --help` / `-h` (FR-2617).
+pub const TERM_APPROVE_USAGE: &str = "\
+Usage: dmuxai term approve ID [--json]
+
+Approve one pending terminal-policy approval. ID is the 16 lowercase hex
+characters from the approval_required error; the approval releases
+exactly one identical send or exec and is then consumed.
+
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term list --help` / `-h` (FR-2617).
+pub const TERM_LIST_USAGE: &str = "\
+Usage: dmuxai term list [--json]
+
+List this workspace's terminal sessions. Prints nothing (an empty JSON
+array with --json) when no host runs; list never starts one.
+
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term show --help` / `-h` (FR-2617).
+pub const TERM_SHOW_USAGE: &str = "\
+Usage: dmuxai term show NAME [--json]
+
+Show one session: kind, state, pid, size, takeover flag and output
+sequence.
+
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term resize --help` / `-h` (FR-2617).
+pub const TERM_RESIZE_USAGE: &str = "\
+Usage: dmuxai term resize NAME --cols N --rows N [--json]
+
+Resize the session's terminal. N must be between 1 and 1000.
+
+  --cols N        New number of columns (required)
+  --rows N        New number of rows (required)
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term close --help` / `-h` (FR-2617).
+pub const TERM_CLOSE_USAGE: &str = "\
+Usage: dmuxai term close NAME [--force] [--json]
+       dmuxai term close --all [--force] [--json]
+
+Close one session, or every session of this workspace with --all.
+Children in the session's process group are asked to hang up first.
+
+  --all           Close every session of this workspace
+  --force         Skip the 2s grace period and terminate immediately
+  --json          Print a machine-readable reply
+";
+
+/// Subcommand-local help for `dmuxai term reopen --help` / `-h` (FR-2617).
+pub const TERM_REOPEN_USAGE: &str = "\
+Usage: dmuxai term reopen NAME [--json]
+
+Reopen a lost session with the same spec: the same name, kind, size,
+command (for --kind cmd) or serial settings.
+
+  --json          Print a machine-readable reply
+";
+
+/// Per-subcommand term help (FR-2617): `term <sub> --help` / `-h` prints this
+/// topic instead of the parent `term` list or the root usage. `open` keeps
+/// [`TERM_OPEN_USAGE`]; an unknown subcommand falls back to [`TERM_USAGE`].
+pub fn term_subcommand_usage(subcommand: &str) -> &'static str {
+    match subcommand {
+        "open" => TERM_OPEN_USAGE,
+        "send" => TERM_SEND_USAGE,
+        "read" => TERM_READ_USAGE,
+        "wait" => TERM_WAIT_USAGE,
+        "exec" => TERM_EXEC_USAGE,
+        "approve" => TERM_APPROVE_USAGE,
+        "list" => TERM_LIST_USAGE,
+        "show" => TERM_SHOW_USAGE,
+        "resize" => TERM_RESIZE_USAGE,
+        "close" => TERM_CLOSE_USAGE,
+        "reopen" => TERM_REOPEN_USAGE,
+        _ => TERM_USAGE,
+    }
+}
+
 /// Table-driven flag specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlagSpec {
@@ -1211,6 +1356,9 @@ fn parse_term_open(args: &[String]) -> Result<TermCommand, String> {
             config.stop = stop;
             config.flow = flow;
             config.usbipd_busid = usbipd_busid.filter(|value| !value.trim().is_empty());
+            // FR-2614: carry the flag in the open request itself so a warm
+            // host skips usbipd.exe even when it did not inherit the CLI env.
+            config.no_usbipd_attach = no_usbipd_attach;
             config.validate().map_err(|error| error.message)?;
             Some(config)
         }
@@ -3241,6 +3389,98 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             },
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // TC-2614 / FR-2614: `--no-usbipd-attach` lands both on the open op and
+    // inside the serial config, so the request carries the flag to a warm host
+    // without relying on env-var inheritance.
+    #[test]
+    fn tc_2614_parse_no_usbipd_attach_sets_serial_config() {
+        let open_args = [
+            "term",
+            "open",
+            "board",
+            "--serial",
+            "/dev/ttyMissing",
+            "--baud",
+            "115200",
+            "--usbipd-busid",
+            "9-99",
+            "--no-usbipd-attach",
+        ];
+        match parse(&args(&open_args)) {
+            Ok(AgentCommand::Term(TermCommand {
+                op:
+                    TermOp::Open {
+                        serial,
+                        no_usbipd_attach,
+                        ..
+                    },
+                ..
+            })) => {
+                assert!(no_usbipd_attach, "op flag must be set");
+                let serial = serial.expect("serial config present");
+                assert!(
+                    serial.no_usbipd_attach,
+                    "config flag must travel to the host"
+                );
+                assert_eq!(serial.usbipd_busid.as_deref(), Some("9-99"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Without the flag both stay false.
+        match parse(&args(&[
+            "term",
+            "open",
+            "board",
+            "--serial",
+            "/dev/ttyMissing",
+            "--baud",
+            "115200",
+            "--usbipd-busid",
+            "9-99",
+        ])) {
+            Ok(AgentCommand::Term(TermCommand {
+                op:
+                    TermOp::Open {
+                        serial,
+                        no_usbipd_attach,
+                        ..
+                    },
+                ..
+            })) => {
+                assert!(!no_usbipd_attach);
+                assert!(!serial.expect("serial config present").no_usbipd_attach);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // TC-2617 / FR-2617: every term subcommand has its own help topic; only
+    // `term` itself (no subcommand) and unknown subcommands fall back to the
+    // parent term list.
+    #[test]
+    fn tc_2617_term_subcommand_usage_topics() {
+        for subcommand in [
+            "open", "send", "read", "wait", "exec", "approve", "list", "show", "resize", "close",
+            "reopen",
+        ] {
+            let text = term_subcommand_usage(subcommand);
+            assert!(
+                text.contains(&format!("Usage: dmuxai term {subcommand}")),
+                "term {subcommand} help has its own usage line"
+            );
+            assert_ne!(text, TERM_USAGE);
+            assert!(!text.contains("Subcommands:"));
+        }
+        assert_eq!(term_subcommand_usage("open"), TERM_OPEN_USAGE);
+        assert_eq!(term_subcommand_usage("nope"), TERM_USAGE);
+        for flag in ["--match", "--idle", "--timeout", "--since"] {
+            assert!(
+                term_subcommand_usage("wait").contains(flag),
+                "term wait help documents {flag}"
+            );
         }
     }
 }

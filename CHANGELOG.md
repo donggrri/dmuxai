@@ -31,14 +31,26 @@ All notable changes to dmuxai are listed here. Versions follow
   when `DMUXAI_RUN_ID` is set); trusted `[terminal.policy]` can add allow/deny patterns
   and `approve_timeout`. `scripts/bench-term.sh` prints p50/p95 for status, send+read,
   and exec versus `bash -c`.
-- **`dmuxai term --help` and `dmuxai term open --help` print term-specific usage (FR-2617, #309),**
-  not the root help. `dmuxai --help` and `dmuxai run --help` are unchanged.
+- **`dmuxai term --help` and `dmuxai term <subcommand> --help` print topic-specific usage (FR-2617, #309, #311),**
+  not the root help and not only the parent term list. `term wait --help` documents
+  `--match`, `--idle`, `--timeout`, and `--since`. `dmuxai --help` and `dmuxai run --help`
+  are unchanged.
 
 ### Fixed
 
 - **`term open --serial` no longer auto-attaches the first `usbipd list` device (#308).**
   Without an explicit busid, dmuxai does not invoke `usbipd.exe` (no `list`, no `attach`)
   and exits with `error_kind` `usbipd_busid_missing` plus a hint to pass `--usbipd-busid`.
+
+- **`--no-usbipd-attach` skips usbipd attach even when a busid is set and a host is
+  already running (#310).** The flag travels on the open request (`SerialConfig`), so a
+  warm host does not inherit-only via `DMUXAI_NO_USBIPD_ATTACH`.
+- **Every `dmuxai term <subcommand> --help` prints that subcommand's help (#311),**
+  not the parent `term` list. `term wait --help` names `--match`, `--idle`, `--timeout`,
+  and `--since`.
+- **`term wait --idle` succeeds when output has already stopped (#312).** The idle clock
+  starts when the wait starts (and resets if new output arrives). It does not require new
+  bytes after `--since`; `--since` still applies only to `--match`.
 
 ## [0.3.1] - 2026-11-09
 

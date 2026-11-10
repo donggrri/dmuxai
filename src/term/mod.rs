@@ -157,6 +157,21 @@ pub struct SerialConfig {
     pub flow: SerialFlow,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usbipd_busid: Option<String>,
+    #[serde(default, serialize_with = "serialize_no_usbipd_attach")]
+    pub no_usbipd_attach: bool,
+}
+
+fn serialize_no_usbipd_attach<S>(value: &bool, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let env_disabled = std::env::var("DMUXAI_NO_USBIPD_ATTACH").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    serializer.serialize_bool(*value || env_disabled)
 }
 
 impl Default for SerialConfig {
@@ -169,6 +184,7 @@ impl Default for SerialConfig {
             stop: default_stop_bits(),
             flow: SerialFlow::None,
             usbipd_busid: None,
+            no_usbipd_attach: false,
         }
     }
 }

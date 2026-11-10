@@ -60,7 +60,9 @@ pub fn wait(buffer: &RingBuffer, options: &WaitOptions) -> Result<WaitResult, Te
         None => None,
     };
 
-    let deadline = Instant::now() + options.timeout;
+    let start_seq = buffer.seq();
+    let started = Instant::now();
+    let deadline = started + options.timeout;
     let mut inner = buffer.lock();
     loop {
         let output = inner.read_since(options.since, false);
@@ -74,10 +76,13 @@ pub fn wait(buffer: &RingBuffer, options: &WaitOptions) -> Result<WaitResult, Te
         }
 
         let now = Instant::now();
-        let idle_deadline = options.idle.and_then(|idle| {
-            (output.seq_to > options.since)
-                .then(|| inner.last_output.map(|last| last + idle))
-                .flatten()
+        let idle_deadline = options.idle.map(|idle| {
+            let idle_start = if output.seq_to > start_seq {
+                inner.last_output.unwrap_or(started)
+            } else {
+                started
+            };
+            idle_start + idle
         });
         if let Some(idle_deadline) = idle_deadline
             && now >= idle_deadline
@@ -397,7 +402,9 @@ mod tests {
     #[test]
     fn tc_2693_idle_wait_uses_notification_without_polling() {
         let buffer = Arc::new(RingBuffer::new(1024));
+        let idle = Duration::from_millis(100);
         let (sender, receiver) = mpsc::channel();
+        let started = Instant::now();
         let waiter = {
             let buffer = Arc::clone(&buffer);
             thread::spawn(move || {
@@ -405,7 +412,7 @@ mod tests {
                     &buffer,
                     &WaitOptions {
                         regex: None,
-                        idle: Some(Duration::from_millis(100)),
+                        idle: Some(idle),
                         timeout: Duration::from_secs(3),
                         since: 0,
                     },
@@ -415,17 +422,90 @@ mod tests {
             })
         };
 
-        thread::sleep(Duration::from_millis(150));
+        thread::sleep(Duration::from_millis(30));
         assert!(
             receiver.try_recv().is_err(),
-            "idle wait must not complete before any output arrives"
+            "idle wait must block until the idle duration elapses"
         );
 
-        let pushed = Instant::now();
-        buffer.push_str("hello\n");
         let (reason, finished) = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(reason, WaitReason::Idle);
-        assert!(finished.duration_since(pushed) < Duration::from_secs(2));
+        let elapsed = finished.duration_since(started);
+        assert!(
+            elapsed >= idle,
+            "idle fired before the idle duration: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "idle must use a timed notification rather than polling: {elapsed:?}"
+        );
+        assert_eq!(buffer.seq(), 0, "an idle wait must not need a push");
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn tc_2619_idle_succeeds_when_since_is_current_seq() {
+        let buffer = RingBuffer::new(1024);
+        buffer.push_str("old output\n");
+        let since = buffer.seq();
+        let started = Instant::now();
+        let result = wait(
+            &buffer,
+            &WaitOptions {
+                regex: None,
+                idle: Some(Duration::from_millis(100)),
+                timeout: Duration::from_secs(3),
+                since,
+            },
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(result.reason, WaitReason::Idle);
+        assert_eq!(result.seq_from, since);
+        assert_eq!(result.seq_to, since);
+        assert!(result.text.is_empty());
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "idle returned too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "idle did not use the wait-start clock: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn tc_2619_idle_timer_resets_after_later_output() {
+        let buffer = Arc::new(RingBuffer::new(1024));
+        let idle = Duration::from_millis(200);
+        let (sender, receiver) = mpsc::channel();
+        let waiter = {
+            let buffer = Arc::clone(&buffer);
+            thread::spawn(move || {
+                let result = wait(
+                    &buffer,
+                    &WaitOptions {
+                        regex: None,
+                        idle: Some(idle),
+                        timeout: Duration::from_secs(3),
+                        since: 0,
+                    },
+                )
+                .unwrap();
+                sender.send((result.reason, Instant::now())).unwrap();
+            })
+        };
+
+        thread::sleep(Duration::from_millis(50));
+        let pushed = Instant::now();
+        buffer.push_str("late\n");
+        let (reason, finished) = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(reason, WaitReason::Idle);
+        let after_push = finished.duration_since(pushed);
+        assert!(
+            after_push >= Duration::from_millis(170),
+            "output must reset the idle clock instead of using the wait start: {after_push:?}"
+        );
         waiter.join().unwrap();
     }
 }

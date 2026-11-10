@@ -257,6 +257,9 @@ pub fn open_with_env(
     match open_port(config, &device) {
         Ok(port) => Ok(SerialBackend::start(config, device, port, journal)),
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) && env.wsl2 => {
+            if config.no_usbipd_attach {
+                return Err(missing_device_error(&device));
+            }
             attach_usbipd(config, env, &device)?;
             match open_port(config, &device) {
                 Ok(port) => Ok(SerialBackend::start(config, device, port, journal)),
@@ -353,6 +356,9 @@ fn attach_disabled() -> bool {
 
 fn attach_usbipd(config: &SerialConfig, env: &SerialEnv, device: &Path) -> Result<(), TermError> {
     let hint = manual_hint(device);
+    if config.no_usbipd_attach {
+        return Err(missing_device_error(device));
+    }
     let Some(busid) = resolve_busid(config.usbipd_busid.as_deref(), env.trusted_busid.as_deref())
     else {
         return Err(serial_error(
@@ -879,6 +885,47 @@ mod tests {
             !log.exists(),
             "attach disabled must not invoke usbipd even with a busid"
         );
+    }
+
+    #[test]
+    fn tc_2614_no_attach_config_skips_usbipd_even_with_busid() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("usbipd.log");
+        fake_usbipd(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+                log.display()
+            ),
+        );
+        let device = dir.path().join("missing-device");
+        let mut config = SerialConfig::new(&device, 115_200);
+        config.usbipd_busid = Some("9-99".to_owned());
+        config.no_usbipd_attach = true;
+        let env = SerialEnv {
+            wsl2: true,
+            trusted_busid: None,
+        };
+        let error = with_path(dir.path(), || {
+            open_with_env(&config, &env, None).expect_err("config disables attach")
+        });
+        assert_eq!(error.code, exit::NOT_FOUND);
+        assert_eq!(error.error_kind, Some(ERROR_MISSING));
+        assert!(
+            !log.exists(),
+            "no_usbipd_attach must not invoke usbipd even with an explicit busid"
+        );
+    }
+
+    #[test]
+    fn tc_2614_no_attach_defaults_false_and_serializes_for_the_host() {
+        let config: SerialConfig =
+            serde_json::from_str(r#"{"device":"/dev/ttyUSB0","baud":115200}"#).unwrap();
+        assert!(!config.no_usbipd_attach);
+        let mut config = config;
+        config.no_usbipd_attach = true;
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value["no_usbipd_attach"], true);
     }
 
     #[test]
