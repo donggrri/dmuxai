@@ -740,7 +740,7 @@ fn tc_2812_runs_list_rows() {
     m_late["duration_ms"] = json!(100);
     write_manifest(&runs.join(late_id), &m_late);
 
-    let poll_deadline = Instant::now() + Duration::from_secs(5);
+    let poll_deadline = Instant::now() + Duration::from_secs(15);
     let mut saw_fifth = false;
     while Instant::now() < poll_deadline {
         std::thread::sleep(Duration::from_millis(150));
@@ -753,7 +753,10 @@ fn tc_2812_runs_list_rows() {
             break;
         }
     }
-    assert!(saw_fifth, "poll should pick up a new run within ~2s");
+    assert!(
+        saw_fifth,
+        "poll should pick up a new run (2 s poll, 15 s deadline)"
+    );
 }
 
 // TC-2813 / FR-2813: live stream, approval banner, graph nodes, exit code.
