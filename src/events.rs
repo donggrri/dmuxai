@@ -153,6 +153,9 @@ pub fn read_since_from(
 ) -> (Vec<EventRecord>, u64) {
     use std::io::{Read, Seek, SeekFrom};
 
+    /// Maximum bytes consumed per call; callers poll again on the next tick.
+    const READ_CAP: u64 = 1024 * 1024;
+
     let Ok(mut file) = std::fs::File::open(path) else {
         return (Vec::new(), 0);
     };
@@ -163,8 +166,9 @@ pub fn read_since_from(
     if file.seek(SeekFrom::Start(start)).is_err() {
         return (Vec::new(), start);
     }
-    let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
+    let capacity = (len - start).min(READ_CAP);
+    let mut bytes = Vec::with_capacity(capacity as usize);
+    if (&mut file).take(capacity).read_to_end(&mut bytes).is_err() {
         return (Vec::new(), start);
     }
 
@@ -1411,5 +1415,65 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].seq, 10);
         assert_eq!(reset_offset, fresh_line.len() as u64);
+    }
+
+    // TC-2805 / FR-2805: a single call never reads more than 1 MiB, and callers
+    // polling again drain the rest of the log.
+    #[test]
+    fn tc_2805_read_since_from_caps_each_call() {
+        const CAP: u64 = 1024 * 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = events_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let total: u64 = 9_000;
+        let mut content = String::new();
+        for seq in 1..=total {
+            let record = EventRecord {
+                v: EVENT_SCHEMA_VERSION,
+                seq,
+                ts: "2026-10-17T11:22:33.456Z".to_string(),
+                ts_ms: 1_792_236_153_456,
+                workspace: "ws".to_string(),
+                kind: "agent".to_string(),
+                task: None,
+                todo: None,
+                node: None,
+                runner: Some("cursor".to_string()),
+                model: None,
+                from_state: None,
+                to_state: "running".to_string(),
+                message: Some("x".repeat(96)),
+                error_kind: None,
+                run_id: None,
+            };
+            content.push_str(&serde_json::to_string(&record).unwrap());
+            content.push('\n');
+        }
+        std::fs::write(&path, content).unwrap();
+
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        assert!(file_len > CAP * 2, "fixture must span several read caps");
+
+        let mut offset = 0u64;
+        let mut seqs = Vec::new();
+        let mut calls = 0;
+        while offset < file_len {
+            let (events, next) = read_since_from(&path, offset, 0, None);
+            calls += 1;
+            assert!(next > offset, "each call must make progress");
+            assert!(
+                next - offset <= CAP,
+                "each call must read at most 1 MiB ({calls})"
+            );
+            assert!(!events.is_empty(), "a capped call still yields records");
+            seqs.extend(events.into_iter().map(|record| record.seq));
+            offset = next;
+        }
+
+        assert!(calls >= 3, "expected multiple capped calls, got {calls}");
+        assert_eq!(offset, file_len);
+        assert_eq!(seqs, (1..=total).collect::<Vec<u64>>());
     }
 }

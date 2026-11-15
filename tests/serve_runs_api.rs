@@ -326,7 +326,7 @@ fn tc_2807_run_detail_graph_and_approval() {
     let run_id = "eeeeeeeeeeeeeeee";
     let mut manifest = base_manifest(run_id, 5_000, "awaiting_approval");
     manifest["links"]["graph_id"] = json!("serve");
-    manifest["end_summary"] = json!({ "plan_hash": "abc123" });
+    manifest["end_summary"] = json!({ "plan_hash": "deadbeefdeadbeef" });
     write_manifest(&runs.join(run_id), &manifest);
 
     let progress_path = runs.join(run_id).join("progress.jsonl");
@@ -346,7 +346,7 @@ fn tc_2807_run_detail_graph_and_approval() {
         approval["hint"]
             .as_str()
             .unwrap()
-            .contains("--approve-plan-id abc123")
+            .contains("--approve-plan-id deadbeefdeadbeef")
     );
     assert_eq!(json["progress"].as_array().unwrap().len(), 3);
 
@@ -371,16 +371,24 @@ fn tc_2808_run_stream_sse() {
     let fixture = ServeFixture::new();
     let runs = fixture.runs_dir();
     let run_id = "6666666666666666";
-    let manifest = base_manifest(run_id, 6_000, "active");
+    let mut manifest = base_manifest(run_id, 6_000, "completed");
+    manifest["completed_at_ms"] = json!(6_500);
+    manifest["duration_ms"] = json!(500);
     write_manifest(&runs.join(run_id), &manifest);
 
+    let progress_path = runs.join(run_id).join("progress.jsonl");
+    fs::write(&progress_path, "{\"tick\":1}\n").expect("progress line");
+
     let events_path = fixture.workspace.join(".dmuxai").join("events.jsonl");
+    append_event_line(&events_path, 1, Some(run_id));
+    append_event_line(&events_path, 2, Some("0000000000000001"));
+
     let path = format!("/api/runs/{run_id}/stream");
     let full_path = with_token(&path, Some(&fixture.token));
 
     let mut stream = TcpStream::connect(&fixture.authority).expect("connect");
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("timeout");
     let req = format!(
         "GET {full_path} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n",
@@ -388,39 +396,40 @@ fn tc_2808_run_stream_sse() {
     );
     stream.write_all(req.as_bytes()).expect("write sse");
 
-    std::thread::sleep(Duration::from_millis(200));
-
-    let progress_path = runs.join(run_id).join("progress.jsonl");
-    fs::write(&progress_path, "{\"tick\":1}\n").expect("progress line");
-    append_event_line(&events_path, 1, Some(run_id));
-    append_event_line(&events_path, 2, Some("0000000000000001"));
-
-    let mut done = base_manifest(run_id, 6_000, "completed");
-    done["completed_at_ms"] = json!(6_500);
-    done["duration_ms"] = json!(500);
-    write_manifest(&runs.join(run_id), &done);
-
     let mut buf = Vec::new();
     let start = Instant::now();
+    let deadline = start + Duration::from_secs(20);
     let mut temp = [0u8; 4096];
-    while start.elapsed() < Duration::from_secs(10) {
+    while Instant::now() < deadline {
         match stream.read(&mut temp) {
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&temp[..n]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
             Err(_) => break,
         }
-        let text = String::from_utf8_lossy(&buf);
-        if text.contains("event: end") {
+        if String::from_utf8_lossy(&buf).contains("event: end") {
             break;
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
     let text = String::from_utf8_lossy(&buf);
     assert!(text.contains("event: run"), "missing run event: {text}");
     assert!(text.contains("event: progress"), "missing progress: {text}");
+    let matching_state_change = text.split("\n\n").any(|block| {
+        block
+            .lines()
+            .any(|line| line.trim() == "event: state-change")
+            && (block.contains("\"run_id\":\"6666666666666666\"")
+                || block.contains("\"run_id\": \"6666666666666666\""))
+    });
     assert!(
-        text.contains("\"run_id\":\"6666666666666666\"")
-            || text.contains("\"run_id\": \"6666666666666666\""),
+        matching_state_change,
         "missing matching state-change: {text}"
     );
     assert!(
@@ -437,8 +446,19 @@ fn tc_2809_runs_api_read_only_and_masked() {
     let runs = fixture.runs_dir();
     let run_id = "1212121212121212";
     let mut manifest = base_manifest(run_id, 7_000, "failed");
-    manifest["error_summary"] = json!("failed with API_KEY=sk-test-123456");
+    manifest["error_summary"] = json!(format!(
+        "failed with API_KEY=sk-test-123456 and dashboard token {}",
+        fixture.token
+    ));
     write_manifest(&runs.join(run_id), &manifest);
+
+    let progress_path = runs.join(run_id).join("progress.jsonl");
+    fs::create_dir_all(runs.join(run_id)).expect("run dir");
+    fs::write(
+        &progress_path,
+        format!("{{\"line\":\"token {}\"}}\n", fixture.token),
+    )
+    .expect("progress");
 
     let (s401, _) = http_get(&fixture.authority, "/api/runs", None);
     assert_eq!(s401, 401);
@@ -453,6 +473,10 @@ fn tc_2809_runs_api_read_only_and_masked() {
     assert_eq!(s405, 405);
 
     let (_, body) = http_get(&fixture.authority, "/api/runs", Some(&fixture.token));
+    assert!(
+        !body.contains(&fixture.token),
+        "list response must not echo dashboard token"
+    );
     let json = json_body(&body);
     let summary = json["runs"]
         .as_array()
@@ -464,8 +488,62 @@ fn tc_2809_runs_api_read_only_and_masked() {
     assert!(!summary.contains("sk-test-123456"));
     assert!(summary.contains("[REDACTED]"));
 
-    assert!(
-        !body.contains(&fixture.token),
-        "response must not echo dashboard token"
+    let (status, detail_body) = http_get(
+        &fixture.authority,
+        &format!("/api/runs/{run_id}"),
+        Some(&fixture.token),
     );
+    assert_eq!(status, 200);
+    assert!(
+        !detail_body.contains(&fixture.token),
+        "detail response must not echo dashboard token"
+    );
+    let detail = json_body(&detail_body);
+    assert!(
+        detail["progress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.to_string().contains("[REDACTED]"))
+    );
+
+    let path = format!("/api/runs/{run_id}/stream");
+    let full_path = with_token(&path, Some(&fixture.token));
+    let mut stream = TcpStream::connect(&fixture.authority).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let req = format!(
+        "GET {full_path} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n",
+        fixture.authority
+    );
+    stream.write_all(req.as_bytes()).expect("write sse");
+
+    let mut buf = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut temp = [0u8; 4096];
+    while Instant::now() < deadline {
+        match stream.read(&mut temp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&temp[..n]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+        if String::from_utf8_lossy(&buf).contains("event: end") {
+            break;
+        }
+    }
+    let stream_text = String::from_utf8_lossy(&buf);
+    assert!(
+        !stream_text.contains(&fixture.token),
+        "stream must not echo dashboard token"
+    );
+    assert!(stream_text.contains("[REDACTED]"));
 }

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path as AxumPath, Query};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -21,11 +21,89 @@ use crate::graph::GraphRun;
 use crate::run_journal::{
     JournalStore, RunManifest, mask_json_value, mask_sensitive_tokens, valid_run_id,
 };
-use crate::web::server::{Ws, error_json, json_ok};
-use crate::web::snapshot::{self, GraphView};
+use crate::web::server::{AppState, Ws, error_json, json_ok};
+use crate::web::snapshot;
 
 static GRAPH_ID_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]{1,128}$").unwrap());
+
+static RUNNER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9._-]{1,64}$").unwrap());
+
+/// Upper bound on bytes read from the progress log per stream tick.
+const PROGRESS_READ_CAP: u64 = 1024 * 1024;
+
+/// Upper bound on bytes read from a graph snapshot file.
+const GRAPH_READ_CAP: u64 = 4 * 1024 * 1024;
+
+/// Opens a regular file without following symlinks. Returns `None` when the
+/// path is a symlink, not a regular file, missing, or unreadable.
+fn open_regular_nofollow(path: &Path) -> Option<fs::File> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_file() => return None,
+        Ok(_) => {}
+        Err(_) => return None,
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    // On non-unix the pre-open symlink check plus post-open metadata is the
+    // strongest available guard; on unix O_NOFOLLOW already closed the race.
+    #[cfg(not(unix))]
+    {
+        if fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true)
+        {
+            return None;
+        }
+    }
+    Some(file)
+}
+
+fn redact_token_in_text(text: &str, token: &str) -> String {
+    if token.is_empty() {
+        text.to_owned()
+    } else {
+        text.replace(token, "[REDACTED]")
+    }
+}
+
+fn redact_token_in_value(value: &mut serde_json::Value, token: &str) {
+    if token.is_empty() {
+        return;
+    }
+    match value {
+        serde_json::Value::String(text) => {
+            if text.contains(token) {
+                *text = text.replace(token, "[REDACTED]");
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_token_in_value(item, token);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                redact_token_in_value(item, token);
+            }
+        }
+        _ => {}
+    }
+}
 
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct RunsListQuery {
@@ -224,24 +302,30 @@ fn manifest_file_meta(path: &Path) -> Option<(u64, SystemTime)> {
     Some((meta.len(), meta.modified().ok()?))
 }
 
-fn load_graph_view(workspace_root: &Path, graph_id: &str) -> Option<GraphView> {
+fn load_graph_view(workspace_root: &Path, graph_id: &str) -> Option<serde_json::Value> {
     if !GRAPH_ID_RE.is_match(graph_id) {
         return None;
     }
-    let path = workspace_root
-        .join(".dmuxai")
-        .join("graphs")
-        .join(format!("{graph_id}.json"));
-    if crate::run_journal::is_symlink(&path).unwrap_or(true) {
+    let graphs_dir = workspace_root.join(".dmuxai").join("graphs");
+    match fs::symlink_metadata(&graphs_dir) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_dir() => return None,
+        Ok(_) => {}
+        Err(_) => return None,
+    }
+    let path = graphs_dir.join(format!("{graph_id}.json"));
+    let mut file = open_regular_nofollow(&path)?;
+    let mut bytes = Vec::new();
+    if (&mut file)
+        .take(GRAPH_READ_CAP)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
         return None;
     }
-    let meta = fs::metadata(&path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    let bytes = fs::read(&path).ok()?;
     let run: GraphRun = serde_json::from_slice(&bytes).ok()?;
-    Some(snapshot::snapshot_from_run(&run))
+    let mut value = serde_json::to_value(snapshot::snapshot_from_run(&run)).ok()?;
+    mask_json_value(&mut value);
+    Some(value)
 }
 
 #[derive(Serialize)]
@@ -261,8 +345,20 @@ fn approval_for(manifest: &RunManifest) -> Option<ApprovalPayload> {
         .and_then(|v| v.get("plan_hash"))
         .and_then(|v| v.as_str())
         .map(mask_sensitive_tokens);
-    let hint = if let Some(ref hash) = plan_hash {
-        format!("dmuxai run --graph --approve-plan-id {hash} -")
+    let has_graph = manifest
+        .links
+        .graph_id
+        .as_deref()
+        .is_some_and(|graph_id| !graph_id.is_empty());
+    let valid_graph_hash = has_graph
+        && plan_hash
+            .as_deref()
+            .is_some_and(crate::state_path::valid_pending_plan_hash);
+    let hint = if valid_graph_hash {
+        format!(
+            "dmuxai run --graph --approve-plan-id {} -",
+            plan_hash.as_deref().unwrap_or_default()
+        )
     } else {
         let runner = manifest
             .requested_runner
@@ -270,6 +366,11 @@ fn approval_for(manifest: &RunManifest) -> Option<ApprovalPayload> {
             .or(manifest.resolved_runner.as_deref())
             .unwrap_or("<agent>");
         let runner = mask_sensitive_tokens(runner);
+        let runner = if RUNNER_RE.is_match(&runner) {
+            runner
+        } else {
+            "<agent>".to_owned()
+        };
         format!("dmuxai run --agent {runner} --approve-plan -")
     };
     Some(ApprovalPayload { plan_hash, hint })
@@ -294,7 +395,11 @@ fn progress_as_json_values(store: &JournalStore, id: &str) -> Vec<serde_json::Va
         .collect()
 }
 
-pub(crate) async fn list(Ws(ws): Ws, Query(params): Query<RunsListQuery>) -> Response {
+pub(crate) async fn list(
+    State(state): State<AppState>,
+    Ws(ws): Ws,
+    Query(params): Query<RunsListQuery>,
+) -> Response {
     let limit = match parse_runs_limit(params.limit.as_deref()) {
         Ok(limit) => limit,
         Err(()) => return error_json(StatusCode::BAD_REQUEST, "invalid limit"),
@@ -307,10 +412,16 @@ pub(crate) async fn list(Ws(ws): Ws, Query(params): Query<RunsListQuery>) -> Res
         .take(limit)
         .map(|manifest| run_item_from_manifest(&store, &manifest))
         .collect();
-    json_ok(StatusCode::OK, &serde_json::json!({ "runs": runs }))
+    let mut payload = serde_json::json!({ "runs": runs });
+    redact_token_in_value(&mut payload, state.token());
+    json_ok(StatusCode::OK, &payload)
 }
 
-pub(crate) async fn detail(Ws(ws): Ws, AxumPath(id): AxumPath<String>) -> Response {
+pub(crate) async fn detail(
+    State(state): State<AppState>,
+    Ws(ws): Ws,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
     if !valid_run_id(&id) {
         return error_json(StatusCode::BAD_REQUEST, "invalid run id");
     }
@@ -329,27 +440,30 @@ pub(crate) async fn detail(Ws(ws): Ws, AxumPath(id): AxumPath<String>) -> Respon
         .and_then(|gid| load_graph_view(&workspace_root, gid));
     let approval = approval_for(&manifest);
     let progress = progress_as_json_values(&store, &id);
-    json_ok(
-        StatusCode::OK,
-        &serde_json::json!({
-            "run": run,
-            "manifest": manifest_to_json(&manifest),
-            "graph": graph,
-            "approval": approval,
-            "progress": progress,
-        }),
-    )
+    let mut payload = serde_json::json!({
+        "run": run,
+        "manifest": manifest_to_json(&manifest),
+        "graph": graph,
+        "approval": approval,
+        "progress": progress,
+    });
+    redact_token_in_value(&mut payload, state.token());
+    json_ok(StatusCode::OK, &payload)
 }
 
-fn masked_event_data(record: &crate::events::EventRecord) -> String {
+fn masked_event_data(record: &crate::events::EventRecord, token: &str) -> String {
     let mut value = serde_json::to_value(record).unwrap_or(serde_json::json!({}));
     mask_json_value(&mut value);
+    redact_token_in_value(&mut value, token);
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned())
 }
 
+/// Reads at most [`PROGRESS_READ_CAP`] bytes of complete progress lines after
+/// `offset`. The file must be a regular file reached without following a
+/// symlink; on any open failure `offset` is left unchanged. A single line
+/// longer than the cap is skipped rather than buffered without limit.
 fn tail_text_lines(path: &Path, offset: &mut u64, max_lines: usize) -> Vec<String> {
-    let Ok(mut file) = fs::File::open(path) else {
-        *offset = 0;
+    let Some(mut file) = open_regular_nofollow(path) else {
         return Vec::new();
     };
     let Ok(len) = file.metadata().map(|m| m.len()) else {
@@ -358,9 +472,10 @@ fn tail_text_lines(path: &Path, offset: &mut u64, max_lines: usize) -> Vec<Strin
     let start = if len < *offset { 0 } else { *offset };
     if file.seek(SeekFrom::Start(start)).is_err() {
         return Vec::new();
-    };
-    let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
+    }
+    let capacity = (len - start).min(PROGRESS_READ_CAP);
+    let mut bytes = Vec::with_capacity(capacity as usize);
+    if (&mut file).take(capacity).read_to_end(&mut bytes).is_err() {
         return Vec::new();
     }
     let mut lines = Vec::new();
@@ -379,7 +494,35 @@ fn tail_text_lines(path: &Path, offset: &mut u64, max_lines: usize) -> Vec<Strin
         line_start = line_end + 1;
         consumed = line_start as u64;
     }
-    *offset = start + consumed;
+    let has_newline = bytes.contains(&b'\n');
+    if max_lines > 0
+        && consumed == 0
+        && !has_newline
+        && bytes.len() as u64 == capacity
+        && capacity == PROGRESS_READ_CAP
+        && capacity < len - start
+    {
+        // No complete line fits in the cap: skip past the oversized line so the
+        // next tick can continue after it.
+        let mut skip_pos = start + capacity;
+        loop {
+            let mut chunk = [0u8; 8192];
+            match file.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Some(relative_newline) = chunk[..n].iter().position(|&b| b == b'\n') {
+                        skip_pos += relative_newline as u64 + 1;
+                        break;
+                    }
+                    skip_pos += n as u64;
+                }
+                Err(_) => break,
+            }
+        }
+        *offset = skip_pos;
+    } else {
+        *offset = start + consumed;
+    }
     lines
 }
 
@@ -387,7 +530,11 @@ fn is_terminal_status(status: &str) -> bool {
     !is_run_active(status)
 }
 
-pub(crate) async fn stream(Ws(ws): Ws, AxumPath(id): AxumPath<String>) -> Response {
+pub(crate) async fn stream(
+    State(state): State<AppState>,
+    Ws(ws): Ws,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
     if !valid_run_id(&id) {
         return error_json(StatusCode::BAD_REQUEST, "invalid run id");
     }
@@ -401,6 +548,7 @@ pub(crate) async fn stream(Ws(ws): Ws, AxumPath(id): AxumPath<String>) -> Respon
     let events_path = ws.services.events_path.clone();
     let store_root = store.root().to_path_buf();
     let run_id = id.clone();
+    let token = state.token().to_owned();
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
 
@@ -414,7 +562,9 @@ pub(crate) async fn stream(Ws(ws): Ws, AxumPath(id): AxumPath<String>) -> Respon
          -> Option<String> {
             let manifest = store.load(&run_id).ok()?;
             let item = run_item_from_manifest(store, &manifest);
-            let json = serde_json::to_string(&item).unwrap_or_else(|_| "{}".to_owned());
+            let mut value = serde_json::to_value(&item).unwrap_or(serde_json::json!({}));
+            redact_token_in_value(&mut value, &token);
+            let json = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
             let _ = tx.send(Ok(Event::default().event("run").data(json)));
             Some(manifest.status)
         };
@@ -445,6 +595,7 @@ pub(crate) async fn stream(Ws(ws): Ws, AxumPath(id): AxumPath<String>) -> Respon
 
                 for line in tail_text_lines(&progress_path, &mut progress_offset, 500) {
                     had_new_data = true;
+                    let line = redact_token_in_text(&line, &token);
                     if tx
                         .send(Ok(Event::default().event("progress").data(line)))
                         .is_err()
@@ -463,7 +614,7 @@ pub(crate) async fn stream(Ws(ws): Ws, AxumPath(id): AxumPath<String>) -> Respon
                             continue;
                         }
                         had_new_data = true;
-                        let data = masked_event_data(&record);
+                        let data = masked_event_data(&record, &token);
                         if tx
                             .send(Ok(Event::default()
                                 .event("state-change")

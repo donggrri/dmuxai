@@ -100,10 +100,16 @@ pub struct ServerConfig {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     token: Arc<String>,
     allowed_hosts: Option<Arc<Vec<String>>>,
     workspaces: Arc<WorkspaceDirectory>,
+}
+
+impl AppState {
+    pub(crate) fn token(&self) -> &str {
+        self.token.as_str()
+    }
 }
 
 pub(crate) struct Ws(pub(crate) Arc<WorkspaceEntry>);
