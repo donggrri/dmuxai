@@ -9064,10 +9064,14 @@ impl App {
                 self.push_system(format!("Could not save the planning run: {error}"));
             }
             self.remember_judge_reason_triage(planning_run.triage.as_ref());
-            if let Some(triage) = planning_run.triage.as_ref() {
-                self.emit_headless_meta_from_triage(triage);
-            }
             let plan_id = planning_run.plan.id.clone();
+            if let Some(triage) = planning_run.triage.as_ref() {
+                self.emit_headless_meta(
+                    Some(plan_id.clone()),
+                    Some(triage.runner.clone()),
+                    Some(triage.model.clone()),
+                );
+            }
             self.todos.commit_pending_graph(&plan_id, &mut planning_run);
             self.last_graph_run = Some(planning_run);
         }
@@ -9313,6 +9317,14 @@ impl App {
             self.push_system(format!("Could not save the plan: {error}"));
         }
         self.remember_judge_reason_triage(run.triage.as_ref());
+        let plan_id = run.plan.id.clone();
+        if let Some(triage) = run.triage.as_ref() {
+            self.emit_headless_meta(
+                Some(plan_id),
+                Some(triage.runner.clone()),
+                Some(triage.model.clone()),
+            );
+        }
         self.last_graph_run = Some(run);
         self.push_plan_waiting_approval_transcript_line();
     }

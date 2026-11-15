@@ -936,6 +936,16 @@ impl JournalStore {
                 continue;
             }
             manifest.status = RunStatus::Approved.as_status_str().to_owned();
+            let now_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(manifest.created_at_ms);
+            if manifest.completed_at_ms.is_none() {
+                manifest.completed_at_ms = Some(now_ms);
+            }
+            if manifest.duration_ms.is_none() {
+                manifest.duration_ms = Some(now_ms.saturating_sub(manifest.created_at_ms));
+            }
             if let Some(summary) = manifest.end_summary.as_mut()
                 && let Some(object) = summary.as_object_mut()
             {

@@ -12,7 +12,10 @@ All notable changes to dmuxai are listed here. Versions follow
   (active before dispatch, then completed / failed / awaiting_approval / cancelled) and a
   masked `progress.jsonl`; the `--json` outcome adds `run_id`; events carry `run_id`. New
   read-only `GET /api/runs`, `/api/runs/{id}` and `/api/runs/{id}/stream` (SSE) behind the
-  dashboard token. The event tail reads by byte offset instead of re-reading the file.
+  dashboard token. The event tail reads by byte offset instead of re-reading the file. While a run is active its manifest already
+  carries the resolved runner/model and graph id (FR-2815, #326); approving a plan with
+  `--approve-plan-id` marks the earlier `awaiting_approval` run as `approved` with
+  `approved_by_run_id` (FR-2816, #325).
 
 - **Persistent terminal sessions: `dmuxai term` (PR1a of SPEC-terminal-sessions,
   FR-2600..2609, FR-2620, FR-2621, FR-2632).** Named Linux PTY sessions (`shell` or `cmd`)

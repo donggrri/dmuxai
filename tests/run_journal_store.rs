@@ -766,6 +766,8 @@ fn tc_2816_store_supersede_awaiting_bounded_scan() {
 
     let mut awaiting_h_dup = sample_manifest("bbbbbbbbbbbbbbbb", "awaiting_approval", 3_000, None);
     awaiting_h_dup.end_summary = Some(json!({ "plan_hash": plan_hash }));
+    awaiting_h_dup.completed_at_ms = Some(5_000);
+    awaiting_h_dup.duration_ms = Some(2_000);
     store
         .save(&awaiting_h_dup)
         .expect("save awaiting H duplicate");
@@ -785,7 +787,33 @@ fn tc_2816_store_supersede_awaiting_bounded_scan() {
         let summary = manifest.end_summary.expect("end_summary kept");
         assert_eq!(summary["plan_hash"], plan_hash, "plan_hash kept for {id}");
         assert_eq!(summary["approved_by_run_id"], approver);
+        let completed_at = manifest
+            .completed_at_ms
+            .unwrap_or_else(|| panic!("run {id} must have completed_at_ms"));
+        assert!(
+            completed_at >= manifest.created_at_ms,
+            "run {id} completed_at_ms must not predate creation"
+        );
+        assert_eq!(
+            manifest.duration_ms,
+            Some(completed_at.saturating_sub(manifest.created_at_ms)),
+            "run {id} duration_ms must match completed_at_ms"
+        );
     }
+
+    let preserved = store
+        .load("bbbbbbbbbbbbbbbb")
+        .expect("load preserved manifest");
+    assert_eq!(
+        preserved.completed_at_ms,
+        Some(5_000),
+        "an existing completed_at_ms must be kept"
+    );
+    assert_eq!(
+        preserved.duration_ms,
+        Some(2_000),
+        "an existing duration_ms must be kept"
+    );
 
     let other = store.load("cccccccccccccccc").expect("load other-hash run");
     assert_eq!(other.status, "awaiting_approval");
@@ -802,30 +830,77 @@ fn tc_2816_store_supersede_awaiting_bounded_scan() {
         "the current run must never touch its own manifest"
     );
 
-    // Bounded scan: with max_scan = 2 only two of the four matching runs are
-    // superseded (which two depends on recency, the count is the contract).
+    // Bounded scan: with max_scan = 2 only the two newest matching runs are
+    // superseded; distinct mtimes make the recency order deterministic.
     let tmp2 = TempDir::new().expect("tempdir");
     let store2 = JournalStore::new(tmp2.path().join("runs"));
+    let base_secs = 1_700_000_000i64;
     for index in 0..4u64 {
         let id = format!("{:016x}", 0x1000 + index);
         let mut manifest = sample_manifest(&id, "awaiting_approval", 1_000 + index, None);
         manifest.end_summary = Some(json!({ "plan_hash": plan_hash }));
         store2.save(&manifest).expect("save bounded fixture");
+        filetime::set_file_mtime(
+            store2.root().join(&id),
+            filetime::FileTime::from_unix_time(base_secs + index as i64, 0),
+        )
+        .expect("set bounded fixture mtime");
     }
+
+    // A symlinked run directory with a matching hash must never be followed or
+    // modified, even when it is newer than every real run.
+    let symlink_target = TempDir::new().expect("symlink target tempdir");
+    let symlink_target_store = JournalStore::new(symlink_target.path().join("runs"));
+    let symlink_target_id = "00000000000000aa";
+    let mut symlink_target_manifest =
+        sample_manifest(symlink_target_id, "awaiting_approval", 9_000, None);
+    symlink_target_manifest.end_summary = Some(json!({ "plan_hash": plan_hash }));
+    symlink_target_store
+        .save(&symlink_target_manifest)
+        .expect("save symlink target manifest");
+    #[cfg(unix)]
+    {
+        let symlink_id = "00000000000000bb";
+        std::os::unix::fs::symlink(
+            symlink_target_store.root().join(symlink_target_id),
+            store2.root().join(symlink_id),
+        )
+        .expect("symlink run directory");
+        filetime::set_file_mtime(
+            store2.root().join(symlink_id),
+            filetime::FileTime::from_unix_time(base_secs + 100, 0),
+        )
+        .expect("set symlink mtime");
+    }
+
     let bounded = store2
         .supersede_awaiting(plan_hash, "ffffffffffffffff", 2)
         .expect("bounded supersede_awaiting");
     assert_eq!(bounded, 2, "max_scan bounds how many runs are superseded");
-    let approved_count = (0..4u64)
-        .filter(|index| {
-            store2
-                .load(&format!("{:016x}", 0x1000 + index))
-                .expect("load bounded fixture")
-                .status
-                == "approved"
-        })
-        .count();
-    assert_eq!(approved_count, 2);
+    // Newest two (indexes 2 and 3) were within the bounded scan; the older
+    // two were not.
+    for index in 0..4u64 {
+        let manifest = store2
+            .load(&format!("{:016x}", 0x1000 + index))
+            .expect("load bounded fixture");
+        let expected = if index >= 2 {
+            "approved"
+        } else {
+            "awaiting_approval"
+        };
+        assert_eq!(
+            manifest.status, expected,
+            "bounded scan must pick the newest runs (index {index})"
+        );
+    }
+    assert_eq!(
+        symlink_target_store
+            .load(symlink_target_id)
+            .expect("load symlink target manifest")
+            .status,
+        "awaiting_approval",
+        "a symlinked run directory must stay untouched"
+    );
 
     // Malformed plan hash / approver ids are rejected, not silently scanned.
     assert!(matches!(

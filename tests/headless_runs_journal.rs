@@ -653,3 +653,110 @@ timeout_secs = 60
         "the approving run must not mark itself approved"
     );
 }
+
+// TC-2816 / FR-2816: an approving run that never executes the plan (missing or
+// malformed `--approve-plan-id`) must not supersede the earlier awaiting run.
+#[cfg(unix)]
+#[test]
+fn tc_2816_bad_or_missing_hash_does_not_supersede_awaiting() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-agent.sh");
+    let config = format!(
+        r#"[routing]
+default_agent = "fake"
+
+[graph]
+allowed_runners = ["fake"]
+
+[[agents.custom]]
+name = "fake"
+command = ["sh", "{fixture}", "plan", "{{prompt}}"]
+prompt_via = "arg"
+output = "text"
+default_model = "composer-2.5"
+timeout_secs = 60
+"#,
+        fixture = fixture.display().to_string().replace('\\', "/"),
+    );
+    let prompt = "ship the whole feature across several steps";
+    let sandbox = Sandbox::new(&config);
+
+    // 1. A first run leaves an awaiting manifest with plan hash H.
+    let first = sandbox.run(&["run", prompt, "--json"]);
+    assert_eq!(
+        first.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_json = stdout_json(&first);
+    let plan_hash = first_json["plan_hash"]
+        .as_str()
+        .expect("plan hash on exit 7")
+        .to_string();
+    let first_run_id = first_json["run_id"]
+        .as_str()
+        .expect("first run_id")
+        .to_string();
+
+    let runs_dir = sandbox.repo_runs_dir();
+    let manifest_path = runs_dir.join(&first_run_id).join("manifest.json");
+    let before: Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read first manifest"))
+            .expect("parse first manifest");
+    assert_eq!(before["status"], "awaiting_approval");
+
+    // 2. A well-formed but missing hash fails before the plan executes.
+    let missing = sandbox.run(&[
+        "run",
+        prompt,
+        "--graph",
+        "--json",
+        "--approve-plan-id",
+        "1234567890abcdef",
+    ]);
+    assert_eq!(
+        missing.status.code(),
+        Some(3),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&missing.stdout),
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
+    // 3. A malformed hash is a usage error and never starts a run either.
+    let malformed = sandbox.run(&[
+        "run",
+        prompt,
+        "--graph",
+        "--json",
+        "--approve-plan-id",
+        "NOT-A-PLAN-HASH",
+    ]);
+    assert_eq!(
+        malformed.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&malformed.stdout),
+        String::from_utf8_lossy(&malformed.stderr)
+    );
+
+    // 4. The awaiting manifest is byte-for-byte unchanged.
+    let after: Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path).expect("read manifest after failed approvals"),
+    )
+    .expect("parse manifest after failed approvals");
+    assert_eq!(
+        after, before,
+        "failed approvals must not touch the manifest"
+    );
+    assert_eq!(after["status"], "awaiting_approval");
+    assert_eq!(after["end_summary"]["plan_hash"], plan_hash.as_str());
+    assert!(
+        after["end_summary"]
+            .as_object()
+            .is_none_or(|summary| summary.get("approved_by_run_id").is_none()),
+        "the awaiting run must not record an approver"
+    );
+}

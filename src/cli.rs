@@ -2519,14 +2519,25 @@ async fn run_headless(
     app.set_headless_meta_sink(Box::new(move |meta| {
         if let Some(plan_hash) = meta_approve_plan_id.as_deref()
             && meta.graph_id.is_some()
-            && !meta_supersede_flag.swap(true, Ordering::SeqCst)
+            && !meta_supersede_flag.load(Ordering::SeqCst)
         {
-            let guard = meta_journal.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((store, manifest)) = guard.as_ref()
-                && let Err(err) = store.supersede_awaiting(plan_hash, &manifest.run_id, 200)
-                && !meta_warned.swap(true, Ordering::SeqCst)
-            {
-                eprintln!("warning: run journal unavailable: {err}");
+            let pair = {
+                let guard = meta_journal.lock().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .as_ref()
+                    .map(|(store, manifest)| (store.clone(), manifest.run_id.clone()))
+            };
+            let result = match pair {
+                Some((store, run_id)) => store.supersede_awaiting(plan_hash, &run_id, 200),
+                None => Ok(0),
+            };
+            match result {
+                Ok(_) => meta_supersede_flag.store(true, Ordering::SeqCst),
+                Err(err) => {
+                    if !meta_warned.swap(true, Ordering::SeqCst) {
+                        eprintln!("warning: run journal unavailable: {err}");
+                    }
+                }
             }
         }
         let mut guard = meta_journal.lock().unwrap_or_else(|e| e.into_inner());
