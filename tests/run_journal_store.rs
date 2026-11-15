@@ -42,7 +42,7 @@ use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
 // Before dmuxai::run_journal is implemented, this import will COMPILE-FAIL as required.
-use dmuxai::run_journal::{JournalConfig, JournalStore, RunManifest};
+use dmuxai::run_journal::{JournalConfig, JournalError, JournalStore, RunManifest};
 
 fn sample_manifest(
     run_id: &str,
@@ -740,4 +740,100 @@ fn tc_2800_save_relaxed_roundtrip_and_permissions() {
 
     let reloaded = store.load(run_id).expect("reload terminal manifest");
     assert_eq!(reloaded, updated, "terminal manifest must roundtrip equal");
+}
+
+/// TC-2816 / FR-2816: `supersede_awaiting` flips only the `awaiting_approval`
+/// manifests whose `end_summary.plan_hash` matches to `approved` (terminal),
+/// keeping `plan_hash` and recording `approved_by_run_id`. The current run id
+/// and foreign hashes stay untouched, the scan is bounded by `max_scan`, and
+/// malformed ids are rejected.
+#[test]
+fn tc_2816_store_supersede_awaiting_bounded_scan() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store = JournalStore::new(tmp.path().join("runs"));
+    let plan_hash = "deadbeefdeadbeef";
+    let approver = "ffffffffffffffff";
+
+    let mut awaiting_h = sample_manifest("aaaaaaaaaaaaaaaa", "awaiting_approval", 1_000, None);
+    awaiting_h.end_summary = Some(json!({ "plan_hash": plan_hash }));
+    store.save(&awaiting_h).expect("save awaiting H");
+
+    let mut awaiting_other = sample_manifest("cccccccccccccccc", "awaiting_approval", 2_000, None);
+    awaiting_other.end_summary = Some(json!({ "plan_hash": "1234567890abcdef" }));
+    store
+        .save(&awaiting_other)
+        .expect("save awaiting other hash");
+
+    let mut awaiting_h_dup = sample_manifest("bbbbbbbbbbbbbbbb", "awaiting_approval", 3_000, None);
+    awaiting_h_dup.end_summary = Some(json!({ "plan_hash": plan_hash }));
+    store
+        .save(&awaiting_h_dup)
+        .expect("save awaiting H duplicate");
+
+    let mut current = sample_manifest(approver, "awaiting_approval", 4_000, None);
+    current.end_summary = Some(json!({ "plan_hash": plan_hash }));
+    store.save(&current).expect("save current run manifest");
+
+    let superseded = store
+        .supersede_awaiting(plan_hash, approver, 200)
+        .expect("supersede_awaiting");
+    assert_eq!(superseded, 2, "both hash matches superseded");
+
+    for id in ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"] {
+        let manifest = store.load(id).expect("load superseded manifest");
+        assert_eq!(manifest.status, "approved", "run {id} must be approved");
+        let summary = manifest.end_summary.expect("end_summary kept");
+        assert_eq!(summary["plan_hash"], plan_hash, "plan_hash kept for {id}");
+        assert_eq!(summary["approved_by_run_id"], approver);
+    }
+
+    let other = store.load("cccccccccccccccc").expect("load other-hash run");
+    assert_eq!(other.status, "awaiting_approval");
+    let other_summary = other.end_summary.expect("other end_summary");
+    assert_eq!(other_summary["plan_hash"], "1234567890abcdef");
+    assert!(
+        other_summary.get("approved_by_run_id").is_none(),
+        "foreign-hash run must not gain approved_by_run_id"
+    );
+
+    let still = store.load(approver).expect("load current run");
+    assert_eq!(
+        still.status, "awaiting_approval",
+        "the current run must never touch its own manifest"
+    );
+
+    // Bounded scan: with max_scan = 2 only two of the four matching runs are
+    // superseded (which two depends on recency, the count is the contract).
+    let tmp2 = TempDir::new().expect("tempdir");
+    let store2 = JournalStore::new(tmp2.path().join("runs"));
+    for index in 0..4u64 {
+        let id = format!("{:016x}", 0x1000 + index);
+        let mut manifest = sample_manifest(&id, "awaiting_approval", 1_000 + index, None);
+        manifest.end_summary = Some(json!({ "plan_hash": plan_hash }));
+        store2.save(&manifest).expect("save bounded fixture");
+    }
+    let bounded = store2
+        .supersede_awaiting(plan_hash, "ffffffffffffffff", 2)
+        .expect("bounded supersede_awaiting");
+    assert_eq!(bounded, 2, "max_scan bounds how many runs are superseded");
+    let approved_count = (0..4u64)
+        .filter(|index| {
+            store2
+                .load(&format!("{:016x}", 0x1000 + index))
+                .expect("load bounded fixture")
+                .status
+                == "approved"
+        })
+        .count();
+    assert_eq!(approved_count, 2);
+
+    // Malformed plan hash / approver ids are rejected, not silently scanned.
+    assert!(matches!(
+        store.supersede_awaiting("NOT-A-PLAN-HASH", approver, 200),
+        Err(JournalError::InvalidId(_))
+    ));
+    assert!(matches!(
+        store.supersede_awaiting(plan_hash, "short", 200),
+        Err(JournalError::InvalidId(_))
+    ));
 }

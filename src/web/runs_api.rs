@@ -231,6 +231,8 @@ struct RunItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     graph_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    approved_by_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
     stale: bool,
     stalled: bool,
@@ -238,6 +240,17 @@ struct RunItem {
 
 fn mask_opt_string(value: &Option<String>) -> Option<String> {
     value.as_ref().map(|s| mask_sensitive_tokens(s))
+}
+
+/// FR-2816: the run id that superseded an `awaiting_approval` run by
+/// executing its approved plan; recorded in `end_summary.approved_by_run_id`.
+fn approved_by_run_id(manifest: &RunManifest) -> Option<String> {
+    manifest
+        .end_summary
+        .as_ref()
+        .and_then(|summary| summary.get("approved_by_run_id"))
+        .and_then(|value| value.as_str())
+        .map(mask_sensitive_tokens)
 }
 
 fn run_item_from_manifest(store: &JournalStore, manifest: &RunManifest) -> RunItem {
@@ -260,6 +273,7 @@ fn run_item_from_manifest(store: &JournalStore, manifest: &RunManifest) -> RunIt
             .graph_id
             .as_ref()
             .map(|s| mask_sensitive_tokens(s)),
+        approved_by_run_id: approved_by_run_id(manifest),
         pid: manifest.pid,
         stale: run_stale(manifest),
         stalled: run_stalled(store, &manifest.run_id, &manifest.status),

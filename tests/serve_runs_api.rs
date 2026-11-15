@@ -547,3 +547,98 @@ fn tc_2809_runs_api_read_only_and_masked() {
     );
     assert!(stream_text.contains("[REDACTED]"));
 }
+
+// TC-2816 / FR-2816: `approved` is a terminal status, gets no approval hint,
+// and exposes `approved_by_run_id` in detail and list payloads.
+#[test]
+fn tc_2816_approved_run_has_no_hint() {
+    let fixture = ServeFixture::new();
+    let runs = fixture.runs_dir();
+    let approved_id = "aaaaaaaaaaaaaaaa";
+    let approver_id = "ffffffffffffffff";
+    let mut manifest = base_manifest(approved_id, 8_000, "approved");
+    manifest["completed_at_ms"] = json!(8_500);
+    manifest["duration_ms"] = json!(500);
+    manifest["end_summary"] = json!({
+        "plan_hash": "deadbeefdeadbeef",
+        "approved_by_run_id": approver_id
+    });
+    write_manifest(&runs.join(approved_id), &manifest);
+
+    // Detail: no approval payload, approved_by_run_id surfaced.
+    let (status, body) = http_get(
+        &fixture.authority,
+        &format!("/api/runs/{approved_id}"),
+        Some(&fixture.token),
+    );
+    assert_eq!(status, 200);
+    let detail = json_body(&body);
+    assert!(
+        detail["approval"].is_null(),
+        "approved run must have no approval hint: {detail}"
+    );
+    assert_eq!(detail["run"]["status"], "approved");
+    assert_eq!(detail["run"]["approved_by_run_id"], approver_id);
+    assert_eq!(
+        detail["manifest"]["end_summary"]["approved_by_run_id"],
+        approver_id
+    );
+
+    // List: terminal flags and the approver id are exposed.
+    let (_, body) = http_get(&fixture.authority, "/api/runs", Some(&fixture.token));
+    let list = json_body(&body);
+    let run = list["runs"]
+        .as_array()
+        .expect("runs array")
+        .iter()
+        .find(|run| run["run_id"] == approved_id)
+        .expect("approved run in list");
+    assert_eq!(run["status"], "approved");
+    assert_eq!(run["stale"], false);
+    assert_eq!(run["stalled"], false);
+    assert_eq!(run["approved_by_run_id"], approver_id);
+
+    // Stream: approved is terminal, so the stream drains and ends (bounded wait).
+    let path = format!("/api/runs/{approved_id}/stream");
+    let full_path = with_token(&path, Some(&fixture.token));
+    let mut stream = TcpStream::connect(&fixture.authority).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let req = format!(
+        "GET {full_path} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n",
+        fixture.authority
+    );
+    stream.write_all(req.as_bytes()).expect("write sse");
+
+    let mut buf = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut temp = [0u8; 4096];
+    while Instant::now() < deadline {
+        match stream.read(&mut temp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&temp[..n]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+        if String::from_utf8_lossy(&buf).contains("event: end") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    assert!(
+        text.contains("event: end"),
+        "approved run stream must end: {text}"
+    );
+    assert!(
+        text.contains("\"status\":\"approved\""),
+        "stream run event must carry the approved status: {text}"
+    );
+}

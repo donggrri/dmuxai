@@ -2493,6 +2493,7 @@ async fn run_headless(
     let journal_handle = Arc::new(std::sync::Mutex::new(journal_pair));
 
     let progress_opt = options.progress;
+    let progress_warned_sink = Arc::clone(&progress_warned);
     app.set_progress_sink(Box::new(move |line: &str| {
         if progress_opt {
             eprintln!("{line}");
@@ -2500,7 +2501,54 @@ async fn run_headless(
         let mut guard = progress_copy.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(writer) = guard.as_mut()
             && let Err(err) = writer.append_line(line)
-            && !progress_warned.swap(true, Ordering::SeqCst)
+            && !progress_warned_sink.swap(true, Ordering::SeqCst)
+        {
+            eprintln!("warning: run journal unavailable: {err}");
+        }
+    }));
+
+    let meta_journal = Arc::clone(&journal_handle);
+    let meta_warned = Arc::clone(&progress_warned);
+    // FR-2816 / TC-2816: supersede older `awaiting_approval` manifests with the
+    // same plan hash exactly once, and only once the approved plan actually
+    // starts executing (the meta sink reports a graph id for this run). Runs
+    // without `--approve-plan-id` never trigger it (FR-2810/#301).
+    let meta_approve_plan_id = options.approve_plan_id.clone();
+    let meta_superseded = Arc::new(AtomicBool::new(false));
+    let meta_supersede_flag = Arc::clone(&meta_superseded);
+    app.set_headless_meta_sink(Box::new(move |meta| {
+        if let Some(plan_hash) = meta_approve_plan_id.as_deref()
+            && meta.graph_id.is_some()
+            && !meta_supersede_flag.swap(true, Ordering::SeqCst)
+        {
+            let guard = meta_journal.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((store, manifest)) = guard.as_ref()
+                && let Err(err) = store.supersede_awaiting(plan_hash, &manifest.run_id, 200)
+                && !meta_warned.swap(true, Ordering::SeqCst)
+            {
+                eprintln!("warning: run journal unavailable: {err}");
+            }
+        }
+        let mut guard = meta_journal.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((store, manifest)) = guard.as_mut() else {
+            return;
+        };
+        let mut changed = false;
+        if meta.graph_id.is_some() && manifest.links.graph_id != meta.graph_id {
+            manifest.links.graph_id = meta.graph_id;
+            changed = true;
+        }
+        if meta.runner.is_some() && manifest.resolved_runner != meta.runner {
+            manifest.resolved_runner = meta.runner;
+            changed = true;
+        }
+        if meta.model.is_some() && manifest.resolved_model != meta.model {
+            manifest.resolved_model = meta.model;
+            changed = true;
+        }
+        if changed
+            && let Err(err) = store.save_relaxed(manifest)
+            && !meta_warned.swap(true, Ordering::SeqCst)
         {
             eprintln!("warning: run journal unavailable: {err}");
         }

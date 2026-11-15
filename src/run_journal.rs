@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::time::SystemTime;
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -60,6 +61,7 @@ pub enum RunStatus {
     Failed,
     Cancelled,
     AwaitingApproval,
+    Approved,
 }
 
 impl RunStatus {
@@ -69,6 +71,19 @@ impl RunStatus {
 
     pub fn is_terminal(&self) -> bool {
         !self.is_active()
+    }
+
+    /// Canonical manifest status string (inverse of `FromStr`).
+    pub fn as_status_str(&self) -> &'static str {
+        match self {
+            RunStatus::Active => "active",
+            RunStatus::Running => "running",
+            RunStatus::Completed => "completed",
+            RunStatus::Failed => "failed",
+            RunStatus::Cancelled => "cancelled",
+            RunStatus::AwaitingApproval => "awaiting_approval",
+            RunStatus::Approved => "approved",
+        }
     }
 }
 
@@ -83,6 +98,7 @@ impl std::str::FromStr for RunStatus {
             "failed" => Ok(RunStatus::Failed),
             "cancelled" => Ok(RunStatus::Cancelled),
             "awaiting_approval" => Ok(RunStatus::AwaitingApproval),
+            "approved" => Ok(RunStatus::Approved),
             _ => Err("unknown run status"),
         }
     }
@@ -845,6 +861,95 @@ impl JournalStore {
         Ok(manifest)
     }
 
+    /// FR-2816: supersedes earlier runs that were left `awaiting_approval` with
+    /// `end_summary.plan_hash == plan_hash` once an approved plan with that hash
+    /// actually starts executing under run `approved_by`. Each matching
+    /// manifest becomes `approved` (terminal) with
+    /// `end_summary.approved_by_run_id = approved_by` and keeps its
+    /// `plan_hash`. The scan is bounded to the `max_scan` most recent run
+    /// directories (valid run ids only, symlinks skipped) and never touches the
+    /// current run (`approved_by`). Returns the number of superseded manifests.
+    /// Load failures on individual runs are skipped; the first save error is
+    /// returned so the caller can warn without failing the run.
+    pub fn supersede_awaiting(
+        &self,
+        plan_hash: &str,
+        approved_by: &str,
+        max_scan: usize,
+    ) -> Result<usize, JournalError> {
+        if !valid_pending_plan_hash(plan_hash) {
+            return Err(JournalError::InvalidId(plan_hash.to_string()));
+        }
+        if !valid_run_id(approved_by) {
+            return Err(JournalError::InvalidId(approved_by.to_string()));
+        }
+        verify_no_symlinks(&self.root)?;
+        if !self.root.is_dir() {
+            return Ok(0);
+        }
+
+        let entries = fs::read_dir(&self.root)?;
+        let mut candidates: Vec<(String, SystemTime)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_symlink(&path).unwrap_or(true) {
+                continue;
+            }
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !valid_run_id(name) {
+                continue;
+            }
+            let modified = fs::symlink_metadata(&path)
+                .and_then(|meta| meta.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            candidates.push((name.to_owned(), modified));
+        }
+
+        // Newest first, deterministic tie-break on the id, bounded scan.
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        candidates.truncate(max_scan);
+
+        let mut superseded = 0;
+        for (name, _) in candidates.into_iter() {
+            if name.as_str() == approved_by {
+                continue;
+            }
+            let Ok(mut manifest) = self.load(&name) else {
+                // Corrupt / oversized / foreign manifest: preserve like prune.
+                continue;
+            };
+            if manifest.status != "awaiting_approval" {
+                continue;
+            }
+            let hash_matches = manifest
+                .end_summary
+                .as_ref()
+                .and_then(|summary| summary.get("plan_hash"))
+                .and_then(|value| value.as_str())
+                .is_some_and(|hash| hash == plan_hash);
+            if !hash_matches {
+                continue;
+            }
+            manifest.status = RunStatus::Approved.as_status_str().to_owned();
+            if let Some(summary) = manifest.end_summary.as_mut()
+                && let Some(object) = summary.as_object_mut()
+            {
+                object.insert(
+                    "approved_by_run_id".to_owned(),
+                    serde_json::Value::String(approved_by.to_owned()),
+                );
+            }
+            self.save_relaxed(&manifest)?;
+            superseded += 1;
+        }
+        Ok(superseded)
+    }
+
     /// Replaces whole diagnostic tail snapshot bounded to 64 KiB with pre-masking.
     pub fn write_diagnostics(&self, id: &str, tail: &str) -> Result<(), JournalError> {
         if !valid_run_id(id) {
@@ -1302,7 +1407,28 @@ fn safe_delete_run_dir(dir: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::mask_sensitive_tokens;
+    use super::{RunStatus, mask_sensitive_tokens};
+
+    // TC-2816 / FR-2816: `approved` is a terminal status; FromStr, serde and
+    // the manifest string all agree.
+    #[test]
+    fn tc_2816_approved_status_roundtrip_and_terminal() {
+        assert_eq!(
+            "approved".parse::<RunStatus>().expect("parse approved"),
+            RunStatus::Approved
+        );
+        assert_eq!(
+            serde_json::to_value(RunStatus::Approved).expect("serialize approved"),
+            serde_json::Value::String("approved".to_owned())
+        );
+        assert_eq!(
+            serde_json::from_str::<RunStatus>("\"approved\"").expect("deserialize approved"),
+            RunStatus::Approved
+        );
+        assert_eq!(RunStatus::Approved.as_status_str(), "approved");
+        assert!(RunStatus::Approved.is_terminal());
+        assert!(!RunStatus::Approved.is_active());
+    }
 
     // TC-2802 / FR-2802, FR-2810: prefilter must not skip real secrets; benign progress lines pass through.
     #[test]

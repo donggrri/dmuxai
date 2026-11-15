@@ -3,7 +3,7 @@
 Status: proposed
 Owner: DmuxAI Team
 Created: 2026-11-15
-Baseline: main b2e8b6b; existing highest FR-2693; this spec adds FR/TC-2800–2810 (PR A); PR B adds FR/TC-2811–2814
+Baseline: main b2e8b6b; existing highest FR-2693; this spec adds FR/TC-2800–2810, 2815–2816 (PR A); PR B adds FR/TC-2811–2814
 Related: SPEC-run-journal, SPEC-agent-api, SPEC-web-dashboard, SPEC-graph-view, issues #147, #148, #301
 
 ## 1. Decision summary
@@ -47,7 +47,7 @@ Controls (stop, approve from the browser) and the terminal-session panel are out
 | Run dir | `$XDG_DATA_HOME/dmuxai/repos/<repo-key>/runs/<run_id>/` (SPEC-run-journal). | `.dmuxai/` workspace state. |
 | Progress copy | `<run dir>/progress.jsonl`, masked copy of the `--progress` JSON lines. | stderr progress output. |
 
-Lifecycle: `active` (before dispatch) → `completed` (exit 0) | `failed` (exit 1–6) | `awaiting_approval` (exit 7) | `cancelled` (exit 130).
+Lifecycle: `active` (before dispatch) → `completed` (exit 0) | `failed` (exit 1–6) | `awaiting_approval` (exit 7) | `cancelled` (exit 130). `awaiting_approval` runs whose plan was later approved and executed (FR-2816) become `approved` (terminal).
 
 ## 4. Requirements
 
@@ -64,6 +64,8 @@ Lifecycle: `active` (before dispatch) → `completed` (exit 0) | `failed` (exit 
 | FR-2808 | Must | `GET /api/runs/{id}/stream` (SSE), | sends `run` (manifest on change), `progress` (new progress lines) and `state-change` (events whose `run_id` matches), using incremental offsets; sends `end` once the run is terminal and drained. | Unknown id → 404. | TC-2808 |
 | FR-2809 | Must | For every runs endpoint, | only GET is routed; the existing dashboard token check applies; payload strings are masked and never contain the dashboard token. | Missing/wrong token → 401 as other `/api` routes. | TC-2809 |
 | FR-2810 | Should | When a trivial headless run is benchmarked against main, | wall time stays within 10 % (#301 rule); numbers are recorded in the PR; masking skips its regexes for lines with no secret-like literal and headless manifest saves stay atomic without fsync. | — | TC-2810 + PR bench |
+| FR-2815 | Must | While a headless run is active (#326), | the manifest gets the resolved runner, resolved model and `links.graph_id` as soon as each is known (relaxed save only when a value changes, at most a handful of saves per run), so `GET /api/runs/{id}` shows the graph view and runner/model before the run ends. | — | TC-2815 |
+| FR-2816 | Must | When a headless `run --graph --approve-plan-id <hash>` starts executing the approved plan (#325), | every earlier run manifest in the same repo with status `awaiting_approval` and `end_summary.plan_hash == <hash>` is changed to status `approved` with `end_summary.approved_by_run_id = <new run id>` (bounded scan of the most recent run dirs; only when `--approve-plan-id` is given). `approved` is a terminal status; the runs API no longer returns an approval hint for it. | — | TC-2816 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -80,12 +82,14 @@ Lifecycle: `active` (before dispatch) → `completed` (exit 0) | `failed` (exit 
 | TC-2808 | FR-2808 | integration | active run fixture | open SSE, append progress line and event with matching / other run_id, then mark terminal | receives `progress`, matching `state-change` only, `run`, then `end` | `tests/serve_runs_api.rs`: `tc_2808_run_stream_sse` |
 | TC-2809 | FR-2809 | integration | server with token; fixture containing a fake secret | requests without token, POST, with token | 401 without token, 405 on POST, masked payload without token string | `tests/serve_runs_api.rs`: `tc_2809_runs_api_read_only_and_masked` |
 | TC-2810 | FR-2810, FR-2802 | unit | masking inputs with and without secret-like literals; relaxed manifest save | mask and save | secrets still masked, plain progress lines unchanged; relaxed save roundtrips with 0700/0600 | `src/run_journal.rs`: `tc_2810_mask_prefilter_keeps_masking`; bench numbers in the PR description |
+| TC-2815 | FR-2815 | integration | fake graph/agent run whose step blocks until the test reads the manifest | read manifest while the run is active | status `active`, `resolved_runner` and `links.graph_id` already set | `tests/headless_runs_journal.rs`: `tc_2815_active_manifest_has_graph_and_runner` |
+| TC-2816 | FR-2816 | integration | an `awaiting_approval` manifest with `plan_hash` H (and one with another hash) | headless run with `--approve-plan-id H` | the H manifest becomes `approved` with `approved_by_run_id` = new run id; the other stays `awaiting_approval`; API detail of the approved one has no approval hint | `tests/headless_runs_journal.rs`: `tc_2816_approval_supersedes_awaiting_run`; `tests/run_journal_store.rs`: `tc_2816_store_supersede_awaiting_bounded_scan`; `tests/serve_runs_api.rs`: `tc_2816_approved_run_has_no_hint` |
 
 ## 6. Data, integration, and safety contracts
 
 | Area | Contract / change | Compatibility and rollback | Evidence |
 | --- | --- | --- | --- |
-| Manifest | adds optional `pid`; statuses gain `awaiting_approval`; origin gains `mcp` | PR1a readers ignore unknown fields (serde default) | TC-2800, TC-2801 |
+| Manifest | adds optional `pid`; statuses gain `awaiting_approval` and `approved`; origin gains `mcp` | PR1a readers ignore unknown fields (serde default) | TC-2800, TC-2801, TC-2816 |
 | Events | optional `run_id` on records | omitted when none; old lines parse | TC-2804 |
 | API | new GET routes only; token required | no change to existing routes | TC-2806–TC-2809 |
 | Security | `mask_sensitive_tokens` on progress copy and error summary; no raw stderr served | — | TC-2802, TC-2809 |
@@ -98,6 +102,8 @@ Lifecycle: `active` (before dispatch) → `completed` (exit 0) | `failed` (exit 
 | 1 | Journal wiring + progress copy | `src/run_journal.rs`, `src/cli.rs`, `tests/headless_runs_journal.rs` | FR-2800–FR-2803 | TC-2800–TC-2803 |
 | 2 | Event run_id + incremental tail | `src/events.rs`, `src/cli.rs`, `src/web/server.rs` | FR-2804, FR-2805 | TC-2804, TC-2805 |
 | 3 | Runs API | `src/web/runs_api.rs`, `src/web/server.rs`, `tests/serve_runs_api.rs` | FR-2806–FR-2809 | TC-2806–TC-2809 |
+| 4 | Active manifest metadata sink (graph id, runner, model) | `src/app.rs`, `src/cli.rs`, `tests/headless_runs_journal.rs` | FR-2815 | TC-2815 |
+| 5 | Approval supersede of stale awaiting runs | `src/run_journal.rs`, `src/cli.rs`, `src/web/runs_api.rs`, tests | FR-2816 | TC-2816 |
 
 ## 8. Review and test exit criteria
 
