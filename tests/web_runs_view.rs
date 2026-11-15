@@ -973,3 +973,185 @@ fn tc_2814_run_text_is_not_html() {
         "literal payload text must be visible"
     );
 }
+
+// TC-2817 / FR-2817: live graph metadata while active; approved continuation link.
+#[test]
+#[ignore]
+fn tc_2817_live_graph_and_approved_link() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2817: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new();
+    let runs = fixture.runs_dir();
+    let active_id = "cccccccccccccccc";
+    let continue_id = "dddddddddddddddd";
+    let approved_id = "eeeeeeeeeeeeeeee";
+
+    let mut manifest = base_manifest(active_id, 10_000, "active");
+    manifest["pid"] = json!(std::process::id());
+    manifest["resolved_runner"] = json!(null);
+    manifest["resolved_model"] = json!(null);
+    write_manifest(&runs.join(active_id), &manifest);
+
+    let mut cont = base_manifest(continue_id, 12_000, "active");
+    cont["pid"] = json!(std::process::id());
+    write_manifest(&runs.join(continue_id), &cont);
+
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+    open_runs_view(&mut session);
+
+    let list_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < list_deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(n) = session
+            .cdp
+            .eval("document.querySelectorAll('.runs-row').length")
+            && n.as_u64().unwrap_or(0) >= 2
+        {
+            break;
+        }
+    }
+
+    session
+        .cdp
+        .eval(&format!(
+            "document.querySelector('[data-run-id=\"{active_id}\"]').click()"
+        ))
+        .expect("select active run");
+
+    let stream_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < stream_deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(n) = session
+            .cdp
+            .eval("document.querySelectorAll('#runs-stream li').length")
+            && n.as_u64().unwrap_or(0) >= 1
+        {
+            break;
+        }
+    }
+
+    write_graph_fixture(&fixture.workspace, "g-live");
+    let mut updated = base_manifest(active_id, 10_000, "active");
+    updated["pid"] = json!(std::process::id());
+    updated["resolved_runner"] = json!("cursor");
+    updated["resolved_model"] = json!("composer-2.5");
+    updated["links"]["graph_id"] = json!("g-live");
+    write_manifest(&runs.join(active_id), &updated);
+
+    let mut saw_graph = false;
+    let graph_deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < graph_deadline {
+        std::thread::sleep(Duration::from_millis(150));
+        if let Ok(n) = session
+            .cdp
+            .eval("document.querySelectorAll('#runs-graph-nodes li').length")
+            && n.as_u64().unwrap_or(0) >= 1
+        {
+            saw_graph = true;
+            break;
+        }
+    }
+    assert!(saw_graph, "graph nodes should appear without reselecting");
+
+    let header = session
+        .cdp
+        .eval("document.querySelector('#runs-detail-header').innerText")
+        .expect("detail header")
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    assert!(
+        header.contains("cursor") && header.contains("composer-2.5"),
+        "resolved runner/model in header: {header}"
+    );
+
+    let selected_val = session
+        .cdp
+        .eval("document.querySelector('.runs-row-selected')?.getAttribute('data-run-id')")
+        .expect("selected row");
+    let selected = selected_val.as_str().unwrap_or("");
+    assert_eq!(selected, active_id, "selection must stay on active run");
+
+    let mut approved = base_manifest(approved_id, 11_000, "approved");
+    approved["completed_at_ms"] = json!(11_500);
+    approved["duration_ms"] = json!(500);
+    approved["dmuxai_exit_code"] = json!(7);
+    approved["end_summary"] = json!({
+        "plan_hash": "cafebabecafebabe",
+        "approved_by_run_id": continue_id
+    });
+    write_manifest(&runs.join(approved_id), &approved);
+
+    let mut saw_approved_row = false;
+    let poll_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < poll_deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        if let Ok(text) = session.cdp.eval(&format!(
+            "document.querySelector('[data-run-id=\"{approved_id}\"] .run-status')?.textContent"
+        )) && text.as_str().unwrap_or("") == "approved"
+        {
+            saw_approved_row = true;
+            break;
+        }
+    }
+    assert!(saw_approved_row, "approved status pill in list");
+
+    session
+        .cdp
+        .eval(&format!(
+            "document.querySelector('[data-run-id=\"{approved_id}\"]').click()"
+        ))
+        .expect("select approved run");
+
+    let mut saw_continue = false;
+    let approve_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < approve_deadline {
+        std::thread::sleep(Duration::from_millis(150));
+        if let Ok(hidden) = session
+            .cdp
+            .eval("document.querySelector('#runs-approval-banner')?.hidden")
+            && hidden.as_bool() == Some(false)
+            && let Ok(text) = session
+                .cdp
+                .eval("document.querySelector('#runs-approval-banner').innerText")
+        {
+            let t = text.as_str().unwrap_or("");
+            if t.contains("continued in run")
+                && !t.contains("--approve-plan")
+                && !t.contains("Waiting for approval")
+            {
+                saw_continue = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_continue,
+        "approved continuation text, not approval hint"
+    );
+
+    let short = &continue_id[..8];
+    session
+        .cdp
+        .eval("document.querySelector('.runs-approved-link')?.click()")
+        .expect("click continuation link");
+
+    let mut linked = false;
+    let link_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < link_deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(sel) = session
+            .cdp
+            .eval("document.querySelector('.runs-row-selected')?.getAttribute('data-run-id')")
+            && sel.as_str() == Some(continue_id)
+        {
+            linked = true;
+            break;
+        }
+    }
+    assert!(linked, "continuation link selects run {short}");
+}

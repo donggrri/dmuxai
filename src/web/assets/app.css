@@ -2736,6 +2736,12 @@ main {
   border: 1px solid var(--badge-waiting_gate-line);
 }
 
+.run-status-approved {
+  color: var(--badge-completed-text);
+  background: var(--bg-badge);
+  border: 1px solid var(--accent);
+}
+
 .runs-flag-stale,
 .runs-flag-stalled {
   margin-right: 4px;
@@ -2766,6 +2772,17 @@ main {
   background: var(--badge-waiting_gate-bg);
   color: var(--badge-waiting_gate-text);
   font-size: 0.85em;
+}
+
+.runs-approved-link {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.95em;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
 }
 
 .runs-approval-hint {

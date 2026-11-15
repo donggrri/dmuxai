@@ -4,6 +4,7 @@
 
 var RUNS_POLL_MS = 2000;
 var RUNS_TICK_MS = 1000;
+var RUNS_DETAIL_REFETCH_MS = 3000;
 var RUNS_STREAM_MAX_LINES = 2000;
 var RUNS_STREAM_BACKOFF = [1000, 2000, 5000, 10000];
 var RUNS_TOKEN_KEY = 'dmuxai.token';
@@ -88,6 +89,38 @@ function runsIsActive(status) {
   return status === 'active' || status === 'running';
 }
 
+function runsIsTerminal(status) {
+  return status && !runsIsActive(status);
+}
+
+function runsRunGraphId(run) {
+  if (!run) { return ''; }
+  if (run.graph_id) { return String(run.graph_id); }
+  if (run.links && run.links.graph_id) { return String(run.links.graph_id); }
+  return '';
+}
+
+function runsStopDetailRefetchPoll() {
+  if (runsDetailRefetchTimer !== null) {
+    clearInterval(runsDetailRefetchTimer);
+    runsDetailRefetchTimer = null;
+  }
+}
+
+function runsStreamRunNeedsRefetch(streamRun, prev) {
+  if (!streamRun || streamRun.run_id !== runsSelectedId) { return false; }
+  if (runsIsActive(streamRun.status)) {
+    if (runsRunnerModel(streamRun) !== runsRunnerModel(prev || {})) { return true; }
+    var gid = runsRunGraphId(streamRun);
+    var prevGid = runsRunGraphId(prev);
+    return !!(gid && gid !== prevGid);
+  }
+  if (prev && runsIsActive(prev.status) && runsIsTerminal(streamRun.status)) {
+    return true;
+  }
+  return streamRun.status === 'awaiting_approval';
+}
+
 function runsFetchJson(path) {
   var tok = runsToken();
   return fetch(runsApiUrl(path), {
@@ -136,6 +169,8 @@ var runsStreamLines = 0;
 var runsStreamStickBottom = true;
 var runsStreamBackoffIx = 0;
 var runsStreamReconnectTimer = null;
+var runsDetailRefetchTimer = null;
+var runsDetailLastRefetchAt = 0;
 
 function runsPanelOpen() {
   var panel = document.getElementById('runs');
@@ -206,6 +241,7 @@ function runsOnViewClose() {
   runsUiOpen = false;
   runsStopPoll();
   runsStopTick();
+  runsStopDetailRefetchPoll();
   runsStopStream();
 }
 
@@ -308,25 +344,67 @@ function runsSelectRun(id) {
 function runsClearDetail() {
   runsSelectedId = null;
   runsDetailRun = null;
+  runsStopDetailRefetchPoll();
   runsStopStream();
   var detail = document.getElementById('runs-detail');
   if (detail) { detail.hidden = true; }
 }
 
+function runsApplyDetailPayload(data, id, gen) {
+  if (gen !== runsDetailGen || id !== runsSelectedId) { return false; }
+  runsDetailRun = data.run || null;
+  var detail = document.getElementById('runs-detail');
+  if (detail) { detail.hidden = false; }
+  runsRenderDetailHeader(data);
+  runsRenderApproval(data.approval, data.run);
+  runsRenderGraphNodes(data.graph);
+  return true;
+}
+
+function runsRefetchDetail(id) {
+  var gen = runsDetailGen;
+  runsFetchJson('/api/runs/' + encodeURIComponent(id)).then(function (data) {
+    if (!runsApplyDetailPayload(data, id, gen)) { return; }
+    if (runsRunGraphId(runsDetailRun)) {
+      runsStopDetailRefetchPoll();
+    }
+  }).catch(function () { /* keep prior detail */ });
+}
+
+function runsMaybeStartDetailRefetchPoll(id) {
+  runsStopDetailRefetchPoll();
+  if (!runsDetailRun || !runsIsActive(runsDetailRun.status)) { return; }
+  if (runsRunGraphId(runsDetailRun)) { return; }
+  runsDetailRefetchTimer = window.setInterval(function () {
+    if (id !== runsSelectedId || !runsUiOpen) {
+      runsStopDetailRefetchPoll();
+      return;
+    }
+    if (!runsDetailRun || !runsIsActive(runsDetailRun.status)) {
+      runsStopDetailRefetchPoll();
+      return;
+    }
+    if (runsRunGraphId(runsDetailRun)) {
+      runsStopDetailRefetchPoll();
+      return;
+    }
+    var now = Date.now();
+    if (now - runsDetailLastRefetchAt < RUNS_DETAIL_REFETCH_MS) { return; }
+    runsDetailLastRefetchAt = now;
+    runsRefetchDetail(id);
+  }, RUNS_DETAIL_REFETCH_MS);
+}
+
 function runsLoadDetail(id, reopenStream) {
   runsDetailGen += 1;
   var gen = runsDetailGen;
+  runsDetailLastRefetchAt = 0;
   runsFetchJson('/api/runs/' + encodeURIComponent(id)).then(function (data) {
-    if (gen !== runsDetailGen || id !== runsSelectedId) { return; }
-    runsDetailRun = data.run || null;
-    var detail = document.getElementById('runs-detail');
-    if (detail) { detail.hidden = false; }
-    runsRenderDetailHeader(data);
-    runsRenderApproval(data.approval);
-    runsRenderGraphNodes(data.graph);
+    if (!runsApplyDetailPayload(data, id, gen)) { return; }
     if (reopenStream && id === runsSelectedId) {
       runsConnectStream(id);
     }
+    runsMaybeStartDetailRefetchPoll(id);
   }).catch(function () { /* keep prior detail */ });
 }
 
@@ -381,10 +459,29 @@ function runsUpdateDetailMeta() {
   }
 }
 
-function runsRenderApproval(approval) {
+function runsRenderApproval(approval, run) {
   var banner = document.getElementById('runs-approval-banner');
   if (!banner) { return; }
   banner.textContent = '';
+  banner.className = 'runs-approval-banner';
+  var detailRun = run || runsDetailRun || {};
+  if (detailRun.status === 'approved') {
+    var contId = detailRun.approved_by_run_id || '';
+    if (!contId) {
+      banner.hidden = true;
+      return;
+    }
+    banner.hidden = false;
+    banner.appendChild(document.createTextNode(
+      'Approved \u2014 continued in run '));
+    var link = runsEl('button', 'runs-approved-link', runsShortId(contId));
+    link.type = 'button';
+    link.addEventListener('click', function () {
+      runsSelectRun(contId);
+    });
+    banner.appendChild(link);
+    return;
+  }
   if (!approval || !approval.hint) {
     banner.hidden = true;
     return;
@@ -495,14 +592,20 @@ function runsConnectStream(id) {
   runsStreamSse.addEventListener('run', function (e) {
     try {
       var run = JSON.parse(e.data);
+      var prev = runsDetailRun;
       runsDetailRun = run;
       runsRenderDetailHeader({ run: run });
       runsListData = runsListData.map(function (item) {
         return item.run_id === run.run_id ? Object.assign({}, item, run) : item;
       });
       runsRenderList();
-      if (runsSelectedId === run.run_id) {
-        runsLoadDetail(run.run_id, false);
+      if (runsStreamRunNeedsRefetch(run, prev)) {
+        runsDetailLastRefetchAt = Date.now();
+        runsRefetchDetail(run.run_id);
+      } else if (runsIsActive(run.status) && !runsRunGraphId(run)) {
+        runsMaybeStartDetailRefetchPoll(run.run_id);
+      } else if (runsRunGraphId(run)) {
+        runsStopDetailRefetchPoll();
       }
     } catch (err) { /* ignore */ }
   });
