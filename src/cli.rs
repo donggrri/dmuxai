@@ -2477,18 +2477,29 @@ async fn run_headless(
     }
 
     let journal_pair = start_headless_journal(workspace_root, options, &run_id);
+    let progress_warned = Arc::new(AtomicBool::new(false));
+    let progress_copy = journal_pair.as_ref().and_then(|(store, manifest)| {
+        match store.open_progress_copy(&manifest.run_id) {
+            Ok(copy) => Some(copy),
+            Err(err) => {
+                if !progress_warned.swap(true, Ordering::SeqCst) {
+                    eprintln!("warning: run journal unavailable: {err}");
+                }
+                None
+            }
+        }
+    });
+    let progress_copy = std::sync::Mutex::new(progress_copy);
     let journal_handle = Arc::new(std::sync::Mutex::new(journal_pair));
 
-    let progress_journal = Arc::clone(&journal_handle);
     let progress_opt = options.progress;
-    let progress_warned = Arc::new(AtomicBool::new(false));
     app.set_progress_sink(Box::new(move |line: &str| {
         if progress_opt {
             eprintln!("{line}");
         }
-        if let Ok(guard) = progress_journal.lock()
-            && let Some((store, manifest)) = guard.as_ref()
-            && let Err(err) = store.append_progress(&manifest.run_id, line)
+        let mut guard = progress_copy.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(writer) = guard.as_mut()
+            && let Err(err) = writer.append_line(line)
             && !progress_warned.swap(true, Ordering::SeqCst)
         {
             eprintln!("warning: run journal unavailable: {err}");
@@ -2512,9 +2523,11 @@ async fn run_headless(
                 dmuxai::process::supervisor::GroupOwner::DEFAULT,
                 Duration::from_secs(2),
             );
-            if let Ok(mut guard) = signal_journal.lock()
-                && let Some((store, manifest)) = guard.as_mut()
-            {
+            let taken = {
+                let mut guard = signal_journal.lock().unwrap_or_else(|e| e.into_inner());
+                guard.take()
+            };
+            if let Some((store, mut manifest)) = taken {
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -2523,7 +2536,9 @@ async fn run_headless(
                 manifest.completed_at_ms = Some(now_ms);
                 manifest.duration_ms = Some(now_ms.saturating_sub(manifest.created_at_ms));
                 manifest.dmuxai_exit_code = Some(130);
-                let _ = store.save(manifest);
+                if let Err(err) = store.save(&manifest) {
+                    eprintln!("warning: run journal unavailable: {err}");
+                }
             }
             eprintln!("error: stopped after signal");
             std::process::exit(130);
@@ -2552,9 +2567,11 @@ async fn run_headless(
 
     outcome.run_id = Some(run_id.clone());
 
-    if let Ok(mut guard) = journal_handle.lock()
-        && let Some((store, manifest)) = guard.as_mut()
-    {
+    let taken = {
+        let mut guard = journal_handle.lock().unwrap_or_else(|e| e.into_inner());
+        guard.take()
+    };
+    if let Some((store, mut manifest)) = taken {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -2574,17 +2591,13 @@ async fn run_headless(
             dmuxai::run_journal::truncate_tail_utf8(&masked, 2048).to_string()
         });
         manifest.resolved_runner = outcome.agent.clone();
-        manifest.resolved_model = outcome
-            .triage
-            .as_ref()
-            .map(|t| t.model.clone())
-            .or_else(|| options.model.clone());
+        manifest.resolved_model = outcome.triage.as_ref().map(|t| t.model.clone());
         manifest.links.graph_id = outcome.graph_id.clone();
         manifest.links.conversation_id = Some(outcome.conversation_id.clone());
         if let Some(plan_hash) = &outcome.plan_hash {
             manifest.end_summary = Some(json!({ "plan_hash": plan_hash }));
         }
-        if let Err(err) = store.save(manifest) {
+        if let Err(err) = store.save(&manifest) {
             eprintln!("warning: run journal unavailable: {err}");
         }
     }

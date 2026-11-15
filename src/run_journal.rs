@@ -505,6 +505,33 @@ fn open_file_read_nofollow(path: &Path) -> Result<File, io::Error> {
     File::open(path)
 }
 
+/// Single-handle append writer for `<root>/<id>/progress.jsonl`.
+/// Created once per run so each progress line is a single write without
+/// per-line ancestor symlink walks or `sync_data`.
+#[derive(Debug)]
+pub struct ProgressCopy {
+    file: File,
+    written_bytes: u64,
+}
+
+impl ProgressCopy {
+    /// Appends a masked progress line, silently skipping once the file would
+    /// exceed `MAX_PROGRESS_COPY_BYTES`.
+    pub fn append_line(&mut self, line: &str) -> Result<(), JournalError> {
+        let masked = mask_sensitive_tokens(line);
+        let mut entry = masked;
+        entry.push('\n');
+        let entry_bytes = entry.as_bytes();
+        let next_len = self.written_bytes.saturating_add(entry_bytes.len() as u64);
+        if next_len > MAX_PROGRESS_COPY_BYTES {
+            return Ok(());
+        }
+        self.file.write_all(entry_bytes)?;
+        self.written_bytes = next_len;
+        Ok(())
+    }
+}
+
 /// Journal storage engine managing runs for a repository.
 #[derive(Debug, Clone)]
 pub struct JournalStore {
@@ -852,10 +879,11 @@ impl JournalStore {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// Appends a masked progress line to `<root>/<id>/progress.jsonl`.
-    /// Validates the id, refuses symlinks, creates the file with 0600 on unix,
-    /// and silently skips (Ok) once the file would exceed MAX_PROGRESS_COPY_BYTES.
-    pub fn append_progress(&self, id: &str, line: &str) -> Result<(), JournalError> {
+    /// Opens `<root>/<id>/progress.jsonl` for appending masked progress lines
+    /// without per-line `sync_data`. Validates the id, refuses symlinks,
+    /// creates the file with 0600 on unix, and tracks the current size against
+    /// `MAX_PROGRESS_COPY_BYTES`.
+    pub fn open_progress_copy(&self, id: &str) -> Result<ProgressCopy, JournalError> {
         if !valid_run_id(id) {
             return Err(JournalError::InvalidId(id.to_string()));
         }
@@ -888,11 +916,6 @@ impl JournalStore {
             return Err(JournalError::SymlinkDetected(progress_path));
         }
 
-        let masked = mask_sensitive_tokens(line);
-        let mut entry = masked;
-        entry.push('\n');
-        let entry_bytes = entry.as_bytes();
-
         let mut opts = OpenOptions::new();
         opts.create(true).append(true);
         #[cfg(unix)]
@@ -901,7 +924,7 @@ impl JournalStore {
             opts.custom_flags(libc::O_NOFOLLOW);
         }
 
-        let mut file = opts.open(&progress_path)?;
+        let file = opts.open(&progress_path)?;
         let meta = file.metadata()?;
         if !meta.is_file() {
             return Err(JournalError::Io(io::Error::new(
@@ -913,15 +936,17 @@ impl JournalStore {
             )));
         }
 
-        let current_len = meta.len();
-        if current_len.saturating_add(entry_bytes.len() as u64) > MAX_PROGRESS_COPY_BYTES {
-            // Silently skip once file would exceed MAX_PROGRESS_COPY_BYTES
-            return Ok(());
-        }
+        Ok(ProgressCopy {
+            file,
+            written_bytes: meta.len(),
+        })
+    }
 
-        file.write_all(entry_bytes)?;
-        file.sync_data()?;
-        Ok(())
+    /// Appends a masked progress line to `<root>/<id>/progress.jsonl`.
+    /// Validates the id, refuses symlinks, creates the file with 0600 on unix,
+    /// and silently skips (Ok) once the file would exceed MAX_PROGRESS_COPY_BYTES.
+    pub fn append_progress(&self, id: &str, line: &str) -> Result<(), JournalError> {
+        self.open_progress_copy(id)?.append_line(line)
     }
 
     /// Loads the last `max_lines` from `<root>/<id>/progress.jsonl`,

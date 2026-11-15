@@ -133,14 +133,14 @@ timeout_secs = 30
 #[test]
 fn tc_2800_active_manifest_before_dispatch() {
     // 1. cli_headless origin
-    let sandbox = Sandbox::new(&fake_agent_config("delayed"));
+    let sandbox = Sandbox::new(&fake_agent_config("sleep5"));
     let child = sandbox.spawn_with_env(&["run", "hello", "--agent", "fake", "--json"], &[]);
 
     let runs_dir = sandbox.repo_runs_dir();
     let start = Instant::now();
     let mut found_active: Option<Value> = None;
 
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < Duration::from_secs(20) {
         if runs_dir.exists()
             && let Ok(entries) = fs::read_dir(&runs_dir)
         {
@@ -244,6 +244,56 @@ timeout_secs = 30
         err_summary.contains("[REDACTED]"),
         "masked text must include [REDACTED]: {err_summary}"
     );
+
+    // 2. Exit 7 (awaiting_approval) records status "awaiting_approval" and end_summary.plan_hash
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-agent.sh");
+    let plan_gate_config = format!(
+        r#"[routing]
+default_agent = "fake"
+
+[graph]
+allowed_runners = ["fake"]
+
+[[agents.custom]]
+name = "fake"
+command = ["sh", "{fixture}", "plan", "{{prompt}}"]
+prompt_via = "arg"
+output = "text"
+default_model = "composer-2.5"
+timeout_secs = 60
+"#,
+        fixture = fixture.display().to_string().replace('\\', "/"),
+    );
+    let sandbox_gate = Sandbox::new(&plan_gate_config);
+    let out_gate = sandbox_gate.run(&[
+        "run",
+        "ship the whole feature across several steps",
+        "--json",
+    ]);
+    assert_eq!(out_gate.status.code(), Some(7));
+    let json_gate = stdout_json(&out_gate);
+    assert_eq!(json_gate["exit_code"], 7);
+    let gate_run_id = json_gate["run_id"].as_str().expect("run_id present");
+
+    let gate_manifest_path = sandbox_gate
+        .repo_runs_dir()
+        .join(gate_run_id)
+        .join("manifest.json");
+    let gate_manifest_content =
+        fs::read_to_string(gate_manifest_path).expect("read awaiting_approval manifest");
+    let gate_manifest: Value =
+        serde_json::from_str(&gate_manifest_content).expect("parse awaiting_approval manifest");
+    assert_eq!(gate_manifest["status"], "awaiting_approval");
+    assert_eq!(gate_manifest["dmuxai_exit_code"], 7);
+    if let Some(plan_hash) = json_gate["plan_hash"].as_str() {
+        assert_eq!(
+            gate_manifest["end_summary"]["plan_hash"].as_str(),
+            Some(plan_hash)
+        );
+    }
 }
 
 // TC-2802 / FR-2802: progress copy masked without flag

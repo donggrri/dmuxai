@@ -144,6 +144,10 @@ case "$behavior" in
     sleep 2
     printf '{"type":"text","part":{"text":"delayed text\\n"}}\n'
     ;;
+  sleep5)
+    sleep 5
+    printf '{"type":"text","part":{"text":"delayed text\\n"}}\n'
+    ;;
   orphan_stdout)
     sleep 60 &
     if [ -n "$FAKE_AGENT_PIDFILE" ]; then

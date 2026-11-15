@@ -1558,6 +1558,8 @@ pub struct App {
     headless_plan_only_approval: bool,
     /// FR-2121: a plan-only agent reply was seen during this headless run.
     headless_plan_only_reply: bool,
+    /// Graph ID of the last graph session started or finished during a headless run.
+    headless_last_graph_id: Option<String>,
     /// Test-only escape hatch: legacy app tests assume a direct send, so they
     /// skip the judge and start a quiet 1-node run with override kind `agent`.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1956,6 +1958,7 @@ impl App {
             headless_require_edits: false,
             headless_plan_only_approval: false,
             headless_plan_only_reply: false,
+            headless_last_graph_id: None,
             skip_judge_for_tests: false,
             last_group_expanded: false,
             all_details_expanded: false,
@@ -11013,6 +11016,7 @@ impl App {
             self.clear_graph_defer_state();
         }
         if self.conversation_id.as_str() == conversation_id {
+            self.headless_last_graph_id = Some(run.plan.id.clone());
             self.last_graph_run = Some(run.clone());
         }
         let success = run.phase == GraphRunPhase::Completed;
@@ -12291,6 +12295,7 @@ impl App {
         let actions = session.schedule();
         let _ = save_run(&self.workspace_root, session.run());
         self.last_graph_run = Some(session.run().clone());
+        self.headless_last_graph_id = Some(session.run().plan.id.clone());
         self.graph_session = Some(session);
         self.dispatch_graph_actions(actions);
     }
@@ -12319,6 +12324,7 @@ impl App {
                     if let Some(session) = self.graph_session.as_mut() {
                         let run = session.run().clone();
                         let _ = save_run(&self.workspace_root, &run);
+                        self.headless_last_graph_id = Some(run.plan.id.clone());
                         self.last_graph_run = Some(run);
                         self.graph_assignment_line = resolved_assignment_line(
                             &self.model_catalogs,
@@ -12367,6 +12373,7 @@ impl App {
                         session.run_mut().phase = GraphRunPhase::Cancelled;
                         let run = session.run().clone();
                         let _ = save_run(&self.workspace_root, &run);
+                        self.headless_last_graph_id = Some(run.plan.id.clone());
                         self.last_graph_run = Some(run);
                         self.graph_assignment_line = resolved_assignment_line(
                             &self.model_catalogs,
@@ -12413,6 +12420,7 @@ impl App {
                         session.finalize_failure();
                         let run = session.run().clone();
                         let _ = save_run(&self.workspace_root, &run);
+                        self.headless_last_graph_id = Some(run.plan.id.clone());
                         self.last_graph_run = Some(run);
                         self.graph_assignment_line = resolved_assignment_line(
                             &self.model_catalogs,
@@ -12687,6 +12695,7 @@ impl App {
                     session.run_mut().phase = GraphRunPhase::Failed;
                     let run = session.run().clone();
                     let _ = save_run(&self.workspace_root, &run);
+                    self.headless_last_graph_id = Some(run.plan.id.clone());
                     self.last_graph_run = Some(run);
                 }
                 self.graph_agent_nodes.remove(&agent);
@@ -14639,6 +14648,7 @@ impl App {
         };
         let headless_conversation_id = self.conversation_id.as_str().to_owned();
         self.last_graph_run = None;
+        self.headless_last_graph_id = None;
         self.graph_session = None;
         self.headless_triage = None;
 
@@ -14883,6 +14893,8 @@ impl App {
 
                 if let Some(session) = &self.graph_session {
                     last_graph_id = Some(session.run().plan.id.clone());
+                } else if last_graph_id.is_none() {
+                    last_graph_id = self.headless_last_graph_id.clone();
                 }
 
                 if !self.busy_agents.is_empty()
@@ -14962,6 +14974,10 @@ impl App {
         } else {
             None
         };
+
+        if last_graph_id.is_none() {
+            last_graph_id = self.headless_last_graph_id.clone();
+        }
 
         let graph_failed = last_graph_id.as_ref().is_some_and(|graph_id| {
             self.last_graph_run
