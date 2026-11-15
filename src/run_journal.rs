@@ -243,9 +243,66 @@ static COMMON_TOKEN_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(sk-[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9]{10,})\b").unwrap()
 });
 
+/// Conservative literal substrings derived from every masking regex (case-insensitive).
+/// If none appear in the input, compiled regexes are not touched.
+const MASK_LITERAL_TRIGGERS: &[&str] = &[
+    "api_key",
+    "access_token",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "auth",
+    "bearer",
+    "authorization",
+    "key",
+    "sig",
+    "signature",
+    "sk-",
+    "ghp_",
+    "gho_",
+    "github_pat",
+    "xox",
+    "credential",
+    "cookie",
+    "session",
+];
+
+fn has_disallowed_control(input: &str) -> bool {
+    input
+        .chars()
+        .any(|ch| ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t')
+}
+
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    let n = needle.len();
+    if n == 0 || haystack.len() < n {
+        return false;
+    }
+    let nb = needle.as_bytes();
+    haystack
+        .as_bytes()
+        .windows(n)
+        .any(|w| w.eq_ignore_ascii_case(nb))
+}
+
+fn may_need_masking(s: &str) -> bool {
+    MASK_LITERAL_TRIGGERS
+        .iter()
+        .any(|needle| contains_ascii_ci(s, needle))
+}
+
 /// Strips ANSI escape sequences and non-standard control characters (retaining \n, \r, \t).
 pub fn strip_ansi_and_control(input: &str) -> String {
-    let stripped = ANSI_RE.replace_all(input, "");
+    let needs_ansi = input.as_bytes().contains(&0x1b);
+    if !needs_ansi && !has_disallowed_control(input) {
+        return input.to_string();
+    }
+    let stripped = if needs_ansi {
+        ANSI_RE.replace_all(input, "").into_owned()
+    } else {
+        input.to_owned()
+    };
     let mut out = String::with_capacity(stripped.len());
     for ch in stripped.chars() {
         if ch == '\n' || ch == '\r' || ch == '\t' || !ch.is_control() {
@@ -257,7 +314,16 @@ pub fn strip_ansi_and_control(input: &str) -> String {
 
 /// Masks sensitive credentials in text before writing to disk.
 pub fn mask_sensitive_tokens(input: &str) -> String {
+    if !input.as_bytes().contains(&0x1b)
+        && !has_disallowed_control(input)
+        && !may_need_masking(input)
+    {
+        return input.to_string();
+    }
     let clean = strip_ansi_and_control(input);
+    if !may_need_masking(&clean) {
+        return clean;
+    }
 
     // 1. JSON quoted secret fields: "api_key": "secret" -> "api_key": "[REDACTED]"
     let step1 = JSON_SECRET_RE.replace_all(&clean, |caps: &regex::Captures| {
@@ -1232,4 +1298,44 @@ fn safe_delete_run_dir(dir: &Path) -> io::Result<()> {
     }
 
     fs::remove_dir(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_sensitive_tokens;
+
+    // TC-2802 / FR-2802, FR-2810: prefilter must not skip real secrets; benign progress lines pass through.
+    #[test]
+    fn tc_2810_mask_prefilter_keeps_masking() {
+        let cases = [
+            (r#"API_KEY="my secret key""#, true),
+            (r#""api_key": "json_secret_pass""#, true),
+            ("Authorization: Bearer sk-1234567890abcdef", true),
+            ("https://example.com/api?token=secrettoken999&other=1", true),
+            ("found sk-1234567890abcdefghij", true),
+            ("leaked ghp_abcdefghijklmnopqrst", true),
+        ];
+        for (input, should_redact) in cases {
+            let masked = mask_sensitive_tokens(input);
+            assert!(
+                masked.contains("[REDACTED]") == should_redact,
+                "input {:?} -> {:?}",
+                input,
+                masked
+            );
+            if should_redact {
+                assert!(
+                    !masked.contains("json_secret_pass")
+                        && !masked.contains("secrettoken999")
+                        && !masked.contains("sk-1234567890abcdefghij")
+                        && !masked.contains("ghp_abcdefghijklmnopqrst"),
+                    "raw secret leaked in {:?}",
+                    masked
+                );
+            }
+        }
+
+        let plain = r#"{"type":"progress","kind":"tool","summary":"read src/main.rs"}"#;
+        assert_eq!(mask_sensitive_tokens(plain), plain);
+    }
 }
