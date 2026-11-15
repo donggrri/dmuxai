@@ -3,7 +3,7 @@
 Status: proposed
 Owner: DmuxAI Team
 Created: 2026-11-15
-Baseline: main b2e8b6b; existing highest FR-2693; this spec adds FR/TC-2800–2810, 2815–2816 (PR A); PR B adds FR/TC-2811–2814 (included)
+Baseline: main b2e8b6b; existing highest FR-2693; this spec adds FR/TC-2800–2810, 2815–2816 (PR A); PR B adds FR/TC-2811–2814, 2817 (included)
 Related: SPEC-run-journal, SPEC-agent-api, SPEC-web-dashboard, SPEC-graph-view, issues #147, #148, #301
 
 ## 1. Decision summary
@@ -70,6 +70,7 @@ Lifecycle: `active` (before dispatch) → `completed` (exit 0) | `failed` (exit 
 | FR-2814 | Must | When run data is rendered, | text is inserted with `textContent` (never `innerHTML` of payload strings); no new JS/CSS dependencies. | — | TC-2814 |
 | FR-2815 | Must | While a headless run is active (#326), | the manifest gets the resolved runner, resolved model and `links.graph_id` as soon as each is known (relaxed save only when a value changes, at most a handful of saves per run), so `GET /api/runs/{id}` shows the graph view and runner/model before the run ends. | — | TC-2815 |
 | FR-2816 | Must | When a headless `run --graph --approve-plan-id <hash>` starts executing the approved plan (#325), | every earlier run manifest in the same repo with status `awaiting_approval` and `end_summary.plan_hash == <hash>` is changed to status `approved` with `end_summary.approved_by_run_id = <new run id>` (bounded scan of the most recent run dirs; only when `--approve-plan-id` is given). `approved` is a terminal status; the runs API no longer returns an approval hint for it. | — | TC-2816 |
+| FR-2817 | Must | When the Runs view shows a run that is active or `approved` (#325, #326), | runner/model and the graph node list update while the run is active (detail refetched when the run's manifest changes, e.g. on the stream `run` event); an `approved` run shows an `approved` status pill and, instead of the approval banner, "Approved — continued in run <id>" where the id selects that run. | — | TC-2817 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -92,6 +93,7 @@ Lifecycle: `active` (before dispatch) → `completed` (exit 0) | `failed` (exit 
 | TC-2814 | FR-2814 | browser | fixture with `<img onerror>` in summary | render | no element injected; text shown literally | `tests/web_runs_view.rs`: `tc_2814_run_text_is_not_html` |
 | TC-2815 | FR-2815 | integration | fake graph/agent run whose step blocks until the test reads the manifest | read manifest while the run is active | status `active`, `resolved_runner` and `links.graph_id` already set | `tests/headless_runs_journal.rs`: `tc_2815_active_manifest_has_graph_and_runner` |
 | TC-2816 | FR-2816 | integration | an `awaiting_approval` manifest with `plan_hash` H (and one with another hash) | headless run with `--approve-plan-id H` | the H manifest becomes `approved` with `approved_by_run_id` = new run id; the other stays `awaiting_approval`; API detail of the approved one has no approval hint | `tests/headless_runs_journal.rs`: `tc_2816_approval_supersedes_awaiting_run`; `tests/run_journal_store.rs`: `tc_2816_store_supersede_awaiting_bounded_scan`; `tests/serve_runs_api.rs`: `tc_2816_approved_run_has_no_hint` |
+| TC-2817 | FR-2817 | browser | active run fixture without graph, then manifest gains `graph_id` + runner/model; an `approved` fixture with `approved_by_run_id` | watch detail; select approved run, click the link | graph nodes and runner/model appear without reselecting; approved pill, no approval banner, link selects the continuing run | `tests/web_runs_view.rs`: `tc_2817_live_graph_and_approved_link` |
 
 ## 6. Data, integration, and safety contracts
 
