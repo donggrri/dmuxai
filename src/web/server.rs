@@ -972,9 +972,10 @@ async fn get_events(Ws(ws): Ws, Query(params): Query<EventsQueryParams>) -> Resp
 
     if let Some((path, replay_since)) = tail {
         tokio::spawn(async move {
-            let mut cursor = replay_since;
-            for record in crate::events::read_since(&path, cursor, None) {
-                cursor = record.seq;
+            let mut offset = 0u64;
+            let (records, next) = crate::events::read_since_from(&path, offset, replay_since, None);
+            offset = next;
+            for record in records {
                 if tx.send(state_change_sse_event(&record)).is_err() {
                     return;
                 }
@@ -987,8 +988,10 @@ async fn get_events(Ws(ws): Ws, Query(params): Query<EventsQueryParams>) -> Resp
                 if tx.is_closed() {
                     return;
                 }
-                for record in crate::events::read_since(&path, cursor, None) {
-                    cursor = record.seq;
+                let (records, next) =
+                    crate::events::read_since_from(&path, offset, replay_since, None);
+                offset = next;
+                for record in records {
                     if tx.send(state_change_sse_event(&record)).is_err() {
                         return;
                     }

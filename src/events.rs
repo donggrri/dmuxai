@@ -49,6 +49,8 @@ pub struct EventRecord {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// An event before it is assigned a `seq` and written.
@@ -137,6 +139,55 @@ pub fn read_since(path: &Path, since: u64, limit: Option<usize>) -> Vec<EventRec
         events.push(record);
     }
     events
+}
+
+/// Reads events with `seq > since` starting at a byte `offset`, oldest first.
+/// Only complete lines are consumed; a trailing partial line is left for the
+/// next read. A file shorter than `offset` restarts from 0. Missing files yield
+/// `(vec![], 0)`.
+pub fn read_since_from(
+    path: &Path,
+    offset: u64,
+    since: u64,
+    limit: Option<usize>,
+) -> (Vec<EventRecord>, u64) {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (Vec::new(), 0);
+    };
+    let Ok(len) = file.metadata().map(|metadata| metadata.len()) else {
+        return (Vec::new(), 0);
+    };
+    let start = if len < offset { 0 } else { offset };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return (Vec::new(), start);
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return (Vec::new(), start);
+    }
+
+    let mut events = Vec::new();
+    let mut consumed = 0u64;
+    let mut line_start = 0usize;
+    while let Some(relative_newline) = bytes[line_start..].iter().position(|&b| b == b'\n') {
+        if limit.is_some_and(|limit| events.len() >= limit) {
+            break;
+        }
+        let line_end = line_start + relative_newline;
+        let line = String::from_utf8_lossy(&bytes[line_start..line_end]);
+        let line = line.trim();
+        if !line.is_empty()
+            && let Ok(record) = serde_json::from_str::<EventRecord>(line)
+            && record.seq > since
+        {
+            events.push(record);
+        }
+        line_start = line_end + 1;
+        consumed = line_start as u64;
+    }
+    (events, start + consumed)
 }
 
 /// Maximum tail window read when looking for the last `seq`, so a large log is
@@ -268,6 +319,7 @@ pub struct EventLog {
     path: Arc<PathBuf>,
     workspace: Arc<String>,
     last_seq: Arc<AtomicU64>,
+    run_id: Arc<Mutex<Option<String>>>,
 }
 
 impl EventLog {
@@ -279,6 +331,7 @@ impl EventLog {
             path: Arc::new(path),
             workspace: Arc::new(workspace_label),
             last_seq: Arc::new(AtomicU64::new(last)),
+            run_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -288,6 +341,19 @@ impl EventLog {
 
     pub fn last_seq(&self) -> u64 {
         self.last_seq.load(Ordering::SeqCst)
+    }
+
+    /// Sets the run id stamped on every subsequent append. Shared across clones.
+    pub fn set_run_id(&self, id: Option<String>) {
+        *self.run_id.lock().unwrap_or_else(|p| p.into_inner()) = id;
+    }
+
+    /// Current run id stamped on appended records, if any. Shared across clones.
+    pub fn run_id(&self) -> Option<String> {
+        self.run_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Appends one JSON line per draft, assigning consecutive `seq` values
@@ -306,6 +372,7 @@ impl EventLog {
 
         // Re-read under the lock so two processes never pick the same seq.
         let mut seq = last_valid_seq(&self.path);
+        let run_id = self.run_id();
         let now = now_ms();
         let ts = format_ts(now);
         let mut file = OpenOptions::new()
@@ -331,6 +398,7 @@ impl EventLog {
                 to_state: draft.to_state,
                 message: draft.message,
                 error_kind: draft.error_kind,
+                run_id: run_id.clone(),
             };
             let line = serde_json::to_string(&record).map_err(std::io::Error::other)?;
             writeln!(file, "{line}")?;
@@ -1186,6 +1254,7 @@ mod tests {
                 to_state: "running".to_string(),
                 message: Some("a".repeat(64)),
                 error_kind: None,
+                run_id: None,
             };
             writeln!(file, "{}", serde_json::to_string(&record).unwrap()).unwrap();
         }
@@ -1247,5 +1316,100 @@ mod tests {
         let mut disabled = StallDetector::new(Duration::ZERO);
         disabled.busy("cursor", None, start);
         assert!(disabled.tick(start + Duration::from_secs(999)).is_empty());
+    }
+
+    // TC-2804 / FR-2804: run_id is optional, omitted when unset, shared across
+    // clones, and old lines without it still parse.
+    #[test]
+    fn tc_2804_event_record_run_id_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::open(dir.path(), "ws".to_string());
+
+        let plain = log.append(vec![draft("agent", "started")]).unwrap();
+        assert!(plain[0].run_id.is_none());
+        let plain_json = serde_json::to_value(&plain[0]).unwrap();
+        assert!(
+            plain_json.get("run_id").is_none(),
+            "run_id must be omitted when unset: {plain_json}"
+        );
+
+        // Setting it on a clone affects every clone because the id is shared.
+        let clone = log.clone();
+        clone.set_run_id(Some("0123456789abcdef".to_string()));
+        assert_eq!(log.run_id().as_deref(), Some("0123456789abcdef"));
+
+        let tagged = log.append(vec![draft("agent", "running")]).unwrap();
+        assert_eq!(tagged[0].run_id.as_deref(), Some("0123456789abcdef"));
+        let line = serde_json::to_string(&tagged[0]).unwrap();
+        let roundtrip: EventRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(roundtrip.run_id.as_deref(), Some("0123456789abcdef"));
+
+        let old = concat!(
+            r#"{"v":1,"seq":9,"ts":"2026-10-17T11:22:33.456Z","ts_ms":1792236153456,"#,
+            r#""workspace":"ws","kind":"agent","to_state":"running"}"#
+        );
+        let parsed: EventRecord = serde_json::from_str(old).unwrap();
+        assert!(parsed.run_id.is_none());
+    }
+
+    // TC-2805 / FR-2805: byte offsets advance over complete lines only, defer a
+    // partial trailing line, restart after truncation and honor the limit.
+    #[test]
+    fn tc_2805_incremental_tail_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::open(dir.path(), "ws".to_string());
+        let path = events_path(dir.path());
+
+        let first = log
+            .append(vec![draft("agent", "started"), draft("agent", "running")])
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        let two_lines_len = std::fs::metadata(&path).unwrap().len();
+
+        let (events, offset) = read_since_from(&path, 0, 0, None);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[1].seq, 2);
+        assert_eq!(offset, two_lines_len);
+
+        // A new complete line plus an incomplete one: only the complete line is
+        // returned and the offset stops before the partial line.
+        let third = log.append(vec![draft("agent", "completed")]).unwrap();
+        let third_line = serde_json::to_string(&third[0]).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{}", &third_line[..third_line.len() / 2]).unwrap();
+        drop(file);
+
+        let (events, next) = read_since_from(&path, offset, 0, None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq, 3);
+        assert_eq!(next, offset + third_line.len() as u64 + 1);
+        assert!(next < std::fs::metadata(&path).unwrap().len());
+
+        // Completing the partial line makes it readable from the saved offset.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{}", &third_line[third_line.len() / 2..]).unwrap();
+        drop(file);
+        let (events, completed_offset) = read_since_from(&path, next, 0, None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq, 3);
+        assert_eq!(completed_offset, std::fs::metadata(&path).unwrap().len());
+
+        // Limit stops after the requested records and consumes only their bytes.
+        let (limited, limited_offset) = read_since_from(&path, 0, 0, Some(2));
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].seq, 1);
+        assert_eq!(limited[1].seq, 2);
+        assert_eq!(limited_offset, two_lines_len);
+
+        // A shorter file restarts from 0 and applies the `since` filter.
+        let mut fresh = third[0].clone();
+        fresh.seq = 10;
+        let fresh_line = format!("{}\n", serde_json::to_string(&fresh).unwrap());
+        std::fs::write(&path, &fresh_line).unwrap();
+        let (events, reset_offset) = read_since_from(&path, completed_offset, 9, None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq, 10);
+        assert_eq!(reset_offset, fresh_line.len() as u64);
     }
 }

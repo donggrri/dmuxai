@@ -340,6 +340,7 @@ mod tests {
             to_state: "started".to_string(),
             message: None,
             error_kind: None,
+            run_id: None,
         };
         let rec2 = crate::events::EventRecord {
             v: 1,
@@ -357,6 +358,7 @@ mod tests {
             to_state: "pending".to_string(),
             message: None,
             error_kind: None,
+            run_id: None,
         };
         let rec3 = crate::events::EventRecord {
             v: 1,
@@ -374,6 +376,7 @@ mod tests {
             to_state: "stalled".to_string(),
             message: None,
             error_kind: None,
+            run_id: None,
         };
 
         let content = format!(
@@ -467,6 +470,7 @@ mod tests {
             to_state: "started".to_string(),
             message: None,
             error_kind: None,
+            run_id: None,
         };
         let rec_act = crate::events::EventRecord {
             v: 1,
@@ -484,6 +488,7 @@ mod tests {
             to_state: "tool".to_string(),
             message: Some("running cargo test".to_string()),
             error_kind: None,
+            run_id: None,
         };
 
         // When only started has arrived, last_output_at_ms equals started_at_ms
